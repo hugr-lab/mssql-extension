@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "**-bootstrap", "feature/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-14
+          find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
+
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ARM64
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            cmake_arch: ""
+
+          # macOS x86_64
+          - os: macos
+            arch: x86_64
+            runner: macos-13
+            cmake_arch: ""
+
+          # Linux x86_64
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-22.04
+            cmake_arch: ""
+
+          # Linux ARM64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            cmake_arch: ""
+
+          # Windows x86_64
+          - os: windows
+            arch: x86_64
+            runner: windows-latest
+            cmake_arch: x64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Ninja (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            brew install ninja
+          else
+            sudo apt-get update
+            sudo apt-get install -y ninja-build
+          fi
+
+      - name: Setup Ninja (Windows)
+        if: matrix.os == 'windows'
+        run: choco install ninja
+
+      - name: Build Release (Unix)
+        if: matrix.os != 'windows'
+        run: make release
+
+      - name: Build Release (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Test Extension Loads
+        if: matrix.os != 'windows'
+        run: |
+          ./build/release/duckdb -c "SELECT mssql_version();"
+          ./build/release/duckdb -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'mssql';"
+
+      - name: Test Extension Loads (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          ./build/release/duckdb.exe -c "SELECT mssql_version();"
+          ./build/release/duckdb.exe -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'mssql';"
+
+      - name: Upload Extension Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mssql-extension-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            build/release/extension/mssql/mssql.duckdb_extension
+          if-no-files-found: error
