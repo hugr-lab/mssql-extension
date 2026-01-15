@@ -41,7 +41,7 @@ As a DuckDB user, I want to attach a SQL Server database as a named connection c
 
 **Acceptance Scenarios**:
 
-1. **Given** an mssql secret named `my_secret` exists, **When** I execute `ATTACH '' AS mydb TYPE mssql (SECRET my_secret)`, **Then** a named connection context `mydb` is created.
+1. **Given** an mssql secret named `my_secret` exists, **When** I execute `ATTACH '' AS mydb (TYPE mssql, SECRET my_secret)`, **Then** a named connection context `mydb` is created.
 2. **Given** an attached database context exists, **When** no queries have been executed against it, **Then** no actual network connection to SQL Server has been opened (lazy connection).
 3. **Given** I attempt to attach without a valid secret, **When** the attach command executes, **Then** it fails with a clear error message.
 

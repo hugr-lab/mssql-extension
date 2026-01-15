@@ -1,0 +1,142 @@
+# name: test/sql/integration/large_data.test
+# description: Test streaming datasets and big row data (large VARCHAR, NVARCHAR, VARBINARY)
+# group: [integration]
+#
+# REQUIRES: SQL Server 2022+ running on localhost:1433 (for GENERATE_SERIES)
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Setup using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS largedb (TYPE mssql);
+
+# Test 1: Result set with GENERATE_SERIES
+query I
+SELECT COUNT(*) FROM mssql_scan('largedb', '
+    SELECT
+        value AS id,
+        CAST(value AS VARCHAR(20)) AS str_id,
+        CAST(value * 1.5 AS FLOAT) AS float_val,
+        GETDATE() AS created_at
+    FROM GENERATE_SERIES(1, 500)
+');
+----
+500
+
+# Test 2: Multiple columns with various data types
+query I
+SELECT COUNT(*) FROM mssql_scan('largedb', '
+    SELECT
+        CAST(value AS INT) AS int_col,
+        CAST(value AS BIGINT) AS bigint_col,
+        CAST(value % 32767 AS SMALLINT) AS smallint_col,
+        CAST(value % 255 AS TINYINT) AS tinyint_col,
+        CAST(value * 0.123 AS FLOAT) AS float_col,
+        CAST(''Row '' + CAST(value AS VARCHAR(10)) AS VARCHAR(50)) AS varchar_col,
+        CAST(value % 2 AS BIT) AS bit_col
+    FROM GENERATE_SERIES(1, 1000)
+');
+----
+1000
+
+# Test 3: Wide rows (many columns)
+query I
+SELECT COUNT(*) FROM mssql_scan('largedb', '
+    SELECT
+        value AS c1, value+1 AS c2, value+2 AS c3, value+3 AS c4, value+4 AS c5,
+        value+5 AS c6, value+6 AS c7, value+7 AS c8, value+8 AS c9, value+9 AS c10,
+        value+10 AS c11, value+11 AS c12, value+12 AS c13, value+13 AS c14, value+14 AS c15,
+        value+15 AS c16, value+16 AS c17, value+17 AS c18, value+18 AS c19, value+19 AS c20
+    FROM GENERATE_SERIES(1, 100)
+');
+----
+100
+
+#
+# Big Row Data Tests
+#
+
+# Test 4: Large VARCHAR (8000 bytes - max for VARCHAR)
+query I
+SELECT LEN(big_text) FROM mssql_scan('largedb', '
+    SELECT REPLICATE(''X'', 8000) AS big_text
+');
+----
+8000
+
+# Test 5: Large NVARCHAR (4000 characters - max for NVARCHAR without MAX)
+query I
+SELECT LEN(big_ntext) FROM mssql_scan('largedb', '
+    SELECT REPLICATE(N''U'', 4000) AS big_ntext
+');
+----
+4000
+
+# Test 6: Multiple large columns in same row
+query III
+SELECT LEN(col1), LEN(col2), LEN(col3) FROM mssql_scan('largedb', '
+    SELECT
+        REPLICATE(''A'', 2000) AS col1,
+        REPLICATE(''B'', 3000) AS col2,
+        REPLICATE(''C'', 2500) AS col3
+');
+----
+2000	3000	2500
+
+# Test 7: VARBINARY data (computed length on SQL Server side)
+query I
+SELECT * FROM mssql_scan('largedb', '
+    SELECT DATALENGTH(CAST(REPLICATE(0x41, 1000) AS VARBINARY(8000))) AS bin_len
+');
+----
+1000
+
+# Test 8: Mix of large and small columns
+query IIII
+SELECT
+    LEN(small_col),
+    LEN(big_col),
+    int_col,
+    bit_col
+FROM mssql_scan('largedb', '
+    SELECT
+        ''hello'' AS small_col,
+        REPLICATE(''Z'', 5000) AS big_col,
+        42 AS int_col,
+        1 AS bit_col
+');
+----
+5	5000	42	1
+
+# Test 9: Multiple rows with large data
+query I
+SELECT COUNT(*) FROM mssql_scan('largedb', '
+    SELECT
+        value AS id,
+        REPLICATE(''X'', 100) AS big_text
+    FROM GENERATE_SERIES(1, 50)
+');
+----
+50
+
+# Test 10: Large data with NULL values
+query III
+SELECT
+    col1 IS NOT NULL,
+    col2 IS NULL,
+    LEN(col3)
+FROM mssql_scan('largedb', '
+    SELECT
+        REPLICATE(''A'', 1000) AS col1,
+        NULL AS col2,
+        REPLICATE(''C'', 2000) AS col3
+');
+----
+true	true	2000
+
+# Cleanup
+statement ok
+DETACH largedb;

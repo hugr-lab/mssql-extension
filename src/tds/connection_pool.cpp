@@ -229,7 +229,6 @@ void ConnectionPool::CleanupThreadFunc() {
 		}
 
 		auto now = std::chrono::steady_clock::now();
-		size_t current_idle = idle_connections_.size();
 		size_t to_keep = config_.min_connections > stats_.active_connections
 		                     ? config_.min_connections - stats_.active_connections
 		                     : 0;

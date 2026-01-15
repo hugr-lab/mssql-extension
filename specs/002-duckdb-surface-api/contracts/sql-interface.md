@@ -280,7 +280,7 @@ FROM mssql_execute('sqlserver', 'DELETE FROM logs WHERE created_at < ''2024-01-0
 
 | Condition | Error Message |
 |-----------|---------------|
-| Context not found | `MSSQL Error: Unknown context '<name>'. Attach a database first with: ATTACH '' AS <name> TYPE mssql (SECRET ...)` |
+| Context not found | `MSSQL Error: Unknown context '<name>'. Attach a database first with: ATTACH '' AS <name> (TYPE mssql, SECRET ...)` |
 
 ### mssql_scan
 
@@ -336,7 +336,7 @@ JOIN local_table l ON s.id = l.user_id;
 
 | Condition | Error Message |
 |-----------|---------------|
-| Context not found | `MSSQL Error: Unknown context '<name>'. Attach a database first with: ATTACH '' AS <name> TYPE mssql (SECRET ...)` |
+| Context not found | `MSSQL Error: Unknown context '<name>'. Attach a database first with: ATTACH '' AS <name> (TYPE mssql, SECRET ...)` |
 
 ---
 
@@ -370,7 +370,7 @@ CREATE SECRET prod_db (
 );
 
 -- 2. Attach the database
-ATTACH '' AS prod TYPE mssql (SECRET prod_db);
+ATTACH '' AS prod (TYPE mssql, SECRET prod_db);
 
 -- 3. Query data (stub returns sample data)
 SELECT * FROM mssql_scan('prod', 'SELECT id, name FROM customers');

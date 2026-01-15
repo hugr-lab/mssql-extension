@@ -220,10 +220,10 @@ make test
 
 ## Acceptance Checklist
 
-- [ ] `CREATE SECRET ... TYPE mssql` works with all 5 required fields
+- [ ] `CREATE SECRET ... (TYPE mssql ...` works with all 5 required fields
 - [ ] Missing/invalid fields produce clear error messages
 - [ ] Secrets appear in `duckdb_secrets()` with password redacted
-- [ ] `ATTACH '' AS name TYPE mssql (SECRET secret_name)` creates context
+- [ ] `ATTACH '' AS name (TYPE mssql, SECRET secret_name)` creates context
 - [ ] Attach does not open network connection (lazy)
 - [ ] `DETACH name` removes context cleanly
 - [ ] `mssql_execute` returns (success, affected_rows, message)

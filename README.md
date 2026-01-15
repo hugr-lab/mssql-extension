@@ -53,6 +53,24 @@ After building, the extension is statically linked into DuckDB. Test it:
 
 Expected output shows the DuckDB commit hash the extension was built against.
 
+### Connect to SQL Server
+
+Use the ATTACH command with a connection string:
+
+```sql
+-- Connection string format
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword' AS db (TYPE mssql);
+
+-- Query SQL Server tables
+SELECT * FROM mssql_scan('db', 'SELECT * FROM your_table') LIMIT 100;
+```
+
+Connection string parameters:
+- `Server` - hostname and port (format: `host,port`)
+- `Database` - database name
+- `User Id` - SQL Server login username
+- `Password` - SQL Server login password
+
 ### Load as Dynamic Extension
 
 The loadable extension is built at:

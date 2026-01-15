@@ -1,6 +1,7 @@
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "mssql_secret.hpp"
+#include "mssql_storage.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -53,45 +54,63 @@ bool ConnectionHandleManager::HasConnection(int64_t handle) {
 //===----------------------------------------------------------------------===//
 
 void MssqlOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &secret_name_vector = args.data[0];
+	auto &input_vector = args.data[0];
 
-	UnaryExecutor::Execute<string_t, int64_t>(secret_name_vector, result, args.size(), [&](string_t secret_name) {
-		// Get the client context from expression state
-		auto &context = state.GetContext();
+	UnaryExecutor::Execute<string_t, int64_t>(input_vector, result, args.size(), [&](string_t input_str) {
+		std::string input = input_str.GetString();
+		std::string host;
+		uint16_t port;
+		std::string database;
+		std::string user;
+		std::string password;
 
-		// Look up the secret
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto &secret_manager = SecretManager::Get(context);
+		// Check if input is a connection string (URI or ADO.NET format)
+		if (MSSQLConnectionInfo::IsUriFormat(input) || MSSQLConnectionInfo::IsConnectionString(input)) {
+			// Parse connection string directly
+			auto conn_info = MSSQLConnectionInfo::FromConnectionString(input);
+			host = conn_info->host;
+			port = conn_info->port;
+			database = conn_info->database;
+			user = conn_info->user;
+			password = conn_info->password;
+		} else {
+			// Treat as secret name (backward compatibility)
+			auto &context = state.GetContext();
+			auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+			auto &secret_manager = SecretManager::Get(context);
 
-		auto secret_entry = secret_manager.GetSecretByName(transaction, secret_name.GetString());
-		if (!secret_entry) {
-			throw InvalidInputException("Secret '%s' not found", secret_name.GetString());
+			auto secret_entry = secret_manager.GetSecretByName(transaction, input);
+			if (!secret_entry) {
+				throw InvalidInputException("Secret '%s' not found. You can also pass a connection string:\n"
+				                            "  mssql://user:password@host:port/database\n"
+				                            "  Server=host,port;Database=db;User Id=user;Password=pass",
+				                            input);
+			}
+
+			auto &secret = *secret_entry->secret;
+			if (secret.GetType() != "mssql") {
+				throw InvalidInputException("Secret '%s' is not an MSSQL secret", input);
+			}
+
+			auto &kv_secret = dynamic_cast<const KeyValueSecret &>(secret);
+
+			auto host_val = kv_secret.TryGetValue(MSSQL_SECRET_HOST);
+			auto port_val = kv_secret.TryGetValue(MSSQL_SECRET_PORT);
+			auto database_val = kv_secret.TryGetValue(MSSQL_SECRET_DATABASE);
+			auto user_val = kv_secret.TryGetValue(MSSQL_SECRET_USER);
+			auto password_val = kv_secret.TryGetValue(MSSQL_SECRET_PASSWORD);
+
+			if (host_val.IsNull() || port_val.IsNull() || database_val.IsNull() ||
+			    user_val.IsNull() || password_val.IsNull()) {
+				throw InvalidInputException("Secret '%s' is missing required fields", input);
+			}
+
+			host = host_val.ToString();
+			port = static_cast<uint16_t>(port_val.GetValue<int64_t>());
+			database = database_val.ToString();
+			user = user_val.ToString();
+			password = password_val.ToString();
 		}
-
-		auto &secret = *secret_entry->secret;
-		if (secret.GetType() != "mssql") {
-			throw InvalidInputException("Secret '%s' is not an MSSQL secret", secret_name.GetString());
-		}
-
-		// Extract connection parameters from secret
-		auto &kv_secret = dynamic_cast<const KeyValueSecret &>(secret);
-
-		auto host_val = kv_secret.TryGetValue(MSSQL_SECRET_HOST);
-		auto port_val = kv_secret.TryGetValue(MSSQL_SECRET_PORT);
-		auto database_val = kv_secret.TryGetValue(MSSQL_SECRET_DATABASE);
-		auto user_val = kv_secret.TryGetValue(MSSQL_SECRET_USER);
-		auto password_val = kv_secret.TryGetValue(MSSQL_SECRET_PASSWORD);
-
-		if (host_val.IsNull() || port_val.IsNull() || database_val.IsNull() ||
-		    user_val.IsNull() || password_val.IsNull()) {
-			throw InvalidInputException("Secret '%s' is missing required fields", secret_name.GetString());
-		}
-
-		std::string host = host_val.ToString();
-		uint16_t port = static_cast<uint16_t>(port_val.GetValue<int64_t>());
-		std::string database = database_val.ToString();
-		std::string user = user_val.ToString();
-		std::string password = password_val.ToString();
 
 		// Create and connect
 		auto conn = std::make_shared<tds::TdsConnection>();
@@ -253,7 +272,11 @@ void MssqlPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
-	// mssql_open(secret_name VARCHAR) -> BIGINT
+	// mssql_open(connection_string VARCHAR) -> BIGINT
+	// Accepts:
+	//   - Connection string: "Server=host,port;Database=db;User Id=user;Password=pass"
+	//   - URI format: "mssql://user:password@host:port/database"
+	//   - Secret name (for backward compatibility)
 	ScalarFunctionSet open_func("mssql_open");
 	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MssqlOpenFunction));
 	loader.RegisterFunction(open_func);

@@ -1,0 +1,36 @@
+# name: test/sql/query/basic_select.test
+# description: Test basic SELECT query with INT, VARCHAR, DATETIME columns
+# group: [query]
+
+# These tests require a live SQL Server connection
+# Skip if no MSSQL test server is configured
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+
+# Test basic SELECT with integer
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
+----
+1
+
+# Test SELECT with VARCHAR
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT ''Hello World'' AS message');
+----
+Hello World
+
+# Test SELECT with multiple columns and types
+# Use fixed date instead of GETDATE() for deterministic test
+query ITT
+SELECT * FROM mssql_scan('test_db', 'SELECT 42 AS id, ''test'' AS name, CAST(''2024-01-15 12:30:45'' AS DATETIME) AS created_at');
+----
+42	test	2024-01-15 12:30:45
+
+statement ok
+DETACH test_db;

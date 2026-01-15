@@ -290,5 +290,60 @@ bool TdsConnection::IsLongIdle() const {
 	return idle_duration > LONG_IDLE_THRESHOLD;
 }
 
+bool TdsConnection::ExecuteBatch(const std::string& sql) {
+	// Can only execute from Idle state
+	ConnectionState expected = ConnectionState::Idle;
+	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
+		last_error_ = "Cannot execute: connection not in Idle state (current: " +
+		              std::string(ConnectionStateToString(expected)) + ")";
+		return false;
+	}
+
+	// Build SQL_BATCH packet(s)
+	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql);
+
+	// Send all packets
+	for (size_t i = 0; i < packets.size(); i++) {
+		auto& packet = packets[i];
+		packet.SetPacketId(next_packet_id_++);
+		if (!socket_->SendPacket(packet)) {
+			last_error_ = "Failed to send SQL_BATCH: " + socket_->GetLastError();
+			state_.store(ConnectionState::Disconnected);
+			return false;
+		}
+	}
+
+	// Connection is now in Executing state, ready to receive response
+	return true;
+}
+
+ssize_t TdsConnection::ReceiveData(uint8_t* buffer, size_t buffer_size, int timeout_ms) {
+	ConnectionState current = state_.load();
+
+	// Can receive data in Executing or Cancelling states
+	if (current != ConnectionState::Executing && current != ConnectionState::Cancelling) {
+		last_error_ = "Cannot receive: connection not in Executing or Cancelling state";
+		return -1;
+	}
+
+	if (!socket_) {
+		last_error_ = "Socket is null";
+		return -1;
+	}
+
+	// Use the socket's receive method with timeout
+	ssize_t received = socket_->Receive(buffer, buffer_size, timeout_ms);
+
+	if (received < 0) {
+		last_error_ = "Receive error: " + socket_->GetLastError();
+		state_.store(ConnectionState::Disconnected);
+	} else if (received == 0) {
+		// Connection closed
+		state_.store(ConnectionState::Disconnected);
+	}
+
+	return received;
+}
+
 }  // namespace tds
 }  // namespace duckdb

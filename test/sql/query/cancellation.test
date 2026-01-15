@@ -1,0 +1,44 @@
+# name: test/sql/query/cancellation.test
+# description: Test query cancellation during execution
+# group: [query]
+
+# These tests require a live SQL Server connection
+# Skip if no MSSQL test server is configured
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Note: Actual cancellation tests require interactive testing or
+# a test harness that can send Ctrl+C during query execution.
+# These tests verify the infrastructure is in place.
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+
+# Basic query that completes quickly (no cancellation needed)
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
+----
+1
+
+# Test that multiple sequential queries work (connection pool reuse)
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 2 AS value');
+----
+2
+
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 3 AS value');
+----
+3
+
+# Interactive cancellation test (manual):
+# Run: SELECT * FROM mssql_scan('test_db', 'WAITFOR DELAY ''00:00:30''');
+# Press Ctrl+C during execution
+# Verify: Query cancelled within 2 seconds
+# Verify: Connection returned to pool (run another query)
+
+statement ok
+DETACH test_db;

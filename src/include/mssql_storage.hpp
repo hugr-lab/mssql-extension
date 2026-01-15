@@ -36,13 +36,20 @@ struct MSSQLConnectionInfo {
 	// Create from secret
 	static shared_ptr<MSSQLConnectionInfo> FromSecret(ClientContext &context, const string &secret_name);
 
-	// Create from connection string
-	// Format: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
+	// Create from connection string (ADO.NET format or URI format)
+	// ADO.NET: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
+	// URI: "mssql://user:password@host:port/database?encrypt=true"
 	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string);
 
 	// Validate connection string format
 	// Returns: empty string if valid, error message if invalid
 	static string ValidateConnectionString(const string &connection_string);
+
+	// Check if string is a URI format (mssql://...)
+	static bool IsUriFormat(const string &str);
+
+	// Check if string is a connection string (contains key=value pairs)
+	static bool IsConnectionString(const string &str);
 };
 
 //===----------------------------------------------------------------------===//

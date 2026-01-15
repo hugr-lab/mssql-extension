@@ -110,9 +110,7 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string& password) {
 	std::vector<uint8_t> encoded = encoding::Utf16LEEncode(password);
 
 	// Apply TDS password obfuscation to each byte:
-	// Note: The correct order (per FreeTDS implementation) is:
-	// 1. Swap nibbles (rotate left 4 bits)
-	// 2. XOR with 0xA5
+	// Per MS-TDS spec: swap nibbles first, then XOR with 0xA5
 	for (auto& byte : encoded) {
 		byte = ((byte << 4) & 0xF0) | ((byte >> 4) & 0x0F);
 		byte ^= 0xA5;
@@ -509,10 +507,108 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 }
 
 TdsPacket TdsProtocol::BuildPing() {
-	// Empty SQL_BATCH packet triggers DONE response
+	// Send a simple SELECT 1 query as a ping
+	// This is more reliable than an empty batch and includes proper ALL_HEADERS
+	return BuildSqlBatch("SELECT 1");
+}
+
+TdsPacket TdsProtocol::BuildSqlBatch(const std::string& sql) {
 	TdsPacket packet(PacketType::SQL_BATCH);
-	// No payload needed for ping
+
+	// SQL_BATCH for TDS 7.1+ requires ALL_HEADERS prefix (MS-TDS 2.2.6.6)
+	// When MARS is enabled (which modern SQL Server requires), we must include
+	// the Transaction Descriptor header.
+	//
+	// ALL_HEADERS structure:
+	//   TotalLength (4 bytes, DWORD) - includes the TotalLength field itself
+	//   *Header - one or more headers
+	//
+	// Transaction Descriptor Header (MS-TDS 2.2.6.5.1):
+	//   HeaderLength (4 bytes, DWORD) = 18 (4 + 2 + 8 + 4)
+	//   HeaderType (2 bytes, USHORT) = 0x0002
+	//   TransactionDescriptor (8 bytes) = 0 for no transaction
+	//   OutstandingRequestCount (4 bytes, DWORD) = 1
+
+	// Transaction Descriptor Header: 18 bytes
+	// Total headers = 4 (length field) + 18 (trans desc) = 22 bytes
+	uint32_t total_headers_length = 22;
+	packet.AppendByte(total_headers_length & 0xFF);
+	packet.AppendByte((total_headers_length >> 8) & 0xFF);
+	packet.AppendByte((total_headers_length >> 16) & 0xFF);
+	packet.AppendByte((total_headers_length >> 24) & 0xFF);
+
+	// Transaction Descriptor Header
+	uint32_t header_length = 18;  // 4 + 2 + 8 + 4
+	packet.AppendByte(header_length & 0xFF);
+	packet.AppendByte((header_length >> 8) & 0xFF);
+	packet.AppendByte((header_length >> 16) & 0xFF);
+	packet.AppendByte((header_length >> 24) & 0xFF);
+
+	// Header Type = 0x0002 (Transaction Descriptor)
+	packet.AppendByte(0x02);
+	packet.AppendByte(0x00);
+
+	// Transaction Descriptor = 0 (no active transaction)
+	for (int i = 0; i < 8; i++) {
+		packet.AppendByte(0x00);
+	}
+
+	// Outstanding Request Count = 1
+	packet.AppendByte(0x01);
+	packet.AppendByte(0x00);
+	packet.AppendByte(0x00);
+	packet.AppendByte(0x00);
+
+	// SQL text encoded as UTF-16LE
+	std::vector<uint8_t> encoded = encoding::Utf16LEEncode(sql);
+	packet.AppendPayload(encoded);
+
 	return packet;
+}
+
+std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string& sql,
+                                                             size_t max_packet_size) {
+	std::vector<TdsPacket> packets;
+
+	// Encode SQL to UTF-16LE
+	std::vector<uint8_t> encoded = encoding::Utf16LEEncode(sql);
+
+	if (encoded.empty()) {
+		// Empty query - send ping (SELECT 1) to get a valid response
+		packets.push_back(BuildPing());
+		return packets;
+	}
+
+	// TDS packet header is 8 bytes, so payload can be up to (max_packet_size - 8) bytes
+	size_t max_payload = max_packet_size - TDS_HEADER_SIZE;
+
+	// If it fits in a single packet, just use BuildSqlBatch
+	if (encoded.size() <= max_payload) {
+		packets.push_back(BuildSqlBatch(sql));
+		return packets;
+	}
+
+	// Split into multiple packets
+	size_t offset = 0;
+	while (offset < encoded.size()) {
+		size_t chunk_size = std::min(max_payload, encoded.size() - offset);
+		bool is_last = (offset + chunk_size >= encoded.size());
+
+		TdsPacket packet(PacketType::SQL_BATCH);
+
+		// Set EOM flag only on last packet
+		if (!is_last) {
+			packet.SetEndOfMessage(false);
+		}
+
+		// Append this chunk of the payload
+		packet.AppendPayload(encoded.data() + offset, chunk_size);
+
+		packets.push_back(std::move(packet));
+		offset += chunk_size;
+	}
+
+	return packets;
 }
 
 TdsPacket TdsProtocol::BuildAttention() {

@@ -1,0 +1,97 @@
+# name: test/sql/integration/pool_limits.test
+# description: Test connection pool reuse and no leaks
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433
+# Run with: make integration-test
+#
+# The main goal is to verify connections are reused properly and not leaked.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Test 1: Set a low connection limit
+statement ok
+SET mssql_connection_limit = 2;
+
+# Attach with limited pool using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS limitdb (TYPE mssql);
+
+# Test 2: First query creates a connection
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 1 AS val');
+----
+1
+
+# Verify connection was created
+query I
+SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='limitdb');
+----
+true
+
+# Test 3: Sequential queries reuse connections
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 2 AS val');
+----
+2
+
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 3 AS val');
+----
+3
+
+# Verify connection reuse (should have created only 1 connection for sequential queries)
+query I
+SELECT connections_created FROM mssql_pool_stats(context_name='limitdb');
+----
+1
+
+# Test 4: Run more queries to verify reuse continues
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 4 AS val');
+----
+4
+
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 5 AS val');
+----
+5
+
+query I
+SELECT * FROM mssql_scan('limitdb', 'SELECT 6 AS val');
+----
+6
+
+# Verify still only 1 connection created (reuse working)
+query I
+SELECT connections_created FROM mssql_pool_stats(context_name='limitdb');
+----
+1
+
+# Test 5: Verify pool settings
+query I
+SELECT current_setting('mssql_connection_limit');
+----
+2
+
+# Test 6: Pool stats after usage
+query I
+SELECT acquire_count >= 6 FROM mssql_pool_stats(context_name='limitdb');
+----
+true
+
+# Test 7: No timeouts should have occurred (sequential queries)
+query I
+SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='limitdb');
+----
+0
+
+# Cleanup
+statement ok
+DETACH limitdb;
+
+# Reset settings
+statement ok
+SET mssql_connection_limit = 64;

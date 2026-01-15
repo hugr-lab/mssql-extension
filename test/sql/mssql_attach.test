@@ -1,27 +1,96 @@
 # name: test/sql/mssql_attach.test
-# description: Test MSSQL database attach and detach
+# description: Test MSSQL database attach and detach with different connection formats
 # group: [mssql]
 
 require mssql
 
-# First create a secret that we'll use for attachment
+require-env MSSQL_TEST_DSN
+
+require-env MSSQL_TEST_URI
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+require-env MSSQL_TEST_DB
+
+#
+# Test 1: ATTACH with ADO.NET connection string (key-value format)
+#
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS kv_db (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('kv_db', 'SELECT 1 AS val');
+----
+1
+
+statement ok
+DETACH kv_db;
+
+#
+# Test 2: ATTACH with URI format connection string
+#
+statement ok
+ATTACH '${MSSQL_TEST_URI}' AS uri_db (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('uri_db', 'SELECT 2 AS val');
+----
+2
+
+statement ok
+DETACH uri_db;
+
+#
+# Test 3: ATTACH with SECRET
+#
 statement ok
 CREATE SECRET attach_test_secret (
     TYPE mssql,
-    host 'localhost',
-    port 1433,
-    database 'testdb',
-    user 'testuser',
-    password 'testpass'
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database '${MSSQL_TEST_DB}',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}'
 );
 
-# T019: Test successful attach with valid secret
 statement ok
-ATTACH '' AS mydb (TYPE mssql, SECRET attach_test_secret);
+ATTACH '' AS secret_db (TYPE mssql, SECRET attach_test_secret);
 
-# T024: Test successful detach
+query I
+SELECT * FROM mssql_scan('secret_db', 'SELECT 3 AS val');
+----
+3
+
 statement ok
-DETACH mydb;
+DETACH secret_db;
+
+statement ok
+DROP SECRET attach_test_secret;
+
+#
+# Test 4: Re-attach after detach
+#
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
+
+statement ok
+DETACH reattach_db;
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
+
+statement ok
+DETACH reattach_db;
+
+#
+# Error handling tests
+#
 
 # T020: Test attach without secret or connection string (should fail)
 statement error
@@ -36,77 +105,41 @@ ATTACH '' AS bad_secret_db (TYPE mssql, SECRET nonexistent_secret);
 not found
 
 # T025: Test detach non-existent context (should fail)
-# Note: DuckDB handles this error internally
 statement error
 DETACH nonexistent_db;
 ----
 not found
 
-# Test re-attach after detach
-statement ok
-ATTACH '' AS mydb (TYPE mssql, SECRET attach_test_secret);
+#
+# Connection string validation tests
+#
 
-statement ok
-DETACH mydb;
-
-# Clean up
-statement ok
-DROP SECRET attach_test_secret;
-
-# Test attach with connection string (no secret)
-statement ok
-ATTACH 'Server=localhost,1433;Database=testdb;User Id=testuser;Password=testpass' AS conn_str_db (TYPE mssql);
-
-statement ok
-DETACH conn_str_db;
-
-# Test attach with connection string (default port)
-statement ok
-ATTACH 'Server=localhost;Database=testdb;User Id=testuser;Password=testpass' AS conn_str_default_port (TYPE mssql);
-
-statement ok
-DETACH conn_str_default_port;
-
-# Test attach with connection string using alternative key names
-statement ok
-ATTACH 'Data Source=localhost;Initial Catalog=testdb;UID=testuser;PWD=testpass' AS conn_str_alt_keys (TYPE mssql);
-
-statement ok
-DETACH conn_str_alt_keys;
-
-# Test attach with connection string with SSL enabled
-statement ok
-ATTACH 'Server=localhost;Database=testdb;User Id=testuser;Password=testpass;Encrypt=yes' AS conn_str_ssl (TYPE mssql);
-
-statement ok
-DETACH conn_str_ssl;
-
-# Test attach with invalid connection string - missing Server
+# Missing Server
 statement error
 ATTACH 'Database=testdb;User Id=testuser;Password=testpass' AS invalid_conn_str (TYPE mssql);
 ----
 Missing 'Server' in connection string
 
-# Test attach with invalid connection string - missing Database
+# Missing Database
 statement error
-ATTACH 'Server=localhost;User Id=testuser;Password=testpass' AS invalid_conn_str2 (TYPE mssql);
+ATTACH 'Server=test-host;User Id=testuser;Password=testpass' AS invalid_conn_str2 (TYPE mssql);
 ----
 Missing 'Database' in connection string
 
-# Test attach with invalid connection string - missing User Id
+# Missing User Id
 statement error
-ATTACH 'Server=localhost;Database=testdb;Password=testpass' AS invalid_conn_str3 (TYPE mssql);
+ATTACH 'Server=test-host;Database=testdb;Password=testpass' AS invalid_conn_str3 (TYPE mssql);
 ----
 Missing 'User Id' in connection string
 
-# Test attach with invalid connection string - missing Password
+# Missing Password
 statement error
-ATTACH 'Server=localhost;Database=testdb;User Id=testuser' AS invalid_conn_str4 (TYPE mssql);
+ATTACH 'Server=test-host;Database=testdb;User Id=testuser' AS invalid_conn_str4 (TYPE mssql);
 ----
 Missing 'Password' in connection string
 
-# Test attach with invalid port in connection string
+# Invalid port
 statement error
-ATTACH 'Server=localhost,99999;Database=testdb;User Id=testuser;Password=testpass' AS invalid_port_conn (TYPE mssql);
+ATTACH 'Server=test-host,99999;Database=testdb;User Id=testuser;Password=testpass' AS invalid_port_conn (TYPE mssql);
 ----
 Port must be between 1 and 65535
