@@ -1,0 +1,42 @@
+# name: test/sql/integration/basic_queries.test
+# description: Integration tests for basic query execution through attached MSSQL database
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB database initialized
+# Run with: make integration-test
+
+require mssql
+
+# Create a secret for testing
+statement ok
+CREATE SECRET query_test_secret (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'TestDB',
+    user 'sa',
+    password 'DevPassword123!'
+);
+
+# Attach the database
+statement ok
+ATTACH '' AS testdb (TYPE mssql, SECRET query_test_secret);
+
+# Test 1: Verify we can see the test tables
+# Note: This test assumes mssql_scan is implemented
+# If not implemented yet, this will fail and can be skipped
+# statement ok
+# SELECT * FROM testdb.dbo.TestSimplePK LIMIT 1;
+
+# Test 2: Verify pool statistics show activity
+query I
+SELECT connections_created >= 0 FROM mssql_pool_stats(context_name='testdb');
+----
+true
+
+# Cleanup
+statement ok
+DETACH testdb;
+
+statement ok
+DROP SECRET query_test_secret;

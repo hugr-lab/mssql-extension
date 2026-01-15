@@ -1,4 +1,6 @@
 #include "mssql_storage.hpp"
+#include "connection/mssql_pool_manager.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -260,6 +262,9 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name)
 }
 
 void MSSQLCatalog::OnDetach(ClientContext &context) {
+	// Remove connection pool for this context (shuts down and cleans up connections)
+	MssqlPoolManager::Instance().RemovePool(context_name);
+
 	// Unregister context from the manager
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.UnregisterContext(context_name);
@@ -308,6 +313,18 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Register context
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.RegisterContext(name, ctx);
+
+	// Create connection pool for this context using current settings
+	auto pool_config = LoadPoolConfig(context);
+	MssqlPoolManager::Instance().GetOrCreatePool(
+	    name,
+	    pool_config,
+	    ctx->connection_info->host,
+	    ctx->connection_info->port,
+	    ctx->connection_info->user,
+	    ctx->connection_info->password,
+	    ctx->connection_info->database
+	);
 
 	// Create MSSQLCatalog that will clean up the context on detach
 	auto catalog = make_uniq<MSSQLCatalog>(db, name);

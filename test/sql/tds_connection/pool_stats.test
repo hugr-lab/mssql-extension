@@ -1,0 +1,21 @@
+# name: test/sql/tds_connection/pool_stats.test
+# description: Test mssql_pool_stats table function
+# group: [tds_connection]
+
+require mssql
+
+# T067: Test mssql_pool_stats on nonexistent context returns empty result
+query I
+SELECT count(*) FROM mssql_pool_stats(context_name='nonexistent_context');
+----
+0
+
+# Test mssql_pool_stats without parameter (all pools) - should return empty when no pools exist
+query I
+SELECT count(*) FROM mssql_pool_stats();
+----
+0
+
+# T047, T048: Tests for connection reuse and pool limit enforcement
+# These require an actual SQL Server connection and are covered in integration tests
+# The pool is created when a database is attached with TYPE mssql

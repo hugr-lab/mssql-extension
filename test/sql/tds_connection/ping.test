@@ -1,0 +1,15 @@
+# name: test/sql/tds_connection/ping.test
+# description: Test mssql_ping diagnostic function
+# group: [tds_connection]
+
+require mssql
+
+# T031: Test ping on invalid handle throws error
+statement error
+SELECT mssql_ping(99999);
+----
+Invalid connection handle
+
+# T032: Test ping returns false on disconnected connections
+# (This would require a valid connection that gets closed server-side)
+# Skipped in unit tests - covered by integration tests

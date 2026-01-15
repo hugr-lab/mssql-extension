@@ -1,0 +1,72 @@
+# name: test/sql/integration/diagnostic_functions.test
+# description: Integration tests for mssql_open, mssql_close, mssql_ping diagnostic functions
+# group: [integration]
+#
+# These tests verify the diagnostic functions work correctly with a real SQL Server.
+
+require mssql
+
+# Create a secret for testing
+statement ok
+CREATE SECRET integration_test_secret (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'TestDB',
+    user 'sa',
+    password 'DevPassword123!'
+);
+
+# Test 1: mssql_open - should succeed and return a connection handle
+query I
+SELECT mssql_open('integration_test_secret') >= 1;
+----
+true
+
+# Test 2: mssql_close the opened connection
+query I
+SELECT mssql_close(1);
+----
+true
+
+# Test 3: mssql_close with invalid handle should be idempotent (return true)
+query I
+SELECT mssql_close(99999);
+----
+true
+
+# Test 4: mssql_ping with invalid handle should fail gracefully
+statement error
+SELECT mssql_ping(99999);
+----
+Invalid connection handle
+
+# Test 5: mssql_open with non-existent secret should fail
+statement error
+SELECT mssql_open('nonexistent_secret');
+----
+not found
+
+# Cleanup
+statement ok
+DROP SECRET integration_test_secret;
+
+# Test 5: Create secret with unreachable host - should fail to connect
+statement ok
+CREATE SECRET unreachable_secret (
+    TYPE mssql,
+    host '192.0.2.1',
+    port 1433,
+    database 'TestDB',
+    user 'test',
+    password 'test'
+);
+
+# Connection to unreachable host should timeout/fail
+statement error
+SELECT mssql_open('unreachable_secret');
+----
+connect
+
+statement ok
+DROP SECRET unreachable_secret;

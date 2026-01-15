@@ -1,18 +1,16 @@
-version: '3.8'
-
 services:
   sqlserver:
+    # Use SQL Server 2022 with x64 emulation on ARM64 Macs
+    # Azure SQL Edge (ARM64 native) can be used if available on your platform
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: mssql-dev
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=DevPassword123!
-      - MSSQL_PID=Developer
     ports:
       - "1433:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
-      - ./init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P DevPassword123! -C -Q 'SELECT 1' || exit 1"]
       interval: 10s

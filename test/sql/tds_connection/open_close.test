@@ -1,0 +1,51 @@
+# name: test/sql/tds_connection/open_close.test
+# description: Test mssql_open and mssql_close diagnostic functions
+# group: [tds_connection]
+
+require mssql
+
+# T015: Test successful connection open (requires valid SQL Server)
+# These tests are skipped unless a test SQL Server is available
+# Set MSSQL_TEST_HOST, MSSQL_TEST_PORT, MSSQL_TEST_DATABASE, MSSQL_TEST_USER, MSSQL_TEST_PASSWORD
+
+# T016: Test authentication failure with invalid credentials
+# Create a secret with invalid password
+statement ok
+CREATE SECRET test_invalid_creds (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'master',
+    user 'sa',
+    password 'WrongPassword123!'
+);
+
+# Opening with invalid credentials should fail with authentication error
+# Note: This requires a SQL Server to be running on localhost:1433
+# The test will fail with "Failed to connect" if no server, or "Authentication failed" if server rejects
+statement error
+SELECT mssql_open('test_invalid_creds');
+----
+connect
+
+# T024: Test mssql_close with invalid handle returns true (idempotent)
+query I
+SELECT mssql_close(99999);
+----
+true
+
+# T025: Closing the same handle twice is idempotent
+query I
+SELECT mssql_close(99999);
+----
+true
+
+# Clean up
+statement ok
+DROP SECRET test_invalid_creds;
+
+# Test with non-existent secret
+statement error
+SELECT mssql_open('nonexistent_secret');
+----
+Secret 'nonexistent_secret' not found
