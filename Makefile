@@ -99,12 +99,44 @@ docker-status:
 	@docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null || echo "Container not running"
 	@echo ""
 	@echo "Testing connection..."
-	@docker exec mssql-dev /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'DevPassword123!' -C -Q "SELECT 'Connection OK' AS status" 2>/dev/null || echo "Connection failed - is the container running?"
+	@docker exec mssql-dev /opt/mssql-tools18/bin/sqlcmd -S localhost -U $(MSSQL_TEST_USER) -P '$(MSSQL_TEST_PASS)' -C -Q "SELECT 'Connection OK' AS status" 2>/dev/null || echo "Connection failed - is the container running?"
+
+# Load environment from .env file if it exists
+-include .env
+export
+
+# Default test environment variables (can be overridden by .env or command line)
+MSSQL_TEST_HOST ?= localhost
+MSSQL_TEST_PORT ?= 1433
+MSSQL_TEST_USER ?= sa
+MSSQL_TEST_PASS ?= TestPassword1
+MSSQL_TEST_DB ?= master
+
+# Derived connection strings (computed from base variables)
+MSSQL_TEST_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=$(MSSQL_TEST_DB);User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
+MSSQL_TEST_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)
+
+# Export all test environment variables for subprocesses
+export MSSQL_TEST_HOST
+export MSSQL_TEST_PORT
+export MSSQL_TEST_USER
+export MSSQL_TEST_PASS
+export MSSQL_TEST_DB
+export MSSQL_TEST_DSN
+export MSSQL_TEST_URI
 
 # Integration tests - requires SQL Server running
 integration-test: release
 	@echo "Running integration tests..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
+	@echo ""
+	@echo "Test environment:"
+	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"
+	@echo "  MSSQL_TEST_PORT=$(MSSQL_TEST_PORT)"
+	@echo "  MSSQL_TEST_USER=$(MSSQL_TEST_USER)"
+	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
+	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
+	@echo "  MSSQL_TEST_URI=$(MSSQL_TEST_URI)"
 	@echo ""
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "ERROR: SQL Server is not running or not healthy."; \
@@ -112,3 +144,19 @@ integration-test: release
 		exit 1; \
 	fi
 	$(BUILD_DIR)/release/test/unittest "[integration]" --force-reload
+
+# Run all tests (unit + integration)
+test-all: release
+	@echo "Running all tests..."
+	@echo ""
+	@echo "Test environment:"
+	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"
+	@echo "  MSSQL_TEST_PORT=$(MSSQL_TEST_PORT)"
+	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
+	@echo ""
+	$(BUILD_DIR)/release/test/unittest "*mssql*" --force-reload
+
+# Debug test run
+test-debug: debug
+	@echo "Running tests (debug build)..."
+	$(BUILD_DIR)/debug/test/unittest "*mssql*" --force-reload

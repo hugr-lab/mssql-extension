@@ -59,6 +59,112 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 // Connection String Parsing
 //===----------------------------------------------------------------------===//
 
+// Check if string is a URI format (mssql://...)
+static bool IsUriFormatImpl(const string &str) {
+	return StringUtil::StartsWith(StringUtil::Lower(str), "mssql://");
+}
+
+bool MSSQLConnectionInfo::IsUriFormat(const string &str) {
+	return IsUriFormatImpl(str);
+}
+
+// Check if string is an ADO.NET connection string (contains key=value pairs)
+static bool IsConnectionStringImpl(const string &str) {
+	// Connection strings have format like "Server=...;Database=..."
+	return str.find('=') != string::npos;
+}
+
+bool MSSQLConnectionInfo::IsConnectionString(const string &str) {
+	return IsConnectionStringImpl(str);
+}
+
+// URL decode a string (handles %XX encoding)
+static string UrlDecode(const string &str) {
+	string result;
+	result.reserve(str.size());
+	for (size_t i = 0; i < str.size(); i++) {
+		if (str[i] == '%' && i + 2 < str.size()) {
+			int hex_val = 0;
+			if (sscanf(str.substr(i + 1, 2).c_str(), "%x", &hex_val) == 1) {
+				result += static_cast<char>(hex_val);
+				i += 2;
+				continue;
+			}
+		}
+		result += str[i];
+	}
+	return result;
+}
+
+// Parse URI format: mssql://user:password@host:port/database?param=value
+static case_insensitive_map_t<string> ParseUri(const string &uri) {
+	case_insensitive_map_t<string> result;
+
+	// Skip "mssql://"
+	string rest = uri.substr(8);
+
+	// Extract query parameters first (after ?)
+	string query_string;
+	auto query_pos = rest.find('?');
+	if (query_pos != string::npos) {
+		query_string = rest.substr(query_pos + 1);
+		rest = rest.substr(0, query_pos);
+	}
+
+	// Extract user:password (before @)
+	auto at_pos = rest.find('@');
+	if (at_pos != string::npos) {
+		string user_pass = rest.substr(0, at_pos);
+		rest = rest.substr(at_pos + 1);
+
+		auto colon_pos = user_pass.find(':');
+		if (colon_pos != string::npos) {
+			result["user"] = UrlDecode(user_pass.substr(0, colon_pos));
+			result["password"] = UrlDecode(user_pass.substr(colon_pos + 1));
+		} else {
+			result["user"] = UrlDecode(user_pass);
+		}
+	}
+
+	// Extract host:port/database
+	auto slash_pos = rest.find('/');
+	string host_port;
+	if (slash_pos != string::npos) {
+		host_port = rest.substr(0, slash_pos);
+		result["database"] = UrlDecode(rest.substr(slash_pos + 1));
+	} else {
+		host_port = rest;
+	}
+
+	// Parse host:port
+	auto colon_pos = host_port.rfind(':');
+	if (colon_pos != string::npos) {
+		result["server"] = host_port.substr(0, colon_pos) + "," + host_port.substr(colon_pos + 1);
+	} else {
+		result["server"] = host_port;
+	}
+
+	// Parse query parameters
+	if (!query_string.empty()) {
+		auto params = StringUtil::Split(query_string, '&');
+		for (auto &param : params) {
+			auto eq_pos = param.find('=');
+			if (eq_pos != string::npos) {
+				string key = UrlDecode(param.substr(0, eq_pos));
+				string value = UrlDecode(param.substr(eq_pos + 1));
+				auto lower_key = StringUtil::Lower(key);
+				if (lower_key == "encrypt" || lower_key == "ssl" || lower_key == "use_ssl") {
+					result["encrypt"] = value;
+				} else {
+					result[key] = value;
+				}
+			}
+		}
+	}
+
+	return result;
+}
+
 // Parse key=value pairs from connection string
 // Format: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
 static case_insensitive_map_t<string> ParseConnectionString(const string &connection_string) {
@@ -110,7 +216,13 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 		return "Connection string cannot be empty.";
 	}
 
-	auto params = ParseConnectionString(connection_string);
+	// Parse based on format
+	case_insensitive_map_t<string> params;
+	if (IsUriFormatImpl(connection_string)) {
+		params = ParseUri(connection_string);
+	} else {
+		params = ParseConnectionString(connection_string);
+	}
 
 	// Check required fields
 	if (params.find("server") == params.end()) {
@@ -151,7 +263,14 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 		throw InvalidInputException("MSSQL Error: %s", error);
 	}
 
-	auto params = ParseConnectionString(connection_string);
+	// Parse based on format
+	case_insensitive_map_t<string> params;
+	if (IsUriFormatImpl(connection_string)) {
+		params = ParseUri(connection_string);
+	} else {
+		params = ParseConnectionString(connection_string);
+	}
+
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
 
 	// Parse server (host,port or just host)
@@ -280,11 +399,15 @@ void MSSQLCatalog::OnDetach(ClientContext &context) {
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                 AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
 	// Extract SECRET parameter (optional if connection string is provided)
+	// Remove it from options so DuckDB's StorageOptions doesn't reject it as unrecognized
 	string secret_name;
-	for (auto &entry : options.options) {
-		auto lower_name = StringUtil::Lower(entry.first);
+	for (auto it = options.options.begin(); it != options.options.end();) {
+		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
-			secret_name = entry.second.ToString();
+			secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else {
+			++it;
 		}
 	}
 
@@ -325,6 +448,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	    ctx->connection_info->password,
 	    ctx->connection_info->database
 	);
+
+	// Set path to :memory: to prevent DuckDB from trying to open the connection string as a file
+	// This is needed because DuckCatalog creates a SingleFileStorageManager with info.path
+	info.path = ":memory:";
 
 	// Create MSSQLCatalog that will clean up the context on detach
 	auto catalog = make_uniq<MSSQLCatalog>(db, name);

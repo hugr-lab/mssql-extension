@@ -4,76 +4,72 @@
 
 require mssql
 
-# Setup: create secret and attach database
-statement ok
-CREATE SECRET scan_test_secret (
-    TYPE mssql,
-    host 'localhost',
-    port 1433,
-    database 'testdb',
-    user 'testuser',
-    password 'testpass'
-);
+require-env MSSQL_TEST_DSN
 
+# Setup: attach database using connection string
 statement ok
-ATTACH '' AS scandb (TYPE mssql, SECRET scan_test_secret);
+ATTACH '${MSSQL_TEST_DSN}' AS scandb (TYPE mssql);
 
-# T041: Test mssql_scan with valid context
+# T041: Test mssql_scan with valid context - simple query
+query I
+SELECT * FROM mssql_scan('scandb', 'SELECT 1 AS id');
+----
+1
+
+# T042: Test mssql_scan with multiple columns
 query II
-SELECT * FROM mssql_scan('scandb', 'SELECT id, name FROM users');
+SELECT * FROM mssql_scan('scandb', 'SELECT 1 AS id, ''Name 1'' AS name');
+----
+1	Name 1
+
+# T043: Test mssql_scan with invalid context (should fail)
+statement error
+SELECT * FROM mssql_scan('nonexistent_context', 'SELECT 1');
+----
+Unknown context
+
+# T044: Test multiple rows using UNION
+query II
+SELECT * FROM mssql_scan('scandb', 'SELECT 1 AS id, ''Name 1'' AS name UNION ALL SELECT 2, ''Name 2'' UNION ALL SELECT 3, ''Name 3''') ORDER BY id;
 ----
 1	Name 1
 2	Name 2
 3	Name 3
 
-# T042: Test mssql_scan with invalid context (should fail)
-statement error
-SELECT * FROM mssql_scan('nonexistent_context', 'SELECT * FROM users');
-----
-Unknown context 'nonexistent_context'
-
-# T043: Test exactly 3 rows returned with correct schema
+# T045: Test COUNT on results
 query I
-SELECT COUNT(*) FROM mssql_scan('scandb', 'SELECT * FROM any_table');
+SELECT COUNT(*) FROM mssql_scan('scandb', 'SELECT 1 AS val UNION ALL SELECT 2 UNION ALL SELECT 3');
 ----
 3
 
-# Verify column types (id INTEGER, name VARCHAR)
+# T046: Verify column types
 query II
-SELECT typeof(id), typeof(name) FROM mssql_scan('scandb', 'SELECT id, name FROM test');
+SELECT typeof(id), typeof(name) FROM mssql_scan('scandb', 'SELECT CAST(1 AS INT) AS id, CAST(''test'' AS VARCHAR(50)) AS name');
 ----
 INTEGER	VARCHAR
-INTEGER	VARCHAR
-INTEGER	VARCHAR
 
-# Verify column names
+# T047: Test filtering works on results
 query II
-SELECT id, name FROM mssql_scan('scandb', 'SELECT * FROM test') WHERE id = 1;
+SELECT * FROM mssql_scan('scandb', 'SELECT 1 AS id, ''A'' AS name UNION ALL SELECT 2, ''B'' UNION ALL SELECT 3, ''C''') WHERE id > 1 ORDER BY id;
 ----
-1	Name 1
+2	B
+3	C
 
-# Test filtering works on stub data
+# T048: Test ordering works on results
 query II
-SELECT * FROM mssql_scan('scandb', 'SELECT * FROM test') WHERE id > 1;
+SELECT * FROM mssql_scan('scandb', 'SELECT 1 AS id, ''A'' AS name UNION ALL SELECT 2, ''B'' UNION ALL SELECT 3, ''C''') ORDER BY id DESC;
 ----
-2	Name 2
-3	Name 3
+3	C
+2	B
+1	A
 
-# Test ordering works on stub data
-query II
-SELECT * FROM mssql_scan('scandb', 'SELECT * FROM test') ORDER BY id DESC;
-----
-3	Name 3
-2	Name 2
-1	Name 1
-
-# Test joining with local data
+# T049: Test joining with local data
 statement ok
 CREATE TABLE local_data AS SELECT 1 AS user_id, 'extra' AS info UNION SELECT 2, 'more';
 
 query III
 SELECT s.id, s.name, l.info
-FROM mssql_scan('scandb', 'SELECT id, name FROM users') s
+FROM mssql_scan('scandb', 'SELECT 1 AS id, ''Name 1'' AS name UNION ALL SELECT 2, ''Name 2'' UNION ALL SELECT 3, ''Name 3''') s
 JOIN local_data l ON s.id = l.user_id
 ORDER BY s.id;
 ----
@@ -86,6 +82,3 @@ DROP TABLE local_data;
 # Cleanup
 statement ok
 DETACH scandb;
-
-statement ok
-DROP SECRET scan_test_secret;

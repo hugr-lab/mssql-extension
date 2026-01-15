@@ -4,29 +4,33 @@
 
 require mssql
 
-# T015: Test successful connection open (requires valid SQL Server)
-# These tests are skipped unless a test SQL Server is available
-# Set MSSQL_TEST_HOST, MSSQL_TEST_PORT, MSSQL_TEST_DATABASE, MSSQL_TEST_USER, MSSQL_TEST_PASSWORD
+require-env MSSQL_TEST_DSN
+
+# T015: Test successful connection open with connection string
+# Store handle in temp table to avoid hardcoded handle numbers
+statement ok
+CREATE TEMP TABLE conn_handle AS SELECT mssql_open('${MSSQL_TEST_DSN}') AS handle;
+
+query I
+SELECT handle >= 1 FROM conn_handle;
+----
+true
+
+# Close the connection we just opened
+query I
+SELECT mssql_close((SELECT handle FROM conn_handle));
+----
+true
+
+statement ok
+DROP TABLE conn_handle;
 
 # T016: Test authentication failure with invalid credentials
-# Create a secret with invalid password
-statement ok
-CREATE SECRET test_invalid_creds (
-    TYPE mssql,
-    host 'localhost',
-    port 1433,
-    database 'master',
-    user 'sa',
-    password 'WrongPassword123!'
-);
-
-# Opening with invalid credentials should fail with authentication error
-# Note: This requires a SQL Server to be running on localhost:1433
-# The test will fail with "Failed to connect" if no server, or "Authentication failed" if server rejects
+# Use connection string with wrong password
 statement error
-SELECT mssql_open('test_invalid_creds');
+SELECT mssql_open('Server=localhost,1433;Database=master;User Id=sa;Password=WrongPassword123!');
 ----
-connect
+Login failed
 
 # T024: Test mssql_close with invalid handle returns true (idempotent)
 query I
@@ -40,12 +44,8 @@ SELECT mssql_close(99999);
 ----
 true
 
-# Clean up
-statement ok
-DROP SECRET test_invalid_creds;
-
 # Test with non-existent secret
 statement error
 SELECT mssql_open('nonexistent_secret');
 ----
-Secret 'nonexistent_secret' not found
+not found
