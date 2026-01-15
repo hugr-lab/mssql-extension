@@ -40,15 +40,33 @@
             "detail": "Clean build artifacts"
         },
         {
-            "label": "Configure",
+            "label": "Test (Release)",
             "type": "shell",
-            "command": "make",
-            "args": ["configure"],
+            "command": "./build/release/test/unittest",
+            "args": ["--test-dir", "${workspaceFolder}/test/sql", "*mssql*"],
             "options": {
                 "cwd": "${workspaceFolder}"
             },
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
             "problemMatcher": [],
-            "detail": "Configure CMake build"
+            "detail": "Run mssql extension tests (release)",
+            "dependsOn": "Build Release"
+        },
+        {
+            "label": "Test (Debug)",
+            "type": "shell",
+            "command": "./build/debug/test/unittest",
+            "args": ["--test-dir", "${workspaceFolder}/test/sql", "*mssql*"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run mssql extension tests (debug)",
+            "dependsOn": "Build Debug"
         }
     ]
 }

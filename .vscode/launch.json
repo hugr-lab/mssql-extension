@@ -32,6 +32,19 @@
             "sourceMap": {
                 "/Users/vgribanov/projects/hugr-lab/mssql-extension": "${workspaceFolder}"
             }
+        },
+        {
+            "name": "Debug Tests",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/test/unittest",
+            "args": ["--test-dir", "${workspaceFolder}/test/sql", "*mssql*"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/mssql-extension": "${workspaceFolder}"
+            }
         }
     ]
 }
