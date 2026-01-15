@@ -1,0 +1,112 @@
+# name: test/sql/mssql_attach.test
+# description: Test MSSQL database attach and detach
+# group: [mssql]
+
+require mssql
+
+# First create a secret that we'll use for attachment
+statement ok
+CREATE SECRET attach_test_secret (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'testdb',
+    user 'testuser',
+    password 'testpass'
+);
+
+# T019: Test successful attach with valid secret
+statement ok
+ATTACH '' AS mydb (TYPE mssql, SECRET attach_test_secret);
+
+# T024: Test successful detach
+statement ok
+DETACH mydb;
+
+# T020: Test attach without secret or connection string (should fail)
+statement error
+ATTACH '' AS no_secret_db (TYPE mssql);
+----
+Either SECRET or connection string is required
+
+# T021: Test attach with non-existent secret (should fail)
+statement error
+ATTACH '' AS bad_secret_db (TYPE mssql, SECRET nonexistent_secret);
+----
+not found
+
+# T025: Test detach non-existent context (should fail)
+# Note: DuckDB handles this error internally
+statement error
+DETACH nonexistent_db;
+----
+not found
+
+# Test re-attach after detach
+statement ok
+ATTACH '' AS mydb (TYPE mssql, SECRET attach_test_secret);
+
+statement ok
+DETACH mydb;
+
+# Clean up
+statement ok
+DROP SECRET attach_test_secret;
+
+# Test attach with connection string (no secret)
+statement ok
+ATTACH 'Server=localhost,1433;Database=testdb;User Id=testuser;Password=testpass' AS conn_str_db (TYPE mssql);
+
+statement ok
+DETACH conn_str_db;
+
+# Test attach with connection string (default port)
+statement ok
+ATTACH 'Server=localhost;Database=testdb;User Id=testuser;Password=testpass' AS conn_str_default_port (TYPE mssql);
+
+statement ok
+DETACH conn_str_default_port;
+
+# Test attach with connection string using alternative key names
+statement ok
+ATTACH 'Data Source=localhost;Initial Catalog=testdb;UID=testuser;PWD=testpass' AS conn_str_alt_keys (TYPE mssql);
+
+statement ok
+DETACH conn_str_alt_keys;
+
+# Test attach with connection string with SSL enabled
+statement ok
+ATTACH 'Server=localhost;Database=testdb;User Id=testuser;Password=testpass;Encrypt=yes' AS conn_str_ssl (TYPE mssql);
+
+statement ok
+DETACH conn_str_ssl;
+
+# Test attach with invalid connection string - missing Server
+statement error
+ATTACH 'Database=testdb;User Id=testuser;Password=testpass' AS invalid_conn_str (TYPE mssql);
+----
+Missing 'Server' in connection string
+
+# Test attach with invalid connection string - missing Database
+statement error
+ATTACH 'Server=localhost;User Id=testuser;Password=testpass' AS invalid_conn_str2 (TYPE mssql);
+----
+Missing 'Database' in connection string
+
+# Test attach with invalid connection string - missing User Id
+statement error
+ATTACH 'Server=localhost;Database=testdb;Password=testpass' AS invalid_conn_str3 (TYPE mssql);
+----
+Missing 'User Id' in connection string
+
+# Test attach with invalid connection string - missing Password
+statement error
+ATTACH 'Server=localhost;Database=testdb;User Id=testuser' AS invalid_conn_str4 (TYPE mssql);
+----
+Missing 'Password' in connection string
+
+# Test attach with invalid port in connection string
+statement error
+ATTACH 'Server=localhost,99999;Database=testdb;User Id=testuser;Password=testpass' AS invalid_port_conn (TYPE mssql);
+----
+Port must be between 1 and 65535

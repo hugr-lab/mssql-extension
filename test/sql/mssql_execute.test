@@ -1,0 +1,69 @@
+# name: test/sql/mssql_execute.test
+# description: Test mssql_execute table function
+# group: [mssql]
+
+require mssql
+
+# Setup: create secret and attach database
+statement ok
+CREATE SECRET exec_test_secret (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'testdb',
+    user 'testuser',
+    password 'testpass'
+);
+
+statement ok
+ATTACH '' AS execdb (TYPE mssql, SECRET exec_test_secret);
+
+# T031: Test mssql_execute with valid context
+query III
+SELECT * FROM mssql_execute('execdb', 'SELECT 1');
+----
+true	1	Query executed successfully (stub)
+
+# T032: Test mssql_execute with invalid context (should fail)
+statement error
+SELECT * FROM mssql_execute('nonexistent_context', 'SELECT 1');
+----
+Unknown context 'nonexistent_context'
+
+# T033: Test return schema (success BOOLEAN, affected_rows BIGINT, message VARCHAR)
+query III
+SELECT typeof(success), typeof(affected_rows), typeof(message)
+FROM mssql_execute('execdb', 'UPDATE table SET x = 1');
+----
+BOOLEAN	BIGINT	VARCHAR
+
+# Test that result has exactly 1 row
+query I
+SELECT COUNT(*) FROM mssql_execute('execdb', 'DELETE FROM table');
+----
+1
+
+# Test success value is true in stub mode
+query I
+SELECT success FROM mssql_execute('execdb', 'CREATE TABLE test (id INT)');
+----
+true
+
+# Test affected_rows is 1 in stub mode
+query I
+SELECT affected_rows FROM mssql_execute('execdb', 'INSERT INTO table VALUES (1)');
+----
+1
+
+# Test message content
+query I
+SELECT message LIKE '%stub%' FROM mssql_execute('execdb', 'TRUNCATE TABLE test');
+----
+true
+
+# Cleanup
+statement ok
+DETACH execdb;
+
+statement ok
+DROP SECRET exec_test_secret;

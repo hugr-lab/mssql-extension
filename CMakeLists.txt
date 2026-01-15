@@ -28,6 +28,9 @@ message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_
 # Set extension sources
 set(EXTENSION_SOURCES
     src/mssql_extension.cpp
+    src/mssql_secret.cpp
+    src/mssql_storage.cpp
+    src/mssql_functions.cpp
 )
 
 # Build static extension (linked into DuckDB)

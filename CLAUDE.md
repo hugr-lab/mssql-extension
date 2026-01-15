@@ -3,6 +3,8 @@
 Auto-generated from all feature plans. Last updated: 2026-01-15
 
 ## Active Technologies
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API) (002-duckdb-surface-api)
+- N/A (connection metadata in memory, secrets via DuckDB's secret manager) (002-duckdb-surface-api)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -22,6 +24,7 @@ tests/
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 002-duckdb-surface-api: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API)
 
 - 001-project-bootstrap: Added C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode)
 
