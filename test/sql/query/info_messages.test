@@ -1,0 +1,27 @@
+# name: test/sql/query/info_messages.test
+# description: Test INFO message handling (PRINT statements, warnings)
+# group: [query]
+
+# These tests require a live SQL Server connection
+# Skip if no MSSQL test server is configured
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+
+# Basic single-statement query works
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
+----
+1
+
+# Note: Multi-statement batches (PRINT + SELECT, SET NOCOUNT + SELECT)
+# are currently not supported - they require enhanced batch handling.
+# This is tracked as a known limitation.
+
+statement ok
+DETACH test_db;

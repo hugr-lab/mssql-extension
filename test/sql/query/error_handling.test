@@ -1,0 +1,50 @@
+# name: test/sql/query/error_handling.test
+# description: Test SQL Server error handling (syntax errors, missing tables, permissions)
+# group: [query]
+#
+# REQUIRES: SQL Server 2022+ running (for GENERATE_SERIES)
+
+# These tests require a live SQL Server connection
+# Skip if no MSSQL test server is configured
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+
+# Syntax error
+statement error
+SELECT * FROM mssql_scan('test_db', 'SELEC * FROM');
+----
+SQL Server error
+
+# Missing table
+statement error
+SELECT * FROM mssql_scan('test_db', 'SELECT * FROM nonexistent_table_xyz123');
+----
+SQL Server error
+
+# Division by zero - SQL Server returns NULL by default (not an error)
+# To get error, would need SET ARITHABORT ON
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT 1/0');
+----
+NULL
+
+# Invalid column in subquery
+statement error
+SELECT * FROM mssql_scan('test_db', 'SELECT nonexistent_column FROM (SELECT value FROM GENERATE_SERIES(1, 10)) x');
+----
+SQL Server error
+
+# Unknown context
+statement error
+SELECT * FROM mssql_scan('unknown_context', 'SELECT 1');
+----
+Unknown context
+
+statement ok
+DETACH test_db;

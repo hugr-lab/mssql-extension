@@ -66,6 +66,17 @@ public:
 		return (static_cast<uint8_t>(status_) & static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE)) != 0;
 	}
 
+	// Helper to set/clear EOM flag
+	void SetEndOfMessage(bool eom) {
+		if (eom) {
+			status_ = static_cast<PacketStatus>(
+			    static_cast<uint8_t>(status_) | static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
+		} else {
+			status_ = static_cast<PacketStatus>(
+			    static_cast<uint8_t>(status_) & ~static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
+		}
+	}
+
 private:
 	PacketType type_;
 	PacketStatus status_;

@@ -2,25 +2,16 @@
 # description: Integration tests for connection pooling with ATTACH
 # group: [integration]
 #
-# REQUIRES: SQL Server running on localhost:1433 with SA password 'DevPassword123!'
+# REQUIRES: SQL Server running on localhost:1433
 # Run with: make integration-test
 
 require mssql
 
-# Create a secret for testing
-statement ok
-CREATE SECRET pool_test_secret (
-    TYPE mssql,
-    host 'localhost',
-    port 1433,
-    database 'TestDB',
-    user 'sa',
-    password 'DevPassword123!'
-);
+require-env MSSQL_TEST_DSN
 
 # Test 1: ATTACH creates a connection pool
 statement ok
-ATTACH '' AS testdb (TYPE mssql, SECRET pool_test_secret);
+ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
 
 # Test 2: Pool statistics should be available for attached database
 query IIIIIIII
@@ -70,7 +61,7 @@ SELECT count(*) FROM mssql_pool_stats(context_name='testdb');
 
 # Test 8: Re-attach with connection string
 statement ok
-ATTACH 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=DevPassword123!' AS testdb2 (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS testdb2 (TYPE mssql);
 
 # Pool should be created for connection string attachment too
 query I
@@ -80,10 +71,6 @@ true
 
 statement ok
 DETACH testdb2;
-
-# Cleanup
-statement ok
-DROP SECRET pool_test_secret;
 
 # Reset settings
 statement ok

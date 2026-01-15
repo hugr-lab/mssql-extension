@@ -7,6 +7,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-15
 - N/A (connection metadata in memory, secrets via DuckDB's secret manager) (002-duckdb-surface-api)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API), POSIX sockets (TCP) (003-tds-connection-pooling)
 - In-memory (connection metadata, pool state) (003-tds-connection-pooling)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API, DataChunk), existing TDS layer from spec 003 (004-streaming-select-cancel)
+- In-memory (result streaming, no intermediate buffering) (004-streaming-select-cancel)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -26,10 +28,10 @@ tests/
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 004-streaming-select-cancel: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, DataChunk), existing TDS layer from spec 003
 - 003-tds-connection-pooling: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), POSIX sockets (TCP)
 - 002-duckdb-surface-api: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API)
 
-- 001-project-bootstrap: Added C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode)
 
 <!-- MANUAL ADDITIONS START -->
 <!-- MANUAL ADDITIONS END -->

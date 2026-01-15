@@ -79,7 +79,7 @@ Represents an attached MSSQL database context.
 | attached_db | optional_ptr<AttachedDatabase> | Reference to DuckDB attached database |
 
 **Lifecycle**:
-- Created during `ATTACH '' AS {name} TYPE mssql (SECRET {secret})`
+- Created during `ATTACH '' AS {name} (TYPE mssql, SECRET {secret})`
 - Registered in MSSQLContextManager
 - Unregistered and destroyed during `DETACH {name}`
 

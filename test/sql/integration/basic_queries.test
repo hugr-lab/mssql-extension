@@ -2,41 +2,52 @@
 # description: Integration tests for basic query execution through attached MSSQL database
 # group: [integration]
 #
-# REQUIRES: SQL Server running on localhost:1433 with TestDB database initialized
+# REQUIRES: SQL Server running on localhost:1433
 # Run with: make integration-test
 
 require mssql
 
-# Create a secret for testing
+require-env MSSQL_TEST_DSN
+
+# Attach the database using connection string
 statement ok
-CREATE SECRET query_test_secret (
-    TYPE mssql,
-    host 'localhost',
-    port 1433,
-    database 'TestDB',
-    user 'sa',
-    password 'DevPassword123!'
-);
+ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
 
-# Attach the database
-statement ok
-ATTACH '' AS testdb (TYPE mssql, SECRET query_test_secret);
-
-# Test 1: Verify we can see the test tables
-# Note: This test assumes mssql_scan is implemented
-# If not implemented yet, this will fail and can be skipped
-# statement ok
-# SELECT * FROM testdb.dbo.TestSimplePK LIMIT 1;
-
-# Test 2: Verify pool statistics show activity
+# Test 1: Simple SELECT
 query I
-SELECT connections_created >= 0 FROM mssql_pool_stats(context_name='testdb');
+SELECT * FROM mssql_scan('testdb', 'SELECT 1 AS val');
+----
+1
+
+# Test 2: Multiple columns
+query II
+SELECT * FROM mssql_scan('testdb', 'SELECT 1 AS a, 2 AS b');
+----
+1	2
+
+# Test 3: String data
+query I
+SELECT * FROM mssql_scan('testdb', 'SELECT ''Hello World'' AS greeting');
+----
+Hello World
+
+# Test 4: Verify pool statistics show activity
+query I
+SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='testdb');
 ----
 true
+
+# Test 5: Connection reuse - multiple sequential queries
+query I
+SELECT * FROM mssql_scan('testdb', 'SELECT 10 AS val');
+----
+10
+
+query I
+SELECT * FROM mssql_scan('testdb', 'SELECT 20 AS val');
+----
+20
 
 # Cleanup
 statement ok
 DETACH testdb;
-
-statement ok
-DROP SECRET query_test_secret;

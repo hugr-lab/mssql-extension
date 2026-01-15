@@ -56,7 +56,7 @@ SELECT mssql_close(mssql_open('my_sqlserver'));
 
 ```sql
 -- After attaching a database (spec 002)
-ATTACH '' AS mydb TYPE mssql (SECRET my_sqlserver);
+ATTACH '' AS mydb (TYPE mssql, SECRET my_sqlserver);
 
 -- Check pool health
 SELECT * FROM mssql_pool_stats('mydb');

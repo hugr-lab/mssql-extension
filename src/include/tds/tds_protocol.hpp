@@ -62,6 +62,15 @@ public:
 	// This sends an empty batch which triggers a DONE response
 	static TdsPacket BuildPing();
 
+	// Build SQL_BATCH packet with SQL query
+	// SQL text is UTF-16LE encoded
+	static TdsPacket BuildSqlBatch(const std::string& sql);
+
+	// Build multiple SQL_BATCH packets for large queries
+	// Returns vector of packets with proper continuation flags
+	static std::vector<TdsPacket> BuildSqlBatchMultiPacket(const std::string& sql,
+	                                                        size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE);
+
 	// Build ATTENTION packet for cancellation
 	static TdsPacket BuildAttention();
 

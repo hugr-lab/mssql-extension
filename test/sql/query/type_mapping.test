@@ -1,0 +1,100 @@
+# name: test/sql/query/type_mapping.test
+# description: Test SQL Server to DuckDB type mapping for all supported types
+# group: [query]
+
+# These tests require a live SQL Server connection
+# Skip if no MSSQL test server is configured
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+
+# Integer types
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(127 AS TINYINT) AS val');
+----
+127
+
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(32000 AS SMALLINT) AS val');
+----
+32000
+
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(2147483647 AS INT) AS val');
+----
+2147483647
+
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(9223372036854775807 AS BIGINT) AS val');
+----
+9223372036854775807
+
+# Boolean
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(1 AS BIT) AS val');
+----
+true
+
+# Float types
+query R
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(3.14 AS REAL) AS val');
+----
+3.14
+
+query R
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(3.14159265358979 AS FLOAT) AS val');
+----
+3.14159265358979
+
+# Decimal types
+query R
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(123.45 AS DECIMAL(10,2)) AS val');
+----
+123.45
+
+query R
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(99.99 AS MONEY) AS val');
+----
+99.99
+
+# String types
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(''Hello'' AS VARCHAR(100)) AS val');
+----
+Hello
+
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(N''Unicode'' AS NVARCHAR(100)) AS val');
+----
+Unicode
+
+# Date/Time types
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(''2024-01-15'' AS DATE) AS val');
+----
+2024-01-15
+
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(''12:30:45'' AS TIME) AS val');
+----
+12:30:45
+
+# GUID
+query T
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(''12345678-1234-1234-1234-123456789ABC'' AS UNIQUEIDENTIFIER) AS val');
+----
+12345678-1234-1234-1234-123456789abc
+
+# NULL handling
+query I
+SELECT * FROM mssql_scan('test_db', 'SELECT CAST(NULL AS INT) AS val');
+----
+NULL
+
+statement ok
+DETACH test_db;

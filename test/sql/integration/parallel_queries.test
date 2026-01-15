@@ -1,0 +1,131 @@
+# name: test/sql/integration/parallel_queries.test
+# description: Test parallel MSSQL queries using DuckDB CTEs
+# group: [integration]
+#
+# REQUIRES: SQL Server 2022+ running on localhost:1433 (for GENERATE_SERIES)
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Set connection limit high enough for parallel queries
+statement ok
+SET mssql_connection_limit = 16;
+
+# Setup using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS paralleldb (TYPE mssql);
+
+# Test 1: Two CTEs (may run in parallel depending on DuckDB planner)
+query I
+WITH
+    data_a AS (
+        SELECT * FROM mssql_scan('paralleldb', 'SELECT value AS id FROM GENERATE_SERIES(1, 100)')
+    ),
+    data_b AS (
+        SELECT * FROM mssql_scan('paralleldb', 'SELECT value AS id FROM GENERATE_SERIES(101, 200)')
+    )
+SELECT COUNT(*) FROM data_a
+UNION ALL
+SELECT COUNT(*) FROM data_b;
+----
+100
+100
+
+# Test 2: Join two query results
+query I
+WITH
+    data_a AS (
+        SELECT * FROM mssql_scan('paralleldb', 'SELECT value AS id FROM GENERATE_SERIES(1, 50)')
+    ),
+    data_b AS (
+        SELECT * FROM mssql_scan('paralleldb', 'SELECT value AS id FROM GENERATE_SERIES(1, 50)')
+    )
+SELECT COUNT(*) FROM data_a a JOIN data_b b ON a.id = b.id;
+----
+50
+
+# Test 3: Three CTEs with aggregation
+query III
+WITH
+    sum_a AS (
+        SELECT SUM(value) AS total FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 100)')
+    ),
+    sum_b AS (
+        SELECT SUM(value) AS total FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(101, 200)')
+    ),
+    sum_c AS (
+        SELECT SUM(value) AS total FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(201, 300)')
+    )
+SELECT sum_a.total, sum_b.total, sum_c.total
+FROM sum_a, sum_b, sum_c;
+----
+5050	15050	25050
+
+# Test 4: Four CTEs
+query IIII
+WITH
+    q1 AS (SELECT COUNT(*) AS c FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 50)')),
+    q2 AS (SELECT COUNT(*) AS c FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 60)')),
+    q3 AS (SELECT COUNT(*) AS c FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 70)')),
+    q4 AS (SELECT COUNT(*) AS c FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 80)'))
+SELECT q1.c, q2.c, q3.c, q4.c FROM q1, q2, q3, q4;
+----
+50	60	70	80
+
+# Test 5: Larger dataset (1000 rows)
+query II
+WITH
+    data_a AS (
+        SELECT COUNT(*) AS cnt FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 1000)')
+    ),
+    data_b AS (
+        SELECT COUNT(*) AS cnt FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 1000)')
+    )
+SELECT data_a.cnt, data_b.cnt FROM data_a, data_b;
+----
+1000	1000
+
+# Test 6: UNION of queries
+query I
+SELECT * FROM mssql_scan('paralleldb', 'SELECT 1 AS val')
+UNION ALL
+SELECT * FROM mssql_scan('paralleldb', 'SELECT 2 AS val')
+UNION ALL
+SELECT * FROM mssql_scan('paralleldb', 'SELECT 3 AS val')
+ORDER BY val;
+----
+1
+2
+3
+
+# Test 7: UNION with aggregation
+query I
+SELECT SUM(total) FROM (
+    SELECT SUM(value) AS total FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(1, 100)')
+    UNION ALL
+    SELECT SUM(value) AS total FROM mssql_scan('paralleldb', 'SELECT value FROM GENERATE_SERIES(101, 200)')
+);
+----
+20100
+
+# Verify pool was used efficiently
+query I
+SELECT connections_created <= 16 FROM mssql_pool_stats(context_name='paralleldb');
+----
+true
+
+# Verify no timeouts occurred
+query I
+SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='paralleldb');
+----
+0
+
+# Cleanup
+statement ok
+DETACH paralleldb;
+
+# Reset settings
+statement ok
+SET mssql_connection_limit = 64;

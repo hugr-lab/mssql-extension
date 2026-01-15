@@ -33,6 +33,10 @@ set(EXTENSION_SOURCES
     src/mssql_functions.cpp
     # Encoding utilities
     src/encoding/utf16.cpp
+    src/encoding/decimal_encoding.cpp
+    src/encoding/datetime_encoding.cpp
+    src/encoding/guid_encoding.cpp
+    src/encoding/type_converter.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp
@@ -40,6 +44,12 @@ set(EXTENSION_SOURCES
     src/tds/tds_protocol.cpp
     src/tds/tds_connection.cpp
     src/tds/connection_pool.cpp
+    src/tds/tds_column_metadata.cpp
+    src/tds/tds_token_parser.cpp
+    src/tds/tds_row_reader.cpp
+    # Query execution layer (DuckDB integration)
+    src/query/mssql_query_executor.cpp
+    src/query/mssql_result_stream.cpp
     # Connection management layer (DuckDB integration)
     src/connection/mssql_settings.cpp
     src/connection/mssql_diagnostic.cpp
@@ -52,7 +62,9 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 # Build loadable extension (.duckdb_extension file)
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Add version definition to both targets
+# Add version definition to both targets (intentionally overrides DuckDB's definition)
+target_compile_options(${EXTENSION_NAME} PRIVATE "-Wno-macro-redefined")
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE "-Wno-macro-redefined")
 target_compile_definitions(${EXTENSION_NAME} PRIVATE EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}")
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}")
 

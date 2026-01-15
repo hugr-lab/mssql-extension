@@ -320,7 +320,7 @@ throw InvalidInputException(
 
 throw InvalidInputException(
     "MSSQL Error: Unknown context '%s'. "
-    "Attach a database first with: ATTACH '' AS %s TYPE mssql (SECRET ...)",
+    "Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
     context_name, context_name
 );
 ```

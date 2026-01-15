@@ -247,7 +247,7 @@ Use DuckDB exception types with clear, actionable messages.
 Examples:
 - "MSSQL Error: Missing required field 'host'. Provide host parameter when creating secret."
 - "MSSQL Error: Port must be between 1 and 65535. Got: -1"
-- "MSSQL Error: Unknown context 'mydb'. Attach a database first with: ATTACH '' AS mydb TYPE mssql (SECRET ...)"
+- "MSSQL Error: Unknown context 'mydb'. Attach a database first with: ATTACH '' AS mydb (TYPE mssql, SECRET ...)"
 ```
 
 ---

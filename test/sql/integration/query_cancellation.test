@@ -1,0 +1,74 @@
+# name: test/sql/integration/query_cancellation.test
+# description: Test query cancellation and connection recovery
+# group: [integration]
+#
+# REQUIRES: SQL Server 2022+ running on localhost:1433 (for GENERATE_SERIES)
+# Run with: make integration-test
+#
+# NOTE: Full cancellation testing requires interactive Ctrl+C or a test harness.
+# These tests verify the infrastructure and connection recovery.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Setup using connection string
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS canceldb (TYPE mssql);
+
+# Test 1: Quick query completes normally
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 1 AS val');
+----
+1
+
+# Test 2: Connection can be reused after query
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 2 AS val');
+----
+2
+
+# Test 3: Query with LIMIT triggers early cancellation
+# This verifies the streaming cancellation infrastructure works
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mssql_scan('canceldb', 'SELECT value FROM GENERATE_SERIES(1, 1000)') LIMIT 5);
+----
+5
+
+# Test 4: Connection still works after limited query
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 3 AS val');
+----
+3
+
+# Test 5: Multiple sequential queries (verifies connection pool)
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 10 AS val');
+----
+10
+
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 20 AS val');
+----
+20
+
+query I
+SELECT * FROM mssql_scan('canceldb', 'SELECT 30 AS val');
+----
+30
+
+# Verify pool statistics show connection reuse
+query I
+SELECT acquire_count >= 7 FROM mssql_pool_stats(context_name='canceldb');
+----
+true
+
+# Test 6: Verify no acquire timeouts occurred
+query I
+SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='canceldb');
+----
+0
+
+# Cleanup
+statement ok
+DETACH canceldb;

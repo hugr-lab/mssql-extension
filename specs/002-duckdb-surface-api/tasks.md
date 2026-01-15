@@ -64,7 +64,7 @@
 
 ## Phase 4: User Story 2 - Attach SQL Server Database (Priority: P1) 🎯 MVP
 
-**Goal**: Enable `ATTACH '' AS name TYPE mssql (SECRET secret_name)` to create named connection context
+**Goal**: Enable `ATTACH '' AS name (TYPE mssql, SECRET secret_name)` to create named connection context
 
 **Independent Test**: Attach a database with a valid secret, verify context is created, verify lazy connection (no network until data access)
 

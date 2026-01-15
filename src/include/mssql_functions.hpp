@@ -10,8 +10,12 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "query/mssql_result_stream.hpp"
 
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -55,24 +59,57 @@ struct MSSQLScanBindData : public FunctionData {
 	vector<LogicalType> return_types;
 	vector<string> column_names;
 
+	// ID to retrieve pre-initialized result stream from registry
+	// This avoids executing the query twice (once for schema, once for data)
+	uint64_t result_stream_id = 0;
+
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
 };
 
-struct MSSQLScanGlobalState : public GlobalTableFunctionState {
-	string context_name;
-	string query;
-	idx_t total_rows;
-	atomic<idx_t> rows_returned;
+//===----------------------------------------------------------------------===//
+// Result Stream Registry - stores result streams between Bind and InitGlobal
+//===----------------------------------------------------------------------===//
 
-	MSSQLScanGlobalState() : total_rows(3), rows_returned(0) {
-	}
+class MSSQLResultStreamRegistry {
+public:
+	static MSSQLResultStreamRegistry& Instance();
+
+	// Register a result stream and get an ID
+	uint64_t Register(std::unique_ptr<MSSQLResultStream> stream);
+
+	// Retrieve and remove a result stream by ID
+	std::unique_ptr<MSSQLResultStream> Retrieve(uint64_t id);
+
+private:
+	MSSQLResultStreamRegistry() = default;
+	std::mutex mutex_;
+	std::unordered_map<uint64_t, std::unique_ptr<MSSQLResultStream>> streams_;
+	std::atomic<uint64_t> next_id_{1};
+};
+
+struct MSSQLScanGlobalState : public GlobalTableFunctionState {
+	// Result stream from SQL Server
+	std::unique_ptr<MSSQLResultStream> result_stream;
+
+	// Context name for pool return
+	string context_name;
+
+	// Set when complete
+	bool done = false;
+
+	// Timing
+	std::chrono::steady_clock::time_point scan_start;
+	bool timing_started = false;
+
+	MSSQLScanGlobalState() = default;
+	~MSSQLScanGlobalState();
 
 	idx_t MaxThreads() const override;
 };
 
 struct MSSQLScanLocalState : public LocalTableFunctionState {
-	idx_t current_row = 0;
+	// No per-thread state needed - single-threaded streaming
 };
 
 // Bind: validates arguments, determines return schema

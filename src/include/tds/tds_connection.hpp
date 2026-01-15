@@ -53,6 +53,17 @@ public:
 	// Wait for ATTENTION acknowledgment
 	bool WaitForAttentionAck(int timeout_ms = CANCELLATION_TIMEOUT * 1000);
 
+	// Execute SQL batch and start receiving response (FR for User Story 1)
+	// Sends SQL_BATCH packet(s) and prepares connection for streaming response
+	// Returns true if batch was sent successfully
+	// After this, use ReceiveData() to read response packets
+	bool ExecuteBatch(const std::string& sql);
+
+	// Receive more response data into provided buffer
+	// Returns bytes received, 0 on connection close, -1 on error
+	// timeout_ms: 0 = non-blocking, >0 = wait up to timeout_ms
+	ssize_t ReceiveData(uint8_t* buffer, size_t buffer_size, int timeout_ms = DEFAULT_QUERY_TIMEOUT * 1000);
+
 	// State management (FR-009, FR-010)
 	ConnectionState GetState() const { return state_.load(std::memory_order_acquire); }
 
