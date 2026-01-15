@@ -1,0 +1,96 @@
+# name: test/sql/tds_connection/settings.test
+# description: Test MSSQL pool settings
+# group: [tds_connection]
+
+require mssql
+
+# T039: Test mssql_connection_limit setting
+statement ok
+SET mssql_connection_limit = 10;
+
+query I
+SELECT current_setting('mssql_connection_limit');
+----
+10
+
+# Test validation - must be >= 1
+statement error
+SET mssql_connection_limit = 0;
+----
+Value must be >= 1
+
+# T040: Test all pool settings
+
+# connection_cache (boolean)
+statement ok
+SET mssql_connection_cache = false;
+
+query I
+SELECT current_setting('mssql_connection_cache');
+----
+false
+
+statement ok
+SET mssql_connection_cache = true;
+
+# connection_timeout (seconds)
+statement ok
+SET mssql_connection_timeout = 60;
+
+query I
+SELECT current_setting('mssql_connection_timeout');
+----
+60
+
+# Non-negative validation
+statement error
+SET mssql_connection_timeout = -1;
+----
+Value must be >= 0
+
+# idle_timeout (seconds)
+statement ok
+SET mssql_idle_timeout = 600;
+
+query I
+SELECT current_setting('mssql_idle_timeout');
+----
+600
+
+# min_connections
+statement ok
+SET mssql_min_connections = 2;
+
+query I
+SELECT current_setting('mssql_min_connections');
+----
+2
+
+# acquire_timeout (seconds)
+statement ok
+SET mssql_acquire_timeout = 45;
+
+query I
+SELECT current_setting('mssql_acquire_timeout');
+----
+45
+
+# Test 0 is valid (fail immediately / no timeout)
+statement ok
+SET mssql_acquire_timeout = 0;
+
+# Reset to defaults
+statement ok
+SET mssql_connection_limit = 64;
+
+statement ok
+SET mssql_connection_timeout = 30;
+
+statement ok
+SET mssql_idle_timeout = 300;
+
+statement ok
+SET mssql_min_connections = 0;
+
+statement ok
+SET mssql_acquire_timeout = 30;

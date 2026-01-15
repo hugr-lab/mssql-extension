@@ -31,6 +31,19 @@ set(EXTENSION_SOURCES
     src/mssql_secret.cpp
     src/mssql_storage.cpp
     src/mssql_functions.cpp
+    # Encoding utilities
+    src/encoding/utf16.cpp
+    # TDS protocol layer (pure C++, no DuckDB dependencies)
+    src/tds/tds_types.cpp
+    src/tds/tds_packet.cpp
+    src/tds/tds_socket.cpp
+    src/tds/tds_protocol.cpp
+    src/tds/tds_connection.cpp
+    src/tds/connection_pool.cpp
+    # Connection management layer (DuckDB integration)
+    src/connection/mssql_settings.cpp
+    src/connection/mssql_diagnostic.cpp
+    src/connection/mssql_pool_manager.cpp
 )
 
 # Build static extension (linked into DuckDB)

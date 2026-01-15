@@ -2,6 +2,8 @@
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
+#include "connection/mssql_diagnostic.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -36,7 +38,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 3. Register table functions
 	RegisterMSSQLFunctions(loader);
 
-	// 4. Register utility functions (mssql_version)
+	// 4. Register connection pool settings
+	RegisterMSSQLSettings(loader);
+
+	// 5. Register diagnostic functions (mssql_open, mssql_close, mssql_ping, mssql_pool_stats)
+	RegisterMSSQLDiagnosticFunctions(loader);
+
+	// 6. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
 	                                         LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
