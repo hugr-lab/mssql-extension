@@ -1,0 +1,23 @@
+# name: test/sql/mssql_version.test
+# description: Test mssql_version() function
+# group: [mssql]
+
+require mssql
+
+# Verify extension is loaded
+query I
+SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'mssql';
+----
+true
+
+# Verify mssql_version() returns a non-empty string
+query I
+SELECT length(mssql_version()) > 0;
+----
+true
+
+# Verify mssql_version() returns VARCHAR type
+query I
+SELECT typeof(mssql_version());
+----
+VARCHAR

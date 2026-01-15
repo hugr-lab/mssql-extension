@@ -1,0 +1,72 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Release",
+            "type": "shell",
+            "command": "make",
+            "args": ["release"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Build extension in release mode"
+        },
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "make",
+            "args": ["debug"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"],
+            "detail": "Build extension in debug mode with symbols"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "detail": "Clean build artifacts"
+        },
+        {
+            "label": "Test (Release)",
+            "type": "shell",
+            "command": "./build/release/test/unittest",
+            "args": ["--test-dir", "${workspaceFolder}/test/sql", "*mssql*"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": [],
+            "detail": "Run mssql extension tests (release)",
+            "dependsOn": "Build Release"
+        },
+        {
+            "label": "Test (Debug)",
+            "type": "shell",
+            "command": "./build/debug/test/unittest",
+            "args": ["--test-dir", "${workspaceFolder}/test/sql", "*mssql*"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run mssql extension tests (debug)",
+            "dependsOn": "Build Debug"
+        }
+    ]
+}
