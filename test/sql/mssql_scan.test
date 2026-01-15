@@ -1,0 +1,91 @@
+# name: test/sql/mssql_scan.test
+# description: Test mssql_scan table function
+# group: [mssql]
+
+require mssql
+
+# Setup: create secret and attach database
+statement ok
+CREATE SECRET scan_test_secret (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'testdb',
+    user 'testuser',
+    password 'testpass'
+);
+
+statement ok
+ATTACH '' AS scandb (TYPE mssql, SECRET scan_test_secret);
+
+# T041: Test mssql_scan with valid context
+query II
+SELECT * FROM mssql_scan('scandb', 'SELECT id, name FROM users');
+----
+1	Name 1
+2	Name 2
+3	Name 3
+
+# T042: Test mssql_scan with invalid context (should fail)
+statement error
+SELECT * FROM mssql_scan('nonexistent_context', 'SELECT * FROM users');
+----
+Unknown context 'nonexistent_context'
+
+# T043: Test exactly 3 rows returned with correct schema
+query I
+SELECT COUNT(*) FROM mssql_scan('scandb', 'SELECT * FROM any_table');
+----
+3
+
+# Verify column types (id INTEGER, name VARCHAR)
+query II
+SELECT typeof(id), typeof(name) FROM mssql_scan('scandb', 'SELECT id, name FROM test');
+----
+INTEGER	VARCHAR
+INTEGER	VARCHAR
+INTEGER	VARCHAR
+
+# Verify column names
+query II
+SELECT id, name FROM mssql_scan('scandb', 'SELECT * FROM test') WHERE id = 1;
+----
+1	Name 1
+
+# Test filtering works on stub data
+query II
+SELECT * FROM mssql_scan('scandb', 'SELECT * FROM test') WHERE id > 1;
+----
+2	Name 2
+3	Name 3
+
+# Test ordering works on stub data
+query II
+SELECT * FROM mssql_scan('scandb', 'SELECT * FROM test') ORDER BY id DESC;
+----
+3	Name 3
+2	Name 2
+1	Name 1
+
+# Test joining with local data
+statement ok
+CREATE TABLE local_data AS SELECT 1 AS user_id, 'extra' AS info UNION SELECT 2, 'more';
+
+query III
+SELECT s.id, s.name, l.info
+FROM mssql_scan('scandb', 'SELECT id, name FROM users') s
+JOIN local_data l ON s.id = l.user_id
+ORDER BY s.id;
+----
+1	Name 1	extra
+2	Name 2	more
+
+statement ok
+DROP TABLE local_data;
+
+# Cleanup
+statement ok
+DETACH scandb;
+
+statement ok
+DROP SECRET scan_test_secret;

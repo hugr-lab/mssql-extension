@@ -1,4 +1,7 @@
 #include "mssql_extension.hpp"
+#include "mssql_functions.hpp"
+#include "mssql_secret.hpp"
+#include "mssql_storage.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -24,9 +27,18 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 
 // Internal function to register extension functionality
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register mssql_version() scalar function for load verification
+	// 1. Register secrets
+	RegisterMSSQLSecretType(loader);
+
+	// 2. Register storage extension (ATTACH TYPE mssql)
+	RegisterMSSQLStorageExtension(loader);
+
+	// 3. Register table functions
+	RegisterMSSQLFunctions(loader);
+
+	// 4. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
-											 LogicalType::VARCHAR, MssqlVersionFunction);
+	                                         LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
 }
 

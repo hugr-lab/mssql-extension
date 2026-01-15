@@ -43,3 +43,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# test output
+duckdb_unittest_tempdir/
