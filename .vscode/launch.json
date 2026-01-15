@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/duckdb",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "env": {
+                "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1"
+            },
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/mssql-extension": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Release",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/release/duckdb",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Release",
+            "env": {
+                "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1"
+            },
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/mssql-extension": "${workspaceFolder}"
+            }
+        }
+    ]
+}
