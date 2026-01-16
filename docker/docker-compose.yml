@@ -6,14 +6,14 @@ services:
     container_name: mssql-dev
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=TestPassword1
+      - MSSQL_SA_PASSWORD=${MSSQL_TEST_PASS:-TestPassword1}
       - MSSQL_ENCRYPT_REQUIRED=true
     ports:
-      - "1433:1433"
+      - "${MSSQL_TEST_PORT:-1433}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"]
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${MSSQL_TEST_PASS:-TestPassword1} -C -Q 'SELECT 1' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -27,7 +27,7 @@ services:
       sqlserver:
         condition: service_healthy
     environment:
-      - MSSQL_SA_PASSWORD=TestPassword1
+      - MSSQL_SA_PASSWORD=${MSSQL_TEST_PASS:-TestPassword1}
     volumes:
       - ./init:/init:ro
     entrypoint: ["/bin/bash", "-c"]
@@ -36,7 +36,7 @@ services:
         echo "Waiting for SQL Server to be ready..."
         sleep 5
         echo "Running init scripts..."
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P TestPassword1 -C -i /init/init.sql
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P ${MSSQL_TEST_PASS:-TestPassword1} -C -i /init/init.sql
         echo "Init complete!"
 
 volumes:
