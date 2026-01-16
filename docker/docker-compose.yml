@@ -8,6 +8,8 @@ services:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=${MSSQL_TEST_PASS:-TestPassword1}
       - MSSQL_ENCRYPT_REQUIRED=true
+    env_file:
+      - ../.env
     ports:
       - "${MSSQL_TEST_PORT:-1433}:1433"
     volumes:
@@ -31,6 +33,8 @@ services:
     volumes:
       - ./init:/init:ro
     entrypoint: ["/bin/bash", "-c"]
+    env_file:
+      - ../.env
     command:
       - |
         echo "Waiting for SQL Server to be ready..."
