@@ -11,6 +11,25 @@
 #include <poll.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+
+// Debug logging
+static int GetMssqlDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char* env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_SOCKET_DEBUG_LOG(lvl, fmt, ...) \
+	do { \
+		if (GetMssqlDebugLevel() >= lvl) \
+			fprintf(stderr, "[MSSQL SOCKET] " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -42,6 +61,7 @@ TdsSocket::TdsSocket(TdsSocket&& other) noexcept
       port_(other.port_),
       connected_(other.connected_),
       last_error_(std::move(other.last_error_)),
+      tls_context_(std::move(other.tls_context_)),
       receive_buffer_(std::move(other.receive_buffer_)) {
 	other.fd_ = -1;
 	other.connected_ = false;
@@ -55,6 +75,7 @@ TdsSocket& TdsSocket::operator=(TdsSocket&& other) noexcept {
 		port_ = other.port_;
 		connected_ = other.connected_;
 		last_error_ = std::move(other.last_error_);
+		tls_context_ = std::move(other.tls_context_);
 		receive_buffer_ = std::move(other.receive_buffer_);
 		other.fd_ = -1;
 		other.connected_ = false;
@@ -148,6 +169,12 @@ bool TdsSocket::Connect(const std::string& host, uint16_t port, int timeout_seco
 }
 
 void TdsSocket::Close() {
+	// Close TLS first if enabled
+	if (tls_context_) {
+		tls_context_->Close();
+		tls_context_.reset();
+	}
+
 	if (fd_ >= 0) {
 		CLOSE_SOCKET(fd_);
 		fd_ = -1;
@@ -160,12 +187,301 @@ bool TdsSocket::IsConnected() const {
 	return connected_ && fd_ >= 0;
 }
 
+bool TdsSocket::EnableTls(uint8_t& packet_id, int timeout_ms) {
+	// For TDS 7.x, TLS handshake data must be wrapped in TDS PRELOGIN packets
+	// See MS-TDS spec: "If encryption was negotiated in TDS 7.x, the TDS client MUST
+	// initiate a TLS/SSL handshake, send to the server a TLS/SSL message obtained from
+	// the TLS/SSL layer encapsulated in TDS packet(s) of type PRELOGIN (0x12)."
+
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: starting (timeout=%dms, fd=%d, packet_id=%d)",
+		timeout_ms, fd_, packet_id);
+
+	// Clear any leftover data in receive buffer before TLS
+	if (!receive_buffer_.empty()) {
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: WARNING - clearing %zu leftover bytes in receive buffer",
+			receive_buffer_.size());
+		receive_buffer_.clear();
+	}
+
+	if (!IsConnected()) {
+		last_error_ = "Cannot enable TLS: not connected";
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - not connected");
+		return false;
+	}
+
+	if (tls_context_) {
+		last_error_ = "TLS is already enabled";
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - already enabled");
+		return false;
+	}
+
+	// Create and initialize TLS context
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: creating TLS context...");
+	tls_context_.reset(new TlsTdsContext());
+
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: initializing TLS context...");
+	if (!tls_context_->Initialize()) {
+		last_error_ = "TLS initialization failed: " + tls_context_->GetLastError();
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - init: %s", last_error_.c_str());
+		tls_context_.reset();
+		return false;
+	}
+
+	// Wrap the existing socket with hostname for SNI
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: wrapping socket with hostname=%s...", host_.c_str());
+	if (!tls_context_->WrapSocket(fd_, host_)) {
+		last_error_ = "TLS socket wrap failed: " + tls_context_->GetLastError();
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - wrap: %s", last_error_.c_str());
+		tls_context_.reset();
+		return false;
+	}
+
+	// Set up TDS-wrapped I/O callbacks for the TLS handshake
+	// The TLS data must be sent inside TDS PRELOGIN packets (type 0x12)
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: setting up TDS-wrapped TLS I/O...");
+
+	// Capture context for lambdas
+	int socket_fd = fd_;
+	uint8_t& pkt_id = packet_id;
+
+	// Buffer for extra TLS data from large TDS packets
+	// (server may send large TLS records that mbedTLS reads in small chunks)
+	auto tls_recv_buffer = std::make_shared<std::vector<uint8_t>>();
+
+	// Send buffer - accumulate TLS data and send in batches like FreeTDS does
+	auto tls_send_buffer = std::make_shared<std::vector<uint8_t>>();
+
+	// Helper to flush the send buffer as a single TDS packet
+	auto flush_send_buffer = [socket_fd, &pkt_id, tls_send_buffer]() -> bool {
+		auto& buffer = *tls_send_buffer;
+		if (buffer.empty()) {
+			return true;
+		}
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Flush: sending %zu bytes in PRELOGIN packet (id=%d)",
+			buffer.size(), pkt_id);
+
+		// Build TDS PRELOGIN packet with accumulated TLS data
+		std::vector<uint8_t> tds_packet;
+		tds_packet.reserve(8 + buffer.size());
+
+		// TDS header (8 bytes)
+		tds_packet.push_back(0x12);  // Type = PRELOGIN
+		tds_packet.push_back(0x01);  // Status = EOM (last packet)
+		uint16_t total_len = static_cast<uint16_t>(8 + buffer.size());
+		tds_packet.push_back((total_len >> 8) & 0xFF);  // Length high
+		tds_packet.push_back(total_len & 0xFF);         // Length low
+		tds_packet.push_back(0x00);  // SPID high
+		tds_packet.push_back(0x00);  // SPID low
+		tds_packet.push_back(pkt_id++);  // Packet ID
+		tds_packet.push_back(0x00);  // Window
+
+		// TLS payload
+		tds_packet.insert(tds_packet.end(), buffer.begin(), buffer.end());
+		buffer.clear();
+
+		// Send the wrapped packet
+		size_t total_sent = 0;
+		while (total_sent < tds_packet.size()) {
+			ssize_t sent = send(socket_fd, tds_packet.data() + total_sent,
+			                    tds_packet.size() - total_sent, 0);
+			if (sent < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+					continue;
+				}
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Flush: socket error %d (%s)", errno, strerror(errno));
+				return false;
+			}
+			total_sent += sent;
+		}
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Flush: sent %zu bytes total", total_sent);
+		return true;
+	};
+
+	// Send callback: buffer TLS data for later sending
+	// Like FreeTDS, we accumulate and send when we need to receive
+	TlsSendCallback send_cb = [tls_send_buffer](const uint8_t* data, size_t len) -> int {
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Send: buffering %zu bytes (buffer now has %zu)",
+			len, tls_send_buffer->size() + len);
+		tls_send_buffer->insert(tls_send_buffer->end(), data, data + len);
+		return static_cast<int>(len);
+	};
+
+	// Receive callback: unwrap TLS data from TDS PRELOGIN packet
+	// Uses tls_recv_buffer to buffer extra data from large TDS packets
+	// Captures flush_send_buffer to send pending data before receiving (like FreeTDS does)
+	TlsRecvCallback recv_cb = [socket_fd, tls_recv_buffer, tls_send_buffer, flush_send_buffer]
+	                          (uint8_t* buf, size_t len, int timeout_ms) -> int {
+		auto& recv_buffer = *tls_recv_buffer;
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: request %zu bytes (recv_buffer=%zu, send_buffer=%zu, timeout=%d)",
+			len, recv_buffer.size(), tls_send_buffer->size(), timeout_ms);
+
+		// Like FreeTDS: flush send buffer before trying to receive
+		// This ensures all pending TLS data is sent as a single TDS packet
+		if (!tls_send_buffer->empty()) {
+			if (!flush_send_buffer()) {
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: failed to flush send buffer");
+				return -1;
+			}
+		}
+
+		// First, return data from buffer if we have any
+		if (!recv_buffer.empty()) {
+			size_t to_copy = std::min(len, recv_buffer.size());
+			std::memcpy(buf, recv_buffer.data(), to_copy);
+			recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + to_copy);
+			MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: returned %zu bytes from buffer (%zu remaining)",
+				to_copy, recv_buffer.size());
+			return static_cast<int>(to_copy);
+		}
+
+		// Wait for data with timeout
+		struct pollfd pfd;
+		pfd.fd = socket_fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+
+		int poll_result = poll(&pfd, 1, timeout_ms);
+		if (poll_result < 0) {
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: poll error %d (%s)", errno, strerror(errno));
+			return -1;
+		}
+		if (poll_result == 0) {
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: timeout");
+			return 0;  // Timeout
+		}
+
+		// Read TDS header first (8 bytes)
+		uint8_t header[8];
+		size_t header_read = 0;
+		while (header_read < 8) {
+			ssize_t n = recv(socket_fd, header + header_read, 8 - header_read, 0);
+			if (n < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+					continue;
+				}
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: header read error %d (%s)", errno, strerror(errno));
+				return -1;
+			}
+			if (n == 0) {
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: connection closed by server");
+				return -1;
+			}
+			header_read += n;
+		}
+
+		uint8_t pkt_type = header[0];
+		uint16_t pkt_len = (static_cast<uint16_t>(header[2]) << 8) | header[3];
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: got TDS packet type=0x%02x, total_len=%d", pkt_type, pkt_len);
+
+		if (pkt_type != 0x04 && pkt_type != 0x12) {  // REPLY or PRELOGIN
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: unexpected packet type 0x%02x", pkt_type);
+			return -1;
+		}
+
+		// Read full payload into temporary buffer
+		size_t payload_len = pkt_len - 8;
+		std::vector<uint8_t> payload(payload_len);
+
+		size_t payload_read = 0;
+		while (payload_read < payload_len) {
+			ssize_t n = recv(socket_fd, payload.data() + payload_read, payload_len - payload_read, 0);
+			if (n < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+					continue;
+				}
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: payload read error %d (%s)", errno, strerror(errno));
+				return -1;
+			}
+			if (n == 0) {
+				MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: connection closed during payload");
+				return -1;
+			}
+			payload_read += n;
+		}
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: read TDS payload of %zu bytes", payload_len);
+
+		// Copy what we can to the output buffer, store rest in our buffer
+		size_t to_copy = std::min(len, payload_len);
+		std::memcpy(buf, payload.data(), to_copy);
+
+		if (payload_len > to_copy) {
+			// Store extra data in buffer for next call
+			recv_buffer.insert(recv_buffer.end(),
+				payload.begin() + to_copy, payload.end());
+			MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: buffered %zu extra bytes",
+				payload_len - to_copy);
+		}
+
+		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: returning %zu bytes of TLS data", to_copy);
+		return static_cast<int>(to_copy);
+	};
+
+	// Set the callbacks
+	tls_context_->SetBioCallbacks(std::move(send_cb), std::move(recv_cb));
+
+	// Perform TLS handshake (will use our TDS-wrapped callbacks)
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: performing TDS-wrapped TLS handshake...");
+	if (!tls_context_->Handshake(timeout_ms)) {
+		last_error_ = "TLS handshake failed: " + tls_context_->GetLastError();
+		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - handshake: %s", last_error_.c_str());
+		tls_context_->ClearBioCallbacks();
+		tls_context_.reset();
+		return false;
+	}
+
+	// Handshake complete - clear the TDS-wrapped callbacks
+	// After handshake, normal TLS I/O goes directly over the socket
+	// (the TLS layer is now established, further TDS packets go through it)
+	tls_context_->ClearBioCallbacks();
+
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: SUCCESS - cipher=%s, version=%s",
+		tls_context_->GetCipherSuite().c_str(), tls_context_->GetTlsVersion().c_str());
+	return true;
+}
+
+bool TdsSocket::IsTlsEnabled() const {
+	return tls_context_ && tls_context_->IsInitialized();
+}
+
+std::string TdsSocket::GetTlsCipherSuite() const {
+	if (!tls_context_) {
+		return "";
+	}
+	return tls_context_->GetCipherSuite();
+}
+
+std::string TdsSocket::GetTlsVersion() const {
+	if (!tls_context_) {
+		return "";
+	}
+	return tls_context_->GetTlsVersion();
+}
+
 bool TdsSocket::Send(const uint8_t* data, size_t length) {
 	if (!IsConnected()) {
 		last_error_ = "Not connected";
 		return false;
 	}
 
+	// Route through TLS if enabled
+	if (tls_context_) {
+		ssize_t sent = tls_context_->Send(data, length);
+		if (sent < 0) {
+			last_error_ = "TLS send failed: " + tls_context_->GetLastError();
+			return false;
+		}
+		if (static_cast<size_t>(sent) != length) {
+			last_error_ = "TLS send incomplete";
+			return false;
+		}
+		return true;
+	}
+
+	// Plain TCP send
 	size_t total_sent = 0;
 	while (total_sent < length) {
 		ssize_t sent = send(fd_, data + total_sent, length - total_sent, 0);
@@ -202,6 +518,20 @@ ssize_t TdsSocket::Receive(uint8_t* buffer, size_t max_length, int timeout_ms) {
 		return -1;
 	}
 
+	// Route through TLS if enabled
+	if (tls_context_) {
+		ssize_t received = tls_context_->Receive(buffer, max_length, timeout_ms);
+		if (received < 0) {
+			last_error_ = "TLS receive failed: " + tls_context_->GetLastError();
+			if (tls_context_->GetLastErrorCode() == TlsErrorCode::PEER_CLOSED) {
+				connected_ = false;
+			}
+			return -1;
+		}
+		return received;
+	}
+
+	// Plain TCP receive
 	// Wait for data with timeout
 	if (!WaitForReady(false, timeout_ms)) {
 		return 0;  // Timeout

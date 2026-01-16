@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include)
+include_directories(src/include src/tls)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -25,7 +25,17 @@ endif()
 
 message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_HASH}")
 
-# Set extension sources
+# =============================================================================
+# TLS Static Library (built as separate subproject)
+# =============================================================================
+# The TLS library is built in src/tls with its own CMakeLists.txt to ensure
+# complete isolation from DuckDB's include paths. DuckDB bundles a stripped-down
+# mbedTLS that's incompatible with our needs.
+add_subdirectory(src/tls)
+
+# =============================================================================
+# Extension Sources (shared between static and loadable builds)
+# =============================================================================
 set(EXTENSION_SOURCES
     src/mssql_extension.cpp
     src/mssql_secret.cpp
@@ -56,19 +66,103 @@ set(EXTENSION_SOURCES
     src/connection/mssql_pool_manager.cpp
 )
 
-# Build static extension (linked into DuckDB)
+# Build static extension (linked into DuckDB) - uses TLS from mssql_tls library
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 
-# Build loadable extension (.duckdb_extension file)
+# Build loadable extension (.duckdb_extension file) - uses TLS from mssql_tls library
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Add version definition to both targets (intentionally overrides DuckDB's definition)
-target_compile_options(${EXTENSION_NAME} PRIVATE "-Wno-macro-redefined")
-target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE "-Wno-macro-redefined")
-target_compile_definitions(${EXTENSION_NAME} PRIVATE EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}")
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}")
+# =============================================================================
+# Static Extension Configuration
+# =============================================================================
+# Link mssql_tls library which includes vcpkg's mbedTLS
+# On macOS: Use -force_load to ensure our mbedTLS symbols are used (first wins)
+# On Linux: Use --allow-multiple-definition to handle DuckDB's bundled mbedTLS
 
+target_compile_options(${EXTENSION_NAME} PRIVATE
+    "-Wno-macro-redefined"
+)
+target_compile_definitions(${EXTENSION_NAME} PRIVATE
+    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
+)
+target_include_directories(${EXTENSION_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tls
+)
+
+# Find mbedTLS for explicit linking (needed because -force_load doesn't transitively link)
+find_package(MbedTLS CONFIG REQUIRED)
+
+# Link TLS library with appropriate flags for duplicate symbol handling
+if(APPLE)
+    # macOS: Force load our library and vcpkg mbedTLS first
+    # This ensures our symbols take precedence over DuckDB's bundled mbedTLS
+    target_link_libraries(${EXTENSION_NAME}
+        "-Wl,-force_load,$<TARGET_FILE:mssql_tls>"
+        "-Wl,-force_load,$<TARGET_FILE:MbedTLS::mbedtls>"
+        "-Wl,-force_load,$<TARGET_FILE:MbedTLS::mbedx509>"
+        "-Wl,-force_load,$<TARGET_FILE:MbedTLS::mbedcrypto>"
+    )
+elseif(UNIX)
+    # Linux: Allow multiple definitions, first one wins
+    target_link_libraries(${EXTENSION_NAME}
+        "-Wl,--whole-archive"
+        mssql_tls
+        MbedTLS::mbedtls
+        MbedTLS::mbedx509
+        MbedTLS::mbedcrypto
+        "-Wl,--no-whole-archive"
+        "-Wl,--allow-multiple-definition"
+    )
+else()
+    # Other platforms (Windows, etc.)
+    target_link_libraries(${EXTENSION_NAME} mssql_tls)
+endif()
+add_dependencies(${EXTENSION_NAME} mssql_tls)
+
+# =============================================================================
+# Loadable Extension Configuration
+# =============================================================================
+# The loadable extension links the TLS static library directly. Symbol visibility
+# is used to hide all mbedTLS symbols, only exporting the extension entry point.
+# This prevents conflicts with DuckDB's bundled mbedTLS when the extension is loaded.
+
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+    "-Wno-macro-redefined"
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/src/tls/mbedtls_compat.h"
+)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
+    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
+)
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/tls
+)
+
+# Link the TLS static library (includes mbedTLS)
+# Use plain signature to match DuckDB's extension build tools
+target_link_libraries(${LOADABLE_EXTENSION_NAME} mssql_tls)
+
+# Use symbol visibility to hide all mbedTLS symbols, only exporting entry point
+if(APPLE)
+    # macOS: Use -exported_symbols_list to only export extension entry point
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extension_exports.txt"
+        "_mssql_duckdb_cpp_init\n"
+    )
+    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+        "-Wl,-exported_symbols_list,${CMAKE_CURRENT_BINARY_DIR}/extension_exports.txt"
+    )
+elseif(UNIX)
+    # Linux: Use version script to only export extension entry point
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extension_version.map"
+        "{ global: mssql_duckdb_cpp_init; local: *; };\n"
+    )
+    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+        "-Wl,--version-script,${CMAKE_CURRENT_BINARY_DIR}/extension_version.map"
+    )
+endif()
+
+# =============================================================================
 # Installation
+# =============================================================================
 install(
     TARGETS ${EXTENSION_NAME}
     EXPORT "${DUCKDB_EXPORT_SET}"

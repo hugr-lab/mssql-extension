@@ -12,6 +12,7 @@ obj/
 *.duckdb_extension
 
 # vcpkg
+vcpkg/
 vcpkg_installed/
 
 # IDE files
@@ -46,3 +47,4 @@ Thumbs.db
 
 # test output
 duckdb_unittest_tempdir/
+future-spec/

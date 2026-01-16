@@ -30,7 +30,7 @@ struct MSSQLConnectionInfo {
 	string database;
 	string user;
 	string password;
-	bool use_ssl = false;
+	bool use_encrypt = false;  // Enable TLS encryption
 	bool connected = false;
 
 	// Create from secret

@@ -32,7 +32,10 @@ public:
 
 	// Authentication (FR-006, FR-007)
 	// Performs PRELOGIN and LOGIN7 handshake with SQL Server authentication
-	bool Authenticate(const std::string& username, const std::string& password, const std::string& database);
+	// Parameters:
+	//   use_encrypt - if true, enables TLS encryption after PRELOGIN (requires server support)
+	bool Authenticate(const std::string& username, const std::string& password, const std::string& database,
+	                  bool use_encrypt = false);
 
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state
@@ -76,6 +79,7 @@ public:
 	uint16_t GetPort() const { return port_; }
 	const std::string& GetDatabase() const { return database_; }
 	const std::string& GetLastError() const { return last_error_; }
+	bool IsTlsEnabled() const { return tls_enabled_; }
 
 	// Timestamps for pool management
 	std::chrono::steady_clock::time_point GetCreatedAt() const { return created_at_; }
@@ -108,8 +112,11 @@ private:
 	// Packet sequencing
 	uint8_t next_packet_id_;
 
+	// TLS state
+	bool tls_enabled_;
+
 	// Internal helpers
-	bool DoPrelogin();
+	bool DoPrelogin(bool use_encrypt);
 	bool DoLogin7(const std::string& username, const std::string& password, const std::string& database);
 };
 

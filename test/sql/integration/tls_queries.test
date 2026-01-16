@@ -1,0 +1,160 @@
+# name: test/sql/integration/tls_queries.test
+# description: Integration tests for various query types over TLS connections
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TLS support
+# SQL Server 2022 has TLS enabled by default with self-signed certificate.
+#
+# Setup:
+#   docker compose -f docker/docker-compose.yml up -d
+#   export MSSQL_TEST_DSN_TLS="mssql://sa:TestPassword1@localhost:1433/master?encrypt=true"
+#
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TEST_DSN_TLS
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
+
+# ============================================================================
+# Test: Various Data Types Over TLS
+# ============================================================================
+
+# Integer types
+query III
+SELECT * FROM mssql_scan('db', 'SELECT CAST(1 AS tinyint) AS tiny, CAST(1000 AS smallint) AS small, CAST(100000 AS int) AS normal');
+----
+1	1000	100000
+
+# Bigint
+query I
+SELECT * FROM mssql_scan('db', 'SELECT CAST(9223372036854775807 AS bigint) AS big');
+----
+9223372036854775807
+
+# Floating point
+query II
+SELECT * FROM mssql_scan('db', 'SELECT CAST(3.14 AS float) AS pi_approx, CAST(2.71828 AS real) AS e_approx');
+----
+3.14	2.71828
+
+# Decimal/Numeric
+query I
+SELECT * FROM mssql_scan('db', 'SELECT CAST(123.456 AS decimal(10,3)) AS dec_val');
+----
+123.456
+
+# Strings
+query II
+SELECT * FROM mssql_scan('db', 'SELECT ''varchar'' AS v, N''nvarchar'' AS nv');
+----
+varchar	nvarchar
+
+# Date/Time
+query I
+SELECT * FROM mssql_scan('db', 'SELECT CAST(''2024-01-15'' AS date) AS d');
+----
+2024-01-15
+
+# NULL values
+query I
+SELECT * FROM mssql_scan('db', 'SELECT NULL AS null_val');
+----
+NULL
+
+# ============================================================================
+# Test: Query with Unicode Data Over TLS
+# ============================================================================
+query I
+SELECT * FROM mssql_scan('db', 'SELECT N''Hello \u4e16\u754c'' AS unicode_str');
+----
+Hello \u4e16\u754c
+
+# ============================================================================
+# Test: Multiple Sequential Queries Over TLS
+# Verifies connection reuse works properly with TLS
+# ============================================================================
+query I
+SELECT * FROM mssql_scan('db', 'SELECT 1 AS seq1');
+----
+1
+
+query I
+SELECT * FROM mssql_scan('db', 'SELECT 2 AS seq2');
+----
+2
+
+query I
+SELECT * FROM mssql_scan('db', 'SELECT 3 AS seq3');
+----
+3
+
+query I
+SELECT * FROM mssql_scan('db', 'SELECT 4 AS seq4');
+----
+4
+
+query I
+SELECT * FROM mssql_scan('db', 'SELECT 5 AS seq5');
+----
+5
+
+# Pool should still have only 1 connection (reuse)
+query I
+SELECT connections_created FROM mssql_pool_stats(context_name='db');
+----
+1
+
+# ============================================================================
+# Test: Complex Query Over TLS
+# ============================================================================
+query III
+SELECT * FROM mssql_scan('db', '
+SELECT
+    a.val,
+    a.val * 2 AS doubled,
+    CASE WHEN a.val % 2 = 0 THEN ''even'' ELSE ''odd'' END AS parity
+FROM (SELECT 1 AS val UNION ALL SELECT 2 UNION ALL SELECT 3) a
+ORDER BY a.val
+');
+----
+1	2	odd
+2	4	even
+3	6	odd
+
+# ============================================================================
+# Test: Aggregate Functions Over TLS
+# ============================================================================
+query IIII
+SELECT * FROM mssql_scan('db', '
+SELECT
+    COUNT(*) AS cnt,
+    SUM(n) AS total,
+    AVG(n) AS average,
+    MAX(n) AS maximum
+FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) t
+');
+----
+5	15	3	5
+
+# ============================================================================
+# Test: String Functions Over TLS
+# ============================================================================
+query III
+SELECT * FROM mssql_scan('db', 'SELECT LEN(''hello'') AS len, UPPER(''hello'') AS upper_str, LOWER(''HELLO'') AS lower_str');
+----
+5	HELLO	hello
+
+# ============================================================================
+# Test: Math Functions Over TLS
+# ============================================================================
+query III
+SELECT * FROM mssql_scan('db', 'SELECT ABS(-5) AS abs_val, CEILING(4.3) AS ceil_val, FLOOR(4.9) AS floor_val');
+----
+5	5	4
+
+# Cleanup
+statement ok
+DETACH db;

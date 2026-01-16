@@ -34,8 +34,11 @@ struct LoginResponse {
 class TdsProtocol {
 public:
 	// Build PRELOGIN packet
-	// Negotiates TDS version and encryption (always ENCRYPT_OFF for this phase)
-	static TdsPacket BuildPrelogin();
+	// Negotiates TDS version and encryption
+	// Parameters:
+	//   use_encrypt - if true, requests ENCRYPT_ON from server
+	//                 if false, sends ENCRYPT_NOT_SUP (no encryption)
+	static TdsPacket BuildPrelogin(bool use_encrypt = false);
 
 	// Parse PRELOGIN response
 	static PreloginResponse ParsePreloginResponse(const std::vector<uint8_t>& data);

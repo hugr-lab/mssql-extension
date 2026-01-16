@@ -1,7 +1,7 @@
 # Makefile for DuckDB MSSQL Extension
 # Builds extension using DuckDB's build system
 
-.PHONY: all release debug clean configure test help docker-up docker-down docker-status integration-test
+.PHONY: all release debug clean configure test help docker-up docker-down docker-status integration-test vcpkg-setup
 
 # Default generator (can be overridden: GEN=ninja make release)
 GEN ?= Ninja
@@ -15,25 +15,37 @@ EXT_CONFIG := $(shell pwd)/extension_config.cmake
 # DuckDB source directory
 DUCKDB_DIR := $(shell pwd)/duckdb
 
+# vcpkg setup
+VCPKG_DIR := $(shell pwd)/vcpkg
+VCPKG_TOOLCHAIN := $(VCPKG_DIR)/scripts/buildsystems/vcpkg.cmake
+
 # Default target
 all: release
 
+# Bootstrap vcpkg if not present
+vcpkg-setup:
+	@if [ ! -d "$(VCPKG_DIR)" ]; then \
+		echo "Bootstrapping vcpkg..."; \
+		git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
+		$(VCPKG_DIR)/bootstrap-vcpkg.sh; \
+	fi
+
 # Release build - uses DuckDB's CMakeLists.txt as root
-release:
+release: vcpkg-setup
 	mkdir -p $(BUILD_DIR)/release
-	cd $(BUILD_DIR)/release && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Release -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
+	cd $(BUILD_DIR)/release && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
 	cmake --build $(BUILD_DIR)/release --config Release
 
 # Debug build with debug symbols
-debug:
+debug: vcpkg-setup
 	mkdir -p $(BUILD_DIR)/debug
-	cd $(BUILD_DIR)/debug && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Debug -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
+	cd $(BUILD_DIR)/debug && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
 	cmake --build $(BUILD_DIR)/debug --config Debug
 
 # Configure only (useful for IDE integration)
-configure:
+configure: vcpkg-setup
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && cmake -G "$(GEN)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
+	cd $(BUILD_DIR) && cmake -G "$(GEN)" -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
 
 # Clean build artifacts
 clean:
@@ -115,6 +127,7 @@ MSSQL_TEST_DB ?= master
 # Derived connection strings (computed from base variables)
 MSSQL_TEST_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=$(MSSQL_TEST_DB);User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
 MSSQL_TEST_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)
+MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)?encrypt=true
 
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
@@ -124,6 +137,7 @@ export MSSQL_TEST_PASS
 export MSSQL_TEST_DB
 export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
+export MSSQL_TEST_DSN_TLS
 
 # Integration tests - requires SQL Server running
 integration-test: release
@@ -137,6 +151,7 @@ integration-test: release
 	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
 	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
 	@echo "  MSSQL_TEST_URI=$(MSSQL_TEST_URI)"
+	@echo "  MSSQL_TEST_DSN_TLS=$(MSSQL_TEST_DSN_TLS)"
 	@echo ""
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "ERROR: SQL Server is not running or not healthy."; \

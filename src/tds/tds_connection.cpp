@@ -1,4 +1,22 @@
 #include "tds/tds_connection.hpp"
+#include <cstdio>
+#include <cstdlib>
+
+// Debug logging
+static int GetMssqlDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char* env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_CONN_DEBUG_LOG(lvl, fmt, ...) \
+	do { \
+		if (GetMssqlDebugLevel() >= lvl) \
+			fprintf(stderr, "[MSSQL CONN] " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
 
 namespace duckdb {
 namespace tds {
@@ -10,6 +28,7 @@ TdsConnection::TdsConnection()
       spid_(0),
       created_at_(std::chrono::steady_clock::now()),
       last_used_at_(created_at_),
+      tls_enabled_(false),
       next_packet_id_(1) {
 }
 
@@ -27,9 +46,11 @@ TdsConnection::TdsConnection(TdsConnection&& other) noexcept
       created_at_(other.created_at_),
       last_used_at_(other.last_used_at_),
       last_error_(std::move(other.last_error_)),
+      tls_enabled_(other.tls_enabled_),
       next_packet_id_(other.next_packet_id_) {
 	other.state_.store(ConnectionState::Disconnected);
 	other.spid_ = 0;
+	other.tls_enabled_ = false;
 }
 
 TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
@@ -44,10 +65,12 @@ TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
 		created_at_ = other.created_at_;
 		last_used_at_ = other.last_used_at_;
 		last_error_ = std::move(other.last_error_);
+		tls_enabled_ = other.tls_enabled_;
 		next_packet_id_ = other.next_packet_id_;
 
 		other.state_.store(ConnectionState::Disconnected);
 		other.spid_ = 0;
+		other.tls_enabled_ = false;
 	}
 	return *this;
 }
@@ -74,21 +97,23 @@ bool TdsConnection::Connect(const std::string& host, uint16_t port, int timeout_
 	return true;
 }
 
-bool TdsConnection::Authenticate(const std::string& username, const std::string& password, const std::string& database) {
+bool TdsConnection::Authenticate(const std::string& username, const std::string& password, const std::string& database,
+                                  bool use_encrypt) {
 	// Must be in Authenticating state
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
 		return false;
 	}
 
-	// Step 1: PRELOGIN handshake
-	if (!DoPrelogin()) {
+	// Step 1: PRELOGIN handshake (negotiates encryption)
+	if (!DoPrelogin(use_encrypt)) {
 		state_.store(ConnectionState::Disconnected);
 		socket_->Close();
 		return false;
 	}
 
 	// Step 2: LOGIN7 authentication
+	// Note: If TLS was enabled during PRELOGIN, all subsequent traffic is encrypted
 	if (!DoLogin7(username, password, database)) {
 		state_.store(ConnectionState::Disconnected);
 		socket_->Close();
@@ -102,8 +127,8 @@ bool TdsConnection::Authenticate(const std::string& username, const std::string&
 	return true;
 }
 
-bool TdsConnection::DoPrelogin() {
-	TdsPacket prelogin = TdsProtocol::BuildPrelogin();
+bool TdsConnection::DoPrelogin(bool use_encrypt) {
+	TdsPacket prelogin = TdsProtocol::BuildPrelogin(use_encrypt);
 	prelogin.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(prelogin)) {
@@ -123,11 +148,40 @@ bool TdsConnection::DoPrelogin() {
 		return false;
 	}
 
-	// Check encryption response
-	if (prelogin_response.encryption != EncryptionOption::ENCRYPT_OFF &&
-	    prelogin_response.encryption != EncryptionOption::ENCRYPT_NOT_SUP) {
-		last_error_ = "Server requires encryption which is not supported in this version";
-		return false;
+	// Log the PRELOGIN response
+	MSSQL_CONN_DEBUG_LOG(1, "DoPrelogin: server version=%d.%d.%d, encryption=%d",
+		prelogin_response.version_major, prelogin_response.version_minor,
+		prelogin_response.version_build, static_cast<int>(prelogin_response.encryption));
+
+	// Handle encryption based on what we requested and what server responded
+	if (use_encrypt) {
+		// We requested encryption
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_NOT_SUP) {
+			last_error_ = "TLS requested but server does not support encryption (ENCRYPT_NOT_SUP)";
+			return false;
+		}
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_OFF) {
+			last_error_ = "TLS requested but server declined encryption (ENCRYPT_OFF)";
+			return false;
+		}
+
+		// Server agreed to encryption (ENCRYPT_ON or ENCRYPT_REQ)
+		// Enable TLS on the socket BEFORE sending LOGIN7
+		// Pass next_packet_id_ so TLS handshake packets continue the sequence
+		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
+			return false;
+		}
+		tls_enabled_ = true;
+	} else {
+		// We did not request encryption
+		// Accept if server doesn't require it
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_REQ) {
+			last_error_ = "Server requires encryption (ENCRYPT_REQ) but use_encrypt=false";
+			return false;
+		}
+		// ENCRYPT_OFF, ENCRYPT_NOT_SUP, or ENCRYPT_ON with client not supporting = no TLS
+		tls_enabled_ = false;
 	}
 
 	return true;

@@ -4,7 +4,12 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 
 ## Status
 
-This extension is currently in bootstrap phase. The core infrastructure is set up but SQL Server connectivity is not yet implemented.
+This extension provides native TDS protocol connectivity to Microsoft SQL Server with the following features:
+- Connection string parsing (ADO.NET and URI formats)
+- TLS/SSL encrypted connections
+- Connection pooling
+- Streaming query execution
+- DuckDB secret management integration
 
 ## Prerequisites
 
@@ -70,6 +75,43 @@ Connection string parameters:
 - `Database` - database name
 - `User Id` - SQL Server login username
 - `Password` - SQL Server login password
+
+### TLS/Encrypted Connections
+
+For secure connections with TLS encryption, you can use any of these methods:
+
+**Method 1: Secret with use_encrypt**
+```sql
+CREATE SECRET mssql_secure (
+    TYPE mssql,
+    host 'sql-server.example.com',
+    port 1433,
+    database 'MyDatabase',
+    user 'sa',
+    password 'MyPassword123!',
+    use_encrypt true
+);
+ATTACH '' AS db (TYPE mssql, SECRET mssql_secure);
+```
+
+**Method 2: ADO.NET connection string with Encrypt**
+```sql
+ATTACH 'Server=sql-server.example.com,1433;Database=MyDatabase;User Id=sa;Password=MyPassword123!;Encrypt=yes' AS db (TYPE mssql);
+```
+
+**Method 3: URI format with encrypt query parameter**
+```sql
+ATTACH 'mssql://sa:MyPassword123!@sql-server.example.com:1433/MyDatabase?encrypt=true' AS db (TYPE mssql);
+```
+
+Key points about TLS support:
+- `use_encrypt` / `Encrypt` defaults to `false` for backward compatibility
+- Uses "trust server certificate" mode (accepts self-signed certificates)
+- TLS 1.2 is the minimum supported version (SQL Server 2016+ requirement)
+- Works with both static and loadable extensions
+- mbedTLS is used as the TLS library (via vcpkg)
+
+Set `MSSQL_DEBUG=1` environment variable to see TLS handshake details in debug output.
 
 ### Load as Dynamic Extension
 

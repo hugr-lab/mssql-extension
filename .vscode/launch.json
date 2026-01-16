@@ -10,7 +10,8 @@
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "Build Debug",
             "env": {
-                "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1"
+                "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1",
+                "MSSQL_DEBUG": "1"
             },
             "stopOnEntry": false,
             "sourceMap": {
