@@ -17,13 +17,16 @@ public:
 	static MssqlPoolManager& Instance();
 
 	// Get or create a pool for a context
+	// Parameters:
+	//   use_encrypt - if true, enables TLS encryption for all connections in the pool
 	tds::ConnectionPool* GetOrCreatePool(const std::string& context_name,
 	                                      const PoolConfig& config,
 	                                      const std::string& host,
 	                                      uint16_t port,
 	                                      const std::string& username,
 	                                      const std::string& password,
-	                                      const std::string& database);
+	                                      const std::string& database,
+	                                      bool use_encrypt = false);
 
 	// Get an existing pool (returns nullptr if not found)
 	tds::ConnectionPool* GetPool(const std::string& context_name);

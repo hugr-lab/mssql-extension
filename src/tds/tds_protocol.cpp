@@ -20,7 +20,7 @@ struct PreloginOptionHeader {
 	uint16_t length;
 };
 
-TdsPacket TdsProtocol::BuildPrelogin() {
+TdsPacket TdsProtocol::BuildPrelogin(bool use_encrypt) {
 	TdsPacket packet(PacketType::PRELOGIN);
 
 	// Build option headers first
@@ -54,8 +54,14 @@ TdsPacket TdsProtocol::BuildPrelogin() {
 	packet.AppendUInt16BE(0); // Build number
 	packet.AppendUInt16BE(0); // Sub-build number
 
-	// ENCRYPTION data: request no encryption
-	packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_NOT_SUP));
+	// ENCRYPTION data: request encryption based on use_encrypt parameter
+	// ENCRYPT_ON: Client requests encryption, expects server to agree
+	// ENCRYPT_NOT_SUP: Client does not support encryption (plaintext only)
+	if (use_encrypt) {
+		packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_ON));
+	} else {
+		packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_NOT_SUP));
+	}
 
 	return packet;
 }

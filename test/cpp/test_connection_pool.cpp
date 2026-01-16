@@ -3,19 +3,21 @@
 //
 // This test requires a running SQL Server instance.
 // Set environment variables:
-//   MSSQL_TEST_HOST: SQL Server hostname (default: localhost)
-//   MSSQL_TEST_PORT: SQL Server port (default: 1433)
-//   MSSQL_TEST_USER: SQL Server username (default: sa)
-//   MSSQL_TEST_PASS: SQL Server password (required)
-//   MSSQL_TEST_DB:   Database name (default: master)
+//   MSSQL_TEST_HOST:    SQL Server hostname (default: localhost)
+//   MSSQL_TEST_PORT:    SQL Server port (default: 1433)
+//   MSSQL_TEST_USER:    SQL Server username (default: sa)
+//   MSSQL_TEST_PASS:    SQL Server password (required)
+//   MSSQL_TEST_DB:      Database name (default: master)
+//   MSSQL_TEST_ENCRYPT: Enable TLS encryption (default: false)
+//                       Set to "true", "1", or "yes" to enable
 //
 // Compile (from project root):
 //   g++ -std=c++17 -I src/include -I duckdb/src/include \
 //       test/cpp/test_connection_pool.cpp \
 //       src/tds/tds_connection.cpp src/tds/tds_socket.cpp \
 //       src/tds/tds_protocol.cpp src/tds/tds_packet.cpp \
-//       src/tds/connection_pool.cpp \
-//       -o test_pool -pthread
+//       src/tds/tds_tls_context.cpp src/tds/connection_pool.cpp \
+//       -o test_pool -pthread -lmbedtls -lmbedx509 -lmbedcrypto
 //
 // Run: ./test_pool
 
@@ -45,6 +47,7 @@ struct TestConfig {
     std::string user;
     std::string pass;
     std::string database;
+    bool use_encrypt;  // Enable TLS encryption
 
     static TestConfig FromEnv() {
         TestConfig config;
@@ -53,6 +56,9 @@ struct TestConfig {
         config.user = getenv_or("MSSQL_TEST_USER", "sa");
         config.pass = getenv_or("MSSQL_TEST_PASS", "");
         config.database = getenv_or("MSSQL_TEST_DB", "master");
+        // Default to false for backward compatibility
+        std::string encrypt_str = getenv_or("MSSQL_TEST_ENCRYPT", "false");
+        config.use_encrypt = (encrypt_str == "true" || encrypt_str == "1" || encrypt_str == "yes");
         return config;
     }
 
@@ -69,7 +75,7 @@ ConnectionFactory createFactory(const TestConfig& config) {
             std::cerr << "[Factory] Connection failed: " << conn->GetLastError() << std::endl;
             return nullptr;
         }
-        if (!conn->Authenticate(config.user, config.pass, config.database)) {
+        if (!conn->Authenticate(config.user, config.pass, config.database, config.use_encrypt)) {
             std::cerr << "[Factory] Authentication failed: " << conn->GetLastError() << std::endl;
             return nullptr;
         }
@@ -287,6 +293,38 @@ void test_connection_validation(const TestConfig& config) {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_backward_compatibility_plaintext(const TestConfig& config) {
+    std::cout << "\n=== Test: Backward Compatibility (Plaintext Default) ===" << std::endl;
+
+    // Create connection without specifying use_encrypt (defaults to false)
+    auto conn = std::make_shared<TdsConnection>();
+    assert(conn != nullptr);
+
+    if (!conn->Connect(config.host, config.port)) {
+        std::cerr << "Connection failed: " << conn->GetLastError() << std::endl;
+        assert(false && "Connection should succeed");
+    }
+
+    // Call Authenticate WITHOUT the use_encrypt parameter
+    // This tests the default parameter value (use_encrypt=false)
+    if (!conn->Authenticate(config.user, config.pass, config.database)) {
+        std::cerr << "Authentication failed: " << conn->GetLastError() << std::endl;
+        assert(false && "Authentication should succeed without TLS");
+    }
+
+    // Verify TLS is NOT enabled (backward compatibility)
+    assert(!conn->IsTlsEnabled());
+    std::cout << "TLS enabled: " << (conn->IsTlsEnabled() ? "yes" : "no") << std::endl;
+    std::cout << "Connection established in plaintext mode (backward compatible)" << std::endl;
+
+    // Verify connection is functional
+    assert(conn->IsAlive());
+    std::cout << "Connection is alive" << std::endl;
+
+    conn->Close();
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "TDS Connection Pool Integration Tests" << std::endl;
@@ -311,6 +349,7 @@ int main() {
     std::cout << "  Port: " << config.port << std::endl;
     std::cout << "  User: " << config.user << std::endl;
     std::cout << "  Database: " << config.database << std::endl;
+    std::cout << "  Encrypt: " << (config.use_encrypt ? "yes" : "no") << std::endl;
 
     // Test basic connectivity first
     std::cout << "\n=== Verifying SQL Server connectivity ===" << std::endl;
@@ -319,15 +358,17 @@ int main() {
         std::cerr << "ERROR: Cannot connect to SQL Server: " << test_conn->GetLastError() << std::endl;
         return 1;
     }
-    if (!test_conn->Authenticate(config.user, config.pass, config.database)) {
+    if (!test_conn->Authenticate(config.user, config.pass, config.database, config.use_encrypt)) {
         std::cerr << "ERROR: Authentication failed: " << test_conn->GetLastError() << std::endl;
         return 1;
     }
     std::cout << "SQL Server connectivity verified!" << std::endl;
+    std::cout << "TLS enabled: " << (test_conn->IsTlsEnabled() ? "yes" : "no") << std::endl;
     test_conn->Close();
 
     // Run all tests
     try {
+        test_backward_compatibility_plaintext(config);  // T029: Backward compatibility test
         test_basic_acquire_release(config);
         test_connection_reuse(config);
         test_pool_limit(config);

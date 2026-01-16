@@ -13,7 +13,8 @@ tds::ConnectionPool* MssqlPoolManager::GetOrCreatePool(const std::string& contex
                                                         uint16_t port,
                                                         const std::string& username,
                                                         const std::string& password,
-                                                        const std::string& database) {
+                                                        const std::string& database,
+                                                        bool use_encrypt) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 
 	// Check if pool already exists
@@ -31,13 +32,13 @@ tds::ConnectionPool* MssqlPoolManager::GetOrCreatePool(const std::string& contex
 	pool_config.min_connections = config.min_connections;
 	pool_config.acquire_timeout = config.acquire_timeout;
 
-	// Create connection factory
-	auto factory = [host, port, username, password, database]() -> std::shared_ptr<tds::TdsConnection> {
+	// Create connection factory that captures use_encrypt for TLS support
+	auto factory = [host, port, username, password, database, use_encrypt]() -> std::shared_ptr<tds::TdsConnection> {
 		auto conn = std::make_shared<tds::TdsConnection>();
 		if (!conn->Connect(host, port)) {
 			return nullptr;
 		}
-		if (!conn->Authenticate(username, password, database)) {
+		if (!conn->Authenticate(username, password, database, use_encrypt)) {
 			return nullptr;
 		}
 		return conn;

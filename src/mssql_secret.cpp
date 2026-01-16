@@ -69,12 +69,12 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_PASSWORD, input);
 
 	// Handle optional use_ssl parameter (defaults to false if not provided)
-	auto use_ssl_it = input.options.find(MSSQL_SECRET_USE_SSL);
+	auto use_ssl_it = input.options.find(MSSQL_SECRET_USE_ENCRYPT);
 	if (use_ssl_it != input.options.end()) {
-		result->TrySetValue(MSSQL_SECRET_USE_SSL, input);
+		result->TrySetValue(MSSQL_SECRET_USE_ENCRYPT, input);
 	} else {
 		// Set default value of false
-		result->secret_map[MSSQL_SECRET_USE_SSL] = Value::BOOLEAN(false);
+		result->secret_map[MSSQL_SECRET_USE_ENCRYPT] = Value::BOOLEAN(false);
 	}
 
 	// Mark password as redacted (hidden in duckdb_secrets() output)
@@ -106,7 +106,7 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_DATABASE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_USER] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_PASSWORD] = LogicalType::VARCHAR;
-	create_func.named_parameters[MSSQL_SECRET_USE_SSL] = LogicalType::BOOLEAN;  // Optional
+	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;  // Optional
 
 	loader.RegisterFunction(std::move(create_func));
 }

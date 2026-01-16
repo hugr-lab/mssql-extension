@@ -10,10 +10,13 @@
     "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
     "C_Cpp.default.includePath": [
         "${workspaceFolder}/src/include",
+        "${workspaceFolder}/src/tls",
         "${workspaceFolder}/duckdb/src/include",
-        "${workspaceFolder}/duckdb/third_party/fmt/include"
+        "${workspaceFolder}/duckdb/third_party/fmt/include",
+        "${workspaceFolder}/build/release/vcpkg_installed/arm64-osx/include",
+        "${workspaceFolder}/build/debug/vcpkg_installed/arm64-osx/include"
     ],
-    "C_Cpp.default.cppStandard": "c++11",
+    "C_Cpp.default.cppStandard": "c++17",
     "files.associations": {
         "*.hpp": "cpp",
         "*.cpp": "cpp"

@@ -1,0 +1,125 @@
+# name: test/sql/integration/tls_parallel.test
+# description: Integration tests for parallel queries over TLS connections
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TLS support
+# SQL Server 2022 has TLS enabled by default with self-signed certificate.
+#
+# Setup:
+#   docker compose -f docker/docker-compose.yml up -d
+#   export MSSQL_TEST_DSN_TLS="mssql://sa:TestPassword1@localhost:1433/master?encrypt=true"
+#
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TEST_DSN_TLS
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
+
+# ============================================================================
+# Test: Multiple Parallel Scans Over TLS
+# DuckDB may execute these in parallel depending on optimization
+# ============================================================================
+
+# Create inline test data
+query IIII
+SELECT * FROM (
+    SELECT a.val AS a_val, b.val AS b_val
+    FROM mssql_scan('db', 'SELECT 1 AS val') a,
+         mssql_scan('db', 'SELECT 2 AS val') b
+) result, (
+    SELECT c.val AS c_val, d.val AS d_val
+    FROM mssql_scan('db', 'SELECT 3 AS val') c,
+         mssql_scan('db', 'SELECT 4 AS val') d
+) result2;
+----
+1	2	3	4
+
+# ============================================================================
+# Test: Pool Statistics After Parallel Queries
+# ============================================================================
+
+# Check that pool handled the queries
+query I
+SELECT acquire_count >= 4 FROM mssql_pool_stats(context_name='db');
+----
+true
+
+# ============================================================================
+# Test: Concurrent Query Execution Pattern
+# ============================================================================
+
+# UNION ALL of multiple mssql_scan calls
+query I rowsort
+SELECT * FROM mssql_scan('db', 'SELECT 1 AS n')
+UNION ALL
+SELECT * FROM mssql_scan('db', 'SELECT 2 AS n')
+UNION ALL
+SELECT * FROM mssql_scan('db', 'SELECT 3 AS n');
+----
+1
+2
+3
+
+# ============================================================================
+# Test: Join Between Multiple TLS Queries
+# ============================================================================
+query II
+SELECT a.id, b.name
+FROM mssql_scan('db', 'SELECT 1 AS id') a
+JOIN mssql_scan('db', 'SELECT 1 AS id, ''Alice'' AS name') b ON a.id = b.id;
+----
+1	Alice
+
+# ============================================================================
+# Test: Subquery in FROM Clause
+# ============================================================================
+query I
+SELECT total FROM (
+    SELECT SUM(n) AS total
+    FROM mssql_scan('db', 'SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3')
+) sub;
+----
+6
+
+# ============================================================================
+# Test: Multiple Attach/Detach Cycles with TLS
+# Verifies that TLS cleanup works correctly
+# ============================================================================
+statement ok
+DETACH db;
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS db1 (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('db1', 'SELECT 100 AS val');
+----
+100
+
+statement ok
+DETACH db1;
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS db2 (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('db2', 'SELECT 200 AS val');
+----
+200
+
+statement ok
+DETACH db2;
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS db3 (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('db3', 'SELECT 300 AS val');
+----
+300
+
+statement ok
+DETACH db3;

@@ -43,12 +43,13 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->user = kv_secret.TryGetValue("user").ToString();
 	result->password = kv_secret.TryGetValue("password").ToString();
 
-	// Read optional use_ssl (defaults to false)
-	auto use_ssl_val = kv_secret.TryGetValue("use_ssl");
-	if (!use_ssl_val.IsNull()) {
-		result->use_ssl = use_ssl_val.GetValue<bool>();
+	// Read optional use_encrypt (defaults to false)
+	// Enables TLS encryption for the connection
+	auto use_encrypt_val = kv_secret.TryGetValue("use_encrypt");
+	if (!use_encrypt_val.IsNull()) {
+		result->use_encrypt = use_encrypt_val.GetValue<bool>();
 	} else {
-		result->use_ssl = false;
+		result->use_encrypt = false;
 	}
 
 	result->connected = false;
@@ -288,12 +289,13 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	result->user = params["user"];
 	result->password = params["password"];
 
-	// Parse optional encrypt/use_ssl
+	// Parse optional encrypt parameter
+	// Enables TLS encryption for the connection
 	if (params.find("encrypt") != params.end()) {
 		auto encrypt_val = StringUtil::Lower(params["encrypt"]);
-		result->use_ssl = (encrypt_val == "yes" || encrypt_val == "true" || encrypt_val == "1");
+		result->use_encrypt = (encrypt_val == "yes" || encrypt_val == "true" || encrypt_val == "1");
 	} else {
-		result->use_ssl = false;
+		result->use_encrypt = false;
 	}
 
 	result->connected = false;
@@ -446,7 +448,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	    ctx->connection_info->port,
 	    ctx->connection_info->user,
 	    ctx->connection_info->password,
-	    ctx->connection_info->database
+	    ctx->connection_info->database,
+	    ctx->connection_info->use_encrypt
 	);
 
 	// Set path to :memory: to prevent DuckDB from trying to open the connection string as a file
