@@ -10,13 +10,21 @@ This directory contains tests for the DuckDB MSSQL extension.
 ### Starting SQL Server with Docker
 
 ```bash
-docker-compose -f docker/docker-compose.yml up -d
+make docker-up
+# Or manually:
+docker compose -f docker/docker-compose.yml up -d
 ```
 
 This starts a SQL Server 2022 instance on port 1433 with credentials:
 - Username: `sa`
 - Password: `TestPassword1`
 - Database: `master`
+
+## TLS Support
+
+**Important:** TLS (encrypted connections) is only available in the **loadable extension** (`.duckdb_extension`). The static extension (built into the test runner) has a TLS stub.
+
+See [TLS_TESTING.md](TLS_TESTING.md) for detailed TLS testing instructions.
 
 ## Running Tests
 
@@ -76,6 +84,11 @@ Tests that require a running SQL Server:
 | `large_data.test` | Large datasets and big row data (VARCHAR, VARBINARY) |
 | `query_cancellation.test` | Query cancellation with LIMIT |
 | `diagnostic_functions.test` | mssql_open, mssql_ping, mssql_close with connection strings |
+| `tls_connection.test` | TLS connection tests (requires loadable extension) |
+| `tls_queries.test` | Data type tests over TLS (requires loadable extension) |
+| `tls_parallel.test` | Parallel query tests over TLS (requires loadable extension) |
+
+**Note:** TLS tests (`tls_*.test`) are skipped by default. See [TLS_TESTING.md](TLS_TESTING.md) for TLS testing instructions.
 
 ### Query Tests (`test/sql/query/`)
 
@@ -111,6 +124,7 @@ Tests that don't require SQL Server:
 | `mssql_execute.test` | mssql_execute function |
 | `mssql_scan.test` | mssql_scan function |
 | `mssql_secret.test` | Secret management |
+| `tls_secret.test` | TLS secret creation (no actual TLS connection) |
 
 ### C++ Tests (`test/cpp/`)
 
@@ -157,11 +171,14 @@ The test verifies:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MSSQL_TEST_DSN` | Connection string for integration tests | (required) |
+| `MSSQL_TEST_DSN_TLS` | TLS connection string for TLS tests | (not exported) |
 | `MSSQL_TEST_HOST` | SQL Server hostname | localhost |
 | `MSSQL_TEST_PORT` | SQL Server port | 1433 |
 | `MSSQL_TEST_USER` | SQL Server username | sa |
 | `MSSQL_TEST_PASS` | SQL Server password | (required for C++ tests) |
 | `MSSQL_TEST_DB` | Database name | master |
+
+Connection parameters are defined in `.env`. See [TLS_TESTING.md](TLS_TESTING.md) for TLS testing.
 
 ## Test Categories
 
