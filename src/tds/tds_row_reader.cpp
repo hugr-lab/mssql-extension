@@ -164,13 +164,17 @@ size_t RowReader::SkipValue(const uint8_t* data, size_t length, size_t col_idx) 
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
-	// Variable-length (2-byte length prefix)
+	// Variable-length (2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY: {
+		// Check for MAX types (PLP encoding)
+		if (col.IsPLPType()) {
+			return SkipPLPType(data, length);
+		}
 		if (length < 2) return 0;
 		uint16_t data_length = static_cast<uint16_t>(data[0]) |
 		                       (static_cast<uint16_t>(data[1]) << 8);
@@ -218,6 +222,10 @@ size_t RowReader::ReadValue(const uint8_t* data, size_t length, size_t col_idx,
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
+		// Check for MAX types (PLP encoding)
+		if (col.IsPLPType()) {
+			return ReadPLPType(data, length, value, is_null);
+		}
 		return ReadVariableLengthType(data, length, col.type_id, value, is_null);
 
 	// DECIMAL/NUMERIC
@@ -471,6 +479,173 @@ size_t RowReader::ReadGuidType(const uint8_t* data, size_t length,
 	return 1 + 16;
 }
 
+// PLP_NULL marker: 0xFFFFFFFFFFFFFFFE
+static constexpr uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFEULL;
+// PLP_UNKNOWN marker: 0xFFFFFFFFFFFFFFFF (unknown total length)
+static constexpr uint64_t PLP_UNKNOWN_MARKER = 0xFFFFFFFFFFFFFFFFULL;
+
+// Debug logging for PLP parsing
+static int GetPLPDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char* env = std::getenv("MSSQL_DEBUG_PLP");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define PLP_DEBUG(level, fmt, ...) \
+	do { if (GetPLPDebugLevel() >= level) { \
+		fprintf(stderr, "[PLP] " fmt "\n", ##__VA_ARGS__); \
+	} } while(0)
+
+size_t RowReader::ReadPLPType(const uint8_t* data, size_t length,
+                               std::vector<uint8_t>& value, bool& is_null) {
+	// PLP format:
+	// 8 bytes: total length (PLP_NULL=null, PLP_UNKNOWN=unknown length, else actual length)
+	// Then chunks: 4-byte chunk length + chunk data, until chunk length == 0
+
+	PLP_DEBUG(1, "ReadPLPType: buffer_length=%zu", length);
+
+	// Hex dump first 16 bytes for debugging
+	if (GetPLPDebugLevel() >= 2 && length >= 16) {
+		fprintf(stderr, "[PLP] ReadPLPType: first 16 bytes: ");
+		for (size_t i = 0; i < 16; i++) {
+			fprintf(stderr, "%02x ", data[i]);
+		}
+		fprintf(stderr, "\n");
+	}
+
+	if (length < 8) {
+		PLP_DEBUG(1, "ReadPLPType: need more data for header (have %zu, need 8)", length);
+		return 0;  // Need total length field
+	}
+
+	// Read 8-byte total length (little-endian)
+	uint64_t total_length = static_cast<uint64_t>(data[0]) |
+	                        (static_cast<uint64_t>(data[1]) << 8) |
+	                        (static_cast<uint64_t>(data[2]) << 16) |
+	                        (static_cast<uint64_t>(data[3]) << 24) |
+	                        (static_cast<uint64_t>(data[4]) << 32) |
+	                        (static_cast<uint64_t>(data[5]) << 40) |
+	                        (static_cast<uint64_t>(data[6]) << 48) |
+	                        (static_cast<uint64_t>(data[7]) << 56);
+
+	size_t offset = 8;
+
+	PLP_DEBUG(1, "ReadPLPType: total_length=0x%llx (%llu)",
+	          (unsigned long long)total_length, (unsigned long long)total_length);
+
+	// Check for NULL
+	if (total_length == PLP_NULL_MARKER) {
+		PLP_DEBUG(1, "ReadPLPType: NULL value");
+		is_null = true;
+		value.clear();
+		return offset;
+	}
+
+	is_null = false;
+
+	// For PLP_UNKNOWN or known length, read chunks
+	// Pre-allocate if we know the total length
+	if (total_length != PLP_UNKNOWN_MARKER && total_length < 0x7FFFFFFF) {
+		value.reserve(static_cast<size_t>(total_length));
+	}
+	value.clear();
+
+	// Read chunks until terminator (chunk length == 0)
+	int chunk_num = 0;
+	while (true) {
+		if (offset + 4 > length) {
+			PLP_DEBUG(1, "ReadPLPType: need more data for chunk header (have %zu, need %zu)",
+			          length, offset + 4);
+			return 0;  // Need chunk length
+		}
+
+		// Read 4-byte chunk length (little-endian)
+		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) |
+		                        (static_cast<uint32_t>(data[offset + 1]) << 8) |
+		                        (static_cast<uint32_t>(data[offset + 2]) << 16) |
+		                        (static_cast<uint32_t>(data[offset + 3]) << 24);
+		offset += 4;
+
+		PLP_DEBUG(2, "ReadPLPType: chunk[%d] length=%u, offset=%zu, buffer_length=%zu",
+		          chunk_num, chunk_length, offset, length);
+
+		// Terminator: chunk length == 0
+		if (chunk_length == 0) {
+			PLP_DEBUG(1, "ReadPLPType: terminator found, total_read=%zu bytes in %d chunks",
+			          value.size(), chunk_num);
+			break;
+		}
+
+		// Read chunk data
+		if (offset + chunk_length > length) {
+			PLP_DEBUG(1, "ReadPLPType: need more data for chunk (have %zu, need %zu)",
+			          length, offset + chunk_length);
+			return 0;  // Need more chunk data
+		}
+
+		// Append chunk data to value
+		value.insert(value.end(), data + offset, data + offset + chunk_length);
+		offset += chunk_length;
+		chunk_num++;
+	}
+
+	PLP_DEBUG(1, "ReadPLPType: complete, consumed=%zu bytes, value_size=%zu", offset, value.size());
+	return offset;
+}
+
+size_t RowReader::SkipPLPType(const uint8_t* data, size_t length) {
+	// Same structure as ReadPLPType but without copying data
+
+	if (length < 8) {
+		return 0;
+	}
+
+	// Read 8-byte total length
+	uint64_t total_length = static_cast<uint64_t>(data[0]) |
+	                        (static_cast<uint64_t>(data[1]) << 8) |
+	                        (static_cast<uint64_t>(data[2]) << 16) |
+	                        (static_cast<uint64_t>(data[3]) << 24) |
+	                        (static_cast<uint64_t>(data[4]) << 32) |
+	                        (static_cast<uint64_t>(data[5]) << 40) |
+	                        (static_cast<uint64_t>(data[6]) << 48) |
+	                        (static_cast<uint64_t>(data[7]) << 56);
+
+	size_t offset = 8;
+
+	// Check for NULL
+	if (total_length == PLP_NULL_MARKER) {
+		return offset;
+	}
+
+	// Skip chunks
+	while (true) {
+		if (offset + 4 > length) {
+			return 0;
+		}
+
+		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) |
+		                        (static_cast<uint32_t>(data[offset + 1]) << 8) |
+		                        (static_cast<uint32_t>(data[offset + 2]) << 16) |
+		                        (static_cast<uint32_t>(data[offset + 3]) << 24);
+		offset += 4;
+
+		if (chunk_length == 0) {
+			break;
+		}
+
+		if (offset + chunk_length > length) {
+			return 0;
+		}
+
+		offset += chunk_length;
+	}
+
+	return offset;
+}
+
 // NBC row value reading - for non-NULL columns (no length prefix for nullable types)
 size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_idx,
                                 std::vector<uint8_t>& value, bool& is_null) {
@@ -507,13 +682,17 @@ size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_id
 		return 1 + actual_length;
 	}
 
-	// Variable-length types still have 2-byte length prefix
+	// Variable-length types still have 2-byte length prefix (or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
+		// Check for MAX types (PLP encoding)
+		if (col.IsPLPType()) {
+			return ReadPLPType(data, length, value, is_null);
+		}
 		return ReadVariableLengthType(data, length, col.type_id, value, is_null);
 
 	// DECIMAL/NUMERIC - has 1-byte length prefix in NBC rows
@@ -599,13 +778,17 @@ size_t RowReader::SkipValueNBC(const uint8_t* data, size_t length, size_t col_id
 		return length >= 1 + actual_length ? 1 + actual_length : 0;
 	}
 
-	// Variable-length (still have 2-byte length prefix)
+	// Variable-length (still have 2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY: {
+		// Check for MAX types (PLP encoding)
+		if (col.IsPLPType()) {
+			return SkipPLPType(data, length);
+		}
 		if (length < 2) return 0;
 		uint16_t data_length = static_cast<uint16_t>(data[0]) |
 		                       (static_cast<uint16_t>(data[1]) << 8);

@@ -72,6 +72,11 @@ public:
 	// Get the connection (for pool return)
 	std::shared_ptr<tds::TdsConnection> GetConnection() const { return connection_; }
 
+	// Set the number of columns to fill in output chunks
+	// This may be less than GetColumnCount() when DuckDB only projects virtual columns (e.g., COUNT(*))
+	// When set to 0, rows are counted but no column data is filled
+	void SetColumnsToFill(idx_t count) { columns_to_fill_ = count; }
+
 	// Surface warnings to DuckDB context
 	void SurfaceWarnings(ClientContext& context);
 
@@ -114,6 +119,11 @@ private:
 
 	// Statistics
 	uint64_t rows_read_;
+
+	// Number of columns to fill in output chunk
+	// May be less than column_metadata_.size() when DuckDB projects virtual columns
+	// Default: maximum value means use column_metadata_.size()
+	idx_t columns_to_fill_ = static_cast<idx_t>(-1);
 
 	// Timeouts
 	int read_timeout_ms_ = 30000;         // Normal read timeout (30 seconds)

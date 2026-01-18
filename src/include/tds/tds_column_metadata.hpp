@@ -35,6 +35,10 @@ struct ColumnMetadata {
 	// Check if this is a nullable variant (INTN, FLOATN, etc.)
 	bool IsNullableVariant() const;
 
+	// Check if this is a PLP (Partially Length-Prefixed) type (MAX types)
+	// MAX types have max_length == 0xFFFF and use chunked encoding
+	bool IsPLPType() const;
+
 	// Get the fixed size for fixed-length types (0 for variable)
 	size_t GetFixedSize() const;
 };

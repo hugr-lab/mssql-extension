@@ -10,6 +10,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "query/mssql_result_stream.hpp"
 
 #include <atomic>
@@ -122,6 +123,10 @@ struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 	// Context name for pool return
 	string context_name;
 
+	// Number of real (non-virtual) columns to fill in the output chunk
+	// When 0 (e.g., COUNT(*)), we don't fill any columns but still count rows
+	idx_t projected_column_count = 0;
+
 	// Set when complete
 	bool done = false;
 
@@ -166,10 +171,27 @@ unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunct
                                               vector<LogicalType> &return_types, vector<string> &names);
 
 //===----------------------------------------------------------------------===//
+// mssql_exec - Execute arbitrary T-SQL and return affected row count
+//===----------------------------------------------------------------------===//
+
+//! mssql_exec scalar function
+//! Signature: mssql_exec(secret_name VARCHAR, sql VARCHAR) -> BIGINT
+//! Returns the number of affected rows (or 0 for DDL statements)
+struct MSSQLExecScalarFunction {
+	static constexpr const char *NAME = "mssql_exec";
+
+	//! Get the scalar function definition
+	static ScalarFunction GetFunction();
+};
+
+//===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
 
 // Register all MSSQL table functions
 void RegisterMSSQLFunctions(ExtensionLoader &loader);
+
+// Register mssql_exec scalar function
+void RegisterMSSQLExecFunction(ExtensionLoader &loader);
 
 }  // namespace duckdb

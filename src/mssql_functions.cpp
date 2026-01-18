@@ -1,14 +1,21 @@
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
+#include "catalog/mssql_catalog.hpp"
 #include "query/mssql_query_executor.hpp"
+#include "query/mssql_simple_query.hpp"
 #include "connection/mssql_pool_manager.hpp"
+#include "tds/tds_connection.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include <chrono>
 #include <cstdlib>
 
@@ -672,31 +679,45 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 
 	// Build column list based on projection pushdown (column_ids)
 	// column_ids contains the indices of columns needed from the table
+	// Note: column_ids may contain special identifiers like COLUMN_IDENTIFIER_ROW_ID or
+	// COLUMN_IDENTIFIER_EMPTY for operations like COUNT(*). These are virtual column IDs
+	// that start at 2^63, so any value >= that is a special identifier to skip.
 	string column_list;
 	const auto &column_ids = input.column_ids;
+
+	// Virtual/special column identifiers start at 2^63
+	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
 
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: projection has %zu columns (table has %zu)",
 	                   column_ids.size(), bind_data.all_column_names.size());
 
-	if (column_ids.empty()) {
-		// No projection - select all columns (shouldn't happen normally)
-		for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
-			if (i > 0) {
-				column_list += ", ";
-			}
-			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[i]) + "]";
+	// Filter out special column identifiers and collect valid column indices
+	vector<column_t> valid_column_ids;
+	for (const auto &col_idx : column_ids) {
+		if (col_idx < VIRTUAL_COL_START && col_idx < bind_data.all_column_names.size()) {
+			valid_column_ids.push_back(col_idx);
+		} else {
+			MSSQL_FN_DEBUG_LOG(2, "  skipping special/invalid column_id=%llu", (unsigned long long)col_idx);
+		}
+	}
+
+	if (valid_column_ids.empty()) {
+		// No valid columns projected (e.g., COUNT(*))
+		// Select only the first column to minimize data transfer while still returning rows
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: no valid columns, selecting first column only for row counting");
+		if (!bind_data.all_column_names.empty()) {
+			column_list = "[" + EscapeBracketIdentifier(bind_data.all_column_names[0]) + "]";
+		} else {
+			// Fallback to constant if table has no columns (shouldn't happen)
+			column_list = "1";
 		}
 	} else {
-		// Build SELECT with only projected columns
-		for (idx_t i = 0; i < column_ids.size(); i++) {
+		// Build SELECT with only valid projected columns
+		for (idx_t i = 0; i < valid_column_ids.size(); i++) {
 			if (i > 0) {
 				column_list += ", ";
 			}
-			column_t col_idx = column_ids[i];
-			if (col_idx >= bind_data.all_column_names.size()) {
-				throw InternalException("Column index %llu out of range (table has %zu columns)",
-				                        (unsigned long long)col_idx, bind_data.all_column_names.size());
-			}
+			column_t col_idx = valid_column_ids[i];
 			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[col_idx]) + "]";
 			MSSQL_FN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i, bind_data.all_column_names[col_idx].c_str());
 		}
@@ -724,6 +745,14 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, query);
 
+	// Set the number of columns to actually fill in the output chunk
+	// When valid_column_ids is empty (e.g., COUNT(*)), we don't fill any columns
+	result->projected_column_count = valid_column_ids.size();
+	if (result->result_stream) {
+		result->result_stream->SetColumnsToFill(valid_column_ids.size());
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: set columns_to_fill=%zu", valid_column_ids.size());
+	}
+
 	return std::move(result);
 }
 
@@ -741,6 +770,143 @@ TableFunction GetMSSQLCatalogScanFunction() {
 	func.filter_pushdown = true;
 
 	return func;
+}
+
+//===----------------------------------------------------------------------===//
+// mssql_exec Scalar Function Implementation
+//===----------------------------------------------------------------------===//
+
+// Bind data for mssql_exec - stores context name (attached database name)
+struct MSSQLExecBindData : public FunctionData {
+	string context_name;
+
+	MSSQLExecBindData(string context_name_p) : context_name(std::move(context_name_p)) {}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<MSSQLExecBindData>(context_name);
+	}
+
+	bool Equals(const FunctionData &other) const override {
+		auto &other_data = other.Cast<MSSQLExecBindData>();
+		return context_name == other_data.context_name;
+	}
+};
+
+// Bind function for mssql_exec
+static unique_ptr<FunctionData> MSSQLExecBind(ClientContext &context, ScalarFunction &bound_function,
+                                               vector<unique_ptr<Expression>> &arguments) {
+	// First argument is the context name (attached database name, must be constant)
+	if (arguments[0]->HasParameter()) {
+		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");
+	}
+
+	// Extract the context name if it's a constant
+	string context_name;
+	if (arguments[0]->IsFoldable()) {
+		auto context_val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+		context_name = context_val.ToString();
+
+		// Validate the context exists (attached database)
+		auto &manager = MSSQLContextManager::Get(*context.db);
+		if (!manager.HasContext(context_name)) {
+			throw BinderException(
+			    "mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+			    context_name, context_name);
+		}
+	}
+
+	return make_uniq<MSSQLExecBindData>(context_name);
+}
+
+// Execute function for mssql_exec
+static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<MSSQLExecBindData>();
+
+	auto &context_names = args.data[0];
+	auto &sql_statements = args.data[1];
+
+	UnaryExecutor::Execute<string_t, int64_t>(sql_statements, result, args.size(),
+	                                          [&](string_t sql_str) -> int64_t {
+		// Get the context name from bind data or first argument
+		string context_name = bind_data.context_name;
+		if (context_name.empty()) {
+			// Get from runtime argument
+			auto context_val = context_names.GetValue(0);
+			context_name = context_val.ToString();
+		}
+
+		string sql = sql_str.GetString();
+
+		MSSQL_FN_DEBUG_LOG(1, "mssql_exec: context=%s, sql=%s", context_name.c_str(), sql.c_str());
+
+		// Get context from the state
+		auto &client_context = state.GetContext();
+
+		// Get the MSSQL context and catalog
+		auto &manager = MSSQLContextManager::Get(*client_context.db);
+		auto ctx = manager.GetContext(context_name);
+		if (!ctx) {
+			throw InvalidInputException(
+			    "mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+			    context_name, context_name);
+		}
+
+		// Get the catalog and check if it's read-only
+		if (!ctx->attached_db) {
+			throw InvalidInputException("mssql_exec: Context '%s' has no attached database", context_name);
+		}
+
+		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
+		if (catalog.IsReadOnly()) {
+			throw InvalidInputException(
+			    "Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
+			    context_name);
+		}
+
+		// Get connection from the catalog's pool
+		auto &pool = catalog.GetConnectionPool();
+		auto connection = pool.Acquire();
+
+		if (!connection) {
+			throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
+		}
+
+		// Execute the SQL
+		try {
+			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql);
+
+			// Release connection back to pool
+			pool.Release(std::move(connection));
+
+			if (!query_result.success) {
+				// Surface SQL Server error with details
+				throw InvalidInputException(
+				    "MSSQL execution error: SQL Server error %d: %s",
+				    query_result.error_number, query_result.error_message);
+			}
+
+			// Return affected row count
+			// For DDL and queries without affected rows, return 0
+			return query_result.rows.empty() ? 0 : static_cast<int64_t>(query_result.rows.size());
+
+		} catch (...) {
+			// Release connection on error
+			pool.Release(std::move(connection));
+			throw;
+		}
+	});
+}
+
+ScalarFunction MSSQLExecScalarFunction::GetFunction() {
+	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                    MSSQLExecExecute, MSSQLExecBind);
+	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	return func;
+}
+
+void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
+	auto func = MSSQLExecScalarFunction::GetFunction();
+	loader.RegisterFunction(func);
 }
 
 //===----------------------------------------------------------------------===//

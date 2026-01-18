@@ -428,6 +428,51 @@ PRINT 'Collation test table created';
 GO
 
 -- =============================================================================
+-- Table 10: MAX data types (VARCHAR(MAX), NVARCHAR(MAX), VARBINARY(MAX))
+-- These use PLP (Partially Length-Prefixed) encoding in TDS protocol
+-- =============================================================================
+IF OBJECT_ID('dbo.MaxTypes', 'U') IS NOT NULL DROP TABLE dbo.MaxTypes;
+GO
+
+CREATE TABLE dbo.MaxTypes (
+    id INT NOT NULL PRIMARY KEY,
+    col_varchar_max VARCHAR(MAX) NULL,
+    col_nvarchar_max NVARCHAR(MAX) NULL,
+    col_varbinary_max VARBINARY(MAX) NULL
+);
+GO
+
+-- Insert test data with various sizes and patterns
+INSERT INTO dbo.MaxTypes (id, col_varchar_max, col_nvarchar_max, col_varbinary_max) VALUES
+-- Row 1: Small values
+(1, 'small varchar', N'small nvarchar', 0x0102030405),
+-- Row 2: Empty strings
+(2, '', N'', 0x),
+-- Row 3: NULL values
+(3, NULL, NULL, NULL),
+-- Row 4: Medium-sized values
+(4, 'Medium length varchar value that contains some text', N'Medium length nvarchar with unicode: café naïve résumé', 0xDEADBEEFCAFEBABE0102030405060708090A0B0C0D0E0F),
+-- Row 5: Values with special characters
+(5, 'varchar with "quotes" and ''apostrophes''', N'nvarchar with unicode: 日本語 中文 한국어 العربية', 0xFF00FF00FF00FF00),
+-- Row 6: Single character
+(6, 'x', N'y', 0xAB);
+GO
+
+-- Add a row with larger data within SQL Server limits
+-- VARCHAR(MAX) limit: 8192 bytes for TDS streaming
+-- NVARCHAR(MAX) limit: 4096 characters (8192 bytes in UTF-16) for TDS streaming
+DECLARE @large_varchar VARCHAR(MAX) = REPLICATE('A', 8000);
+DECLARE @large_nvarchar NVARCHAR(MAX) = REPLICATE(N'X', 4000);
+DECLARE @large_varbinary VARBINARY(MAX) = CAST(REPLICATE('Z', 8000) AS VARBINARY(MAX));
+
+INSERT INTO dbo.MaxTypes (id, col_varchar_max, col_nvarchar_max, col_varbinary_max)
+VALUES (7, @large_varchar, @large_nvarchar, @large_varbinary);
+GO
+
+PRINT 'MaxTypes table created (VARCHAR(MAX), NVARCHAR(MAX), VARBINARY(MAX))';
+GO
+
+-- =============================================================================
 -- Views
 -- =============================================================================
 CREATE VIEW dbo.LargeTableView AS
