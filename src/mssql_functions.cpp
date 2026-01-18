@@ -4,6 +4,11 @@
 #include "connection/mssql_pool_manager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include <chrono>
 #include <cstdlib>
 
@@ -307,6 +312,435 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 		global_state.done = true;
 		throw;
 	}
+}
+
+//===----------------------------------------------------------------------===//
+// MSSQLCatalogScanBindData Implementation
+//===----------------------------------------------------------------------===//
+
+unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
+	auto result = make_uniq<MSSQLCatalogScanBindData>();
+	result->context_name = context_name;
+	result->schema_name = schema_name;
+	result->table_name = table_name;
+	result->all_types = all_types;
+	result->all_column_names = all_column_names;
+	result->return_types = return_types;
+	result->column_names = column_names;
+	result->result_stream_id = result_stream_id;
+	return std::move(result);
+}
+
+bool MSSQLCatalogScanBindData::Equals(const FunctionData &other) const {
+	auto &other_data = other.Cast<MSSQLCatalogScanBindData>();
+	return context_name == other_data.context_name &&
+	       schema_name == other_data.schema_name &&
+	       table_name == other_data.table_name;
+}
+
+//===----------------------------------------------------------------------===//
+// Catalog-based Table Scan Implementation
+//===----------------------------------------------------------------------===//
+
+// Helper to escape SQL Server bracket identifier (] becomes ]])
+static string EscapeBracketIdentifier(const string &name) {
+	string result;
+	result.reserve(name.size() + 2);
+	for (char c : name) {
+		result += c;
+		if (c == ']') {
+			result += ']';  // Double the ] character
+		}
+	}
+	return result;
+}
+
+// Helper to escape SQL Server string literal (' becomes '')
+static string EscapeStringLiteral(const string &value) {
+	string result;
+	result.reserve(value.size() + 10);
+	for (char c : value) {
+		result += c;
+		if (c == '\'') {
+			result += '\'';  // Double the ' character
+		}
+	}
+	return result;
+}
+
+// Forward declaration for recursive filter conversion
+static string ConvertFilterToSQL(const TableFilter &filter, const string &column_name, const LogicalType &column_type);
+
+// Convert a DuckDB Value to SQL Server literal
+static string ValueToSQLLiteral(const Value &value, const LogicalType &type) {
+	if (value.IsNull()) {
+		return "NULL";
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return value.GetValue<bool>() ? "1" : "0";
+
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UBIGINT:
+		return value.ToString();
+
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+		return value.ToString();
+
+	case LogicalTypeId::DECIMAL:
+		return value.ToString();
+
+	case LogicalTypeId::VARCHAR:
+		// Use N'' for NVARCHAR compatibility and escape single quotes
+		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
+
+	case LogicalTypeId::DATE: {
+		auto date_val = value.GetValue<date_t>();
+		return "'" + Date::ToString(date_val) + "'";
+	}
+
+	case LogicalTypeId::TIME:
+		// TIME is stored as microseconds since midnight
+		return "'" + value.ToString() + "'";
+
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		auto ts_val = value.GetValue<timestamp_t>();
+		return "'" + Timestamp::ToString(ts_val) + "'";
+	}
+
+	case LogicalTypeId::UUID: {
+		return "'" + value.ToString() + "'";
+	}
+
+	case LogicalTypeId::BLOB: {
+		// Convert blob to hex string for SQL Server
+		auto blob_val = value.GetValueUnsafe<string_t>();
+		string hex = "0x";
+		for (idx_t i = 0; i < blob_val.GetSize(); i++) {
+			char buf[3];
+			snprintf(buf, sizeof(buf), "%02X", (unsigned char)blob_val.GetData()[i]);
+			hex += buf;
+		}
+		return hex;
+	}
+
+	default:
+		// For other types, try ToString and quote as string
+		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
+	}
+}
+
+// Convert comparison type to SQL operator
+static string ComparisonTypeToOperator(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return " = ";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return " <> ";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return " < ";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return " > ";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return " <= ";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return " >= ";
+	default:
+		throw InternalException("Unsupported comparison type for filter pushdown: %s",
+		                        ExpressionTypeToString(type));
+	}
+}
+
+// Convert a ConstantFilter to SQL
+static string ConvertConstantFilterToSQL(const ConstantFilter &filter, const string &column_name,
+                                         const LogicalType &column_type) {
+	string sql = column_name;
+	sql += ComparisonTypeToOperator(filter.comparison_type);
+	sql += ValueToSQLLiteral(filter.constant, column_type);
+	return sql;
+}
+
+// Convert an InFilter to SQL
+static string ConvertInFilterToSQL(const InFilter &filter, const string &column_name,
+                                   const LogicalType &column_type) {
+	string sql = column_name + " IN (";
+	for (idx_t i = 0; i < filter.values.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		sql += ValueToSQLLiteral(filter.values[i], column_type);
+	}
+	sql += ")";
+	return sql;
+}
+
+// Convert an IsNullFilter to SQL
+static string ConvertIsNullFilterToSQL(const string &column_name) {
+	return column_name + " IS NULL";
+}
+
+// Convert an IsNotNullFilter to SQL
+static string ConvertIsNotNullFilterToSQL(const string &column_name) {
+	return column_name + " IS NOT NULL";
+}
+
+// Convert a ConjunctionOrFilter to SQL
+static string ConvertConjunctionOrFilterToSQL(const ConjunctionOrFilter &filter, const string &column_name,
+                                               const LogicalType &column_type) {
+	if (filter.child_filters.empty()) {
+		return "";
+	}
+	vector<string> conditions;
+	for (const auto &child : filter.child_filters) {
+		string child_sql = ConvertFilterToSQL(*child, column_name, column_type);
+		if (!child_sql.empty()) {
+			conditions.push_back(child_sql);
+		}
+	}
+	if (conditions.empty()) {
+		return "";
+	}
+	if (conditions.size() == 1) {
+		return conditions[0];
+	}
+	string sql = "(";
+	for (idx_t i = 0; i < conditions.size(); i++) {
+		if (i > 0) {
+			sql += " OR ";
+		}
+		sql += conditions[i];
+	}
+	sql += ")";
+	return sql;
+}
+
+// Convert a ConjunctionAndFilter to SQL
+static string ConvertConjunctionAndFilterToSQL(const ConjunctionAndFilter &filter, const string &column_name,
+                                                const LogicalType &column_type) {
+	if (filter.child_filters.empty()) {
+		return "";
+	}
+	vector<string> conditions;
+	for (const auto &child : filter.child_filters) {
+		string child_sql = ConvertFilterToSQL(*child, column_name, column_type);
+		if (!child_sql.empty()) {
+			conditions.push_back(child_sql);
+		}
+	}
+	if (conditions.empty()) {
+		return "";
+	}
+	if (conditions.size() == 1) {
+		return conditions[0];
+	}
+	string sql = "(";
+	for (idx_t i = 0; i < conditions.size(); i++) {
+		if (i > 0) {
+			sql += " AND ";
+		}
+		sql += conditions[i];
+	}
+	sql += ")";
+	return sql;
+}
+
+// Main filter conversion function
+static string ConvertFilterToSQL(const TableFilter &filter, const string &column_name, const LogicalType &column_type) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON:
+		return ConvertConstantFilterToSQL(filter.Cast<ConstantFilter>(), column_name, column_type);
+
+	case TableFilterType::IS_NULL:
+		return ConvertIsNullFilterToSQL(column_name);
+
+	case TableFilterType::IS_NOT_NULL:
+		return ConvertIsNotNullFilterToSQL(column_name);
+
+	case TableFilterType::IN_FILTER:
+		return ConvertInFilterToSQL(filter.Cast<InFilter>(), column_name, column_type);
+
+	case TableFilterType::CONJUNCTION_OR:
+		return ConvertConjunctionOrFilterToSQL(filter.Cast<ConjunctionOrFilter>(), column_name, column_type);
+
+	case TableFilterType::CONJUNCTION_AND:
+		return ConvertConjunctionAndFilterToSQL(filter.Cast<ConjunctionAndFilter>(), column_name, column_type);
+
+	case TableFilterType::OPTIONAL_FILTER:
+	case TableFilterType::STRUCT_EXTRACT:
+	case TableFilterType::DYNAMIC_FILTER:
+	case TableFilterType::EXPRESSION_FILTER:
+		// These filter types cannot be pushed down to SQL Server
+		MSSQL_FN_DEBUG_LOG(1, "Filter type %d cannot be pushed down, will be applied locally",
+		                   (int)filter.filter_type);
+		return "";
+
+	default:
+		MSSQL_FN_DEBUG_LOG(1, "Unknown filter type %d, will be applied locally", (int)filter.filter_type);
+		return "";
+	}
+}
+
+// Build WHERE clause from TableFilterSet
+// Returns empty string if no filters can be pushed down
+// Note: DuckDB's filter column indices are based on the projected column list (column_ids),
+// not the original table column indices. We need to map through column_ids to get the actual
+// table column index.
+static string BuildWhereClause(const TableFilterSet &filters, const vector<string> &all_column_names,
+                               const vector<LogicalType> &all_types, const vector<column_t> &column_ids) {
+	vector<string> where_conditions;
+
+	for (const auto &filter_entry : filters.filters) {
+		idx_t projected_col_idx = filter_entry.first;
+
+		// Map from projected column index to actual table column index
+		// DuckDB passes filter indices based on the projection (column_ids)
+		idx_t table_col_idx;
+		if (column_ids.empty()) {
+			// No projection - use filter index directly as table column index
+			table_col_idx = projected_col_idx;
+		} else if (projected_col_idx >= column_ids.size()) {
+			MSSQL_FN_DEBUG_LOG(1, "Filter column index %llu out of projected range (%zu), skipping",
+			                   (unsigned long long)projected_col_idx, column_ids.size());
+			continue;
+		} else {
+			// Map through column_ids to get actual table column index
+			table_col_idx = column_ids[projected_col_idx];
+		}
+
+		if (table_col_idx >= all_column_names.size()) {
+			MSSQL_FN_DEBUG_LOG(1, "Table column index %llu out of range (%zu), skipping",
+			                   (unsigned long long)table_col_idx, all_column_names.size());
+			continue;
+		}
+
+		const string &col_name = all_column_names[table_col_idx];
+		const LogicalType &col_type = all_types[table_col_idx];
+		string escaped_col = "[" + EscapeBracketIdentifier(col_name) + "]";
+
+		MSSQL_FN_DEBUG_LOG(2, "  filter: projected_idx=%llu -> table_idx=%llu -> column=%s",
+		                   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx, col_name.c_str());
+
+		string condition = ConvertFilterToSQL(*filter_entry.second, escaped_col, col_type);
+		if (!condition.empty()) {
+			where_conditions.push_back(condition);
+			MSSQL_FN_DEBUG_LOG(2, "  filter condition: %s", condition.c_str());
+		}
+	}
+
+	if (where_conditions.empty()) {
+		return "";
+	}
+
+	// Combine all conditions with AND
+	string where_clause = " WHERE ";
+	for (idx_t i = 0; i < where_conditions.size(); i++) {
+		if (i > 0) {
+			where_clause += " AND ";
+		}
+		where_clause += where_conditions[i];
+	}
+
+	return where_clause;
+}
+
+// Note: MSSQLCatalogScanBind is not used directly - bind_data is set by GetScanFunction
+// and passed to InitGlobal/Execute. We keep this for completeness but it shouldn't be called.
+unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
+	throw InternalException("MSSQLCatalogScanBind should not be called directly");
+}
+
+unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: START");
+
+	auto &bind_data = input.bind_data->Cast<MSSQLCatalogScanBindData>();
+	auto result = make_uniq<MSSQLScanGlobalState>();
+	result->context_name = bind_data.context_name;
+
+	// Build column list based on projection pushdown (column_ids)
+	// column_ids contains the indices of columns needed from the table
+	string column_list;
+	const auto &column_ids = input.column_ids;
+
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: projection has %zu columns (table has %zu)",
+	                   column_ids.size(), bind_data.all_column_names.size());
+
+	if (column_ids.empty()) {
+		// No projection - select all columns (shouldn't happen normally)
+		for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
+			if (i > 0) {
+				column_list += ", ";
+			}
+			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[i]) + "]";
+		}
+	} else {
+		// Build SELECT with only projected columns
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (i > 0) {
+				column_list += ", ";
+			}
+			column_t col_idx = column_ids[i];
+			if (col_idx >= bind_data.all_column_names.size()) {
+				throw InternalException("Column index %llu out of range (table has %zu columns)",
+				                        (unsigned long long)col_idx, bind_data.all_column_names.size());
+			}
+			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[col_idx]) + "]";
+			MSSQL_FN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i, bind_data.all_column_names[col_idx].c_str());
+		}
+	}
+
+	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
+	string query = "SELECT " + column_list + " FROM [" + EscapeBracketIdentifier(bind_data.schema_name) +
+	               "].[" + EscapeBracketIdentifier(bind_data.table_name) + "]";
+
+	// Build WHERE clause from filter pushdown
+	if (input.filters && !input.filters->filters.empty()) {
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: filter pushdown with %zu filter(s)",
+		                   input.filters->filters.size());
+		string where_clause = BuildWhereClause(*input.filters, bind_data.all_column_names,
+		                                       bind_data.all_types, column_ids);
+		if (!where_clause.empty()) {
+			query += where_clause;
+			MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: added WHERE clause: %s", where_clause.c_str());
+		}
+	}
+
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: generated query = %s", query.c_str());
+
+	// Execute the query
+	MSSQLQueryExecutor executor(bind_data.context_name);
+	result->result_stream = executor.Execute(context, query);
+
+	return std::move(result);
+}
+
+TableFunction GetMSSQLCatalogScanFunction() {
+	// Create table function without arguments - bind_data is set from TableEntry
+	TableFunction func("mssql_catalog_scan", {}, MSSQLScanFunction, MSSQLCatalogScanBind,
+	                   MSSQLCatalogScanInitGlobal, MSSQLScanInitLocal);
+
+	// Enable projection pushdown - allows DuckDB to tell us which columns are needed
+	// The column_ids will be passed to InitGlobal via TableFunctionInitInput
+	func.projection_pushdown = true;
+
+	// Enable filter pushdown - allows DuckDB to push WHERE conditions to SQL Server
+	// The filters will be passed to InitGlobal via TableFunctionInitInput
+	func.filter_pushdown = true;
+
+	return func;
 }
 
 //===----------------------------------------------------------------------===//

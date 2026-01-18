@@ -1,0 +1,188 @@
+# name: test/sql/catalog/catalog_parsing.test
+# description: Integration tests for MSSQL catalog parsing (schemas, tables, columns)
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_catalog (TYPE mssql);
+
+# =============================================================================
+# Schema Tests
+# =============================================================================
+
+# Test 1: Check standard schemas exist
+query I
+SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE catalog_name = 'testdb_catalog' AND schema_name = 'dbo';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE catalog_name = 'testdb_catalog' AND schema_name = 'test';
+----
+true
+
+# Test 2: Check reserved word schema name "SELECT" exists
+query I
+SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE catalog_name = 'testdb_catalog' AND schema_name = 'SELECT';
+----
+true
+
+# Test 3: Check schema with space in name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE catalog_name = 'testdb_catalog' AND schema_name = 'My Schema';
+----
+true
+
+# Test 4: Check schema with quote in name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE catalog_name = 'testdb_catalog' AND schema_name = 'schema"quote';
+----
+true
+
+# =============================================================================
+# Table Tests - Standard names
+# =============================================================================
+
+# Test 5: Check dbo tables exist
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'TestSimplePK';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'TestCompositePK';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'LargeTable';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'AllDataTypes';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'NullableTypes';
+----
+true
+
+# Test 6: Check test.test table
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'test' AND table_name = 'test';
+----
+true
+
+# =============================================================================
+# Table Tests - Reserved word names
+# =============================================================================
+
+# Test 7: Check table with reserved word schema name [SELECT].[TABLE]
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'SELECT' AND table_name = 'TABLE';
+----
+true
+
+# Test 8: Check table with reserved word table name dbo.[SELECT]
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'SELECT';
+----
+true
+
+# =============================================================================
+# Table Tests - Special character names
+# =============================================================================
+
+# Test 9: Check table with space in schema name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'My Schema' AND table_name = 'My Table';
+----
+true
+
+# Test 10: Check table with quote in schema/table name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'schema"quote' AND table_name = 'table"quote';
+----
+true
+
+# Test 11: Check table with space in table name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'Space Column Table';
+----
+true
+
+# =============================================================================
+# Column Tests - Standard types
+# =============================================================================
+
+# Test 12: Check TestSimplePK columns
+query I
+SELECT COUNT(*) FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'TestSimplePK';
+----
+4
+
+# Test 13: Check AllDataTypes has all columns
+query I
+SELECT COUNT(*) FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'AllDataTypes';
+----
+26
+
+# Test 14: Check NullableTypes has all columns
+query I
+SELECT COUNT(*) FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'NullableTypes';
+----
+24
+
+# =============================================================================
+# Column Tests - Reserved word column names
+# =============================================================================
+
+# Test 15: Check columns with reserved word names exist
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'SELECT' AND table_name = 'TABLE' AND column_name = 'COLUMN';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'SELECT' AND table_name = 'TABLE' AND column_name = 'INDEX';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'SELECT' AND table_name = 'TABLE' AND column_name = 'SELECT';
+----
+true
+
+# =============================================================================
+# Column Tests - Special character column names
+# =============================================================================
+
+# Test 16: Check columns with space in name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'My Schema' AND table_name = 'My Table' AND column_name = 'My Column';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'My Schema' AND table_name = 'My Table' AND column_name = 'Column With Spaces';
+----
+true
+
+# Test 17: Check columns with quote in name
+query I
+SELECT COUNT(*) > 0 FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'schema"quote' AND table_name = 'table"quote' AND column_name = 'col"quote';
+----
+true
+
+# Cleanup
+statement ok
+DETACH testdb_catalog;

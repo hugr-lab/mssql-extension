@@ -1,0 +1,70 @@
+# name: test/sql/catalog/datetimeoffset.test
+# description: Integration tests for DATETIMEOFFSET data type support
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_dto (TYPE mssql);
+
+# =============================================================================
+# Basic DATETIMEOFFSET Select Tests
+# =============================================================================
+
+# Test 1: Select DATETIMEOFFSET columns
+# Note: DATETIMEOFFSET is converted to UTC in DuckDB's TIMESTAMP_TZ
+# Row 1: '2024-06-15 13:45:30.1234567 +05:30' -> UTC: '2024-06-15 08:15:30.123456'
+query I
+SELECT id FROM testdb_dto.dbo.AllDataTypes WHERE id = 1;
+----
+1
+
+# Test 2: Query DATETIMEOFFSET value - verify UTC conversion
+# SQL Server stores DATETIMEOFFSET with the datetime component already in UTC
+# Original: 2024-06-15 13:45:30.1234567 +05:30 (stores as UTC: 08:15:30)
+query IT
+SELECT id, col_datetimeoffset FROM testdb_dto.dbo.AllDataTypes WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123456+00
+
+# Test 3: Query DATETIMEOFFSET with negative offset
+# Row 2: '1900-01-01 00:00:00.0000000 -08:00' -> stored as UTC: '1900-01-01 08:00:00'
+query IT
+SELECT id, col_datetimeoffset FROM testdb_dto.dbo.AllDataTypes WHERE id = 2;
+----
+2	1900-01-01 08:00:00+00
+
+# Test 4: Query DATETIMEOFFSET with zero offset
+# Row 3: '2024-12-31 23:59:59.9999999 +00:00' -> stored as UTC (same)
+query IT
+SELECT id, col_datetimeoffset FROM testdb_dto.dbo.AllDataTypes WHERE id = 3;
+----
+3	2024-12-31 23:59:59.999999+00
+
+# Test 5: Query DATETIMEOFFSET with lower precision (scale 3)
+query IT
+SELECT id, col_datetimeoffset_scale FROM testdb_dto.dbo.AllDataTypes WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123+00
+
+# =============================================================================
+# Multiple DATETIMEOFFSET columns
+# =============================================================================
+
+# Test 6: Select both DATETIMEOFFSET columns
+query ITT
+SELECT id, col_datetimeoffset, col_datetimeoffset_scale FROM testdb_dto.dbo.AllDataTypes WHERE id <= 3 ORDER BY id;
+----
+1	2024-06-15 08:15:30.123456+00	2024-06-15 08:15:30.123+00
+2	1900-01-01 08:00:00+00	1900-01-01 08:00:00+00
+3	2024-12-31 23:59:59.999999+00	2024-12-31 23:59:59.999+00
+
+# Cleanup
+statement ok
+DETACH testdb_dto;

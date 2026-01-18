@@ -1,14 +1,14 @@
 #include "mssql_storage.hpp"
+#include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/storage/storage_extension.hpp"
-#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
 namespace duckdb {
@@ -375,26 +375,6 @@ vector<string> MSSQLContextManager::ListContexts() {
 }
 
 //===----------------------------------------------------------------------===//
-// MSSQLCatalog implementation
-//===----------------------------------------------------------------------===//
-
-MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name)
-    : DuckCatalog(db), context_name(context_name) {
-}
-
-void MSSQLCatalog::OnDetach(ClientContext &context) {
-	// Remove connection pool for this context (shuts down and cleans up connections)
-	MssqlPoolManager::Instance().RemovePool(context_name);
-
-	// Unregister context from the manager
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	manager.UnregisterContext(context_name);
-
-	// Call parent implementation
-	DuckCatalog::OnDetach(context);
-}
-
-//===----------------------------------------------------------------------===//
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
@@ -452,12 +432,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	    ctx->connection_info->use_encrypt
 	);
 
-	// Set path to :memory: to prevent DuckDB from trying to open the connection string as a file
-	// This is needed because DuckCatalog creates a SingleFileStorageManager with info.path
-	info.path = ":memory:";
-
-	// Create MSSQLCatalog that will clean up the context on detach
-	auto catalog = make_uniq<MSSQLCatalog>(db, name);
+	// Create MSSQLCatalog with connection info and read-only access mode
+	// The catalog will use the connection pool to query SQL Server
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, AccessMode::READ_ONLY);
 	catalog->Initialize(false);
 
 	return std::move(catalog);
@@ -465,8 +442,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 unique_ptr<TransactionManager> MSSQLCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                              AttachedDatabase &db, Catalog &catalog) {
-	// Use DuckDB's standard transaction manager
-	return make_uniq<DuckTransactionManager>(db);
+	// Use custom transaction manager for external MSSQL catalog
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+	return make_uniq<MSSQLTransactionManager>(db, mssql_catalog);
 }
 
 //===----------------------------------------------------------------------===//

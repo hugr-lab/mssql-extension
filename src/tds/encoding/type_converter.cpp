@@ -33,8 +33,9 @@ namespace encoding {
 LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	switch (column.type_id) {
 	// Integer types
+	// Note: SQL Server TINYINT is unsigned (0-255), maps to UTINYINT
 	case TDS_TYPE_TINYINT:
-		return LogicalType::TINYINT;
+		return LogicalType::UTINYINT;
 	case TDS_TYPE_SMALLINT:
 		return LogicalType::SMALLINT;
 	case TDS_TYPE_INT:
@@ -45,7 +46,7 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	// Nullable integer variants
 	case TDS_TYPE_INTN:
 		switch (column.max_length) {
-		case 1: return LogicalType::TINYINT;
+		case 1: return LogicalType::UTINYINT;  // SQL Server TINYINT is unsigned
 		case 2: return LogicalType::SMALLINT;
 		case 4: return LogicalType::INTEGER;
 		case 8: return LogicalType::BIGINT;
@@ -101,6 +102,8 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	case TDS_TYPE_DATETIME2:
 	case TDS_TYPE_DATETIMEN:
 		return LogicalType::TIMESTAMP;
+	case TDS_TYPE_DATETIMEOFFSET:
+		return LogicalType::TIMESTAMP_TZ;
 
 	// GUID
 	case TDS_TYPE_UNIQUEIDENTIFIER:
@@ -154,6 +157,7 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_SMALLDATETIME:
 	case TDS_TYPE_DATETIME2:
 	case TDS_TYPE_DATETIMEN:
+	case TDS_TYPE_DATETIMEOFFSET:
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 		return true;
 	default:
@@ -190,6 +194,7 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 	case TDS_TYPE_SMALLDATETIME: return "SMALLDATETIME";
 	case TDS_TYPE_DATETIME2: return "DATETIME2";
 	case TDS_TYPE_DATETIMEN: return "DATETIMEN";
+	case TDS_TYPE_DATETIMEOFFSET: return "DATETIMEOFFSET";
 	case TDS_TYPE_UNIQUEIDENTIFIER: return "UNIQUEIDENTIFIER";
 	case TDS_TYPE_XML: return "XML";
 	case TDS_TYPE_UDT: return "UDT";
@@ -267,6 +272,10 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t>& value, bool is_null
 		ConvertDateTime(value, column, vector, row_idx);
 		break;
 
+	case TDS_TYPE_DATETIMEOFFSET:
+		ConvertDatetimeOffset(value, column, vector, row_idx);
+		break;
+
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 		ConvertGuid(value, vector, row_idx);
 		break;
@@ -283,7 +292,8 @@ void TypeConverter::ConvertInteger(const std::vector<uint8_t>& value,
 
 	switch (len) {
 	case 1:
-		FlatVector::GetData<int8_t>(vector)[row_idx] = static_cast<int8_t>(value[0]);
+		// SQL Server TINYINT is unsigned (0-255), use uint8_t
+		FlatVector::GetData<uint8_t>(vector)[row_idx] = value[0];
 		break;
 	case 2: {
 		int16_t v = 0;
@@ -451,6 +461,13 @@ void TypeConverter::ConvertDateTime(const std::vector<uint8_t>& value,
 		throw InvalidInputException("Unexpected datetime type: 0x%02X", column.type_id);
 	}
 
+	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
+}
+
+void TypeConverter::ConvertDatetimeOffset(const std::vector<uint8_t>& value,
+                                           const ColumnMetadata& column,
+                                           Vector& vector, idx_t row_idx) {
+	timestamp_t ts = DateTimeEncoding::ConvertDatetimeOffset(value.data(), column.scale);
 	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
 }
 

@@ -2,6 +2,7 @@
 
 #include "tds_types.hpp"
 #include "tds_column_metadata.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -67,9 +68,27 @@ struct RowData {
 	std::vector<std::vector<uint8_t>> values;  // Raw value data per column
 	std::vector<bool> null_mask;               // NULL indicators
 
+	// Clear values but preserve allocated capacity
 	void Clear() {
-		values.clear();
-		null_mask.clear();
+		for (auto& v : values) {
+			v.clear();  // Clears content but preserves capacity
+		}
+		// Just reset null_mask values, don't deallocate
+		std::fill(null_mask.begin(), null_mask.end(), false);
+	}
+
+	// Prepare for a specific number of columns (pre-allocate if needed)
+	void Prepare(size_t num_columns) {
+		if (values.size() != num_columns) {
+			values.resize(num_columns);
+			null_mask.resize(num_columns, false);
+			// Pre-reserve capacity for common value sizes
+			for (auto& v : values) {
+				v.reserve(32);  // Most values are < 32 bytes
+			}
+		} else {
+			Clear();
+		}
 	}
 };
 
@@ -142,6 +161,7 @@ private:
 	// Parse specific token types
 	bool ParseColMetadata();
 	bool ParseRow();
+	bool ParseNBCRow();  // Null Bitmap Compressed Row
 	bool ParseDone();
 	bool ParseError();
 	bool ParseInfo();

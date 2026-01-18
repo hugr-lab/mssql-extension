@@ -1,0 +1,93 @@
+# name: test/sql/catalog_discovery.test
+# description: Test MSSQL catalog discovery - schemas, tables, columns, queries
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+#
+# Test 1: Attach and browse schemas
+#
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS mssql_catalog (TYPE mssql);
+
+# SHOW SCHEMAS should work and include dbo
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'mssql_catalog' AND schema_name = 'dbo';
+----
+dbo
+
+#
+# Test 2: List tables and views
+#
+# Ensure dbo.test exists (we use master.dbo.test for testing)
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'mssql_catalog' AND schema_name = 'dbo' AND table_name = 'test';
+----
+test
+
+#
+# Test 3: Describe table columns
+#
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'mssql_catalog' AND schema_name = 'dbo' AND table_name = 'test' ORDER BY column_name;
+----
+id	INTEGER
+name	VARCHAR
+
+#
+# Test 4: Query via catalog namespace
+#
+query II
+SELECT id, name FROM mssql_catalog.dbo.test ORDER BY id LIMIT 3;
+----
+1	A
+2	B
+3	C
+
+#
+# Test 5: Column selection (projection)
+#
+query I
+SELECT name FROM mssql_catalog.dbo.test WHERE id = 1;
+----
+A
+
+#
+# Test 6: Write operations should fail
+#
+
+# INSERT should fail
+statement error
+INSERT INTO mssql_catalog.dbo.test VALUES (99, 'Test');
+----
+read-only
+
+# UPDATE should fail
+statement error
+UPDATE mssql_catalog.dbo.test SET name = 'X' WHERE id = 1;
+----
+read-only
+
+#
+# Test 7: Join with local DuckDB table
+#
+statement ok
+CREATE TEMPORARY TABLE local_lookup AS SELECT * FROM (VALUES (1, 'First'), (2, 'Second')) AS t(id, label);
+
+query III
+SELECT m.id, m.name, l.label FROM mssql_catalog.dbo.test m LEFT JOIN local_lookup l ON m.id = l.id ORDER BY m.id;
+----
+1	A	First
+2	B	Second
+3	C	NULL
+
+statement ok
+DROP TABLE local_lookup;
+
+#
+# Cleanup
+#
+statement ok
+DETACH mssql_catalog;

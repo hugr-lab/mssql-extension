@@ -1,0 +1,74 @@
+# name: test/sql/catalog/data_types.test
+# description: Integration tests for supported SQL Server data types
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_types (TYPE mssql);
+
+# =============================================================================
+# Tests using TestSimplePK table (simple types)
+# =============================================================================
+
+# Test 1: INT column
+query II
+SELECT id, id FROM testdb_types.dbo.TestSimplePK WHERE id = 1;
+----
+1	1
+
+# Test 2: VARCHAR (NVARCHAR) column
+query IT
+SELECT id, name FROM testdb_types.dbo.TestSimplePK WHERE id = 1;
+----
+1	First Record
+
+# Test 3: DECIMAL column with NULL
+query IR
+SELECT id, value FROM testdb_types.dbo.TestSimplePK WHERE id = 3;
+----
+3	NULL
+
+# Test 4: DECIMAL column with value
+query IR
+SELECT id, value FROM testdb_types.dbo.TestSimplePK WHERE id = 1;
+----
+1	100.50
+
+# =============================================================================
+# Tests using LargeTable (more types)
+# =============================================================================
+
+# Test 5: INT and VARCHAR
+query IIT
+SELECT id, category, name FROM testdb_types.dbo.LargeTable WHERE id = 1;
+----
+1	2	Item_1
+
+# Test 6: BIT column
+query II
+SELECT id, is_active FROM testdb_types.dbo.LargeTable WHERE id = 1;
+----
+1	true
+
+# Test 7: DECIMAL column
+query IR
+SELECT id, value FROM testdb_types.dbo.LargeTable WHERE id = 1;
+----
+1	1.5100
+
+# Test 8: DATE column
+query IT
+SELECT id, created_date FROM testdb_types.dbo.LargeTable WHERE id = 1;
+----
+1	2024-01-02
+
+# Cleanup
+statement ok
+DETACH testdb_types;

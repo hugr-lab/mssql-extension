@@ -1,0 +1,114 @@
+# name: test/sql/catalog/select_queries.test
+# description: Integration tests for SELECT queries through MSSQL catalog
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_select (TYPE mssql);
+
+# =============================================================================
+# Basic SELECT Tests - Standard tables
+# =============================================================================
+
+# Test 1: Simple query from TestSimplePK
+query II
+SELECT id, name FROM testdb_select.dbo.TestSimplePK WHERE id = 1;
+----
+1	First Record
+
+# Test 2: Query with NULL value
+query IR
+SELECT id, value FROM testdb_select.dbo.TestSimplePK WHERE id = 3;
+----
+3	NULL
+
+# Test 3: Query from test.test table
+query II
+SELECT id, name FROM testdb_select.test.test WHERE id <= 3 ORDER BY id;
+----
+1	A
+2	B
+3	C
+
+# =============================================================================
+# Large Table Tests (150k rows)
+# =============================================================================
+
+# Test 4: Sample from LargeTable (category = (id % 100) + 1)
+query IIT
+SELECT id, category, name FROM testdb_select.dbo.LargeTable WHERE id = 1;
+----
+1	2	Item_1
+
+# Test 5: Limit query on LargeTable (category = (id % 100) + 1)
+query IIT
+SELECT id, category, name FROM testdb_select.dbo.LargeTable WHERE id BETWEEN 100 AND 105 ORDER BY id LIMIT 3;
+----
+100	1	Item_100
+101	2	Item_101
+102	3	Item_102
+
+# =============================================================================
+# Reserved Word Names Tests
+# =============================================================================
+
+# Test 6: Query from [SELECT].[TABLE] with reserved word column names
+query ITT
+SELECT "COLUMN", "INDEX", "SELECT" FROM testdb_select."SELECT"."TABLE" WHERE "COLUMN" = 1;
+----
+1	first	select value 1
+
+# Test 7: Query with NULL in reserved word table
+query ITT
+SELECT "COLUMN", "INDEX", "SELECT" FROM testdb_select."SELECT"."TABLE" WHERE "COLUMN" = 3;
+----
+3	third	NULL
+
+# Test 8: Query from dbo.[SELECT]
+query ITI
+SELECT id, "FROM", "WHERE" FROM testdb_select.dbo."SELECT" WHERE id = 1;
+----
+1	from_value_1	10
+
+# =============================================================================
+# Special Character Names Tests
+# =============================================================================
+
+# Test 9: Query from [My Schema].[My Table]
+query ITT
+SELECT "My Column", "Another Column", "Column With Spaces" FROM testdb_select."My Schema"."My Table" WHERE "My Column" = 1;
+----
+1	value1	space value 1
+
+# Test 10: Query from [schema"quote].[table"quote]
+query IT
+SELECT "col""quote", normal_col FROM testdb_select."schema""quote"."table""quote" WHERE "col""quote" = 1;
+----
+1	quote_value_1
+
+# Test 11: Query from table with space in name
+query ITI
+SELECT id, "Column With Space", "Another Space Col" FROM testdb_select.dbo."Space Column Table" WHERE id = 1;
+----
+1	space test 1	10
+
+# =============================================================================
+# Composite Primary Key Tests
+# =============================================================================
+
+# Test 12: Query with composite key table
+query IIIR
+SELECT region_id, product_id, quantity, unit_price FROM testdb_select.dbo.TestCompositePK WHERE region_id = 1 AND product_id = 100;
+----
+1	100	10	25.50
+
+# Cleanup
+statement ok
+DETACH testdb_select;

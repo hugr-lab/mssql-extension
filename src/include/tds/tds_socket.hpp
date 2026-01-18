@@ -71,6 +71,9 @@ public:
 	// Error handling
 	const std::string& GetLastError() const { return last_error_; }
 
+	// Clear receive buffer (useful before starting a new query)
+	void ClearReceiveBuffer() { receive_buffer_.clear(); }
+
 private:
 	int fd_;                  // Socket file descriptor (-1 if closed)
 	std::string host_;        // Remote hostname

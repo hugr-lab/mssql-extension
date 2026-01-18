@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -71,10 +71,25 @@ set(EXTENSION_SOURCES
     # Query execution layer (DuckDB integration)
     src/query/mssql_query_executor.cpp
     src/query/mssql_result_stream.cpp
+    src/query/mssql_simple_query.cpp
     # Connection management layer (DuckDB integration)
     src/connection/mssql_settings.cpp
     src/connection/mssql_diagnostic.cpp
     src/connection/mssql_pool_manager.cpp
+    # Catalog integration layer (DuckDB catalog API)
+    src/catalog/mssql_column_info.cpp
+    src/catalog/mssql_metadata_cache.cpp
+    src/catalog/mssql_catalog.cpp
+    src/catalog/mssql_schema_entry.cpp
+    src/catalog/mssql_table_entry.cpp
+    src/catalog/mssql_table_set.cpp
+    src/catalog/mssql_table_function.cpp
+    src/catalog/mssql_refresh_function.cpp
+    src/catalog/mssql_transaction.cpp
+    # Pushdown layer (filter/projection optimization)
+    src/pushdown/mssql_projection_builder.cpp
+    src/pushdown/mssql_filter_translator.cpp
+    src/pushdown/mssql_prepared_statement.cpp
 )
 
 # Build static extension (linked into DuckDB) - uses TLS objects from mssql_tls_static

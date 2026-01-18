@@ -75,6 +75,10 @@ private:
 	                            const tds::ColumnMetadata& column,
 	                            Vector& vector, idx_t row_idx);
 
+	static void ConvertDatetimeOffset(const std::vector<uint8_t>& value,
+	                                  const tds::ColumnMetadata& column,
+	                                  Vector& vector, idx_t row_idx);
+
 	static void ConvertGuid(const std::vector<uint8_t>& value,
 	                        Vector& vector, idx_t row_idx);
 };

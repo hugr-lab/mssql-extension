@@ -13,6 +13,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-15
 - In-memory (TLS context per connection) (005-tls-connection-support)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), mbedTLS (vcpkg 3.6.4 for loadable, DuckDB bundled for static) (006-split-tls-build)
 - N/A (build system only) (006-split-tls-build)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), mbedTLS (via split TLS build) (007-catalog-integration)
+- In-memory (metadata cache with TTL), DuckDB secret manager for credentials (007-catalog-integration)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -32,9 +34,9 @@ tests/
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 007-catalog-integration: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), mbedTLS (via split TLS build)
 - 006-split-tls-build: Added C++17 (DuckDB extension standard) + DuckDB (main branch), mbedTLS (vcpkg 3.6.4 for loadable, DuckDB bundled for static)
 - 005-tls-connection-support: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), mbedTLS 3.x (TLS library via vcpkg)
-- 004-streaming-select-cancel: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, DataChunk), existing TDS layer from spec 003
 
 
 <!-- MANUAL ADDITIONS START -->

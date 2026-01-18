@@ -1,0 +1,156 @@
+# name: test/sql/catalog/collation_filter.test
+# description: Integration tests for VARCHAR filter pushdown with different collations
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_coll (TYPE mssql);
+
+# =============================================================================
+# Case-Insensitive Collation Filter Tests (SQL_Latin1_General_CP1_CI_AS)
+# =============================================================================
+
+# Test 1: Filter on default collation (case-insensitive)
+# SQL Server CI collation: 'Apple' matches 'Apple', 'apple', 'APPLE'
+query IT
+SELECT id, col_default FROM testdb_coll.dbo.CollationTest WHERE col_default = 'Apple' ORDER BY id;
+----
+1	Apple
+2	apple
+3	APPLE
+
+# Test 2: Filter on case-insensitive column - lowercase search
+# SQL Server CI collation: 'apple' matches all case variants
+query IT
+SELECT id, col_case_insensitive FROM testdb_coll.dbo.CollationTest WHERE col_case_insensitive = 'apple' ORDER BY id;
+----
+1	Apple
+2	apple
+3	APPLE
+
+# Test 3: Filter on Windows-1252 collation (case-insensitive)
+query IT
+SELECT id, col_win1252 FROM testdb_coll.dbo.CollationTest WHERE col_win1252 = 'Banana' ORDER BY id;
+----
+4	Banana
+
+# =============================================================================
+# Case-Sensitive Collation Filter Tests
+# =============================================================================
+
+# Test 4: Filter on case-sensitive column - exact case match
+query IT
+SELECT id, col_case_sensitive FROM testdb_coll.dbo.CollationTest WHERE col_case_sensitive = 'Apple' ORDER BY id;
+----
+1	Apple
+
+# Test 5: Filter on case-sensitive column - different case (should NOT match in SQL Server)
+query IT
+SELECT id, col_case_sensitive FROM testdb_coll.dbo.CollationTest WHERE col_case_sensitive = 'apple' ORDER BY id;
+----
+2	apple
+
+# Test 6: Filter on case-sensitive column - uppercase
+query IT
+SELECT id, col_case_sensitive FROM testdb_coll.dbo.CollationTest WHERE col_case_sensitive = 'APPLE' ORDER BY id;
+----
+3	APPLE
+
+# =============================================================================
+# Binary Collation Filter Tests
+# =============================================================================
+
+# Test 7: Filter on binary collation - exact match
+query IT
+SELECT id, col_binary FROM testdb_coll.dbo.CollationTest WHERE col_binary = 'Apple' ORDER BY id;
+----
+1	Apple
+
+# Test 8: Filter on binary collation - different case (binary comparison)
+query IT
+SELECT id, col_binary FROM testdb_coll.dbo.CollationTest WHERE col_binary = 'apple' ORDER BY id;
+----
+2	apple
+
+# =============================================================================
+# Unicode Column Filter Tests (NVARCHAR)
+# =============================================================================
+
+# Test 9: Filter on Unicode case-sensitive column
+query IT
+SELECT id, col_unicode_cs FROM testdb_coll.dbo.CollationTest WHERE col_unicode_cs = 'Apple' ORDER BY id;
+----
+1	Apple
+
+# Test 10: Filter on Unicode case-insensitive column
+query IT
+SELECT id, col_unicode_ci FROM testdb_coll.dbo.CollationTest WHERE col_unicode_ci = 'apple' ORDER BY id;
+----
+2	apple
+
+# =============================================================================
+# Accent-Sensitive Filter Tests (using accented characters)
+# =============================================================================
+
+# Test 11: Filter with accented character - exact match
+query IT
+SELECT id, col_default FROM testdb_coll.dbo.CollationTest WHERE col_default = 'café' ORDER BY id;
+----
+5	café
+
+# Test 12: Filter with accented character - uppercase
+query IT
+SELECT id, col_case_sensitive FROM testdb_coll.dbo.CollationTest WHERE col_case_sensitive = 'CAFÉ' ORDER BY id;
+----
+6	CAFÉ
+
+# Test 13: Filter with umlaut character
+query IT
+SELECT id, col_default FROM testdb_coll.dbo.CollationTest WHERE col_default = 'naïve' ORDER BY id;
+----
+7	naïve
+
+# =============================================================================
+# Combined Filter Tests
+# =============================================================================
+
+# Test 14: Combined filter with string and integer
+query IIT
+SELECT id, col_default, col_win1252 FROM testdb_coll.dbo.CollationTest WHERE col_default = 'Apple' AND id < 5 ORDER BY id;
+----
+1	Apple	Apple
+
+# Test 15: Multiple string filters
+query IIT
+SELECT id, col_case_sensitive, col_binary FROM testdb_coll.dbo.CollationTest WHERE col_case_sensitive = 'Apple' AND col_binary = 'Apple' ORDER BY id;
+----
+1	Apple	Apple
+
+# =============================================================================
+# Range Filter Tests on Strings (comparison operators)
+# =============================================================================
+
+# Test 16: Greater than filter on string
+query IT
+SELECT id, col_default FROM testdb_coll.dbo.CollationTest WHERE col_default > 'Test' ORDER BY id;
+----
+8	Test123
+
+# Test 17: Less than filter on string
+query IT
+SELECT id, col_default FROM testdb_coll.dbo.CollationTest WHERE col_default < 'Banana' ORDER BY id;
+----
+1	Apple
+2	apple
+3	APPLE
+
+# Cleanup
+statement ok
+DETACH testdb_coll;
