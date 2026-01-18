@@ -88,6 +88,16 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	    ValidateNonNegative,
 	    SetScope::GLOBAL
 	);
+
+	// mssql_catalog_cache_ttl - Metadata cache TTL in seconds (0 = manual refresh only)
+	config.AddExtensionOption(
+	    "mssql_catalog_cache_ttl",
+	    "Metadata cache TTL in seconds (0 = manual refresh only)",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(0),  // Default: disabled, manual refresh only
+	    ValidateNonNegative,
+	    SetScope::GLOBAL
+	);
 }
 
 //===----------------------------------------------------------------------===//
@@ -123,6 +133,14 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 	}
 
 	return config;
+}
+
+int64_t LoadCatalogCacheTTL(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_catalog_cache_ttl", val)) {
+		return val.GetValue<int64_t>();
+	}
+	return 0;  // Default: manual refresh only
 }
 
 }  // namespace duckdb

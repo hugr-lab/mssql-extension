@@ -23,4 +23,7 @@ void RegisterMSSQLSettings(ExtensionLoader &loader);
 // Load current pool configuration from context settings
 MSSQLPoolConfig LoadPoolConfig(ClientContext &context);
 
+// Load catalog cache TTL setting (0 = manual refresh only)
+int64_t LoadCatalogCacheTTL(ClientContext &context);
+
 }  // namespace duckdb

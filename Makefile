@@ -127,6 +127,9 @@ MSSQL_TEST_DB ?= master
 MSSQL_TEST_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=$(MSSQL_TEST_DB);User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
 MSSQL_TEST_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)
 MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)?encrypt=true
+# TestDB connection strings for catalog tests
+MSSQL_TESTDB_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=TestDB;User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
+MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/TestDB
 
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
@@ -136,6 +139,8 @@ export MSSQL_TEST_PASS
 export MSSQL_TEST_DB
 export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
+export MSSQL_TESTDB_DSN
+export MSSQL_TESTDB_URI
 # NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default because TLS tests require
 # the loadable extension (.duckdb_extension). The built-in test runner uses the
 # static extension which has a TLS stub. To run TLS tests, use the loadable
@@ -157,6 +162,7 @@ integration-test: release
 	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
 	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
 	@echo "  MSSQL_TEST_URI=$(MSSQL_TEST_URI)"
+	@echo "  MSSQL_TESTDB_DSN=$(MSSQL_TESTDB_DSN)"
 	@echo ""
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "ERROR: SQL Server is not running or not healthy."; \
@@ -164,6 +170,7 @@ integration-test: release
 		exit 1; \
 	fi
 	$(BUILD_DIR)/release/test/unittest "[integration]" --force-reload
+	$(BUILD_DIR)/release/test/unittest "[sql]" --force-reload
 
 # Run all tests (unit + integration)
 test-all: release
@@ -180,3 +187,38 @@ test-all: release
 test-debug: debug
 	@echo "Running tests (debug build)..."
 	$(BUILD_DIR)/debug/test/unittest "*mssql*" --force-reload
+
+# C++ test sources (TDS layer + query layer - minimal, no DuckDB dependencies)
+CPP_TEST_SOURCES := \
+    src/tds/tds_connection.cpp \
+    src/tds/tds_packet.cpp \
+    src/tds/tds_socket.cpp \
+    src/tds/tds_types.cpp \
+    src/tds/tds_protocol.cpp \
+    src/tds/tds_token_parser.cpp \
+    src/tds/tds_column_metadata.cpp \
+    src/tds/tds_row_reader.cpp \
+    src/tds/encoding/utf16.cpp \
+    src/tds/tls/tds_tls_stub.cpp \
+    src/query/mssql_simple_query.cpp
+
+CPP_TEST_INCLUDES := -I src/include -I duckdb/src/include
+CPP_TEST_FLAGS := -std=c++17 -pthread -DMSSQL_TLS_STUB=1 -Wno-deprecated-declarations
+
+# Build and run C++ simple query test
+test-simple-query:
+	@echo "Building C++ simple query test..."
+	@mkdir -p $(BUILD_DIR)/test
+	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_INCLUDES) \
+	    test/cpp/test_simple_query.cpp \
+	    $(CPP_TEST_SOURCES) \
+	    -o $(BUILD_DIR)/test/test_simple_query
+	@echo ""
+	@echo "Running test..."
+	@echo "Test environment:"
+	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"
+	@echo "  MSSQL_TEST_PORT=$(MSSQL_TEST_PORT)"
+	@echo "  MSSQL_TEST_USER=$(MSSQL_TEST_USER)"
+	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
+	@echo ""
+	$(BUILD_DIR)/test/test_simple_query

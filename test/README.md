@@ -131,10 +131,23 @@ Tests that don't require SQL Server:
 | Test File | Description |
 |-----------|-------------|
 | `test_connection_pool.cpp` | Connection pool integration tests |
+| `test_simple_query.cpp` | MSSQLSimpleQuery API tests (metadata query execution) |
 
-#### Running C++ Connection Pool Tests
+#### Running C++ Tests
 
-The C++ tests require manual compilation:
+The C++ tests can be run using Makefile targets or manual compilation.
+
+**Simple Query Test (using Makefile):**
+
+```bash
+# Start SQL Server if not running
+make docker-up
+
+# Build and run the simple query test
+make test-simple-query
+```
+
+**Connection Pool Test (manual compilation):**
 
 ```bash
 # Compile the test

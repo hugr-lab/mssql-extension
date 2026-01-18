@@ -75,6 +75,12 @@ ParsedTokenType TokenParser::TryParseNext() {
 		}
 		return ParsedTokenType::NeedMoreData;
 
+	case TokenType::NBCROW:
+		if (ParseNBCRow()) {
+			return ParsedTokenType::Row;
+		}
+		return ParsedTokenType::NeedMoreData;
+
 	case TokenType::DONE:
 	case TokenType::DONEPROC:
 	case TokenType::DONEINPROC:
@@ -188,6 +194,48 @@ bool TokenParser::ParseRow() {
 		}
 	} catch (const std::exception& e) {
 		parse_error_ = std::string("ROW parse error: ") + e.what();
+		state_ = ParserState::Error;
+		return false;
+	}
+
+	ConsumeBytes(1 + bytes_consumed);
+	return true;
+}
+
+bool TokenParser::ParseNBCRow() {
+	if (columns_.empty()) {
+		parse_error_ = "NBCROW token before COLMETADATA";
+		state_ = ParserState::Error;
+		return false;
+	}
+
+	// Token type + null bitmap + row data for non-NULL columns
+	if (Available() < 1) {
+		return false;
+	}
+
+	RowReader reader(columns_);
+	const uint8_t* data = Current() + 1;  // Skip token type
+	size_t length = Available() - 1;
+	size_t bytes_consumed = 0;
+
+	// Fast path: skip mode (for drain)
+	if (skip_rows_) {
+		if (!reader.SkipNBCRow(data, length, bytes_consumed)) {
+			return false;  // Need more data
+		}
+		ConsumeBytes(1 + bytes_consumed);
+		return true;
+	}
+
+	// Normal path: full parsing
+	current_row_.Clear();
+	try {
+		if (!reader.ReadNBCRow(data, length, bytes_consumed, current_row_)) {
+			return false;  // Need more data
+		}
+	} catch (const std::exception& e) {
+		parse_error_ = std::string("NBCROW parse error: ") + e.what();
 		state_ = ParserState::Error;
 		return false;
 	}

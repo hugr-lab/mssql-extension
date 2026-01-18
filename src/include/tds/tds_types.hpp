@@ -74,6 +74,7 @@ enum class TokenType : uint8_t {
 	ENVCHANGE = 0xE3,
 	COLMETADATA = 0x81,
 	ROW = 0xD1,
+	NBCROW = 0xD2,        // Null Bitmap Compressed Row
 	RETURNSTATUS = 0x79,
 	ORDER = 0xA9,
 	RETURNVALUE = 0xAC

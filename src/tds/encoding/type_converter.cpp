@@ -33,8 +33,9 @@ namespace encoding {
 LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	switch (column.type_id) {
 	// Integer types
+	// Note: SQL Server TINYINT is unsigned (0-255), maps to UTINYINT
 	case TDS_TYPE_TINYINT:
-		return LogicalType::TINYINT;
+		return LogicalType::UTINYINT;
 	case TDS_TYPE_SMALLINT:
 		return LogicalType::SMALLINT;
 	case TDS_TYPE_INT:
@@ -45,7 +46,7 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	// Nullable integer variants
 	case TDS_TYPE_INTN:
 		switch (column.max_length) {
-		case 1: return LogicalType::TINYINT;
+		case 1: return LogicalType::UTINYINT;  // SQL Server TINYINT is unsigned
 		case 2: return LogicalType::SMALLINT;
 		case 4: return LogicalType::INTEGER;
 		case 8: return LogicalType::BIGINT;
@@ -283,7 +284,8 @@ void TypeConverter::ConvertInteger(const std::vector<uint8_t>& value,
 
 	switch (len) {
 	case 1:
-		FlatVector::GetData<int8_t>(vector)[row_idx] = static_cast<int8_t>(value[0]);
+		// SQL Server TINYINT is unsigned (0-255), use uint8_t
+		FlatVector::GetData<uint8_t>(vector)[row_idx] = value[0];
 		break;
 	case 2: {
 		int16_t v = 0;

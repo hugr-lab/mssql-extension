@@ -10,7 +10,6 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -26,7 +25,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 struct MSSQLConnectionInfo {
 	string host;
-	uint16_t port;
+	uint16_t port = 1433;
 	string database;
 	string user;
 	string password;
@@ -89,19 +88,6 @@ private:
 //===----------------------------------------------------------------------===//
 struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 	// Reserved for future connection pooling, etc.
-};
-
-//===----------------------------------------------------------------------===//
-// MSSQLCatalog - Custom catalog that cleans up context on detach
-//===----------------------------------------------------------------------===//
-class MSSQLCatalog : public DuckCatalog {
-public:
-	MSSQLCatalog(AttachedDatabase &db, const string &context_name);
-
-	void OnDetach(ClientContext &context) override;
-
-private:
-	string context_name;
 };
 
 //===----------------------------------------------------------------------===//

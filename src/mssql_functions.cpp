@@ -310,6 +310,119 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 }
 
 //===----------------------------------------------------------------------===//
+// MSSQLCatalogScanBindData Implementation
+//===----------------------------------------------------------------------===//
+
+unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
+	auto result = make_uniq<MSSQLCatalogScanBindData>();
+	result->context_name = context_name;
+	result->schema_name = schema_name;
+	result->table_name = table_name;
+	result->all_types = all_types;
+	result->all_column_names = all_column_names;
+	result->return_types = return_types;
+	result->column_names = column_names;
+	result->result_stream_id = result_stream_id;
+	return std::move(result);
+}
+
+bool MSSQLCatalogScanBindData::Equals(const FunctionData &other) const {
+	auto &other_data = other.Cast<MSSQLCatalogScanBindData>();
+	return context_name == other_data.context_name &&
+	       schema_name == other_data.schema_name &&
+	       table_name == other_data.table_name;
+}
+
+//===----------------------------------------------------------------------===//
+// Catalog-based Table Scan Implementation
+//===----------------------------------------------------------------------===//
+
+// Helper to escape SQL Server bracket identifier (] becomes ]])
+static string EscapeBracketIdentifier(const string &name) {
+	string result;
+	result.reserve(name.size() + 2);
+	for (char c : name) {
+		result += c;
+		if (c == ']') {
+			result += ']';  // Double the ] character
+		}
+	}
+	return result;
+}
+
+// Note: MSSQLCatalogScanBind is not used directly - bind_data is set by GetScanFunction
+// and passed to InitGlobal/Execute. We keep this for completeness but it shouldn't be called.
+unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
+	throw InternalException("MSSQLCatalogScanBind should not be called directly");
+}
+
+unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: START");
+
+	auto &bind_data = input.bind_data->Cast<MSSQLCatalogScanBindData>();
+	auto result = make_uniq<MSSQLScanGlobalState>();
+	result->context_name = bind_data.context_name;
+
+	// Build column list based on projection pushdown (column_ids)
+	// column_ids contains the indices of columns needed from the table
+	string column_list;
+	const auto &column_ids = input.column_ids;
+
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: projection has %zu columns (table has %zu)",
+	                   column_ids.size(), bind_data.all_column_names.size());
+
+	if (column_ids.empty()) {
+		// No projection - select all columns (shouldn't happen normally)
+		for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
+			if (i > 0) {
+				column_list += ", ";
+			}
+			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[i]) + "]";
+		}
+	} else {
+		// Build SELECT with only projected columns
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (i > 0) {
+				column_list += ", ";
+			}
+			column_t col_idx = column_ids[i];
+			if (col_idx >= bind_data.all_column_names.size()) {
+				throw InternalException("Column index %llu out of range (table has %zu columns)",
+				                        (unsigned long long)col_idx, bind_data.all_column_names.size());
+			}
+			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[col_idx]) + "]";
+			MSSQL_FN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i, bind_data.all_column_names[col_idx].c_str());
+		}
+	}
+
+	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
+	string query = "SELECT " + column_list + " FROM [" + EscapeBracketIdentifier(bind_data.schema_name) +
+	               "].[" + EscapeBracketIdentifier(bind_data.table_name) + "]";
+
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: generated query = %s", query.c_str());
+
+	// Execute the query
+	MSSQLQueryExecutor executor(bind_data.context_name);
+	result->result_stream = executor.Execute(context, query);
+
+	return std::move(result);
+}
+
+TableFunction GetMSSQLCatalogScanFunction() {
+	// Create table function without arguments - bind_data is set from TableEntry
+	TableFunction func("mssql_catalog_scan", {}, MSSQLScanFunction, MSSQLCatalogScanBind,
+	                   MSSQLCatalogScanInitGlobal, MSSQLScanInitLocal);
+
+	// Enable projection pushdown - allows DuckDB to tell us which columns are needed
+	// The column_ids will be passed to InitGlobal via TableFunctionInitInput
+	func.projection_pushdown = true;
+
+	return func;
+}
+
+//===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
 

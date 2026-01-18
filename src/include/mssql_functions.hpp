@@ -68,6 +68,33 @@ struct MSSQLScanBindData : public FunctionData {
 };
 
 //===----------------------------------------------------------------------===//
+// MSSQLCatalogScanBindData - For catalog-based table scans
+//===----------------------------------------------------------------------===//
+
+struct MSSQLCatalogScanBindData : public FunctionData {
+	string context_name;
+	string schema_name;
+	string table_name;
+
+	// All columns from the table (for projection pushdown)
+	// Query will be generated at InitGlobal time based on column_ids
+	vector<LogicalType> all_types;      // Types for all columns
+	vector<string> all_column_names;    // Names for all columns
+
+	// Projected columns (set after InitGlobal based on column_ids)
+	vector<LogicalType> return_types;
+	vector<string> column_names;
+
+	// ID to retrieve pre-initialized result stream from registry
+	// Note: with projection pushdown, we can't pre-execute the query at bind time
+	// because we don't know which columns are needed yet
+	uint64_t result_stream_id = 0;
+
+	unique_ptr<FunctionData> Copy() const override;
+	bool Equals(const FunctionData &other) const override;
+};
+
+//===----------------------------------------------------------------------===//
 // Result Stream Registry - stores result streams between Bind and InitGlobal
 //===----------------------------------------------------------------------===//
 
@@ -125,6 +152,18 @@ unique_ptr<LocalTableFunctionState> MSSQLScanInitLocal(ExecutionContext &context
 
 // Execute: produces output rows
 void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+
+//===----------------------------------------------------------------------===//
+// Catalog-based Table Scan Functions
+//===----------------------------------------------------------------------===//
+
+// Get a table function for scanning a catalog table entry
+// This is called by MSSQLTableEntry::GetScanFunction
+TableFunction GetMSSQLCatalogScanFunction();
+
+// Bind function for catalog scan - generates query from table columns
+unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names);
 
 //===----------------------------------------------------------------------===//
 // Registration
