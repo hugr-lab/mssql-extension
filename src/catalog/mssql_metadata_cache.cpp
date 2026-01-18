@@ -8,16 +8,16 @@ namespace duckdb {
 // SQL Queries for Metadata Discovery
 //===----------------------------------------------------------------------===//
 
-// Query to discover schemas that contain tables or views
+// Query to discover all user schemas (including empty ones)
+// Excludes system schemas: INFORMATION_SCHEMA (3), sys (4), and other built-in schemas
 static const char *SCHEMA_DISCOVERY_SQL = R"(
 SELECT s.name AS schema_name
 FROM sys.schemas s
 WHERE s.schema_id NOT IN (3, 4)
-  AND EXISTS (
-    SELECT 1 FROM sys.tables t WHERE t.schema_id = s.schema_id
-    UNION ALL
-    SELECT 1 FROM sys.views v WHERE v.schema_id = s.schema_id
-  )
+  AND s.principal_id != 0
+  AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
+                     'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
+                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
 ORDER BY s.name
 )";
 

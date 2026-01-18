@@ -98,6 +98,50 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	    ValidateNonNegative,
 	    SetScope::GLOBAL
 	);
+
+	//===----------------------------------------------------------------------===//
+	// Statistics Settings
+	//===----------------------------------------------------------------------===//
+
+	// mssql_enable_statistics - Enable statistics collection for optimizer
+	config.AddExtensionOption(
+	    "mssql_enable_statistics",
+	    "Enable statistics collection from SQL Server for query optimizer",
+	    LogicalType::BOOLEAN,
+	    Value::BOOLEAN(DEFAULT_STATISTICS_ENABLED),
+	    nullptr,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_statistics_level - Statistics detail level (0=rowcount, 1=+histogram, 2=+NDV)
+	config.AddExtensionOption(
+	    "mssql_statistics_level",
+	    "Statistics detail level: 0=row count, 1=+histogram min/max, 2=+NDV",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(DEFAULT_STATISTICS_LEVEL),
+	    ValidateNonNegative,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_statistics_use_dbcc - Allow DBCC SHOW_STATISTICS for column stats
+	config.AddExtensionOption(
+	    "mssql_statistics_use_dbcc",
+	    "Allow DBCC SHOW_STATISTICS for column statistics (requires permissions)",
+	    LogicalType::BOOLEAN,
+	    Value::BOOLEAN(DEFAULT_STATISTICS_USE_DBCC),
+	    nullptr,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_statistics_cache_ttl_seconds - Statistics cache TTL
+	config.AddExtensionOption(
+	    "mssql_statistics_cache_ttl_seconds",
+	    "Statistics cache TTL in seconds",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(DEFAULT_STATISTICS_CACHE_TTL),
+	    ValidateNonNegative,
+	    SetScope::GLOBAL
+	);
 }
 
 //===----------------------------------------------------------------------===//
@@ -141,6 +185,51 @@ int64_t LoadCatalogCacheTTL(ClientContext &context) {
 		return val.GetValue<int64_t>();
 	}
 	return 0;  // Default: manual refresh only
+}
+
+//===----------------------------------------------------------------------===//
+// Statistics Configuration Loading
+//===----------------------------------------------------------------------===//
+
+bool LoadStatisticsEnabled(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_enable_statistics", val)) {
+		return val.GetValue<bool>();
+	}
+	return DEFAULT_STATISTICS_ENABLED;
+}
+
+int64_t LoadStatisticsLevel(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_statistics_level", val)) {
+		return val.GetValue<int64_t>();
+	}
+	return DEFAULT_STATISTICS_LEVEL;
+}
+
+bool LoadStatisticsUseDBCC(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_statistics_use_dbcc", val)) {
+		return val.GetValue<bool>();
+	}
+	return DEFAULT_STATISTICS_USE_DBCC;
+}
+
+int64_t LoadStatisticsCacheTTL(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_statistics_cache_ttl_seconds", val)) {
+		return val.GetValue<int64_t>();
+	}
+	return DEFAULT_STATISTICS_CACHE_TTL;
+}
+
+MSSQLStatisticsConfig LoadStatisticsConfig(ClientContext &context) {
+	MSSQLStatisticsConfig config;
+	config.enabled = LoadStatisticsEnabled(context);
+	config.level = LoadStatisticsLevel(context);
+	config.use_dbcc = LoadStatisticsUseDBCC(context);
+	config.cache_ttl_seconds = LoadStatisticsCacheTTL(context);
+	return config;
 }
 
 }  // namespace duckdb

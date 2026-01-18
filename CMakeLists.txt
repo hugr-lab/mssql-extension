@@ -86,6 +86,8 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_table_function.cpp
     src/catalog/mssql_refresh_function.cpp
     src/catalog/mssql_transaction.cpp
+    src/catalog/mssql_ddl_translator.cpp
+    src/catalog/mssql_statistics.cpp
     # Pushdown layer (filter/projection optimization)
     src/pushdown/mssql_projection_builder.cpp
     src/pushdown/mssql_filter_translator.cpp

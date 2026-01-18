@@ -1,0 +1,79 @@
+# name: test/sql/catalog/ddl_alter.test
+# description: Test ALTER TABLE DDL via catalog
+# group: [mssql]
+
+# Requires MSSQL server and secret configured
+# Set up with: CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+
+require mssql
+
+# Test 1: Basic extension load
+statement ok
+SELECT mssql_version();
+
+# Integration tests - uncomment when running against a live SQL Server:
+
+# Test 2: Create secret for testing
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# Test 3: Attach database (default READ_WRITE mode)
+# statement ok
+# ATTACH '' AS mssql_alter_test (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 4: Create base table for alter tests
+# statement ok
+# CREATE TABLE mssql_alter_test.dbo.alter_test (id INTEGER, name VARCHAR);
+
+# Test 5: ADD COLUMN
+# statement ok
+# ALTER TABLE mssql_alter_test.dbo.alter_test ADD COLUMN age INTEGER;
+
+# Test 6: Verify column was added
+# statement ok
+# SELECT id, name, age FROM mssql_alter_test.dbo.alter_test;
+
+# Test 7: DROP COLUMN
+# statement ok
+# ALTER TABLE mssql_alter_test.dbo.alter_test DROP COLUMN age;
+
+# Test 8: Verify column was dropped
+# statement ok
+# SELECT id, name FROM mssql_alter_test.dbo.alter_test;
+
+# Test 9: RENAME TABLE
+# statement ok
+# ALTER TABLE mssql_alter_test.dbo.alter_test RENAME TO alter_test_renamed;
+
+# Test 10: Verify table was renamed
+# statement ok
+# SELECT * FROM mssql_alter_test.dbo.alter_test_renamed;
+
+# Test 11: Rename back for cleanup
+# statement ok
+# ALTER TABLE mssql_alter_test.dbo.alter_test_renamed RENAME TO alter_test;
+
+# Test 12: ALTER COLUMN TYPE
+# statement ok
+# ALTER TABLE mssql_alter_test.dbo.alter_test ALTER COLUMN name TYPE VARCHAR(100);
+
+# Test 13: Cleanup
+# statement ok
+# DROP TABLE mssql_alter_test.dbo.alter_test;
+
+# Test 14: Detach
+# statement ok
+# DETACH mssql_alter_test;
+
+# Test 15: READ_ONLY mode blocks ALTER TABLE
+# statement ok
+# ATTACH '' AS mssql_ro (TYPE mssql, SECRET mssql_test_secret, READ_ONLY);
+
+# statement error
+# ALTER TABLE mssql_ro.dbo.some_table ADD COLUMN x INTEGER;
+# ----
+# read-only mode
+
+# statement ok
+# DETACH mssql_ro;
+

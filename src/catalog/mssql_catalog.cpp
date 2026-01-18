@@ -1,5 +1,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_ddl_translator.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -36,6 +38,9 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
 	int64_t cache_ttl = 0;  // Default: manual refresh only
 	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl);
+
+	// Create statistics provider with default TTL (will be configured from settings later)
+	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
 }
 
 MSSQLCatalog::~MSSQLCatalog() = default;
@@ -173,11 +178,46 @@ MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name
 
 optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction,
                                                        CreateSchemaInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE SCHEMA is not supported");
+	CheckWriteAccess("CREATE SCHEMA");
+
+	// Generate T-SQL for CREATE SCHEMA
+	string tsql = MSSQLDDLTranslator::TranslateCreateSchema(info.schema);
+
+	// Execute DDL on SQL Server
+	if (transaction.HasContext()) {
+		ExecuteDDL(transaction.GetContext(), tsql);
+	} else {
+		throw InternalException("Cannot execute CREATE SCHEMA without client context");
+	}
+
+	// Invalidate cache so the new schema is visible
+	InvalidateMetadataCache();
+
+	// Re-load and return the schema entry
+	if (transaction.HasContext()) {
+		EnsureCacheLoaded(transaction.GetContext());
+	}
+
+	return &GetOrCreateSchemaEntry(info.schema);
 }
 
 void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: DROP SCHEMA is not supported");
+	CheckWriteAccess("DROP SCHEMA");
+
+	// Generate T-SQL for DROP SCHEMA
+	string tsql = MSSQLDDLTranslator::TranslateDropSchema(info.name);
+
+	// Execute DDL on SQL Server
+	ExecuteDDL(context, tsql);
+
+	// Invalidate cache
+	InvalidateMetadataCache();
+
+	// Remove the schema entry from our local cache
+	{
+		std::lock_guard<std::mutex> lock(schema_mutex_);
+		schema_entries_.erase(info.name);
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -262,6 +302,10 @@ MSSQLMetadataCache &MSSQLCatalog::GetMetadataCache() {
 	return *metadata_cache_;
 }
 
+MSSQLStatisticsProvider &MSSQLCatalog::GetStatisticsProvider() {
+	return *statistics_provider_;
+}
+
 const string &MSSQLCatalog::GetDatabaseCollation() const {
 	return database_collation_;
 }
@@ -272,6 +316,71 @@ const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
 
 const string &MSSQLCatalog::GetContextName() const {
 	return context_name_;
+}
+
+//===----------------------------------------------------------------------===//
+// Access Mode (READ_ONLY Support)
+//===----------------------------------------------------------------------===//
+
+bool MSSQLCatalog::IsReadOnly() const {
+	return access_mode_ == AccessMode::READ_ONLY;
+}
+
+AccessMode MSSQLCatalog::GetAccessMode() const {
+	return access_mode_;
+}
+
+void MSSQLCatalog::CheckWriteAccess(const char *operation_name) const {
+	if (IsReadOnly()) {
+		if (operation_name) {
+			throw CatalogException("Cannot execute %s: MSSQL catalog '%s' is attached in read-only mode",
+			                       operation_name, context_name_);
+		} else {
+			throw CatalogException("Cannot modify MSSQL catalog '%s': attached in read-only mode", context_name_);
+		}
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// DDL Execution
+//===----------------------------------------------------------------------===//
+
+void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
+	if (!connection_pool_) {
+		throw IOException("MSSQL connection pool not initialized - cannot execute DDL");
+	}
+
+	auto connection = connection_pool_->Acquire();
+	if (!connection) {
+		throw IOException("Failed to acquire connection for DDL execution");
+	}
+
+	try {
+		auto result = MSSQLSimpleQuery::Execute(*connection, tsql);
+
+		if (!result.success) {
+			connection_pool_->Release(std::move(connection));
+			throw CatalogException("MSSQL DDL error: SQL Server error %d: %s",
+			                       result.error_number, result.error_message);
+		}
+	} catch (...) {
+		connection_pool_->Release(std::move(connection));
+		throw;
+	}
+
+	connection_pool_->Release(std::move(connection));
+}
+
+void MSSQLCatalog::InvalidateMetadataCache() {
+	if (metadata_cache_) {
+		metadata_cache_->Invalidate();
+	}
+
+	// Also clear the local schema entry cache
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	for (auto &entry : schema_entries_) {
+		entry.second->GetTableSet().Invalidate();
+	}
 }
 
 void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {

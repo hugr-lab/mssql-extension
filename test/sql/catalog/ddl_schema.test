@@ -1,0 +1,83 @@
+# name: test/sql/catalog/ddl_schema.test
+# description: Test CREATE SCHEMA and DROP SCHEMA DDL via catalog
+# group: [mssql]
+
+# Requires MSSQL server and secret configured
+# Set up with: CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+
+require mssql
+
+# Test 1: Basic extension load
+statement ok
+SELECT mssql_version();
+
+# Integration tests - uncomment when running against a live SQL Server:
+
+# Test 2: Create secret for testing
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# Test 3: Attach database (default READ_WRITE mode)
+# statement ok
+# ATTACH '' AS mssql_schema_test (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 4: CREATE SCHEMA
+# statement ok
+# CREATE SCHEMA mssql_schema_test.test_schema_ddl;
+
+# Test 5: Verify schema exists by creating a table in it
+# statement ok
+# CREATE TABLE mssql_schema_test.test_schema_ddl.test_table (id INTEGER);
+
+# Test 6: Verify table exists
+# statement ok
+# SELECT * FROM mssql_schema_test.test_schema_ddl.test_table;
+
+# Test 7: Clean up table before dropping schema
+# statement ok
+# DROP TABLE mssql_schema_test.test_schema_ddl.test_table;
+
+# Test 8: DROP SCHEMA (must be empty)
+# statement ok
+# DROP SCHEMA mssql_schema_test.test_schema_ddl;
+
+# Test 9: Verify schema is gone (should error on table create)
+# statement error
+# CREATE TABLE mssql_schema_test.test_schema_ddl.should_fail (id INTEGER);
+# ----
+# does not exist
+
+# Test 10: DROP SCHEMA on non-empty schema (expects SQL Server error)
+# statement ok
+# CREATE SCHEMA mssql_schema_test.test_nonempty;
+
+# statement ok
+# CREATE TABLE mssql_schema_test.test_nonempty.my_table (id INTEGER);
+
+# statement error
+# DROP SCHEMA mssql_schema_test.test_nonempty;
+# ----
+# cannot drop
+
+# Test 11: Cleanup non-empty schema
+# statement ok
+# DROP TABLE mssql_schema_test.test_nonempty.my_table;
+
+# statement ok
+# DROP SCHEMA mssql_schema_test.test_nonempty;
+
+# Test 12: Detach catalog
+# statement ok
+# DETACH mssql_schema_test;
+
+# Test 13: READ_ONLY mode blocks CREATE SCHEMA
+# statement ok
+# ATTACH '' AS mssql_ro (TYPE mssql, SECRET mssql_test_secret, READ_ONLY);
+
+# statement error
+# CREATE SCHEMA mssql_ro.test_should_fail;
+# ----
+# read-only mode
+
+# statement ok
+# DETACH mssql_ro;
