@@ -43,7 +43,8 @@ target_compile_options(mssql_tls_static PRIVATE
 )
 target_include_directories(mssql_tls_static PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include/tds/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
 message(STATUS "TLS target 'mssql_tls_static' configured (STUB - no TLS support)")
@@ -78,7 +79,7 @@ target_compile_features(mssql_tls_loadable PRIVATE cxx_std_17)
 target_compile_definitions(mssql_tls_loadable PRIVATE MSSQL_TLS_BACKEND_LOADABLE=1)
 target_compile_options(mssql_tls_loadable PRIVATE
     "-fvisibility=hidden"
-    "-include${CMAKE_CURRENT_SOURCE_DIR}/mbedtls_compat.h"
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/../../include/tds/tls/mbedtls_compat.h"
 )
 
 # Add vcpkg mbedTLS includes BEFORE everything else
@@ -87,7 +88,8 @@ target_include_directories(mssql_tls_loadable BEFORE PRIVATE
 )
 target_include_directories(mssql_tls_loadable PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include/tds/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
 # Link full mbedTLS suite (loadable extension needs everything self-contained)

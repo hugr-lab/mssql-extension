@@ -8,7 +8,7 @@
 // all mbedTLS symbols hidden to avoid conflicts with DuckDB's bundled mbedTLS.
 //===----------------------------------------------------------------------===//
 
-#include "tds_tls_impl.hpp"
+#include "tds/tls/tds_tls_impl.hpp"
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>

@@ -8,8 +8,8 @@
 // crypto library. Use the loadable extension for TLS support.
 //===----------------------------------------------------------------------===//
 
-#include "tds_tls_impl.hpp"
-#include "tds_tls_context.hpp"
+#include "tds/tls/tds_tls_impl.hpp"
+#include "tds/tls/tds_tls_context.hpp"
 
 namespace duckdb {
 namespace tds {

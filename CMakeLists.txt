@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/tls)
+include_directories(src/include src/include/tds/tls)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -42,7 +42,7 @@ message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_
 #   macOS doesn't support --allow-multiple-definition, making symbol conflicts fatal.
 #   Static build: Stub implementation avoids the conflict entirely.
 #   Loadable build: Symbol hiding prevents conflicts when dynamically loaded.
-add_subdirectory(src/tls)
+add_subdirectory(src/tds/tls)
 
 # =============================================================================
 # Extension Sources (shared between static and loadable builds)
@@ -52,19 +52,19 @@ set(EXTENSION_SOURCES
     src/mssql_secret.cpp
     src/mssql_storage.cpp
     src/mssql_functions.cpp
-    # Encoding utilities
-    src/encoding/utf16.cpp
-    src/encoding/decimal_encoding.cpp
-    src/encoding/datetime_encoding.cpp
-    src/encoding/guid_encoding.cpp
-    src/encoding/type_converter.cpp
+    # Encoding utilities (in tds namespace)
+    src/tds/encoding/utf16.cpp
+    src/tds/encoding/decimal_encoding.cpp
+    src/tds/encoding/datetime_encoding.cpp
+    src/tds/encoding/guid_encoding.cpp
+    src/tds/encoding/type_converter.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp
     src/tds/tds_socket.cpp
     src/tds/tds_protocol.cpp
     src/tds/tds_connection.cpp
-    src/tds/connection_pool.cpp
+    src/tds/tds_connection_pool.cpp
     src/tds/tds_column_metadata.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
@@ -98,7 +98,7 @@ target_compile_definitions(${EXTENSION_NAME} PRIVATE
     MSSQL_TLS_STUB=1
 )
 target_include_directories(${EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
 )
 
 # Link TLS stub objects into static extension (no mbedTLS dependency)
@@ -117,13 +117,13 @@ message(STATUS "Static extension configured: TLS STUB (no TLS support - use load
 
 target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
     "-Wno-macro-redefined"
-    "-include${CMAKE_CURRENT_SOURCE_DIR}/src/tls/mbedtls_compat.h"
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls/mbedtls_compat.h"
 )
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
     EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
 )
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
 )
 
 # Link the TLS static library (includes full mbedTLS suite via transitive dependencies)
