@@ -36,6 +36,11 @@ public:
 	// TDS format: 2 bytes days since 1900-01-01 + 2 bytes minutes since midnight
 	static timestamp_t ConvertSmallDatetime(const uint8_t* data);
 
+	// Convert SQL Server DATETIMEOFFSET to DuckDB timestamp_t (UTC)
+	// TDS format: time (3-5 bytes) + date (3 bytes) + offset (2 bytes signed minutes)
+	// The timestamp is returned as UTC by subtracting the offset
+	static timestamp_t ConvertDatetimeOffset(const uint8_t* data, uint8_t scale);
+
 	// Get the byte length for TIME/DATETIME2 based on scale
 	static size_t GetTimeByteLength(uint8_t scale);
 };

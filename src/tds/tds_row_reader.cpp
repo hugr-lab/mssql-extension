@@ -237,6 +237,10 @@ size_t RowReader::ReadValue(const uint8_t* data, size_t length, size_t col_idx,
 	case TDS_TYPE_DATETIME2:
 		return ReadDateTime2Type(data, length, col.scale, value, is_null);
 
+	// DATETIMEOFFSET
+	case TDS_TYPE_DATETIMEOFFSET:
+		return ReadDateTimeOffsetType(data, length, col.scale, value, is_null);
+
 	// UNIQUEIDENTIFIER
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 		return ReadGuidType(data, length, value, is_null);
@@ -401,6 +405,29 @@ size_t RowReader::ReadTimeType(const uint8_t* data, size_t length, uint8_t scale
 size_t RowReader::ReadDateTime2Type(const uint8_t* data, size_t length, uint8_t scale,
                                      std::vector<uint8_t>& value, bool& is_null) {
 	// DATETIME2 has length prefix
+	if (length < 1) {
+		return 0;
+	}
+
+	uint8_t data_length = data[0];
+
+	if (data_length == 0) {
+		is_null = true;
+		value.clear();
+		return 1;
+	}
+
+	if (length < 1 + data_length) {
+		return 0;
+	}
+
+	value.assign(data + 1, data + 1 + data_length);
+	return 1 + data_length;
+}
+
+size_t RowReader::ReadDateTimeOffsetType(const uint8_t* data, size_t length, uint8_t scale,
+                                          std::vector<uint8_t>& value, bool& is_null) {
+	// DATETIMEOFFSET has length prefix: time (3-5 bytes) + date (3 bytes) + offset (2 bytes)
 	if (length < 1) {
 		return 0;
 	}

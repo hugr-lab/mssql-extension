@@ -100,6 +100,57 @@ timestamp_t DateTimeEncoding::ConvertSmallDatetime(const uint8_t* data) {
 	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
 }
 
+timestamp_t DateTimeEncoding::ConvertDatetimeOffset(const uint8_t* data, uint8_t scale) {
+	// DATETIMEOFFSET: time (3-5 bytes) + date (3 bytes) + offset (2 bytes signed minutes)
+	// Note: SQL Server stores DATETIMEOFFSET with the time component already in UTC.
+	// The offset is stored for display purposes only. We just need to read the UTC time.
+	//
+	// Time encoding varies by scale:
+	// - Time is stored in units of 10^(-scale) seconds
+	// - Scale 7: 100-nanosecond ticks (divide by 10 for microseconds)
+	// - Scale 3: millisecond ticks (multiply by 1000 for microseconds)
+	// - Scale 0: second ticks (multiply by 1000000 for microseconds)
+	size_t time_len = GetTimeByteLength(scale);
+
+	// Read time ticks - this is already in UTC
+	int64_t time_ticks = 0;
+	for (size_t i = 0; i < time_len; i++) {
+		time_ticks |= static_cast<int64_t>(data[i]) << (i * 8);
+	}
+
+	// Read date (days since 0001-01-01) - this is already in UTC
+	int32_t days = static_cast<int32_t>(data[time_len]) |
+	               (static_cast<int32_t>(data[time_len + 1]) << 8) |
+	               (static_cast<int32_t>(data[time_len + 2]) << 16);
+
+	// Offset (2 bytes) is at data[time_len + 3] but we don't need it for UTC conversion
+	// The time is already stored as UTC
+
+	// Convert to days since 1970-01-01
+	int32_t unix_days = days - DAYS_FROM_0001_TO_EPOCH;
+
+	// Convert time ticks to microseconds based on scale
+	// Time is in units of 10^(-scale) seconds, we need microseconds (10^(-6) seconds)
+	// microseconds = ticks * 10^(6-scale)
+	int64_t microseconds;
+	if (scale <= 6) {
+		// Multiply for scales 0-6
+		int64_t multiplier = 1;
+		for (int i = 0; i < 6 - scale; i++) {
+			multiplier *= 10;
+		}
+		microseconds = time_ticks * multiplier;
+	} else {
+		// Divide for scale 7
+		microseconds = time_ticks / 10;
+	}
+
+	// Calculate UTC timestamp directly (time is already in UTC)
+	int64_t utc_timestamp = static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds;
+
+	return timestamp_t(utc_timestamp);
+}
+
 size_t DateTimeEncoding::GetTimeByteLength(uint8_t scale) {
 	// Scale 0-2: 3 bytes
 	// Scale 3-4: 4 bytes

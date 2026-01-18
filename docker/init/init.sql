@@ -172,7 +172,9 @@ CREATE TABLE dbo.AllDataTypes (
     col_datetime DATETIME NOT NULL,
     col_datetime2 DATETIME2 NOT NULL,
     col_datetime2_scale DATETIME2(3) NOT NULL,
-    col_smalldatetime SMALLDATETIME NOT NULL
+    col_smalldatetime SMALLDATETIME NOT NULL,
+    col_datetimeoffset DATETIMEOFFSET NOT NULL,
+    col_datetimeoffset_scale DATETIMEOFFSET(3) NOT NULL
 );
 GO
 
@@ -189,7 +191,8 @@ INSERT INTO dbo.AllDataTypes VALUES
  0x0102030405060708090A0B0C0D0E0F10, 0xDEADBEEF,
  '2024-06-15', '13:45:30.1234567', '13:45:30.123',
  '2024-06-15 13:45:30.123', '2024-06-15 13:45:30.1234567', '2024-06-15 13:45:30.123',
- '2024-06-15 13:45:00'),
+ '2024-06-15 13:45:00',
+ '2024-06-15 13:45:30.1234567 +05:30', '2024-06-15 13:45:30.123 +05:30'),
 (2,
  0, -32768, -2147483648, -9223372036854775808,
  0,
@@ -201,7 +204,8 @@ INSERT INTO dbo.AllDataTypes VALUES
  0x00000000000000000000000000000000, 0x00,
  '1900-01-01', '00:00:00.0000000', '00:00:00.000',
  '1900-01-01 00:00:00.000', '0001-01-01 00:00:00.0000000', '0001-01-01 00:00:00.000',
- '1900-01-01 00:00:00'),
+ '1900-01-01 00:00:00',
+ '1900-01-01 00:00:00.0000000 -08:00', '1900-01-01 00:00:00.000 -08:00'),
 (3,
  128, 0, 0, 0,
  1,
@@ -213,7 +217,8 @@ INSERT INTO dbo.AllDataTypes VALUES
  0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF, 0xFF,
  '2024-12-31', '23:59:59.9999999', '23:59:59.999',
  '2024-12-31 23:59:59.997', '9999-12-31 23:59:59.9999999', '9999-12-31 23:59:59.999',
- '2079-06-06 23:59:00');
+ '2079-06-06 23:59:00',
+ '2024-12-31 23:59:59.9999999 +00:00', '2024-12-31 23:59:59.999 +00:00');
 GO
 
 -- Add more rows for testing
@@ -230,7 +235,8 @@ SELECT
     col_binary, col_varbinary,
     DATEADD(day, id, col_date), col_time, col_time_scale,
     DATEADD(day, id, col_datetime), DATEADD(day, id, col_datetime2), col_datetime2_scale,
-    col_smalldatetime
+    col_smalldatetime,
+    DATEADD(day, id, col_datetimeoffset), col_datetimeoffset_scale
 FROM dbo.AllDataTypes WHERE id <= 3;
 GO
 
@@ -384,6 +390,41 @@ INSERT INTO dbo.[Space Column Table] (id, [Column With Space], [Another Space Co
 GO
 
 PRINT 'Special character tables created';
+GO
+
+-- =============================================================================
+-- Table 9: Collation test table (different collations for filter pushdown tests)
+-- =============================================================================
+CREATE TABLE dbo.CollationTest (
+    id INT NOT NULL PRIMARY KEY,
+    -- Default collation (database default, typically SQL_Latin1_General_CP1_CI_AS)
+    col_default VARCHAR(100) NOT NULL,
+    -- Case-sensitive collation
+    col_case_sensitive VARCHAR(100) COLLATE Latin1_General_CS_AS NOT NULL,
+    -- Case-insensitive collation
+    col_case_insensitive VARCHAR(100) COLLATE Latin1_General_CI_AS NOT NULL,
+    -- Binary collation (exact byte comparison)
+    col_binary VARCHAR(100) COLLATE Latin1_General_BIN NOT NULL,
+    -- Windows-1252 (CP1252) collation
+    col_win1252 VARCHAR(100) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+    -- Unicode with different collations
+    col_unicode_cs NVARCHAR(100) COLLATE Latin1_General_CS_AS NOT NULL,
+    col_unicode_ci NVARCHAR(100) COLLATE Latin1_General_CI_AS NOT NULL
+);
+GO
+
+INSERT INTO dbo.CollationTest (id, col_default, col_case_sensitive, col_case_insensitive, col_binary, col_win1252, col_unicode_cs, col_unicode_ci) VALUES
+(1, 'Apple', 'Apple', 'Apple', 'Apple', 'Apple', N'Apple', N'Apple'),
+(2, 'apple', 'apple', 'apple', 'apple', 'apple', N'apple', N'apple'),
+(3, 'APPLE', 'APPLE', 'APPLE', 'APPLE', 'APPLE', N'APPLE', N'APPLE'),
+(4, 'Banana', 'Banana', 'Banana', 'Banana', 'Banana', N'Banana', N'Banana'),
+(5, 'café', 'café', 'café', 'café', 'café', N'café', N'café'),
+(6, 'CAFÉ', 'CAFÉ', 'CAFÉ', 'CAFÉ', 'CAFÉ', N'CAFÉ', N'CAFÉ'),
+(7, 'naïve', 'naïve', 'naïve', 'naïve', 'naïve', N'naïve', N'naïve'),
+(8, 'Test123', 'Test123', 'Test123', 'Test123', 'Test123', N'Test123', N'Test123');
+GO
+
+PRINT 'Collation test table created';
 GO
 
 -- =============================================================================

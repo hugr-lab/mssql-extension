@@ -70,6 +70,9 @@ private:
 	size_t ReadDateTime2Type(const uint8_t* data, size_t length, uint8_t scale,
 	                         std::vector<uint8_t>& value, bool& is_null);
 
+	size_t ReadDateTimeOffsetType(const uint8_t* data, size_t length, uint8_t scale,
+	                              std::vector<uint8_t>& value, bool& is_null);
+
 	size_t ReadGuidType(const uint8_t* data, size_t length,
 	                    std::vector<uint8_t>& value, bool& is_null);
 

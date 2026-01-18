@@ -1,0 +1,305 @@
+# name: test/sql/catalog/filter_pushdown.test
+# description: Integration tests for filter pushdown through MSSQL catalog
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_filter (TYPE mssql);
+
+# =============================================================================
+# Simple Equality Filter Tests
+# =============================================================================
+
+# Test 1: Simple equality filter on integer column
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id = 2;
+----
+2	Second Record
+
+# Test 2: Equality filter on string column
+query II
+SELECT id, name FROM testdb_filter.test.test WHERE name = 'B';
+----
+2	B
+
+# =============================================================================
+# Comparison Filter Tests
+# =============================================================================
+
+# Test 3: Greater than filter
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id > 3 ORDER BY id;
+----
+4	Fourth Record
+5	Fifth Record
+
+# Test 4: Less than filter
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id < 3 ORDER BY id;
+----
+1	First Record
+2	Second Record
+
+# Test 5: Greater than or equal filter
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id >= 4 ORDER BY id;
+----
+4	Fourth Record
+5	Fifth Record
+
+# Test 6: Less than or equal filter
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id <= 2 ORDER BY id;
+----
+1	First Record
+2	Second Record
+
+# Test 7: Not equal filter
+query II
+SELECT id, name FROM testdb_filter.test.test WHERE id <> 2 AND id < 5 ORDER BY id;
+----
+1	A
+3	C
+4	D
+
+# =============================================================================
+# NULL Filter Tests (using NullableTypes table which has more varied NULL patterns)
+# =============================================================================
+
+# Test 8: IS NULL filter on integer column
+query II
+SELECT id, col_tinyint FROM testdb_filter.dbo.NullableTypes WHERE col_tinyint IS NULL ORDER BY id;
+----
+2	NULL
+4	NULL
+
+# Test 9: IS NOT NULL filter on integer column
+query II
+SELECT id, col_tinyint FROM testdb_filter.dbo.NullableTypes WHERE col_tinyint IS NOT NULL ORDER BY id;
+----
+1	1
+3	3
+5	5
+
+# Test 10: IS NULL filter on decimal column (value column in TestSimplePK)
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE value IS NULL ORDER BY id;
+----
+3	Third Record
+
+# Test 11: IS NOT NULL filter on decimal column
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE value IS NOT NULL ORDER BY id;
+----
+1	First Record
+2	Second Record
+4	Fourth Record
+5	Fifth Record
+
+# =============================================================================
+# Combined Filter Tests (AND)
+# =============================================================================
+
+# Test 12: Multiple filters combined with AND
+query II
+SELECT id, name FROM testdb_filter.dbo.TestSimplePK WHERE id >= 2 AND id <= 4 ORDER BY id;
+----
+2	Second Record
+3	Third Record
+4	Fourth Record
+
+# Test 13: Filter on multiple columns (LargeTable: category = (id % 100) + 1)
+# For id=50, category=(50%100)+1=51
+# For id=51, category=(51%100)+1=52, etc.
+query IIT
+SELECT id, category, name FROM testdb_filter.dbo.LargeTable WHERE id >= 50 AND id <= 55 AND category > 50 ORDER BY id;
+----
+50	51	Item_50
+51	52	Item_51
+52	53	Item_52
+53	54	Item_53
+54	55	Item_54
+55	56	Item_55
+
+# =============================================================================
+# Filter Pushdown with Large Data (Performance Test)
+# =============================================================================
+
+# Test 14: Filter should significantly reduce data transfer from 150k rows
+# With filter pushdown, this should only fetch 1 row from SQL Server
+query IIT
+SELECT id, category, name FROM testdb_filter.dbo.LargeTable WHERE id = 75000;
+----
+75000	1	Item_75000
+
+# Test 15: Range filter on large table - should only fetch 6 rows
+query I
+SELECT id FROM testdb_filter.dbo.LargeTable WHERE id BETWEEN 100000 AND 100005 ORDER BY id;
+----
+100000
+100001
+100002
+100003
+100004
+100005
+
+# =============================================================================
+# Filter on Reserved Word Tables
+# =============================================================================
+
+# Test 16: Filter on table with reserved word names
+query ITT
+SELECT "COLUMN", "INDEX", "SELECT" FROM testdb_filter."SELECT"."TABLE" WHERE "COLUMN" >= 2 ORDER BY "COLUMN";
+----
+2	second	select value 2
+3	third	NULL
+
+# =============================================================================
+# Filter on Tables with Special Characters
+# =============================================================================
+
+# Test 17: Filter on table with spaces in names
+query ITT
+SELECT "My Column", "Another Column", "Column With Spaces" FROM testdb_filter."My Schema"."My Table" WHERE "My Column" > 1 ORDER BY "My Column";
+----
+2	value2	space value 2
+3	value3	NULL
+
+# =============================================================================
+# String Filter Tests
+# =============================================================================
+
+# Test 18: String equality filter - exact match
+query II
+SELECT id, name FROM testdb_filter.test.test WHERE name = 'A';
+----
+1	A
+
+# Test 19: String comparison with special characters
+query IT
+SELECT "col""quote", normal_col FROM testdb_filter."schema""quote"."table""quote" WHERE normal_col = 'quote_value_2';
+----
+2	quote_value_2
+
+# =============================================================================
+# Decimal/Numeric Filter Tests
+# =============================================================================
+
+# Test 20: Filter on decimal column
+query IR
+SELECT id, value FROM testdb_filter.dbo.TestSimplePK WHERE value > 300.00 ORDER BY id;
+----
+4	400.00
+5	500.25
+
+# Test 21: Filter on decimal column with specific value
+query IR
+SELECT id, value FROM testdb_filter.dbo.TestSimplePK WHERE value = 100.50;
+----
+1	100.50
+
+# =============================================================================
+# DATE Filter Tests
+# =============================================================================
+
+# Test 22: Filter on DATE column with equality
+query IIIR
+SELECT region_id, product_id, quantity, unit_price FROM testdb_filter.dbo.TestCompositePK WHERE order_date = '2024-01-15' ORDER BY region_id, product_id;
+----
+1	100	10	25.50
+2	100	15	25.50
+
+# Test 23: Filter on DATE column with greater than
+query IIIR
+SELECT region_id, product_id, quantity, unit_price FROM testdb_filter.dbo.TestCompositePK WHERE order_date > '2024-01-17' ORDER BY region_id, product_id;
+----
+2	101	8	50.00
+3	100	25	25.50
+3	102	12	12.75
+
+# Test 24: Filter on DATE column with range (BETWEEN)
+query IIIR
+SELECT region_id, product_id, quantity, unit_price FROM testdb_filter.dbo.TestCompositePK WHERE order_date BETWEEN '2024-01-16' AND '2024-01-18' ORDER BY region_id, product_id;
+----
+1	101	5	50.00
+1	102	20	12.75
+2	101	8	50.00
+
+# Test 25: Filter on DATE column in LargeTable
+# created_date = DATEADD(day, n % 365, '2024-01-01')
+# For id=1: created_date = '2024-01-02' (1 % 365 = 1, so +1 day from 2024-01-01)
+query IIT
+SELECT id, category, name FROM testdb_filter.dbo.LargeTable WHERE created_date = '2024-01-02' AND id <= 1000 ORDER BY id LIMIT 3;
+----
+1	2	Item_1
+366	67	Item_366
+731	32	Item_731
+
+# =============================================================================
+# DATETIME Filter Tests (using AllDataTypes table)
+# =============================================================================
+
+# Test 26: Filter on DATETIME2 column
+# Row 1 has col_datetime2 = '2024-06-15 13:45:30.1234567'
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_date = '2024-06-15' ORDER BY id;
+----
+1	2147483647
+
+# Test 27: Filter on DATE column with less than
+# id=1 has 2024-06-15, id=2 has 1900-01-01
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_date < '2024-06-16' ORDER BY id;
+----
+1	2147483647
+2	-2147483648
+
+# =============================================================================
+# TIMESTAMP (DATETIME/DATETIME2) Filter Tests
+# =============================================================================
+
+# Test 28: Filter on TIMESTAMP (DATETIME) column with equality
+# id=1 has col_datetime = '2024-06-15 13:45:30.123'
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime >= '2024-06-15 00:00:00' AND col_datetime < '2024-06-16 00:00:00' ORDER BY id;
+----
+1	2147483647
+
+# Test 29: Filter on TIMESTAMP (DATETIME2) column with greater than
+# id=1: 2024-06-15, id=2: 0001-01-01, id=3: 9999-12-31
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime2 > '2024-06-15 00:00:00' ORDER BY id;
+----
+1	2147483647
+3	0
+
+# Test 30: Filter on TIMESTAMP column with less than
+# Should return id=2 (1900-01-01 00:00:00)
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime < '1901-01-01 00:00:00' ORDER BY id;
+----
+2	-2147483648
+
+# Test 31: Filter on TIMESTAMP column with range (year 2024)
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime >= '2024-01-01 00:00:00' AND col_datetime < '2025-01-01 00:00:00' ORDER BY id;
+----
+1	2147483647
+3	0
+
+# Test 32: Combined DATE and TIMESTAMP filter
+query II
+SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_date = '2024-06-15' AND col_datetime >= '2024-06-15 13:00:00' ORDER BY id;
+----
+1	2147483647
+
+# Cleanup
+statement ok
+DETACH testdb_filter;
