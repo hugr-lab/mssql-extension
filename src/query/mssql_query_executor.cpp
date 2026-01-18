@@ -1,6 +1,6 @@
 #include "query/mssql_query_executor.hpp"
 #include "connection/mssql_pool_manager.hpp"
-#include "tds/connection_pool.hpp"
+#include "tds/tds_connection_pool.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
 #include <chrono>

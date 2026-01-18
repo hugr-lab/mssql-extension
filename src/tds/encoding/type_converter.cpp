@@ -1,8 +1,8 @@
-#include "encoding/type_converter.hpp"
-#include "encoding/decimal_encoding.hpp"
-#include "encoding/datetime_encoding.hpp"
-#include "encoding/guid_encoding.hpp"
-#include "encoding/utf16.hpp"
+#include "tds/encoding/type_converter.hpp"
+#include "tds/encoding/decimal_encoding.hpp"
+#include "tds/encoding/datetime_encoding.hpp"
+#include "tds/encoding/guid_encoding.hpp"
+#include "tds/encoding/utf16.hpp"
 #include "tds/tds_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -27,9 +27,8 @@ static int GetTypeConverterDebugLevel() {
 	} } while(0)
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
-
-using namespace tds;
 
 LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	switch (column.type_id) {
@@ -462,4 +461,5 @@ void TypeConverter::ConvertGuid(const std::vector<uint8_t>& value,
 }
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

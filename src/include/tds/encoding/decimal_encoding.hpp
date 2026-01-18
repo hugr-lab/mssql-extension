@@ -5,6 +5,7 @@
 #include <vector>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 //===----------------------------------------------------------------------===//
@@ -29,4 +30,5 @@ public:
 };
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

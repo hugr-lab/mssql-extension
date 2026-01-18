@@ -12,19 +12,19 @@ namespace duckdb {
 // ConnectionHandleManager
 //===----------------------------------------------------------------------===//
 
-ConnectionHandleManager& ConnectionHandleManager::Instance() {
-	static ConnectionHandleManager instance;
+MSSQLConnectionHandleManager& MSSQLConnectionHandleManager::Instance() {
+	static MSSQLConnectionHandleManager instance;
 	return instance;
 }
 
-int64_t ConnectionHandleManager::AddConnection(std::shared_ptr<tds::TdsConnection> conn) {
+int64_t MSSQLConnectionHandleManager::AddConnection(std::shared_ptr<tds::TdsConnection> conn) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	int64_t handle = next_handle_++;
 	connections_[handle] = std::move(conn);
 	return handle;
 }
 
-std::shared_ptr<tds::TdsConnection> ConnectionHandleManager::GetConnection(int64_t handle) {
+std::shared_ptr<tds::TdsConnection> MSSQLConnectionHandleManager::GetConnection(int64_t handle) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = connections_.find(handle);
 	if (it != connections_.end()) {
@@ -33,7 +33,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionHandleManager::GetConnection(int64
 	return nullptr;
 }
 
-std::shared_ptr<tds::TdsConnection> ConnectionHandleManager::RemoveConnection(int64_t handle) {
+std::shared_ptr<tds::TdsConnection> MSSQLConnectionHandleManager::RemoveConnection(int64_t handle) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = connections_.find(handle);
 	if (it != connections_.end()) {
@@ -44,7 +44,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionHandleManager::RemoveConnection(in
 	return nullptr;
 }
 
-bool ConnectionHandleManager::HasConnection(int64_t handle) {
+bool MSSQLConnectionHandleManager::HasConnection(int64_t handle) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return connections_.find(handle) != connections_.end();
 }
@@ -53,7 +53,7 @@ bool ConnectionHandleManager::HasConnection(int64_t handle) {
 // mssql_open
 //===----------------------------------------------------------------------===//
 
-void MssqlOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &input_vector = args.data[0];
 
 	UnaryExecutor::Execute<string_t, int64_t>(input_vector, result, args.size(), [&](string_t input_str) {
@@ -124,7 +124,7 @@ void MssqlOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 		}
 
 		// Add to handle manager and return handle
-		return ConnectionHandleManager::Instance().AddConnection(std::move(conn));
+		return MSSQLConnectionHandleManager::Instance().AddConnection(std::move(conn));
 	});
 }
 
@@ -132,11 +132,11 @@ void MssqlOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 // mssql_close
 //===----------------------------------------------------------------------===//
 
-void MssqlCloseFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void MSSQLCloseFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &handle_vector = args.data[0];
 
 	UnaryExecutor::Execute<int64_t, bool>(handle_vector, result, args.size(), [&](int64_t handle) {
-		auto conn = ConnectionHandleManager::Instance().RemoveConnection(handle);
+		auto conn = MSSQLConnectionHandleManager::Instance().RemoveConnection(handle);
 		if (conn) {
 			conn->Close();
 		}
@@ -149,11 +149,11 @@ void MssqlCloseFunction(DataChunk &args, ExpressionState &state, Vector &result)
 // mssql_ping
 //===----------------------------------------------------------------------===//
 
-void MssqlPingFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &handle_vector = args.data[0];
 
 	UnaryExecutor::Execute<int64_t, bool>(handle_vector, result, args.size(), [&](int64_t handle) {
-		auto conn = ConnectionHandleManager::Instance().GetConnection(handle);
+		auto conn = MSSQLConnectionHandleManager::Instance().GetConnection(handle);
 		if (!conn) {
 			throw InvalidInputException("Invalid connection handle: %lld", handle);
 		}
@@ -166,7 +166,7 @@ void MssqlPingFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 // mssql_pool_stats table function
 //===----------------------------------------------------------------------===//
 
-TableFunction MssqlPoolStatsFunction::GetFunction() {
+TableFunction MSSQLPoolStatsFunction::GetFunction() {
 	// Create function with optional VARCHAR parameter
 	TableFunction func("mssql_pool_stats", {}, Execute, Bind, InitGlobal);
 	// Add overload with optional context_name parameter
@@ -174,9 +174,9 @@ TableFunction MssqlPoolStatsFunction::GetFunction() {
 	return func;
 }
 
-unique_ptr<FunctionData> MssqlPoolStatsFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
+unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<MssqlPoolStatsBindData>();
+	auto bind_data = make_uniq<MSSQLPoolStatsBindData>();
 
 	// Check if context_name parameter was provided
 	auto it = input.named_parameters.find("context_name");
@@ -216,10 +216,10 @@ unique_ptr<FunctionData> MssqlPoolStatsFunction::Bind(ClientContext &context, Ta
 	return bind_data;
 }
 
-unique_ptr<GlobalTableFunctionState> MssqlPoolStatsFunction::InitGlobal(ClientContext &context,
+unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientContext &context,
                                                                          TableFunctionInitInput &input) {
 	auto gstate = make_uniq<MssqlPoolStatsGlobalState>();
-	auto &bind_data = input.bind_data->Cast<MssqlPoolStatsBindData>();
+	auto &bind_data = input.bind_data->Cast<MSSQLPoolStatsBindData>();
 
 	if (bind_data.all_pools) {
 		// Get all pool names
@@ -235,7 +235,7 @@ unique_ptr<GlobalTableFunctionState> MssqlPoolStatsFunction::InitGlobal(ClientCo
 	return gstate;
 }
 
-void MssqlPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &gstate = input.global_state->Cast<MssqlPoolStatsGlobalState>();
 
 	if (gstate.current_index >= gstate.pool_names.size()) {
@@ -278,21 +278,21 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	//   - URI format: "mssql://user:password@host:port/database"
 	//   - Secret name (for backward compatibility)
 	ScalarFunctionSet open_func("mssql_open");
-	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MssqlOpenFunction));
+	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction));
 	loader.RegisterFunction(open_func);
 
 	// mssql_close(handle BIGINT) -> BOOLEAN
 	ScalarFunctionSet close_func("mssql_close");
-	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MssqlCloseFunction));
+	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction));
 	loader.RegisterFunction(close_func);
 
 	// mssql_ping(handle BIGINT) -> BOOLEAN
 	ScalarFunctionSet ping_func("mssql_ping");
-	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MssqlPingFunction));
+	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);
 
 	// mssql_pool_stats(context_name VARCHAR) -> TABLE
-	loader.RegisterFunction(MssqlPoolStatsFunction::GetFunction());
+	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunction());
 }
 
 }  // namespace duckdb

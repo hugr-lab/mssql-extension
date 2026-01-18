@@ -1,7 +1,8 @@
-#include "encoding/decimal_encoding.hpp"
+#include "tds/encoding/decimal_encoding.hpp"
 #include <cstring>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 hugeint_t DecimalEncoding::ConvertDecimal(const uint8_t* data, size_t length) {
@@ -46,4 +47,5 @@ hugeint_t DecimalEncoding::ConvertSmallMoney(const uint8_t* data) {
 }
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

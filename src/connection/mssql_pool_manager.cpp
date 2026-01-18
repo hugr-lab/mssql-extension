@@ -8,7 +8,7 @@ MssqlPoolManager& MssqlPoolManager::Instance() {
 }
 
 tds::ConnectionPool* MssqlPoolManager::GetOrCreatePool(const std::string& context_name,
-                                                        const PoolConfig& config,
+                                                        const MSSQLPoolConfig& config,
                                                         const std::string& host,
                                                         uint16_t port,
                                                         const std::string& username,

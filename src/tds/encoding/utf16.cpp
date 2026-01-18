@@ -1,6 +1,7 @@
-#include "encoding/utf16.hpp"
+#include "tds/encoding/utf16.hpp"
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 std::vector<uint8_t> Utf16LEEncode(const std::string& input) {
@@ -177,4 +178,5 @@ size_t Utf16LEByteLength(const std::string& input) {
 }
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

@@ -1,6 +1,6 @@
 #include "tds/tds_token_parser.hpp"
 #include "tds/tds_row_reader.hpp"
-#include "encoding/utf16.hpp"
+#include "tds/encoding/utf16.hpp"
 #include <cstring>
 #include <stdexcept>
 

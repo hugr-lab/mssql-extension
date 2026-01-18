@@ -1,4 +1,4 @@
-#include "tds/connection_pool.hpp"
+#include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
 namespace tds {

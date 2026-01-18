@@ -94,8 +94,8 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 // Loading Configuration
 //===----------------------------------------------------------------------===//
 
-PoolConfig LoadPoolConfig(ClientContext &context) {
-	PoolConfig config;
+MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
+	MSSQLPoolConfig config;
 	Value val;
 
 	if (context.TryGetCurrentSetting("mssql_connection_limit", val)) {

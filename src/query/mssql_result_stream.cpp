@@ -1,5 +1,5 @@
 #include "query/mssql_result_stream.hpp"
-#include "encoding/type_converter.hpp"
+#include "tds/encoding/type_converter.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_socket.hpp"
 #include "connection/mssql_pool_manager.hpp"
@@ -36,14 +36,14 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
     : connection_(std::move(connection)),
       context_name_(context_name),
       sql_(sql),
-      state_(ResultStreamState::Initializing),
+      state_(MSSQLResultStreamState::Initializing),
       is_cancelled_(false),
       rows_read_(0) {
 }
 
 MSSQLResultStream::~MSSQLResultStream() {
 	// If we're still in streaming state, try to cancel
-	if (state_ == ResultStreamState::Streaming) {
+	if (state_ == MSSQLResultStreamState::Streaming) {
 		Cancel();
 	}
 
@@ -65,7 +65,7 @@ MSSQLResultStream::~MSSQLResultStream() {
 }
 
 bool MSSQLResultStream::Initialize() {
-	if (state_ != ResultStreamState::Initializing) {
+	if (state_ != MSSQLResultStreamState::Initializing) {
 		throw InvalidInputException("MSSQLResultStream already initialized");
 	}
 
@@ -75,7 +75,7 @@ bool MSSQLResultStream::Initialize() {
 	}
 
 	// Read and parse until we get COLMETADATA
-	while (state_ == ResultStreamState::Initializing) {
+	while (state_ == MSSQLResultStreamState::Initializing) {
 		if (!ReadMoreData(read_timeout_ms_)) {
 			throw IOException("Connection closed while waiting for COLMETADATA");
 		}
@@ -96,11 +96,11 @@ bool MSSQLResultStream::Initialize() {
 
 				for (const auto& col : column_metadata_) {
 					column_names_.push_back(col.name);
-					column_types_.push_back(encoding::TypeConverter::GetDuckDBType(col));
+					column_types_.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
 				}
 
 				row_reader_ = make_uniq<tds::RowReader>(parsed_columns);
-				state_ = ResultStreamState::Streaming;
+				state_ = MSSQLResultStreamState::Streaming;
 				return true;
 			}
 
@@ -109,7 +109,7 @@ bool MSSQLResultStream::Initialize() {
 				errors_.push_back(error);
 				// Fatal errors (severity >= 20) throw immediately
 				if (error.IsFatal()) {
-					state_ = ResultStreamState::Error;
+					state_ = MSSQLResultStreamState::Error;
 					throw IOException("SQL Server fatal error [%d, severity %d]: %s",
 					                  error.number, error.severity, error.message);
 				}
@@ -123,13 +123,13 @@ bool MSSQLResultStream::Initialize() {
 			case tds::ParsedTokenType::Done:
 				// Unexpected DONE before COLMETADATA - might be empty result or error
 				if (!errors_.empty()) {
-					state_ = ResultStreamState::Error;
+					state_ = MSSQLResultStreamState::Error;
 					auto& err = errors_[0];
 					throw InvalidInputException("SQL Server error [%d, severity %d]: %s",
 					                            err.number, err.severity, err.message);
 				}
 				// Empty result set (e.g., UPDATE statement)
-				state_ = ResultStreamState::Complete;
+				state_ = MSSQLResultStreamState::Complete;
 				return true;
 
 			case tds::ParsedTokenType::None:
@@ -145,17 +145,17 @@ bool MSSQLResultStream::Initialize() {
 		}
 	}
 
-	return state_ == ResultStreamState::Streaming || state_ == ResultStreamState::Complete;
+	return state_ == MSSQLResultStreamState::Streaming || state_ == MSSQLResultStreamState::Complete;
 }
 
 idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 	auto chunk_start = std::chrono::steady_clock::now();
 
-	if (state_ == ResultStreamState::Complete || state_ == ResultStreamState::Error) {
+	if (state_ == MSSQLResultStreamState::Complete || state_ == MSSQLResultStreamState::Error) {
 		return 0;
 	}
 
-	if (state_ != ResultStreamState::Streaming) {
+	if (state_ != MSSQLResultStreamState::Streaming) {
 		throw InvalidInputException("MSSQLResultStream not in streaming state");
 	}
 
@@ -174,7 +174,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 	uint64_t read_time_us = 0;
 	uint64_t process_time_us = 0;
 
-	while (row_count < max_rows && state_ == ResultStreamState::Streaming) {
+	while (row_count < max_rows && state_ == MSSQLResultStreamState::Streaming) {
 		// Check for cancellation periodically
 		if (is_cancelled_.load(std::memory_order_acquire)) {
 			break;
@@ -199,7 +199,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 			auto done = parser_.GetDone();
 			if (done.HasError()) {
 				// Error indicated in DONE token
-				state_ = ResultStreamState::Error;
+				state_ = MSSQLResultStreamState::Error;
 				if (!errors_.empty()) {
 					auto& err = errors_[0];
 					throw InvalidInputException("SQL Server error [%d, severity %d]: %s",
@@ -208,7 +208,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 				throw InvalidInputException("SQL Server returned error status");
 			}
 			if (done.IsFinal()) {
-				state_ = ResultStreamState::Complete;
+				state_ = MSSQLResultStreamState::Complete;
 				// Transition connection back to Idle
 				connection_->TransitionState(tds::ConnectionState::Executing,
 				                             tds::ConnectionState::Idle);
@@ -221,7 +221,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 			errors_.push_back(error);
 			// Fatal errors (severity >= 20) throw immediately
 			if (error.IsFatal()) {
-				state_ = ResultStreamState::Error;
+				state_ = MSSQLResultStreamState::Error;
 				throw IOException("SQL Server fatal error [%d, severity %d]: %s",
 				                  error.number, error.severity, error.message);
 			}
@@ -235,13 +235,13 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 		case tds::ParsedTokenType::NeedMoreData:
 			// Check if parser is in terminal state (Complete or Error)
 			if (parser_.GetState() == tds::ParserState::Complete) {
-				state_ = ResultStreamState::Complete;
+				state_ = MSSQLResultStreamState::Complete;
 				connection_->TransitionState(tds::ConnectionState::Executing,
 				                             tds::ConnectionState::Idle);
 				goto exit_loop;  // Exit the while loop
 			}
 			if (parser_.GetState() == tds::ParserState::Error) {
-				state_ = ResultStreamState::Error;
+				state_ = MSSQLResultStreamState::Error;
 				throw IOException("TDS parse error: " + parser_.GetParseError());
 			}
 			{
@@ -261,11 +261,11 @@ idx_t MSSQLResultStream::FillChunk(DataChunk& chunk) {
 
 		case tds::ParsedTokenType::None:
 			if (parser_.GetState() == tds::ParserState::Error) {
-				state_ = ResultStreamState::Error;
+				state_ = MSSQLResultStreamState::Error;
 				throw IOException("TDS parse error: " + parser_.GetParseError());
 			}
 			if (parser_.GetState() == tds::ParserState::Complete) {
-				state_ = ResultStreamState::Complete;
+				state_ = MSSQLResultStreamState::Complete;
 				connection_->TransitionState(tds::ConnectionState::Executing,
 				                             tds::ConnectionState::Idle);
 			}
@@ -293,7 +293,7 @@ void MSSQLResultStream::ProcessRow(DataChunk& chunk, idx_t row_idx) {
 	const auto& row = parser_.GetRow();
 
 	for (idx_t col_idx = 0; col_idx < column_metadata_.size(); col_idx++) {
-		encoding::TypeConverter::ConvertValue(
+		tds::encoding::TypeConverter::ConvertValue(
 		    row.values[col_idx],
 		    row.null_mask[col_idx],
 		    column_metadata_[col_idx],
@@ -333,10 +333,10 @@ void MSSQLResultStream::Cancel() {
 	is_cancelled_.store(true, std::memory_order_release);
 
 	// Send ATTENTION signal if we're in streaming state
-	if (state_ == ResultStreamState::Streaming) {
+	if (state_ == MSSQLResultStreamState::Streaming) {
 		MSSQL_DEBUG_LOG(1, "Cancel: sending ATTENTION (state=Streaming, rows_read=%llu)",
 		                (unsigned long long)rows_read_);
-		state_ = ResultStreamState::Draining;
+		state_ = MSSQLResultStreamState::Draining;
 
 		if (connection_->SendAttention()) {
 			MSSQL_DEBUG_LOG(1, "Cancel: ATTENTION sent, starting drain");
@@ -370,7 +370,7 @@ void MSSQLResultStream::DrainAfterCancel() {
 	int read_count = 0;
 	int token_count = 0;
 
-	while (state_ == ResultStreamState::Draining) {
+	while (state_ == MSSQLResultStreamState::Draining) {
 		auto elapsed = std::chrono::steady_clock::now() - start;
 		if (elapsed > timeout) {
 			// Overall timeout - close connection, don't try to reuse
@@ -378,7 +378,7 @@ void MSSQLResultStream::DrainAfterCancel() {
 			                (long)std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
 			                read_count, token_count);
 			connection_->Close();
-			state_ = ResultStreamState::Error;
+			state_ = MSSQLResultStreamState::Error;
 			return;
 		}
 
@@ -402,7 +402,7 @@ void MSSQLResultStream::DrainAfterCancel() {
 					MSSQL_DEBUG_LOG(1, "DrainAfterCancel: SUCCESS - got ATTN ack in %ldms, connection reusable",
 					                (long)std::chrono::duration_cast<std::chrono::milliseconds>(
 					                    std::chrono::steady_clock::now() - start).count());
-					state_ = ResultStreamState::Complete;
+					state_ = MSSQLResultStreamState::Complete;
 					connection_->TransitionState(tds::ConnectionState::Cancelling,
 					                             tds::ConnectionState::Idle);
 					return;

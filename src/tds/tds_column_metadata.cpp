@@ -1,5 +1,5 @@
 #include "tds/tds_column_metadata.hpp"
-#include "encoding/utf16.hpp"
+#include "tds/encoding/utf16.hpp"
 #include <stdexcept>
 
 namespace duckdb {

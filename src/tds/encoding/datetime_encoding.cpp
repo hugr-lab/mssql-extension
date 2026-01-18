@@ -1,7 +1,8 @@
-#include "encoding/datetime_encoding.hpp"
+#include "tds/encoding/datetime_encoding.hpp"
 #include <cstring>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 // Days from 0001-01-01 to 1970-01-01
@@ -109,4 +110,5 @@ size_t DateTimeEncoding::GetTimeByteLength(uint8_t scale) {
 }
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

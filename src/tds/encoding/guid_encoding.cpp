@@ -1,7 +1,8 @@
-#include "encoding/guid_encoding.hpp"
+#include "tds/encoding/guid_encoding.hpp"
 #include <cstring>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 void GuidEncoding::ReorderGuidBytes(const uint8_t* input, uint8_t* output) {
@@ -68,4 +69,5 @@ hugeint_t GuidEncoding::ConvertGuid(const uint8_t* data) {
 }
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb
