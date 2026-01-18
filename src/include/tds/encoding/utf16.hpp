@@ -5,6 +5,7 @@
 #include <vector>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 //===----------------------------------------------------------------------===//
@@ -33,4 +34,5 @@ std::string Utf16LEDecode(const std::vector<uint8_t>& data);
 size_t Utf16LEByteLength(const std::string& input);
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

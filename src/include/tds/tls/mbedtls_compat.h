@@ -1,9 +1,10 @@
 /*
  * mbedtls_compat.h - Compatibility definitions for vcpkg mbedTLS with DuckDB
  *
- * This header provides definitions that are missing when DuckDB's stripped-down
- * mbedtls_config.h is found before vcpkg's full version due to include path ordering.
- * Force-include this header before any other includes to ensure these macros are defined.
+ * This header was originally created to provide missing definitions when DuckDB's
+ * stripped-down mbedtls_config.h was found before vcpkg's full version. Now that
+ * the TLS build filters out DuckDB's mbedtls include path, most of these are no
+ * longer needed but are kept for robustness.
  */
 
 #ifndef MSSQL_MBEDTLS_COMPAT_H
@@ -26,8 +27,7 @@
 #endif
 
 /* mbedtls_f_rng_t - Random number generator function type
- * This typedef is in platform_util.h but may not be available if
- * DuckDB's limited config is used.
+ * This typedef is in platform_util.h but may not be available in all configs.
  */
 #ifndef MBEDTLS_F_RNG_T_DEFINED
 #define MBEDTLS_F_RNG_T_DEFINED

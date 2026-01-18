@@ -30,7 +30,7 @@
 #include <cstring>
 
 #include "tds/tds_connection.hpp"
-#include "tds/connection_pool.hpp"
+#include "tds/tds_connection_pool.hpp"
 
 using namespace duckdb::tds;
 

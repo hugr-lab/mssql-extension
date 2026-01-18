@@ -12,9 +12,9 @@ namespace duckdb {
 
 // Global connection handle manager
 // Manages connections opened via mssql_open for diagnostic purposes
-class ConnectionHandleManager {
+class MSSQLConnectionHandleManager {
 public:
-	static ConnectionHandleManager& Instance();
+	static MSSQLConnectionHandleManager& Instance();
 
 	// Add a connection and return its handle
 	int64_t AddConnection(std::shared_ptr<tds::TdsConnection> conn);
@@ -29,7 +29,7 @@ public:
 	bool HasConnection(int64_t handle);
 
 private:
-	ConnectionHandleManager() : next_handle_(1) {}
+	MSSQLConnectionHandleManager() : next_handle_(1) {}
 
 	std::mutex mutex_;
 	std::unordered_map<int64_t, std::shared_ptr<tds::TdsConnection>> connections_;
@@ -44,35 +44,35 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader);
 // mssql_open(secret_name VARCHAR) -> BIGINT
 // Opens a connection using credentials from the named mssql secret
 // Returns connection handle for use with other diagnostic functions
-void MssqlOpenFunction(DataChunk &args, ExpressionState &state, Vector &result);
+void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result);
 
 // mssql_close(handle BIGINT) -> BOOLEAN
 // Closes a connection and releases resources
 // Idempotent: closing already-closed handle returns true
-void MssqlCloseFunction(DataChunk &args, ExpressionState &state, Vector &result);
+void MSSQLCloseFunction(DataChunk &args, ExpressionState &state, Vector &result);
 
 // mssql_ping(handle BIGINT) -> BOOLEAN
 // Tests if a connection is alive by sending a minimal TDS packet
 // Returns true if connection responds, false otherwise
-void MssqlPingFunction(DataChunk &args, ExpressionState &state, Vector &result);
+void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result);
 
 // mssql_pool_stats table function
 // Returns statistics for connection pools associated with attached databases
 // If context_name is provided, returns stats for that specific pool
 // If context_name is not provided, returns stats for all pools
-struct MssqlPoolStatsBindData : public FunctionData {
+struct MSSQLPoolStatsBindData : public FunctionData {
 	std::string context_name;  // Empty string means all pools
 	bool all_pools;            // True if no parameter provided
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<MssqlPoolStatsBindData>();
+		auto result = make_uniq<MSSQLPoolStatsBindData>();
 		result->context_name = context_name;
 		result->all_pools = all_pools;
 		return result;
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
-		auto &other = other_p.Cast<MssqlPoolStatsBindData>();
+		auto &other = other_p.Cast<MSSQLPoolStatsBindData>();
 		return context_name == other.context_name && all_pools == other.all_pools;
 	}
 };
@@ -82,7 +82,7 @@ struct MssqlPoolStatsGlobalState : public GlobalTableFunctionState {
 	idx_t current_index = 0;              // Current position in pool_names
 };
 
-class MssqlPoolStatsFunction {
+class MSSQLPoolStatsFunction {
 public:
 	static TableFunction GetFunction();
 

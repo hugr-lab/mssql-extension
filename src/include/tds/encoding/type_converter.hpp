@@ -8,6 +8,7 @@
 #include <vector>
 
 namespace duckdb {
+namespace tds {
 namespace encoding {
 
 //===----------------------------------------------------------------------===//
@@ -79,4 +80,5 @@ private:
 };
 
 }  // namespace encoding
+}  // namespace tds
 }  // namespace duckdb

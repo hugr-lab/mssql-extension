@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tds/connection_pool.hpp"
+#include "tds/tds_connection_pool.hpp"
 #include "connection/mssql_settings.hpp"
 #include <memory>
 #include <unordered_map>
@@ -20,7 +20,7 @@ public:
 	// Parameters:
 	//   use_encrypt - if true, enables TLS encryption for all connections in the pool
 	tds::ConnectionPool* GetOrCreatePool(const std::string& context_name,
-	                                      const PoolConfig& config,
+	                                      const MSSQLPoolConfig& config,
 	                                      const std::string& host,
 	                                      uint16_t port,
 	                                      const std::string& username,

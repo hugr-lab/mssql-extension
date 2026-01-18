@@ -115,7 +115,6 @@ docker-status:
 
 # Load environment from .env file if it exists
 -include .env
-export
 
 # Default test environment variables (can be overridden by .env or command line)
 MSSQL_TEST_HOST ?= localhost
@@ -137,12 +136,19 @@ export MSSQL_TEST_PASS
 export MSSQL_TEST_DB
 export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
-export MSSQL_TEST_DSN_TLS
+# NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default because TLS tests require
+# the loadable extension (.duckdb_extension). The built-in test runner uses the
+# static extension which has a TLS stub. To run TLS tests, use the loadable
+# extension with standalone DuckDB and manually export MSSQL_TEST_DSN_TLS.
+# export MSSQL_TEST_DSN_TLS
 
 # Integration tests - requires SQL Server running
+# NOTE: TLS tests are skipped because the test runner uses the static extension
+# which has a TLS stub. To run TLS tests, use the loadable extension.
 integration-test: release
 	@echo "Running integration tests..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
+	@echo "NOTE: TLS tests are skipped (static extension has TLS stub)"
 	@echo ""
 	@echo "Test environment:"
 	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"
@@ -151,7 +157,6 @@ integration-test: release
 	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
 	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
 	@echo "  MSSQL_TEST_URI=$(MSSQL_TEST_URI)"
-	@echo "  MSSQL_TEST_DSN_TLS=$(MSSQL_TEST_DSN_TLS)"
 	@echo ""
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "ERROR: SQL Server is not running or not healthy."; \

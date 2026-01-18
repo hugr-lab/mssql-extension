@@ -8,7 +8,7 @@ namespace duckdb {
 
 // Pool configuration structure
 // Loaded from DuckDB settings at runtime
-struct PoolConfig {
+struct MSSQLPoolConfig {
 	size_t connection_limit = tds::DEFAULT_CONNECTION_LIMIT;
 	bool connection_cache = tds::DEFAULT_CONNECTION_CACHE;
 	int connection_timeout = tds::DEFAULT_CONNECTION_TIMEOUT;
@@ -21,6 +21,6 @@ struct PoolConfig {
 void RegisterMSSQLSettings(ExtensionLoader &loader);
 
 // Load current pool configuration from context settings
-PoolConfig LoadPoolConfig(ClientContext &context);
+MSSQLPoolConfig LoadPoolConfig(ClientContext &context);
 
 }  // namespace duckdb

@@ -7,8 +7,8 @@
 // This file wraps TlsImpl from the static library which contains mbedTLS.
 //===----------------------------------------------------------------------===//
 
-#include "tds_tls_context.hpp"
-#include "tds_tls_impl.hpp"
+#include "tds/tls/tds_tls_context.hpp"
+#include "tds/tls/tds_tls_impl.hpp"
 
 #include <cstdio>
 #include <cstdlib>

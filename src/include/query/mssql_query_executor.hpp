@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mssql_result_stream.hpp"
-#include "tds/connection_pool.hpp"
+#include "tds/tds_connection_pool.hpp"
 #include "duckdb.hpp"
 #include <memory>
 #include <string>

@@ -1,5 +1,5 @@
 #include "tds/tds_protocol.hpp"
-#include "encoding/utf16.hpp"
+#include "tds/encoding/utf16.hpp"
 #include <cstring>
 #include <stdexcept>
 #ifdef _WIN32

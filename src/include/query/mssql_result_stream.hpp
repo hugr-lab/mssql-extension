@@ -3,7 +3,7 @@
 #include "tds/tds_connection.hpp"
 #include "tds/tds_token_parser.hpp"
 #include "tds/tds_row_reader.hpp"
-#include "encoding/type_converter.hpp"
+#include "tds/encoding/type_converter.hpp"
 #include "duckdb.hpp"
 #include <atomic>
 #include <memory>
@@ -16,7 +16,7 @@ class ClientContext;
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
 
-enum class ResultStreamState : uint8_t {
+enum class MSSQLResultStreamState : uint8_t {
 	Initializing,   // Waiting for COLMETADATA
 	Streaming,      // Yielding ROW tokens
 	Draining,       // Cancellation in progress
@@ -55,7 +55,7 @@ public:
 	void Cancel();
 
 	// Check if query is complete
-	bool IsComplete() const { return state_ == ResultStreamState::Complete; }
+	bool IsComplete() const { return state_ == MSSQLResultStreamState::Complete; }
 
 	// Check if cancelled
 	bool IsCancelled() const { return is_cancelled_.load(std::memory_order_acquire); }
@@ -96,7 +96,7 @@ private:
 	string sql_;
 
 	// State
-	ResultStreamState state_;
+	MSSQLResultStreamState state_;
 	std::atomic<bool> is_cancelled_;
 
 	// Parser and reader
