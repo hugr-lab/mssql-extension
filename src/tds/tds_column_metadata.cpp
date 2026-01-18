@@ -78,6 +78,25 @@ bool ColumnMetadata::IsNullableVariant() const {
 	}
 }
 
+bool ColumnMetadata::IsPLPType() const {
+	// PLP (Partially Length-Prefixed) encoding is used for MAX types
+	// where max_length == 0xFFFF (65535)
+	if (max_length != 0xFFFF) {
+		return false;
+	}
+	switch (type_id) {
+	case TDS_TYPE_BIGCHAR:      // CHAR(MAX) - rare but possible
+	case TDS_TYPE_BIGVARCHAR:   // VARCHAR(MAX)
+	case TDS_TYPE_NCHAR:        // NCHAR(MAX) - rare but possible
+	case TDS_TYPE_NVARCHAR:     // NVARCHAR(MAX)
+	case TDS_TYPE_BIGBINARY:    // BINARY(MAX) - rare but possible
+	case TDS_TYPE_BIGVARBINARY: // VARBINARY(MAX)
+		return true;
+	default:
+		return false;
+	}
+}
+
 size_t ColumnMetadata::GetFixedSize() const {
 	switch (type_id) {
 	case TDS_TYPE_TINYINT: return 1;

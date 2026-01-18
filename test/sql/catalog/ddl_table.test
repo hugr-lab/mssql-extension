@@ -1,0 +1,95 @@
+# name: test/sql/catalog/ddl_table.test
+# description: Test CREATE TABLE and DROP TABLE DDL via catalog
+# group: [mssql]
+
+# Requires MSSQL server and secret configured
+# Set up with: CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+
+require mssql
+
+# Test 1: Basic extension load
+statement ok
+SELECT mssql_version();
+
+# Integration tests - uncomment when running against a live SQL Server:
+
+# Test 2: Create secret for testing
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# Test 3: Attach database (default READ_WRITE mode)
+# statement ok
+# ATTACH '' AS mssql_ddl_test (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 4: CREATE TABLE with basic types
+# statement ok
+# CREATE TABLE mssql_ddl_test.dbo.test_ddl_create (
+#     id INTEGER,
+#     name VARCHAR,
+#     active BOOLEAN
+# );
+
+# Test 5: Verify table exists by selecting from it
+# statement ok
+# SELECT * FROM mssql_ddl_test.dbo.test_ddl_create;
+
+# Test 6: DROP TABLE
+# statement ok
+# DROP TABLE mssql_ddl_test.dbo.test_ddl_create;
+
+# Test 7: Verify table is gone (should error)
+# statement error
+# SELECT * FROM mssql_ddl_test.dbo.test_ddl_create;
+# ----
+# does not exist
+
+# Test 8: CREATE TABLE with various DuckDB types
+# statement ok
+# CREATE TABLE mssql_ddl_test.dbo.test_all_types (
+#     col_bool BOOLEAN,
+#     col_tinyint TINYINT,
+#     col_smallint SMALLINT,
+#     col_int INTEGER,
+#     col_bigint BIGINT,
+#     col_float FLOAT,
+#     col_double DOUBLE,
+#     col_decimal DECIMAL(10, 2),
+#     col_varchar VARCHAR,
+#     col_blob BLOB,
+#     col_date DATE,
+#     col_time TIME,
+#     col_timestamp TIMESTAMP,
+#     col_uuid UUID
+# );
+
+# Test 9: Verify all types table exists
+# statement ok
+# SELECT * FROM mssql_ddl_test.dbo.test_all_types;
+
+# Test 10: Cleanup
+# statement ok
+# DROP TABLE mssql_ddl_test.dbo.test_all_types;
+
+# Test 11: CREATE TABLE with special characters in name
+# statement ok
+# CREATE TABLE mssql_ddl_test.dbo."test_with spaces" (id INTEGER);
+
+# Test 12: DROP TABLE with special characters
+# statement ok
+# DROP TABLE mssql_ddl_test.dbo."test_with spaces";
+
+# Test 13: Detach catalog
+# statement ok
+# DETACH mssql_ddl_test;
+
+# Test 14: READ_ONLY mode blocks CREATE TABLE
+# statement ok
+# ATTACH '' AS mssql_ro (TYPE mssql, SECRET mssql_test_secret, READ_ONLY);
+
+# statement error
+# CREATE TABLE mssql_ro.dbo.should_fail (id INTEGER);
+# ----
+# read-only mode
+
+# statement ok
+# DETACH mssql_ro;

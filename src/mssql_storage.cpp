@@ -432,9 +432,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	    ctx->connection_info->use_encrypt
 	);
 
-	// Create MSSQLCatalog with connection info and read-only access mode
+	// Create MSSQLCatalog with connection info and access mode from options
 	// The catalog will use the connection pool to query SQL Server
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, AccessMode::READ_ONLY);
+	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, options.access_mode);
 	catalog->Initialize(false);
 
 	return std::move(catalog);

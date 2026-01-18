@@ -1,6 +1,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "mssql_functions.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
@@ -105,13 +106,42 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context,
 }
 
 unique_ptr<BaseStatistics> MSSQLTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
-	// We don't have detailed statistics from SQL Server
+	// We don't have detailed column-level statistics from SQL Server
+	// Table-level cardinality is provided via GetStorageInfo
 	return nullptr;
 }
 
 TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	TableStorageInfo info;
-	info.cardinality = approx_row_count_;
+
+	// Try to get fresh row count from statistics provider
+	auto &mssql_catalog = GetMSSQLCatalog();
+	auto &mssql_schema = GetMSSQLSchema();
+
+	try {
+		auto &pool = mssql_catalog.GetConnectionPool();
+		auto connection = pool.Acquire();
+
+		if (connection) {
+			auto &stats_provider = mssql_catalog.GetStatisticsProvider();
+			idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
+			info.cardinality = row_count;
+			pool.Release(std::move(connection));
+			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)",
+			               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)row_count);
+		} else {
+			// Fallback to cached row count if connection fails
+			info.cardinality = approx_row_count_;
+			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
+			               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+		}
+	} catch (...) {
+		// Fallback to cached row count on any error
+		info.cardinality = approx_row_count_;
+		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)",
+		               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+	}
+
 	return info;
 }
 

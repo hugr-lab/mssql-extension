@@ -292,7 +292,26 @@ exit_loop:
 void MSSQLResultStream::ProcessRow(DataChunk& chunk, idx_t row_idx) {
 	const auto& row = parser_.GetRow();
 
-	for (idx_t col_idx = 0; col_idx < column_metadata_.size(); col_idx++) {
+	// Determine how many columns to fill:
+	// - If columns_to_fill_ was explicitly set (e.g., for COUNT(*)), use that
+	// - Otherwise, fill up to chunk's column count (but not more than we have data for)
+	idx_t cols_to_fill;
+	if (columns_to_fill_ != static_cast<idx_t>(-1)) {
+		// Explicitly set - use this value (may be 0 for COUNT(*))
+		cols_to_fill = std::min(columns_to_fill_, static_cast<idx_t>(column_metadata_.size()));
+	} else {
+		// Default behavior - fill columns that exist in both SQL result and chunk
+		cols_to_fill = std::min(static_cast<idx_t>(column_metadata_.size()), chunk.ColumnCount());
+	}
+
+	// Debug: log column count info on first row
+	if (row_idx == 0) {
+		MSSQL_DEBUG_LOG(1, "ProcessRow: sql_columns=%zu, chunk_columns=%llu, columns_to_fill_=%llu, cols_to_fill=%llu",
+		                column_metadata_.size(), (unsigned long long)chunk.ColumnCount(),
+		                (unsigned long long)columns_to_fill_, (unsigned long long)cols_to_fill);
+	}
+
+	for (idx_t col_idx = 0; col_idx < cols_to_fill; col_idx++) {
 		tds::encoding::TypeConverter::ConvertValue(
 		    row.values[col_idx],
 		    row.null_mask[col_idx],

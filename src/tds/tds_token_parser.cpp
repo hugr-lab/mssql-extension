@@ -3,6 +3,25 @@
 #include "tds/encoding/utf16.hpp"
 #include <cstring>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstdio>
+#include <sstream>
+#include <iomanip>
+
+// Debug logging controlled by MSSQL_DEBUG environment variable
+static int GetParserDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char* env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define TDS_PARSER_DEBUG(level, fmt, ...) \
+	do { if (GetParserDebugLevel() >= level) { \
+		fprintf(stderr, "[TDS PARSER] " fmt "\n", ##__VA_ARGS__); \
+	} } while(0)
 
 namespace duckdb {
 namespace tds {
@@ -128,7 +147,17 @@ ParsedTokenType TokenParser::TryParseNext() {
 		return TryParseNext();  // Try next token
 
 	default:
-		// Unknown token - try to skip if it has length prefix
+		// Unknown token - dump buffer for debugging
+		{
+			std::ostringstream hex_dump;
+			size_t dump_len = std::min(Available(), static_cast<size_t>(32));
+			for (size_t i = 0; i < dump_len; i++) {
+				hex_dump << std::hex << std::setw(2) << std::setfill('0')
+				         << static_cast<int>(Current()[i]) << " ";
+			}
+			TDS_PARSER_DEBUG(1, "Unknown token 0x%02x at pos=%zu, buffer_size=%zu, available=%zu, hex: %s",
+			                 token_type, buffer_pos_, buffer_.size(), Available(), hex_dump.str().c_str());
+		}
 		parse_error_ = "Unknown token type: 0x" + std::to_string(token_type);
 		state_ = ParserState::Error;
 		return ParsedTokenType::None;

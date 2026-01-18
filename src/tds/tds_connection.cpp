@@ -188,7 +188,10 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 }
 
 bool TdsConnection::DoLogin7(const std::string& username, const std::string& password, const std::string& database) {
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database);
+	// Request larger packet size for better handling of VARCHAR(MAX)/NVARCHAR(MAX) data
+	// Default is 4096, but we request 32767 (TDS_MAX_PACKET_SIZE) for larger PLP data
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database,
+	                                           "DuckDB MSSQL Extension", TDS_MAX_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

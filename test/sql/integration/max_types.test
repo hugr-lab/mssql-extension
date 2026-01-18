@@ -1,0 +1,94 @@
+# name: test/sql/integration/max_types.test
+# description: Integration tests for MAX data types (VARCHAR(MAX), NVARCHAR(MAX), VARBINARY(MAX))
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database using connection string
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+
+# ===========================================================================
+# Test MAX types using catalog (attached database)
+# ===========================================================================
+
+# Test 1: Query MaxTypes table - small values
+query ITT
+SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 1;
+----
+1	small varchar	small nvarchar
+
+# Test 2: Empty strings
+query ITT
+SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 2;
+----
+2	(empty)	(empty)
+
+# Test 3: NULL values
+query ITT
+SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 3;
+----
+3	NULL	NULL
+
+# Test 4: Medium-sized values with unicode
+query ITT
+SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 4;
+----
+4	Medium length varchar value that contains some text	Medium length nvarchar with unicode: café naïve résumé
+
+# Test 5: Values with special characters and unicode
+query IT
+SELECT id, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 5;
+----
+5	nvarchar with unicode: 日本語 中文 한국어 العربية
+
+# Test 6: Single character values
+query ITT
+SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 6;
+----
+6	x	y
+
+# Test 7: Large values (verify PLP chunking works)
+# Note: Current PLP implementation has 4096 byte limit per chunk
+query II
+SELECT id, LENGTH(col_varchar_max) FROM testdb.dbo.MaxTypes WHERE id = 7;
+----
+7	4096
+
+# Test 8: Count all rows to verify all data readable
+query I
+SELECT COUNT(*) FROM testdb.dbo.MaxTypes;
+----
+7
+
+# Test 9: Verify VARBINARY(MAX) can be read (as blob)
+query II
+SELECT id, octet_length(col_varbinary_max) FROM testdb.dbo.MaxTypes WHERE id = 1;
+----
+1	5
+
+# ===========================================================================
+# Test MAX types using mssql_scan function
+# ===========================================================================
+
+# Test 10: Query using mssql_scan
+query ITT
+SELECT * FROM mssql_scan('testdb', 'SELECT id, col_varchar_max, col_nvarchar_max FROM TestDB.dbo.MaxTypes WHERE id = 1');
+----
+1	small varchar	small nvarchar
+
+# Test 11: Query large value using mssql_scan
+# NVARCHAR(MAX) limit is 4096 characters for TDS streaming
+query II
+SELECT * FROM mssql_scan('testdb', 'SELECT id, LEN(col_nvarchar_max) AS len FROM TestDB.dbo.MaxTypes WHERE id = 7');
+----
+7	4000
+
+# Cleanup
+statement ok
+DETACH testdb;

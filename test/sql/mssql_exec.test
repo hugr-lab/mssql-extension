@@ -1,0 +1,81 @@
+# name: test/sql/mssql_exec.test
+# description: Test mssql_exec scalar function
+# group: [mssql]
+
+# mssql_exec uses the attached database name (context), not the secret name
+# Set up with:
+# CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+# ATTACH '' AS mssql_db (TYPE mssql, SECRET mssql_test_secret);
+
+require mssql
+
+# Test 1: mssql_exec function exists
+statement ok
+SELECT mssql_version();
+
+# Test 2: mssql_exec with unknown context fails with clear error
+statement error
+SELECT mssql_exec('nonexistent_context', 'SELECT 1');
+----
+Unknown context 'nonexistent_context'
+
+# Test 3: mssql_exec with valid context (requires server)
+# Skip if no server available - these are integration tests
+# Uncomment when running against a live SQL Server:
+
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# statement ok
+# ATTACH '' AS mssql_db (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 4: Basic DDL execution
+# query I
+# SELECT mssql_exec('mssql_db', 'CREATE TABLE test_exec_table (id INT, name NVARCHAR(50))');
+# ----
+# 0
+
+# Test 5: INSERT returns affected row count
+# query I
+# SELECT mssql_exec('mssql_db', 'INSERT INTO test_exec_table VALUES (1, N''Alice''), (2, N''Bob'')');
+# ----
+# 2
+
+# Test 6: UPDATE returns affected row count
+# query I
+# SELECT mssql_exec('mssql_db', 'UPDATE test_exec_table SET name = N''Charlie'' WHERE id = 1');
+# ----
+# 1
+
+# Test 7: DELETE returns affected row count
+# query I
+# SELECT mssql_exec('mssql_db', 'DELETE FROM test_exec_table WHERE id = 2');
+# ----
+# 1
+
+# Test 8: Cleanup
+# query I
+# SELECT mssql_exec('mssql_db', 'DROP TABLE test_exec_table');
+# ----
+# 0
+
+# Test 9: SQL Server error is surfaced properly
+# statement error
+# SELECT mssql_exec('mssql_db', 'SELECT * FROM nonexistent_table_xyz');
+# ----
+# MSSQL execution error
+
+# Test 10: READ_ONLY mode blocks mssql_exec
+# statement ok
+# ATTACH '' AS mssql_ro (TYPE mssql, SECRET mssql_test_secret, READ_ONLY);
+
+# statement error
+# SELECT mssql_exec('mssql_ro', 'CREATE TABLE should_fail (id INT)');
+# ----
+# read-only mode
+
+# statement ok
+# DETACH mssql_ro;
+
+# statement ok
+# DETACH mssql_db;

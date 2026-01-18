@@ -1,0 +1,51 @@
+# name: test/sql/catalog/statistics.test
+# description: Test table statistics from SQL Server DMVs
+# group: [mssql]
+
+# Requires MSSQL server and secret configured
+# Set up with: CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+
+require mssql
+
+# Test 1: Basic extension load
+statement ok
+SELECT mssql_version();
+
+# Integration tests - uncomment when running against a live SQL Server:
+
+# Test 2: Create secret for testing
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# Test 3: Attach database
+# statement ok
+# ATTACH '' AS mssql_stats_test (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 4: Create a test table with some data
+# statement ok
+# CREATE TABLE mssql_stats_test.dbo.stats_test_table (id INTEGER, value VARCHAR);
+
+# Test 5: Insert some rows for statistics
+# statement ok
+# INSERT INTO mssql_stats_test.dbo.stats_test_table (id, value) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+# Test 6: Query the table (should work with statistics)
+# query II
+# SELECT * FROM mssql_stats_test.dbo.stats_test_table ORDER BY id;
+# ----
+# 1	a
+# 2	b
+# 3	c
+
+# Test 7: EXPLAIN should show cardinality estimate
+# statement ok
+# EXPLAIN SELECT * FROM mssql_stats_test.dbo.stats_test_table;
+
+# Test 8: Clean up
+# statement ok
+# DROP TABLE mssql_stats_test.dbo.stats_test_table;
+
+# Test 9: Detach
+# statement ok
+# DETACH mssql_stats_test;
+

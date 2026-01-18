@@ -76,6 +76,14 @@ private:
 	size_t ReadGuidType(const uint8_t* data, size_t length,
 	                    std::vector<uint8_t>& value, bool& is_null);
 
+	// PLP (Partially Length-Prefixed) type reader for MAX types
+	// MAX types use: 8-byte total length + chunks (4-byte length + data) + terminator (4-byte 0)
+	size_t ReadPLPType(const uint8_t* data, size_t length,
+	                   std::vector<uint8_t>& value, bool& is_null);
+
+	// PLP type skipper for MAX types
+	size_t SkipPLPType(const uint8_t* data, size_t length);
+
 	const std::vector<ColumnMetadata>& columns_;
 };
 

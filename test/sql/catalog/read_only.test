@@ -1,0 +1,74 @@
+# name: test/sql/catalog/read_only.test
+# description: Test READ_ONLY mode blocks DDL operations
+# group: [mssql]
+
+# Requires MSSQL server and secret configured
+# Set up with: CREATE SECRET mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword');
+
+require mssql
+
+# Test 1: Basic extension load
+statement ok
+SELECT mssql_version();
+
+# Integration tests - uncomment when running against a live SQL Server:
+
+# Test 2: Create secret for testing
+# statement ok
+# CREATE SECRET IF NOT EXISTS mssql_test_secret (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password 'YourPassword123');
+
+# Test 3: Attach database in READ_ONLY mode
+# statement ok
+# ATTACH '' AS mssql_ro (TYPE mssql, SECRET mssql_test_secret, READ_ONLY);
+
+# Test 4: SELECT queries work in READ_ONLY mode
+# statement ok
+# SELECT * FROM mssql_ro.dbo.sysobjects LIMIT 1;
+
+# Test 5: CREATE TABLE is blocked in READ_ONLY mode
+# statement error
+# CREATE TABLE mssql_ro.dbo.test_table (id INTEGER);
+# ----
+# read-only mode
+
+# Test 6: DROP TABLE is blocked in READ_ONLY mode (even for non-existent table)
+# statement error
+# DROP TABLE mssql_ro.dbo.nonexistent_table;
+# ----
+# read-only mode
+
+# Test 7: CREATE SCHEMA is blocked in READ_ONLY mode
+# statement error
+# CREATE SCHEMA mssql_ro.test_schema;
+# ----
+# read-only mode
+
+# Test 8: DROP SCHEMA is blocked in READ_ONLY mode
+# statement error
+# DROP SCHEMA mssql_ro.dbo;
+# ----
+# read-only mode
+
+# Test 9: mssql_exec is blocked when catalog is attached in READ_ONLY mode
+# statement error
+# SELECT mssql_exec('mssql_test_secret', 'CREATE TABLE test_ro_table (id INT)');
+# ----
+# read-only mode
+
+# Test 10: Detach read-only catalog
+# statement ok
+# DETACH mssql_ro;
+
+# Test 11: Attach database in READ_WRITE mode (default)
+# statement ok
+# ATTACH '' AS mssql_rw (TYPE mssql, SECRET mssql_test_secret);
+
+# Test 12: mssql_exec works in READ_WRITE mode
+# query I
+# SELECT mssql_exec('mssql_test_secret', 'SELECT 1');
+# ----
+# 0
+
+# Test 13: Cleanup
+# statement ok
+# DETACH mssql_rw;

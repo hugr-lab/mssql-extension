@@ -1,11 +1,17 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "catalog/mssql_ddl_translator.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 namespace duckdb {
 
@@ -73,66 +79,249 @@ void MSSQLSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEn
 }
 
 //===----------------------------------------------------------------------===//
-// Write Operations (all throw - read-only catalog)
+// Write Operations - Check access mode and throw appropriate error
 //===----------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                           BoundCreateTableInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE TABLE is not supported");
+	// Check if catalog is read-only
+	auto &mssql_catalog = GetMSSQLCatalog();
+	mssql_catalog.CheckWriteAccess("CREATE TABLE");
+
+	// Get table name and columns from bound info
+	auto &base_info = info.Base();
+	string table_name = base_info.table;
+
+	// Extract columns from the bound info
+	// BoundCreateTableInfo contains the resolved column definitions
+	auto &columns = base_info.columns;
+
+	// Generate T-SQL for CREATE TABLE
+	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns);
+
+	// Execute DDL on SQL Server
+	if (transaction.HasContext()) {
+		mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
+	} else {
+		throw InternalException("Cannot execute CREATE TABLE without client context");
+	}
+
+	// Invalidate cache so the new table is visible
+	mssql_catalog.InvalidateMetadataCache();
+
+	// Re-load the table entry from SQL Server
+	// First ensure cache is loaded
+	mssql_catalog.EnsureCacheLoaded(transaction.GetContext());
+
+	// Look up the newly created table
+	return tables_.GetEntry(transaction.GetContext(), table_name);
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateFunction(CatalogTransaction transaction,
                                                              CreateFunctionInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE FUNCTION is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE FUNCTION");
+	throw NotImplementedException("MSSQL catalog: CREATE FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateIndex(CatalogTransaction transaction,
                                                           CreateIndexInfo &info,
                                                           TableCatalogEntry &table) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE INDEX is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE INDEX");
+	throw NotImplementedException("MSSQL catalog: CREATE INDEX via DDL is not yet implemented. "
+	                              "Use mssql_exec() to execute T-SQL directly.");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateView(CatalogTransaction transaction,
                                                          CreateViewInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE VIEW is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE VIEW");
+	throw NotImplementedException("MSSQL catalog: CREATE VIEW via DDL is not yet implemented. "
+	                              "Use mssql_exec() to execute T-SQL directly.");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateSequence(CatalogTransaction transaction,
                                                              CreateSequenceInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE SEQUENCE is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE SEQUENCE");
+	throw NotImplementedException("MSSQL catalog: CREATE SEQUENCE is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
                                                                   CreateTableFunctionInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE TABLE FUNCTION is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE TABLE FUNCTION");
+	throw NotImplementedException("MSSQL catalog: CREATE TABLE FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
                                                                  CreateCopyFunctionInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE COPY FUNCTION is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE COPY FUNCTION");
+	throw NotImplementedException("MSSQL catalog: CREATE COPY FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
                                                                    CreatePragmaFunctionInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE PRAGMA FUNCTION is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE PRAGMA FUNCTION");
+	throw NotImplementedException("MSSQL catalog: CREATE PRAGMA FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateCollation(CatalogTransaction transaction,
                                                               CreateCollationInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE COLLATION is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE COLLATION");
+	throw NotImplementedException("MSSQL catalog: CREATE COLLATION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateType(CatalogTransaction transaction,
                                                          CreateTypeInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE TYPE is not supported");
+	GetMSSQLCatalog().CheckWriteAccess("CREATE TYPE");
+	throw NotImplementedException("MSSQL catalog: CREATE TYPE is not supported");
 }
 
 void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: ALTER is not supported");
+	auto &mssql_catalog = GetMSSQLCatalog();
+	mssql_catalog.CheckWriteAccess("ALTER");
+
+	// Check if this is an ALTER TABLE operation
+	if (info.type != AlterType::ALTER_TABLE) {
+		throw NotImplementedException("MSSQL catalog: ALTER %s via DDL is not yet implemented. "
+		                              "Use mssql_exec() to execute T-SQL directly.",
+		                              EnumUtil::ToString(info.type));
+	}
+
+	auto &alter_table_info = info.Cast<AlterTableInfo>();
+	string tsql;
+
+	// The table name is stored in the base AlterInfo class
+	const string &table_name = alter_table_info.name;
+
+	switch (alter_table_info.alter_table_type) {
+	case AlterTableType::RENAME_TABLE: {
+		auto &rename_info = alter_table_info.Cast<RenameTableInfo>();
+		tsql = MSSQLDDLTranslator::TranslateRenameTable(name, table_name, rename_info.new_table_name);
+		break;
+	}
+
+	case AlterTableType::ADD_COLUMN: {
+		auto &add_info = alter_table_info.Cast<AddColumnInfo>();
+		tsql = MSSQLDDLTranslator::TranslateAddColumn(name, table_name, add_info.new_column);
+		break;
+	}
+
+	case AlterTableType::REMOVE_COLUMN: {
+		auto &remove_info = alter_table_info.Cast<RemoveColumnInfo>();
+		tsql = MSSQLDDLTranslator::TranslateDropColumn(name, table_name, remove_info.removed_column);
+		break;
+	}
+
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename_col_info = alter_table_info.Cast<RenameColumnInfo>();
+		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name, table_name,
+		                                                  rename_col_info.old_name, rename_col_info.new_name);
+		break;
+	}
+
+	case AlterTableType::ALTER_COLUMN_TYPE: {
+		auto &type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
+		// SQL Server requires specifying nullability when altering type
+		// We default to NULL since we don't have that info easily available
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name, table_name,
+		                                                     type_info.column_name, type_info.target_type, true);
+		break;
+	}
+
+	case AlterTableType::SET_NOT_NULL: {
+		auto &notnull_info = alter_table_info.Cast<SetNotNullInfo>();
+		// For SET NOT NULL, we need the column's current type
+		// Look up the table to get the column type
+		if (!transaction.HasContext()) {
+			throw InternalException("Cannot execute SET NOT NULL without client context");
+		}
+		auto entry = tables_.GetEntry(transaction.GetContext(), table_name);
+		if (!entry) {
+			throw CatalogException("Table '%s' not found", table_name);
+		}
+		auto &mssql_table = entry->Cast<MSSQLTableEntry>();
+		LogicalType col_type;
+		bool found = false;
+		for (auto &col : mssql_table.GetMSSQLColumns()) {
+			if (col.name == notnull_info.column_name) {
+				col_type = col.duckdb_type;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw CatalogException("Column '%s' not found in table '%s'",
+			                       notnull_info.column_name, table_name);
+		}
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name,
+		                                                            notnull_info.column_name, col_type, true);
+		break;
+	}
+
+	case AlterTableType::DROP_NOT_NULL: {
+		auto &dropnull_info = alter_table_info.Cast<DropNotNullInfo>();
+		// For DROP NOT NULL, we need the column's current type
+		if (!transaction.HasContext()) {
+			throw InternalException("Cannot execute DROP NOT NULL without client context");
+		}
+		auto entry = tables_.GetEntry(transaction.GetContext(), table_name);
+		if (!entry) {
+			throw CatalogException("Table '%s' not found", table_name);
+		}
+		auto &mssql_table = entry->Cast<MSSQLTableEntry>();
+		LogicalType col_type;
+		bool found = false;
+		for (auto &col : mssql_table.GetMSSQLColumns()) {
+			if (col.name == dropnull_info.column_name) {
+				col_type = col.duckdb_type;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw CatalogException("Column '%s' not found in table '%s'",
+			                       dropnull_info.column_name, table_name);
+		}
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name,
+		                                                            dropnull_info.column_name, col_type, false);
+		break;
+	}
+
+	default:
+		throw NotImplementedException("MSSQL catalog: ALTER TABLE %s via DDL is not yet implemented. "
+		                              "Use mssql_exec() to execute T-SQL directly.",
+		                              EnumUtil::ToString(alter_table_info.alter_table_type));
+	}
+
+	// Execute DDL on SQL Server
+	if (!transaction.HasContext()) {
+		throw InternalException("Cannot execute ALTER without client context");
+	}
+	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
+
+	// Invalidate cache so the changes are visible
+	mssql_catalog.InvalidateMetadataCache();
 }
 
 void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	throw NotImplementedException("MSSQL catalog is read-only: DROP is not supported");
+	auto &mssql_catalog = GetMSSQLCatalog();
+	mssql_catalog.CheckWriteAccess("DROP");
+
+	// Handle DROP TABLE
+	if (info.type == CatalogType::TABLE_ENTRY) {
+		// Generate T-SQL for DROP TABLE
+		string tsql = MSSQLDDLTranslator::TranslateDropTable(name, info.name);
+
+		// Execute DDL on SQL Server
+		mssql_catalog.ExecuteDDL(context, tsql);
+
+		// Invalidate cache
+		mssql_catalog.InvalidateMetadataCache();
+		return;
+	}
+
+	// Other drop types not yet implemented
+	throw NotImplementedException("MSSQL catalog: DROP %s via DDL is not yet implemented. "
+	                              "Use mssql_exec() to execute T-SQL directly.",
+	                              CatalogTypeToString(info.type));
 }
 
 //===----------------------------------------------------------------------===//

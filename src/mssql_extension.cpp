@@ -38,13 +38,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 3. Register table functions
 	RegisterMSSQLFunctions(loader);
 
-	// 4. Register connection pool settings
+	// 4. Register mssql_exec scalar function
+	RegisterMSSQLExecFunction(loader);
+
+	// 5. Register connection pool settings
 	RegisterMSSQLSettings(loader);
 
-	// 5. Register diagnostic functions (mssql_open, mssql_close, mssql_ping, mssql_pool_stats)
+	// 6. Register diagnostic functions (mssql_open, mssql_close, mssql_ping, mssql_pool_stats)
 	RegisterMSSQLDiagnosticFunctions(loader);
 
-	// 6. Register utility functions (mssql_version)
+	// 7. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
 	                                         LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
