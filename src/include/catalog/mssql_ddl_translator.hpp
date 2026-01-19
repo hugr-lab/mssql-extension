@@ -5,7 +5,6 @@
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/planner/bound_tableref.hpp"
 
 namespace duckdb {
 
