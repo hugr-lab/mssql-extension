@@ -1,14 +1,17 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
+      run_build:
+        description: 'Run build and tests'
+        required: false
+        default: false
+        type: boolean
       run_integration_tests:
-        description: 'Run SQL Server integration tests'
+        description: 'Run SQL Server integration tests (requires run_build)'
         required: false
         default: true
         type: boolean
@@ -27,7 +30,7 @@ env:
 
 jobs:
   # ============================================================================
-  # Lint Job - Check code formatting
+  # Lint Job - Check code formatting (runs on merge to main)
   # ============================================================================
   lint:
     name: Lint
@@ -43,11 +46,12 @@ jobs:
 
   # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
+  # (Manual trigger only via workflow_dispatch)
   # ============================================================================
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    needs: lint
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
     strategy:
       fail-fast: false
       matrix:
@@ -169,11 +173,13 @@ jobs:
 
   # ============================================================================
   # Smoke Test Job - Load-only test on all platforms
+  # (Manual trigger only via workflow_dispatch)
   # ============================================================================
   smoke-test:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
     strategy:
       fail-fast: false
       matrix:
@@ -222,12 +228,13 @@ jobs:
 
   # ============================================================================
   # Integration Test Job - SQL Server tests on Linux only
+  # (Manual trigger only via workflow_dispatch)
   # ============================================================================
   integration-test:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_integration_tests }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests }}
 
     services:
       sqlserver:

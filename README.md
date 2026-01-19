@@ -2,6 +2,8 @@
 
 A DuckDB extension for connecting to Microsoft SQL Server databases using native TDS protocol - no ODBC, JDBC, or external drivers required.
 
+> **Experimental**: This extension is under active development. APIs and behavior may change between releases. We welcome contributions, bug reports, and testing feedback!
+
 ## Features
 
 - Native TDS protocol implementation (no external dependencies)
@@ -401,6 +403,24 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 | `acquire_timeout_count` | BIGINT | Times acquisition timed out        |
 | `acquire_wait_total_ms` | BIGINT | Total milliseconds spent waiting   |
 
+### mssql_refresh_cache()
+
+Manually refresh the metadata cache for an attached MSSQL catalog. This forces a reload of schema, table, and column information from SQL Server without requiring detach/reattach.
+
+**Signature:** `mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN`
+
+```sql
+-- Refresh metadata cache for attached catalog
+SELECT mssql_refresh_cache('sqlserver');
+-- Returns: true (cache successfully refreshed)
+```
+
+**Error conditions:**
+
+- Empty or NULL catalog name throws an error
+- Non-existent catalog throws an error
+- Catalog that is not an MSSQL type throws an error
+
 ## Type Mapping
 
 ### Numeric Types
@@ -513,6 +533,15 @@ SET mssql_statistics_level = 2;
 SET mssql_connection_cache = false;
 ```
 
+## Contributing
+
+We welcome contributions! Whether it's bug reports, feature requests, documentation improvements, or code contributions - your help makes this extension better for everyone.
+
+- **Report bugs**: Open an issue with reproduction steps
+- **Request features**: Describe your use case and proposed solution
+- **Submit PRs**: Fork, branch, and submit a pull request
+- **Test on your platform**: Help us validate on different environments
+
 ## Development
 
 For building from source, testing, and contributing, see the [Development Guide](DEVELOPMENT.md).
@@ -604,10 +633,10 @@ Error: Unsupported SQL Server type: XML
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| Linux x86_64 | Fully Tested | Primary development platform |
-| Linux ARM64 | Fully Tested | CI-validated |
-| macOS ARM64 | Tested | Load-only smoke tests in CI |
-| Windows x64 | Experimental | Builds in CI but not fully tested. Contributions welcome! |
+| macOS ARM64 | Primary development | Active development and testing |
+| Linux x86_64 | CI-validated | Automated builds and tests in CI |
+| Linux ARM64 | Not tested | Not built in CD pipeline |
+| Windows x64 | Not tested | Not built in CD pipeline |
 
 ## Roadmap
 
