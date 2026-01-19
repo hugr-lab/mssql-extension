@@ -11,10 +11,12 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 // Default batch size (rows per INSERT statement)
-constexpr idx_t MSSQL_DEFAULT_INSERT_BATCH_SIZE = 2000;
+// SQL Server limits VALUES clause to 1000 rows per INSERT statement
+constexpr idx_t MSSQL_DEFAULT_INSERT_BATCH_SIZE = 1000;
 
 // Default maximum rows per INSERT statement (hard cap)
-constexpr idx_t MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT = 2000;
+// SQL Server limit: max 1000 row value expressions per INSERT
+constexpr idx_t MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT = 1000;
 
 // Default maximum SQL statement size in bytes (8MB)
 constexpr idx_t MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES = 8388608;

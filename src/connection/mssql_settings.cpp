@@ -150,9 +150,10 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	//===----------------------------------------------------------------------===//
 
 	// mssql_insert_batch_size - Maximum rows per INSERT statement
+	// SQL Server limits VALUES clause to 1000 rows per INSERT
 	config.AddExtensionOption(
 	    "mssql_insert_batch_size",
-	    "Maximum rows per INSERT statement",
+	    "Maximum rows per INSERT statement (SQL Server limit: 1000)",
 	    LogicalType::BIGINT,
 	    Value::BIGINT(MSSQL_DEFAULT_INSERT_BATCH_SIZE),
 	    ValidatePositive,
@@ -162,7 +163,7 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// mssql_insert_max_rows_per_statement - Hard cap on rows per INSERT statement
 	config.AddExtensionOption(
 	    "mssql_insert_max_rows_per_statement",
-	    "Hard cap on rows per INSERT statement",
+	    "Hard cap on rows per INSERT statement (SQL Server limit: 1000)",
 	    LogicalType::BIGINT,
 	    Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT),
 	    ValidatePositive,
