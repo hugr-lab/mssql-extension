@@ -68,7 +68,7 @@ struct MSSQLPoolStatsBindData : public FunctionData {
 		auto result = make_uniq<MSSQLPoolStatsBindData>();
 		result->context_name = context_name;
 		result->all_pools = all_pools;
-		return result;
+		return std::move(result);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
