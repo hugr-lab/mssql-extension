@@ -49,25 +49,28 @@ make test
 
 ### TLS Support
 
-The extension uses a split TLS build approach to avoid symbol conflicts with DuckDB's bundled mbedTLS:
+The extension uses OpenSSL for TLS support. Both static and loadable builds include full TLS support:
 
 | Build Type | TLS Support | Use Case |
 | ---------- | ----------- | -------- |
-| Static     | No (stub)   | CLI development, embedded DuckDB |
-| Loadable   | Yes (mbedTLS via vcpkg) | Production with encrypted connections |
+| Static     | Yes (OpenSSL via vcpkg) | CLI development, embedded DuckDB |
+| Loadable   | Yes (OpenSSL via vcpkg) | Production with encrypted connections |
 
-**Why the split?** DuckDB bundles a crypto-only mbedTLS which conflicts with vcpkg's full mbedTLS (includes SSL/TLS). The static build uses a stub that returns "TLS not available", while the loadable build uses symbol hiding to prevent conflicts.
+OpenSSL is statically linked and symbol visibility is controlled to prevent conflicts with other libraries.
 
-### Building with TLS (Loadable Extension)
+### Building with TLS
 
-To build the loadable extension with TLS support, you need vcpkg:
+TLS support is automatically included when building with vcpkg:
 
 ```bash
 # Bootstrap vcpkg (if not already installed)
 git clone https://github.com/microsoft/vcpkg.git
 ./vcpkg/bootstrap-vcpkg.sh
 
-# Build with vcpkg
+# Build with vcpkg (using make)
+make
+
+# Or build manually with CMake
 mkdir -p build/release && cd build/release
 cmake -G "Ninja" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -138,9 +141,11 @@ docker compose -f docker/docker-compose.linux-ci.yml run --rm build
 ```
 
 This will:
-1. Fetch DuckDB nightly from main branch
-2. Configure with `-DMSSQL_DUCKDB_API_NIGHTLY=ON`
-3. Build with GCC (same as GitHub Actions)
+1. Fetch DuckDB v1.4.3 (stable release)
+2. Auto-detect DuckDB API version
+3. Build DuckDB CLI (static extension with TLS)
+4. Build loadable extension with full TLS support
+5. Build with GCC (same as GitHub Actions)
 
 ### Run Lint Check
 
@@ -164,31 +169,31 @@ docker compose -f docker/docker-compose.linux-ci.yml run --rm test
 docker compose -f docker/docker-compose.linux-ci.yml down -v
 ```
 
-### Known Issues with Docker Build
+### Build Targets
 
-**mbedTLS Symbol Conflicts**: When building the loadable extension in Docker, you may see linker errors like:
-```
-multiple definition of `mbedtls_*`
-```
+The Docker CI builds the following targets:
 
-This happens because vcpkg's mbedTLS symbols conflict with DuckDB's bundled mbedTLS during test executable linking. The main extension binary still builds successfully. The CI handles this through symbol hiding (version scripts on Linux, exported_symbols_list on macOS).
+| Target | Description |
+| ------ | ----------- |
+| `duckdb` | DuckDB CLI with statically linked extension (with TLS) |
+| `mssql_loadable_extension` | Loadable extension with full TLS support |
 
-For local Docker builds, the static extension (no TLS) builds cleanly. The loadable extension build may fail at the linking stage for test executables, but the extension itself is usable.
+Both builds use OpenSSL for TLS support. Symbol visibility is controlled using version scripts (Linux) or exported_symbols_list (macOS) to prevent runtime conflicts when dynamically loaded.
 
 ## DuckDB API Compatibility
 
-The extension supports both DuckDB stable (1.4.x) and nightly (main) APIs through conditional compilation:
+The extension supports both DuckDB stable (1.4.x) and nightly (main) APIs through automatic detection at CMake configure time:
 
-| DuckDB Version | CMake Flag | API |
-| -------------- | ---------- | --- |
-| 1.4.x (stable) | (default) | `GetData` |
-| main (nightly) | `-DMSSQL_DUCKDB_API_NIGHTLY=ON` | `GetDataInternal` |
+| DuckDB Version | API | Detection |
+| -------------- | --- | --------- |
+| 1.4.x (stable) | `GetData` | Auto-detected |
+| main (nightly) | `GetDataInternal` | Auto-detected |
 
-The CI automatically uses the nightly flag when building against DuckDB main.
+CMake automatically detects which API to use by checking the DuckDB headers. No manual configuration is needed.
 
 ### How It Works
 
-The compatibility is handled via `src/include/mssql_compat.hpp`:
+CMake detects the API version by checking for `GetDataInternal` in the DuckDB headers, then sets the appropriate compile definition. The compatibility is handled via `src/include/mssql_compat.hpp`:
 
 ```cpp
 #ifdef MSSQL_DUCKDB_NIGHTLY
@@ -243,7 +248,7 @@ src/
 ├── query/             # Query execution
 └── tds/               # TDS protocol
     ├── encoding/      # Type encoding/decoding
-    └── tls/           # TLS implementation (split build)
+    └── tls/           # TLS implementation (OpenSSL)
 
 tests/
 ├── cpp/               # Unit tests (no SQL Server)

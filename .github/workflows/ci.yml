@@ -42,7 +42,7 @@ jobs:
           find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
 
   # ============================================================================
-  # Build Job - Build against DuckDB nightly on representative platforms
+  # Build Job - Build against DuckDB stable on representative platforms
   # ============================================================================
   build:
     name: Build (${{ matrix.platform.id }})
@@ -71,11 +71,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB nightly
+      - name: Fetch DuckDB v1.4.3
         id: duckdb
         run: |
           chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh main)
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
 
       - name: Log build metadata
@@ -83,7 +83,7 @@ jobs:
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: main (nightly)"
+          echo "DuckDB Version: v1.4.3"
           echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
           echo "Platform: ${{ matrix.platform.id }}"
           echo "Runner: ${{ matrix.platform.runner }}"
@@ -147,7 +147,6 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
-            -DMSSQL_DUCKDB_API_NIGHTLY=ON \
             ../../duckdb
           cmake --build . --config Release
 
@@ -157,14 +156,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-nightly-${{ matrix.platform.id }}
+          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-nightly-${{ matrix.platform.id }}
+          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
@@ -195,13 +194,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-nightly-${{ matrix.platform.id }}
+          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-nightly-${{ matrix.platform.id }}
+          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
           path: cli
 
       - name: Setup executables
@@ -251,13 +250,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-nightly-linux_amd64
+          name: mssql-extension-v1.4.3-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-nightly-linux_amd64
+          name: duckdb-cli-v1.4.3-linux_amd64
           path: cli
 
       - name: Setup executables

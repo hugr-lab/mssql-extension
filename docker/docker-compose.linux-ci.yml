@@ -51,9 +51,9 @@ services:
         echo 'Linux amd64 CI Build'
         echo '============================================'
 
-        echo '>>> Fetching DuckDB nightly...'
+        echo '>>> Fetching DuckDB v1.4.3...'
         chmod +x scripts/ci/fetch_duckdb.sh
-        scripts/ci/fetch_duckdb.sh main
+        scripts/ci/fetch_duckdb.sh 1.4.3
 
         echo '>>> Configuring CMake...'
         mkdir -p build/linux-ci
@@ -63,16 +63,18 @@ services:
           -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
           -DVCPKG_MANIFEST_DIR=/workspace \
           -DDUCKDB_EXTENSION_CONFIGS=/workspace/extension_config.cmake \
-          -DMSSQL_DUCKDB_API_NIGHTLY=ON \
           /workspace/duckdb
 
-        echo '>>> Building...'
-        cmake --build . --config Release
+        echo '>>> Building DuckDB CLI (with static extension)...'
+        cmake --build . --config Release --target duckdb
+
+        echo '>>> Building loadable extension (with TLS)...'
+        cmake --build . --config Release --target mssql_loadable_extension
 
         echo '============================================'
         echo 'Build complete!'
-        echo 'Extension: build/linux-ci/extension/mssql/mssql.duckdb_extension'
-        echo 'DuckDB CLI: build/linux-ci/duckdb'
+        echo 'DuckDB CLI: build/linux-ci/duckdb (static extension with TLS)'
+        echo 'Loadable:   build/linux-ci/extension/mssql/mssql.duckdb_extension (with TLS)'
         echo '============================================'
 
   # Smoke test (load extension only)

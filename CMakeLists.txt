@@ -26,41 +26,42 @@ endif()
 message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_HASH}")
 
 # =============================================================================
-# DuckDB API Compatibility
+# DuckDB API Compatibility (Auto-detected)
 # =============================================================================
 # DuckDB nightly (main) renamed PhysicalOperator::GetData to GetDataInternal.
-# Set MSSQL_DUCKDB_API_NIGHTLY=ON when building against DuckDB main branch.
-# Default: OFF (stable API for 1.4.x releases)
-option(MSSQL_DUCKDB_API_NIGHTLY "Build against DuckDB nightly API (GetDataInternal)" OFF)
+# We auto-detect this by checking if GetDataInternal exists in the header.
+set(DUCKDB_PHYSICAL_OPERATOR_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include/duckdb/execution/physical_operator.hpp")
+if(EXISTS "${DUCKDB_PHYSICAL_OPERATOR_HEADER}")
+    file(READ "${DUCKDB_PHYSICAL_OPERATOR_HEADER}" PHYSICAL_OPERATOR_CONTENT)
+    string(FIND "${PHYSICAL_OPERATOR_CONTENT}" "GetDataInternal" GETDATA_INTERNAL_POS)
+    if(GETDATA_INTERNAL_POS GREATER -1)
+        set(MSSQL_DUCKDB_NIGHTLY_DETECTED TRUE)
+    else()
+        set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
+    endif()
+else()
+    message(WARNING "DuckDB physical_operator.hpp not found, assuming stable API")
+    set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
+endif()
 
-if(MSSQL_DUCKDB_API_NIGHTLY)
-    message(STATUS "Using DuckDB nightly API (GetDataInternal)")
+if(MSSQL_DUCKDB_NIGHTLY_DETECTED)
+    message(STATUS "Detected DuckDB nightly API (GetDataInternal)")
     add_compile_definitions(MSSQL_DUCKDB_NIGHTLY=1)
 else()
-    message(STATUS "Using DuckDB stable API (GetData)")
+    message(STATUS "Detected DuckDB stable API (GetData)")
 endif()
 
 # =============================================================================
-# TLS Libraries (built as separate subproject with two variants)
+# OpenSSL for TLS support
 # =============================================================================
-# The TLS library is built in src/tls with its own CMakeLists.txt.
-#
-# Two TLS library variants are built:
-#   - mssql_tls_static (OBJECT library): STUB implementation for static extension
-#     Returns "TLS not available" - directs users to loadable extension
-#     NO mbedTLS dependency - completely avoids symbol conflicts
-#   - mssql_tls_loadable (STATIC library): FULL TLS for loadable extension
-#     Uses vcpkg mbedTLS with all symbols hidden via visibility controls
-#
-# Why this split?
-#   DuckDB bundles crypto-only mbedTLS which conflicts with vcpkg's full mbedTLS.
-#   macOS doesn't support --allow-multiple-definition, making symbol conflicts fatal.
-#   Static build: Stub implementation avoids the conflict entirely.
-#   Loadable build: Symbol hiding prevents conflicts when dynamically loaded.
-add_subdirectory(src/tds/tls)
+set(OPENSSL_USE_STATIC_LIBS ON)
+find_package(OpenSSL REQUIRED)
+
+message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
+message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
 
 # =============================================================================
-# Extension Sources (shared between static and loadable builds)
+# Extension Sources
 # =============================================================================
 set(EXTENSION_SOURCES
     src/mssql_extension.cpp
@@ -83,6 +84,9 @@ set(EXTENSION_SOURCES
     src/tds/tds_column_metadata.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
+    # TLS layer (OpenSSL)
+    src/tds/tls/tds_tls_impl.cpp
+    src/tds/tls/tds_tls_context.cpp
     # Query execution layer (DuckDB integration)
     src/query/mssql_query_executor.cpp
     src/query/mssql_result_stream.cpp
@@ -118,60 +122,45 @@ set(EXTENSION_SOURCES
     src/insert/mssql_returning_parser.cpp
 )
 
-# Build static extension (linked into DuckDB) - uses TLS objects from mssql_tls_static
+# Build static extension (linked into DuckDB)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 
-# Build loadable extension (.duckdb_extension file) - uses TLS from mssql_tls_loadable
+# Build loadable extension (.duckdb_extension file)
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # =============================================================================
 # Static Extension Configuration
 # =============================================================================
-# The static extension uses TLS STUB implementation (no actual TLS).
-# This avoids mbedTLS symbol conflicts with DuckDB's bundled crypto library.
-# Users who need TLS should use the loadable extension (.duckdb_extension).
-
 target_compile_options(${EXTENSION_NAME} PRIVATE
     "-Wno-macro-redefined"
 )
 target_compile_definitions(${EXTENSION_NAME} PRIVATE
     EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
-    MSSQL_TLS_STUB=1
 )
 target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
+    ${OPENSSL_INCLUDE_DIR}
 )
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 
-# Link TLS stub objects into static extension (no mbedTLS dependency)
-target_sources(${EXTENSION_NAME} PRIVATE $<TARGET_OBJECTS:mssql_tls_static>)
-add_dependencies(${EXTENSION_NAME} mssql_tls_static)
-
-message(STATUS "Static extension configured: TLS STUB (no TLS support - use loadable extension for TLS)")
+message(STATUS "Static extension configured with full TLS support (OpenSSL)")
 
 # =============================================================================
 # Loadable Extension Configuration
 # =============================================================================
-# The loadable extension links the mssql_tls_loadable static library which includes
-# all mbedTLS dependencies (mbedtls, mbedx509, mbedcrypto). Symbol visibility controls
-# hide all internal symbols, only exporting the extension entry point. This prevents
-# conflicts with DuckDB's bundled mbedTLS when the extension is dynamically loaded.
-
 target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
     "-Wno-macro-redefined"
-    "-include${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls/mbedtls_compat.h"
 )
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
     EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
 )
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
+    ${OPENSSL_INCLUDE_DIR}
 )
-
-# Link the TLS static library (includes full mbedTLS suite via transitive dependencies)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} mssql_tls_loadable)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 
 # Symbol export control - hide all symbols except extension entry point
-# This is critical to prevent symbol collisions with DuckDB's bundled mbedTLS
 if(APPLE)
     # macOS: Use -exported_symbols_list to only export extension entry point
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/extension_exports.txt"
@@ -202,6 +191,8 @@ elseif(WIN32)
     )
     message(STATUS "Loadable extension: Windows symbol export via .def file")
 endif()
+
+message(STATUS "Loadable extension configured with full TLS support (OpenSSL)")
 
 # =============================================================================
 # Installation

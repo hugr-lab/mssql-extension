@@ -165,7 +165,7 @@ ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=tr
     AS db (TYPE mssql);
 ```
 
-> **Note**: TLS support requires the loadable extension build. The static build does not include TLS.
+> **Note**: TLS support is available in both static and loadable extension builds (using OpenSSL).
 
 ## Catalog Integration
 
@@ -562,9 +562,8 @@ Error: Server requires encryption but TLS is not available
 
 **Solutions:**
 
-- Use the loadable extension build (includes TLS support)
 - Enable encryption in connection: `use_encrypt true` or `Encrypt=yes`
-- If using static build, encryption is not available
+- Ensure extension was built with OpenSSL (default for vcpkg builds)
 
 ### TLS Handshake Failed
 

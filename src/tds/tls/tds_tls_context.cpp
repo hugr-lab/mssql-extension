@@ -3,8 +3,8 @@
 //
 // tds_tls_context.cpp
 //
-// TLS wrapper implementation using the static TLS library (mssql_tls).
-// This file wraps TlsImpl from the static library which contains mbedTLS.
+// TLS wrapper implementation using the TLS library (mssql_tls).
+// This file wraps TlsImpl which uses OpenSSL for TLS functionality.
 //===----------------------------------------------------------------------===//
 
 #include "tds/tls/tds_tls_context.hpp"

@@ -3,7 +3,7 @@
 //
 // tds_tls_impl.hpp
 //
-// TLS implementation interface - provides TLS functionality using mbedTLS.
+// TLS implementation interface - provides TLS functionality using OpenSSL.
 // This is compiled into a static library and linked with symbol hiding.
 //
 // TDS Protocol TLS Integration:
@@ -31,7 +31,7 @@ struct TlsImplContext;
 using TlsSendCallback = std::function<int(const uint8_t *data, size_t len)>;
 using TlsRecvCallback = std::function<int(uint8_t *buf, size_t len, int timeout_ms)>;
 
-// TLS implementation class using mbedTLS
+// TLS implementation class using OpenSSL
 // This class is used by the loadable extension with symbols hidden
 class TlsImpl {
 public:
