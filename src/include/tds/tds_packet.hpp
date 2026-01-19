@@ -1,9 +1,9 @@
 #pragma once
 
-#include "tds_types.hpp"
-#include <vector>
 #include <cstdint>
 #include <memory>
+#include <vector>
+#include "tds_types.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -23,43 +23,63 @@ public:
 	~TdsPacket() = default;
 
 	// Getters
-	PacketType GetType() const { return type_; }
-	PacketStatus GetStatus() const { return status_; }
+	PacketType GetType() const {
+		return type_;
+	}
+	PacketStatus GetStatus() const {
+		return status_;
+	}
 	uint16_t GetLength() const;
-	uint16_t GetSpid() const { return spid_; }
-	uint8_t GetPacketId() const { return packet_id_; }
-	const std::vector<uint8_t>& GetPayload() const { return payload_; }
-	std::vector<uint8_t>& GetPayload() { return payload_; }
+	uint16_t GetSpid() const {
+		return spid_;
+	}
+	uint8_t GetPacketId() const {
+		return packet_id_;
+	}
+	const std::vector<uint8_t> &GetPayload() const {
+		return payload_;
+	}
+	std::vector<uint8_t> &GetPayload() {
+		return payload_;
+	}
 
 	// Setters
-	void SetType(PacketType type) { type_ = type; }
-	void SetStatus(PacketStatus status) { status_ = status; }
-	void SetSpid(uint16_t spid) { spid_ = spid; }
-	void SetPacketId(uint8_t id) { packet_id_ = id; }
+	void SetType(PacketType type) {
+		type_ = type;
+	}
+	void SetStatus(PacketStatus status) {
+		status_ = status;
+	}
+	void SetSpid(uint16_t spid) {
+		spid_ = spid;
+	}
+	void SetPacketId(uint8_t id) {
+		packet_id_ = id;
+	}
 
 	// Payload manipulation
-	void AppendPayload(const uint8_t* data, size_t length);
-	void AppendPayload(const std::vector<uint8_t>& data);
+	void AppendPayload(const uint8_t *data, size_t length);
+	void AppendPayload(const std::vector<uint8_t> &data);
 	void AppendByte(uint8_t byte);
 	void AppendUInt16BE(uint16_t value);
 	void AppendUInt32BE(uint32_t value);
 	void AppendUInt16LE(uint16_t value);
 	void AppendUInt32LE(uint32_t value);
-	void AppendString(const std::string& str);  // ASCII/UTF-8
-	void AppendUTF16LE(const std::string& str); // UTF-16LE for TDS strings
+	void AppendString(const std::string &str);	 // ASCII/UTF-8
+	void AppendUTF16LE(const std::string &str);	 // UTF-16LE for TDS strings
 	void ClearPayload();
 
 	// Serialize packet to bytes (header + payload)
 	std::vector<uint8_t> Serialize() const;
 
 	// Parse packet from bytes (returns bytes consumed, 0 on incomplete)
-	static size_t Parse(const uint8_t* data, size_t length, TdsPacket& packet);
+	static size_t Parse(const uint8_t *data, size_t length, TdsPacket &packet);
 
 	// Check if we have a complete packet header
-	static bool HasCompleteHeader(const uint8_t* data, size_t length);
+	static bool HasCompleteHeader(const uint8_t *data, size_t length);
 
 	// Get the expected packet length from header
-	static uint16_t GetPacketLength(const uint8_t* data);
+	static uint16_t GetPacketLength(const uint8_t *data);
 
 	// Helper to check EOM flag
 	bool IsEndOfMessage() const {
@@ -69,11 +89,11 @@ public:
 	// Helper to set/clear EOM flag
 	void SetEndOfMessage(bool eom) {
 		if (eom) {
-			status_ = static_cast<PacketStatus>(
-			    static_cast<uint8_t>(status_) | static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
+			status_ = static_cast<PacketStatus>(static_cast<uint8_t>(status_) |
+												static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
 		} else {
-			status_ = static_cast<PacketStatus>(
-			    static_cast<uint8_t>(status_) & ~static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
+			status_ = static_cast<PacketStatus>(static_cast<uint8_t>(status_) &
+												~static_cast<uint8_t>(PacketStatus::END_OF_MESSAGE));
 		}
 	}
 

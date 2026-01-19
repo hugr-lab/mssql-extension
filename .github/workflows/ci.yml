@@ -1,10 +1,14 @@
 name: CI
 
 on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
-      run_tests:
-        description: 'Run tests after build'
+      run_integration_tests:
+        description: 'Run SQL Server integration tests'
         required: false
         default: true
         type: boolean
@@ -13,14 +17,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # SQL Server test environment
+  MSSQL_TEST_HOST: localhost
+  MSSQL_TEST_PORT: 1433
+  MSSQL_TEST_USER: sa
+  MSSQL_TEST_PASS: TestPassword1
+  MSSQL_TEST_DB: master
+
 jobs:
+  # ============================================================================
+  # Lint Job - Check code formatting
+  # ============================================================================
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Check clang-format
         run: |
@@ -28,161 +41,235 @@ jobs:
           sudo apt-get install -y clang-format-14
           find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
 
+  # ============================================================================
+  # Build Job - Build against DuckDB stable on representative platforms
+  # ============================================================================
   build:
-    name: Build (${{ matrix.os }}-${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    name: Build (${{ matrix.platform.id }})
+    runs-on: ${{ matrix.platform.runner }}
     needs: lint
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # macOS ARM64
-          - os: macos
+        platform:
+          # Linux x86_64 - with Docker support for integration tests
+          - id: linux_amd64
+            os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            docker_available: true
+            vcpkg_triplet: x64-linux
+
+          # macOS ARM64 - load-only testing
+          - id: osx_arm64
+            os: osx
             arch: arm64
             runner: macos-14
-            cmake_arch: ""
-
-          # Linux x86_64
-          - os: linux
-            arch: x86_64
-            runner: ubuntu-22.04
-            cmake_arch: ""
-
-          # Linux ARM64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-22.04-arm
-            cmake_arch: ""
-
-          # Windows x86_64
-          - os: windows
-            arch: x86_64
-            runner: windows-latest
-            cmake_arch: x64
+            docker_available: false
+            vcpkg_triplet: arm64-osx
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Setup Ninja (Unix)
-        if: matrix.os != 'windows'
+      - name: Fetch DuckDB v1.4.3
+        id: duckdb
         run: |
-          if [ "${{ matrix.os }}" = "macos" ]; then
-            brew install ninja
+          chmod +x scripts/ci/fetch_duckdb.sh
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Log build metadata
+        run: |
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "Platform: ${{ matrix.platform.id }}"
+          echo "Runner: ${{ matrix.platform.runner }}"
+          echo "============================================"
+
+      - name: Setup Ninja
+        run: |
+          if [ "${{ matrix.platform.os }}" = "osx" ]; then
+            brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build
+            sudo apt-get install -y ninja-build ccache
           fi
 
-      - name: Setup Ninja (Windows)
-        if: matrix.os == 'windows'
-        run: choco install ninja
+      # Cache ccache to speed up compilation
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
+            ccache-${{ matrix.platform.id }}-
 
-      - name: Build Release (Unix)
-        if: matrix.os != 'windows'
-        run: make release
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
 
-      - name: Build Release (Windows)
-        if: matrix.os == 'windows'
-        shell: bash
+      - name: Setup vcpkg
+        run: |
+          if [ ! -d "vcpkg" ]; then
+            git clone https://github.com/microsoft/vcpkg.git
+            ./vcpkg/bootstrap-vcpkg.sh
+          fi
+
+      # Cache vcpkg installed packages
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+            vcpkg/buildtrees
+          key: vcpkg-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.platform.vcpkg_triplet }}-
+
+      - name: Build Release
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           mkdir -p build/release
           cd build/release
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      - name: Show ccache stats
+        run: ccache -s
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            build/release/extension/mssql/mssql.duckdb_extension
+          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
+          path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
-  test:
-    name: Test (${{ matrix.os }}-${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+      - name: Upload DuckDB CLI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
+          path: build/release/duckdb
+          if-no-files-found: error
+
+  # ============================================================================
+  # Smoke Test Job - Load-only test on all platforms
+  # ============================================================================
+  smoke-test:
+    name: Smoke Test (${{ matrix.platform.id }})
+    runs-on: ${{ matrix.platform.runner }}
     needs: build
-    if: ${{ inputs.run_tests }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos
-            arch: arm64
-            runner: macos-14
-
-          - os: linux
-            arch: x86_64
+        platform:
+          - id: linux_amd64
+            os: linux
             runner: ubuntu-22.04
+            docker_available: true
 
-          - os: linux
-            arch: arm64
-            runner: ubuntu-22.04-arm
-
-          - os: windows
-            arch: x86_64
-            runner: windows-latest
+          - id: osx_arm64
+            os: osx
+            runner: macos-14
+            docker_available: false
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
+          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
+          path: extension
 
-      - name: Setup Ninja (Unix)
-        if: matrix.os != 'windows'
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
+          path: cli
+
+      - name: Setup executables
         run: |
-          if [ "${{ matrix.os }}" = "macos" ]; then
-            brew install ninja
-          else
-            sudo apt-get update
-            sudo apt-get install -y ninja-build
-          fi
+          chmod +x cli/duckdb
+          chmod +x scripts/ci/smoke_test.sh
 
-      - name: Setup Ninja (Windows)
-        if: matrix.os == 'windows'
-        run: choco install ninja
-
-      - name: Build Release (Unix)
-        if: matrix.os != 'windows'
-        run: make release
-
-      - name: Build Release (Windows)
-        if: matrix.os == 'windows'
-        shell: bash
+      - name: Run load-only smoke test
         run: |
-          mkdir -p build/release
-          cd build/release
-          cmake -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
-            ../../duckdb
-          cmake --build . --config Release
+          scripts/ci/smoke_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension
 
-      - name: Test Extension Loads (Unix)
-        if: matrix.os != 'windows'
+      - name: Log integration test status (non-Linux)
+        if: matrix.platform.docker_available == false
         run: |
-          ./build/release/duckdb -c "SELECT mssql_version();"
-          ./build/release/duckdb -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'mssql';"
+          echo "============================================"
+          echo "Integration test skipped - Docker not available on ${{ matrix.platform.id }}"
+          echo "Load-only smoke test passed successfully"
+          echo "============================================"
 
-      - name: Test Extension Loads (Windows)
-        if: matrix.os == 'windows'
-        shell: bash
-        run: |
-          ./build/release/duckdb.exe -c "SELECT mssql_version();"
-          ./build/release/duckdb.exe -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'mssql';"
+  # ============================================================================
+  # Integration Test Job - SQL Server tests on Linux only
+  # ============================================================================
+  integration-test:
+    name: Integration Test (linux_amd64)
+    runs-on: ubuntu-22.04
+    needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_integration_tests }}
 
-      - name: Run SQL Tests (Unix)
-        if: matrix.os != 'windows'
-        run: |
-          ./build/release/test/unittest --test-dir test/sql "*mssql*"
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
 
-      - name: Run SQL Tests (Windows)
-        if: matrix.os == 'windows'
-        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mssql-extension-v1.4.3-linux_amd64
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-linux_amd64
+          path: cli
+
+      - name: Setup executables
         run: |
-          ./build/release/test/unittest.exe --test-dir test/sql "*mssql*"
+          chmod +x cli/duckdb
+          chmod +x scripts/ci/integration_test.sh
+
+      - name: Wait for SQL Server
+        run: |
+          echo "Waiting for SQL Server to be ready..."
+          timeout 120 bash -c 'until echo > /dev/tcp/localhost/1433 2>/dev/null; do sleep 5; done'
+          echo "SQL Server is ready!"
+
+      - name: Run integration tests
+        run: |
+          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension

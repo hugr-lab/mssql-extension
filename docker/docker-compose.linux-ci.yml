@@ -1,0 +1,145 @@
+# Docker Compose for Linux amd64 CI-like build and integration testing
+# This replicates the GitHub Actions CI environment locally
+#
+# Usage:
+#   # Build the extension (like CI does)
+#   docker compose -f docker/docker-compose.linux-ci.yml run --rm build
+#
+#   # Run lint check
+#   docker compose -f docker/docker-compose.linux-ci.yml run --rm lint
+#
+#   # Run integration tests (starts SQL Server automatically)
+#   docker compose -f docker/docker-compose.linux-ci.yml run --rm test
+#
+#   # Clean up
+#   docker compose -f docker/docker-compose.linux-ci.yml down -v
+
+services:
+  # SQL Server for integration tests
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "TestPassword1"
+    ports:
+      - "11433:1433"  # Different port to avoid conflict with local dev
+    healthcheck:
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Linux amd64 build environment (matches GitHub Actions ubuntu-22.04)
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    platform: linux/amd64
+    volumes:
+      - ..:/workspace
+      - vcpkg-cache:/opt/vcpkg/installed
+      - vcpkg-buildtrees:/opt/vcpkg/buildtrees
+    working_dir: /workspace
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo '============================================'
+        echo 'Linux amd64 CI Build'
+        echo '============================================'
+
+        echo '>>> Fetching DuckDB v1.4.3...'
+        chmod +x scripts/ci/fetch_duckdb.sh
+        scripts/ci/fetch_duckdb.sh 1.4.3
+
+        echo '>>> Configuring CMake...'
+        mkdir -p build/linux-ci
+        cd build/linux-ci
+        cmake -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DVCPKG_MANIFEST_DIR=/workspace \
+          -DDUCKDB_EXTENSION_CONFIGS=/workspace/extension_config.cmake \
+          /workspace/duckdb
+
+        echo '>>> Building DuckDB CLI (with static extension)...'
+        cmake --build . --config Release --target duckdb
+
+        echo '>>> Building loadable extension (with TLS)...'
+        cmake --build . --config Release --target mssql_loadable_extension
+
+        echo '============================================'
+        echo 'Build complete!'
+        echo 'DuckDB CLI: build/linux-ci/duckdb (static extension with TLS)'
+        echo 'Loadable:   build/linux-ci/extension/mssql/mssql.duckdb_extension (with TLS)'
+        echo '============================================'
+
+  # Smoke test (load extension only)
+  smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    platform: linux/amd64
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo '>>> Running smoke test...'
+        chmod +x scripts/ci/smoke_test.sh
+        scripts/ci/smoke_test.sh ./build/linux-ci/duckdb ./build/linux-ci/extension/mssql/mssql.duckdb_extension
+
+  # Integration tests (requires SQL Server)
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    platform: linux/amd64
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    environment:
+      MSSQL_TEST_HOST: sqlserver
+      MSSQL_TEST_PORT: "1433"
+      MSSQL_TEST_USER: sa
+      MSSQL_TEST_PASS: TestPassword1
+      MSSQL_TEST_DB: master
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo '>>> Running integration tests...'
+        chmod +x scripts/ci/integration_test.sh
+        scripts/ci/integration_test.sh ./build/linux-ci/duckdb ./build/linux-ci/extension/mssql/mssql.duckdb_extension
+
+  # Lint check
+  lint:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    platform: linux/amd64
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo '>>> Checking clang-format...'
+        find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
+        echo '>>> Lint passed!'
+
+volumes:
+  vcpkg-cache:
+  vcpkg-buildtrees:

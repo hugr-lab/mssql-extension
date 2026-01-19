@@ -1,7 +1,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include "catalog/mssql_catalog.hpp"
-#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
@@ -10,8 +10,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLTransaction::MSSQLTransaction(TransactionManager &manager, ClientContext &context, MSSQLCatalog &catalog)
-    : Transaction(manager, context), catalog_(catalog) {
-}
+	: Transaction(manager, context), catalog_(catalog) {}
 
 MSSQLTransaction::~MSSQLTransaction() = default;
 
@@ -24,8 +23,7 @@ MSSQLTransaction &MSSQLTransaction::Get(ClientContext &context, Catalog &catalog
 //===----------------------------------------------------------------------===//
 
 MSSQLTransactionManager::MSSQLTransactionManager(AttachedDatabase &db, MSSQLCatalog &catalog)
-    : TransactionManager(db), catalog_(catalog) {
-}
+	: TransactionManager(db), catalog_(catalog) {}
 
 MSSQLTransactionManager::~MSSQLTransactionManager() = default;
 

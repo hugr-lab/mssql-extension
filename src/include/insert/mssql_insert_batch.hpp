@@ -1,8 +1,8 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
-#include <string>
 #include <cstddef>
+#include <string>
+#include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
@@ -19,11 +19,11 @@ struct MSSQLInsertBatch {
 	//===----------------------------------------------------------------------===//
 
 	enum class State {
-		BUILDING,     // Accumulating rows
-		READY,        // SQL generated, ready to execute
-		EXECUTING,    // Sent to SQL Server
-		COMPLETED,    // Successfully executed
-		FAILED        // Execution failed
+		BUILDING,	// Accumulating rows
+		READY,		// SQL generated, ready to execute
+		EXECUTING,	// Sent to SQL Server
+		COMPLETED,	// Successfully executed
+		FAILED		// Execution failed
 	};
 
 	//===----------------------------------------------------------------------===//
@@ -31,8 +31,8 @@ struct MSSQLInsertBatch {
 	//===----------------------------------------------------------------------===//
 
 	// Row range in the overall INSERT operation (for error reporting)
-	idx_t row_offset_start;    // First row index (0-based)
-	idx_t row_offset_end;      // Last row index (exclusive)
+	idx_t row_offset_start;	 // First row index (0-based)
+	idx_t row_offset_end;	 // Last row index (exclusive)
 
 	// Row count in this batch
 	idx_t row_count;
@@ -51,34 +51,47 @@ struct MSSQLInsertBatch {
 	//===----------------------------------------------------------------------===//
 
 	// Default constructor
-	MSSQLInsertBatch()
-	    : row_offset_start(0), row_offset_end(0), row_count(0),
-	      sql_bytes(0), state(State::BUILDING) {}
+	MSSQLInsertBatch() : row_offset_start(0), row_offset_end(0), row_count(0), sql_bytes(0), state(State::BUILDING) {}
 
 	// Constructor with row range
 	MSSQLInsertBatch(idx_t start, idx_t end)
-	    : row_offset_start(start), row_offset_end(end),
-	      row_count(end - start), sql_bytes(0), state(State::BUILDING) {}
+		: row_offset_start(start), row_offset_end(end), row_count(end - start), sql_bytes(0), state(State::BUILDING) {}
 
 	//===----------------------------------------------------------------------===//
 	// State Helpers
 	//===----------------------------------------------------------------------===//
 
-	bool IsBuilding() const { return state == State::BUILDING; }
-	bool IsReady() const { return state == State::READY; }
-	bool IsExecuting() const { return state == State::EXECUTING; }
-	bool IsCompleted() const { return state == State::COMPLETED; }
-	bool IsFailed() const { return state == State::FAILED; }
+	bool IsBuilding() const {
+		return state == State::BUILDING;
+	}
+	bool IsReady() const {
+		return state == State::READY;
+	}
+	bool IsExecuting() const {
+		return state == State::EXECUTING;
+	}
+	bool IsCompleted() const {
+		return state == State::COMPLETED;
+	}
+	bool IsFailed() const {
+		return state == State::FAILED;
+	}
 
 	// Get state as string (for logging/debugging)
 	const char *GetStateString() const {
 		switch (state) {
-		case State::BUILDING: return "BUILDING";
-		case State::READY: return "READY";
-		case State::EXECUTING: return "EXECUTING";
-		case State::COMPLETED: return "COMPLETED";
-		case State::FAILED: return "FAILED";
-		default: return "UNKNOWN";
+		case State::BUILDING:
+			return "BUILDING";
+		case State::READY:
+			return "READY";
+		case State::EXECUTING:
+			return "EXECUTING";
+		case State::COMPLETED:
+			return "COMPLETED";
+		case State::FAILED:
+			return "FAILED";
+		default:
+			return "UNKNOWN";
 		}
 	}
 };

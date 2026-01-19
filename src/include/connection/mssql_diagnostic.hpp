@@ -1,12 +1,12 @@
 #pragma once
 
-#include "duckdb/main/extension/extension_loader.hpp"
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "tds/tds_connection.hpp"
-#include <memory>
-#include <unordered_map>
-#include <mutex>
 
 namespace duckdb {
 
@@ -14,7 +14,7 @@ namespace duckdb {
 // Manages connections opened via mssql_open for diagnostic purposes
 class MSSQLConnectionHandleManager {
 public:
-	static MSSQLConnectionHandleManager& Instance();
+	static MSSQLConnectionHandleManager &Instance();
 
 	// Add a connection and return its handle
 	int64_t AddConnection(std::shared_ptr<tds::TdsConnection> conn);
@@ -62,13 +62,13 @@ void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result);
 // If context_name is not provided, returns stats for all pools
 struct MSSQLPoolStatsBindData : public FunctionData {
 	std::string context_name;  // Empty string means all pools
-	bool all_pools;            // True if no parameter provided
+	bool all_pools;			   // True if no parameter provided
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<MSSQLPoolStatsBindData>();
 		result->context_name = context_name;
 		result->all_pools = all_pools;
-		return result;
+		return std::move(result);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
@@ -79,7 +79,7 @@ struct MSSQLPoolStatsBindData : public FunctionData {
 
 struct MssqlPoolStatsGlobalState : public GlobalTableFunctionState {
 	std::vector<std::string> pool_names;  // Pools to iterate over
-	idx_t current_index = 0;              // Current position in pool_names
+	idx_t current_index = 0;			  // Current position in pool_names
 };
 
 class MSSQLPoolStatsFunction {
@@ -88,7 +88,7 @@ public:
 
 private:
 	static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
-	                                     vector<LogicalType> &return_types, vector<string> &names);
+										 vector<LogicalType> &return_types, vector<string> &names);
 	static unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &context, TableFunctionInitInput &input);
 	static void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output);
 };

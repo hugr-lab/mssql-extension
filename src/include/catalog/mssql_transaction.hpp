@@ -1,9 +1,9 @@
 #pragma once
 
-#include "duckdb/transaction/transaction.hpp"
-#include "duckdb/transaction/transaction_manager.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
+#include "duckdb/transaction/transaction.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
 
 namespace duckdb {
 

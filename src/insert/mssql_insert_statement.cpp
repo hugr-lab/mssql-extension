@@ -1,6 +1,6 @@
 #include "insert/mssql_insert_statement.hpp"
-#include "insert/mssql_value_serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "insert/mssql_value_serializer.hpp"
 
 namespace duckdb {
 
@@ -9,8 +9,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLInsertStatement::MSSQLInsertStatement(const MSSQLInsertTarget &target, bool include_output)
-    : target_(target), include_output_(include_output) {
-}
+	: target_(target), include_output_(include_output) {}
 
 //===----------------------------------------------------------------------===//
 // Cache Initialization
@@ -23,7 +22,7 @@ void MSSQLInsertStatement::InitializeCache() const {
 
 	// Build table name: [schema].[table]
 	cached_table_name_ = MSSQLValueSerializer::EscapeIdentifier(target_.schema_name) + "." +
-	                     MSSQLValueSerializer::EscapeIdentifier(target_.table_name);
+						 MSSQLValueSerializer::EscapeIdentifier(target_.table_name);
 
 	// Build column list: [col1], [col2], ...
 	string columns;
@@ -79,15 +78,15 @@ string MSSQLInsertStatement::Build(const vector<vector<string>> &row_literals) c
 	InitializeCache();
 
 	// Estimate total size for reservation
-	size_t estimated_size = 50; // INSERT INTO + overhead
+	size_t estimated_size = 50;	 // INSERT INTO + overhead
 	estimated_size += cached_table_name_.size();
 	estimated_size += cached_column_list_.size();
 	estimated_size += cached_output_clause_.size();
 
 	for (const auto &row : row_literals) {
-		estimated_size += 4; // "(", ")", ",\n"
+		estimated_size += 4;  // "(", ")", ",\n"
 		for (const auto &lit : row) {
-			estimated_size += lit.size() + 2; // ", "
+			estimated_size += lit.size() + 2;  // ", "
 		}
 	}
 

@@ -121,7 +121,6 @@ Tests that don't require SQL Server:
 |-----------|-------------|
 | `mssql_version.test` | Extension version function |
 | `mssql_attach.test` | ATTACH syntax validation |
-| `mssql_execute.test` | mssql_execute function |
 | `mssql_scan.test` | mssql_scan function |
 | `mssql_secret.test` | Secret management |
 | `tls_secret.test` | TLS secret creation (no actual TLS connection) |

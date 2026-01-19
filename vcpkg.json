@@ -3,6 +3,6 @@
   "version": "0.0.1",
   "description": "DuckDB extension for Microsoft SQL Server using native TDS protocol",
   "dependencies": [
-    "mbedtls"
+    "openssl"
   ]
 }

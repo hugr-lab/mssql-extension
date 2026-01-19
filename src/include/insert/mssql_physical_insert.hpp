@@ -1,12 +1,13 @@
 #pragma once
 
-#include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
-#include "insert/mssql_insert_error.hpp"
 #include <memory>
 #include <mutex>
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "insert/mssql_insert_config.hpp"
+#include "insert/mssql_insert_error.hpp"
+#include "insert/mssql_insert_target.hpp"
+#include "mssql_compat.hpp"
 
 namespace duckdb {
 
@@ -36,21 +37,26 @@ public:
 	// @param config Insert configuration
 	// @param return_chunk Whether to return inserted data (RETURNING mode)
 	MSSQLPhysicalInsert(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                    MSSQLInsertTarget target, MSSQLInsertConfig config,
-	                    bool return_chunk);
+						MSSQLInsertTarget target, MSSQLInsertConfig config, bool return_chunk);
 
 	//===----------------------------------------------------------------------===//
 	// Target Information
 	//===----------------------------------------------------------------------===//
 
 	// Get insert target
-	const MSSQLInsertTarget &GetTarget() const { return target_; }
+	const MSSQLInsertTarget &GetTarget() const {
+		return target_;
+	}
 
 	// Get insert configuration
-	const MSSQLInsertConfig &GetConfig() const { return config_; }
+	const MSSQLInsertConfig &GetConfig() const {
+		return config_;
+	}
 
 	// Check if in RETURNING mode
-	bool ReturnsChunk() const { return return_chunk_; }
+	bool ReturnsChunk() const {
+		return return_chunk_;
+	}
 
 public:
 	//===----------------------------------------------------------------------===//
@@ -76,15 +82,12 @@ public:
 	// Sink Interface
 	//===----------------------------------------------------------------------===//
 
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
-	                    OperatorSinkInput &input) const override;
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 
-	SinkCombineResultType Combine(ExecutionContext &context,
-	                               OperatorSinkCombineInput &input) const override;
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 
-	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
-	                           ClientContext &context,
-	                           OperatorSinkFinalizeInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+							  OperatorSinkFinalizeInput &input) const override;
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
@@ -94,8 +97,8 @@ public:
 	// Source Interface (for returning results)
 	//===----------------------------------------------------------------------===//
 
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
-	                         OperatorSourceInput &input) const override;
+	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
+										  OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -113,10 +116,8 @@ private:
 
 class MSSQLInsertGlobalSinkState : public GlobalSinkState {
 public:
-	explicit MSSQLInsertGlobalSinkState(ClientContext &context,
-	                                    const MSSQLInsertTarget &target,
-	                                    const MSSQLInsertConfig &config,
-	                                    bool return_chunk);
+	explicit MSSQLInsertGlobalSinkState(ClientContext &context, const MSSQLInsertTarget &target,
+										const MSSQLInsertConfig &config, bool return_chunk);
 
 	// The insert executor
 	unique_ptr<MSSQLInsertExecutor> executor;

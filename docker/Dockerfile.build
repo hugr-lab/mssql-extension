@@ -1,0 +1,34 @@
+# Build environment for mssql-extension on Linux amd64
+# Matches CI environment (ubuntu-22.04 with GCC)
+
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    curl \
+    zip \
+    unzip \
+    tar \
+    pkg-config \
+    clang-format-14 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install vcpkg
+RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh
+
+ENV VCPKG_ROOT=/opt/vcpkg
+ENV PATH="${VCPKG_ROOT}:${PATH}"
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]

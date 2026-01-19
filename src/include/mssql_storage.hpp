@@ -99,10 +99,10 @@ void RegisterMSSQLStorageExtension(ExtensionLoader &loader);
 
 // Attach callback
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
-                                AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options);
+								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options);
 
 // Transaction manager factory
 unique_ptr<TransactionManager> MSSQLCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
-                                                             AttachedDatabase &db, Catalog &catalog);
+															 AttachedDatabase &db, Catalog &catalog);
 
 }  // namespace duckdb

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
 #include <algorithm>
 #include <cstddef>
+#include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
@@ -83,9 +83,9 @@ struct MSSQLInsertColumn {
 	string mssql_type;
 
 	// Column flags
-	bool is_identity;     // IDENTITY column (auto-generated)
-	bool is_nullable;     // Allows NULL values
-	bool has_default;     // Has DEFAULT constraint
+	bool is_identity;  // IDENTITY column (auto-generated)
+	bool is_nullable;  // Allows NULL values
+	bool has_default;  // Has DEFAULT constraint
 
 	// Collation name (for text types, may be empty)
 	string collation;
@@ -95,17 +95,20 @@ struct MSSQLInsertColumn {
 	uint8_t scale;
 
 	// Default constructor
-	MSSQLInsertColumn()
-	    : is_identity(false), is_nullable(true), has_default(false),
-	      precision(0), scale(0) {}
+	MSSQLInsertColumn() : is_identity(false), is_nullable(true), has_default(false), precision(0), scale(0) {}
 
 	// Full constructor
-	MSSQLInsertColumn(const string &name, LogicalType duckdb_type, const string &mssql_type,
-	                  bool is_identity, bool is_nullable, bool has_default,
-	                  const string &collation, uint8_t precision, uint8_t scale)
-	    : name(name), duckdb_type(std::move(duckdb_type)), mssql_type(mssql_type),
-	      is_identity(is_identity), is_nullable(is_nullable), has_default(has_default),
-	      collation(collation), precision(precision), scale(scale) {}
+	MSSQLInsertColumn(const string &name, LogicalType duckdb_type, const string &mssql_type, bool is_identity,
+					  bool is_nullable, bool has_default, const string &collation, uint8_t precision, uint8_t scale)
+		: name(name),
+		  duckdb_type(std::move(duckdb_type)),
+		  mssql_type(mssql_type),
+		  is_identity(is_identity),
+		  is_nullable(is_nullable),
+		  has_default(has_default),
+		  collation(collation),
+		  precision(precision),
+		  scale(scale) {}
 };
 
 }  // namespace duckdb

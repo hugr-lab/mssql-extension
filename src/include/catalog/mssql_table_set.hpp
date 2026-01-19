@@ -1,11 +1,11 @@
 #pragma once
 
-#include "duckdb/catalog/catalog_entry.hpp"
-#include "catalog/mssql_metadata_cache.hpp"
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include "catalog/mssql_metadata_cache.hpp"
+#include "duckdb/catalog/catalog_entry.hpp"
 
 namespace duckdb {
 
@@ -69,11 +69,11 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	MSSQLSchemaEntry &schema_;                                        // Parent schema
-	std::atomic<bool> is_loaded_;                                     // Load state
-	std::mutex load_mutex_;                                           // Loading synchronization
-	std::mutex entry_mutex_;                                          // Entry access synchronization
-	unordered_map<string, unique_ptr<MSSQLTableEntry>> entries_;      // Cached entries
+	MSSQLSchemaEntry &schema_;									  // Parent schema
+	std::atomic<bool> is_loaded_;								  // Load state
+	std::mutex load_mutex_;										  // Loading synchronization
+	std::mutex entry_mutex_;									  // Entry access synchronization
+	unordered_map<string, unique_ptr<MSSQLTableEntry>> entries_;  // Cached entries
 };
 
 }  // namespace duckdb

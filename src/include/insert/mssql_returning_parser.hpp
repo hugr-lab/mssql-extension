@@ -1,13 +1,13 @@
 #pragma once
 
+#include <memory>
+#include <vector>
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "insert/mssql_insert_target.hpp"
+#include "tds/tds_column_metadata.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_token_parser.hpp"
-#include "tds/tds_column_metadata.hpp"
-#include <memory>
-#include <vector>
 
 namespace duckdb {
 
@@ -33,8 +33,7 @@ public:
 	// Constructor
 	// @param target Insert target with column metadata
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
-	MSSQLReturningParser(const MSSQLInsertTarget &target,
-	                     const vector<idx_t> &returning_column_ids);
+	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids);
 
 	//===----------------------------------------------------------------------===//
 	// Parsing
@@ -46,10 +45,8 @@ public:
 	// @param socket TDS socket for reading more data
 	// @param timeout_ms Read timeout in milliseconds
 	// @return DataChunk containing OUTPUT INSERTED results, or nullptr if empty
-	unique_ptr<DataChunk> Parse(tds::TdsConnection &connection,
-	                            tds::TokenParser &parser,
-	                            tds::TdsSocket &socket,
-	                            int timeout_ms = 30000);
+	unique_ptr<DataChunk> Parse(tds::TdsConnection &connection, tds::TokenParser &parser, tds::TdsSocket &socket,
+								int timeout_ms = 30000);
 
 	// Parse from a fresh connection (sends no query, just reads response)
 	// Use this after ExecuteBatch() has been called
@@ -63,29 +60,37 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	// Get number of rows parsed
-	idx_t GetRowCount() const { return row_count_; }
+	idx_t GetRowCount() const {
+		return row_count_;
+	}
 
 	// Check if parsing encountered errors
-	bool HasError() const { return !error_message_.empty(); }
+	bool HasError() const {
+		return !error_message_.empty();
+	}
 
 	// Get error message (if any)
-	const string &GetErrorMessage() const { return error_message_; }
+	const string &GetErrorMessage() const {
+		return error_message_;
+	}
 
 	// Get SQL Server error number (if any)
-	uint32_t GetErrorNumber() const { return error_number_; }
+	uint32_t GetErrorNumber() const {
+		return error_number_;
+	}
 
 	// Get the DuckDB types for the result columns
-	const vector<LogicalType> &GetResultTypes() const { return result_types_; }
+	const vector<LogicalType> &GetResultTypes() const {
+		return result_types_;
+	}
 
 private:
 	// Initialize result chunk with proper types
 	unique_ptr<DataChunk> InitializeResultChunk();
 
 	// Process a single row from parser into the chunk
-	void ProcessRow(const tds::RowData &row,
-	                const std::vector<tds::ColumnMetadata> &columns,
-	                DataChunk &chunk,
-	                idx_t row_idx);
+	void ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns, DataChunk &chunk,
+					idx_t row_idx);
 
 	// Target metadata
 	const MSSQLInsertTarget &target_;

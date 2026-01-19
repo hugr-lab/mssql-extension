@@ -1,7 +1,7 @@
 #pragma once
 
-#include "duckdb/common/types/hugeint.hpp"
 #include <cstdint>
+#include "duckdb/common/types/hugeint.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -20,11 +20,11 @@ public:
 	//   bytes 6-7: Data3 (little-endian uint16)
 	//   bytes 8-15: Data4 (big-endian, as-is)
 	// DuckDB UUID is stored as big-endian hugeint_t
-	static hugeint_t ConvertGuid(const uint8_t* data);
+	static hugeint_t ConvertGuid(const uint8_t *data);
 
 	// Reorder GUID bytes from TDS mixed-endian to standard big-endian
 	// Output buffer must be 16 bytes
-	static void ReorderGuidBytes(const uint8_t* input, uint8_t* output);
+	static void ReorderGuidBytes(const uint8_t *input, uint8_t *output);
 };
 
 }  // namespace encoding

@@ -48,7 +48,7 @@ string MSSQLDDLTranslator::QuoteIdentifier(const string &identifier) {
 	for (char c : identifier) {
 		result += c;
 		if (c == ']') {
-			result += ']'; // Double the ] character
+			result += ']';	// Double the ] character
 		}
 	}
 	result += ']';
@@ -91,22 +91,22 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 
 	case LogicalTypeId::UTINYINT:
 		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
-		return "TINYINT"; // Range 0-255 fits in SQL Server TINYINT
+		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
 
 	case LogicalTypeId::USMALLINT:
-		return "INT"; // Wider to fit full range
+		return "INT";  // Wider to fit full range
 
 	case LogicalTypeId::UINTEGER:
-		return "BIGINT"; // Wider to fit full range
+		return "BIGINT";  // Wider to fit full range
 
 	case LogicalTypeId::UBIGINT:
-		return "DECIMAL(20,0)"; // No native unsigned 64-bit
+		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
 
 	case LogicalTypeId::FLOAT:
-		return "REAL"; // 32-bit float
+		return "REAL";	// 32-bit float
 
 	case LogicalTypeId::DOUBLE:
-		return "FLOAT"; // 64-bit float in SQL Server
+		return "FLOAT";	 // 64-bit float in SQL Server
 
 	case LogicalTypeId::DECIMAL: {
 		// Get precision and scale, clamp to SQL Server limits
@@ -124,7 +124,7 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 		// Check for collation info to determine length
 		// Default to NVARCHAR for Unicode safety
 		// DuckDB VARCHAR maps to NVARCHAR in SQL Server
-		return "NVARCHAR(MAX)"; // Default to MAX for unbounded strings
+		return "NVARCHAR(MAX)";	 // Default to MAX for unbounded strings
 	}
 
 	case LogicalTypeId::BLOB:
@@ -134,13 +134,13 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 		return "DATE";
 
 	case LogicalTypeId::TIME:
-		return "TIME(7)"; // Maximum precision
+		return "TIME(7)";  // Maximum precision
 
 	case LogicalTypeId::TIMESTAMP:
-		return "DATETIME2(6)"; // Microsecond precision
+		return "DATETIME2(6)";	// Microsecond precision
 
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return "DATETIMEOFFSET(7)"; // With timezone
+		return "DATETIMEOFFSET(7)";	 // With timezone
 
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";
@@ -154,8 +154,7 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 		return "NVARCHAR(100)";
 
 	default:
-		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type",
-		                              type.ToString());
+		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type", type.ToString());
 	}
 }
 
@@ -199,7 +198,7 @@ string MSSQLDDLTranslator::TranslateDropSchema(const string &schema_name) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
-                                                 const ColumnList &columns) {
+												const ColumnList &columns) {
 	if (columns.empty()) {
 		throw InvalidInputException("CREATE TABLE requires at least one column");
 	}
@@ -228,7 +227,7 @@ string MSSQLDDLTranslator::TranslateDropTable(const string &schema_name, const s
 }
 
 string MSSQLDDLTranslator::TranslateRenameTable(const string &schema_name, const string &old_name,
-                                                 const string &new_name) {
+												const string &new_name) {
 	// SQL Server uses sp_rename for renaming tables
 	// Syntax: EXEC sp_rename N'schema.old_name', N'new_name'
 	// Note: new_name should not include schema
@@ -241,7 +240,7 @@ string MSSQLDDLTranslator::TranslateRenameTable(const string &schema_name, const
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateAddColumn(const string &schema_name, const string &table_name,
-                                               const ColumnDefinition &column) {
+											  const ColumnDefinition &column) {
 	string result = "ALTER TABLE ";
 	result += QuoteIdentifier(schema_name);
 	result += ".";
@@ -253,23 +252,23 @@ string MSSQLDDLTranslator::TranslateAddColumn(const string &schema_name, const s
 }
 
 string MSSQLDDLTranslator::TranslateDropColumn(const string &schema_name, const string &table_name,
-                                                const string &column_name) {
+											   const string &column_name) {
 	return "ALTER TABLE " + QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name) + " DROP COLUMN " +
-	       QuoteIdentifier(column_name) + ";";
+		   QuoteIdentifier(column_name) + ";";
 }
 
 string MSSQLDDLTranslator::TranslateRenameColumn(const string &schema_name, const string &table_name,
-                                                  const string &old_name, const string &new_name) {
+												 const string &old_name, const string &new_name) {
 	// SQL Server uses sp_rename for renaming columns
 	// Syntax: EXEC sp_rename N'schema.table.old_column', N'new_column', N'COLUMN'
 	string old_full_name = schema_name + "." + table_name + "." + old_name;
 	return "EXEC sp_rename N'" + EscapeStringLiteral(old_full_name) + "', N'" + EscapeStringLiteral(new_name) +
-	       "', N'COLUMN';";
+		   "', N'COLUMN';";
 }
 
 string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, const string &table_name,
-                                                     const string &column_name, const LogicalType &new_type,
-                                                     bool is_nullable) {
+													const string &column_name, const LogicalType &new_type,
+													bool is_nullable) {
 	string result = "ALTER TABLE ";
 	result += QuoteIdentifier(schema_name);
 	result += ".";
@@ -284,8 +283,8 @@ string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, c
 }
 
 string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_name, const string &table_name,
-                                                            const string &column_name, const LogicalType &current_type,
-                                                            bool set_not_null) {
+														   const string &column_name, const LogicalType &current_type,
+														   bool set_not_null) {
 	// SQL Server requires specifying the full type when altering nullability
 	string result = "ALTER TABLE ";
 	result += QuoteIdentifier(schema_name);
@@ -300,4 +299,4 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 	return result;
 }
 
-} // namespace duckdb
+}  // namespace duckdb

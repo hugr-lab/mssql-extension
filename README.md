@@ -16,7 +16,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 
 ### Prerequisites
 
-- DuckDB v1.0 or later
+- DuckDB v1.4.1 or later (minimum supported version)
 - SQL Server 2019 or later accessible on network
 
 ### Step 1: Install Extension
@@ -54,13 +54,13 @@ ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword12
 
 ```sql
 -- List schemas
-SHOW SCHEMAS FROM sqlserver;
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'sqlserver';
 
 -- List tables in dbo schema
-SHOW TABLES FROM sqlserver.dbo;
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'sqlserver' AND schema_name = 'dbo';
 
 -- Query a table
-SELECT * FROM sqlserver.dbo.my_table LIMIT 10;
+FROM sqlserver.dbo.my_table LIMIT 10;
 ```
 
 ### Step 4: Disconnect
@@ -165,7 +165,7 @@ ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=tr
     AS db (TYPE mssql);
 ```
 
-> **Note**: TLS support requires the loadable extension build. The static build does not include TLS.
+> **Note**: TLS support is available in both static and loadable extension builds (using OpenSSL).
 
 ## Catalog Integration
 
@@ -187,13 +187,15 @@ DETACH sqlserver;
 
 ```sql
 -- List all schemas
-SHOW SCHEMAS FROM sqlserver;
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'sqlserver';
 
 -- List tables in a schema
-SHOW TABLES FROM sqlserver.dbo;
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'sqlserver' AND schema_name = 'dbo';
 
--- Describe table structure
-DESCRIBE sqlserver.dbo.my_table;
+-- Describe table structure (list columns)
+SELECT column_name, data_type, is_nullable
+FROM duckdb_columns()
+WHERE database_name = 'sqlserver' AND schema_name = 'dbo' AND table_name = 'my_table';
 ```
 
 ### Three-Part Naming
@@ -315,16 +317,6 @@ SELECT mssql_version();
 -- Returns: 'abc123def...'
 ```
 
-### mssql_execute()
-
-Execute a SQL statement and return results as a table.
-
-**Signature:** `mssql_execute(context VARCHAR, sql VARCHAR) -> TABLE(success BOOLEAN, affected_rows BIGINT, message VARCHAR)`
-
-```sql
-SELECT * FROM mssql_execute('sqlserver', 'EXEC sp_who2');
-```
-
 ### mssql_scan()
 
 Stream SELECT query results from SQL Server.
@@ -339,13 +331,17 @@ The return schema is dynamic based on the query result columns.
 
 ### mssql_exec()
 
-Execute a SQL statement and return affected row count.
+Execute a SQL statement and return affected row count. Use this for SQL Server-specific DDL or statements that don't return results.
 
-**Signature:** `mssql_exec(secret VARCHAR, sql VARCHAR) -> BIGINT`
+**Signature:** `mssql_exec(context VARCHAR, sql VARCHAR) -> BIGINT`
 
 ```sql
-SELECT mssql_exec('my_secret', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
--- Returns: 1 (number of affected rows)
+-- Execute DDL
+SELECT mssql_exec('sqlserver', 'CREATE TABLE dbo.my_table (id INT PRIMARY KEY)');
+
+-- Execute DML
+SELECT mssql_exec('sqlserver', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
+-- Returns: number of affected rows
 ```
 
 ### mssql_open()
@@ -517,106 +513,17 @@ SET mssql_statistics_level = 2;
 SET mssql_connection_cache = false;
 ```
 
-## Building from Source
+## Development
 
-### Build Prerequisites
+For building from source, testing, and contributing, see the [Development Guide](DEVELOPMENT.md).
 
-- CMake 3.21+
-- Ninja build system
-- C++17 compatible compiler
-- Git (for submodules)
-- Docker (optional, for SQL Server test environment)
-
-### Clone and Build
+Quick start:
 
 ```bash
-# Clone with submodules
 git clone --recurse-submodules <repository-url>
 cd mssql-extension
-
-# Build release version
-make release
-
-# Build debug version
-make debug
-```
-
-If you already cloned without submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-### Build Targets
-
-| Target          | Description                              |
-| --------------- | ---------------------------------------- |
-| `make release`  | Build optimized release version          |
-| `make debug`    | Build with debug symbols                 |
-| `make clean`    | Remove all build artifacts               |
-| `make test`     | Run DuckDB extension tests               |
-| `make help`     | Show available targets                   |
-
-### TLS Support
-
-The extension uses a split TLS build approach:
-
-| Build Type | TLS Support | Use Case                              |
-| ---------- | ----------- | ------------------------------------- |
-| Static     | No (stub)   | CLI development, minimal dependencies |
-| Loadable   | Yes (mbedTLS) | Production with encrypted connections |
-
-The loadable extension is built at:
-`build/release/extension/mssql/mssql.duckdb_extension`
-
-### Running Tests
-
-```bash
-# Run unit tests (no SQL Server required)
-make test
-
-# Start SQL Server for integration tests
-cd docker && docker-compose up -d
-
-# Wait for SQL Server to initialize, then run integration tests
-make test
-```
-
-### VS Code Configuration
-
-1. Open the project folder in VS Code
-2. Install recommended extensions when prompted
-3. Use `Cmd+Shift+B` (macOS) or `Ctrl+Shift+B` (Windows/Linux) to build
-4. Use `F5` to debug with DuckDB shell
-
-### CLion Configuration
-
-1. Open the project as a CMake project
-2. Set CMake options: `-DCMAKE_BUILD_TYPE=Debug`
-3. Select the `mssql` target
-4. Build and debug normally
-
-### Test Environment
-
-Start the SQL Server development container:
-
-```bash
-cd docker
-docker-compose up -d
-```
-
-Connect to verify:
-
-```bash
-docker exec -it mssql-dev /opt/mssql-tools18/bin/sqlcmd \
-  -S localhost -U sa -P 'DevPassword123!' -C \
-  -d TestDB -Q "SELECT * FROM TestSimplePK"
-```
-
-Stop the environment:
-
-```bash
-docker-compose down
+make        # Build release
+make test   # Run tests
 ```
 
 ## Troubleshooting
@@ -655,9 +562,8 @@ Error: Server requires encryption but TLS is not available
 
 **Solutions:**
 
-- Use the loadable extension build (includes TLS support)
 - Enable encryption in connection: `use_encrypt true` or `Encrypt=yes`
-- If using static build, encryption is not available
+- Ensure extension was built with OpenSSL (default for vcpkg builds)
 
 ### TLS Handshake Failed
 
@@ -694,6 +600,39 @@ Error: Unsupported SQL Server type: XML
 - Check network latency to SQL Server
 - Consider using `mssql_scan()` for complex queries with explicit SQL
 
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux x86_64 | Fully Tested | Primary development platform |
+| Linux ARM64 | Fully Tested | CI-validated |
+| macOS ARM64 | Tested | Load-only smoke tests in CI |
+| Windows x64 | Experimental | Builds in CI but not fully tested. Contributions welcome! |
+
+## Roadmap
+
+The following features are planned for future releases:
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | Planned |
+| **Transactions** | BEGIN/COMMIT/ROLLBACK, savepoints, connection pinning | Planned |
+| **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
+| **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
+| **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | Planned |
+
+### Feature Details
+
+**UPDATE/DELETE**: Will support `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Requires primary key for row identification. Batched execution using `UPDATE ... FROM (VALUES ...)` pattern.
+
+**Transactions**: DML-only transactions with connection pinning. Savepoints via `SAVE TRANSACTION`. DDL executes outside transactions (auto-commit).
+
+**CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` implemented as DDL creation followed by bulk INSERT (no RETURNING).
+
+**MERGE/UPSERT**: Batched upsert using SQL Server `MERGE` statement. Supports primary key or user-specified key columns.
+
+**BCP/COPY**: Binary bulk copy protocol for maximum throughput. Streaming execution with bounded memory. No RETURNING support (use regular INSERT for that).
+
 ## Limitations
 
 ### Unsupported Features
@@ -701,7 +640,7 @@ Error: Unsupported SQL Server type: XML
 - **UPDATE/DELETE**: Use `mssql_exec()` for data modification other than INSERT
 - **Windows Authentication**: Only SQL Server authentication is supported
 - **Transactions**: Multi-statement transactions are not supported
-- **Stored Procedures with Output Parameters**: Use `mssql_execute()` for stored procedures
+- **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 
 ### Known Issues
 
@@ -711,4 +650,4 @@ Error: Unsupported SQL Server type: XML
 
 ## License
 
-[TBD]
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

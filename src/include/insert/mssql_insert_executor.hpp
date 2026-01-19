@@ -1,12 +1,12 @@
 #pragma once
 
+#include <memory>
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
 #include "insert/mssql_insert_error.hpp"
-#include <memory>
+#include "insert/mssql_insert_target.hpp"
 
 namespace duckdb {
 
@@ -14,7 +14,7 @@ namespace duckdb {
 namespace tds {
 class ConnectionPool;
 class TdsConnection;
-}
+}  // namespace tds
 
 //===----------------------------------------------------------------------===//
 // MSSQLInsertExecutor - Main orchestrator for INSERT operations
@@ -38,9 +38,7 @@ public:
 	// @param context DuckDB client context
 	// @param target Insert target metadata
 	// @param config Insert configuration
-	MSSQLInsertExecutor(ClientContext &context,
-	                    const MSSQLInsertTarget &target,
-	                    const MSSQLInsertConfig &config);
+	MSSQLInsertExecutor(ClientContext &context, const MSSQLInsertTarget &target, const MSSQLInsertConfig &config);
 
 	~MSSQLInsertExecutor();
 
@@ -63,8 +61,7 @@ public:
 	// @param returning_column_ids Column IDs to return
 	// @return DataChunk containing OUTPUT INSERTED results
 	// @throws MSSQLInsertException on failure
-	unique_ptr<DataChunk> ExecuteWithReturning(DataChunk &input_chunk,
-	                                            const vector<idx_t> &returning_column_ids);
+	unique_ptr<DataChunk> ExecuteWithReturning(DataChunk &input_chunk, const vector<idx_t> &returning_column_ids);
 
 	//===----------------------------------------------------------------------===//
 	// Finalization
@@ -113,8 +110,7 @@ private:
 	idx_t ExecuteBatch(const string &sql);
 
 	// Execute a batch and parse OUTPUT results
-	unique_ptr<DataChunk> ExecuteBatchWithOutput(const string &sql,
-	                                              const vector<idx_t> &returning_column_ids);
+	unique_ptr<DataChunk> ExecuteBatchWithOutput(const string &sql, const vector<idx_t> &returning_column_ids);
 
 	// Get connection pool from catalog
 	tds::ConnectionPool &GetConnectionPool();
@@ -128,7 +124,9 @@ class MSSQLInsertException : public Exception {
 public:
 	explicit MSSQLInsertException(const MSSQLInsertError &error);
 
-	const MSSQLInsertError &GetError() const { return error_; }
+	const MSSQLInsertError &GetError() const {
+		return error_;
+	}
 
 private:
 	MSSQLInsertError error_;

@@ -10,9 +10,7 @@ namespace duckdb {
 // Constructor
 //===----------------------------------------------------------------------===//
 
-MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
-    : schema_(schema), is_loaded_(false) {
-}
+MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema) : schema_(schema), is_loaded_(false) {}
 
 //===----------------------------------------------------------------------===//
 // Entry Access

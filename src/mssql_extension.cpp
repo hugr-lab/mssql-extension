@@ -1,13 +1,13 @@
 #include "mssql_extension.hpp"
-#include "mssql_functions.hpp"
-#include "mssql_secret.hpp"
-#include "mssql_storage.hpp"
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "mssql_functions.hpp"
+#include "mssql_secret.hpp"
+#include "mssql_storage.hpp"
 
 namespace duckdb {
 
@@ -49,7 +49,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 7. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
-	                                         LogicalType::VARCHAR, MssqlVersionFunction);
+											 LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
 }
 

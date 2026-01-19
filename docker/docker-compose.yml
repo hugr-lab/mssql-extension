@@ -1,3 +1,12 @@
+# Docker Compose for local development (SQL Server only)
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d          # Start SQL Server
+#   docker compose -f docker/docker-compose.yml down           # Stop
+#   docker compose -f docker/docker-compose.yml down -v        # Stop and remove data
+#
+# For Linux CI-like build/test, use docker-compose.linux-ci.yml instead
+
 services:
   sqlserver:
     # Use SQL Server 2022 with x64 emulation on ARM64 Macs

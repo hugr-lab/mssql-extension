@@ -1,14 +1,14 @@
 #pragma once
 
+#include <memory>
+#include <unordered_map>
+#include "catalog/mssql_metadata_cache.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
-#include "catalog/mssql_metadata_cache.hpp"
-#include "catalog/mssql_statistics.hpp"
-#include "tds/tds_connection_pool.hpp"
 #include "mssql_storage.hpp"
-#include <memory>
-#include <unordered_map>
+#include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
 
@@ -37,9 +37,8 @@ class LogicalUpdate;
 class MSSQLCatalog : public Catalog {
 public:
 	// Constructor
-	MSSQLCatalog(AttachedDatabase &db, const string &context_name,
-	             shared_ptr<MSSQLConnectionInfo> connection_info,
-	             AccessMode access_mode);
+	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
+				 AccessMode access_mode);
 
 	~MSSQLCatalog() override;
 
@@ -51,35 +50,31 @@ public:
 
 	string GetCatalogType() override;
 
-	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction,
-	                                              const EntryLookupInfo &schema_lookup,
-	                                              OnEntryNotFound if_not_found) override;
+	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
+												  OnEntryNotFound if_not_found) override;
 
-	void ScanSchemas(ClientContext &context,
-	                 std::function<void(SchemaCatalogEntry &)> callback) override;
+	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
 
-	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction,
-	                                        CreateSchemaInfo &info) override;
+	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 
 	//===----------------------------------------------------------------------===//
 	// DML Planning (all throw - writes not supported)
 	//===----------------------------------------------------------------------===//
 
-	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-	                             LogicalInsert &op, optional_ptr<PhysicalOperator> plan) override;
+	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+								 optional_ptr<PhysicalOperator> plan) override;
 
-	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
-	                                    LogicalCreateTable &op, PhysicalOperator &plan) override;
+	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
+										PhysicalOperator &plan) override;
 
-	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
-	                             LogicalDelete &op, PhysicalOperator &plan) override;
+	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+								 PhysicalOperator &plan) override;
 
-	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
-	                             LogicalUpdate &op, PhysicalOperator &plan) override;
+	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+								 PhysicalOperator &plan) override;
 
-	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt,
-	                                            TableCatalogEntry &table,
-	                                            unique_ptr<LogicalOperator> plan) override;
+	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
+												unique_ptr<LogicalOperator> plan) override;
 
 	//===----------------------------------------------------------------------===//
 	// Catalog Information
@@ -175,16 +170,16 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	string context_name_;                                              // Attached context name
-	shared_ptr<MSSQLConnectionInfo> connection_info_;                  // Connection parameters
-	AccessMode access_mode_;                                           // READ_ONLY enforced
-	shared_ptr<tds::ConnectionPool> connection_pool_;                  // Connection pool
-	unique_ptr<MSSQLMetadataCache> metadata_cache_;                    // Metadata cache
-	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;          // Statistics provider
-	string database_collation_;                                        // Database default collation
-	string default_schema_;                                            // Default schema ("dbo")
+	string context_name_;												  // Attached context name
+	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
+	AccessMode access_mode_;											  // READ_ONLY enforced
+	shared_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool
+	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
+	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider
+	string database_collation_;											  // Database default collation
+	string default_schema_;												  // Default schema ("dbo")
 	unordered_map<string, unique_ptr<MSSQLSchemaEntry>> schema_entries_;  // Schema entry cache
-	mutable std::mutex schema_mutex_;                                  // Thread-safety for schema access
+	mutable std::mutex schema_mutex_;									  // Thread-safety for schema access
 };
 
 }  // namespace duckdb

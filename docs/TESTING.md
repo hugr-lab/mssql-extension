@@ -181,7 +181,6 @@ test/
 │   │   └── type_mapping.test
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_scan.test             # mssql_scan() function tests
-│   ├── mssql_execute.test          # mssql_execute() function tests
 │   ├── mssql_secret.test           # Secret management tests
 │   ├── mssql_version.test          # Version info tests
 │   └── tls_secret.test             # TLS secret tests

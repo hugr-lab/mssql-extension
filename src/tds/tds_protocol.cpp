@@ -1,7 +1,7 @@
 #include "tds/tds_protocol.hpp"
-#include "tds/encoding/utf16.hpp"
 #include <cstring>
 #include <stdexcept>
+#include "tds/encoding/utf16.hpp"
 #ifdef _WIN32
 #include <process.h>
 #define GET_PID() _getpid()
@@ -36,23 +36,23 @@ TdsPacket TdsProtocol::BuildPrelogin(bool use_encrypt) {
 
 	// VERSION option header
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::VERSION));
-	packet.AppendUInt16BE(data_offset);     // offset
-	packet.AppendUInt16BE(6);               // length
+	packet.AppendUInt16BE(data_offset);	 // offset
+	packet.AppendUInt16BE(6);			 // length
 
 	// ENCRYPTION option header
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::ENCRYPTION));
-	packet.AppendUInt16BE(data_offset + 6); // offset (after VERSION data)
-	packet.AppendUInt16BE(1);               // length
+	packet.AppendUInt16BE(data_offset + 6);	 // offset (after VERSION data)
+	packet.AppendUInt16BE(1);				 // length
 
 	// TERMINATOR
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::TERMINATOR));
 
 	// VERSION data: UL_VERSION (4 bytes) + US_SUBBUILD (2 bytes)
 	// We report as a generic TDS 7.4 client
-	packet.AppendByte(15);  // Major version (SQL Server 2019 = 15.x)
-	packet.AppendByte(0);   // Minor version
-	packet.AppendUInt16BE(0); // Build number
-	packet.AppendUInt16BE(0); // Sub-build number
+	packet.AppendByte(15);	   // Major version (SQL Server 2019 = 15.x)
+	packet.AppendByte(0);	   // Minor version
+	packet.AppendUInt16BE(0);  // Build number
+	packet.AppendUInt16BE(0);  // Sub-build number
 
 	// ENCRYPTION data: request encryption based on use_encrypt parameter
 	// ENCRYPT_ON: Client requests encryption, expects server to agree
@@ -66,7 +66,7 @@ TdsPacket TdsProtocol::BuildPrelogin(bool use_encrypt) {
 	return packet;
 }
 
-PreloginResponse TdsProtocol::ParsePreloginResponse(const std::vector<uint8_t>& data) {
+PreloginResponse TdsProtocol::ParsePreloginResponse(const std::vector<uint8_t> &data) {
 	PreloginResponse response = {};
 	response.success = false;
 
@@ -111,13 +111,13 @@ PreloginResponse TdsProtocol::ParsePreloginResponse(const std::vector<uint8_t>& 
 	return response;
 }
 
-std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string& password) {
+std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string &password) {
 	// Convert password to UTF-16LE
 	std::vector<uint8_t> encoded = encoding::Utf16LEEncode(password);
 
 	// Apply TDS password obfuscation to each byte:
 	// Per MS-TDS spec: swap nibbles first, then XOR with 0xA5
-	for (auto& byte : encoded) {
+	for (auto &byte : encoded) {
 		byte = ((byte << 4) & 0xF0) | ((byte >> 4) & 0x0F);
 		byte ^= 0xA5;
 	}
@@ -125,12 +125,8 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string& password) {
 	return encoded;
 }
 
-TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
-                                   const std::string& username,
-                                   const std::string& password,
-                                   const std::string& database,
-                                   const std::string& app_name,
-                                   uint32_t packet_size) {
+TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
+								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 fixed header is 94 bytes
@@ -144,7 +140,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
 	uint16_t username_len = static_cast<uint16_t>(username.size());
 	uint16_t password_len = static_cast<uint16_t>(password.size());
 	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(host.size()); // Server name same as host
+	uint16_t servername_len = static_cast<uint16_t>(host.size());  // Server name same as host
 	uint16_t database_len = static_cast<uint16_t>(database.size());
 
 	// Variable data starts at offset 94 (end of fixed header)
@@ -155,15 +151,15 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
 	uint16_t password_offset = username_offset + username_len * 2;
 	uint16_t appname_offset = password_offset + password_len * 2;
 	uint16_t servername_offset = appname_offset + appname_len * 2;
-	uint16_t unused_offset = servername_offset + servername_len * 2; // CltIntName (unused)
-	uint16_t language_offset = unused_offset; // Language (unused)
-	uint16_t database_offset = language_offset; // Database follows unused fields
+	uint16_t unused_offset = servername_offset + servername_len * 2;  // CltIntName (unused)
+	uint16_t language_offset = unused_offset;						  // Language (unused)
+	uint16_t database_offset = language_offset;						  // Database follows unused fields
 	// Actually, database follows in the sequence
 
 	// Recalculate properly
-	// Fields in order: HostName, UserName, Password, AppName, ServerName, Unused, CltIntName, Language, Database, SSPI, AtchDBFile, ChangePassword
-	// We only use HostName, UserName, Password, AppName, ServerName, Database
-	// Others have length 0
+	// Fields in order: HostName, UserName, Password, AppName, ServerName, Unused, CltIntName, Language, Database, SSPI,
+	// AtchDBFile, ChangePassword We only use HostName, UserName, Password, AppName, ServerName, Database Others have
+	// length 0
 
 	var_offset = 94;
 	hostname_offset = var_offset;
@@ -235,7 +231,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
 	// Offset 24: OptionFlags1 (1 byte)
 	// Bit 5: USE_DB (switch to database on login)
 	// Bit 6: SET_LANG
-	uint8_t flags1 = 0x20; // USE_DB
+	uint8_t flags1 = 0x20;	// USE_DB
 	packet.AppendByte(flags1);
 
 	// Offset 25: OptionFlags2 (1 byte)
@@ -259,7 +255,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
 	packet.AppendUInt32LE(0);
 
 	// Offset 32: ClientLCID (4 bytes, LE) - locale ID
-	packet.AppendUInt32LE(0x0409); // en-US
+	packet.AppendUInt32LE(0x0409);	// en-US
 
 	// Offset 36-93: Offset/Length pairs for variable fields (58 bytes = 29 uint16_t values)
 	// Each field: offset (2 bytes) + length (2 bytes) = 4 bytes
@@ -361,7 +357,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string& host,
 	return packet;
 }
 
-std::string TdsProtocol::ReadUTF16LE(const uint8_t* data, size_t char_count) {
+std::string TdsProtocol::ReadUTF16LE(const uint8_t *data, size_t char_count) {
 	std::string result;
 	result.reserve(char_count);
 	for (size_t i = 0; i < char_count; i++) {
@@ -371,7 +367,7 @@ std::string TdsProtocol::ReadUTF16LE(const uint8_t* data, size_t char_count) {
 	return result;
 }
 
-const uint8_t* TdsProtocol::FindToken(const uint8_t* data, size_t length, TokenType token) {
+const uint8_t *TdsProtocol::FindToken(const uint8_t *data, size_t length, TokenType token) {
 	uint8_t target = static_cast<uint8_t>(token);
 	for (size_t i = 0; i < length; i++) {
 		if (data[i] == target) {
@@ -381,31 +377,33 @@ const uint8_t* TdsProtocol::FindToken(const uint8_t* data, size_t length, TokenT
 	return nullptr;
 }
 
-LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) {
+LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) {
 	LoginResponse response = {};
 	response.success = false;
-	response.negotiated_packet_size = TDS_DEFAULT_PACKET_SIZE;  // Default until server tells us
+	response.negotiated_packet_size = TDS_DEFAULT_PACKET_SIZE;	// Default until server tells us
 
 	if (data.empty()) {
 		response.error_message = "Empty LOGIN response";
 		return response;
 	}
 
-	const uint8_t* ptr = data.data();
-	const uint8_t* end = ptr + data.size();
+	const uint8_t *ptr = data.data();
+	const uint8_t *end = ptr + data.size();
 
 	// Look for LOGINACK token (0xAD)
 	while (ptr < end) {
 		uint8_t token_type = *ptr++;
 
 		if (token_type == static_cast<uint8_t>(TokenType::LOGINACK)) {
-			if (ptr + 2 > end) break;
+			if (ptr + 2 > end)
+				break;
 
 			// Length (2 bytes, LE)
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 
-			if (ptr + len > end) break;
+			if (ptr + len > end)
+				break;
 
 			// Interface (1 byte)
 			// TDSVersion (4 bytes)
@@ -417,10 +415,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 				// Skip interface
 				ptr++;
 				// Read TDS version (big-endian in LOGINACK)
-				response.tds_version = (static_cast<uint32_t>(ptr[0]) << 24) |
-				                       (static_cast<uint32_t>(ptr[1]) << 16) |
-				                       (static_cast<uint32_t>(ptr[2]) << 8) |
-				                       static_cast<uint32_t>(ptr[3]);
+				response.tds_version = (static_cast<uint32_t>(ptr[0]) << 24) | (static_cast<uint32_t>(ptr[1]) << 16) |
+									   (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
 				ptr += 4;
 
 				// Server name length
@@ -434,17 +430,18 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 			return response;
 
 		} else if (token_type == static_cast<uint8_t>(TokenType::ERROR_TOKEN)) {
-			if (ptr + 2 > end) break;
+			if (ptr + 2 > end)
+				break;
 
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 
-			if (ptr + len > end || len < 14) break;
+			if (ptr + len > end || len < 14)
+				break;
 
 			// Error number (4 bytes, LE)
 			response.error_number = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) |
-			                        (static_cast<uint32_t>(ptr[2]) << 16) |
-			                        (static_cast<uint32_t>(ptr[3]) << 24);
+									(static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
 			ptr += 4;
 
 			// State (1 byte)
@@ -464,8 +461,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 			return response;
 
 		} else if (token_type == static_cast<uint8_t>(TokenType::DONE) ||
-		           token_type == static_cast<uint8_t>(TokenType::DONEPROC) ||
-		           token_type == static_cast<uint8_t>(TokenType::DONEINPROC)) {
+				   token_type == static_cast<uint8_t>(TokenType::DONEPROC) ||
+				   token_type == static_cast<uint8_t>(TokenType::DONEINPROC)) {
 			// DONE token: skip 8 bytes (status + curcmd + rowcount)
 			if (ptr + 8 <= end) {
 				ptr += 8;
@@ -473,11 +470,12 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 				break;
 			}
 		} else if (token_type == static_cast<uint8_t>(TokenType::ENVCHANGE)) {
-			if (ptr + 2 > end) break;
+			if (ptr + 2 > end)
+				break;
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 			if (ptr + len <= end) {
-				const uint8_t* env_data = ptr;
+				const uint8_t *env_data = ptr;
 				// ENVCHANGE type is first byte
 				uint8_t env_type = env_data[0];
 				// Type 4 = PACKETSIZE
@@ -499,7 +497,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 				break;
 			}
 		} else if (token_type == static_cast<uint8_t>(TokenType::INFO)) {
-			if (ptr + 2 > end) break;
+			if (ptr + 2 > end)
+				break;
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 			if (ptr + len <= end) {
@@ -536,7 +535,7 @@ TdsPacket TdsProtocol::BuildPing() {
 	return BuildSqlBatch("SELECT 1");
 }
 
-TdsPacket TdsProtocol::BuildSqlBatch(const std::string& sql) {
+TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql) {
 	TdsPacket packet(PacketType::SQL_BATCH);
 
 	// SQL_BATCH for TDS 7.1+ requires ALL_HEADERS prefix (MS-TDS 2.2.6.6)
@@ -590,8 +589,7 @@ TdsPacket TdsProtocol::BuildSqlBatch(const std::string& sql) {
 	return packet;
 }
 
-std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string& sql,
-                                                             size_t max_packet_size) {
+std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &sql, size_t max_packet_size) {
 	std::vector<TdsPacket> packets;
 
 	// Encode SQL to UTF-16LE
@@ -684,18 +682,16 @@ TdsPacket TdsProtocol::BuildAttention() {
 	return packet;
 }
 
-bool TdsProtocol::ParseDoneForAttentionAck(const std::vector<uint8_t>& data) {
+bool TdsProtocol::ParseDoneForAttentionAck(const std::vector<uint8_t> &data) {
 	// Look for DONE token with DONE_ATTN flag
-	const uint8_t* ptr = data.data();
-	const uint8_t* end = ptr + data.size();
+	const uint8_t *ptr = data.data();
+	const uint8_t *end = ptr + data.size();
 
 	while (ptr < end) {
 		uint8_t token = *ptr++;
 
-		if (token == static_cast<uint8_t>(TokenType::DONE) ||
-		    token == static_cast<uint8_t>(TokenType::DONEPROC) ||
-		    token == static_cast<uint8_t>(TokenType::DONEINPROC)) {
-
+		if (token == static_cast<uint8_t>(TokenType::DONE) || token == static_cast<uint8_t>(TokenType::DONEPROC) ||
+			token == static_cast<uint8_t>(TokenType::DONEINPROC)) {
 			if (ptr + 8 <= end) {
 				// Status (2 bytes, LE)
 				uint16_t status = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
@@ -725,7 +721,7 @@ bool TdsProtocol::ParseDoneForAttentionAck(const std::vector<uint8_t>& data) {
 	return false;
 }
 
-bool TdsProtocol::IsSuccessResponse(const std::vector<uint8_t>& data) {
+bool TdsProtocol::IsSuccessResponse(const std::vector<uint8_t> &data) {
 	// Check for ERROR token
 	for (size_t i = 0; i < data.size(); i++) {
 		if (data[i] == static_cast<uint8_t>(TokenType::ERROR_TOKEN)) {
@@ -734,16 +730,14 @@ bool TdsProtocol::IsSuccessResponse(const std::vector<uint8_t>& data) {
 	}
 
 	// Check for DONE with error flag
-	const uint8_t* ptr = data.data();
-	const uint8_t* end = ptr + data.size();
+	const uint8_t *ptr = data.data();
+	const uint8_t *end = ptr + data.size();
 
 	while (ptr < end) {
 		uint8_t token = *ptr++;
 
-		if (token == static_cast<uint8_t>(TokenType::DONE) ||
-		    token == static_cast<uint8_t>(TokenType::DONEPROC) ||
-		    token == static_cast<uint8_t>(TokenType::DONEINPROC)) {
-
+		if (token == static_cast<uint8_t>(TokenType::DONE) || token == static_cast<uint8_t>(TokenType::DONEPROC) ||
+			token == static_cast<uint8_t>(TokenType::DONEINPROC)) {
 			if (ptr + 2 <= end) {
 				uint16_t status = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 				if (status & static_cast<uint16_t>(DoneStatus::DONE_ERROR)) {
@@ -770,20 +764,22 @@ bool TdsProtocol::IsSuccessResponse(const std::vector<uint8_t>& data) {
 	return true;
 }
 
-std::string TdsProtocol::ExtractErrorMessage(const std::vector<uint8_t>& data) {
-	const uint8_t* ptr = data.data();
-	const uint8_t* end = ptr + data.size();
+std::string TdsProtocol::ExtractErrorMessage(const std::vector<uint8_t> &data) {
+	const uint8_t *ptr = data.data();
+	const uint8_t *end = ptr + data.size();
 
 	while (ptr < end) {
 		uint8_t token = *ptr++;
 
 		if (token == static_cast<uint8_t>(TokenType::ERROR_TOKEN)) {
-			if (ptr + 2 > end) break;
+			if (ptr + 2 > end)
+				break;
 
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 
-			if (ptr + len > end || len < 10) break;
+			if (ptr + len > end || len < 10)
+				break;
 
 			// Skip error number (4), state (1), class (1)
 			ptr += 6;

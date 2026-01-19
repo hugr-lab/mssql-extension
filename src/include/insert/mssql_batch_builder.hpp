@@ -1,12 +1,12 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
-#include "insert/mssql_insert_batch.hpp"
 #include <string>
 #include <vector>
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "insert/mssql_insert_batch.hpp"
+#include "insert/mssql_insert_config.hpp"
+#include "insert/mssql_insert_target.hpp"
 
 namespace duckdb {
 
@@ -37,9 +37,7 @@ public:
 	// @param target Insert target metadata
 	// @param config Insert configuration (batch size, limits)
 	// @param include_output_clause Whether to include OUTPUT clause
-	MSSQLBatchBuilder(const MSSQLInsertTarget &target,
-	                  const MSSQLInsertConfig &config,
-	                  bool include_output_clause);
+	MSSQLBatchBuilder(const MSSQLInsertTarget &target, const MSSQLInsertConfig &config, bool include_output_clause);
 
 	//===----------------------------------------------------------------------===//
 	// Row Operations
@@ -78,16 +76,16 @@ private:
 	bool include_output_clause_;
 
 	// Current batch state
-	vector<vector<string>> row_literals_;     // Serialized values per row
-	idx_t current_sql_bytes_;                 // Estimated SQL size
-	idx_t pending_row_count_;                 // Rows in current batch
+	vector<vector<string>> row_literals_;  // Serialized values per row
+	idx_t current_sql_bytes_;			   // Estimated SQL size
+	idx_t pending_row_count_;			   // Rows in current batch
 
 	// Progress tracking
-	idx_t current_row_offset_;                // Global row offset
-	idx_t batch_count_;                       // Number of batches flushed
+	idx_t current_row_offset_;	// Global row offset
+	idx_t batch_count_;			// Number of batches flushed
 
 	// Pre-calculated values for efficiency
-	idx_t base_sql_size_;                     // INSERT INTO ... VALUES prefix size
+	idx_t base_sql_size_;  // INSERT INTO ... VALUES prefix size
 
 	// Serialize a row from DataChunk
 	// @return vector of serialized literals for each column

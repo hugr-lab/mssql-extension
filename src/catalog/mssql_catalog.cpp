@@ -1,16 +1,13 @@
 #include "catalog/mssql_catalog.hpp"
-#include "catalog/mssql_schema_entry.hpp"
-#include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
+#include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
-#include "query/mssql_simple_query.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
-#include "insert/mssql_physical_insert.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -19,7 +16,10 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
+#include "insert/mssql_insert_config.hpp"
+#include "insert/mssql_insert_target.hpp"
+#include "insert/mssql_physical_insert.hpp"
+#include "query/mssql_simple_query.hpp"
 
 namespace duckdb {
 
@@ -28,19 +28,21 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 static const char *DATABASE_COLLATION_SQL =
-    "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation";
+	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation";
 
 //===----------------------------------------------------------------------===//
 // Constructor / Destructor
 //===----------------------------------------------------------------------===//
 
 MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
-                           shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode)
-    : Catalog(db), context_name_(context_name), connection_info_(std::move(connection_info)),
-      access_mode_(access_mode), default_schema_("dbo") {
-
+						   shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode)
+	: Catalog(db),
+	  context_name_(context_name),
+	  connection_info_(std::move(connection_info)),
+	  access_mode_(access_mode),
+	  default_schema_("dbo") {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
-	int64_t cache_ttl = 0;  // Default: manual refresh only
+	int64_t cache_ttl = 0;	// Default: manual refresh only
 	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl);
 
 	// Create statistics provider with default TTL (will be configured from settings later)
@@ -73,7 +75,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 }
 
 tds::ConnectionFactory MSSQLCatalog::CreateConnectionFactory() {
-	auto conn_info = connection_info_;  // Capture shared_ptr
+	auto conn_info = connection_info_;	// Capture shared_ptr
 	return [conn_info]() -> std::shared_ptr<tds::TdsConnection> {
 		auto connection = std::make_shared<tds::TdsConnection>();
 		// First establish TCP connection
@@ -81,8 +83,8 @@ tds::ConnectionFactory MSSQLCatalog::CreateConnectionFactory() {
 			throw IOException("Failed to connect to MSSQL server %s:%d", conn_info->host, conn_info->port);
 		}
 		// Then authenticate (optionally with TLS)
-		if (!connection->Authenticate(conn_info->user, conn_info->password,
-		                              conn_info->database, conn_info->use_encrypt)) {
+		if (!connection->Authenticate(conn_info->user, conn_info->password, conn_info->database,
+									  conn_info->use_encrypt)) {
 			throw IOException("Failed to authenticate to MSSQL server");
 		}
 		return connection;
@@ -132,8 +134,8 @@ string MSSQLCatalog::GetCatalogType() {
 //===----------------------------------------------------------------------===//
 
 optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction transaction,
-                                                             const EntryLookupInfo &schema_lookup,
-                                                             OnEntryNotFound if_not_found) {
+															const EntryLookupInfo &schema_lookup,
+															OnEntryNotFound if_not_found) {
 	auto &name = schema_lookup.GetEntryName();
 
 	// Ensure metadata cache is loaded
@@ -153,8 +155,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	return &GetOrCreateSchemaEntry(name);
 }
 
-void MSSQLCatalog::ScanSchemas(ClientContext &context,
-                               std::function<void(SchemaCatalogEntry &)> callback) {
+void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	// Ensure cache is loaded
 	EnsureCacheLoaded(context);
 
@@ -180,8 +181,7 @@ MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name
 	return entry_ref;
 }
 
-optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction,
-                                                       CreateSchemaInfo &info) {
+optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	CheckWriteAccess("CREATE SCHEMA");
 
 	// Generate T-SQL for CREATE SCHEMA
@@ -228,8 +228,8 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 // Write Operations (all throw - read-only catalog)
 //===----------------------------------------------------------------------===//
 
-PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-                                            LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
+PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+										   optional_ptr<PhysicalOperator> plan) {
 	// Check write access first (throws if read-only)
 	CheckWriteAccess("INSERT");
 
@@ -279,9 +279,9 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		insert_col.name = col.name;
 		insert_col.duckdb_type = col.duckdb_type;
 		insert_col.mssql_type = col.sql_type_name;
-		insert_col.is_identity = false;  // Will be detected below if needed
+		insert_col.is_identity = false;	 // Will be detected below if needed
 		insert_col.is_nullable = col.is_nullable;
-		insert_col.has_default = false;  // TODO: Query this from sys.columns
+		insert_col.has_default = false;	 // TODO: Query this from sys.columns
 		insert_col.collation = col.collation_name;
 		insert_col.precision = col.precision;
 		insert_col.scale = col.scale;
@@ -315,13 +315,8 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	}
 
 	// Create the physical operator using planner.Make<T>()
-	auto &physical_insert = planner.Make<MSSQLPhysicalInsert>(
-	    std::move(result_types),
-	    op.estimated_cardinality,
-	    std::move(target),
-	    std::move(config),
-	    op.return_chunk
-	);
+	auto &physical_insert = planner.Make<MSSQLPhysicalInsert>(std::move(result_types), op.estimated_cardinality,
+															  std::move(target), std::move(config), op.return_chunk);
 
 	// Add child operator if present
 	if (plan) {
@@ -332,23 +327,22 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 }
 
 PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
-                                                   LogicalCreateTable &op, PhysicalOperator &plan) {
+												  LogicalCreateTable &op, PhysicalOperator &plan) {
 	throw NotImplementedException("MSSQL catalog is read-only: CREATE TABLE AS is not supported");
 }
 
-PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
-                                            LogicalDelete &op, PhysicalOperator &plan) {
+PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+										   PhysicalOperator &plan) {
 	throw NotImplementedException("MSSQL catalog is read-only: DELETE is not supported");
 }
 
-PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
-                                            LogicalUpdate &op, PhysicalOperator &plan) {
+PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+										   PhysicalOperator &plan) {
 	throw NotImplementedException("MSSQL catalog is read-only: UPDATE is not supported");
 }
 
 unique_ptr<LogicalOperator> MSSQLCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
-                                                           TableCatalogEntry &table,
-                                                           unique_ptr<LogicalOperator> plan) {
+														  TableCatalogEntry &table, unique_ptr<LogicalOperator> plan) {
 	throw NotImplementedException("MSSQL catalog is read-only: CREATE INDEX is not supported");
 }
 
@@ -373,7 +367,7 @@ bool MSSQLCatalog::InMemory() {
 string MSSQLCatalog::GetDBPath() {
 	// Return connection info as path representation
 	return "mssql://" + connection_info_->host + ":" + std::to_string(connection_info_->port) + "/" +
-	       connection_info_->database;
+		   connection_info_->database;
 }
 
 //===----------------------------------------------------------------------===//
@@ -436,7 +430,7 @@ void MSSQLCatalog::CheckWriteAccess(const char *operation_name) const {
 	if (IsReadOnly()) {
 		if (operation_name) {
 			throw CatalogException("Cannot execute %s: MSSQL catalog '%s' is attached in read-only mode",
-			                       operation_name, context_name_);
+								   operation_name, context_name_);
 		} else {
 			throw CatalogException("Cannot modify MSSQL catalog '%s': attached in read-only mode", context_name_);
 		}
@@ -462,8 +456,8 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 
 		if (!result.success) {
 			connection_pool_->Release(std::move(connection));
-			throw CatalogException("MSSQL DDL error: SQL Server error %d: %s",
-			                       result.error_number, result.error_message);
+			throw CatalogException("MSSQL DDL error: SQL Server error %d: %s", result.error_number,
+								   result.error_message);
 		}
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));

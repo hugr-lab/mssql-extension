@@ -17,17 +17,16 @@ constexpr int64_t MICROS_PER_DAY = 86400000000LL;
 // Microseconds per second
 constexpr int64_t MICROS_PER_SECOND = 1000000LL;
 
-date_t DateTimeEncoding::ConvertDate(const uint8_t* data) {
+date_t DateTimeEncoding::ConvertDate(const uint8_t *data) {
 	// DATE: 3 bytes unsigned little-endian, days since 0001-01-01
-	int32_t days = static_cast<int32_t>(data[0]) |
-	               (static_cast<int32_t>(data[1]) << 8) |
-	               (static_cast<int32_t>(data[2]) << 16);
+	int32_t days =
+		static_cast<int32_t>(data[0]) | (static_cast<int32_t>(data[1]) << 8) | (static_cast<int32_t>(data[2]) << 16);
 
 	// Convert to days since 1970-01-01
 	return date_t(days - DAYS_FROM_0001_TO_EPOCH);
 }
 
-dtime_t DateTimeEncoding::ConvertTime(const uint8_t* data, uint8_t scale) {
+dtime_t DateTimeEncoding::ConvertTime(const uint8_t *data, uint8_t scale) {
 	// TIME: 3-5 bytes depending on scale
 	// Value is in 100-nanosecond units
 	size_t len = GetTimeByteLength(scale);
@@ -43,7 +42,7 @@ dtime_t DateTimeEncoding::ConvertTime(const uint8_t* data, uint8_t scale) {
 	return dtime_t(microseconds);
 }
 
-timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t* data) {
+timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 	// DATETIME: 4 bytes days since 1900-01-01 + 4 bytes ticks (1/300 second)
 	int32_t days = 0;
 	int32_t ticks = 0;
@@ -60,7 +59,7 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t* data) {
 	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
 }
 
-timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t* data, uint8_t scale) {
+timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t *data, uint8_t scale) {
 	// DATETIME2: time (3-5 bytes) + date (3 bytes)
 	size_t time_len = GetTimeByteLength(scale);
 
@@ -71,9 +70,8 @@ timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t* data, uint8_t scal
 	}
 
 	// Read date (days since 0001-01-01)
-	int32_t days = static_cast<int32_t>(data[time_len]) |
-	               (static_cast<int32_t>(data[time_len + 1]) << 8) |
-	               (static_cast<int32_t>(data[time_len + 2]) << 16);
+	int32_t days = static_cast<int32_t>(data[time_len]) | (static_cast<int32_t>(data[time_len + 1]) << 8) |
+				   (static_cast<int32_t>(data[time_len + 2]) << 16);
 
 	// Convert to days since 1970-01-01
 	int32_t unix_days = days - DAYS_FROM_0001_TO_EPOCH;
@@ -84,7 +82,7 @@ timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t* data, uint8_t scal
 	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
 }
 
-timestamp_t DateTimeEncoding::ConvertSmallDatetime(const uint8_t* data) {
+timestamp_t DateTimeEncoding::ConvertSmallDatetime(const uint8_t *data) {
 	// SMALLDATETIME: 2 bytes days since 1900-01-01 + 2 bytes minutes since midnight
 	uint16_t days = 0;
 	uint16_t minutes = 0;
@@ -100,7 +98,7 @@ timestamp_t DateTimeEncoding::ConvertSmallDatetime(const uint8_t* data) {
 	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
 }
 
-timestamp_t DateTimeEncoding::ConvertDatetimeOffset(const uint8_t* data, uint8_t scale) {
+timestamp_t DateTimeEncoding::ConvertDatetimeOffset(const uint8_t *data, uint8_t scale) {
 	// DATETIMEOFFSET: time (3-5 bytes) + date (3 bytes) + offset (2 bytes signed minutes)
 	// Note: SQL Server stores DATETIMEOFFSET with the time component already in UTC.
 	// The offset is stored for display purposes only. We just need to read the UTC time.
@@ -119,9 +117,8 @@ timestamp_t DateTimeEncoding::ConvertDatetimeOffset(const uint8_t* data, uint8_t
 	}
 
 	// Read date (days since 0001-01-01) - this is already in UTC
-	int32_t days = static_cast<int32_t>(data[time_len]) |
-	               (static_cast<int32_t>(data[time_len + 1]) << 8) |
-	               (static_cast<int32_t>(data[time_len + 2]) << 16);
+	int32_t days = static_cast<int32_t>(data[time_len]) | (static_cast<int32_t>(data[time_len + 1]) << 8) |
+				   (static_cast<int32_t>(data[time_len + 2]) << 16);
 
 	// Offset (2 bytes) is at data[time_len + 3] but we don't need it for UTC conversion
 	// The time is already stored as UTC
@@ -155,8 +152,10 @@ size_t DateTimeEncoding::GetTimeByteLength(uint8_t scale) {
 	// Scale 0-2: 3 bytes
 	// Scale 3-4: 4 bytes
 	// Scale 5-7: 5 bytes
-	if (scale <= 2) return 3;
-	if (scale <= 4) return 4;
+	if (scale <= 2)
+		return 3;
+	if (scale <= 4)
+		return 4;
 	return 5;
 }
 

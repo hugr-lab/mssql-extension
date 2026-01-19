@@ -23,15 +23,16 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto secret_entry = secret_manager.GetSecretByName(transaction, secret_name);
 	if (!secret_entry) {
-		throw BinderException("MSSQL Error: Secret '%s' not found. Create it first with: CREATE SECRET %s (TYPE "
-		                      "mssql, host '...', port ..., database '...', user '...', password '...')",
-		                      secret_name, secret_name);
+		throw BinderException(
+			"MSSQL Error: Secret '%s' not found. Create it first with: CREATE SECRET %s (TYPE "
+			"mssql, host '...', port ..., database '...', user '...', password '...')",
+			secret_name, secret_name);
 	}
 
 	auto &secret = secret_entry->secret;
 	if (secret->GetType() != "mssql") {
 		throw BinderException("MSSQL Error: Secret '%s' is not of type 'mssql'. Got type: '%s'", secret_name,
-		                      secret->GetType());
+							  secret->GetType());
 	}
 
 	auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret);
@@ -254,7 +255,7 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 		}
 	}
 
-	return "";  // Valid
+	return "";	// Valid
 }
 
 shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const string &connection_string) {
@@ -306,8 +307,7 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 // MSSQLContext implementation
 //===----------------------------------------------------------------------===//
 
-MSSQLContext::MSSQLContext(const string &name, const string &secret_name) : name(name), secret_name(secret_name) {
-}
+MSSQLContext::MSSQLContext(const string &name, const string &secret_name) : name(name), secret_name(secret_name) {}
 
 //===----------------------------------------------------------------------===//
 // MSSQLContextManager implementation
@@ -379,7 +379,7 @@ vector<string> MSSQLContextManager::ListContexts() {
 //===----------------------------------------------------------------------===//
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
-                                AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
+								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
 	// Extract SECRET parameter (optional if connection string is provided)
 	// Remove it from options so DuckDB's StorageOptions doesn't reject it as unrecognized
 	string secret_name;
@@ -409,10 +409,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	} else {
 		// Neither SECRET nor connection string provided
 		throw InvalidInputException(
-		    "MSSQL Error: Either SECRET or connection string is required for ATTACH.\n"
-		    "With secret: ATTACH '' AS %s (TYPE mssql, SECRET <secret_name>)\n"
-		    "With connection string: ATTACH 'Server=host;Database=db;User Id=user;Password=pass' AS %s (TYPE mssql)",
-		    name, name);
+			"MSSQL Error: Either SECRET or connection string is required for ATTACH.\n"
+			"With secret: ATTACH '' AS %s (TYPE mssql, SECRET <secret_name>)\n"
+			"With connection string: ATTACH 'Server=host;Database=db;User Id=user;Password=pass' AS %s (TYPE mssql)",
+			name, name);
 	}
 
 	// Register context
@@ -422,15 +422,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Create connection pool for this context using current settings
 	auto pool_config = LoadPoolConfig(context);
 	MssqlPoolManager::Instance().GetOrCreatePool(
-	    name,
-	    pool_config,
-	    ctx->connection_info->host,
-	    ctx->connection_info->port,
-	    ctx->connection_info->user,
-	    ctx->connection_info->password,
-	    ctx->connection_info->database,
-	    ctx->connection_info->use_encrypt
-	);
+		name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
+		ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
 
 	// Create MSSQLCatalog with connection info and access mode from options
 	// The catalog will use the connection pool to query SQL Server
@@ -442,7 +435,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 }
 
 unique_ptr<TransactionManager> MSSQLCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
-                                                             AttachedDatabase &db, Catalog &catalog) {
+															 AttachedDatabase &db, Catalog &catalog) {
 	// Use custom transaction manager for external MSSQL catalog
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	return make_uniq<MSSQLTransactionManager>(db, mssql_catalog);

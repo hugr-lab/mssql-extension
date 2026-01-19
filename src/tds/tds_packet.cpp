@@ -6,30 +6,20 @@ namespace duckdb {
 namespace tds {
 
 TdsPacket::TdsPacket()
-    : type_(PacketType::SQL_BATCH),
-      status_(PacketStatus::END_OF_MESSAGE),
-      spid_(0),
-      packet_id_(1),
-      window_(0) {
-}
+	: type_(PacketType::SQL_BATCH), status_(PacketStatus::END_OF_MESSAGE), spid_(0), packet_id_(1), window_(0) {}
 
 TdsPacket::TdsPacket(PacketType type, PacketStatus status)
-    : type_(type),
-      status_(status),
-      spid_(0),
-      packet_id_(1),
-      window_(0) {
-}
+	: type_(type), status_(status), spid_(0), packet_id_(1), window_(0) {}
 
 uint16_t TdsPacket::GetLength() const {
 	return static_cast<uint16_t>(TDS_HEADER_SIZE + payload_.size());
 }
 
-void TdsPacket::AppendPayload(const uint8_t* data, size_t length) {
+void TdsPacket::AppendPayload(const uint8_t *data, size_t length) {
 	payload_.insert(payload_.end(), data, data + length);
 }
 
-void TdsPacket::AppendPayload(const std::vector<uint8_t>& data) {
+void TdsPacket::AppendPayload(const std::vector<uint8_t> &data) {
 	payload_.insert(payload_.end(), data.begin(), data.end());
 }
 
@@ -61,16 +51,16 @@ void TdsPacket::AppendUInt32LE(uint32_t value) {
 	payload_.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
 }
 
-void TdsPacket::AppendString(const std::string& str) {
+void TdsPacket::AppendString(const std::string &str) {
 	payload_.insert(payload_.end(), str.begin(), str.end());
 }
 
-void TdsPacket::AppendUTF16LE(const std::string& str) {
+void TdsPacket::AppendUTF16LE(const std::string &str) {
 	// Simple ASCII to UTF-16LE conversion
 	// For full Unicode support, would need proper conversion
 	for (char c : str) {
 		payload_.push_back(static_cast<uint8_t>(c));
-		payload_.push_back(0);  // High byte for ASCII chars
+		payload_.push_back(0);	// High byte for ASCII chars
 	}
 }
 
@@ -102,16 +92,16 @@ std::vector<uint8_t> TdsPacket::Serialize() const {
 	return result;
 }
 
-bool TdsPacket::HasCompleteHeader(const uint8_t* data, size_t length) {
+bool TdsPacket::HasCompleteHeader(const uint8_t *data, size_t length) {
 	return length >= TDS_HEADER_SIZE;
 }
 
-uint16_t TdsPacket::GetPacketLength(const uint8_t* data) {
+uint16_t TdsPacket::GetPacketLength(const uint8_t *data) {
 	// Length is at offset 2-3, big-endian
 	return (static_cast<uint16_t>(data[2]) << 8) | static_cast<uint16_t>(data[3]);
 }
 
-size_t TdsPacket::Parse(const uint8_t* data, size_t length, TdsPacket& packet) {
+size_t TdsPacket::Parse(const uint8_t *data, size_t length, TdsPacket &packet) {
 	if (!HasCompleteHeader(data, length)) {
 		return 0;  // Need more data
 	}
@@ -136,9 +126,7 @@ size_t TdsPacket::Parse(const uint8_t* data, size_t length, TdsPacket& packet) {
 	// Copy payload
 	packet.payload_.clear();
 	if (packet_length > TDS_HEADER_SIZE) {
-		packet.payload_.insert(packet.payload_.end(),
-		                       data + TDS_HEADER_SIZE,
-		                       data + packet_length);
+		packet.payload_.insert(packet.payload_.end(), data + TDS_HEADER_SIZE, data + packet_length);
 	}
 
 	return packet_length;

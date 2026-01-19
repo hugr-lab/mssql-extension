@@ -1,10 +1,10 @@
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_pool_manager.hpp"
-#include "mssql_secret.hpp"
-#include "mssql_storage.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "mssql_secret.hpp"
+#include "mssql_storage.hpp"
 
 namespace duckdb {
 
@@ -12,7 +12,7 @@ namespace duckdb {
 // ConnectionHandleManager
 //===----------------------------------------------------------------------===//
 
-MSSQLConnectionHandleManager& MSSQLConnectionHandleManager::Instance() {
+MSSQLConnectionHandleManager &MSSQLConnectionHandleManager::Instance() {
 	static MSSQLConnectionHandleManager instance;
 	return instance;
 }
@@ -81,10 +81,11 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 
 			auto secret_entry = secret_manager.GetSecretByName(transaction, input);
 			if (!secret_entry) {
-				throw InvalidInputException("Secret '%s' not found. You can also pass a connection string:\n"
-				                            "  mssql://user:password@host:port/database\n"
-				                            "  Server=host,port;Database=db;User Id=user;Password=pass",
-				                            input);
+				throw InvalidInputException(
+					"Secret '%s' not found. You can also pass a connection string:\n"
+					"  mssql://user:password@host:port/database\n"
+					"  Server=host,port;Database=db;User Id=user;Password=pass",
+					input);
 			}
 
 			auto &secret = *secret_entry->secret;
@@ -100,8 +101,8 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 			auto user_val = kv_secret.TryGetValue(MSSQL_SECRET_USER);
 			auto password_val = kv_secret.TryGetValue(MSSQL_SECRET_PASSWORD);
 
-			if (host_val.IsNull() || port_val.IsNull() || database_val.IsNull() ||
-			    user_val.IsNull() || password_val.IsNull()) {
+			if (host_val.IsNull() || port_val.IsNull() || database_val.IsNull() || user_val.IsNull() ||
+				password_val.IsNull()) {
 				throw InvalidInputException("Secret '%s' is missing required fields", input);
 			}
 
@@ -175,7 +176,7 @@ TableFunction MSSQLPoolStatsFunction::GetFunction() {
 }
 
 unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+													  vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<MSSQLPoolStatsBindData>();
 
 	// Check if context_name parameter was provided
@@ -213,11 +214,11 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	names.emplace_back("acquire_timeout_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
-	return bind_data;
+	return std::move(bind_data);
 }
 
 unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientContext &context,
-                                                                         TableFunctionInitInput &input) {
+																		TableFunctionInitInput &input) {
 	auto gstate = make_uniq<MssqlPoolStatsGlobalState>();
 	auto &bind_data = input.bind_data->Cast<MSSQLPoolStatsBindData>();
 
@@ -232,7 +233,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientCo
 		// If pool doesn't exist, pool_names remains empty (no rows returned)
 	}
 
-	return gstate;
+	return std::move(gstate);
 }
 
 void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -248,7 +249,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
 	while (gstate.current_index < gstate.pool_names.size() && count < max_count) {
-		const auto& pool_name = gstate.pool_names[gstate.current_index];
+		const auto &pool_name = gstate.pool_names[gstate.current_index];
 		auto stats = MssqlPoolManager::Instance().GetPoolStats(pool_name);
 
 		output.data[0].SetValue(count, Value(pool_name));  // db

@@ -1,27 +1,27 @@
 #include "query/mssql_simple_query.hpp"
-#include "tds/tds_token_parser.hpp"
-#include "tds/tds_types.hpp"
-#include "tds/tds_packet.hpp"
-#include "tds/tds_socket.hpp"
-#include "tds/encoding/utf16.hpp"
 #include <chrono>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include "tds/encoding/utf16.hpp"
+#include "tds/tds_packet.hpp"
+#include "tds/tds_socket.hpp"
+#include "tds/tds_token_parser.hpp"
+#include "tds/tds_types.hpp"
 
 // Debug logging
 static int GetSimpleQueryDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define SIMPLE_QUERY_DEBUG(lvl, fmt, ...) \
-	do { \
-		if (GetSimpleQueryDebugLevel() >= lvl) \
+#define SIMPLE_QUERY_DEBUG(lvl, fmt, ...)                                     \
+	do {                                                                      \
+		if (GetSimpleQueryDebugLevel() >= lvl)                                \
 			fprintf(stderr, "[MSSQL SIMPLE_QUERY] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
@@ -31,8 +31,7 @@ namespace duckdb {
 // Value Conversion Helper
 //===----------------------------------------------------------------------===//
 
-static std::string ConvertValueToString(const std::vector<uint8_t> &value,
-                                        const tds::ColumnMetadata &column) {
+static std::string ConvertValueToString(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column) {
 	if (value.empty()) {
 		return "";
 	}
@@ -40,21 +39,18 @@ static std::string ConvertValueToString(const std::vector<uint8_t> &value,
 	uint8_t type_id = column.type_id;
 
 	// Unicode string types (NVARCHAR, NCHAR, NTEXT)
-	if (type_id == tds::TDS_TYPE_NVARCHAR || type_id == tds::TDS_TYPE_NCHAR ||
-	    type_id == tds::TDS_TYPE_NTEXT) {
+	if (type_id == tds::TDS_TYPE_NVARCHAR || type_id == tds::TDS_TYPE_NCHAR || type_id == tds::TDS_TYPE_NTEXT) {
 		return tds::encoding::Utf16LEDecode(value.data(), value.size());
 	}
 
 	// ASCII/single-byte string types (VARCHAR, CHAR, TEXT)
-	if (type_id == tds::TDS_TYPE_BIGVARCHAR || type_id == tds::TDS_TYPE_BIGCHAR ||
-	    type_id == tds::TDS_TYPE_TEXT) {
+	if (type_id == tds::TDS_TYPE_BIGVARCHAR || type_id == tds::TDS_TYPE_BIGCHAR || type_id == tds::TDS_TYPE_TEXT) {
 		return std::string(reinterpret_cast<const char *>(value.data()), value.size());
 	}
 
 	// Integer types
-	if (type_id == tds::TDS_TYPE_INTN || type_id == tds::TDS_TYPE_TINYINT ||
-	    type_id == tds::TDS_TYPE_SMALLINT || type_id == tds::TDS_TYPE_INT ||
-	    type_id == tds::TDS_TYPE_BIGINT) {
+	if (type_id == tds::TDS_TYPE_INTN || type_id == tds::TDS_TYPE_TINYINT || type_id == tds::TDS_TYPE_SMALLINT ||
+		type_id == tds::TDS_TYPE_INT || type_id == tds::TDS_TYPE_BIGINT) {
 		if (value.size() == 1) {
 			return std::to_string(static_cast<int32_t>(value[0]));
 		} else if (value.size() == 2) {
@@ -78,8 +74,7 @@ static std::string ConvertValueToString(const std::vector<uint8_t> &value,
 	}
 
 	// Float types
-	if (type_id == tds::TDS_TYPE_FLOATN || type_id == tds::TDS_TYPE_REAL ||
-	    type_id == tds::TDS_TYPE_FLOAT) {
+	if (type_id == tds::TDS_TYPE_FLOATN || type_id == tds::TDS_TYPE_REAL || type_id == tds::TDS_TYPE_FLOAT) {
 		if (value.size() == 4) {
 			float v;
 			std::memcpy(&v, value.data(), 4);
@@ -99,18 +94,17 @@ static std::string ConvertValueToString(const std::vector<uint8_t> &value,
 // MSSQLSimpleQuery Implementation
 //===----------------------------------------------------------------------===//
 
-SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, const std::string &sql,
-                                            int timeout_ms) {
+SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, const std::string &sql, int timeout_ms) {
 	SimpleQueryResult result;
 
 	// Use callback version to collect all rows
 	auto collect_result = ExecuteWithCallback(
-	    connection, sql,
-	    [&result](const std::vector<std::string> &row) {
-		    result.rows.push_back(row);
-		    return true;  // continue
-	    },
-	    timeout_ms);
+		connection, sql,
+		[&result](const std::vector<std::string> &row) {
+			result.rows.push_back(row);
+			return true;  // continue
+		},
+		timeout_ms);
 
 	// Copy error info and column names
 	result.success = collect_result.success;
@@ -121,8 +115,7 @@ SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, cons
 	return result;
 }
 
-std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, const std::string &sql,
-                                            int timeout_ms) {
+std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, const std::string &sql, int timeout_ms) {
 	SimpleQueryResult result = Execute(connection, sql, timeout_ms);
 	if (result.HasError() || result.rows.empty() || result.rows[0].empty()) {
 		return "";
@@ -130,9 +123,8 @@ std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, cons
 	return result.rows[0][0];
 }
 
-SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &connection,
-                                                        const std::string &sql,
-                                                        RowCallback callback, int timeout_ms) {
+SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
+														RowCallback callback, int timeout_ms) {
 	SimpleQueryResult result;
 
 	SIMPLE_QUERY_DEBUG(2, "ExecuteWithCallback: starting, timeout=%dms", timeout_ms);
@@ -184,10 +176,8 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 		}
 
 		// Calculate remaining time
-		auto remaining_ms =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-		int recv_timeout =
-		    static_cast<int>(std::min(remaining_ms, static_cast<long long>(timeout_ms)));
+		auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+		int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
 
 		// Read TDS packet (properly framed with 8-byte header)
 		tds::TdsPacket packet;
@@ -253,8 +243,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 				if (done_token.IsFinal()) {
 					done = true;
 					// Transition connection back to Idle
-					connection.TransitionState(tds::ConnectionState::Executing,
-					                           tds::ConnectionState::Idle);
+					connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
 				}
 				break;
 			}
@@ -283,8 +272,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 		if (is_eom && !done) {
 			// Force done - the server has sent all data it's going to send
 			done = true;
-			connection.TransitionState(tds::ConnectionState::Executing,
-			                           tds::ConnectionState::Idle);
+			connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
 		}
 	}
 

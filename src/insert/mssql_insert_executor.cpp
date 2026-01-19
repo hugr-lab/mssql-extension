@@ -1,33 +1,35 @@
 #include "insert/mssql_insert_executor.hpp"
-#include "insert/mssql_batch_builder.hpp"
-#include "insert/mssql_returning_parser.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_pool_manager.hpp"
-#include "tds/tds_connection_pool.hpp"
-#include "tds/tds_connection.hpp"
-#include "tds/tds_token_parser.hpp"
-#include "tds/tds_packet.hpp"
-#include "tds/encoding/type_converter.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
-#include <chrono>
-#include <cstdlib>
-#include <cstdio>
+#include "insert/mssql_batch_builder.hpp"
+#include "insert/mssql_returning_parser.hpp"
+#include "tds/encoding/type_converter.hpp"
+#include "tds/tds_connection.hpp"
+#include "tds/tds_connection_pool.hpp"
+#include "tds/tds_packet.hpp"
+#include "tds/tds_token_parser.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetInsertDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define INSERT_DEBUG(level, fmt, ...) \
-	do { if (GetInsertDebugLevel() >= level) { \
-		fprintf(stderr, "[MSSQL INSERT] " fmt "\n", ##__VA_ARGS__); \
-	} } while(0)
+#define INSERT_DEBUG(level, fmt, ...)                                   \
+	do {                                                                \
+		if (GetInsertDebugLevel() >= level) {                           \
+			fprintf(stderr, "[MSSQL INSERT] " fmt "\n", ##__VA_ARGS__); \
+		}                                                               \
+	} while (0)
 
 namespace duckdb {
 
@@ -36,19 +38,15 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLInsertException::MSSQLInsertException(const MSSQLInsertError &error)
-    : Exception(ExceptionType::IO, error.FormatMessage()), error_(error) {
-}
+	: Exception(ExceptionType::IO, error.FormatMessage()), error_(error) {}
 
 //===----------------------------------------------------------------------===//
 // Constructor / Destructor
 //===----------------------------------------------------------------------===//
 
-MSSQLInsertExecutor::MSSQLInsertExecutor(ClientContext &context,
-                                         const MSSQLInsertTarget &target,
-                                         const MSSQLInsertConfig &config)
-    : context_(context), target_(target), config_(config),
-      finalized_(false), connection_pool_(nullptr) {
-}
+MSSQLInsertExecutor::MSSQLInsertExecutor(ClientContext &context, const MSSQLInsertTarget &target,
+										 const MSSQLInsertConfig &config)
+	: context_(context), target_(target), config_(config), finalized_(false), connection_pool_(nullptr) {}
 
 MSSQLInsertExecutor::~MSSQLInsertExecutor() {
 	// Ensure we finalize even if caller forgets
@@ -145,7 +143,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
 		bool done = false;
-		int timeout_ms = 30000;  // 30 second timeout
+		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 		string error_message;
 		uint32_t error_number = 0;
@@ -163,9 +161,10 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			}
 
 			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-			int recv_timeout = static_cast<int>(std::min(remaining_ms, static_cast<long long>(timeout_ms)));
+			int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
 
-			INSERT_DEBUG(2, "ExecuteBatch: calling ReceivePacket, timeout=%d, packets_so_far=%d", recv_timeout, packet_count);
+			INSERT_DEBUG(2, "ExecuteBatch: calling ReceivePacket, timeout=%d, packets_so_far=%d", recv_timeout,
+						 packet_count);
 
 			// Read TDS packet
 			tds::TdsPacket packet;
@@ -173,15 +172,15 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 				// Capture error message BEFORE releasing connection
 				string socket_error = socket->GetLastError();
 				bool still_connected = socket->IsConnected();
-				INSERT_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s', connected=%d",
-				            socket_error.c_str(), still_connected);
+				INSERT_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s', connected=%d", socket_error.c_str(),
+							 still_connected);
 				pool.Release(std::move(connection));
 				throw IOException("Failed to receive TDS packet: %s", socket_error);
 			}
 
 			packet_count++;
-			INSERT_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d",
-			            packet_count, packet.GetPayload().size(), packet.IsEndOfMessage());
+			INSERT_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d", packet_count,
+						 packet.GetPayload().size(), packet.IsEndOfMessage());
 
 			bool is_eom = packet.IsEndOfMessage();
 
@@ -198,17 +197,17 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 				switch (token) {
 				case tds::ParsedTokenType::Done: {
 					const tds::DoneToken &done_token = parser.GetDone();
-					INSERT_DEBUG(1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d, is_final=%d",
-					            done_token.status, (unsigned long long)done_token.row_count,
-					            done_token.HasRowCount(), done_token.IsFinal());
+					INSERT_DEBUG(
+						1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d, is_final=%d",
+						done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount(),
+						done_token.IsFinal());
 					if (done_token.HasRowCount()) {
 						rows_affected = done_token.row_count;
 					}
 					if (done_token.IsFinal()) {
 						done = true;
 						// Transition connection back to Idle
-						connection->TransitionState(tds::ConnectionState::Executing,
-						                           tds::ConnectionState::Idle);
+						connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
 					}
 					break;
 				}
@@ -216,8 +215,8 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 					const tds::TdsError &tds_error = parser.GetError();
 					error_number = tds_error.number;
 					error_message = tds_error.message;
-					INSERT_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'",
-					            error_number, error_message.c_str());
+					INSERT_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'", error_number,
+								 error_message.c_str());
 					// Continue reading to drain the response
 					break;
 				}
@@ -231,13 +230,12 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			if (is_eom && !done) {
 				INSERT_DEBUG(1, "ExecuteBatch: EOM without DONE final, marking done");
 				done = true;
-				connection->TransitionState(tds::ConnectionState::Executing,
-				                           tds::ConnectionState::Idle);
+				connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
 			}
 		}
 
 		INSERT_DEBUG(1, "ExecuteBatch: response parsed, rows_affected=%llu, error='%s'",
-		            (unsigned long long)rows_affected, error_message.c_str());
+					 (unsigned long long)rows_affected, error_message.c_str());
 
 		// Check for errors
 		if (!error_message.empty()) {
@@ -253,7 +251,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 		}
 
 	} catch (const MSSQLInsertException &) {
-		throw;  // Re-throw insert exceptions
+		throw;	// Re-throw insert exceptions
 	} catch (const std::exception &e) {
 		pool.Release(std::move(connection));
 		throw IOException("INSERT execution failed: %s", e.what());
@@ -270,7 +268,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 }
 
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &sql,
-                                                                   const vector<idx_t> &returning_column_ids) {
+																  const vector<idx_t> &returning_column_ids) {
 	auto &pool = GetConnectionPool();
 	auto connection = pool.Acquire();
 	if (!connection) {
@@ -328,7 +326,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 		statistics_.RecordBatch(rows_inserted, sql.size(), duration_us);
 
 	} catch (const MSSQLInsertException &) {
-		throw;  // Re-throw insert exceptions
+		throw;	// Re-throw insert exceptions
 	} catch (const std::exception &e) {
 		pool.Release(std::move(connection));
 		throw IOException("INSERT with RETURNING execution failed: %s", e.what());
@@ -360,8 +358,8 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 			// Batch is full, flush it
 			INSERT_DEBUG(1, "Execute: batch full at row %llu, flushing...", (unsigned long long)row_idx);
 			auto batch = batch_builder_->FlushBatch();
-			INSERT_DEBUG(1, "Execute: flushed batch with %llu rows, %llu bytes",
-			            (unsigned long long)batch.row_count, (unsigned long long)batch.sql_bytes);
+			INSERT_DEBUG(1, "Execute: flushed batch with %llu rows, %llu bytes", (unsigned long long)batch.row_count,
+						 (unsigned long long)batch.sql_bytes);
 			total_inserted += ExecuteBatch(batch.sql_statement);
 
 			// Now add the row that didn't fit
@@ -371,9 +369,8 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 		}
 	}
 
-	INSERT_DEBUG(1, "Execute: chunk processed, total_inserted=%llu, pending=%llu",
-	            (unsigned long long)total_inserted,
-	            (unsigned long long)batch_builder_->GetPendingRowCount());
+	INSERT_DEBUG(1, "Execute: chunk processed, total_inserted=%llu, pending=%llu", (unsigned long long)total_inserted,
+				 (unsigned long long)batch_builder_->GetPendingRowCount());
 
 	return total_inserted;
 }
@@ -383,7 +380,7 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 //===----------------------------------------------------------------------===//
 
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input_chunk,
-                                                                 const vector<idx_t> &returning_column_ids) {
+																const vector<idx_t> &returning_column_ids) {
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after Finalize");
 	}
@@ -431,8 +428,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 //===----------------------------------------------------------------------===//
 
 void MSSQLInsertExecutor::Finalize() {
-	INSERT_DEBUG(1, "Finalize: starting, finalized=%d, has_builder=%d",
-	            finalized_, batch_builder_ != nullptr);
+	INSERT_DEBUG(1, "Finalize: starting, finalized=%d, has_builder=%d", finalized_, batch_builder_ != nullptr);
 
 	if (finalized_) {
 		INSERT_DEBUG(1, "Finalize: already finalized, returning");
@@ -443,7 +439,7 @@ void MSSQLInsertExecutor::Finalize() {
 
 	if (batch_builder_ && batch_builder_->HasPendingRows()) {
 		INSERT_DEBUG(1, "Finalize: flushing %llu pending rows",
-		            (unsigned long long)batch_builder_->GetPendingRowCount());
+					 (unsigned long long)batch_builder_->GetPendingRowCount());
 		auto batch = batch_builder_->FlushBatch();
 		INSERT_DEBUG(1, "Finalize: executing final batch with %llu bytes", (unsigned long long)batch.sql_bytes);
 		ExecuteBatch(batch.sql_statement);

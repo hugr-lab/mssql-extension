@@ -9,16 +9,18 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - In-memory (connection metadata, pool state) (003-tds-connection-pooling)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API, DataChunk), existing TDS layer from spec 003 (004-streaming-select-cancel)
 - In-memory (result streaming, no intermediate buffering) (004-streaming-select-cancel)
-- C++17 (DuckDB extension standard) + DuckDB main branch (extension API), mbedTLS 3.x (TLS library via vcpkg) (005-tls-connection-support)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (TLS library via vcpkg) (005-tls-connection-support)
 - In-memory (TLS context per connection) (005-tls-connection-support)
-- C++17 (DuckDB extension standard) + DuckDB (main branch), mbedTLS (vcpkg 3.6.4 for loadable, DuckDB bundled for static) (006-split-tls-build)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg, unified for both static and loadable) (006-split-tls-build)
 - N/A (build system only) (006-split-tls-build)
-- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), mbedTLS (via split TLS build) (007-catalog-integration)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), OpenSSL (007-catalog-integration)
 - In-memory (metadata cache with TTL), DuckDB secret manager for credentials (007-catalog-integration)
-- C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable) (008-catalog-ddl-statistics)
-- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable) (009-dml-insert)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), OpenSSL (via vcpkg) (008-catalog-ddl-statistics)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), OpenSSL (via vcpkg) (009-dml-insert)
 - In-memory (no intermediate buffering per Streaming First principle) (009-dml-insert)
 - Markdown (GitHub-flavored) + N/A (documentation only) (010-extension-documentation)
+- YAML (GitHub Actions workflow syntax) + Bash scripts + GitHub Actions runners, CMake, vcpkg, Ninja, Docker (Linux only) (011-ci-release-workflows)
+- N/A (workflow artifacts stored in GitHub) (011-ci-release-workflows)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -55,10 +57,10 @@ make debug
 # Run DuckDB tests for mssql extension
 make test
 
-# Load extension in DuckDB CLI for manual testing (the release and debug builds already statically link the extension without TLS support)
+# Load extension in DuckDB CLI for manual testing (the release and debug builds include TLS support via OpenSSL)
 ./build/release/duckdb
 
-# Run DuckDB CLI with TLS-enabled mssql extension (dynamic load)
+# Or dynamically load the mssql extension
 # The duckdb cli version must be the same as the built extension (release/debug) (branch in the submodule duckdb).
 duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 
@@ -76,10 +78,11 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- Migrated TLS from mbedTLS to OpenSSL - unified TLS support for both static and loadable extensions
+- DuckDB API version (stable vs nightly) is now auto-detected at CMake configure time
+- 011-ci-release-workflows: Added YAML (GitHub Actions workflow syntax) + Bash scripts + GitHub Actions runners, CMake, vcpkg, Ninja, Docker (Linux only)
 - 010-extension-documentation: Added Markdown (GitHub-flavored) + N/A (documentation only)
-- 009-dml-insert: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
-- 008-catalog-ddl-statistics: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
-
+- 009-dml-insert: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), OpenSSL (via vcpkg)
 
 <!-- MANUAL ADDITIONS START -->
 <!-- MANUAL ADDITIONS END -->

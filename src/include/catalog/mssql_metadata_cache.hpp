@@ -1,11 +1,11 @@
 #pragma once
 
-#include "catalog/mssql_column_info.hpp"
-#include "tds/tds_connection_pool.hpp"
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "catalog/mssql_column_info.hpp"
+#include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
 
@@ -20,8 +20,8 @@ class MSSQLCatalog;
 //===----------------------------------------------------------------------===//
 
 enum class MSSQLObjectType : uint8_t {
-	TABLE = 0,  // 'U' in sys.objects
-	VIEW = 1    // 'V' in sys.objects
+	TABLE = 0,	// 'U' in sys.objects
+	VIEW = 1	// 'V' in sys.objects
 };
 
 //===----------------------------------------------------------------------===//
@@ -29,10 +29,10 @@ enum class MSSQLObjectType : uint8_t {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLTableMetadata {
-	string name;                         // Table/view name
-	MSSQLObjectType object_type;         // TABLE or VIEW
-	vector<MSSQLColumnInfo> columns;     // Column metadata
-	idx_t approx_row_count;              // Cardinality estimate from sys.partitions
+	string name;					  // Table/view name
+	MSSQLObjectType object_type;	  // TABLE or VIEW
+	vector<MSSQLColumnInfo> columns;  // Column metadata
+	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
 };
 
 //===----------------------------------------------------------------------===//
@@ -40,8 +40,8 @@ struct MSSQLTableMetadata {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLSchemaMetadata {
-	string name;                                          // Schema name
-	unordered_map<string, MSSQLTableMetadata> tables;     // Tables and views in schema
+	string name;									   // Schema name
+	unordered_map<string, MSSQLTableMetadata> tables;  // Tables and views in schema
 };
 
 //===----------------------------------------------------------------------===//
@@ -49,11 +49,11 @@ struct MSSQLSchemaMetadata {
 //===----------------------------------------------------------------------===//
 
 enum class MSSQLCacheState : uint8_t {
-	EMPTY = 0,      // No metadata loaded
-	LOADING = 1,    // Currently loading metadata
-	LOADED = 2,     // Metadata loaded and valid
-	STALE = 3,      // TTL expired, needs refresh
-	INVALID = 4     // Invalidated, must refresh before use
+	EMPTY = 0,	  // No metadata loaded
+	LOADING = 1,  // Currently loading metadata
+	LOADED = 2,	  // Metadata loaded and valid
+	STALE = 3,	  // TTL expired, needs refresh
+	INVALID = 4	  // Invalidated, must refresh before use
 };
 
 //===----------------------------------------------------------------------===//
@@ -131,19 +131,19 @@ private:
 	void LoadTables(tds::TdsConnection &connection, const string &schema_name);
 
 	// Load columns from sys.columns
-	void LoadColumns(tds::TdsConnection &connection, const string &schema_name,
-	                 const string &table_name, MSSQLTableMetadata &table_metadata);
+	void LoadColumns(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+					 MSSQLTableMetadata &table_metadata);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	mutable std::mutex mutex_;                                        // Thread-safety
-	MSSQLCacheState state_;                                           // Current cache state
-	unordered_map<string, MSSQLSchemaMetadata> schemas_;              // Cached schemas
-	std::chrono::steady_clock::time_point last_refresh_;              // Last refresh timestamp
-	int64_t ttl_seconds_;                                             // Cache TTL (0 = manual only)
-	string database_collation_;                                       // Database default collation
+	mutable std::mutex mutex_;							  // Thread-safety
+	MSSQLCacheState state_;								  // Current cache state
+	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
+	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp
+	int64_t ttl_seconds_;								  // Cache TTL (0 = manual only)
+	string database_collation_;							  // Database default collation
 };
 
 }  // namespace duckdb
