@@ -699,6 +699,30 @@ Error: Unsupported SQL Server type: XML
 | macOS ARM64 | Tested | Load-only smoke tests in CI |
 | Windows x64 | Experimental | Builds in CI but not fully tested. Contributions welcome! |
 
+## Roadmap
+
+The following features are planned for future releases:
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | Planned |
+| **Transactions** | BEGIN/COMMIT/ROLLBACK, savepoints, connection pinning | Planned |
+| **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
+| **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
+| **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | Planned |
+
+### Feature Details
+
+**UPDATE/DELETE**: Will support `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Requires primary key for row identification. Batched execution using `UPDATE ... FROM (VALUES ...)` pattern.
+
+**Transactions**: DML-only transactions with connection pinning. Savepoints via `SAVE TRANSACTION`. DDL executes outside transactions (auto-commit).
+
+**CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` implemented as DDL creation followed by bulk INSERT (no RETURNING).
+
+**MERGE/UPSERT**: Batched upsert using SQL Server `MERGE` statement. Supports primary key or user-specified key columns.
+
+**BCP/COPY**: Binary bulk copy protocol for maximum throughput. Streaming execution with bounded memory. No RETURNING support (use regular INSERT for that).
+
 ## Limitations
 
 ### Unsupported Features
