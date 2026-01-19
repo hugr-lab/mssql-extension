@@ -27,6 +27,7 @@ struct LoginResponse {
 	uint32_t tds_version;
 	std::string error_message;
 	uint32_t error_number;
+	uint32_t negotiated_packet_size;  // Server-negotiated packet size from ENVCHANGE
 };
 
 // TDS Protocol message builders and parsers

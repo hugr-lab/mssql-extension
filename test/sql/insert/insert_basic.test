@@ -1,0 +1,104 @@
+# name: test/sql/insert/insert_basic.test
+# description: Test basic INSERT operations via catalog
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database with READ_WRITE mode (required for INSERT)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 2: Create test table using standard DDL
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_basic_test;
+
+statement ok
+CREATE TABLE mssql.dbo.insert_basic_test (
+    id INTEGER,
+    name VARCHAR,
+    value DECIMAL(10, 2)
+);
+
+# Test 3: INSERT single row with VALUES
+statement ok
+INSERT INTO mssql.dbo.insert_basic_test (id, name, value) VALUES (1, 'Alice', 100.50);
+
+# Test 4: Verify row was inserted
+query ITR
+SELECT * FROM mssql.dbo.insert_basic_test WHERE id = 1;
+----
+1	Alice	100.50
+
+# Test 5: INSERT multiple rows with VALUES
+statement ok
+INSERT INTO mssql.dbo.insert_basic_test (id, name, value) VALUES
+    (2, 'Bob', 200.00),
+    (3, 'Charlie', 300.75),
+    (4, 'Diana', 400.25);
+
+# Test 6: Verify all rows inserted
+query I
+SELECT COUNT(*) FROM mssql.dbo.insert_basic_test;
+----
+4
+
+# Test 7: INSERT from SELECT (same table)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_target_test;
+
+statement ok
+CREATE TABLE mssql.dbo.insert_target_test (
+    id INTEGER,
+    name VARCHAR,
+    value DECIMAL(10, 2)
+);
+
+statement ok
+INSERT INTO mssql.dbo.insert_target_test
+SELECT * FROM mssql.dbo.insert_basic_test WHERE id > 2;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.insert_target_test;
+----
+2
+
+# Test 8: INSERT from local DuckDB table
+statement ok
+CREATE TABLE local_data AS SELECT 5 AS id, 'Eve' AS name, 500.00::DECIMAL(10,2) AS value;
+
+statement ok
+INSERT INTO mssql.dbo.insert_basic_test
+SELECT * FROM local_data;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.insert_basic_test;
+----
+5
+
+# Test 9: INSERT with NULL values
+statement ok
+INSERT INTO mssql.dbo.insert_basic_test (id, name, value) VALUES (6, NULL, NULL);
+
+query IT
+SELECT id, name FROM mssql.dbo.insert_basic_test WHERE id = 6;
+----
+6	NULL
+
+# Test 10: Cleanup
+statement ok
+DROP TABLE local_data;
+
+statement ok
+DROP TABLE mssql.dbo.insert_basic_test;
+
+statement ok
+DROP TABLE mssql.dbo.insert_target_test;
+
+statement ok
+DETACH mssql;

@@ -167,7 +167,8 @@ ssize_t TlsTdsContext::Receive(uint8_t* buffer, size_t max_length, int timeout_m
 	}
 
 	ssize_t result = impl_->tls->Receive(buffer, max_length, timeout_ms);
-	if (result < 0) {
+	if (result <= 0) {
+		// Copy error info for both errors (< 0) and peer closed (== 0)
 		impl_->last_error_code = static_cast<TlsErrorCode>(impl_->tls->GetLastErrorCode());
 		impl_->last_error = impl_->tls->GetLastError();
 	}

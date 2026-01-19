@@ -1,6 +1,6 @@
 # mssql-extension Development Guidelines
 
-Auto-generated from all feature plans. Last updated: 2026-01-15
+Auto-generated from all feature plans. Last updated: 2026-01-19
 
 ## Active Technologies
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API) (002-duckdb-surface-api)
@@ -16,6 +16,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-15
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), mbedTLS (via split TLS build) (007-catalog-integration)
 - In-memory (metadata cache with TTL), DuckDB secret manager for credentials (007-catalog-integration)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable) (008-catalog-ddl-statistics)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable) (009-dml-insert)
+- In-memory (no intermediate buffering per Streaming First principle) (009-dml-insert)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -23,21 +25,59 @@ Auto-generated from all feature plans. Last updated: 2026-01-15
 
 ```text
 src/
+  insert/               # DML INSERT implementation (spec 009)
+    mssql_value_serializer.cpp   # Type → T-SQL literal conversion
+    mssql_insert_statement.cpp   # SQL statement generation
+    mssql_batch_builder.cpp      # Row accumulation and batching
+    mssql_insert_executor.cpp    # Batch execution orchestration
+    mssql_physical_insert.cpp    # DuckDB physical operator
+    mssql_returning_parser.cpp   # OUTPUT INSERTED result parsing
+  include/insert/       # Headers for insert module
+  catalog/              # DuckDB catalog integration
+  tds/                  # TDS protocol implementation
+  connection/           # Connection pooling and settings
+  query/                # Query execution
 tests/
+  cpp/                  # Unit tests (no SQL Server required)
+  integration/          # Integration tests (require SQL Server)
 ```
 
 ## Commands
 
-# Add commands for C++17 (DuckDB extension standard)
+```bash
+# Build release (default)
+make
+
+# Build debug
+make debug
+
+# Run DuckDB tests for mssql extension
+make test
+
+# Load extension in DuckDB CLI for manual testing (the release and debug builds already statically link the extension without TLS support)
+./build/release/duckdb
+
+# Run DuckDB CLI with TLS-enabled mssql extension (dynamic load)
+# The duckdb cli version must be the same as the built extension (release/debug) (branch in the submodule duckdb).
+duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
+
+# Extension installation sources:
+# core - `http://extensions.duckdb.org` DuckDB core extensions
+# core_nightly - `http://nightly-extensions.duckdb.org` Nightly builds for core
+# community - `http://community-extensions.duckdb.org` DuckDB community extensions
+# local_build_debug - `./build/debug/repository` Repository created when building DuckDB from source in debug mode (for development)
+# local_build_release - `./build/release/repository` Repository created when building DuckDB from source in release mode (for development)
+
+```
 
 ## Code Style
 
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 009-dml-insert: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
 - 008-catalog-ddl-statistics: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
 - 007-catalog-integration: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-006), mbedTLS (via split TLS build)
-- 006-split-tls-build: Added C++17 (DuckDB extension standard) + DuckDB (main branch), mbedTLS (vcpkg 3.6.4 for loadable, DuckDB bundled for static)
 
 
 <!-- MANUAL ADDITIONS START -->

@@ -1,5 +1,7 @@
 #include "connection/mssql_settings.hpp"
+#include "insert/mssql_insert_config.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/common/exception.hpp"
 
 namespace duckdb {
 
@@ -142,6 +144,50 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	    ValidateNonNegative,
 	    SetScope::GLOBAL
 	);
+
+	//===----------------------------------------------------------------------===//
+	// INSERT Settings
+	//===----------------------------------------------------------------------===//
+
+	// mssql_insert_batch_size - Maximum rows per INSERT statement
+	config.AddExtensionOption(
+	    "mssql_insert_batch_size",
+	    "Maximum rows per INSERT statement",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(MSSQL_DEFAULT_INSERT_BATCH_SIZE),
+	    ValidatePositive,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_insert_max_rows_per_statement - Hard cap on rows per INSERT statement
+	config.AddExtensionOption(
+	    "mssql_insert_max_rows_per_statement",
+	    "Hard cap on rows per INSERT statement",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT),
+	    ValidatePositive,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_insert_max_sql_bytes - Maximum SQL statement size in bytes
+	config.AddExtensionOption(
+	    "mssql_insert_max_sql_bytes",
+	    "Maximum SQL statement size in bytes",
+	    LogicalType::BIGINT,
+	    Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES),
+	    ValidatePositive,
+	    SetScope::GLOBAL
+	);
+
+	// mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING clause
+	config.AddExtensionOption(
+	    "mssql_insert_use_returning_output",
+	    "Use OUTPUT INSERTED for RETURNING clause",
+	    LogicalType::BOOLEAN,
+	    Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT),
+	    nullptr,
+	    SetScope::GLOBAL
+	);
 }
 
 //===----------------------------------------------------------------------===//
@@ -229,6 +275,36 @@ MSSQLStatisticsConfig LoadStatisticsConfig(ClientContext &context) {
 	config.level = LoadStatisticsLevel(context);
 	config.use_dbcc = LoadStatisticsUseDBCC(context);
 	config.cache_ttl_seconds = LoadStatisticsCacheTTL(context);
+	return config;
+}
+
+//===----------------------------------------------------------------------===//
+// INSERT Configuration Loading
+//===----------------------------------------------------------------------===//
+
+MSSQLInsertConfig LoadInsertConfig(ClientContext &context) {
+	MSSQLInsertConfig config;
+	Value val;
+
+	if (context.TryGetCurrentSetting("mssql_insert_batch_size", val)) {
+		config.batch_size = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_max_rows_per_statement", val)) {
+		config.max_rows_per_statement = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_max_sql_bytes", val)) {
+		config.max_sql_bytes = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_use_returning_output", val)) {
+		config.use_returning_output = val.GetValue<bool>();
+	}
+
+	// Validate loaded config
+	config.Validate();
+
 	return config;
 }
 

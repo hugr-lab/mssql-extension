@@ -57,4 +57,14 @@ int64_t LoadStatisticsLevel(ClientContext &context);
 bool LoadStatisticsUseDBCC(ClientContext &context);
 int64_t LoadStatisticsCacheTTL(ClientContext &context);
 
+//===----------------------------------------------------------------------===//
+// INSERT Configuration
+//===----------------------------------------------------------------------===//
+
+// Forward declaration (full definition in insert/mssql_insert_config.hpp)
+struct MSSQLInsertConfig;
+
+// Load INSERT configuration from context settings
+MSSQLInsertConfig LoadInsertConfig(ClientContext &context);
+
 }  // namespace duckdb

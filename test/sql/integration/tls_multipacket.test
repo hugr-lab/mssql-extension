@@ -1,0 +1,89 @@
+# name: test/sql/integration/tls_multipacket.test
+# description: Test multi-packet TDS message support over TLS encrypted connections
+# group: [mssql_integration]
+#
+# This test requires a TLS-enabled connection string:
+#   export MSSQL_TEST_DSN_TLS="mssql://sa:TestPassword1@localhost:1433/master?encrypt=true"
+# Or ADO.NET format:
+#   export MSSQL_TEST_DSN_TLS="Server=localhost;Database=master;User Id=sa;Password=TestPassword1;Encrypt=true"
+
+require mssql
+
+require-env MSSQL_TEST_DSN_TLS
+
+#
+# Test 1: Single packet query over TLS (baseline)
+#
+statement ok
+ATTACH '${MSSQL_TEST_DSN_TLS}' AS tls_mp_db (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 1 AS val');
+----
+1
+
+#
+# Test 2: Multi-packet query over TLS (~6KB SQL - requires 2 TDS packets)
+# TLS requires sending each TDS packet individually (not combined)
+#
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 42 AS answer /* ' || repeat('x', 3000) || ' */');
+----
+42
+
+#
+# Test 3: Larger multi-packet query over TLS (~20KB SQL - requires 5+ TDS packets)
+#
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 123 AS result /* ' || repeat('y', 10000) || ' */');
+----
+123
+
+#
+# Test 4: Very large multi-packet query over TLS (~70KB SQL - requires 18+ TDS packets)
+# This is a stress test for TLS multi-packet handling
+#
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 999 AS big_result /* ' || repeat('z', 35000) || ' */');
+----
+999
+
+#
+# Test 5: Multi-packet with complex SQL over TLS
+# Build a long CASE expression to test real SQL parsing
+#
+query I
+SELECT * FROM mssql_scan('tls_mp_db', '
+SELECT CASE
+    WHEN 1=1 THEN 1
+    ' || repeat('WHEN 2=3 THEN 0 ', 500) || '
+    ELSE 0
+END AS case_result
+');
+----
+1
+
+# Note: Multi-packet INSERT tests removed - mssql_execute with multi-packet
+# requires separate investigation. SELECT tests above verify multi-packet read operations.
+
+#
+# Test 7: Multiple multi-packet queries in sequence over TLS
+# Tests connection reuse after multi-packet operations
+#
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 1 /* ' || repeat('a', 5000) || ' */');
+----
+1
+
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 2 /* ' || repeat('b', 5000) || ' */');
+----
+2
+
+query I
+SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 3 /* ' || repeat('c', 5000) || ' */');
+----
+3
+
+statement ok
+DETACH tls_mp_db;

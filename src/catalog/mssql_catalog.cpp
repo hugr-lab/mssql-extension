@@ -1,10 +1,14 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "insert/mssql_insert_config.hpp"
+#include "insert/mssql_insert_target.hpp"
+#include "insert/mssql_physical_insert.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -226,7 +230,105 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                             LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
-	throw NotImplementedException("MSSQL catalog is read-only: INSERT is not supported");
+	// Check write access first (throws if read-only)
+	CheckWriteAccess("INSERT");
+
+	// Get the target table entry
+	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+
+	// Build MSSQLInsertTarget from table metadata
+	MSSQLInsertTarget target;
+	target.catalog_name = context_name_;
+	target.schema_name = table_entry.ParentSchema().name;
+	target.table_name = table_entry.name;
+
+	// Get MSSQL column info
+	auto &mssql_columns = table_entry.GetMSSQLColumns();
+
+	// Determine which columns are being inserted
+	// If no column map is specified, use all non-identity columns
+	vector<idx_t> insert_col_indices;
+	if (op.column_index_map.empty()) {
+		// All columns - INSERT without column list
+		for (idx_t i = 0; i < mssql_columns.size(); i++) {
+			insert_col_indices.push_back(i);
+		}
+	} else {
+		// Specific columns from the INSERT statement
+		// The column_index_map maps physical column index -> source index in values
+		// Iterate over table columns and check which have mapped values
+		for (idx_t i = 0; i < mssql_columns.size(); i++) {
+			PhysicalIndex phys_idx(i);
+			if (i < op.column_index_map.size()) {
+				auto mapped_index = op.column_index_map[phys_idx];
+				if (mapped_index != DConstants::INVALID_INDEX) {
+					// This column is being inserted
+					insert_col_indices.push_back(i);
+				}
+			}
+		}
+	}
+
+	// Build column metadata for insert target
+	target.has_identity_column = false;
+	target.identity_column_index = 0;
+
+	for (idx_t i = 0; i < mssql_columns.size(); i++) {
+		auto &col = mssql_columns[i];
+		MSSQLInsertColumn insert_col;
+		insert_col.name = col.name;
+		insert_col.duckdb_type = col.duckdb_type;
+		insert_col.mssql_type = col.sql_type_name;
+		insert_col.is_identity = false;  // Will be detected below if needed
+		insert_col.is_nullable = col.is_nullable;
+		insert_col.has_default = false;  // TODO: Query this from sys.columns
+		insert_col.collation = col.collation_name;
+		insert_col.precision = col.precision;
+		insert_col.scale = col.scale;
+		target.columns.push_back(std::move(insert_col));
+	}
+
+	// Set insert column indices
+	target.insert_column_indices = std::move(insert_col_indices);
+
+	// Handle RETURNING columns
+	if (op.return_chunk) {
+		// Map RETURNING columns
+		for (idx_t i = 0; i < mssql_columns.size(); i++) {
+			target.returning_column_indices.push_back(i);
+		}
+	}
+
+	// Load insert configuration from settings
+	MSSQLInsertConfig config = LoadInsertConfig(context);
+
+	// Determine result types
+	vector<LogicalType> result_types;
+	if (op.return_chunk) {
+		// RETURNING mode - return the inserted columns
+		for (auto &col_idx : target.returning_column_indices) {
+			result_types.push_back(target.columns[col_idx].duckdb_type);
+		}
+	} else {
+		// Count mode - return BIGINT count
+		result_types.push_back(LogicalType::BIGINT);
+	}
+
+	// Create the physical operator using planner.Make<T>()
+	auto &physical_insert = planner.Make<MSSQLPhysicalInsert>(
+	    std::move(result_types),
+	    op.estimated_cardinality,
+	    std::move(target),
+	    std::move(config),
+	    op.return_chunk
+	);
+
+	// Add child operator if present
+	if (plan) {
+		physical_insert.children.push_back(*plan);
+	}
+
+	return physical_insert;
 }
 
 PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
