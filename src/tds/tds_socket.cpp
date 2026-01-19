@@ -1,5 +1,20 @@
 #include "tds/tds_socket.hpp"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#define CLOSE_SOCKET closesocket
+#define SOCKET_ERROR_CODE WSAGetLastError()
+#define poll WSAPoll
+typedef int socklen_t;
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -9,11 +24,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
+#define CLOSE_SOCKET close
+#define SOCKET_ERROR_CODE errno
+#endif
 
 // Debug logging
 static int GetMssqlDebugLevel() {
@@ -30,17 +43,6 @@ static int GetMssqlDebugLevel() {
 		if (GetMssqlDebugLevel() >= lvl)                                \
 			fprintf(stderr, "[MSSQL SOCKET] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#define CLOSE_SOCKET closesocket
-#define SOCKET_ERROR_CODE WSAGetLastError()
-#else
-#define CLOSE_SOCKET close
-#define SOCKET_ERROR_CODE errno
-#endif
 
 namespace duckdb {
 namespace tds {
