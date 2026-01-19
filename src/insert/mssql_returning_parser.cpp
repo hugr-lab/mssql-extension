@@ -76,7 +76,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 		}
 
 		auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-		int recv_timeout = static_cast<int>(std::min(remaining_ms, static_cast<long long>(timeout_ms)));
+		int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
 
 		// Try to parse tokens from existing buffer
 		tds::ParsedTokenType token;

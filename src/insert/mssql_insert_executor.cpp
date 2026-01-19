@@ -161,7 +161,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			}
 
 			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-			int recv_timeout = static_cast<int>(std::min(remaining_ms, static_cast<long long>(timeout_ms)));
+			int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
 
 			INSERT_DEBUG(2, "ExecuteBatch: calling ReceivePacket, timeout=%d, packets_so_far=%d", recv_timeout,
 						 packet_count);
