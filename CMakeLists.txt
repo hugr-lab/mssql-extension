@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown src/include/insert)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -92,6 +92,15 @@ set(EXTENSION_SOURCES
     src/pushdown/mssql_projection_builder.cpp
     src/pushdown/mssql_filter_translator.cpp
     src/pushdown/mssql_prepared_statement.cpp
+    # Insert layer (DML INSERT support)
+    src/insert/mssql_insert_config.cpp
+    src/insert/mssql_insert_target.cpp
+    src/insert/mssql_value_serializer.cpp
+    src/insert/mssql_insert_statement.cpp
+    src/insert/mssql_batch_builder.cpp
+    src/insert/mssql_insert_executor.cpp
+    src/insert/mssql_physical_insert.cpp
+    src/insert/mssql_returning_parser.cpp
 )
 
 # Build static extension (linked into DuckDB) - uses TLS objects from mssql_tls_static

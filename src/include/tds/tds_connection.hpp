@@ -115,6 +115,9 @@ private:
 	// TLS state
 	bool tls_enabled_;
 
+	// Negotiated packet size from server (from ENVCHANGE during login)
+	uint32_t negotiated_packet_size_;
+
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);
 	bool DoLogin7(const std::string& username, const std::string& password, const std::string& database);

@@ -534,6 +534,10 @@ ssize_t TdsSocket::Receive(uint8_t* buffer, size_t max_length, int timeout_ms) {
 	// Plain TCP receive
 	// Wait for data with timeout
 	if (!WaitForReady(false, timeout_ms)) {
+		// If connected_ was set to false, it's an error not timeout
+		if (!connected_) {
+			return -1;
+		}
 		return 0;  // Timeout
 	}
 
@@ -633,12 +637,28 @@ bool TdsSocket::WaitForReady(bool for_write, int timeout_ms) {
 		return false;
 	}
 	if (ret == 0) {
+		last_error_ = "Socket timeout waiting for data";
 		return false;  // Timeout
 	}
 
-	// Check for errors
-	if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+	// Check for hard errors
+	if (pfd.revents & (POLLERR | POLLNVAL)) {
 		last_error_ = "Socket error during poll";
+		connected_ = false;
+		return false;
+	}
+
+	// If we're waiting for read and data is available, allow read even if POLLHUP is set
+	// This handles the case where server sends an error response and then closes
+	if (!for_write && (pfd.revents & POLLIN)) {
+		// Data available to read - allow the read even if POLLHUP is also set
+		// After reading, the next poll will detect the closed connection
+		return true;
+	}
+
+	// No data available and connection closed
+	if (pfd.revents & POLLHUP) {
+		last_error_ = "Connection closed by server (POLLHUP)";
 		connected_ = false;
 		return false;
 	}

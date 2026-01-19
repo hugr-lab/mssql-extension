@@ -384,6 +384,7 @@ const uint8_t* TdsProtocol::FindToken(const uint8_t* data, size_t length, TokenT
 LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) {
 	LoginResponse response = {};
 	response.success = false;
+	response.negotiated_packet_size = TDS_DEFAULT_PACKET_SIZE;  // Default until server tells us
 
 	if (data.empty()) {
 		response.error_message = "Empty LOGIN response";
@@ -476,6 +477,23 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t>& data) 
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 			if (ptr + len <= end) {
+				const uint8_t* env_data = ptr;
+				// ENVCHANGE type is first byte
+				uint8_t env_type = env_data[0];
+				// Type 4 = PACKETSIZE
+				if (env_type == 4 && len >= 3) {
+					// NewValueLen (1 byte)
+					uint8_t new_val_len = env_data[1];
+					// NewValue (string of digits in UTF-16LE)
+					if (new_val_len > 0 && 2 + new_val_len * 2 <= len) {
+						std::string packet_size_str = ReadUTF16LE(env_data + 2, new_val_len);
+						try {
+							response.negotiated_packet_size = std::stoul(packet_size_str);
+						} catch (...) {
+							// Ignore parse errors
+						}
+					}
+				}
 				ptr += len;
 			} else {
 				break;
@@ -577,28 +595,70 @@ std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string& 
 	std::vector<TdsPacket> packets;
 
 	// Encode SQL to UTF-16LE
-	std::vector<uint8_t> encoded = encoding::Utf16LEEncode(sql);
+	std::vector<uint8_t> sql_encoded = encoding::Utf16LEEncode(sql);
 
-	if (encoded.empty()) {
+	if (sql_encoded.empty()) {
 		// Empty query - send ping (SELECT 1) to get a valid response
 		packets.push_back(BuildPing());
 		return packets;
 	}
 
+	// Build ALL_HEADERS section (required for SQL_BATCH in TDS 7.2+)
+	// This is 22 bytes: TotalLength (4) + Transaction Descriptor Header (18)
+	std::vector<uint8_t> all_headers;
+	all_headers.reserve(22);
+
+	// TotalLength = 22 (little-endian)
+	uint32_t total_headers_length = 22;
+	all_headers.push_back(total_headers_length & 0xFF);
+	all_headers.push_back((total_headers_length >> 8) & 0xFF);
+	all_headers.push_back((total_headers_length >> 16) & 0xFF);
+	all_headers.push_back((total_headers_length >> 24) & 0xFF);
+
+	// Transaction Descriptor Header: HeaderLength = 18
+	uint32_t header_length = 18;
+	all_headers.push_back(header_length & 0xFF);
+	all_headers.push_back((header_length >> 8) & 0xFF);
+	all_headers.push_back((header_length >> 16) & 0xFF);
+	all_headers.push_back((header_length >> 24) & 0xFF);
+
+	// HeaderType = 0x0002 (Transaction Descriptor)
+	all_headers.push_back(0x02);
+	all_headers.push_back(0x00);
+
+	// TransactionDescriptor = 0 (8 bytes)
+	for (int i = 0; i < 8; i++) {
+		all_headers.push_back(0x00);
+	}
+
+	// OutstandingRequestCount = 1 (4 bytes, little-endian)
+	all_headers.push_back(0x01);
+	all_headers.push_back(0x00);
+	all_headers.push_back(0x00);
+	all_headers.push_back(0x00);
+
+	// Combine ALL_HEADERS + SQL for fragmentation
+	std::vector<uint8_t> payload;
+	payload.reserve(all_headers.size() + sql_encoded.size());
+	payload.insert(payload.end(), all_headers.begin(), all_headers.end());
+	payload.insert(payload.end(), sql_encoded.begin(), sql_encoded.end());
+
 	// TDS packet header is 8 bytes, so payload can be up to (max_packet_size - 8) bytes
 	size_t max_payload = max_packet_size - TDS_HEADER_SIZE;
 
-	// If it fits in a single packet, just use BuildSqlBatch
-	if (encoded.size() <= max_payload) {
-		packets.push_back(BuildSqlBatch(sql));
+	// If it fits in a single packet, use single packet (this should match BuildSqlBatch behavior)
+	if (payload.size() <= max_payload) {
+		TdsPacket packet(PacketType::SQL_BATCH);
+		packet.AppendPayload(payload);
+		packets.push_back(std::move(packet));
 		return packets;
 	}
 
 	// Split into multiple packets
 	size_t offset = 0;
-	while (offset < encoded.size()) {
-		size_t chunk_size = std::min(max_payload, encoded.size() - offset);
-		bool is_last = (offset + chunk_size >= encoded.size());
+	while (offset < payload.size()) {
+		size_t chunk_size = std::min(max_payload, payload.size() - offset);
+		bool is_last = (offset + chunk_size >= payload.size());
 
 		TdsPacket packet(PacketType::SQL_BATCH);
 
@@ -608,7 +668,7 @@ std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string& 
 		}
 
 		// Append this chunk of the payload
-		packet.AppendPayload(encoded.data() + offset, chunk_size);
+		packet.AppendPayload(payload.data() + offset, chunk_size);
 
 		packets.push_back(std::move(packet));
 		offset += chunk_size;

@@ -1,0 +1,141 @@
+# name: test/sql/insert/insert_types.test
+# description: Test INSERT with various DuckDB types mapped to SQL Server types
+# group: [mssql]
+
+# Type mapping:
+#   BOOLEAN → BIT (0/1)
+#   TINYINT/SMALLINT/INTEGER/BIGINT → corresponding SQL Server types
+#   FLOAT/DOUBLE → FLOAT
+#   DECIMAL(p,s) → DECIMAL(p,s)
+#   VARCHAR → NVARCHAR (Unicode with N'...')
+#   BLOB → VARBINARY (0x hex encoding)
+#   UUID → UNIQUEIDENTIFIER
+#   DATE → DATE
+#   TIME → TIME
+#   TIMESTAMP → DATETIME2
+#   TIMESTAMP WITH TIME ZONE → DATETIMEOFFSET
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 2: Create table with all supported types
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_types_test;
+
+statement ok
+CREATE TABLE mssql.dbo.insert_types_test (
+    col_bool BOOLEAN,
+    col_tinyint TINYINT,
+    col_smallint SMALLINT,
+    col_int INTEGER,
+    col_bigint BIGINT,
+    col_float DOUBLE,
+    col_decimal DECIMAL(10,2),
+    col_varchar VARCHAR,
+    col_blob BLOB,
+    col_uuid UUID,
+    col_date DATE,
+    col_time TIME,
+    col_timestamp TIMESTAMP
+);
+
+# Test 3: INSERT with basic numeric types
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_bool, col_tinyint, col_smallint, col_int, col_bigint)
+VALUES (true, 255, 32767, 2147483647, 9223372036854775807);
+
+query IIIII
+SELECT col_bool, col_tinyint, col_smallint, col_int, col_bigint
+FROM mssql.dbo.insert_types_test WHERE col_tinyint = 255;
+----
+1	255	32767	2147483647	9223372036854775807
+
+# Test 4: INSERT with BOOLEAN false
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_bool) VALUES (false);
+
+query I
+SELECT col_bool FROM mssql.dbo.insert_types_test WHERE col_bool = 0;
+----
+0
+
+# Test 5: INSERT with negative integers
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_smallint, col_int, col_bigint)
+VALUES (-32768, -2147483648, -9223372036854775808);
+
+query III
+SELECT col_smallint, col_int, col_bigint FROM mssql.dbo.insert_types_test WHERE col_smallint = -32768;
+----
+-32768	-2147483648	-9223372036854775808
+
+# Test 6: INSERT with float and decimal
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_float, col_decimal)
+VALUES (3.14159, 12345.67);
+
+query RR
+SELECT col_float, col_decimal FROM mssql.dbo.insert_types_test WHERE col_decimal = 12345.67;
+----
+3.14159	12345.67
+
+# Test 7: INSERT with ASCII string
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_varchar) VALUES ('Hello World');
+
+query T
+SELECT col_varchar FROM mssql.dbo.insert_types_test WHERE col_varchar = N'Hello World';
+----
+Hello World
+
+# Test 8: INSERT with Unicode Chinese characters
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_varchar) VALUES ('你好世界');
+
+query T
+SELECT col_varchar FROM mssql.dbo.insert_types_test WHERE col_varchar = N'你好世界';
+----
+你好世界
+
+# Test 9: INSERT with Unicode emoji
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_varchar) VALUES ('Hello 😀🎉🚀');
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.insert_types_test WHERE col_varchar LIKE N'Hello %';
+----
+2
+
+# Test 10: INSERT with date and time types
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_date, col_time, col_timestamp)
+VALUES ('2026-01-19', '14:30:00', '2026-01-19 14:30:00');
+
+query TTT
+SELECT CAST(col_date AS VARCHAR), CAST(col_time AS VARCHAR), CAST(col_timestamp AS VARCHAR)
+FROM mssql.dbo.insert_types_test WHERE col_date = '2026-01-19';
+----
+2026-01-19	14:30:00.0000000	2026-01-19 14:30:00.0000000
+
+# Test 11: INSERT with NULL values
+statement ok
+INSERT INTO mssql.dbo.insert_types_test (col_bool, col_int, col_varchar)
+VALUES (NULL, NULL, NULL);
+
+query III
+SELECT col_bool, col_int, col_varchar FROM mssql.dbo.insert_types_test
+WHERE col_bool IS NULL AND col_int IS NULL AND col_varchar IS NULL;
+----
+NULL	NULL	NULL
+
+# Test 12: Cleanup
+statement ok
+DROP TABLE mssql.dbo.insert_types_test;
+
+statement ok
+DETACH mssql;

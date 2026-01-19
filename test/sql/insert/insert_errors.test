@@ -1,0 +1,137 @@
+# name: test/sql/insert/insert_errors.test
+# description: Test INSERT error handling including READ_ONLY mode
+# group: [mssql]
+
+# Error handling tests:
+#   - READ_ONLY mode blocks INSERT
+#   - Primary key violations
+#   - Foreign key violations
+#   - Unique constraint violations
+#   - NOT NULL violations
+#   - Check constraint violations
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: READ_ONLY mode blocks INSERT
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ro (TYPE mssql, READ_ONLY);
+
+# Try to INSERT into any table - should fail with read-only error
+statement error
+INSERT INTO mssql_ro.dbo.sysobjects (name) VALUES ('test');
+----
+read-only
+
+statement ok
+DETACH mssql_ro;
+
+# Test 2: Attach with READ_WRITE for constraint tests
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 3: Primary key violation (use mssql_exec for PRIMARY KEY constraint)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_pk_test;
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_pk_test (id INT PRIMARY KEY, name NVARCHAR(100))');
+
+statement ok
+INSERT INTO mssql.dbo.insert_pk_test (id, name) VALUES (1, 'Alice');
+
+statement error
+INSERT INTO mssql.dbo.insert_pk_test (id, name) VALUES (1, 'Bob');
+----
+2627
+
+statement ok
+DROP TABLE mssql.dbo.insert_pk_test;
+
+# Test 4: Foreign key violation (needs mssql_exec for REFERENCES syntax)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_fk_child;
+
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_fk_parent;
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_fk_parent (id INT PRIMARY KEY)');
+
+statement ok
+SELECT mssql_exec('mssql', '
+    CREATE TABLE dbo.insert_fk_child (
+        id INT PRIMARY KEY,
+        parent_id INT REFERENCES dbo.insert_fk_parent(id)
+    )
+');
+
+statement ok
+INSERT INTO mssql.dbo.insert_fk_parent (id) VALUES (1);
+
+statement error
+INSERT INTO mssql.dbo.insert_fk_child (id, parent_id) VALUES (1, 999);
+----
+547
+
+statement ok
+DROP TABLE mssql.dbo.insert_fk_child;
+
+statement ok
+DROP TABLE mssql.dbo.insert_fk_parent;
+
+# Test 5: Unique constraint violation (use mssql_exec for UNIQUE constraint)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_unique_test;
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_unique_test (id INT PRIMARY KEY, email NVARCHAR(100) UNIQUE)');
+
+statement ok
+INSERT INTO mssql.dbo.insert_unique_test (id, email) VALUES (1, 'test@example.com');
+
+statement error
+INSERT INTO mssql.dbo.insert_unique_test (id, email) VALUES (2, 'test@example.com');
+----
+2627
+
+statement ok
+DROP TABLE mssql.dbo.insert_unique_test;
+
+# Test 6: NOT NULL violation (use mssql_exec for NOT NULL constraint)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_notnull_test;
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_notnull_test (id INT PRIMARY KEY, required_field NVARCHAR(100) NOT NULL)');
+
+statement error
+INSERT INTO mssql.dbo.insert_notnull_test (id, required_field) VALUES (1, NULL);
+----
+515
+
+statement ok
+DROP TABLE mssql.dbo.insert_notnull_test;
+
+# Test 7: Check constraint violation (use mssql_exec for CHECK constraint)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_check_test;
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_check_test (id INT PRIMARY KEY, value INT CHECK (value > 0))');
+
+statement ok
+INSERT INTO mssql.dbo.insert_check_test (id, value) VALUES (1, 100);
+
+statement error
+INSERT INTO mssql.dbo.insert_check_test (id, value) VALUES (2, -1);
+----
+547
+
+statement ok
+DROP TABLE mssql.dbo.insert_check_test;
+
+# Test 8: Cleanup
+statement ok
+DETACH mssql;

@@ -1,0 +1,87 @@
+# name: test/sql/insert/insert_returning.test
+# description: Test INSERT with RETURNING clause (uses OUTPUT INSERTED)
+# group: [mssql]
+
+# RETURNING uses SQL Server's OUTPUT INSERTED clause to return inserted values
+# including auto-generated identity columns and default values.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database with READ_WRITE mode
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 2: Create table with IDENTITY column (use mssql_exec for IDENTITY syntax)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.insert_returning_test;
+
+statement ok
+SELECT mssql_exec('mssql', '
+    CREATE TABLE dbo.insert_returning_test (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(100) NOT NULL,
+        created_at DATETIME2 DEFAULT GETDATE()
+    )
+');
+
+# Test 3: INSERT with RETURNING * (returns all columns including identity)
+# Note: created_at will have a timestamp value
+query IT
+INSERT INTO mssql.dbo.insert_returning_test (name)
+VALUES ('Alice')
+RETURNING id, name;
+----
+1	Alice
+
+# Test 4: INSERT multiple rows with RETURNING
+query IT
+INSERT INTO mssql.dbo.insert_returning_test (name)
+VALUES ('Bob'), ('Charlie')
+RETURNING id, name;
+----
+2	Bob
+3	Charlie
+
+# Test 5: Verify identity values are sequential
+query I
+INSERT INTO mssql.dbo.insert_returning_test (name) VALUES ('Diana') RETURNING id;
+----
+4
+
+# Test 6: INSERT from local table with RETURNING
+statement ok
+CREATE TABLE local_names AS SELECT 'Eve' AS name UNION ALL SELECT 'Frank';
+
+query IT
+INSERT INTO mssql.dbo.insert_returning_test (name)
+SELECT name FROM local_names
+RETURNING id, name;
+----
+5	Eve
+6	Frank
+
+# Test 7: RETURNING specific columns only
+query I
+INSERT INTO mssql.dbo.insert_returning_test (name)
+VALUES ('Grace')
+RETURNING id;
+----
+7
+
+# Test 8: Verify total rows
+query I
+SELECT COUNT(*) FROM mssql.dbo.insert_returning_test;
+----
+7
+
+# Test 9: Cleanup
+statement ok
+DROP TABLE local_names;
+
+statement ok
+DROP TABLE mssql.dbo.insert_returning_test;
+
+statement ok
+DETACH mssql;

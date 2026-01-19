@@ -29,7 +29,8 @@ TdsConnection::TdsConnection()
       created_at_(std::chrono::steady_clock::now()),
       last_used_at_(created_at_),
       tls_enabled_(false),
-      next_packet_id_(1) {
+      next_packet_id_(1),
+      negotiated_packet_size_(TDS_DEFAULT_PACKET_SIZE) {
 }
 
 TdsConnection::~TdsConnection() {
@@ -47,10 +48,12 @@ TdsConnection::TdsConnection(TdsConnection&& other) noexcept
       last_used_at_(other.last_used_at_),
       last_error_(std::move(other.last_error_)),
       tls_enabled_(other.tls_enabled_),
-      next_packet_id_(other.next_packet_id_) {
+      next_packet_id_(other.next_packet_id_),
+      negotiated_packet_size_(other.negotiated_packet_size_) {
 	other.state_.store(ConnectionState::Disconnected);
 	other.spid_ = 0;
 	other.tls_enabled_ = false;
+	other.negotiated_packet_size_ = TDS_DEFAULT_PACKET_SIZE;
 }
 
 TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
@@ -67,10 +70,12 @@ TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
 		last_error_ = std::move(other.last_error_);
 		tls_enabled_ = other.tls_enabled_;
 		next_packet_id_ = other.next_packet_id_;
+		negotiated_packet_size_ = other.negotiated_packet_size_;
 
 		other.state_.store(ConnectionState::Disconnected);
 		other.spid_ = 0;
 		other.tls_enabled_ = false;
+		other.negotiated_packet_size_ = TDS_DEFAULT_PACKET_SIZE;
 	}
 	return *this;
 }
@@ -188,10 +193,10 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 }
 
 bool TdsConnection::DoLogin7(const std::string& username, const std::string& password, const std::string& database) {
-	// Request larger packet size for better handling of VARCHAR(MAX)/NVARCHAR(MAX) data
-	// Default is 4096, but we request 32767 (TDS_MAX_PACKET_SIZE) for larger PLP data
+	// Request default packet size - server will negotiate up if it supports larger
+	// This allows the server to tell us its optimal packet size via ENVCHANGE
 	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database,
-	                                           "DuckDB MSSQL Extension", TDS_MAX_PACKET_SIZE);
+	                                           "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
@@ -217,6 +222,8 @@ bool TdsConnection::DoLogin7(const std::string& username, const std::string& pas
 	}
 
 	spid_ = login_response.spid;
+	// Use server-negotiated packet size from ENVCHANGE, or keep default if not received
+	negotiated_packet_size_ = login_response.negotiated_packet_size;
 	return true;
 }
 
@@ -356,19 +363,96 @@ bool TdsConnection::ExecuteBatch(const std::string& sql) {
 		return false;
 	}
 
-	// Build SQL_BATCH packet(s)
-	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql);
+	// Build SQL_BATCH packet(s) using the server-negotiated packet size
+	// This was received via ENVCHANGE during LOGIN7
+	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_);
 
-	// Send all packets
-	for (size_t i = 0; i < packets.size(); i++) {
-		auto& packet = packets[i];
-		packet.SetPacketId(next_packet_id_++);
-		if (!socket_->SendPacket(packet)) {
-			last_error_ = "Failed to send SQL_BATCH: " + socket_->GetLastError();
-			state_.store(ConnectionState::Disconnected);
-			return false;
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: sql_size=%zu, packet_count=%zu", sql.size(), packets.size());
+
+	// For multi-packet messages:
+	// - Over TLS: send each packet individually (some SQL Server versions have issues with combined)
+	// - Over plain TCP: combine and send at once for efficiency
+	if (packets.size() > 1) {
+		bool use_combined = !socket_->IsTlsEnabled();
+		uint8_t pkt_id = 1;
+
+		if (use_combined) {
+			// Plain TCP: combine all packets and send at once
+			std::vector<uint8_t> combined;
+			size_t total_size = 0;
+			for (size_t i = 0; i < packets.size(); i++) {
+				auto& packet = packets[i];
+				packet.SetPacketId(pkt_id++);
+				MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: preparing packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
+				                i + 1, packets.size(),
+				                static_cast<unsigned>(packet.GetType()),
+				                static_cast<unsigned>(packet.GetStatus()),
+				                packet.GetLength(),
+				                packet.GetPayload().size(), packet.IsEndOfMessage(),
+				                packet.GetPacketId());
+				std::vector<uint8_t> serialized = packet.Serialize();
+				combined.insert(combined.end(), serialized.begin(), serialized.end());
+				total_size += serialized.size();
+			}
+			MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: sending %zu combined bytes", total_size);
+			if (!socket_->Send(combined)) {
+				last_error_ = "Failed to send multi-packet SQL_BATCH: " + socket_->GetLastError();
+				state_.store(ConnectionState::Disconnected);
+				return false;
+			}
+		} else {
+			// TLS: send packets individually
+			for (size_t i = 0; i < packets.size(); i++) {
+				auto& packet = packets[i];
+				packet.SetPacketId(pkt_id++);
+				MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: sending TLS packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
+				                i + 1, packets.size(),
+				                static_cast<unsigned>(packet.GetType()),
+				                static_cast<unsigned>(packet.GetStatus()),
+				                packet.GetLength(),
+				                packet.GetPayload().size(), packet.IsEndOfMessage(),
+				                packet.GetPacketId());
+				if (!socket_->SendPacket(packet)) {
+					last_error_ = "Failed to send TLS packet " + std::to_string(i+1) + "/" +
+					              std::to_string(packets.size()) + ": " + socket_->GetLastError();
+					state_.store(ConnectionState::Disconnected);
+					return false;
+				}
+			}
+		}
+	} else {
+		// Single packet - send normally
+		for (size_t i = 0; i < packets.size(); i++) {
+			auto& packet = packets[i];
+			packet.SetPacketId(next_packet_id_++);
+			MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: sending packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
+			                i + 1, packets.size(),
+			                static_cast<unsigned>(packet.GetType()),
+			                static_cast<unsigned>(packet.GetStatus()),
+			                packet.GetLength(),
+			                packet.GetPayload().size(), packet.IsEndOfMessage(),
+			                packet.GetPacketId());
+			// Dump full packet header and first bytes of payload for debugging
+			if (i == 0 && GetMssqlDebugLevel() >= 3) {
+				std::vector<uint8_t> serialized = packet.Serialize();
+				std::string hex_dump;
+				// Dump header (8 bytes) + first 42 bytes of payload = 50 bytes total
+				for (size_t j = 0; j < std::min<size_t>(50, serialized.size()); j++) {
+					char buf[4];
+					snprintf(buf, sizeof(buf), "%02x ", serialized[j]);
+					hex_dump += buf;
+				}
+				MSSQL_CONN_DEBUG_LOG(3, "ExecuteBatch: packet bytes (header+payload, first 50): %s", hex_dump.c_str());
+			}
+			if (!socket_->SendPacket(packet)) {
+				last_error_ = "Failed to send SQL_BATCH: " + socket_->GetLastError();
+				state_.store(ConnectionState::Disconnected);
+				return false;
+			}
 		}
 	}
+
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: all packets sent");
 
 	// Connection is now in Executing state, ready to receive response
 	return true;

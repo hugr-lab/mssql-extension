@@ -84,6 +84,7 @@ ParsedTokenType TokenParser::TryParseNext() {
 	switch (static_cast<TokenType>(token_type)) {
 	case TokenType::COLMETADATA:
 		if (ParseColMetadata()) {
+			TDS_PARSER_DEBUG(1, "TryParseNext: returning ColMetadata (1)");
 			return ParsedTokenType::ColMetadata;
 		}
 		return ParsedTokenType::NeedMoreData;
@@ -165,8 +166,11 @@ ParsedTokenType TokenParser::TryParseNext() {
 }
 
 bool TokenParser::ParseColMetadata() {
+	TDS_PARSER_DEBUG(2, "ParseColMetadata: entry, available=%zu, existing_columns=%zu", Available(), columns_.size());
+
 	// Token type + at least 2 bytes for count
 	if (Available() < 3) {
+		TDS_PARSER_DEBUG(2, "ParseColMetadata: need more data (have %zu, need 3)", Available());
 		return false;
 	}
 
@@ -176,14 +180,17 @@ bool TokenParser::ParseColMetadata() {
 
 	try {
 		if (!ColumnMetadataParser::Parse(data, length, bytes_consumed, columns_)) {
+			TDS_PARSER_DEBUG(2, "ParseColMetadata: ColumnMetadataParser needs more data");
 			return false;  // Need more data
 		}
 	} catch (const std::exception& e) {
 		parse_error_ = std::string("COLMETADATA parse error: ") + e.what();
 		state_ = ParserState::Error;
+		TDS_PARSER_DEBUG(1, "ParseColMetadata: exception: %s", e.what());
 		return false;
 	}
 
+	TDS_PARSER_DEBUG(1, "ParseColMetadata: parsed %zu columns, consumed %zu bytes", columns_.size(), bytes_consumed);
 	ConsumeBytes(1 + bytes_consumed);  // token type + parsed data
 	state_ = ParserState::ParsingRow;
 	return true;

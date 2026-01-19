@@ -1,0 +1,73 @@
+# name: test/sql/insert/insert_config.test
+# description: Test INSERT configuration settings
+# group: [mssql]
+
+# Configuration settings:
+#   mssql_insert_batch_size - Maximum rows per INSERT statement (default: 2000)
+#   mssql_insert_max_rows_per_statement - Hard cap on rows per statement (default: 2000)
+#   mssql_insert_max_sql_bytes - Maximum SQL statement size (default: 8MB)
+#   mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING (default: true)
+
+require mssql
+
+# Test 1: Check default settings exist
+statement ok
+SELECT current_setting('mssql_insert_batch_size');
+
+statement ok
+SELECT current_setting('mssql_insert_max_rows_per_statement');
+
+statement ok
+SELECT current_setting('mssql_insert_max_sql_bytes');
+
+statement ok
+SELECT current_setting('mssql_insert_use_returning_output');
+
+# Test 2: Set batch size
+statement ok
+SET mssql_insert_batch_size = 1000;
+
+query I
+SELECT current_setting('mssql_insert_batch_size')::INTEGER;
+----
+1000
+
+# Test 3: Set max SQL bytes
+statement ok
+SET mssql_insert_max_sql_bytes = 4194304;
+
+query I
+SELECT current_setting('mssql_insert_max_sql_bytes')::INTEGER;
+----
+4194304
+
+# Test 4: Set RETURNING output flag
+statement ok
+SET mssql_insert_use_returning_output = false;
+
+query I
+SELECT current_setting('mssql_insert_use_returning_output')::BOOLEAN::INTEGER;
+----
+0
+
+statement ok
+SET mssql_insert_use_returning_output = true;
+
+# Test 5: Batch size validation - must be >= 1
+statement error
+SET mssql_insert_batch_size = 0;
+----
+must be >= 1
+
+# Test 6: Max SQL bytes validation - must be >= 1
+statement error
+SET mssql_insert_max_sql_bytes = 0;
+----
+must be >= 1
+
+# Test 7: Reset to defaults
+statement ok
+SET mssql_insert_batch_size = 2000;
+
+statement ok
+SET mssql_insert_max_sql_bytes = 8388608;
