@@ -214,7 +214,7 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	names.emplace_back("acquire_timeout_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
-	return bind_data;
+	return std::move(bind_data);
 }
 
 unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientContext &context,
@@ -233,7 +233,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientCo
 		// If pool doesn't exist, pool_names remains empty (no rows returned)
 	}
 
-	return gstate;
+	return std::move(gstate);
 }
 
 void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
