@@ -1,31 +1,544 @@
 # DuckDB MSSQL Extension
 
-A DuckDB extension for connecting to Microsoft SQL Server databases using native TDS protocol.
+A DuckDB extension for connecting to Microsoft SQL Server databases using native TDS protocol - no ODBC, JDBC, or external drivers required.
 
-## Status
+## Features
 
-This extension provides native TDS protocol connectivity to Microsoft SQL Server with the following features:
-- Connection string parsing (ADO.NET and URI formats)
+- Native TDS protocol implementation (no external dependencies)
+- Stream query results directly into DuckDB without buffering
+- Full DuckDB catalog integration with three-part naming (`database.schema.table`)
+- Connection pooling with configurable limits
 - TLS/SSL encrypted connections
-- Connection pooling
-- Streaming query execution
-- DuckDB secret management integration
-
-## Prerequisites
-
-- CMake 3.21+
-- Ninja build system
-- C++ compiler with C++11 support
-- Git (for submodule management)
-- Docker (for SQL Server development environment)
+- INSERT support with RETURNING clause and automatic batching
+- DuckDB secret management for secure credential storage
 
 ## Quick Start
 
-### Clone and Initialize
+### Prerequisites
+
+- DuckDB v1.0 or later
+- SQL Server 2019 or later accessible on network
+
+### Step 1: Install Extension
+
+```sql
+INSTALL mssql FROM community;
+LOAD mssql;
+```
+
+### Step 2: Connect to SQL Server
+
+#### Option A: Using a Secret (Recommended)
+
+```sql
+CREATE SECRET my_sqlserver (
+    TYPE mssql,
+    host 'localhost',
+    port 1433,
+    database 'master',
+    user 'sa',
+    password 'YourPassword123'
+);
+
+ATTACH '' AS sqlserver (TYPE mssql, SECRET my_sqlserver);
+```
+
+#### Option B: Using Connection String
+
+```sql
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword123'
+    AS sqlserver (TYPE mssql);
+```
+
+### Step 3: Query Data
+
+```sql
+-- List schemas
+SHOW SCHEMAS FROM sqlserver;
+
+-- List tables in dbo schema
+SHOW TABLES FROM sqlserver.dbo;
+
+-- Query a table
+SELECT * FROM sqlserver.dbo.my_table LIMIT 10;
+```
+
+### Step 4: Disconnect
+
+```sql
+DETACH sqlserver;
+DROP SECRET my_sqlserver;
+```
+
+## Connection Configuration
+
+### Using Secrets
+
+Create a secret to store connection credentials securely:
+
+```sql
+CREATE SECRET secret_name (
+    TYPE mssql,
+    host 'hostname',
+    port 1433,
+    database 'database_name',
+    user 'username',
+    password 'password',
+    use_encrypt false
+);
+```
+
+#### Secret Fields
+
+| Field         | Type    | Required | Description                          |
+| ------------- | ------- | -------- | ------------------------------------ |
+| `host`        | VARCHAR | Yes      | SQL Server hostname or IP address    |
+| `port`        | INTEGER | Yes      | TCP port (1-65535, default: 1433)    |
+| `database`    | VARCHAR | Yes      | Database name                        |
+| `user`        | VARCHAR | Yes      | SQL Server username                  |
+| `password`    | VARCHAR | Yes      | Password (hidden in duckdb_secrets)  |
+| `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: false) |
+
+Attach using the secret:
+
+```sql
+ATTACH '' AS context_name (TYPE mssql, SECRET secret_name);
+```
+
+### Using Connection Strings
+
+#### ADO.NET Format
+
+```sql
+ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
+    AS context_name (TYPE mssql);
+```
+
+#### Key Aliases (case-insensitive)
+
+| Key                         | Aliases                    |
+| --------------------------- | -------------------------- |
+| `Server`                    | `Data Source`              |
+| `Database`                  | `Initial Catalog`          |
+| `User Id`                   | `Uid`, `User`              |
+| `Password`                  | `Pwd`                      |
+| `Encrypt`                   | `Use Encryption for Data`  |
+
+#### URI Format
+
+```sql
+ATTACH 'mssql://user:password@host:port/database?encrypt=true'
+    AS context_name (TYPE mssql);
+```
+
+URI format supports URL-encoded components for special characters in credentials.
+
+### TLS/SSL Configuration
+
+To enable encrypted connections:
+
+#### Using Secret
+
+```sql
+CREATE SECRET secure_conn (
+    TYPE mssql,
+    host 'sql-server.example.com',
+    port 1433,
+    database 'MyDatabase',
+    user 'sa',
+    password 'Password123',
+    use_encrypt true
+);
+```
+
+#### Using Connection String
+
+```sql
+ATTACH 'Server=sql-server.example.com,1433;Database=MyDatabase;User Id=sa;Password=Password123;Encrypt=yes'
+    AS db (TYPE mssql);
+```
+
+#### Using URI
+
+```sql
+ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=true'
+    AS db (TYPE mssql);
+```
+
+> **Note**: TLS support requires the loadable extension build. The static build does not include TLS.
+
+## Catalog Integration
+
+### Attaching and Detaching
+
+```sql
+-- Attach with secret
+ATTACH '' AS sqlserver (TYPE mssql, SECRET my_secret);
+
+-- Attach with connection string
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass'
+    AS sqlserver (TYPE mssql);
+
+-- Detach when done
+DETACH sqlserver;
+```
+
+### Schema Browsing
+
+```sql
+-- List all schemas
+SHOW SCHEMAS FROM sqlserver;
+
+-- List tables in a schema
+SHOW TABLES FROM sqlserver.dbo;
+
+-- Describe table structure
+DESCRIBE sqlserver.dbo.my_table;
+```
+
+### Three-Part Naming
+
+Access SQL Server tables using `context.schema.table` naming:
+
+```sql
+SELECT id, name, created_at
+FROM sqlserver.dbo.customers
+WHERE status = 'active'
+LIMIT 100;
+```
+
+### Cross-Catalog Joins
+
+Join SQL Server tables with local DuckDB tables:
+
+```sql
+-- Create local table
+CREATE TABLE local_data (customer_id INTEGER, extra_info VARCHAR);
+
+-- Join with SQL Server
+SELECT c.id, c.name, l.extra_info
+FROM sqlserver.dbo.customers c
+JOIN local_data l ON c.id = l.customer_id;
+```
+
+## Query Execution
+
+### Streaming SELECT
+
+Results are streamed directly into DuckDB without buffering the entire result set:
+
+```sql
+SELECT * FROM sqlserver.dbo.large_table;
+```
+
+### Filter and Projection Pushdown
+
+The extension pushes filters and column selections to SQL Server:
+
+```sql
+-- Only 'id' and 'name' columns are fetched, filter applied server-side
+SELECT id, name FROM sqlserver.dbo.customers WHERE status = 'active';
+```
+
+Supported filter operations for pushdown:
+
+- Equality: `column = value`
+- Comparisons: `>`, `<`, `>=`, `<=`, `<>`
+- IN clause: `column IN (val1, val2, ...)`
+- LIKE patterns: `column LIKE 'pattern%'`
+- NULL checks: `IS NULL`, `IS NOT NULL`
+- Conjunctions: `AND`, `OR`
+
+## Data Modification (INSERT)
+
+### Basic INSERT
+
+```sql
+-- Single row
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('test', 42);
+
+-- Multiple rows
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('first', 1), ('second', 2), ('third', 3);
+```
+
+### INSERT from SELECT
+
+```sql
+INSERT INTO sqlserver.dbo.target_table (name, value)
+SELECT name, value FROM local_source_table;
+```
+
+### INSERT with RETURNING
+
+Get inserted values back (uses SQL Server's OUTPUT INSERTED):
+
+```sql
+INSERT INTO sqlserver.dbo.my_table (name)
+VALUES ('test')
+RETURNING id, name;
+```
+
+```sql
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('a', 1), ('b', 2)
+RETURNING *;
+```
+
+### Batch Configuration
+
+Large inserts are automatically batched. Configure batch size:
+
+```sql
+-- Set batch size (default: 1000, SQL Server limit)
+SET mssql_insert_batch_size = 500;
+
+-- Maximum SQL statement size (default: 8MB)
+SET mssql_insert_max_sql_bytes = 4194304;
+```
+
+### Identity Columns
+
+Identity (auto-increment) columns are automatically excluded from INSERT statements. The generated values are returned via RETURNING clause.
+
+## Function Reference
+
+### mssql_version()
+
+Returns the extension version (DuckDB commit hash).
+
+**Signature:** `mssql_version() -> VARCHAR`
+
+```sql
+SELECT mssql_version();
+-- Returns: 'abc123def...'
+```
+
+### mssql_execute()
+
+Execute a SQL statement and return results as a table.
+
+**Signature:** `mssql_execute(context VARCHAR, sql VARCHAR) -> TABLE(success BOOLEAN, affected_rows BIGINT, message VARCHAR)`
+
+```sql
+SELECT * FROM mssql_execute('sqlserver', 'EXEC sp_who2');
+```
+
+### mssql_scan()
+
+Stream SELECT query results from SQL Server.
+
+**Signature:** `mssql_scan(context VARCHAR, query VARCHAR) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_scan('sqlserver', 'SELECT TOP 10 * FROM sys.tables');
+```
+
+The return schema is dynamic based on the query result columns.
+
+### mssql_exec()
+
+Execute a SQL statement and return affected row count.
+
+**Signature:** `mssql_exec(secret VARCHAR, sql VARCHAR) -> BIGINT`
+
+```sql
+SELECT mssql_exec('my_secret', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
+-- Returns: 1 (number of affected rows)
+```
+
+### mssql_open()
+
+Open a diagnostic connection to SQL Server.
+
+**Signature:** `mssql_open(secret VARCHAR) -> BIGINT`
+
+```sql
+SELECT mssql_open('my_secret');
+-- Returns: 12345 (connection handle)
+```
+
+### mssql_close()
+
+Close a diagnostic connection.
+
+**Signature:** `mssql_close(handle BIGINT) -> BOOLEAN`
+
+```sql
+SELECT mssql_close(12345);
+-- Returns: true
+```
+
+### mssql_ping()
+
+Test if a connection is alive.
+
+**Signature:** `mssql_ping(handle BIGINT) -> BOOLEAN`
+
+```sql
+SELECT mssql_ping(12345);
+-- Returns: true (connection alive) or false (connection dead)
+```
+
+### mssql_pool_stats()
+
+Get connection pool statistics.
+
+**Signature:** `mssql_pool_stats(context? VARCHAR) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_pool_stats('sqlserver');
+```
+
+**Return columns:**
+
+| Column                  | Type   | Description                        |
+| ----------------------- | ------ | ---------------------------------- |
+| `context_name`          | VARCHAR | Attached database context name     |
+| `total_connections`     | BIGINT | Current pool size                  |
+| `idle_connections`      | BIGINT | Available connections              |
+| `active_connections`    | BIGINT | Currently in use                   |
+| `connections_created`   | BIGINT | Lifetime connections created       |
+| `connections_closed`    | BIGINT | Lifetime connections closed        |
+| `acquire_count`         | BIGINT | Times connections acquired         |
+| `acquire_timeout_count` | BIGINT | Times acquisition timed out        |
+| `acquire_wait_total_ms` | BIGINT | Total milliseconds spent waiting   |
+
+## Type Mapping
+
+### Numeric Types
+
+| SQL Server Type   | DuckDB Type    | Notes                        |
+| ----------------- | -------------- | ---------------------------- |
+| `TINYINT`         | `UTINYINT`     | Unsigned 0-255               |
+| `SMALLINT`        | `SMALLINT`     | -32768 to 32767              |
+| `INT`             | `INTEGER`      | Standard 32-bit integer      |
+| `BIGINT`          | `BIGINT`       | 64-bit integer               |
+| `BIT`             | `BOOLEAN`      | 0 or 1                       |
+| `REAL`            | `FLOAT`        | 32-bit floating point        |
+| `FLOAT`           | `DOUBLE`       | 64-bit floating point        |
+| `DECIMAL(p,s)`    | `DECIMAL(p,s)` | Preserves precision/scale    |
+| `NUMERIC(p,s)`    | `DECIMAL(p,s)` | Preserves precision/scale    |
+| `MONEY`           | `DECIMAL(19,4)`| Fixed precision              |
+| `SMALLMONEY`      | `DECIMAL(10,4)`| Fixed precision              |
+
+### String Types
+
+| SQL Server Type   | DuckDB Type    | Notes                        |
+| ----------------- | -------------- | ---------------------------- |
+| `CHAR(n)`         | `VARCHAR`      | Fixed-length, trailing spaces trimmed |
+| `VARCHAR(n)`      | `VARCHAR`      | Variable-length              |
+| `NCHAR(n)`        | `VARCHAR`      | UTF-16LE decoded             |
+| `NVARCHAR(n)`     | `VARCHAR`      | UTF-16LE decoded             |
+
+### Binary Types
+
+| SQL Server Type   | DuckDB Type    | Notes                        |
+| ----------------- | -------------- | ---------------------------- |
+| `BINARY(n)`       | `BLOB`         | Fixed-length binary          |
+| `VARBINARY(n)`    | `BLOB`         | Variable-length binary       |
+
+### Date/Time Types
+
+| SQL Server Type     | DuckDB Type     | Notes                        |
+| ------------------- | --------------- | ---------------------------- |
+| `DATE`              | `DATE`          | Date only                    |
+| `TIME`              | `TIME`          | Up to 100ns precision        |
+| `DATETIME`          | `TIMESTAMP`     | 3.33ms precision             |
+| `SMALLDATETIME`     | `TIMESTAMP`     | 1 minute precision           |
+| `DATETIME2`         | `TIMESTAMP`     | Up to 100ns precision        |
+| `DATETIMEOFFSET`    | `TIMESTAMP_TZ`  | Timezone-aware               |
+
+### Special Types
+
+| SQL Server Type     | DuckDB Type    | Notes                        |
+| ------------------- | -------------- | ---------------------------- |
+| `UNIQUEIDENTIFIER`  | `UUID`         | 128-bit GUID                 |
+
+### Unsupported Types
+
+The following SQL Server types are not currently supported:
+
+- `XML`
+- `UDT` (User-Defined Types)
+- `SQL_VARIANT`
+- `IMAGE` (deprecated)
+- `TEXT` (deprecated)
+- `NTEXT` (deprecated)
+
+Queries involving unsupported types will raise an error.
+
+## Configuration Reference
+
+### Connection Pool Settings
+
+| Setting                    | Type    | Default | Range | Description                              |
+| -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
+| `mssql_connection_limit`   | BIGINT  | 10      | ≥1    | Max connections per attached database    |
+| `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
+| `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
+| `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
+| `mssql_min_connections`    | BIGINT  | 2       | ≥0    | Minimum connections to maintain          |
+| `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | Connection acquire timeout (seconds)     |
+| `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
+
+### Statistics Settings
+
+| Setting                            | Type    | Default | Range | Description                           |
+| ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
+| `mssql_enable_statistics`          | BOOLEAN | true    | -     | Enable statistics collection          |
+| `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
+| `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |
+| `mssql_statistics_cache_ttl_seconds` | BIGINT | 300    | ≥0    | Statistics cache TTL (seconds)        |
+
+### INSERT Settings
+
+| Setting                            | Type    | Default  | Range  | Description                           |
+| ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
+| `mssql_insert_batch_size`          | BIGINT  | 1000     | ≥1     | Rows per INSERT (SQL Server limit: 1000) |
+| `mssql_insert_max_rows_per_statement` | BIGINT | 1000   | ≥1     | Hard cap on rows per INSERT           |
+| `mssql_insert_max_sql_bytes`       | BIGINT  | 8388608  | ≥1024  | Max SQL statement size (8MB)          |
+| `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Use OUTPUT INSERTED for RETURNING     |
+
+### Usage Examples
+
+```sql
+-- Increase connection pool for high-concurrency workloads
+SET mssql_connection_limit = 20;
+
+-- Reduce batch size for tables with large rows
+SET mssql_insert_batch_size = 100;
+
+-- Enable detailed statistics for query optimization
+SET mssql_statistics_level = 2;
+
+-- Disable connection caching for debugging
+SET mssql_connection_cache = false;
+```
+
+## Building from Source
+
+### Build Prerequisites
+
+- CMake 3.21+
+- Ninja build system
+- C++17 compatible compiler
+- Git (for submodules)
+- Docker (optional, for SQL Server test environment)
+
+### Clone and Build
 
 ```bash
+# Clone with submodules
 git clone --recurse-submodules <repository-url>
 cd mssql-extension
+
+# Build release version
+make release
+
+# Build debug version
+make debug
 ```
 
 If you already cloned without submodules:
@@ -34,132 +547,65 @@ If you already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-### Build
+### Build Targets
 
-Build the release version:
+| Target          | Description                              |
+| --------------- | ---------------------------------------- |
+| `make release`  | Build optimized release version          |
+| `make debug`    | Build with debug symbols                 |
+| `make clean`    | Remove all build artifacts               |
+| `make test`     | Run DuckDB extension tests               |
+| `make help`     | Show available targets                   |
 
-```bash
-make release
-```
+### TLS Support
 
-Build the debug version:
+The extension uses a split TLS build approach:
 
-```bash
-make debug
-```
-
-### Verify Extension
-
-After building, the extension is statically linked into DuckDB. Test it:
-
-```bash
-./build/release/duckdb -c "SELECT mssql_version();"
-```
-
-Expected output shows the DuckDB commit hash the extension was built against.
-
-### Connect to SQL Server
-
-Use the ATTACH command with a connection string:
-
-```sql
--- Connection string format
-ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword' AS db (TYPE mssql);
-
--- Query SQL Server tables
-SELECT * FROM mssql_scan('db', 'SELECT * FROM your_table') LIMIT 100;
-```
-
-Connection string parameters:
-- `Server` - hostname and port (format: `host,port`)
-- `Database` - database name
-- `User Id` - SQL Server login username
-- `Password` - SQL Server login password
-
-### TLS/Encrypted Connections
-
-For secure connections with TLS encryption, you can use any of these methods:
-
-**Method 1: Secret with use_encrypt**
-```sql
-CREATE SECRET mssql_secure (
-    TYPE mssql,
-    host 'sql-server.example.com',
-    port 1433,
-    database 'MyDatabase',
-    user 'sa',
-    password 'MyPassword123!',
-    use_encrypt true
-);
-ATTACH '' AS db (TYPE mssql, SECRET mssql_secure);
-```
-
-**Method 2: ADO.NET connection string with Encrypt**
-```sql
-ATTACH 'Server=sql-server.example.com,1433;Database=MyDatabase;User Id=sa;Password=MyPassword123!;Encrypt=yes' AS db (TYPE mssql);
-```
-
-**Method 3: URI format with encrypt query parameter**
-```sql
-ATTACH 'mssql://sa:MyPassword123!@sql-server.example.com:1433/MyDatabase?encrypt=true' AS db (TYPE mssql);
-```
-
-Key points about TLS support:
-- `use_encrypt` / `Encrypt` defaults to `false` for backward compatibility
-- Uses "trust server certificate" mode (accepts self-signed certificates)
-- TLS 1.2 is the minimum supported version (SQL Server 2016+ requirement)
-- Works with both static and loadable extensions
-- mbedTLS is used as the TLS library (via vcpkg)
-
-Set `MSSQL_DEBUG=1` environment variable to see TLS handshake details in debug output.
-
-### Load as Dynamic Extension
+| Build Type | TLS Support | Use Case                              |
+| ---------- | ----------- | ------------------------------------- |
+| Static     | No (stub)   | CLI development, minimal dependencies |
+| Loadable   | Yes (mbedTLS) | Production with encrypted connections |
 
 The loadable extension is built at:
-- `build/release/extension/mssql/mssql.duckdb_extension`
+`build/release/extension/mssql/mssql.duckdb_extension`
 
-## Development
+### Running Tests
 
-### Project Structure
+```bash
+# Run unit tests (no SQL Server required)
+make test
 
-```
-mssql-extension/
-├── src/                          # Extension source code
-│   ├── include/                  # Header files
-│   │   └── mssql_extension.hpp   # Main extension header
-│   └── mssql_extension.cpp       # Extension implementation
-├── duckdb/                       # DuckDB submodule (main branch)
-├── docker/                       # Docker configuration
-│   ├── docker-compose.yml        # SQL Server container setup
-│   └── init/                     # Database initialization scripts
-│       └── init.sql              # Test tables and data
-├── .vscode/                      # VSCode configuration
-│   ├── tasks.json                # Build tasks
-│   ├── launch.json               # Debug configurations
-│   └── settings.json             # Workspace settings
-├── CMakeLists.txt                # Extension CMake configuration
-├── extension_config.cmake        # DuckDB extension registration
-├── Makefile                      # Build convenience wrapper
-└── vcpkg.json                    # Dependency manifest
+# Start SQL Server for integration tests
+cd docker && docker-compose up -d
+
+# Wait for SQL Server to initialize, then run integration tests
+make test
 ```
 
-### VSCode Development
+### VS Code Configuration
 
-1. Open the project folder in VSCode
+1. Open the project folder in VS Code
 2. Install recommended extensions when prompted
-3. Use `Cmd+Shift+B` to build (defaults to debug)
+3. Use `Cmd+Shift+B` (macOS) or `Ctrl+Shift+B` (Windows/Linux) to build
 4. Use `F5` to debug with DuckDB shell
 
-### SQL Server Development Environment
+### CLion Configuration
 
-Start the SQL Server container:
+1. Open the project as a CMake project
+2. Set CMake options: `-DCMAKE_BUILD_TYPE=Debug`
+3. Select the `mssql` target
+4. Build and debug normally
+
+### Test Environment
+
+Start the SQL Server development container:
 
 ```bash
 cd docker
 docker-compose up -d
 ```
 
-Wait for initialization to complete, then connect:
+Connect to verify:
 
 ```bash
 docker exec -it mssql-dev /opt/mssql-tools18/bin/sqlcmd \
@@ -173,37 +619,95 @@ Stop the environment:
 docker-compose down
 ```
 
-### Test Tables
+## Troubleshooting
 
-The init script creates two test tables:
+### Connection Refused
 
-1. **TestSimplePK** - Single-column primary key (scalar rowid)
-   - `id` (INT, PK), `name`, `value`, `created_at`
+```text
+Error: Failed to connect to SQL Server: Connection refused
+```
 
-2. **TestCompositePK** - Composite primary key (STRUCT rowid)
-   - `region_id` + `product_id` (composite PK), `quantity`, `unit_price`, `order_date`
+**Solutions:**
 
-## Build Targets
+- Verify SQL Server hostname and port are correct
+- Check firewall allows TCP connections on port 1433
+- Ensure SQL Server is configured for TCP/IP connections (SQL Server Configuration Manager)
+- Test connectivity: `telnet hostname 1433`
 
-| Target | Description |
-|--------|-------------|
-| `make release` | Build optimized release version |
-| `make debug` | Build with debug symbols |
-| `make clean` | Remove all build artifacts |
-| `make test` | Run tests |
-| `make help` | Show available targets |
+### Login Failed
 
-## Architecture
+```text
+Error: Login failed for user 'username'
+```
 
-### DuckDB Version
+**Solutions:**
 
-This extension tracks DuckDB's `main` branch. The extension version reported by `mssql_version()` is the DuckDB commit hash.
+- Verify username and password are correct
+- Ensure SQL Server authentication mode is enabled (not Windows-only)
+- Check user has access to the specified database
+- Verify user account is not locked or disabled
 
-### Row Identity Model
+### TLS Required
 
-The extension implements PK-based row identity:
-- **Single-column PK**: Scalar rowid
-- **Composite PK**: STRUCT-based rowid with named fields
+```text
+Error: Server requires encryption but TLS is not available
+```
+
+**Solutions:**
+
+- Use the loadable extension build (includes TLS support)
+- Enable encryption in connection: `use_encrypt true` or `Encrypt=yes`
+- If using static build, encryption is not available
+
+### TLS Handshake Failed
+
+```text
+Error: TLS handshake failed
+```
+
+**Solutions:**
+
+- Verify server certificate is valid
+- Check TLS version compatibility (TLS 1.2+ required)
+- Set `MSSQL_DEBUG=1` for detailed TLS debugging output
+- Verify server hostname matches certificate
+
+### Type Conversion Error
+
+```text
+Error: Unsupported SQL Server type: XML
+```
+
+**Solutions:**
+
+- Check the [Type Mapping](#type-mapping) section for supported types
+- Cast unsupported columns to supported types in your query
+- Exclude unsupported columns from SELECT
+
+### Slow Query Performance
+
+**Solutions:**
+
+- Verify filter pushdown is working (check query plan)
+- Reduce result set size with LIMIT or WHERE clauses
+- Increase connection pool size for concurrent queries
+- Check network latency to SQL Server
+- Consider using `mssql_scan()` for complex queries with explicit SQL
+
+## Limitations
+
+### Unsupported Features
+
+- **UPDATE/DELETE**: Use `mssql_exec()` for data modification other than INSERT
+- **Windows Authentication**: Only SQL Server authentication is supported
+- **Transactions**: Multi-statement transactions are not supported
+- **Stored Procedures with Output Parameters**: Use `mssql_execute()` for stored procedures
+
+### Known Issues
+
+- Queries with unsupported types (XML, UDT, etc.) will fail
+- Very large DECIMAL values may lose precision at extreme scales
+- Connection pool statistics reset when all connections close
 
 ## License
 
