@@ -7,6 +7,7 @@
 #include "insert/mssql_insert_config.hpp"
 #include "insert/mssql_insert_error.hpp"
 #include "insert/mssql_insert_target.hpp"
+#include "mssql_compat.hpp"
 
 namespace duckdb {
 
@@ -96,7 +97,8 @@ public:
 	// Source Interface (for returning results)
 	//===----------------------------------------------------------------------===//
 
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
+										  OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;

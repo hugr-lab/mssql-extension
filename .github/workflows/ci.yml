@@ -147,6 +147,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            -DMSSQL_DUCKDB_API_NIGHTLY=ON \
             ../../duckdb
           cmake --build . --config Release
 

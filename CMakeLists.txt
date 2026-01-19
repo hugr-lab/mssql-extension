@@ -26,6 +26,21 @@ endif()
 message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_HASH}")
 
 # =============================================================================
+# DuckDB API Compatibility
+# =============================================================================
+# DuckDB nightly (main) renamed PhysicalOperator::GetData to GetDataInternal.
+# Set MSSQL_DUCKDB_API_NIGHTLY=ON when building against DuckDB main branch.
+# Default: OFF (stable API for 1.4.x releases)
+option(MSSQL_DUCKDB_API_NIGHTLY "Build against DuckDB nightly API (GetDataInternal)" OFF)
+
+if(MSSQL_DUCKDB_API_NIGHTLY)
+    message(STATUS "Using DuckDB nightly API (GetDataInternal)")
+    add_compile_definitions(MSSQL_DUCKDB_NIGHTLY=1)
+else()
+    message(STATUS "Using DuckDB stable API (GetData)")
+endif()
+
+# =============================================================================
 # TLS Libraries (built as separate subproject with two variants)
 # =============================================================================
 # The TLS library is built in src/tls with its own CMakeLists.txt.
