@@ -6,10 +6,10 @@
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/common/vector_operations/unary_executor.hpp"
 
 namespace duckdb {
 
@@ -18,7 +18,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, ScalarFunction &bound_function,
-                                                      vector<unique_ptr<Expression>> &arguments) {
+													  vector<unique_ptr<Expression>> &arguments) {
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_refresh_cache: catalog_name must be a constant, not a parameter");
@@ -45,9 +45,9 @@ static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, Sc
 		auto &manager = MSSQLContextManager::Get(*context.db);
 		if (!manager.HasContext(catalog_name)) {
 			throw BinderException(
-			    "mssql_refresh_cache: catalog '%s' not found. "
-			    "Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-			    catalog_name, catalog_name);
+				"mssql_refresh_cache: catalog '%s' not found. "
+				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+				catalog_name, catalog_name);
 		}
 
 		// Verify it's an MSSQL catalog
@@ -60,7 +60,7 @@ static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, Sc
 		auto &catalog = ctx->attached_db->GetCatalog();
 		if (catalog.GetCatalogType() != "mssql") {
 			throw BinderException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)", catalog_name,
-			                      catalog.GetCatalogType());
+								  catalog.GetCatalogType());
 		}
 	}
 
@@ -91,9 +91,9 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 		auto ctx = manager.GetContext(catalog_name);
 		if (!ctx) {
 			throw InvalidInputException(
-			    "mssql_refresh_cache: catalog '%s' not found. "
-			    "Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-			    catalog_name, catalog_name);
+				"mssql_refresh_cache: catalog '%s' not found. "
+				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+				catalog_name, catalog_name);
 		}
 
 		if (!ctx->attached_db) {
@@ -122,7 +122,7 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
-	                    MSSQLRefreshCacheBind);
+						MSSQLRefreshCacheBind);
 	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(func);
 }
