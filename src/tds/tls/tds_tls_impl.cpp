@@ -68,24 +68,23 @@ struct TlsImplContext {
 	// Custom I/O callbacks for TDS-wrapped TLS
 	TlsSendCallback send_callback;
 	TlsRecvCallback recv_callback;
-	int current_timeout_ms;  // Timeout for current operation
+	int current_timeout_ms;	 // Timeout for current operation
 
 	TlsImplContext()
-	    : ssl_ctx(nullptr),
-	      ssl(nullptr),
-	      bio(nullptr),
-	      initialized(false),
-	      handshake_complete(false),
-	      socket_fd(-1),
-	      last_error_code(0),
-	      current_timeout_ms(30000) {
-	}
+		: ssl_ctx(nullptr),
+		  ssl(nullptr),
+		  bio(nullptr),
+		  initialized(false),
+		  handshake_complete(false),
+		  socket_fd(-1),
+		  last_error_code(0),
+		  current_timeout_ms(30000) {}
 
 	~TlsImplContext() {
 		if (ssl) {
-			SSL_free(ssl);  // This also frees the BIO attached to SSL
+			SSL_free(ssl);	// This also frees the BIO attached to SSL
 			ssl = nullptr;
-			bio = nullptr;  // BIO is freed by SSL_free
+			bio = nullptr;	// BIO is freed by SSL_free
 		}
 		if (ssl_ctx) {
 			SSL_CTX_free(ssl_ctx);
@@ -265,8 +264,7 @@ static void ClearOpenSSLErrors() {
 // TlsImpl class implementation
 // =============================================================================
 
-TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {
-}
+TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {}
 
 TlsImpl::~TlsImpl() {
 	Close();
@@ -284,7 +282,7 @@ bool TlsImpl::Initialize() {
 	// Create SSL context for TLS client
 	ctx_->ssl_ctx = SSL_CTX_new(TLS_client_method());
 	if (!ctx_->ssl_ctx) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "SSL_CTX_new failed: " + FormatOpenSSLError();
 		MSSQL_TLS_DEBUG_LOG(1, "Initialize: FAILED - %s", ctx_->last_error.c_str());
 		return false;
@@ -300,7 +298,7 @@ bool TlsImpl::Initialize() {
 	// Create SSL object
 	ctx_->ssl = SSL_new(ctx_->ssl_ctx);
 	if (!ctx_->ssl) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "SSL_new failed: " + FormatOpenSSLError();
 		MSSQL_TLS_DEBUG_LOG(1, "Initialize: FAILED - %s", ctx_->last_error.c_str());
 		return false;
@@ -309,7 +307,7 @@ bool TlsImpl::Initialize() {
 	// Create custom BIO and attach to SSL
 	ctx_->bio = BIO_new(GetCustomBioMethod());
 	if (!ctx_->bio) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "BIO_new failed: " + FormatOpenSSLError();
 		MSSQL_TLS_DEBUG_LOG(1, "Initialize: FAILED - %s", ctx_->last_error.c_str());
 		return false;
@@ -330,7 +328,7 @@ bool TlsImpl::WrapSocket(int socket_fd, const std::string &hostname) {
 	MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: fd=%d, hostname=%s", socket_fd, hostname.empty() ? "(none)" : hostname.c_str());
 
 	if (!ctx_->initialized) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Call Initialize() first";
 		return false;
 	}
@@ -340,7 +338,7 @@ bool TlsImpl::WrapSocket(int socket_fd, const std::string &hostname) {
 	// Set hostname for SNI (Server Name Indication) if provided
 	if (!hostname.empty()) {
 		if (SSL_set_tlsext_host_name(ctx_->ssl, hostname.c_str()) != 1) {
-			ctx_->last_error_code = 1;  // INIT_FAILED
+			ctx_->last_error_code = 1;	// INIT_FAILED
 			ctx_->last_error = "Failed to set hostname for SNI: " + FormatOpenSSLError();
 			MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: FAILED to set hostname - %s", ctx_->last_error.c_str());
 			return false;
@@ -355,13 +353,13 @@ bool TlsImpl::Handshake(int timeout_ms) {
 	MSSQL_TLS_DEBUG_LOG(1, "Handshake: starting (timeout=%dms)", timeout_ms);
 
 	if (!ctx_->initialized) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Not initialized";
 		return false;
 	}
 
 	if (ctx_->socket_fd < 0) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Socket not wrapped";
 		return false;
 	}
@@ -379,9 +377,9 @@ bool TlsImpl::Handshake(int timeout_ms) {
 		if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
 			// Need to wait for socket readiness
 			auto elapsed =
-			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 			if (elapsed >= timeout_ms) {
-				ctx_->last_error_code = 3;  // HANDSHAKE_TIMEOUT
+				ctx_->last_error_code = 3;	// HANDSHAKE_TIMEOUT
 				ctx_->last_error = "Timeout after " + std::to_string(elapsed) + "ms";
 				MSSQL_TLS_DEBUG_LOG(1, "Handshake: TIMEOUT");
 				return false;
@@ -414,7 +412,7 @@ bool TlsImpl::Handshake(int timeout_ms) {
 		}
 
 		// Other error
-		ctx_->last_error_code = 2;  // HANDSHAKE_FAILED
+		ctx_->last_error_code = 2;	// HANDSHAKE_FAILED
 		ctx_->last_error = "Handshake failed: " + FormatOpenSSLError();
 		MSSQL_TLS_DEBUG_LOG(1, "Handshake: FAILED - %s (ssl_error=%d)", ctx_->last_error.c_str(), ssl_error);
 		return false;
@@ -431,7 +429,7 @@ bool TlsImpl::Handshake(int timeout_ms) {
 
 ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 	if (!ctx_->handshake_complete) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Handshake not complete";
 		return -1;
 	}
@@ -450,11 +448,11 @@ ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 			if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
 				continue;
 			} else if (ssl_error == SSL_ERROR_ZERO_RETURN) {
-				ctx_->last_error_code = 7;  // PEER_CLOSED
+				ctx_->last_error_code = 7;	// PEER_CLOSED
 				ctx_->last_error = "Peer closed connection";
 				return -1;
 			} else {
-				ctx_->last_error_code = 4;  // SEND_FAILED
+				ctx_->last_error_code = 4;	// SEND_FAILED
 				ctx_->last_error = "Send failed: " + FormatOpenSSLError();
 				return -1;
 			}
@@ -466,7 +464,7 @@ ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 
 ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	if (!ctx_->handshake_complete) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Handshake not complete";
 		return -1;
 	}
@@ -505,13 +503,13 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 
 	int ssl_error = SSL_get_error(ctx_->ssl, ret);
 	if (ssl_error == SSL_ERROR_ZERO_RETURN) {
-		ctx_->last_error_code = 7;  // PEER_CLOSED
+		ctx_->last_error_code = 7;	// PEER_CLOSED
 		ctx_->last_error = "Connection closed by peer";
 		return 0;
 	} else if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
 		return 0;
 	} else {
-		ctx_->last_error_code = 5;  // RECV_FAILED
+		ctx_->last_error_code = 5;	// RECV_FAILED
 		ctx_->last_error = "Receive failed: " + FormatOpenSSLError();
 		return -1;
 	}
