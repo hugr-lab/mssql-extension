@@ -1,4 +1,5 @@
 #include "mssql_extension.hpp"
+#include "catalog/mssql_refresh_function.hpp"
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
@@ -47,7 +48,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 6. Register diagnostic functions (mssql_open, mssql_close, mssql_ping, mssql_pool_stats)
 	RegisterMSSQLDiagnosticFunctions(loader);
 
-	// 7. Register utility functions (mssql_version)
+	// 7. Register mssql_refresh_cache function
+	RegisterMSSQLRefreshCacheFunction(loader);
+
+	// 8. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
 											 LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
