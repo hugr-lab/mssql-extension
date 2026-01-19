@@ -289,7 +289,8 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 		// Send the wrapped packet
 		size_t total_sent = 0;
 		while (total_sent < tds_packet.size()) {
-			ssize_t sent = send(socket_fd, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent), tds_packet.size() - total_sent, 0);
+			ssize_t sent =
+				send(socket_fd, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent), tds_packet.size() - total_sent, 0);
 			if (sent < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
