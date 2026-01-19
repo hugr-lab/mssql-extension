@@ -14,6 +14,11 @@
 #define SOCKET_ERROR_CODE WSAGetLastError()
 #define poll WSAPoll
 typedef int socklen_t;
+// Windows socket functions use char* instead of void*
+#define SOCK_OPT_CAST(x) reinterpret_cast<char *>(x)
+#define SOCK_OPT_CONST_CAST(x) reinterpret_cast<const char *>(x)
+#define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
+#define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -26,6 +31,11 @@ typedef int socklen_t;
 #include <unistd.h>
 #define CLOSE_SOCKET close
 #define SOCKET_ERROR_CODE errno
+// POSIX socket functions use void* - no cast needed
+#define SOCK_OPT_CAST(x) (x)
+#define SOCK_OPT_CONST_CAST(x) (x)
+#define SOCK_BUF_CAST(x) (x)
+#define SOCK_BUF_CONST_CAST(x) (x)
 #endif
 
 // Debug logging
@@ -133,7 +143,7 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 				// Check if connection succeeded
 				int error = 0;
 				socklen_t len = sizeof(error);
-				if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+				if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, SOCK_OPT_CAST(&error), &len) == 0 && error == 0) {
 					connected_ = true;
 					break;
 				}
@@ -158,7 +168,7 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 
 	// Set TCP_NODELAY for low latency
 	int flag = 1;
-	setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+	setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, SOCK_OPT_CONST_CAST(&flag), sizeof(flag));
 
 	// Set back to blocking mode for simpler I/O
 	SetNonBlocking(false);
@@ -279,7 +289,7 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 		// Send the wrapped packet
 		size_t total_sent = 0;
 		while (total_sent < tds_packet.size()) {
-			ssize_t sent = send(socket_fd, tds_packet.data() + total_sent, tds_packet.size() - total_sent, 0);
+			ssize_t sent = send(socket_fd, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent), tds_packet.size() - total_sent, 0);
 			if (sent < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
@@ -351,7 +361,7 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 		uint8_t header[8];
 		size_t header_read = 0;
 		while (header_read < 8) {
-			ssize_t n = recv(socket_fd, header + header_read, 8 - header_read, 0);
+			ssize_t n = recv(socket_fd, SOCK_BUF_CAST(header + header_read), 8 - header_read, 0);
 			if (n < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
@@ -382,7 +392,7 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 
 		size_t payload_read = 0;
 		while (payload_read < payload_len) {
-			ssize_t n = recv(socket_fd, payload.data() + payload_read, payload_len - payload_read, 0);
+			ssize_t n = recv(socket_fd, SOCK_BUF_CAST(payload.data() + payload_read), payload_len - payload_read, 0);
 			if (n < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
@@ -477,7 +487,7 @@ bool TdsSocket::Send(const uint8_t *data, size_t length) {
 	// Plain TCP send
 	size_t total_sent = 0;
 	while (total_sent < length) {
-		ssize_t sent = send(fd_, data + total_sent, length - total_sent, 0);
+		ssize_t sent = send(fd_, SOCK_BUF_CONST_CAST(data + total_sent), length - total_sent, 0);
 		if (sent <= 0) {
 			if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				// Would block, wait and retry
@@ -534,7 +544,7 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		return 0;  // Timeout
 	}
 
-	ssize_t received = recv(fd_, buffer, max_length, 0);
+	ssize_t received = recv(fd_, SOCK_BUF_CAST(buffer), max_length, 0);
 	if (received < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return 0;  // No data available
