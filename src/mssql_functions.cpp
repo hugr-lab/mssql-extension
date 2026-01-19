@@ -1,38 +1,40 @@
 #include "mssql_functions.hpp"
-#include "mssql_storage.hpp"
-#include "catalog/mssql_catalog.hpp"
-#include "query/mssql_query_executor.hpp"
-#include "query/mssql_simple_query.hpp"
-#include "connection/mssql_pool_manager.hpp"
-#include "tds/tds_connection.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/main/database.hpp"
-#include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/planner/table_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/common/vector_operations/unary_executor.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include <chrono>
 #include <cstdlib>
+#include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_pool_manager.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "mssql_storage.hpp"
+#include "query/mssql_query_executor.hpp"
+#include "query/mssql_simple_query.hpp"
+#include "tds/tds_connection.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetFunctionDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_FN_DEBUG_LOG(level, fmt, ...) \
-	do { if (GetFunctionDebugLevel() >= level) { \
-		fprintf(stderr, "[MSSQL FN] " fmt "\n", ##__VA_ARGS__); \
-	} } while(0)
+#define MSSQL_FN_DEBUG_LOG(level, fmt, ...)                         \
+	do {                                                            \
+		if (GetFunctionDebugLevel() >= level) {                     \
+			fprintf(stderr, "[MSSQL FN] " fmt "\n", ##__VA_ARGS__); \
+		}                                                           \
+	} while (0)
 
 namespace duckdb {
 
@@ -40,7 +42,7 @@ namespace duckdb {
 // MSSQLResultStreamRegistry Implementation
 //===----------------------------------------------------------------------===//
 
-MSSQLResultStreamRegistry& MSSQLResultStreamRegistry::Instance() {
+MSSQLResultStreamRegistry &MSSQLResultStreamRegistry::Instance() {
 	static MSSQLResultStreamRegistry instance;
 	return instance;
 }
@@ -94,7 +96,8 @@ MSSQLScanGlobalState::~MSSQLScanGlobalState() {
 	if (timing_started) {
 		auto end = std::chrono::steady_clock::now();
 		auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - scan_start).count();
-		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanGlobalState::~dtor - total scan time: %ldms (including cancel)", (long)total_ms);
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanGlobalState::~dtor - total scan time: %ldms (including cancel)",
+						   (long)total_ms);
 	}
 }
 
@@ -104,7 +107,7 @@ idx_t MSSQLScanGlobalState::MaxThreads() const {
 }
 
 unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+									   vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_start = std::chrono::steady_clock::now();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: START");
 
@@ -121,8 +124,8 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	if (!manager.HasContext(bind_data->context_name)) {
 		throw InvalidInputException(
-		    "MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-		    bind_data->context_name, bind_data->context_name);
+			"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+			bind_data->context_name, bind_data->context_name);
 	}
 
 	// Execute query to get schema from COLMETADATA
@@ -135,14 +138,14 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: query executed in %ldms", (long)exec_ms);
 
 	// Get schema from result stream
-	const auto& stream_types = result_stream->GetColumnTypes();
+	const auto &stream_types = result_stream->GetColumnTypes();
 	return_types.clear();
-	for (const auto& type : stream_types) {
+	for (const auto &type : stream_types) {
 		return_types.push_back(type);
 	}
 
 	names.clear();
-	for (const auto& name : result_stream->GetColumnNames()) {
+	for (const auto &name : result_stream->GetColumnNames()) {
 		names.push_back(name);
 	}
 
@@ -152,7 +155,8 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	// Register the result stream for later retrieval in InitGlobal
 	// This avoids executing the query twice (which causes 30s timeout on large datasets)
 	bind_data->result_stream_id = MSSQLResultStreamRegistry::Instance().Register(std::move(result_stream));
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%llu", (unsigned long long)bind_data->result_stream_id);
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%llu",
+					   (unsigned long long)bind_data->result_stream_id);
 
 	auto bind_end = std::chrono::steady_clock::now();
 	auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bind_end - bind_start).count();
@@ -172,7 +176,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	// Try to retrieve pre-initialized result stream from registry
 	// This was created in Bind and avoids executing the query twice
 	if (bind_data.result_stream_id != 0) {
-		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieving result_stream_id=%llu", (unsigned long long)bind_data.result_stream_id);
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieving result_stream_id=%llu",
+						   (unsigned long long)bind_data.result_stream_id);
 		result->result_stream = MSSQLResultStreamRegistry::Instance().Retrieve(bind_data.result_stream_id);
 		if (result->result_stream) {
 			auto init_end = std::chrono::steady_clock::now();
@@ -200,7 +205,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 }
 
 unique_ptr<LocalTableFunctionState> MSSQLScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
-                                                       GlobalTableFunctionState *global_state) {
+													   GlobalTableFunctionState *global_state) {
 	return make_uniq<MSSQLScanLocalState>();
 }
 
@@ -217,7 +222,8 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	// Check if we're done
 	if (global_state.done || !global_state.result_stream) {
 		auto scan_end = std::chrono::steady_clock::now();
-		auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
+		auto total_ms =
+			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanFunction: SCAN COMPLETE - total=%ldms", (long)total_ms);
 		output.SetCardinality(0);
 		return;
@@ -239,7 +245,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 			// Surface any warnings
 			global_state.result_stream->SurfaceWarnings(context);
 		}
-	} catch (const Exception& e) {
+	} catch (const Exception &e) {
 		global_state.done = true;
 		throw;
 	}
@@ -264,9 +270,8 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 
 bool MSSQLCatalogScanBindData::Equals(const FunctionData &other) const {
 	auto &other_data = other.Cast<MSSQLCatalogScanBindData>();
-	return context_name == other_data.context_name &&
-	       schema_name == other_data.schema_name &&
-	       table_name == other_data.table_name;
+	return context_name == other_data.context_name && schema_name == other_data.schema_name &&
+		   table_name == other_data.table_name;
 }
 
 //===----------------------------------------------------------------------===//
@@ -280,7 +285,7 @@ static string EscapeBracketIdentifier(const string &name) {
 	for (char c : name) {
 		result += c;
 		if (c == ']') {
-			result += ']';  // Double the ] character
+			result += ']';	// Double the ] character
 		}
 	}
 	return result;
@@ -293,7 +298,7 @@ static string EscapeStringLiteral(const string &value) {
 	for (char c : value) {
 		result += c;
 		if (c == '\'') {
-			result += '\'';  // Double the ' character
+			result += '\'';	 // Double the ' character
 		}
 	}
 	return result;
@@ -389,14 +394,13 @@ static string ComparisonTypeToOperator(ExpressionType type) {
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
 		return " >= ";
 	default:
-		throw InternalException("Unsupported comparison type for filter pushdown: %s",
-		                        ExpressionTypeToString(type));
+		throw InternalException("Unsupported comparison type for filter pushdown: %s", ExpressionTypeToString(type));
 	}
 }
 
 // Convert a ConstantFilter to SQL
 static string ConvertConstantFilterToSQL(const ConstantFilter &filter, const string &column_name,
-                                         const LogicalType &column_type) {
+										 const LogicalType &column_type) {
 	string sql = column_name;
 	sql += ComparisonTypeToOperator(filter.comparison_type);
 	sql += ValueToSQLLiteral(filter.constant, column_type);
@@ -404,8 +408,7 @@ static string ConvertConstantFilterToSQL(const ConstantFilter &filter, const str
 }
 
 // Convert an InFilter to SQL
-static string ConvertInFilterToSQL(const InFilter &filter, const string &column_name,
-                                   const LogicalType &column_type) {
+static string ConvertInFilterToSQL(const InFilter &filter, const string &column_name, const LogicalType &column_type) {
 	string sql = column_name + " IN (";
 	for (idx_t i = 0; i < filter.values.size(); i++) {
 		if (i > 0) {
@@ -429,7 +432,7 @@ static string ConvertIsNotNullFilterToSQL(const string &column_name) {
 
 // Convert a ConjunctionOrFilter to SQL
 static string ConvertConjunctionOrFilterToSQL(const ConjunctionOrFilter &filter, const string &column_name,
-                                               const LogicalType &column_type) {
+											  const LogicalType &column_type) {
 	if (filter.child_filters.empty()) {
 		return "";
 	}
@@ -459,7 +462,7 @@ static string ConvertConjunctionOrFilterToSQL(const ConjunctionOrFilter &filter,
 
 // Convert a ConjunctionAndFilter to SQL
 static string ConvertConjunctionAndFilterToSQL(const ConjunctionAndFilter &filter, const string &column_name,
-                                                const LogicalType &column_type) {
+											   const LogicalType &column_type) {
 	if (filter.child_filters.empty()) {
 		return "";
 	}
@@ -513,8 +516,7 @@ static string ConvertFilterToSQL(const TableFilter &filter, const string &column
 	case TableFilterType::DYNAMIC_FILTER:
 	case TableFilterType::EXPRESSION_FILTER:
 		// These filter types cannot be pushed down to SQL Server
-		MSSQL_FN_DEBUG_LOG(1, "Filter type %d cannot be pushed down, will be applied locally",
-		                   (int)filter.filter_type);
+		MSSQL_FN_DEBUG_LOG(1, "Filter type %d cannot be pushed down, will be applied locally", (int)filter.filter_type);
 		return "";
 
 	default:
@@ -529,7 +531,7 @@ static string ConvertFilterToSQL(const TableFilter &filter, const string &column
 // not the original table column indices. We need to map through column_ids to get the actual
 // table column index.
 static string BuildWhereClause(const TableFilterSet &filters, const vector<string> &all_column_names,
-                               const vector<LogicalType> &all_types, const vector<column_t> &column_ids) {
+							   const vector<LogicalType> &all_types, const vector<column_t> &column_ids) {
 	vector<string> where_conditions;
 
 	for (const auto &filter_entry : filters.filters) {
@@ -543,7 +545,7 @@ static string BuildWhereClause(const TableFilterSet &filters, const vector<strin
 			table_col_idx = projected_col_idx;
 		} else if (projected_col_idx >= column_ids.size()) {
 			MSSQL_FN_DEBUG_LOG(1, "Filter column index %llu out of projected range (%zu), skipping",
-			                   (unsigned long long)projected_col_idx, column_ids.size());
+							   (unsigned long long)projected_col_idx, column_ids.size());
 			continue;
 		} else {
 			// Map through column_ids to get actual table column index
@@ -552,7 +554,7 @@ static string BuildWhereClause(const TableFilterSet &filters, const vector<strin
 
 		if (table_col_idx >= all_column_names.size()) {
 			MSSQL_FN_DEBUG_LOG(1, "Table column index %llu out of range (%zu), skipping",
-			                   (unsigned long long)table_col_idx, all_column_names.size());
+							   (unsigned long long)table_col_idx, all_column_names.size());
 			continue;
 		}
 
@@ -561,7 +563,7 @@ static string BuildWhereClause(const TableFilterSet &filters, const vector<strin
 		string escaped_col = "[" + EscapeBracketIdentifier(col_name) + "]";
 
 		MSSQL_FN_DEBUG_LOG(2, "  filter: projected_idx=%llu -> table_idx=%llu -> column=%s",
-		                   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx, col_name.c_str());
+						   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx, col_name.c_str());
 
 		string condition = ConvertFilterToSQL(*filter_entry.second, escaped_col, col_type);
 		if (!condition.empty()) {
@@ -589,7 +591,7 @@ static string BuildWhereClause(const TableFilterSet &filters, const vector<strin
 // Note: MSSQLCatalogScanBind is not used directly - bind_data is set by GetScanFunction
 // and passed to InitGlobal/Execute. We keep this for completeness but it shouldn't be called.
 unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+											  vector<LogicalType> &return_types, vector<string> &names) {
 	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
 	throw InternalException("MSSQLCatalogScanBind should not be called directly");
 }
@@ -612,8 +614,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 	// Virtual/special column identifiers start at 2^63
 	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
 
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: projection has %zu columns (table has %zu)",
-	                   column_ids.size(), bind_data.all_column_names.size());
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: projection has %zu columns (table has %zu)", column_ids.size(),
+					   bind_data.all_column_names.size());
 
 	// Filter out special column identifiers and collect valid column indices
 	vector<column_t> valid_column_ids;
@@ -628,7 +630,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 	if (valid_column_ids.empty()) {
 		// No valid columns projected (e.g., COUNT(*))
 		// Select only the first column to minimize data transfer while still returning rows
-		MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: no valid columns, selecting first column only for row counting");
+		MSSQL_FN_DEBUG_LOG(
+			1, "MSSQLCatalogScanInitGlobal: no valid columns, selecting first column only for row counting");
 		if (!bind_data.all_column_names.empty()) {
 			column_list = "[" + EscapeBracketIdentifier(bind_data.all_column_names[0]) + "]";
 		} else {
@@ -643,20 +646,21 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 			}
 			column_t col_idx = valid_column_ids[i];
 			column_list += "[" + EscapeBracketIdentifier(bind_data.all_column_names[col_idx]) + "]";
-			MSSQL_FN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i, bind_data.all_column_names[col_idx].c_str());
+			MSSQL_FN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i,
+							   bind_data.all_column_names[col_idx].c_str());
 		}
 	}
 
 	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
-	string query = "SELECT " + column_list + " FROM [" + EscapeBracketIdentifier(bind_data.schema_name) +
-	               "].[" + EscapeBracketIdentifier(bind_data.table_name) + "]";
+	string query = "SELECT " + column_list + " FROM [" + EscapeBracketIdentifier(bind_data.schema_name) + "].[" +
+				   EscapeBracketIdentifier(bind_data.table_name) + "]";
 
 	// Build WHERE clause from filter pushdown
 	if (input.filters && !input.filters->filters.empty()) {
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: filter pushdown with %zu filter(s)",
-		                   input.filters->filters.size());
-		string where_clause = BuildWhereClause(*input.filters, bind_data.all_column_names,
-		                                       bind_data.all_types, column_ids);
+						   input.filters->filters.size());
+		string where_clause =
+			BuildWhereClause(*input.filters, bind_data.all_column_names, bind_data.all_types, column_ids);
 		if (!where_clause.empty()) {
 			query += where_clause;
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLCatalogScanInitGlobal: added WHERE clause: %s", where_clause.c_str());
@@ -682,8 +686,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLCatalogScanInitGlobal(ClientContext &c
 
 TableFunction GetMSSQLCatalogScanFunction() {
 	// Create table function without arguments - bind_data is set from TableEntry
-	TableFunction func("mssql_catalog_scan", {}, MSSQLScanFunction, MSSQLCatalogScanBind,
-	                   MSSQLCatalogScanInitGlobal, MSSQLScanInitLocal);
+	TableFunction func("mssql_catalog_scan", {}, MSSQLScanFunction, MSSQLCatalogScanBind, MSSQLCatalogScanInitGlobal,
+					   MSSQLScanInitLocal);
 
 	// Enable projection pushdown - allows DuckDB to tell us which columns are needed
 	// The column_ids will be passed to InitGlobal via TableFunctionInitInput
@@ -718,7 +722,7 @@ struct MSSQLExecBindData : public FunctionData {
 
 // Bind function for mssql_exec
 static unique_ptr<FunctionData> MSSQLExecBind(ClientContext &context, ScalarFunction &bound_function,
-                                               vector<unique_ptr<Expression>> &arguments) {
+											  vector<unique_ptr<Expression>> &arguments) {
 	// First argument is the context name (attached database name, must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");
@@ -734,8 +738,9 @@ static unique_ptr<FunctionData> MSSQLExecBind(ClientContext &context, ScalarFunc
 		auto &manager = MSSQLContextManager::Get(*context.db);
 		if (!manager.HasContext(context_name)) {
 			throw BinderException(
-			    "mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-			    context_name, context_name);
+				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
+				"...)",
+				context_name, context_name);
 		}
 	}
 
@@ -749,8 +754,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 	auto &context_names = args.data[0];
 	auto &sql_statements = args.data[1];
 
-	UnaryExecutor::Execute<string_t, int64_t>(sql_statements, result, args.size(),
-	                                          [&](string_t sql_str) -> int64_t {
+	UnaryExecutor::Execute<string_t, int64_t>(sql_statements, result, args.size(), [&](string_t sql_str) -> int64_t {
 		// Get the context name from bind data or first argument
 		string context_name = bind_data.context_name;
 		if (context_name.empty()) {
@@ -771,8 +775,9 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		auto ctx = manager.GetContext(context_name);
 		if (!ctx) {
 			throw InvalidInputException(
-			    "mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-			    context_name, context_name);
+				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
+				"...)",
+				context_name, context_name);
 		}
 
 		// Get the catalog and check if it's read-only
@@ -782,9 +787,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 
 		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
 		if (catalog.IsReadOnly()) {
-			throw InvalidInputException(
-			    "Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
-			    context_name);
+			throw InvalidInputException("Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
+										context_name);
 		}
 
 		// Get connection from the catalog's pool
@@ -804,9 +808,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 
 			if (!query_result.success) {
 				// Surface SQL Server error with details
-				throw InvalidInputException(
-				    "MSSQL execution error: SQL Server error %d: %s",
-				    query_result.error_number, query_result.error_message);
+				throw InvalidInputException("MSSQL execution error: SQL Server error %d: %s", query_result.error_number,
+											query_result.error_message);
 			}
 
 			// Return affected row count
@@ -822,8 +825,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 ScalarFunction MSSQLExecScalarFunction::GetFunction() {
-	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
-	                    MSSQLExecExecute, MSSQLExecBind);
+	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLExecExecute,
+						MSSQLExecBind);
 	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	return func;
 }
@@ -841,7 +844,7 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 	// mssql_scan(context_name VARCHAR, query VARCHAR)
 	// -> dynamic return schema based on query result columns
 	TableFunction mssql_scan("mssql_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLScanFunction,
-	                         MSSQLScanBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
+							 MSSQLScanBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
 	loader.RegisterFunction(mssql_scan);
 }
 

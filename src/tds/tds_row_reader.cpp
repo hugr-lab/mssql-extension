@@ -1,16 +1,14 @@
 #include "tds/tds_row_reader.hpp"
-#include "tds/tds_types.hpp"
 #include <cstring>
 #include <stdexcept>
+#include "tds/tds_types.hpp"
 
 namespace duckdb {
 namespace tds {
 
-RowReader::RowReader(const std::vector<ColumnMetadata>& columns)
-    : columns_(columns) {
-}
+RowReader::RowReader(const std::vector<ColumnMetadata> &columns) : columns_(columns) {}
 
-bool RowReader::ReadRow(const uint8_t* data, size_t length, size_t& bytes_consumed, RowData& row) {
+bool RowReader::ReadRow(const uint8_t *data, size_t length, size_t &bytes_consumed, RowData &row) {
 	// Use Prepare to allocate/clear efficiently (preserves capacity)
 	row.Prepare(columns_.size());
 
@@ -34,7 +32,7 @@ bool RowReader::ReadRow(const uint8_t* data, size_t length, size_t& bytes_consum
 	return true;
 }
 
-bool RowReader::SkipRow(const uint8_t* data, size_t length, size_t& bytes_consumed) {
+bool RowReader::SkipRow(const uint8_t *data, size_t length, size_t &bytes_consumed) {
 	// Fast path: just calculate byte size without copying data
 	size_t offset = 0;
 
@@ -50,7 +48,7 @@ bool RowReader::SkipRow(const uint8_t* data, size_t length, size_t& bytes_consum
 	return true;
 }
 
-bool RowReader::ReadNBCRow(const uint8_t* data, size_t length, size_t& bytes_consumed, RowData& row) {
+bool RowReader::ReadNBCRow(const uint8_t *data, size_t length, size_t &bytes_consumed, RowData &row) {
 	// Use Prepare to allocate/clear efficiently (preserves capacity)
 	row.Prepare(columns_.size());
 
@@ -95,7 +93,7 @@ bool RowReader::ReadNBCRow(const uint8_t* data, size_t length, size_t& bytes_con
 	return true;
 }
 
-bool RowReader::SkipNBCRow(const uint8_t* data, size_t length, size_t& bytes_consumed) {
+bool RowReader::SkipNBCRow(const uint8_t *data, size_t length, size_t &bytes_consumed) {
 	// Calculate null bitmap size
 	size_t bitmap_bytes = (columns_.size() + 7) / 8;
 
@@ -126,8 +124,8 @@ bool RowReader::SkipNBCRow(const uint8_t* data, size_t length, size_t& bytes_con
 	return true;
 }
 
-size_t RowReader::SkipValue(const uint8_t* data, size_t length, size_t col_idx) {
-	const ColumnMetadata& col = columns_[col_idx];
+size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) {
+	const ColumnMetadata &col = columns_[col_idx];
 
 	switch (col.type_id) {
 	// Fixed-length types
@@ -159,7 +157,8 @@ size_t RowReader::SkipValue(const uint8_t* data, size_t length, size_t col_idx) 
 	case TDS_TYPE_TIME:
 	case TDS_TYPE_DATETIME2:
 	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
@@ -175,10 +174,11 @@ size_t RowReader::SkipValue(const uint8_t* data, size_t length, size_t col_idx) 
 		if (col.IsPLPType()) {
 			return SkipPLPType(data, length);
 		}
-		if (length < 2) return 0;
-		uint16_t data_length = static_cast<uint16_t>(data[0]) |
-		                       (static_cast<uint16_t>(data[1]) << 8);
-		if (data_length == 0xFFFF) return 2;  // NULL
+		if (length < 2)
+			return 0;
+		uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+		if (data_length == 0xFFFF)
+			return 2;  // NULL
 		return length >= 2 + data_length ? 2 + data_length : 0;
 	}
 
@@ -187,9 +187,9 @@ size_t RowReader::SkipValue(const uint8_t* data, size_t length, size_t col_idx) 
 	}
 }
 
-size_t RowReader::ReadValue(const uint8_t* data, size_t length, size_t col_idx,
-                             std::vector<uint8_t>& value, bool& is_null) {
-	const ColumnMetadata& col = columns_[col_idx];
+size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value,
+							bool &is_null) {
+	const ColumnMetadata &col = columns_[col_idx];
 	is_null = false;
 
 	switch (col.type_id) {
@@ -258,8 +258,7 @@ size_t RowReader::ReadValue(const uint8_t* data, size_t length, size_t col_idx,
 	}
 }
 
-size_t RowReader::ReadFixedType(const uint8_t* data, size_t length, uint8_t type_id,
-                                 std::vector<uint8_t>& value) {
+size_t RowReader::ReadFixedType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value) {
 	size_t size = 0;
 	switch (type_id) {
 	case TDS_TYPE_TINYINT:
@@ -293,9 +292,8 @@ size_t RowReader::ReadFixedType(const uint8_t* data, size_t length, uint8_t type
 	return size;
 }
 
-size_t RowReader::ReadNullableFixedType(const uint8_t* data, size_t length, uint8_t type_id,
-                                         uint8_t declared_length,
-                                         std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadNullableFixedType(const uint8_t *data, size_t length, uint8_t type_id, uint8_t declared_length,
+										std::vector<uint8_t> &value, bool &is_null) {
 	if (length < 1) {
 		return 0;  // Need more data
 	}
@@ -317,14 +315,13 @@ size_t RowReader::ReadNullableFixedType(const uint8_t* data, size_t length, uint
 	return 1 + actual_length;
 }
 
-size_t RowReader::ReadVariableLengthType(const uint8_t* data, size_t length, uint8_t type_id,
-                                          std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadVariableLengthType(const uint8_t *data, size_t length, uint8_t type_id,
+										 std::vector<uint8_t> &value, bool &is_null) {
 	if (length < 2) {
 		return 0;  // Need length field
 	}
 
-	uint16_t data_length = static_cast<uint16_t>(data[0]) |
-	                       (static_cast<uint16_t>(data[1]) << 8);
+	uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
 
 	// 0xFFFF indicates NULL
 	if (data_length == 0xFFFF) {
@@ -341,8 +338,7 @@ size_t RowReader::ReadVariableLengthType(const uint8_t* data, size_t length, uin
 	return 2 + data_length;
 }
 
-size_t RowReader::ReadDecimalType(const uint8_t* data, size_t length,
-                                   std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadDecimalType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
 	if (length < 1) {
 		return 0;  // Need length byte
 	}
@@ -363,8 +359,7 @@ size_t RowReader::ReadDecimalType(const uint8_t* data, size_t length,
 	return 1 + data_length;
 }
 
-size_t RowReader::ReadDateType(const uint8_t* data, size_t length,
-                                std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadDateType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
 	// DATE has a 1-byte length prefix (0=NULL, 3=data)
 	if (length < 1) {
 		return 0;
@@ -387,8 +382,8 @@ size_t RowReader::ReadDateType(const uint8_t* data, size_t length,
 	return 1 + data_length;
 }
 
-size_t RowReader::ReadTimeType(const uint8_t* data, size_t length, uint8_t scale,
-                                std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadTimeType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
+							   bool &is_null) {
 	// TIME has length prefix even though it's "fixed" size based on scale
 	if (length < 1) {
 		return 0;
@@ -410,8 +405,8 @@ size_t RowReader::ReadTimeType(const uint8_t* data, size_t length, uint8_t scale
 	return 1 + data_length;
 }
 
-size_t RowReader::ReadDateTime2Type(const uint8_t* data, size_t length, uint8_t scale,
-                                     std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadDateTime2Type(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
+									bool &is_null) {
 	// DATETIME2 has length prefix
 	if (length < 1) {
 		return 0;
@@ -433,8 +428,8 @@ size_t RowReader::ReadDateTime2Type(const uint8_t* data, size_t length, uint8_t 
 	return 1 + data_length;
 }
 
-size_t RowReader::ReadDateTimeOffsetType(const uint8_t* data, size_t length, uint8_t scale,
-                                          std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadDateTimeOffsetType(const uint8_t *data, size_t length, uint8_t scale, std::vector<uint8_t> &value,
+										 bool &is_null) {
 	// DATETIMEOFFSET has length prefix: time (3-5 bytes) + date (3 bytes) + offset (2 bytes)
 	if (length < 1) {
 		return 0;
@@ -456,8 +451,7 @@ size_t RowReader::ReadDateTimeOffsetType(const uint8_t* data, size_t length, uin
 	return 1 + data_length;
 }
 
-size_t RowReader::ReadGuidType(const uint8_t* data, size_t length,
-                                std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadGuidType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
 	if (length < 1) {
 		return 0;
 	}
@@ -488,19 +482,20 @@ static constexpr uint64_t PLP_UNKNOWN_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 static int GetPLPDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG_PLP");
+		const char *env = std::getenv("MSSQL_DEBUG_PLP");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define PLP_DEBUG(level, fmt, ...) \
-	do { if (GetPLPDebugLevel() >= level) { \
-		fprintf(stderr, "[PLP] " fmt "\n", ##__VA_ARGS__); \
-	} } while(0)
+#define PLP_DEBUG(level, fmt, ...)                             \
+	do {                                                       \
+		if (GetPLPDebugLevel() >= level) {                     \
+			fprintf(stderr, "[PLP] " fmt "\n", ##__VA_ARGS__); \
+		}                                                      \
+	} while (0)
 
-size_t RowReader::ReadPLPType(const uint8_t* data, size_t length,
-                               std::vector<uint8_t>& value, bool& is_null) {
+size_t RowReader::ReadPLPType(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
 	// PLP format:
 	// 8 bytes: total length (PLP_NULL=null, PLP_UNKNOWN=unknown length, else actual length)
 	// Then chunks: 4-byte chunk length + chunk data, until chunk length == 0
@@ -522,19 +517,15 @@ size_t RowReader::ReadPLPType(const uint8_t* data, size_t length,
 	}
 
 	// Read 8-byte total length (little-endian)
-	uint64_t total_length = static_cast<uint64_t>(data[0]) |
-	                        (static_cast<uint64_t>(data[1]) << 8) |
-	                        (static_cast<uint64_t>(data[2]) << 16) |
-	                        (static_cast<uint64_t>(data[3]) << 24) |
-	                        (static_cast<uint64_t>(data[4]) << 32) |
-	                        (static_cast<uint64_t>(data[5]) << 40) |
-	                        (static_cast<uint64_t>(data[6]) << 48) |
-	                        (static_cast<uint64_t>(data[7]) << 56);
+	uint64_t total_length = static_cast<uint64_t>(data[0]) | (static_cast<uint64_t>(data[1]) << 8) |
+							(static_cast<uint64_t>(data[2]) << 16) | (static_cast<uint64_t>(data[3]) << 24) |
+							(static_cast<uint64_t>(data[4]) << 32) | (static_cast<uint64_t>(data[5]) << 40) |
+							(static_cast<uint64_t>(data[6]) << 48) | (static_cast<uint64_t>(data[7]) << 56);
 
 	size_t offset = 8;
 
-	PLP_DEBUG(1, "ReadPLPType: total_length=0x%llx (%llu)",
-	          (unsigned long long)total_length, (unsigned long long)total_length);
+	PLP_DEBUG(1, "ReadPLPType: total_length=0x%llx (%llu)", (unsigned long long)total_length,
+			  (unsigned long long)total_length);
 
 	// Check for NULL
 	if (total_length == PLP_NULL_MARKER) {
@@ -557,32 +548,28 @@ size_t RowReader::ReadPLPType(const uint8_t* data, size_t length,
 	int chunk_num = 0;
 	while (true) {
 		if (offset + 4 > length) {
-			PLP_DEBUG(1, "ReadPLPType: need more data for chunk header (have %zu, need %zu)",
-			          length, offset + 4);
+			PLP_DEBUG(1, "ReadPLPType: need more data for chunk header (have %zu, need %zu)", length, offset + 4);
 			return 0;  // Need chunk length
 		}
 
 		// Read 4-byte chunk length (little-endian)
-		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) |
-		                        (static_cast<uint32_t>(data[offset + 1]) << 8) |
-		                        (static_cast<uint32_t>(data[offset + 2]) << 16) |
-		                        (static_cast<uint32_t>(data[offset + 3]) << 24);
+		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+								(static_cast<uint32_t>(data[offset + 2]) << 16) |
+								(static_cast<uint32_t>(data[offset + 3]) << 24);
 		offset += 4;
 
-		PLP_DEBUG(2, "ReadPLPType: chunk[%d] length=%u, offset=%zu, buffer_length=%zu",
-		          chunk_num, chunk_length, offset, length);
+		PLP_DEBUG(2, "ReadPLPType: chunk[%d] length=%u, offset=%zu, buffer_length=%zu", chunk_num, chunk_length, offset,
+				  length);
 
 		// Terminator: chunk length == 0
 		if (chunk_length == 0) {
-			PLP_DEBUG(1, "ReadPLPType: terminator found, total_read=%zu bytes in %d chunks",
-			          value.size(), chunk_num);
+			PLP_DEBUG(1, "ReadPLPType: terminator found, total_read=%zu bytes in %d chunks", value.size(), chunk_num);
 			break;
 		}
 
 		// Read chunk data
 		if (offset + chunk_length > length) {
-			PLP_DEBUG(1, "ReadPLPType: need more data for chunk (have %zu, need %zu)",
-			          length, offset + chunk_length);
+			PLP_DEBUG(1, "ReadPLPType: need more data for chunk (have %zu, need %zu)", length, offset + chunk_length);
 			return 0;  // Need more chunk data
 		}
 
@@ -596,7 +583,7 @@ size_t RowReader::ReadPLPType(const uint8_t* data, size_t length,
 	return offset;
 }
 
-size_t RowReader::SkipPLPType(const uint8_t* data, size_t length) {
+size_t RowReader::SkipPLPType(const uint8_t *data, size_t length) {
 	// Same structure as ReadPLPType but without copying data
 
 	if (length < 8) {
@@ -604,14 +591,10 @@ size_t RowReader::SkipPLPType(const uint8_t* data, size_t length) {
 	}
 
 	// Read 8-byte total length
-	uint64_t total_length = static_cast<uint64_t>(data[0]) |
-	                        (static_cast<uint64_t>(data[1]) << 8) |
-	                        (static_cast<uint64_t>(data[2]) << 16) |
-	                        (static_cast<uint64_t>(data[3]) << 24) |
-	                        (static_cast<uint64_t>(data[4]) << 32) |
-	                        (static_cast<uint64_t>(data[5]) << 40) |
-	                        (static_cast<uint64_t>(data[6]) << 48) |
-	                        (static_cast<uint64_t>(data[7]) << 56);
+	uint64_t total_length = static_cast<uint64_t>(data[0]) | (static_cast<uint64_t>(data[1]) << 8) |
+							(static_cast<uint64_t>(data[2]) << 16) | (static_cast<uint64_t>(data[3]) << 24) |
+							(static_cast<uint64_t>(data[4]) << 32) | (static_cast<uint64_t>(data[5]) << 40) |
+							(static_cast<uint64_t>(data[6]) << 48) | (static_cast<uint64_t>(data[7]) << 56);
 
 	size_t offset = 8;
 
@@ -626,10 +609,9 @@ size_t RowReader::SkipPLPType(const uint8_t* data, size_t length) {
 			return 0;
 		}
 
-		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) |
-		                        (static_cast<uint32_t>(data[offset + 1]) << 8) |
-		                        (static_cast<uint32_t>(data[offset + 2]) << 16) |
-		                        (static_cast<uint32_t>(data[offset + 3]) << 24);
+		uint32_t chunk_length = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+								(static_cast<uint32_t>(data[offset + 2]) << 16) |
+								(static_cast<uint32_t>(data[offset + 3]) << 24);
 		offset += 4;
 
 		if (chunk_length == 0) {
@@ -647,9 +629,9 @@ size_t RowReader::SkipPLPType(const uint8_t* data, size_t length) {
 }
 
 // NBC row value reading - for non-NULL columns (no length prefix for nullable types)
-size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_idx,
-                                std::vector<uint8_t>& value, bool& is_null) {
-	const ColumnMetadata& col = columns_[col_idx];
+size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value,
+							   bool &is_null) {
+	const ColumnMetadata &col = columns_[col_idx];
 	is_null = false;  // NBC rows don't include data for NULL columns
 
 	switch (col.type_id) {
@@ -675,9 +657,11 @@ size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_id
 	case TDS_TYPE_FLOATN:
 	case TDS_TYPE_MONEYN:
 	case TDS_TYPE_DATETIMEN: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t actual_length = data[0];
-		if (length < 1 + actual_length) return 0;
+		if (length < 1 + actual_length)
+			return 0;
 		value.assign(data + 1, data + 1 + actual_length);
 		return 1 + actual_length;
 	}
@@ -698,45 +682,55 @@ size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_id
 	// DECIMAL/NUMERIC - has 1-byte length prefix in NBC rows
 	case TDS_TYPE_DECIMAL:
 	case TDS_TYPE_NUMERIC: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
-		if (length < 1 + data_length) return 0;
+		if (length < 1 + data_length)
+			return 0;
 		value.assign(data + 1, data + 1 + data_length);
 		return 1 + data_length;
 	}
 
 	// DATE - has 1-byte length prefix in NBC rows (0 or 3)
 	case TDS_TYPE_DATE: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
-		if (length < 1 + data_length) return 0;
+		if (length < 1 + data_length)
+			return 0;
 		value.assign(data + 1, data + 1 + data_length);
 		return 1 + data_length;
 	}
 
 	// TIME - has 1-byte length prefix in NBC rows
 	case TDS_TYPE_TIME: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
-		if (length < 1 + data_length) return 0;
+		if (length < 1 + data_length)
+			return 0;
 		value.assign(data + 1, data + 1 + data_length);
 		return 1 + data_length;
 	}
 
 	// DATETIME2 - has 1-byte length prefix in NBC rows
 	case TDS_TYPE_DATETIME2: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
-		if (length < 1 + data_length) return 0;
+		if (length < 1 + data_length)
+			return 0;
 		value.assign(data + 1, data + 1 + data_length);
 		return 1 + data_length;
 	}
 
 	// UNIQUEIDENTIFIER - has 1-byte length prefix in NBC rows (0 or 16)
 	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
-		if (length < 1 + data_length) return 0;
+		if (length < 1 + data_length)
+			return 0;
 		value.assign(data + 1, data + 1 + data_length);
 		return 1 + data_length;
 	}
@@ -746,8 +740,8 @@ size_t RowReader::ReadValueNBC(const uint8_t* data, size_t length, size_t col_id
 	}
 }
 
-size_t RowReader::SkipValueNBC(const uint8_t* data, size_t length, size_t col_idx) {
-	const ColumnMetadata& col = columns_[col_idx];
+size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx) {
+	const ColumnMetadata &col = columns_[col_idx];
 
 	switch (col.type_id) {
 	// Fixed-length types
@@ -773,7 +767,8 @@ size_t RowReader::SkipValueNBC(const uint8_t* data, size_t length, size_t col_id
 	case TDS_TYPE_FLOATN:
 	case TDS_TYPE_MONEYN:
 	case TDS_TYPE_DATETIMEN: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t actual_length = data[0];
 		return length >= 1 + actual_length ? 1 + actual_length : 0;
 	}
@@ -789,45 +784,51 @@ size_t RowReader::SkipValueNBC(const uint8_t* data, size_t length, size_t col_id
 		if (col.IsPLPType()) {
 			return SkipPLPType(data, length);
 		}
-		if (length < 2) return 0;
-		uint16_t data_length = static_cast<uint16_t>(data[0]) |
-		                       (static_cast<uint16_t>(data[1]) << 8);
-		if (data_length == 0xFFFF) return 2;  // Should not happen in NBC for non-NULL
+		if (length < 2)
+			return 0;
+		uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+		if (data_length == 0xFFFF)
+			return 2;  // Should not happen in NBC for non-NULL
 		return length >= 2 + data_length ? 2 + data_length : 0;
 	}
 
 	// DECIMAL/NUMERIC - has 1-byte length prefix
 	case TDS_TYPE_DECIMAL:
 	case TDS_TYPE_NUMERIC: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
 	// DATE - has 1-byte length prefix
 	case TDS_TYPE_DATE: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
 	// TIME - has 1-byte length prefix
 	case TDS_TYPE_TIME: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
 	// DATETIME2 - has 1-byte length prefix
 	case TDS_TYPE_DATETIME2: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
 	// UNIQUEIDENTIFIER - has 1-byte length prefix
 	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		if (length < 1) return 0;
+		if (length < 1)
+			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/string_util.hpp"
 #include <string>
 #include <vector>
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
@@ -18,25 +18,27 @@ namespace duckdb {
 
 struct MSSQLInsertError {
 	// Batch identification
-	idx_t statement_index;     // Batch number (0-based)
-	idx_t row_offset_start;    // First row in failed batch (0-based)
-	idx_t row_offset_end;      // Last row in failed batch (exclusive)
+	idx_t statement_index;	 // Batch number (0-based)
+	idx_t row_offset_start;	 // First row in failed batch (0-based)
+	idx_t row_offset_end;	 // Last row in failed batch (exclusive)
 
 	// SQL Server error details
 	int32_t sql_error_number;  // SQL Server error number (e.g., 2627 for PK violation)
 	string sql_error_message;  // SQL Server error text
-	string sql_state;          // SQLSTATE code if available
+	string sql_state;		   // SQLSTATE code if available
 
 	// Default constructor
-	MSSQLInsertError()
-	    : statement_index(0), row_offset_start(0), row_offset_end(0),
-	      sql_error_number(0) {}
+	MSSQLInsertError() : statement_index(0), row_offset_start(0), row_offset_end(0), sql_error_number(0) {}
 
 	// Constructor with all fields
-	MSSQLInsertError(idx_t stmt_idx, idx_t start, idx_t end,
-	                 int32_t error_num, const string &error_msg, const string &state = "")
-	    : statement_index(stmt_idx), row_offset_start(start), row_offset_end(end),
-	      sql_error_number(error_num), sql_error_message(error_msg), sql_state(state) {}
+	MSSQLInsertError(idx_t stmt_idx, idx_t start, idx_t end, int32_t error_num, const string &error_msg,
+					 const string &state = "")
+		: statement_index(stmt_idx),
+		  row_offset_start(start),
+		  row_offset_end(end),
+		  sql_error_number(error_num),
+		  sql_error_message(error_msg),
+		  sql_state(state) {}
 
 	//===----------------------------------------------------------------------===//
 	// Message Formatting
@@ -45,13 +47,9 @@ struct MSSQLInsertError {
 	// Format error message for display
 	// Returns: "INSERT failed at statement N (rows X-Y): [error_num] message"
 	string FormatMessage() const {
-		return StringUtil::Format(
-		    "INSERT failed at statement %d (rows %d-%d): [%d] %s",
-		    statement_index,
-		    row_offset_start,
-		    row_offset_end > 0 ? row_offset_end - 1 : 0,
-		    sql_error_number,
-		    sql_error_message);
+		return StringUtil::Format("INSERT failed at statement %d (rows %d-%d): [%d] %s", statement_index,
+								  row_offset_start, row_offset_end > 0 ? row_offset_end - 1 : 0, sql_error_number,
+								  sql_error_message);
 	}
 };
 
@@ -72,16 +70,13 @@ struct MSSQLInsertResult {
 	MSSQLInsertError error;
 
 	// Default constructor (success case)
-	MSSQLInsertResult()
-	    : success(true), rows_affected(0) {}
+	MSSQLInsertResult() : success(true), rows_affected(0) {}
 
 	// Constructor for success case
-	explicit MSSQLInsertResult(idx_t rows)
-	    : success(true), rows_affected(rows) {}
+	explicit MSSQLInsertResult(idx_t rows) : success(true), rows_affected(rows) {}
 
 	// Constructor for failure case
-	explicit MSSQLInsertResult(const MSSQLInsertError &err)
-	    : success(false), rows_affected(0), error(err) {}
+	explicit MSSQLInsertResult(const MSSQLInsertError &err) : success(false), rows_affected(0), error(err) {}
 };
 
 //===----------------------------------------------------------------------===//
@@ -110,10 +105,15 @@ struct MSSQLInsertStatistics {
 
 	// Default constructor
 	MSSQLInsertStatistics()
-	    : total_rows_inserted(0), total_batches_executed(0),
-	      total_execution_time_us(0), total_serialization_time_us(0),
-	      min_batch_size(0), max_batch_size(0), avg_batch_size(0),
-	      min_sql_bytes(0), max_sql_bytes(0) {}
+		: total_rows_inserted(0),
+		  total_batches_executed(0),
+		  total_execution_time_us(0),
+		  total_serialization_time_us(0),
+		  min_batch_size(0),
+		  max_batch_size(0),
+		  avg_batch_size(0),
+		  min_sql_bytes(0),
+		  max_sql_bytes(0) {}
 
 	// Update statistics with batch info
 	void RecordBatch(idx_t row_count, idx_t sql_bytes, uint64_t execution_time_us) {
@@ -137,9 +137,9 @@ struct MSSQLInsertStatistics {
 
 	// Get rows per second (0 if no time recorded)
 	double GetRowsPerSecond() const {
-		if (total_execution_time_us == 0) return 0.0;
-		return static_cast<double>(total_rows_inserted) * 1000000.0 /
-		       static_cast<double>(total_execution_time_us);
+		if (total_execution_time_us == 0)
+			return 0.0;
+		return static_cast<double>(total_rows_inserted) * 1000000.0 / static_cast<double>(total_execution_time_us);
 	}
 };
 

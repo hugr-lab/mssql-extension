@@ -4,8 +4,8 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/column_list.hpp"
-#include "duckdb/planner/bound_tableref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/bound_tableref.hpp"
 
 namespace duckdb {
 
@@ -71,8 +71,7 @@ public:
 	//! @param table_name Target table name
 	//! @param columns Column list with definitions
 	//! @return T-SQL statement
-	static string TranslateCreateTable(const string &schema_name, const string &table_name,
-	                                   const ColumnList &columns);
+	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns);
 
 	//! Generate DROP TABLE T-SQL
 	//! @param schema_name Schema containing table
@@ -97,7 +96,7 @@ public:
 	//! @param column Column definition
 	//! @return T-SQL statement
 	static string TranslateAddColumn(const string &schema_name, const string &table_name,
-	                                 const ColumnDefinition &column);
+									 const ColumnDefinition &column);
 
 	//! Generate DROP COLUMN T-SQL
 	//! @param schema_name Schema containing table
@@ -113,7 +112,7 @@ public:
 	//! @param new_name New column name
 	//! @return T-SQL statement
 	static string TranslateRenameColumn(const string &schema_name, const string &table_name, const string &old_name,
-	                                    const string &new_name);
+										const string &new_name);
 
 	//! Generate ALTER COLUMN T-SQL for type change
 	//! @param schema_name Schema containing table
@@ -123,7 +122,7 @@ public:
 	//! @param is_nullable Whether column allows nulls
 	//! @return T-SQL statement
 	static string TranslateAlterColumnType(const string &schema_name, const string &table_name,
-	                                       const string &column_name, const LogicalType &new_type, bool is_nullable);
+										   const string &column_name, const LogicalType &new_type, bool is_nullable);
 
 	//! Generate ALTER COLUMN T-SQL for nullability change
 	//! @param schema_name Schema containing table
@@ -133,8 +132,8 @@ public:
 	//! @param set_not_null True to set NOT NULL, false for NULL
 	//! @return T-SQL statement
 	static string TranslateAlterColumnNullability(const string &schema_name, const string &table_name,
-	                                              const string &column_name, const LogicalType &current_type,
-	                                              bool set_not_null);
+												  const string &column_name, const LogicalType &current_type,
+												  bool set_not_null);
 
 	//===----------------------------------------------------------------------===//
 	// Type Mapping
@@ -153,4 +152,4 @@ private:
 	static string EscapeStringLiteral(const string &value);
 };
 
-} // namespace duckdb
+}  // namespace duckdb

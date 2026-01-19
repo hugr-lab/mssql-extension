@@ -1,16 +1,16 @@
 #include "insert/mssql_value_serializer.hpp"
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/common/types/hugeint.hpp"
-#include "duckdb/common/operator/cast_operators.hpp"
-#include "duckdb/common/types/decimal.hpp"
-#include <cmath>
-#include <sstream>
-#include <iomanip>
 
 namespace duckdb {
 
@@ -92,8 +92,7 @@ string MSSQLValueSerializer::SerializeFloat(float value) {
 	string result = oss.str();
 
 	// Ensure result has decimal point or exponent for SQL Server to treat as float
-	if (result.find('.') == string::npos && result.find('e') == string::npos &&
-	    result.find('E') == string::npos) {
+	if (result.find('.') == string::npos && result.find('e') == string::npos && result.find('E') == string::npos) {
 		result += ".0";
 	}
 	return result;
@@ -107,8 +106,7 @@ string MSSQLValueSerializer::SerializeDouble(double value) {
 	string result = oss.str();
 
 	// Ensure result has decimal point or exponent
-	if (result.find('.') == string::npos && result.find('e') == string::npos &&
-	    result.find('E') == string::npos) {
+	if (result.find('.') == string::npos && result.find('e') == string::npos && result.find('E') == string::npos) {
 		result += ".0";
 	}
 	return result;
@@ -246,9 +244,8 @@ string MSSQLValueSerializer::SerializeTimestamp(timestamp_t value) {
 	// Convert microseconds to 100-nanosecond units
 	int32_t nanos100 = micros * 10;
 
-	return StringUtil::Format(
-	    "CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d' AS DATETIME2(7))",
-	    year, month, day, hour, min, sec, nanos100);
+	return StringUtil::Format("CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d' AS DATETIME2(7))", year, month, day, hour, min,
+							  sec, nanos100);
 }
 
 string MSSQLValueSerializer::SerializeTimestampTZ(timestamp_t value, int32_t offset_seconds) {
@@ -272,9 +269,8 @@ string MSSQLValueSerializer::SerializeTimestampTZ(timestamp_t value, int32_t off
 	int32_t offset_hours = abs_offset / 3600;
 	int32_t offset_mins = (abs_offset % 3600) / 60;
 
-	return StringUtil::Format(
-	    "CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d%c%02d:%02d' AS DATETIMEOFFSET(7))",
-	    year, month, day, hour, min, sec, nanos100, sign, offset_hours, offset_mins);
+	return StringUtil::Format("CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d%c%02d:%02d' AS DATETIMEOFFSET(7))", year, month,
+							  day, hour, min, sec, nanos100, sign, offset_hours, offset_mins);
 }
 
 //===----------------------------------------------------------------------===//
@@ -379,8 +375,7 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	}
 
 	default:
-		throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT",
-		                            type.ToString());
+		throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT", type.ToString());
 	}
 }
 
@@ -393,42 +388,42 @@ string MSSQLValueSerializer::SerializeFromVector(Vector &vector, idx_t index, co
 
 idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const LogicalType &type) {
 	if (value.IsNull()) {
-		return 4; // "NULL"
+		return 4;  // "NULL"
 	}
 
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return 1; // "0" or "1"
+		return 1;  // "0" or "1"
 
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
-		return 4; // max 3 digits + sign
+		return 4;  // max 3 digits + sign
 
 	case LogicalTypeId::SMALLINT:
 	case LogicalTypeId::USMALLINT:
-		return 6; // max 5 digits + sign
+		return 6;  // max 5 digits + sign
 
 	case LogicalTypeId::INTEGER:
 	case LogicalTypeId::UINTEGER:
-		return 11; // max 10 digits + sign
+		return 11;	// max 10 digits + sign
 
 	case LogicalTypeId::BIGINT:
-		return 20; // max 19 digits + sign
+		return 20;	// max 19 digits + sign
 
 	case LogicalTypeId::UBIGINT:
-		return 40; // CAST(... AS DECIMAL(20,0))
+		return 40;	// CAST(... AS DECIMAL(20,0))
 
 	case LogicalTypeId::HUGEINT:
-		return 45; // max 39 digits + sign
+		return 45;	// max 39 digits + sign
 
 	case LogicalTypeId::FLOAT:
-		return 20; // scientific notation
+		return 20;	// scientific notation
 
 	case LogicalTypeId::DOUBLE:
-		return 30; // scientific notation
+		return 30;	// scientific notation
 
 	case LogicalTypeId::DECIMAL:
-		return 45; // max precision 38 + scale + sign + decimal point
+		return 45;	// max precision 38 + scale + sign + decimal point
 
 	case LogicalTypeId::VARCHAR: {
 		auto str_val = StringValue::Get(value);
@@ -443,25 +438,25 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 	}
 
 	case LogicalTypeId::UUID:
-		return 38; // 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+		return 38;	// 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 	case LogicalTypeId::DATE:
-		return 12; // 'YYYY-MM-DD'
+		return 12;	// 'YYYY-MM-DD'
 
 	case LogicalTypeId::TIME:
-		return 20; // 'HH:MM:SS.fffffff'
+		return 20;	// 'HH:MM:SS.fffffff'
 
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return 60; // CAST('...' AS DATETIME2(7))
+		return 60;	// CAST('...' AS DATETIME2(7))
 
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return 75; // CAST('...' AS DATETIMEOFFSET(7))
+		return 75;	// CAST('...' AS DATETIMEOFFSET(7))
 
 	default:
-		return 50; // Conservative default
+		return 50;	// Conservative default
 	}
 }
 

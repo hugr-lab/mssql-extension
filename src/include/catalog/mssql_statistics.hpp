@@ -53,7 +53,7 @@ public:
 	//! @param table_name SQL Server table name
 	//! @return BaseStatistics with cardinality estimate
 	unique_ptr<BaseStatistics> GetTableStatistics(tds::TdsConnection &connection, const string &schema_name,
-	                                               const string &table_name);
+												  const string &table_name);
 
 	//! Invalidate statistics for a specific table
 	void InvalidateTable(const string &schema_name, const string &table_name);
@@ -90,4 +90,4 @@ private:
 	mutable std::mutex mutex_;
 };
 
-} // namespace duckdb
+}  // namespace duckdb

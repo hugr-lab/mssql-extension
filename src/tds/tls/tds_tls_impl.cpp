@@ -10,28 +10,28 @@
 
 #include "tds/tls/tds_tls_impl.hpp"
 
-#include <mbedtls/ssl.h>
-#include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
-#include <mbedtls/net_sockets.h>
-#include <mbedtls/error.h>
 #include <mbedtls/debug.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
 
-#include <string>
-#include <cstring>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
-#include <sys/socket.h>
-#include <poll.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace duckdb {
@@ -41,15 +41,15 @@ namespace tds {
 static int GetMssqlDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_TLS_DEBUG_LOG(lvl, fmt, ...) \
-	do { \
-		if (GetMssqlDebugLevel() >= lvl) \
+#define MSSQL_TLS_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                             \
+		if (GetMssqlDebugLevel() >= lvl)                             \
 			fprintf(stderr, "[MSSQL TLS] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
@@ -70,14 +70,10 @@ struct TlsImplContext {
 	// Custom I/O callbacks for TDS-wrapped TLS
 	TlsSendCallback send_callback;
 	TlsRecvCallback recv_callback;
-	int current_timeout_ms;  // Timeout for current operation
+	int current_timeout_ms;	 // Timeout for current operation
 
 	TlsImplContext()
-	    : initialized(false),
-	      handshake_complete(false),
-	      socket_fd(-1),
-	      last_error_code(0),
-	      current_timeout_ms(30000) {
+		: initialized(false), handshake_complete(false), socket_fd(-1), last_error_code(0), current_timeout_ms(30000) {
 		mbedtls_ssl_init(&ssl);
 		mbedtls_ssl_config_init(&conf);
 		mbedtls_ctr_drbg_init(&ctr_drbg);
@@ -102,15 +98,15 @@ static std::string FormatMbedTlsError(int ret) {
 }
 
 // mbedTLS debug callback
-static void MbedTlsDebugCallback(void* ctx, int level, const char* file, int line, const char* str) {
-	(void)ctx;  // unused
+static void MbedTlsDebugCallback(void *ctx, int level, const char *file, int line, const char *str) {
+	(void)ctx;								  // unused
 	if (GetMssqlDebugLevel() >= level + 1) {  // level is 0-4 in mbedTLS, map to our 1-5
 		// Remove trailing newline from str
 		size_t len = strlen(str);
-		if (len > 0 && str[len-1] == '\n') {
-			char* buf = new char[len];
-			memcpy(buf, str, len-1);
-			buf[len-1] = '\0';
+		if (len > 0 && str[len - 1] == '\n') {
+			char *buf = new char[len];
+			memcpy(buf, str, len - 1);
+			buf[len - 1] = '\0';
 			MSSQL_TLS_DEBUG_LOG(level + 1, "[mbedTLS %d] %s:%04d: %s", level, file, line, buf);
 			delete[] buf;
 		} else {
@@ -122,13 +118,13 @@ static void MbedTlsDebugCallback(void* ctx, int level, const char* file, int lin
 // Custom I/O callbacks for mbedTLS
 // These check if custom callbacks are set (for TDS-wrapped TLS) and use them,
 // otherwise fall back to direct socket I/O
-static int BioSend(void* ctx, const unsigned char* buf, size_t len) {
-	auto* impl = static_cast<TlsImplContext*>(ctx);
+static int BioSend(void *ctx, const unsigned char *buf, size_t len) {
+	auto *impl = static_cast<TlsImplContext *>(ctx);
 
 	// Use custom callback if set (for TDS-wrapped TLS handshake)
 	if (impl->send_callback) {
 		MSSQL_TLS_DEBUG_LOG(3, "BioSend: using custom callback, len=%zu", len);
-		int ret = impl->send_callback(reinterpret_cast<const uint8_t*>(buf), len);
+		int ret = impl->send_callback(reinterpret_cast<const uint8_t *>(buf), len);
 		if (ret < 0) {
 			return MBEDTLS_ERR_NET_SEND_FAILED;
 		}
@@ -143,7 +139,7 @@ static int BioSend(void* ctx, const unsigned char* buf, size_t len) {
 	MSSQL_TLS_DEBUG_LOG(3, "BioSend: direct socket fd=%d, len=%zu", fd, len);
 
 #ifdef _WIN32
-	int ret = send(fd, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0);
+	int ret = send(fd, reinterpret_cast<const char *>(buf), static_cast<int>(len), 0);
 	if (ret < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) {
@@ -164,13 +160,13 @@ static int BioSend(void* ctx, const unsigned char* buf, size_t len) {
 	return static_cast<int>(ret);
 }
 
-static int BioRecv(void* ctx, unsigned char* buf, size_t len) {
-	auto* impl = static_cast<TlsImplContext*>(ctx);
+static int BioRecv(void *ctx, unsigned char *buf, size_t len) {
+	auto *impl = static_cast<TlsImplContext *>(ctx);
 
 	// Use custom callback if set (for TDS-wrapped TLS handshake)
 	if (impl->recv_callback) {
 		MSSQL_TLS_DEBUG_LOG(3, "BioRecv: using custom callback, len=%zu", len);
-		int ret = impl->recv_callback(reinterpret_cast<uint8_t*>(buf), len, 0);
+		int ret = impl->recv_callback(reinterpret_cast<uint8_t *>(buf), len, 0);
 		if (ret < 0) {
 			return MBEDTLS_ERR_NET_RECV_FAILED;
 		}
@@ -185,7 +181,7 @@ static int BioRecv(void* ctx, unsigned char* buf, size_t len) {
 	MSSQL_TLS_DEBUG_LOG(3, "BioRecv: direct socket fd=%d, len=%zu", fd, len);
 
 #ifdef _WIN32
-	int ret = recv(fd, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
+	int ret = recv(fd, reinterpret_cast<char *>(buf), static_cast<int>(len), 0);
 	if (ret < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) {
@@ -206,13 +202,13 @@ static int BioRecv(void* ctx, unsigned char* buf, size_t len) {
 	return static_cast<int>(ret);
 }
 
-static int BioRecvTimeout(void* ctx, unsigned char* buf, size_t len, uint32_t timeout) {
-	auto* impl = static_cast<TlsImplContext*>(ctx);
+static int BioRecvTimeout(void *ctx, unsigned char *buf, size_t len, uint32_t timeout) {
+	auto *impl = static_cast<TlsImplContext *>(ctx);
 
 	// Use custom callback if set (for TDS-wrapped TLS handshake)
 	if (impl->recv_callback) {
 		MSSQL_TLS_DEBUG_LOG(3, "BioRecvTimeout: using custom callback, len=%zu, timeout=%u", len, timeout);
-		int ret = impl->recv_callback(reinterpret_cast<uint8_t*>(buf), len, static_cast<int>(timeout));
+		int ret = impl->recv_callback(reinterpret_cast<uint8_t *>(buf), len, static_cast<int>(timeout));
 		if (ret < 0) {
 			return MBEDTLS_ERR_NET_RECV_FAILED;
 		}
@@ -264,8 +260,7 @@ static int BioRecvTimeout(void* ctx, unsigned char* buf, size_t len, uint32_t ti
 // TlsImpl class implementation
 // =============================================================================
 
-TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {
-}
+TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {}
 
 TlsImpl::~TlsImpl() {
 	Close();
@@ -281,22 +276,20 @@ bool TlsImpl::Initialize() {
 	int ret;
 
 	// Seed the random number generator
-	const char* pers = "duckdb_mssql_tls";
+	const char *pers = "duckdb_mssql_tls";
 	ret = mbedtls_ctr_drbg_seed(&ctx_->ctr_drbg, mbedtls_entropy_func, &ctx_->entropy,
-	                           reinterpret_cast<const unsigned char*>(pers), strlen(pers));
+								reinterpret_cast<const unsigned char *>(pers), strlen(pers));
 	if (ret != 0) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "CTR DRBG seed failed: " + FormatMbedTlsError(ret);
 		return false;
 	}
 
 	// Set up SSL config for client mode
-	ret = mbedtls_ssl_config_defaults(&ctx_->conf,
-	                                  MBEDTLS_SSL_IS_CLIENT,
-	                                  MBEDTLS_SSL_TRANSPORT_STREAM,
-	                                  MBEDTLS_SSL_PRESET_DEFAULT);
+	ret = mbedtls_ssl_config_defaults(&ctx_->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+									  MBEDTLS_SSL_PRESET_DEFAULT);
 	if (ret != 0) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "SSL config defaults failed: " + FormatMbedTlsError(ret);
 		return false;
 	}
@@ -307,7 +300,7 @@ bool TlsImpl::Initialize() {
 	// Enable debug output if MSSQL_DEBUG is set high enough
 	if (GetMssqlDebugLevel() >= 3) {
 		mbedtls_ssl_conf_dbg(&ctx_->conf, MbedTlsDebugCallback, nullptr);
-		mbedtls_debug_set_threshold(4);  // 0-4, 4 is most verbose
+		mbedtls_debug_set_threshold(4);	 // 0-4, 4 is most verbose
 	}
 
 	// Trust server certificate by default (VERIFY_NONE)
@@ -323,7 +316,7 @@ bool TlsImpl::Initialize() {
 	// Setup SSL context with config
 	ret = mbedtls_ssl_setup(&ctx_->ssl, &ctx_->conf);
 	if (ret != 0) {
-		ctx_->last_error_code = 1;  // INIT_FAILED
+		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "SSL setup failed: " + FormatMbedTlsError(ret);
 		return false;
 	}
@@ -333,12 +326,11 @@ bool TlsImpl::Initialize() {
 	return true;
 }
 
-bool TlsImpl::WrapSocket(int socket_fd, const std::string& hostname) {
-	MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: fd=%d, hostname=%s", socket_fd,
-	                    hostname.empty() ? "(none)" : hostname.c_str());
+bool TlsImpl::WrapSocket(int socket_fd, const std::string &hostname) {
+	MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: fd=%d, hostname=%s", socket_fd, hostname.empty() ? "(none)" : hostname.c_str());
 
 	if (!ctx_->initialized) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Call Initialize() first";
 		return false;
 	}
@@ -349,7 +341,7 @@ bool TlsImpl::WrapSocket(int socket_fd, const std::string& hostname) {
 	if (!hostname.empty()) {
 		int ret = mbedtls_ssl_set_hostname(&ctx_->ssl, hostname.c_str());
 		if (ret != 0) {
-			ctx_->last_error_code = 1;  // INIT_FAILED
+			ctx_->last_error_code = 1;	// INIT_FAILED
 			ctx_->last_error = "Failed to set hostname for SNI: " + FormatMbedTlsError(ret);
 			MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: FAILED to set hostname - %s", ctx_->last_error.c_str());
 			return false;
@@ -365,13 +357,13 @@ bool TlsImpl::Handshake(int timeout_ms) {
 	MSSQL_TLS_DEBUG_LOG(1, "Handshake: starting (timeout=%dms)", timeout_ms);
 
 	if (!ctx_->initialized) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Not initialized";
 		return false;
 	}
 
 	if (ctx_->socket_fd < 0) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Socket not wrapped";
 		return false;
 	}
@@ -381,16 +373,16 @@ bool TlsImpl::Handshake(int timeout_ms) {
 	int ret;
 	while ((ret = mbedtls_ssl_handshake(&ctx_->ssl)) != 0) {
 		if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-			ctx_->last_error_code = 2;  // HANDSHAKE_FAILED
+			ctx_->last_error_code = 2;	// HANDSHAKE_FAILED
 			ctx_->last_error = "Handshake failed: " + FormatMbedTlsError(ret);
 			MSSQL_TLS_DEBUG_LOG(1, "Handshake: FAILED - %s", ctx_->last_error.c_str());
 			return false;
 		}
 
-		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-		    std::chrono::steady_clock::now() - start).count();
+		auto elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 		if (elapsed >= timeout_ms) {
-			ctx_->last_error_code = 3;  // HANDSHAKE_TIMEOUT
+			ctx_->last_error_code = 3;	// HANDSHAKE_TIMEOUT
 			ctx_->last_error = "Timeout after " + std::to_string(elapsed) + "ms";
 			MSSQL_TLS_DEBUG_LOG(1, "Handshake: TIMEOUT");
 			return false;
@@ -399,17 +391,16 @@ bool TlsImpl::Handshake(int timeout_ms) {
 
 	ctx_->handshake_complete = true;
 
-	const char* cipher = mbedtls_ssl_get_ciphersuite(&ctx_->ssl);
-	const char* version = mbedtls_ssl_get_version(&ctx_->ssl);
-	MSSQL_TLS_DEBUG_LOG(1, "Handshake: SUCCESS - %s, %s",
-	    version ? version : "unknown", cipher ? cipher : "unknown");
+	const char *cipher = mbedtls_ssl_get_ciphersuite(&ctx_->ssl);
+	const char *version = mbedtls_ssl_get_version(&ctx_->ssl);
+	MSSQL_TLS_DEBUG_LOG(1, "Handshake: SUCCESS - %s, %s", version ? version : "unknown", cipher ? cipher : "unknown");
 
 	return true;
 }
 
-ssize_t TlsImpl::Send(const uint8_t* data, size_t length) {
+ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 	if (!ctx_->handshake_complete) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Handshake not complete";
 		return -1;
 	}
@@ -423,11 +414,11 @@ ssize_t TlsImpl::Send(const uint8_t* data, size_t length) {
 		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
 			continue;
 		} else if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-			ctx_->last_error_code = 7;  // PEER_CLOSED
+			ctx_->last_error_code = 7;	// PEER_CLOSED
 			ctx_->last_error = "Peer closed connection";
 			return -1;
 		} else {
-			ctx_->last_error_code = 4;  // SEND_FAILED
+			ctx_->last_error_code = 4;	// SEND_FAILED
 			ctx_->last_error = "Send failed: " + FormatMbedTlsError(ret);
 			return -1;
 		}
@@ -436,9 +427,9 @@ ssize_t TlsImpl::Send(const uint8_t* data, size_t length) {
 	return static_cast<ssize_t>(total_sent);
 }
 
-ssize_t TlsImpl::Receive(uint8_t* buffer, size_t max_length, int timeout_ms) {
+ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	if (!ctx_->handshake_complete) {
-		ctx_->last_error_code = 6;  // NOT_INITIALIZED
+		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Handshake not complete";
 		return -1;
 	}
@@ -473,13 +464,13 @@ ssize_t TlsImpl::Receive(uint8_t* buffer, size_t max_length, int timeout_ms) {
 	if (ret > 0) {
 		return ret;
 	} else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-		ctx_->last_error_code = 7;  // PEER_CLOSED
+		ctx_->last_error_code = 7;	// PEER_CLOSED
 		ctx_->last_error = "Connection closed by peer";
 		return 0;
 	} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
 		return 0;
 	} else {
-		ctx_->last_error_code = 5;  // RECV_FAILED
+		ctx_->last_error_code = 5;	// RECV_FAILED
 		ctx_->last_error = "Receive failed: " + FormatMbedTlsError(ret);
 		return -1;
 	}
@@ -529,7 +520,7 @@ bool TlsImpl::IsInitialized() const {
 	return ctx_->initialized;
 }
 
-const std::string& TlsImpl::GetLastError() const {
+const std::string &TlsImpl::GetLastError() const {
 	return ctx_->last_error;
 }
 
@@ -541,7 +532,7 @@ std::string TlsImpl::GetCipherSuite() const {
 	if (!ctx_->handshake_complete) {
 		return "";
 	}
-	const char* suite = mbedtls_ssl_get_ciphersuite(&ctx_->ssl);
+	const char *suite = mbedtls_ssl_get_ciphersuite(&ctx_->ssl);
 	return suite ? suite : "";
 }
 
@@ -549,7 +540,7 @@ std::string TlsImpl::GetTlsVersion() const {
 	if (!ctx_->handshake_complete) {
 		return "";
 	}
-	const char* version = mbedtls_ssl_get_version(&ctx_->ssl);
+	const char *version = mbedtls_ssl_get_version(&ctx_->ssl);
 	return version ? version : "";
 }
 

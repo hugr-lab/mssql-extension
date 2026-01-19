@@ -17,34 +17,45 @@
 static int GetMssqlDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_TLS_DEBUG_LOG(lvl, fmt, ...) \
-	do { \
-		if (GetMssqlDebugLevel() >= lvl) \
+#define MSSQL_TLS_DEBUG_LOG(lvl, fmt, ...)                                  \
+	do {                                                                    \
+		if (GetMssqlDebugLevel() >= lvl)                                    \
 			fprintf(stderr, "[MSSQL TLS STATIC] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
 namespace duckdb {
 namespace tds {
 
-const char* TlsErrorCodeToString(TlsErrorCode code) {
+const char *TlsErrorCodeToString(TlsErrorCode code) {
 	switch (code) {
-	case TlsErrorCode::NONE: return "No error";
-	case TlsErrorCode::INIT_FAILED: return "TLS initialization failed";
-	case TlsErrorCode::HANDSHAKE_FAILED: return "TLS handshake failed";
-	case TlsErrorCode::HANDSHAKE_TIMEOUT: return "TLS handshake timed out";
-	case TlsErrorCode::SEND_FAILED: return "TLS send failed";
-	case TlsErrorCode::RECV_FAILED: return "TLS receive failed";
-	case TlsErrorCode::NOT_INITIALIZED: return "TLS not initialized";
-	case TlsErrorCode::PEER_CLOSED: return "Server closed TLS connection";
-	case TlsErrorCode::SERVER_NO_ENCRYPT: return "Server does not support encryption";
-	case TlsErrorCode::TLS_NOT_AVAILABLE: return "TLS not available";
-	default: return "Unknown TLS error";
+	case TlsErrorCode::NONE:
+		return "No error";
+	case TlsErrorCode::INIT_FAILED:
+		return "TLS initialization failed";
+	case TlsErrorCode::HANDSHAKE_FAILED:
+		return "TLS handshake failed";
+	case TlsErrorCode::HANDSHAKE_TIMEOUT:
+		return "TLS handshake timed out";
+	case TlsErrorCode::SEND_FAILED:
+		return "TLS send failed";
+	case TlsErrorCode::RECV_FAILED:
+		return "TLS receive failed";
+	case TlsErrorCode::NOT_INITIALIZED:
+		return "TLS not initialized";
+	case TlsErrorCode::PEER_CLOSED:
+		return "Server closed TLS connection";
+	case TlsErrorCode::SERVER_NO_ENCRYPT:
+		return "Server does not support encryption";
+	case TlsErrorCode::TLS_NOT_AVAILABLE:
+		return "TLS not available";
+	default:
+		return "Unknown TLS error";
 	}
 }
 
@@ -65,11 +76,9 @@ TlsTdsContext::~TlsTdsContext() {
 	}
 }
 
-TlsTdsContext::TlsTdsContext(TlsTdsContext&& other) noexcept
-    : impl_(std::move(other.impl_)) {
-}
+TlsTdsContext::TlsTdsContext(TlsTdsContext &&other) noexcept : impl_(std::move(other.impl_)) {}
 
-TlsTdsContext& TlsTdsContext::operator=(TlsTdsContext&& other) noexcept {
+TlsTdsContext &TlsTdsContext::operator=(TlsTdsContext &&other) noexcept {
 	if (this != &other) {
 		if (impl_ && impl_->tls) {
 			impl_->tls->Close();
@@ -99,9 +108,8 @@ bool TlsTdsContext::Initialize() {
 	return false;
 }
 
-bool TlsTdsContext::WrapSocket(int socket_fd, const std::string& hostname) {
-	MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: fd=%d, hostname=%s", socket_fd,
-	                    hostname.empty() ? "(none)" : hostname.c_str());
+bool TlsTdsContext::WrapSocket(int socket_fd, const std::string &hostname) {
+	MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: fd=%d, hostname=%s", socket_fd, hostname.empty() ? "(none)" : hostname.c_str());
 	if (!impl_->tls) {
 		MSSQL_TLS_DEBUG_LOG(1, "WrapSocket: FAILED - TLS impl not available");
 		return false;
@@ -148,7 +156,7 @@ bool TlsTdsContext::Handshake(int timeout_ms) {
 	return false;
 }
 
-ssize_t TlsTdsContext::Send(const uint8_t* data, size_t length) {
+ssize_t TlsTdsContext::Send(const uint8_t *data, size_t length) {
 	if (!impl_->tls) {
 		return -1;
 	}
@@ -161,7 +169,7 @@ ssize_t TlsTdsContext::Send(const uint8_t* data, size_t length) {
 	return result;
 }
 
-ssize_t TlsTdsContext::Receive(uint8_t* buffer, size_t max_length, int timeout_ms) {
+ssize_t TlsTdsContext::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	if (!impl_->tls) {
 		return -1;
 	}
@@ -185,7 +193,7 @@ bool TlsTdsContext::IsInitialized() const {
 	return impl_->tls && impl_->tls->IsInitialized();
 }
 
-const std::string& TlsTdsContext::GetLastError() const {
+const std::string &TlsTdsContext::GetLastError() const {
 	return impl_->last_error;
 }
 

@@ -1,8 +1,8 @@
 #include "insert/mssql_returning_parser.hpp"
-#include "tds/tds_packet.hpp"
-#include "tds/encoding/type_converter.hpp"
-#include "duckdb/common/exception.hpp"
 #include <chrono>
+#include "duckdb/common/exception.hpp"
+#include "tds/encoding/type_converter.hpp"
+#include "tds/tds_packet.hpp"
 
 namespace duckdb {
 
@@ -10,10 +10,8 @@ namespace duckdb {
 // Constructor
 //===----------------------------------------------------------------------===//
 
-MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target,
-                                           const vector<idx_t> &returning_column_ids)
-    : target_(target), returning_column_ids_(returning_column_ids) {
-
+MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids)
+	: target_(target), returning_column_ids_(returning_column_ids) {
 	// Build result types from returning column indices
 	for (auto col_idx : returning_column_ids_) {
 		if (col_idx < target_.columns.size()) {
@@ -36,10 +34,8 @@ unique_ptr<DataChunk> MSSQLReturningParser::InitializeResultChunk() {
 // Row Processing
 //===----------------------------------------------------------------------===//
 
-void MSSQLReturningParser::ProcessRow(const tds::RowData &row,
-                                       const std::vector<tds::ColumnMetadata> &columns,
-                                       DataChunk &chunk,
-                                       idx_t row_idx) {
+void MSSQLReturningParser::ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns,
+									  DataChunk &chunk, idx_t row_idx) {
 	// The OUTPUT INSERTED columns should match our returning_column_ids in order
 	// Process each column from the TDS response
 	for (idx_t i = 0; i < columns.size() && i < result_types_.size(); i++) {
@@ -47,8 +43,7 @@ void MSSQLReturningParser::ProcessRow(const tds::RowData &row,
 		const auto &value = (i < row.values.size()) ? row.values[i] : std::vector<uint8_t>{};
 
 		// Use TypeConverter to convert TDS value to DuckDB format
-		tds::encoding::TypeConverter::ConvertValue(value, is_null, columns[i],
-		                                           chunk.data[i], row_idx);
+		tds::encoding::TypeConverter::ConvertValue(value, is_null, columns[i], chunk.data[i], row_idx);
 	}
 }
 
@@ -56,10 +51,8 @@ void MSSQLReturningParser::ProcessRow(const tds::RowData &row,
 // Main Parse Method (with existing parser)
 //===----------------------------------------------------------------------===//
 
-unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection,
-                                                   tds::TokenParser &parser,
-                                                   tds::TdsSocket &socket,
-                                                   int timeout_ms) {
+unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection, tds::TokenParser &parser,
+												  tds::TdsSocket &socket, int timeout_ms) {
 	// Initialize result chunk
 	auto chunk = InitializeResultChunk();
 	row_count_ = 0;
@@ -114,8 +107,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 				const tds::DoneToken &done_token = parser.GetDone();
 				if (done_token.IsFinal()) {
 					done = true;
-					connection.TransitionState(tds::ConnectionState::Executing,
-					                           tds::ConnectionState::Idle);
+					connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
 				}
 				break;
 			}
@@ -168,8 +160,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 // Parse from Fresh Connection
 //===----------------------------------------------------------------------===//
 
-unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &connection,
-                                                           int timeout_ms) {
+unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &connection, int timeout_ms) {
 	auto *socket = connection.GetSocket();
 	if (!socket) {
 		error_message_ = "Connection socket is null";

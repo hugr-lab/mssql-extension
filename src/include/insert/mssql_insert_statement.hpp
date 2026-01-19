@@ -1,9 +1,9 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
-#include "insert/mssql_insert_target.hpp"
 #include <string>
 #include <vector>
+#include "duckdb/common/types.hpp"
+#include "insert/mssql_insert_target.hpp"
 
 namespace duckdb {
 
@@ -60,7 +60,9 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	// Check if OUTPUT clause is enabled
-	bool HasOutput() const { return include_output_; }
+	bool HasOutput() const {
+		return include_output_;
+	}
 
 private:
 	const MSSQLInsertTarget &target_;

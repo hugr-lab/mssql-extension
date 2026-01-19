@@ -1,16 +1,16 @@
 #pragma once
 
-#include "tds_types.hpp"
-#include "tds_connection.hpp"
-#include <memory>
-#include <queue>
-#include <unordered_map>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
+#include "tds_connection.hpp"
+#include "tds_types.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -50,14 +50,14 @@ using ConnectionFactory = std::function<std::shared_ptr<TdsConnection>()>;
 // Thread-safe connection pool for a single database context
 class ConnectionPool {
 public:
-	ConnectionPool(const std::string& context_name, PoolConfiguration config, ConnectionFactory factory);
+	ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory);
 	~ConnectionPool();
 
 	// Non-copyable, non-movable
-	ConnectionPool(const ConnectionPool&) = delete;
-	ConnectionPool& operator=(const ConnectionPool&) = delete;
-	ConnectionPool(ConnectionPool&&) = delete;
-	ConnectionPool& operator=(ConnectionPool&&) = delete;
+	ConnectionPool(const ConnectionPool &) = delete;
+	ConnectionPool &operator=(const ConnectionPool &) = delete;
+	ConnectionPool(ConnectionPool &&) = delete;
+	ConnectionPool &operator=(ConnectionPool &&) = delete;
 
 	// Acquire a connection from the pool
 	// Blocks up to acquire_timeout if pool is exhausted
@@ -74,7 +74,9 @@ public:
 	void Shutdown();
 
 	// Get context name
-	const std::string& GetContextName() const { return context_name_; }
+	const std::string &GetContextName() const {
+		return context_name_;
+	}
 
 private:
 	std::string context_name_;
@@ -101,7 +103,7 @@ private:
 	void CleanupThreadFunc();
 	std::shared_ptr<TdsConnection> TryAcquireIdle();
 	std::shared_ptr<TdsConnection> CreateNewConnection();
-	bool ValidateConnection(std::shared_ptr<TdsConnection>& conn);
+	bool ValidateConnection(std::shared_ptr<TdsConnection> &conn);
 };
 
 }  // namespace tds

@@ -15,10 +15,10 @@
 
 #pragma once
 
-#include <string>
-#include <memory>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <string>
 
 namespace duckdb {
 namespace tds {
@@ -28,8 +28,8 @@ struct TlsImplContext;
 
 // I/O callback types for custom send/receive (used for TDS-wrapped TLS)
 // Return: bytes sent/received on success, -1 on error, 0 on would-block
-using TlsSendCallback = std::function<int(const uint8_t* data, size_t len)>;
-using TlsRecvCallback = std::function<int(uint8_t* buf, size_t len, int timeout_ms)>;
+using TlsSendCallback = std::function<int(const uint8_t *data, size_t len)>;
+using TlsRecvCallback = std::function<int(uint8_t *buf, size_t len, int timeout_ms)>;
 
 // TLS implementation class using mbedTLS
 // This class is used by the loadable extension with symbols hidden
@@ -39,15 +39,15 @@ public:
 	~TlsImpl();
 
 	// Non-copyable
-	TlsImpl(const TlsImpl&) = delete;
-	TlsImpl& operator=(const TlsImpl&) = delete;
+	TlsImpl(const TlsImpl &) = delete;
+	TlsImpl &operator=(const TlsImpl &) = delete;
 
 	// Initialize TLS context (entropy, RNG, config)
 	bool Initialize();
 
 	// Wrap an existing socket file descriptor
 	// hostname is optional, used for SNI (Server Name Indication)
-	bool WrapSocket(int socket_fd, const std::string& hostname = "");
+	bool WrapSocket(int socket_fd, const std::string &hostname = "");
 
 	// Set custom I/O callbacks for send/receive
 	// This is used for TDS-wrapped TLS where handshake data must be wrapped
@@ -62,10 +62,10 @@ public:
 	bool Handshake(int timeout_ms = 30000);
 
 	// Send data over TLS
-	ssize_t Send(const uint8_t* data, size_t length);
+	ssize_t Send(const uint8_t *data, size_t length);
 
 	// Receive data over TLS
-	ssize_t Receive(uint8_t* buffer, size_t max_length, int timeout_ms = 0);
+	ssize_t Receive(uint8_t *buffer, size_t max_length, int timeout_ms = 0);
 
 	// Close TLS connection gracefully
 	void Close();
@@ -74,7 +74,7 @@ public:
 	bool IsInitialized() const;
 
 	// Get last error message
-	const std::string& GetLastError() const;
+	const std::string &GetLastError() const;
 
 	// Get last error code
 	int GetLastErrorCode() const;

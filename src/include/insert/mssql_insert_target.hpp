@@ -1,9 +1,9 @@
 #pragma once
 
-#include "duckdb/common/types.hpp"
-#include "insert/mssql_insert_config.hpp"
 #include <string>
 #include <vector>
+#include "duckdb/common/types.hpp"
+#include "insert/mssql_insert_config.hpp"
 
 namespace duckdb {
 
@@ -19,9 +19,9 @@ namespace duckdb {
 
 struct MSSQLInsertTarget {
 	// Fully qualified table name components
-	string catalog_name;    // Database/catalog name
-	string schema_name;     // Schema name (e.g., "dbo")
-	string table_name;      // Table name
+	string catalog_name;  // Database/catalog name
+	string schema_name;	  // Schema name (e.g., "dbo")
+	string table_name;	  // Table name
 
 	// All columns in the table (in ordinal order)
 	vector<MSSQLInsertColumn> columns;
@@ -35,12 +35,11 @@ struct MSSQLInsertTarget {
 	vector<idx_t> returning_column_indices;
 
 	// Identity column tracking
-	bool has_identity_column;    // Table has an IDENTITY column
-	idx_t identity_column_index; // Index of identity column in columns vector
+	bool has_identity_column;	  // Table has an IDENTITY column
+	idx_t identity_column_index;  // Index of identity column in columns vector
 
 	// Default constructor
-	MSSQLInsertTarget()
-	    : has_identity_column(false), identity_column_index(0) {}
+	MSSQLInsertTarget() : has_identity_column(false), identity_column_index(0) {}
 
 	//===----------------------------------------------------------------------===//
 	// Accessors

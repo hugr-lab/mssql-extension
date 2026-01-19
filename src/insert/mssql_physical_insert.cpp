@@ -1,6 +1,6 @@
 #include "insert/mssql_physical_insert.hpp"
-#include "insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
+#include "insert/mssql_insert_executor.hpp"
 
 namespace duckdb {
 
@@ -8,11 +8,9 @@ namespace duckdb {
 // MSSQLInsertGlobalSinkState
 //===----------------------------------------------------------------------===//
 
-MSSQLInsertGlobalSinkState::MSSQLInsertGlobalSinkState(ClientContext &context,
-                                                       const MSSQLInsertTarget &target,
-                                                       const MSSQLInsertConfig &config,
-                                                       bool return_chunk_flag)
-    : total_rows_inserted(0), returned(false), return_chunk(return_chunk_flag), result_chunk_index(0) {
+MSSQLInsertGlobalSinkState::MSSQLInsertGlobalSinkState(ClientContext &context, const MSSQLInsertTarget &target,
+													   const MSSQLInsertConfig &config, bool return_chunk_flag)
+	: total_rows_inserted(0), returned(false), return_chunk(return_chunk_flag), result_chunk_index(0) {
 	executor = make_uniq<MSSQLInsertExecutor>(context, target, config);
 
 	// Build returning column indices from target
@@ -26,11 +24,11 @@ MSSQLInsertGlobalSinkState::MSSQLInsertGlobalSinkState(ClientContext &context,
 //===----------------------------------------------------------------------===//
 
 MSSQLPhysicalInsert::MSSQLPhysicalInsert(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                                         MSSQLInsertTarget target, MSSQLInsertConfig config,
-                                         bool return_chunk)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-      target_(std::move(target)), config_(std::move(config)), return_chunk_(return_chunk) {
-}
+										 MSSQLInsertTarget target, MSSQLInsertConfig config, bool return_chunk)
+	: PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	  target_(std::move(target)),
+	  config_(std::move(config)),
+	  return_chunk_(return_chunk) {}
 
 //===----------------------------------------------------------------------===//
 // State Management
@@ -48,8 +46,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalInsert::GetLocalSinkState(ExecutionConte
 // Sink Implementation
 //===----------------------------------------------------------------------===//
 
-SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chunk,
-                                          OperatorSinkInput &input) const {
+SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLInsertGlobalSinkState>();
 
 	// Thread-safe execution
@@ -71,15 +68,13 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-SinkCombineResultType MSSQLPhysicalInsert::Combine(ExecutionContext &context,
-                                                    OperatorSinkCombineInput &input) const {
+SinkCombineResultType MSSQLPhysicalInsert::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	// Nothing to combine - we use a global executor with mutex
 	return SinkCombineResultType::FINISHED;
 }
 
-SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
-                                                ClientContext &context,
-                                                OperatorSinkFinalizeInput &input) const {
+SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+											   OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLInsertGlobalSinkState>();
 
 	// Thread-safe finalization
@@ -105,7 +100,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalInsert::GetData(ExecutionContext &context, DataChunk &chunk,
-                                               OperatorSourceInput &input) const {
+											  OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLInsertGlobalSinkState>();
 
 	// Thread-safe access
@@ -125,9 +120,8 @@ SourceResultType MSSQLPhysicalInsert::GetData(ExecutionContext &context, DataChu
 		// This avoids copying and uses the already-parsed data directly
 		chunk.Reference(*result);
 
-		return gstate.result_chunk_index >= gstate.result_chunks.size()
-		           ? SourceResultType::FINISHED
-		           : SourceResultType::HAVE_MORE_OUTPUT;
+		return gstate.result_chunk_index >= gstate.result_chunks.size() ? SourceResultType::FINISHED
+																		: SourceResultType::HAVE_MORE_OUTPUT;
 	} else {
 		// Normal mode - return row count
 		if (gstate.returned) {

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "tds/tds_types.hpp"
 
 namespace duckdb {
@@ -23,15 +23,15 @@ struct MSSQLPoolConfig {
 
 // Default values for statistics settings
 constexpr bool DEFAULT_STATISTICS_ENABLED = true;
-constexpr int64_t DEFAULT_STATISTICS_LEVEL = 0;       // 0 = row count only
-constexpr bool DEFAULT_STATISTICS_USE_DBCC = false;   // DBCC requires permissions
-constexpr int64_t DEFAULT_STATISTICS_CACHE_TTL = 300; // 5 minutes
+constexpr int64_t DEFAULT_STATISTICS_LEVEL = 0;		   // 0 = row count only
+constexpr bool DEFAULT_STATISTICS_USE_DBCC = false;	   // DBCC requires permissions
+constexpr int64_t DEFAULT_STATISTICS_CACHE_TTL = 300;  // 5 minutes
 
 // Statistics configuration structure
 struct MSSQLStatisticsConfig {
 	bool enabled = DEFAULT_STATISTICS_ENABLED;
-	int64_t level = DEFAULT_STATISTICS_LEVEL;          // 0=rowcount, 1=+histogram, 2=+NDV
-	bool use_dbcc = DEFAULT_STATISTICS_USE_DBCC;       // Allow DBCC SHOW_STATISTICS
+	int64_t level = DEFAULT_STATISTICS_LEVEL;	  // 0=rowcount, 1=+histogram, 2=+NDV
+	bool use_dbcc = DEFAULT_STATISTICS_USE_DBCC;  // Allow DBCC SHOW_STATISTICS
 	int64_t cache_ttl_seconds = DEFAULT_STATISTICS_CACHE_TTL;
 };
 

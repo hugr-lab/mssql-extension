@@ -1,7 +1,7 @@
 #include "connection/mssql_settings.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "duckdb/main/config.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/config.hpp"
+#include "insert/mssql_insert_config.hpp"
 
 namespace duckdb {
 
@@ -32,118 +32,62 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(db);
 
 	// mssql_connection_limit - Maximum connections per attached database context
-	config.AddExtensionOption(
-	    "mssql_connection_limit",
-	    "Maximum connections per attached mssql database",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(tds::DEFAULT_CONNECTION_LIMIT),
-	    ValidatePositive,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_connection_limit", "Maximum connections per attached mssql database",
+							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_CONNECTION_LIMIT), ValidatePositive,
+							  SetScope::GLOBAL);
 
 	// mssql_connection_cache - Enable connection pooling and reuse
-	config.AddExtensionOption(
-	    "mssql_connection_cache",
-	    "Enable connection pooling and reuse",
-	    LogicalType::BOOLEAN,
-	    Value::BOOLEAN(tds::DEFAULT_CONNECTION_CACHE),
-	    nullptr,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_connection_cache", "Enable connection pooling and reuse", LogicalType::BOOLEAN,
+							  Value::BOOLEAN(tds::DEFAULT_CONNECTION_CACHE), nullptr, SetScope::GLOBAL);
 
 	// mssql_connection_timeout - TCP connection timeout in seconds
-	config.AddExtensionOption(
-	    "mssql_connection_timeout",
-	    "TCP connection timeout in seconds",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
+							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_idle_timeout - Idle connection timeout in seconds
-	config.AddExtensionOption(
-	    "mssql_idle_timeout",
-	    "Idle connection timeout in seconds (0 = no timeout)",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(tds::DEFAULT_IDLE_TIMEOUT),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_idle_timeout", "Idle connection timeout in seconds (0 = no timeout)",
+							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_IDLE_TIMEOUT), ValidateNonNegative,
+							  SetScope::GLOBAL);
 
 	// mssql_min_connections - Minimum connections to maintain per context
-	config.AddExtensionOption(
-	    "mssql_min_connections",
-	    "Minimum connections to maintain per context",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(tds::DEFAULT_MIN_CONNECTIONS),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_min_connections", "Minimum connections to maintain per context",
+							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_MIN_CONNECTIONS), ValidateNonNegative,
+							  SetScope::GLOBAL);
 
 	// mssql_acquire_timeout - Connection acquire timeout in seconds
-	config.AddExtensionOption(
-	    "mssql_acquire_timeout",
-	    "Connection acquire timeout in seconds (0 = fail immediately)",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(tds::DEFAULT_ACQUIRE_TIMEOUT),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_acquire_timeout", "Connection acquire timeout in seconds (0 = fail immediately)",
+							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_ACQUIRE_TIMEOUT), ValidateNonNegative,
+							  SetScope::GLOBAL);
 
 	// mssql_catalog_cache_ttl - Metadata cache TTL in seconds (0 = manual refresh only)
-	config.AddExtensionOption(
-	    "mssql_catalog_cache_ttl",
-	    "Metadata cache TTL in seconds (0 = manual refresh only)",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(0),  // Default: disabled, manual refresh only
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_catalog_cache_ttl", "Metadata cache TTL in seconds (0 = manual refresh only)",
+							  LogicalType::BIGINT,
+							  Value::BIGINT(0),	 // Default: disabled, manual refresh only
+							  ValidateNonNegative, SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//
 	// Statistics Settings
 	//===----------------------------------------------------------------------===//
 
 	// mssql_enable_statistics - Enable statistics collection for optimizer
-	config.AddExtensionOption(
-	    "mssql_enable_statistics",
-	    "Enable statistics collection from SQL Server for query optimizer",
-	    LogicalType::BOOLEAN,
-	    Value::BOOLEAN(DEFAULT_STATISTICS_ENABLED),
-	    nullptr,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_enable_statistics",
+							  "Enable statistics collection from SQL Server for query optimizer", LogicalType::BOOLEAN,
+							  Value::BOOLEAN(DEFAULT_STATISTICS_ENABLED), nullptr, SetScope::GLOBAL);
 
 	// mssql_statistics_level - Statistics detail level (0=rowcount, 1=+histogram, 2=+NDV)
-	config.AddExtensionOption(
-	    "mssql_statistics_level",
-	    "Statistics detail level: 0=row count, 1=+histogram min/max, 2=+NDV",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(DEFAULT_STATISTICS_LEVEL),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_statistics_level",
+							  "Statistics detail level: 0=row count, 1=+histogram min/max, 2=+NDV", LogicalType::BIGINT,
+							  Value::BIGINT(DEFAULT_STATISTICS_LEVEL), ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_statistics_use_dbcc - Allow DBCC SHOW_STATISTICS for column stats
 	config.AddExtensionOption(
-	    "mssql_statistics_use_dbcc",
-	    "Allow DBCC SHOW_STATISTICS for column statistics (requires permissions)",
-	    LogicalType::BOOLEAN,
-	    Value::BOOLEAN(DEFAULT_STATISTICS_USE_DBCC),
-	    nullptr,
-	    SetScope::GLOBAL
-	);
+		"mssql_statistics_use_dbcc", "Allow DBCC SHOW_STATISTICS for column statistics (requires permissions)",
+		LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_STATISTICS_USE_DBCC), nullptr, SetScope::GLOBAL);
 
 	// mssql_statistics_cache_ttl_seconds - Statistics cache TTL
-	config.AddExtensionOption(
-	    "mssql_statistics_cache_ttl_seconds",
-	    "Statistics cache TTL in seconds",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(DEFAULT_STATISTICS_CACHE_TTL),
-	    ValidateNonNegative,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_statistics_cache_ttl_seconds", "Statistics cache TTL in seconds",
+							  LogicalType::BIGINT, Value::BIGINT(DEFAULT_STATISTICS_CACHE_TTL), ValidateNonNegative,
+							  SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//
 	// INSERT Settings
@@ -151,44 +95,24 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 
 	// mssql_insert_batch_size - Maximum rows per INSERT statement
 	// SQL Server limits VALUES clause to 1000 rows per INSERT
-	config.AddExtensionOption(
-	    "mssql_insert_batch_size",
-	    "Maximum rows per INSERT statement (SQL Server limit: 1000)",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(MSSQL_DEFAULT_INSERT_BATCH_SIZE),
-	    ValidatePositive,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_insert_batch_size", "Maximum rows per INSERT statement (SQL Server limit: 1000)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_INSERT_BATCH_SIZE), ValidatePositive,
+							  SetScope::GLOBAL);
 
 	// mssql_insert_max_rows_per_statement - Hard cap on rows per INSERT statement
-	config.AddExtensionOption(
-	    "mssql_insert_max_rows_per_statement",
-	    "Hard cap on rows per INSERT statement (SQL Server limit: 1000)",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT),
-	    ValidatePositive,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_insert_max_rows_per_statement",
+							  "Hard cap on rows per INSERT statement (SQL Server limit: 1000)", LogicalType::BIGINT,
+							  Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_ROWS_PER_STATEMENT), ValidatePositive,
+							  SetScope::GLOBAL);
 
 	// mssql_insert_max_sql_bytes - Maximum SQL statement size in bytes
-	config.AddExtensionOption(
-	    "mssql_insert_max_sql_bytes",
-	    "Maximum SQL statement size in bytes",
-	    LogicalType::BIGINT,
-	    Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES),
-	    ValidatePositive,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_insert_max_sql_bytes", "Maximum SQL statement size in bytes", LogicalType::BIGINT,
+							  Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES), ValidatePositive, SetScope::GLOBAL);
 
 	// mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING clause
-	config.AddExtensionOption(
-	    "mssql_insert_use_returning_output",
-	    "Use OUTPUT INSERTED for RETURNING clause",
-	    LogicalType::BOOLEAN,
-	    Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT),
-	    nullptr,
-	    SetScope::GLOBAL
-	);
+	config.AddExtensionOption("mssql_insert_use_returning_output", "Use OUTPUT INSERTED for RETURNING clause",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT), nullptr,
+							  SetScope::GLOBAL);
 }
 
 //===----------------------------------------------------------------------===//

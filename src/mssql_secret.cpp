@@ -11,13 +11,13 @@ namespace duckdb {
 string ValidateMSSQLSecretFields(const CreateSecretInput &input) {
 	// Check required string fields
 	const char *required_string_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE, MSSQL_SECRET_USER,
-	                                        MSSQL_SECRET_PASSWORD};
+											MSSQL_SECRET_PASSWORD};
 
 	for (auto field : required_string_fields) {
 		auto it = input.options.find(field);
 		if (it == input.options.end()) {
 			return StringUtil::Format("Missing required field '%s'. Provide %s parameter when creating secret.", field,
-			                          field);
+									  field);
 		}
 		auto str_val = it->second.ToString();
 		if (str_val.empty()) {
@@ -43,7 +43,7 @@ string ValidateMSSQLSecretFields(const CreateSecretInput &input) {
 		return StringUtil::Format("Port must be between 1 and 65535. Got: %lld", port_value);
 	}
 
-	return "";  // Valid
+	return "";	// Valid
 }
 
 //===----------------------------------------------------------------------===//
@@ -106,7 +106,7 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_DATABASE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_USER] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_PASSWORD] = LogicalType::VARCHAR;
-	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;  // Optional
+	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;	// Optional
 
 	loader.RegisterFunction(std::move(create_func));
 }

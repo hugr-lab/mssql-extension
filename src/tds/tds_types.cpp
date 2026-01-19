@@ -3,7 +3,7 @@
 namespace duckdb {
 namespace tds {
 
-const char* ConnectionStateToString(ConnectionState state) {
+const char *ConnectionStateToString(ConnectionState state) {
 	switch (state) {
 	case ConnectionState::Disconnected:
 		return "Disconnected";

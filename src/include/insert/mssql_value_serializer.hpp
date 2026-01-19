@@ -1,9 +1,9 @@
 #pragma once
 
+#include <string>
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include <string>
 
 namespace duckdb {
 

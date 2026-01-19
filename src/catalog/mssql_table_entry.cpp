@@ -1,28 +1,30 @@
 #include "catalog/mssql_table_entry.hpp"
+#include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
-#include "mssql_functions.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include <cstdlib>
+#include "duckdb/storage/table_storage_info.hpp"
+#include "mssql_functions.hpp"
 
 // Debug logging
 static int GetTableEntryDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_TE_DEBUG(fmt, ...) \
-	do { if (GetTableEntryDebugLevel() >= 1) { \
-		fprintf(stderr, "[MSSQL TE] " fmt "\n", ##__VA_ARGS__); \
-	} } while(0)
+#define MSSQL_TE_DEBUG(fmt, ...)                                    \
+	do {                                                            \
+		if (GetTableEntryDebugLevel() >= 1) {                       \
+			fprintf(stderr, "[MSSQL TE] " fmt "\n", ##__VA_ARGS__); \
+		}                                                           \
+	} while (0)
 
 namespace duckdb {
 
@@ -47,17 +49,16 @@ static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata) {
 // Constructor / Destructor
 //===----------------------------------------------------------------------===//
 
-MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
-                                 const MSSQLTableMetadata &metadata)
-    : TableCatalogEntry(catalog, schema, [&]() -> CreateTableInfo& {
-          static thread_local CreateTableInfo info;
-          info = MakeTableInfo(metadata);
-          return info;
-      }()),
-      mssql_columns_(metadata.columns),
-      object_type_(metadata.object_type),
-      approx_row_count_(metadata.approx_row_count) {
-}
+MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const MSSQLTableMetadata &metadata)
+	: TableCatalogEntry(catalog, schema,
+						[&]() -> CreateTableInfo & {
+							static thread_local CreateTableInfo info;
+							info = MakeTableInfo(metadata);
+							return info;
+						}()),
+	  mssql_columns_(metadata.columns),
+	  object_type_(metadata.object_type),
+	  approx_row_count_(metadata.approx_row_count) {}
 
 MSSQLTableEntry::~MSSQLTableEntry() = default;
 
@@ -72,14 +73,13 @@ static string EscapeBracketIdentifier(const string &name) {
 	for (char c : name) {
 		result += c;
 		if (c == ']') {
-			result += ']';  // Double the ] character
+			result += ']';	// Double the ] character
 		}
 	}
 	return result;
 }
 
-TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context,
-                                                unique_ptr<FunctionData> &bind_data) {
+TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto &mssql_schema = GetMSSQLSchema();
 
@@ -98,7 +98,7 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context,
 	}
 
 	MSSQL_TE_DEBUG("GetScanFunction: table=%s.%s with %zu columns (projection deferred to InitGlobal)",
-	               mssql_schema.name.c_str(), name.c_str(), mssql_columns_.size());
+				   mssql_schema.name.c_str(), name.c_str(), mssql_columns_.size());
 
 	bind_data = std::move(catalog_bind_data);
 
@@ -127,26 +127,26 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 			idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
 			info.cardinality = row_count;
 			pool.Release(std::move(connection));
-			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)",
-			               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)row_count);
+			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
+						   name.c_str(), (unsigned long long)row_count);
 		} else {
 			// Fallback to cached row count if connection fails
 			info.cardinality = approx_row_count_;
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
-			               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+						   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
 		}
 	} catch (...) {
 		// Fallback to cached row count on any error
 		info.cardinality = approx_row_count_;
-		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)",
-		               mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)", mssql_schema.name.c_str(),
+					   name.c_str(), (unsigned long long)approx_row_count_);
 	}
 
 	return info;
 }
 
 void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
-                                            LogicalUpdate &update, ClientContext &context) {
+											LogicalUpdate &update, ClientContext &context) {
 	// Updates are not supported - this shouldn't be called for read-only catalog
 	throw NotImplementedException("MSSQL catalog is read-only: UPDATE binding is not supported");
 }

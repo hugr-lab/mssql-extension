@@ -1,6 +1,6 @@
 #include "catalog/mssql_metadata_cache.hpp"
-#include "query/mssql_simple_query.hpp"
 #include "duckdb/common/exception.hpp"
+#include "query/mssql_simple_query.hpp"
 
 namespace duckdb {
 
@@ -60,20 +60,18 @@ ORDER BY c.column_id
 
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
-static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql,
-                                 MetadataRowCallback callback) {
-	auto result = MSSQLSimpleQuery::ExecuteWithCallback(
-	    connection, sql,
-	    [&callback](const std::vector<std::string> &row) {
-		    // Convert std::vector to duckdb::vector
-		    vector<string> duckdb_row;
-		    duckdb_row.reserve(row.size());
-		    for (const auto &val : row) {
-			    duckdb_row.push_back(val);
-		    }
-		    callback(duckdb_row);
-		    return true;  // continue processing
-	    });
+static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback) {
+	auto result =
+		MSSQLSimpleQuery::ExecuteWithCallback(connection, sql, [&callback](const std::vector<std::string> &row) {
+			// Convert std::vector to duckdb::vector
+			vector<string> duckdb_row;
+			duckdb_row.reserve(row.size());
+			for (const auto &val : row) {
+				duckdb_row.push_back(val);
+			}
+			callback(duckdb_row);
+			return true;  // continue processing
+		});
 
 	if (result.HasError()) {
 		throw IOException("Metadata query failed: %s", result.error_message);
@@ -85,8 +83,7 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 //===----------------------------------------------------------------------===//
 
 MSSQLMetadataCache::MSSQLMetadataCache(int64_t ttl_seconds)
-    : state_(MSSQLCacheState::EMPTY), ttl_seconds_(ttl_seconds) {
-}
+	: state_(MSSQLCacheState::EMPTY), ttl_seconds_(ttl_seconds) {}
 
 //===----------------------------------------------------------------------===//
 // Cache Access
@@ -113,8 +110,7 @@ vector<string> MSSQLMetadataCache::GetTableNames(const string &schema_name) {
 	return names;
 }
 
-const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(const string &schema_name,
-                                                               const string &table_name) {
+const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(const string &schema_name, const string &table_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto schema_it = schemas_.find(schema_name);
 	if (schema_it == schemas_.end()) {
@@ -195,8 +191,7 @@ bool MSSQLMetadataCache::IsExpired() const {
 
 bool MSSQLMetadataCache::NeedsRefresh() const {
 	std::lock_guard<std::mutex> lock(mutex_);
-	return state_ == MSSQLCacheState::EMPTY || state_ == MSSQLCacheState::STALE ||
-	       state_ == MSSQLCacheState::INVALID;
+	return state_ == MSSQLCacheState::EMPTY || state_ == MSSQLCacheState::STALE || state_ == MSSQLCacheState::INVALID;
 }
 
 void MSSQLMetadataCache::Invalidate() {
@@ -280,46 +275,45 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 }
 
 void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const string &schema_name,
-                                     const string &table_name, MSSQLTableMetadata &table_metadata) {
+									 const string &table_name, MSSQLTableMetadata &table_metadata) {
 	// Build fully qualified object name
 	string full_name = "[" + schema_name + "].[" + table_name + "]";
 
 	// Build query with object name
 	string query = StringUtil::Format(COLUMN_DISCOVERY_SQL_TEMPLATE, full_name);
 
-	ExecuteMetadataQuery(connection, query,
-	                     [this, &table_metadata](const vector<string> &values) {
-		                     if (values.size() >= 8) {
-			                     string col_name = values[0];
-			                     int32_t col_id = 0;
-			                     try {
-				                     col_id = static_cast<int32_t>(std::stoi(values[1]));
-			                     } catch (...) {
-			                     }
-			                     string type_name = values[2];
-			                     int16_t max_len = 0;
-			                     try {
-				                     max_len = static_cast<int16_t>(std::stoi(values[3]));
-			                     } catch (...) {
-			                     }
-			                     uint8_t prec = 0;
-			                     try {
-				                     prec = static_cast<uint8_t>(std::stoi(values[4]));
-			                     } catch (...) {
-			                     }
-			                     uint8_t scl = 0;
-			                     try {
-				                     scl = static_cast<uint8_t>(std::stoi(values[5]));
-			                     } catch (...) {
-			                     }
-			                     bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
-			                     string collation = values[7];
+	ExecuteMetadataQuery(connection, query, [this, &table_metadata](const vector<string> &values) {
+		if (values.size() >= 8) {
+			string col_name = values[0];
+			int32_t col_id = 0;
+			try {
+				col_id = static_cast<int32_t>(std::stoi(values[1]));
+			} catch (...) {
+			}
+			string type_name = values[2];
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(values[3]));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(values[4]));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(values[5]));
+			} catch (...) {
+			}
+			bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
+			string collation = values[7];
 
-			                     MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable,
-			                                              collation, database_collation_);
-			                     table_metadata.columns.push_back(std::move(col_info));
-		                     }
-	                     });
+			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+									 database_collation_);
+			table_metadata.columns.push_back(std::move(col_info));
+		}
+	});
 }
 
 }  // namespace duckdb

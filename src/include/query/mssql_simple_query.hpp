@@ -1,9 +1,9 @@
 #pragma once
 
-#include "tds/tds_connection.hpp"
 #include <functional>
 #include <string>
 #include <vector>
+#include "tds/tds_connection.hpp"
 
 namespace duckdb {
 
@@ -38,9 +38,15 @@ struct SimpleQueryResult {
 	std::vector<std::string> column_names;
 	std::vector<std::vector<std::string>> rows;
 
-	bool HasError() const { return !success; }
-	bool HasRows() const { return !rows.empty(); }
-	size_t RowCount() const { return rows.size(); }
+	bool HasError() const {
+		return !success;
+	}
+	bool HasRows() const {
+		return !rows.empty();
+	}
+	size_t RowCount() const {
+		return rows.size();
+	}
 };
 
 class MSSQLSimpleQuery {
@@ -50,16 +56,14 @@ public:
 	using RowCallback = std::function<bool(const std::vector<std::string> &values)>;
 
 	// Execute a query and return all results as strings
-	static SimpleQueryResult Execute(tds::TdsConnection &connection, const std::string &sql,
-	                                 int timeout_ms = 30000);
+	static SimpleQueryResult Execute(tds::TdsConnection &connection, const std::string &sql, int timeout_ms = 30000);
 
 	// Execute a query with row callback (for large results)
 	static SimpleQueryResult ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
-	                                             RowCallback callback, int timeout_ms = 30000);
+												 RowCallback callback, int timeout_ms = 30000);
 
 	// Execute a query and return single scalar value
-	static std::string ExecuteScalar(tds::TdsConnection &connection, const std::string &sql,
-	                                 int timeout_ms = 30000);
+	static std::string ExecuteScalar(tds::TdsConnection &connection, const std::string &sql, int timeout_ms = 30000);
 };
 
 }  // namespace duckdb

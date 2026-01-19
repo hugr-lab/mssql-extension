@@ -5,7 +5,7 @@ namespace duckdb {
 namespace tds {
 namespace encoding {
 
-void GuidEncoding::ReorderGuidBytes(const uint8_t* input, uint8_t* output) {
+void GuidEncoding::ReorderGuidBytes(const uint8_t *input, uint8_t *output) {
 	// SQL Server GUID wire format (mixed-endian):
 	//   bytes 0-3: Data1 (little-endian uint32)
 	//   bytes 4-5: Data2 (little-endian uint16)
@@ -36,28 +36,20 @@ void GuidEncoding::ReorderGuidBytes(const uint8_t* input, uint8_t* output) {
 	std::memcpy(output + 8, input + 8, 8);
 }
 
-hugeint_t GuidEncoding::ConvertGuid(const uint8_t* data) {
+hugeint_t GuidEncoding::ConvertGuid(const uint8_t *data) {
 	// Reorder bytes to standard UUID format
 	uint8_t reordered[16];
 	ReorderGuidBytes(data, reordered);
 
 	// Convert to hugeint_t (big-endian)
-	uint64_t upper = static_cast<uint64_t>(reordered[0]) << 56 |
-	                 static_cast<uint64_t>(reordered[1]) << 48 |
-	                 static_cast<uint64_t>(reordered[2]) << 40 |
-	                 static_cast<uint64_t>(reordered[3]) << 32 |
-	                 static_cast<uint64_t>(reordered[4]) << 24 |
-	                 static_cast<uint64_t>(reordered[5]) << 16 |
-	                 static_cast<uint64_t>(reordered[6]) << 8 |
-	                 static_cast<uint64_t>(reordered[7]);
-	uint64_t lower = static_cast<uint64_t>(reordered[8]) << 56 |
-	                 static_cast<uint64_t>(reordered[9]) << 48 |
-	                 static_cast<uint64_t>(reordered[10]) << 40 |
-	                 static_cast<uint64_t>(reordered[11]) << 32 |
-	                 static_cast<uint64_t>(reordered[12]) << 24 |
-	                 static_cast<uint64_t>(reordered[13]) << 16 |
-	                 static_cast<uint64_t>(reordered[14]) << 8 |
-	                 static_cast<uint64_t>(reordered[15]);
+	uint64_t upper = static_cast<uint64_t>(reordered[0]) << 56 | static_cast<uint64_t>(reordered[1]) << 48 |
+					 static_cast<uint64_t>(reordered[2]) << 40 | static_cast<uint64_t>(reordered[3]) << 32 |
+					 static_cast<uint64_t>(reordered[4]) << 24 | static_cast<uint64_t>(reordered[5]) << 16 |
+					 static_cast<uint64_t>(reordered[6]) << 8 | static_cast<uint64_t>(reordered[7]);
+	uint64_t lower = static_cast<uint64_t>(reordered[8]) << 56 | static_cast<uint64_t>(reordered[9]) << 48 |
+					 static_cast<uint64_t>(reordered[10]) << 40 | static_cast<uint64_t>(reordered[11]) << 32 |
+					 static_cast<uint64_t>(reordered[12]) << 24 | static_cast<uint64_t>(reordered[13]) << 16 |
+					 static_cast<uint64_t>(reordered[14]) << 8 | static_cast<uint64_t>(reordered[15]);
 
 	// DuckDB expects UUID with high bit flipped for sortability
 	// See duckdb/src/common/types/uuid.cpp

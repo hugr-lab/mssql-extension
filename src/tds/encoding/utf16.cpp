@@ -4,7 +4,7 @@ namespace duckdb {
 namespace tds {
 namespace encoding {
 
-std::vector<uint8_t> Utf16LEEncode(const std::string& input) {
+std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
 	std::vector<uint8_t> result;
 	result.reserve(input.size() * 2);  // Minimum size for ASCII
 
@@ -20,24 +20,24 @@ std::vector<uint8_t> Utf16LEEncode(const std::string& input) {
 			i += 1;
 		} else if ((byte & 0xE0) == 0xC0) {
 			// Two bytes: 110xxxxx 10xxxxxx
-			if (i + 1 >= input.size()) break;
-			codepoint = ((byte & 0x1F) << 6) |
-			            (static_cast<uint8_t>(input[i + 1]) & 0x3F);
+			if (i + 1 >= input.size())
+				break;
+			codepoint = ((byte & 0x1F) << 6) | (static_cast<uint8_t>(input[i + 1]) & 0x3F);
 			i += 2;
 		} else if ((byte & 0xF0) == 0xE0) {
 			// Three bytes: 1110xxxx 10xxxxxx 10xxxxxx
-			if (i + 2 >= input.size()) break;
-			codepoint = ((byte & 0x0F) << 12) |
-			            ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
-			            (static_cast<uint8_t>(input[i + 2]) & 0x3F);
+			if (i + 2 >= input.size())
+				break;
+			codepoint = ((byte & 0x0F) << 12) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 2]) & 0x3F);
 			i += 3;
 		} else if ((byte & 0xF8) == 0xF0) {
 			// Four bytes: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-			if (i + 3 >= input.size()) break;
-			codepoint = ((byte & 0x07) << 18) |
-			            ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
-			            ((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
-			            (static_cast<uint8_t>(input[i + 3]) & 0x3F);
+			if (i + 3 >= input.size())
+				break;
+			codepoint = ((byte & 0x07) << 18) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
+						((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 3]) & 0x3F);
 			i += 4;
 		} else {
 			// Invalid UTF-8 byte, skip it
@@ -48,7 +48,7 @@ std::vector<uint8_t> Utf16LEEncode(const std::string& input) {
 		// Encode Unicode codepoint to UTF-16LE
 		if (codepoint <= 0xFFFF) {
 			// Basic Multilingual Plane (BMP) - single 16-bit code unit
-			result.push_back(static_cast<uint8_t>(codepoint & 0xFF));         // Low byte
+			result.push_back(static_cast<uint8_t>(codepoint & 0xFF));		  // Low byte
 			result.push_back(static_cast<uint8_t>((codepoint >> 8) & 0xFF));  // High byte
 		} else if (codepoint <= 0x10FFFF) {
 			// Supplementary planes - surrogate pair
@@ -68,15 +68,14 @@ std::vector<uint8_t> Utf16LEEncode(const std::string& input) {
 	return result;
 }
 
-std::string Utf16LEDecode(const uint8_t* data, size_t byte_length) {
+std::string Utf16LEDecode(const uint8_t *data, size_t byte_length) {
 	std::string result;
 	result.reserve(byte_length);  // Rough estimate
 
 	size_t i = 0;
 	while (i + 1 < byte_length) {
 		// Read UTF-16LE code unit (little-endian)
-		uint16_t code_unit = static_cast<uint16_t>(data[i]) |
-		                     (static_cast<uint16_t>(data[i + 1]) << 8);
+		uint16_t code_unit = static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
 		i += 2;
 
 		uint32_t codepoint;
@@ -84,16 +83,14 @@ std::string Utf16LEDecode(const uint8_t* data, size_t byte_length) {
 		// Check for surrogate pair
 		if (code_unit >= 0xD800 && code_unit <= 0xDBFF) {
 			// High surrogate - expect low surrogate next
-			if (i + 1 >= byte_length) break;
-			uint16_t low_surrogate = static_cast<uint16_t>(data[i]) |
-			                         (static_cast<uint16_t>(data[i + 1]) << 8);
+			if (i + 1 >= byte_length)
+				break;
+			uint16_t low_surrogate = static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
 			i += 2;
 
 			if (low_surrogate >= 0xDC00 && low_surrogate <= 0xDFFF) {
 				// Valid surrogate pair
-				codepoint = 0x10000 +
-				            ((static_cast<uint32_t>(code_unit - 0xD800) << 10) |
-				             (low_surrogate - 0xDC00));
+				codepoint = 0x10000 + ((static_cast<uint32_t>(code_unit - 0xD800) << 10) | (low_surrogate - 0xDC00));
 			} else {
 				// Invalid surrogate pair, use replacement character
 				codepoint = 0xFFFD;
@@ -127,11 +124,11 @@ std::string Utf16LEDecode(const uint8_t* data, size_t byte_length) {
 	return result;
 }
 
-std::string Utf16LEDecode(const std::vector<uint8_t>& data) {
+std::string Utf16LEDecode(const std::vector<uint8_t> &data) {
 	return Utf16LEDecode(data.data(), data.size());
 }
 
-size_t Utf16LEByteLength(const std::string& input) {
+size_t Utf16LEByteLength(const std::string &input) {
 	size_t byte_count = 0;
 
 	size_t i = 0;
@@ -144,22 +141,22 @@ size_t Utf16LEByteLength(const std::string& input) {
 			codepoint = byte;
 			i += 1;
 		} else if ((byte & 0xE0) == 0xC0) {
-			if (i + 1 >= input.size()) break;
-			codepoint = ((byte & 0x1F) << 6) |
-			            (static_cast<uint8_t>(input[i + 1]) & 0x3F);
+			if (i + 1 >= input.size())
+				break;
+			codepoint = ((byte & 0x1F) << 6) | (static_cast<uint8_t>(input[i + 1]) & 0x3F);
 			i += 2;
 		} else if ((byte & 0xF0) == 0xE0) {
-			if (i + 2 >= input.size()) break;
-			codepoint = ((byte & 0x0F) << 12) |
-			            ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
-			            (static_cast<uint8_t>(input[i + 2]) & 0x3F);
+			if (i + 2 >= input.size())
+				break;
+			codepoint = ((byte & 0x0F) << 12) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 2]) & 0x3F);
 			i += 3;
 		} else if ((byte & 0xF8) == 0xF0) {
-			if (i + 3 >= input.size()) break;
-			codepoint = ((byte & 0x07) << 18) |
-			            ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
-			            ((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
-			            (static_cast<uint8_t>(input[i + 3]) & 0x3F);
+			if (i + 3 >= input.size())
+				break;
+			codepoint = ((byte & 0x07) << 18) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
+						((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 3]) & 0x3F);
 			i += 4;
 		} else {
 			i += 1;

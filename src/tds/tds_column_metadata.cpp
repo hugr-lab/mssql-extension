@@ -1,6 +1,6 @@
 #include "tds/tds_column_metadata.hpp"
-#include "tds/encoding/utf16.hpp"
 #include <stdexcept>
+#include "tds/encoding/utf16.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -11,43 +11,80 @@ namespace tds {
 
 std::string ColumnMetadata::GetTypeName() const {
 	switch (type_id) {
-	case TDS_TYPE_NULL: return "NULL";
-	case TDS_TYPE_TINYINT: return "TINYINT";
-	case TDS_TYPE_BIT: return "BIT";
-	case TDS_TYPE_SMALLINT: return "SMALLINT";
-	case TDS_TYPE_INT: return "INT";
-	case TDS_TYPE_BIGINT: return "BIGINT";
-	case TDS_TYPE_REAL: return "REAL";
-	case TDS_TYPE_FLOAT: return "FLOAT";
-	case TDS_TYPE_MONEY: return "MONEY";
-	case TDS_TYPE_SMALLMONEY: return "SMALLMONEY";
-	case TDS_TYPE_DATETIME: return "DATETIME";
-	case TDS_TYPE_SMALLDATETIME: return "SMALLDATETIME";
-	case TDS_TYPE_INTN: return "INTN";
-	case TDS_TYPE_BITN: return "BITN";
-	case TDS_TYPE_FLOATN: return "FLOATN";
-	case TDS_TYPE_MONEYN: return "MONEYN";
-	case TDS_TYPE_DATETIMEN: return "DATETIMEN";
-	case TDS_TYPE_DECIMAL: return "DECIMAL";
-	case TDS_TYPE_NUMERIC: return "NUMERIC";
-	case TDS_TYPE_UNIQUEIDENTIFIER: return "UNIQUEIDENTIFIER";
-	case TDS_TYPE_BIGCHAR: return "CHAR";
-	case TDS_TYPE_BIGVARCHAR: return "VARCHAR";
-	case TDS_TYPE_NCHAR: return "NCHAR";
-	case TDS_TYPE_NVARCHAR: return "NVARCHAR";
-	case TDS_TYPE_BIGBINARY: return "BINARY";
-	case TDS_TYPE_BIGVARBINARY: return "VARBINARY";
-	case TDS_TYPE_DATE: return "DATE";
-	case TDS_TYPE_TIME: return "TIME";
-	case TDS_TYPE_DATETIME2: return "DATETIME2";
-	case TDS_TYPE_DATETIMEOFFSET: return "DATETIMEOFFSET";
-	case TDS_TYPE_XML: return "XML";
-	case TDS_TYPE_UDT: return "UDT";
-	case TDS_TYPE_SQL_VARIANT: return "SQL_VARIANT";
-	case TDS_TYPE_IMAGE: return "IMAGE";
-	case TDS_TYPE_TEXT: return "TEXT";
-	case TDS_TYPE_NTEXT: return "NTEXT";
-	default: return "UNKNOWN(0x" + std::to_string(type_id) + ")";
+	case TDS_TYPE_NULL:
+		return "NULL";
+	case TDS_TYPE_TINYINT:
+		return "TINYINT";
+	case TDS_TYPE_BIT:
+		return "BIT";
+	case TDS_TYPE_SMALLINT:
+		return "SMALLINT";
+	case TDS_TYPE_INT:
+		return "INT";
+	case TDS_TYPE_BIGINT:
+		return "BIGINT";
+	case TDS_TYPE_REAL:
+		return "REAL";
+	case TDS_TYPE_FLOAT:
+		return "FLOAT";
+	case TDS_TYPE_MONEY:
+		return "MONEY";
+	case TDS_TYPE_SMALLMONEY:
+		return "SMALLMONEY";
+	case TDS_TYPE_DATETIME:
+		return "DATETIME";
+	case TDS_TYPE_SMALLDATETIME:
+		return "SMALLDATETIME";
+	case TDS_TYPE_INTN:
+		return "INTN";
+	case TDS_TYPE_BITN:
+		return "BITN";
+	case TDS_TYPE_FLOATN:
+		return "FLOATN";
+	case TDS_TYPE_MONEYN:
+		return "MONEYN";
+	case TDS_TYPE_DATETIMEN:
+		return "DATETIMEN";
+	case TDS_TYPE_DECIMAL:
+		return "DECIMAL";
+	case TDS_TYPE_NUMERIC:
+		return "NUMERIC";
+	case TDS_TYPE_UNIQUEIDENTIFIER:
+		return "UNIQUEIDENTIFIER";
+	case TDS_TYPE_BIGCHAR:
+		return "CHAR";
+	case TDS_TYPE_BIGVARCHAR:
+		return "VARCHAR";
+	case TDS_TYPE_NCHAR:
+		return "NCHAR";
+	case TDS_TYPE_NVARCHAR:
+		return "NVARCHAR";
+	case TDS_TYPE_BIGBINARY:
+		return "BINARY";
+	case TDS_TYPE_BIGVARBINARY:
+		return "VARBINARY";
+	case TDS_TYPE_DATE:
+		return "DATE";
+	case TDS_TYPE_TIME:
+		return "TIME";
+	case TDS_TYPE_DATETIME2:
+		return "DATETIME2";
+	case TDS_TYPE_DATETIMEOFFSET:
+		return "DATETIMEOFFSET";
+	case TDS_TYPE_XML:
+		return "XML";
+	case TDS_TYPE_UDT:
+		return "UDT";
+	case TDS_TYPE_SQL_VARIANT:
+		return "SQL_VARIANT";
+	case TDS_TYPE_IMAGE:
+		return "IMAGE";
+	case TDS_TYPE_TEXT:
+		return "TEXT";
+	case TDS_TYPE_NTEXT:
+		return "NTEXT";
+	default:
+		return "UNKNOWN(0x" + std::to_string(type_id) + ")";
 	}
 }
 
@@ -85,12 +122,12 @@ bool ColumnMetadata::IsPLPType() const {
 		return false;
 	}
 	switch (type_id) {
-	case TDS_TYPE_BIGCHAR:      // CHAR(MAX) - rare but possible
-	case TDS_TYPE_BIGVARCHAR:   // VARCHAR(MAX)
-	case TDS_TYPE_NCHAR:        // NCHAR(MAX) - rare but possible
-	case TDS_TYPE_NVARCHAR:     // NVARCHAR(MAX)
-	case TDS_TYPE_BIGBINARY:    // BINARY(MAX) - rare but possible
-	case TDS_TYPE_BIGVARBINARY: // VARBINARY(MAX)
+	case TDS_TYPE_BIGCHAR:		 // CHAR(MAX) - rare but possible
+	case TDS_TYPE_BIGVARCHAR:	 // VARCHAR(MAX)
+	case TDS_TYPE_NCHAR:		 // NCHAR(MAX) - rare but possible
+	case TDS_TYPE_NVARCHAR:		 // NVARCHAR(MAX)
+	case TDS_TYPE_BIGBINARY:	 // BINARY(MAX) - rare but possible
+	case TDS_TYPE_BIGVARBINARY:	 // VARBINARY(MAX)
 		return true;
 	default:
 		return false;
@@ -99,18 +136,30 @@ bool ColumnMetadata::IsPLPType() const {
 
 size_t ColumnMetadata::GetFixedSize() const {
 	switch (type_id) {
-	case TDS_TYPE_TINYINT: return 1;
-	case TDS_TYPE_BIT: return 1;
-	case TDS_TYPE_SMALLINT: return 2;
-	case TDS_TYPE_INT: return 4;
-	case TDS_TYPE_BIGINT: return 8;
-	case TDS_TYPE_REAL: return 4;
-	case TDS_TYPE_FLOAT: return 8;
-	case TDS_TYPE_MONEY: return 8;
-	case TDS_TYPE_SMALLMONEY: return 4;
-	case TDS_TYPE_DATETIME: return 8;
-	case TDS_TYPE_SMALLDATETIME: return 4;
-	case TDS_TYPE_DATE: return 3;
+	case TDS_TYPE_TINYINT:
+		return 1;
+	case TDS_TYPE_BIT:
+		return 1;
+	case TDS_TYPE_SMALLINT:
+		return 2;
+	case TDS_TYPE_INT:
+		return 4;
+	case TDS_TYPE_BIGINT:
+		return 8;
+	case TDS_TYPE_REAL:
+		return 4;
+	case TDS_TYPE_FLOAT:
+		return 8;
+	case TDS_TYPE_MONEY:
+		return 8;
+	case TDS_TYPE_SMALLMONEY:
+		return 4;
+	case TDS_TYPE_DATETIME:
+		return 8;
+	case TDS_TYPE_SMALLDATETIME:
+		return 4;
+	case TDS_TYPE_DATE:
+		return 3;
 	default:
 		return 0;  // Variable length or has length prefix
 	}
@@ -120,8 +169,8 @@ size_t ColumnMetadata::GetFixedSize() const {
 // ColumnMetadataParser Implementation
 //===----------------------------------------------------------------------===//
 
-bool ColumnMetadataParser::Parse(const uint8_t* data, size_t length, size_t& bytes_consumed,
-                                  std::vector<ColumnMetadata>& columns) {
+bool ColumnMetadataParser::Parse(const uint8_t *data, size_t length, size_t &bytes_consumed,
+								 std::vector<ColumnMetadata> &columns) {
 	columns.clear();
 	size_t offset = 0;
 
@@ -155,8 +204,7 @@ bool ColumnMetadataParser::Parse(const uint8_t* data, size_t length, size_t& byt
 	return true;
 }
 
-bool ColumnMetadataParser::ParseColumn(const uint8_t* data, size_t length, size_t& offset,
-                                        ColumnMetadata& column) {
+bool ColumnMetadataParser::ParseColumn(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column) {
 	size_t local_offset = 0;
 
 	// Need at least 4 bytes for UserType
@@ -173,8 +221,7 @@ bool ColumnMetadataParser::ParseColumn(const uint8_t* data, size_t length, size_
 	}
 
 	// Read flags (uint16_t LE)
-	column.flags = static_cast<uint16_t>(data[local_offset]) |
-	               (static_cast<uint16_t>(data[local_offset + 1]) << 8);
+	column.flags = static_cast<uint16_t>(data[local_offset]) | (static_cast<uint16_t>(data[local_offset + 1]) << 8);
 	local_offset += 2;
 
 	// Parse type info
@@ -195,8 +242,7 @@ bool ColumnMetadataParser::ParseColumn(const uint8_t* data, size_t length, size_
 	return true;
 }
 
-bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, size_t& offset,
-                                          ColumnMetadata& column) {
+bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, size_t &offset, ColumnMetadata &column) {
 	if (offset >= length) {
 		return false;
 	}
@@ -229,14 +275,16 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, siz
 	case TDS_TYPE_FLOATN:
 	case TDS_TYPE_MONEYN:
 	case TDS_TYPE_DATETIMEN:
-		if (offset >= length) return false;
+		if (offset >= length)
+			return false;
 		column.max_length = data[offset++];
 		break;
 
 	// DECIMAL/NUMERIC (1 byte length, 1 byte precision, 1 byte scale)
 	case TDS_TYPE_DECIMAL:
 	case TDS_TYPE_NUMERIC:
-		if (offset + 3 > length) return false;
+		if (offset + 3 > length)
+			return false;
 		column.max_length = data[offset++];
 		column.precision = data[offset++];
 		column.scale = data[offset++];
@@ -244,7 +292,8 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, siz
 
 	// UNIQUEIDENTIFIER (1 byte length, always 16)
 	case TDS_TYPE_UNIQUEIDENTIFIER:
-		if (offset >= length) return false;
+		if (offset >= length)
+			return false;
 		column.max_length = data[offset++];
 		break;
 
@@ -253,24 +302,23 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, siz
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
-		if (offset + 7 > length) return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) |
-		                    (static_cast<uint16_t>(data[offset + 1]) << 8);
+		if (offset + 7 > length)
+			return false;
+		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
 		offset += 2;
 		// Collation (5 bytes)
-		column.collation = static_cast<uint32_t>(data[offset]) |
-		                   (static_cast<uint32_t>(data[offset + 1]) << 8) |
-		                   (static_cast<uint32_t>(data[offset + 2]) << 16) |
-		                   (static_cast<uint32_t>(data[offset + 3]) << 24);
+		column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+						   (static_cast<uint32_t>(data[offset + 2]) << 16) |
+						   (static_cast<uint32_t>(data[offset + 3]) << 24);
 		offset += 5;  // collation is 5 bytes but we only store 4
 		break;
 
 	// Variable-length binary types (2 bytes length)
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
-		if (offset + 2 > length) return false;
-		column.max_length = static_cast<uint16_t>(data[offset]) |
-		                    (static_cast<uint16_t>(data[offset + 1]) << 8);
+		if (offset + 2 > length)
+			return false;
+		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
 		offset += 2;
 		break;
 
@@ -280,19 +328,22 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, siz
 
 	// TIME (1 byte scale)
 	case TDS_TYPE_TIME:
-		if (offset >= length) return false;
+		if (offset >= length)
+			return false;
 		column.scale = data[offset++];
 		break;
 
 	// DATETIME2 (1 byte scale)
 	case TDS_TYPE_DATETIME2:
-		if (offset >= length) return false;
+		if (offset >= length)
+			return false;
 		column.scale = data[offset++];
 		break;
 
 	// DATETIMEOFFSET (1 byte scale)
 	case TDS_TYPE_DATETIMEOFFSET:
-		if (offset >= length) return false;
+		if (offset >= length)
+			return false;
 		column.scale = data[offset++];
 		break;
 
@@ -303,8 +354,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t* data, size_t length, siz
 	return true;
 }
 
-bool ColumnMetadataParser::ParseColumnName(const uint8_t* data, size_t length, size_t& offset,
-                                            std::string& name) {
+bool ColumnMetadataParser::ParseColumnName(const uint8_t *data, size_t length, size_t &offset, std::string &name) {
 	if (offset >= length) {
 		return false;
 	}

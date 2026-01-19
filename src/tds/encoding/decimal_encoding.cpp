@@ -5,7 +5,7 @@ namespace duckdb {
 namespace tds {
 namespace encoding {
 
-hugeint_t DecimalEncoding::ConvertDecimal(const uint8_t* data, size_t length) {
+hugeint_t DecimalEncoding::ConvertDecimal(const uint8_t *data, size_t length) {
 	if (length == 0) {
 		return hugeint_t(0);
 	}
@@ -23,7 +23,7 @@ hugeint_t DecimalEncoding::ConvertDecimal(const uint8_t* data, size_t length) {
 	return negative ? -magnitude : magnitude;
 }
 
-hugeint_t DecimalEncoding::ConvertMoney(const uint8_t* data) {
+hugeint_t DecimalEncoding::ConvertMoney(const uint8_t *data) {
 	// TDS MONEY is stored as two int32_t:
 	// bytes 0-3: high-order 32 bits (little-endian)
 	// bytes 4-7: low-order 32 bits (little-endian)
@@ -37,7 +37,7 @@ hugeint_t DecimalEncoding::ConvertMoney(const uint8_t* data) {
 	return hugeint_t(value);
 }
 
-hugeint_t DecimalEncoding::ConvertSmallMoney(const uint8_t* data) {
+hugeint_t DecimalEncoding::ConvertSmallMoney(const uint8_t *data) {
 	// SMALLMONEY is stored as int32_t little-endian
 	// Value represents amount × 10000
 	int32_t value = 0;

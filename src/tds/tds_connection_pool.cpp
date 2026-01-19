@@ -3,13 +3,12 @@
 namespace duckdb {
 namespace tds {
 
-ConnectionPool::ConnectionPool(const std::string& context_name, PoolConfiguration config, ConnectionFactory factory)
-    : context_name_(context_name),
-      config_(std::move(config)),
-      factory_(std::move(factory)),
-      next_connection_id_(1),
-      shutdown_flag_(false) {
-
+ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory)
+	: context_name_(context_name),
+	  config_(std::move(config)),
+	  factory_(std::move(factory)),
+	  next_connection_id_(1),
+	  shutdown_flag_(false) {
 	// Start background cleanup thread
 	cleanup_thread_ = std::thread(&ConnectionPool::CleanupThreadFunc, this);
 }
@@ -35,7 +34,7 @@ void ConnectionPool::Shutdown() {
 
 	// Close idle connections
 	while (!idle_connections_.empty()) {
-		auto& meta = idle_connections_.front();
+		auto &meta = idle_connections_.front();
 		if (meta.connection) {
 			meta.connection->Close();
 		}
@@ -44,7 +43,7 @@ void ConnectionPool::Shutdown() {
 	}
 
 	// Close active connections
-	for (auto& pair : active_connections_) {
+	for (auto &pair : active_connections_) {
 		if (pair.second) {
 			pair.second->Close();
 		}
@@ -76,8 +75,8 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 		// Try to get an idle connection
 		auto conn = TryAcquireIdle();
 		if (conn) {
-			auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-			    std::chrono::steady_clock::now() - start).count();
+			auto elapsed =
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 			stats_.acquire_wait_total_ms += elapsed;
 			return conn;
 		}
@@ -95,8 +94,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 				stats_.active_connections++;
 				stats_.connections_created++;
 
-				auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-				    std::chrono::steady_clock::now() - start).count();
+				auto elapsed =
+					std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+						.count();
 				stats_.acquire_wait_total_ms += elapsed;
 				return conn;
 			}
@@ -200,7 +200,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
 	return factory_();
 }
 
-bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection>& conn) {
+bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection> &conn) {
 	if (!conn || !conn->IsAlive()) {
 		return false;
 	}
@@ -230,8 +230,8 @@ void ConnectionPool::CleanupThreadFunc() {
 
 		auto now = std::chrono::steady_clock::now();
 		size_t to_keep = config_.min_connections > stats_.active_connections
-		                     ? config_.min_connections - stats_.active_connections
-		                     : 0;
+							 ? config_.min_connections - stats_.active_connections
+							 : 0;
 
 		// Check each idle connection
 		std::queue<ConnectionMetadata> remaining;
@@ -239,8 +239,7 @@ void ConnectionPool::CleanupThreadFunc() {
 			auto meta = std::move(idle_connections_.front());
 			idle_connections_.pop();
 
-			auto idle_duration = std::chrono::duration_cast<std::chrono::seconds>(
-			    now - meta.last_released).count();
+			auto idle_duration = std::chrono::duration_cast<std::chrono::seconds>(now - meta.last_released).count();
 
 			bool should_close = idle_duration > config_.idle_timeout && remaining.size() >= to_keep;
 

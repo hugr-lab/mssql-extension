@@ -6,15 +6,15 @@
 static int GetMssqlDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_CONN_DEBUG_LOG(lvl, fmt, ...) \
-	do { \
-		if (GetMssqlDebugLevel() >= lvl) \
+#define MSSQL_CONN_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                              \
+		if (GetMssqlDebugLevel() >= lvl)                              \
 			fprintf(stderr, "[MSSQL CONN] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
@@ -22,41 +22,40 @@ namespace duckdb {
 namespace tds {
 
 TdsConnection::TdsConnection()
-    : socket_(new TdsSocket()),
-      state_(ConnectionState::Disconnected),
-      port_(0),
-      spid_(0),
-      created_at_(std::chrono::steady_clock::now()),
-      last_used_at_(created_at_),
-      tls_enabled_(false),
-      next_packet_id_(1),
-      negotiated_packet_size_(TDS_DEFAULT_PACKET_SIZE) {
-}
+	: socket_(new TdsSocket()),
+	  state_(ConnectionState::Disconnected),
+	  port_(0),
+	  spid_(0),
+	  created_at_(std::chrono::steady_clock::now()),
+	  last_used_at_(created_at_),
+	  tls_enabled_(false),
+	  next_packet_id_(1),
+	  negotiated_packet_size_(TDS_DEFAULT_PACKET_SIZE) {}
 
 TdsConnection::~TdsConnection() {
 	Close();
 }
 
-TdsConnection::TdsConnection(TdsConnection&& other) noexcept
-    : socket_(std::move(other.socket_)),
-      state_(other.state_.load()),
-      host_(std::move(other.host_)),
-      port_(other.port_),
-      database_(std::move(other.database_)),
-      spid_(other.spid_),
-      created_at_(other.created_at_),
-      last_used_at_(other.last_used_at_),
-      last_error_(std::move(other.last_error_)),
-      tls_enabled_(other.tls_enabled_),
-      next_packet_id_(other.next_packet_id_),
-      negotiated_packet_size_(other.negotiated_packet_size_) {
+TdsConnection::TdsConnection(TdsConnection &&other) noexcept
+	: socket_(std::move(other.socket_)),
+	  state_(other.state_.load()),
+	  host_(std::move(other.host_)),
+	  port_(other.port_),
+	  database_(std::move(other.database_)),
+	  spid_(other.spid_),
+	  created_at_(other.created_at_),
+	  last_used_at_(other.last_used_at_),
+	  last_error_(std::move(other.last_error_)),
+	  tls_enabled_(other.tls_enabled_),
+	  next_packet_id_(other.next_packet_id_),
+	  negotiated_packet_size_(other.negotiated_packet_size_) {
 	other.state_.store(ConnectionState::Disconnected);
 	other.spid_ = 0;
 	other.tls_enabled_ = false;
 	other.negotiated_packet_size_ = TDS_DEFAULT_PACKET_SIZE;
 }
 
-TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
+TdsConnection &TdsConnection::operator=(TdsConnection &&other) noexcept {
 	if (this != &other) {
 		Close();
 		socket_ = std::move(other.socket_);
@@ -80,7 +79,7 @@ TdsConnection& TdsConnection::operator=(TdsConnection&& other) noexcept {
 	return *this;
 }
 
-bool TdsConnection::Connect(const std::string& host, uint16_t port, int timeout_seconds) {
+bool TdsConnection::Connect(const std::string &host, uint16_t port, int timeout_seconds) {
 	// Can only connect from Disconnected state
 	ConnectionState expected = ConnectionState::Disconnected;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Authenticating)) {
@@ -102,8 +101,8 @@ bool TdsConnection::Connect(const std::string& host, uint16_t port, int timeout_
 	return true;
 }
 
-bool TdsConnection::Authenticate(const std::string& username, const std::string& password, const std::string& database,
-                                  bool use_encrypt) {
+bool TdsConnection::Authenticate(const std::string &username, const std::string &password, const std::string &database,
+								 bool use_encrypt) {
 	// Must be in Authenticating state
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
@@ -154,9 +153,9 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 	}
 
 	// Log the PRELOGIN response
-	MSSQL_CONN_DEBUG_LOG(1, "DoPrelogin: server version=%d.%d.%d, encryption=%d",
-		prelogin_response.version_major, prelogin_response.version_minor,
-		prelogin_response.version_build, static_cast<int>(prelogin_response.encryption));
+	MSSQL_CONN_DEBUG_LOG(1, "DoPrelogin: server version=%d.%d.%d, encryption=%d", prelogin_response.version_major,
+						 prelogin_response.version_minor, prelogin_response.version_build,
+						 static_cast<int>(prelogin_response.encryption));
 
 	// Handle encryption based on what we requested and what server responded
 	if (use_encrypt) {
@@ -192,11 +191,11 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 	return true;
 }
 
-bool TdsConnection::DoLogin7(const std::string& username, const std::string& password, const std::string& database) {
+bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database,
-	                                           "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, "DuckDB MSSQL Extension",
+											   TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
@@ -213,8 +212,8 @@ bool TdsConnection::DoLogin7(const std::string& username, const std::string& pas
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
-			last_error_ = "Authentication failed (error " + std::to_string(login_response.error_number) + "): " +
-			              login_response.error_message;
+			last_error_ = "Authentication failed (error " + std::to_string(login_response.error_number) +
+						  "): " + login_response.error_message;
 		} else {
 			last_error_ = "Authentication failed: " + login_response.error_message;
 		}
@@ -236,7 +235,7 @@ bool TdsConnection::Ping(int timeout_ms) {
 	// Can only ping from Idle state
 	ConnectionState expected = ConnectionState::Idle;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
-		return state_.load() == ConnectionState::Executing;  // Already executing is "alive"
+		return state_.load() == ConnectionState::Executing;	 // Already executing is "alive"
 	}
 
 	TdsPacket ping = TdsProtocol::BuildPing();
@@ -318,8 +317,8 @@ bool TdsConnection::WaitForAttentionAck(int timeout_ms) {
 	auto start = std::chrono::steady_clock::now();
 
 	while (true) {
-		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-		    std::chrono::steady_clock::now() - start).count();
+		auto elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 		if (elapsed >= timeout_ms) {
 			// Timeout - force disconnect
@@ -354,12 +353,13 @@ bool TdsConnection::IsLongIdle() const {
 	return idle_duration > LONG_IDLE_THRESHOLD;
 }
 
-bool TdsConnection::ExecuteBatch(const std::string& sql) {
+bool TdsConnection::ExecuteBatch(const std::string &sql) {
 	// Can only execute from Idle state
 	ConnectionState expected = ConnectionState::Idle;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
-		last_error_ = "Cannot execute: connection not in Idle state (current: " +
-		              std::string(ConnectionStateToString(expected)) + ")";
+		last_error_ =
+			"Cannot execute: connection not in Idle state (current: " + std::string(ConnectionStateToString(expected)) +
+			")";
 		return false;
 	}
 
@@ -381,15 +381,14 @@ bool TdsConnection::ExecuteBatch(const std::string& sql) {
 			std::vector<uint8_t> combined;
 			size_t total_size = 0;
 			for (size_t i = 0; i < packets.size(); i++) {
-				auto& packet = packets[i];
+				auto &packet = packets[i];
 				packet.SetPacketId(pkt_id++);
-				MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: preparing packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
-				                i + 1, packets.size(),
-				                static_cast<unsigned>(packet.GetType()),
-				                static_cast<unsigned>(packet.GetStatus()),
-				                packet.GetLength(),
-				                packet.GetPayload().size(), packet.IsEndOfMessage(),
-				                packet.GetPacketId());
+				MSSQL_CONN_DEBUG_LOG(2,
+									 "ExecuteBatch: preparing packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, "
+									 "payload_size=%zu, eom=%d, pkt_id=%u",
+									 i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
+									 static_cast<unsigned>(packet.GetStatus()), packet.GetLength(),
+									 packet.GetPayload().size(), packet.IsEndOfMessage(), packet.GetPacketId());
 				std::vector<uint8_t> serialized = packet.Serialize();
 				combined.insert(combined.end(), serialized.begin(), serialized.end());
 				total_size += serialized.size();
@@ -403,18 +402,17 @@ bool TdsConnection::ExecuteBatch(const std::string& sql) {
 		} else {
 			// TLS: send packets individually
 			for (size_t i = 0; i < packets.size(); i++) {
-				auto& packet = packets[i];
+				auto &packet = packets[i];
 				packet.SetPacketId(pkt_id++);
-				MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: sending TLS packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
-				                i + 1, packets.size(),
-				                static_cast<unsigned>(packet.GetType()),
-				                static_cast<unsigned>(packet.GetStatus()),
-				                packet.GetLength(),
-				                packet.GetPayload().size(), packet.IsEndOfMessage(),
-				                packet.GetPacketId());
+				MSSQL_CONN_DEBUG_LOG(2,
+									 "ExecuteBatch: sending TLS packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, "
+									 "payload_size=%zu, eom=%d, pkt_id=%u",
+									 i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
+									 static_cast<unsigned>(packet.GetStatus()), packet.GetLength(),
+									 packet.GetPayload().size(), packet.IsEndOfMessage(), packet.GetPacketId());
 				if (!socket_->SendPacket(packet)) {
-					last_error_ = "Failed to send TLS packet " + std::to_string(i+1) + "/" +
-					              std::to_string(packets.size()) + ": " + socket_->GetLastError();
+					last_error_ = "Failed to send TLS packet " + std::to_string(i + 1) + "/" +
+								  std::to_string(packets.size()) + ": " + socket_->GetLastError();
 					state_.store(ConnectionState::Disconnected);
 					return false;
 				}
@@ -423,15 +421,14 @@ bool TdsConnection::ExecuteBatch(const std::string& sql) {
 	} else {
 		// Single packet - send normally
 		for (size_t i = 0; i < packets.size(); i++) {
-			auto& packet = packets[i];
+			auto &packet = packets[i];
 			packet.SetPacketId(next_packet_id_++);
-			MSSQL_CONN_DEBUG_LOG(2, "ExecuteBatch: sending packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, payload_size=%zu, eom=%d, pkt_id=%u",
-			                i + 1, packets.size(),
-			                static_cast<unsigned>(packet.GetType()),
-			                static_cast<unsigned>(packet.GetStatus()),
-			                packet.GetLength(),
-			                packet.GetPayload().size(), packet.IsEndOfMessage(),
-			                packet.GetPacketId());
+			MSSQL_CONN_DEBUG_LOG(2,
+								 "ExecuteBatch: sending packet %zu/%zu, type=0x%02x, status=0x%02x, length=%u, "
+								 "payload_size=%zu, eom=%d, pkt_id=%u",
+								 i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
+								 static_cast<unsigned>(packet.GetStatus()), packet.GetLength(),
+								 packet.GetPayload().size(), packet.IsEndOfMessage(), packet.GetPacketId());
 			// Dump full packet header and first bytes of payload for debugging
 			if (i == 0 && GetMssqlDebugLevel() >= 3) {
 				std::vector<uint8_t> serialized = packet.Serialize();
@@ -458,7 +455,7 @@ bool TdsConnection::ExecuteBatch(const std::string& sql) {
 	return true;
 }
 
-ssize_t TdsConnection::ReceiveData(uint8_t* buffer, size_t buffer_size, int timeout_ms) {
+ssize_t TdsConnection::ReceiveData(uint8_t *buffer, size_t buffer_size, int timeout_ms) {
 	ConnectionState current = state_.load();
 
 	// Can receive data in Executing or Cancelling states

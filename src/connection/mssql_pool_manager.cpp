@@ -2,19 +2,15 @@
 
 namespace duckdb {
 
-MssqlPoolManager& MssqlPoolManager::Instance() {
+MssqlPoolManager &MssqlPoolManager::Instance() {
 	static MssqlPoolManager instance;
 	return instance;
 }
 
-tds::ConnectionPool* MssqlPoolManager::GetOrCreatePool(const std::string& context_name,
-                                                        const MSSQLPoolConfig& config,
-                                                        const std::string& host,
-                                                        uint16_t port,
-                                                        const std::string& username,
-                                                        const std::string& password,
-                                                        const std::string& database,
-                                                        bool use_encrypt) {
+tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &context_name, const MSSQLPoolConfig &config,
+													   const std::string &host, uint16_t port,
+													   const std::string &username, const std::string &password,
+													   const std::string &database, bool use_encrypt) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 
 	// Check if pool already exists
@@ -46,13 +42,13 @@ tds::ConnectionPool* MssqlPoolManager::GetOrCreatePool(const std::string& contex
 
 	// Create the pool
 	std::unique_ptr<tds::ConnectionPool> pool(new tds::ConnectionPool(context_name, pool_config, factory));
-	auto* ptr = pool.get();
+	auto *ptr = pool.get();
 	pools_[context_name] = std::move(pool);
 
 	return ptr;
 }
 
-tds::ConnectionPool* MssqlPoolManager::GetPool(const std::string& context_name) {
+tds::ConnectionPool *MssqlPoolManager::GetPool(const std::string &context_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	auto it = pools_.find(context_name);
 	if (it != pools_.end()) {
@@ -61,7 +57,7 @@ tds::ConnectionPool* MssqlPoolManager::GetPool(const std::string& context_name) 
 	return nullptr;
 }
 
-void MssqlPoolManager::RemovePool(const std::string& context_name) {
+void MssqlPoolManager::RemovePool(const std::string &context_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	auto it = pools_.find(context_name);
 	if (it != pools_.end()) {
@@ -70,7 +66,7 @@ void MssqlPoolManager::RemovePool(const std::string& context_name) {
 	}
 }
 
-tds::PoolStatistics MssqlPoolManager::GetPoolStats(const std::string& context_name) {
+tds::PoolStatistics MssqlPoolManager::GetPoolStats(const std::string &context_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	auto it = pools_.find(context_name);
 	if (it != pools_.end()) {
@@ -79,7 +75,7 @@ tds::PoolStatistics MssqlPoolManager::GetPoolStats(const std::string& context_na
 	return tds::PoolStatistics{};
 }
 
-bool MssqlPoolManager::HasPool(const std::string& context_name) {
+bool MssqlPoolManager::HasPool(const std::string &context_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	return pools_.find(context_name) != pools_.end();
 }
@@ -88,7 +84,7 @@ std::vector<std::string> MssqlPoolManager::GetAllPoolNames() {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	std::vector<std::string> names;
 	names.reserve(pools_.size());
-	for (const auto& pair : pools_) {
+	for (const auto &pair : pools_) {
 		names.push_back(pair.first);
 	}
 	return names;

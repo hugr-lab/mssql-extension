@@ -1,14 +1,14 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_catalog.hpp"
-#include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "catalog/mssql_table_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -31,12 +31,13 @@ static CreateSchemaInfo MakeSchemaInfo(const string &name) {
 //===----------------------------------------------------------------------===//
 
 MSSQLSchemaEntry::MSSQLSchemaEntry(Catalog &catalog, const string &name)
-    : SchemaCatalogEntry(catalog, [&]() -> CreateSchemaInfo& {
-          static thread_local CreateSchemaInfo info;
-          info = MakeSchemaInfo(name);
-          return info;
-      }()), tables_(*this) {
-}
+	: SchemaCatalogEntry(catalog,
+						 [&]() -> CreateSchemaInfo & {
+							 static thread_local CreateSchemaInfo info;
+							 info = MakeSchemaInfo(name);
+							 return info;
+						 }()),
+	  tables_(*this) {}
 
 MSSQLSchemaEntry::~MSSQLSchemaEntry() = default;
 
@@ -45,7 +46,7 @@ MSSQLSchemaEntry::~MSSQLSchemaEntry() = default;
 //===----------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::LookupEntry(CatalogTransaction transaction,
-                                                          const EntryLookupInfo &lookup_info) {
+														 const EntryLookupInfo &lookup_info) {
 	CatalogType type = lookup_info.GetCatalogType();
 	const string &name = lookup_info.GetEntryName();
 
@@ -63,7 +64,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::LookupEntry(CatalogTransaction tran
 }
 
 void MSSQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
-                            const std::function<void(CatalogEntry &)> &callback) {
+							const std::function<void(CatalogEntry &)> &callback) {
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
@@ -82,8 +83,7 @@ void MSSQLSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEn
 // Write Operations - Check access mode and throw appropriate error
 //===----------------------------------------------------------------------===//
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction transaction,
-                                                          BoundCreateTableInfo &info) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	// Check if catalog is read-only
 	auto &mssql_catalog = GetMSSQLCatalog();
 	mssql_catalog.CheckWriteAccess("CREATE TABLE");
@@ -117,59 +117,56 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	return tables_.GetEntry(transaction.GetContext(), table_name);
 }
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateFunction(CatalogTransaction transaction,
-                                                             CreateFunctionInfo &info) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE FUNCTION");
 	throw NotImplementedException("MSSQL catalog: CREATE FUNCTION is not supported");
 }
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateIndex(CatalogTransaction transaction,
-                                                          CreateIndexInfo &info,
-                                                          TableCatalogEntry &table) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
+														 TableCatalogEntry &table) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE INDEX");
-	throw NotImplementedException("MSSQL catalog: CREATE INDEX via DDL is not yet implemented. "
-	                              "Use mssql_exec() to execute T-SQL directly.");
+	throw NotImplementedException(
+		"MSSQL catalog: CREATE INDEX via DDL is not yet implemented. "
+		"Use mssql_exec() to execute T-SQL directly.");
 }
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateView(CatalogTransaction transaction,
-                                                         CreateViewInfo &info) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE VIEW");
-	throw NotImplementedException("MSSQL catalog: CREATE VIEW via DDL is not yet implemented. "
-	                              "Use mssql_exec() to execute T-SQL directly.");
+	throw NotImplementedException(
+		"MSSQL catalog: CREATE VIEW via DDL is not yet implemented. "
+		"Use mssql_exec() to execute T-SQL directly.");
 }
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateSequence(CatalogTransaction transaction,
-                                                             CreateSequenceInfo &info) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE SEQUENCE");
 	throw NotImplementedException("MSSQL catalog: CREATE SEQUENCE is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
-                                                                  CreateTableFunctionInfo &info) {
+																 CreateTableFunctionInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE TABLE FUNCTION");
 	throw NotImplementedException("MSSQL catalog: CREATE TABLE FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
-                                                                 CreateCopyFunctionInfo &info) {
+																CreateCopyFunctionInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE COPY FUNCTION");
 	throw NotImplementedException("MSSQL catalog: CREATE COPY FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
-                                                                   CreatePragmaFunctionInfo &info) {
+																  CreatePragmaFunctionInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE PRAGMA FUNCTION");
 	throw NotImplementedException("MSSQL catalog: CREATE PRAGMA FUNCTION is not supported");
 }
 
 optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateCollation(CatalogTransaction transaction,
-                                                              CreateCollationInfo &info) {
+															 CreateCollationInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE COLLATION");
 	throw NotImplementedException("MSSQL catalog: CREATE COLLATION is not supported");
 }
 
-optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateType(CatalogTransaction transaction,
-                                                         CreateTypeInfo &info) {
+optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
 	GetMSSQLCatalog().CheckWriteAccess("CREATE TYPE");
 	throw NotImplementedException("MSSQL catalog: CREATE TYPE is not supported");
 }
@@ -180,9 +177,10 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 	// Check if this is an ALTER TABLE operation
 	if (info.type != AlterType::ALTER_TABLE) {
-		throw NotImplementedException("MSSQL catalog: ALTER %s via DDL is not yet implemented. "
-		                              "Use mssql_exec() to execute T-SQL directly.",
-		                              EnumUtil::ToString(info.type));
+		throw NotImplementedException(
+			"MSSQL catalog: ALTER %s via DDL is not yet implemented. "
+			"Use mssql_exec() to execute T-SQL directly.",
+			EnumUtil::ToString(info.type));
 	}
 
 	auto &alter_table_info = info.Cast<AlterTableInfo>();
@@ -212,8 +210,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename_col_info = alter_table_info.Cast<RenameColumnInfo>();
-		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name, table_name,
-		                                                  rename_col_info.old_name, rename_col_info.new_name);
+		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name, table_name, rename_col_info.old_name,
+														 rename_col_info.new_name);
 		break;
 	}
 
@@ -221,8 +219,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
 		// SQL Server requires specifying nullability when altering type
 		// We default to NULL since we don't have that info easily available
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name, table_name,
-		                                                     type_info.column_name, type_info.target_type, true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name, table_name, type_info.column_name,
+															type_info.target_type, true);
 		break;
 	}
 
@@ -248,11 +246,10 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			}
 		}
 		if (!found) {
-			throw CatalogException("Column '%s' not found in table '%s'",
-			                       notnull_info.column_name, table_name);
+			throw CatalogException("Column '%s' not found in table '%s'", notnull_info.column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name,
-		                                                            notnull_info.column_name, col_type, true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name, notnull_info.column_name, col_type,
+																   true);
 		break;
 	}
 
@@ -277,18 +274,18 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			}
 		}
 		if (!found) {
-			throw CatalogException("Column '%s' not found in table '%s'",
-			                       dropnull_info.column_name, table_name);
+			throw CatalogException("Column '%s' not found in table '%s'", dropnull_info.column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name,
-		                                                            dropnull_info.column_name, col_type, false);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name, dropnull_info.column_name,
+																   col_type, false);
 		break;
 	}
 
 	default:
-		throw NotImplementedException("MSSQL catalog: ALTER TABLE %s via DDL is not yet implemented. "
-		                              "Use mssql_exec() to execute T-SQL directly.",
-		                              EnumUtil::ToString(alter_table_info.alter_table_type));
+		throw NotImplementedException(
+			"MSSQL catalog: ALTER TABLE %s via DDL is not yet implemented. "
+			"Use mssql_exec() to execute T-SQL directly.",
+			EnumUtil::ToString(alter_table_info.alter_table_type));
 	}
 
 	// Execute DDL on SQL Server
@@ -319,9 +316,10 @@ void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 
 	// Other drop types not yet implemented
-	throw NotImplementedException("MSSQL catalog: DROP %s via DDL is not yet implemented. "
-	                              "Use mssql_exec() to execute T-SQL directly.",
-	                              CatalogTypeToString(info.type));
+	throw NotImplementedException(
+		"MSSQL catalog: DROP %s via DDL is not yet implemented. "
+		"Use mssql_exec() to execute T-SQL directly.",
+		CatalogTypeToString(info.type));
 }
 
 //===----------------------------------------------------------------------===//

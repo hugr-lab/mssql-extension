@@ -25,16 +25,14 @@ WHERE s.name = '%s'
 // Constructor
 //===----------------------------------------------------------------------===//
 
-MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds)
-    : cache_ttl_seconds_(cache_ttl_seconds) {
-}
+MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds) : cache_ttl_seconds_(cache_ttl_seconds) {}
 
 //===----------------------------------------------------------------------===//
 // Public Methods
 //===----------------------------------------------------------------------===//
 
 idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const string &schema_name,
-                                            const string &table_name) {
+										   const string &table_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
 	auto key = BuildCacheKey(schema_name, table_name);
@@ -59,8 +57,8 @@ idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const
 }
 
 unique_ptr<BaseStatistics> MSSQLStatisticsProvider::GetTableStatistics(tds::TdsConnection &connection,
-                                                                        const string &schema_name,
-                                                                        const string &table_name) {
+																	   const string &schema_name,
+																	   const string &table_name) {
 	idx_t row_count = GetRowCount(connection, schema_name, table_name);
 
 	// Create base statistics with cardinality estimate
@@ -135,7 +133,7 @@ bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats) co
 }
 
 idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, const string &schema_name,
-                                              const string &table_name) {
+											 const string &table_name) {
 	// Escape single quotes in schema/table names to prevent SQL injection
 	string safe_schema = schema_name;
 	string safe_table = table_name;
@@ -171,4 +169,4 @@ idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, con
 	}
 }
 
-} // namespace duckdb
+}  // namespace duckdb

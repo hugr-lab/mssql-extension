@@ -1,36 +1,38 @@
 #include "tds/encoding/type_converter.hpp"
-#include "tds/encoding/decimal_encoding.hpp"
-#include "tds/encoding/datetime_encoding.hpp"
-#include "tds/encoding/guid_encoding.hpp"
-#include "tds/encoding/utf16.hpp"
-#include "tds/tds_types.hpp"
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include <cstring>
-#include <cstdlib>
-#include <chrono>
+#include "tds/encoding/datetime_encoding.hpp"
+#include "tds/encoding/decimal_encoding.hpp"
+#include "tds/encoding/guid_encoding.hpp"
+#include "tds/encoding/utf16.hpp"
+#include "tds/tds_types.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetTypeConverterDebugLevel() {
 	static int level = -1;
 	if (level == -1) {
-		const char* env = std::getenv("MSSQL_DEBUG");
+		const char *env = std::getenv("MSSQL_DEBUG");
 		level = env ? std::atoi(env) : 0;
 	}
 	return level;
 }
 
-#define MSSQL_TC_DEBUG_LOG(level, fmt, ...) \
-	do { if (GetTypeConverterDebugLevel() >= level) { \
-		fprintf(stderr, "[MSSQL TC] " fmt "\n", ##__VA_ARGS__); \
-	} } while(0)
+#define MSSQL_TC_DEBUG_LOG(level, fmt, ...)                         \
+	do {                                                            \
+		if (GetTypeConverterDebugLevel() >= level) {                \
+			fprintf(stderr, "[MSSQL TC] " fmt "\n", ##__VA_ARGS__); \
+		}                                                           \
+	} while (0)
 
 namespace duckdb {
 namespace tds {
 namespace encoding {
 
-LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
+LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	switch (column.type_id) {
 	// Integer types
 	// Note: SQL Server TINYINT is unsigned (0-255), maps to UTINYINT
@@ -46,10 +48,14 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	// Nullable integer variants
 	case TDS_TYPE_INTN:
 		switch (column.max_length) {
-		case 1: return LogicalType::UTINYINT;  // SQL Server TINYINT is unsigned
-		case 2: return LogicalType::SMALLINT;
-		case 4: return LogicalType::INTEGER;
-		case 8: return LogicalType::BIGINT;
+		case 1:
+			return LogicalType::UTINYINT;  // SQL Server TINYINT is unsigned
+		case 2:
+			return LogicalType::SMALLINT;
+		case 4:
+			return LogicalType::INTEGER;
+		case 8:
+			return LogicalType::BIGINT;
 		default:
 			throw InvalidInputException("Invalid INTN length: %d", column.max_length);
 		}
@@ -117,14 +123,13 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata& column) {
 	case TDS_TYPE_TEXT:
 	case TDS_TYPE_NTEXT:
 		throw InvalidInputException(
-		    "MSSQL Error: Unsupported SQL Server type '%s' (0x%02X) for column '%s'. "
-		    "Consider casting to VARCHAR or excluding this column.",
-		    GetTypeName(column.type_id).c_str(), column.type_id, column.name.c_str());
+			"MSSQL Error: Unsupported SQL Server type '%s' (0x%02X) for column '%s'. "
+			"Consider casting to VARCHAR or excluding this column.",
+			GetTypeName(column.type_id).c_str(), column.type_id, column.name.c_str());
 
 	default:
-		throw InvalidInputException(
-		    "MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.",
-		    column.type_id, column.name.c_str());
+		throw InvalidInputException("MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.", column.type_id,
+									column.name.c_str());
 	}
 }
 
@@ -167,48 +172,83 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 
 std::string TypeConverter::GetTypeName(uint8_t type_id) {
 	switch (type_id) {
-	case TDS_TYPE_TINYINT: return "TINYINT";
-	case TDS_TYPE_SMALLINT: return "SMALLINT";
-	case TDS_TYPE_INT: return "INT";
-	case TDS_TYPE_BIGINT: return "BIGINT";
-	case TDS_TYPE_INTN: return "INTN";
-	case TDS_TYPE_BIT: return "BIT";
-	case TDS_TYPE_BITN: return "BITN";
-	case TDS_TYPE_REAL: return "REAL";
-	case TDS_TYPE_FLOAT: return "FLOAT";
-	case TDS_TYPE_FLOATN: return "FLOATN";
-	case TDS_TYPE_DECIMAL: return "DECIMAL";
-	case TDS_TYPE_NUMERIC: return "NUMERIC";
-	case TDS_TYPE_MONEY: return "MONEY";
-	case TDS_TYPE_SMALLMONEY: return "SMALLMONEY";
-	case TDS_TYPE_MONEYN: return "MONEYN";
-	case TDS_TYPE_BIGCHAR: return "CHAR";
-	case TDS_TYPE_BIGVARCHAR: return "VARCHAR";
-	case TDS_TYPE_NCHAR: return "NCHAR";
-	case TDS_TYPE_NVARCHAR: return "NVARCHAR";
-	case TDS_TYPE_BIGBINARY: return "BINARY";
-	case TDS_TYPE_BIGVARBINARY: return "VARBINARY";
-	case TDS_TYPE_DATE: return "DATE";
-	case TDS_TYPE_TIME: return "TIME";
-	case TDS_TYPE_DATETIME: return "DATETIME";
-	case TDS_TYPE_SMALLDATETIME: return "SMALLDATETIME";
-	case TDS_TYPE_DATETIME2: return "DATETIME2";
-	case TDS_TYPE_DATETIMEN: return "DATETIMEN";
-	case TDS_TYPE_DATETIMEOFFSET: return "DATETIMEOFFSET";
-	case TDS_TYPE_UNIQUEIDENTIFIER: return "UNIQUEIDENTIFIER";
-	case TDS_TYPE_XML: return "XML";
-	case TDS_TYPE_UDT: return "UDT";
-	case TDS_TYPE_SQL_VARIANT: return "SQL_VARIANT";
-	case TDS_TYPE_IMAGE: return "IMAGE";
-	case TDS_TYPE_TEXT: return "TEXT";
-	case TDS_TYPE_NTEXT: return "NTEXT";
-	default: return "UNKNOWN";
+	case TDS_TYPE_TINYINT:
+		return "TINYINT";
+	case TDS_TYPE_SMALLINT:
+		return "SMALLINT";
+	case TDS_TYPE_INT:
+		return "INT";
+	case TDS_TYPE_BIGINT:
+		return "BIGINT";
+	case TDS_TYPE_INTN:
+		return "INTN";
+	case TDS_TYPE_BIT:
+		return "BIT";
+	case TDS_TYPE_BITN:
+		return "BITN";
+	case TDS_TYPE_REAL:
+		return "REAL";
+	case TDS_TYPE_FLOAT:
+		return "FLOAT";
+	case TDS_TYPE_FLOATN:
+		return "FLOATN";
+	case TDS_TYPE_DECIMAL:
+		return "DECIMAL";
+	case TDS_TYPE_NUMERIC:
+		return "NUMERIC";
+	case TDS_TYPE_MONEY:
+		return "MONEY";
+	case TDS_TYPE_SMALLMONEY:
+		return "SMALLMONEY";
+	case TDS_TYPE_MONEYN:
+		return "MONEYN";
+	case TDS_TYPE_BIGCHAR:
+		return "CHAR";
+	case TDS_TYPE_BIGVARCHAR:
+		return "VARCHAR";
+	case TDS_TYPE_NCHAR:
+		return "NCHAR";
+	case TDS_TYPE_NVARCHAR:
+		return "NVARCHAR";
+	case TDS_TYPE_BIGBINARY:
+		return "BINARY";
+	case TDS_TYPE_BIGVARBINARY:
+		return "VARBINARY";
+	case TDS_TYPE_DATE:
+		return "DATE";
+	case TDS_TYPE_TIME:
+		return "TIME";
+	case TDS_TYPE_DATETIME:
+		return "DATETIME";
+	case TDS_TYPE_SMALLDATETIME:
+		return "SMALLDATETIME";
+	case TDS_TYPE_DATETIME2:
+		return "DATETIME2";
+	case TDS_TYPE_DATETIMEN:
+		return "DATETIMEN";
+	case TDS_TYPE_DATETIMEOFFSET:
+		return "DATETIMEOFFSET";
+	case TDS_TYPE_UNIQUEIDENTIFIER:
+		return "UNIQUEIDENTIFIER";
+	case TDS_TYPE_XML:
+		return "XML";
+	case TDS_TYPE_UDT:
+		return "UDT";
+	case TDS_TYPE_SQL_VARIANT:
+		return "SQL_VARIANT";
+	case TDS_TYPE_IMAGE:
+		return "IMAGE";
+	case TDS_TYPE_TEXT:
+		return "TEXT";
+	case TDS_TYPE_NTEXT:
+		return "NTEXT";
+	default:
+		return "UNKNOWN";
 	}
 }
 
-void TypeConverter::ConvertValue(const std::vector<uint8_t>& value, bool is_null,
-                                  const ColumnMetadata& column,
-                                  Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null, const ColumnMetadata &column,
+								 Vector &vector, idx_t row_idx) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
@@ -285,9 +325,8 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t>& value, bool is_null
 	}
 }
 
-void TypeConverter::ConvertInteger(const std::vector<uint8_t>& value,
-                                    const ColumnMetadata& column,
-                                    Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertInteger(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								   idx_t row_idx) {
 	size_t len = value.size();
 
 	switch (len) {
@@ -318,15 +357,13 @@ void TypeConverter::ConvertInteger(const std::vector<uint8_t>& value,
 	}
 }
 
-void TypeConverter::ConvertBoolean(const std::vector<uint8_t>& value,
-                                    Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertBoolean(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
 	bool b = !value.empty() && value[0] != 0;
 	FlatVector::GetData<bool>(vector)[row_idx] = b;
 }
 
-void TypeConverter::ConvertFloat(const std::vector<uint8_t>& value,
-                                  const ColumnMetadata& column,
-                                  Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertFloat(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								 idx_t row_idx) {
 	if (value.size() == 4) {
 		float f = 0;
 		std::memcpy(&f, value.data(), 4);
@@ -338,9 +375,8 @@ void TypeConverter::ConvertFloat(const std::vector<uint8_t>& value,
 	}
 }
 
-void TypeConverter::ConvertDecimal(const std::vector<uint8_t>& value,
-                                    const ColumnMetadata& column,
-                                    Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertDecimal(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								   idx_t row_idx) {
 	hugeint_t int_value = DecimalEncoding::ConvertDecimal(value.data(), value.size());
 
 	// DuckDB DECIMAL uses different storage based on precision
@@ -355,9 +391,8 @@ void TypeConverter::ConvertDecimal(const std::vector<uint8_t>& value,
 	}
 }
 
-void TypeConverter::ConvertMoney(const std::vector<uint8_t>& value,
-                                  const ColumnMetadata& column,
-                                  Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertMoney(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								 idx_t row_idx) {
 	hugeint_t int_value;
 
 	if (value.size() == 8) {
@@ -373,9 +408,8 @@ void TypeConverter::ConvertMoney(const std::vector<uint8_t>& value,
 	}
 }
 
-void TypeConverter::ConvertString(const std::vector<uint8_t>& value,
-                                   const ColumnMetadata& column,
-                                   Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertString(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								  idx_t row_idx) {
 	auto start = std::chrono::steady_clock::now();
 	std::string str;
 
@@ -385,7 +419,7 @@ void TypeConverter::ConvertString(const std::vector<uint8_t>& value,
 		str = Utf16LEDecode(value.data(), value.size());
 	} else {
 		// CHAR/VARCHAR are single-byte (respect collation for encoding, but typically CP1252/UTF-8)
-		str = std::string(reinterpret_cast<const char*>(value.data()), value.size());
+		str = std::string(reinterpret_cast<const char *>(value.data()), value.size());
 	}
 	auto decode_end = std::chrono::steady_clock::now();
 
@@ -409,33 +443,29 @@ void TypeConverter::ConvertString(const std::vector<uint8_t>& value,
 
 	// Log only for large strings (>100 bytes) at debug level 2
 	if (value.size() > 100) {
-		MSSQL_TC_DEBUG_LOG(2, "ConvertString: len=%zu, total=%ldus, decode=%ldus, addstr=%ldus",
-		                   value.size(), (long)total_us, (long)decode_us, (long)add_us);
+		MSSQL_TC_DEBUG_LOG(2, "ConvertString: len=%zu, total=%ldus, decode=%ldus, addstr=%ldus", value.size(),
+						   (long)total_us, (long)decode_us, (long)add_us);
 	}
 }
 
-void TypeConverter::ConvertBinary(const std::vector<uint8_t>& value,
-                                   Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertBinary(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
 	FlatVector::GetData<string_t>(vector)[row_idx] =
-	    StringVector::AddStringOrBlob(vector, reinterpret_cast<const char*>(value.data()), value.size());
+		StringVector::AddStringOrBlob(vector, reinterpret_cast<const char *>(value.data()), value.size());
 }
 
-void TypeConverter::ConvertDate(const std::vector<uint8_t>& value,
-                                 Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertDate(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
 	date_t d = DateTimeEncoding::ConvertDate(value.data());
 	FlatVector::GetData<date_t>(vector)[row_idx] = d;
 }
 
-void TypeConverter::ConvertTime(const std::vector<uint8_t>& value,
-                                 const ColumnMetadata& column,
-                                 Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertTime(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+								idx_t row_idx) {
 	dtime_t t = DateTimeEncoding::ConvertTime(value.data(), column.scale);
 	FlatVector::GetData<dtime_t>(vector)[row_idx] = t;
 }
 
-void TypeConverter::ConvertDateTime(const std::vector<uint8_t>& value,
-                                     const ColumnMetadata& column,
-                                     Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertDateTime(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
+									idx_t row_idx) {
 	timestamp_t ts;
 
 	switch (column.type_id) {
@@ -464,15 +494,13 @@ void TypeConverter::ConvertDateTime(const std::vector<uint8_t>& value,
 	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
 }
 
-void TypeConverter::ConvertDatetimeOffset(const std::vector<uint8_t>& value,
-                                           const ColumnMetadata& column,
-                                           Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertDatetimeOffset(const std::vector<uint8_t> &value, const ColumnMetadata &column,
+										  Vector &vector, idx_t row_idx) {
 	timestamp_t ts = DateTimeEncoding::ConvertDatetimeOffset(value.data(), column.scale);
 	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
 }
 
-void TypeConverter::ConvertGuid(const std::vector<uint8_t>& value,
-                                 Vector& vector, idx_t row_idx) {
+void TypeConverter::ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
 	hugeint_t guid = GuidEncoding::ConvertGuid(value.data());
 	FlatVector::GetData<hugeint_t>(vector)[row_idx] = guid;
 }
