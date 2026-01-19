@@ -63,8 +63,8 @@ END AS case_result
 ----
 1
 
-# Note: Multi-packet INSERT tests removed - mssql_execute with multi-packet
-# requires separate investigation. SELECT tests above verify multi-packet read operations.
+# Note: Multi-packet INSERT tests require catalog integration.
+# SELECT tests above verify multi-packet read operations.
 
 #
 # Test 7: Multiple multi-packet queries in sequence over TLS

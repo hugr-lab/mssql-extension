@@ -57,8 +57,8 @@ END AS case_result
 ----
 1
 
-# Note: Multi-packet INSERT tests removed - mssql_execute with multi-packet
-# requires separate investigation. SELECT tests above verify multi-packet read operations.
+# Note: Multi-packet INSERT tests require catalog integration.
+# SELECT tests above verify multi-packet read operations.
 
 statement ok
 DETACH mp_db;

@@ -67,82 +67,6 @@ std::unique_ptr<MSSQLResultStream> MSSQLResultStreamRegistry::Retrieve(uint64_t 
 }
 
 //===----------------------------------------------------------------------===//
-// mssql_execute implementation
-//===----------------------------------------------------------------------===//
-
-unique_ptr<FunctionData> MSSQLExecuteBindData::Copy() const {
-	auto result = make_uniq<MSSQLExecuteBindData>();
-	result->context_name = context_name;
-	result->sql_statement = sql_statement;
-	return std::move(result);
-}
-
-bool MSSQLExecuteBindData::Equals(const FunctionData &other) const {
-	auto &other_data = other.Cast<MSSQLExecuteBindData>();
-	return context_name == other_data.context_name && sql_statement == other_data.sql_statement;
-}
-
-unique_ptr<FunctionData> MSSQLExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
-	// Extract arguments
-	if (input.inputs.size() != 2) {
-		throw InvalidInputException("MSSQL Error: mssql_execute requires 2 arguments: context_name and sql_statement");
-	}
-
-	auto bind_data = make_uniq<MSSQLExecuteBindData>();
-	bind_data->context_name = input.inputs[0].GetValue<string>();
-	bind_data->sql_statement = input.inputs[1].GetValue<string>();
-
-	// Validate context exists
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	if (!manager.HasContext(bind_data->context_name)) {
-		throw InvalidInputException(
-		    "MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-		    bind_data->context_name, bind_data->context_name);
-	}
-
-	// Set return schema
-	return_types.push_back(LogicalType::BOOLEAN);
-	names.push_back("success");
-	return_types.push_back(LogicalType::BIGINT);
-	names.push_back("affected_rows");
-	return_types.push_back(LogicalType::VARCHAR);
-	names.push_back("message");
-
-	return std::move(bind_data);
-}
-
-unique_ptr<GlobalTableFunctionState> MSSQLExecuteInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<MSSQLExecuteGlobalState>();
-}
-
-void MSSQLExecuteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &global_state = data.global_state->Cast<MSSQLExecuteGlobalState>();
-
-	if (global_state.done) {
-		output.SetCardinality(0);
-		return;
-	}
-
-	// For stub implementation, return success with 1 affected row
-	output.SetCardinality(1);
-
-	// success = true
-	auto &success_vec = output.data[0];
-	FlatVector::GetData<bool>(success_vec)[0] = true;
-
-	// affected_rows = 1
-	auto &rows_vec = output.data[1];
-	FlatVector::GetData<int64_t>(rows_vec)[0] = 1;
-
-	// message
-	auto &message_vec = output.data[2];
-	FlatVector::GetData<string_t>(message_vec)[0] = StringVector::AddString(message_vec, "Query executed successfully (stub)");
-
-	global_state.done = true;
-}
-
-//===----------------------------------------------------------------------===//
 // mssql_scan implementation
 //===----------------------------------------------------------------------===//
 
@@ -914,14 +838,8 @@ void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLFunctions(ExtensionLoader &loader) {
-	// mssql_execute(context_name VARCHAR, sql_statement VARCHAR)
-	// -> (success BOOLEAN, affected_rows BIGINT, message VARCHAR)
-	TableFunction mssql_execute("mssql_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLExecuteFunction,
-	                            MSSQLExecuteBind, MSSQLExecuteInitGlobal);
-	loader.RegisterFunction(mssql_execute);
-
 	// mssql_scan(context_name VARCHAR, query VARCHAR)
-	// -> (id INTEGER, name VARCHAR) for stub
+	// -> dynamic return schema based on query result columns
 	TableFunction mssql_scan("mssql_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLScanFunction,
 	                         MSSQLScanBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
 	loader.RegisterFunction(mssql_scan);

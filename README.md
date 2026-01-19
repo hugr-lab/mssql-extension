@@ -16,7 +16,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 
 ### Prerequisites
 
-- DuckDB v1.0 or later
+- DuckDB v1.4.1 or later (minimum supported version)
 - SQL Server 2019 or later accessible on network
 
 ### Step 1: Install Extension
@@ -54,13 +54,13 @@ ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword12
 
 ```sql
 -- List schemas
-SHOW SCHEMAS FROM sqlserver;
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'sqlserver';
 
 -- List tables in dbo schema
-SHOW TABLES FROM sqlserver.dbo;
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'sqlserver' AND schema_name = 'dbo';
 
 -- Query a table
-SELECT * FROM sqlserver.dbo.my_table LIMIT 10;
+FROM sqlserver.dbo.my_table LIMIT 10;
 ```
 
 ### Step 4: Disconnect
@@ -187,13 +187,15 @@ DETACH sqlserver;
 
 ```sql
 -- List all schemas
-SHOW SCHEMAS FROM sqlserver;
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'sqlserver';
 
 -- List tables in a schema
-SHOW TABLES FROM sqlserver.dbo;
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'sqlserver' AND schema_name = 'dbo';
 
--- Describe table structure
-DESCRIBE sqlserver.dbo.my_table;
+-- Describe table structure (list columns)
+SELECT column_name, data_type, is_nullable
+FROM duckdb_columns()
+WHERE database_name = 'sqlserver' AND schema_name = 'dbo' AND table_name = 'my_table';
 ```
 
 ### Three-Part Naming
@@ -315,16 +317,6 @@ SELECT mssql_version();
 -- Returns: 'abc123def...'
 ```
 
-### mssql_execute()
-
-Execute a SQL statement and return results as a table.
-
-**Signature:** `mssql_execute(context VARCHAR, sql VARCHAR) -> TABLE(success BOOLEAN, affected_rows BIGINT, message VARCHAR)`
-
-```sql
-SELECT * FROM mssql_execute('sqlserver', 'EXEC sp_who2');
-```
-
 ### mssql_scan()
 
 Stream SELECT query results from SQL Server.
@@ -339,13 +331,17 @@ The return schema is dynamic based on the query result columns.
 
 ### mssql_exec()
 
-Execute a SQL statement and return affected row count.
+Execute a SQL statement and return affected row count. Use this for SQL Server-specific DDL or statements that don't return results.
 
-**Signature:** `mssql_exec(secret VARCHAR, sql VARCHAR) -> BIGINT`
+**Signature:** `mssql_exec(context VARCHAR, sql VARCHAR) -> BIGINT`
 
 ```sql
-SELECT mssql_exec('my_secret', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
--- Returns: 1 (number of affected rows)
+-- Execute DDL
+SELECT mssql_exec('sqlserver', 'CREATE TABLE dbo.my_table (id INT PRIMARY KEY)');
+
+-- Execute DML
+SELECT mssql_exec('sqlserver', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
+-- Returns: number of affected rows
 ```
 
 ### mssql_open()
@@ -694,6 +690,15 @@ Error: Unsupported SQL Server type: XML
 - Check network latency to SQL Server
 - Consider using `mssql_scan()` for complex queries with explicit SQL
 
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux x86_64 | Fully Tested | Primary development platform |
+| Linux ARM64 | Fully Tested | CI-validated |
+| macOS ARM64 | Tested | Load-only smoke tests in CI |
+| Windows x64 | Experimental | Builds in CI but not fully tested. Contributions welcome! |
+
 ## Limitations
 
 ### Unsupported Features
@@ -701,7 +706,7 @@ Error: Unsupported SQL Server type: XML
 - **UPDATE/DELETE**: Use `mssql_exec()` for data modification other than INSERT
 - **Windows Authentication**: Only SQL Server authentication is supported
 - **Transactions**: Multi-statement transactions are not supported
-- **Stored Procedures with Output Parameters**: Use `mssql_execute()` for stored procedures
+- **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 
 ### Known Issues
 
@@ -711,4 +716,4 @@ Error: Unsupported SQL Server type: XML
 
 ## License
 
-[TBD]
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -1,0 +1,433 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # SQL Server test environment
+  MSSQL_TEST_HOST: localhost
+  MSSQL_TEST_PORT: 1433
+  MSSQL_TEST_USER: sa
+  MSSQL_TEST_PASS: TestPassword1
+  MSSQL_TEST_DB: master
+
+jobs:
+  # ============================================================================
+  # Lint Job - Check code formatting
+  # ============================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-14
+          find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
+
+  # ============================================================================
+  # Build Job - Build extension for all platform/version combinations
+  # ============================================================================
+  build:
+    name: Build (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - id: linux_amd64
+            os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            docker_available: true
+
+          - id: linux_arm64
+            os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            docker_available: true
+
+          - id: osx_arm64
+            os: osx
+            arch: arm64
+            runner: macos-14
+            docker_available: false
+
+          - id: windows_amd64
+            os: windows
+            arch: amd64
+            runner: windows-latest
+            docker_available: false
+
+        duckdb_version:
+          - '1.4.1'
+          - '1.4.2'
+          - '1.4.3'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        shell: bash
+        run: |
+          # Extract version from tag (v0.1.0 -> 0.1.0)
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+          echo "Extension version: $EXT_VERSION"
+
+      - name: Fetch DuckDB sources
+        id: duckdb
+        shell: bash
+        run: |
+          chmod +x scripts/ci/fetch_duckdb.sh
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh "${{ matrix.duckdb_version }}")
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Log build metadata
+        shell: bash
+        run: |
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
+          echo "DuckDB Version: ${{ matrix.duckdb_version }}"
+          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "Platform: ${{ matrix.platform.id }}"
+          echo "Runner: ${{ matrix.platform.runner }}"
+          echo "============================================"
+
+      - name: Setup Ninja (Unix)
+        if: matrix.platform.os != 'windows'
+        run: |
+          if [ "${{ matrix.platform.os }}" = "osx" ]; then
+            brew install ninja
+          else
+            sudo apt-get update
+            sudo apt-get install -y ninja-build
+          fi
+
+      - name: Setup Ninja (Windows)
+        if: matrix.platform.os == 'windows'
+        run: choco install ninja
+
+      - name: Setup vcpkg
+        shell: bash
+        run: |
+          if [ ! -d "vcpkg" ]; then
+            git clone https://github.com/microsoft/vcpkg.git
+            if [ "${{ matrix.platform.os }}" = "windows" ]; then
+              ./vcpkg/bootstrap-vcpkg.bat
+            else
+              ./vcpkg/bootstrap-vcpkg.sh
+            fi
+          fi
+
+      - name: Build Release (Unix)
+        if: matrix.platform.os != 'windows'
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Build Release (Windows)
+        if: matrix.platform.os == 'windows'
+        shell: bash
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          ARTIFACT_NAME="mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          cp build/release/extension/mssql/mssql.duckdb_extension "$ARTIFACT_NAME"
+          echo "Created artifact: $ARTIFACT_NAME"
+          ls -la "$ARTIFACT_NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI artifact (Unix)
+        if: matrix.platform.os != 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: build/release/duckdb
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI artifact (Windows)
+        if: matrix.platform.os == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: build/release/duckdb.exe
+          if-no-files-found: error
+
+  # ============================================================================
+  # Smoke Test Job - Verify extension loads correctly
+  # ============================================================================
+  smoke-test:
+    name: Smoke Test (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - id: linux_amd64
+            os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            docker_available: true
+
+          - id: linux_arm64
+            os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            docker_available: true
+
+          - id: osx_arm64
+            os: osx
+            arch: arm64
+            runner: macos-14
+            docker_available: false
+
+          - id: windows_amd64
+            os: windows
+            arch: amd64
+            runner: windows-latest
+            docker_available: false
+
+        duckdb_version:
+          - '1.4.1'
+          - '1.4.2'
+          - '1.4.3'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: cli
+
+      - name: Setup executables (Unix)
+        if: matrix.platform.os != 'windows'
+        run: chmod +x cli/duckdb
+
+      - name: Run load-only smoke test (Unix)
+        if: matrix.platform.os != 'windows'
+        run: |
+          chmod +x scripts/ci/smoke_test.sh
+          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          scripts/ci/smoke_test.sh ./cli/duckdb "$EXTENSION_FILE"
+
+      - name: Run load-only smoke test (Windows)
+        if: matrix.platform.os == 'windows'
+        shell: bash
+        run: |
+          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          ./cli/duckdb.exe --unsigned -c "LOAD '$EXTENSION_FILE'; SELECT mssql_version();"
+
+      - name: Log integration test status
+        if: matrix.platform.docker_available == false
+        run: |
+          echo "============================================"
+          echo "Integration test skipped - Docker not available on ${{ matrix.platform.id }}"
+          echo "Load-only smoke test passed successfully"
+          echo "============================================"
+
+  # ============================================================================
+  # Integration Test Job - Full SQL Server tests on Linux platforms
+  # ============================================================================
+  integration-test:
+    name: Integration Test (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: smoke-test
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - id: linux_amd64
+            runner: ubuntu-22.04
+
+          - id: linux_arm64
+            runner: ubuntu-22.04-arm
+
+        duckdb_version:
+          - '1.4.1'
+          - '1.4.2'
+          - '1.4.3'
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          path: cli
+
+      - name: Setup executables
+        run: |
+          chmod +x cli/duckdb
+          chmod +x scripts/ci/integration_test.sh
+
+      - name: Wait for SQL Server
+        run: |
+          echo "Waiting for SQL Server to be ready..."
+          timeout 120 bash -c 'until echo > /dev/tcp/localhost/1433 2>/dev/null; do sleep 5; done'
+          echo "SQL Server is ready!"
+
+      - name: Run integration tests
+        run: |
+          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          scripts/ci/integration_test.sh ./cli/duckdb "$EXTENSION_FILE"
+
+  # ============================================================================
+  # Release Job - Collect artifacts and publish to GitHub Release
+  # ============================================================================
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [smoke-test, integration-test]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and rename artifacts
+        run: |
+          mkdir -p release
+          find artifacts -name "*.duckdb_extension" -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd release
+          sha256sum *.duckdb_extension > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          files: |
+            release/*.duckdb_extension
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          body: |
+            ## MSSQL Extension ${{ steps.version.outputs.tag }}
+
+            ### Downloads
+
+            Download the extension for your platform and DuckDB version:
+
+            | Platform | DuckDB 1.4.1 | DuckDB 1.4.2 | DuckDB 1.4.3 |
+            |----------|--------------|--------------|--------------|
+            | Linux x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_amd64.duckdb_extension) |
+            | Linux ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_arm64.duckdb_extension) |
+            | macOS ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-osx_arm64.duckdb_extension) |
+            | Windows x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-windows_amd64.duckdb_extension) |
+
+            ### Verification
+
+            Verify downloads using SHA256 checksums:
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ### Installation
+
+            ```sql
+            INSTALL 'path/to/mssql-${{ steps.version.outputs.ext_version }}-duckdb-<VERSION>-<PLATFORM>.duckdb_extension';
+            LOAD mssql;
+            ```

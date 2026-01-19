@@ -19,6 +19,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable) (009-dml-insert)
 - In-memory (no intermediate buffering per Streaming First principle) (009-dml-insert)
 - Markdown (GitHub-flavored) + N/A (documentation only) (010-extension-documentation)
+- YAML (GitHub Actions workflow syntax) + Bash scripts + GitHub Actions runners, CMake, vcpkg, Ninja, Docker (Linux only) (011-ci-release-workflows)
+- N/A (workflow artifacts stored in GitHub) (011-ci-release-workflows)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -76,9 +78,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 011-ci-release-workflows: Added YAML (GitHub Actions workflow syntax) + Bash scripts + GitHub Actions runners, CMake, vcpkg, Ninja, Docker (Linux only)
 - 010-extension-documentation: Added Markdown (GitHub-flavored) + N/A (documentation only)
 - 009-dml-insert: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
-- 008-catalog-ddl-statistics: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-007), mbedTLS 3.6.4 (via vcpkg for loadable)
 
 
 <!-- MANUAL ADDITIONS START -->

@@ -3,7 +3,7 @@
 //
 // mssql_functions.hpp
 //
-// Table functions: mssql_execute and mssql_scan
+// Table functions: mssql_scan
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -19,36 +19,6 @@
 #include <unordered_map>
 
 namespace duckdb {
-
-//===----------------------------------------------------------------------===//
-// mssql_execute - Execute raw SQL statement
-//===----------------------------------------------------------------------===//
-
-struct MSSQLExecuteBindData : public FunctionData {
-	string context_name;
-	string sql_statement;
-
-	unique_ptr<FunctionData> Copy() const override;
-	bool Equals(const FunctionData &other) const override;
-};
-
-struct MSSQLExecuteGlobalState : public GlobalTableFunctionState {
-	bool done = false;
-
-	idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-// Bind: validates arguments, sets return schema
-unique_ptr<FunctionData> MSSQLExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names);
-
-// Global init: sets up execution state
-unique_ptr<GlobalTableFunctionState> MSSQLExecuteInitGlobal(ClientContext &context, TableFunctionInitInput &input);
-
-// Execute: produces single-row result
-void MSSQLExecuteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output);
 
 //===----------------------------------------------------------------------===//
 // mssql_scan - Scan SQL Server data
