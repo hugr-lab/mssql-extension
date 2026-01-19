@@ -513,106 +513,17 @@ SET mssql_statistics_level = 2;
 SET mssql_connection_cache = false;
 ```
 
-## Building from Source
+## Development
 
-### Build Prerequisites
+For building from source, testing, and contributing, see the [Development Guide](DEVELOPMENT.md).
 
-- CMake 3.21+
-- Ninja build system
-- C++17 compatible compiler
-- Git (for submodules)
-- Docker (optional, for SQL Server test environment)
-
-### Clone and Build
+Quick start:
 
 ```bash
-# Clone with submodules
 git clone --recurse-submodules <repository-url>
 cd mssql-extension
-
-# Build release version
-make release
-
-# Build debug version
-make debug
-```
-
-If you already cloned without submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-### Build Targets
-
-| Target          | Description                              |
-| --------------- | ---------------------------------------- |
-| `make release`  | Build optimized release version          |
-| `make debug`    | Build with debug symbols                 |
-| `make clean`    | Remove all build artifacts               |
-| `make test`     | Run DuckDB extension tests               |
-| `make help`     | Show available targets                   |
-
-### TLS Support
-
-The extension uses a split TLS build approach:
-
-| Build Type | TLS Support | Use Case                              |
-| ---------- | ----------- | ------------------------------------- |
-| Static     | No (stub)   | CLI development, minimal dependencies |
-| Loadable   | Yes (mbedTLS) | Production with encrypted connections |
-
-The loadable extension is built at:
-`build/release/extension/mssql/mssql.duckdb_extension`
-
-### Running Tests
-
-```bash
-# Run unit tests (no SQL Server required)
-make test
-
-# Start SQL Server for integration tests
-cd docker && docker-compose up -d
-
-# Wait for SQL Server to initialize, then run integration tests
-make test
-```
-
-### VS Code Configuration
-
-1. Open the project folder in VS Code
-2. Install recommended extensions when prompted
-3. Use `Cmd+Shift+B` (macOS) or `Ctrl+Shift+B` (Windows/Linux) to build
-4. Use `F5` to debug with DuckDB shell
-
-### CLion Configuration
-
-1. Open the project as a CMake project
-2. Set CMake options: `-DCMAKE_BUILD_TYPE=Debug`
-3. Select the `mssql` target
-4. Build and debug normally
-
-### Test Environment
-
-Start the SQL Server development container:
-
-```bash
-cd docker
-docker-compose up -d
-```
-
-Connect to verify:
-
-```bash
-docker exec -it mssql-dev /opt/mssql-tools18/bin/sqlcmd \
-  -S localhost -U sa -P 'DevPassword123!' -C \
-  -d TestDB -Q "SELECT * FROM TestSimplePK"
-```
-
-Stop the environment:
-
-```bash
-docker-compose down
+make        # Build release
+make test   # Run tests
 ```
 
 ## Troubleshooting
