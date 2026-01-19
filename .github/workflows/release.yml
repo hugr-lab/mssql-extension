@@ -107,19 +107,47 @@ jobs:
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
 
-      - name: Setup Ninja (Unix)
+      - name: Setup Ninja and ccache (Unix)
         if: matrix.platform.os != 'windows'
         run: |
           if [ "${{ matrix.platform.os }}" = "osx" ]; then
-            brew install ninja
+            brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build
+            sudo apt-get install -y ninja-build ccache
           fi
 
       - name: Setup Ninja (Windows)
         if: matrix.platform.os == 'windows'
-        run: choco install ninja
+        run: choco install ninja ccache
+
+      # Cache ccache to speed up compilation
+      - name: Cache ccache (Unix)
+        if: matrix.platform.os != 'windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-
+            ccache-${{ matrix.platform.id }}-
+
+      - name: Cache ccache (Windows)
+        if: matrix.platform.os == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ccache
+          key: ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-
+            ccache-${{ matrix.platform.id }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
 
       - name: Setup vcpkg
         shell: bash
@@ -133,6 +161,17 @@ jobs:
             fi
           fi
 
+      # Cache vcpkg installed packages
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+          key: vcpkg-${{ matrix.platform.id }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.platform.id }}-
+
       - name: Build Release (Unix)
         if: matrix.platform.os != 'windows'
         run: |
@@ -140,6 +179,8 @@ jobs:
           cd build/release
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
@@ -154,11 +195,17 @@ jobs:
           cd build/release
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      - name: Show ccache stats
+        shell: bash
+        run: ccache -s
 
       - name: Rename artifact
         shell: bash

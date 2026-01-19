@@ -58,6 +58,7 @@ jobs:
             arch: amd64
             runner: ubuntu-22.04
             docker_available: true
+            vcpkg_triplet: x64-linux
 
           # macOS ARM64 - load-only testing
           - id: osx_arm64
@@ -65,6 +66,7 @@ jobs:
             arch: arm64
             runner: macos-14
             docker_available: false
+            vcpkg_triplet: arm64-osx
 
     steps:
       - uses: actions/checkout@v4
@@ -87,14 +89,30 @@ jobs:
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
 
-      - name: Setup Ninja (Unix)
+      - name: Setup Ninja
         run: |
           if [ "${{ matrix.platform.os }}" = "osx" ]; then
-            brew install ninja
+            brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build
+            sudo apt-get install -y ninja-build ccache
           fi
+
+      # Cache ccache to speed up compilation
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
+            ccache-${{ matrix.platform.id }}-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
 
       - name: Setup vcpkg
         run: |
@@ -103,17 +121,37 @@ jobs:
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 
+      # Cache vcpkg installed packages
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+            vcpkg/buildtrees
+          key: vcpkg-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.platform.vcpkg_triplet }}-
+
       - name: Build Release
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           mkdir -p build/release
           cd build/release
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      - name: Show ccache stats
+        run: ccache -s
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
