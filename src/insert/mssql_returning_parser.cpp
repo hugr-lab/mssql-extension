@@ -142,18 +142,14 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 				return nullptr;
 			}
 
-			bool is_eom = packet.IsEndOfMessage();
 			const auto &payload = packet.GetPayload();
 			if (!payload.empty()) {
 				parser.Feed(payload);
 			}
 
-			// Handle EOM without explicit done
-			if (is_eom && parser.TryParseNext() == tds::ParsedTokenType::NeedMoreData) {
-				done = true;
-				connection.TransitionState(tds::ConnectionState::Executing,
-				                           tds::ConnectionState::Idle);
-			}
+			// Note: Don't call TryParseNext() here - it would consume tokens!
+			// The inner while loop at the top of the outer loop will handle parsing.
+			// EOM handling is done when we see the DONE token with final flag.
 		}
 	}
 

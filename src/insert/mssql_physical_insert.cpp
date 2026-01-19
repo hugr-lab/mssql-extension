@@ -121,9 +121,9 @@ SourceResultType MSSQLPhysicalInsert::GetData(ExecutionContext &context, DataChu
 		auto &result = gstate.result_chunks[gstate.result_chunk_index];
 		gstate.result_chunk_index++;
 
-		// Copy data to output chunk
-		chunk.Initialize(Allocator::DefaultAllocator(), result->GetTypes());
-		result->Copy(chunk, 0);
+		// Reference the data from result chunk
+		// This avoids copying and uses the already-parsed data directly
+		chunk.Reference(*result);
 
 		return gstate.result_chunk_index >= gstate.result_chunks.size()
 		           ? SourceResultType::FINISHED
