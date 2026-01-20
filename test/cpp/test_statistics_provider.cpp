@@ -1,6 +1,6 @@
-#include "catch.hpp"
-#include "catalog/mssql_statistics.hpp"
 #include <thread>
+#include "catalog/mssql_statistics.hpp"
+#include "catch.hpp"
 
 using namespace duckdb;
 
@@ -8,7 +8,7 @@ TEST_CASE("MSSQLStatisticsProvider cache key building", "[statistics]") {
 	// Note: We can't test actual statistics fetching without a connection,
 	// but we can test the cache behavior through the public interface
 
-	MSSQLStatisticsProvider provider(300);  // 5 minute TTL
+	MSSQLStatisticsProvider provider(300);	// 5 minute TTL
 
 	SECTION("Initial state") {
 		REQUIRE(provider.GetCacheTTL() == 300);

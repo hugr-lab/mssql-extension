@@ -47,10 +47,10 @@
 // To skip tests without SQL Server:
 //   SKIP_INTEGRATION_TESTS=1 ./test_insert_integration
 
-#include <iostream>
 #include <cassert>
-#include <cstdlib>
 #include <chrono>
+#include <cstdlib>
+#include <iostream>
 
 // These tests require full DuckDB + extension linkage
 // For now, this file serves as documentation of integration test cases
@@ -181,38 +181,38 @@
 // Stub main for documentation
 //==============================================================================
 int main() {
-    const char* skip = std::getenv("SKIP_INTEGRATION_TESTS");
-    if (skip && std::string(skip) == "1") {
-        std::cout << "Integration tests skipped (SKIP_INTEGRATION_TESTS=1)" << std::endl;
-        return 0;
-    }
+	const char *skip = std::getenv("SKIP_INTEGRATION_TESTS");
+	if (skip && std::string(skip) == "1") {
+		std::cout << "Integration tests skipped (SKIP_INTEGRATION_TESTS=1)" << std::endl;
+		return 0;
+	}
 
-    std::cout << "==========================================" << std::endl;
-    std::cout << "INSERT Integration Tests" << std::endl;
-    std::cout << "==========================================" << std::endl;
-    std::cout << std::endl;
-    std::cout << "These integration tests require:" << std::endl;
-    std::cout << "  1. Running SQL Server instance" << std::endl;
-    std::cout << "  2. Test tables created (see file header)" << std::endl;
-    std::cout << "  3. Environment variables set:" << std::endl;
-    std::cout << "     - MSSQL_HOST" << std::endl;
-    std::cout << "     - MSSQL_PORT" << std::endl;
-    std::cout << "     - MSSQL_USER" << std::endl;
-    std::cout << "     - MSSQL_PASS" << std::endl;
-    std::cout << "     - MSSQL_DATABASE" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Test scenarios documented in this file:" << std::endl;
-    std::cout << "  - T070: End-to-end INSERT" << std::endl;
-    std::cout << "  - T071: 10M row bulk insert (memory/performance)" << std::endl;
-    std::cout << "  - T072: INSERT with RETURNING identity values" << std::endl;
-    std::cout << "  - T073: Constraint violation error handling" << std::endl;
-    std::cout << "  - Unicode data preservation" << std::endl;
-    std::cout << "  - Batch size configuration" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Run DuckDB CLI to execute tests manually:" << std::endl;
-    std::cout << "  duckdb -c \"LOAD 'mssql'; <test SQL>\"" << std::endl;
-    std::cout << std::endl;
-    std::cout << "==========================================" << std::endl;
+	std::cout << "==========================================" << std::endl;
+	std::cout << "INSERT Integration Tests" << std::endl;
+	std::cout << "==========================================" << std::endl;
+	std::cout << std::endl;
+	std::cout << "These integration tests require:" << std::endl;
+	std::cout << "  1. Running SQL Server instance" << std::endl;
+	std::cout << "  2. Test tables created (see file header)" << std::endl;
+	std::cout << "  3. Environment variables set:" << std::endl;
+	std::cout << "     - MSSQL_HOST" << std::endl;
+	std::cout << "     - MSSQL_PORT" << std::endl;
+	std::cout << "     - MSSQL_USER" << std::endl;
+	std::cout << "     - MSSQL_PASS" << std::endl;
+	std::cout << "     - MSSQL_DATABASE" << std::endl;
+	std::cout << std::endl;
+	std::cout << "Test scenarios documented in this file:" << std::endl;
+	std::cout << "  - T070: End-to-end INSERT" << std::endl;
+	std::cout << "  - T071: 10M row bulk insert (memory/performance)" << std::endl;
+	std::cout << "  - T072: INSERT with RETURNING identity values" << std::endl;
+	std::cout << "  - T073: Constraint violation error handling" << std::endl;
+	std::cout << "  - Unicode data preservation" << std::endl;
+	std::cout << "  - Batch size configuration" << std::endl;
+	std::cout << std::endl;
+	std::cout << "Run DuckDB CLI to execute tests manually:" << std::endl;
+	std::cout << "  duckdb -c \"LOAD 'mssql'; <test SQL>\"" << std::endl;
+	std::cout << std::endl;
+	std::cout << "==========================================" << std::endl;
 
-    return 0;
+	return 0;
 }
