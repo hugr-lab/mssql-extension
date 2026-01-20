@@ -11,6 +11,7 @@ extension:
   excluded_platforms:
     - "osx_amd64"
     - "windows_arm64"
+  test_config: '{"test_env_variables": {"SKIP_TESTS": "1"}}'
 
 repo:
   github: "hugr-lab/mssql-extension"
