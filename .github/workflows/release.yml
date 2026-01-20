@@ -305,19 +305,25 @@ jobs:
         if: matrix.platform.os != 'windows'
         run: chmod +x cli/duckdb
 
+      - name: Rename extension for loading
+        shell: bash
+        run: |
+          # DuckDB derives extension name from filename - must be named mssql.duckdb_extension
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
+          ls -la extension/
+
       - name: Run load-only smoke test (Unix)
         if: matrix.platform.os != 'windows'
         run: |
           chmod +x scripts/ci/smoke_test.sh
-          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
-          scripts/ci/smoke_test.sh ./cli/duckdb "$EXTENSION_FILE"
+          scripts/ci/smoke_test.sh ./cli/duckdb extension/mssql.duckdb_extension
 
       - name: Run load-only smoke test (Windows)
         if: matrix.platform.os == 'windows'
         shell: bash
         run: |
-          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
-          ./cli/duckdb.exe --unsigned -c "LOAD '$EXTENSION_FILE'; SELECT mssql_version();"
+          ./cli/duckdb.exe --unsigned -c "LOAD 'extension/mssql.duckdb_extension'; SELECT mssql_version();"
 
       - name: Log integration test status
         if: matrix.platform.docker_available == false
@@ -391,6 +397,13 @@ jobs:
           chmod +x cli/duckdb
           chmod +x scripts/ci/integration_test.sh
 
+      - name: Rename extension for loading
+        run: |
+          # DuckDB derives extension name from filename - must be named mssql.duckdb_extension
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
+          ls -la extension/
+
       - name: Wait for SQL Server
         run: |
           echo "Waiting for SQL Server to be ready..."
@@ -399,8 +412,7 @@ jobs:
 
       - name: Run integration tests
         run: |
-          EXTENSION_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
-          scripts/ci/integration_test.sh ./cli/duckdb "$EXTENSION_FILE"
+          scripts/ci/integration_test.sh ./cli/duckdb extension/mssql.duckdb_extension
 
   # ============================================================================
   # Release Job - Collect artifacts and publish to GitHub Release
