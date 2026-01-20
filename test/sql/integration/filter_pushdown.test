@@ -1,0 +1,390 @@
+# name: test/sql/integration/filter_pushdown.test
+# description: Integration tests for filter pushdown with column projection
+# group: [integration]
+#
+# Tests three scenarios:
+# 1. All filters pushed down - fully supported filters
+# 2. No filters pushed down - unsupported function in filter
+# 3. Partial filters pushed down - mix of supported and unsupported
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+
+# =============================================================================
+# SCENARIO 1: All Filters Pushed Down
+# =============================================================================
+# When all filters are supported, they should be pushed to SQL Server
+# and column projection should work correctly
+
+# Test 1.1: Simple equality filter with single column projection
+# Filter: id = X (supported)
+# Projection: only 'name' column
+query I
+SELECT name FROM testdb.dbo.TestSimplePK WHERE id = 1;
+----
+First Record
+
+# Test 1.2: Simple equality filter with multiple columns (excluding timestamp for determinism)
+query IIR
+SELECT id, name, value FROM testdb.dbo.TestSimplePK WHERE id = 2;
+----
+2	Second Record	200.75
+
+# Test 1.3: Comparison filter (greater than)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id > 3 ORDER BY id;
+----
+4	Fourth Record
+5	Fifth Record
+
+# Test 1.4: Comparison filter (less than or equal)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id <= 2 ORDER BY id;
+----
+1	First Record
+2	Second Record
+
+# Test 1.5: Multiple AND filters (all supported)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id >= 2 AND id <= 4 ORDER BY id;
+----
+2	Second Record
+3	Third Record
+4	Fourth Record
+
+# Test 1.6: IS NULL filter
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE value IS NULL;
+----
+3	Third Record
+
+# Test 1.7: IS NOT NULL filter
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE value IS NOT NULL ORDER BY id LIMIT 3;
+----
+1	First Record
+2	Second Record
+4	Fourth Record
+
+# Test 1.8: IN filter
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id IN (1, 3, 5) ORDER BY id;
+----
+1	First Record
+3	Third Record
+5	Fifth Record
+
+# Test 1.9: Projection with filter - only filter column used in output
+query I
+SELECT id FROM testdb.dbo.TestSimplePK WHERE id = 3;
+----
+3
+
+# Test 1.10: Projection with filter - neither filter nor output column overlap
+# Filter on 'id', select only 'value'
+query R
+SELECT value FROM testdb.dbo.TestSimplePK WHERE id = 1;
+----
+100.50
+
+# =============================================================================
+# SCENARIO 2: Filters with String Comparisons
+# =============================================================================
+
+# Test 2.1: String equality filter
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE name = 'First Record';
+----
+1	First Record
+
+# Test 2.2: String filter with projection (only non-filter column)
+query R
+SELECT value FROM testdb.dbo.TestSimplePK WHERE name = 'Second Record';
+----
+200.75
+
+# =============================================================================
+# SCENARIO 3: Filters on LargeTable (more complex data)
+# =============================================================================
+
+# Test 3.1: Category filter with count
+query I
+SELECT COUNT(id) FROM testdb.dbo.LargeTable WHERE category = 1;
+----
+1500
+
+# Test 3.2: Multiple conditions on LargeTable
+query II
+SELECT id, name FROM testdb.dbo.LargeTable WHERE category = 2 AND is_active = true ORDER BY id LIMIT 5;
+----
+1	Item_1
+101	Item_101
+201	Item_201
+301	Item_301
+401	Item_401
+
+# Test 3.3: Range filter on LargeTable
+query II
+SELECT id, name FROM testdb.dbo.LargeTable WHERE id >= 100 AND id < 105 ORDER BY id;
+----
+100	Item_100
+101	Item_101
+102	Item_102
+103	Item_103
+104	Item_104
+
+# =============================================================================
+# SCENARIO 4: No Filters Pushed Down (Unsupported Functions)
+# =============================================================================
+# These tests use DuckDB-only functions that can't be pushed to SQL Server
+# The scan should return all rows and DuckDB applies the filter
+
+# Test 4.1: Using list_contains (DuckDB-only function)
+# This filter cannot be pushed, so all data is fetched and filtered locally
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE list_contains([1, 3, 5], id) ORDER BY id;
+----
+1	First Record
+3	Third Record
+5	Fifth Record
+
+# Test 4.2: Using regexp_matches (DuckDB-only function)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE regexp_matches(name, '.*Record') ORDER BY id LIMIT 3;
+----
+1	First Record
+2	Second Record
+3	Third Record
+
+# Test 4.3: DuckDB function in projection (filter still pushed)
+# Filter is simple equality (pushed), but projection includes DuckDB function
+query II
+SELECT id, upper(name) FROM testdb.dbo.TestSimplePK WHERE id = 1;
+----
+1	FIRST RECORD
+
+# =============================================================================
+# SCENARIO 5: Partial Filter Pushdown
+# =============================================================================
+# Mix of supported and unsupported filters - supported parts are pushed
+
+# Test 5.1: Supported AND unsupported filter
+# 'id > 3' can be pushed, 'list_contains' cannot
+# SQL Server should apply id > 3, DuckDB applies list_contains
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id > 3 AND list_contains([4, 5], id) ORDER BY id;
+----
+4	Fourth Record
+5	Fifth Record
+
+# Test 5.2: Column projection with partial pushdown
+# Only 'name' in output, filter uses 'id' (pushed) and DuckDB function (not pushed)
+query I
+SELECT name FROM testdb.dbo.TestSimplePK WHERE id >= 4 AND regexp_matches(name, 'Fifth.*');
+----
+Fifth Record
+
+# =============================================================================
+# SCENARIO 6: Edge Cases for Projection
+# =============================================================================
+
+# Test 6.1: SELECT all columns except timestamp with filter
+query IIR
+SELECT id, name, value FROM testdb.dbo.TestSimplePK WHERE id = 5;
+----
+5	Fifth Record	500.25
+
+# Test 6.2: COUNT(*) with filter (virtual column handling)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE id <= 3;
+----
+3
+
+# Test 6.3: Aggregate with filter (column not in output)
+query R
+SELECT SUM(value) FROM testdb.dbo.TestSimplePK WHERE id IN (1, 2, 4);
+----
+701.25
+
+# Test 6.4: Multiple columns with filter on non-selected column
+query IR
+SELECT id, value FROM testdb.dbo.TestSimplePK WHERE name = 'Fourth Record';
+----
+4	400.00
+
+# =============================================================================
+# SCENARIO 7: OR Conditions
+# =============================================================================
+# OR handling: all branches must be supported for pushdown
+
+# Test 7.1: Simple OR with supported comparisons
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id = 1 OR id = 5 ORDER BY id;
+----
+1	First Record
+5	Fifth Record
+
+# Test 7.2: OR with one unsupported branch - entire OR not pushed
+# Since list_contains is not supported, the entire OR stays in DuckDB
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE id = 1 OR list_contains([5], id) ORDER BY id;
+----
+1	First Record
+5	Fifth Record
+
+# =============================================================================
+# SCENARIO 8: Complex Nested Conditions
+# =============================================================================
+
+# Test 8.1: Nested AND conditions
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE (id > 1 AND id < 4) AND value IS NOT NULL ORDER BY id;
+----
+2	Second Record
+
+# Test 8.2: AND with nested OR (supported)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE value IS NOT NULL AND (id = 1 OR id = 4) ORDER BY id;
+----
+1	First Record
+4	Fourth Record
+
+# =============================================================================
+# SCENARIO 9: Date/Time Filter Pushdown
+# =============================================================================
+# Test that date and datetime filters are properly pushed to SQL Server
+
+# Test 9.1: Date equality filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date = '2024-01-02' ORDER BY id LIMIT 3;
+----
+1	2024-01-02
+366	2024-01-02
+731	2024-01-02
+
+# Test 9.2: Date range filter (>= and <)
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date >= '2024-06-01' AND created_date < '2024-06-03' ORDER BY id LIMIT 5;
+----
+152	2024-06-01
+153	2024-06-02
+517	2024-06-01
+518	2024-06-02
+882	2024-06-01
+
+# Test 9.3: Date comparison with other filters
+query III
+SELECT id, category, created_date FROM testdb.dbo.LargeTable WHERE created_date = '2024-01-01' AND category = 1 ORDER BY id LIMIT 3;
+----
+7300	1	2024-01-01
+14600	1	2024-01-01
+21900	1	2024-01-01
+
+# Test 9.4: Date greater than filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date > '2024-12-28' ORDER BY id LIMIT 3;
+----
+363	2024-12-29
+364	2024-12-30
+728	2024-12-29
+
+# Test 9.5: Date less than or equal filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date <= '2024-01-01' ORDER BY id LIMIT 3;
+----
+365	2024-01-01
+730	2024-01-01
+1095	2024-01-01
+
+# Test 9.6: Timestamp comparison filter (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE created_at >= '2020-01-01';
+----
+5
+
+# Test 9.7: Timestamp comparison with no results (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE created_at < '2020-01-01';
+----
+0
+
+# =============================================================================
+# SCENARIO 10: DateTime Function Pushdown (Complex Expression Filters)
+# =============================================================================
+# These datetime functions are pushed down to SQL Server via pushdown_complex_filter
+
+# Test 10.1: YEAR() function filter (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE year(created_date) = 2024;
+----
+150000
+
+# Test 10.2: MONTH() function filter (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE month(created_date) = 6;
+----
+12330
+
+# Test 10.3: DAY() function filter (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE day(created_date) = 15;
+----
+4932
+
+# Test 10.4: Combined datetime function filters (all pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE year(created_date) = 2024 AND month(created_date) = 1;
+----
+12740
+
+# Test 10.5: DateTime function with other filters (all pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE year(created_date) = 2024 AND category = 1;
+----
+1500
+
+# Test 10.6: Multiple datetime functions on same column
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE month(created_date) = 6 AND day(created_date) = 15;
+----
+411
+
+# =============================================================================
+# SCENARIO 11: Filters NOT Pushed Down (Applied by DuckDB)
+# =============================================================================
+# These filters work correctly but are applied locally by DuckDB, not SQL Server
+
+# Test 11.1: LIKE with leading wildcard (NOT pushed - applied by DuckDB)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE name LIKE '%Record';
+----
+5
+
+# Test 11.2: DuckDB-only functions (NOT pushed - applied by DuckDB)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE list_contains([1, 3, 5], id) ORDER BY id;
+----
+1	First Record
+3	Third Record
+5	Fifth Record
+
+# Test 11.3: regexp_matches (NOT pushed - applied by DuckDB)
+query II
+SELECT id, name FROM testdb.dbo.TestSimplePK WHERE regexp_matches(name, 'First|Second') ORDER BY id;
+----
+1	First Record
+2	Second Record
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+statement ok
+DETACH testdb;

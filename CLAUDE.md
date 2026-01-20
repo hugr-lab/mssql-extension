@@ -23,6 +23,7 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - N/A (workflow artifacts stored in GitHub) (011-ci-release-workflows)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API), existing TDS layer (specs 001-011) (012-docs-platform-refresh)
 - In-memory (metadata cache) (012-docs-platform-refresh)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-012), OpenSSL (via vcpkg) (013-table-scan-filter-refactor)
 
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
 
@@ -80,9 +81,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 013-table-scan-filter-refactor: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-012), OpenSSL (via vcpkg)
 - 012-docs-platform-refresh: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API), existing TDS layer (specs 001-011)
 - Migrated TLS from mbedTLS to OpenSSL - unified TLS support for both static and loadable extensions
-- DuckDB API version (stable vs nightly) is now auto-detected at CMake configure time
 
 <!-- MANUAL ADDITIONS START -->
 <!-- MANUAL ADDITIONS END -->

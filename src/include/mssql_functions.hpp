@@ -61,6 +61,11 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// because we don't know which columns are needed yet
 	uint64_t result_stream_id = 0;
 
+	// Complex filter expressions pushed down via pushdown_complex_filter callback
+	// These are expressions like year(col) = 2024, BETWEEN, etc. that cannot be
+	// represented as simple TableFilter objects
+	mutable string complex_filter_where_clause;
+
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
 };
@@ -132,13 +137,8 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 // Catalog-based Table Scan Functions
 //===----------------------------------------------------------------------===//
 
-// Get a table function for scanning a catalog table entry
-// This is called by MSSQLTableEntry::GetScanFunction
-TableFunction GetMSSQLCatalogScanFunction();
-
-// Bind function for catalog scan - generates query from table columns
-unique_ptr<FunctionData> MSSQLCatalogScanBind(ClientContext &context, TableFunctionBindInput &input,
-											  vector<LogicalType> &return_types, vector<string> &names);
+// Note: Catalog scan functions have been moved to src/table_scan/mssql_table_scan.hpp
+// Use mssql::GetCatalogScanFunction() from that module instead.
 
 //===----------------------------------------------------------------------===//
 // mssql_exec - Execute arbitrary T-SQL and return affected row count

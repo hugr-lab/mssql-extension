@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown src/include/insert)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/insert src/include/table_scan)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -107,10 +107,13 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_transaction.cpp
     src/catalog/mssql_ddl_translator.cpp
     src/catalog/mssql_statistics.cpp
-    # Pushdown layer (filter/projection optimization)
-    src/pushdown/mssql_projection_builder.cpp
-    src/pushdown/mssql_filter_translator.cpp
-    src/pushdown/mssql_prepared_statement.cpp
+    # Table scan layer (refactored table scan and filter encoding)
+    src/table_scan/table_scan_bind.cpp
+    src/table_scan/table_scan_state.cpp
+    src/table_scan/table_scan_execute.cpp
+    src/table_scan/filter_encoder.cpp
+    src/table_scan/function_mapping.cpp
+    src/table_scan/mssql_table_scan.cpp
     # Insert layer (DML INSERT support)
     src/insert/mssql_insert_config.cpp
     src/insert/mssql_insert_target.cpp
@@ -131,12 +134,8 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # =============================================================================
 # Static Extension Configuration
 # =============================================================================
-target_compile_options(${EXTENSION_NAME} PRIVATE
-    "-Wno-macro-redefined"
-)
-target_compile_definitions(${EXTENSION_NAME} PRIVATE
-    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
-)
+# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
+# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
@@ -148,12 +147,8 @@ message(STATUS "Static extension configured with full TLS support (OpenSSL)")
 # =============================================================================
 # Loadable Extension Configuration
 # =============================================================================
-target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
-    "-Wno-macro-redefined"
-)
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
-    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
-)
+# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
+# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
