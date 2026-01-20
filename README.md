@@ -570,7 +570,7 @@ make test   # Run tests
 
 This extension is compatible with DuckDB Community Extensions CI.
 
-### Prerequisites
+### Setup
 
 ```bash
 # Clone with submodules
@@ -625,18 +625,18 @@ make docker-down
 
 Run `make help` to see all available targets:
 
-| Target | Description |
-|--------|-------------|
-| `release` | Build release version |
-| `debug` | Build debug version |
-| `test` | Run unit tests |
+| Target               | Description                                          |
+| -------------------- | ---------------------------------------------------- |
+| `release`            | Build release version                                |
+| `debug`              | Build debug version                                  |
+| `test`               | Run unit tests                                       |
 | `set_duckdb_version` | Set DuckDB version (use `DUCKDB_GIT_VERSION=v1.x.x`) |
-| `vcpkg-setup` | Bootstrap vcpkg (required for TLS support) |
-| `integration-test` | Run integration tests (requires SQL Server) |
-| `test-all` | Run all tests |
-| `docker-up` | Start SQL Server test container |
-| `docker-down` | Stop SQL Server test container |
-| `docker-status` | Check SQL Server container status |
+| `vcpkg-setup`        | Bootstrap vcpkg (required for TLS support)           |
+| `integration-test`   | Run integration tests (requires SQL Server)          |
+| `test-all`           | Run all tests                                        |
+| `docker-up`          | Start SQL Server test container                      |
+| `docker-down`        | Stop SQL Server test container                       |
+| `docker-status`      | Check SQL Server container status                    |
 
 ## Troubleshooting
 
