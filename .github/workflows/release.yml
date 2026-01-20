@@ -321,9 +321,9 @@ jobs:
 
       - name: Run load-only smoke test (Windows)
         if: matrix.platform.os == 'windows'
-        shell: bash
+        shell: pwsh
         run: |
-          ./cli/duckdb.exe --unsigned -c "LOAD 'extension/mssql.duckdb_extension'; SELECT mssql_version();"
+          .\cli\duckdb.exe --unsigned -c "LOAD 'extension/mssql.duckdb_extension'; SELECT mssql_version();"
 
       - name: Log integration test status
         if: matrix.platform.docker_available == false
