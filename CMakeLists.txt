@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown src/include/insert src/include/table_scan)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/insert src/include/table_scan)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
