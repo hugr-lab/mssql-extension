@@ -566,6 +566,78 @@ make        # Build release
 make test   # Run tests
 ```
 
+## Building with DuckDB Extension CI Tools
+
+This extension is compatible with DuckDB Community Extensions CI.
+
+### Prerequisites
+
+```bash
+# Clone with submodules
+git clone --recurse-submodules https://github.com/hugr-lab/mssql-extension.git
+cd mssql-extension
+
+# Or initialize submodules after clone
+git submodule update --init --recursive
+```
+
+### CI Build (Community Extensions compatible)
+
+```bash
+# Set DuckDB version (required by Community CI)
+DUCKDB_GIT_VERSION=v1.4.3 make set_duckdb_version
+
+# Build release
+make release
+
+# Run tests
+make test
+```
+
+### Local Development Build
+
+```bash
+# Bootstrap vcpkg (required for TLS/OpenSSL support)
+make vcpkg-setup
+
+# Build
+make release   # or: make debug
+
+# Load extension in DuckDB
+./build/release/duckdb
+> LOAD mssql;
+```
+
+### Running Integration Tests
+
+```bash
+# Start SQL Server container
+make docker-up
+
+# Run integration tests
+make integration-test
+
+# Stop container when done
+make docker-down
+```
+
+### Available Build Targets
+
+Run `make help` to see all available targets:
+
+| Target | Description |
+|--------|-------------|
+| `release` | Build release version |
+| `debug` | Build debug version |
+| `test` | Run unit tests |
+| `set_duckdb_version` | Set DuckDB version (use `DUCKDB_GIT_VERSION=v1.x.x`) |
+| `vcpkg-setup` | Bootstrap vcpkg (required for TLS support) |
+| `integration-test` | Run integration tests (requires SQL Server) |
+| `test-all` | Run all tests |
+| `docker-up` | Start SQL Server test container |
+| `docker-down` | Stop SQL Server test container |
+| `docker-status` | Check SQL Server container status |
+
 ## Troubleshooting
 
 ### Connection Refused
