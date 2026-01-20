@@ -12,8 +12,7 @@ namespace mssql {
 // Convert string to lowercase
 static std::string ToLower(const std::string &str) {
 	std::string result = str;
-	std::transform(result.begin(), result.end(), result.begin(),
-				   [](unsigned char c) { return std::tolower(c); });
+	std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return std::tolower(c); });
 	return result;
 }
 
@@ -23,42 +22,42 @@ static std::string ToLower(const std::string &str) {
 static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappingTable() {
 	static const std::unordered_map<std::string, FunctionMapping> mappings = {
 		// String functions
-		{"lower",   {"lower",   "LOWER({0})",           1}},
-		{"upper",   {"upper",   "UPPER({0})",           1}},
-		{"length",  {"length",  "LEN({0})",             1}},
-		{"len",     {"len",     "LEN({0})",             1}},
-		{"trim",    {"trim",    "LTRIM(RTRIM({0}))",    1}},
-		{"ltrim",   {"ltrim",   "LTRIM({0})",           1}},
-		{"rtrim",   {"rtrim",   "RTRIM({0})",           1}},
+		{"lower", {"lower", "LOWER({0})", 1}},
+		{"upper", {"upper", "UPPER({0})", 1}},
+		{"length", {"length", "LEN({0})", 1}},
+		{"len", {"len", "LEN({0})", 1}},
+		{"trim", {"trim", "LTRIM(RTRIM({0}))", 1}},
+		{"ltrim", {"ltrim", "LTRIM({0})", 1}},
+		{"rtrim", {"rtrim", "RTRIM({0})", 1}},
 
 		// Note: LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
 		// are handled by EncodeLikePattern() directly for proper Unicode (N'') encoding
 		// and LIKE special character escaping. Do not add them here.
 
 		// Date/Time extraction functions
-		{"year",        {"year",        "YEAR({0})",                    1}},
-		{"month",       {"month",       "MONTH({0})",                   1}},
-		{"day",         {"day",         "DAY({0})",                     1}},
-		{"hour",        {"hour",        "DATEPART(HOUR, {0})",          1}},
-		{"minute",      {"minute",      "DATEPART(MINUTE, {0})",        1}},
-		{"second",      {"second",      "DATEPART(SECOND, {0})",        1}},
+		{"year", {"year", "YEAR({0})", 1}},
+		{"month", {"month", "MONTH({0})", 1}},
+		{"day", {"day", "DAY({0})", 1}},
+		{"hour", {"hour", "DATEPART(HOUR, {0})", 1}},
+		{"minute", {"minute", "DATEPART(MINUTE, {0})", 1}},
+		{"second", {"second", "DATEPART(SECOND, {0})", 1}},
 
 		// Date/Time arithmetic and parts
 		// Note: date_diff has args: (part, start, end) -> DATEDIFF(part, start, end)
-		{"date_diff",   {"date_diff",   "DATEDIFF({0}, {1}, {2})",      3}},
+		{"date_diff", {"date_diff", "DATEDIFF({0}, {1}, {2})", 3}},
 		// Note: date_add has args: (date, part, amount) -> DATEADD(part, amount, date) - reordered
-		{"date_add",    {"date_add",    "DATEADD({1}, {2}, {0})",       3}},
-		{"date_part",   {"date_part",   "DATEPART({0}, {1})",           2}},
+		{"date_add", {"date_add", "DATEADD({1}, {2}, {0})", 3}},
+		{"date_part", {"date_part", "DATEPART({0}, {1})", 2}},
 
 		// Arithmetic operators (in DuckDB these are function expressions)
-		{"+",           {"+",           "({0} + {1})",                  2}},
-		{"-",           {"-",           "({0} - {1})",                  2}},
-		{"*",           {"*",           "({0} * {1})",                  2}},
-		{"/",           {"/",           "({0} / {1})",                  2}},
-		{"%",           {"%",           "({0} % {1})",                  2}},
+		{"+", {"+", "({0} + {1})", 2}},
+		{"-", {"-", "({0} - {1})", 2}},
+		{"*", {"*", "({0} * {1})", 2}},
+		{"/", {"/", "({0} / {1})", 2}},
+		{"%", {"%", "({0} % {1})", 2}},
 
 		// Unary minus
-		{"negate",      {"negate",      "(-{0})",                       1}},
+		{"negate", {"negate", "(-{0})", 1}},
 	};
 	return mappings;
 }
@@ -66,17 +65,17 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 // Date part mappings from DuckDB to SQL Server
 static const std::unordered_map<std::string, std::string> &GetDatePartMappingTable() {
 	static const std::unordered_map<std::string, std::string> mappings = {
-		{"year",        "year"},
-		{"month",       "month"},
-		{"day",         "day"},
-		{"hour",        "hour"},
-		{"minute",      "minute"},
-		{"second",      "second"},
+		{"year", "year"},
+		{"month", "month"},
+		{"day", "day"},
+		{"hour", "hour"},
+		{"minute", "minute"},
+		{"second", "second"},
 		{"millisecond", "millisecond"},
-		{"week",        "week"},
-		{"quarter",     "quarter"},
-		{"dayofweek",   "weekday"},
-		{"dayofyear",   "dayofyear"},
+		{"week", "week"},
+		{"quarter", "quarter"},
+		{"dayofweek", "weekday"},
+		{"dayofyear", "dayofyear"},
 	};
 	return mappings;
 }
@@ -97,8 +96,8 @@ bool IsFunctionSupported(const std::string &function_name) {
 
 bool IsLikePatternFunction(const std::string &function_name) {
 	std::string lower_name = ToLower(function_name);
-	return lower_name == "prefix" || lower_name == "suffix" || lower_name == "contains" ||
-		   lower_name == "iprefix" || lower_name == "isuffix" || lower_name == "icontains";
+	return lower_name == "prefix" || lower_name == "suffix" || lower_name == "contains" || lower_name == "iprefix" ||
+		   lower_name == "isuffix" || lower_name == "icontains";
 }
 
 bool IsCaseInsensitiveLikeFunction(const std::string &function_name) {
@@ -117,5 +116,5 @@ bool GetDatePartMapping(const std::string &duckdb_part, std::string &out_result)
 	return false;
 }
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

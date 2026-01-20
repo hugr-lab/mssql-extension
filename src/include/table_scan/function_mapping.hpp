@@ -16,9 +16,9 @@ namespace mssql {
  * Mapping from DuckDB function name to SQL Server equivalent.
  */
 struct FunctionMapping {
-	const char *duckdb_name;       // DuckDB function name (lowercase)
-	const char *sql_template;      // T-SQL template with {0}, {1}, ... placeholders
-	int expected_args;             // Expected argument count (-1 for variadic)
+	const char *duckdb_name;   // DuckDB function name (lowercase)
+	const char *sql_template;  // T-SQL template with {0}, {1}, ... placeholders
+	int expected_args;		   // Expected argument count (-1 for variadic)
 };
 
 /**
@@ -51,5 +51,5 @@ bool IsCaseInsensitiveLikeFunction(const std::string &function_name);
  */
 bool GetDatePartMapping(const std::string &duckdb_part, std::string &out_result);
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

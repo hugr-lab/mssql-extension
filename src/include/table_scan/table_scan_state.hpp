@@ -56,5 +56,5 @@ struct TableScanLocalState : public LocalTableFunctionState {
 	idx_t current_chunk = 0;
 };
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

@@ -14,11 +14,11 @@ static int GetDebugLevel() {
 	return level;
 }
 
-#define MSSQL_TABLE_SCAN_DEBUG_LOG(level, fmt, ...)                                \
-	do {                                                                           \
-		if (GetDebugLevel() >= level) {                                            \
-			fprintf(stderr, "[MSSQL TABLE_SCAN] " fmt "\n", ##__VA_ARGS__);         \
-		}                                                                          \
+#define MSSQL_TABLE_SCAN_DEBUG_LOG(level, fmt, ...)                         \
+	do {                                                                    \
+		if (GetDebugLevel() >= level) {                                     \
+			fprintf(stderr, "[MSSQL TABLE_SCAN] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                   \
 	} while (0)
 
 namespace duckdb {
@@ -43,5 +43,5 @@ idx_t TableScanGlobalState::MaxThreads() const {
 	return 1;
 }
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

@@ -2,14 +2,14 @@
 // Feature: 013-table-scan-filter-refactor
 
 #include "table_scan/mssql_table_scan.hpp"
+#include <cstdlib>
+#include "connection/mssql_pool_manager.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
+#include "query/mssql_query_executor.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/table_scan_bind.hpp"
 #include "table_scan/table_scan_state.hpp"
-#include "mssql_functions.hpp"  // For backward compatibility with MSSQLCatalogScanBindData
-#include "connection/mssql_pool_manager.hpp"
-#include "query/mssql_query_executor.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include <cstdlib>
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetDebugLevel() {
@@ -21,11 +21,11 @@ static int GetDebugLevel() {
 	return level;
 }
 
-#define MSSQL_SCAN_DEBUG_LOG(level, fmt, ...)                                  \
-	do {                                                                       \
-		if (GetDebugLevel() >= level) {                                        \
-			fprintf(stderr, "[MSSQL TABLE_SCAN] " fmt "\n", ##__VA_ARGS__);     \
-		}                                                                      \
+#define MSSQL_SCAN_DEBUG_LOG(level, fmt, ...)                               \
+	do {                                                                    \
+		if (GetDebugLevel() >= level) {                                     \
+			fprintf(stderr, "[MSSQL TABLE_SCAN] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                   \
 	} while (0)
 
 namespace duckdb {
@@ -119,16 +119,13 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
 							 input.filters->filters.size());
 
-		auto encode_result = FilterEncoder::Encode(
-			input.filters.get(),
-			column_ids,
-			bind_data.all_column_names,
-			bind_data.all_types
-		);
+		auto encode_result =
+			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types);
 
 		if (!encode_result.where_clause.empty()) {
 			where_conditions.push_back(encode_result.where_clause);
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filters encoded: %s", encode_result.where_clause.c_str());
+			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filters encoded: %s",
+								 encode_result.where_clause.c_str());
 		}
 
 		needs_duckdb_filter = encode_result.needs_duckdb_filter;
@@ -154,8 +151,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: final WHERE clause: %s", combined_where.c_str());
 	}
 
-	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s",
-						 needs_duckdb_filter ? "true" : "false");
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s", needs_duckdb_filter ? "true" : "false");
 
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
@@ -261,7 +257,8 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
-		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%zu]: type=%d class=%d", i, (int)filter->type, (int)filter->GetExpressionClass());
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%zu]: type=%d class=%d", i, (int)filter->type,
+							 (int)filter->GetExpressionClass());
 
 		// Try to encode this expression
 		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
@@ -324,5 +321,5 @@ TableFunction GetCatalogScanFunction() {
 	return func;
 }
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

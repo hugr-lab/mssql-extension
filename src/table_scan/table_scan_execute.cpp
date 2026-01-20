@@ -1,9 +1,9 @@
 // Table Scan Execute Implementation
 // Feature: 013-table-scan-filter-refactor
 
-#include "table_scan/table_scan_state.hpp"
-#include "duckdb.hpp"
 #include <cstdlib>
+#include "duckdb.hpp"
+#include "table_scan/table_scan_state.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetDebugLevel() {
@@ -15,11 +15,11 @@ static int GetDebugLevel() {
 	return level;
 }
 
-#define MSSQL_EXEC_DEBUG_LOG(level, fmt, ...)                                  \
-	do {                                                                       \
-		if (GetDebugLevel() >= level) {                                        \
+#define MSSQL_EXEC_DEBUG_LOG(level, fmt, ...)                                    \
+	do {                                                                         \
+		if (GetDebugLevel() >= level) {                                          \
 			fprintf(stderr, "[MSSQL TABLE_SCAN EXEC] " fmt "\n", ##__VA_ARGS__); \
-		}                                                                      \
+		}                                                                        \
 	} while (0)
 
 namespace duckdb {
@@ -68,5 +68,5 @@ void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChun
 	}
 }
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

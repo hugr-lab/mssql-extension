@@ -46,10 +46,9 @@ unique_ptr<FunctionData> TableScanBindData::Copy() const {
 
 bool TableScanBindData::Equals(const FunctionData &other) const {
 	auto &other_data = other.Cast<TableScanBindData>();
-	return context_name == other_data.context_name &&
-		   schema_name == other_data.schema_name &&
+	return context_name == other_data.context_name && schema_name == other_data.schema_name &&
 		   table_name == other_data.table_name;
 }
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

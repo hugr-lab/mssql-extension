@@ -26,5 +26,5 @@ namespace mssql {
  */
 TableFunction GetCatalogScanFunction();
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb

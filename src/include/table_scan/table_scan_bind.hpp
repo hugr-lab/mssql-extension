@@ -52,5 +52,5 @@ struct TableScanBindData : public TableFunctionData {
 	bool Equals(const FunctionData &other) const override;
 };
 
-} // namespace mssql
-} // namespace duckdb
+}  // namespace mssql
+}  // namespace duckdb
