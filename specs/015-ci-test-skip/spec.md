@@ -2,7 +2,7 @@
 
 **Feature Branch**: `015-ci-test-skip`
 **Created**: 2026-01-20
-**Status**: Draft
+**Status**: Implemented
 **Input**: User description: "The workflow in the community extension repo fails because the CI runs `make release_test`, and it fails because SQL Server is not set up. Skip all extension tests in the community_extensions repo."
 
 ## Problem Statement
