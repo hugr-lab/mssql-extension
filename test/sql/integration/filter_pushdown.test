@@ -304,6 +304,41 @@ SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date <= '2024-0
 730	2024-01-01
 1095	2024-01-01
 
+# Test 9.6: Timestamp comparison filter (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE created_at >= '2020-01-01';
+----
+5
+
+# Test 9.7: Timestamp comparison with no results (pushed down)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE created_at < '2020-01-01';
+----
+0
+
+# =============================================================================
+# SCENARIO 10: Filters NOT Pushed Down (Applied by DuckDB)
+# =============================================================================
+# These filters work correctly but are applied locally by DuckDB, not SQL Server
+
+# Test 10.1: Date function filter (NOT pushed - applied by DuckDB)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE year(created_date) = 2024;
+----
+150000
+
+# Test 10.2: Month extraction filter (NOT pushed - applied by DuckDB)
+query I
+SELECT COUNT(*) FROM testdb.dbo.LargeTable WHERE month(created_date) = 6;
+----
+12330
+
+# Test 10.3: LIKE with leading wildcard (NOT pushed - applied by DuckDB)
+query I
+SELECT COUNT(*) FROM testdb.dbo.TestSimplePK WHERE name LIKE '%Record';
+----
+5
+
 # =============================================================================
 # Cleanup
 # =============================================================================

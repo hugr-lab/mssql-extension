@@ -251,6 +251,17 @@ Supported filter operations for pushdown:
 - IN clause: `column IN (val1, val2, ...)`
 - NULL checks: `IS NULL`, `IS NOT NULL`
 - Conjunctions: `AND`, `OR`
+- Date/timestamp comparisons: `date_col >= '2024-01-01'`
+- Boolean comparisons: `is_active = true` (converted to `= 1`)
+
+**Not pushed down** (applied locally by DuckDB):
+
+- LIKE patterns with leading wildcards: `LIKE '%pattern'`, `LIKE '%pattern%'`
+- ILIKE (case-insensitive LIKE)
+- Function expressions: `year(date_col) = 2024`, `lower(name) = 'test'`
+- DuckDB-specific functions: `list_contains()`, `regexp_matches()`
+
+Note: `LIKE 'prefix%'` patterns are optimized by DuckDB into range comparisons which ARE pushed down.
 
 ## Data Modification (INSERT)
 
