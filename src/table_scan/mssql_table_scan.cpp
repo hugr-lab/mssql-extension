@@ -8,6 +8,7 @@
 #include "mssql_functions.hpp"  // For backward compatibility with MSSQLCatalogScanBindData
 #include "connection/mssql_pool_manager.hpp"
 #include "query/mssql_query_executor.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include <cstdlib>
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
@@ -108,12 +109,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 							 FilterEncoder::EscapeBracketIdentifier(bind_data.table_name) + "]";
 	string query = "SELECT " + column_list + " FROM " + full_table_name;
 
-	// Build WHERE clause from filter pushdown using FilterEncoder
-	bool filter_pushdown_applied = false;
+	// Build WHERE clause from filter pushdown
+	// Combine: simple filters (from FilterEncoder::Encode) + complex filters (from pushdown_complex_filter)
+	std::vector<std::string> where_conditions;
 	bool needs_duckdb_filter = false;
 
+	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
 	if (input.filters && !input.filters->filters.empty()) {
-		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: filter pushdown with %zu filter(s)",
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
 							 input.filters->filters.size());
 
 		auto encode_result = FilterEncoder::Encode(
@@ -124,19 +127,35 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		);
 
 		if (!encode_result.where_clause.empty()) {
-			query += " WHERE " + encode_result.where_clause;
-			filter_pushdown_applied = true;
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: added WHERE clause: %s", encode_result.where_clause.c_str());
+			where_conditions.push_back(encode_result.where_clause);
+			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filters encoded: %s", encode_result.where_clause.c_str());
 		}
 
 		needs_duckdb_filter = encode_result.needs_duckdb_filter;
-		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s",
-							 needs_duckdb_filter ? "true" : "false");
 	}
 
-	// Store filter state for potential future use (currently for logging only)
-	(void)filter_pushdown_applied;
-	(void)needs_duckdb_filter;
+	// 2. Add complex filters (from pushdown_complex_filter callback)
+	if (!bind_data.complex_filter_where_clause.empty()) {
+		where_conditions.push_back(bind_data.complex_filter_where_clause);
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: complex filters added: %s",
+							 bind_data.complex_filter_where_clause.c_str());
+	}
+
+	// 3. Combine all conditions with AND
+	if (!where_conditions.empty()) {
+		std::string combined_where;
+		for (idx_t i = 0; i < where_conditions.size(); i++) {
+			if (i > 0) {
+				combined_where += " AND ";
+			}
+			combined_where += where_conditions[i];
+		}
+		query += " WHERE " + combined_where;
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: final WHERE clause: %s", combined_where.c_str());
+	}
+
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s",
+						 needs_duckdb_filter ? "true" : "false");
 
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
@@ -207,6 +226,78 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 }
 
 //------------------------------------------------------------------------------
+// Complex Filter Pushdown
+//------------------------------------------------------------------------------
+// Handles expressions that cannot be represented as simple TableFilter objects:
+// - Function expressions: year(col) = 2024, month(col) = 6, etc.
+// - BETWEEN: col BETWEEN a AND b
+// - Complex arithmetic in filters
+
+static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+								  vector<unique_ptr<Expression>> &filters) {
+	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
+
+	MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: processing %zu expression(s)", filters.size());
+
+	// Build context for expression encoding
+	// The expressions from DuckDB use column bindings that reference indices in get.GetColumnIds()
+	// We need to map from those indices to actual table column names
+	// get.GetColumnIds()[i] gives the table column index for projected column i
+	const auto &get_column_ids = get.GetColumnIds();
+	vector<column_t> column_ids;
+	for (const auto &col_idx : get_column_ids) {
+		column_ids.push_back(col_idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : col_idx.GetPrimaryIndex());
+	}
+
+	MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: get.column_ids has %zu entries", column_ids.size());
+	for (idx_t i = 0; i < column_ids.size() && i < 10; i++) {
+		MSSQL_SCAN_DEBUG_LOG(2, "  column_ids[%zu] = %llu", i, (unsigned long long)column_ids[i]);
+	}
+
+	ExpressionEncodeContext ctx(column_ids, bind_data.all_column_names, bind_data.all_types);
+
+	std::vector<std::string> encoded_conditions;
+	std::vector<idx_t> expressions_to_remove;
+
+	for (idx_t i = 0; i < filters.size(); i++) {
+		auto &filter = filters[i];
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%zu]: type=%d class=%d", i, (int)filter->type, (int)filter->GetExpressionClass());
+
+		// Try to encode this expression
+		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
+
+		if (result.supported && !result.sql.empty()) {
+			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%zu]: encoded -> %s", i, result.sql.c_str());
+			encoded_conditions.push_back(result.sql);
+			expressions_to_remove.push_back(i);
+		} else {
+			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%zu]: not supported, will be applied by DuckDB", i);
+		}
+	}
+
+	// Remove the expressions we handled (in reverse order to keep indices valid)
+	for (auto it = expressions_to_remove.rbegin(); it != expressions_to_remove.rend(); ++it) {
+		filters.erase(filters.begin() + *it);
+	}
+
+	// Build the WHERE clause from encoded conditions
+	if (!encoded_conditions.empty()) {
+		std::string where_clause;
+		for (idx_t i = 0; i < encoded_conditions.size(); i++) {
+			if (i > 0) {
+				where_clause += " AND ";
+			}
+			where_clause += encoded_conditions[i];
+		}
+		bind_data.complex_filter_where_clause = where_clause;
+		MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: stored WHERE clause: %s", where_clause.c_str());
+	}
+
+	MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: %zu expressions handled, %zu remaining for DuckDB",
+						 expressions_to_remove.size(), filters.size());
+}
+
+//------------------------------------------------------------------------------
 // Public Interface
 //------------------------------------------------------------------------------
 
@@ -222,6 +313,10 @@ TableFunction GetCatalogScanFunction() {
 	// Enable filter pushdown - allows DuckDB to push WHERE conditions to SQL Server
 	// The filters will be passed to InitGlobal via TableFunctionInitInput
 	func.filter_pushdown = true;
+
+	// Enable complex filter pushdown - allows us to handle expressions like year(col) = 2024
+	// that cannot be represented as simple TableFilter objects
+	func.pushdown_complex_filter = ComplexFilterPushdown;
 
 	// Note: We don't set filter_prune = true because that can cause issues with
 	// the DataChunk column count when filter-only columns are excluded

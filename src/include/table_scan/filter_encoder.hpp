@@ -140,6 +140,16 @@ public:
 	 */
 	static std::string EscapeLikePattern(const std::string &pattern);
 
+	/**
+	 * Encode a DuckDB Expression to T-SQL.
+	 * Used by pushdown_complex_filter callback for expressions that cannot
+	 * be represented as simple TableFilter objects (e.g., year(col) = 2024).
+	 */
+	static ExpressionEncodeResult EncodeExpression(
+		const Expression &expr,
+		const ExpressionEncodeContext &ctx
+	);
+
 private:
 	//--------------------------------------------------------------------------
 	// TableFilter Encoding
@@ -214,16 +224,8 @@ private:
 	);
 
 	//--------------------------------------------------------------------------
-	// Expression Encoding
+	// Expression Encoding Helpers
 	//--------------------------------------------------------------------------
-
-	/**
-	 * Encode a DuckDB Expression to T-SQL.
-	 */
-	static ExpressionEncodeResult EncodeExpression(
-		const Expression &expr,
-		const ExpressionEncodeContext &ctx
-	);
 
 	/**
 	 * Encode a function call expression.

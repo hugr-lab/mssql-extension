@@ -134,12 +134,8 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # =============================================================================
 # Static Extension Configuration
 # =============================================================================
-target_compile_options(${EXTENSION_NAME} PRIVATE
-    "-Wno-macro-redefined"
-)
-target_compile_definitions(${EXTENSION_NAME} PRIVATE
-    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
-)
+# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
+# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
@@ -151,12 +147,8 @@ message(STATUS "Static extension configured with full TLS support (OpenSSL)")
 # =============================================================================
 # Loadable Extension Configuration
 # =============================================================================
-target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
-    "-Wno-macro-redefined"
-)
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE
-    EXT_VERSION_MSSQL="${DUCKDB_COMMIT_HASH}"
-)
+# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
+# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}

@@ -253,12 +253,13 @@ Supported filter operations for pushdown:
 - Conjunctions: `AND`, `OR`
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
+- Datetime functions: `year(date_col) = 2024`, `month(date_col) = 6`, `day(date_col) = 15`
 
 **Not pushed down** (applied locally by DuckDB):
 
 - LIKE patterns with leading wildcards: `LIKE '%pattern'`, `LIKE '%pattern%'`
 - ILIKE (case-insensitive LIKE)
-- Function expressions: `year(date_col) = 2024`, `lower(name) = 'test'`
+- Most function expressions: `lower(name) = 'test'`, `length(col) > 5`
 - DuckDB-specific functions: `list_contains()`, `regexp_matches()`
 
 Note: `LIKE 'prefix%'` patterns are optimized by DuckDB into range comparisons which ARE pushed down.
