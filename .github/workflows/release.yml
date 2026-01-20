@@ -334,22 +334,16 @@ jobs:
           echo "============================================"
 
   # ============================================================================
-  # Integration Test Job - Full SQL Server tests on Linux platforms
+  # Integration Test Job - Full SQL Server tests on Linux x64 only
+  # (SQL Server Docker image doesn't support ARM64)
   # ============================================================================
   integration-test:
-    name: Integration Test (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
-    runs-on: ${{ matrix.platform.runner }}
+    name: Integration Test (linux_amd64, DuckDB ${{ matrix.duckdb_version }})
+    runs-on: ubuntu-22.04
     needs: smoke-test
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - id: linux_amd64
-            runner: ubuntu-22.04
-
-          - id: linux_arm64
-            runner: ubuntu-22.04-arm
-
         duckdb_version:
           - '1.4.1'
           - '1.4.2'
@@ -383,13 +377,13 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.duckdb_version }}-linux_amd64
           path: cli
 
       - name: Setup executables
@@ -400,7 +394,7 @@ jobs:
       - name: Rename extension for loading
         run: |
           # DuckDB derives extension name from filename - must be named mssql.duckdb_extension
-          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-linux_amd64.duckdb_extension"
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
 
