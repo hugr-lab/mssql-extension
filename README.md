@@ -249,7 +249,6 @@ Supported filter operations for pushdown:
 - Equality: `column = value`
 - Comparisons: `>`, `<`, `>=`, `<=`, `<>`
 - IN clause: `column IN (val1, val2, ...)`
-- LIKE patterns: `column LIKE 'pattern%'`
 - NULL checks: `IS NULL`, `IS NOT NULL`
 - Conjunctions: `AND`, `OR`
 

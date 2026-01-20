@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown src/include/insert)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/pushdown src/include/insert src/include/table_scan)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -107,10 +107,13 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_transaction.cpp
     src/catalog/mssql_ddl_translator.cpp
     src/catalog/mssql_statistics.cpp
-    # Pushdown layer (filter/projection optimization)
-    src/pushdown/mssql_projection_builder.cpp
-    src/pushdown/mssql_filter_translator.cpp
-    src/pushdown/mssql_prepared_statement.cpp
+    # Table scan layer (refactored table scan and filter encoding)
+    src/table_scan/table_scan_bind.cpp
+    src/table_scan/table_scan_state.cpp
+    src/table_scan/table_scan_execute.cpp
+    src/table_scan/filter_encoder.cpp
+    src/table_scan/function_mapping.cpp
+    src/table_scan/mssql_table_scan.cpp
     # Insert layer (DML INSERT support)
     src/insert/mssql_insert_config.cpp
     src/insert/mssql_insert_target.cpp

@@ -8,6 +8,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "mssql_functions.hpp"
+#include "table_scan/mssql_table_scan.hpp"
 
 // Debug logging
 static int GetTableEntryDebugLevel() {
@@ -102,7 +103,7 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 
 	bind_data = std::move(catalog_bind_data);
 
-	return GetMSSQLCatalogScanFunction();
+	return mssql::GetCatalogScanFunction();
 }
 
 unique_ptr<BaseStatistics> MSSQLTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
