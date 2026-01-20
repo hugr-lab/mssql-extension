@@ -258,6 +258,53 @@ SELECT id, name FROM testdb.dbo.TestSimplePK WHERE value IS NOT NULL AND (id = 1
 4	Fourth Record
 
 # =============================================================================
+# SCENARIO 9: Date/Time Filter Pushdown
+# =============================================================================
+# Test that date and datetime filters are properly pushed to SQL Server
+
+# Test 9.1: Date equality filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date = '2024-01-02' ORDER BY id LIMIT 3;
+----
+1	2024-01-02
+366	2024-01-02
+731	2024-01-02
+
+# Test 9.2: Date range filter (>= and <)
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date >= '2024-06-01' AND created_date < '2024-06-03' ORDER BY id LIMIT 5;
+----
+152	2024-06-01
+153	2024-06-02
+517	2024-06-01
+518	2024-06-02
+882	2024-06-01
+
+# Test 9.3: Date comparison with other filters
+query III
+SELECT id, category, created_date FROM testdb.dbo.LargeTable WHERE created_date = '2024-01-01' AND category = 1 ORDER BY id LIMIT 3;
+----
+7300	1	2024-01-01
+14600	1	2024-01-01
+21900	1	2024-01-01
+
+# Test 9.4: Date greater than filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date > '2024-12-28' ORDER BY id LIMIT 3;
+----
+363	2024-12-29
+364	2024-12-30
+728	2024-12-29
+
+# Test 9.5: Date less than or equal filter
+query II
+SELECT id, created_date FROM testdb.dbo.LargeTable WHERE created_date <= '2024-01-01' ORDER BY id LIMIT 3;
+----
+365	2024-01-01
+730	2024-01-01
+1095	2024-01-01
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 statement ok
