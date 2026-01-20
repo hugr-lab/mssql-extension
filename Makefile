@@ -1,26 +1,29 @@
 # Makefile for DuckDB MSSQL Extension
-# Builds extension using DuckDB's build system
+# Compatible with DuckDB Community Extensions CI
 
-.PHONY: all release debug clean configure test help docker-up docker-down docker-status integration-test vcpkg-setup
+PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# Default generator (can be overridden: GEN=ninja make release)
-GEN ?= Ninja
+# Extension configuration
+EXT_NAME=mssql
+EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# Build directory
-BUILD_DIR := build
-
-# Extension config path (absolute path)
-EXT_CONFIG := $(shell pwd)/extension_config.cmake
-
-# DuckDB source directory
-DUCKDB_DIR := $(shell pwd)/duckdb
-
-# vcpkg setup
-VCPKG_DIR := $(shell pwd)/vcpkg
+# vcpkg integration
+VCPKG_DIR := $(PROJ_DIR)vcpkg
 VCPKG_TOOLCHAIN := $(VCPKG_DIR)/scripts/buildsystems/vcpkg.cmake
 
-# Default target
-all: release
+# Pass vcpkg toolchain to all builds (if vcpkg exists)
+ifneq ($(wildcard $(VCPKG_TOOLCHAIN)),)
+    EXT_FLAGS := -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(PROJ_DIR)"
+endif
+
+# Include DuckDB extension CI tools (provides: set_duckdb_version, release, debug, test, etc.)
+include extension-ci-tools/makefiles/duckdb_extension.Makefile
+
+#
+# Custom targets (preserved from original Makefile)
+#
+
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -29,58 +32,6 @@ vcpkg-setup:
 		git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
 		$(VCPKG_DIR)/bootstrap-vcpkg.sh; \
 	fi
-
-# Release build - uses DuckDB's CMakeLists.txt as root
-release: vcpkg-setup
-	mkdir -p $(BUILD_DIR)/release
-	cd $(BUILD_DIR)/release && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
-	cmake --build $(BUILD_DIR)/release --config Release
-
-# Debug build with debug symbols
-debug: vcpkg-setup
-	mkdir -p $(BUILD_DIR)/debug
-	cd $(BUILD_DIR)/debug && cmake -G "$(GEN)" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
-	cmake --build $(BUILD_DIR)/debug --config Debug
-
-# Configure only (useful for IDE integration)
-configure: vcpkg-setup
-	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && cmake -G "$(GEN)" -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(shell pwd)" -DDUCKDB_EXTENSION_CONFIGS="$(EXT_CONFIG)" $(DUCKDB_DIR)
-
-# Clean build artifacts
-clean:
-	rm -rf $(BUILD_DIR)
-
-# Run tests (requires built extension) - excludes integration tests
-test: release
-	$(BUILD_DIR)/release/test/unittest "[sql]" --force-reload
-
-# Show help
-help:
-	@echo "DuckDB MSSQL Extension Build System"
-	@echo ""
-	@echo "Targets:"
-	@echo "  release          - Build release version (default)"
-	@echo "  debug            - Build debug version with symbols"
-	@echo "  clean            - Remove build artifacts"
-	@echo "  test             - Run unit tests (no SQL Server required)"
-	@echo "  integration-test - Run integration tests (requires SQL Server)"
-	@echo "  docker-up        - Start SQL Server test container"
-	@echo "  docker-down      - Stop SQL Server test container"
-	@echo "  docker-status    - Check SQL Server container status"
-	@echo "  help             - Show this help"
-	@echo ""
-	@echo "Options:"
-	@echo "  GEN=<generator>  - CMake generator (default: Ninja)"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make release"
-	@echo "  make debug"
-	@echo "  make docker-up && make integration-test"
-	@echo "  GEN='Unix Makefiles' make release"
-	@echo ""
-	@echo "Extension will be built at:"
-	@echo "  build/release/extension/mssql/mssql.duckdb_extension"
 
 # Docker targets for SQL Server test container
 DOCKER_COMPOSE := docker/docker-compose.yml
@@ -165,12 +116,10 @@ integration-test: release
 	@echo "  MSSQL_TESTDB_DSN=$(MSSQL_TESTDB_DSN)"
 	@echo ""
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
-		echo "ERROR: SQL Server is not running or not healthy."; \
-		echo "Run 'make docker-up' first to start the test container."; \
-		exit 1; \
+		echo "WARNING: SQL Server container not detected. Run 'make docker-up' first."; \
 	fi
-	$(BUILD_DIR)/release/test/unittest "[integration]" --force-reload
-	$(BUILD_DIR)/release/test/unittest "[sql]" --force-reload
+	build/release/test/unittest "[integration]" --force-reload
+	build/release/test/unittest "[sql]" --force-reload
 
 # Run all tests (unit + integration)
 test-all: release
@@ -181,12 +130,12 @@ test-all: release
 	@echo "  MSSQL_TEST_PORT=$(MSSQL_TEST_PORT)"
 	@echo "  MSSQL_TEST_DSN=$(MSSQL_TEST_DSN)"
 	@echo ""
-	$(BUILD_DIR)/release/test/unittest "*mssql*" --force-reload
+	build/release/test/unittest "*mssql*" --force-reload
 
 # Debug test run
 test-debug: debug
 	@echo "Running tests (debug build)..."
-	$(BUILD_DIR)/debug/test/unittest "*mssql*" --force-reload
+	build/debug/test/unittest "*mssql*" --force-reload
 
 # C++ test sources (TDS layer + query layer - minimal, no DuckDB dependencies)
 CPP_TEST_SOURCES := \
@@ -208,11 +157,11 @@ CPP_TEST_FLAGS := -std=c++17 -pthread -DMSSQL_TLS_STUB=1 -Wno-deprecated-declara
 # Build and run C++ simple query test
 test-simple-query:
 	@echo "Building C++ simple query test..."
-	@mkdir -p $(BUILD_DIR)/test
+	@mkdir -p build/test
 	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_INCLUDES) \
 	    test/cpp/test_simple_query.cpp \
 	    $(CPP_TEST_SOURCES) \
-	    -o $(BUILD_DIR)/test/test_simple_query
+	    -o build/test/test_simple_query
 	@echo ""
 	@echo "Running test..."
 	@echo "Test environment:"
@@ -221,4 +170,33 @@ test-simple-query:
 	@echo "  MSSQL_TEST_USER=$(MSSQL_TEST_USER)"
 	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
 	@echo ""
-	$(BUILD_DIR)/test/test_simple_query
+	build/test/test_simple_query
+
+# Show help
+help:
+	@echo "DuckDB MSSQL Extension Build System"
+	@echo ""
+	@echo "Standard CI targets (from extension-ci-tools):"
+	@echo "  make release              - Build release version"
+	@echo "  make debug                - Build debug version"
+	@echo "  make test                 - Run unit tests"
+	@echo "  make set_duckdb_version   - Set DuckDB version (use DUCKDB_GIT_VERSION=v1.x.x)"
+	@echo ""
+	@echo "Custom targets:"
+	@echo "  make vcpkg-setup          - Bootstrap vcpkg (required for TLS support)"
+	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
+	@echo "  make test-all             - Run all tests"
+	@echo "  make test-debug           - Run tests with debug build"
+	@echo "  make test-simple-query    - Run C++ simple query test"
+	@echo "  make docker-up            - Start SQL Server test container"
+	@echo "  make docker-down          - Stop SQL Server test container"
+	@echo "  make docker-status        - Check SQL Server container status"
+	@echo "  make help                 - Show this help"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make vcpkg-setup && make release"
+	@echo "  DUCKDB_GIT_VERSION=v1.4.3 make set_duckdb_version"
+	@echo "  make docker-up && make integration-test"
+	@echo ""
+	@echo "Extension will be built at:"
+	@echo "  build/release/extension/mssql/mssql.duckdb_extension"
