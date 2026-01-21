@@ -317,6 +317,98 @@ SET mssql_insert_max_sql_bytes = 4194304;
 
 Identity (auto-increment) columns are automatically excluded from INSERT statements. The generated values are returned via RETURNING clause.
 
+## DDL Operations
+
+The extension supports standard DuckDB DDL syntax for common operations, which are translated to T-SQL and executed on SQL Server. For advanced operations (indexes, constraints), use `mssql_exec()`.
+
+### Create Table
+
+```sql
+-- Standard DuckDB syntax - automatically translated to T-SQL
+CREATE TABLE sqlserver.dbo.users (
+    id INTEGER,
+    username VARCHAR,
+    email VARCHAR,
+    created_at TIMESTAMP
+);
+```
+
+DuckDB types are mapped to SQL Server types (INTEGER → INT, VARCHAR → NVARCHAR(MAX), TIMESTAMP → DATETIME2).
+
+For SQL Server-specific features (IDENTITY, constraints, defaults), use `mssql_exec()`:
+
+```sql
+SELECT mssql_exec('sqlserver', '
+    CREATE TABLE dbo.products (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(100) NOT NULL,
+        price DECIMAL(10,2) DEFAULT 0.00
+    )
+');
+```
+
+### Drop Table
+
+```sql
+-- Standard DuckDB syntax
+DROP TABLE sqlserver.dbo.users;
+
+-- With IF EXISTS (via mssql_exec)
+SELECT mssql_exec('sqlserver', 'DROP TABLE IF EXISTS dbo.old_table');
+```
+
+### Alter Table
+
+```sql
+-- Add a column
+ALTER TABLE sqlserver.dbo.users ADD COLUMN status VARCHAR;
+
+-- Drop a column
+ALTER TABLE sqlserver.dbo.users DROP COLUMN status;
+
+-- Rename a column
+ALTER TABLE sqlserver.dbo.users RENAME COLUMN email TO email_address;
+```
+
+For constraints, use `mssql_exec()`:
+
+```sql
+SELECT mssql_exec('sqlserver', 'ALTER TABLE dbo.users ADD CONSTRAINT UQ_email UNIQUE (email)');
+```
+
+### Rename Table
+
+```sql
+ALTER TABLE sqlserver.dbo.old_name RENAME TO new_name;
+```
+
+### Create and Drop Schema
+
+```sql
+-- Create schema
+CREATE SCHEMA sqlserver.sales;
+
+-- Drop schema (must be empty)
+DROP SCHEMA sqlserver.sales;
+```
+
+### Indexes (via mssql_exec)
+
+Index operations are not supported via DuckDB DDL syntax. Use `mssql_exec()`:
+
+```sql
+-- Create index
+SELECT mssql_exec('sqlserver', 'CREATE INDEX IX_users_email ON dbo.users (email)');
+
+-- Create unique index
+SELECT mssql_exec('sqlserver', 'CREATE UNIQUE INDEX IX_users_username ON dbo.users (username)');
+
+-- Drop index
+SELECT mssql_exec('sqlserver', 'DROP INDEX IX_users_email ON dbo.users');
+```
+
+> **Note**: After DDL operations via `mssql_exec()`, use `mssql_refresh_cache('sqlserver')` to update the metadata cache. Standard DuckDB DDL operations automatically refresh the cache.
+
 ## Function Reference
 
 ### mssql_version()
