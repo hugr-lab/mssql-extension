@@ -272,8 +272,6 @@ jobs:
             docker_available: false
 
         duckdb_version:
-          - '1.4.1'
-          - '1.4.2'
           - '1.4.3'
 
     steps:
@@ -343,8 +341,6 @@ jobs:
       fail-fast: false
       matrix:
         duckdb_version:
-          - '1.4.1'
-          - '1.4.2'
           - '1.4.3'
 
     services:
