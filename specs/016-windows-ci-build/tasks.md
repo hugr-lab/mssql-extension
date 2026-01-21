@@ -48,9 +48,9 @@
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Create git tag with source fixes (e.g., v0.1.6)
+- [x] T007 [US1] Create git tag with source fixes (e.g., v0.1.6)
 - [ ] T008 [US1] Push tag to origin
-- [ ] T009 [US1] Update description.yml ref to new tag
+- [x] T009 [US1] Update description.yml ref to new tag
 - [ ] T010 [US1] Update community-extensions PR with new ref (external action)
 
 **Checkpoint**: Community-extensions CI Windows builds should now pass.
