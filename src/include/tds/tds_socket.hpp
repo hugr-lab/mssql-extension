@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include "tds/tds_platform.hpp"
 #include "tds/tls/tds_tls_context.hpp"
 #include "tds_packet.hpp"
 #include "tds_types.hpp"

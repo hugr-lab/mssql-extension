@@ -4,6 +4,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include "tds_platform.hpp"
 #include "tds_protocol.hpp"
 #include "tds_socket.hpp"
 #include "tds_types.hpp"

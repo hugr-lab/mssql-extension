@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       run_build:
@@ -14,6 +16,11 @@ on:
         description: 'Run SQL Server integration tests (requires run_build)'
         required: false
         default: true
+        type: boolean
+      run_windows_build:
+        description: 'Run Windows builds (MSVC and MinGW)'
+        required: false
+        default: false
         type: boolean
 
 concurrency:
@@ -280,3 +287,224 @@ jobs:
       - name: Run integration tests
         run: |
           scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension
+
+  # ============================================================================
+  # Windows Build Job - MSVC (Visual Studio 2022)
+  # Matches community-extensions CI configuration
+  # (Manual trigger only via workflow_dispatch)
+  # ============================================================================
+  build-windows-msvc:
+    name: Build Windows (MSVC)
+    runs-on: windows-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch DuckDB v1.4.3
+        id: duckdb
+        shell: bash
+        run: |
+          chmod +x scripts/ci/fetch_duckdb.sh
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Log build metadata
+        shell: bash
+        run: |
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "Platform: windows_amd64 (MSVC)"
+          echo "vcpkg Triplet: x64-windows-static-release"
+          echo "============================================"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a34c873a9717a888f58dc05571dde15571c85e3e'
+
+      # Cache vcpkg installed packages
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-msvc-x64-windows-static-release-
+
+      - name: Setup Visual Studio Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Release
+        shell: cmd
+        run: |
+          mkdir build\release
+          cd build\release
+          cmake -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-release ^
+            -DVCPKG_HOST_TRIPLET=x64-windows-static-release ^
+            -DVCPKG_MANIFEST_DIR="%cd%\..\..\" ^
+            -DDUCKDB_EXTENSION_CONFIGS="%cd%\..\..\extension_config.cmake" ^
+            ..\..\duckdb
+          cmake --build . --config Release
+
+      - name: Upload Extension Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mssql-extension-v1.4.3-windows_amd64_msvc
+          path: build/release/extension/mssql/mssql.duckdb_extension
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-windows_amd64_msvc
+          path: build/release/duckdb.exe
+          if-no-files-found: error
+
+  # ============================================================================
+  # Windows Build Job - MinGW (Rtools 4.2)
+  # Matches community-extensions CI configuration
+  # (Manual trigger only via workflow_dispatch)
+  # ============================================================================
+  build-windows-mingw:
+    name: Build Windows (MinGW)
+    runs-on: windows-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
+    env:
+      CC: gcc
+      CXX: g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch DuckDB v1.4.3
+        id: duckdb
+        shell: bash
+        run: |
+          chmod +x scripts/ci/fetch_duckdb.sh
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Log build metadata
+        shell: bash
+        run: |
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "Platform: windows_amd64 (MinGW)"
+          echo "vcpkg Triplet: x64-mingw-static"
+          echo "============================================"
+
+      # Setup Rtools 4.2 for MinGW compiler
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'devel'
+          update-rtools: true
+          rtools-version: '42'
+
+      - name: Setup rtools gcc for vcpkg
+        shell: bash
+        run: |
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/gcc.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-gcc.exe
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/g++.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-g++.exe
+          echo "C:/rtools42/x86_64-w64-mingw32.static.posix/bin" >> $GITHUB_PATH
+          echo "C:/rtools42/usr/bin" >> $GITHUB_PATH
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'a34c873a9717a888f58dc05571dde15571c85e3e'
+
+      # Cache vcpkg installed packages
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-mingw-x64-mingw-static-
+
+      - name: Build Release
+        shell: bash
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-mingw-static \
+            -DVCPKG_HOST_TRIPLET=x64-mingw-static \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Upload Extension Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mssql-extension-v1.4.3-windows_amd64_mingw
+          path: build/release/extension/mssql/mssql.duckdb_extension
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-windows_amd64_mingw
+          path: build/release/duckdb.exe
+          if-no-files-found: error
+
+  # ============================================================================
+  # Windows Smoke Test Job - Verify extension loads on Windows
+  # (Manual trigger only via workflow_dispatch)
+  # ============================================================================
+  smoke-test-windows:
+    name: Smoke Test Windows (${{ matrix.config.name }})
+    runs-on: windows-latest
+    needs: [build-windows-msvc, build-windows-mingw]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: MSVC
+            artifact_suffix: windows_amd64_msvc
+          - name: MinGW
+            artifact_suffix: windows_amd64_mingw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mssql-extension-v1.4.3-${{ matrix.config.artifact_suffix }}
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-v1.4.3-${{ matrix.config.artifact_suffix }}
+          path: cli
+
+      - name: Run load-only smoke test
+        shell: bash
+        run: |
+          echo "Testing extension load for ${{ matrix.config.name }} build..."
+          ./cli/duckdb.exe -unsigned -c "LOAD 'extension/mssql.duckdb_extension'; SELECT mssql_version();"
+          echo "Smoke test passed!"
