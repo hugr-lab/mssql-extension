@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include "../tds_platform.hpp"
 
 namespace duckdb {
 namespace tds {

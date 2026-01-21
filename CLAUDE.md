@@ -24,8 +24,12 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API), existing TDS layer (specs 001-011) (012-docs-platform-refresh)
 - In-memory (metadata cache) (012-docs-platform-refresh)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-012), OpenSSL (via vcpkg) (013-table-scan-filter-refactor)
-
+- Makefile (GNU Make), CMake 3.20+, Bash + duckdb/extension-ci-tools (git submodule), duckdb (existing submodule) (001-extension-ci-tools-integration)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), vcpkg (manifest mode) (001-project-bootstrap)
+- YAML configuration + Shell/Makefile + DuckDB extension-ci-tools (Makefile-based test runner) (015-ci-test-skip)
+- N/A (configuration files only) (015-ci-test-skip)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (via vcpkg), WinSock2 (Windows) (016-windows-ci-build)
+- N/A (build/CI configuration only) (016-windows-ci-build)
 
 ## Project Structure
 
@@ -81,9 +85,37 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 016-windows-ci-build: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (via vcpkg), WinSock2 (Windows)
+- 015-ci-test-skip: Added YAML configuration + Shell/Makefile + DuckDB extension-ci-tools (Makefile-based test runner)
 - 013-table-scan-filter-refactor: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-012), OpenSSL (via vcpkg)
-- 012-docs-platform-refresh: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API), existing TDS layer (specs 001-011)
-- Migrated TLS from mbedTLS to OpenSSL - unified TLS support for both static and loadable extensions
 
 <!-- MANUAL ADDITIONS START -->
+
+## Windows Build Support
+
+The extension supports Windows builds with both MSVC and MinGW toolchains.
+
+### Platform Compatibility
+
+- **ssize_t**: Windows MSVC does not define the POSIX `ssize_t` type. The header `src/include/tds/tds_platform.hpp` provides the Windows-compatible typedef.
+
+### CI Windows Build Testing
+
+To test Windows builds before submitting to community-extensions:
+
+```bash
+# Trigger Windows build manually via GitHub Actions
+# Go to Actions → CI → Run workflow → Check "Run Windows build jobs"
+```
+
+### Build Configurations
+
+| Toolchain           | vcpkg Triplet              | Notes                                       |
+|---------------------|----------------------------|---------------------------------------------|
+| MSVC (VS2022)       | x64-windows-static-release | Primary Windows build                       |
+| MinGW (Rtools 4.2)  | x64-mingw-static           | Must use Rtools 4.2, not 4.3 (linker bugs)  |
+
+### Community Extensions CI
+
+The community-extensions CI uses both MSVC and MinGW builds. Local CI workflow matches these configurations for accurate pre-submission testing.
 <!-- MANUAL ADDITIONS END -->

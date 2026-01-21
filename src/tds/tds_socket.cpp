@@ -7,6 +7,11 @@
 #include <memory>
 
 #ifdef _WIN32
+// NOMINMAX must be defined before including winsock2.h (which includes windows.h)
+// to prevent min/max macros that conflict with std::min/std::max
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
