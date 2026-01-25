@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -476,6 +477,9 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 	case ExpressionClass::BOUND_CASE:
 		return EncodeCaseExpression(expr.Cast<BoundCaseExpression>(), ctx);
 
+	case ExpressionClass::BOUND_BETWEEN:
+		return EncodeBetweenExpression(expr.Cast<BoundBetweenExpression>(), ctx);
+
 	default:
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: unsupported expression class %d", (int)expr.GetExpressionClass());
 		return {"", false};
@@ -542,6 +546,20 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundComparisonExpression &expr,
 																 const ExpressionEncodeContext &ctx) {
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: type=%d", (int)expr.type);
+
+	// Check for rowid equality: rowid = value (Spec 001-pk-rowid-semantics)
+	if (expr.type == ExpressionType::COMPARE_EQUAL && ctx.HasPKInfo()) {
+		// Check if left is rowid and right is constant
+		if (IsRowidColumn(*expr.left, ctx)) {
+			MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: detected rowid = value");
+			return EncodeRowidEquality(*expr.right, ctx);
+		}
+		// Check if right is rowid and left is constant (value = rowid)
+		if (IsRowidColumn(*expr.right, ctx)) {
+			MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: detected value = rowid");
+			return EncodeRowidEquality(*expr.left, ctx);
+		}
+	}
 
 	// Get the comparison operator
 	std::string op;
@@ -653,6 +671,51 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	return {sql, true};
 }
 
+ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundBetweenExpression &expr,
+															  const ExpressionEncodeContext &ctx) {
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: lower_inclusive=%s, upper_inclusive=%s",
+						   expr.lower_inclusive ? "true" : "false", expr.upper_inclusive ? "true" : "false");
+
+	auto child_ctx = ctx.child();
+
+	// Encode the input expression (the column or expression being checked)
+	auto input_result = EncodeExpression(*expr.input, child_ctx);
+	if (!input_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: input encoding failed");
+		return {"", false};
+	}
+
+	// Encode the lower bound
+	auto lower_result = EncodeExpression(*expr.lower, child_ctx);
+	if (!lower_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
+		return {"", false};
+	}
+
+	// Encode the upper bound
+	auto upper_result = EncodeExpression(*expr.upper, child_ctx);
+	if (!upper_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");
+		return {"", false};
+	}
+
+	// Build the SQL: (input >= lower AND input <= upper) or variants based on inclusivity
+	// For standard BETWEEN (both inclusive), we can use T-SQL BETWEEN
+	if (expr.lower_inclusive && expr.upper_inclusive) {
+		std::string sql = "(" + input_result.sql + " BETWEEN " + lower_result.sql + " AND " + upper_result.sql + ")";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
+		return {sql, true};
+	}
+
+	// For non-standard bounds, use explicit comparisons
+	std::string lower_op = expr.lower_inclusive ? " >= " : " > ";
+	std::string upper_op = expr.upper_inclusive ? " <= " : " < ";
+	std::string sql = "((" + input_result.sql + lower_op + lower_result.sql + ") AND (" + input_result.sql + upper_op +
+					  upper_result.sql + "))";
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
+	return {sql, true};
+}
+
 ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpression &expr,
 													  const ExpressionEncodeContext &ctx) {
 	// Get the column binding - this contains the table index and column index
@@ -679,7 +742,21 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 		table_col_idx = ctx.column_ids[projected_idx];
 	}
 
-	// Skip virtual columns
+	// Handle rowid virtual column (Spec 001-pk-rowid-semantics)
+	// For non-equality expressions like rowid > 100, we can use scalar PK
+	if (table_col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+		// Only scalar PK can be used in arbitrary expressions
+		if (ctx.HasPKInfo() && !ctx.pk_is_composite) {
+			std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
+			MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: rowid (scalar PK) -> %s", sql.c_str());
+			return {sql, true};
+		}
+		// Composite PK rowid can only be used in equality (handled in EncodeComparisonExpression)
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: rowid not supported for non-equality (composite PK or no PK info)");
+		return {"", false};
+	}
+
+	// Skip other virtual columns
 	if (table_col_idx >= VIRTUAL_COL_START) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: virtual column %llu not supported",
 							   (unsigned long long)table_col_idx);
@@ -827,6 +904,78 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeLikePattern: encoded -> %s", sql.c_str());
 	return {sql, true};
+}
+
+//------------------------------------------------------------------------------
+// Rowid Filter Pushdown Helpers (Spec 001-pk-rowid-semantics)
+//------------------------------------------------------------------------------
+
+bool FilterEncoder::IsRowidColumn(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+	idx_t projected_idx = col_ref.binding.column_index;
+
+	if (ctx.column_ids.empty()) {
+		// No projection - check if the index is COLUMN_IDENTIFIER_ROW_ID
+		return projected_idx == COLUMN_IDENTIFIER_ROW_ID;
+	}
+	if (projected_idx >= ctx.column_ids.size()) {
+		return false;
+	}
+	return ctx.column_ids[projected_idx] == COLUMN_IDENTIFIER_ROW_ID;
+}
+
+ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &value_expr,
+														  const ExpressionEncodeContext &ctx) {
+	if (!ctx.HasPKInfo()) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: no PK info available");
+		return {"", false};
+	}
+
+	// Value must be a constant
+	if (value_expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: value is not a constant");
+		return {"", false};
+	}
+	auto &const_expr = value_expr.Cast<BoundConstantExpression>();
+
+	if (ctx.pk_is_composite) {
+		// Composite PK: rowid = {'col1': val1, 'col2': val2}
+		// Extract struct children and build AND conditions
+		if (const_expr.value.type().id() != LogicalTypeId::STRUCT) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: composite PK expects STRUCT value, got %s",
+								   const_expr.value.type().ToString().c_str());
+			return {"", false};
+		}
+		auto &children = StructValue::GetChildren(const_expr.value);
+		if (children.size() != ctx.pk_column_names->size()) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: STRUCT has %zu children, expected %zu", children.size(),
+								   ctx.pk_column_names->size());
+			return {"", false};
+		}
+
+		std::string sql = "(";
+		for (idx_t i = 0; i < children.size(); i++) {
+			if (i > 0) {
+				sql += " AND ";
+			}
+			sql += "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[i]) + "]";
+			sql += " = ";
+			sql += ValueToSQLLiteral(children[i], (*ctx.pk_column_types)[i]);
+		}
+		sql += ")";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: composite PK -> %s", sql.c_str());
+		return {sql, true};
+	} else {
+		// Scalar PK: rowid = value
+		std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
+		sql += " = ";
+		sql += ValueToSQLLiteral(const_expr.value, (*ctx.pk_column_types)[0]);
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: scalar PK -> %s", sql.c_str());
+		return {sql, true};
+	}
 }
 
 }  // namespace mssql

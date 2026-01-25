@@ -98,6 +98,7 @@ set(EXTENSION_SOURCES
     # Catalog integration layer (DuckDB catalog API)
     src/catalog/mssql_column_info.cpp
     src/catalog/mssql_metadata_cache.cpp
+    src/catalog/mssql_primary_key.cpp
     src/catalog/mssql_catalog.cpp
     src/catalog/mssql_schema_entry.cpp
     src/catalog/mssql_table_entry.cpp

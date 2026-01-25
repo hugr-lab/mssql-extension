@@ -30,6 +30,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - N/A (configuration files only) (015-ci-test-skip)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (via vcpkg), WinSock2 (Windows) (016-windows-ci-build)
 - N/A (build/CI configuration only) (016-windows-ci-build)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-012) (001-pk-rowid-semantics)
+- In-memory (PK metadata cache per table entry) (001-pk-rowid-semantics)
 
 ## Project Structure
 
@@ -85,9 +87,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 001-pk-rowid-semantics: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-012)
 - 016-windows-ci-build: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (via vcpkg), WinSock2 (Windows)
 - 015-ci-test-skip: Added YAML configuration + Shell/Makefile + DuckDB extension-ci-tools (Makefile-based test runner)
-- 013-table-scan-filter-refactor: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API, catalog API, DataChunk), existing TDS layer (specs 001-012), OpenSSL (via vcpkg)
 
 <!-- MANUAL ADDITIONS START -->
 

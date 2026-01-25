@@ -1,0 +1,167 @@
+# name: test/sql/rowid/rowid_filter_pushdown.test
+# description: Tests for rowid filter pushdown (WHERE rowid = value)
+# group: [rowid]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+#
+# Spec: 001-pk-rowid-semantics - rowid filter pushdown
+# This tests that filters on the rowid pseudo-column are pushed down to SQL Server
+# as filters on the underlying primary key columns.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_rowid_filter (TYPE mssql);
+
+# =============================================================================
+# Scalar PK - Simple rowid equality filter
+# =============================================================================
+
+# Test 1: Basic rowid = value filter with INT PK
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid = 1;
+----
+1	First
+
+# Test 2: rowid = value with other conditions
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid = 2 AND name = 'Second';
+----
+2	Second
+
+# Test 3: rowid = value with VARCHAR PK
+query TT
+SELECT rowid, description FROM testdb_rowid_filter.dbo.RowidTestVarchar WHERE rowid = 'ABC';
+----
+ABC	Alpha Beta Charlie
+
+# Test 4: rowid = value with BIGINT PK (large value)
+query IT
+SELECT rowid, data FROM testdb_rowid_filter.dbo.RowidTestBigint WHERE rowid = 9223372036854775807;
+----
+9223372036854775807	max_bigint
+
+# Test 5: rowid = value with negative BIGINT PK
+query IT
+SELECT rowid, data FROM testdb_rowid_filter.dbo.RowidTestBigint WHERE rowid = -9223372036854775808;
+----
+-9223372036854775808	min_bigint
+
+# =============================================================================
+# Scalar PK - Non-equality rowid filters (uses PK column directly)
+# =============================================================================
+
+# Test 6: rowid > value (should push down as PK column filter)
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid > 3 ORDER BY rowid;
+----
+10	Ten
+100	Hundred
+
+# Test 7: rowid < value
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid < 3 ORDER BY rowid;
+----
+1	First
+2	Second
+
+# Test 8: rowid BETWEEN (uses >= and <=)
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid BETWEEN 2 AND 3 ORDER BY rowid;
+----
+2	Second
+3	Third
+
+# =============================================================================
+# Composite PK - rowid equality filter with STRUCT
+# =============================================================================
+
+# Test 9: Composite PK rowid = STRUCT filter (2 columns)
+query RR
+SELECT rowid, value FROM testdb_rowid_filter.dbo.RowidTestComposite2 WHERE rowid = {'tenant_id': 1, 'id': 100};
+----
+{'tenant_id': 1, 'id': 100}	99.99
+
+# Test 10: Composite PK rowid = STRUCT with different tenant
+query RR
+SELECT rowid, value FROM testdb_rowid_filter.dbo.RowidTestComposite2 WHERE rowid = {'tenant_id': 2, 'id': 100};
+----
+{'tenant_id': 2, 'id': 100}	75.00
+
+# Test 11: Three-column composite PK rowid = STRUCT filter
+query RT
+SELECT rowid, data FROM testdb_rowid_filter.dbo.RowidTestComposite3 WHERE rowid = {'region': 'US', 'year': 2024, 'seq': 1};
+----
+{'region': US, 'year': 2024, 'seq': 1}	US record 1
+
+# Test 12: Composite PK with mixed types (VARCHAR, INT, INT)
+query RT
+SELECT rowid, data FROM testdb_rowid_filter.dbo.RowidTestComposite3 WHERE rowid = {'region': 'APAC', 'year': 2023, 'seq': 1};
+----
+{'region': APAC, 'year': 2023, 'seq': 1}	APAC old record
+
+# =============================================================================
+# Special Character Column Names - Scalar PK
+# =============================================================================
+
+# Test 13: Scalar PK with space in column name ([My ID])
+query IT
+SELECT rowid, MixedCase FROM testdb_rowid_filter.dbo.RowidSpecialPKScalar WHERE rowid = 1;
+----
+1	Mixed 1
+
+# Test 14: Scalar PK with space - range filter
+query IT
+SELECT rowid, MixedCase FROM testdb_rowid_filter.dbo.RowidSpecialPKScalar WHERE rowid >= 2 ORDER BY rowid;
+----
+2	Mixed 2
+3	NULL
+
+# =============================================================================
+# Special Character Column Names - Composite PK
+# =============================================================================
+
+# Test 15: Composite PK with special chars in column names
+query RI
+SELECT rowid, quantity FROM testdb_rowid_filter.dbo.RowidSpecialPKComposite WHERE rowid = {'Region ID': 1, 'Product]Code': 'ABC-001'};
+----
+{'Region ID': 1, 'Product]Code': ABC-001}	100
+
+# Test 16: Another composite PK with special chars
+query RI
+SELECT rowid, quantity FROM testdb_rowid_filter.dbo.RowidSpecialPKComposite WHERE rowid = {'Region ID': 2, 'Product]Code': 'ABC-001'};
+----
+{'Region ID': 2, 'Product]Code': ABC-001}	150
+
+# =============================================================================
+# Edge Cases
+# =============================================================================
+
+# Test 17: rowid filter with no matching row (should return empty)
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid = 999;
+----
+
+# Test 18: Composite rowid filter with no matching row
+query RR
+SELECT rowid, value FROM testdb_rowid_filter.dbo.RowidTestComposite2 WHERE rowid = {'tenant_id': 999, 'id': 999};
+----
+
+# Test 19: rowid equality combined with other column filter that narrows result
+query IT
+SELECT rowid, name FROM testdb_rowid_filter.dbo.RowidTestInt WHERE rowid = 1 AND name <> 'First';
+----
+
+# Test 20: rowid with existing table (TestSimplePK)
+query II
+SELECT rowid, id FROM testdb_rowid_filter.dbo.TestSimplePK WHERE rowid = 3;
+----
+3	3
+
+# Cleanup
+statement ok
+DETACH testdb_rowid_filter;

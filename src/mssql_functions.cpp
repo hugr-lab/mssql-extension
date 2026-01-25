@@ -266,6 +266,13 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->column_names = column_names;
 	result->result_stream_id = result_stream_id;
 	result->complex_filter_where_clause = complex_filter_where_clause;
+	// RowId support fields
+	result->rowid_requested = rowid_requested;
+	result->pk_column_names = pk_column_names;
+	result->pk_column_types = pk_column_types;
+	result->pk_result_indices = pk_result_indices;
+	result->pk_is_composite = pk_is_composite;
+	result->rowid_type = rowid_type;
 	return std::move(result);
 }
 

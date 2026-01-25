@@ -292,10 +292,14 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 	const auto &row = parser_.GetRow();
 
 	// Determine how many columns to fill:
+	// - If target_vectors_ is set, use those vectors instead of chunk.data
 	// - If columns_to_fill_ was explicitly set (e.g., for COUNT(*)), use that
 	// - Otherwise, fill up to chunk's column count (but not more than we have data for)
 	idx_t cols_to_fill;
-	if (columns_to_fill_ != static_cast<idx_t>(-1)) {
+	if (!target_vectors_.empty()) {
+		// Use target vectors - columns_to_fill_ should match target_vectors_.size()
+		cols_to_fill = std::min(target_vectors_.size(), column_metadata_.size());
+	} else if (columns_to_fill_ != static_cast<idx_t>(-1)) {
 		// Explicitly set - use this value (may be 0 for COUNT(*))
 		cols_to_fill = std::min(columns_to_fill_, static_cast<idx_t>(column_metadata_.size()));
 	} else {
@@ -305,14 +309,29 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 
 	// Debug: log column count info on first row
 	if (row_idx == 0) {
-		MSSQL_DEBUG_LOG(1, "ProcessRow: sql_columns=%zu, chunk_columns=%llu, columns_to_fill_=%llu, cols_to_fill=%llu",
+		MSSQL_DEBUG_LOG(1,
+						"ProcessRow: sql_columns=%zu, chunk_columns=%llu, columns_to_fill_=%llu, cols_to_fill=%llu, "
+						"target_vectors=%zu",
 						column_metadata_.size(), (unsigned long long)chunk.ColumnCount(),
-						(unsigned long long)columns_to_fill_, (unsigned long long)cols_to_fill);
+						(unsigned long long)columns_to_fill_, (unsigned long long)cols_to_fill, target_vectors_.size());
 	}
 
 	for (idx_t col_idx = 0; col_idx < cols_to_fill; col_idx++) {
+		// Get the target vector: either from target_vectors_ or from chunk.data
+		Vector *target_vector;
+		if (!target_vectors_.empty()) {
+			// Write to target vectors (e.g., STRUCT children)
+			target_vector = target_vectors_[col_idx];
+		} else if (!output_column_mapping_.empty()) {
+			// Map SQL column index to output chunk column index
+			target_vector = &chunk.data[output_column_mapping_[col_idx]];
+		} else {
+			// Default: SQL column i goes to output i
+			target_vector = &chunk.data[col_idx];
+		}
+
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
-												   column_metadata_[col_idx], chunk.data[col_idx], row_idx);
+												   column_metadata_[col_idx], *target_vector, row_idx);
 	}
 }
 
