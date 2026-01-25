@@ -6,8 +6,7 @@ extension:
   build: "cmake"
   licence: "MIT"
   maintainers:
-    - name: "Vladimir Gribanov"
-      github: "VGSML"
+    - "VGSML"
   excluded_platforms:
     - "osx_amd64"
     - "windows_arm64"
@@ -38,5 +37,6 @@ docs:
     - Projection and filter pushdown
     - TLS/SSL encrypted connections (encrypt parameter)
     - INSERT support with RETURNING clause
+    - UPDATE and DELETE support (requires primary key)
     - Connection pooling with configurable limits
     - DuckDB secret management for credentials
