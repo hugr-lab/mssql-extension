@@ -105,7 +105,7 @@ public:
 	idx_t batch_count = 0;
 
 	//! Mutex for thread safety
-	mutex mutex;
+	std::mutex mutex;
 
 	//! Whether finalization has been done
 	bool finalized = false;
