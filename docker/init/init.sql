@@ -583,6 +583,49 @@ CREATE VIEW dbo.RowidTestView AS
 SELECT id, name FROM dbo.RowidTestInt;
 GO
 
+-- =============================================================================
+-- Rowid test tables with special character column names (for filter pushdown)
+-- Spec 001-pk-rowid-semantics: rowid filter pushdown
+-- =============================================================================
+
+-- Drop existing special char rowid test tables
+IF OBJECT_ID('dbo.RowidSpecialPKScalar', 'U') IS NOT NULL DROP TABLE dbo.RowidSpecialPKScalar;
+IF OBJECT_ID('dbo.RowidSpecialPKComposite', 'U') IS NOT NULL DROP TABLE dbo.RowidSpecialPKComposite;
+GO
+
+-- Scalar PK with special characters: space, uppercase, bracket
+CREATE TABLE dbo.RowidSpecialPKScalar (
+    [My ID] INT NOT NULL PRIMARY KEY,
+    [Some]]Value] VARCHAR(100) NOT NULL,  -- Column with right bracket (escaped with ]])
+    [MixedCase] NVARCHAR(50) NULL
+);
+GO
+
+INSERT INTO dbo.RowidSpecialPKScalar ([My ID], [Some]]Value], [MixedCase]) VALUES
+(1, 'value_1', N'Mixed 1'),
+(2, 'value_2', N'Mixed 2'),
+(3, 'value_3', NULL);
+GO
+
+-- Composite PK with special characters
+CREATE TABLE dbo.RowidSpecialPKComposite (
+    [Region ID] INT NOT NULL,
+    [Product]]Code] VARCHAR(20) NOT NULL,  -- Contains right bracket (escaped with ]])
+    [Order Date] DATE NOT NULL,
+    quantity INT NOT NULL,
+    CONSTRAINT PK_RowidSpecialPKComposite PRIMARY KEY ([Region ID], [Product]]Code])
+);
+GO
+
+INSERT INTO dbo.RowidSpecialPKComposite ([Region ID], [Product]]Code], [Order Date], quantity) VALUES
+(1, 'ABC-001', '2024-01-15', 100),
+(1, 'XYZ-002', '2024-01-16', 200),
+(2, 'ABC-001', '2024-01-17', 150);
+GO
+
+PRINT 'Special character rowid test tables created (RowidSpecialPKScalar, RowidSpecialPKComposite)';
+GO
+
 PRINT 'Rowid test tables created (RowidTestInt, RowidTestBigint, RowidTestVarchar, RowidTestComposite2, RowidTestComposite3, RowidTestNoPK, RowidTestView)';
 GO
 

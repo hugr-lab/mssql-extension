@@ -50,14 +50,34 @@ struct ExpressionEncodeContext {
 	int depth;									   // Current recursion depth
 	static constexpr int MAX_DEPTH = 100;		   // Maximum nesting depth
 
+	// PK info for rowid filter pushdown (Spec 001-pk-rowid-semantics)
+	const std::vector<std::string> *pk_column_names = nullptr;
+	const std::vector<LogicalType> *pk_column_types = nullptr;
+	bool pk_is_composite = false;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
 
-	// Create child context with incremented depth
+	// Set PK information for rowid filter pushdown
+	void SetPKInfo(const std::vector<std::string> *names, const std::vector<LogicalType> *types, bool composite) {
+		pk_column_names = names;
+		pk_column_types = types;
+		pk_is_composite = composite;
+	}
+
+	// Check if PK info is available
+	bool HasPKInfo() const {
+		return pk_column_names != nullptr && !pk_column_names->empty();
+	}
+
+	// Create child context with incremented depth (copies PK info)
 	ExpressionEncodeContext child() const {
 		ExpressionEncodeContext ctx(column_ids, column_names, column_types);
 		ctx.depth = depth + 1;
+		ctx.pk_column_names = pk_column_names;
+		ctx.pk_column_types = pk_column_types;
+		ctx.pk_is_composite = pk_is_composite;
 		return ctx;
 	}
 
@@ -257,6 +277,21 @@ private:
 	 */
 	static ExpressionEncodeResult EncodeLikePattern(const std::string &function_name, const Expression &column_expr,
 													const Expression &pattern_expr, const ExpressionEncodeContext &ctx);
+
+	//--------------------------------------------------------------------------
+	// Rowid Filter Pushdown Helpers (Spec 001-pk-rowid-semantics)
+	//--------------------------------------------------------------------------
+
+	/**
+	 * Check if an expression is a rowid column reference.
+	 */
+	static bool IsRowidColumn(const Expression &expr, const ExpressionEncodeContext &ctx);
+
+	/**
+	 * Encode rowid = value for scalar or composite PK.
+	 * Returns: T-SQL condition using PK columns, or empty if not supported.
+	 */
+	static ExpressionEncodeResult EncodeRowidEquality(const Expression &value_expr, const ExpressionEncodeContext &ctx);
 };
 
 }  // namespace mssql

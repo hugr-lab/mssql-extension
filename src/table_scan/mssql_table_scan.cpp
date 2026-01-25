@@ -591,6 +591,13 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	ExpressionEncodeContext ctx(column_ids, bind_data.all_column_names, bind_data.all_types);
 
+	// Add PK info for rowid filter pushdown (Spec 001-pk-rowid-semantics)
+	if (!bind_data.pk_column_names.empty()) {
+		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
+		MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: PK info set (%zu columns, composite=%s)",
+		                     bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
+	}
+
 	std::vector<std::string> encoded_conditions;
 	std::vector<idx_t> expressions_to_remove;
 
