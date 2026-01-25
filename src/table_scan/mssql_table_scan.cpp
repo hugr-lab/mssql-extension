@@ -5,8 +5,8 @@
 #include "table_scan/mssql_table_scan.hpp"
 #include <cstdlib>
 #include "connection/mssql_pool_manager.hpp"
-#include "duckdb/common/common.hpp"       // For COLUMN_IDENTIFIER_ROW_ID
-#include "duckdb/common/table_column.hpp" // For TableColumn, virtual_column_map_t
+#include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
+#include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
@@ -100,8 +100,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			throw BinderException("MSSQL: rowid requires a primary key");
 		}
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: PK has %zu columns, composite=%s",
-		                     bind_data.pk_column_names.size(),
-		                     bind_data.pk_is_composite ? "true" : "false");
+							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
 	}
 
 	// Filter out special column identifiers and collect valid column indices
@@ -121,8 +120,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// Track which columns are in the SQL result and their indices
 	vector<string> sql_column_names;  // Column names in order of SQL SELECT
 	vector<idx_t> pk_result_indices;  // Indices of PK columns in OUTPUT CHUNK (not SQL result)
-	vector<idx_t> pk_sql_indices;     // Indices of PK columns in SQL result
-	bool pk_columns_added = false;    // True if PK columns were added (not in user projection)
+	vector<idx_t> pk_sql_indices;	  // Indices of PK columns in SQL result
+	bool pk_columns_added = false;	  // True if PK columns were added (not in user projection)
 
 	if (rowid_requested) {
 		// Build a set of already-projected column names for deduplication
@@ -156,8 +155,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				column_list += "[" + FilterEncoder::EscapeBracketIdentifier(pk_col) + "]";
 				sql_column_names.push_back(pk_col);
 				pk_columns_added = true;
-				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu",
-				                     pk_col.c_str(), sql_column_names.size() - 1);
+				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
+									 sql_column_names.size() - 1);
 			}
 
 			// Record the SQL result index of this PK column
@@ -172,18 +171,18 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 
 			// Find the output chunk index for this PK column (if it's in user projection)
 			// column_ids maps output positions to table column indices
-			idx_t output_idx = UINT64_MAX;  // Sentinel for "not in output"
+			idx_t output_idx = UINT64_MAX;	// Sentinel for "not in output"
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 				if (column_ids[out_col] < VIRTUAL_COL_START &&
-				    bind_data.all_column_names[column_ids[out_col]] == pk_col) {
+					bind_data.all_column_names[column_ids[out_col]] == pk_col) {
 					output_idx = out_col;
 					break;
 				}
 			}
 			pk_result_indices.push_back(output_idx);
-			MSSQL_SCAN_DEBUG_LOG(2, "  PK column %s: sql_idx=%llu, output_idx=%s",
-			                     pk_col.c_str(), (unsigned long long)sql_result_idx,
-			                     output_idx == UINT64_MAX ? "N/A (extra)" : std::to_string(output_idx).c_str());
+			MSSQL_SCAN_DEBUG_LOG(2, "  PK column %s: sql_idx=%llu, output_idx=%s", pk_col.c_str(),
+								 (unsigned long long)sql_result_idx,
+								 output_idx == UINT64_MAX ? "N/A (extra)" : std::to_string(output_idx).c_str());
 		}
 	} else if (valid_column_ids.empty()) {
 		// No valid columns projected (e.g., COUNT(*))
@@ -224,10 +223,10 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// 3. pk_columns_added: rowid + other columns, but PK not in user projection - write extra PK columns
 	result->pk_direct_to_rowid = (rowid_requested && valid_column_ids.empty() && !bind_data.pk_is_composite);
 	result->composite_pk_direct_to_struct = (rowid_requested && valid_column_ids.empty() && bind_data.pk_is_composite);
-	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid=%s, composite_pk_direct_to_struct=%s, pk_columns_added=%s",
-	                     result->pk_direct_to_rowid ? "true" : "false",
-	                     result->composite_pk_direct_to_struct ? "true" : "false",
-	                     result->pk_columns_added ? "true" : "false");
+	MSSQL_SCAN_DEBUG_LOG(
+		1, "TableScanInitGlobal: pk_direct_to_rowid=%s, composite_pk_direct_to_struct=%s, pk_columns_added=%s",
+		result->pk_direct_to_rowid ? "true" : "false", result->composite_pk_direct_to_struct ? "true" : "false",
+		result->pk_columns_added ? "true" : "false");
 
 	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
 	string full_table_name = "[" + FilterEncoder::EscapeBracketIdentifier(bind_data.schema_name) + "].[" +
@@ -292,18 +291,18 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		if (result->pk_direct_to_rowid) {
 			// Special case: only rowid requested with scalar PK
 			// SQL returns 1 column (PK), we write it directly to rowid output position
-			result->result_stream->SetColumnsToFill(1);  // Fill 1 column (the PK)
+			result->result_stream->SetColumnsToFill(1);	 // Fill 1 column (the PK)
 			vector<idx_t> output_mapping;
-			output_mapping.push_back(rowid_output_idx);  // SQL col 0 -> rowid position
+			output_mapping.push_back(rowid_output_idx);	 // SQL col 0 -> rowid position
 			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
 			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid mode - SQL col 0 -> output %zu",
-			                     rowid_output_idx);
+								 rowid_output_idx);
 		} else if (result->composite_pk_direct_to_struct) {
 			// Special case: only rowid requested with composite PK
 			// SQL returns N columns (PK columns), we write them directly to STRUCT children
 			// The STRUCT is at rowid_output_idx in the output chunk
 			idx_t pk_count = bind_data.pk_column_names.size();
-			result->result_stream->SetColumnsToFill(pk_count);  // Fill all PK columns
+			result->result_stream->SetColumnsToFill(pk_count);	// Fill all PK columns
 			// Use special marker (-1) to indicate STRUCT mode - data will be written in PopulateRowIdVector
 			// Actually, we need to skip ProcessRow entirely and handle this in PopulateRowIdVector
 			// Set columns_to_fill to 0 so ProcessRow doesn't write anything
@@ -313,13 +312,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			for (idx_t i = 0; i < pk_count; i++) {
 				result->pk_result_indices.push_back(i);
 			}
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %zu PK columns -> STRUCT at output %zu",
-			                     pk_count, rowid_output_idx);
+			MSSQL_SCAN_DEBUG_LOG(
+				1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %zu PK columns -> STRUCT at output %zu",
+				pk_count, rowid_output_idx);
 		} else if (rowid_requested && pk_columns_added && !bind_data.pk_is_composite) {
 			// Special case: rowid + other columns, scalar PK NOT in user projection
 			// SQL returns [user_cols..., pk_col]
 			// Write user columns to their positions, write PK column directly to rowid position
-			idx_t total_sql_cols = valid_column_ids.size() + 1;  // user cols + 1 PK col
+			idx_t total_sql_cols = valid_column_ids.size() + 1;	 // user cols + 1 PK col
 			result->result_stream->SetColumnsToFill(total_sql_cols);
 
 			// Build mapping: SQL column index -> output chunk index
@@ -331,21 +331,21 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				}
 				if (column_ids[out_col] < VIRTUAL_COL_START) {
 					output_mapping.push_back(out_col);
-					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (user col)",
-					                     (unsigned long long)sql_col, (unsigned long long)out_col);
+					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (user col)", (unsigned long long)sql_col,
+										 (unsigned long long)out_col);
 					sql_col++;
 				}
 			}
 			// Map the extra PK column (last SQL column) to rowid position
 			output_mapping.push_back(rowid_output_idx);
-			MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (PK to rowid)",
-			                     (unsigned long long)sql_col, (unsigned long long)rowid_output_idx);
+			MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu (PK to rowid)", (unsigned long long)sql_col,
+								 (unsigned long long)rowid_output_idx);
 
 			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
 			// Mark that PK was written directly to rowid
 			result->pk_direct_to_rowid = true;
 			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_columns_added scalar mode - %llu cols with PK -> rowid",
-			                     (unsigned long long)total_sql_cols);
+								 (unsigned long long)total_sql_cols);
 		} else if (rowid_requested && pk_columns_added && bind_data.pk_is_composite) {
 			// Special case: rowid + other columns, composite PK NOT in user projection
 			// SQL returns [user_cols..., pk_cols...]
@@ -365,7 +365,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
 			// Mark for special handling in Execute
 			result->composite_pk_direct_to_struct = true;
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_columns_added composite mode - user cols + STRUCT handling");
+			MSSQL_SCAN_DEBUG_LOG(1,
+								 "TableScanInitGlobal: pk_columns_added composite mode - user cols + STRUCT handling");
 		} else if (rowid_requested) {
 			// Rowid with other columns, PK IS in user projection
 			// Build mapping: SQL column index -> output chunk index
@@ -384,14 +385,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				}
 				if (column_ids[out_col] < VIRTUAL_COL_START) {
 					output_mapping.push_back(out_col);
-					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu",
-					                     (unsigned long long)sql_col, (unsigned long long)out_col);
+					MSSQL_SCAN_DEBUG_LOG(2, "  SQL col %llu -> output col %llu", (unsigned long long)sql_col,
+										 (unsigned long long)out_col);
 					sql_col++;
 				}
 			}
 			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
 			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid with PK in projection - %llu user cols",
-			                     (unsigned long long)valid_column_ids.size());
+								 (unsigned long long)valid_column_ids.size());
 		} else {
 			// No rowid - simple case
 			result->result_stream->SetColumnsToFill(valid_column_ids.size());
@@ -430,7 +431,8 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		auto &rowid_vector = output.data[state.rowid_output_idx];
 		auto &validity = FlatVector::Validity(rowid_vector);
 		validity.SetAllValid(row_count);
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %zu rows", row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %zu rows",
+							 row_count);
 		return;
 	}
 
@@ -454,7 +456,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		validity.SetAllValid(row_count);
 
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %zu rows",
-		                     state.pk_result_indices.size(), row_count);
+							 state.pk_result_indices.size(), row_count);
 	} else {
 		// Scalar PK: copy single PK column to rowid
 		D_ASSERT(state.pk_result_indices.size() == 1);
@@ -464,8 +466,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		// Copy the PK column to rowid vector
 		VectorOperations::Copy(src_vector, rowid_vector, row_count, 0, 0);
 
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated scalar rowid from column %zu for %zu rows",
-		                     src_col_idx, row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated scalar rowid from column %zu for %zu rows", src_col_idx, row_count);
 	}
 }
 
@@ -508,8 +509,9 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(total_cols);
 
-				MSSQL_SCAN_DEBUG_LOG(1, "Execute: pk_columns_added composite mode - %llu user cols + %zu STRUCT children",
-				                     (unsigned long long)(total_cols - entries.size()), entries.size());
+				MSSQL_SCAN_DEBUG_LOG(1,
+									 "Execute: pk_columns_added composite mode - %llu user cols + %zu STRUCT children",
+									 (unsigned long long)(total_cols - entries.size()), entries.size());
 			} else {
 				// Composite PK rowid-only: write directly to STRUCT children
 				vector<Vector *> target_vectors;
@@ -519,8 +521,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(entries.size());
 
-				MSSQL_SCAN_DEBUG_LOG(1, "Execute: composite rowid-only - %zu STRUCT children",
-				                     entries.size());
+				MSSQL_SCAN_DEBUG_LOG(1, "Execute: composite rowid-only - %zu STRUCT children", entries.size());
 			}
 		}
 	}
@@ -595,7 +596,7 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 	if (!bind_data.pk_column_names.empty()) {
 		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
 		MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: PK info set (%zu columns, composite=%s)",
-		                     bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
+							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
 	}
 
 	std::vector<std::string> encoded_conditions;
@@ -659,14 +660,12 @@ static virtual_column_map_t GetVirtualColumns(ClientContext &context, optional_p
 	// Views and tables without PK don't support rowid
 	if (bind_data.rowid_requested && !bind_data.pk_column_names.empty()) {
 		// Expose rowid with the correct type based on PK structure
-		virtual_columns.insert(
-			make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", bind_data.rowid_type)));
+		virtual_columns.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", bind_data.rowid_type)));
 		MSSQL_SCAN_DEBUG_LOG(1, "GetVirtualColumns: exposing rowid with type %s",
-		                     bind_data.rowid_type.ToString().c_str());
+							 bind_data.rowid_type.ToString().c_str());
 	} else {
 		MSSQL_SCAN_DEBUG_LOG(1, "GetVirtualColumns: rowid not available (rowid_requested=%s, pk_columns=%zu)",
-		                     bind_data.rowid_requested ? "true" : "false",
-		                     bind_data.pk_column_names.size());
+							 bind_data.rowid_requested ? "true" : "false", bind_data.pk_column_names.size());
 	}
 
 	return virtual_columns;

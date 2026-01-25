@@ -879,7 +879,7 @@ bool FilterEncoder::IsRowidColumn(const Expression &expr, const ExpressionEncode
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &value_expr,
-                                                          const ExpressionEncodeContext &ctx) {
+														  const ExpressionEncodeContext &ctx) {
 	if (!ctx.HasPKInfo()) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: no PK info available");
 		return {"", false};
@@ -897,13 +897,13 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		// Extract struct children and build AND conditions
 		if (const_expr.value.type().id() != LogicalTypeId::STRUCT) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: composite PK expects STRUCT value, got %s",
-			                       const_expr.value.type().ToString().c_str());
+								   const_expr.value.type().ToString().c_str());
 			return {"", false};
 		}
 		auto &children = StructValue::GetChildren(const_expr.value);
 		if (children.size() != ctx.pk_column_names->size()) {
-			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: STRUCT has %zu children, expected %zu",
-			                       children.size(), ctx.pk_column_names->size());
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: STRUCT has %zu children, expected %zu", children.size(),
+								   ctx.pk_column_names->size());
 			return {"", false};
 		}
 
