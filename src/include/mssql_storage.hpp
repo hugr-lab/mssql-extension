@@ -94,6 +94,10 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 // Registration and callbacks
 //===----------------------------------------------------------------------===//
 
+// Validate connection by attempting to connect and authenticate
+// Throws IOException or InvalidInputException with descriptive error on failure
+void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
+
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);
 
