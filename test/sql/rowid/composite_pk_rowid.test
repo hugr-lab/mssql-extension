@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_composite(TYPE mssql);
 
 # =============================================================================
 # Two-Column Composite PK Tests (INT, BIGINT)
@@ -19,26 +19,26 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
 
 # Test 1: Basic rowid query with composite PK (returns STRUCT)
 query R
-SELECT rowid FROM testdb.dbo.RowidTestComposite2 WHERE tenant_id = 1 AND id = 100;
+SELECT rowid FROM testdb_composite.dbo.RowidTestComposite2 WHERE tenant_id = 1 AND id = 100;
 ----
 {'tenant_id': 1, 'id': 100}
 
 # Test 2: rowid with additional columns
 query RR
-SELECT rowid, value FROM testdb.dbo.RowidTestComposite2 WHERE tenant_id = 1 AND id = 100;
+SELECT rowid, value FROM testdb_composite.dbo.RowidTestComposite2 WHERE tenant_id = 1 AND id = 100;
 ----
 {'tenant_id': 1, 'id': 100}	99.99
 
 # Test 3: Multiple rows with composite rowid
 query RR
-SELECT rowid, value FROM testdb.dbo.RowidTestComposite2 WHERE tenant_id = 1 ORDER BY value;
+SELECT rowid, value FROM testdb_composite.dbo.RowidTestComposite2 WHERE tenant_id = 1 ORDER BY value;
 ----
 {'tenant_id': 1, 'id': 100}	99.99
 {'tenant_id': 1, 'id': 101}	149.50
 
 # Test 4: Access STRUCT fields from rowid
 query IIR
-SELECT rowid.tenant_id, rowid.id, value FROM testdb.dbo.RowidTestComposite2 WHERE tenant_id = 2;
+SELECT rowid.tenant_id, rowid.id, value FROM testdb_composite.dbo.RowidTestComposite2 WHERE tenant_id = 2;
 ----
 2	100	75.00
 2	200	250.00
@@ -49,20 +49,20 @@ SELECT rowid.tenant_id, rowid.id, value FROM testdb.dbo.RowidTestComposite2 WHER
 
 # Test 5: Three-column composite PK
 query R
-SELECT rowid FROM testdb.dbo.RowidTestComposite3 WHERE region = 'US' AND year = 2024 AND seq = 1;
+SELECT rowid FROM testdb_composite.dbo.RowidTestComposite3 WHERE region = 'US' AND year = 2024 AND seq = 1;
 ----
 {'region': US, 'year': 2024, 'seq': 1}
 
 # Test 6: Three-column composite with data
 query RT
-SELECT rowid, data FROM testdb.dbo.RowidTestComposite3 WHERE region = 'US' AND year = 2024 ORDER BY seq;
+SELECT rowid, data FROM testdb_composite.dbo.RowidTestComposite3 WHERE region = 'US' AND year = 2024 ORDER BY seq;
 ----
 {'region': US, 'year': 2024, 'seq': 1}	US record 1
 {'region': US, 'year': 2024, 'seq': 2}	US record 2
 
 # Test 7: Access individual fields from three-column composite
 query TIIT
-SELECT rowid.region, rowid.year, rowid.seq, data FROM testdb.dbo.RowidTestComposite3 WHERE region = 'APAC';
+SELECT rowid.region, rowid.year, rowid.seq, data FROM testdb_composite.dbo.RowidTestComposite3 WHERE region = 'APAC';
 ----
 APAC	2023	1	APAC old record
 
@@ -72,10 +72,10 @@ APAC	2023	1	APAC old record
 
 # Test 8: rowid with existing TestCompositePK table
 query RII
-SELECT rowid, quantity, unit_price FROM testdb.dbo.TestCompositePK WHERE region_id = 1 AND product_id = 100;
+SELECT rowid, quantity, unit_price FROM testdb_composite.dbo.TestCompositePK WHERE region_id = 1 AND product_id = 100;
 ----
 {'region_id': 1, 'product_id': 100}	10	25.50
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH testdb_composite;

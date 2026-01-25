@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_scalar (TYPE mssql);
 
 # =============================================================================
 # INT Primary Key Tests
@@ -19,13 +19,13 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
 
 # Test 1: Basic rowid query with INT PK
 query II
-SELECT rowid, name FROM testdb.dbo.RowidTestInt WHERE id = 1;
+SELECT rowid, name FROM testdb_scalar.dbo.RowidTestInt WHERE id = 1;
 ----
 1	First
 
 # Test 2: rowid equals id column for INT PK
 query III
-SELECT rowid, id, rowid = id AS rowid_matches FROM testdb.dbo.RowidTestInt WHERE id IN (1, 2, 3) ORDER BY id;
+SELECT rowid, id, rowid = id AS rowid_matches FROM testdb_scalar.dbo.RowidTestInt WHERE id IN (1, 2, 3) ORDER BY id;
 ----
 1	1	true
 2	2	true
@@ -33,7 +33,7 @@ SELECT rowid, id, rowid = id AS rowid_matches FROM testdb.dbo.RowidTestInt WHERE
 
 # Test 3: SELECT rowid and all columns
 query IIT
-SELECT rowid, id, name FROM testdb.dbo.RowidTestInt ORDER BY id LIMIT 3;
+SELECT rowid, id, name FROM testdb_scalar.dbo.RowidTestInt ORDER BY id LIMIT 3;
 ----
 1	1	First
 2	2	Second
@@ -41,7 +41,7 @@ SELECT rowid, id, name FROM testdb.dbo.RowidTestInt ORDER BY id LIMIT 3;
 
 # Test 4: Only select rowid (no other columns)
 query I
-SELECT rowid FROM testdb.dbo.RowidTestInt WHERE id = 10;
+SELECT rowid FROM testdb_scalar.dbo.RowidTestInt WHERE id = 10;
 ----
 10
 
@@ -51,19 +51,19 @@ SELECT rowid FROM testdb.dbo.RowidTestInt WHERE id = 10;
 
 # Test 5: rowid with BIGINT PK
 query IT
-SELECT rowid, data FROM testdb.dbo.RowidTestBigint WHERE id = 1;
+SELECT rowid, data FROM testdb_scalar.dbo.RowidTestBigint WHERE id = 1;
 ----
 1	data_1
 
 # Test 6: rowid with large BIGINT values
 query IT
-SELECT rowid, data FROM testdb.dbo.RowidTestBigint WHERE data = 'max_bigint';
+SELECT rowid, data FROM testdb_scalar.dbo.RowidTestBigint WHERE data = 'max_bigint';
 ----
 9223372036854775807	max_bigint
 
 # Test 7: rowid with negative BIGINT values
 query IT
-SELECT rowid, data FROM testdb.dbo.RowidTestBigint WHERE data = 'min_bigint';
+SELECT rowid, data FROM testdb_scalar.dbo.RowidTestBigint WHERE data = 'min_bigint';
 ----
 -9223372036854775808	min_bigint
 
@@ -73,19 +73,19 @@ SELECT rowid, data FROM testdb.dbo.RowidTestBigint WHERE data = 'min_bigint';
 
 # Test 8: rowid with VARCHAR PK
 query TT
-SELECT rowid, description FROM testdb.dbo.RowidTestVarchar WHERE code = 'ABC';
+SELECT rowid, description FROM testdb_scalar.dbo.RowidTestVarchar WHERE code = 'ABC';
 ----
 ABC	Alpha Beta Charlie
 
 # Test 9: rowid VARCHAR PK with special characters
 query TT
-SELECT rowid, description FROM testdb.dbo.RowidTestVarchar WHERE code = 'CODE-123';
+SELECT rowid, description FROM testdb_scalar.dbo.RowidTestVarchar WHERE code = 'CODE-123';
 ----
 CODE-123	Code with dash and numbers
 
 # Test 10: rowid VARCHAR PK with single character
 query TT
-SELECT rowid, description FROM testdb.dbo.RowidTestVarchar WHERE code = 'a';
+SELECT rowid, description FROM testdb_scalar.dbo.RowidTestVarchar WHERE code = 'a';
 ----
 a	Single character
 
@@ -95,11 +95,11 @@ a	Single character
 
 # Test 11: rowid with existing TestSimplePK table
 query IIT
-SELECT rowid, id, name FROM testdb.dbo.TestSimplePK WHERE id <= 2 ORDER BY id;
+SELECT rowid, id, name FROM testdb_scalar.dbo.TestSimplePK WHERE id <= 2 ORDER BY id;
 ----
 1	1	First Record
 2	2	Second Record
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH testdb_scalar;

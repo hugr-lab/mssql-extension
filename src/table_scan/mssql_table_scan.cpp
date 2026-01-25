@@ -312,6 +312,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			for (idx_t i = 0; i < pk_count; i++) {
 				result->pk_result_indices.push_back(i);
 			}
+			// Mark pk_columns_added as false - Execute uses this to distinguish from mixed case
+			result->pk_columns_added = false;
 			MSSQL_SCAN_DEBUG_LOG(
 				1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %zu PK columns -> STRUCT at output %zu",
 				pk_count, rowid_output_idx);
@@ -425,10 +427,28 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		return;
 	}
 
-	// If composite_pk_direct_to_struct is true, data was written directly to STRUCT children
-	// Just need to set the STRUCT validity
+	// If composite_pk_direct_to_struct is true, some data was written directly to STRUCT children
+	// But if pk_columns_added is also true, some PK columns may be in the user projection
+	// and need to be copied from output positions to STRUCT children
 	if (state.composite_pk_direct_to_struct) {
 		auto &rowid_vector = output.data[state.rowid_output_idx];
+
+		// If pk_columns_added, copy PK columns that are in the projection to STRUCT children
+		if (state.pk_columns_added && state.pk_is_composite) {
+			auto &entries = StructVector::GetEntries(rowid_vector);
+			for (idx_t pk_idx = 0; pk_idx < state.pk_result_indices.size(); pk_idx++) {
+				idx_t output_idx = state.pk_result_indices[pk_idx];
+				if (output_idx != UINT64_MAX) {
+					// This PK column is in the projection - copy to STRUCT child
+					auto &src_vector = output.data[output_idx];
+					auto &dst_vector = *entries[pk_idx];
+					VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
+					MSSQL_SCAN_DEBUG_LOG(2, "Execute: copied PK column %llu from output[%llu] to STRUCT child",
+										 (unsigned long long)pk_idx, (unsigned long long)output_idx);
+				}
+			}
+		}
+
 		auto &validity = FlatVector::Validity(rowid_vector);
 		validity.SetAllValid(row_count);
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %zu rows",
@@ -485,13 +505,14 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 			auto &entries = StructVector::GetEntries(rowid_vector);
 
 			if (global_state.pk_columns_added) {
-				// Composite PK with other columns, PK NOT in user projection
-				// SQL: [user_cols..., pk_cols...]
-				// Need to write user cols to their output positions AND pk cols to STRUCT children
+				// Composite PK with other columns, some PK columns may be in user projection
+				// SQL: [user_cols..., added_pk_cols...]
+				// - User cols go to their output positions
+				// - Added PK cols (not in projection) go to STRUCT children
+				// - PK cols already in projection need to be copied to STRUCT children after fill
 				vector<Vector *> target_vectors;
 
 				// First, add targets for user columns (based on column_ids order)
-				const auto &bind_data = data.bind_data->Cast<MSSQLCatalogScanBindData>();
 				for (idx_t out_col = 0; out_col < output.ColumnCount(); out_col++) {
 					// Skip rowid position - PK columns go to STRUCT children
 					if (out_col == global_state.rowid_output_idx) {
@@ -500,18 +521,25 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 					target_vectors.push_back(&output.data[out_col]);
 				}
 
-				// Then add STRUCT children for PK columns
-				for (auto &entry : entries) {
-					target_vectors.push_back(entry.get());
+				// Then add STRUCT children ONLY for PK columns that were ADDED (not in projection)
+				// pk_result_indices[i] == UINT64_MAX means the column was added for rowid
+				idx_t added_pk_count = 0;
+				for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
+					if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
+						// This PK column was added - SQL will write to STRUCT child
+						target_vectors.push_back(entries[pk_idx].get());
+						added_pk_count++;
+					}
+					// PK columns already in projection will be copied after FillChunk
 				}
 
 				idx_t total_cols = target_vectors.size();
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(total_cols);
 
-				MSSQL_SCAN_DEBUG_LOG(1,
-									 "Execute: pk_columns_added composite mode - %llu user cols + %zu STRUCT children",
-									 (unsigned long long)(total_cols - entries.size()), entries.size());
+				MSSQL_SCAN_DEBUG_LOG(
+					1, "Execute: pk_columns_added composite mode - %llu user cols + %llu added PK cols",
+					(unsigned long long)(total_cols - added_pk_count), (unsigned long long)added_pk_count);
 			} else {
 				// Composite PK rowid-only: write directly to STRUCT children
 				vector<Vector *> target_vectors;

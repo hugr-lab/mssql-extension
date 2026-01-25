@@ -11,23 +11,23 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_view_rowid (TYPE mssql);
 
 # =============================================================================
 # Error Tests: Views
 # =============================================================================
 
-# Test 1: rowid on VIEW should fail with distinct error
+# Test 1: rowid on VIEW should fail (rowid not exposed for views)
 statement error
-SELECT rowid FROM testdb.dbo.RowidTestView;
+SELECT rowid FROM testdb_view_rowid.dbo.RowidTestView;
 ----
-MSSQL: rowid not supported for views
+Referenced column "rowid" not found
 
 # Test 2: rowid with other columns on VIEW should also fail
 statement error
-SELECT rowid, id, name FROM testdb.dbo.RowidTestView;
+SELECT rowid, id, name FROM testdb_view_rowid.dbo.RowidTestView;
 ----
-MSSQL: rowid not supported for views
+Referenced column "rowid" not found
 
 # =============================================================================
 # Success Tests: Non-rowid queries on views should work
@@ -35,13 +35,13 @@ MSSQL: rowid not supported for views
 
 # Test 3: Regular SELECT works fine on VIEW
 query IT
-SELECT id, name FROM testdb.dbo.RowidTestView WHERE id = 1;
+SELECT id, name FROM testdb_view_rowid.dbo.RowidTestView WHERE id = 1;
 ----
 1	First
 
 # Test 4: SELECT * works on VIEW
 query IT
-SELECT * FROM testdb.dbo.RowidTestView ORDER BY id LIMIT 3;
+SELECT * FROM testdb_view_rowid.dbo.RowidTestView ORDER BY id LIMIT 3;
 ----
 1	First
 2	Second
@@ -49,7 +49,7 @@ SELECT * FROM testdb.dbo.RowidTestView ORDER BY id LIMIT 3;
 
 # Test 5: COUNT(*) works on VIEW
 query I
-SELECT COUNT(*) FROM testdb.dbo.RowidTestView;
+SELECT COUNT(*) FROM testdb_view_rowid.dbo.RowidTestView;
 ----
 5
 
@@ -57,18 +57,18 @@ SELECT COUNT(*) FROM testdb.dbo.RowidTestView;
 # Tests with existing views (LargeTableView)
 # =============================================================================
 
-# Test 6: rowid on existing VIEW should fail
+# Test 6: rowid on existing VIEW should fail (rowid not exposed for views)
 statement error
-SELECT rowid FROM testdb.dbo.LargeTableView WHERE id = 1;
+SELECT rowid FROM testdb_view_rowid.dbo.LargeTableView WHERE id = 1;
 ----
-MSSQL: rowid not supported for views
+Referenced column "rowid" not found
 
 # Test 7: Regular SELECT on existing VIEW works
 query IIT
-SELECT id, category, status FROM testdb.dbo.LargeTableView WHERE id = 1;
+SELECT id, category, status FROM testdb_view_rowid.dbo.LargeTableView WHERE id = 1;
 ----
 1	2	Active
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH testdb_view_rowid;

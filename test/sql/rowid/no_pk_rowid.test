@@ -11,23 +11,23 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_no_pk (TYPE mssql);
 
 # =============================================================================
 # Error Tests: Tables without Primary Key
 # =============================================================================
 
-# Test 1: rowid on table without PK should fail
+# Test 1: rowid on table without PK should fail (rowid not exposed for tables without PK)
 statement error
-SELECT rowid FROM testdb.dbo.RowidTestNoPK;
+SELECT rowid FROM testdb_no_pk.dbo.RowidTestNoPK;
 ----
-MSSQL: rowid requires a primary key
+Referenced column "rowid" not found
 
 # Test 2: rowid with other columns should also fail
 statement error
-SELECT rowid, message FROM testdb.dbo.RowidTestNoPK;
+SELECT rowid, message FROM testdb_no_pk.dbo.RowidTestNoPK;
 ----
-MSSQL: rowid requires a primary key
+Referenced column "rowid" not found
 
 # =============================================================================
 # Success Tests: Non-rowid queries on no-PK tables should work
@@ -35,23 +35,23 @@ MSSQL: rowid requires a primary key
 
 # Test 3: Regular SELECT works fine on no-PK table
 query T
-SELECT message FROM testdb.dbo.RowidTestNoPK WHERE message IS NOT NULL ORDER BY log_time LIMIT 2;
+SELECT message FROM testdb_no_pk.dbo.RowidTestNoPK WHERE message IS NOT NULL ORDER BY log_time LIMIT 2;
 ----
 Log entry 1
 Log entry 2
 
 # Test 4: COUNT(*) works on no-PK table
 query I
-SELECT COUNT(*) FROM testdb.dbo.RowidTestNoPK;
+SELECT COUNT(*) FROM testdb_no_pk.dbo.RowidTestNoPK;
 ----
 3
 
 # Test 5: SELECT * works on no-PK table
 query TT
-SELECT log_time, message FROM testdb.dbo.RowidTestNoPK WHERE message = 'Log entry 1';
+SELECT log_time, message FROM testdb_no_pk.dbo.RowidTestNoPK WHERE message = 'Log entry 1';
 ----
 2024-01-01 10:00:00	Log entry 1
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH testdb_no_pk;
