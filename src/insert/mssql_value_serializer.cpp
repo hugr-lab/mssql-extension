@@ -328,15 +328,18 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 		auto width = DecimalType::GetWidth(type);
 		auto scale = DecimalType::GetScale(type);
 		// Get the internal storage type
+		// IMPORTANT: Use GetValueUnsafe to get the raw scaled integer representation.
+		// GetValue<T>() performs conversion which loses the scale information.
+		// DECIMAL(10,2) stores 10.00 internally as 1000; we need that 1000, not 10.
 		switch (type.InternalType()) {
 		case PhysicalType::INT16:
-			return SerializeDecimal(hugeint_t(value.GetValue<int16_t>()), width, scale);
+			return SerializeDecimal(hugeint_t(value.GetValueUnsafe<int16_t>()), width, scale);
 		case PhysicalType::INT32:
-			return SerializeDecimal(hugeint_t(value.GetValue<int32_t>()), width, scale);
+			return SerializeDecimal(hugeint_t(value.GetValueUnsafe<int32_t>()), width, scale);
 		case PhysicalType::INT64:
-			return SerializeDecimal(hugeint_t(value.GetValue<int64_t>()), width, scale);
+			return SerializeDecimal(hugeint_t(value.GetValueUnsafe<int64_t>()), width, scale);
 		case PhysicalType::INT128:
-			return SerializeDecimal(value.GetValue<hugeint_t>(), width, scale);
+			return SerializeDecimal(value.GetValueUnsafe<hugeint_t>(), width, scale);
 		default:
 			throw InternalException("Unknown decimal internal type");
 		}

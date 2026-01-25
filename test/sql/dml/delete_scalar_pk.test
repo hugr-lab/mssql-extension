@@ -1,0 +1,112 @@
+# name: test/sql/dml/delete_scalar_pk.test
+# description: Test DELETE operations on tables with scalar (single-column) primary key
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database with READ_WRITE mode (required for DELETE)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 2: Create test table with primary key
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.delete_test_scalar;
+
+statement ok
+CREATE TABLE mssql.dbo.delete_test_scalar (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    price DECIMAL(10, 2),
+    quantity INTEGER
+);
+
+# Test 3: Insert test data
+statement ok
+INSERT INTO mssql.dbo.delete_test_scalar (id, name, price, quantity) VALUES
+    (1, 'Widget A', 10.00, 100),
+    (2, 'Widget B', 20.00, 200),
+    (3, 'Widget C', 30.00, 300),
+    (4, 'Widget D', 40.00, 400),
+    (5, 'Widget E', 50.00, 500);
+
+# Verify initial row count
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+5
+
+# Test 4: DELETE single row by primary key
+statement ok
+DELETE FROM mssql.dbo.delete_test_scalar WHERE id = 1;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar WHERE id = 1;
+----
+0
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+4
+
+# Test 5: DELETE multiple rows with range filter
+statement ok
+DELETE FROM mssql.dbo.delete_test_scalar WHERE id >= 4;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+2
+
+# Test 6: Verify remaining rows
+query ITRI
+SELECT id, name, price, quantity FROM mssql.dbo.delete_test_scalar ORDER BY id;
+----
+2	Widget B	20.00	200
+3	Widget C	30.00	300
+
+# Test 7: DELETE with non-matching filter (no rows deleted)
+statement ok
+DELETE FROM mssql.dbo.delete_test_scalar WHERE id = 999;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+2
+
+# Test 8: DELETE with price filter (filters via rowid)
+statement ok
+DELETE FROM mssql.dbo.delete_test_scalar WHERE price > 25;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+1
+
+# Test 9: Verify final state
+query ITRI
+SELECT id, name, price, quantity FROM mssql.dbo.delete_test_scalar;
+----
+2	Widget B	20.00	200
+
+# Test 10: DELETE all remaining rows
+statement ok
+DELETE FROM mssql.dbo.delete_test_scalar;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_test_scalar;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE mssql.dbo.delete_test_scalar;
+
+statement ok
+DETACH mssql;

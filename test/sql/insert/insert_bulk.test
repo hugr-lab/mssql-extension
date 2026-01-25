@@ -13,44 +13,47 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_bulk (TYPE mssql);
 
 # Test 2: Create test table (use mssql_exec for PRIMARY KEY constraint)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_bulk_test;
+DROP TABLE IF EXISTS mssql_insert_bulk.dbo.insert_bulk_test;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_bulk_test (id INT PRIMARY KEY, data NVARCHAR(100))');
+SELECT mssql_exec('mssql_insert_bulk', 'CREATE TABLE dbo.insert_bulk_test (id INT PRIMARY KEY, data NVARCHAR(100))');
+
+statement ok
+SELECT mssql_refresh_cache('mssql_insert_bulk');
 
 # Test 3: Bulk insert 1000 rows with default batch size
 statement ok
-INSERT INTO mssql.dbo.insert_bulk_test (id, data)
+INSERT INTO mssql_insert_bulk.dbo.insert_bulk_test (id, data)
 SELECT i, 'data_' || i FROM generate_series(1, 1000) AS t(i);
 
 query I
-SELECT COUNT(*) FROM mssql.dbo.insert_bulk_test;
+SELECT COUNT(*) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 1000
 
 # Test 4: Verify data integrity
 query II
-SELECT MIN(id), MAX(id) FROM mssql.dbo.insert_bulk_test;
+SELECT MIN(id), MAX(id) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 1	1000
 
 # Test 5: Clear and re-insert with small batch size
 statement ok
-SELECT mssql_exec('mssql', 'DELETE FROM dbo.insert_bulk_test');
+SELECT mssql_exec('mssql_insert_bulk', 'DELETE FROM dbo.insert_bulk_test');
 
 statement ok
 SET mssql_insert_batch_size = 100;
 
 statement ok
-INSERT INTO mssql.dbo.insert_bulk_test (id, data)
+INSERT INTO mssql_insert_bulk.dbo.insert_bulk_test (id, data)
 SELECT i, 'batch_' || i FROM generate_series(1, 500) AS t(i);
 
 query I
-SELECT COUNT(*) FROM mssql.dbo.insert_bulk_test;
+SELECT COUNT(*) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 500
 
@@ -59,14 +62,14 @@ statement ok
 SET mssql_insert_batch_size = 2000;
 
 statement ok
-SELECT mssql_exec('mssql', 'DELETE FROM dbo.insert_bulk_test');
+SELECT mssql_exec('mssql_insert_bulk', 'DELETE FROM dbo.insert_bulk_test');
 
 statement ok
-INSERT INTO mssql.dbo.insert_bulk_test (id, data)
+INSERT INTO mssql_insert_bulk.dbo.insert_bulk_test (id, data)
 SELECT i, 'large_' || i FROM generate_series(1, 5000) AS t(i);
 
 query I
-SELECT COUNT(*) FROM mssql.dbo.insert_bulk_test;
+SELECT COUNT(*) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 5000
 
@@ -75,17 +78,17 @@ statement ok
 CREATE TABLE local_bulk AS SELECT i AS id, 'local_' || i AS data FROM generate_series(5001, 6000) AS t(i);
 
 statement ok
-INSERT INTO mssql.dbo.insert_bulk_test
+INSERT INTO mssql_insert_bulk.dbo.insert_bulk_test
 SELECT * FROM local_bulk;
 
 query I
-SELECT COUNT(*) FROM mssql.dbo.insert_bulk_test;
+SELECT COUNT(*) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 6000
 
 # Test 8: Verify no duplicates
 query I
-SELECT COUNT(DISTINCT id) FROM mssql.dbo.insert_bulk_test;
+SELECT COUNT(DISTINCT id) FROM mssql_insert_bulk.dbo.insert_bulk_test;
 ----
 6000
 
@@ -94,7 +97,7 @@ statement ok
 DROP TABLE local_bulk;
 
 statement ok
-DROP TABLE mssql.dbo.insert_bulk_test;
+DROP TABLE mssql_insert_bulk.dbo.insert_bulk_test;
 
 statement ok
-DETACH mssql;
+DETACH mssql_insert_bulk;

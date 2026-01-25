@@ -94,8 +94,8 @@ void MSSQLInsertExecutor::EnsureBatchBuilder(bool with_output) {
 
 idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 	INSERT_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", sql.size());
-	// Print first 500 chars of SQL for debugging
-	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.500s%s", sql.c_str(), sql.size() > 500 ? "..." : "");
+	// Print first 2000 chars of SQL for debugging
+	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.2000s%s", sql.c_str(), sql.size() > 2000 ? "..." : "");
 
 	auto &pool = GetConnectionPool();
 	auto connection = pool.Acquire();

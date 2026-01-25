@@ -1,0 +1,109 @@
+# name: test/sql/dml/update_scalar_pk.test
+# description: Test UPDATE operations on tables with scalar (single-column) primary key
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database with READ_WRITE mode (required for UPDATE)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_upd_scalar (TYPE mssql);
+
+# Test 2: Create test table with primary key
+statement ok
+DROP TABLE IF EXISTS mssql_upd_scalar.dbo.update_test_scalar;
+
+statement ok
+CREATE TABLE mssql_upd_scalar.dbo.update_test_scalar (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    price DECIMAL(10, 2),
+    quantity INTEGER
+);
+
+# Test 3: Insert test data
+statement ok
+INSERT INTO mssql_upd_scalar.dbo.update_test_scalar (id, name, price, quantity) VALUES
+    (1, 'Widget A', 10.00, 100),
+    (2, 'Widget B', 20.00, 200),
+    (3, 'Widget C', 30.00, 300),
+    (4, 'Widget D', 40.00, 400),
+    (5, 'Widget E', 50.00, 500);
+
+# Test 4: UPDATE single row - single column
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET price = 99.99 WHERE id = 1;
+
+query IR
+SELECT id, price FROM mssql_upd_scalar.dbo.update_test_scalar WHERE id = 1;
+----
+1	99.99
+
+# Test 5: UPDATE single row - multiple columns
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET name = 'Updated Widget', quantity = 999 WHERE id = 2;
+
+query ITI
+SELECT id, name, quantity FROM mssql_upd_scalar.dbo.update_test_scalar WHERE id = 2;
+----
+2	Updated Widget	999
+
+# Test 6: UPDATE multiple rows with filter
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET quantity = quantity + 1000 WHERE id >= 3;
+
+query II
+SELECT id, quantity FROM mssql_upd_scalar.dbo.update_test_scalar WHERE id >= 3 ORDER BY id;
+----
+3	1300
+4	1400
+5	1500
+
+# Test 7: UPDATE with NULL value
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET name = NULL WHERE id = 5;
+
+query IT
+SELECT id, name FROM mssql_upd_scalar.dbo.update_test_scalar WHERE id = 5;
+----
+5	NULL
+
+# Test 8: UPDATE with expression
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET price = price * 1.1 WHERE id = 3;
+
+query IR
+SELECT id, price FROM mssql_upd_scalar.dbo.update_test_scalar WHERE id = 3;
+----
+3	33.00
+
+# Test 9: UPDATE using subquery in WHERE (filters via rowid)
+statement ok
+UPDATE mssql_upd_scalar.dbo.update_test_scalar SET name = 'Expensive' WHERE price > 35;
+
+query I
+SELECT COUNT(*) FROM mssql_upd_scalar.dbo.update_test_scalar WHERE name = 'Expensive';
+----
+3
+
+# Test 10: Verify all data is correct
+query ITRI
+SELECT id, name, price, quantity FROM mssql_upd_scalar.dbo.update_test_scalar ORDER BY id;
+----
+1	Expensive	99.99	100
+2	Updated Widget	20.00	999
+3	Widget C	33.00	1300
+4	Expensive	40.00	1400
+5	Expensive	50.00	1500
+
+# Cleanup
+statement ok
+DROP TABLE mssql_upd_scalar.dbo.update_test_scalar;
+
+statement ok
+DETACH mssql_upd_scalar;

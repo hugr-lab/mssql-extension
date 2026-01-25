@@ -11,14 +11,14 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database with READ_WRITE mode
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_returning (TYPE mssql);
 
 # Test 2: Create table with IDENTITY column (use mssql_exec for IDENTITY syntax)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_returning_test;
+DROP TABLE IF EXISTS mssql_insert_returning.dbo.insert_returning_test;
 
 statement ok
-SELECT mssql_exec('mssql', '
+SELECT mssql_exec('mssql_insert_returning', '
     CREATE TABLE dbo.insert_returning_test (
         id INT IDENTITY(1,1) PRIMARY KEY,
         name NVARCHAR(100) NOT NULL,
@@ -26,10 +26,13 @@ SELECT mssql_exec('mssql', '
     )
 ');
 
+statement ok
+SELECT mssql_refresh_cache('mssql_insert_returning');
+
 # Test 3: INSERT with RETURNING * (returns all columns including identity)
 # Note: created_at will have a timestamp value
 query IT
-INSERT INTO mssql.dbo.insert_returning_test (name)
+INSERT INTO mssql_insert_returning.dbo.insert_returning_test (name)
 VALUES ('Alice')
 RETURNING id, name;
 ----
@@ -37,7 +40,7 @@ RETURNING id, name;
 
 # Test 4: INSERT multiple rows with RETURNING
 query IT
-INSERT INTO mssql.dbo.insert_returning_test (name)
+INSERT INTO mssql_insert_returning.dbo.insert_returning_test (name)
 VALUES ('Bob'), ('Charlie')
 RETURNING id, name;
 ----
@@ -46,7 +49,7 @@ RETURNING id, name;
 
 # Test 5: Verify identity values are sequential
 query I
-INSERT INTO mssql.dbo.insert_returning_test (name) VALUES ('Diana') RETURNING id;
+INSERT INTO mssql_insert_returning.dbo.insert_returning_test (name) VALUES ('Diana') RETURNING id;
 ----
 4
 
@@ -55,7 +58,7 @@ statement ok
 CREATE TABLE local_names AS SELECT 'Eve' AS name UNION ALL SELECT 'Frank';
 
 query IT
-INSERT INTO mssql.dbo.insert_returning_test (name)
+INSERT INTO mssql_insert_returning.dbo.insert_returning_test (name)
 SELECT name FROM local_names
 RETURNING id, name;
 ----
@@ -64,7 +67,7 @@ RETURNING id, name;
 
 # Test 7: RETURNING specific columns only
 query I
-INSERT INTO mssql.dbo.insert_returning_test (name)
+INSERT INTO mssql_insert_returning.dbo.insert_returning_test (name)
 VALUES ('Grace')
 RETURNING id;
 ----
@@ -72,7 +75,7 @@ RETURNING id;
 
 # Test 8: Verify total rows
 query I
-SELECT COUNT(*) FROM mssql.dbo.insert_returning_test;
+SELECT COUNT(*) FROM mssql_insert_returning.dbo.insert_returning_test;
 ----
 7
 
@@ -81,7 +84,7 @@ statement ok
 DROP TABLE local_names;
 
 statement ok
-DROP TABLE mssql.dbo.insert_returning_test;
+DROP TABLE mssql_insert_returning.dbo.insert_returning_test;
 
 statement ok
-DETACH mssql;
+DETACH mssql_insert_returning;

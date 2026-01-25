@@ -1,6 +1,7 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 
 namespace duckdb {
 
@@ -172,11 +173,9 @@ string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column)
 	// Column type
 	result += MapTypeToSQLServer(column.GetType());
 
-	// Nullability (default is NULL in SQL Server if not specified)
-	// DuckDB's ColumnDefinition doesn't expose nullability directly in the same way
-	// We'll check for NOT NULL constraint
-	// For now, default to NOT NULL to match common DDL expectations
-	result += " NULL";
+	// Don't explicitly specify NULL/NOT NULL here - let SQL Server use its defaults
+	// or let constraints (PRIMARY KEY, NOT NULL) override this.
+	// Explicitly specifying NULL prevents columns from being part of a PRIMARY KEY.
 
 	return result;
 }
@@ -198,7 +197,15 @@ string MSSQLDDLTranslator::TranslateDropSchema(const string &schema_name) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
-												const ColumnList &columns) {
+                                                const ColumnList &columns) {
+	// Delegate to the overload with empty constraints
+	vector<unique_ptr<Constraint>> empty_constraints;
+	return TranslateCreateTable(schema_name, table_name, columns, empty_constraints);
+}
+
+string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
+                                                const ColumnList &columns,
+                                                const vector<unique_ptr<Constraint>> &constraints) {
 	if (columns.empty()) {
 		throw InvalidInputException("CREATE TABLE requires at least one column");
 	}
@@ -216,6 +223,42 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 		}
 		first = false;
 		result += BuildColumnDefinition(column);
+	}
+
+	// Process constraints - look for PRIMARY KEY
+	for (auto &constraint : constraints) {
+		if (constraint->type == ConstraintType::UNIQUE) {
+			auto &unique_constraint = constraint->Cast<UniqueConstraint>();
+			if (unique_constraint.IsPrimaryKey()) {
+				result += ", PRIMARY KEY (";
+
+				// Get the column names for the PK
+				const auto &pk_columns = unique_constraint.GetColumnNames();
+				if (!pk_columns.empty()) {
+					// Multi-column or named constraint
+					for (idx_t i = 0; i < pk_columns.size(); i++) {
+						if (i > 0) {
+							result += ", ";
+						}
+						result += QuoteIdentifier(pk_columns[i]);
+					}
+				} else if (unique_constraint.HasIndex()) {
+					// Single column constraint by index
+					auto idx = unique_constraint.GetIndex();
+					// Find the column name at this index
+					idx_t col_idx = 0;
+					for (auto &column : columns.Logical()) {
+						if (col_idx == idx.index) {
+							result += QuoteIdentifier(column.GetName());
+							break;
+						}
+						col_idx++;
+					}
+				}
+
+				result += ")";
+			}
+		}
 	}
 
 	result += ");";

@@ -1,6 +1,7 @@
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
+#include "dml/mssql_dml_config.hpp"
 #include "insert/mssql_insert_config.hpp"
 
 namespace duckdb {
@@ -112,6 +113,29 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING clause
 	config.AddExtensionOption("mssql_insert_use_returning_output", "Use OUTPUT INSERTED for RETURNING clause",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT), nullptr,
+							  SetScope::GLOBAL);
+
+	//===----------------------------------------------------------------------===//
+	// DML (UPDATE/DELETE) Settings
+	//===----------------------------------------------------------------------===//
+
+	// mssql_dml_batch_size - Maximum rows per UPDATE/DELETE batch
+	// Conservative default (500) to stay well under SQL Server's ~2100 parameter limit
+	config.AddExtensionOption("mssql_dml_batch_size",
+							  "Maximum rows per UPDATE/DELETE batch (default: 500, affects parameter count)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_BATCH_SIZE), ValidatePositive,
+							  SetScope::GLOBAL);
+
+	// mssql_dml_max_parameters - Maximum parameters per DML statement
+	// SQL Server limit is approximately 2100, we use 2000 for safety margin
+	config.AddExtensionOption("mssql_dml_max_parameters",
+							  "Maximum parameters per UPDATE/DELETE statement (SQL Server limit ~2100)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_MAX_PARAMETERS), ValidatePositive,
+							  SetScope::GLOBAL);
+
+	// mssql_dml_use_prepared - Use prepared statements for DML operations
+	config.AddExtensionOption("mssql_dml_use_prepared", "Use prepared statements for UPDATE/DELETE operations",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_DML_USE_PREPARED), nullptr,
 							  SetScope::GLOBAL);
 }
 

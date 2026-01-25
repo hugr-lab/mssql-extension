@@ -16,10 +16,15 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "dml/mssql_dml_config.hpp"
 #include "insert/mssql_insert_config.hpp"
 #include "insert/mssql_insert_target.hpp"
 #include "insert/mssql_physical_insert.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "update/mssql_physical_update.hpp"
+#include "update/mssql_update_target.hpp"
+#include "delete/mssql_physical_delete.hpp"
+#include "delete/mssql_delete_target.hpp"
 
 namespace duckdb {
 
@@ -256,16 +261,23 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	} else {
 		// Specific columns from the INSERT statement
 		// The column_index_map maps physical column index -> source index in values
-		// Iterate over table columns and check which have mapped values
+		// IMPORTANT: We must preserve INSERT statement column order, not table column order.
+		// Build a list of (source_index, table_col_index) pairs and sort by source index.
+		vector<pair<idx_t, idx_t>> col_pairs;
 		for (idx_t i = 0; i < mssql_columns.size(); i++) {
 			PhysicalIndex phys_idx(i);
 			if (i < op.column_index_map.size()) {
 				auto mapped_index = op.column_index_map[phys_idx];
 				if (mapped_index != DConstants::INVALID_INDEX) {
-					// This column is being inserted
-					insert_col_indices.push_back(i);
+					col_pairs.emplace_back(mapped_index, i);
 				}
 			}
+		}
+		// Sort by source index (INSERT statement order)
+		std::sort(col_pairs.begin(), col_pairs.end());
+		// Extract table column indices in INSERT statement order
+		for (auto &pair : col_pairs) {
+			insert_col_indices.push_back(pair.second);
 		}
 	}
 
@@ -332,13 +344,123 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 }
 
 PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
-										   PhysicalOperator &plan) {
-	throw NotImplementedException("MSSQL catalog is read-only: DELETE is not supported");
+                                           PhysicalOperator &plan) {
+	// Check write access first (throws if read-only)
+	CheckWriteAccess("DELETE");
+
+	// Get the target table entry
+	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+
+	// Check if table has a primary key (required for DELETE via rowid)
+	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
+	if (!pk_info.exists) {
+		throw NotImplementedException("MSSQL: DELETE requires a primary key. Table '%s' has no primary key.",
+		                              table_entry.name);
+	}
+
+	// Build MSSQLDeleteTarget from table metadata
+	MSSQLDeleteTarget target;
+	target.catalog_name = context_name_;
+	target.schema_name = table_entry.ParentSchema().name;
+	target.table_name = table_entry.name;
+	target.pk_info = pk_info;
+
+	// Load DML configuration from settings
+	MSSQLDMLConfig config = LoadDMLConfig(context);
+
+	// Result type is BIGINT (row count)
+	vector<LogicalType> result_types;
+	result_types.push_back(LogicalType::BIGINT);
+
+	// Create the physical operator using planner.Make<T>()
+	auto &physical_delete =
+	    planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+
+	// Add child operator (provides rowid values)
+	physical_delete.children.push_back(plan);
+
+	return physical_delete;
 }
 
 PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
-										   PhysicalOperator &plan) {
-	throw NotImplementedException("MSSQL catalog is read-only: UPDATE is not supported");
+                                           PhysicalOperator &plan) {
+	// Check write access first (throws if read-only)
+	CheckWriteAccess("UPDATE");
+
+	// Get the target table entry
+	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+
+	// Check if table has a primary key (this will fetch PK info if not cached)
+	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
+	if (!pk_info.exists) {
+		throw NotImplementedException("MSSQL: UPDATE requires a primary key. Table '%s' has no primary key.",
+		                              table_entry.name);
+	}
+
+	// Get MSSQL column info
+	auto &mssql_columns = table_entry.GetMSSQLColumns();
+
+	// Check if any PK column is being updated (reject if so)
+	for (auto &pk_col : pk_info.columns) {
+		for (idx_t i = 0; i < op.columns.size(); i++) {
+			auto physical_idx = op.columns[i].index;
+			if (physical_idx < mssql_columns.size() && mssql_columns[physical_idx].name == pk_col.name) {
+				throw NotImplementedException(
+				    "MSSQL: Updating primary key columns is not supported. Cannot update column '%s'.", pk_col.name);
+			}
+		}
+	}
+
+	// Build MSSQLUpdateTarget from table metadata
+	MSSQLUpdateTarget target;
+	target.catalog_name = context_name_;
+	target.schema_name = table_entry.ParentSchema().name;
+	target.table_name = table_entry.name;
+	target.pk_info = pk_info;
+	target.table_columns = mssql_columns;
+
+	// Build update column metadata
+	// The columns in op.columns are the physical indices of columns being updated
+	// The values come after the rowid in the input chunk
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		auto physical_idx = op.columns[i].index;
+		if (physical_idx >= mssql_columns.size()) {
+			throw InternalException("UPDATE column index %llu out of bounds (table has %llu columns)",
+			                        (unsigned long long)physical_idx, (unsigned long long)mssql_columns.size());
+		}
+
+		auto &col = mssql_columns[physical_idx];
+		MSSQLUpdateColumn update_col;
+		update_col.name = col.name;
+		update_col.column_index = physical_idx;
+		update_col.duckdb_type = col.duckdb_type;
+		update_col.mssql_type = col.sql_type_name;
+		update_col.collation = col.collation_name;
+		update_col.precision = col.precision;
+		update_col.scale = col.scale;
+		update_col.is_nullable = col.is_nullable;
+		// chunk_index: update expressions are at columns 0 to N-1, rowid is at column N (last)
+		// See DuckDB bind_update.cpp: BindRowIdColumns appends rowid AFTER update expressions
+		update_col.chunk_index = i;
+
+		target.update_columns.push_back(std::move(update_col));
+	}
+
+	// Load DML configuration from settings
+	MSSQLDMLConfig config = LoadDMLConfig(context);
+
+	// Result type is BIGINT (row count)
+	vector<LogicalType> result_types;
+	result_types.push_back(LogicalType::BIGINT);
+
+	// Create the physical operator using planner.Make<T>()
+	auto &physical_update =
+	    planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+
+	// Add child operator (provides rowid + new values)
+	physical_update.children.push_back(plan);
+
+	return physical_update;
 }
 
 unique_ptr<LogicalOperator> MSSQLCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,

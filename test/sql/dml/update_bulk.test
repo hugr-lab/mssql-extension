@@ -1,0 +1,98 @@
+# name: test/sql/dml/update_bulk.test
+# description: Test bulk UPDATE operations (1000+ rows) to verify batching
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_upd_bulk (TYPE mssql);
+
+# Test 2: Create test table with primary key
+statement ok
+DROP TABLE IF EXISTS mssql_upd_bulk.dbo.update_bulk_test;
+
+statement ok
+CREATE TABLE mssql_upd_bulk.dbo.update_bulk_test (
+    id INTEGER PRIMARY KEY,
+    value INTEGER,
+    status VARCHAR(20)
+);
+
+# Test 3: Insert 1000 rows using INSERT INTO ... SELECT
+statement ok
+INSERT INTO mssql_upd_bulk.dbo.update_bulk_test
+SELECT i, i * 10, 'pending'
+FROM generate_series(1, 1000) AS t(i);
+
+# Verify initial row count
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test;
+----
+1000
+
+# Test 4: Bulk UPDATE - update all rows
+statement ok
+UPDATE mssql_upd_bulk.dbo.update_bulk_test SET status = 'processed';
+
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test WHERE status = 'processed';
+----
+1000
+
+# Test 5: Bulk UPDATE - update value column with expression
+statement ok
+UPDATE mssql_upd_bulk.dbo.update_bulk_test SET value = value + 1;
+
+# Verify values were incremented
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test WHERE value = id * 10 + 1;
+----
+1000
+
+# Test 6: Bulk UPDATE - update subset (500 rows)
+statement ok
+UPDATE mssql_upd_bulk.dbo.update_bulk_test SET status = 'archived' WHERE id <= 500;
+
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test WHERE status = 'archived';
+----
+500
+
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test WHERE status = 'processed';
+----
+500
+
+# Test 7: Bulk UPDATE with multiple columns
+statement ok
+UPDATE mssql_upd_bulk.dbo.update_bulk_test SET value = 0, status = 'reset' WHERE id > 900;
+
+query I
+SELECT COUNT(*) FROM mssql_upd_bulk.dbo.update_bulk_test WHERE status = 'reset' AND value = 0;
+----
+100
+
+# Test 8: Verify data integrity after all updates
+query IIII
+SELECT
+    COUNT(*) AS total_rows,
+    SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) AS archived_count,
+    SUM(CASE WHEN status = 'processed' THEN 1 ELSE 0 END) AS processed_count,
+    SUM(CASE WHEN status = 'reset' THEN 1 ELSE 0 END) AS reset_count
+FROM mssql_upd_bulk.dbo.update_bulk_test;
+----
+1000	500	400	100
+
+# Cleanup
+statement ok
+DROP TABLE mssql_upd_bulk.dbo.update_bulk_test;
+
+statement ok
+DETACH mssql_upd_bulk;

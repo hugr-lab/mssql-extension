@@ -196,8 +196,24 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 
 void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
 											LogicalUpdate &update, ClientContext &context) {
-	// Updates are not supported - this shouldn't be called for read-only catalog
-	throw NotImplementedException("MSSQL catalog is read-only: UPDATE binding is not supported");
+	// MSSQL tables don't have DuckDB constraints to bind, but we need to ensure
+	// PK info is loaded so that GetVirtualColumns() can expose the rowid column
+	// when BindRowIdColumns() is called later in the UPDATE binding flow.
+	//
+	// Flow: BindUpdateConstraints -> BindRowIdColumns -> GetVirtualColumns
+	//
+	MSSQL_TE_DEBUG("BindUpdateConstraints: ensuring PK loaded for %s.%s", schema.name.c_str(), name.c_str());
+
+	// Load PK info if not already loaded
+	EnsurePKLoaded(context);
+
+	if (!pk_info_.exists) {
+		throw BinderException("MSSQL: UPDATE/DELETE requires a table with a primary key. "
+							  "Table '%s.%s' has no primary key.", schema.name.c_str(), name.c_str());
+	}
+
+	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s",
+				   pk_info_.columns.size(), pk_info_.rowid_type.ToString().c_str());
 }
 
 //===----------------------------------------------------------------------===//
