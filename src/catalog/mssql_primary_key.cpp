@@ -17,11 +17,11 @@ static int GetPKDebugLevel() {
 	return level;
 }
 
-#define MSSQL_PK_DEBUG(fmt, ...)                                        \
-	do {                                                                \
-		if (GetPKDebugLevel() >= 1) {                                   \
-			fprintf(stderr, "[MSSQL PK] " fmt "\n", ##__VA_ARGS__);     \
-		}                                                               \
+#define MSSQL_PK_DEBUG(fmt, ...)                                    \
+	do {                                                            \
+		if (GetPKDebugLevel() >= 1) {                               \
+			fprintf(stderr, "[MSSQL PK] " fmt "\n", ##__VA_ARGS__); \
+		}                                                           \
 	} while (0)
 
 namespace duckdb {
@@ -89,17 +89,9 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 // PKColumnInfo Implementation
 //===----------------------------------------------------------------------===//
 
-PKColumnInfo PKColumnInfo::FromMetadata(
-	const string& name,
-	int32_t column_id,
-	int32_t key_ordinal,
-	const string& type_name,
-	int16_t max_length,
-	uint8_t precision,
-	uint8_t scale,
-	const string& collation_name,
-	const string& database_collation
-) {
+PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, int32_t key_ordinal,
+										const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale,
+										const string &collation_name, const string &database_collation) {
 	PKColumnInfo info;
 	info.name = name;
 	info.column_id = column_id;
@@ -115,9 +107,8 @@ PKColumnInfo PKColumnInfo::FromMetadata(
 	// Map SQL Server type to DuckDB type using MSSQLColumnInfo helper
 	info.duckdb_type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(type_name, max_length, precision, scale);
 
-	MSSQL_PK_DEBUG("  PK column: name=%s ordinal=%d type=%s -> %s",
-	               name.c_str(), key_ordinal, type_name.c_str(),
-	               info.duckdb_type.ToString().c_str());
+	MSSQL_PK_DEBUG("  PK column: name=%s ordinal=%d type=%s -> %s", name.c_str(), key_ordinal, type_name.c_str(),
+				   info.duckdb_type.ToString().c_str());
 
 	return info;
 }
@@ -156,12 +147,8 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 	}
 }
 
-PrimaryKeyInfo PrimaryKeyInfo::Discover(
-	tds::TdsConnection& connection,
-	const string& schema_name,
-	const string& table_name,
-	const string& database_collation
-) {
+PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name,
+										const string &table_name, const string &database_collation) {
 	PrimaryKeyInfo info;
 	info.loaded = true;
 
@@ -179,35 +166,38 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(
 			int32_t col_id = 0;
 			try {
 				col_id = static_cast<int32_t>(std::stoi(values[1]));
-			} catch (...) {}
+			} catch (...) {
+			}
 
 			int32_t key_ordinal = 0;
 			try {
 				key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
-			} catch (...) {}
+			} catch (...) {
+			}
 
 			string type_name = values[3];
 			int16_t max_len = 0;
 			try {
 				max_len = static_cast<int16_t>(std::stoi(values[4]));
-			} catch (...) {}
+			} catch (...) {
+			}
 
 			uint8_t prec = 0;
 			try {
 				prec = static_cast<uint8_t>(std::stoi(values[5]));
-			} catch (...) {}
+			} catch (...) {
+			}
 
 			uint8_t scl = 0;
 			try {
 				scl = static_cast<uint8_t>(std::stoi(values[6]));
-			} catch (...) {}
+			} catch (...) {
+			}
 
 			string collation = values[7];
 
-			auto pk_col = PKColumnInfo::FromMetadata(
-				col_name, col_id, key_ordinal, type_name,
-				max_len, prec, scl, collation, database_collation
-			);
+			auto pk_col = PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
+													 collation, database_collation);
 			info.columns.push_back(std::move(pk_col));
 		}
 	});
@@ -217,8 +207,7 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(
 		MSSQL_PK_DEBUG("No primary key found for %s", full_name.c_str());
 		info.exists = false;
 	} else {
-		MSSQL_PK_DEBUG("Found PK with %zu column(s) for %s",
-		               info.columns.size(), full_name.c_str());
+		MSSQL_PK_DEBUG("Found PK with %zu column(s) for %s", info.columns.size(), full_name.c_str());
 		info.exists = true;
 		info.ComputeRowIdType();
 	}
