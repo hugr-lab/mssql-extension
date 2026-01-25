@@ -1,6 +1,6 @@
 #include "update/mssql_update_statement.hpp"
-#include "insert/mssql_value_serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "insert/mssql_value_serializer.hpp"
 
 namespace duckdb {
 
@@ -8,11 +8,10 @@ namespace duckdb {
 // MSSQLUpdateStatement Implementation
 //===----------------------------------------------------------------------===//
 
-MSSQLUpdateStatement::MSSQLUpdateStatement(const MSSQLUpdateTarget &target) : target_(target) {
-}
+MSSQLUpdateStatement::MSSQLUpdateStatement(const MSSQLUpdateTarget &target) : target_(target) {}
 
 MSSQLDMLBatch MSSQLUpdateStatement::Build(const vector<vector<Value>> &pk_values,
-                                          const vector<vector<Value>> &update_values, idx_t batch_number) {
+										  const vector<vector<Value>> &update_values, idx_t batch_number) {
 	MSSQLDMLBatch batch;
 	batch.batch_number = batch_number;
 	batch.row_count = pk_values.size();

@@ -5,6 +5,9 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
+#include "delete/mssql_delete_target.hpp"
+#include "delete/mssql_physical_delete.hpp"
+#include "dml/mssql_dml_config.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -16,15 +19,12 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
-#include "dml/mssql_dml_config.hpp"
 #include "insert/mssql_insert_config.hpp"
 #include "insert/mssql_insert_target.hpp"
 #include "insert/mssql_physical_insert.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "update/mssql_physical_update.hpp"
 #include "update/mssql_update_target.hpp"
-#include "delete/mssql_physical_delete.hpp"
-#include "delete/mssql_delete_target.hpp"
 
 namespace duckdb {
 
@@ -344,7 +344,7 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 }
 
 PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
-                                           PhysicalOperator &plan) {
+										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
 	CheckWriteAccess("DELETE");
 
@@ -355,7 +355,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		throw NotImplementedException("MSSQL: DELETE requires a primary key. Table '%s' has no primary key.",
-		                              table_entry.name);
+									  table_entry.name);
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -374,7 +374,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Create the physical operator using planner.Make<T>()
 	auto &physical_delete =
-	    planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+		planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
 
 	// Add child operator (provides rowid values)
 	physical_delete.children.push_back(plan);
@@ -383,7 +383,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 }
 
 PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
-                                           PhysicalOperator &plan) {
+										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
 	CheckWriteAccess("UPDATE");
 
@@ -394,7 +394,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		throw NotImplementedException("MSSQL: UPDATE requires a primary key. Table '%s' has no primary key.",
-		                              table_entry.name);
+									  table_entry.name);
 	}
 
 	// Get MSSQL column info
@@ -406,7 +406,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			auto physical_idx = op.columns[i].index;
 			if (physical_idx < mssql_columns.size() && mssql_columns[physical_idx].name == pk_col.name) {
 				throw NotImplementedException(
-				    "MSSQL: Updating primary key columns is not supported. Cannot update column '%s'.", pk_col.name);
+					"MSSQL: Updating primary key columns is not supported. Cannot update column '%s'.", pk_col.name);
 			}
 		}
 	}
@@ -426,7 +426,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 		auto physical_idx = op.columns[i].index;
 		if (physical_idx >= mssql_columns.size()) {
 			throw InternalException("UPDATE column index %llu out of bounds (table has %llu columns)",
-			                        (unsigned long long)physical_idx, (unsigned long long)mssql_columns.size());
+									(unsigned long long)physical_idx, (unsigned long long)mssql_columns.size());
 		}
 
 		auto &col = mssql_columns[physical_idx];
@@ -455,7 +455,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Create the physical operator using planner.Make<T>()
 	auto &physical_update =
-	    planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+		planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
 
 	// Add child operator (provides rowid + new values)
 	physical_update.children.push_back(plan);

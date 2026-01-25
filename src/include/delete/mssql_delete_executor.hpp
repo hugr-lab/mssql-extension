@@ -8,15 +8,15 @@
 
 #pragma once
 
-#include "duckdb/common/common.hpp"
-#include "duckdb/common/vector.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "delete/mssql_delete_target.hpp"
 #include "delete/mssql_delete_statement.hpp"
+#include "delete/mssql_delete_target.hpp"
 #include "dml/mssql_dml_config.hpp"
 #include "dml/mssql_dml_result.hpp"
+#include "duckdb/common/common.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 

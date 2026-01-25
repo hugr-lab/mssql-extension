@@ -1,7 +1,7 @@
 #include "delete/mssql_delete_statement.hpp"
-#include "insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "insert/mssql_value_serializer.hpp"
 
 namespace duckdb {
 

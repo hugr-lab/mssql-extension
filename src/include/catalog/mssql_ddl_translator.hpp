@@ -80,7 +80,7 @@ public:
 	//! @param constraints Table constraints (PRIMARY KEY, UNIQUE, etc.)
 	//! @return T-SQL statement
 	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns,
-	                                   const vector<unique_ptr<Constraint>> &constraints);
+									   const vector<unique_ptr<Constraint>> &constraints);
 
 	//! Generate DROP TABLE T-SQL
 	//! @param schema_name Schema containing table

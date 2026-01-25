@@ -2,10 +2,10 @@
 
 #include <string>
 #include <vector>
+#include "dml/mssql_dml_batch.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "update/mssql_update_target.hpp"
-#include "dml/mssql_dml_batch.hpp"
 
 namespace duckdb {
 
@@ -42,7 +42,7 @@ public:
 	// @param batch_number Sequential batch number for error reporting
 	// @return Complete batch ready for execution
 	MSSQLDMLBatch Build(const vector<vector<Value>> &pk_values, const vector<vector<Value>> &update_values,
-	                    idx_t batch_number);
+						idx_t batch_number);
 
 private:
 	const MSSQLUpdateTarget &target_;

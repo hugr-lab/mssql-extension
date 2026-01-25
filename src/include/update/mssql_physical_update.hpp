@@ -2,11 +2,11 @@
 
 #include <memory>
 #include <mutex>
+#include "dml/mssql_dml_config.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "update/mssql_update_target.hpp"
-#include "dml/mssql_dml_config.hpp"
 #include "mssql_compat.hpp"
+#include "update/mssql_update_target.hpp"
 
 namespace duckdb {
 
@@ -35,7 +35,7 @@ public:
 	// @param target Update target metadata
 	// @param config DML configuration
 	MSSQLPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                    MSSQLUpdateTarget target, MSSQLDMLConfig config);
+						MSSQLUpdateTarget target, MSSQLDMLConfig config);
 
 	//===----------------------------------------------------------------------===//
 	// Target Information
@@ -80,7 +80,7 @@ public:
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          OperatorSinkFinalizeInput &input) const override;
+							  OperatorSinkFinalizeInput &input) const override;
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
@@ -91,7 +91,7 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
-	                                      OperatorSourceInput &input) const override;
+										  OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -109,7 +109,7 @@ private:
 class MSSQLUpdateGlobalSinkState : public GlobalSinkState {
 public:
 	explicit MSSQLUpdateGlobalSinkState(ClientContext &context, const MSSQLUpdateTarget &target,
-	                                    const MSSQLDMLConfig &config);
+										const MSSQLDMLConfig &config);
 
 	// The update executor
 	unique_ptr<MSSQLUpdateExecutor> executor;

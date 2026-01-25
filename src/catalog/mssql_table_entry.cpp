@@ -208,12 +208,14 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	EnsurePKLoaded(context);
 
 	if (!pk_info_.exists) {
-		throw BinderException("MSSQL: UPDATE/DELETE requires a table with a primary key. "
-							  "Table '%s.%s' has no primary key.", schema.name.c_str(), name.c_str());
+		throw BinderException(
+			"MSSQL: UPDATE/DELETE requires a table with a primary key. "
+			"Table '%s.%s' has no primary key.",
+			schema.name.c_str(), name.c_str());
 	}
 
-	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s",
-				   pk_info_.columns.size(), pk_info_.rowid_type.ToString().c_str());
+	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s", pk_info_.columns.size(),
+				   pk_info_.rowid_type.ToString().c_str());
 }
 
 //===----------------------------------------------------------------------===//

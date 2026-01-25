@@ -9,17 +9,16 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLPhysicalDelete::MSSQLPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                                         MSSQLDeleteTarget target, MSSQLDMLConfig config)
-    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), target_(std::move(target)),
-      config_(std::move(config)) {
-}
+										 MSSQLDeleteTarget target, MSSQLDMLConfig config)
+	: PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality),
+	  target_(std::move(target)),
+	  config_(std::move(config)) {}
 
 //===----------------------------------------------------------------------===//
 // Sink Interface
 //===----------------------------------------------------------------------===//
 
-SinkResultType MSSQLPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chunk,
-                                         OperatorSinkInput &input) const {
+SinkResultType MSSQLPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -29,14 +28,13 @@ SinkResultType MSSQLPhysicalDelete::Sink(ExecutionContext &context, DataChunk &c
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-SinkCombineResultType MSSQLPhysicalDelete::Combine(ExecutionContext &context,
-                                                   OperatorSinkCombineInput &input) const {
+SinkCombineResultType MSSQLPhysicalDelete::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	// No local state to combine
 	return SinkCombineResultType::FINISHED;
 }
 
 SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                               OperatorSinkFinalizeInput &input) const {
+											   OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -66,7 +64,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalDelete::GetLocalSinkState(ExecutionConte
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalDelete::MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
-                                                           OperatorSourceInput &input) const {
+														   OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -87,7 +85,7 @@ SourceResultType MSSQLPhysicalDelete::MSSQL_GETDATA_METHOD(ExecutionContext &con
 //===----------------------------------------------------------------------===//
 
 MSSQLDeleteGlobalSinkState::MSSQLDeleteGlobalSinkState(ClientContext &context, const MSSQLDeleteTarget &target,
-                                                       const MSSQLDMLConfig &config) {
+													   const MSSQLDMLConfig &config) {
 	executor = make_uniq<MSSQLDeleteExecutor>(context, target, config);
 }
 

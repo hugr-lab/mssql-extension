@@ -8,11 +8,11 @@
 
 #pragma once
 
-#include "duckdb/common/common.hpp"
-#include "duckdb/common/vector.hpp"
-#include "duckdb/common/types/value.hpp"
 #include "delete/mssql_delete_target.hpp"
 #include "dml/mssql_dml_batch.hpp"
+#include "duckdb/common/common.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector.hpp"
 
 namespace duckdb {
 

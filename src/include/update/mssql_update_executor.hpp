@@ -3,12 +3,12 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include "dml/mssql_dml_config.hpp"
+#include "dml/mssql_dml_result.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "update/mssql_update_target.hpp"
-#include "dml/mssql_dml_config.hpp"
-#include "dml/mssql_dml_result.hpp"
 
 namespace duckdb {
 

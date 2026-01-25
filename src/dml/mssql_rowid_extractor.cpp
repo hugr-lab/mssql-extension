@@ -10,8 +10,7 @@ namespace duckdb {
 // ExtractSingleRowPK - Extract PK values for a single row
 //===----------------------------------------------------------------------===//
 
-vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx,
-                                 const mssql::PrimaryKeyInfo &pk_info) {
+vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssql::PrimaryKeyInfo &pk_info) {
 	vector<Value> pk_values;
 
 	if (!pk_info.exists || pk_info.columns.empty()) {
@@ -28,8 +27,7 @@ vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx,
 		// Composite PK: rowid is STRUCT with PK fields
 		// Extract each field in PK column order
 		if (rowid_value.type().id() != LogicalTypeId::STRUCT) {
-			throw InternalException("Expected STRUCT rowid for composite PK, got %s",
-			                        rowid_value.type().ToString());
+			throw InternalException("Expected STRUCT rowid for composite PK, got %s", rowid_value.type().ToString());
 		}
 
 		auto &struct_children = StructValue::GetChildren(rowid_value);
@@ -51,8 +49,7 @@ vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx,
 // ExtractPKFromRowid - Extract PK values from rowid column (bulk)
 //===----------------------------------------------------------------------===//
 
-vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count,
-                                         const mssql::PrimaryKeyInfo &pk_info) {
+vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count, const mssql::PrimaryKeyInfo &pk_info) {
 	vector<vector<Value>> result;
 	result.reserve(count);
 

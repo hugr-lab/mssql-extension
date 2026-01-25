@@ -197,15 +197,15 @@ string MSSQLDDLTranslator::TranslateDropSchema(const string &schema_name) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
-                                                const ColumnList &columns) {
+												const ColumnList &columns) {
 	// Delegate to the overload with empty constraints
 	vector<unique_ptr<Constraint>> empty_constraints;
 	return TranslateCreateTable(schema_name, table_name, columns, empty_constraints);
 }
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
-                                                const ColumnList &columns,
-                                                const vector<unique_ptr<Constraint>> &constraints) {
+												const ColumnList &columns,
+												const vector<unique_ptr<Constraint>> &constraints) {
 	if (columns.empty()) {
 		throw InvalidInputException("CREATE TABLE requires at least one column");
 	}

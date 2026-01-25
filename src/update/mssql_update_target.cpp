@@ -9,7 +9,7 @@ namespace duckdb {
 
 string MSSQLUpdateTarget::GetFullyQualifiedName() const {
 	return MSSQLValueSerializer::EscapeIdentifier(schema_name) + "." +
-	       MSSQLValueSerializer::EscapeIdentifier(table_name);
+		   MSSQLValueSerializer::EscapeIdentifier(table_name);
 }
 
 idx_t MSSQLUpdateTarget::GetParamsPerRow() const {

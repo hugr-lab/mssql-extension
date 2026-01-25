@@ -1,9 +1,9 @@
 #pragma once
 
 #include <vector>
+#include "catalog/mssql_primary_key.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "catalog/mssql_primary_key.hpp"
 
 namespace duckdb {
 
@@ -29,8 +29,7 @@ namespace duckdb {
 // @return Vector of vectors: outer[row_idx] = inner[pk_col_idx] = value
 //===----------------------------------------------------------------------===//
 
-vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count,
-                                         const mssql::PrimaryKeyInfo &pk_info);
+vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count, const mssql::PrimaryKeyInfo &pk_info);
 
 //===----------------------------------------------------------------------===//
 // ExtractSingleRowPK - Extract PK values for a single row
@@ -41,8 +40,7 @@ vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count,
 // @return Vector of PK column values for this row
 //===----------------------------------------------------------------------===//
 
-vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx,
-                                 const mssql::PrimaryKeyInfo &pk_info);
+vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssql::PrimaryKeyInfo &pk_info);
 
 //===----------------------------------------------------------------------===//
 // GetPKValueAsString - Convert PK value to T-SQL literal string

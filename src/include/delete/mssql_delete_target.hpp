@@ -10,8 +10,8 @@
 
 #include <string>
 #include <vector>
-#include "duckdb/common/types.hpp"
 #include "catalog/mssql_primary_key.hpp"
+#include "duckdb/common/types.hpp"
 
 namespace duckdb {
 

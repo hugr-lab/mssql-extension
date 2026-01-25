@@ -1,14 +1,14 @@
 #include "delete/mssql_delete_executor.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include "connection/mssql_pool_manager.hpp"
 #include "delete/mssql_delete_statement.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_token_parser.hpp"
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetDeleteDebugLevel() {
@@ -34,22 +34,22 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLDeleteExecutor::MSSQLDeleteExecutor(ClientContext &context, const MSSQLDeleteTarget &target,
-                                         const MSSQLDMLConfig &config)
-    : context_(context), target_(target), config_(config) {
+										 const MSSQLDMLConfig &config)
+	: context_(context), target_(target), config_(config) {
 	// Create statement generator
 	statement_ = make_uniq<MSSQLDeleteStatement>(target_);
 
 	// Compute effective batch size based on parameters per row (PK columns only for DELETE)
 	effective_batch_size_ = config_.EffectiveBatchSize(statement_->GetParametersPerRow());
 	DELETE_DEBUG(1, "DeleteExecutor: effective_batch_size=%llu (params_per_row=%llu)",
-	             (unsigned long long)effective_batch_size_, (unsigned long long)statement_->GetParametersPerRow());
+				 (unsigned long long)effective_batch_size_, (unsigned long long)statement_->GetParametersPerRow());
 }
 
 MSSQLDeleteExecutor::~MSSQLDeleteExecutor() = default;
 
 idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 	DELETE_DEBUG(1, "Execute: chunk_size=%llu, column_count=%llu", (unsigned long long)chunk.size(),
-	             (unsigned long long)chunk.ColumnCount());
+				 (unsigned long long)chunk.ColumnCount());
 
 	if (finalized_) {
 		throw InternalException("MSSQLDeleteExecutor::Execute called after Finalize");
@@ -72,7 +72,7 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 		// Check if we need to flush the batch
 		if (pending_pk_values_.size() >= effective_batch_size_) {
 			DELETE_DEBUG(1, "Execute: batch full, flushing %llu rows...",
-			             (unsigned long long)pending_pk_values_.size());
+						 (unsigned long long)pending_pk_values_.size());
 			auto result = FlushBatch();
 			if (!result.success) {
 				throw IOException("%s", result.FormatError("DELETE"));
@@ -81,14 +81,14 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 	}
 
 	DELETE_DEBUG(1, "Execute: chunk processed, total_deleted=%llu, pending=%llu",
-	             (unsigned long long)total_rows_deleted_, (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)total_rows_deleted_, (unsigned long long)pending_pk_values_.size());
 
 	return total_rows_deleted_;
 }
 
 MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
 	DELETE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
-	             (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)pending_pk_values_.size());
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_deleted_, batch_count_);
@@ -106,7 +106,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
 	}
 
 	DELETE_DEBUG(1, "Finalize: done, total_deleted=%llu, batch_count=%llu", (unsigned long long)total_rows_deleted_,
-	             (unsigned long long)batch_count_);
+				 (unsigned long long)batch_count_);
 	return MSSQLDMLResult::Success(total_rows_deleted_, batch_count_);
 }
 
@@ -117,7 +117,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::FlushBatch() {
 
 	batch_count_++;
 	DELETE_DEBUG(1, "FlushBatch: batch %llu with %llu rows", (unsigned long long)batch_count_,
-	             (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)pending_pk_values_.size());
 
 	// Build the DELETE statement
 	auto batch = statement_->Build(pending_pk_values_);
@@ -143,7 +143,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 	if (!pool) {
 		DELETE_DEBUG(1, "ExecuteBatch: pool not found for catalog '%s'", target_.catalog_name.c_str());
 		return MSSQLDMLResult::Failure("MSSQL connection pool for catalog '" + target_.catalog_name + "' not found", 0,
-		                               batch_count_);
+									   batch_count_);
 	}
 
 	auto connection = pool->Acquire();
@@ -181,7 +181,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
 		bool done = false;
-		int timeout_ms = 30000;  // 30 second timeout
+		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 		string error_message;
 		uint32_t error_number = 0;
@@ -212,7 +212,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 
 			packet_count++;
 			DELETE_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d", packet_count,
-			             packet.GetPayload().size(), packet.IsEndOfMessage());
+						 packet.GetPayload().size(), packet.IsEndOfMessage());
 
 			bool is_eom = packet.IsEndOfMessage();
 
@@ -230,7 +230,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 				case tds::ParsedTokenType::Done: {
 					const tds::DoneToken &done_token = parser.GetDone();
 					DELETE_DEBUG(1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d",
-					             done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount());
+								 done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount());
 					if (done_token.HasRowCount()) {
 						rows_affected = done_token.row_count;
 					}
@@ -246,7 +246,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 					error_number = tds_error.number;
 					error_message = tds_error.message;
 					DELETE_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'", error_number,
-					             error_message.c_str());
+								 error_message.c_str());
 					// Continue reading to drain the response
 					break;
 				}
@@ -265,7 +265,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		}
 
 		DELETE_DEBUG(1, "ExecuteBatch: response parsed, rows_affected=%llu, error='%s'",
-		             (unsigned long long)rows_affected, error_message.c_str());
+					 (unsigned long long)rows_affected, error_message.c_str());
 
 		// Check for errors
 		if (!error_message.empty()) {

@@ -8,10 +8,10 @@
 
 #pragma once
 
-#include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
 #include "delete/mssql_delete_target.hpp"
 #include "dml/mssql_dml_config.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 
 // Forward declaration for GetData compatibility
 #ifndef MSSQL_GETDATA_METHOD
@@ -39,7 +39,7 @@ public:
 	//! @param target Target table metadata
 	//! @param config DML configuration
 	MSSQLPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                    MSSQLDeleteTarget target, MSSQLDMLConfig config);
+						MSSQLDeleteTarget target, MSSQLDMLConfig config);
 
 	//! Get the name of this operator
 	string GetName() const override {
@@ -64,7 +64,7 @@ public:
 
 	//! Finalize - flush remaining batches
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          OperatorSinkFinalizeInput &input) const override;
+							  OperatorSinkFinalizeInput &input) const override;
 
 	//! Get global sink state
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
@@ -79,7 +79,7 @@ public:
 
 	//! Source interface - return the row count
 	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
-	                                      OperatorSourceInput &input) const override;
+										  OperatorSourceInput &input) const override;
 
 private:
 	//! Target table metadata
@@ -93,7 +93,7 @@ private:
 class MSSQLDeleteGlobalSinkState : public GlobalSinkState {
 public:
 	explicit MSSQLDeleteGlobalSinkState(ClientContext &context, const MSSQLDeleteTarget &target,
-	                                    const MSSQLDMLConfig &config);
+										const MSSQLDMLConfig &config);
 
 	//! The executor that handles batch accumulation and execution
 	unique_ptr<MSSQLDeleteExecutor> executor;

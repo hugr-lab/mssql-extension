@@ -2,9 +2,9 @@
 
 #include <string>
 #include <vector>
-#include "duckdb/common/types.hpp"
-#include "catalog/mssql_primary_key.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_primary_key.hpp"
+#include "duckdb/common/types.hpp"
 #include "update/mssql_update_column.hpp"
 
 namespace duckdb {

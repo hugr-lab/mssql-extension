@@ -1,14 +1,14 @@
 #include "update/mssql_update_executor.hpp"
-#include "update/mssql_update_statement.hpp"
-#include "dml/mssql_rowid_extractor.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "connection/mssql_pool_manager.hpp"
+#include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_token_parser.hpp"
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
+#include "update/mssql_update_statement.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetUpdateDebugLevel() {
@@ -34,12 +34,12 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLUpdateExecutor::MSSQLUpdateExecutor(ClientContext &context, const MSSQLUpdateTarget &target,
-                                         const MSSQLDMLConfig &config)
-    : context_(context), target_(target), config_(config), connection_pool_(nullptr) {
+										 const MSSQLDMLConfig &config)
+	: context_(context), target_(target), config_(config), connection_pool_(nullptr) {
 	// Compute effective batch size based on parameters per row
 	effective_batch_size_ = config_.EffectiveBatchSize(target_.GetParamsPerRow());
 	UPDATE_DEBUG(1, "UpdateExecutor: effective_batch_size=%llu (params_per_row=%llu)",
-	             (unsigned long long)effective_batch_size_, (unsigned long long)target_.GetParamsPerRow());
+				 (unsigned long long)effective_batch_size_, (unsigned long long)target_.GetParamsPerRow());
 }
 
 MSSQLUpdateExecutor::~MSSQLUpdateExecutor() = default;
@@ -81,14 +81,14 @@ idx_t MSSQLUpdateExecutor::Execute(DataChunk &chunk) {
 	}
 
 	UPDATE_DEBUG(1, "Execute: chunk processed, total_updated=%llu, pending=%llu",
-	             (unsigned long long)total_rows_updated_, (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)total_rows_updated_, (unsigned long long)pending_pk_values_.size());
 
 	return total_rows_updated_;
 }
 
 MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 	UPDATE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
-	             (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)pending_pk_values_.size());
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_updated_, batch_count_);
@@ -106,7 +106,7 @@ MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 	}
 
 	UPDATE_DEBUG(1, "Finalize: done, total_updated=%llu, batch_count=%llu", (unsigned long long)total_rows_updated_,
-	             (unsigned long long)batch_count_);
+				 (unsigned long long)batch_count_);
 	return MSSQLDMLResult::Success(total_rows_updated_, batch_count_);
 }
 
@@ -143,7 +143,7 @@ MSSQLDMLResult MSSQLUpdateExecutor::FlushBatch() {
 
 	batch_count_++;
 	UPDATE_DEBUG(1, "FlushBatch: batch %llu with %llu rows", (unsigned long long)batch_count_,
-	             (unsigned long long)pending_pk_values_.size());
+				 (unsigned long long)pending_pk_values_.size());
 
 	// Build the UPDATE statement
 	MSSQLUpdateStatement stmt(target_);
@@ -209,7 +209,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
 		bool done = false;
-		int timeout_ms = 30000;  // 30 second timeout
+		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 		string error_message;
 		uint32_t error_number = 0;
@@ -240,7 +240,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 			packet_count++;
 			UPDATE_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d", packet_count,
-			             packet.GetPayload().size(), packet.IsEndOfMessage());
+						 packet.GetPayload().size(), packet.IsEndOfMessage());
 
 			bool is_eom = packet.IsEndOfMessage();
 
@@ -258,7 +258,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 				case tds::ParsedTokenType::Done: {
 					const tds::DoneToken &done_token = parser.GetDone();
 					UPDATE_DEBUG(1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d",
-					             done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount());
+								 done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount());
 					if (done_token.HasRowCount()) {
 						rows_affected = done_token.row_count;
 					}
@@ -274,7 +274,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 					error_number = tds_error.number;
 					error_message = tds_error.message;
 					UPDATE_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'", error_number,
-					             error_message.c_str());
+								 error_message.c_str());
 					// Continue reading to drain the response
 					break;
 				}
@@ -293,7 +293,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		}
 
 		UPDATE_DEBUG(1, "ExecuteBatch: response parsed, rows_affected=%llu, error='%s'",
-		             (unsigned long long)rows_affected, error_message.c_str());
+					 (unsigned long long)rows_affected, error_message.c_str());
 
 		// Check for errors
 		if (!error_message.empty()) {
@@ -302,7 +302,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		}
 
 	} catch (const IOException &) {
-		throw;  // Re-throw IO exceptions
+		throw;	// Re-throw IO exceptions
 	} catch (const std::exception &e) {
 		pool.Release(std::move(connection));
 		throw IOException("UPDATE execution failed: %s", e.what());

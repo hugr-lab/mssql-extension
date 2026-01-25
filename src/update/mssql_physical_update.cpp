@@ -1,6 +1,6 @@
 #include "update/mssql_physical_update.hpp"
-#include "update/mssql_update_executor.hpp"
 #include "duckdb/common/exception.hpp"
+#include "update/mssql_update_executor.hpp"
 
 namespace duckdb {
 
@@ -9,17 +9,16 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLPhysicalUpdate::MSSQLPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                                         MSSQLUpdateTarget target, MSSQLDMLConfig config)
-    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), target_(std::move(target)),
-      config_(std::move(config)) {
-}
+										 MSSQLUpdateTarget target, MSSQLDMLConfig config)
+	: PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality),
+	  target_(std::move(target)),
+	  config_(std::move(config)) {}
 
 //===----------------------------------------------------------------------===//
 // Sink Interface
 //===----------------------------------------------------------------------===//
 
-SinkResultType MSSQLPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
-                                         OperatorSinkInput &input) const {
+SinkResultType MSSQLPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -29,14 +28,13 @@ SinkResultType MSSQLPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &c
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-SinkCombineResultType MSSQLPhysicalUpdate::Combine(ExecutionContext &context,
-                                                   OperatorSinkCombineInput &input) const {
+SinkCombineResultType MSSQLPhysicalUpdate::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	// No local state to combine
 	return SinkCombineResultType::FINISHED;
 }
 
 SinkFinalizeType MSSQLPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                               OperatorSinkFinalizeInput &input) const {
+											   OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -66,7 +64,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalUpdate::GetLocalSinkState(ExecutionConte
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalUpdate::MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
-                                                           OperatorSourceInput &input) const {
+														   OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
@@ -87,7 +85,7 @@ SourceResultType MSSQLPhysicalUpdate::MSSQL_GETDATA_METHOD(ExecutionContext &con
 //===----------------------------------------------------------------------===//
 
 MSSQLUpdateGlobalSinkState::MSSQLUpdateGlobalSinkState(ClientContext &context, const MSSQLUpdateTarget &target,
-                                                       const MSSQLDMLConfig &config) {
+													   const MSSQLDMLConfig &config) {
 	executor = make_uniq<MSSQLUpdateExecutor>(context, target, config);
 }
 
