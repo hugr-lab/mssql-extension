@@ -1,0 +1,42 @@
+# name: test/sql/attach/attach_validation.test
+# description: Test ATTACH connection validation - fail fast on invalid credentials
+# group: [attach]
+
+require mssql
+
+#
+# Test 1: Invalid credentials should fail immediately with clear error
+# Note: We use a non-existent server to test connection validation
+# This ensures ATTACH fails at validation time, not later during catalog queries
+#
+
+# Invalid hostname - should fail immediately
+statement error
+ATTACH 'Server=nonexistent.invalid.host,1433;Database=master;User Id=sa;Password=test' AS mssql_invalid_host (TYPE mssql);
+----
+MSSQL connection validation failed
+
+#
+# Test 2: Verify no catalog entry exists after failed ATTACH
+# (Testing US2: No Catalog Created on Connection Failure)
+#
+query I
+SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'mssql_invalid_host';
+----
+0
+
+#
+# Test 3: Invalid port - should fail with port validation error
+#
+statement error
+ATTACH 'Server=localhost,99999;Database=master;User Id=sa;Password=test' AS mssql_bad_port (TYPE mssql);
+----
+Port must be between 1 and 65535
+
+#
+# Test 4: Verify no catalog after invalid port attempt
+#
+query I
+SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'mssql_bad_port';
+----
+0

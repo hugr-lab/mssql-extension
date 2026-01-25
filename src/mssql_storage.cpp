@@ -10,6 +10,7 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
+#include "tds/tds_connection.hpp"
 
 namespace duckdb {
 
@@ -157,6 +158,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 				auto lower_key = StringUtil::Lower(key);
 				if (lower_key == "encrypt" || lower_key == "ssl" || lower_key == "use_ssl") {
 					result["encrypt"] = value;
+				} else if (lower_key == "trustservercertificate") {
+					result["trustservercertificate"] = value;
 				} else {
 					result[key] = value;
 				}
@@ -205,6 +208,8 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["password"] = value;
 		} else if (lower_key == "encrypt" || lower_key == "use encryption for data") {
 			result["encrypt"] = value;
+		} else if (lower_key == "trustservercertificate") {
+			result["trustservercertificate"] = value;
 		} else {
 			result[key] = value;
 		}
@@ -290,14 +295,34 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	result->user = params["user"];
 	result->password = params["password"];
 
-	// Parse optional encrypt parameter
-	// Enables TLS encryption for the connection
-	if (params.find("encrypt") != params.end()) {
+	// Parse optional encrypt and trustservercertificate parameters
+	// TrustServerCertificate is an alias for Encrypt (both enable TLS)
+	bool encrypt_specified = params.find("encrypt") != params.end();
+	bool trust_cert_specified = params.find("trustservercertificate") != params.end();
+
+	bool encrypt_value = false;
+	bool trust_cert_value = false;
+
+	if (encrypt_specified) {
 		auto encrypt_val = StringUtil::Lower(params["encrypt"]);
-		result->use_encrypt = (encrypt_val == "yes" || encrypt_val == "true" || encrypt_val == "1");
-	} else {
-		result->use_encrypt = false;
+		encrypt_value = (encrypt_val == "yes" || encrypt_val == "true" || encrypt_val == "1");
 	}
+
+	if (trust_cert_specified) {
+		auto trust_val = StringUtil::Lower(params["trustservercertificate"]);
+		trust_cert_value = (trust_val == "yes" || trust_val == "true" || trust_val == "1");
+	}
+
+	// Check for conflicting values
+	if (encrypt_specified && trust_cert_specified && encrypt_value != trust_cert_value) {
+		throw InvalidInputException(
+			"MSSQL Error: Conflicting values for Encrypt (%s) and TrustServerCertificate (%s). "
+			"These parameters must have the same value or only one should be specified.",
+			encrypt_value ? "true" : "false", trust_cert_value ? "true" : "false");
+	}
+
+	// Apply: either parameter enables TLS
+	result->use_encrypt = encrypt_value || trust_cert_value;
 
 	result->connected = false;
 	return result;
@@ -375,6 +400,83 @@ vector<string> MSSQLContextManager::ListContexts() {
 }
 
 //===----------------------------------------------------------------------===//
+// Connection Validation
+//===----------------------------------------------------------------------===//
+
+// Translate TDS error message to user-friendly message
+static string TranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
+									   const string &database) {
+	string lower_error = StringUtil::Lower(error);
+
+	// Authentication failures
+	if (lower_error.find("login failed") != string::npos || lower_error.find("authentication") != string::npos ||
+		lower_error.find("18456") != string::npos) {
+		return StringUtil::Format("Authentication failed for user '%s' - check username and password", user);
+	}
+
+	// Database access failures
+	if (lower_error.find("cannot open database") != string::npos || lower_error.find("4060") != string::npos) {
+		return StringUtil::Format("Cannot access database '%s' - check database name and permissions", database);
+	}
+
+	// TLS failures
+	if (lower_error.find("tls") != string::npos || lower_error.find("ssl") != string::npos ||
+		lower_error.find("handshake") != string::npos || lower_error.find("encrypt") != string::npos) {
+		return StringUtil::Format("TLS handshake failed to %s:%d - check TLS configuration", host, port);
+	}
+
+	// Connection refused
+	if (lower_error.find("connection refused") != string::npos || lower_error.find("econnrefused") != string::npos) {
+		return StringUtil::Format(
+			"Connection refused to %s:%d - check if SQL Server is running and accepting "
+			"connections",
+			host, port);
+	}
+
+	// DNS/hostname resolution
+	if (lower_error.find("resolve") != string::npos || lower_error.find("host") != string::npos ||
+		lower_error.find("enoent") != string::npos || lower_error.find("name or service not known") != string::npos) {
+		return StringUtil::Format("Cannot resolve hostname '%s' - check server name", host);
+	}
+
+	// Timeout
+	if (lower_error.find("timeout") != string::npos || lower_error.find("timed out") != string::npos) {
+		return StringUtil::Format("Connection timed out to %s:%d - check network connectivity and firewall settings",
+								  host, port);
+	}
+
+	// Generic connection error
+	if (!error.empty()) {
+		return StringUtil::Format("Connection failed to %s:%d: %s", host, port, error);
+	}
+
+	return StringUtil::Format("Connection failed to %s:%d", host, port);
+}
+
+void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+	// Create a temporary connection to test credentials
+	tds::TdsConnection conn;
+
+	// Attempt TCP connection
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		throw IOException("MSSQL connection validation failed: %s",
+						  TranslateConnectionError(error, info.host, info.port, info.user, info.database));
+	}
+
+	// Attempt authentication
+	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: %s",
+									TranslateConnectionError(error, info.host, info.port, info.user, info.database));
+	}
+
+	// Close the test connection - it will be recreated by the pool
+	conn.Close();
+}
+
+//===----------------------------------------------------------------------===//
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
@@ -415,12 +517,16 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			name, name);
 	}
 
-	// Register context
+	// Validate connection before registering context or creating catalog
+	// This ensures we fail fast on invalid credentials
+	auto pool_config = LoadPoolConfig(context);
+	ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
+
+	// Register context (only reached if validation succeeds)
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.RegisterContext(name, ctx);
 
-	// Create connection pool for this context using current settings
-	auto pool_config = LoadPoolConfig(context);
+	// Create connection pool for this context
 	MssqlPoolManager::Instance().GetOrCreatePool(
 		name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
 		ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);

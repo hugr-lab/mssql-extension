@@ -119,13 +119,13 @@ ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
 
 #### Key Aliases (case-insensitive)
 
-| Key                         | Aliases                    |
-| --------------------------- | -------------------------- |
-| `Server`                    | `Data Source`              |
-| `Database`                  | `Initial Catalog`          |
-| `User Id`                   | `Uid`, `User`              |
-| `Password`                  | `Pwd`                      |
-| `Encrypt`                   | `Use Encryption for Data`  |
+| Key                         | Aliases                              |
+| --------------------------- | ------------------------------------ |
+| `Server`                    | `Data Source`                        |
+| `Database`                  | `Initial Catalog`                    |
+| `User Id`                   | `Uid`, `User`                        |
+| `Password`                  | `Pwd`                                |
+| `Encrypt`                   | `Use Encryption for Data`, `TrustServerCertificate` |
 
 #### URI Format
 
@@ -169,6 +169,40 @@ ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=tr
 ```
 
 > **Note**: TLS support is available in both static and loadable extension builds (using OpenSSL).
+
+#### TrustServerCertificate Parameter
+
+For compatibility with ADO.NET connection strings, `TrustServerCertificate` is supported as an alias for `Encrypt`:
+
+```sql
+-- Using TrustServerCertificate (equivalent to Encrypt=yes)
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass;TrustServerCertificate=true'
+    AS db (TYPE mssql);
+```
+
+> **Note**: If both `Encrypt` and `TrustServerCertificate` are specified with conflicting values (e.g., `Encrypt=true;TrustServerCertificate=false`), ATTACH will fail with an error. Either omit one parameter or ensure they have the same value.
+
+### Connection Validation
+
+The extension validates connections at ATTACH time, providing immediate feedback on configuration errors:
+
+```sql
+-- Invalid hostname - fails immediately with clear error
+ATTACH 'Server=nonexistent.host,1433;Database=master;User Id=sa;Password=pass'
+    AS db (TYPE mssql);
+-- Error: MSSQL connection validation failed: Cannot resolve hostname 'nonexistent.host'
+
+-- Invalid credentials - fails immediately
+ATTACH 'Server=localhost,1433;Database=master;User Id=wrong;Password=wrong'
+    AS db (TYPE mssql);
+-- Error: MSSQL connection validation failed: Authentication failed for user 'wrong'
+```
+
+This fail-fast behavior ensures that:
+
+1. **No orphaned catalogs**: Failed ATTACH operations do not create catalog entries
+2. **Clear error messages**: Connection errors are reported immediately with specific details
+3. **Faster debugging**: Invalid configurations are caught at ATTACH time, not during first query
 
 ## Catalog Integration
 

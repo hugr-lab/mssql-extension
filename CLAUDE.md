@@ -33,6 +33,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-012) (001-pk-rowid-semantics)
 - In-memory (PK metadata cache per table entry) (001-pk-rowid-semantics)
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, PhysicalOperator, DataChunk), existing TDS layer (specs 001-009) (002-dml-update-delete)
+- C++17 (DuckDB extension standard) + DuckDB main branch (catalog API), existing TDS layer (specs 001-012) (001-attach-connection-validation)
+- In-memory (connection pool, metadata cache) (001-attach-connection-validation)
 
 ## Project Structure
 
@@ -88,9 +90,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 001-attach-connection-validation: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API), existing TDS layer (specs 001-012)
 - 002-dml-update-delete: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, PhysicalOperator, DataChunk), existing TDS layer (specs 001-009)
 - 001-pk-rowid-semantics: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-012)
-- 016-windows-ci-build: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), OpenSSL (via vcpkg), WinSock2 (Windows)
 
 <!-- MANUAL ADDITIONS START -->
 
