@@ -88,7 +88,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	auto &mssql_catalog = GetMSSQLCatalog();
 	mssql_catalog.CheckWriteAccess("CREATE TABLE");
 
-	// Get table name and columns from bound info
+	// Get table name, columns, and constraints from bound info
 	auto &base_info = info.Base();
 	string table_name = base_info.table;
 
@@ -96,8 +96,11 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// BoundCreateTableInfo contains the resolved column definitions
 	auto &columns = base_info.columns;
 
-	// Generate T-SQL for CREATE TABLE
-	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns);
+	// Extract constraints (includes PRIMARY KEY, UNIQUE, etc.)
+	auto &constraints = base_info.constraints;
+
+	// Generate T-SQL for CREATE TABLE (with constraints)
+	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints);
 
 	// Execute DDL on SQL Server
 	if (transaction.HasContext()) {

@@ -1,0 +1,102 @@
+# name: test/sql/dml/delete_bulk.test
+# description: Test bulk DELETE operations (5000+ rows) to verify batching
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_del_bulk (TYPE mssql);
+
+# Test 2: Create test table with primary key
+statement ok
+DROP TABLE IF EXISTS mssql_del_bulk.dbo.delete_bulk_test;
+
+statement ok
+CREATE TABLE mssql_del_bulk.dbo.delete_bulk_test (
+    id INTEGER PRIMARY KEY,
+    value INTEGER,
+    status VARCHAR(20)
+);
+
+# Test 3: Insert 5000 rows using INSERT INTO ... SELECT
+statement ok
+INSERT INTO mssql_del_bulk.dbo.delete_bulk_test
+SELECT i, i * 10, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END
+FROM generate_series(1, 5000) AS t(i);
+
+# Verify initial row count
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+5000
+
+# Test 4: Bulk DELETE - delete odd rows (2500 rows)
+statement ok
+DELETE FROM mssql_del_bulk.dbo.delete_bulk_test WHERE status = 'odd';
+
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+2500
+
+# Test 5: Verify only even IDs remain
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test WHERE id % 2 = 0;
+----
+2500
+
+# Test 6: Bulk DELETE - delete subset by range (1000 rows: IDs 2-2000 even = 1000)
+statement ok
+DELETE FROM mssql_del_bulk.dbo.delete_bulk_test WHERE id <= 2000;
+
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+1500
+
+# Test 7: Verify remaining IDs are > 2000 and even
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test WHERE id > 2000 AND id % 2 = 0;
+----
+1500
+
+# Test 8: Bulk DELETE - delete by value range
+# value = id * 10, so value > 40000 means id > 4000
+# This deletes ids 4002, 4004, ..., 5000 (even only) = 500 rows
+# Remaining: ids 2002, 2004, ..., 4000 (even only) = 1000 rows
+statement ok
+DELETE FROM mssql_del_bulk.dbo.delete_bulk_test WHERE value > 40000;
+
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+1000
+
+# Test 9: Verify data integrity after all deletes
+query II
+SELECT MIN(id), MAX(id) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+2002	4000
+
+# Test 10: Delete all remaining rows
+statement ok
+DELETE FROM mssql_del_bulk.dbo.delete_bulk_test;
+
+query I
+SELECT COUNT(*) FROM mssql_del_bulk.dbo.delete_bulk_test;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE mssql_del_bulk.dbo.delete_bulk_test;
+
+statement ok
+DETACH mssql_del_bulk;

@@ -237,22 +237,32 @@ src/
 ├── include/           # Header files
 │   ├── catalog/       # DuckDB catalog integration
 │   ├── connection/    # Connection pooling, settings
+│   ├── dml/           # Shared DML utilities (value serializer, statement builder)
 │   ├── insert/        # INSERT implementation
+│   ├── update/        # UPDATE implementation
+│   ├── delete/        # DELETE implementation
 │   ├── pushdown/      # Filter/projection pushdown
 │   ├── query/         # Query execution
 │   └── tds/           # TDS protocol implementation
 ├── catalog/           # Catalog implementation
 ├── connection/        # Connection management
+├── dml/               # Shared DML components
 ├── insert/            # INSERT operators
+├── update/            # UPDATE operators
+├── delete/            # DELETE operators
 ├── pushdown/          # Pushdown optimization
 ├── query/             # Query execution
 └── tds/               # TDS protocol
     ├── encoding/      # Type encoding/decoding
     └── tls/           # TLS implementation (OpenSSL)
 
-tests/
-├── cpp/               # Unit tests (no SQL Server)
-└── integration/       # Integration tests (require SQL Server)
+test/sql/
+├── catalog/           # Catalog integration tests
+├── dml/               # UPDATE and DELETE tests
+├── insert/            # INSERT tests
+├── integration/       # Core integration tests
+├── query/             # Query-level tests
+└── tds_connection/    # TDS protocol tests
 
 docker/
 ├── docker-compose.yml         # Local SQL Server for development
@@ -280,6 +290,20 @@ export MSSQL_DEBUG=1
 ./build/debug/duckdb
 ```
 
+### DML Debugging
+
+```bash
+# Debug DML operations (INSERT, UPDATE, DELETE)
+export MSSQL_DML_DEBUG=1
+./build/debug/duckdb
+
+# This will output:
+# - Generated SQL statements
+# - Batch sizes and parameter counts
+# - Execution timing
+# - rowid values for UPDATE/DELETE targeting
+```
+
 ### TLS Debugging
 
 ```bash
@@ -299,6 +323,15 @@ lldb ./build/debug/duckdb
 # or
 gdb ./build/debug/duckdb
 ```
+
+### DML Component Debugging Tips
+
+When debugging DML operations:
+
+1. **INSERT issues**: Check `mssql_insert_executor.cpp` - the batch builder and statement generator
+2. **UPDATE/DELETE issues**: Check `mssql_update.cpp` or `mssql_delete.cpp` - ensure rowid column is properly positioned
+3. **Value serialization**: Check `mssql_value_serializer.cpp` for type → T-SQL literal conversion
+4. **Column ordering**: Ensure INSERT columns are in statement order, not table order (see `mssql_catalog.cpp`)
 
 ## Release Process
 

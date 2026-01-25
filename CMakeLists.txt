@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/insert src/include/table_scan)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/insert src/include/table_scan src/include/dml src/include/update src/include/delete)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -124,6 +124,19 @@ set(EXTENSION_SOURCES
     src/insert/mssql_insert_executor.cpp
     src/insert/mssql_physical_insert.cpp
     src/insert/mssql_returning_parser.cpp
+    # DML shared layer (UPDATE/DELETE common)
+    src/dml/mssql_dml_config.cpp
+    src/dml/mssql_rowid_extractor.cpp
+    # UPDATE layer (DML UPDATE support)
+    src/update/mssql_update_target.cpp
+    src/update/mssql_update_statement.cpp
+    src/update/mssql_update_executor.cpp
+    src/update/mssql_physical_update.cpp
+    # DELETE layer (DML DELETE support)
+    src/delete/mssql_delete_target.cpp
+    src/delete/mssql_delete_statement.cpp
+    src/delete/mssql_delete_executor.cpp
+    src/delete/mssql_physical_delete.cpp
 )
 
 # Build static extension (linked into DuckDB)

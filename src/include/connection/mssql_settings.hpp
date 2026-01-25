@@ -67,4 +67,11 @@ struct MSSQLInsertConfig;
 // Load INSERT configuration from context settings
 MSSQLInsertConfig LoadInsertConfig(ClientContext &context);
 
+//===----------------------------------------------------------------------===//
+// DML (UPDATE/DELETE) Configuration
+//===----------------------------------------------------------------------===//
+
+// DML configuration is defined in dml/mssql_dml_config.hpp
+// LoadDMLConfig() is declared there along with MSSQLDMLConfig struct
+
 }  // namespace duckdb

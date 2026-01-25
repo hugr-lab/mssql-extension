@@ -1,0 +1,116 @@
+# name: test/sql/dml/update_composite_pk.test
+# description: Test UPDATE operations on tables with composite (multi-column) primary key
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_upd_comp (TYPE mssql);
+
+# Test 2: Create test table with composite primary key (2 columns)
+statement ok
+DROP TABLE IF EXISTS mssql_upd_comp.dbo.update_composite_pk_test;
+
+statement ok
+CREATE TABLE mssql_upd_comp.dbo.update_composite_pk_test (
+    tenant_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    name VARCHAR(100),
+    quantity INTEGER,
+    price DECIMAL(10, 2),
+    PRIMARY KEY (tenant_id, item_id)
+);
+
+# Test 3: Insert test data (3 tenants, each with 3 items)
+statement ok
+INSERT INTO mssql_upd_comp.dbo.update_composite_pk_test (tenant_id, item_id, name, quantity, price) VALUES
+    (1, 1, 'Tenant1 Item1', 10, 100.00),
+    (1, 2, 'Tenant1 Item2', 20, 200.00),
+    (1, 3, 'Tenant1 Item3', 30, 300.00),
+    (2, 1, 'Tenant2 Item1', 11, 110.00),
+    (2, 2, 'Tenant2 Item2', 21, 210.00),
+    (2, 3, 'Tenant2 Item3', 31, 310.00),
+    (3, 1, 'Tenant3 Item1', 12, 120.00),
+    (3, 2, 'Tenant3 Item2', 22, 220.00),
+    (3, 3, 'Tenant3 Item3', 32, 320.00);
+
+# Verify initial row count
+query I
+SELECT COUNT(*) FROM mssql_upd_comp.dbo.update_composite_pk_test;
+----
+9
+
+# Test 4: UPDATE single row using both PK columns in filter
+statement ok
+UPDATE mssql_upd_comp.dbo.update_composite_pk_test SET quantity = 999 WHERE tenant_id = 1 AND item_id = 1;
+
+query III
+SELECT tenant_id, item_id, quantity FROM mssql_upd_comp.dbo.update_composite_pk_test WHERE tenant_id = 1 AND item_id = 1;
+----
+1	1	999
+
+# Test 5: UPDATE multiple rows for a single tenant
+statement ok
+UPDATE mssql_upd_comp.dbo.update_composite_pk_test SET price = price * 1.1 WHERE tenant_id = 2;
+
+query IIR
+SELECT tenant_id, item_id, price FROM mssql_upd_comp.dbo.update_composite_pk_test WHERE tenant_id = 2 ORDER BY item_id;
+----
+2	1	121.00
+2	2	231.00
+2	3	341.00
+
+# Test 6: UPDATE multiple rows using item_id filter (spans multiple tenants)
+statement ok
+UPDATE mssql_upd_comp.dbo.update_composite_pk_test SET name = 'Updated Item' WHERE item_id = 3;
+
+query I
+SELECT COUNT(*) FROM mssql_upd_comp.dbo.update_composite_pk_test WHERE name = 'Updated Item';
+----
+3
+
+# Test 7: UPDATE with multiple columns
+statement ok
+UPDATE mssql_upd_comp.dbo.update_composite_pk_test SET name = 'Special', quantity = 0, price = 0.00 WHERE tenant_id = 3 AND item_id = 2;
+
+query ITIR
+SELECT tenant_id, name, quantity, price FROM mssql_upd_comp.dbo.update_composite_pk_test WHERE tenant_id = 3 AND item_id = 2;
+----
+3	Special	0	0.00
+
+# Test 8: UPDATE with NULL value
+statement ok
+UPDATE mssql_upd_comp.dbo.update_composite_pk_test SET name = NULL WHERE tenant_id = 1 AND item_id = 2;
+
+query IT
+SELECT tenant_id, name FROM mssql_upd_comp.dbo.update_composite_pk_test WHERE tenant_id = 1 AND item_id = 2;
+----
+1	NULL
+
+# Test 9: Verify all data is correct
+query IIITR
+SELECT tenant_id, item_id, quantity, name, price FROM mssql_upd_comp.dbo.update_composite_pk_test ORDER BY tenant_id, item_id;
+----
+1	1	999	Tenant1 Item1	100.00
+1	2	20	NULL	200.00
+1	3	30	Updated Item	300.00
+2	1	11	Tenant2 Item1	121.00
+2	2	21	Tenant2 Item2	231.00
+2	3	31	Updated Item	341.00
+3	1	12	Tenant3 Item1	120.00
+3	2	0	Special	0.00
+3	3	32	Updated Item	320.00
+
+# Cleanup
+statement ok
+DROP TABLE mssql_upd_comp.dbo.update_composite_pk_test;
+
+statement ok
+DETACH mssql_upd_comp;

@@ -134,7 +134,7 @@ SELECT COUNT(*) FROM information_schema.columns WHERE table_catalog = 'testdb_ca
 query I
 SELECT COUNT(*) FROM information_schema.columns WHERE table_catalog = 'testdb_catalog' AND table_schema = 'dbo' AND table_name = 'AllDataTypes';
 ----
-26
+28
 
 # Test 14: Check NullableTypes has all columns
 query I

@@ -4,6 +4,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/column_list.hpp"
+#include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 
 namespace duckdb {
@@ -71,6 +72,15 @@ public:
 	//! @param columns Column list with definitions
 	//! @return T-SQL statement
 	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns);
+
+	//! Generate CREATE TABLE T-SQL from column definitions and constraints
+	//! @param schema_name Target schema
+	//! @param table_name Target table name
+	//! @param columns Column list with definitions
+	//! @param constraints Table constraints (PRIMARY KEY, UNIQUE, etc.)
+	//! @return T-SQL statement
+	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns,
+									   const vector<unique_ptr<Constraint>> &constraints);
 
 	//! Generate DROP TABLE T-SQL
 	//! @param schema_name Schema containing table

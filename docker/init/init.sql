@@ -17,6 +17,11 @@ GO
 USE TestDB;
 GO
 
+-- Set ANSI_NULL_DFLT_ON so columns default to NULL when nullability isn't specified.
+-- This ensures consistent behavior and matches standard SQL semantics.
+ALTER DATABASE TestDB SET ANSI_NULL_DEFAULT ON;
+GO
+
 -- =============================================================================
 -- Create test schemas including ones with special/reserved names
 -- =============================================================================

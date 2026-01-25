@@ -1,0 +1,126 @@
+# name: test/sql/dml/delete_composite_pk.test
+# description: Test DELETE operations on tables with composite (multi-column) primary key
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Test 2: Create test table with composite primary key (2 columns)
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.delete_composite_pk_test;
+
+statement ok
+CREATE TABLE mssql.dbo.delete_composite_pk_test (
+    tenant_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    name VARCHAR(100),
+    quantity INTEGER,
+    status VARCHAR(20),
+    PRIMARY KEY (tenant_id, item_id)
+);
+
+# Test 3: Insert test data (3 tenants, each with 4 items)
+statement ok
+INSERT INTO mssql.dbo.delete_composite_pk_test (tenant_id, item_id, name, quantity, status) VALUES
+    (1, 1, 'Tenant1 Item1', 10, 'active'),
+    (1, 2, 'Tenant1 Item2', 20, 'active'),
+    (1, 3, 'Tenant1 Item3', 30, 'inactive'),
+    (1, 4, 'Tenant1 Item4', 40, 'inactive'),
+    (2, 1, 'Tenant2 Item1', 11, 'active'),
+    (2, 2, 'Tenant2 Item2', 21, 'active'),
+    (2, 3, 'Tenant2 Item3', 31, 'inactive'),
+    (2, 4, 'Tenant2 Item4', 41, 'inactive'),
+    (3, 1, 'Tenant3 Item1', 12, 'active'),
+    (3, 2, 'Tenant3 Item2', 22, 'active'),
+    (3, 3, 'Tenant3 Item3', 32, 'inactive'),
+    (3, 4, 'Tenant3 Item4', 42, 'inactive');
+
+# Verify initial row count
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+12
+
+# Test 4: DELETE single row using both PK columns in filter
+statement ok
+DELETE FROM mssql.dbo.delete_composite_pk_test WHERE tenant_id = 1 AND item_id = 1;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test WHERE tenant_id = 1 AND item_id = 1;
+----
+0
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+11
+
+# Test 5: DELETE all items for a single tenant
+statement ok
+DELETE FROM mssql.dbo.delete_composite_pk_test WHERE tenant_id = 2;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test WHERE tenant_id = 2;
+----
+0
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+7
+
+# Test 6: DELETE using item_id filter (spans multiple tenants)
+statement ok
+DELETE FROM mssql.dbo.delete_composite_pk_test WHERE item_id = 4;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test WHERE item_id = 4;
+----
+0
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+5
+
+# Test 7: DELETE using non-PK column filter (status)
+statement ok
+DELETE FROM mssql.dbo.delete_composite_pk_test WHERE status = 'inactive';
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+3
+
+# Test 8: Verify remaining data
+query IITI
+SELECT tenant_id, item_id, name, quantity FROM mssql.dbo.delete_composite_pk_test ORDER BY tenant_id, item_id;
+----
+1	2	Tenant1 Item2	20
+3	1	Tenant3 Item1	12
+3	2	Tenant3 Item2	22
+
+# Test 9: DELETE all remaining rows
+statement ok
+DELETE FROM mssql.dbo.delete_composite_pk_test;
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.delete_composite_pk_test;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE mssql.dbo.delete_composite_pk_test;
+
+statement ok
+DETACH mssql;

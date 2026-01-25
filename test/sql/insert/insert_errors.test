@@ -16,51 +16,54 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: READ_ONLY mode blocks INSERT
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ro (TYPE mssql, READ_ONLY);
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_err_ro (TYPE mssql, READ_ONLY);
 
 # Try to INSERT into any table - should fail with read-only error
 statement error
-INSERT INTO mssql_ro.dbo.sysobjects (name) VALUES ('test');
+INSERT INTO mssql_insert_err_ro.dbo.TestSimplePK (id, name, value) VALUES (999, 'test', 1.00);
 ----
 read-only
 
 statement ok
-DETACH mssql_ro;
+DETACH mssql_insert_err_ro;
 
 # Test 2: Attach with READ_WRITE for constraint tests
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_errors (TYPE mssql);
 
 # Test 3: Primary key violation (use mssql_exec for PRIMARY KEY constraint)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_pk_test;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_pk_test;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_pk_test (id INT PRIMARY KEY, name NVARCHAR(100))');
+SELECT mssql_exec('mssql_insert_errors', 'CREATE TABLE dbo.insert_pk_test (id INT PRIMARY KEY, name NVARCHAR(100))');
 
 statement ok
-INSERT INTO mssql.dbo.insert_pk_test (id, name) VALUES (1, 'Alice');
+SELECT mssql_refresh_cache('mssql_insert_errors');
+
+statement ok
+INSERT INTO mssql_insert_errors.dbo.insert_pk_test (id, name) VALUES (1, 'Alice');
 
 statement error
-INSERT INTO mssql.dbo.insert_pk_test (id, name) VALUES (1, 'Bob');
+INSERT INTO mssql_insert_errors.dbo.insert_pk_test (id, name) VALUES (1, 'Bob');
 ----
 2627
 
 statement ok
-DROP TABLE mssql.dbo.insert_pk_test;
+DROP TABLE mssql_insert_errors.dbo.insert_pk_test;
 
 # Test 4: Foreign key violation (needs mssql_exec for REFERENCES syntax)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_fk_child;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_fk_child;
 
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_fk_parent;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_fk_parent;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_fk_parent (id INT PRIMARY KEY)');
+SELECT mssql_exec('mssql_insert_errors', 'CREATE TABLE dbo.insert_fk_parent (id INT PRIMARY KEY)');
 
 statement ok
-SELECT mssql_exec('mssql', '
+SELECT mssql_exec('mssql_insert_errors', '
     CREATE TABLE dbo.insert_fk_child (
         id INT PRIMARY KEY,
         parent_id INT REFERENCES dbo.insert_fk_parent(id)
@@ -68,70 +71,82 @@ SELECT mssql_exec('mssql', '
 ');
 
 statement ok
-INSERT INTO mssql.dbo.insert_fk_parent (id) VALUES (1);
+SELECT mssql_refresh_cache('mssql_insert_errors');
+
+statement ok
+INSERT INTO mssql_insert_errors.dbo.insert_fk_parent (id) VALUES (1);
 
 statement error
-INSERT INTO mssql.dbo.insert_fk_child (id, parent_id) VALUES (1, 999);
+INSERT INTO mssql_insert_errors.dbo.insert_fk_child (id, parent_id) VALUES (1, 999);
 ----
 547
 
 statement ok
-DROP TABLE mssql.dbo.insert_fk_child;
+DROP TABLE mssql_insert_errors.dbo.insert_fk_child;
 
 statement ok
-DROP TABLE mssql.dbo.insert_fk_parent;
+DROP TABLE mssql_insert_errors.dbo.insert_fk_parent;
 
 # Test 5: Unique constraint violation (use mssql_exec for UNIQUE constraint)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_unique_test;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_unique_test;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_unique_test (id INT PRIMARY KEY, email NVARCHAR(100) UNIQUE)');
+SELECT mssql_exec('mssql_insert_errors', 'CREATE TABLE dbo.insert_unique_test (id INT PRIMARY KEY, email NVARCHAR(100) UNIQUE)');
 
 statement ok
-INSERT INTO mssql.dbo.insert_unique_test (id, email) VALUES (1, 'test@example.com');
+SELECT mssql_refresh_cache('mssql_insert_errors');
+
+statement ok
+INSERT INTO mssql_insert_errors.dbo.insert_unique_test (id, email) VALUES (1, 'test@example.com');
 
 statement error
-INSERT INTO mssql.dbo.insert_unique_test (id, email) VALUES (2, 'test@example.com');
+INSERT INTO mssql_insert_errors.dbo.insert_unique_test (id, email) VALUES (2, 'test@example.com');
 ----
 2627
 
 statement ok
-DROP TABLE mssql.dbo.insert_unique_test;
+DROP TABLE mssql_insert_errors.dbo.insert_unique_test;
 
 # Test 6: NOT NULL violation (use mssql_exec for NOT NULL constraint)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_notnull_test;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_notnull_test;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_notnull_test (id INT PRIMARY KEY, required_field NVARCHAR(100) NOT NULL)');
+SELECT mssql_exec('mssql_insert_errors', 'CREATE TABLE dbo.insert_notnull_test (id INT PRIMARY KEY, required_field NVARCHAR(100) NOT NULL)');
+
+statement ok
+SELECT mssql_refresh_cache('mssql_insert_errors');
 
 statement error
-INSERT INTO mssql.dbo.insert_notnull_test (id, required_field) VALUES (1, NULL);
+INSERT INTO mssql_insert_errors.dbo.insert_notnull_test (id, required_field) VALUES (1, NULL);
 ----
 515
 
 statement ok
-DROP TABLE mssql.dbo.insert_notnull_test;
+DROP TABLE mssql_insert_errors.dbo.insert_notnull_test;
 
 # Test 7: Check constraint violation (use mssql_exec for CHECK constraint)
 statement ok
-DROP TABLE IF EXISTS mssql.dbo.insert_check_test;
+DROP TABLE IF EXISTS mssql_insert_errors.dbo.insert_check_test;
 
 statement ok
-SELECT mssql_exec('mssql', 'CREATE TABLE dbo.insert_check_test (id INT PRIMARY KEY, value INT CHECK (value > 0))');
+SELECT mssql_exec('mssql_insert_errors', 'CREATE TABLE dbo.insert_check_test (id INT PRIMARY KEY, value INT CHECK (value > 0))');
 
 statement ok
-INSERT INTO mssql.dbo.insert_check_test (id, value) VALUES (1, 100);
+SELECT mssql_refresh_cache('mssql_insert_errors');
+
+statement ok
+INSERT INTO mssql_insert_errors.dbo.insert_check_test (id, value) VALUES (1, 100);
 
 statement error
-INSERT INTO mssql.dbo.insert_check_test (id, value) VALUES (2, -1);
+INSERT INTO mssql_insert_errors.dbo.insert_check_test (id, value) VALUES (2, -1);
 ----
 547
 
 statement ok
-DROP TABLE mssql.dbo.insert_check_test;
+DROP TABLE mssql_insert_errors.dbo.insert_check_test;
 
 # Test 8: Cleanup
 statement ok
-DETACH mssql;
+DETACH mssql_insert_errors;

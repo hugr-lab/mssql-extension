@@ -12,7 +12,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits
 - TLS/SSL encrypted connections
-- INSERT support with RETURNING clause and automatic batching
+- Full DML support: INSERT (with RETURNING), UPDATE, DELETE
 - DuckDB secret management for secure credential storage
 
 ## Quick Start
@@ -359,6 +359,84 @@ SET mssql_insert_max_sql_bytes = 4194304;
 
 Identity (auto-increment) columns are automatically excluded from INSERT statements. The generated values are returned via RETURNING clause.
 
+## Data Modification (UPDATE)
+
+UPDATE operations are supported for tables with primary keys. The extension uses rowid-based targeting for efficient updates.
+
+### Basic UPDATE
+
+```sql
+-- Update single row
+UPDATE sqlserver.dbo.products SET price = 19.99 WHERE id = 1;
+
+-- Update multiple rows
+UPDATE sqlserver.dbo.products SET status = 'discontinued' WHERE category = 'legacy';
+
+-- Update with expressions
+UPDATE sqlserver.dbo.products SET price = price * 1.10 WHERE category = 'premium';
+```
+
+### UPDATE with Multiple Columns
+
+```sql
+UPDATE sqlserver.dbo.customers
+SET name = 'John Doe', email = 'john@example.com', updated_at = NOW()
+WHERE id = 42;
+```
+
+### Batch Configuration
+
+Large updates are automatically batched:
+
+```sql
+-- Set batch size (default: 1000)
+SET mssql_update_batch_size = 500;
+```
+
+### Limitations
+
+- **RETURNING clause is not supported** for UPDATE operations
+- Tables must have a primary key (uses rowid for row identification)
+- Updates are executed as batched DELETE + INSERT internally for composite PKs
+
+## Data Modification (DELETE)
+
+DELETE operations are supported for tables with primary keys.
+
+### Basic DELETE
+
+```sql
+-- Delete single row
+DELETE FROM sqlserver.dbo.products WHERE id = 1;
+
+-- Delete multiple rows
+DELETE FROM sqlserver.dbo.products WHERE status = 'discontinued';
+
+-- Delete all rows (use with caution)
+DELETE FROM sqlserver.dbo.products;
+```
+
+### DELETE with Complex Conditions
+
+```sql
+DELETE FROM sqlserver.dbo.order_items
+WHERE order_id IN (SELECT id FROM sqlserver.dbo.orders WHERE status = 'cancelled');
+```
+
+### Batch Configuration
+
+Large deletes are automatically batched:
+
+```sql
+-- Set batch size (default: 1000)
+SET mssql_delete_batch_size = 500;
+```
+
+### Limitations
+
+- **RETURNING clause is not supported** for DELETE operations
+- Tables must have a primary key (uses rowid for row identification)
+
 ## DDL Operations
 
 The extension supports standard DuckDB DDL syntax for common operations, which are translated to T-SQL and executed on SQL Server. For advanced operations (indexes, constraints), use `mssql_exec()`.
@@ -662,6 +740,14 @@ Queries involving unsupported types will raise an error.
 | `mssql_insert_max_sql_bytes`       | BIGINT  | 8388608  | ≥1024  | Max SQL statement size (8MB)          |
 | `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Use OUTPUT INSERTED for RETURNING     |
 
+### UPDATE/DELETE Settings
+
+| Setting                            | Type    | Default  | Range  | Description                           |
+| ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
+| `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
+| `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
+| `mssql_dml_use_prepared`           | BOOLEAN | false    | -      | Use prepared statements for DML       |
+
 ### Usage Examples
 
 ```sql
@@ -862,7 +948,7 @@ The following features are planned for future releases:
 | Feature | Description | Status |
 |---------|-------------|--------|
 | **Row Identity** | `rowid` pseudo-column mapping to primary keys | ✅ Implemented |
-| **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | Planned |
+| **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | ✅ Implemented |
 | **Transactions** | BEGIN/COMMIT/ROLLBACK, savepoints, connection pinning | Planned |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
 | **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
@@ -870,9 +956,9 @@ The following features are planned for future releases:
 
 ### Feature Details
 
-**Row Identity**: Tables with primary keys expose a virtual `rowid` column. Scalar PKs map to their native type; composite PKs map to DuckDB STRUCT. This enables future UPDATE/DELETE support.
+**Row Identity**: Tables with primary keys expose a virtual `rowid` column. Scalar PKs map to their native type; composite PKs map to DuckDB STRUCT. This enables UPDATE/DELETE support.
 
-**UPDATE/DELETE**: Will support `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Uses `rowid` for row identification. Batched execution using `UPDATE ... FROM (VALUES ...)` pattern.
+**UPDATE/DELETE**: Supports `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Uses `rowid` for row identification. Batched execution for large operations. Note: RETURNING clause is not supported for UPDATE/DELETE (only for INSERT).
 
 **Transactions**: DML-only transactions with connection pinning. Savepoints via `SAVE TRANSACTION`. DDL executes outside transactions (auto-commit).
 
@@ -886,7 +972,8 @@ The following features are planned for future releases:
 
 ### Unsupported Features
 
-- **UPDATE/DELETE**: Use `mssql_exec()` for data modification other than INSERT
+- **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
+- **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
 - **Windows Authentication**: Only SQL Server authentication is supported
 - **Transactions**: Multi-statement transactions are not supported
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
