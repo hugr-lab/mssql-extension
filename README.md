@@ -9,6 +9,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Native TDS protocol implementation (no external dependencies)
 - Stream query results directly into DuckDB without buffering
 - Full DuckDB catalog integration with three-part naming (`database.schema.table`)
+- Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits
 - TLS/SSL encrypted connections
 - INSERT support with RETURNING clause and automatic batching
@@ -263,6 +264,47 @@ Supported filter operations for pushdown:
 - DuckDB-specific functions: `list_contains()`, `regexp_matches()`
 
 Note: `LIKE 'prefix%'` patterns are optimized by DuckDB into range comparisons which ARE pushed down.
+
+### Row Identity (rowid)
+
+Tables with primary keys expose a virtual `rowid` column that provides stable row identification:
+
+```sql
+-- Query rowid alongside other columns
+SELECT rowid, name, value FROM sqlserver.dbo.products LIMIT 5;
+```
+
+**rowid Type Mapping:**
+
+| Primary Key Type | rowid Type | Example |
+|------------------|------------|---------|
+| Single column (INT) | `INTEGER` | `42` |
+| Single column (BIGINT) | `BIGINT` | `9223372036854775807` |
+| Single column (VARCHAR) | `VARCHAR` | `'ABC-001'` |
+| Single column (UNIQUEIDENTIFIER) | `UUID` | `a1b2c3d4-e5f6-...` |
+| Composite (multiple columns) | `STRUCT` | `{'region_id': 1, 'product_id': 100}` |
+
+**Usage Examples:**
+
+```sql
+-- Scalar primary key (INT)
+SELECT rowid, name FROM sqlserver.dbo.customers;
+-- rowid: 1, 2, 3, ...
+
+-- Composite primary key (VARCHAR + INT)
+SELECT rowid, quantity FROM sqlserver.dbo.order_items;
+-- rowid: {'tenant_code': 'ACME', 'item_id': 1}, ...
+
+-- Filter using rowid (composite key)
+SELECT * FROM sqlserver.dbo.order_items
+WHERE rowid = {'tenant_code': 'ACME', 'item_id': 1};
+```
+
+**Limitations:**
+
+- Tables without primary keys do not expose `rowid`
+- Views do not support `rowid`
+- `rowid` is read-only (cannot be used in INSERT/UPDATE)
 
 ## Data Modification (INSERT)
 
@@ -819,6 +861,7 @@ The following features are planned for future releases:
 
 | Feature | Description | Status |
 |---------|-------------|--------|
+| **Row Identity** | `rowid` pseudo-column mapping to primary keys | ✅ Implemented |
 | **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | Planned |
 | **Transactions** | BEGIN/COMMIT/ROLLBACK, savepoints, connection pinning | Planned |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
@@ -827,7 +870,9 @@ The following features are planned for future releases:
 
 ### Feature Details
 
-**UPDATE/DELETE**: Will support `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Requires primary key for row identification. Batched execution using `UPDATE ... FROM (VALUES ...)` pattern.
+**Row Identity**: Tables with primary keys expose a virtual `rowid` column. Scalar PKs map to their native type; composite PKs map to DuckDB STRUCT. This enables future UPDATE/DELETE support.
+
+**UPDATE/DELETE**: Will support `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Uses `rowid` for row identification. Batched execution using `UPDATE ... FROM (VALUES ...)` pattern.
 
 **Transactions**: DML-only transactions with connection pinning. Savepoints via `SAVE TRANSACTION`. DDL executes outside transactions (auto-commit).
 
@@ -845,6 +890,7 @@ The following features are planned for future releases:
 - **Windows Authentication**: Only SQL Server authentication is supported
 - **Transactions**: Multi-statement transactions are not supported
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
+- **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
 
 ### Known Issues
 
