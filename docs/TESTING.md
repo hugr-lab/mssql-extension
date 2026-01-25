@@ -133,6 +133,13 @@ Tests require these environment variables (automatically set by `make integratio
 | `MSSQL_TEST_DSN` | (computed) | ADO.NET connection string for master |
 | `MSSQL_TESTDB_DSN` | (computed) | ADO.NET connection string for TestDB |
 
+**Debug Environment Variables:**
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `MSSQL_DEBUG` | `1`, `2`, `3` | TDS protocol debug level (1=basic, 3=trace) |
+| `MSSQL_DML_DEBUG` | `1` | Enable DML operation debugging (INSERT/UPDATE/DELETE) |
+
 To run tests manually with custom environment:
 
 ```bash
@@ -159,6 +166,20 @@ test/
 │   │   ├── catalog_parsing.test    # Schema/table/column discovery
 │   │   ├── select_queries.test     # SELECT query tests
 │   │   └── data_types.test         # Data type handling tests
+│   ├── dml/                        # UPDATE and DELETE tests
+│   │   ├── update_scalar.test      # Single-row UPDATE tests
+│   │   ├── update_bulk.test        # Bulk UPDATE tests
+│   │   ├── update_types.test       # UPDATE data type handling
+│   │   ├── update_errors.test      # UPDATE error handling
+│   │   ├── delete_basic.test       # Basic DELETE tests
+│   │   ├── delete_bulk.test        # Bulk DELETE tests
+│   │   └── delete_errors.test      # DELETE error handling
+│   ├── insert/                     # INSERT tests
+│   │   ├── insert_basic.test       # Basic INSERT tests
+│   │   ├── insert_bulk.test        # Bulk INSERT tests
+│   │   ├── insert_types.test       # INSERT data type handling
+│   │   ├── insert_errors.test      # INSERT error handling
+│   │   └── insert_returning.test   # INSERT with RETURNING clause
 │   ├── integration/                # Core integration tests
 │   │   ├── basic_queries.test      # Basic query functionality
 │   │   ├── large_data.test         # Large dataset handling
@@ -247,7 +268,8 @@ DETACH testdb;
 |-------|-------------|---------------------|
 | `[sql]` | General SQL tests | Yes |
 | `[integration]` | Integration tests | Yes |
-| `[mssql]` | MSSQL-specific tests | Varies |
+| `[mssql]` | MSSQL-specific tests (catalog, DML) | Yes |
+| `[dml]` | DML operations (INSERT/UPDATE/DELETE) | Yes |
 
 ---
 
@@ -256,6 +278,8 @@ DETACH testdb;
 ### 1. Choose the Right Location
 
 - **Catalog tests** → `test/sql/catalog/`
+- **DML tests (UPDATE/DELETE)** → `test/sql/dml/`
+- **INSERT tests** → `test/sql/insert/`
 - **Integration tests** → `test/sql/integration/`
 - **TDS protocol tests** → `test/sql/tds_connection/`
 - **Query tests** → `test/sql/query/`
@@ -331,6 +355,88 @@ SELECT "col""quote" FROM testdb."schema""quote"."table""quote";
 
 # Spaces - use double quotes
 SELECT "My Column" FROM testdb."My Schema"."My Table";
+```
+
+### 6. Writing DML Tests (INSERT/UPDATE/DELETE)
+
+DML tests require careful setup and cleanup to ensure test isolation:
+
+```sql
+# name: test/sql/dml/my_update_test.test
+# description: Test UPDATE operations
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Use unique context name to avoid conflicts
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_upd_mytest (TYPE mssql);
+
+# Create test table with PRIMARY KEY (required for rowid-based UPDATE/DELETE)
+# Use mssql_exec for CREATE TABLE with constraints
+statement ok
+DROP TABLE IF EXISTS mssql_upd_mytest.dbo.my_update_test;
+
+statement ok
+SELECT mssql_exec('mssql_upd_mytest', 'CREATE TABLE dbo.my_update_test (id INT PRIMARY KEY, name NVARCHAR(100), value DECIMAL(10,2))');
+
+# IMPORTANT: Refresh cache after DDL via mssql_exec
+statement ok
+SELECT mssql_refresh_cache('mssql_upd_mytest');
+
+# Insert test data
+statement ok
+INSERT INTO mssql_upd_mytest.dbo.my_update_test (id, name, value) VALUES (1, 'Test', 100.00);
+
+# Test UPDATE
+statement ok
+UPDATE mssql_upd_mytest.dbo.my_update_test SET name = 'Updated' WHERE id = 1;
+
+# Verify UPDATE worked
+query IT
+SELECT id, name FROM mssql_upd_mytest.dbo.my_update_test WHERE id = 1;
+----
+1	Updated
+
+# Test DELETE
+statement ok
+DELETE FROM mssql_upd_mytest.dbo.my_update_test WHERE id = 1;
+
+# Verify DELETE worked
+query I
+SELECT COUNT(*) FROM mssql_upd_mytest.dbo.my_update_test WHERE id = 1;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE mssql_upd_mytest.dbo.my_update_test;
+
+statement ok
+DETACH mssql_upd_mytest;
+```
+
+**DML Test Best Practices:**
+
+1. **Always use unique context names** - Prefix with operation type (e.g., `mssql_upd_`, `mssql_del_`, `mssql_ins_`)
+2. **Tables need PRIMARY KEY for UPDATE/DELETE** - rowid is derived from PK columns
+3. **Call `mssql_refresh_cache()` after `mssql_exec()`** - Required for DuckDB to see DDL changes
+4. **Clean up test data** - Delete or drop tables at the end of tests
+5. **RETURNING clause** - Only supported for INSERT, not for UPDATE/DELETE
+
+**DML Settings for Tests:**
+
+```sql
+# Configure batch size (default: 1000)
+SET mssql_dml_batch_size = 100;
+
+# Configure max parameters per batch (default: 2100)
+SET mssql_dml_max_parameters = 500;
+
+# Enable/disable prepared statements (default: true)
+SET mssql_dml_use_prepared = false;
 ```
 
 ---
@@ -469,6 +575,62 @@ echo $MSSQL_TESTDB_DSN
 
 # Set manually if needed
 export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1"
+```
+
+#### 7. UPDATE/DELETE fails with "Table has no primary key"
+
+UPDATE and DELETE operations require tables to have a PRIMARY KEY. The extension uses PK columns to generate a synthetic `rowid` for targeting specific rows:
+
+```sql
+-- Won't work - table without primary key
+UPDATE testdb.dbo.table_without_pk SET col = 'value' WHERE id = 1;
+
+-- Solution: Add primary key to the table or use mssql_exec for direct SQL
+SELECT mssql_exec('testdb', 'UPDATE dbo.table_without_pk SET col = ''value'' WHERE id = 1');
+```
+
+#### 8. INSERT values going to wrong columns
+
+This can happen if INSERT column order doesn't match table column order. The extension should preserve INSERT statement column order, but verify:
+
+```sql
+-- Explicit column order (recommended)
+INSERT INTO testdb.dbo.table (col_b, col_a) VALUES ('b_val', 'a_val');
+
+-- Verify the values are correct
+SELECT col_a, col_b FROM testdb.dbo.table WHERE ...;
+```
+
+#### 9. DML changes not visible after mssql_exec
+
+After using `mssql_exec()` for DDL operations (CREATE TABLE, ALTER TABLE, etc.), refresh the catalog cache:
+
+```sql
+-- Create table via mssql_exec
+SELECT mssql_exec('testdb', 'CREATE TABLE dbo.new_table (id INT PRIMARY KEY)');
+
+-- REQUIRED: Refresh cache to see the new table
+SELECT mssql_refresh_cache('testdb');
+
+-- Now you can use the table
+INSERT INTO testdb.dbo.new_table (id) VALUES (1);
+```
+
+#### 10. RETURNING clause not working for UPDATE/DELETE
+
+RETURNING is only supported for INSERT operations (implemented via SQL Server's `OUTPUT INSERTED`). UPDATE and DELETE do not support RETURNING:
+
+```sql
+-- Works - INSERT with RETURNING
+INSERT INTO testdb.dbo.table (id, name) VALUES (1, 'test') RETURNING *;
+
+-- Does NOT work - UPDATE with RETURNING
+UPDATE testdb.dbo.table SET name = 'updated' WHERE id = 1 RETURNING *;
+-- Error: RETURNING is not supported for UPDATE
+
+-- Workaround: Query after UPDATE
+UPDATE testdb.dbo.table SET name = 'updated' WHERE id = 1;
+SELECT * FROM testdb.dbo.table WHERE id = 1;
 ```
 
 ### Debug Mode
