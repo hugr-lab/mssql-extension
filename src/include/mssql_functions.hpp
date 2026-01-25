@@ -66,6 +66,33 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// represented as simple TableFilter objects
 	mutable string complex_filter_where_clause;
 
+	//===----------------------------------------------------------------------===//
+	// RowId Support (Spec 001-pk-rowid-semantics)
+	//===----------------------------------------------------------------------===//
+
+	// Pointer to the table entry (for GetTable() / get_bind_info)
+	// This allows DuckDB to discover virtual columns like rowid
+	optional_ptr<TableCatalogEntry> table_entry;
+
+	// Whether rowid was requested in the projection
+	bool rowid_requested = false;
+
+	// Primary key column names (for building SELECT with PK columns)
+	vector<string> pk_column_names;
+
+	// Primary key column types (for composite PK STRUCT construction)
+	vector<LogicalType> pk_column_types;
+
+	// Indices of PK columns in the SQL Server result set
+	// Used to map from result columns to PK values for rowid construction
+	vector<idx_t> pk_result_indices;
+
+	// Whether the PK is composite (STRUCT) or scalar
+	bool pk_is_composite = false;
+
+	// The rowid type (scalar or STRUCT)
+	LogicalType rowid_type;
+
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
 };
@@ -108,6 +135,47 @@ struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 	// Timing
 	std::chrono::steady_clock::time_point scan_start;
 	bool timing_started = false;
+
+	//===----------------------------------------------------------------------===//
+	// RowId Support (Spec 001-pk-rowid-semantics)
+	//===----------------------------------------------------------------------===//
+
+	// Whether rowid was requested in the projection
+	bool rowid_requested = false;
+
+	// Index of the rowid column in DuckDB output (if rowid_requested)
+	idx_t rowid_output_idx = 0;
+
+	// Indices of PK columns in the SQL Server result set
+	// Used to map from result columns to PK values for rowid construction
+	vector<idx_t> pk_result_indices;
+
+	// Whether the PK is composite (STRUCT) or scalar
+	bool pk_is_composite = false;
+
+	// The rowid type (scalar or STRUCT)
+	LogicalType rowid_type;
+
+	// PK column types (for composite PK STRUCT construction)
+	vector<LogicalType> pk_column_types;
+
+	// Whether PK data should be written directly to rowid position
+	// True when user projects only rowid (SELECT rowid FROM table)
+	// and the PK is scalar (non-composite)
+	bool pk_direct_to_rowid = false;
+
+	// Whether we need to build STRUCT rowid from SQL columns directly
+	// True when user projects only rowid and PK is composite
+	// In this case, SQL columns are written directly to STRUCT children
+	bool composite_pk_direct_to_struct = false;
+
+	// Whether PK columns were added as extra SQL columns (not in user projection)
+	// True when user selects rowid + other columns but NOT the PK column(s)
+	// e.g., SELECT rowid, name FROM table (where id is the PK)
+	bool pk_columns_added = false;
+
+	// SQL result indices of PK columns (for reading PK data from result)
+	vector<idx_t> pk_sql_indices;
 
 	MSSQLScanGlobalState() = default;
 	~MSSQLScanGlobalState();

@@ -96,6 +96,19 @@ public:
 		columns_to_fill_ = count;
 	}
 
+	// Set a mapping from SQL result column indices to output chunk column indices
+	// This is needed when virtual columns (like rowid) are interspersed with data columns
+	// If not set, SQL column i is written to output position i
+	void SetOutputColumnMapping(vector<idx_t> mapping) {
+		output_column_mapping_ = std::move(mapping);
+	}
+
+	// Set target vectors for writing (bypasses chunk.data)
+	// Used for composite PK rowid-only case where we write directly to STRUCT children
+	void SetTargetVectors(vector<Vector *> targets) {
+		target_vectors_ = std::move(targets);
+	}
+
 	// Surface warnings to DuckDB context
 	void SurfaceWarnings(ClientContext &context);
 
@@ -143,6 +156,16 @@ private:
 	// May be less than column_metadata_.size() when DuckDB projects virtual columns
 	// Default: maximum value means use column_metadata_.size()
 	idx_t columns_to_fill_ = static_cast<idx_t>(-1);
+
+	// Mapping from SQL result column index to output chunk column index
+	// If empty, SQL column i is written to output position i
+	// Example: for output [id, rowid, name] with SQL [id, name], mapping is [0, 2]
+	vector<idx_t> output_column_mapping_;
+
+	// Target vectors for writing (alternative to chunk.data)
+	// Used for composite PK rowid-only case where we write to STRUCT children
+	// If non-empty, these vectors are used instead of chunk.data
+	vector<Vector *> target_vectors_;
 
 	// Timeouts
 	int read_timeout_ms_ = 30000;  // Normal read timeout (30 seconds)

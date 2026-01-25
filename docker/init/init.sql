@@ -473,6 +473,120 @@ PRINT 'MaxTypes table created (VARCHAR(MAX), NVARCHAR(MAX), VARBINARY(MAX))';
 GO
 
 -- =============================================================================
+-- Table 11: Rowid test tables (for PK-based row identity tests)
+-- Spec 001-pk-rowid-semantics
+-- =============================================================================
+
+-- Drop existing rowid test objects if they exist
+IF OBJECT_ID('dbo.RowidTestView', 'V') IS NOT NULL DROP VIEW dbo.RowidTestView;
+IF OBJECT_ID('dbo.RowidTestInt', 'U') IS NOT NULL DROP TABLE dbo.RowidTestInt;
+IF OBJECT_ID('dbo.RowidTestBigint', 'U') IS NOT NULL DROP TABLE dbo.RowidTestBigint;
+IF OBJECT_ID('dbo.RowidTestVarchar', 'U') IS NOT NULL DROP TABLE dbo.RowidTestVarchar;
+IF OBJECT_ID('dbo.RowidTestComposite2', 'U') IS NOT NULL DROP TABLE dbo.RowidTestComposite2;
+IF OBJECT_ID('dbo.RowidTestComposite3', 'U') IS NOT NULL DROP TABLE dbo.RowidTestComposite3;
+IF OBJECT_ID('dbo.RowidTestNoPK', 'U') IS NOT NULL DROP TABLE dbo.RowidTestNoPK;
+GO
+
+-- Scalar PK table with INT primary key
+CREATE TABLE dbo.RowidTestInt (
+    id INT NOT NULL PRIMARY KEY,
+    name NVARCHAR(100) NOT NULL
+);
+GO
+
+INSERT INTO dbo.RowidTestInt (id, name) VALUES
+(1, N'First'),
+(2, N'Second'),
+(3, N'Third'),
+(10, N'Ten'),
+(100, N'Hundred');
+GO
+
+-- Scalar PK table with BIGINT primary key
+CREATE TABLE dbo.RowidTestBigint (
+    id BIGINT NOT NULL PRIMARY KEY,
+    data VARCHAR(50) NOT NULL
+);
+GO
+
+INSERT INTO dbo.RowidTestBigint (id, data) VALUES
+(1, 'data_1'),
+(9223372036854775807, 'max_bigint'),
+(-9223372036854775808, 'min_bigint'),
+(1000000000000, 'trillion');
+GO
+
+-- Scalar PK table with VARCHAR primary key
+CREATE TABLE dbo.RowidTestVarchar (
+    code VARCHAR(20) NOT NULL PRIMARY KEY,
+    description NVARCHAR(200) NOT NULL
+);
+GO
+
+INSERT INTO dbo.RowidTestVarchar (code, description) VALUES
+('ABC', N'Alpha Beta Charlie'),
+('XYZ', N'X-ray Yankee Zulu'),
+('CODE-123', N'Code with dash and numbers'),
+('a', N'Single character');
+GO
+
+-- Composite PK table with 2 columns (INT, BIGINT)
+CREATE TABLE dbo.RowidTestComposite2 (
+    tenant_id INT NOT NULL,
+    id BIGINT NOT NULL,
+    value DECIMAL(10,2) NOT NULL,
+    CONSTRAINT PK_RowidTestComposite2 PRIMARY KEY (tenant_id, id)
+);
+GO
+
+INSERT INTO dbo.RowidTestComposite2 (tenant_id, id, value) VALUES
+(1, 100, 99.99),
+(1, 101, 149.50),
+(2, 100, 75.00),
+(2, 200, 250.00),
+(3, 100, 10.00);
+GO
+
+-- Composite PK table with 3 columns (VARCHAR, INT, INT)
+CREATE TABLE dbo.RowidTestComposite3 (
+    region VARCHAR(10) NOT NULL,
+    year INT NOT NULL,
+    seq INT NOT NULL,
+    data NVARCHAR(100) NOT NULL,
+    CONSTRAINT PK_RowidTestComposite3 PRIMARY KEY (region, year, seq)
+);
+GO
+
+INSERT INTO dbo.RowidTestComposite3 (region, year, seq, data) VALUES
+('US', 2024, 1, N'US record 1'),
+('US', 2024, 2, N'US record 2'),
+('EU', 2024, 1, N'EU record 1'),
+('APAC', 2023, 1, N'APAC old record'),
+('US', 2023, 1, N'US old record');
+GO
+
+-- Table without primary key (for error testing)
+CREATE TABLE dbo.RowidTestNoPK (
+    log_time DATETIME NOT NULL DEFAULT GETDATE(),
+    message NVARCHAR(MAX) NULL
+);
+GO
+
+INSERT INTO dbo.RowidTestNoPK (log_time, message) VALUES
+('2024-01-01 10:00:00', N'Log entry 1'),
+('2024-01-01 11:00:00', N'Log entry 2'),
+('2024-01-01 12:00:00', NULL);
+GO
+
+-- View (for view rowid error testing)
+CREATE VIEW dbo.RowidTestView AS
+SELECT id, name FROM dbo.RowidTestInt;
+GO
+
+PRINT 'Rowid test tables created (RowidTestInt, RowidTestBigint, RowidTestVarchar, RowidTestComposite2, RowidTestComposite3, RowidTestNoPK, RowidTestView)';
+GO
+
+-- =============================================================================
 -- Views
 -- =============================================================================
 CREATE VIEW dbo.LargeTableView AS

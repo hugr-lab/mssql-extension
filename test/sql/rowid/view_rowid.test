@@ -1,0 +1,74 @@
+# name: test/sql/rowid/view_rowid.test
+# description: Tests for rowid error handling on SQL Server views
+# group: [rowid]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+
+# =============================================================================
+# Error Tests: Views
+# =============================================================================
+
+# Test 1: rowid on VIEW should fail with distinct error
+statement error
+SELECT rowid FROM testdb.dbo.RowidTestView;
+----
+MSSQL: rowid not supported for views
+
+# Test 2: rowid with other columns on VIEW should also fail
+statement error
+SELECT rowid, id, name FROM testdb.dbo.RowidTestView;
+----
+MSSQL: rowid not supported for views
+
+# =============================================================================
+# Success Tests: Non-rowid queries on views should work
+# =============================================================================
+
+# Test 3: Regular SELECT works fine on VIEW
+query IT
+SELECT id, name FROM testdb.dbo.RowidTestView WHERE id = 1;
+----
+1	First
+
+# Test 4: SELECT * works on VIEW
+query IT
+SELECT * FROM testdb.dbo.RowidTestView ORDER BY id LIMIT 3;
+----
+1	First
+2	Second
+3	Third
+
+# Test 5: COUNT(*) works on VIEW
+query I
+SELECT COUNT(*) FROM testdb.dbo.RowidTestView;
+----
+5
+
+# =============================================================================
+# Tests with existing views (LargeTableView)
+# =============================================================================
+
+# Test 6: rowid on existing VIEW should fail
+statement error
+SELECT rowid FROM testdb.dbo.LargeTableView WHERE id = 1;
+----
+MSSQL: rowid not supported for views
+
+# Test 7: Regular SELECT on existing VIEW works
+query IIT
+SELECT id, category, status FROM testdb.dbo.LargeTableView WHERE id = 1;
+----
+1	2	Active
+
+# Cleanup
+statement ok
+DETACH testdb;
