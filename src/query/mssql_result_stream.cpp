@@ -309,10 +309,11 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 
 	// Debug: log column count info on first row
 	if (row_idx == 0) {
-		MSSQL_DEBUG_LOG(1, "ProcessRow: sql_columns=%zu, chunk_columns=%llu, columns_to_fill_=%llu, cols_to_fill=%llu, target_vectors=%zu",
+		MSSQL_DEBUG_LOG(1,
+						"ProcessRow: sql_columns=%zu, chunk_columns=%llu, columns_to_fill_=%llu, cols_to_fill=%llu, "
+						"target_vectors=%zu",
 						column_metadata_.size(), (unsigned long long)chunk.ColumnCount(),
-						(unsigned long long)columns_to_fill_, (unsigned long long)cols_to_fill,
-						target_vectors_.size());
+						(unsigned long long)columns_to_fill_, (unsigned long long)cols_to_fill, target_vectors_.size());
 	}
 
 	for (idx_t col_idx = 0; col_idx < cols_to_fill; col_idx++) {

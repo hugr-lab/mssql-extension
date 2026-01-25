@@ -5,7 +5,7 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/common.hpp"        // For COLUMN_IDENTIFIER_ROW_ID
+#include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -117,15 +117,15 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	if (object_type_ == MSSQLObjectType::VIEW) {
 		// Views cannot have rowid - mark as not available
 		catalog_bind_data->rowid_requested = false;
-		MSSQL_TE_DEBUG("GetScanFunction: %s.%s is a VIEW (rowid not supported)",
-		               mssql_schema.name.c_str(), name.c_str());
+		MSSQL_TE_DEBUG("GetScanFunction: %s.%s is a VIEW (rowid not supported)", mssql_schema.name.c_str(),
+					   name.c_str());
 	} else {
 		// Load PK info (lazy-loaded, cached)
 		EnsurePKLoaded(context);
 
 		if (pk_info_.exists) {
 			// Table has a PK - populate rowid support fields
-			catalog_bind_data->rowid_requested = true;  // Mark as available for InitGlobal
+			catalog_bind_data->rowid_requested = true;	// Mark as available for InitGlobal
 			catalog_bind_data->pk_is_composite = pk_info_.IsComposite();
 			catalog_bind_data->rowid_type = pk_info_.rowid_type;
 
@@ -136,15 +136,13 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 			}
 
 			MSSQL_TE_DEBUG("GetScanFunction: %s.%s has %zu PK column(s), composite=%s, rowid_type=%s",
-			               mssql_schema.name.c_str(), name.c_str(),
-			               pk_info_.columns.size(),
-			               pk_info_.IsComposite() ? "true" : "false",
-			               pk_info_.rowid_type.ToString().c_str());
+						   mssql_schema.name.c_str(), name.c_str(), pk_info_.columns.size(),
+						   pk_info_.IsComposite() ? "true" : "false", pk_info_.rowid_type.ToString().c_str());
 		} else {
 			// Table has no PK - rowid not supported
 			catalog_bind_data->rowid_requested = false;
-			MSSQL_TE_DEBUG("GetScanFunction: %s.%s has no PK (rowid not supported)",
-			               mssql_schema.name.c_str(), name.c_str());
+			MSSQL_TE_DEBUG("GetScanFunction: %s.%s has no PK (rowid not supported)", mssql_schema.name.c_str(),
+						   name.c_str());
 		}
 	}
 
@@ -246,12 +244,8 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 
 		if (connection) {
 			auto &cache = mssql_catalog.GetMetadataCache();
-			pk_info_ = mssql::PrimaryKeyInfo::Discover(
-				*connection,
-				mssql_schema.name,
-				name,
-				cache.GetDatabaseCollation()
-			);
+			pk_info_ =
+				mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name, cache.GetDatabaseCollation());
 			pool.Release(std::move(connection));
 		} else {
 			// No connection available - mark as loaded but no PK
@@ -303,10 +297,8 @@ const mssql::PrimaryKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &c
 virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
 
-	MSSQL_TE_DEBUG("GetVirtualColumns: table=%s, pk_loaded=%s, pk_exists=%s",
-	               name.c_str(),
-	               pk_info_.loaded ? "true" : "false",
-	               pk_info_.exists ? "true" : "false");
+	MSSQL_TE_DEBUG("GetVirtualColumns: table=%s, pk_loaded=%s, pk_exists=%s", name.c_str(),
+				   pk_info_.loaded ? "true" : "false", pk_info_.exists ? "true" : "false");
 
 	// Views don't support rowid
 	if (object_type_ == MSSQLObjectType::VIEW) {
@@ -329,8 +321,8 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 
 	// Expose rowid with the correct type based on PK structure
 	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", pk_info_.rowid_type)));
-	MSSQL_TE_DEBUG("GetVirtualColumns: exposing rowid with type %s for %s",
-	               pk_info_.rowid_type.ToString().c_str(), name.c_str());
+	MSSQL_TE_DEBUG("GetVirtualColumns: exposing rowid with type %s for %s", pk_info_.rowid_type.ToString().c_str(),
+				   name.c_str());
 
 	return result;
 }
