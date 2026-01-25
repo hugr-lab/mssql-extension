@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -476,6 +477,9 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 	case ExpressionClass::BOUND_CASE:
 		return EncodeCaseExpression(expr.Cast<BoundCaseExpression>(), ctx);
 
+	case ExpressionClass::BOUND_BETWEEN:
+		return EncodeBetweenExpression(expr.Cast<BoundBetweenExpression>(), ctx);
+
 	default:
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: unsupported expression class %d", (int)expr.GetExpressionClass());
 		return {"", false};
@@ -664,6 +668,51 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	sql += " ELSE " + else_result.sql + " END";
 
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeCaseExpression: encoded -> %s", sql.c_str());
+	return {sql, true};
+}
+
+ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundBetweenExpression &expr,
+															  const ExpressionEncodeContext &ctx) {
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: lower_inclusive=%s, upper_inclusive=%s",
+						   expr.lower_inclusive ? "true" : "false", expr.upper_inclusive ? "true" : "false");
+
+	auto child_ctx = ctx.child();
+
+	// Encode the input expression (the column or expression being checked)
+	auto input_result = EncodeExpression(*expr.input, child_ctx);
+	if (!input_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: input encoding failed");
+		return {"", false};
+	}
+
+	// Encode the lower bound
+	auto lower_result = EncodeExpression(*expr.lower, child_ctx);
+	if (!lower_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
+		return {"", false};
+	}
+
+	// Encode the upper bound
+	auto upper_result = EncodeExpression(*expr.upper, child_ctx);
+	if (!upper_result.supported) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");
+		return {"", false};
+	}
+
+	// Build the SQL: (input >= lower AND input <= upper) or variants based on inclusivity
+	// For standard BETWEEN (both inclusive), we can use T-SQL BETWEEN
+	if (expr.lower_inclusive && expr.upper_inclusive) {
+		std::string sql = "(" + input_result.sql + " BETWEEN " + lower_result.sql + " AND " + upper_result.sql + ")";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
+		return {sql, true};
+	}
+
+	// For non-standard bounds, use explicit comparisons
+	std::string lower_op = expr.lower_inclusive ? " >= " : " > ";
+	std::string upper_op = expr.upper_inclusive ? " <= " : " < ";
+	std::string sql = "((" + input_result.sql + lower_op + lower_result.sql + ") AND (" + input_result.sql + upper_op +
+					  upper_result.sql + "))";
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
 

@@ -248,6 +248,12 @@ private:
 													   const ExpressionEncodeContext &ctx);
 
 	/**
+	 * Encode a BETWEEN expression (input BETWEEN lower AND upper).
+	 */
+	static ExpressionEncodeResult EncodeBetweenExpression(const BoundBetweenExpression &expr,
+														  const ExpressionEncodeContext &ctx);
+
+	/**
 	 * Encode a column reference.
 	 */
 	static ExpressionEncodeResult EncodeColumnRef(const BoundColumnRefExpression &expr,
