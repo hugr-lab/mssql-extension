@@ -11,7 +11,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "mssql_functions.hpp"
-#include "table_scan/mssql_table_scan.hpp"
+#include "table_scan/table_scan.hpp"
 
 // Debug logging
 static int GetTableEntryDebugLevel() {
@@ -69,19 +69,6 @@ MSSQLTableEntry::~MSSQLTableEntry() = default;
 //===----------------------------------------------------------------------===//
 // Required Overrides
 //===----------------------------------------------------------------------===//
-
-// Helper to escape SQL Server bracket identifier (] becomes ]])
-static string EscapeBracketIdentifier(const string &name) {
-	string result;
-	result.reserve(name.size() + 2);
-	for (char c : name) {
-		result += c;
-		if (c == ']') {
-			result += ']';	// Double the ] character
-		}
-	}
-	return result;
-}
 
 TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto &mssql_catalog = GetMSSQLCatalog();

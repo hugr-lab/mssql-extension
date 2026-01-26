@@ -70,6 +70,7 @@ jobs:
 
         duckdb_version:
           - '1.4.3'
+          - '1.4.4'
 
     steps:
       - uses: actions/checkout@v4
@@ -273,6 +274,7 @@ jobs:
 
         duckdb_version:
           - '1.4.3'
+          - '1.4.4'
 
     steps:
       - uses: actions/checkout@v4
@@ -342,6 +344,7 @@ jobs:
       matrix:
         duckdb_version:
           - '1.4.3'
+          - '1.4.4'
 
     services:
       sqlserver:
@@ -458,12 +461,12 @@ jobs:
 
             Download the extension for your platform and DuckDB version:
 
-            | Platform | DuckDB 1.4.1 | DuckDB 1.4.2 | DuckDB 1.4.3 |
+            | Platform | DuckDB 1.4.2 | DuckDB 1.4.3 | DuckDB 1.4.4 |
             |----------|--------------|--------------|--------------|
-            | Linux x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_amd64.duckdb_extension) |
-            | Linux ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_arm64.duckdb_extension) |
-            | macOS ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-osx_arm64.duckdb_extension) |
-            | Windows x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.1-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-windows_amd64.duckdb_extension) |
+            | Linux x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-linux_amd64.duckdb_extension) |
+            | Linux ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-linux_arm64.duckdb_extension) |
+            | macOS ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-osx_arm64.duckdb_extension) |
+            | Windows x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-windows_amd64.duckdb_extension) |
 
             ### Verification
 

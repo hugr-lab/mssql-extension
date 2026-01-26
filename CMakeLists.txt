@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/insert src/include/table_scan src/include/dml src/include/update src/include/delete)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -114,29 +114,29 @@ set(EXTENSION_SOURCES
     src/table_scan/table_scan_execute.cpp
     src/table_scan/filter_encoder.cpp
     src/table_scan/function_mapping.cpp
-    src/table_scan/mssql_table_scan.cpp
-    # Insert layer (DML INSERT support)
-    src/insert/mssql_insert_config.cpp
-    src/insert/mssql_insert_target.cpp
-    src/insert/mssql_value_serializer.cpp
-    src/insert/mssql_insert_statement.cpp
-    src/insert/mssql_batch_builder.cpp
-    src/insert/mssql_insert_executor.cpp
-    src/insert/mssql_physical_insert.cpp
-    src/insert/mssql_returning_parser.cpp
+    src/table_scan/table_scan.cpp
     # DML shared layer (UPDATE/DELETE common)
     src/dml/mssql_dml_config.cpp
     src/dml/mssql_rowid_extractor.cpp
-    # UPDATE layer (DML UPDATE support)
-    src/update/mssql_update_target.cpp
-    src/update/mssql_update_statement.cpp
-    src/update/mssql_update_executor.cpp
-    src/update/mssql_physical_update.cpp
-    # DELETE layer (DML DELETE support)
-    src/delete/mssql_delete_target.cpp
-    src/delete/mssql_delete_statement.cpp
-    src/delete/mssql_delete_executor.cpp
-    src/delete/mssql_physical_delete.cpp
+    # DML INSERT layer
+    src/dml/insert/mssql_insert_config.cpp
+    src/dml/insert/mssql_insert_target.cpp
+    src/dml/insert/mssql_value_serializer.cpp
+    src/dml/insert/mssql_insert_statement.cpp
+    src/dml/insert/mssql_batch_builder.cpp
+    src/dml/insert/mssql_insert_executor.cpp
+    src/dml/insert/mssql_physical_insert.cpp
+    src/dml/insert/mssql_returning_parser.cpp
+    # DML UPDATE layer
+    src/dml/update/mssql_update_target.cpp
+    src/dml/update/mssql_update_statement.cpp
+    src/dml/update/mssql_update_executor.cpp
+    src/dml/update/mssql_physical_update.cpp
+    # DML DELETE layer
+    src/dml/delete/mssql_delete_target.cpp
+    src/dml/delete/mssql_delete_statement.cpp
+    src/dml/delete/mssql_delete_executor.cpp
+    src/dml/delete/mssql_physical_delete.cpp
 )
 
 # Build static extension (linked into DuckDB)

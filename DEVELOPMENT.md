@@ -237,21 +237,21 @@ src/
 ├── include/           # Header files
 │   ├── catalog/       # DuckDB catalog integration
 │   ├── connection/    # Connection pooling, settings
-│   ├── dml/           # Shared DML utilities (value serializer, statement builder)
-│   ├── insert/        # INSERT implementation
-│   ├── update/        # UPDATE implementation
-│   ├── delete/        # DELETE implementation
-│   ├── pushdown/      # Filter/projection pushdown
+│   ├── dml/           # DML operations (INSERT, UPDATE, DELETE)
+│   │   ├── insert/    # INSERT implementation
+│   │   ├── update/    # UPDATE implementation
+│   │   └── delete/    # DELETE implementation
 │   ├── query/         # Query execution
+│   ├── table_scan/    # Table scan and filter pushdown
 │   └── tds/           # TDS protocol implementation
 ├── catalog/           # Catalog implementation
 ├── connection/        # Connection management
-├── dml/               # Shared DML components
-├── insert/            # INSERT operators
-├── update/            # UPDATE operators
-├── delete/            # DELETE operators
-├── pushdown/          # Pushdown optimization
+├── dml/               # DML operations
+│   ├── insert/        # INSERT operators
+│   ├── update/        # UPDATE operators
+│   └── delete/        # DELETE operators
 ├── query/             # Query execution
+├── table_scan/        # Table scan and filter encoding
 └── tds/               # TDS protocol
     ├── encoding/      # Type encoding/decoding
     └── tls/           # TLS implementation (OpenSSL)
@@ -328,10 +328,10 @@ gdb ./build/debug/duckdb
 
 When debugging DML operations:
 
-1. **INSERT issues**: Check `mssql_insert_executor.cpp` - the batch builder and statement generator
-2. **UPDATE/DELETE issues**: Check `mssql_update.cpp` or `mssql_delete.cpp` - ensure rowid column is properly positioned
-3. **Value serialization**: Check `mssql_value_serializer.cpp` for type → T-SQL literal conversion
-4. **Column ordering**: Ensure INSERT columns are in statement order, not table order (see `mssql_catalog.cpp`)
+1. **INSERT issues**: Check `src/dml/insert/mssql_insert_executor.cpp` - the batch builder and statement generator
+2. **UPDATE/DELETE issues**: Check `src/dml/update/` or `src/dml/delete/` - ensure rowid column is properly positioned
+3. **Value serialization**: Check `src/dml/insert/mssql_value_serializer.cpp` for type → T-SQL literal conversion
+4. **Column ordering**: Ensure INSERT columns are in statement order, not table order (see `src/catalog/mssql_catalog.cpp`)
 
 ## Release Process
 

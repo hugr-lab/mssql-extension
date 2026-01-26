@@ -1,11 +1,10 @@
-// Stub file - will be implemented in Phase 6 (US4)
-// Provides the MSSQL table scan function for SELECT queries
+// This file is a placeholder for potential future catalog-level table function helpers.
+// The main table scan implementation is in src/table_scan/table_scan.cpp
 
-#include "duckdb/function/table_function.hpp"
+#include "duckdb.hpp"
 
 namespace duckdb {
 
-// TODO: Implement MSSQLTableFunction for Phase 6
-// This will provide the scan function returned by MSSQLTableEntry::GetScanFunction
+// Reserved for future catalog-specific table function utilities
 
 }  // namespace duckdb

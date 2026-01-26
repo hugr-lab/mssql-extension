@@ -35,20 +35,29 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, PhysicalOperator, DataChunk), existing TDS layer (specs 001-009) (002-dml-update-delete)
 - C++17 (DuckDB extension standard) + DuckDB main branch (catalog API), existing TDS layer (specs 001-012) (001-attach-connection-validation)
 - In-memory (connection pool, metadata cache) (001-attach-connection-validation)
+- C++17 (DuckDB extension standard) + DuckDB main branch (extension API), existing TDS layer (001-code-cleanup)
+- N/A (code refactoring only, no new data storage) (001-code-cleanup)
 
 ## Project Structure
 
 ```text
 src/
-  insert/               # DML INSERT implementation (spec 009)
-    mssql_value_serializer.cpp   # Type → T-SQL literal conversion
-    mssql_insert_statement.cpp   # SQL statement generation
-    mssql_batch_builder.cpp      # Row accumulation and batching
-    mssql_insert_executor.cpp    # Batch execution orchestration
-    mssql_physical_insert.cpp    # DuckDB physical operator
-    mssql_returning_parser.cpp   # OUTPUT INSERTED result parsing
-  include/insert/       # Headers for insert module
+  dml/                  # DML operations
+    insert/             # INSERT implementation (spec 009)
+      mssql_value_serializer.cpp   # Type → T-SQL literal conversion
+      mssql_insert_statement.cpp   # SQL statement generation
+      mssql_batch_builder.cpp      # Row accumulation and batching
+      mssql_insert_executor.cpp    # Batch execution orchestration
+      mssql_physical_insert.cpp    # DuckDB physical operator
+      mssql_returning_parser.cpp   # OUTPUT INSERTED result parsing
+    update/             # UPDATE implementation
+    delete/             # DELETE implementation
+  include/dml/          # Headers for DML modules
+    insert/
+    update/
+    delete/
   catalog/              # DuckDB catalog integration
+  table_scan/           # Table scan and filter pushdown
   tds/                  # TDS protocol implementation
   connection/           # Connection pooling and settings
   query/                # Query execution
@@ -90,9 +99,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 001-code-cleanup: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), existing TDS layer
 - 001-attach-connection-validation: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API), existing TDS layer (specs 001-012)
 - 002-dml-update-delete: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, PhysicalOperator, DataChunk), existing TDS layer (specs 001-009)
-- 001-pk-rowid-semantics: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, DataChunk), existing TDS layer (specs 001-012)
 
 <!-- MANUAL ADDITIONS START -->
 

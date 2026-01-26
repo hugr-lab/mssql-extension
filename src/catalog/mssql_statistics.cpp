@@ -21,10 +21,6 @@ WHERE s.name = '%s'
   AND p.index_id IN (0, 1)
 )";
 
-//===----------------------------------------------------------------------===//
-// Constructor
-//===----------------------------------------------------------------------===//
-
 MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds) : cache_ttl_seconds_(cache_ttl_seconds) {}
 
 //===----------------------------------------------------------------------===//

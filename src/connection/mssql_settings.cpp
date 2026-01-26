@@ -1,8 +1,8 @@
 #include "connection/mssql_settings.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
 #include "dml/mssql_dml_config.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
-#include "insert/mssql_insert_config.hpp"
 
 namespace duckdb {
 

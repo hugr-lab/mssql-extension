@@ -22,7 +22,7 @@ This starts a SQL Server 2022 instance on port 1433 with credentials:
 
 ## TLS Support
 
-**Important:** TLS (encrypted connections) is only available in the **loadable extension** (`.duckdb_extension`). The static extension (built into the test runner) has a TLS stub.
+Both static and loadable extensions support TLS via OpenSSL. TLS tests require `MSSQL_TEST_DSN_TLS` to be exported.
 
 See [TLS_TESTING.md](TLS_TESTING.md) for detailed TLS testing instructions.
 

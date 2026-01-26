@@ -205,7 +205,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 // Catalog-based Table Scan Functions
 //===----------------------------------------------------------------------===//
 
-// Note: Catalog scan functions have been moved to src/table_scan/mssql_table_scan.hpp
+// Note: Catalog scan functions have been moved to src/table_scan/table_scan.hpp
 // Use mssql::GetCatalogScanFunction() from that module instead.
 
 //===----------------------------------------------------------------------===//

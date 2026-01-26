@@ -1,8 +1,8 @@
 #include "dml/mssql_rowid_extractor.hpp"
+#include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "insert/mssql_value_serializer.hpp"
 
 namespace duckdb {
 

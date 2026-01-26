@@ -9,11 +9,6 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/table_filter.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -281,113 +276,6 @@ bool MSSQLCatalogScanBindData::Equals(const FunctionData &other) const {
 	return context_name == other_data.context_name && schema_name == other_data.schema_name &&
 		   table_name == other_data.table_name;
 }
-
-//===----------------------------------------------------------------------===//
-// Catalog-based Table Scan Implementation
-//===----------------------------------------------------------------------===//
-
-// Helper to escape SQL Server bracket identifier (] becomes ]])
-static string EscapeBracketIdentifier(const string &name) {
-	string result;
-	result.reserve(name.size() + 2);
-	for (char c : name) {
-		result += c;
-		if (c == ']') {
-			result += ']';	// Double the ] character
-		}
-	}
-	return result;
-}
-
-// Helper to escape SQL Server string literal (' becomes '')
-static string EscapeStringLiteral(const string &value) {
-	string result;
-	result.reserve(value.size() + 10);
-	for (char c : value) {
-		result += c;
-		if (c == '\'') {
-			result += '\'';	 // Double the ' character
-		}
-	}
-	return result;
-}
-
-// Forward declaration for recursive filter conversion
-static string ConvertFilterToSQL(const TableFilter &filter, const string &column_name, const LogicalType &column_type);
-
-// Convert a DuckDB Value to SQL Server literal
-static string ValueToSQLLiteral(const Value &value, const LogicalType &type) {
-	if (value.IsNull()) {
-		return "NULL";
-	}
-
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return value.GetValue<bool>() ? "1" : "0";
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
-		return value.ToString();
-
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-		return value.ToString();
-
-	case LogicalTypeId::DECIMAL:
-		return value.ToString();
-
-	case LogicalTypeId::VARCHAR:
-		// Use N'' for NVARCHAR compatibility and escape single quotes
-		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
-
-	case LogicalTypeId::DATE: {
-		auto date_val = value.GetValue<date_t>();
-		return "'" + Date::ToString(date_val) + "'";
-	}
-
-	case LogicalTypeId::TIME:
-		// TIME is stored as microseconds since midnight
-		return "'" + value.ToString() + "'";
-
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		auto ts_val = value.GetValue<timestamp_t>();
-		return "'" + Timestamp::ToString(ts_val) + "'";
-	}
-
-	case LogicalTypeId::UUID: {
-		return "'" + value.ToString() + "'";
-	}
-
-	case LogicalTypeId::BLOB: {
-		// Convert blob to hex string for SQL Server
-		auto blob_val = value.GetValueUnsafe<string_t>();
-		string hex = "0x";
-		for (idx_t i = 0; i < blob_val.GetSize(); i++) {
-			char buf[3];
-			snprintf(buf, sizeof(buf), "%02X", (unsigned char)blob_val.GetData()[i]);
-			hex += buf;
-		}
-		return hex;
-	}
-
-	default:
-		// For other types, try ToString and quote as string
-		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
-	}
-}
-
-// Note: Catalog scan functions have been moved to src/table_scan/mssql_table_scan.cpp
-// The new implementation uses FilterEncoder for enhanced filter pushdown support.
 
 //===----------------------------------------------------------------------===//
 // mssql_exec Scalar Function Implementation

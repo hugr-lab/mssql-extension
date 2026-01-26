@@ -92,19 +92,16 @@ export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
 export MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_URI
-# NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default because TLS tests require
-# the loadable extension (.duckdb_extension). The built-in test runner uses the
-# static extension which has a TLS stub. To run TLS tests, use the loadable
-# extension with standalone DuckDB and manually export MSSQL_TEST_DSN_TLS.
+# NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default. Export it manually to
+# run TLS-specific tests (requires SQL Server with TLS enabled).
 # export MSSQL_TEST_DSN_TLS
 
 # Integration tests - requires SQL Server running
-# NOTE: TLS tests are skipped because the test runner uses the static extension
-# which has a TLS stub. To run TLS tests, use the loadable extension.
+# NOTE: TLS tests are skipped unless MSSQL_TEST_DSN_TLS is exported.
 integration-test: release
 	@echo "Running integration tests..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
-	@echo "NOTE: TLS tests are skipped (static extension has TLS stub)"
+	@echo "NOTE: TLS tests skipped unless MSSQL_TEST_DSN_TLS is exported"
 	@echo ""
 	@echo "Test environment:"
 	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"

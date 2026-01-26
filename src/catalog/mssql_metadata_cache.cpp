@@ -78,10 +78,6 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 	}
 }
 
-//===----------------------------------------------------------------------===//
-// Constructor
-//===----------------------------------------------------------------------===//
-
 MSSQLMetadataCache::MSSQLMetadataCache(int64_t ttl_seconds)
 	: state_(MSSQLCacheState::EMPTY), ttl_seconds_(ttl_seconds) {}
 

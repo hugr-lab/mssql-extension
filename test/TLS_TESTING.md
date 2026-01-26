@@ -4,14 +4,14 @@ This guide explains how to test TLS (encrypted) connections with the MSSQL exten
 
 ## TLS Architecture
 
-TLS support is **only available in the loadable extension** (`.duckdb_extension`). The static extension has a TLS stub that returns "TLS not available".
+Both static and loadable extensions have **full TLS support** via OpenSSL (statically linked with symbol visibility control).
 
 | Build Type | TLS Support | Use Case |
 |------------|-------------|----------|
-| Static extension | Stub (no TLS) | Built-in test runner, embedded DuckDB |
-| Loadable extension | Full TLS | Standalone DuckDB CLI |
+| Static extension | Full TLS (OpenSSL) | Built-in test runner, embedded DuckDB |
+| Loadable extension | Full TLS (OpenSSL) | Standalone DuckDB CLI |
 
-**Why?** DuckDB bundles a crypto-only mbedTLS which conflicts with vcpkg's full mbedTLS needed for TLS connections. The loadable extension uses symbol hiding to avoid conflicts. macOS doesn't support `--allow-multiple-definition`, making this split necessary.
+Symbol visibility is controlled using version scripts (Linux) or exported_symbols_list (macOS) to prevent runtime conflicts with other OpenSSL libraries.
 
 ## Prerequisites
 
