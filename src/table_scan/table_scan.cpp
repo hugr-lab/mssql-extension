@@ -85,7 +85,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
 			rowid_requested = true;
 			rowid_output_idx = i;
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid requested at output index %zu", i);
+			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: rowid requested at output index %llu", (unsigned long long)i);
 			break;
 		}
 	}
@@ -295,8 +295,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			vector<idx_t> output_mapping;
 			output_mapping.push_back(rowid_output_idx);	 // SQL col 0 -> rowid position
 			result->result_stream->SetOutputColumnMapping(std::move(output_mapping));
-			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid mode - SQL col 0 -> output %zu",
-								 rowid_output_idx);
+			MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: pk_direct_to_rowid mode - SQL col 0 -> output %llu",
+								 (unsigned long long)rowid_output_idx);
 		} else if (result->composite_pk_direct_to_struct) {
 			// Special case: only rowid requested with composite PK
 			// SQL returns N columns (PK columns), we write them directly to STRUCT children
@@ -315,8 +315,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			// Mark pk_columns_added as false - Execute uses this to distinguish from mixed case
 			result->pk_columns_added = false;
 			MSSQL_SCAN_DEBUG_LOG(
-				1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %zu PK columns -> STRUCT at output %zu",
-				pk_count, rowid_output_idx);
+				1, "TableScanInitGlobal: composite_pk_direct_to_struct mode - %llu PK columns -> STRUCT at output %llu",
+				(unsigned long long)pk_count, (unsigned long long)rowid_output_idx);
 		} else if (rowid_requested && pk_columns_added && !bind_data.pk_is_composite) {
 			// Special case: rowid + other columns, scalar PK NOT in user projection
 			// SQL returns [user_cols..., pk_col]
@@ -423,7 +423,8 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 	// If pk_direct_to_rowid is true, data was written directly to rowid position
 	// by the result stream - no copying needed
 	if (state.pk_direct_to_rowid) {
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: pk_direct_to_rowid mode - rowid already populated for %zu rows", row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: pk_direct_to_rowid mode - rowid already populated for %llu rows",
+							 (unsigned long long)row_count);
 		return;
 	}
 
@@ -451,8 +452,8 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 
 		auto &validity = FlatVector::Validity(rowid_vector);
 		validity.SetAllValid(row_count);
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %zu rows",
-							 row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %llu rows",
+							 (unsigned long long)row_count);
 		return;
 	}
 
@@ -475,8 +476,8 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		auto &validity = FlatVector::Validity(rowid_vector);
 		validity.SetAllValid(row_count);
 
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %zu rows",
-							 state.pk_result_indices.size(), row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %llu rows",
+							 state.pk_result_indices.size(), (unsigned long long)row_count);
 	} else {
 		// Scalar PK: copy single PK column to rowid
 		D_ASSERT(state.pk_result_indices.size() == 1);
@@ -486,7 +487,8 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		// Copy the PK column to rowid vector
 		VectorOperations::Copy(src_vector, rowid_vector, row_count, 0, 0);
 
-		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated scalar rowid from column %zu for %zu rows", src_col_idx, row_count);
+		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated scalar rowid from column %llu for %llu rows",
+							 (unsigned long long)src_col_idx, (unsigned long long)row_count);
 	}
 }
 
@@ -615,7 +617,7 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: get.column_ids has %zu entries", column_ids.size());
 	for (idx_t i = 0; i < column_ids.size() && i < 10; i++) {
-		MSSQL_SCAN_DEBUG_LOG(2, "  column_ids[%zu] = %llu", i, (unsigned long long)column_ids[i]);
+		MSSQL_SCAN_DEBUG_LOG(2, "  column_ids[%llu] = %llu", (unsigned long long)i, (unsigned long long)column_ids[i]);
 	}
 
 	ExpressionEncodeContext ctx(column_ids, bind_data.all_column_names, bind_data.all_types);
@@ -632,18 +634,18 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
-		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%zu]: type=%d class=%d", i, (int)filter->type,
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i, (int)filter->type,
 							 (int)filter->GetExpressionClass());
 
 		// Try to encode this expression
 		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
 
 		if (result.supported && !result.sql.empty()) {
-			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%zu]: encoded -> %s", i, result.sql.c_str());
+			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%llu]: encoded -> %s", (unsigned long long)i, result.sql.c_str());
 			encoded_conditions.push_back(result.sql);
 			expressions_to_remove.push_back(i);
 		} else {
-			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%zu]: not supported, will be applied by DuckDB", i);
+			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%llu]: not supported, will be applied by DuckDB", (unsigned long long)i);
 		}
 	}
 

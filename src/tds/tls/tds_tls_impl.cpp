@@ -155,8 +155,10 @@ static int CustomBioRead(BIO *bio, char *buf, int len) {
 
 	// Check if custom callback is set (for TDS-wrapped TLS handshake)
 	if (impl->recv_callback) {
-		MSSQL_TLS_DEBUG_LOG(3, "CustomBioRead: using custom callback, len=%d, timeout=%d", len, impl->current_timeout_ms);
-		int ret = impl->recv_callback(reinterpret_cast<uint8_t *>(buf), static_cast<size_t>(len), impl->current_timeout_ms);
+		MSSQL_TLS_DEBUG_LOG(3, "CustomBioRead: using custom callback, len=%d, timeout=%d", len,
+							impl->current_timeout_ms);
+		int ret =
+			impl->recv_callback(reinterpret_cast<uint8_t *>(buf), static_cast<size_t>(len), impl->current_timeout_ms);
 		if (ret < 0) {
 			return -1;
 		}
