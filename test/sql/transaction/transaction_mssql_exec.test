@@ -1,0 +1,159 @@
+# name: test/sql/transaction/transaction_mssql_exec.test
+# description: Test mssql_exec within transactions
+# group: [mssql]
+# Spec: 001-mssql-transactions, User Story 4 - Execute via mssql_exec in Transaction
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_exec_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_exec_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    value DECIMAL(10, 2)
+);
+
+# Insert initial data
+statement ok
+INSERT INTO txtest.dbo.tx_exec_test (id, name, value) VALUES (1, 'Initial', 100.00);
+
+# =============================================================================
+# Test 1: mssql_exec UPDATE in transaction with COMMIT
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT mssql_exec('txtest', 'UPDATE dbo.tx_exec_test SET value = 999.00 WHERE id = 1');
+----
+1
+
+statement ok
+COMMIT;
+
+# Verify the update persisted
+query R
+SELECT value FROM txtest.dbo.tx_exec_test WHERE id = 1;
+----
+999.00
+
+# =============================================================================
+# Test 2: mssql_exec INSERT in transaction with COMMIT
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT mssql_exec('txtest', 'INSERT INTO dbo.tx_exec_test (id, name, value) VALUES (2, ''Via Exec'', 200.00)');
+----
+1
+
+statement ok
+COMMIT;
+
+# Verify the insert persisted
+query IT
+SELECT id, name FROM txtest.dbo.tx_exec_test WHERE id = 2;
+----
+2	Via Exec
+
+# =============================================================================
+# Test 3: mssql_exec in transaction with ROLLBACK
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT mssql_exec('txtest', 'UPDATE dbo.tx_exec_test SET name = ''Should Not Persist'' WHERE id = 1');
+----
+1
+
+statement ok
+ROLLBACK;
+
+# Verify the update was rolled back (original name still 'Initial')
+query T
+SELECT name FROM txtest.dbo.tx_exec_test WHERE id = 1;
+----
+Initial
+
+# =============================================================================
+# Test 4: Temp table creation via mssql_exec (session-scoped)
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# Create temp table
+query I
+SELECT mssql_exec('txtest', 'CREATE TABLE #TempData (id INT, data VARCHAR(50))');
+----
+0
+
+# Insert into temp table
+query I
+SELECT mssql_exec('txtest', 'INSERT INTO #TempData (id, data) VALUES (1, ''temp row'')');
+----
+1
+
+# Read from temp table using mssql_scan
+query IT
+SELECT * FROM mssql_scan('txtest', 'SELECT * FROM #TempData');
+----
+1	temp row
+
+statement ok
+COMMIT;
+
+# Note: Temp table persists for the session but is no longer in the transaction
+
+# =============================================================================
+# Test 5: Mixed DML - catalog DML and mssql_exec in same transaction
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# Use catalog-based INSERT
+statement ok
+INSERT INTO txtest.dbo.tx_exec_test (id, name, value) VALUES (3, 'Catalog Insert', 300.00);
+
+# Use mssql_exec for UPDATE
+query I
+SELECT mssql_exec('txtest', 'UPDATE dbo.tx_exec_test SET value = value + 50 WHERE id = 3');
+----
+1
+
+statement ok
+COMMIT;
+
+# Verify both operations persisted
+query IR
+SELECT id, value FROM txtest.dbo.tx_exec_test WHERE id = 3;
+----
+3	350.00
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_exec_test;
+
+statement ok
+DETACH txtest;

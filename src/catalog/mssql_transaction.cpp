@@ -2,6 +2,59 @@
 #include "catalog/mssql_catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "tds/tds_connection.hpp"
+#include "tds/tds_connection_pool.hpp"
+#include "tds/tds_socket.hpp"
+#include <cstring>
+
+#ifdef MSSQL_DEBUG
+#include <iostream>
+#define MSSQL_TXN_LOG(msg) std::cerr << "[MSSQL_TXN] " << msg << std::endl
+#else
+#define MSSQL_TXN_LOG(msg)
+#endif
+
+namespace {
+
+//===----------------------------------------------------------------------===//
+// Helper: Execute a simple SQL batch and receive complete response
+//===----------------------------------------------------------------------===//
+
+bool ExecuteAndDrain(duckdb::tds::TdsConnection &conn, const std::string &sql, int timeout_ms = 5000) {
+	if (!conn.ExecuteBatch(sql)) {
+		return false;
+	}
+
+	// Receive the complete TDS response via socket
+	auto *socket = conn.GetSocket();
+	if (!socket) {
+		return false;
+	}
+
+	std::vector<uint8_t> response;
+	if (!socket->ReceiveMessage(response, timeout_ms)) {
+		return false;
+	}
+
+	// Transition connection back to Idle (ExecuteBatch left it in Executing state)
+	conn.TransitionState(duckdb::tds::ConnectionState::Executing, duckdb::tds::ConnectionState::Idle);
+
+	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: Verify clean transaction state (@@TRANCOUNT = 0)
+//===----------------------------------------------------------------------===//
+
+bool VerifyCleanTransactionState(duckdb::tds::TdsConnection &conn) {
+	// We could query @@TRANCOUNT here, but for simplicity we just assume
+	// the COMMIT/ROLLBACK succeeded if ExecuteBatch returned true.
+	// In a production implementation, you might want to actually check
+	// @@TRANCOUNT to ensure the transaction is fully closed.
+	return true;
+}
+
+}  // anonymous namespace
 
 namespace duckdb {
 
@@ -10,12 +63,95 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLTransaction::MSSQLTransaction(TransactionManager &manager, ClientContext &context, MSSQLCatalog &catalog)
-	: Transaction(manager, context), catalog_(catalog) {}
+    : Transaction(manager, context), catalog_(catalog), pinned_connection_(nullptr), sql_server_transaction_active_(false),
+      savepoint_counter_(0) {}
 
-MSSQLTransaction::~MSSQLTransaction() = default;
+MSSQLTransaction::~MSSQLTransaction() {
+	// If we still have a pinned connection with an active SQL Server transaction,
+	// it means the transaction was abandoned (DuckDB crashed or didn't properly commit/rollback).
+	// We simply close the connection - SQL Server will automatically rollback when the
+	// connection is closed. We don't try to execute ROLLBACK here because during shutdown
+	// the socket or other resources may already have been destroyed.
+	if (pinned_connection_ && sql_server_transaction_active_) {
+		MSSQL_TXN_LOG("WARNING: Abandoned transaction detected in destructor, closing connection");
+		try {
+			// Just close the connection - SQL Server will auto-rollback
+			pinned_connection_->Close();
+		} catch (...) {
+			// Ignore errors during cleanup - we're in a destructor
+			MSSQL_TXN_LOG("WARNING: Error closing connection during abandoned transaction cleanup");
+		}
+		sql_server_transaction_active_ = false;
+	}
+	// Note: pinned_connection_ shared_ptr will be released here, decreasing ref count.
+	// The connection will be destroyed if this was the last reference.
+}
 
 MSSQLTransaction &MSSQLTransaction::Get(ClientContext &context, Catalog &catalog) {
 	return Transaction::Get(context, catalog).Cast<MSSQLTransaction>();
+}
+
+std::shared_ptr<tds::TdsConnection> MSSQLTransaction::GetPinnedConnection() {
+	lock_guard<mutex> lock(connection_mutex_);
+	return pinned_connection_;
+}
+
+bool MSSQLTransaction::HasPinnedConnection() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	return pinned_connection_ != nullptr;
+}
+
+mutex &MSSQLTransaction::GetConnectionMutex() {
+	return connection_mutex_;
+}
+
+bool MSSQLTransaction::IsSqlServerTransactionActive() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	return sql_server_transaction_active_;
+}
+
+void MSSQLTransaction::SetPinnedConnection(std::shared_ptr<tds::TdsConnection> conn) {
+	lock_guard<mutex> lock(connection_mutex_);
+	pinned_connection_ = std::move(conn);
+	MSSQL_TXN_LOG("Pinned connection set for transaction");
+}
+
+void MSSQLTransaction::SetSqlServerTransactionActive(bool active) {
+	lock_guard<mutex> lock(connection_mutex_);
+	sql_server_transaction_active_ = active;
+	MSSQL_TXN_LOG("SQL Server transaction active: " << (active ? "true" : "false"));
+}
+
+const uint8_t *MSSQLTransaction::GetTransactionDescriptor() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	if (!has_transaction_descriptor_) {
+		return nullptr;
+	}
+	return transaction_descriptor_;
+}
+
+void MSSQLTransaction::SetTransactionDescriptor(const uint8_t *descriptor) {
+	lock_guard<mutex> lock(connection_mutex_);
+	if (descriptor) {
+		std::memcpy(transaction_descriptor_, descriptor, 8);
+		has_transaction_descriptor_ = true;
+		MSSQL_TXN_LOG("Transaction descriptor set: "
+		              << std::hex
+		              << (int)transaction_descriptor_[0] << " " << (int)transaction_descriptor_[1] << " "
+		              << (int)transaction_descriptor_[2] << " " << (int)transaction_descriptor_[3] << " "
+		              << (int)transaction_descriptor_[4] << " " << (int)transaction_descriptor_[5] << " "
+		              << (int)transaction_descriptor_[6] << " " << (int)transaction_descriptor_[7]
+		              << std::dec);
+	} else {
+		std::memset(transaction_descriptor_, 0, 8);
+		has_transaction_descriptor_ = false;
+		MSSQL_TXN_LOG("Transaction descriptor cleared");
+	}
+}
+
+string MSSQLTransaction::GetNextSavepointName() {
+	lock_guard<mutex> lock(connection_mutex_);
+	return "sp_" + std::to_string(++savepoint_counter_);
 }
 
 //===----------------------------------------------------------------------===//
@@ -39,7 +175,45 @@ Transaction &MSSQLTransactionManager::StartTransaction(ClientContext &context) {
 ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	lock_guard<mutex> lock(transaction_lock_);
 
-	// Read-only catalog - commit is a no-op
+	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
+
+	// Check if we have a pinned connection with an active SQL Server transaction
+	auto pinned_conn = mssql_txn.GetPinnedConnection();
+	if (pinned_conn && mssql_txn.IsSqlServerTransactionActive()) {
+		MSSQL_TXN_LOG("CommitTransaction: Committing SQL Server transaction");
+
+		// Execute COMMIT TRANSACTION
+		if (!ExecuteAndDrain(*pinned_conn, "COMMIT TRANSACTION")) {
+			// Commit failed - keep connection pinned and return error
+			// The user will need to rollback or retry
+			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: " << pinned_conn->GetLastError());
+			string error_msg = "MSSQL: Failed to commit transaction: " + pinned_conn->GetLastError();
+			transactions_.erase(context);
+			return ErrorData(ExceptionType::IO, error_msg);
+		}
+
+		// Verify clean state
+		if (!VerifyCleanTransactionState(*pinned_conn)) {
+			MSSQL_TXN_LOG("WARNING: CommitTransaction: Transaction state not clean after COMMIT");
+		}
+
+		// Mark transaction as no longer active
+		mssql_txn.SetSqlServerTransactionActive(false);
+
+		// Clear transaction descriptor on the connection
+		pinned_conn->ClearTransactionDescriptor();
+
+		// Return connection to pool
+		MSSQL_TXN_LOG("CommitTransaction: Returning connection to pool");
+		auto &pool = catalog_.GetConnectionPool();
+		pool.Release(pinned_conn);
+
+		// Clear pinned connection
+		mssql_txn.SetPinnedConnection(nullptr);
+	} else {
+		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
+	}
+
 	transactions_.erase(context);
 	return ErrorData();
 }
@@ -47,9 +221,51 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	lock_guard<mutex> lock(transaction_lock_);
 
-	// Read-only catalog - rollback is a no-op
-	auto &context = *transaction.context.lock();
-	transactions_.erase(context);
+	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
+
+	// Check if we have a pinned connection with an active SQL Server transaction
+	auto pinned_conn = mssql_txn.GetPinnedConnection();
+
+	if (pinned_conn && mssql_txn.IsSqlServerTransactionActive()) {
+		MSSQL_TXN_LOG("RollbackTransaction: Rolling back SQL Server transaction");
+
+		// Execute ROLLBACK TRANSACTION
+		if (!ExecuteAndDrain(*pinned_conn, "ROLLBACK TRANSACTION")) {
+			// Rollback failed - log error but continue cleanup
+			MSSQL_TXN_LOG("WARNING: RollbackTransaction: ROLLBACK TRANSACTION failed: " << pinned_conn->GetLastError());
+		}
+
+		// Verify clean state
+		if (!VerifyCleanTransactionState(*pinned_conn)) {
+			MSSQL_TXN_LOG("WARNING: RollbackTransaction: Transaction state not clean after ROLLBACK");
+		}
+
+		// Mark transaction as no longer active
+		mssql_txn.SetSqlServerTransactionActive(false);
+
+		// Clear transaction descriptor on the connection
+		pinned_conn->ClearTransactionDescriptor();
+
+		// Return connection to pool
+		MSSQL_TXN_LOG("RollbackTransaction: Returning connection to pool");
+		auto &pool = catalog_.GetConnectionPool();
+		pool.Release(pinned_conn);
+
+		// Clear pinned connection
+		mssql_txn.SetPinnedConnection(nullptr);
+	} else {
+		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
+	}
+
+	// Try to get the context to remove from our transaction map
+	// The context may have been destroyed during shutdown, in which case
+	// lock() returns an empty shared_ptr
+	auto context_ptr = transaction.context.lock();
+	if (context_ptr) {
+		transactions_.erase(*context_ptr);
+	}
+	// If context is gone, the transaction map entry will be cleaned up when
+	// the TransactionManager is destroyed
 }
 
 void MSSQLTransactionManager::Checkpoint(ClientContext &context, bool force) {

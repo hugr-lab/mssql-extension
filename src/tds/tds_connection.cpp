@@ -1,6 +1,7 @@
 #include "tds/tds_connection.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Debug logging
 static int GetMssqlDebugLevel() {
@@ -353,6 +354,35 @@ bool TdsConnection::IsLongIdle() const {
 	return idle_duration > LONG_IDLE_THRESHOLD;
 }
 
+void TdsConnection::SetTransactionDescriptor(const uint8_t *descriptor) {
+	if (descriptor) {
+		std::memcpy(transaction_descriptor_, descriptor, 8);
+		has_transaction_descriptor_ = true;
+		MSSQL_CONN_DEBUG_LOG(1, "SetTransactionDescriptor: %02x %02x %02x %02x %02x %02x %02x %02x",
+		                     transaction_descriptor_[0], transaction_descriptor_[1],
+		                     transaction_descriptor_[2], transaction_descriptor_[3],
+		                     transaction_descriptor_[4], transaction_descriptor_[5],
+		                     transaction_descriptor_[6], transaction_descriptor_[7]);
+	} else {
+		std::memset(transaction_descriptor_, 0, 8);
+		has_transaction_descriptor_ = false;
+		MSSQL_CONN_DEBUG_LOG(1, "SetTransactionDescriptor: cleared");
+	}
+}
+
+const uint8_t *TdsConnection::GetTransactionDescriptor() const {
+	if (!has_transaction_descriptor_) {
+		return nullptr;
+	}
+	return transaction_descriptor_;
+}
+
+void TdsConnection::ClearTransactionDescriptor() {
+	std::memset(transaction_descriptor_, 0, 8);
+	has_transaction_descriptor_ = false;
+	MSSQL_CONN_DEBUG_LOG(1, "ClearTransactionDescriptor: cleared");
+}
+
 bool TdsConnection::ExecuteBatch(const std::string &sql) {
 	// Can only execute from Idle state
 	ConnectionState expected = ConnectionState::Idle;
@@ -365,7 +395,12 @@ bool TdsConnection::ExecuteBatch(const std::string &sql) {
 
 	// Build SQL_BATCH packet(s) using the server-negotiated packet size
 	// This was received via ENVCHANGE during LOGIN7
-	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_);
+	// Pass the transaction descriptor if one is set (from BEGIN TRANSACTION response)
+	const uint8_t *txn_desc = has_transaction_descriptor_ ? transaction_descriptor_ : nullptr;
+	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
+
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: using transaction descriptor: %s",
+	                     has_transaction_descriptor_ ? "yes" : "no");
 
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: sql_size=%zu, packet_count=%zu", sql.size(), packets.size());
 

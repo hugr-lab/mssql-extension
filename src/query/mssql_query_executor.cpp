@@ -1,7 +1,10 @@
 #include "query/mssql_query_executor.hpp"
 #include <chrono>
 #include <cstdlib>
+#include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/tds_connection_pool.hpp"
@@ -47,20 +50,20 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 
 	ValidateContext(context);
 
-	// Get pool from pool manager
-	auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
-	if (!pool) {
-		throw IOException("Failed to get connection pool for context '%s'", context_name_.c_str());
-	}
+	// Get MSSQLCatalog for transaction-aware connection handling
+	auto &catalog = Catalog::GetCatalog(context, context_name_);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Log pool stats before acquire
-	auto stats = pool->GetStats();
+	auto &pool = mssql_catalog.GetConnectionPool();
+	auto stats = pool.GetStats();
 	MSSQL_EXEC_DEBUG_LOG(1, "Execute: pool stats - total=%d, active=%d, idle=%d", (int)stats.total_connections,
 						 (int)stats.active_connections, (int)stats.idle_connections);
 
+	// Use ConnectionProvider for transaction-aware connection acquisition
 	auto acquire_start = std::chrono::steady_clock::now();
 	MSSQL_EXEC_DEBUG_LOG(1, "Execute: acquiring connection (timeout=%dms)...", acquire_timeout_ms_);
-	auto connection = pool->Acquire(acquire_timeout_ms_);
+	auto connection = ConnectionProvider::GetConnection(context, mssql_catalog, acquire_timeout_ms_);
 	auto acquire_end = std::chrono::steady_clock::now();
 	auto acquire_ms = std::chrono::duration_cast<std::chrono::milliseconds>(acquire_end - acquire_start).count();
 	MSSQL_EXEC_DEBUG_LOG(1, "Execute: connection acquired in %ldms", (long)acquire_ms);
@@ -70,8 +73,8 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	}
 
 	// Create result stream with the shared connection
-	// Note: result_stream takes ownership of connection - its destructor handles pool release
-	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_);
+	// Pass client context for transaction-aware connection release in destructor
+	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, &context);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)
 	// If Initialize() throws, result_stream destructor will release connection back to pool

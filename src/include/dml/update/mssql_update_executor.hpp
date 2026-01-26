@@ -90,6 +90,10 @@ private:
 	// Has Finalize() been called?
 	bool finalized_ = false;
 
+	// Whether to defer batch execution until Finalize
+	// This is needed when in a transaction where the scan and update share the pinned connection
+	bool defer_execution_ = false;
+
 	//===----------------------------------------------------------------------===//
 	// Internal Methods
 	//===----------------------------------------------------------------------===//

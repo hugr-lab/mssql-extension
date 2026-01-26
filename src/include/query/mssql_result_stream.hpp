@@ -28,7 +28,9 @@ class MSSQLResultStream {
 public:
 	// Create result stream with shared connection
 	// context_name is needed for returning connection to pool
-	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name);
+	// client_context is needed for transaction-aware connection release
+	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
+	                  ClientContext *client_context = nullptr);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
@@ -128,6 +130,10 @@ private:
 
 	// Context name for pool release
 	string context_name_;
+
+	// Client context for transaction-aware connection release
+	// May be nullptr for non-transactional use
+	ClientContext *client_context_;
 
 	// Query
 	string sql_;

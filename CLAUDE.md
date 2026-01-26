@@ -37,6 +37,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-19
 - In-memory (connection pool, metadata cache) (001-attach-connection-validation)
 - C++17 (DuckDB extension standard) + DuckDB main branch (extension API), existing TDS layer (001-code-cleanup)
 - N/A (code refactoring only, no new data storage) (001-code-cleanup)
+- C++17 (DuckDB extension standard) + DuckDB main branch (TransactionManager, Transaction classes), existing TDS layer (ConnectionPool, TdsConnection) (001-mssql-transactions)
+- In-memory (pinned connection stored in MSSQLTransaction object) (001-mssql-transactions)
 
 ## Project Structure
 
@@ -99,9 +101,9 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql; ...."
 C++17 (DuckDB extension standard): Follow standard conventions
 
 ## Recent Changes
+- 001-mssql-transactions: Added C++17 (DuckDB extension standard) + DuckDB main branch (TransactionManager, Transaction classes), existing TDS layer (ConnectionPool, TdsConnection)
 - 001-code-cleanup: Added C++17 (DuckDB extension standard) + DuckDB main branch (extension API), existing TDS layer
 - 001-attach-connection-validation: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API), existing TDS layer (specs 001-012)
-- 002-dml-update-delete: Added C++17 (DuckDB extension standard) + DuckDB main branch (catalog API, PhysicalOperator, DataChunk), existing TDS layer (specs 001-009)
 
 <!-- MANUAL ADDITIONS START -->
 

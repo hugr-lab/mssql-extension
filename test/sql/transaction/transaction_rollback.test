@@ -1,0 +1,163 @@
+# name: test/sql/transaction/transaction_rollback.test
+# description: Test DML transaction rollback operations
+# group: [mssql]
+# Spec: 001-mssql-transactions, User Story 2 - DML Transaction Rollback
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_rollback_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_rollback_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    value DECIMAL(10, 2)
+);
+
+# Insert initial data (outside transaction)
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (1, 'Initial', 100.00);
+
+# =============================================================================
+# Test 1: Basic INSERT rollback
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (2, 'Should Not Exist', 200.00);
+
+statement ok
+ROLLBACK;
+
+# Verify INSERT was rolled back - only initial row exists
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_rollback_test;
+----
+1
+
+# =============================================================================
+# Test 2: UPDATE rollback
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE txtest.dbo.tx_rollback_test SET value = 999.00 WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+# Verify UPDATE was rolled back - original value restored
+query R
+SELECT value FROM txtest.dbo.tx_rollback_test WHERE id = 1;
+----
+100.00
+
+# =============================================================================
+# Test 3: DELETE rollback
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM txtest.dbo.tx_rollback_test WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+# Verify DELETE was rolled back - row still exists
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_rollback_test;
+----
+1
+
+# =============================================================================
+# Test 4: Combined DML rollback
+# =============================================================================
+
+# First add some rows to work with
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (2, 'Second', 200.00);
+
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (3, 'Third', 300.00);
+
+# Now test rollback of combined operations
+# After the first DML (INSERT), catalog-based table scans are blocked per spec 001-mssql-transactions.
+# For subsequent DML operations in the same transaction, use mssql_exec which uses the pinned connection.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (4, 'Fourth', 400.00);
+
+# Use mssql_exec for UPDATE after INSERT to use the pinned transaction connection
+# mssql_exec returns the number of affected rows
+query I
+SELECT mssql_exec('txtest', 'UPDATE dbo.tx_rollback_test SET value = 999.00 WHERE id = 2');
+----
+1
+
+# Use mssql_exec for DELETE after INSERT to use the pinned transaction connection
+query I
+SELECT mssql_exec('txtest', 'DELETE FROM dbo.tx_rollback_test WHERE id = 3');
+----
+1
+
+statement ok
+ROLLBACK;
+
+# Verify all changes rolled back
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_rollback_test;
+----
+3
+
+query R
+SELECT value FROM txtest.dbo.tx_rollback_test WHERE id = 2;
+----
+200.00
+
+query IT
+SELECT id, name FROM txtest.dbo.tx_rollback_test WHERE id = 3;
+----
+3	Third
+
+# =============================================================================
+# Test 5: Transaction state verification (empty after rollback)
+# After rollback, a new operation should work in autocommit mode
+# =============================================================================
+
+# Insert should work in autocommit after rollback
+statement ok
+INSERT INTO txtest.dbo.tx_rollback_test (id, name, value) VALUES (5, 'After Rollback', 500.00);
+
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_rollback_test;
+----
+4
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_rollback_test;
+
+statement ok
+DETACH txtest;

@@ -65,12 +65,20 @@ public:
 
 	// Build SQL_BATCH packet with SQL query
 	// SQL text is UTF-16LE encoded
-	static TdsPacket BuildSqlBatch(const std::string &sql);
+	// Parameters:
+	//   sql - SQL statement to execute
+	//   transaction_descriptor - 8-byte transaction descriptor (nullptr = no active transaction)
+	static TdsPacket BuildSqlBatch(const std::string &sql, const uint8_t *transaction_descriptor = nullptr);
 
 	// Build multiple SQL_BATCH packets for large queries
 	// Returns vector of packets with proper continuation flags
+	// Parameters:
+	//   sql - SQL statement to execute
+	//   max_packet_size - maximum TDS packet size
+	//   transaction_descriptor - 8-byte transaction descriptor (nullptr = no active transaction)
 	static std::vector<TdsPacket> BuildSqlBatchMultiPacket(const std::string &sql,
-														   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE);
+														   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE,
+														   const uint8_t *transaction_descriptor = nullptr);
 
 	// Build ATTENTION packet for cancellation
 	static TdsPacket BuildAttention();

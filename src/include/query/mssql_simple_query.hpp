@@ -38,6 +38,9 @@ struct SimpleQueryResult {
 	std::vector<std::string> column_names;
 	std::vector<std::vector<std::string>> rows;
 
+	// Affected row count from DONE token (for DML operations)
+	int64_t rows_affected = 0;
+
 	bool HasError() const {
 		return !success;
 	}
