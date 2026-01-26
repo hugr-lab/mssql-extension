@@ -12,6 +12,7 @@ IF OBJECT_ID('dbo.TxTestOrders', 'U') IS NOT NULL DROP TABLE dbo.TxTestOrders;
 IF OBJECT_ID('dbo.TxTestProducts', 'U') IS NOT NULL DROP TABLE dbo.TxTestProducts;
 IF OBJECT_ID('dbo.TxTestLogs', 'U') IS NOT NULL DROP TABLE dbo.TxTestLogs;
 IF OBJECT_ID('dbo.TxTestCounter', 'U') IS NOT NULL DROP TABLE dbo.TxTestCounter;
+IF OBJECT_ID('dbo.tx_test', 'U') IS NOT NULL DROP TABLE dbo.tx_test;
 GO
 
 -- =============================================================================
@@ -93,13 +94,34 @@ PRINT 'TxTestCounter table created with 2 rows';
 GO
 
 -- =============================================================================
+-- Table 5: tx_test - For multi-connection transaction isolation tests
+-- =============================================================================
+CREATE TABLE dbo.tx_test (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    name NVARCHAR(100) NOT NULL,
+    value INT NOT NULL DEFAULT 0,
+    created_at DATETIME2 NOT NULL DEFAULT GETDATE()
+);
+GO
+
+-- Initial test data
+INSERT INTO dbo.tx_test (name, value) VALUES
+    (N'initial_1', 10),
+    (N'initial_2', 20),
+    (N'initial_3', 30);
+GO
+
+PRINT 'tx_test table created with 3 rows';
+GO
+
+-- =============================================================================
 -- Summary
 -- =============================================================================
 SELECT 'Transaction test tables:' AS info;
 SELECT TABLE_NAME,
        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_NAME = t.TABLE_NAME AND c.TABLE_SCHEMA = 'dbo') as column_count
 FROM INFORMATION_SCHEMA.TABLES t
-WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME LIKE 'TxTest%'
+WHERE TABLE_SCHEMA = 'dbo' AND (TABLE_NAME LIKE 'TxTest%' OR TABLE_NAME = 'tx_test')
 ORDER BY TABLE_NAME;
 GO
 
