@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 #ifdef _WIN32
 // NOMINMAX must be defined before including winsock2.h (which includes windows.h)
@@ -24,6 +25,19 @@ typedef int socklen_t;
 #define SOCK_OPT_CONST_CAST(x) reinterpret_cast<const char *>(x)
 #define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
+
+// One-time Winsock initialization (required before any socket API call on Windows)
+static std::once_flag winsock_init_flag;
+static bool winsock_initialized = false;
+
+static void InitializeWinsock() {
+	WSADATA wsaData;
+	int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (result == 0) {
+		winsock_initialized = true;
+		atexit([]() { WSACleanup(); });
+	}
+}
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -97,6 +111,8 @@ TdsSocket &TdsSocket::operator=(TdsSocket &&other) noexcept {
 }
 
 bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seconds) {
+	MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connecting to %s:%d (timeout=%ds)", host.c_str(), port, timeout_seconds);
+
 	if (connected_) {
 		Close();
 	}
@@ -104,6 +120,17 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 	host_ = host;
 	port_ = port;
 	last_error_.clear();
+
+#ifdef _WIN32
+	MSSQL_SOCKET_DEBUG_LOG(2, "Connect: initializing Winsock");
+	std::call_once(winsock_init_flag, InitializeWinsock);
+	if (!winsock_initialized) {
+		last_error_ = "Failed to initialize Windows socket library (WSAStartup failed)";
+		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: WSAStartup failed");
+		return false;
+	}
+	MSSQL_SOCKET_DEBUG_LOG(2, "Connect: Winsock initialized successfully");
+#endif
 
 	// Resolve hostname
 	struct addrinfo hints, *result, *rp;
@@ -113,24 +140,36 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 	hints.ai_flags = 0;
 	hints.ai_protocol = IPPROTO_TCP;
 
+	MSSQL_SOCKET_DEBUG_LOG(2, "Connect: resolving hostname '%s'", host.c_str());
 	std::string port_str = std::to_string(port);
 	int ret = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
 	if (ret != 0) {
 		last_error_ = "Failed to resolve hostname: " + std::string(gai_strerror(ret));
+		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: DNS resolution failed: %s", last_error_.c_str());
 		return false;
 	}
+	MSSQL_SOCKET_DEBUG_LOG(2, "Connect: hostname resolved successfully");
 
 	// Try each address until we connect
+	int addr_index = 0;
 	for (rp = result; rp != nullptr; rp = rp->ai_next) {
+		const char *family_str = rp->ai_family == AF_INET ? "IPv4" : (rp->ai_family == AF_INET6 ? "IPv6" : "other");
+		MSSQL_SOCKET_DEBUG_LOG(2, "Connect: trying address %d (%s)", addr_index, family_str);
+
 		fd_ = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if (fd_ == -1) {
+			MSSQL_SOCKET_DEBUG_LOG(2, "Connect: socket() failed for address %d (error=%d)", addr_index,
+								   SOCKET_ERROR_CODE);
+			addr_index++;
 			continue;
 		}
 
 		// Set non-blocking for timeout support
 		if (!SetNonBlocking(true)) {
+			MSSQL_SOCKET_DEBUG_LOG(2, "Connect: SetNonBlocking failed for address %d", addr_index);
 			CLOSE_SOCKET(fd_);
 			fd_ = -1;
+			addr_index++;
 			continue;
 		}
 
@@ -138,28 +177,45 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 		ret = connect(fd_, rp->ai_addr, rp->ai_addrlen);
 		if (ret == 0) {
 			// Connected immediately
+			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connected immediately to address %d", addr_index);
 			connected_ = true;
 			break;
 		}
 
-		if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+		int connect_error = SOCKET_ERROR_CODE;
+		MSSQL_SOCKET_DEBUG_LOG(2, "Connect: connect() returned %d, error code=%d", ret, connect_error);
+
+#ifdef _WIN32
+		if (connect_error == WSAEWOULDBLOCK) {
+#else
+		if (connect_error == EINPROGRESS || connect_error == EWOULDBLOCK) {
+#endif
+			MSSQL_SOCKET_DEBUG_LOG(2, "Connect: waiting for connection (timeout=%ds)...", timeout_seconds);
 			// Wait for connection with timeout
 			if (WaitForReady(true, timeout_seconds * 1000)) {
 				// Check if connection succeeded
 				int error = 0;
 				socklen_t len = sizeof(error);
 				if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, SOCK_OPT_CAST(&error), &len) == 0 && error == 0) {
+					MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connected to address %d after wait", addr_index);
 					connected_ = true;
 					break;
 				}
 				last_error_ = "Connection failed: " + std::string(strerror(error));
+				MSSQL_SOCKET_DEBUG_LOG(1, "Connect: getsockopt SO_ERROR=%d for address %d: %s", error, addr_index,
+									   last_error_.c_str());
 			} else {
 				last_error_ = "Connection timed out";
+				MSSQL_SOCKET_DEBUG_LOG(1, "Connect: timed out on address %d", addr_index);
 			}
+		} else {
+			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with unexpected error %d", addr_index,
+								   connect_error);
 		}
 
 		CLOSE_SOCKET(fd_);
 		fd_ = -1;
+		addr_index++;
 	}
 
 	freeaddrinfo(result);
@@ -168,6 +224,7 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 		if (last_error_.empty()) {
 			last_error_ = "Failed to connect to " + host + ":" + std::to_string(port);
 		}
+		MSSQL_SOCKET_DEBUG_LOG(1, "Connect: FAILED - %s", last_error_.c_str());
 		return false;
 	}
 
