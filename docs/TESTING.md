@@ -131,7 +131,10 @@ Tests require these environment variables (automatically set by `make integratio
 | `MSSQL_TEST_PASS` | `TestPassword1` | SQL Server password |
 | `MSSQL_TEST_DB` | `master` | Default database |
 | `MSSQL_TEST_DSN` | (computed) | ADO.NET connection string for master |
+| `MSSQL_TEST_URI` | (computed) | URI connection string for master |
 | `MSSQL_TESTDB_DSN` | (computed) | ADO.NET connection string for TestDB |
+| `MSSQL_TESTDB_URI` | (computed) | URI connection string for TestDB |
+| `MSSQL_TEST_DSN_TLS` | (not exported) | TLS URI string (export manually for TLS tests) |
 
 **Debug Environment Variables:**
 
@@ -162,51 +165,91 @@ build/release/test/unittest "[sql]" --force-reload
 ```
 test/
 ├── sql/
+│   ├── attach/                     # ATTACH/DETACH tests
+│   │   ├── attach_trust_cert.test  # TLS trust certificate tests
+│   │   └── attach_validation.test  # Connection validation tests
 │   ├── catalog/                    # Catalog integration tests
 │   │   ├── catalog_parsing.test    # Schema/table/column discovery
+│   │   ├── collation_filter.test   # Collation-aware filter pushdown
+│   │   ├── data_types.test         # Data type handling tests
+│   │   ├── datetimeoffset.test     # DATETIMEOFFSET type tests
+│   │   ├── ddl_alter.test          # ALTER TABLE tests
+│   │   ├── ddl_schema.test         # CREATE/DROP SCHEMA tests
+│   │   ├── ddl_table.test          # CREATE/DROP TABLE tests
+│   │   ├── filter_pushdown.test    # Filter pushdown tests
+│   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests
-│   │   └── data_types.test         # Data type handling tests
+│   │   └── statistics.test         # Statistics provider tests
 │   ├── dml/                        # UPDATE and DELETE tests
-│   │   ├── update_scalar.test      # Single-row UPDATE tests
-│   │   ├── update_bulk.test        # Bulk UPDATE tests
-│   │   ├── update_types.test       # UPDATE data type handling
-│   │   ├── update_errors.test      # UPDATE error handling
-│   │   ├── delete_basic.test       # Basic DELETE tests
 │   │   ├── delete_bulk.test        # Bulk DELETE tests
-│   │   └── delete_errors.test      # DELETE error handling
+│   │   ├── delete_composite_pk.test # DELETE with composite PK
+│   │   ├── delete_scalar_pk.test   # DELETE with scalar PK
+│   │   ├── update_bulk.test        # Bulk UPDATE tests
+│   │   ├── update_composite_pk.test # UPDATE with composite PK
+│   │   └── update_scalar_pk.test   # UPDATE with scalar PK
 │   ├── insert/                     # INSERT tests
 │   │   ├── insert_basic.test       # Basic INSERT tests
 │   │   ├── insert_bulk.test        # Bulk INSERT tests
-│   │   ├── insert_types.test       # INSERT data type handling
+│   │   ├── insert_config.test      # INSERT configuration tests
 │   │   ├── insert_errors.test      # INSERT error handling
-│   │   └── insert_returning.test   # INSERT with RETURNING clause
+│   │   ├── insert_returning.test   # INSERT with RETURNING clause
+│   │   └── insert_types.test       # INSERT data type handling
 │   ├── integration/                # Core integration tests
 │   │   ├── basic_queries.test      # Basic query functionality
-│   │   ├── large_data.test         # Large dataset handling
-│   │   ├── parallel_queries.test   # Concurrent query tests
 │   │   ├── connection_pool.test    # Connection pool tests
+│   │   ├── diagnostic_functions.test # Diagnostic function tests
+│   │   ├── filter_pushdown.test    # Integration filter pushdown
+│   │   ├── large_data.test         # Large dataset handling
+│   │   ├── max_types.test          # MAX type tests (VARCHAR(MAX), etc.)
+│   │   ├── parallel_queries.test   # Concurrent query tests
+│   │   ├── pool_limits.test        # Connection pool limit tests
 │   │   ├── query_cancellation.test # Query cancellation tests
 │   │   ├── tls_connection.test     # TLS connection tests
-│   │   ├── tls_queries.test        # TLS query tests
-│   │   └── tls_parallel.test       # TLS parallel tests
-│   ├── tds_connection/             # TDS protocol tests
-│   │   ├── open_close.test
-│   │   ├── ping.test
-│   │   ├── pool_stats.test
-│   │   └── settings.test
+│   │   ├── tls_multipacket.test    # TLS multi-packet tests
+│   │   ├── tls_parallel.test       # TLS parallel tests
+│   │   └── tls_queries.test        # TLS query tests
 │   ├── query/                      # Query-level tests
 │   │   ├── basic_select.test
 │   │   ├── cancellation.test
 │   │   ├── error_handling.test
 │   │   ├── info_messages.test
 │   │   └── type_mapping.test
+│   ├── rowid/                      # Rowid pseudo-column tests
+│   │   ├── composite_pk_rowid.test # Composite PK rowid behavior
+│   │   ├── no_pk_rowid.test        # Tables without PK
+│   │   ├── rowid_filter_pushdown.test # Rowid in filters
+│   │   ├── scalar_pk_rowid.test    # Scalar PK rowid behavior
+│   │   └── view_rowid.test         # Views and rowid
+│   ├── tds_connection/             # TDS protocol tests
+│   │   ├── open_close.test
+│   │   ├── ping.test
+│   │   ├── pool_stats.test
+│   │   └── settings.test
+│   ├── transaction/                # Transaction management tests
+│   │   ├── transaction_autocommit.test       # Autocommit mode behavior
+│   │   ├── transaction_catalog_restriction.test # Catalog scans in transactions
+│   │   ├── transaction_commit.test           # DML commit operations
+│   │   ├── transaction_mssql_exec.test       # mssql_exec in transactions
+│   │   ├── transaction_mssql_scan.test       # mssql_scan in transactions
+│   │   └── transaction_rollback.test         # Rollback operations
+│   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
+│   ├── mssql_exec.test             # mssql_exec() function tests
 │   ├── mssql_scan.test             # mssql_scan() function tests
 │   ├── mssql_secret.test           # Secret management tests
 │   ├── mssql_version.test          # Version info tests
+│   ├── multipacket.test            # Multi-packet query tests
 │   └── tls_secret.test             # TLS secret tests
 └── cpp/                            # C++ unit tests
-    └── test_simple_query.cpp
+    ├── test_batch_builder.cpp      # INSERT batch building
+    ├── test_connection_pool.cpp    # Connection pooling
+    ├── test_ddl_translator.cpp     # DDL translation
+    ├── test_insert_executor.cpp    # INSERT execution
+    ├── test_multi_connection_transactions.cpp # Multi-connection transaction isolation
+    ├── test_simple_query.cpp       # Basic query execution
+    ├── test_statistics_provider.cpp # Statistics collection
+    ├── test_tls_connection.cpp     # TLS connection support
+    └── test_value_serializer.cpp   # Type serialization
 ```
 
 ### Test File Format
@@ -268,8 +311,9 @@ DETACH testdb;
 |-------|-------------|---------------------|
 | `[sql]` | General SQL tests | Yes |
 | `[integration]` | Integration tests | Yes |
-| `[mssql]` | MSSQL-specific tests (catalog, DML) | Yes |
+| `[mssql]` | MSSQL-specific tests (catalog, DML, transactions) | Yes |
 | `[dml]` | DML operations (INSERT/UPDATE/DELETE) | Yes |
+| `[transaction]` | Transaction management tests | Yes |
 
 ---
 
@@ -277,12 +321,15 @@ DETACH testdb;
 
 ### 1. Choose the Right Location
 
+- **Attach/detach tests** → `test/sql/attach/`
 - **Catalog tests** → `test/sql/catalog/`
 - **DML tests (UPDATE/DELETE)** → `test/sql/dml/`
 - **INSERT tests** → `test/sql/insert/`
 - **Integration tests** → `test/sql/integration/`
-- **TDS protocol tests** → `test/sql/tds_connection/`
 - **Query tests** → `test/sql/query/`
+- **Rowid tests** → `test/sql/rowid/`
+- **TDS protocol tests** → `test/sql/tds_connection/`
+- **Transaction tests** → `test/sql/transaction/`
 
 ### 2. Create Test File
 
@@ -429,15 +476,78 @@ DETACH mssql_upd_mytest;
 **DML Settings for Tests:**
 
 ```sql
-# Configure batch size (default: 1000)
+# Configure batch size (default: 500)
 SET mssql_dml_batch_size = 100;
 
-# Configure max parameters per batch (default: 2100)
+# Configure max parameters per batch (default: 2000)
 SET mssql_dml_max_parameters = 500;
 
 # Enable/disable prepared statements (default: true)
 SET mssql_dml_use_prepared = false;
 ```
+
+### 7. Writing Transaction Tests
+
+Transaction tests verify BEGIN/COMMIT/ROLLBACK behavior with the MSSQL extension:
+
+```sql
+# name: test/sql/transaction/my_transaction_test.test
+# description: Test transaction behavior
+# group: [transaction]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txdb (TYPE mssql);
+
+# Test COMMIT: changes persist
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txdb.dbo.TxTestOrders (id, customer, amount, status)
+VALUES (100, 'Test Customer', 50.00, 'pending');
+
+statement ok
+COMMIT;
+
+query I
+SELECT COUNT(id) FROM txdb.dbo.TxTestOrders WHERE id = 100;
+----
+1
+
+# Test ROLLBACK: changes discarded
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM txdb.dbo.TxTestOrders WHERE id = 100;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT COUNT(id) FROM txdb.dbo.TxTestOrders WHERE id = 100;
+----
+1
+
+# Cleanup
+statement ok
+DELETE FROM txdb.dbo.TxTestOrders WHERE id = 100;
+
+statement ok
+DETACH txdb;
+```
+
+**Transaction Test Best Practices:**
+
+1. **Use dedicated transaction test tables** (TxTestOrders, TxTestProducts, TxTestCounter, TxTestLogs)
+2. **Always clean up** rows inserted during tests to restore initial state
+3. **Test both COMMIT and ROLLBACK** to verify atomicity
+4. **Tables need PRIMARY KEY** for UPDATE/DELETE within transactions
+5. **mssql_exec and mssql_scan work inside transactions** using the pinned connection
 
 ---
 
@@ -471,6 +581,11 @@ SET mssql_dml_use_prepared = false;
 | `NullableTypes` | 5 | Table with nullable columns and NULL patterns |
 | `SELECT` | 3 | Table with reserved word name |
 | `Space Column Table` | 3 | Table with spaces in column names |
+| `TxTestOrders` | 3 | Transaction test: INSERT/UPDATE/DELETE with orders |
+| `TxTestProducts` | 5 | Transaction test: combined DML operations |
+| `TxTestLogs` | 0 | Transaction test: mssql_exec logging (IDENTITY PK) |
+| `TxTestCounter` | 2 | Transaction test: numeric UPDATE operations |
+| `tx_test` | 3 | Multi-connection transaction isolation tests |
 
 ### Tables in Other Schemas
 

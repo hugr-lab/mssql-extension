@@ -32,12 +32,21 @@ make test
 
 ### Makefile Targets
 
-| Target         | Description                              |
-| -------------- | ---------------------------------------- |
-| `make`         | Build optimized release version          |
-| `make debug`   | Build with debug symbols                 |
-| `make clean`   | Remove all build artifacts               |
-| `make test`    | Run DuckDB extension tests               |
+| Target                   | Description                                       |
+| ------------------------ | ------------------------------------------------- |
+| `make` / `make release`  | Build optimized release version                   |
+| `make debug`             | Build with debug symbols                          |
+| `make clean`             | Remove all build artifacts                        |
+| `make test`              | Run unit tests (no SQL Server required)           |
+| `make integration-test`  | Run integration tests (requires SQL Server)       |
+| `make test-all`          | Run all tests (unit + integration)                |
+| `make test-debug`        | Run tests with debug build                        |
+| `make test-simple-query` | Run C++ simple query test                         |
+| `make docker-up`         | Start SQL Server test container                   |
+| `make docker-down`       | Stop SQL Server test container                    |
+| `make docker-status`     | Check SQL Server container status                 |
+| `make vcpkg-setup`       | Bootstrap vcpkg (required for TLS support)        |
+| `make help`              | Show all available targets                        |
 
 ### Build Outputs
 
@@ -110,8 +119,14 @@ Default credentials:
 # Unit tests (no SQL Server required)
 make test
 
-# Integration tests require SQL Server running
-# Tests are in tests/integration/
+# Integration tests (requires SQL Server running)
+make docker-up
+make integration-test
+
+# All tests
+make test-all
+
+# See docs/TESTING.md for comprehensive testing guide
 ```
 
 ### Manual Testing
@@ -230,45 +245,104 @@ Recommended extensions:
 - Run `find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i` before committing
 - The CI will reject PRs that don't pass lint
 
+## Naming Conventions
+
+### Files
+
+| Pattern | Example | Usage |
+|---------|---------|-------|
+| `mssql_<component>.cpp` | `mssql_catalog.cpp` | Extension modules |
+| `tds_<component>.cpp` | `tds_connection.cpp` | TDS protocol modules |
+| `<encoding>_encoding.cpp` | `datetime_encoding.cpp` | Type encoding |
+| `test_<component>.cpp` | `test_batch_builder.cpp` | C++ unit tests |
+| `<feature>_<scenario>.test` | `update_scalar_pk.test` | SQL integration tests |
+
+Headers mirror source layout under `src/include/`.
+
+### C++ Naming
+
+| Element | Convention | Example |
+|---------|-----------|---------|
+| Classes | PascalCase (see prefix rule below) | `MSSQLCatalog`, `ConnectionProvider` |
+| Structs (data) | PascalCase + Info/Metadata/Config suffix | `ColumnInfo`, `PoolStatistics` |
+| Methods | PascalCase (DuckDB style) | `GetConnection()`, `ExecuteBatch()` |
+| Boolean methods | `Is*()` / `Has*()` | `IsAlive()`, `HasPinnedConnection()` |
+| Member variables | `snake_case_` (trailing underscore) | `connection_pool_`, `schema_mutex_` |
+| Local variables | `snake_case` | `row_count`, `schema_name` |
+| Constants | `constexpr` UPPER_SNAKE_CASE | `TDS_VERSION_7_4`, `TDS_HEADER_SIZE` |
+| Enums | `enum class` with PascalCase values | `ConnectionState::Idle` |
+| Namespaces | `duckdb`, `duckdb::tds`, `duckdb::mssql` | — |
+
+### Namespace Prefix Rule
+
+Types and functions in the **common `duckdb` namespace** (e.g., `duckdb`, `duckdb::encoding`) **must** have the `MSSQL` or `Tds` prefix to avoid name collisions. Types in **extension-specific namespaces** (`duckdb::mssql`, `duckdb::tds`, `duckdb::tds::tls`) **must not** have a prefix — the namespace already provides scoping.
+
+| Namespace | Prefix Required | Examples |
+|-----------|----------------|---------|
+| `duckdb` | Yes (`MSSQL`/`Tds`) | `MSSQLCatalog`, `MSSQLTransaction`, `TdsConnection` |
+| `duckdb::mssql` | No | `ConnectionProvider`, `InsertConfig` |
+| `duckdb::tds` | No | `Connection`, `Socket`, `PacketType` |
+| `duckdb::tds::tls` | No | `TlsContext`, `TlsBio` |
+
+### Test Naming
+
+- SQL test groups: `[sql]`, `[mssql]`, `[integration]`, `[transaction]`, `[dml]`
+- SQL test context names: unique per file, prefixed by operation (e.g., `txtest`, `mssql_upd_scalar`)
+- Test tables: PascalCase (`TestSimplePK`, `TxTestOrders`)
+
 ## Project Structure
 
 ```
 src/
-├── include/           # Header files
+├── include/           # Header files (mirrors src/ layout)
 │   ├── catalog/       # DuckDB catalog integration
 │   ├── connection/    # Connection pooling, settings
 │   ├── dml/           # DML operations (INSERT, UPDATE, DELETE)
-│   │   ├── insert/    # INSERT implementation
-│   │   ├── update/    # UPDATE implementation
-│   │   └── delete/    # DELETE implementation
+│   │   ├── insert/
+│   │   ├── update/
+│   │   └── delete/
 │   ├── query/         # Query execution
 │   ├── table_scan/    # Table scan and filter pushdown
 │   └── tds/           # TDS protocol implementation
-├── catalog/           # Catalog implementation
-├── connection/        # Connection management
+├── catalog/           # Catalog, schema, table entries, transactions
+├── connection/        # Connection pooling, provider, settings
 ├── dml/               # DML operations
-│   ├── insert/        # INSERT operators
-│   ├── update/        # UPDATE operators
-│   └── delete/        # DELETE operators
-├── query/             # Query execution
+│   ├── insert/        # INSERT operators and batching
+│   ├── update/        # UPDATE operators (rowid-based)
+│   └── delete/        # DELETE operators (rowid-based)
+├── query/             # Query execution and result streaming
 ├── table_scan/        # Table scan and filter encoding
 └── tds/               # TDS protocol
-    ├── encoding/      # Type encoding/decoding
+    ├── encoding/      # Type encoding/decoding (datetime, decimal, GUID, UTF-16)
     └── tls/           # TLS implementation (OpenSSL)
 
-test/sql/
-├── catalog/           # Catalog integration tests
-├── dml/               # UPDATE and DELETE tests
-├── insert/            # INSERT tests
-├── integration/       # Core integration tests
-├── query/             # Query-level tests
-└── tds_connection/    # TDS protocol tests
+test/
+├── sql/
+│   ├── attach/            # ATTACH/DETACH and validation tests
+│   ├── catalog/           # Catalog integration (DDL, filters, types)
+│   ├── dml/               # UPDATE and DELETE tests
+│   ├── insert/            # INSERT tests
+│   ├── integration/       # Core integration tests (pool, TLS, large data)
+│   ├── query/             # Query-level tests
+│   ├── rowid/             # Rowid pseudo-column tests
+│   ├── tds_connection/    # TDS protocol tests
+│   └── transaction/       # Transaction management tests
+└── cpp/                   # C++ unit tests (no SQL Server required)
+
+docs/                      # Architecture documentation
+├── architecture.md        # System overview and component diagram
+├── catalog-integration.md # Catalog, schema, table metadata
+├── connection-management.md # Connection pool and provider
+├── query-execution.md     # Query execution and DML pipelines
+├── tds-protocol.md        # TDS protocol layer
+├── transactions.md        # Transaction management
+└── type-mapping.md        # SQL Server ↔ DuckDB type mapping
 
 docker/
-├── docker-compose.yml         # Local SQL Server for development
+├── docker-compose.yml          # Local SQL Server for development
 ├── docker-compose.linux-ci.yml # Linux CI build environment
-├── Dockerfile.build           # Ubuntu 22.04 build image
-└── init/                      # SQL Server init scripts
+├── Dockerfile.build            # Ubuntu 22.04 build image
+└── init/                       # SQL Server init scripts
 ```
 
 ## Contributing
