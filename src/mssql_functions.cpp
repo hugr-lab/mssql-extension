@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
@@ -368,9 +369,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 										context_name);
 		}
 
-		// Get connection from the catalog's pool
-		auto &pool = catalog.GetConnectionPool();
-		auto connection = pool.Acquire();
+		// Get connection via ConnectionProvider (handles transaction pinning)
+		auto connection = ConnectionProvider::GetConnection(client_context, catalog);
 
 		if (!connection) {
 			throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
@@ -380,8 +380,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		try {
 			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql);
 
-			// Release connection back to pool
-			pool.Release(std::move(connection));
+			// Release connection via ConnectionProvider (no-op if in transaction)
+			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
 
 			if (!query_result.success) {
 				// Surface SQL Server error with details
@@ -389,13 +389,14 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 											query_result.error_message);
 			}
 
-			// Return affected row count
-			// For DDL and queries without affected rows, return 0
-			return query_result.rows.empty() ? 0 : static_cast<int64_t>(query_result.rows.size());
+			// Return affected row count from DONE token
+			// For DML operations (INSERT/UPDATE/DELETE), this is the number of affected rows
+			// For DDL and SELECT statements, this may be 0
+			return query_result.rows_affected;
 
 		} catch (...) {
 			// Release connection on error
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
 			throw;
 		}
 	});

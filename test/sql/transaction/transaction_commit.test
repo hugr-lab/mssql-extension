@@ -1,0 +1,162 @@
+# name: test/sql/transaction/transaction_commit.test
+# description: Test DML transaction commit operations
+# group: [mssql]
+# Spec: 001-mssql-transactions, User Story 1 - DML Transaction Commit
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table (outside transaction - DDL uses separate connection)
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_commit_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_commit_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    value DECIMAL(10, 2)
+);
+
+# =============================================================================
+# Test 1: Basic INSERT in transaction with COMMIT
+# =============================================================================
+
+# Start transaction
+statement ok
+BEGIN;
+
+# Insert single row
+statement ok
+INSERT INTO txtest.dbo.tx_commit_test (id, name, value) VALUES (1, 'First', 100.00);
+
+# Commit transaction
+statement ok
+COMMIT;
+
+# Verify row persisted after commit
+query ITR
+SELECT * FROM txtest.dbo.tx_commit_test WHERE id = 1;
+----
+1	First	100.00
+
+# =============================================================================
+# Test 2: Multi-statement INSERT in transaction
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_commit_test (id, name, value) VALUES (2, 'Second', 200.00);
+
+statement ok
+INSERT INTO txtest.dbo.tx_commit_test (id, name, value) VALUES (3, 'Third', 300.00);
+
+statement ok
+INSERT INTO txtest.dbo.tx_commit_test (id, name, value) VALUES (4, 'Fourth', 400.00);
+
+statement ok
+COMMIT;
+
+# Verify all rows persisted
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_commit_test;
+----
+4
+
+# =============================================================================
+# Test 3: UPDATE in transaction with COMMIT
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE txtest.dbo.tx_commit_test SET value = 150.00 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+# Verify update persisted
+query R
+SELECT value FROM txtest.dbo.tx_commit_test WHERE id = 1;
+----
+150.00
+
+# =============================================================================
+# Test 4: DELETE in transaction with COMMIT
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM txtest.dbo.tx_commit_test WHERE id = 4;
+
+statement ok
+COMMIT;
+
+# Verify delete persisted
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_commit_test;
+----
+3
+
+# =============================================================================
+# Test 5: Combined INSERT/UPDATE/DELETE in single transaction
+# Uses mssql_exec for UPDATE/DELETE after INSERT per spec 001-mssql-transactions
+# (catalog-based table scans are blocked after first DML)
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# Insert new row
+statement ok
+INSERT INTO txtest.dbo.tx_commit_test (id, name, value) VALUES (5, 'Fifth', 500.00);
+
+# Update existing row - use mssql_exec after INSERT
+query I
+SELECT mssql_exec('txtest', 'UPDATE dbo.tx_commit_test SET name = ''Updated Second'' WHERE id = 2');
+----
+1
+
+# Delete a row - use mssql_exec after INSERT
+query I
+SELECT mssql_exec('txtest', 'DELETE FROM dbo.tx_commit_test WHERE id = 3');
+----
+1
+
+statement ok
+COMMIT;
+
+# Verify final state
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_commit_test;
+----
+3
+
+query IT
+SELECT id, name FROM txtest.dbo.tx_commit_test ORDER BY id;
+----
+1	First
+2	Updated Second
+5	Fifth
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_commit_test;
+
+statement ok
+DETACH txtest;

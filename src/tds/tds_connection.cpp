@@ -1,6 +1,7 @@
 #include "tds/tds_connection.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Debug logging
 static int GetMssqlDebugLevel() {
@@ -192,6 +193,8 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 }
 
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
+						 database.c_str());
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
 	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, "DuckDB MSSQL Extension",
@@ -223,6 +226,8 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	spid_ = login_response.spid;
 	// Use server-negotiated packet size from ENVCHANGE, or keep default if not received
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: authentication successful, spid=%d, packet_size=%d", spid_,
+						 negotiated_packet_size_);
 	return true;
 }
 
@@ -353,19 +358,56 @@ bool TdsConnection::IsLongIdle() const {
 	return idle_duration > LONG_IDLE_THRESHOLD;
 }
 
+void TdsConnection::SetTransactionDescriptor(const uint8_t *descriptor) {
+	if (descriptor) {
+		std::memcpy(transaction_descriptor_, descriptor, 8);
+		has_transaction_descriptor_ = true;
+		MSSQL_CONN_DEBUG_LOG(1, "SetTransactionDescriptor: %02x %02x %02x %02x %02x %02x %02x %02x",
+							 transaction_descriptor_[0], transaction_descriptor_[1], transaction_descriptor_[2],
+							 transaction_descriptor_[3], transaction_descriptor_[4], transaction_descriptor_[5],
+							 transaction_descriptor_[6], transaction_descriptor_[7]);
+	} else {
+		std::memset(transaction_descriptor_, 0, 8);
+		has_transaction_descriptor_ = false;
+		MSSQL_CONN_DEBUG_LOG(1, "SetTransactionDescriptor: cleared");
+	}
+}
+
+const uint8_t *TdsConnection::GetTransactionDescriptor() const {
+	if (!has_transaction_descriptor_) {
+		return nullptr;
+	}
+	return transaction_descriptor_;
+}
+
+void TdsConnection::ClearTransactionDescriptor() {
+	std::memset(transaction_descriptor_, 0, 8);
+	has_transaction_descriptor_ = false;
+	MSSQL_CONN_DEBUG_LOG(1, "ClearTransactionDescriptor: cleared");
+}
+
 bool TdsConnection::ExecuteBatch(const std::string &sql) {
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: starting, state=%d, socket_connected=%d", static_cast<int>(state_.load()),
+						 socket_ ? socket_->IsConnected() : -1);
+
 	// Can only execute from Idle state
 	ConnectionState expected = ConnectionState::Idle;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
 		last_error_ =
 			"Cannot execute: connection not in Idle state (current: " + std::string(ConnectionStateToString(expected)) +
 			")";
+		MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: FAILED - wrong state: %d", static_cast<int>(expected));
 		return false;
 	}
 
 	// Build SQL_BATCH packet(s) using the server-negotiated packet size
 	// This was received via ENVCHANGE during LOGIN7
-	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_);
+	// Pass the transaction descriptor if one is set (from BEGIN TRANSACTION response)
+	const uint8_t *txn_desc = has_transaction_descriptor_ ? transaction_descriptor_ : nullptr;
+	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
+
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: using transaction descriptor: %s",
+						 has_transaction_descriptor_ ? "yes" : "no");
 
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: sql_size=%zu, packet_count=%zu", sql.size(), packets.size());
 

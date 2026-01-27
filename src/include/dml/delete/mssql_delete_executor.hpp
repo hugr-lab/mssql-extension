@@ -81,6 +81,10 @@ private:
 	//! Whether execution has been finalized
 	bool finalized_ = false;
 
+	//! Whether to defer batch execution until Finalize
+	//! This is needed when in a transaction where the scan and delete share the pinned connection
+	bool defer_execution_ = false;
+
 	//! Flush the current batch to the database
 	//! @return Result of the batch execution
 	MSSQLDMLResult FlushBatch();

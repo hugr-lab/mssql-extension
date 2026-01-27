@@ -2,10 +2,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_transaction.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "dml/delete/mssql_delete_statement.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_token_parser.hpp"
@@ -43,6 +48,21 @@ MSSQLDeleteExecutor::MSSQLDeleteExecutor(ClientContext &context, const MSSQLDele
 	effective_batch_size_ = config_.EffectiveBatchSize(statement_->GetParametersPerRow());
 	DELETE_DEBUG(1, "DeleteExecutor: effective_batch_size=%llu (params_per_row=%llu)",
 				 (unsigned long long)effective_batch_size_, (unsigned long long)statement_->GetParametersPerRow());
+
+	// Check if we need to defer execution until Finalize
+	// This is required when in an explicit transaction because:
+	// 1. The scan uses the pinned connection to stream rowids
+	// 2. DELETE batches would need the same pinned connection
+	// 3. But the connection is in "Executing" state while streaming
+	// Solution: Buffer all rowids during Sink, execute in Finalize after scan completes
+	if (!context.transaction.IsAutoCommit()) {
+		auto &catalog = Catalog::GetCatalog(context, target_.catalog_name);
+		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
+			defer_execution_ = true;
+			DELETE_DEBUG(1, "DeleteExecutor: defer_execution=true (in transaction)");
+		}
+	}
 }
 
 MSSQLDeleteExecutor::~MSSQLDeleteExecutor() = default;
@@ -70,7 +90,8 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 		pending_pk_values_.push_back(std::move(pk));
 
 		// Check if we need to flush the batch
-		if (pending_pk_values_.size() >= effective_batch_size_) {
+		// In defer_execution_ mode, we accumulate everything and flush in Finalize
+		if (!defer_execution_ && pending_pk_values_.size() >= effective_batch_size_) {
 			DELETE_DEBUG(1, "Execute: batch full, flushing %llu rows...",
 						 (unsigned long long)pending_pk_values_.size());
 			auto result = FlushBatch();
@@ -87,8 +108,8 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 }
 
 MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
-	DELETE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
-				 (unsigned long long)pending_pk_values_.size());
+	DELETE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu, defer_execution=%d", finalized_,
+				 (unsigned long long)pending_pk_values_.size(), defer_execution_);
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_deleted_, batch_count_);
@@ -96,9 +117,10 @@ MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
 
 	finalized_ = true;
 
-	// Flush any remaining rows
-	if (!pending_pk_values_.empty()) {
-		DELETE_DEBUG(1, "Finalize: flushing %llu pending rows", (unsigned long long)pending_pk_values_.size());
+	// Flush all remaining rows in batches
+	// In defer_execution_ mode, we may have accumulated many batches worth of rows
+	while (!pending_pk_values_.empty()) {
+		DELETE_DEBUG(1, "Finalize: flushing batch, pending=%llu", (unsigned long long)pending_pk_values_.size());
 		auto result = FlushBatch();
 		if (!result.success) {
 			return result;
@@ -116,14 +138,24 @@ MSSQLDMLResult MSSQLDeleteExecutor::FlushBatch() {
 	}
 
 	batch_count_++;
-	DELETE_DEBUG(1, "FlushBatch: batch %llu with %llu rows", (unsigned long long)batch_count_,
-				 (unsigned long long)pending_pk_values_.size());
+
+	// Extract up to effective_batch_size_ rows for this batch
+	vector<vector<Value>> batch_pk_values;
+	idx_t rows_to_process = std::min<idx_t>(pending_pk_values_.size(), effective_batch_size_);
+
+	batch_pk_values.reserve(rows_to_process);
+	for (idx_t i = 0; i < rows_to_process; i++) {
+		batch_pk_values.push_back(std::move(pending_pk_values_[i]));
+	}
+
+	// Remove processed rows from pending
+	pending_pk_values_.erase(pending_pk_values_.begin(), pending_pk_values_.begin() + rows_to_process);
+
+	DELETE_DEBUG(1, "FlushBatch: batch %llu with %llu rows (remaining=%llu)", (unsigned long long)batch_count_,
+				 (unsigned long long)rows_to_process, (unsigned long long)pending_pk_values_.size());
 
 	// Build the DELETE statement
-	auto batch = statement_->Build(pending_pk_values_);
-
-	// Clear pending data
-	pending_pk_values_.clear();
+	auto batch = statement_->Build(batch_pk_values);
 
 	if (!batch.IsValid()) {
 		return MSSQLDMLResult::Failure("Failed to build DELETE batch", 0, batch_count_);
@@ -138,15 +170,12 @@ MSSQLDMLResult MSSQLDeleteExecutor::FlushBatch() {
 MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 	DELETE_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", batch.sql.size());
 
-	// Get the connection pool from the pool manager using the catalog name
-	auto *pool = MssqlPoolManager::Instance().GetPool(target_.catalog_name);
-	if (!pool) {
-		DELETE_DEBUG(1, "ExecuteBatch: pool not found for catalog '%s'", target_.catalog_name.c_str());
-		return MSSQLDMLResult::Failure("MSSQL connection pool for catalog '" + target_.catalog_name + "' not found", 0,
-									   batch_count_);
-	}
+	// Get the MSSQLCatalog for ConnectionProvider
+	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
-	auto connection = pool->Acquire();
+	// Acquire connection via ConnectionProvider (handles transaction pinning)
+	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
 	if (!connection) {
 		DELETE_DEBUG(1, "ExecuteBatch: failed to acquire connection");
 		return MSSQLDMLResult::Failure("Failed to acquire connection for DELETE execution", 0, batch_count_);
@@ -161,7 +190,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			DELETE_DEBUG(1, "ExecuteBatch: socket is null");
-			pool->Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			return MSSQLDMLResult::Failure("Connection socket is null", 0, batch_count_);
 		}
 
@@ -171,9 +200,10 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		// Send the SQL batch
 		DELETE_DEBUG(1, "ExecuteBatch: sending SQL batch...");
 		if (!connection->ExecuteBatch(batch.sql)) {
-			DELETE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", connection->GetLastError().c_str());
-			pool->Release(std::move(connection));
-			return MSSQLDMLResult::Failure("DELETE execution failed: " + connection->GetLastError(), 0, batch_count_);
+			string error = connection->GetLastError();
+			DELETE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			return MSSQLDMLResult::Failure("DELETE execution failed: " + error, 0, batch_count_);
 		}
 
 		DELETE_DEBUG(1, "ExecuteBatch: SQL sent successfully, waiting for response...");
@@ -194,7 +224,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 				DELETE_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				pool->Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				return MSSQLDMLResult::Failure("DELETE execution timeout", 0, batch_count_);
 			}
 
@@ -206,7 +236,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 			if (!socket->ReceivePacket(packet, recv_timeout)) {
 				string socket_error = socket->GetLastError();
 				DELETE_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s'", socket_error.c_str());
-				pool->Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				return MSSQLDMLResult::Failure("Failed to receive TDS packet: " + socket_error, 0, batch_count_);
 			}
 
@@ -269,16 +299,16 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 
 		// Check for errors
 		if (!error_message.empty()) {
-			pool->Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			return MSSQLDMLResult::Failure("DELETE failed: " + error_message, 0, batch_count_);
 		}
 
-		pool->Release(std::move(connection));
+		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 		total_rows_deleted_ += rows_affected;
 		return MSSQLDMLResult::Success(rows_affected, batch_count_);
 
 	} catch (const std::exception &e) {
-		pool->Release(std::move(connection));
+		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
 	}
 }

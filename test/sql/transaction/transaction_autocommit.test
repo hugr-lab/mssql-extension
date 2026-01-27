@@ -1,0 +1,141 @@
+# name: test/sql/transaction/transaction_autocommit.test
+# description: Test autocommit mode behavior (non-transactional operations)
+# group: [mssql]
+# Spec: 001-mssql-transactions, User Story 6 - Autocommit Mode Behavior
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_autocommit_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_autocommit_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    value DECIMAL(10, 2)
+);
+
+# =============================================================================
+# Test 1: INSERT autocommit - row immediately visible
+# =============================================================================
+
+# Insert without BEGIN/COMMIT
+statement ok
+INSERT INTO txtest.dbo.tx_autocommit_test (id, name, value) VALUES (1, 'Autocommit Insert', 100.00);
+
+# Row should be immediately visible (autocommit)
+query IT
+SELECT id, name FROM txtest.dbo.tx_autocommit_test WHERE id = 1;
+----
+1	Autocommit Insert
+
+# =============================================================================
+# Test 2: Multiple independent DML operations in autocommit
+# =============================================================================
+
+# Each DML should commit independently
+statement ok
+INSERT INTO txtest.dbo.tx_autocommit_test (id, name, value) VALUES (2, 'Second Row', 200.00);
+
+statement ok
+UPDATE txtest.dbo.tx_autocommit_test SET value = 150.00 WHERE id = 1;
+
+statement ok
+INSERT INTO txtest.dbo.tx_autocommit_test (id, name, value) VALUES (3, 'Third Row', 300.00);
+
+# All operations committed independently
+query IR
+SELECT id, value FROM txtest.dbo.tx_autocommit_test ORDER BY id;
+----
+1	150.00
+2	200.00
+3	300.00
+
+# =============================================================================
+# Test 3: Catalog scan works in autocommit mode (no transaction)
+# =============================================================================
+
+# Catalog scan should work fine outside transactions
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_autocommit_test;
+----
+3
+
+# =============================================================================
+# Test 4: DELETE in autocommit mode
+# =============================================================================
+
+statement ok
+DELETE FROM txtest.dbo.tx_autocommit_test WHERE id = 3;
+
+# Verify delete persisted immediately
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_autocommit_test;
+----
+2
+
+# =============================================================================
+# Test 5: mssql_exec in autocommit mode
+# =============================================================================
+
+# mssql_exec should also autocommit
+query I
+SELECT mssql_exec('txtest', 'INSERT INTO dbo.tx_autocommit_test (id, name, value) VALUES (4, ''Via Exec'', 400.00)');
+----
+1
+
+# Verify immediately persisted
+query IT
+SELECT id, name FROM txtest.dbo.tx_autocommit_test WHERE id = 4;
+----
+4	Via Exec
+
+# =============================================================================
+# Test 6: mssql_scan in autocommit mode
+# =============================================================================
+
+# mssql_scan should work in autocommit
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_autocommit_test');
+----
+3
+
+# =============================================================================
+# Test 7: Autocommit isolation - changes persist even if subsequent operations fail
+# =============================================================================
+
+# This insert will succeed
+statement ok
+INSERT INTO txtest.dbo.tx_autocommit_test (id, name, value) VALUES (5, 'Will Persist', 500.00);
+
+# This will fail (duplicate key)
+statement error
+INSERT INTO txtest.dbo.tx_autocommit_test (id, name, value) VALUES (5, 'Duplicate', 555.00);
+----
+Violation of PRIMARY KEY constraint
+
+# The first insert should still be committed
+query IT
+SELECT id, name FROM txtest.dbo.tx_autocommit_test WHERE id = 5;
+----
+5	Will Persist
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_autocommit_test;
+
+statement ok
+DETACH txtest;

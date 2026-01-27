@@ -1,0 +1,195 @@
+# name: test/sql/transaction/transaction_catalog_restriction.test
+# description: Test catalog scan works inside transactions (using pinned connection)
+# group: [mssql]
+# Spec: 001-mssql-transactions - Catalog scans use pinned connection in transactions
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_scan_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_scan_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+# Insert initial data (outside transaction)
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (1, 'Initial');
+
+# =============================================================================
+# Test 1: Catalog scan works OUTSIDE transaction (autocommit mode)
+# =============================================================================
+
+# This should work fine - no transaction active
+query IT
+SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+----
+1	Initial
+
+# =============================================================================
+# Test 2: Catalog scan works inside transaction BEFORE DML
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# Catalog scan works before any DML - there are no uncommitted changes to miss
+query IT
+SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+----
+1	Initial
+
+statement ok
+ROLLBACK;
+
+# =============================================================================
+# Test 3: Catalog scan works inside transaction AFTER INSERT (sees uncommitted)
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# Do INSERT first
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (2, 'New Row');
+
+# Catalog scan should see the uncommitted INSERT
+query IT
+SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+----
+1	Initial
+2	New Row
+
+statement ok
+ROLLBACK;
+
+# Verify the INSERT was rolled back
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+----
+1
+
+# =============================================================================
+# Test 4: UPDATE with WHERE clause works in transaction
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# UPDATE requires scanning to find matching rows (for rowid)
+statement ok
+UPDATE txtest.dbo.tx_scan_test SET name = 'Updated' WHERE id = 1;
+
+# Catalog scan should see the uncommitted UPDATE
+query IT
+SELECT id, name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+----
+1	Updated
+
+statement ok
+ROLLBACK;
+
+# Verify the UPDATE was rolled back
+query T
+SELECT name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+----
+Initial
+
+# =============================================================================
+# Test 5: DELETE with WHERE clause works in transaction
+# =============================================================================
+
+# First add more data
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (3, 'To Delete');
+
+statement ok
+BEGIN;
+
+# DELETE requires scanning to find matching rows (for rowid)
+statement ok
+DELETE FROM txtest.dbo.tx_scan_test WHERE id = 3;
+
+# Catalog scan should see the uncommitted DELETE
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+----
+1
+
+statement ok
+ROLLBACK;
+
+# Verify the DELETE was rolled back
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+----
+2
+
+# =============================================================================
+# Test 6: Multiple DML operations with interleaved scans
+# =============================================================================
+
+statement ok
+BEGIN;
+
+# INSERT
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (4, 'Fourth');
+
+# Scan sees 3 rows
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+----
+3
+
+# UPDATE
+statement ok
+UPDATE txtest.dbo.tx_scan_test SET name = 'Modified' WHERE id = 1;
+
+# Scan sees the update
+query T
+SELECT name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+----
+Modified
+
+# DELETE
+statement ok
+DELETE FROM txtest.dbo.tx_scan_test WHERE id = 3;
+
+# Scan sees 2 rows now
+query I
+SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+----
+2
+
+statement ok
+COMMIT;
+
+# Verify all changes persisted
+query IT
+SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+----
+1	Modified
+4	Fourth
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_scan_test;
+
+statement ok
+DETACH txtest;

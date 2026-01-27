@@ -3,9 +3,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -97,8 +99,12 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 	// Print first 2000 chars of SQL for debugging
 	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.2000s%s", sql.c_str(), sql.size() > 2000 ? "..." : "");
 
-	auto &pool = GetConnectionPool();
-	auto connection = pool.Acquire();
+	// Get catalog for ConnectionProvider
+	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+
+	// Use ConnectionProvider to get connection (handles transaction pinning)
+	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
 	if (!connection) {
 		INSERT_DEBUG(1, "ExecuteBatch: failed to acquire connection");
 		throw IOException("Failed to acquire connection for INSERT execution");
@@ -114,7 +120,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			INSERT_DEBUG(1, "ExecuteBatch: socket is null");
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw IOException("Connection socket is null");
 		}
 
@@ -134,7 +140,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
 		}
 
@@ -156,7 +162,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 				INSERT_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				pool.Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				throw IOException("INSERT execution timeout");
 			}
 
@@ -174,7 +180,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 				bool still_connected = socket->IsConnected();
 				INSERT_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s', connected=%d", socket_error.c_str(),
 							 still_connected);
-				pool.Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				throw IOException("Failed to receive TDS packet: %s", socket_error);
 			}
 
@@ -246,18 +252,18 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			error.sql_error_number = error_number;
 			error.sql_error_message = error_message;
 
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
 		}
 
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
 	} catch (const std::exception &e) {
-		pool.Release(std::move(connection));
+		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 		throw IOException("INSERT execution failed: %s", e.what());
 	}
 
-	pool.Release(std::move(connection));
+	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 
 	// Record timing
 	auto end_time = std::chrono::steady_clock::now();
@@ -269,8 +275,12 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &sql,
 																  const vector<idx_t> &returning_column_ids) {
-	auto &pool = GetConnectionPool();
-	auto connection = pool.Acquire();
+	// Get catalog for ConnectionProvider
+	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+
+	// Use ConnectionProvider to get connection (handles transaction pinning)
+	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
 	if (!connection) {
 		throw IOException("Failed to acquire connection for INSERT execution");
 	}
@@ -282,7 +292,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 		// Get socket for packet-based reading
 		auto *socket = connection->GetSocket();
 		if (!socket) {
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw IOException("Connection socket is null");
 		}
 
@@ -298,7 +308,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
 		}
 
@@ -315,7 +325,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 			error.sql_error_number = parser.GetErrorNumber();
 			error.sql_error_message = parser.GetErrorMessage();
 
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
 		}
 
@@ -328,11 +338,11 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
 	} catch (const std::exception &e) {
-		pool.Release(std::move(connection));
+		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 		throw IOException("INSERT with RETURNING execution failed: %s", e.what());
 	}
 
-	pool.Release(std::move(connection));
+	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 	return result_chunk;
 }
 

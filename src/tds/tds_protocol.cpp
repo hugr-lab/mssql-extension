@@ -535,7 +535,7 @@ TdsPacket TdsProtocol::BuildPing() {
 	return BuildSqlBatch("SELECT 1");
 }
 
-TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql) {
+TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql, const uint8_t *transaction_descriptor) {
 	TdsPacket packet(PacketType::SQL_BATCH);
 
 	// SQL_BATCH for TDS 7.1+ requires ALL_HEADERS prefix (MS-TDS 2.2.6.6)
@@ -549,7 +549,7 @@ TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql) {
 	// Transaction Descriptor Header (MS-TDS 2.2.6.5.1):
 	//   HeaderLength (4 bytes, DWORD) = 18 (4 + 2 + 8 + 4)
 	//   HeaderType (2 bytes, USHORT) = 0x0002
-	//   TransactionDescriptor (8 bytes) = 0 for no transaction
+	//   TransactionDescriptor (8 bytes) = from parameter or 0 for no transaction
 	//   OutstandingRequestCount (4 bytes, DWORD) = 1
 
 	// Transaction Descriptor Header: 18 bytes
@@ -571,9 +571,15 @@ TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql) {
 	packet.AppendByte(0x02);
 	packet.AppendByte(0x00);
 
-	// Transaction Descriptor = 0 (no active transaction)
-	for (int i = 0; i < 8; i++) {
-		packet.AppendByte(0x00);
+	// Transaction Descriptor (8 bytes) - use provided descriptor or zeros
+	if (transaction_descriptor) {
+		for (int i = 0; i < 8; i++) {
+			packet.AppendByte(transaction_descriptor[i]);
+		}
+	} else {
+		for (int i = 0; i < 8; i++) {
+			packet.AppendByte(0x00);
+		}
 	}
 
 	// Outstanding Request Count = 1
@@ -589,7 +595,8 @@ TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql) {
 	return packet;
 }
 
-std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &sql, size_t max_packet_size) {
+std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &sql, size_t max_packet_size,
+															 const uint8_t *transaction_descriptor) {
 	std::vector<TdsPacket> packets;
 
 	// Encode SQL to UTF-16LE
@@ -624,9 +631,15 @@ std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &
 	all_headers.push_back(0x02);
 	all_headers.push_back(0x00);
 
-	// TransactionDescriptor = 0 (8 bytes)
-	for (int i = 0; i < 8; i++) {
-		all_headers.push_back(0x00);
+	// TransactionDescriptor (8 bytes) - use provided descriptor or zeros
+	if (transaction_descriptor) {
+		for (int i = 0; i < 8; i++) {
+			all_headers.push_back(transaction_descriptor[i]);
+		}
+	} else {
+		for (int i = 0; i < 8; i++) {
+			all_headers.push_back(0x00);
+		}
 	}
 
 	// OutstandingRequestCount = 1 (4 bytes, little-endian)

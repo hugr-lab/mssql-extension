@@ -96,6 +96,21 @@ public:
 		return tls_enabled_;
 	}
 
+	// Transaction descriptor management (for SQL_BATCH ALL_HEADERS)
+	// Set the transaction descriptor (8 bytes) from ENVCHANGE BEGIN_TRANS response
+	void SetTransactionDescriptor(const uint8_t *descriptor);
+
+	// Get the current transaction descriptor (returns pointer to 8 bytes, or nullptr if not set)
+	const uint8_t *GetTransactionDescriptor() const;
+
+	// Clear the transaction descriptor (e.g., after COMMIT/ROLLBACK)
+	void ClearTransactionDescriptor();
+
+	// Check if a transaction descriptor is currently set
+	bool HasTransactionDescriptor() const {
+		return has_transaction_descriptor_;
+	}
+
 	// Timestamps for pool management
 	std::chrono::steady_clock::time_point GetCreatedAt() const {
 		return created_at_;
@@ -140,6 +155,11 @@ private:
 
 	// Negotiated packet size from server (from ENVCHANGE during login)
 	uint32_t negotiated_packet_size_;
+
+	// Transaction descriptor (8 bytes) for SQL_BATCH ALL_HEADERS
+	// Set via SetTransactionDescriptor() after BEGIN TRANSACTION response
+	uint8_t transaction_descriptor_[8] = {0};
+	bool has_transaction_descriptor_ = false;
 
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);

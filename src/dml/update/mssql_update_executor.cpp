@@ -2,10 +2,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_transaction.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "dml/update/mssql_update_statement.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_token_parser.hpp"
@@ -40,6 +45,21 @@ MSSQLUpdateExecutor::MSSQLUpdateExecutor(ClientContext &context, const MSSQLUpda
 	effective_batch_size_ = config_.EffectiveBatchSize(target_.GetParamsPerRow());
 	UPDATE_DEBUG(1, "UpdateExecutor: effective_batch_size=%llu (params_per_row=%llu)",
 				 (unsigned long long)effective_batch_size_, (unsigned long long)target_.GetParamsPerRow());
+
+	// Check if we need to defer execution until Finalize
+	// This is required when in an explicit transaction because:
+	// 1. The scan uses the pinned connection to stream rowids
+	// 2. UPDATE batches would need the same pinned connection
+	// 3. But the connection is in "Executing" state while streaming
+	// Solution: Buffer all data during Sink, execute in Finalize after scan completes
+	if (!context.transaction.IsAutoCommit()) {
+		auto &catalog = Catalog::GetCatalog(context, target_.catalog_name);
+		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
+			defer_execution_ = true;
+			UPDATE_DEBUG(1, "UpdateExecutor: defer_execution=true (in transaction)");
+		}
+	}
 }
 
 MSSQLUpdateExecutor::~MSSQLUpdateExecutor() = default;
@@ -71,7 +91,8 @@ idx_t MSSQLUpdateExecutor::Execute(DataChunk &chunk) {
 		AccumulateRow(chunk, row_idx);
 
 		// Check if we need to flush the batch
-		if (pending_pk_values_.size() >= effective_batch_size_) {
+		// In defer_execution_ mode, we accumulate everything and flush in Finalize
+		if (!defer_execution_ && pending_pk_values_.size() >= effective_batch_size_) {
 			UPDATE_DEBUG(1, "Execute: batch full at row %llu, flushing...", (unsigned long long)row_idx);
 			auto result = FlushBatch();
 			if (!result.success) {
@@ -87,8 +108,8 @@ idx_t MSSQLUpdateExecutor::Execute(DataChunk &chunk) {
 }
 
 MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
-	UPDATE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
-				 (unsigned long long)pending_pk_values_.size());
+	UPDATE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu, defer_execution=%d", finalized_,
+				 (unsigned long long)pending_pk_values_.size(), defer_execution_);
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_updated_, batch_count_);
@@ -96,9 +117,10 @@ MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 
 	finalized_ = true;
 
-	// Flush any remaining rows
-	if (!pending_pk_values_.empty()) {
-		UPDATE_DEBUG(1, "Finalize: flushing %llu pending rows", (unsigned long long)pending_pk_values_.size());
+	// Flush all remaining rows in batches
+	// In defer_execution_ mode, we may have accumulated many batches worth of rows
+	while (!pending_pk_values_.empty()) {
+		UPDATE_DEBUG(1, "Finalize: flushing batch, pending=%llu", (unsigned long long)pending_pk_values_.size());
 		auto result = FlushBatch();
 		if (!result.success) {
 			return result;
@@ -142,16 +164,30 @@ MSSQLDMLResult MSSQLUpdateExecutor::FlushBatch() {
 	}
 
 	batch_count_++;
-	UPDATE_DEBUG(1, "FlushBatch: batch %llu with %llu rows", (unsigned long long)batch_count_,
-				 (unsigned long long)pending_pk_values_.size());
+
+	// Extract up to effective_batch_size_ rows for this batch
+	idx_t rows_to_process = std::min<idx_t>(pending_pk_values_.size(), effective_batch_size_);
+
+	vector<vector<Value>> batch_pk_values;
+	vector<vector<Value>> batch_update_values;
+	batch_pk_values.reserve(rows_to_process);
+	batch_update_values.reserve(rows_to_process);
+
+	for (idx_t i = 0; i < rows_to_process; i++) {
+		batch_pk_values.push_back(std::move(pending_pk_values_[i]));
+		batch_update_values.push_back(std::move(pending_update_values_[i]));
+	}
+
+	// Remove processed rows from pending
+	pending_pk_values_.erase(pending_pk_values_.begin(), pending_pk_values_.begin() + rows_to_process);
+	pending_update_values_.erase(pending_update_values_.begin(), pending_update_values_.begin() + rows_to_process);
+
+	UPDATE_DEBUG(1, "FlushBatch: batch %llu with %llu rows (remaining=%llu)", (unsigned long long)batch_count_,
+				 (unsigned long long)rows_to_process, (unsigned long long)pending_pk_values_.size());
 
 	// Build the UPDATE statement
 	MSSQLUpdateStatement stmt(target_);
-	auto batch = stmt.Build(pending_pk_values_, pending_update_values_, batch_count_);
-
-	// Clear pending data
-	pending_pk_values_.clear();
-	pending_update_values_.clear();
+	auto batch = stmt.Build(batch_pk_values, batch_update_values, batch_count_);
 
 	if (!batch.IsValid()) {
 		return MSSQLDMLResult::Failure("Failed to build UPDATE batch", 0, batch_count_);
@@ -173,8 +209,12 @@ MSSQLDMLResult MSSQLUpdateExecutor::FlushBatch() {
 idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 	UPDATE_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", sql.size());
 
-	auto &pool = GetConnectionPool();
-	auto connection = pool.Acquire();
+	// Get the MSSQLCatalog for ConnectionProvider
+	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+
+	// Acquire connection via ConnectionProvider (handles transaction pinning)
+	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
 	if (!connection) {
 		UPDATE_DEBUG(1, "ExecuteBatch: failed to acquire connection");
 		throw IOException("Failed to acquire connection for UPDATE execution");
@@ -189,7 +229,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			UPDATE_DEBUG(1, "ExecuteBatch: socket is null");
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw IOException("Connection socket is null");
 		}
 
@@ -199,9 +239,10 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		// Send the SQL batch
 		UPDATE_DEBUG(1, "ExecuteBatch: sending SQL batch...");
 		if (!connection->ExecuteBatch(sql)) {
-			UPDATE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", connection->GetLastError().c_str());
-			pool.Release(std::move(connection));
-			throw IOException("UPDATE execution failed: %s", connection->GetLastError());
+			string error = connection->GetLastError();
+			UPDATE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			throw IOException("UPDATE execution failed: %s", error);
 		}
 
 		UPDATE_DEBUG(1, "ExecuteBatch: SQL sent successfully, waiting for response...");
@@ -222,7 +263,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 				UPDATE_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				pool.Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				throw IOException("UPDATE execution timeout");
 			}
 
@@ -234,7 +275,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 			if (!socket->ReceivePacket(packet, recv_timeout)) {
 				string socket_error = socket->GetLastError();
 				UPDATE_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s'", socket_error.c_str());
-				pool.Release(std::move(connection));
+				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 				throw IOException("Failed to receive TDS packet: %s", socket_error);
 			}
 
@@ -297,18 +338,18 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 		// Check for errors
 		if (!error_message.empty()) {
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw IOException("UPDATE failed: %s", error_message);
 		}
 
 	} catch (const IOException &) {
 		throw;	// Re-throw IO exceptions
 	} catch (const std::exception &e) {
-		pool.Release(std::move(connection));
+		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 		throw IOException("UPDATE execution failed: %s", e.what());
 	}
 
-	pool.Release(std::move(connection));
+	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 	return rows_affected;
 }
 

@@ -1,0 +1,143 @@
+# name: test/sql/transaction/transaction_mssql_scan.test
+# description: Test mssql_scan within transactions (read-your-writes)
+# group: [mssql]
+# Spec: 001-mssql-transactions, User Story 3 - Read-Your-Writes via mssql_scan
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Setup: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
+
+# Setup: Create test table
+statement ok
+DROP TABLE IF EXISTS txtest.dbo.tx_scan_test;
+
+statement ok
+CREATE TABLE txtest.dbo.tx_scan_test (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100),
+    value DECIMAL(10, 2)
+);
+
+# Insert initial data (outside transaction)
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name, value) VALUES (1, 'Initial', 100.00);
+
+# =============================================================================
+# Test 1: Read-your-writes with INSERT using mssql_scan
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name, value) VALUES (2, 'In Transaction', 200.00);
+
+# Use mssql_scan to see uncommitted data - should see both rows
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+2
+
+# Verify the specific inserted row is visible via mssql_scan
+query IT
+SELECT id, name FROM mssql_scan('txtest', 'SELECT id, name FROM dbo.tx_scan_test WHERE id = 2');
+----
+2	In Transaction
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# Test 2: Read-your-writes with UPDATE using mssql_scan
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE txtest.dbo.tx_scan_test SET name = 'Updated Name' WHERE id = 1;
+
+# Verify the update is visible via mssql_scan
+query IT
+SELECT id, name FROM mssql_scan('txtest', 'SELECT id, name FROM dbo.tx_scan_test WHERE id = 1');
+----
+1	Updated Name
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# Test 3: Rollback verification via mssql_scan
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name, value) VALUES (3, 'Will Rollback', 300.00);
+
+# Verify the insert is visible during transaction
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+3
+
+statement ok
+ROLLBACK;
+
+# After rollback, mssql_scan should only see 2 rows (outside any transaction)
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+2
+
+# =============================================================================
+# Test 4: Multiple mssql_scan calls in same transaction
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name, value) VALUES (4, 'Row Four', 400.00);
+
+# First mssql_scan
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+3
+
+statement ok
+INSERT INTO txtest.dbo.tx_scan_test (id, name, value) VALUES (5, 'Row Five', 500.00);
+
+# Second mssql_scan should see both new rows
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+4
+
+statement ok
+COMMIT;
+
+# Final state verification
+query I
+SELECT COUNT(*) FROM mssql_scan('txtest', 'SELECT * FROM dbo.tx_scan_test');
+----
+4
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE txtest.dbo.tx_scan_test;
+
+statement ok
+DETACH txtest;

@@ -2,7 +2,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -34,9 +37,10 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
-									 const string &context_name)
+									 const string &context_name, ClientContext *client_context)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
+	  client_context_(client_context),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
@@ -56,10 +60,25 @@ MSSQLResultStream::~MSSQLResultStream() {
 			connection_->Close();
 		}
 
-		// Release connection back to pool
-		auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
-		if (pool) {
-			pool->Release(std::move(connection_));
+		// Use ConnectionProvider if we have a client context (transaction-aware)
+		if (client_context_) {
+			try {
+				auto &catalog = Catalog::GetCatalog(*client_context_, context_name_);
+				auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+				ConnectionProvider::ReleaseConnection(*client_context_, mssql_catalog, std::move(connection_));
+			} catch (...) {
+				// Fall back to direct pool release on error
+				auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
+				if (pool) {
+					pool->Release(std::move(connection_));
+				}
+			}
+		} else {
+			// Fall back to direct pool release (legacy code path)
+			auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
+			if (pool) {
+				pool->Release(std::move(connection_));
+			}
 		}
 	}
 }
@@ -336,17 +355,22 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 }
 
 bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
+	MSSQL_DEBUG_LOG(1, "ReadMoreData: starting, timeout=%d", timeout_ms);
 	// Read TDS packet from connection (packet includes 8-byte header)
 	// We use the socket's ReceivePacket method to properly parse the header
 	auto *socket = connection_->GetSocket();
 	if (!socket) {
+		MSSQL_DEBUG_LOG(1, "ReadMoreData: socket is null!");
 		return false;
 	}
+	MSSQL_DEBUG_LOG(1, "ReadMoreData: socket=%p, connected=%d", (void *)socket, socket->IsConnected());
 
 	tds::TdsPacket packet;
 	if (!socket->ReceivePacket(packet, timeout_ms)) {
+		MSSQL_DEBUG_LOG(1, "ReadMoreData: ReceivePacket failed, error=%s", socket->GetLastError().c_str());
 		return false;
 	}
+	MSSQL_DEBUG_LOG(1, "ReadMoreData: received packet, payload_size=%zu", packet.GetPayload().size());
 
 	// Feed only the payload to the parser (not the header)
 	const auto &payload = packet.GetPayload();

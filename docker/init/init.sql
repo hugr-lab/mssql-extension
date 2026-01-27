@@ -679,10 +679,9 @@ PRINT 'Views created';
 GO
 
 -- =============================================================================
--- Also create tables in master.dbo for existing tests compatibility
+-- Create dbo.test table in TestDB for catalog_discovery tests
 -- =============================================================================
-USE master;
-GO
+-- Note: All test tables are in TestDB. Set MSSQL_TEST_DB=TestDB in .env
 
 IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE dbo.test;
 GO
@@ -697,7 +696,7 @@ INSERT INTO dbo.test (id, name) VALUES
 (1, 'A'), (2, 'B'), (3, 'C');
 GO
 
-PRINT 'master.dbo.test table created';
+PRINT 'dbo.test table created in TestDB';
 GO
 
 -- =============================================================================

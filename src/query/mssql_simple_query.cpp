@@ -106,11 +106,12 @@ SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, cons
 		},
 		timeout_ms);
 
-	// Copy error info and column names
+	// Copy error info, column names, and rows_affected
 	result.success = collect_result.success;
 	result.error_message = collect_result.error_message;
 	result.error_number = collect_result.error_number;
 	result.column_names = collect_result.column_names;
+	result.rows_affected = collect_result.rows_affected;
 
 	return result;
 }
@@ -240,6 +241,12 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 
 			case tds::ParsedTokenType::Done: {
 				const tds::DoneToken &done_token = parser.GetDone();
+				// Capture rows_affected from DONE token (for DML operations)
+				if (done_token.HasRowCount()) {
+					result.rows_affected = static_cast<int64_t>(done_token.row_count);
+					SIMPLE_QUERY_DEBUG(2, "ExecuteWithCallback: DONE token rows_affected=%lld",
+									   (long long)result.rows_affected);
+				}
 				if (done_token.IsFinal()) {
 					done = true;
 					// Transition connection back to Idle

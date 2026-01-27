@@ -4,6 +4,7 @@
 #include "catalog/mssql_primary_key.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/exception.hpp"
