@@ -245,7 +245,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 				if (done_token.HasRowCount()) {
 					result.rows_affected = static_cast<int64_t>(done_token.row_count);
 					SIMPLE_QUERY_DEBUG(2, "ExecuteWithCallback: DONE token rows_affected=%lld",
-					                   (long long)result.rows_affected);
+									   (long long)result.rows_affected);
 				}
 				if (done_token.IsFinal()) {
 					done = true;

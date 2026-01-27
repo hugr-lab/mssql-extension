@@ -22,11 +22,11 @@ static int GetConnProviderDebugLevel() {
 	return level;
 }
 
-#define MSSQL_CONN_LOG(fmt, ...)                                             \
-	do {                                                                     \
-		if (GetConnProviderDebugLevel() >= 1) {                              \
-			fprintf(stderr, "[MSSQL_CONN_PROV] " fmt "\n", ##__VA_ARGS__);   \
-		}                                                                    \
+#define MSSQL_CONN_LOG(fmt, ...)                                           \
+	do {                                                                   \
+		if (GetConnProviderDebugLevel() >= 1) {                            \
+			fprintf(stderr, "[MSSQL_CONN_PROV] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                  \
 	} while (0)
 
 namespace duckdb {
@@ -95,45 +95,43 @@ bool ConnectionProvider::IsSqlServerTransactionActive(ClientContext &context, MS
 //===----------------------------------------------------------------------===//
 
 std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientContext &context, MSSQLCatalog &catalog,
-                                                                      int timeout_ms) {
+																	  int timeout_ms) {
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
 
 	// Check if we're in autocommit mode (implicit transaction per statement)
 	// In autocommit mode, each statement is independent - no need to pin a connection
 	bool is_autocommit = context.transaction.IsAutoCommit();
 
-	MSSQL_CONN_LOG("GetConnection: context=%p, txn=%p, is_autocommit=%d",
-	               (void *)&context, (void *)txn, is_autocommit);
+	MSSQL_CONN_LOG("GetConnection: context=%p, txn=%p, is_autocommit=%d", (void *)&context, (void *)txn, is_autocommit);
 
 	if (!txn || is_autocommit) {
 		// Not in a transaction OR in autocommit mode - acquire from pool
-		MSSQL_CONN_LOG("GetConnection: Autocommit mode (txn=%p, is_autocommit=%d), acquiring from pool",
-		               (void *)txn, is_autocommit);
+		MSSQL_CONN_LOG("GetConnection: Autocommit mode (txn=%p, is_autocommit=%d), acquiring from pool", (void *)txn,
+					   is_autocommit);
 		auto &pool = catalog.GetConnectionPool();
 		auto stats_before = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
-		               stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
+					   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 		auto conn = pool.Acquire(timeout_ms);
 		if (!conn) {
 			throw IOException("MSSQL: Failed to acquire connection from pool (timeout)");
 		}
 		auto stats_after = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool connection acquired, tds_conn=%p, spid=%d, has_txn_desc=%d",
-		               (void *)conn.get(), conn->GetSpid(), conn->HasTransactionDescriptor());
+					   (void *)conn.get(), conn->GetSpid(), conn->HasTransactionDescriptor());
 		MSSQL_CONN_LOG("GetConnection: Pool after acquire - total=%zu, active=%zu, idle=%zu",
-		               stats_after.total_connections, stats_after.active_connections, stats_after.idle_connections);
+					   stats_after.total_connections, stats_after.active_connections, stats_after.idle_connections);
 		return conn;
 	}
 
 	// In an explicit DuckDB transaction (BEGIN was issued) - use pinned connection
-	MSSQL_CONN_LOG("GetConnection: Explicit transaction mode (context=%p, txn=%p)",
-	               (void *)&context, (void *)txn);
+	MSSQL_CONN_LOG("GetConnection: Explicit transaction mode (context=%p, txn=%p)", (void *)&context, (void *)txn);
 
 	// Check if we already have a pinned connection
 	auto pinned = txn->GetPinnedConnection();
 	if (pinned) {
-		MSSQL_CONN_LOG("GetConnection: Returning existing pinned tds_conn=%p, spid=%d",
-		               (void *)pinned.get(), pinned->GetSpid());
+		MSSQL_CONN_LOG("GetConnection: Returning existing pinned tds_conn=%p, spid=%d", (void *)pinned.get(),
+					   pinned->GetSpid());
 		return pinned;
 	}
 
@@ -144,13 +142,12 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	auto &pool = catalog.GetConnectionPool();
 	auto stats_before = pool.GetStats();
 	MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
-	               stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
+				   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 	auto conn = pool.Acquire(timeout_ms);
 	if (!conn) {
 		throw IOException("MSSQL: Failed to acquire connection from pool for transaction (timeout)");
 	}
-	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning",
-	               (void *)conn.get(), conn->GetSpid());
+	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning", (void *)conn.get(), conn->GetSpid());
 
 	// Pin the connection to this transaction
 	txn->SetPinnedConnection(conn);
@@ -192,15 +189,18 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		uint8_t token_type = response[offset++];
 
 		if (token_type == 0xE3) {  // ENVCHANGE
-			if (offset + 2 > response.size()) break;
+			if (offset + 2 > response.size())
+				break;
 			uint16_t token_len = response[offset] | (response[offset + 1] << 8);
 			offset += 2;
 
-			if (offset >= response.size()) break;
+			if (offset >= response.size())
+				break;
 			uint8_t env_type = response[offset++];
 
-			if (env_type == 0x08) {  // BEGIN_TRANS
-				if (offset >= response.size()) break;
+			if (env_type == 0x08) {	 // BEGIN_TRANS
+				if (offset >= response.size())
+					break;
 				uint8_t new_len = response[offset++];
 				if (new_len == 8 && offset + 8 <= response.size()) {
 					// Store transaction descriptor in both transaction and connection
@@ -241,7 +241,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 //===----------------------------------------------------------------------===//
 
 void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog &catalog,
-                                           std::shared_ptr<tds::TdsConnection> conn) {
+										   std::shared_ptr<tds::TdsConnection> conn) {
 	if (!conn) {
 		return;
 	}
