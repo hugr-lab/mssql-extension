@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 #ifdef _WIN32
 // NOMINMAX must be defined before including winsock2.h (which includes windows.h)
@@ -24,6 +25,19 @@ typedef int socklen_t;
 #define SOCK_OPT_CONST_CAST(x) reinterpret_cast<const char *>(x)
 #define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
+
+// One-time Winsock initialization (required before any socket API call on Windows)
+static std::once_flag winsock_init_flag;
+static bool winsock_initialized = false;
+
+static void InitializeWinsock() {
+	WSADATA wsaData;
+	int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (result == 0) {
+		winsock_initialized = true;
+		atexit([]() { WSACleanup(); });
+	}
+}
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -104,6 +118,14 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 	host_ = host;
 	port_ = port;
 	last_error_.clear();
+
+#ifdef _WIN32
+	std::call_once(winsock_init_flag, InitializeWinsock);
+	if (!winsock_initialized) {
+		last_error_ = "Failed to initialize Windows socket library (WSAStartup failed)";
+		return false;
+	}
+#endif
 
 	// Resolve hostname
 	struct addrinfo hints, *result, *rp;
