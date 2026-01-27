@@ -5,11 +5,11 @@
   "dependencies": [
     "openssl"
   ],
-  "builtin-baseline": "a0b74c122a9e955e0a2f5404ddcad04659cd85e7",
+  "builtin-baseline": "2ad004460f5db4d3b66f62f5799ff66c265c4b5d",
   "overrides": [
     {
       "name": "openssl",
-      "version": "3.5.4"
+      "version": "3.5.0"
     }
   ]
 }
