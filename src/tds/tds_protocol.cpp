@@ -596,7 +596,7 @@ TdsPacket TdsProtocol::BuildSqlBatch(const std::string &sql, const uint8_t *tran
 }
 
 std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &sql, size_t max_packet_size,
-                                                             const uint8_t *transaction_descriptor) {
+															 const uint8_t *transaction_descriptor) {
 	std::vector<TdsPacket> packets;
 
 	// Encode SQL to UTF-16LE

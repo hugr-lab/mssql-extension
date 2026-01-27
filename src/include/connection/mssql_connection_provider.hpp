@@ -47,7 +47,7 @@ public:
 	//! @return Shared pointer to a TDS connection
 	//! @throws Exception if connection cannot be acquired
 	static std::shared_ptr<tds::TdsConnection> GetConnection(ClientContext &context, MSSQLCatalog &catalog,
-	                                                         int timeout_ms = -1);
+															 int timeout_ms = -1);
 
 	//! Release a connection back to the pool (no-op if in transaction)
 	//! If in a DuckDB transaction, this is a no-op - connection stays pinned
@@ -56,7 +56,7 @@ public:
 	//! @param catalog The MSSQL catalog (for pool access)
 	//! @param conn The connection to release
 	static void ReleaseConnection(ClientContext &context, MSSQLCatalog &catalog,
-	                              std::shared_ptr<tds::TdsConnection> conn);
+								  std::shared_ptr<tds::TdsConnection> conn);
 
 	//! Check if the context is in an active DuckDB transaction with MSSQL
 	//! @param context The DuckDB client context

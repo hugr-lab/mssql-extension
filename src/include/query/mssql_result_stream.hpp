@@ -30,7 +30,7 @@ public:
 	// context_name is needed for returning connection to pool
 	// client_context is needed for transaction-aware connection release
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
-	                  ClientContext *client_context = nullptr);
+					  ClientContext *client_context = nullptr);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
