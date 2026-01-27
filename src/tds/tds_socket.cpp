@@ -164,7 +164,11 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 			break;
 		}
 
+#ifdef _WIN32
+		if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
 		if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+#endif
 			// Wait for connection with timeout
 			if (WaitForReady(true, timeout_seconds * 1000)) {
 				// Check if connection succeeded
