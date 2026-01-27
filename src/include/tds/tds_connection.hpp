@@ -106,6 +106,11 @@ public:
 	// Clear the transaction descriptor (e.g., after COMMIT/ROLLBACK)
 	void ClearTransactionDescriptor();
 
+	// Check if a transaction descriptor is currently set
+	bool HasTransactionDescriptor() const {
+		return has_transaction_descriptor_;
+	}
+
 	// Timestamps for pool management
 	std::chrono::steady_clock::time_point GetCreatedAt() const {
 		return created_at_;

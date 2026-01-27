@@ -193,6 +193,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 }
 
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(), database.c_str());
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
 	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, "DuckDB MSSQL Extension",
@@ -224,6 +225,7 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	spid_ = login_response.spid;
 	// Use server-negotiated packet size from ENVCHANGE, or keep default if not received
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: authentication successful, spid=%d, packet_size=%d", spid_, negotiated_packet_size_);
 	return true;
 }
 
@@ -384,12 +386,16 @@ void TdsConnection::ClearTransactionDescriptor() {
 }
 
 bool TdsConnection::ExecuteBatch(const std::string &sql) {
+	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: starting, state=%d, socket_connected=%d",
+	                     static_cast<int>(state_.load()), socket_ ? socket_->IsConnected() : -1);
+
 	// Can only execute from Idle state
 	ConnectionState expected = ConnectionState::Idle;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
 		last_error_ =
 			"Cannot execute: connection not in Idle state (current: " + std::string(ConnectionStateToString(expected)) +
 			")";
+		MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: FAILED - wrong state: %d", static_cast<int>(expected));
 		return false;
 	}
 

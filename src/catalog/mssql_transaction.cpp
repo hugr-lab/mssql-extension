@@ -7,12 +7,25 @@
 #include "tds/tds_socket.hpp"
 #include <cstring>
 
-#ifdef MSSQL_DEBUG
-#include <iostream>
-#define MSSQL_TXN_LOG(msg) std::cerr << "[MSSQL_TXN] " << msg << std::endl
-#else
-#define MSSQL_TXN_LOG(msg)
-#endif
+#include <cstdio>
+#include <cstdlib>
+
+// Debug logging controlled by MSSQL_DEBUG environment variable
+static int GetTxnDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_TXN_LOG(fmt, ...)                                         \
+	do {                                                                \
+		if (GetTxnDebugLevel() >= 1) {                                  \
+			fprintf(stderr, "[MSSQL_TXN] " fmt "\n", ##__VA_ARGS__);    \
+		}                                                               \
+	} while (0)
 
 namespace {
 
@@ -119,7 +132,7 @@ void MSSQLTransaction::SetPinnedConnection(std::shared_ptr<tds::TdsConnection> c
 void MSSQLTransaction::SetSqlServerTransactionActive(bool active) {
 	lock_guard<mutex> lock(connection_mutex_);
 	sql_server_transaction_active_ = active;
-	MSSQL_TXN_LOG("SQL Server transaction active: " << (active ? "true" : "false"));
+	MSSQL_TXN_LOG("SQL Server transaction active: %s", active ? "true" : "false");
 }
 
 const uint8_t *MSSQLTransaction::GetTransactionDescriptor() const {
@@ -135,13 +148,11 @@ void MSSQLTransaction::SetTransactionDescriptor(const uint8_t *descriptor) {
 	if (descriptor) {
 		std::memcpy(transaction_descriptor_, descriptor, 8);
 		has_transaction_descriptor_ = true;
-		MSSQL_TXN_LOG("Transaction descriptor set: "
-		              << std::hex
-		              << (int)transaction_descriptor_[0] << " " << (int)transaction_descriptor_[1] << " "
-		              << (int)transaction_descriptor_[2] << " " << (int)transaction_descriptor_[3] << " "
-		              << (int)transaction_descriptor_[4] << " " << (int)transaction_descriptor_[5] << " "
-		              << (int)transaction_descriptor_[6] << " " << (int)transaction_descriptor_[7]
-		              << std::dec);
+		MSSQL_TXN_LOG("Transaction descriptor set: %02x %02x %02x %02x %02x %02x %02x %02x",
+		              transaction_descriptor_[0], transaction_descriptor_[1],
+		              transaction_descriptor_[2], transaction_descriptor_[3],
+		              transaction_descriptor_[4], transaction_descriptor_[5],
+		              transaction_descriptor_[6], transaction_descriptor_[7]);
 	} else {
 		std::memset(transaction_descriptor_, 0, 8);
 		has_transaction_descriptor_ = false;
@@ -166,8 +177,12 @@ MSSQLTransactionManager::~MSSQLTransactionManager() = default;
 Transaction &MSSQLTransactionManager::StartTransaction(ClientContext &context) {
 	lock_guard<mutex> lock(transaction_lock_);
 
+	MSSQL_TXN_LOG("StartTransaction: context=%p, is_autocommit=%d",
+	              (void *)&context, context.transaction.IsAutoCommit());
+
 	auto transaction = make_uniq<MSSQLTransaction>(*this, context, catalog_);
 	auto &result = *transaction;
+	MSSQL_TXN_LOG("StartTransaction: created MSSQLTransaction=%p", (void *)&result);
 	transactions_[context] = std::move(transaction);
 	return result;
 }
@@ -176,6 +191,10 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 	lock_guard<mutex> lock(transaction_lock_);
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
+
+	MSSQL_TXN_LOG("CommitTransaction: context=%p, txn=%p, has_pinned=%d, sql_txn_active=%d",
+	              (void *)&context, (void *)&mssql_txn,
+	              mssql_txn.HasPinnedConnection(), mssql_txn.IsSqlServerTransactionActive());
 
 	// Check if we have a pinned connection with an active SQL Server transaction
 	auto pinned_conn = mssql_txn.GetPinnedConnection();
@@ -186,7 +205,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		if (!ExecuteAndDrain(*pinned_conn, "COMMIT TRANSACTION")) {
 			// Commit failed - keep connection pinned and return error
 			// The user will need to rollback or retry
-			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: " << pinned_conn->GetLastError());
+			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: %s", pinned_conn->GetLastError().c_str());
 			string error_msg = "MSSQL: Failed to commit transaction: " + pinned_conn->GetLastError();
 			transactions_.erase(context);
 			return ErrorData(ExceptionType::IO, error_msg);
@@ -223,6 +242,10 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
+	MSSQL_TXN_LOG("RollbackTransaction: txn=%p, has_pinned=%d, sql_txn_active=%d",
+	              (void *)&mssql_txn,
+	              mssql_txn.HasPinnedConnection(), mssql_txn.IsSqlServerTransactionActive());
+
 	// Check if we have a pinned connection with an active SQL Server transaction
 	auto pinned_conn = mssql_txn.GetPinnedConnection();
 
@@ -232,7 +255,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		// Execute ROLLBACK TRANSACTION
 		if (!ExecuteAndDrain(*pinned_conn, "ROLLBACK TRANSACTION")) {
 			// Rollback failed - log error but continue cleanup
-			MSSQL_TXN_LOG("WARNING: RollbackTransaction: ROLLBACK TRANSACTION failed: " << pinned_conn->GetLastError());
+			MSSQL_TXN_LOG("WARNING: RollbackTransaction: ROLLBACK TRANSACTION failed: %s", pinned_conn->GetLastError().c_str());
 		}
 
 		// Verify clean state
