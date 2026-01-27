@@ -12,6 +12,24 @@
 #include "duckdb/transaction/transaction_manager.hpp"
 #include "tds/tds_connection.hpp"
 
+#include <cstdlib>
+
+// Debug logging (same pattern as tds_socket.cpp)
+static int GetMssqlStorageDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_STORAGE_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                                \
+		if (GetMssqlStorageDebugLevel() >= lvl)                         \
+			fprintf(stderr, "[MSSQL STORAGE] " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
+
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
@@ -454,26 +472,39 @@ static string TranslateConnectionError(const string &error, const string &host, 
 }
 
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
+							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
+							info.use_encrypt ? "yes" : "no", timeout_seconds);
+
 	// Create a temporary connection to test credentials
 	tds::TdsConnection conn;
 
 	// Attempt TCP connection
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
-		throw IOException("MSSQL connection validation failed: %s",
-						  TranslateConnectionError(error, info.host, info.port, info.user, info.database));
+		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s",
+								error.c_str(), translated.c_str());
+		throw IOException("MSSQL connection validation failed: %s", translated);
 	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection succeeded");
 
 	// Attempt authentication
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
 		string error = conn.GetLastError();
+		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s",
+								error.c_str(), translated.c_str());
 		conn.Close();
-		throw InvalidInputException("MSSQL connection validation failed: %s",
-									TranslateConnectionError(error, info.host, info.port, info.user, info.database));
+		throw InvalidInputException("MSSQL connection validation failed: %s", translated);
 	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication succeeded");
 
 	// Close the test connection - it will be recreated by the pool
 	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: validation complete, test connection closed");
 }
 
 //===----------------------------------------------------------------------===//
