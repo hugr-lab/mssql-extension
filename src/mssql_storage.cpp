@@ -25,8 +25,8 @@ static int GetMssqlStorageDebugLevel() {
 }
 
 #define MSSQL_STORAGE_DEBUG_LOG(lvl, fmt, ...)                           \
-	do {                                                                \
-		if (GetMssqlStorageDebugLevel() >= lvl)                         \
+	do {                                                                 \
+		if (GetMssqlStorageDebugLevel() >= lvl)                          \
 			fprintf(stderr, "[MSSQL STORAGE] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
@@ -484,8 +484,8 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s",
-								error.c_str(), translated.c_str());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s", error.c_str(),
+								translated.c_str());
 		throw IOException("MSSQL connection validation failed: %s", translated);
 	}
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection succeeded");
@@ -495,8 +495,8 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s",
-								error.c_str(), translated.c_str());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
+								translated.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", translated);
 	}

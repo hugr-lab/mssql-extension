@@ -158,7 +158,8 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 
 		fd_ = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if (fd_ == -1) {
-			MSSQL_SOCKET_DEBUG_LOG(2, "Connect: socket() failed for address %d (error=%d)", addr_index, SOCKET_ERROR_CODE);
+			MSSQL_SOCKET_DEBUG_LOG(2, "Connect: socket() failed for address %d (error=%d)", addr_index,
+								   SOCKET_ERROR_CODE);
 			addr_index++;
 			continue;
 		}
@@ -201,13 +202,15 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 					break;
 				}
 				last_error_ = "Connection failed: " + std::string(strerror(error));
-				MSSQL_SOCKET_DEBUG_LOG(1, "Connect: getsockopt SO_ERROR=%d for address %d: %s", error, addr_index, last_error_.c_str());
+				MSSQL_SOCKET_DEBUG_LOG(1, "Connect: getsockopt SO_ERROR=%d for address %d: %s", error, addr_index,
+									   last_error_.c_str());
 			} else {
 				last_error_ = "Connection timed out";
 				MSSQL_SOCKET_DEBUG_LOG(1, "Connect: timed out on address %d", addr_index);
 			}
 		} else {
-			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with unexpected error %d", addr_index, connect_error);
+			MSSQL_SOCKET_DEBUG_LOG(1, "Connect: connect failed on address %d with unexpected error %d", addr_index,
+								   connect_error);
 		}
 
 		CLOSE_SOCKET(fd_);
