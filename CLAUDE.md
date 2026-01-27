@@ -41,6 +41,12 @@ docs/                   # Architecture documentation (see docs/architecture.md)
 docker/                 # SQL Server container and Linux CI build
 ```
 
+## Versioning
+
+- The extension version is defined in `CMakeLists.txt` as `MSSQL_EXTENSION_VERSION` (e.g., `set(MSSQL_EXTENSION_VERSION "0.1.10")`)
+- This is passed to C++ code via the `MSSQL_VERSION` compile definition and returned by `mssql_version()`
+- **When releasing a new version**: update `MSSQL_EXTENSION_VERSION` in `CMakeLists.txt` and `version` in `vcpkg.json`
+
 ## Commands
 
 ```bash

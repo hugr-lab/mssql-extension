@@ -14,8 +14,8 @@ namespace duckdb {
 
 // Extension version string
 static const char *GetMssqlExtensionVersion() {
-#ifdef EXT_VERSION_MSSQL
-	return EXT_VERSION_MSSQL;
+#ifdef MSSQL_VERSION
+	return MSSQL_VERSION;
 #else
 	return "unknown";
 #endif

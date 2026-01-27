@@ -82,11 +82,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.3
+      - name: Fetch DuckDB v1.4.4
         id: duckdb
         run: |
           chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
 
       - name: Log build metadata
@@ -94,7 +94,7 @@ jobs:
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Version: v1.4.4"
           echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
           echo "Platform: ${{ matrix.platform.id }}"
           echo "Runner: ${{ matrix.platform.runner }}"
@@ -167,14 +167,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
+          name: mssql-extension-v1.4.4-${{ matrix.platform.id }}
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
+          name: duckdb-cli-v1.4.4-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
@@ -207,13 +207,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-${{ matrix.platform.id }}
+          name: mssql-extension-v1.4.4-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-${{ matrix.platform.id }}
+          name: duckdb-cli-v1.4.4-${{ matrix.platform.id }}
           path: cli
 
       - name: Setup executables
@@ -264,13 +264,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-linux_amd64
+          name: mssql-extension-v1.4.4-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-linux_amd64
+          name: duckdb-cli-v1.4.4-linux_amd64
           path: cli
 
       - name: Setup executables
@@ -301,12 +301,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.3
+      - name: Fetch DuckDB v1.4.4
         id: duckdb
         shell: bash
         run: |
           chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
 
       - name: Log build metadata
@@ -315,7 +315,7 @@ jobs:
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Version: v1.4.4"
           echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
           echo "Platform: windows_amd64 (MSVC)"
           echo "vcpkg Triplet: x64-windows-static-release"
@@ -361,14 +361,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-windows_amd64_msvc
+          name: mssql-extension-v1.4.4-windows_amd64_msvc
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-windows_amd64_msvc
+          name: duckdb-cli-v1.4.4-windows_amd64_msvc
           path: build/release/duckdb.exe
           if-no-files-found: error
 
@@ -388,12 +388,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.3
+      - name: Fetch DuckDB v1.4.4
         id: duckdb
         shell: bash
         run: |
           chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.3)
+          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
 
       - name: Log build metadata
@@ -402,7 +402,7 @@ jobs:
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.3"
+          echo "DuckDB Version: v1.4.4"
           echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
           echo "Platform: windows_amd64 (MinGW)"
           echo "vcpkg Triplet: x64-mingw-static"
@@ -459,14 +459,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-windows_amd64_mingw
+          name: mssql-extension-v1.4.4-windows_amd64_mingw
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-windows_amd64_mingw
+          name: duckdb-cli-v1.4.4-windows_amd64_mingw
           path: build/release/duckdb.exe
           if-no-files-found: error
 
@@ -494,13 +494,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.3-${{ matrix.config.artifact_suffix }}
+          name: mssql-extension-v1.4.4-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.3-${{ matrix.config.artifact_suffix }}
+          name: duckdb-cli-v1.4.4-${{ matrix.config.artifact_suffix }}
           path: cli
 
       - name: Run load-only smoke test

@@ -5,6 +5,9 @@ set(TARGET_NAME mssql)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
+# Extension version - update this when creating a new release tag
+set(MSSQL_EXTENSION_VERSION "0.1.10")
+
 # Project configuration
 project(${TARGET_NAME})
 
@@ -149,26 +152,26 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # =============================================================================
 # Static Extension Configuration
 # =============================================================================
-# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
-# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+# Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
+target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
 message(STATUS "Static extension configured with full TLS support (OpenSSL)")
 
 # =============================================================================
 # Loadable Extension Configuration
 # =============================================================================
-# Note: EXT_VERSION_MSSQL is automatically defined by DuckDB's build system
-# via duckdb_extension_generate_version() - do not define it again here.
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+# Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
 # Symbol export control - hide all symbols except extension entry point
 if(APPLE)
