@@ -37,8 +37,9 @@ class LogicalUpdate;
 class MSSQLCatalog : public Catalog {
 public:
 	// Constructor
+	// @param catalog_enabled When false, catalog integration is disabled (raw query mode only via mssql_scan/mssql_exec)
 	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
-				 AccessMode access_mode);
+				 AccessMode access_mode, bool catalog_enabled = true);
 
 	~MSSQLCatalog() override;
 
@@ -132,6 +133,10 @@ public:
 	// Get access mode
 	AccessMode GetAccessMode() const;
 
+	// Check if catalog integration is enabled
+	// When false, only mssql_scan() and mssql_exec() can be used
+	bool IsCatalogEnabled() const;
+
 	//===----------------------------------------------------------------------===//
 	// DDL Execution
 	//===----------------------------------------------------------------------===//
@@ -173,6 +178,7 @@ private:
 	string context_name_;												  // Attached context name
 	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
 	AccessMode access_mode_;											  // READ_ONLY enforced
+	bool catalog_enabled_;												  // Catalog integration enabled
 	shared_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider

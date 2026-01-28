@@ -29,8 +29,9 @@ struct MSSQLConnectionInfo {
 	string database;
 	string user;
 	string password;
-	bool use_encrypt = false;  // Enable TLS encryption
+	bool use_encrypt = true;  // Enable TLS encryption (default: true for security)
 	bool connected = false;
+	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
 	// Create from secret
 	static shared_ptr<MSSQLConnectionInfo> FromSecret(ClientContext &context, const string &secret_name);

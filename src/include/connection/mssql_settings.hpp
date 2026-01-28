@@ -15,6 +15,7 @@ struct MSSQLPoolConfig {
 	int idle_timeout = tds::DEFAULT_IDLE_TIMEOUT;
 	size_t min_connections = tds::DEFAULT_MIN_CONNECTIONS;
 	int acquire_timeout = tds::DEFAULT_ACQUIRE_TIMEOUT;
+	int query_timeout = tds::DEFAULT_QUERY_TIMEOUT;  // Query execution timeout in seconds (0 = infinite)
 };
 
 //===----------------------------------------------------------------------===//
@@ -47,6 +48,9 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context);
 
 // Load catalog cache TTL setting (0 = manual refresh only)
 int64_t LoadCatalogCacheTTL(ClientContext &context);
+
+// Load query timeout setting (0 = no timeout)
+int LoadQueryTimeout(ClientContext &context);
 
 // Load statistics configuration from context settings
 MSSQLStatisticsConfig LoadStatisticsConfig(ClientContext &context);

@@ -1,5 +1,6 @@
 #include "query/mssql_result_stream.hpp"
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <iostream>
 #include "catalog/mssql_catalog.hpp"
@@ -37,14 +38,24 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
-									 const string &context_name, ClientContext *client_context)
+									 const string &context_name, ClientContext *client_context,
+									 int query_timeout_seconds)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
 	  client_context_(client_context),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
-	  rows_read_(0) {}
+	  rows_read_(0) {
+	// Convert timeout from seconds to milliseconds
+	// 0 = no timeout (use INT_MAX for effectively infinite wait)
+	// Otherwise, multiply by 1000 to convert to milliseconds
+	if (query_timeout_seconds <= 0) {
+		read_timeout_ms_ = INT_MAX;  // Effectively infinite timeout
+	} else {
+		read_timeout_ms_ = query_timeout_seconds * 1000;
+	}
+}
 
 MSSQLResultStream::~MSSQLResultStream() {
 	// If we're still in streaming state, try to cancel
@@ -96,6 +107,9 @@ bool MSSQLResultStream::Initialize() {
 	// Read and parse until we get COLMETADATA
 	while (state_ == MSSQLResultStreamState::Initializing) {
 		if (!ReadMoreData(read_timeout_ms_)) {
+			if (IsTimeoutError()) {
+				throw IOException(GetTimeoutErrorMessage());
+			}
 			throw IOException("Connection closed while waiting for COLMETADATA");
 		}
 
@@ -278,6 +292,9 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 						// Return what we have
 						goto exit_loop;
 					}
+					if (IsTimeoutError()) {
+						throw IOException(GetTimeoutErrorMessage());
+					}
 					throw IOException("Connection closed unexpectedly");
 				}
 			}
@@ -379,13 +396,15 @@ bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
 	auto *socket = connection_->GetSocket();
 	if (!socket) {
 		MSSQL_DEBUG_LOG(1, "ReadMoreData: socket is null!");
+		last_socket_error_ = "Socket is null";
 		return false;
 	}
 	MSSQL_DEBUG_LOG(1, "ReadMoreData: socket=%p, connected=%d", (void *)socket, socket->IsConnected());
 
 	tds::TdsPacket packet;
 	if (!socket->ReceivePacket(packet, timeout_ms)) {
-		MSSQL_DEBUG_LOG(1, "ReadMoreData: ReceivePacket failed, error=%s", socket->GetLastError().c_str());
+		last_socket_error_ = socket->GetLastError();
+		MSSQL_DEBUG_LOG(1, "ReadMoreData: ReceivePacket failed, error=%s", last_socket_error_.c_str());
 		return false;
 	}
 	MSSQL_DEBUG_LOG(1, "ReadMoreData: received packet, payload_size=%zu", packet.GetPayload().size());

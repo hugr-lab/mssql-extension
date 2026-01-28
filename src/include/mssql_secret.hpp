@@ -19,7 +19,8 @@ constexpr const char *MSSQL_SECRET_PORT = "port";
 constexpr const char *MSSQL_SECRET_DATABASE = "database";
 constexpr const char *MSSQL_SECRET_USER = "user";
 constexpr const char *MSSQL_SECRET_PASSWORD = "password";
-constexpr const char *MSSQL_SECRET_USE_ENCRYPT = "use_encrypt";	 // Optional, defaults to false
+constexpr const char *MSSQL_SECRET_USE_ENCRYPT = "use_encrypt";	 // Optional, defaults to true
+constexpr const char *MSSQL_SECRET_CATALOG = "catalog";			 // Optional, defaults to true
 
 // Register MSSQL secret type and creation function
 void RegisterMSSQLSecretType(ExtensionLoader &loader);

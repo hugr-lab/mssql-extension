@@ -41,11 +41,13 @@ static const char *DATABASE_COLLATION_SQL =
 //===----------------------------------------------------------------------===//
 
 MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
-						   shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode)
+						   shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode,
+						   bool catalog_enabled)
 	: Catalog(db),
 	  context_name_(context_name),
 	  connection_info_(std::move(connection_info)),
 	  access_mode_(access_mode),
+	  catalog_enabled_(catalog_enabled),
 	  default_schema_("dbo") {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
 	int64_t cache_ttl = 0;	// Default: manual refresh only
@@ -73,6 +75,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		connection_pool_ = shared_ptr<tds::ConnectionPool>(existing_pool, [](tds::ConnectionPool *) {});
 	}
 	// Note: Pool should be created during ATTACH; if missing, queries will fail later
+
+	// Skip metadata initialization when catalog integration is disabled
+	// (mssql_scan/mssql_exec will still work via raw queries)
+	if (!catalog_enabled_) {
+		return;
+	}
 
 	// Query database collation (needed for column metadata)
 	if (connection_pool_) {
@@ -553,6 +561,10 @@ AccessMode MSSQLCatalog::GetAccessMode() const {
 	return access_mode_;
 }
 
+bool MSSQLCatalog::IsCatalogEnabled() const {
+	return catalog_enabled_;
+}
+
 void MSSQLCatalog::CheckWriteAccess(const char *operation_name) const {
 	if (IsReadOnly()) {
 		if (operation_name) {
@@ -607,6 +619,15 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 }
 
 void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
+	// Check if catalog integration is disabled
+	if (!catalog_enabled_) {
+		throw CatalogException(
+			"MSSQL catalog '%s' is attached with catalog=false (catalog disabled). "
+			"Schema discovery and direct table access are not available. "
+			"Use mssql_scan('%s', 'SELECT ...') or mssql_exec('%s', 'SQL') for raw queries.",
+			context_name_, context_name_, context_name_);
+	}
+
 	if (!connection_pool_) {
 		throw IOException("MSSQL connection pool not initialized - cannot refresh cache");
 	}

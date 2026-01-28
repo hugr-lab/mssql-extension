@@ -214,6 +214,9 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	names.emplace_back("acquire_timeout_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
+	names.emplace_back("pinned_connections");
+	return_types.emplace_back(LogicalType::BIGINT);
+
 	return std::move(bind_data);
 }
 
@@ -251,6 +254,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 	while (gstate.current_index < gstate.pool_names.size() && count < max_count) {
 		const auto &pool_name = gstate.pool_names[gstate.current_index];
 		auto stats = MssqlPoolManager::Instance().GetPoolStats(pool_name);
+		auto pinned_count = MssqlPoolManager::Instance().GetPinnedCount(pool_name);
 
 		output.data[0].SetValue(count, Value(pool_name));  // db
 		output.data[1].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.total_connections)));
@@ -260,6 +264,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 		output.data[5].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_closed)));
 		output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
 		output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
+		output.data[8].SetValue(count, Value::BIGINT(static_cast<int64_t>(pinned_count)));
 
 		count++;
 		gstate.current_index++;
