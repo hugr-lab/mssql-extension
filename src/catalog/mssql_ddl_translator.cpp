@@ -1,4 +1,6 @@
 #include "catalog/mssql_ddl_translator.hpp"
+#include "dml/ctas/mssql_ctas_config.hpp"
+#include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -339,6 +341,181 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 	result += MapTypeToSQLServer(current_type);
 	result += set_not_null ? " NOT NULL" : " NULL";
 	result += ";";
+	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// CTAS-Specific Type Mapping
+//===----------------------------------------------------------------------===//
+
+string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const mssql::CTASConfig &config) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return "BIT";
+
+	case LogicalTypeId::TINYINT:
+		return "TINYINT";
+
+	case LogicalTypeId::SMALLINT:
+		return "SMALLINT";
+
+	case LogicalTypeId::INTEGER:
+		return "INT";
+
+	case LogicalTypeId::BIGINT:
+		return "BIGINT";
+
+	case LogicalTypeId::UTINYINT:
+		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
+		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
+
+	case LogicalTypeId::USMALLINT:
+		return "INT";  // Wider to fit full range
+
+	case LogicalTypeId::UINTEGER:
+		return "BIGINT";  // Wider to fit full range
+
+	case LogicalTypeId::UBIGINT:
+		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
+
+	case LogicalTypeId::FLOAT:
+		return "REAL";	// 32-bit float
+
+	case LogicalTypeId::DOUBLE:
+		return "FLOAT";	 // 64-bit float in SQL Server
+
+	case LogicalTypeId::DECIMAL: {
+		// Get precision and scale, clamp to SQL Server limits (FR-017)
+		uint8_t width, scale;
+		type.GetDecimalProperties(width, scale);
+		// SQL Server: precision 1-38, scale 0-precision
+		uint8_t precision = width > 38 ? 38 : width;
+		if (scale > precision) {
+			scale = precision;
+		}
+		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
+	}
+
+	case LogicalTypeId::VARCHAR: {
+		// CTAS-specific: respect text_type setting (FR-013)
+		if (config.text_type == mssql::CTASTextType::VARCHAR) {
+			return "VARCHAR(MAX)";
+		}
+		return "NVARCHAR(MAX)";	 // Default to NVARCHAR for Unicode safety
+	}
+
+	case LogicalTypeId::BLOB:
+		return "VARBINARY(MAX)";
+
+	case LogicalTypeId::DATE:
+		return "DATE";
+
+	case LogicalTypeId::TIME:
+		return "TIME(7)";  // Maximum precision
+
+	case LogicalTypeId::TIMESTAMP:
+		return "DATETIME2(7)";	// Maximum precision (100 nanoseconds)
+
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return "DATETIMEOFFSET(7)";	 // With timezone
+
+	case LogicalTypeId::UUID:
+		return "UNIQUEIDENTIFIER";
+
+	// Unsupported types - CTAS must fail with clear error (FR-012)
+	case LogicalTypeId::HUGEINT:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type HUGEINT. "
+			"Consider casting to DECIMAL(38,0) in your SELECT query.");
+
+	case LogicalTypeId::UHUGEINT:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type UHUGEINT. "
+			"Consider casting to DECIMAL(38,0) in your SELECT query.");
+
+	case LogicalTypeId::INTERVAL:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type INTERVAL. "
+			"SQL Server has no equivalent. Consider casting to VARCHAR.");
+
+	case LogicalTypeId::LIST:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type LIST. "
+			"SQL Server has no array type. Consider flattening or serializing to JSON.");
+
+	case LogicalTypeId::STRUCT:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type STRUCT. "
+			"SQL Server has no struct type. Consider flattening or serializing to JSON.");
+
+	case LogicalTypeId::MAP:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type MAP. "
+			"SQL Server has no map type. Consider serializing to JSON.");
+
+	case LogicalTypeId::UNION:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type UNION. "
+			"SQL Server has no union type. Consider normalizing the data.");
+
+	case LogicalTypeId::ENUM:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type ENUM. "
+			"Consider casting to VARCHAR or INTEGER.");
+
+	case LogicalTypeId::BIT:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type BIT. "
+			"Consider using BOOLEAN or BLOB.");
+
+	case LogicalTypeId::ARRAY:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type ARRAY. "
+			"SQL Server has no array type. Consider flattening or serializing to JSON.");
+
+	default:
+		throw NotImplementedException(
+			"CTAS does not support DuckDB type '%s'. "
+			"No SQL Server equivalent exists.",
+			type.ToString());
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// CTAS CREATE TABLE Generation
+//===----------------------------------------------------------------------===//
+
+string MSSQLDDLTranslator::TranslateCreateTableFromSchema(const string &schema_name, const string &table_name,
+														  const vector<mssql::CTASColumnDef> &columns) {
+	if (columns.empty()) {
+		throw InvalidInputException("CREATE TABLE requires at least one column");
+	}
+
+	string result = "CREATE TABLE ";
+	result += QuoteIdentifier(schema_name);
+	result += ".";
+	result += QuoteIdentifier(table_name);
+	result += " (";
+
+	bool first = true;
+	for (const auto &column : columns) {
+		if (!first) {
+			result += ", ";
+		}
+		first = false;
+
+		// Column name (bracket-escaped per FR-010)
+		result += QuoteIdentifier(column.name);
+		result += " ";
+
+		// Column type (already resolved to SQL Server type)
+		result += column.mssql_type;
+
+		// Nullability (FR-011)
+		result += column.nullable ? " NULL" : " NOT NULL";
+	}
+
+	result += ");";
 	return result;
 }
 

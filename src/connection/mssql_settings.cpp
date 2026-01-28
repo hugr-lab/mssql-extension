@@ -1,7 +1,9 @@
 #include "connection/mssql_settings.hpp"
+#include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/mssql_dml_config.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
@@ -135,6 +137,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_dml_use_prepared", "Use prepared statements for UPDATE/DELETE operations",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_DML_USE_PREPARED), nullptr,
 							  SetScope::GLOBAL);
+
+	//===----------------------------------------------------------------------===//
+	// CTAS (CREATE TABLE AS SELECT) Settings
+	//===----------------------------------------------------------------------===//
+
+	// mssql_ctas_drop_on_failure - Drop table if CTAS insert phase fails
+	config.AddExtensionOption("mssql_ctas_drop_on_failure",
+							  "Drop table if CTAS insert phase fails (default: false, table remains for debugging)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+
+	// mssql_ctas_text_type - Text column type for CTAS: NVARCHAR or VARCHAR
+	config.AddExtensionOption("mssql_ctas_text_type",
+							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
+							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
 }
 
 //===----------------------------------------------------------------------===//
@@ -254,5 +270,57 @@ MSSQLInsertConfig LoadInsertConfig(ClientContext &context) {
 
 	return config;
 }
+
+//===----------------------------------------------------------------------===//
+// CTAS Configuration Loading
+//===----------------------------------------------------------------------===//
+
+namespace mssql {
+
+CTASTextType CTASConfig::ParseTextType(const string &text_type_str) {
+	auto upper = StringUtil::Upper(text_type_str);
+	if (upper == "NVARCHAR") {
+		return CTASTextType::NVARCHAR;
+	} else if (upper == "VARCHAR") {
+		return CTASTextType::VARCHAR;
+	}
+	throw InvalidInputException("Invalid mssql_ctas_text_type: '%s'. Must be 'NVARCHAR' or 'VARCHAR'", text_type_str);
+}
+
+CTASConfig CTASConfig::Load(ClientContext &context) {
+	return LoadCTASConfig(context);
+}
+
+CTASConfig LoadCTASConfig(ClientContext &context) {
+	CTASConfig config;
+	Value val;
+
+	// Load drop_on_failure setting
+	if (context.TryGetCurrentSetting("mssql_ctas_drop_on_failure", val)) {
+		config.drop_on_failure = val.GetValue<bool>();
+	}
+
+	// Load text_type setting
+	if (context.TryGetCurrentSetting("mssql_ctas_text_type", val)) {
+		config.text_type = CTASConfig::ParseTextType(val.ToString());
+	}
+
+	// Inherit INSERT settings for batch insert phase
+	if (context.TryGetCurrentSetting("mssql_insert_batch_size", val)) {
+		config.batch_size = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_max_rows_per_statement", val)) {
+		config.max_rows_per_statement = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_max_sql_bytes", val)) {
+		config.max_sql_bytes = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	return config;
+}
+
+}  // namespace mssql
 
 }  // namespace duckdb

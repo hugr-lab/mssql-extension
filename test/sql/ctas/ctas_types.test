@@ -1,0 +1,219 @@
+# name: test/sql/ctas/ctas_types.test
+# description: Test CTAS type mapping from DuckDB to SQL Server
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_types (TYPE mssql);
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_int_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_float_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_text_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_datetime_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_other_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_varchar_policy;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_decimal_precision;
+
+# =============================================================================
+# Integer Types
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_int_types AS
+SELECT
+    1::TINYINT AS col_tinyint,
+    127::TINYINT AS col_tinyint_max,
+    1000::SMALLINT AS col_smallint,
+    100000::INTEGER AS col_int,
+    9223372036854775807::BIGINT AS col_bigint,
+    200::UTINYINT AS col_utinyint,
+    60000::USMALLINT AS col_usmallint,
+    3000000000::UINTEGER AS col_uint,
+    18000000000000000000::UBIGINT AS col_ubigint;
+
+query IIIIIIIII
+SELECT * FROM mssql_ctas_types.dbo.ctas_int_types;
+----
+1	127	1000	100000	9223372036854775807	200	60000	3000000000	18000000000000000000
+
+# =============================================================================
+# Floating Point Types
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_float_types AS
+SELECT
+    3.14::FLOAT AS col_float,
+    2.718281828::DOUBLE AS col_double,
+    123.45::DECIMAL(10,2) AS col_decimal,
+    9999999999.999999::DECIMAL(18,6) AS col_decimal_large;
+
+query RRRR
+SELECT * FROM mssql_ctas_types.dbo.ctas_float_types;
+----
+3.14	2.718281828	123.45	9999999999.999999
+
+# =============================================================================
+# Text Types (default NVARCHAR policy)
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_text_types AS
+SELECT
+    'hello world' AS col_varchar,
+    N'Привіт світ' AS col_unicode;
+
+query TT
+SELECT * FROM mssql_ctas_types.dbo.ctas_text_types;
+----
+hello world	Привіт світ
+
+# =============================================================================
+# Date/Time Types
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_datetime_types AS
+SELECT
+    DATE '2024-01-15' AS col_date,
+    TIME '10:30:45' AS col_time,
+    TIMESTAMP '2024-01-15 10:30:45' AS col_timestamp,
+    TIMESTAMPTZ '2024-01-15 10:30:45+00' AS col_timestamptz;
+
+query TTTT
+SELECT * FROM mssql_ctas_types.dbo.ctas_datetime_types;
+----
+2024-01-15	10:30:45	2024-01-15 10:30:45	2024-01-15 10:30:45+00
+
+# =============================================================================
+# Other Types
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_other_types AS
+SELECT
+    true AS col_bool,
+    false AS col_bool_false,
+    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS col_uuid,
+    '\x48454C4C4F'::BLOB AS col_blob;
+
+query IITT
+SELECT * FROM mssql_ctas_types.dbo.ctas_other_types;
+----
+1	0	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	H454C4C4F
+
+# =============================================================================
+# Text Type Policy: VARCHAR
+# =============================================================================
+
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR';
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_varchar_policy AS
+SELECT 'varchar test' AS col_text;
+
+query T
+SELECT * FROM mssql_ctas_types.dbo.ctas_varchar_policy;
+----
+varchar test
+
+statement ok
+RESET mssql_ctas_text_type;
+
+# =============================================================================
+# DECIMAL Precision Clamping (SQL Server max is 38)
+# =============================================================================
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_decimal_precision AS
+SELECT
+    12345678901234567890.12345::DECIMAL(38,5) AS col_decimal_max;
+
+query R
+SELECT * FROM mssql_ctas_types.dbo.ctas_decimal_precision;
+----
+12345678901234567890.12345
+
+# =============================================================================
+# Unsupported Types - Should Error
+# =============================================================================
+
+# HUGEINT is unsupported
+statement error
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 170141183460469231731687303715884105727::HUGEINT AS val;
+----
+HUGEINT
+
+# INTERVAL is unsupported
+statement error
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT INTERVAL '1 day' AS val;
+----
+INTERVAL
+
+# LIST is unsupported
+statement error
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT [1, 2, 3] AS val;
+----
+LIST
+
+# STRUCT is unsupported
+statement error
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT {'a': 1, 'b': 2} AS val;
+----
+STRUCT
+
+# MAP is unsupported
+statement error
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT MAP {'key': 'value'} AS val;
+----
+MAP
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_int_types;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_float_types;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_text_types;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_datetime_types;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_other_types;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_varchar_policy;
+
+statement ok
+DROP TABLE mssql_ctas_types.dbo.ctas_decimal_precision;
+
+statement ok
+DETACH mssql_ctas_types;

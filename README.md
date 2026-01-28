@@ -13,6 +13,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Connection pooling with configurable limits and automatic session reset
 - TLS/SSL encrypted connections
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE
+- CREATE TABLE AS SELECT (CTAS) with streaming and type mapping
 - Transaction support: BEGIN/COMMIT/ROLLBACK with connection pinning
 - Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
@@ -377,6 +378,89 @@ FROM mssql_scan('sqlserver', '
 ```
 
 **Constraint**: Only one statement in the batch may produce a result set. Batches with multiple SELECTs will return a clear error message.
+
+## CREATE TABLE AS SELECT (CTAS)
+
+Create SQL Server tables directly from DuckDB query results.
+
+### Basic CTAS
+
+```sql
+-- Create table from DuckDB query
+CREATE TABLE sqlserver.dbo.summary AS
+SELECT region, COUNT(*) AS order_count, SUM(amount) AS total
+FROM sqlserver.dbo.orders
+GROUP BY region;
+
+-- Create from local DuckDB table
+CREATE TABLE sqlserver.dbo.imported_data AS
+SELECT * FROM read_csv('data.csv');
+
+-- Create from generate_series
+CREATE TABLE sqlserver.dbo.sequence AS
+SELECT i AS id, 'item_' || i::VARCHAR AS name
+FROM generate_series(1, 1000) t(i);
+```
+
+### CREATE OR REPLACE
+
+Replace an existing table with new data:
+
+```sql
+-- Overwrites existing table (non-atomic: DROP then CREATE)
+CREATE OR REPLACE TABLE sqlserver.dbo.daily_report AS
+SELECT * FROM sqlserver.dbo.transactions WHERE date = CURRENT_DATE;
+```
+
+### Type Mapping
+
+DuckDB types are automatically mapped to SQL Server types:
+
+| DuckDB Type | SQL Server Type |
+|-------------|-----------------|
+| `BOOLEAN` | `BIT` |
+| `TINYINT` | `TINYINT` |
+| `SMALLINT` | `SMALLINT` |
+| `INTEGER` | `INT` |
+| `BIGINT` | `BIGINT` |
+| `FLOAT` | `REAL` |
+| `DOUBLE` | `FLOAT` |
+| `DECIMAL(p,s)` | `DECIMAL(p,s)` (max 38) |
+| `VARCHAR` | `NVARCHAR(MAX)` |
+| `BLOB` | `VARBINARY(MAX)` |
+| `DATE` | `DATE` |
+| `TIME` | `TIME(7)` |
+| `TIMESTAMP` | `DATETIME2(7)` |
+| `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET(7)` |
+| `UUID` | `UNIQUEIDENTIFIER` |
+
+**Unsupported types** (will error with clear message):
+- `HUGEINT`, `UHUGEINT` - Consider casting to `DECIMAL(38,0)`
+- `INTERVAL` - No SQL Server equivalent
+- `LIST`, `STRUCT`, `MAP`, `ARRAY` - No SQL Server equivalent
+
+### CTAS Settings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | Text column type: `NVARCHAR` or `VARCHAR` |
+| `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if INSERT phase fails |
+
+```sql
+-- Use VARCHAR instead of NVARCHAR for text columns
+SET mssql_ctas_text_type = 'VARCHAR';
+
+-- Auto-cleanup on failure (for production pipelines)
+SET mssql_ctas_drop_on_failure = true;
+```
+
+### CTAS Behavior
+
+- **Two-phase execution**: CREATE TABLE DDL, then batched INSERT statements
+- **Streaming**: Large result sets are streamed without full buffering
+- **Non-atomic**: DDL commits immediately; INSERT respects transactions
+- **Schema validation**: Target schema must exist before CTAS
+- **Batching**: Uses `mssql_insert_batch_size` setting for INSERT batches
 
 ## Data Modification (INSERT)
 
@@ -1027,7 +1111,7 @@ The following features are planned for future releases:
 | **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | ✅ Implemented |
 | **Transactions** | BEGIN/COMMIT/ROLLBACK with connection pinning | ✅ Implemented |
 | **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
-| **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
+| **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | ✅ Implemented |
 | **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
 | **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | Planned |
 
@@ -1041,7 +1125,7 @@ The following features are planned for future releases:
 
 **Multi-Statement Batches**: `mssql_scan()` supports batches where intermediate statements (DML/DDL) don't return result sets. Only one result-producing statement per batch is allowed. Session state (temp tables, variables) is reset via TDS RESET_CONNECTION flag when connections return to the pool.
 
-**CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` implemented as DDL creation followed by bulk INSERT (no RETURNING).
+**CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` with two-phase execution: CREATE TABLE DDL followed by batched INSERT. Supports CREATE OR REPLACE, configurable text type (NVARCHAR/VARCHAR), and streaming for large result sets. Type mapping from DuckDB to SQL Server with clear errors for unsupported types.
 
 **MERGE/UPSERT**: Batched upsert using SQL Server `MERGE` statement. Supports primary key or user-specified key columns.
 

@@ -9,6 +9,12 @@
 
 namespace duckdb {
 
+// Forward declaration for CTAS config
+namespace mssql {
+struct CTASConfig;
+struct CTASColumnDef;
+}  // namespace mssql
+
 //===----------------------------------------------------------------------===//
 // DDLOperation - Identifies the type of DDL operation for error messages
 //===----------------------------------------------------------------------===//
@@ -153,12 +159,36 @@ public:
 	//! @return SQL Server type string
 	static string MapTypeToSQLServer(const LogicalType &type);
 
-private:
-	//! Build column definition string for CREATE TABLE or ADD COLUMN
-	static string BuildColumnDefinition(const ColumnDefinition &column);
+	//===----------------------------------------------------------------------===//
+	// CTAS-Specific Methods
+	//===----------------------------------------------------------------------===//
+
+	//! Map DuckDB LogicalType to SQL Server type for CTAS
+	//! Respects CTASConfig.text_type for VARCHAR mapping
+	//! @param type DuckDB type
+	//! @param config CTAS configuration
+	//! @return SQL Server type string
+	//! @throws NotImplementedException for unsupported types (LIST, STRUCT, MAP, etc.)
+	static string MapLogicalTypeToCTAS(const LogicalType &type, const mssql::CTASConfig &config);
+
+	//! Generate CREATE TABLE SQL from CTAS column definitions
+	//! @param schema_name Target schema
+	//! @param table_name Target table name
+	//! @param columns CTAS column definitions with mssql_type already resolved
+	//! @return T-SQL CREATE TABLE statement
+	static string TranslateCreateTableFromSchema(const string &schema_name, const string &table_name,
+												 const vector<mssql::CTASColumnDef> &columns);
+
+	//===----------------------------------------------------------------------===//
+	// String Utilities
+	//===----------------------------------------------------------------------===//
 
 	//! Escape a string for use in N'...' literals (doubles single quotes)
 	static string EscapeStringLiteral(const string &value);
+
+private:
+	//! Build column definition string for CREATE TABLE or ADD COLUMN
+	static string BuildColumnDefinition(const ColumnDefinition &column);
 };
 
 }  // namespace duckdb

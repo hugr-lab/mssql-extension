@@ -662,19 +662,7 @@ This is a known issue with TINYINT type mapping. SQL Server TINYINT (0-255) maps
 SELECT CAST(col_tinyint AS INTEGER) FROM table;
 ```
 
-#### 4. "Virtual columns require projection pushdown"
-
-Don't use `COUNT(*)` on MSSQL tables. Instead, count a specific column:
-
-```sql
--- Won't work
-SELECT COUNT(*) FROM testdb.dbo.table;
-
--- Works
-SELECT COUNT(id) FROM testdb.dbo.table;
-```
-
-#### 5. Tests not being discovered
+#### 4. Tests not being discovered
 
 Ensure:
 - Test file has `.test` extension
@@ -682,7 +670,7 @@ Ensure:
 - Test file is in `test/sql/` directory tree
 - Run `cmake` to regenerate test registration
 
-#### 6. Environment variable not found
+#### 5. Environment variable not found
 
 ```bash
 # Check if variable is exported
@@ -692,7 +680,7 @@ echo $MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1"
 ```
 
-#### 7. UPDATE/DELETE fails with "Table has no primary key"
+#### 6. UPDATE/DELETE fails with "Table has no primary key"
 
 UPDATE and DELETE operations require tables to have a PRIMARY KEY. The extension uses PK columns to generate a synthetic `rowid` for targeting specific rows:
 
@@ -704,7 +692,7 @@ UPDATE testdb.dbo.table_without_pk SET col = 'value' WHERE id = 1;
 SELECT mssql_exec('testdb', 'UPDATE dbo.table_without_pk SET col = ''value'' WHERE id = 1');
 ```
 
-#### 8. INSERT values going to wrong columns
+#### 7. INSERT values going to wrong columns
 
 This can happen if INSERT column order doesn't match table column order. The extension should preserve INSERT statement column order, but verify:
 
@@ -716,7 +704,7 @@ INSERT INTO testdb.dbo.table (col_b, col_a) VALUES ('b_val', 'a_val');
 SELECT col_a, col_b FROM testdb.dbo.table WHERE ...;
 ```
 
-#### 9. DML changes not visible after mssql_exec
+#### 8. DML changes not visible after mssql_exec
 
 After using `mssql_exec()` for DDL operations (CREATE TABLE, ALTER TABLE, etc.), refresh the catalog cache:
 
@@ -731,7 +719,7 @@ SELECT mssql_refresh_cache('testdb');
 INSERT INTO testdb.dbo.new_table (id) VALUES (1);
 ```
 
-#### 10. RETURNING clause not working for UPDATE/DELETE
+#### 9. RETURNING clause not working for UPDATE/DELETE
 
 RETURNING is only supported for INSERT operations (implemented via SQL Server's `OUTPUT INSERTED`). UPDATE and DELETE do not support RETURNING:
 
