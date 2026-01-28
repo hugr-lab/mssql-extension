@@ -141,6 +141,10 @@ set(EXTENSION_SOURCES
     src/dml/delete/mssql_delete_statement.cpp
     src/dml/delete/mssql_delete_executor.cpp
     src/dml/delete/mssql_physical_delete.cpp
+    # DML CTAS layer (CREATE TABLE AS SELECT)
+    src/dml/ctas/mssql_ctas_executor.cpp
+    src/dml/ctas/mssql_ctas_planner.cpp
+    src/dml/ctas/mssql_physical_ctas.cpp
 )
 
 # Build static extension (linked into DuckDB)

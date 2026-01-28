@@ -5,6 +5,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
+#include "dml/ctas/mssql_ctas_planner.hpp"
 #include "dml/delete/mssql_delete_target.hpp"
 #include "dml/delete/mssql_physical_delete.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
@@ -340,7 +341,11 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 
 PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
 												  LogicalCreateTable &op, PhysicalOperator &plan) {
-	throw NotImplementedException("MSSQL catalog is read-only: CREATE TABLE AS is not supported");
+	// Check write access first (throws if read-only)
+	CheckWriteAccess("CREATE TABLE AS");
+
+	// Delegate to CTAS planner
+	return mssql::CTASPlanner::Plan(context, planner, *this, op, plan);
 }
 
 PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
