@@ -8,6 +8,8 @@
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
