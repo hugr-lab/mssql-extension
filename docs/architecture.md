@@ -51,7 +51,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 │  │ - Filter     │  │ - INSERT     │  │ - BEGIN/COMMIT/ROLLBACK  │    │
 │  │   pushdown   │  │ - UPDATE     │  │ - Connection pinning     │    │
 │  │ - Projection │  │ - DELETE     │  │ - Transaction descriptor │    │
-│  │   pushdown   │  │ - RETURNING  │  │                          │    │
+│  │   pushdown   │  │ - CTAS       │  │                          │    │
 │  └──────┬──────┘  └──────┬───────┘  └────────────┬─────────────┘    │
 │         │                │                        │                  │
 │  ┌──────┴────────────────┴────────────────────────┴─────────────┐    │
@@ -156,10 +156,14 @@ src/
 │   │   ├── mssql_physical_update.cpp
 │   │   ├── mssql_update_executor.cpp
 │   │   └── mssql_update_statement.cpp
-│   └── delete/                   # DELETE implementation (rowid-based)
-│       ├── mssql_physical_delete.cpp
-│       ├── mssql_delete_executor.cpp
-│       └── mssql_delete_statement.cpp
+│   ├── delete/                   # DELETE implementation (rowid-based)
+│   │   ├── mssql_physical_delete.cpp
+│   │   ├── mssql_delete_executor.cpp
+│   │   └── mssql_delete_statement.cpp
+│   └── ctas/                     # CREATE TABLE AS SELECT
+│       ├── mssql_ctas_planner.cpp      # CTAS planning and type mapping
+│       ├── mssql_ctas_executor.cpp     # Two-phase execution (DDL + INSERT)
+│       └── mssql_physical_ctas.cpp     # DuckDB PhysicalOperator (Sink)
 │
 └── include/                      # Headers (mirrors src/ structure)
 ```
@@ -176,6 +180,7 @@ src/
 | `PhysicalOperator` | `MSSQLPhysicalInsert` | INSERT execution operator |
 | `PhysicalOperator` | `MSSQLPhysicalUpdate` | UPDATE execution operator |
 | `PhysicalOperator` | `MSSQLPhysicalDelete` | DELETE execution operator |
+| `PhysicalOperator` | `MSSQLPhysicalCreateTableAs` | CTAS execution operator (Sink) |
 
 ## Registered Functions
 
@@ -226,6 +231,12 @@ src/
 |---|---|---|
 | `mssql_dml_batch_size` | 500 | Rows per UPDATE/DELETE batch |
 | `mssql_dml_max_parameters` | 2000 | Max SQL parameters per statement |
+
+### CTAS (CREATE TABLE AS SELECT)
+| Setting | Default | Description |
+|---|---|---|
+| `mssql_ctas_text_type` | NVARCHAR | Text column type (NVARCHAR or VARCHAR) |
+| `mssql_ctas_drop_on_failure` | false | Drop table if INSERT phase fails |
 
 ## Cross-References
 
