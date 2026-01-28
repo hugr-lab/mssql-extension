@@ -73,6 +73,10 @@ Release(connection)
   └─ Otherwise: Push to idle_connections_ queue, notify available_cv_
 ```
 
+### Connection Reset on Pool Return
+
+When a connection is returned to the pool (autocommit mode or after transaction commit/rollback), it is flagged for reset via `TdsConnection::SetNeedsReset(true)`. On the next `ExecuteBatch()` call, the TDS `RESET_CONNECTION` flag (0x08) is OR'd into the first packet's Status byte. This causes SQL Server to clean up session state (temp tables, session variables, SET options) before executing the next batch — the same mechanism used by ADO.NET, JDBC, and ODBC drivers.
+
 ### Background Cleanup Thread
 
 Runs every 1 second:
@@ -168,11 +172,13 @@ GetConnection(context, catalog, timeout_ms)
 ```
 ReleaseConnection(context, catalog, conn)
   │
-  ├─ Autocommit? ─── YES ──→ Return to pool
+  ├─ Autocommit? ─── YES ──→ Flag for reset, return to pool
   │
   └─ In transaction? ─── YES ──→ No-op (stays pinned)
-                         NO  ──→ Return to pool
+                         NO  ──→ Flag for reset, return to pool
 ```
+
+In autocommit mode, `ReleaseConnection()` calls `conn->SetNeedsReset(true)` before returning the connection to the pool. The `RESET_CONNECTION` flag will be set on the TDS header of the next `SQL_BATCH`, resetting session state (temp tables, variables, SET options).
 
 ### Error Handling
 

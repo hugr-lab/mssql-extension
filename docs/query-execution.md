@@ -79,17 +79,40 @@ Streams query results from SQL Server into DuckDB DataChunks.
 
 **State machine**:
 - `Initializing` → `Streaming` → `Complete`
+- `Initializing` → `Complete` (DML-only batch, no result set)
 - `Initializing` → `Streaming` → `Draining` (on cancel) → `Complete`
+- `Initializing` → `Streaming` → `Error` (multiple result sets detected)
 
 **Key methods**:
 
 | Method | Purpose |
 |---|---|
-| `Initialize()` | Send query, wait for COLMETADATA token |
-| `FillChunk()` | Read rows into DataChunk, return row count |
+| `Initialize()` | Send query, wait for COLMETADATA token. Skips non-final DONE tokens (DONE_MORE flag) to support multi-statement batches where intermediate statements don't return results |
+| `FillChunk()` | Read rows into DataChunk, return row count. Detects second COLMETADATA token (multiple result sets) and throws a clear error |
 | `Cancel()` | Send ATTENTION, drain remaining data |
+| `DrainRemainingTokens()` | Drain remaining TDS tokens after error (e.g., multiple result sets). Similar to cancel drain but without ATTENTION signal |
 | `SetColumnsToFill()` | Partial column filling (e.g., skip virtual columns) |
 | `SetOutputColumnMapping()` | Map SQL result indices to output chunk indices |
+
+### Multi-Statement Batch Support
+
+`mssql_scan()` supports multi-statement SQL batches where intermediate statements don't return result sets. For example:
+
+```sql
+-- Create temp table, then query it
+FROM mssql_scan('db', 'SELECT * INTO #t FROM dbo.test; SELECT * FROM #t');
+```
+
+`Initialize()` handles this by checking the `DONE_MORE` flag on DONE tokens. Non-final DONE tokens (from intermediate DML/DDL statements) are skipped, and the parser continues looking for COLMETADATA from the next result-producing statement.
+
+**Constraint**: Only one statement in the batch may produce a result set. If a second COLMETADATA token is encountered during `FillChunk()`, the system throws a clear error:
+
+```
+MSSQL Error: The SQL batch produced multiple result sets.
+Only one result-producing statement is allowed per mssql_scan() call.
+```
+
+The connection is left in a clean state after this error (remaining tokens are drained).
 
 ## INSERT Workflow
 
@@ -264,3 +287,5 @@ SELECT mssql_exec('mydb', 'DELETE FROM users WHERE id = 1');
 3. **Deferred execution in transactions**: avoids conflict with pinned connection streaming state
 4. **Partial filter pushdown**: maximizes server-side filtering while maintaining correctness
 5. **LIKE pattern encoding**: uses SQL Server's bracket escaping syntax (`[%]`, `[_]`, `[[]`)
+6. **Multi-statement batch support**: `Initialize()` skips non-final DONE tokens to reach COLMETADATA from later statements
+7. **Single result set enforcement**: `FillChunk()` detects second COLMETADATA and throws clear error instead of crashing

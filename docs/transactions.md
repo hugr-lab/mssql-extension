@@ -197,6 +197,7 @@ MSSQLTransactionManager::CommitTransaction()
   │   ├─ On success:
   │   │   ├─ Clear SQL Server transaction state
   │   │   ├─ conn->ClearTransactionDescriptor()
+  │   │   ├─ conn->SetNeedsReset(true) (RESET_CONNECTION on next batch)
   │   │   ├─ Return connection to pool
   │   │   └─ Clear pinned connection
   │   └─ Remove from transactions_ map
@@ -219,6 +220,7 @@ MSSQLTransactionManager::RollbackTransaction()
   │   ├─ Log errors as WARNING but continue cleanup
   │   ├─ Clear SQL Server transaction state
   │   ├─ conn->ClearTransactionDescriptor()
+  │   ├─ conn->SetNeedsReset(true) (RESET_CONNECTION on next batch)
   │   ├─ Return connection to pool
   │   └─ Clear pinned connection
   │
