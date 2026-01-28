@@ -37,7 +37,8 @@ class LogicalUpdate;
 class MSSQLCatalog : public Catalog {
 public:
 	// Constructor
-	// @param catalog_enabled When false, catalog integration is disabled (raw query mode only via mssql_scan/mssql_exec)
+	// @param catalog_enabled When false, catalog integration is disabled (raw query mode only via
+	// mssql_scan/mssql_exec)
 	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
 				 AccessMode access_mode, bool catalog_enabled = true);
 

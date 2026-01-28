@@ -63,8 +63,7 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  SetScope::GLOBAL);
 
 	// mssql_query_timeout - Query execution timeout in seconds (0 = no timeout)
-	config.AddExtensionOption("mssql_query_timeout",
-							  "Query execution timeout in seconds (0 = no timeout, default: 30)",
+	config.AddExtensionOption("mssql_query_timeout", "Query execution timeout in seconds (0 = no timeout, default: 30)",
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_QUERY_TIMEOUT), ValidateNonNegative,
 							  SetScope::GLOBAL);
 
@@ -211,7 +210,7 @@ int LoadQueryTimeout(ClientContext &context) {
 	if (context.TryGetCurrentSetting("mssql_query_timeout", val)) {
 		return static_cast<int>(val.GetValue<int64_t>());
 	}
-	return tds::DEFAULT_QUERY_TIMEOUT;  // Default: 30 seconds
+	return tds::DEFAULT_QUERY_TIMEOUT;	// Default: 30 seconds
 }
 
 //===----------------------------------------------------------------------===//

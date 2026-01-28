@@ -15,7 +15,7 @@ struct MSSQLPoolConfig {
 	int idle_timeout = tds::DEFAULT_IDLE_TIMEOUT;
 	size_t min_connections = tds::DEFAULT_MIN_CONNECTIONS;
 	int acquire_timeout = tds::DEFAULT_ACQUIRE_TIMEOUT;
-	int query_timeout = tds::DEFAULT_QUERY_TIMEOUT;  // Query execution timeout in seconds (0 = infinite)
+	int query_timeout = tds::DEFAULT_QUERY_TIMEOUT;	 // Query execution timeout in seconds (0 = infinite)
 };
 
 //===----------------------------------------------------------------------===//

@@ -468,8 +468,9 @@ static string TranslateConnectionError(const string &error, const string &host, 
 	// Server requires encryption but client disabled it
 	if (lower_error.find("encrypt_req") != string::npos ||
 		(lower_error.find("encryption") != string::npos && lower_error.find("require") != string::npos)) {
-		return StringUtil::Format("Server requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
-								  "Set use_encrypt=true or Encrypt=yes in connection string.");
+		return StringUtil::Format(
+			"Server requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
+			"Set use_encrypt=true or Encrypt=yes in connection string.");
 	}
 
 	// Certificate validation failures

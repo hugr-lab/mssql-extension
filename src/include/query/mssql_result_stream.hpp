@@ -201,9 +201,10 @@ private:
 		if (timeout_seconds <= 0) {
 			return "MSSQL query timed out";
 		}
-		return StringUtil::Format("MSSQL query timed out after %d seconds. "
-								  "Use SET mssql_query_timeout to increase the timeout.",
-								  timeout_seconds);
+		return StringUtil::Format(
+			"MSSQL query timed out after %d seconds. "
+			"Use SET mssql_query_timeout to increase the timeout.",
+			timeout_seconds);
 	}
 };
 

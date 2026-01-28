@@ -51,7 +51,7 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	// 0 = no timeout (use INT_MAX for effectively infinite wait)
 	// Otherwise, multiply by 1000 to convert to milliseconds
 	if (query_timeout_seconds <= 0) {
-		read_timeout_ms_ = INT_MAX;  // Effectively infinite timeout
+		read_timeout_ms_ = INT_MAX;	 // Effectively infinite timeout
 	} else {
 		read_timeout_ms_ = query_timeout_seconds * 1000;
 	}
