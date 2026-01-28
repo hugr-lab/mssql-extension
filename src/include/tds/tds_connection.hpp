@@ -111,6 +111,14 @@ public:
 		return has_transaction_descriptor_;
 	}
 
+	// Connection reset — flag the next SQL_BATCH to include RESET_CONNECTION in TDS header
+	void SetNeedsReset(bool reset) {
+		needs_reset_ = reset;
+	}
+	bool NeedsReset() const {
+		return needs_reset_;
+	}
+
 	// Timestamps for pool management
 	std::chrono::steady_clock::time_point GetCreatedAt() const {
 		return created_at_;
@@ -160,6 +168,9 @@ private:
 	// Set via SetTransactionDescriptor() after BEGIN TRANSACTION response
 	uint8_t transaction_descriptor_[8] = {0};
 	bool has_transaction_descriptor_ = false;
+
+	// Connection reset flag — when true, next SQL_BATCH sets RESET_CONNECTION in TDS header
+	bool needs_reset_ = false;
 
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);

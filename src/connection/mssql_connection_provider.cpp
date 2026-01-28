@@ -250,8 +250,11 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 	bool is_autocommit = context.transaction.IsAutoCommit();
 
 	if (!txn || is_autocommit) {
-		// Not in a transaction OR in autocommit mode - return to pool
-		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, returning to pool");
+		// Not in a transaction OR in autocommit mode - flag for reset and return to pool
+		// The RESET_CONNECTION flag will be set on the TDS header of the next SQL_BATCH,
+		// which is how ADO.NET/JDBC drivers reset session state (temp tables, variables, SET options)
+		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, flagging connection for reset");
+		conn->SetNeedsReset(true);
 		auto &pool = catalog.GetConnectionPool();
 		pool.Release(conn);
 		return;

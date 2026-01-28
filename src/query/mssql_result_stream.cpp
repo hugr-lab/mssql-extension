@@ -139,17 +139,23 @@ bool MSSQLResultStream::Initialize() {
 				info_messages_.push_back(parser_.GetInfo());
 				break;
 
-			case tds::ParsedTokenType::Done:
-				// Unexpected DONE before COLMETADATA - might be empty result or error
+			case tds::ParsedTokenType::Done: {
+				auto done = parser_.GetDone();
+				// Check for errors accumulated from previous ERROR tokens
 				if (!errors_.empty()) {
 					state_ = MSSQLResultStreamState::Error;
 					auto &err = errors_[0];
 					throw InvalidInputException("SQL Server error [%d, severity %d]: %s", err.number, err.severity,
 												err.message);
 				}
-				// Empty result set (e.g., UPDATE statement)
+				// If more results follow, continue looking for COLMETADATA
+				if (!done.IsFinal()) {
+					break;
+				}
+				// Final DONE with no columns — empty result set
 				state_ = MSSQLResultStreamState::Complete;
 				return true;
+			}
 
 			case tds::ParsedTokenType::None:
 				if (parser_.GetState() == tds::ParserState::Error) {
