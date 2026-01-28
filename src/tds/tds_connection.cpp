@@ -411,6 +411,15 @@ bool TdsConnection::ExecuteBatch(const std::string &sql) {
 
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: sql_size=%zu, packet_count=%zu", sql.size(), packets.size());
 
+	// If connection needs reset, set RESET_CONNECTION flag on the first packet
+	if (needs_reset_ && !packets.empty()) {
+		auto &first = packets[0];
+		auto status = static_cast<uint8_t>(first.GetStatus()) | static_cast<uint8_t>(PacketStatus::RESET_CONNECTION);
+		first.SetStatus(static_cast<PacketStatus>(status));
+		needs_reset_ = false;
+		MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: RESET_CONNECTION flag set on first packet");
+	}
+
 	// For multi-packet messages:
 	// - Over TLS: send each packet individually (some SQL Server versions have issues with combined)
 	// - Over plain TCP: combine and send at once for efficiency

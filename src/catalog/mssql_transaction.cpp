@@ -223,6 +223,10 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
 
+		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header
+		MSSQL_TXN_LOG("CommitTransaction: Flagging connection for reset");
+		pinned_conn->SetNeedsReset(true);
+
 		// Return connection to pool
 		MSSQL_TXN_LOG("CommitTransaction: Returning connection to pool");
 		auto &pool = catalog_.GetConnectionPool();
@@ -269,6 +273,10 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
+
+		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header
+		MSSQL_TXN_LOG("RollbackTransaction: Flagging connection for reset");
+		pinned_conn->SetNeedsReset(true);
 
 		// Return connection to pool
 		MSSQL_TXN_LOG("RollbackTransaction: Returning connection to pool");
