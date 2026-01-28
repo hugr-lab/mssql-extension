@@ -1,0 +1,84 @@
+# name: test/sql/ctas/ctas_failure.test
+# description: Test CTAS failure handling and cleanup behavior
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_fail (TYPE mssql);
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS mssql_fail.dbo.ctas_fail_test;
+
+# =============================================================================
+# DDL Phase Failure - Table Exists (no cleanup needed)
+# =============================================================================
+
+# Create initial table
+statement ok
+CREATE TABLE mssql_fail.dbo.ctas_fail_test AS
+SELECT 1 AS id, 'initial' AS name;
+
+# Verify table exists
+query IT
+SELECT * FROM mssql_fail.dbo.ctas_fail_test;
+----
+1	initial
+
+# Try CTAS without OR REPLACE - should fail at DDL phase
+# Table should remain intact after failure
+statement error
+CREATE TABLE mssql_fail.dbo.ctas_fail_test AS
+SELECT 2 AS new_id;
+----
+already an object named
+
+# Verify original table still exists with original data
+query IT
+SELECT * FROM mssql_fail.dbo.ctas_fail_test;
+----
+1	initial
+
+# =============================================================================
+# Unsupported Type Failure - Fail before DDL
+# =============================================================================
+
+# HUGEINT is unsupported - should fail before creating table
+statement error
+CREATE TABLE mssql_fail.dbo.ctas_fail_unsupported AS
+SELECT 170141183460469231731687303715884105727::HUGEINT AS huge_val;
+----
+HUGEINT
+
+# Verify table was NOT created (failure happened before DDL)
+statement error
+SELECT * FROM mssql_fail.dbo.ctas_fail_unsupported;
+----
+does not exist
+
+# =============================================================================
+# Schema Does Not Exist - Fail at validation
+# =============================================================================
+
+statement error
+CREATE TABLE mssql_fail.nonexistent_schema.ctas_fail AS
+SELECT 1 AS id;
+----
+not found
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE mssql_fail.dbo.ctas_fail_test;
+
+statement ok
+DETACH mssql_fail;

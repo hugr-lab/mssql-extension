@@ -80,9 +80,9 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 2
 
-- [ ] T020 [US2] Ensure INSERT batching reuses existing `MSSQLInsertExecutor` with batch_size from settings in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T021 [US2] Verify streaming behavior - no full result buffering in `MSSQLPhysicalCreateTableAs::Sink()` in `src/dml/ctas/mssql_physical_ctas.cpp`
-- [ ] T022 [US2] Create integration test `test/sql/ctas/ctas_large.test` with 1M row CTAS, row count verification
+- [x] T020 [US2] Ensure INSERT batching reuses existing `MSSQLInsertExecutor` with batch_size from settings in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T021 [US2] Verify streaming behavior - no full result buffering in `MSSQLPhysicalCreateTableAs::Sink()` in `src/dml/ctas/mssql_physical_ctas.cpp`
+- [x] T022 [US2] Create integration test `test/sql/ctas/ctas_large.test` with 1M row CTAS, row count verification
 
 **Checkpoint**: Large CTAS works with stable memory
 
@@ -96,10 +96,10 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 3
 
-- [ ] T023 [US3] Add unsupported type detection (HUGEINT, INTERVAL, LIST, STRUCT, etc.) with clear errors in `src/catalog/mssql_ddl_translator.cpp`
-- [ ] T024 [US3] Implement DECIMAL precision/scale clamping to SQL Server max (38,38) in `src/catalog/mssql_ddl_translator.cpp`
-- [ ] T025 [US3] Create unit test `test/cpp/test_ctas_type_mapping.cpp` for type mapping logic
-- [ ] T026 [US3] Create integration test `test/sql/ctas/ctas_types.test` covering all supported types, unsupported type errors
+- [x] T023 [US3] Add unsupported type detection (HUGEINT, INTERVAL, LIST, STRUCT, etc.) with clear errors in `src/catalog/mssql_ddl_translator.cpp`
+- [x] T024 [US3] Implement DECIMAL precision/scale clamping to SQL Server max (38,38) in `src/catalog/mssql_ddl_translator.cpp`
+- [x] T025 [US3] Create unit test `test/cpp/test_ctas_type_mapping.cpp` for type mapping logic
+- [x] T026 [US3] Create integration test `test/sql/ctas/ctas_types.test` covering all supported types, unsupported type errors
 
 **Checkpoint**: Type mapping is complete and verified
 
@@ -113,10 +113,10 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 4
 
-- [ ] T027 [US4] Implement insert phase error handling with table retention in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T028 [US4] Implement `mssql_ctas_drop_on_failure` cleanup logic (best-effort DROP) in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T029 [US4] Implement dual error surfacing when cleanup DROP also fails in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T030 [US4] Create integration test `test/sql/ctas/ctas_failure.test` covering insert failures, cleanup setting behavior
+- [x] T027 [US4] Implement insert phase error handling with table retention in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T028 [US4] Implement `mssql_ctas_drop_on_failure` cleanup logic (best-effort DROP) in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T029 [US4] Implement dual error surfacing when cleanup DROP also fails in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T030 [US4] Create integration test `test/sql/ctas/ctas_failure.test` covering insert failures, cleanup setting behavior
 
 **Checkpoint**: Failure handling works as specified
 
@@ -130,8 +130,8 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 5
 
-- [ ] T031 [US5] Implement `mssql_ctas_text_type` setting usage in `MapLogicalTypeToCTAS()` in `src/catalog/mssql_ddl_translator.cpp`
-- [ ] T032 [US5] Add text type policy test cases to `test/sql/ctas/ctas_types.test`
+- [x] T031 [US5] Implement `mssql_ctas_text_type` setting usage in `MapLogicalTypeToCTAS()` in `src/catalog/mssql_ddl_translator.cpp`
+- [x] T032 [US5] Add text type policy test cases to `test/sql/ctas/ctas_types.test`
 
 **Checkpoint**: Text type policy works
 
@@ -145,8 +145,8 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 6
 
-- [ ] T033 [US6] Ensure INSERT phase uses transaction-aware connection via `ConnectionProvider::GetConnection()` in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T034 [US6] Create integration test `test/sql/ctas/ctas_transaction.test` covering commit and rollback scenarios
+- [x] T033 [US6] Ensure INSERT phase uses transaction-aware connection via `ConnectionProvider::GetConnection()` in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T034 [US6] Create integration test `test/sql/ctas/ctas_transaction.test` covering commit and rollback scenarios
 
 **Checkpoint**: Transaction semantics work
 
@@ -160,10 +160,10 @@ Per plan.md, this is a DuckDB extension (single project):
 
 ### Implementation for User Story 7
 
-- [ ] T035 [US7] Detect OR REPLACE flag in `CTASPlanner::Plan()` from DuckDB CreateStatement in `src/dml/ctas/mssql_ctas_planner.cpp`
-- [ ] T036 [US7] Implement table existence check for OR REPLACE in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T037 [US7] Implement DROP TABLE execution before CREATE when OR REPLACE and table exists in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T038 [US7] Create integration test `test/sql/ctas/ctas_or_replace.test` covering replace existing, create new, non-atomic failure
+- [x] T035 [US7] Detect OR REPLACE flag in `CTASPlanner::Plan()` from DuckDB CreateStatement in `src/dml/ctas/mssql_ctas_planner.cpp`
+- [x] T036 [US7] Implement table existence check for OR REPLACE in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T037 [US7] Implement DROP TABLE execution before CREATE when OR REPLACE and table exists in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T038 [US7] Create integration test `test/sql/ctas/ctas_or_replace.test` covering replace existing, create new, non-atomic failure
 
 **Checkpoint**: OR REPLACE works
 
@@ -173,12 +173,12 @@ Per plan.md, this is a DuckDB extension (single project):
 
 **Purpose**: Observability, edge cases, and code quality
 
-- [ ] T039 Implement debug logging (DDL size, row counts, phase timing) using existing MSSQL_DEBUG macros in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T040 [P] Add zero-row CTAS handling (create table with schema, no data) in `src/dml/ctas/mssql_ctas_executor.cpp`
-- [ ] T041 [P] Ensure column name bracket-escaping in DDL generation in `src/catalog/mssql_ddl_translator.cpp`
-- [ ] T042 Add CMakeLists.txt entries for new CTAS source files
-- [ ] T043 Run clang-format on all new/modified files
-- [ ] T044 Validate all tests pass with `make test-all`
+- [x] T039 Implement debug logging (DDL size, row counts, phase timing) using existing MSSQL_DEBUG macros in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T040 [P] Add zero-row CTAS handling (create table with schema, no data) in `src/dml/ctas/mssql_ctas_executor.cpp`
+- [x] T041 [P] Ensure column name bracket-escaping in DDL generation in `src/catalog/mssql_ddl_translator.cpp`
+- [x] T042 Add CMakeLists.txt entries for new CTAS source files
+- [x] T043 Run clang-format on all new/modified files
+- [x] T044 Validate all tests pass with `make test-all`
 
 ---
 

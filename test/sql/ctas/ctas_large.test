@@ -1,0 +1,89 @@
+# name: test/sql/ctas/ctas_large.test
+# description: Test CTAS with large result sets (streaming behavior)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_large (TYPE mssql);
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_large.dbo.ctas_large_100k;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_large.dbo.ctas_large_batch;
+
+# Test 2: CTAS with 100,000 rows (tests batching and streaming)
+statement ok
+CREATE TABLE mssql_ctas_large.dbo.ctas_large_100k AS
+SELECT
+    i AS id,
+    'row_' || i::VARCHAR AS name,
+    (i * 1.5)::DECIMAL(10,2) AS value,
+    CASE WHEN i % 2 = 0 THEN true ELSE false END AS is_even
+FROM generate_series(1, 100000) t(i);
+
+# Test 3: Verify row count
+query I
+SELECT COUNT(*) FROM mssql_ctas_large.dbo.ctas_large_100k;
+----
+100000
+
+# Test 4: Verify data integrity - first row
+query ITRI
+SELECT * FROM mssql_ctas_large.dbo.ctas_large_100k WHERE id = 1;
+----
+1	row_1	1.50	0
+
+# Test 5: Verify data integrity - last row
+query ITRI
+SELECT * FROM mssql_ctas_large.dbo.ctas_large_100k WHERE id = 100000;
+----
+100000	row_100000	150000.00	1
+
+# Test 6: Verify data integrity - middle row
+query ITRI
+SELECT * FROM mssql_ctas_large.dbo.ctas_large_100k WHERE id = 50000;
+----
+50000	row_50000	75000.00	1
+
+# Test 7: Verify aggregations work correctly
+query IR
+SELECT COUNT(*), SUM(value) FROM mssql_ctas_large.dbo.ctas_large_100k;
+----
+100000	7500075000.00
+
+# Test 8: CTAS with custom batch size setting
+statement ok
+SET mssql_insert_batch_size = 100;
+
+statement ok
+CREATE TABLE mssql_ctas_large.dbo.ctas_large_batch AS
+SELECT i AS id, 'test' AS name
+FROM generate_series(1, 1000) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_large.dbo.ctas_large_batch;
+----
+1000
+
+# Reset batch size
+statement ok
+RESET mssql_insert_batch_size;
+
+# Cleanup
+statement ok
+DROP TABLE mssql_ctas_large.dbo.ctas_large_100k;
+
+statement ok
+DROP TABLE mssql_ctas_large.dbo.ctas_large_batch;
+
+statement ok
+DETACH mssql_ctas_large;

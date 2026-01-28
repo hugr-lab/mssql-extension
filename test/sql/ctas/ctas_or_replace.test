@@ -1,0 +1,106 @@
+# name: test/sql/ctas/ctas_or_replace.test
+# description: Test CREATE OR REPLACE TABLE AS SELECT
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Test 1: Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_or_replace (TYPE mssql);
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS mssql_or_replace.dbo.ctas_replace_test;
+
+# =============================================================================
+# CREATE OR REPLACE when table does not exist
+# =============================================================================
+
+# Test 2: OR REPLACE creates new table when it doesn't exist
+statement ok
+CREATE OR REPLACE TABLE mssql_or_replace.dbo.ctas_replace_test AS
+SELECT 1 AS id, 'original' AS name;
+
+query IT
+SELECT * FROM mssql_or_replace.dbo.ctas_replace_test;
+----
+1	original
+
+# =============================================================================
+# CREATE OR REPLACE when table exists
+# =============================================================================
+
+# Test 3: OR REPLACE replaces existing table
+statement ok
+CREATE OR REPLACE TABLE mssql_or_replace.dbo.ctas_replace_test AS
+SELECT 100 AS new_id, 'replaced' AS new_name, 3.14 AS value;
+
+# Verify old data is gone and new schema/data is present
+query ITR
+SELECT * FROM mssql_or_replace.dbo.ctas_replace_test;
+----
+100	replaced	3.14
+
+# =============================================================================
+# Regular CTAS fails when table exists
+# =============================================================================
+
+# Test 4: Regular CTAS (without OR REPLACE) fails when table exists
+statement error
+CREATE TABLE mssql_or_replace.dbo.ctas_replace_test AS
+SELECT 1 AS id;
+----
+already an object named
+
+# =============================================================================
+# OR REPLACE with different column count
+# =============================================================================
+
+# Test 5: OR REPLACE can change column count
+statement ok
+CREATE OR REPLACE TABLE mssql_or_replace.dbo.ctas_replace_test AS
+SELECT 'only one column' AS single_col;
+
+query T
+SELECT * FROM mssql_or_replace.dbo.ctas_replace_test;
+----
+only one column
+
+# =============================================================================
+# OR REPLACE with multiple rows
+# =============================================================================
+
+# Test 6: OR REPLACE with multiple rows
+statement ok
+CREATE OR REPLACE TABLE mssql_or_replace.dbo.ctas_replace_test AS
+SELECT i AS id, 'row_' || i::VARCHAR AS name
+FROM generate_series(1, 5) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_or_replace.dbo.ctas_replace_test;
+----
+5
+
+query IT
+SELECT * FROM mssql_or_replace.dbo.ctas_replace_test ORDER BY id;
+----
+1	row_1
+2	row_2
+3	row_3
+4	row_4
+5	row_5
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE mssql_or_replace.dbo.ctas_replace_test;
+
+statement ok
+DETACH mssql_or_replace;
