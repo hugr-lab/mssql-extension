@@ -125,6 +125,10 @@ private:
 	// Handle cancellation draining
 	void DrainAfterCancel();
 
+	// Drain remaining TDS tokens after detecting an error (e.g., multiple result sets)
+	// Similar to DrainAfterCancel but without sending ATTENTION signal
+	void DrainRemainingTokens();
+
 	// Connection (shared with pool)
 	std::shared_ptr<tds::TdsConnection> connection_;
 
