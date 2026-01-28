@@ -100,6 +100,11 @@ Byte 7:    Window (reserved, always 0)
 |---|---|---|
 | `NORMAL` | 0x00 | More packets follow |
 | `END_OF_MESSAGE` | 0x01 | Last packet in message |
+| `IGNORE_EVENT` | 0x02 | Ignore this event |
+| `RESET_CONNECTION` | 0x08 | Reset connection state (session cleanup) |
+| `RESET_SKIP_TRAN` | 0x10 | Reset connection but preserve transaction |
+
+**RESET_CONNECTION**: When set on the first packet of a `SQL_BATCH`, SQL Server resets session state (temp tables, session variables, SET options) before executing the batch. This is used by ADO.NET/JDBC/ODBC drivers for connection pool hygiene. The extension sets this flag on connections returned to the pool (via `TdsConnection::SetNeedsReset()`).
 
 ### SQL_BATCH with ALL_HEADERS
 

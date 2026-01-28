@@ -10,9 +10,11 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Stream query results directly into DuckDB without buffering
 - Full DuckDB catalog integration with three-part naming (`database.schema.table`)
 - Row identity (`rowid`) support for tables with primary keys
-- Connection pooling with configurable limits
+- Connection pooling with configurable limits and automatic session reset
 - TLS/SSL encrypted connections
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE
+- Transaction support: BEGIN/COMMIT/ROLLBACK with connection pinning
+- Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
 
 ## Quick Start
@@ -340,6 +342,42 @@ WHERE rowid = {'tenant_code': 'ACME', 'item_id': 1};
 - Views do not support `rowid`
 - `rowid` is read-only (cannot be used in INSERT/UPDATE)
 
+## Transactions
+
+The extension supports DuckDB transactions mapped to SQL Server transactions with connection pinning.
+
+### Basic Transaction Usage
+
+```sql
+BEGIN;
+INSERT INTO sqlserver.dbo.orders (customer_id, amount) VALUES (1, 99.99);
+UPDATE sqlserver.dbo.customers SET order_count = order_count + 1 WHERE id = 1;
+COMMIT;
+```
+
+All statements within a transaction execute on the same SQL Server connection. If any statement fails, use `ROLLBACK` to undo changes.
+
+### Transaction Behavior
+
+- **Autocommit (default)**: Each statement is independent with its own implicit transaction
+- **Explicit transactions**: `BEGIN` pins a connection; all subsequent operations reuse it until `COMMIT` or `ROLLBACK`
+- **Isolation level**: SQL Server default (READ COMMITTED). Use `mssql_exec()` to change if needed
+- **Connection reset**: After commit/rollback, the connection's session state is reset via TDS RESET_CONNECTION flag before pool reuse
+
+### Multi-Statement SQL Batches
+
+`mssql_scan()` supports multi-statement batches where intermediate statements don't return result sets:
+
+```sql
+-- Temp table workflow: create, populate, query
+FROM mssql_scan('sqlserver', '
+    SELECT * INTO #temp FROM dbo.large_table WHERE region = ''US'';
+    SELECT * FROM #temp ORDER BY created_at
+');
+```
+
+**Constraint**: Only one statement in the batch may produce a result set. Batches with multiple SELECTs will return a clear error message.
+
 ## Data Modification (INSERT)
 
 ### Basic INSERT
@@ -578,15 +616,19 @@ SELECT mssql_version();
 
 ### mssql_scan()
 
-Stream SELECT query results from SQL Server.
+Stream SELECT query results from SQL Server. Supports multi-statement batches where only one statement returns a result set.
 
 **Signature:** `mssql_scan(context VARCHAR, query VARCHAR) -> TABLE(...)`
 
 ```sql
+-- Simple query
 SELECT * FROM mssql_scan('sqlserver', 'SELECT TOP 10 * FROM sys.tables');
+
+-- Multi-statement batch with temp table
+FROM mssql_scan('sqlserver', 'SELECT * INTO #t FROM dbo.src; SELECT * FROM #t');
 ```
 
-The return schema is dynamic based on the query result columns.
+The return schema is dynamic based on the query result columns. Multi-statement batches support intermediate DML/DDL statements that don't return results, but only one result-producing statement is allowed per call.
 
 ### mssql_exec()
 
@@ -983,7 +1025,8 @@ The following features are planned for future releases:
 |---------|-------------|--------|
 | **Row Identity** | `rowid` pseudo-column mapping to primary keys | ✅ Implemented |
 | **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | ✅ Implemented |
-| **Transactions** | BEGIN/COMMIT/ROLLBACK, savepoints, connection pinning | Planned |
+| **Transactions** | BEGIN/COMMIT/ROLLBACK with connection pinning | ✅ Implemented |
+| **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | Planned |
 | **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
 | **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | Planned |
@@ -994,7 +1037,9 @@ The following features are planned for future releases:
 
 **UPDATE/DELETE**: Supports `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Uses `rowid` for row identification. Batched execution for large operations. Note: RETURNING clause is not supported for UPDATE/DELETE (only for INSERT).
 
-**Transactions**: DML-only transactions with connection pinning. Savepoints via `SAVE TRANSACTION`. DDL executes outside transactions (auto-commit).
+**Transactions**: DML transactions with connection pinning. Each explicit transaction pins a single TDS connection for the transaction's duration, using SQL Server's 8-byte transaction descriptor in ALL_HEADERS. Connections are flagged for session reset (RESET_CONNECTION) on pool return.
+
+**Multi-Statement Batches**: `mssql_scan()` supports batches where intermediate statements (DML/DDL) don't return result sets. Only one result-producing statement per batch is allowed. Session state (temp tables, variables) is reset via TDS RESET_CONNECTION flag when connections return to the pool.
 
 **CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` implemented as DDL creation followed by bulk INSERT (no RETURNING).
 
@@ -1009,7 +1054,7 @@ The following features are planned for future releases:
 - **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
 - **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
 - **Windows Authentication**: Only SQL Server authentication is supported
-- **Transactions**: Multi-statement transactions are not supported
+- **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 - **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
 
