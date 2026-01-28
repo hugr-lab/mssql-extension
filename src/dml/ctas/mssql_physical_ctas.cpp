@@ -70,7 +70,7 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 		throw;
 	}
 
-	return gstate;
+	return std::move(gstate);
 }
 
 unique_ptr<LocalSinkState> MSSQLPhysicalCreateTableAs::GetLocalSinkState(ExecutionContext &context) const {

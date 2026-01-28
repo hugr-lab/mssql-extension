@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include "duckdb.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_row_reader.hpp"
@@ -29,8 +30,9 @@ public:
 	// Create result stream with shared connection
 	// context_name is needed for returning connection to pool
 	// client_context is needed for transaction-aware connection release
+	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
-					  ClientContext *client_context = nullptr);
+					  ClientContext *client_context = nullptr, int query_timeout_seconds = 30);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
@@ -184,6 +186,26 @@ private:
 	// Overall timeout determines when we give up and close connection
 	int cancel_timeout_ms_ = 5000;	   // Overall cancel timeout - if no DONE+ATTN in 5s, close connection
 	int cancel_read_timeout_ms_ = 10;  // Per-read timeout during cancel (10ms - just poll for data)
+
+	// Last socket error for better error reporting
+	string last_socket_error_;
+
+	// Check if last error was a timeout
+	bool IsTimeoutError() const {
+		return last_socket_error_.find("timeout") != string::npos;
+	}
+
+	// Get formatted timeout error message
+	string GetTimeoutErrorMessage() const {
+		int timeout_seconds = read_timeout_ms_ / 1000;
+		if (timeout_seconds <= 0) {
+			return "MSSQL query timed out";
+		}
+		return StringUtil::Format(
+			"MSSQL query timed out after %d seconds. "
+			"Use SET mssql_query_timeout to increase the timeout.",
+			timeout_seconds);
+	}
 };
 
 }  // namespace duckdb

@@ -8,6 +8,8 @@
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -271,11 +273,11 @@ void CTASExecutionState::LogMetrics() const {
 	fprintf(stderr, "  Target: %s\n", target.GetQualifiedName().c_str());
 	fprintf(stderr, "  OR REPLACE: %s\n", target.or_replace ? "yes" : "no");
 	fprintf(stderr, "  DDL bytes: %llu\n", (unsigned long long)ddl_bytes);
-	fprintf(stderr, "  DDL time: %lld ms\n", ddl_time_ms);
+	fprintf(stderr, "  DDL time: %lld ms\n", (long long)ddl_time_ms);
 	fprintf(stderr, "  Rows produced: %llu\n", (unsigned long long)rows_produced);
 	fprintf(stderr, "  Rows inserted: %llu\n", (unsigned long long)rows_inserted);
-	fprintf(stderr, "  INSERT time: %lld ms\n", insert_time_ms);
-	fprintf(stderr, "  Total time: %lld ms\n", total_time_ms);
+	fprintf(stderr, "  INSERT time: %lld ms\n", (long long)insert_time_ms);
+	fprintf(stderr, "  Total time: %lld ms\n", (long long)total_time_ms);
 	fprintf(stderr, "  Phase: %s\n", GetPhaseName(phase).c_str());
 	if (!error_message.empty()) {
 		fprintf(stderr, "  Error: %s\n", error_message.c_str());
@@ -321,11 +323,11 @@ void CTASObservability::Log(int level) const {
 	fprintf(stderr, "  Target: %s\n", target_table.c_str());
 	fprintf(stderr, "  OR REPLACE: %s\n", or_replace ? "yes" : "no");
 	fprintf(stderr, "  DDL bytes: %llu\n", (unsigned long long)ddl_bytes);
-	fprintf(stderr, "  DDL time: %lld ms\n", ddl_time_ms);
+	fprintf(stderr, "  DDL time: %lld ms\n", (long long)ddl_time_ms);
 	fprintf(stderr, "  Rows produced: %llu\n", (unsigned long long)rows_produced);
 	fprintf(stderr, "  Rows inserted: %llu\n", (unsigned long long)rows_inserted);
 	fprintf(stderr, "  Batches: %llu\n", (unsigned long long)batches_executed);
-	fprintf(stderr, "  INSERT time: %lld ms\n", insert_time_ms);
+	fprintf(stderr, "  INSERT time: %lld ms\n", (long long)insert_time_ms);
 	fprintf(stderr, "  Success: %s\n", success ? "yes" : "no");
 	if (!success) {
 		fprintf(stderr, "  Failure phase: %s\n", failure_phase.c_str());

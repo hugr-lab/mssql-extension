@@ -206,6 +206,7 @@ src/
 | `mssql_idle_timeout` | 300 | Idle connection eviction (seconds) |
 | `mssql_min_connections` | 0 | Minimum pool size |
 | `mssql_acquire_timeout` | 30 | Pool acquire timeout (seconds) |
+| `mssql_query_timeout` | 30 | Query execution timeout (seconds, 0=infinite) |
 
 ### Catalog Cache
 | Setting | Default | Description |

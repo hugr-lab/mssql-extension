@@ -1,6 +1,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include <cstring>
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/tds_connection.hpp"
@@ -128,8 +129,24 @@ bool MSSQLTransaction::IsSqlServerTransactionActive() const {
 
 void MSSQLTransaction::SetPinnedConnection(std::shared_ptr<tds::TdsConnection> conn) {
 	lock_guard<mutex> lock(connection_mutex_);
+
+	// Track pinned connection count for pool statistics
+	bool was_pinned = (pinned_connection_ != nullptr);
+	bool will_be_pinned = (conn != nullptr);
+
+	if (!was_pinned && will_be_pinned) {
+		// Pinning a connection - increment count
+		MssqlPoolManager::Instance().IncrementPinnedCount(catalog_.GetContextName());
+		MSSQL_TXN_LOG("Pinned connection set for transaction (pinned_count incremented)");
+	} else if (was_pinned && !will_be_pinned) {
+		// Unpinning a connection - decrement count
+		MssqlPoolManager::Instance().DecrementPinnedCount(catalog_.GetContextName());
+		MSSQL_TXN_LOG("Pinned connection cleared for transaction (pinned_count decremented)");
+	} else {
+		MSSQL_TXN_LOG("Pinned connection set for transaction (no count change)");
+	}
+
 	pinned_connection_ = std::move(conn);
-	MSSQL_TXN_LOG("Pinned connection set for transaction");
 }
 
 void MSSQLTransaction::SetSqlServerTransactionActive(bool active) {

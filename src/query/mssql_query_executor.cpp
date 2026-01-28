@@ -4,6 +4,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -72,9 +73,14 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 		throw IOException("Failed to acquire connection from pool for context '%s'", context_name_.c_str());
 	}
 
+	// Load query timeout from settings (0 = no timeout)
+	int query_timeout = LoadQueryTimeout(context);
+	MSSQL_EXEC_DEBUG_LOG(1, "Execute: query_timeout=%ds", query_timeout);
+
 	// Create result stream with the shared connection
 	// Pass client context for transaction-aware connection release in destructor
-	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, &context);
+	auto result_stream =
+		make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, &context, query_timeout);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)
 	// If Initialize() throws, result_stream destructor will release connection back to pool

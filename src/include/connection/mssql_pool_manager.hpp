@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,11 +40,22 @@ public:
 	// Get all pool names
 	std::vector<std::string> GetAllPoolNames();
 
+	// Pinned connection tracking (called by MSSQLTransaction)
+	void IncrementPinnedCount(const std::string &context_name);
+	void DecrementPinnedCount(const std::string &context_name);
+
+	// Get pinned count for a context
+	size_t GetPinnedCount(const std::string &context_name) const;
+
 private:
 	MssqlPoolManager() = default;
 
-	std::mutex manager_mutex_;
+	mutable std::mutex manager_mutex_;
 	std::unordered_map<std::string, std::unique_ptr<tds::ConnectionPool>> pools_;
+
+	// Pinned connection counters per context (atomic for thread safety)
+	mutable std::mutex pinned_mutex_;
+	std::unordered_map<std::string, std::atomic<size_t>> pinned_counts_;
 };
 
 }  // namespace duckdb

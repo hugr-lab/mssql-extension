@@ -42,6 +42,7 @@ struct PoolStatistics {
 	size_t acquire_count = 0;
 	size_t acquire_timeout_count = 0;
 	uint64_t acquire_wait_total_ms = 0;
+	size_t pinned_connections = 0;	// Connections pinned to active transactions
 };
 
 // Connection factory function type

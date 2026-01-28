@@ -90,4 +90,27 @@ std::vector<std::string> MssqlPoolManager::GetAllPoolNames() {
 	return names;
 }
 
+void MssqlPoolManager::IncrementPinnedCount(const std::string &context_name) {
+	std::lock_guard<std::mutex> lock(pinned_mutex_);
+	// Create entry if it doesn't exist (will be 0), then increment
+	pinned_counts_[context_name]++;
+}
+
+void MssqlPoolManager::DecrementPinnedCount(const std::string &context_name) {
+	std::lock_guard<std::mutex> lock(pinned_mutex_);
+	auto it = pinned_counts_.find(context_name);
+	if (it != pinned_counts_.end() && it->second > 0) {
+		it->second--;
+	}
+}
+
+size_t MssqlPoolManager::GetPinnedCount(const std::string &context_name) const {
+	std::lock_guard<std::mutex> lock(pinned_mutex_);
+	auto it = pinned_counts_.find(context_name);
+	if (it != pinned_counts_.end()) {
+		return it->second.load();
+	}
+	return 0;
+}
+
 }  // namespace duckdb

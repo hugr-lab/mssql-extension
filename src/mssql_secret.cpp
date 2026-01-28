@@ -68,13 +68,23 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_USER, input);
 	result->TrySetValue(MSSQL_SECRET_PASSWORD, input);
 
-	// Handle optional use_ssl parameter (defaults to false if not provided)
+	// Handle optional use_encrypt parameter (defaults to true for security)
 	auto use_ssl_it = input.options.find(MSSQL_SECRET_USE_ENCRYPT);
 	if (use_ssl_it != input.options.end()) {
 		result->TrySetValue(MSSQL_SECRET_USE_ENCRYPT, input);
 	} else {
-		// Set default value of false
-		result->secret_map[MSSQL_SECRET_USE_ENCRYPT] = Value::BOOLEAN(false);
+		// Set default value of true (TLS enabled by default for security)
+		result->secret_map[MSSQL_SECRET_USE_ENCRYPT] = Value::BOOLEAN(true);
+	}
+
+	// Handle optional catalog parameter (defaults to true if not provided)
+	// When false, catalog integration is disabled (raw query mode only)
+	auto catalog_it = input.options.find(MSSQL_SECRET_CATALOG);
+	if (catalog_it != input.options.end()) {
+		result->TrySetValue(MSSQL_SECRET_CATALOG, input);
+	} else {
+		// Set default value of true (enable catalog integration)
+		result->secret_map[MSSQL_SECRET_CATALOG] = Value::BOOLEAN(true);
 	}
 
 	// Mark password as redacted (hidden in duckdb_secrets() output)
@@ -107,6 +117,7 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_USER] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_PASSWORD] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;	// Optional
+	create_func.named_parameters[MSSQL_SECRET_CATALOG] = LogicalType::BOOLEAN;		// Optional, defaults to true
 
 	loader.RegisterFunction(std::move(create_func));
 }

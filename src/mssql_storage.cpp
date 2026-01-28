@@ -63,14 +63,21 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->user = kv_secret.TryGetValue("user").ToString();
 	result->password = kv_secret.TryGetValue("password").ToString();
 
-	// Read optional use_encrypt (defaults to false)
+	// Read optional use_encrypt (defaults to true for security)
 	// Enables TLS encryption for the connection
 	auto use_encrypt_val = kv_secret.TryGetValue("use_encrypt");
 	if (!use_encrypt_val.IsNull()) {
 		result->use_encrypt = use_encrypt_val.GetValue<bool>();
-	} else {
-		result->use_encrypt = false;
 	}
+	// Default is true (use_encrypt initialized to true in struct definition)
+
+	// Read optional catalog (defaults to true)
+	// When false, catalog integration is disabled (raw query mode only)
+	auto catalog_val = kv_secret.TryGetValue("catalog");
+	if (!catalog_val.IsNull()) {
+		result->catalog_enabled = catalog_val.GetValue<bool>();
+	}
+	// Default is true (catalog_enabled initialized to true in struct definition)
 
 	result->connected = false;
 	return result;
@@ -315,32 +322,47 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 
 	// Parse optional encrypt and trustservercertificate parameters
 	// TrustServerCertificate is an alias for Encrypt (both enable TLS)
+	// Default: TLS enabled for security (use_encrypt = true in struct definition)
 	bool encrypt_specified = params.find("encrypt") != params.end();
 	bool trust_cert_specified = params.find("trustservercertificate") != params.end();
 
-	bool encrypt_value = false;
-	bool trust_cert_value = false;
+	// Only override the default (true) if explicitly specified
+	if (encrypt_specified || trust_cert_specified) {
+		bool encrypt_value = true;	// Default when not specified
+		bool trust_cert_value = true;
 
-	if (encrypt_specified) {
-		auto encrypt_val = StringUtil::Lower(params["encrypt"]);
-		encrypt_value = (encrypt_val == "yes" || encrypt_val == "true" || encrypt_val == "1");
+		if (encrypt_specified) {
+			auto encrypt_val = StringUtil::Lower(params["encrypt"]);
+			// "no" or "false" disables TLS; anything else enables it
+			encrypt_value = !(encrypt_val == "no" || encrypt_val == "false" || encrypt_val == "0");
+		}
+
+		if (trust_cert_specified) {
+			auto trust_val = StringUtil::Lower(params["trustservercertificate"]);
+			trust_cert_value = !(trust_val == "no" || trust_val == "false" || trust_val == "0");
+		}
+
+		// Check for conflicting values
+		if (encrypt_specified && trust_cert_specified && encrypt_value != trust_cert_value) {
+			throw InvalidInputException(
+				"MSSQL Error: Conflicting values for Encrypt (%s) and TrustServerCertificate (%s). "
+				"These parameters must have the same value or only one should be specified.",
+				encrypt_value ? "true" : "false", trust_cert_value ? "true" : "false");
+		}
+
+		// Apply: if any is specified, use their value (both must agree if both specified)
+		result->use_encrypt = encrypt_specified ? encrypt_value : trust_cert_value;
 	}
+	// If neither specified, use_encrypt keeps its default value (true from struct definition)
 
-	if (trust_cert_specified) {
-		auto trust_val = StringUtil::Lower(params["trustservercertificate"]);
-		trust_cert_value = (trust_val == "yes" || trust_val == "true" || trust_val == "1");
+	// Parse optional Catalog parameter (defaults to true)
+	// When false, catalog integration is disabled (raw query mode only)
+	bool catalog_specified = params.find("catalog") != params.end();
+	if (catalog_specified) {
+		auto catalog_val = StringUtil::Lower(params["catalog"]);
+		result->catalog_enabled = (catalog_val == "yes" || catalog_val == "true" || catalog_val == "1");
 	}
-
-	// Check for conflicting values
-	if (encrypt_specified && trust_cert_specified && encrypt_value != trust_cert_value) {
-		throw InvalidInputException(
-			"MSSQL Error: Conflicting values for Encrypt (%s) and TrustServerCertificate (%s). "
-			"These parameters must have the same value or only one should be specified.",
-			encrypt_value ? "true" : "false", trust_cert_value ? "true" : "false");
-	}
-
-	// Apply: either parameter enables TLS
-	result->use_encrypt = encrypt_value || trust_cert_value;
+	// Default is true (catalog_enabled initialized to true in struct definition)
 
 	result->connected = false;
 	return result;
@@ -439,8 +461,21 @@ static string TranslateConnectionError(const string &error, const string &host, 
 
 	// TLS failures
 	if (lower_error.find("tls") != string::npos || lower_error.find("ssl") != string::npos ||
-		lower_error.find("handshake") != string::npos || lower_error.find("encrypt") != string::npos) {
+		lower_error.find("handshake") != string::npos) {
 		return StringUtil::Format("TLS handshake failed to %s:%d - check TLS configuration", host, port);
+	}
+
+	// Server requires encryption but client disabled it
+	if (lower_error.find("encrypt_req") != string::npos ||
+		(lower_error.find("encryption") != string::npos && lower_error.find("require") != string::npos)) {
+		return StringUtil::Format(
+			"Server requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
+			"Set use_encrypt=true or Encrypt=yes in connection string.");
+	}
+
+	// Certificate validation failures
+	if (lower_error.find("certificate") != string::npos || lower_error.find("cert") != string::npos) {
+		return StringUtil::Format("TLS certificate validation failed - server certificate not trusted");
 	}
 
 	// Connection refused
@@ -501,6 +536,43 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 		throw InvalidInputException("MSSQL connection validation failed: %s", translated);
 	}
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication succeeded");
+
+	// If TLS is enabled, execute a simple validation query to verify TLS data path works
+	// This catches TLS issues that may only appear during actual data transfer
+	if (info.use_encrypt) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: executing TLS validation query (SELECT 1)...");
+		try {
+			if (!conn.ExecuteBatch("SELECT 1")) {
+				string error = conn.GetLastError();
+				string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED - raw: %s, translated: %s",
+										error.c_str(), translated.c_str());
+				conn.Close();
+				throw InvalidInputException(
+					"MSSQL connection validation failed: TLS connection established but validation query failed. "
+					"The server may have network issues or TLS may be misconfigured. Details: %s",
+					translated);
+			}
+			// Drain any results to reset connection state
+			auto *socket = conn.GetSocket();
+			if (socket) {
+				std::vector<uint8_t> response;
+				socket->ReceiveMessage(response, 5000);
+				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+			}
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query succeeded");
+		} catch (const std::exception &e) {
+			string error = e.what();
+			string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED with exception - %s",
+									error.c_str());
+			conn.Close();
+			throw InvalidInputException(
+				"MSSQL connection validation failed: TLS connection established but validation query failed. "
+				"Details: %s",
+				translated);
+		}
+	}
 
 	// Close the test connection - it will be recreated by the pool
 	conn.Close();
@@ -565,7 +637,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Create MSSQLCatalog with connection info and access mode from options
 	// The catalog will use the connection pool to query SQL Server
 	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, options.access_mode);
+	// catalog_enabled flag determines whether schema discovery is available
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, options.access_mode,
+										   ctx->connection_info->catalog_enabled);
 	catalog->Initialize(false);
 
 	return std::move(catalog);
