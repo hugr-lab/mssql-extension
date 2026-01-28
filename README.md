@@ -90,7 +90,7 @@ CREATE SECRET secret_name (
     database 'database_name',
     user 'username',
     password 'password',
-    use_encrypt false
+    use_encrypt true  -- TLS enabled by default
 );
 ```
 
@@ -103,7 +103,8 @@ CREATE SECRET secret_name (
 | `database`    | VARCHAR | Yes      | Database name                        |
 | `user`        | VARCHAR | Yes      | SQL Server username                  |
 | `password`    | VARCHAR | Yes      | Password (hidden in duckdb_secrets)  |
-| `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: false) |
+| `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: true) |
+| `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
 
 Attach using the secret:
 
@@ -171,7 +172,7 @@ ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=tr
     AS db (TYPE mssql);
 ```
 
-> **Note**: TLS support is available in both static and loadable extension builds (using OpenSSL).
+> **Note**: TLS is enabled by default for security. Use `use_encrypt=false` or `Encrypt=no` to disable. TLS support is available in both static and loadable extension builds (using OpenSSL).
 
 #### TrustServerCertificate Parameter
 
@@ -184,6 +185,39 @@ ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass;TrustServ
 ```
 
 > **Note**: If both `Encrypt` and `TrustServerCertificate` are specified with conflicting values (e.g., `Encrypt=true;TrustServerCertificate=false`), ATTACH will fail with an error. Either omit one parameter or ensure they have the same value.
+
+### Catalog-Free Mode
+
+For serverless databases (like Azure SQL Serverless) or databases with restricted permissions where catalog queries fail, disable catalog integration:
+
+#### Using Secret
+
+```sql
+CREATE SECRET serverless_db (
+    TYPE mssql,
+    host 'myserver.database.windows.net',
+    port 1433,
+    database 'mydb',
+    user 'sa',
+    password 'Password123',
+    catalog false  -- Disable catalog integration
+);
+
+ATTACH '' AS serverless (TYPE mssql, SECRET serverless_db);
+```
+
+#### Using Connection String
+
+```sql
+ATTACH 'Server=myserver.database.windows.net,1433;Database=mydb;User Id=sa;Password=Password123;Catalog=false'
+    AS serverless (TYPE mssql);
+```
+
+With catalog disabled:
+- `mssql_scan()` and `mssql_exec()` work normally for raw SQL queries
+- Schema browsing via `duckdb_schemas()`, `duckdb_tables()` is not available
+- Three-part naming (`db.schema.table`) is not available
+- Use `mssql_scan()` for all queries instead
 
 ### Connection Validation
 
@@ -776,7 +810,7 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 
 | Column                  | Type   | Description                        |
 | ----------------------- | ------ | ---------------------------------- |
-| `context_name`          | VARCHAR | Attached database context name     |
+| `db`                    | VARCHAR | Attached database context name     |
 | `total_connections`     | BIGINT | Current pool size                  |
 | `idle_connections`      | BIGINT | Available connections              |
 | `active_connections`    | BIGINT | Currently in use                   |
@@ -784,7 +818,7 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 | `connections_closed`    | BIGINT | Lifetime connections closed        |
 | `acquire_count`         | BIGINT | Times connections acquired         |
 | `acquire_timeout_count` | BIGINT | Times acquisition timed out        |
-| `acquire_wait_total_ms` | BIGINT | Total milliseconds spent waiting   |
+| `pinned_connections`    | BIGINT | Connections pinned to transactions |
 
 ### mssql_refresh_cache()
 
@@ -880,6 +914,7 @@ Queries involving unsupported types will raise an error.
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 2       | ≥0    | Minimum connections to maintain          |
 | `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | Connection acquire timeout (seconds)     |
+| `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
 
 ### Statistics Settings

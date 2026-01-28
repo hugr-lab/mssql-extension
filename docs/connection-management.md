@@ -46,6 +46,7 @@ struct PoolConfiguration {
     int idle_timeout;          // Default: 300 seconds (5 minutes)
     size_t min_connections;    // Default: 0
     int acquire_timeout;       // Default: 30 seconds
+    int query_timeout;         // Default: 30 seconds (0 = infinite)
 };
 ```
 
@@ -105,7 +106,7 @@ struct PoolStatistics {
     size_t connections_closed;
     size_t acquire_count;           // Total acquisition attempts
     size_t acquire_timeout_count;   // Failed acquisitions
-    uint64_t acquire_wait_total_ms; // Cumulative wait time
+    size_t pinned_connections;      // Connections pinned to transactions
 };
 ```
 
@@ -202,7 +203,8 @@ Integrates with DuckDB's secret manager for credential storage.
 | `database` | VARCHAR | Yes | Database name |
 | `user` | VARCHAR | Yes | Login username |
 | `password` | VARCHAR | Yes | Redacted in duckdb_secrets() |
-| `use_encrypt` | BOOLEAN | No | TLS encryption (default false) |
+| `use_encrypt` | BOOLEAN | No | TLS encryption (default: true) |
+| `catalog` | BOOLEAN | No | Catalog integration (default: true). Set false for serverless/restricted databases |
 
 ### Usage
 
@@ -229,12 +231,15 @@ ATTACH '' AS mydb (TYPE mssql, SECRET mssql_cred)
   │
   ├─ MSSQLAttach() in mssql_storage.cpp
   ├─ Extract SECRET parameter
-  ├─ Parse connection info from secret
-  ├─ Validate connection (TCP + LOGIN7 test)
+  ├─ Parse connection info from secret (including catalog_enabled flag)
+  ├─ Validate connection:
+  │   ├─ TCP connection
+  │   ├─ LOGIN7 authentication
+  │   └─ TLS validation (SELECT 1 query if use_encrypt=true)
   ├─ Register context in MSSQLContextManager
   ├─ Create/get connection pool via MssqlPoolManager
-  ├─ Create MSSQLCatalog
-  └─ Initialize catalog (query database collation)
+  ├─ Create MSSQLCatalog (with catalog_enabled flag)
+  └─ Initialize catalog (query database collation) - skipped if catalog_enabled=false
 ```
 
 ### DETACH Flow
