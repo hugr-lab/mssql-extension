@@ -18,18 +18,18 @@ CREATE TABLE int_types AS SELECT
     1000000::BIGINT AS big_val;
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_int_types');
+DROP TABLE IF EXISTS db.dbo.copy_int_types;
 
 statement ok
 COPY int_types TO 'mssql://db/dbo/copy_int_types' (FORMAT 'bcp', CREATE_TABLE true);
 
 query IIII
-SELECT * FROM mssql_scan('db', 'SELECT * FROM dbo.copy_int_types');
+SELECT * FROM db.dbo.copy_int_types;
 ----
 1	100	1000	1000000
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_int_types');
+DROP TABLE IF EXISTS db.dbo.copy_int_types;
 
 statement ok
 DROP TABLE int_types;
@@ -41,18 +41,18 @@ CREATE TABLE float_types AS SELECT
     2.71828::DOUBLE AS double_val;
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_float_types');
+DROP TABLE IF EXISTS db.dbo.copy_float_types;
 
 statement ok
 COPY float_types TO 'mssql://db/dbo/copy_float_types' (FORMAT 'bcp', CREATE_TABLE true);
 
 query II
-SELECT * FROM mssql_scan('db', 'SELECT ROUND(float_val, 2), ROUND(double_val, 5) FROM dbo.copy_float_types');
+SELECT ROUND(float_val, 2), ROUND(double_val, 5) FROM db.dbo.copy_float_types;
 ----
 3.14	2.71828
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_float_types');
+DROP TABLE IF EXISTS db.dbo.copy_float_types;
 
 statement ok
 DROP TABLE float_types;
@@ -64,18 +64,18 @@ CREATE TABLE string_types AS SELECT
     'A longer string with spaces'::VARCHAR AS long_str;
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_string_types');
+DROP TABLE IF EXISTS db.dbo.copy_string_types;
 
 statement ok
 COPY string_types TO 'mssql://db/dbo/copy_string_types' (FORMAT 'bcp', CREATE_TABLE true);
 
 query II
-SELECT * FROM mssql_scan('db', 'SELECT * FROM dbo.copy_string_types');
+SELECT * FROM db.dbo.copy_string_types;
 ----
 Hello	A longer string with spaces
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_string_types');
+DROP TABLE IF EXISTS db.dbo.copy_string_types;
 
 statement ok
 DROP TABLE string_types;
@@ -85,18 +85,18 @@ statement ok
 CREATE TABLE bool_types AS SELECT true::BOOLEAN AS bool_true, false::BOOLEAN AS bool_false;
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_bool_types');
+DROP TABLE IF EXISTS db.dbo.copy_bool_types;
 
 statement ok
 COPY bool_types TO 'mssql://db/dbo/copy_bool_types' (FORMAT 'bcp', CREATE_TABLE true);
 
 query II
-SELECT * FROM mssql_scan('db', 'SELECT * FROM dbo.copy_bool_types');
+SELECT * FROM db.dbo.copy_bool_types;
 ----
 1	0
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_bool_types');
+DROP TABLE IF EXISTS db.dbo.copy_bool_types;
 
 statement ok
 DROP TABLE bool_types;
@@ -106,18 +106,18 @@ statement ok
 CREATE TABLE date_types AS SELECT DATE '2024-06-15' AS date_val;
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_date_types');
+DROP TABLE IF EXISTS db.dbo.copy_date_types;
 
 statement ok
 COPY date_types TO 'mssql://db/dbo/copy_date_types' (FORMAT 'bcp', CREATE_TABLE true);
 
 query I
-SELECT * FROM mssql_scan('db', 'SELECT CONVERT(varchar, date_val, 23) FROM dbo.copy_date_types');
+SELECT CAST(date_val AS DATE) FROM db.dbo.copy_date_types;
 ----
 2024-06-15
 
 statement ok
-SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_date_types');
+DROP TABLE IF EXISTS db.dbo.copy_date_types;
 
 statement ok
 DROP TABLE date_types;
