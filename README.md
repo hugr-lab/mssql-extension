@@ -512,6 +512,17 @@ The COPY TO command supports two target formats:
 
 Both formats are equivalent and can be used interchangeably.
 
+#### Empty Schema Syntax for Temp Tables
+
+Temp tables can use an empty schema notation for clarity:
+
+| Format | Standard Syntax | Empty Schema Syntax |
+|--------|-----------------|---------------------|
+| **URL** | `mssql://catalog/#temp` | `mssql://catalog//#temp` |
+| **Catalog** | `catalog.#temp` | `catalog..#temp` |
+
+Both syntaxes are equivalent for temp tables. The empty schema syntax (`//` or `..`) explicitly shows there's no schema component.
+
 ### Basic COPY TO
 
 ```sql
@@ -569,11 +580,17 @@ COPY data TO 'sqlserver.#temp_table' (FORMAT 'bcp');
 SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
 COMMIT;
 
+-- Empty schema syntax (equivalent alternatives)
+BEGIN;
+COPY data TO 'mssql://sqlserver//#temp_table' (FORMAT 'bcp');  -- URL with empty schema
+COPY data TO 'sqlserver..#temp_table' (FORMAT 'bcp');          -- Catalog with empty schema
+COMMIT;
+
 -- Global temp table (visible to all sessions)
 COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 ```
 
-> **Note**: Temp tables have no schema component. Use `catalog.#table` or `mssql://catalog/#table` format.
+> **Note**: Temp tables have no schema component. Use `catalog.#table`, `catalog..#table`, `mssql://catalog/#table`, or `mssql://catalog//#table` format.
 
 ### COPY TO Settings
 
@@ -595,6 +612,33 @@ COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 - **Type mapping**: DuckDB types mapped to SQL Server equivalents (VARCHAR→NVARCHAR, etc.)
 - **No RETURNING**: Use INSERT for cases requiring returned values
 - **Transaction support**: Works within transactions; temp tables require transaction context
+
+### Column Mapping (Existing Tables)
+
+When copying to an existing table with `CREATE_TABLE false`, columns are matched **by name** (case-insensitive), not by position:
+
+```sql
+-- Target table has columns: id INT, name VARCHAR(50), value FLOAT
+
+-- Source can have different column order
+CREATE TABLE source AS SELECT 1.5::DOUBLE AS value, 1 AS id;
+
+-- Copies successfully: id→id, value→value, name→NULL
+COPY source TO 'mssql://db/dbo/target' (FORMAT 'bcp', CREATE_TABLE false);
+```
+
+**Column Mapping Rules:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Same columns, same order | Direct mapping (backward compatible) |
+| Same columns, different order | Mapped by name |
+| Source has fewer columns | Missing target columns receive NULL |
+| Source has extra columns | Extra columns are ignored |
+| No matching columns | Error: "No matching columns" |
+| Case mismatch (id vs ID) | Matched case-insensitively |
+
+> **Note**: Target columns that don't have matching source columns must allow NULL values.
 
 ## Data Modification (INSERT)
 

@@ -126,7 +126,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		// URL syntax
 		bind_data->target = TargetResolver::ResolveURL(context, target_path);
 	} else {
-		// Try catalog syntax: catalog.schema.table or catalog.table
+		// Try catalog syntax: catalog.schema.table or catalog.table or catalog..#temp
 		vector<string> parts = StringUtil::Split(target_path, '.');
 
 		if (parts.size() < 2 || parts.size() > 3) {
@@ -134,6 +134,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 				"MSSQL COPY: Invalid target format. Use either:\n"
 				"  - URL syntax: 'mssql://<catalog>/<schema>/<table>'\n"
 				"  - Catalog syntax: <catalog>.<schema>.<table> or <catalog>.<table>\n"
+				"  - Temp table: <catalog>..#temp_table (empty schema)\n"
 				"Got: %s",
 				target_path);
 		}
@@ -141,15 +142,18 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		string catalog_name = parts[0];
 		string schema_name;
 		string table_name;
+		bool allow_empty_schema = false;
 
 		if (parts.size() == 2) {
 			// catalog.table - use default schema 'dbo'
 			schema_name = "dbo";
 			table_name = parts[1];
 		} else {
-			// catalog.schema.table
+			// catalog.schema.table or catalog..#temp (empty schema)
 			schema_name = parts[1];
 			table_name = parts[2];
+			// If schema is empty, this is the catalog..#temp syntax
+			allow_empty_schema = schema_name.empty();
 		}
 
 		// Verify catalog exists and is an MSSQL catalog
@@ -169,10 +173,11 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		}
 
 		// Use ResolveCatalog to create the target
-		bind_data->target = TargetResolver::ResolveCatalog(context, catalog_name, schema_name, table_name);
+		bind_data->target =
+			TargetResolver::ResolveCatalog(context, catalog_name, schema_name, table_name, allow_empty_schema);
 
-		CopyDebugLog(1, "BCPCopyBind: resolved catalog syntax: catalog='%s', schema='%s', table='%s'",
-					 catalog_name.c_str(), schema_name.c_str(), table_name.c_str());
+		CopyDebugLog(1, "BCPCopyBind: resolved catalog syntax: catalog='%s', schema='%s', table='%s', empty_schema=%d",
+					 catalog_name.c_str(), schema_name.c_str(), table_name.c_str(), allow_empty_schema ? 1 : 0);
 	}
 
 	bind_data->catalog_name = bind_data->target.catalog_name;
@@ -227,112 +232,184 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 
 	// Acquire a connection from the pool
 	// For BCP, we need an exclusive connection that will remain in Executing state
+	CopyDebugLog(2, "BCPCopyInitGlobal: acquiring connection from pool");
 	gstate->connection = ConnectionProvider::GetConnection(context, mssql_catalog);
 	if (!gstate->connection) {
 		throw IOException("MSSQL COPY: Failed to acquire connection from pool");
 	}
+	CopyDebugLog(2, "BCPCopyInitGlobal: connection acquired");
 
-	// Check connection is in Idle state
-	if (gstate->connection->GetState() != tds::ConnectionState::Idle) {
-		auto state = gstate->connection->GetState();
-		string state_str = tds::ConnectionStateToString(state);
+	// Helper to release connection on error
+	auto release_connection_on_error = [&]() {
+		if (gstate->connection) {
+			CopyDebugLog(2, "BCPCopyInitGlobal: releasing connection due to error");
+			// Ensure connection is in Idle state before releasing
+			if (gstate->connection->GetState() == tds::ConnectionState::Executing) {
+				gstate->connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+			}
+			bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+			if (in_transaction) {
+				ConnectionProvider::ReleaseConnection(context, mssql_catalog, gstate->connection);
+			} else {
+				mssql_catalog.GetConnectionPool().Release(gstate->connection);
+			}
+			gstate->connection.reset();
+		}
+	};
 
-		// Provide specific error messages based on connection state
-		if (state == tds::ConnectionState::Executing) {
-			throw InvalidInputException(
-				"MSSQL COPY: Connection is busy executing another query. "
-				"This can happen if you're reading from an MSSQL table (via mssql_scan) "
-				"and writing to the same MSSQL database within a transaction. "
-				"Either: (1) Read data into a local table first, then COPY to MSSQL, or "
-				"(2) Use separate transactions for reading and writing. "
-				"Connection state: %s",
-				state_str);
+	try {
+		// Check connection is in Idle state
+		if (gstate->connection->GetState() != tds::ConnectionState::Idle) {
+			auto state = gstate->connection->GetState();
+			string state_str = tds::ConnectionStateToString(state);
+
+			// Provide specific error messages based on connection state
+			if (state == tds::ConnectionState::Executing) {
+				throw InvalidInputException(
+					"MSSQL COPY: Connection is busy executing another query. "
+					"This can happen if you're reading from an MSSQL table (via mssql_scan) "
+					"and writing to the same MSSQL database within a transaction. "
+					"Either: (1) Read data into a local table first, then COPY to MSSQL, or "
+					"(2) Use separate transactions for reading and writing. "
+					"Connection state: %s",
+					state_str);
+			} else {
+				throw InvalidInputException(
+					"MSSQL COPY: Connection is not ready for BCP operation (state: %s). "
+					"The connection may be in an error state or performing another operation.",
+					state_str);
+			}
+		}
+
+		// Check if we're in a DuckDB transaction - warn about potential issues
+		bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+		if (in_transaction) {
+			CopyDebugLog(1,
+						 "BCPCopyInitGlobal: Running COPY within a transaction. "
+						 "If COPY fails mid-stream, partial data may be committed. "
+						 "For atomic bulk loads, ensure the COPY completes successfully before COMMIT.");
+		}
+
+		// Validate target and optionally create table
+		TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
+									   bdata.source_names);
+
+		// Invalidate catalog cache if table was created/dropped (non-temp tables only)
+		// This ensures the new table schema is visible for subsequent queries
+		if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
+			mssql_catalog.InvalidateMetadataCache();
+			CopyDebugLog(2, "BCPCopyInitGlobal: catalog cache invalidated after table creation/modification");
+		}
+
+		// Generate column metadata for BCP
+		// For existing tables (not created or replaced), we MUST use the target table's column types
+		// for COLMETADATA. The BCP protocol requires COLMETADATA to match the target table exactly.
+		// For newly created tables, we use source types since the table was created from them.
+		bool need_target_metadata = !bdata.config.overwrite;
+		bool need_column_mapping = false;
+		if (need_target_metadata) {
+			// Try to get target column metadata - this will work for existing tables
+			try {
+				gstate->columns = TargetResolver::GetExistingTableColumnMetadata(*gstate->connection, bdata.target);
+				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
+							 (unsigned long long)gstate->columns.size());
+
+				// Build column mapping from source to target
+				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
+
+				// Check if we need to use column mapping (i.e., not a 1:1 positional match)
+				// Mapping is needed if: column counts differ, or any mapping != position
+				need_column_mapping = (bdata.source_names.size() != gstate->columns.size());
+				if (!need_column_mapping) {
+					for (idx_t i = 0; i < gstate->column_mapping.size(); i++) {
+						if (gstate->column_mapping[i] != static_cast<int32_t>(i)) {
+							need_column_mapping = true;
+							break;
+						}
+					}
+				}
+
+				if (need_column_mapping) {
+					CopyDebugLog(1, "BCPCopyInitGlobal: using column mapping (source: %llu cols, target: %llu cols)",
+								 (unsigned long long)bdata.source_names.size(),
+								 (unsigned long long)gstate->columns.size());
+				}
+			} catch (...) {
+				// If we can't get target metadata (e.g., table was just created), use source types
+				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+				CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
+							 (unsigned long long)gstate->columns.size());
+			}
 		} else {
-			throw InvalidInputException(
-				"MSSQL COPY: Connection is not ready for BCP operation (state: %s). "
-				"The connection may be in an error state or performing another operation.",
-				state_str);
+			// Table was replaced or created, use source types
+			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
-	}
 
-	// Check if we're in a DuckDB transaction - warn about potential issues
-	bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
-	if (in_transaction) {
-		CopyDebugLog(1,
-					 "BCPCopyInitGlobal: Running COPY within a transaction. "
-					 "If COPY fails mid-stream, partial data may be committed. "
-					 "For atomic bulk loads, ensure the COPY completes successfully before COMMIT.");
-	}
-
-	// Validate target and optionally create table
-	TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
-								   bdata.source_names);
-
-	// Invalidate catalog cache if table was created/dropped (non-temp tables only)
-	// This ensures the new table schema is visible for subsequent queries
-	if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
-		mssql_catalog.InvalidateMetadataCache();
-		CopyDebugLog(2, "BCPCopyInitGlobal: catalog cache invalidated after table creation/modification");
-	}
-
-	// Generate column metadata for BCP
-	gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
-
-	// Build and execute INSERT BULK statement
-	// This prepares the server to receive BulkLoad packets
-	// For temp tables, use just the table name (not schema-qualified)
-	string target_name;
-	if (bdata.target.IsTempTable()) {
-		target_name = bdata.target.GetBracketedTable();
-	} else {
-		target_name = bdata.target.GetFullyQualifiedName();
-	}
-	string insert_bulk = "INSERT BULK " + target_name + " (";
-	for (idx_t i = 0; i < gstate->columns.size(); i++) {
-		if (i > 0) {
-			insert_bulk += ", ";
+		// Build and execute INSERT BULK statement
+		// This prepares the server to receive BulkLoad packets
+		// For temp tables, use just the table name (not schema-qualified)
+		string target_name;
+		if (bdata.target.IsTempTable()) {
+			target_name = bdata.target.GetBracketedTable();
+		} else {
+			target_name = bdata.target.GetFullyQualifiedName();
 		}
-		insert_bulk += "[" + gstate->columns[i].name + "] ";
-		insert_bulk += TargetResolver::GetSQLServerTypeDeclaration(gstate->columns[i].duckdb_type);
-	}
-	insert_bulk += ")";
-
-	// Add bulk load hints for performance
-	// TABLOCK: Table-level lock instead of row locks (15-30% faster, enables minimal logging)
-	// ROWS_PER_BATCH: Helps SQL Server optimize batch processing
-	if (bdata.config.tablock) {
-		insert_bulk += " WITH (TABLOCK";
-		if (bdata.config.flush_rows > 0) {
-			insert_bulk += ", ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows);
+		string insert_bulk = "INSERT BULK " + target_name + " (";
+		for (idx_t i = 0; i < gstate->columns.size(); i++) {
+			if (i > 0) {
+				insert_bulk += ", ";
+			}
+			insert_bulk += "[" + gstate->columns[i].name + "] ";
+			// Use the column's method to get accurate type declaration for INSERT BULK
+			// This handles both existing tables (uses actual TDS type info) and new tables
+			insert_bulk += gstate->columns[i].GetSQLServerTypeDeclaration();
 		}
 		insert_bulk += ")";
-	} else if (bdata.config.flush_rows > 0) {
-		insert_bulk += " WITH (ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows) + ")";
+
+		// Add bulk load hints for performance
+		// TABLOCK: Table-level lock instead of row locks (15-30% faster, enables minimal logging)
+		// ROWS_PER_BATCH: Helps SQL Server optimize batch processing
+		if (bdata.config.tablock) {
+			insert_bulk += " WITH (TABLOCK";
+			if (bdata.config.flush_rows > 0) {
+				insert_bulk += ", ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows);
+			}
+			insert_bulk += ")";
+		} else if (bdata.config.flush_rows > 0) {
+			insert_bulk += " WITH (ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows) + ")";
+		}
+
+		CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
+
+		// Cache the INSERT BULK SQL for re-execution on batch flush
+		gstate->insert_bulk_sql = insert_bulk;
+
+		// Execute INSERT BULK to prepare server for bulk load
+		auto result = MSSQLSimpleQuery::Execute(*gstate->connection, insert_bulk);
+		if (!result.success) {
+			throw InvalidInputException("MSSQL COPY: Failed to execute INSERT BULK: %s", result.error_message);
+		}
+
+		// Transition connection to Executing state for BCP
+		if (!gstate->connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
+			throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
+		}
+
+		// Create BCP writer with optional column mapping
+		gstate->writer =
+			make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns, gstate->column_mapping);
+
+		// Send COLMETADATA token to start the BCP stream
+		gstate->writer->WriteColmetadata();
+
+		CopyDebugLog(1, "BCPCopyInitGlobal: BCP stream started, ready to receive rows");
+
+	} catch (...) {
+		// Release connection on any error during initialization
+		release_connection_on_error();
+		throw;
 	}
-
-	CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
-
-	// Cache the INSERT BULK SQL for re-execution on batch flush
-	gstate->insert_bulk_sql = insert_bulk;
-
-	// Execute INSERT BULK to prepare server for bulk load
-	auto result = MSSQLSimpleQuery::Execute(*gstate->connection, insert_bulk);
-	if (!result.success) {
-		throw InvalidInputException("MSSQL COPY: Failed to execute INSERT BULK: %s", result.error_message);
-	}
-
-	// Transition connection to Executing state for BCP
-	if (!gstate->connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-		throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
-	}
-
-	// Create BCP writer
-	gstate->writer = make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns);
-
-	// Send COLMETADATA token to start the BCP stream
-	gstate->writer->WriteColmetadata();
-
-	CopyDebugLog(1, "BCPCopyInitGlobal: BCP stream started, ready to receive rows");
 
 	return std::move(gstate);
 }
@@ -374,51 +451,60 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 
 	CopyDebugLog(2, "BCPCopySink: encoding %llu rows...", (unsigned long long)input.size());
 
-	// Write directly to the BCPWriter (no local buffering to reduce memory)
-	// This is thread-safe because BCPWriter::WriteRows has its own mutex
-	auto start_write = Clock::now();
-	idx_t rows_written = gdata.writer->WriteRows(input);
-	double write_ms = ElapsedMs(start_write);
-	gdata.rows_sent.fetch_add(rows_written);
+	try {
+		// Write directly to the BCPWriter (no local buffering to reduce memory)
+		// This is thread-safe because BCPWriter::WriteRows has its own mutex
+		auto start_write = Clock::now();
+		idx_t rows_written = gdata.writer->WriteRows(input);
+		double write_ms = ElapsedMs(start_write);
+		gdata.rows_sent.fetch_add(rows_written);
 
-	CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.2f ms, checking flush...", (unsigned long long)rows_written,
-				 write_ms);
+		CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.2f ms, checking flush...",
+					 (unsigned long long)rows_written, write_ms);
 
-	// Check for interrupt after encoding
-	if (context.client.interrupted) {
-		CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after encoding");
-		throw InterruptException();
-	}
-
-	// Check if we should flush to SQL Server
-	double flush_ms = 0;
-	if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
-		CopyDebugLog(1, "BCPCopySink: triggering server flush (rows_in_batch=%llu, threshold=%llu)...",
-					 (unsigned long long)gdata.writer->GetRowsInCurrentBatch(),
-					 (unsigned long long)bdata.config.flush_rows);
-		auto start_flush = Clock::now();
-		std::lock_guard<std::mutex> lock(gdata.write_mutex);
-		// Double-check after acquiring lock
-		if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
-			FlushToServer(gdata, bdata);
+		// Check for interrupt after encoding
+		if (context.client.interrupted) {
+			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after encoding");
+			throw InterruptException();
 		}
-		flush_ms = ElapsedMs(start_flush);
-		CopyDebugLog(1, "BCPCopySink: server flush completed in %.2f ms", flush_ms);
-	}
 
-	// Check for interrupt after flush
-	if (context.client.interrupted) {
-		CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after flush");
-		throw InterruptException();
-	}
+		// Check if we should flush to SQL Server
+		double flush_ms = 0;
+		if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
+			CopyDebugLog(1, "BCPCopySink: triggering server flush (rows_in_batch=%llu, threshold=%llu)...",
+						 (unsigned long long)gdata.writer->GetRowsInCurrentBatch(),
+						 (unsigned long long)bdata.config.flush_rows);
+			auto start_flush = Clock::now();
+			std::lock_guard<std::mutex> lock(gdata.write_mutex);
+			// Double-check after acquiring lock
+			if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
+				FlushToServer(gdata, bdata);
+			}
+			flush_ms = ElapsedMs(start_flush);
+			CopyDebugLog(1, "BCPCopySink: server flush completed in %.2f ms", flush_ms);
+		}
 
-	double total_ms = ElapsedMs(start_sink);
-	if (GetCopyDebugLevel() >= 1) {
-		double rows_per_sec = (total_ms > 0) ? (rows_written * 1000.0 / total_ms) : 0;
-		CopyDebugLog(
-			1, "BCPCopySink: DONE - %llu rows in %.2f ms (write: %.2f, flush: %.2f) | %.0f rows/s | total sent: %llu",
-			(unsigned long long)rows_written, total_ms, write_ms, flush_ms, rows_per_sec,
-			(unsigned long long)gdata.rows_sent.load());
+		// Check for interrupt after flush
+		if (context.client.interrupted) {
+			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after flush");
+			throw InterruptException();
+		}
+
+		double total_ms = ElapsedMs(start_sink);
+		if (GetCopyDebugLevel() >= 1) {
+			double rows_per_sec = (total_ms > 0) ? (rows_written * 1000.0 / total_ms) : 0;
+			CopyDebugLog(
+				1,
+				"BCPCopySink: DONE - %llu rows in %.2f ms (write: %.2f, flush: %.2f) | %.0f rows/s | total sent: %llu",
+				(unsigned long long)rows_written, total_ms, write_ms, flush_ms, rows_per_sec,
+				(unsigned long long)gdata.rows_sent.load());
+		}
+	} catch (std::exception &e) {
+		// Record the error for finalize to handle cleanup
+		CopyDebugLog(1, "BCPCopySink: ERROR - %s", e.what());
+		gdata.has_error = true;
+		gdata.error_message = e.what();
+		throw;
 	}
 }
 

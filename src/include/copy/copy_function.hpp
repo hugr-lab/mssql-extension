@@ -43,6 +43,20 @@ struct MSSQLCopyBindData : public TableFunctionData {
 
 	// Catalog name for connection provider lookup
 	string catalog_name;
+
+	// Target table column metadata (populated when copying to existing table)
+	// When non-empty, these are used for COLMETADATA instead of source_types
+	vector<mssql::BCPColumnMetadata> target_columns;
+
+	// Flag indicating we're copying to an existing table (not creating new)
+	bool use_target_types = false;
+
+	// Column mapping: mapping[target_idx] = source_idx, or -1 if source doesn't have this column
+	// Used when copying to existing table with name-based column matching
+	vector<int32_t> column_mapping;
+
+	// Flag indicating column mapping is needed (source columns differ from target)
+	bool use_column_mapping = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -61,6 +75,10 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 
 	// Column metadata for encoding
 	vector<mssql::BCPColumnMetadata> columns;
+
+	// Column mapping: mapping[target_idx] = source_idx, or -1 if source doesn't have this column
+	// When non-empty, BCPWriter uses this to map source data to target columns
+	vector<int32_t> column_mapping;
 
 	// Progress tracking
 	std::atomic<idx_t> rows_sent{0};		// Total rows sent to writer

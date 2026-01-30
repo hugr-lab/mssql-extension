@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 
 namespace duckdb {
 namespace mssql {
@@ -58,6 +59,10 @@ void BCPCopyTarget::DetectTempTable() {
 }
 
 string BCPCopyTarget::GetFullyQualifiedName() const {
+	// For temp tables with empty schema, return just the table name
+	if (schema_name.empty() && IsTempTable()) {
+		return GetBracketedTable();
+	}
 	return GetBracketedSchema() + "." + GetBracketedTable();
 }
 
@@ -97,6 +102,69 @@ bool BCPColumnMetadata::IsFixedLength() const {
 	}
 }
 
+string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
+	switch (tds_type_token) {
+	case tds::TDS_TYPE_BITN:
+		return "bit";
+
+	case tds::TDS_TYPE_INTN:
+		if (max_length == 1) {
+			return "tinyint";
+		} else if (max_length == 2) {
+			return "smallint";
+		} else if (max_length == 4) {
+			return "int";
+		} else {
+			return "bigint";
+		}
+
+	case tds::TDS_TYPE_FLOATN:
+		if (max_length == 4) {
+			return "real";
+		} else {
+			return "float";
+		}
+
+	case tds::TDS_TYPE_DECIMAL:
+	case tds::TDS_TYPE_NUMERIC:
+		return "decimal(" + std::to_string(precision) + ", " + std::to_string(scale) + ")";
+
+	case tds::TDS_TYPE_NVARCHAR:
+		if (max_length == 0xFFFF) {
+			return "nvarchar(max)";
+		} else {
+			// max_length is in bytes, nvarchar is 2 bytes per character
+			return "nvarchar(" + std::to_string(max_length / 2) + ")";
+		}
+
+	case tds::TDS_TYPE_BIGVARBINARY:
+		if (max_length == 0xFFFF) {
+			return "varbinary(max)";
+		} else {
+			return "varbinary(" + std::to_string(max_length) + ")";
+		}
+
+	case tds::TDS_TYPE_UNIQUEIDENTIFIER:
+		return "uniqueidentifier";
+
+	case tds::TDS_TYPE_DATE:
+		return "date";
+
+	case tds::TDS_TYPE_TIME:
+		return "time(" + std::to_string(scale) + ")";
+
+	case tds::TDS_TYPE_DATETIME2:
+		return "datetime2(" + std::to_string(scale) + ")";
+
+	case tds::TDS_TYPE_DATETIMEOFFSET:
+		return "datetimeoffset(" + std::to_string(scale) + ")";
+
+	default:
+		// Fallback to DuckDB type-based declaration
+		return TargetResolver::GetSQLServerTypeDeclaration(duckdb_type);
+	}
+}
+
 uint8_t BCPColumnMetadata::GetLengthPrefixSize() const {
 	if (IsVariableLengthUSHORT()) {
 		return 2;  // USHORTLEN
@@ -111,9 +179,12 @@ uint8_t BCPColumnMetadata::GetLengthPrefixSize() const {
 //===----------------------------------------------------------------------===//
 
 BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &url) {
-	// URL format: mssql://<catalog>/<schema>/<table>
-	// or: mssql://<catalog>/#temp_table
-	// or: mssql://<catalog>/##global_temp_table
+	// URL formats supported:
+	// - mssql://<catalog>/<table>           (schema defaults to 'dbo')
+	// - mssql://<catalog>/<schema>/<table>  (explicit schema)
+	// - mssql://<catalog>/#temp_table       (temp table, no schema)
+	// - mssql://<catalog>//#temp_table      (temp table, empty schema - NEW)
+	// - mssql://<catalog>//##global_temp    (global temp, empty schema - NEW)
 
 	DebugLog(2, "ResolveURL: parsing '%s'", url.c_str());
 
@@ -124,6 +195,20 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 
 	// Remove prefix
 	string path = url.substr(8);  // Skip "mssql://"
+
+	// Check for triple slash (invalid)
+	if (path.find("///") != string::npos) {
+		throw InvalidInputException(
+			"MSSQL COPY: Invalid URL format - triple slash not allowed. Expected:\n"
+			"  mssql://<catalog>/<table>\n"
+			"  mssql://<catalog>/<schema>/<table>\n"
+			"  mssql://<catalog>/#temp_table\n"
+			"  mssql://<catalog>//#temp_table");
+	}
+
+	// Check for empty schema syntax: mssql://catalog//#table
+	// This creates ["catalog", "", "#table"] when split
+	bool has_empty_schema = path.find("//") != string::npos;
 
 	// Split by '/'
 	vector<string> parts = StringUtil::Split(path, '/');
@@ -158,8 +243,8 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 		target.schema_name = "dbo";
 		target.table_name = parts[1];
 	} else if (parts.size() == 3) {
-		// mssql://<catalog>/<schema>/<table>
-		target.schema_name = parts[1];
+		// mssql://<catalog>/<schema>/<table> or mssql://<catalog>//<table> (empty schema)
+		target.schema_name = parts[1];	// May be empty for temp tables
 		target.table_name = parts[2];
 	} else {
 		throw InvalidInputException(
@@ -173,6 +258,17 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 	// Detect temp table from name
 	target.DetectTempTable();
 
+	// Validate empty schema: only allowed for temp tables
+	if (target.schema_name.empty()) {
+		if (!target.IsTempTable()) {
+			throw InvalidInputException(
+				"MSSQL COPY: Empty schema only valid for temp tables (table name must start with '#'). "
+				"Got table name: '%s'",
+				target.table_name);
+		}
+		DebugLog(2, "ResolveURL: empty schema accepted for temp table '%s'", target.table_name.c_str());
+	}
+
 	DebugLog(1, "ResolveURL: catalog='%s', schema='%s', table='%s', is_temp=%d, is_global_temp=%d",
 			 target.catalog_name.c_str(), target.schema_name.c_str(), target.table_name.c_str(), target.is_temp_table,
 			 target.is_global_temp);
@@ -185,11 +281,31 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 //===----------------------------------------------------------------------===//
 
 BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const string &catalog, const string &schema,
-											 const string &table) {
+											 const string &table, bool allow_empty_schema) {
 	BCPCopyTarget target;
 	target.catalog_name = catalog;
-	target.schema_name = schema.empty() ? "dbo" : schema;
 	target.table_name = table;
+
+	// Detect temp table first (needed for empty schema validation)
+	target.DetectTempTable();
+
+	// Handle schema: empty schema allowed only for temp tables
+	if (schema.empty() && allow_empty_schema && target.IsTempTable()) {
+		// Empty schema explicitly requested for temp table - keep it empty
+		target.schema_name = "";
+		DebugLog(2, "ResolveCatalog: empty schema accepted for temp table '%s'", table.c_str());
+	} else if (schema.empty() && allow_empty_schema && !target.IsTempTable()) {
+		// Empty schema for non-temp table is an error
+		throw InvalidInputException(
+			"MSSQL COPY: Empty schema only valid for temp tables (table name must start with '#'). "
+			"Got table name: '%s'",
+			table);
+	} else if (schema.empty()) {
+		// Default behavior: empty schema defaults to 'dbo'
+		target.schema_name = "dbo";
+	} else {
+		target.schema_name = schema;
+	}
 
 	// Verify catalog exists and is an MSSQL catalog
 	try {
@@ -203,10 +319,8 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 									target.catalog_name);
 	}
 
-	target.DetectTempTable();
-
-	DebugLog(1, "ResolveCatalog: catalog='%s', schema='%s', table='%s'", target.catalog_name.c_str(),
-			 target.schema_name.c_str(), target.table_name.c_str());
+	DebugLog(1, "ResolveCatalog: catalog='%s', schema='%s', table='%s', is_temp=%d", target.catalog_name.c_str(),
+			 target.schema_name.c_str(), target.table_name.c_str(), target.IsTempTable() ? 1 : 0);
 
 	return target;
 }
@@ -449,48 +563,318 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		throw InvalidInputException("MSSQL COPY: Failed to query table schema: %s", result.error_message);
 	}
 
-	// Check column count
-	if (result.rows.size() != source_types.size()) {
-		throw InvalidInputException(
-			"MSSQL COPY: Column count mismatch. Source has %llu columns, target table '%s' has %llu columns. "
-			"Use REPLACE=true to recreate the table with the new schema.",
-			(unsigned long long)source_types.size(), target.GetFullyQualifiedName(),
-			(unsigned long long)result.rows.size());
+	// Build a map of target column names to their type information (case-insensitive)
+	std::unordered_map<string, std::pair<string, idx_t>> target_columns;  // name -> (type, index)
+	for (idx_t i = 0; i < result.rows.size(); i++) {
+		if (result.rows[i].size() >= 2) {
+			string col_name_lower = StringUtil::Lower(result.rows[i][0]);
+			target_columns[col_name_lower] = {result.rows[i][1], i};
+		}
 	}
 
-	// Validate each column
-	for (idx_t i = 0; i < source_types.size(); i++) {
-		if (result.rows[i].size() < 2) {
-			continue;  // Skip if we couldn't get column info
+	// Validate each source column exists in target and has compatible type
+	idx_t matched_columns = 0;
+	for (idx_t i = 0; i < source_names.size(); i++) {
+		string source_name_lower = StringUtil::Lower(source_names[i]);
+		auto it = target_columns.find(source_name_lower);
+
+		if (it == target_columns.end()) {
+			// Source column not found in target - this is OK, we'll just ignore it
+			DebugLog(2, "ValidateExistingTableSchema: source column '%s' not in target (will be ignored)",
+					 source_names[i].c_str());
+			continue;
 		}
 
-		const string &target_col_name = result.rows[i][0];
-		const string &target_type_name = result.rows[i][1];
+		matched_columns++;
+		const string &target_type_name = it->second.first;
 
-		// Check column name (case-insensitive)
-		if (!StringUtil::CIEquals(source_names[i], target_col_name)) {
-			throw InvalidInputException(
-				"MSSQL COPY: Column name mismatch at position %llu. Source has '%s', target table has '%s'. "
-				"Use REPLACE=true to recreate the table with the new schema.",
-				(unsigned long long)(i + 1), source_names[i], target_col_name);
-		}
-
-		// Check type compatibility (basic validation)
-		// We allow some flexibility in type mapping, so we check for broad compatibility
+		// Check type compatibility
 		bool compatible = IsTypeCompatible(source_types[i], target_type_name);
 		if (!compatible) {
 			throw InvalidInputException(
-				"MSSQL COPY: Type mismatch for column '%s'. Source type '%s' is not compatible with target type '%s'. "
+				"MSSQL COPY: Column '%s' type mismatch: target expects %s, source provides %s. "
 				"Use REPLACE=true to recreate the table with the new schema.",
-				source_names[i], source_types[i].ToString(), target_type_name);
+				source_names[i], StringUtil::Upper(target_type_name), source_types[i].ToString());
 		}
 
-		DebugLog(3, "ValidateExistingTableSchema: column %llu '%s' compatible (source: %s, target: %s)",
-				 (unsigned long long)i, source_names[i].c_str(), source_types[i].ToString().c_str(),
-				 target_type_name.c_str());
+		DebugLog(3, "ValidateExistingTableSchema: column '%s' compatible (source: %s, target: %s)",
+				 source_names[i].c_str(), source_types[i].ToString().c_str(), target_type_name.c_str());
 	}
 
-	DebugLog(2, "ValidateExistingTableSchema: schema validated successfully");
+	// At least one source column must match a target column
+	if (matched_columns == 0) {
+		throw InvalidInputException(
+			"MSSQL COPY: No matching columns between source and target table '%s'. "
+			"Source columns: %s. Target table has %llu columns. "
+			"Column matching is case-insensitive by name.",
+			target.GetFullyQualifiedName(), StringUtil::Join(source_names, ", "),
+			(unsigned long long)result.rows.size());
+	}
+
+	DebugLog(2,
+			 "ValidateExistingTableSchema: validated %llu/%llu source columns match target (target has %llu columns)",
+			 (unsigned long long)matched_columns, (unsigned long long)source_names.size(),
+			 (unsigned long long)result.rows.size());
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: Map SQL Server type name to TDS type token
+//===----------------------------------------------------------------------===//
+
+static uint8_t SQLServerTypeToTDSToken(const string &type_name) {
+	string type_lower = StringUtil::Lower(type_name);
+
+	if (type_lower == "bit") {
+		return tds::TDS_TYPE_BITN;
+	} else if (type_lower == "tinyint") {
+		return tds::TDS_TYPE_INTN;
+	} else if (type_lower == "smallint") {
+		return tds::TDS_TYPE_INTN;
+	} else if (type_lower == "int") {
+		return tds::TDS_TYPE_INTN;
+	} else if (type_lower == "bigint") {
+		return tds::TDS_TYPE_INTN;
+	} else if (type_lower == "real") {
+		return tds::TDS_TYPE_FLOATN;
+	} else if (type_lower == "float") {
+		return tds::TDS_TYPE_FLOATN;
+	} else if (type_lower == "decimal" || type_lower == "numeric") {
+		return tds::TDS_TYPE_DECIMAL;
+	} else if (type_lower == "money" || type_lower == "smallmoney") {
+		return tds::TDS_TYPE_DECIMAL;
+	} else if (type_lower == "varchar" || type_lower == "char" || type_lower == "text") {
+		return tds::TDS_TYPE_NVARCHAR;	// Use NVARCHAR for all char types in BCP
+	} else if (type_lower == "nvarchar" || type_lower == "nchar" || type_lower == "ntext") {
+		return tds::TDS_TYPE_NVARCHAR;
+	} else if (type_lower == "varbinary" || type_lower == "binary" || type_lower == "image") {
+		return tds::TDS_TYPE_BIGVARBINARY;
+	} else if (type_lower == "uniqueidentifier") {
+		return tds::TDS_TYPE_UNIQUEIDENTIFIER;
+	} else if (type_lower == "date") {
+		return tds::TDS_TYPE_DATE;
+	} else if (type_lower == "time") {
+		return tds::TDS_TYPE_TIME;
+	} else if (type_lower == "datetime" || type_lower == "datetime2" || type_lower == "smalldatetime") {
+		return tds::TDS_TYPE_DATETIME2;
+	} else if (type_lower == "datetimeoffset") {
+		return tds::TDS_TYPE_DATETIMEOFFSET;
+	}
+
+	// Default to NVARCHAR for unknown types
+	return tds::TDS_TYPE_NVARCHAR;
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: Get max_length for SQL Server type
+//===----------------------------------------------------------------------===//
+
+static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_length, uint8_t precision) {
+	string type_lower = StringUtil::Lower(type_name);
+
+	if (type_lower == "bit") {
+		return 1;
+	} else if (type_lower == "tinyint") {
+		return 1;
+	} else if (type_lower == "smallint") {
+		return 2;
+	} else if (type_lower == "int") {
+		return 4;
+	} else if (type_lower == "bigint") {
+		return 8;
+	} else if (type_lower == "real") {
+		return 4;
+	} else if (type_lower == "float") {
+		return 8;
+	} else if (type_lower == "decimal" || type_lower == "numeric") {
+		// Calculate based on precision
+		if (precision <= 9) {
+			return 5;
+		} else if (precision <= 19) {
+			return 9;
+		} else if (precision <= 28) {
+			return 13;
+		} else {
+			return 17;
+		}
+	} else if (type_lower == "money") {
+		return 8;
+	} else if (type_lower == "smallmoney") {
+		return 4;
+	} else if (type_lower == "varchar" || type_lower == "nvarchar" || type_lower == "char" || type_lower == "nchar") {
+		// For (max), max_length is -1 in sys.columns
+		if (max_length == -1) {
+			return 0xFFFF;	// MAX indicator
+		}
+		// For nvarchar/nchar, max_length is in bytes (2 bytes per char)
+		return static_cast<uint16_t>(max_length);
+	} else if (type_lower == "text" || type_lower == "ntext") {
+		return 0xFFFF;	// MAX indicator
+	} else if (type_lower == "varbinary" || type_lower == "binary") {
+		if (max_length == -1) {
+			return 0xFFFF;	// MAX indicator
+		}
+		return static_cast<uint16_t>(max_length);
+	} else if (type_lower == "image") {
+		return 0xFFFF;
+	} else if (type_lower == "uniqueidentifier") {
+		return 16;
+	} else if (type_lower == "date") {
+		return 3;
+	} else if (type_lower == "time") {
+		return 5;
+	} else if (type_lower == "datetime2") {
+		return 8;
+	} else if (type_lower == "datetime") {
+		return 8;
+	} else if (type_lower == "smalldatetime") {
+		return 4;
+	} else if (type_lower == "datetimeoffset") {
+		return 10;
+	}
+
+	// Default
+	return 0xFFFF;
+}
+
+//===----------------------------------------------------------------------===//
+// TargetResolver::GetExistingTableColumnMetadata
+//===----------------------------------------------------------------------===//
+
+vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::TdsConnection &conn,
+																		 const BCPCopyTarget &target) {
+	// Query the target table's column information
+	string column_sql;
+	if (target.IsTempTable()) {
+		column_sql = StringUtil::Format(
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"FROM tempdb.sys.columns c "
+			"JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id "
+			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
+			"ORDER BY c.column_id",
+			target.GetBracketedTable());
+	} else {
+		column_sql = StringUtil::Format(
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"FROM sys.columns c "
+			"JOIN sys.types t ON c.user_type_id = t.user_type_id "
+			"WHERE c.object_id = OBJECT_ID('%s') "
+			"ORDER BY c.column_id",
+			target.GetFullyQualifiedName());
+	}
+
+	DebugLog(3, "GetExistingTableColumnMetadata SQL: %s", column_sql.c_str());
+
+	auto result = MSSQLSimpleQuery::Execute(conn, column_sql);
+	if (!result.success) {
+		throw InvalidInputException("MSSQL COPY: Failed to query table schema: %s", result.error_message);
+	}
+
+	vector<BCPColumnMetadata> columns;
+	columns.reserve(result.rows.size());
+
+	for (idx_t i = 0; i < result.rows.size(); i++) {
+		if (result.rows[i].size() < 6) {
+			continue;
+		}
+
+		BCPColumnMetadata col;
+		col.name = result.rows[i][0];
+		const string &type_name = result.rows[i][1];
+		int16_t max_length = static_cast<int16_t>(std::stoi(result.rows[i][2]));
+		col.precision = static_cast<uint8_t>(std::stoi(result.rows[i][3]));
+		col.scale = static_cast<uint8_t>(std::stoi(result.rows[i][4]));
+		col.nullable = (result.rows[i][5] == "1" || result.rows[i][5] == "true");
+
+		// Map SQL Server type to TDS type token
+		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
+		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision);
+
+		// Set a reasonable DuckDB type for encoding purposes
+		// This is used by BCPRowEncoder to know how to encode the data
+		string type_lower = StringUtil::Lower(type_name);
+		if (type_lower == "bit") {
+			col.duckdb_type = LogicalType::BOOLEAN;
+		} else if (type_lower == "tinyint") {
+			col.duckdb_type = LogicalType::TINYINT;
+		} else if (type_lower == "smallint") {
+			col.duckdb_type = LogicalType::SMALLINT;
+		} else if (type_lower == "int") {
+			col.duckdb_type = LogicalType::INTEGER;
+		} else if (type_lower == "bigint") {
+			col.duckdb_type = LogicalType::BIGINT;
+		} else if (type_lower == "real") {
+			col.duckdb_type = LogicalType::FLOAT;
+		} else if (type_lower == "float") {
+			col.duckdb_type = LogicalType::DOUBLE;
+		} else if (type_lower == "decimal" || type_lower == "numeric") {
+			col.duckdb_type = LogicalType::DECIMAL(col.precision, col.scale);
+		} else if (type_lower == "money") {
+			col.duckdb_type = LogicalType::DECIMAL(19, 4);
+		} else if (type_lower == "smallmoney") {
+			col.duckdb_type = LogicalType::DECIMAL(10, 4);
+		} else if (type_lower == "uniqueidentifier") {
+			col.duckdb_type = LogicalType::UUID;
+		} else if (type_lower == "date") {
+			col.duckdb_type = LogicalType::DATE;
+		} else if (type_lower == "time") {
+			col.duckdb_type = LogicalType::TIME;
+		} else if (type_lower == "datetime" || type_lower == "datetime2" || type_lower == "smalldatetime") {
+			col.duckdb_type = LogicalType::TIMESTAMP;
+		} else if (type_lower == "datetimeoffset") {
+			col.duckdb_type = LogicalType::TIMESTAMP_TZ;
+		} else if (type_lower == "varbinary" || type_lower == "binary" || type_lower == "image") {
+			col.duckdb_type = LogicalType::BLOB;
+		} else {
+			// Default to VARCHAR for text types
+			col.duckdb_type = LogicalType::VARCHAR;
+		}
+
+		DebugLog(3, "GetExistingTableColumnMetadata: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d",
+				 col.name.c_str(), type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale);
+
+		columns.push_back(std::move(col));
+	}
+
+	DebugLog(2, "GetExistingTableColumnMetadata: retrieved %llu columns from target table",
+			 (unsigned long long)columns.size());
+
+	return columns;
+}
+
+//===----------------------------------------------------------------------===//
+// TargetResolver::BuildColumnMapping
+//===----------------------------------------------------------------------===//
+
+vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_names,
+												   const vector<BCPColumnMetadata> &target_columns) {
+	vector<int32_t> mapping;
+	mapping.reserve(target_columns.size());
+
+	// Build a case-insensitive map of source column names to indices
+	std::unordered_map<string, int32_t> source_name_to_idx;
+	for (idx_t i = 0; i < source_names.size(); i++) {
+		source_name_to_idx[StringUtil::Lower(source_names[i])] = static_cast<int32_t>(i);
+	}
+
+	// For each target column, find the matching source column by name
+	for (idx_t target_idx = 0; target_idx < target_columns.size(); target_idx++) {
+		string target_name_lower = StringUtil::Lower(target_columns[target_idx].name);
+		auto it = source_name_to_idx.find(target_name_lower);
+		if (it != source_name_to_idx.end()) {
+			mapping.push_back(it->second);
+			DebugLog(3, "BuildColumnMapping: target[%llu]='%s' -> source[%d]", (unsigned long long)target_idx,
+					 target_columns[target_idx].name.c_str(), it->second);
+		} else {
+			mapping.push_back(-1);	// No source column for this target
+			DebugLog(3, "BuildColumnMapping: target[%llu]='%s' -> NULL (no source)", (unsigned long long)target_idx,
+					 target_columns[target_idx].name.c_str());
+		}
+	}
+
+	DebugLog(2, "BuildColumnMapping: mapped %llu source columns to %llu target columns",
+			 (unsigned long long)source_names.size(), (unsigned long long)target_columns.size());
+
+	return mapping;
 }
 
 //===----------------------------------------------------------------------===//

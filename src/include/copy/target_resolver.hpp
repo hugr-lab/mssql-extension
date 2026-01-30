@@ -143,6 +143,10 @@ struct BCPColumnMetadata {
 
 	// Get the wire size for the length prefix (0 for fixed, 1 for BYTELEN, 2 for USHORTLEN)
 	uint8_t GetLengthPrefixSize() const;
+
+	// Get SQL Server type declaration for INSERT BULK statement
+	// Returns the exact type matching the target column (e.g., "nvarchar(50)", "int")
+	string GetSQLServerTypeDeclaration() const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -169,12 +173,13 @@ struct TargetResolver {
 	// Resolve target from catalog syntax: catalog.schema.table
 	// @param context DuckDB client context for catalog lookup
 	// @param catalog Catalog name (attached database alias)
-	// @param schema Schema name (e.g., "dbo")
+	// @param schema Schema name (e.g., "dbo") - may be empty for temp tables
 	// @param table Table name
+	// @param allow_empty_schema If true, empty schema allowed for temp tables (catalog..#temp)
 	// @return Resolved BCPCopyTarget
-	// @throws InvalidInputException for unknown catalogs
+	// @throws InvalidInputException for unknown catalogs or invalid empty schema usage
 	static BCPCopyTarget ResolveCatalog(ClientContext &context, const string &catalog, const string &schema,
-										const string &table);
+										const string &table, bool allow_empty_schema = false);
 
 	//===----------------------------------------------------------------------===//
 	// Target Validation
@@ -221,6 +226,26 @@ struct TargetResolver {
 	static void ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
 											const vector<LogicalType> &source_types,
 											const vector<string> &source_names);
+
+	// Get column metadata for an existing table
+	// Used when copying to existing table - BCP COLMETADATA must match target schema
+	// @param conn TDS connection for SQL execution
+	// @param target The target table
+	// @return Vector of BCPColumnMetadata matching the target table's schema
+	static vector<BCPColumnMetadata> GetExistingTableColumnMetadata(tds::TdsConnection &conn,
+																	const BCPCopyTarget &target);
+
+	//===----------------------------------------------------------------------===//
+	// Column Mapping
+	//===----------------------------------------------------------------------===//
+
+	// Build column mapping from source columns to target columns by name
+	// Returns a mapping where mapping[target_idx] = source_idx, or -1 if source doesn't have this column
+	// @param source_names Column names from the source query
+	// @param target_columns Target table column metadata
+	// @return Vector of size target_columns.size() with source indices (-1 for missing)
+	static vector<int32_t> BuildColumnMapping(const vector<string> &source_names,
+											  const vector<BCPColumnMetadata> &target_columns);
 
 	//===----------------------------------------------------------------------===//
 	// Column Metadata Generation

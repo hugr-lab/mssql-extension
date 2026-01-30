@@ -1,0 +1,242 @@
+# name: test/sql/copy/copy_column_mapping.test
+# description: Test COPY TO with name-based column mapping
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach to SQL Server
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# ===========================================================================
+# Test 1: Exact column match (backward compatibility)
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with 3 columns
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_exact (id INT, name NVARCHAR(50), value FLOAT)');
+
+# Create source with exact same columns
+statement ok
+CREATE TABLE source_exact AS SELECT 1 AS id, 'Alice' AS name, 1.5::DOUBLE AS value;
+
+# Copy exact match
+statement ok
+COPY source_exact TO 'mssql://db//#test_exact' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify
+query III
+SELECT * FROM mssql_scan('db', 'SELECT * FROM #test_exact ORDER BY id');
+----
+1	Alice	1.5
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 2: Subset of columns (source has fewer columns than target)
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with 3 columns (name can be NULL for this test)
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_subset (id INT, name NVARCHAR(50) NULL, value FLOAT)');
+
+# Create source with only 2 columns (name column is missing)
+statement ok
+CREATE TABLE source_subset AS SELECT 1 AS id, 2.5::DOUBLE AS value;
+
+# Copy subset - 'name' column should be NULL in target
+statement ok
+COPY source_subset TO 'mssql://db//#test_subset' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify - name should be NULL
+query III
+SELECT id, name, value FROM mssql_scan('db', 'SELECT * FROM #test_subset ORDER BY id');
+----
+1	NULL	2.5
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 3: Column reordering (source column order differs from target)
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with columns in order: id, name, value
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_reorder (id INT, name NVARCHAR(50), value FLOAT)');
+
+# Create source with columns in different order: value, name, id
+statement ok
+CREATE TABLE source_reorder AS SELECT 3.5::DOUBLE AS value, 'Bob' AS name, 2 AS id;
+
+# Copy with reordered columns - should map by name, not position
+statement ok
+COPY source_reorder TO 'mssql://db//#test_reorder' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify - values should be correctly mapped by name
+query III
+SELECT id, name, value FROM mssql_scan('db', 'SELECT * FROM #test_reorder ORDER BY id');
+----
+2	Bob	3.5
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 4: Extra source columns (should be ignored)
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with 2 columns
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_extra (id INT, name NVARCHAR(50))');
+
+# Create source with 3 columns (extra 'value' column)
+statement ok
+CREATE TABLE source_extra AS SELECT 3 AS id, 'Charlie' AS name, 4.5::DOUBLE AS value;
+
+# Copy - extra 'value' column should be ignored
+statement ok
+COPY source_extra TO 'mssql://db//#test_extra' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify
+query II
+SELECT id, name FROM mssql_scan('db', 'SELECT * FROM #test_extra ORDER BY id');
+----
+3	Charlie
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 5: Combined - subset + reorder
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with 4 columns (names can be NULL for this test)
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_combined (id INT, first_name NVARCHAR(50) NULL, last_name NVARCHAR(50) NULL, score FLOAT)');
+
+# Create source with only 2 columns in different order
+statement ok
+CREATE TABLE source_combined AS SELECT 99.5::DOUBLE AS score, 4 AS id;
+
+# Copy - first_name and last_name should be NULL, id and score should be correctly mapped
+statement ok
+COPY source_combined TO 'mssql://db//#test_combined' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify
+query IIII
+SELECT id, first_name, last_name, score FROM mssql_scan('db', 'SELECT * FROM #test_combined ORDER BY id');
+----
+4	NULL	NULL	99.5
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 6: Case-insensitive matching
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with mixed case column names
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_case (ID INT, Name NVARCHAR(50), VALUE FLOAT)');
+
+# Create source with different case column names
+statement ok
+CREATE TABLE source_case AS SELECT 5 AS id, 'Eve' AS name, 5.5::DOUBLE AS value;
+
+# Copy - should match case-insensitively
+statement ok
+COPY source_case TO 'mssql://db//#test_case' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify
+query III
+SELECT ID, Name, VALUE FROM mssql_scan('db', 'SELECT * FROM #test_case ORDER BY ID');
+----
+5	Eve	5.5
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 7: No matching columns (error expected)
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_nomatch (id INT, name NVARCHAR(50))');
+
+# Create source with completely different column names
+statement ok
+CREATE TABLE source_nomatch AS SELECT 6 AS x, 'Frank' AS y;
+
+# Copy should fail - no columns match
+statement error
+COPY source_nomatch TO 'mssql://db//#test_nomatch' (FORMAT 'bcp', CREATE_TABLE false);
+----
+No matching columns
+
+statement ok
+ROLLBACK;
+
+# ===========================================================================
+# Test 8: Multiple rows with column mapping
+# ===========================================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_multirow (id INT, name NVARCHAR(50), active BIT)');
+
+# Create source with reordered columns and multiple rows
+statement ok
+CREATE TABLE source_multirow AS
+SELECT 'Alice' AS name, 1 AS id, true AS active
+UNION ALL
+SELECT 'Bob' AS name, 2 AS id, false AS active
+UNION ALL
+SELECT 'Charlie' AS name, 3 AS id, true AS active;
+
+# Copy multiple rows
+statement ok
+COPY source_multirow TO 'mssql://db//#test_multirow' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify all rows were correctly mapped
+query III
+SELECT id, name, active FROM mssql_scan('db', 'SELECT * FROM #test_multirow ORDER BY id');
+----
+1	Alice	1
+2	Bob	0
+3	Charlie	1
+
+statement ok
+ROLLBACK;
+
+# Cleanup
+statement ok
+DETACH db;

@@ -11,7 +11,7 @@
             "preLaunchTask": "Build Debug",
             "env": {
                 "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1",
-                "MSSQL_DEBUG": "1"
+                "MSSQL_DEBUG": "3"
             },
             "stopOnEntry": false,
             "sourceMap": {
@@ -28,7 +28,7 @@
             "preLaunchTask": "Build Release",
             "env": {
                 "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1",
-                "MSSQL_DEBUG": "1"
+                "MSSQL_DEBUG": "0"
             },
             "stopOnEntry": false,
             "sourceMap": {
