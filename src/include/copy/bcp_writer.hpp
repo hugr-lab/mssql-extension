@@ -40,7 +40,9 @@ public:
 	// @param conn TDS connection (must be in BulkLoad mode after INSERT BULK)
 	// @param target Resolved copy target
 	// @param columns Column metadata for encoding
-	BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns);
+	// @param column_mapping Optional column mapping for name-based source-to-target mapping
+	BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
+	          vector<int32_t> column_mapping = {});
 
 	// Non-copyable
 	BCPWriter(const BCPWriter &) = delete;
@@ -168,6 +170,10 @@ private:
 
 	// Column metadata
 	vector<BCPColumnMetadata> columns_;
+
+	// Column mapping: mapping[target_idx] = source_idx, or -1 if source doesn't have this column
+	// Empty if no mapping needed (1:1 positional match)
+	vector<int32_t> column_mapping_;
 
 	// State tracking
 	bool colmetadata_sent_ = false;

@@ -40,9 +40,12 @@ public:
 	// @param buffer Output buffer (ROW token data, not including 0xD1)
 	// @param chunk Source DataChunk
 	// @param row_idx Row index within the chunk
-	// @param columns Column metadata for type information
+	// @param columns Column metadata for type information (target columns)
+	// @param column_mapping Optional mapping: mapping[target_idx] = source_idx, or -1 for NULL
+	//                       If nullptr, assumes 1:1 positional mapping
 	static void EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx,
-						  const vector<mssql::BCPColumnMetadata> &columns);
+	                      const vector<mssql::BCPColumnMetadata> &columns,
+	                      const vector<int32_t> *column_mapping = nullptr);
 
 	// Encode a single Value into buffer
 	// @param buffer Output buffer

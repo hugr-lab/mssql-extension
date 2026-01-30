@@ -67,8 +67,9 @@ static double ElapsedMs(TimePoint start) {
 // BCPWriter Construction
 //===----------------------------------------------------------------------===//
 
-BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns)
-	: conn_(conn), target_(target), columns_(std::move(columns)) {
+BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
+                     vector<int32_t> column_mapping)
+    : conn_(conn), target_(target), columns_(std::move(columns)), column_mapping_(std::move(column_mapping)) {
 	// Pre-allocate buffer to reduce reallocation overhead
 	// Estimate: 100 bytes per column per row, reserve for 10K rows
 	// This will grow as needed but reduces initial reallocations
@@ -432,7 +433,9 @@ void BCPWriter::BuildRowToken(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 	WriteUInt8(buffer, TOKEN_ROW);
 
 	// Encode all column values using BCPRowEncoder
-	tds::encoding::BCPRowEncoder::EncodeRow(buffer, chunk, row_idx, columns_);
+	// Pass column mapping if we have one (for name-based source-to-target mapping)
+	const vector<int32_t> *mapping_ptr = column_mapping_.empty() ? nullptr : &column_mapping_;
+	tds::encoding::BCPRowEncoder::EncodeRow(buffer, chunk, row_idx, columns_, mapping_ptr);
 }
 
 void BCPWriter::BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count) {
