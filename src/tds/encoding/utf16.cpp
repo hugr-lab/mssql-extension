@@ -66,7 +66,7 @@ static inline void AsciiToUtf16LE(const char *input, size_t len, std::vector<uin
 //===----------------------------------------------------------------------===//
 
 static void Utf8ToUtf16LEGeneral(const char *input, size_t input_len, std::vector<uint8_t> &result) {
-	result.reserve(input_len * 2);  // Minimum size for ASCII
+	result.reserve(input_len * 2);	// Minimum size for ASCII
 
 	size_t i = 0;
 	while (i < input_len) {

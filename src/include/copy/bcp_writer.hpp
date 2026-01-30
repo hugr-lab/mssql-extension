@@ -171,8 +171,8 @@ private:
 
 	// State tracking
 	bool colmetadata_sent_ = false;
-	std::atomic<idx_t> rows_sent_{0};      // Total rows sent across all batches
-	std::atomic<idx_t> bytes_sent_{0};     // Total bytes sent across all batches
+	std::atomic<idx_t> rows_sent_{0};	   // Total rows sent across all batches
+	std::atomic<idx_t> bytes_sent_{0};	   // Total bytes sent across all batches
 	std::atomic<idx_t> rows_in_batch_{0};  // Rows in current batch (resets on flush)
 
 	// Packet ID counter for TDS protocol

@@ -14,7 +14,7 @@ class ClientContext;
 // This controls memory usage on both DuckDB and SQL Server sides
 // 0 = no intermediate flushes (send all at end) - WARNING: high memory usage
 // Default 100K rows keeps buffer around 10-50MB depending on row size
-constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 100000;  // 100K rows
+constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 100000;	 // 100K rows
 
 namespace mssql {
 

@@ -123,9 +123,10 @@ idx_t BCPWriter::WriteRows(DataChunk &chunk) {
 	if (GetBCPDebugLevel() >= 1) {
 		double rows_per_sec = (encode_ms > 0) ? (rows_written * 1000.0 / encode_ms) : 0;
 		double mb_per_sec = (encode_ms > 0) ? (bytes_added / 1024.0 / 1024.0 * 1000.0 / encode_ms) : 0;
-		BCPDebugLog(1, "WriteRows: %llu rows, %zu bytes in %.2f ms (lock: %.2f ms) | %.0f rows/s, %.1f MB/s | buffer: %zu MB",
-					(unsigned long long)rows_written, bytes_added, encode_ms, lock_ms, rows_per_sec, mb_per_sec,
-					accumulator_buffer_.size() / (1024 * 1024));
+		BCPDebugLog(
+			1, "WriteRows: %llu rows, %zu bytes in %.2f ms (lock: %.2f ms) | %.0f rows/s, %.1f MB/s | buffer: %zu MB",
+			(unsigned long long)rows_written, bytes_added, encode_ms, lock_ms, rows_per_sec, mb_per_sec,
+			accumulator_buffer_.size() / (1024 * 1024));
 	}
 
 	return rows_written;
@@ -312,7 +313,8 @@ idx_t BCPWriter::FlushBatch(idx_t row_count) {
 }
 
 void BCPWriter::ResetForNextBatch() {
-	BCPDebugLog(2, "ResetForNextBatch: clearing state for next batch, buffer_capacity=%zu", accumulator_buffer_.capacity());
+	BCPDebugLog(2, "ResetForNextBatch: clearing state for next batch, buffer_capacity=%zu",
+				accumulator_buffer_.capacity());
 
 	// Clear buffer but KEEP capacity for reuse (reduces memory fragmentation)
 	// The buffer will be reused for the next batch without reallocation
@@ -486,7 +488,8 @@ void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) 
 	std::vector<tds::TdsPacket> packets = tds::TdsProtocol::BuildBulkLoadMultiPacket(buffer, packet_size);
 	double build_ms = ElapsedMs(start_build);
 
-	BCPDebugLog(1, "SendBulkLoadPacket: built %zu packets in %.2f ms (packet_size=%u)", packets.size(), build_ms, packet_size);
+	BCPDebugLog(1, "SendBulkLoadPacket: built %zu packets in %.2f ms (packet_size=%u)", packets.size(), build_ms,
+				packet_size);
 
 	// Send all packets with incrementing packet IDs
 	auto start_send = Clock::now();
@@ -535,8 +538,8 @@ void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) 
 		if ((i + 1) % 1000 == 0 || i + 1 == packets.size()) {
 			double elapsed = ElapsedMs(start_send);
 			double mb_per_sec = (elapsed > 0) ? (bytes_sent_so_far / 1024.0 / 1024.0 * 1000.0 / elapsed) : 0;
-			BCPDebugLog(1, "SendBulkLoadPacket: sent %zu/%zu packets (%zu KB) in %.2f ms | %.1f MB/s",
-						i + 1, packets.size(), bytes_sent_so_far / 1024, elapsed, mb_per_sec);
+			BCPDebugLog(1, "SendBulkLoadPacket: sent %zu/%zu packets (%zu KB) in %.2f ms | %.1f MB/s", i + 1,
+						packets.size(), bytes_sent_so_far / 1024, elapsed, mb_per_sec);
 		}
 	}
 
@@ -544,8 +547,11 @@ void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) 
 	double total_ms = ElapsedMs(start_total);
 	double mb_per_sec = (send_ms > 0) ? (bytes_sent_so_far / 1024.0 / 1024.0 * 1000.0 / send_ms) : 0;
 
-	BCPDebugLog(1, "SendBulkLoadPacket: DONE - %zu packets, %zu KB in %.2f ms (build: %.2f, send: %.2f) | %.1f MB/s | slowest pkt[%zu]: %.2f ms",
-				packets.size(), bytes_sent_so_far / 1024, total_ms, build_ms, send_ms, mb_per_sec, slowest_packet_idx, slowest_packet_ms);
+	BCPDebugLog(1,
+				"SendBulkLoadPacket: DONE - %zu packets, %zu KB in %.2f ms (build: %.2f, send: %.2f) | %.1f MB/s | "
+				"slowest pkt[%zu]: %.2f ms",
+				packets.size(), bytes_sent_so_far / 1024, total_ms, build_ms, send_ms, mb_per_sec, slowest_packet_idx,
+				slowest_packet_ms);
 }
 
 void BCPWriter::WriteUInt8(vector<uint8_t> &buffer, uint8_t value) {

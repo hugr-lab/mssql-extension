@@ -24,7 +24,7 @@ constexpr int64_t MICROS_PER_DAY = 86400000000LL;
 template <typename T>
 static T GetVectorValue(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);  // We only need format info, not count
+	vec.ToUnifiedFormat(1, format);	 // We only need format info, not count
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];

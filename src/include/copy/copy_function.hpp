@@ -63,10 +63,10 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	vector<mssql::BCPColumnMetadata> columns;
 
 	// Progress tracking
-	std::atomic<idx_t> rows_sent{0};       // Total rows sent to writer
-	std::atomic<idx_t> bytes_sent{0};      // Total bytes sent
-	std::atomic<idx_t> rows_confirmed{0};  // Total rows confirmed by SQL Server (across all batches)
-	std::atomic<idx_t> batches_flushed{0}; // Number of batches flushed to server
+	std::atomic<idx_t> rows_sent{0};		// Total rows sent to writer
+	std::atomic<idx_t> bytes_sent{0};		// Total bytes sent
+	std::atomic<idx_t> rows_confirmed{0};	// Total rows confirmed by SQL Server (across all batches)
+	std::atomic<idx_t> batches_flushed{0};	// Number of batches flushed to server
 
 	// Total rows expected (for progress reporting, 0 if unknown)
 	idx_t total_rows_expected = 0;

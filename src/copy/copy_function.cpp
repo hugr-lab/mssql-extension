@@ -44,7 +44,7 @@ static void CopyDebugLog(int level, const char *format, ...) {
 	fprintf(stderr, "[MSSQL COPY] ");
 	vfprintf(stderr, format, args);
 	fprintf(stderr, "\n");
-	fflush(stderr);  // Ensure output is flushed before potential crash
+	fflush(stderr);	 // Ensure output is flushed before potential crash
 	va_end(args);
 }
 
@@ -381,8 +381,8 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	double write_ms = ElapsedMs(start_write);
 	gdata.rows_sent.fetch_add(rows_written);
 
-	CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.2f ms, checking flush...",
-				 (unsigned long long)rows_written, write_ms);
+	CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.2f ms, checking flush...", (unsigned long long)rows_written,
+				 write_ms);
 
 	// Check for interrupt after encoding
 	if (context.client.interrupted) {
@@ -415,9 +415,10 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	double total_ms = ElapsedMs(start_sink);
 	if (GetCopyDebugLevel() >= 1) {
 		double rows_per_sec = (total_ms > 0) ? (rows_written * 1000.0 / total_ms) : 0;
-		CopyDebugLog(1, "BCPCopySink: DONE - %llu rows in %.2f ms (write: %.2f, flush: %.2f) | %.0f rows/s | total sent: %llu",
-					 (unsigned long long)rows_written, total_ms, write_ms, flush_ms, rows_per_sec,
-					 (unsigned long long)gdata.rows_sent.load());
+		CopyDebugLog(
+			1, "BCPCopySink: DONE - %llu rows in %.2f ms (write: %.2f, flush: %.2f) | %.0f rows/s | total sent: %llu",
+			(unsigned long long)rows_written, total_ms, write_ms, flush_ms, rows_per_sec,
+			(unsigned long long)gdata.rows_sent.load());
 	}
 }
 
@@ -443,7 +444,8 @@ static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &
 		CopyDebugLog(1, "FlushToServer: >> Sending data to server...");
 		idx_t confirmed = gdata.writer->FlushBatch(rows_in_batch);
 		double flush_ms = ElapsedMs(start_flush);
-		CopyDebugLog(1, "FlushToServer: >> Server confirmed %llu rows in %.2f ms", (unsigned long long)confirmed, flush_ms);
+		CopyDebugLog(1, "FlushToServer: >> Server confirmed %llu rows in %.2f ms", (unsigned long long)confirmed,
+					 flush_ms);
 		gdata.rows_confirmed.fetch_add(confirmed);
 		gdata.batches_flushed.fetch_add(1);
 
@@ -474,9 +476,11 @@ static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &
 
 		double total_ms = ElapsedMs(start_total);
 		double rows_per_sec = (total_ms > 0) ? (rows_in_batch * 1000.0 / total_ms) : 0;
-		CopyDebugLog(1, "FlushToServer: DONE batch %llu - %llu rows in %.2f ms (flush: %.2f, INSERT BULK: %.2f, reset: %.2f) | %.0f rows/s",
-					 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)confirmed,
-					 total_ms, flush_ms, insert_ms, reset_ms, rows_per_sec);
+		CopyDebugLog(1,
+					 "FlushToServer: DONE batch %llu - %llu rows in %.2f ms (flush: %.2f, INSERT BULK: %.2f, reset: "
+					 "%.2f) | %.0f rows/s",
+					 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)confirmed, total_ms,
+					 flush_ms, insert_ms, reset_ms, rows_per_sec);
 
 	} catch (std::exception &e) {
 		gdata.has_error = true;
@@ -590,8 +594,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		idx_t final_batch_confirmed = gdata.writer->Finalize();
 		gdata.rows_confirmed.fetch_add(final_batch_confirmed);
 
-		CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows",
-					 (unsigned long long)final_batch_confirmed);
+		CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows", (unsigned long long)final_batch_confirmed);
 
 		idx_t total_confirmed = gdata.rows_confirmed.load();
 		idx_t batches = gdata.batches_flushed.load() + (rows_in_final_batch > 0 ? 1 : 0);
@@ -601,8 +604,8 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 
 		// Verify row counts match (warning only, server is authoritative)
 		if (total_confirmed != total_rows) {
-			CopyDebugLog(1, "WARNING: Row count mismatch - sent %llu, confirmed %llu",
-						 (unsigned long long)total_rows, (unsigned long long)total_confirmed);
+			CopyDebugLog(1, "WARNING: Row count mismatch - sent %llu, confirmed %llu", (unsigned long long)total_rows,
+						 (unsigned long long)total_confirmed);
 		}
 
 	} catch (std::exception &e) {

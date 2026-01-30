@@ -260,8 +260,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	DebugLog(2, "ValidateTarget: exists=%d, is_view=%d", table_exists, is_view);
 
 	// Handle different scenarios
-	DebugLog(1, "ValidateTarget: exists=%d, is_view=%d, config.overwrite=%d, config.create_table=%d",
-			 table_exists, is_view, config.overwrite ? 1 : 0, config.create_table ? 1 : 0);
+	DebugLog(1, "ValidateTarget: exists=%d, is_view=%d, config.overwrite=%d, config.create_table=%d", table_exists,
+			 is_view, config.overwrite ? 1 : 0, config.create_table ? 1 : 0);
 
 	if (table_exists) {
 		if (is_view) {
@@ -698,10 +698,10 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 		return 17;	// Max decimal size
 
 	case LogicalTypeId::VARCHAR:
-		return 0xFFFF;  // MAX indicator for nvarchar(max)
+		return 0xFFFF;	// MAX indicator for nvarchar(max)
 
 	case LogicalTypeId::BLOB:
-		return 0xFFFF;  // MAX indicator for varbinary(max)
+		return 0xFFFF;	// MAX indicator for varbinary(max)
 
 	case LogicalTypeId::UUID:
 		return 16;
