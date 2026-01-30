@@ -613,6 +613,33 @@ COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 - **No RETURNING**: Use INSERT for cases requiring returned values
 - **Transaction support**: Works within transactions; temp tables require transaction context
 
+### Column Mapping (Existing Tables)
+
+When copying to an existing table with `CREATE_TABLE false`, columns are matched **by name** (case-insensitive), not by position:
+
+```sql
+-- Target table has columns: id INT, name VARCHAR(50), value FLOAT
+
+-- Source can have different column order
+CREATE TABLE source AS SELECT 1.5::DOUBLE AS value, 1 AS id;
+
+-- Copies successfully: id→id, value→value, name→NULL
+COPY source TO 'mssql://db/dbo/target' (FORMAT 'bcp', CREATE_TABLE false);
+```
+
+**Column Mapping Rules:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Same columns, same order | Direct mapping (backward compatible) |
+| Same columns, different order | Mapped by name |
+| Source has fewer columns | Missing target columns receive NULL |
+| Source has extra columns | Extra columns are ignored |
+| No matching columns | Error: "No matching columns" |
+| Case mismatch (id vs ID) | Matched case-insensitively |
+
+> **Note**: Target columns that don't have matching source columns must allow NULL values.
+
 ## Data Modification (INSERT)
 
 ### Basic INSERT

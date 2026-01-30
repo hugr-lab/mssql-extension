@@ -239,7 +239,8 @@ test/
 │   │   ├── copy_errors.test        # Error handling (missing table, bad data)
 │   │   ├── copy_overwrite.test     # REPLACE option (drop and recreate)
 │   │   ├── copy_temp.test          # Session-scoped temp table COPY
-│   │   └── copy_transaction.test   # COPY within transactions
+│   │   ├── copy_transaction.test   # COPY within transactions
+│   │   └── copy_column_mapping.test # Name-based column mapping tests
 │   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_exec.test             # mssql_exec() function tests
@@ -644,6 +645,68 @@ DETACH copydb;
 | `TABLOCK` | BOOLEAN | true | Use TABLOCK for faster inserts |
 
 **Note**: Use `REPLACE` instead of `OVERWRITE` - DuckDB intercepts `OVERWRITE` as a built-in file operation.
+
+### 9. Writing Column Mapping Tests (COPY TO)
+
+When copying to existing tables with `CREATE_TABLE false`, the extension uses name-based column mapping:
+
+```sql
+# name: test/sql/copy/my_column_mapping_test.test
+# description: Test column mapping for COPY TO existing tables
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+statement ok
+BEGIN TRANSACTION;
+
+# Create target table with specific columns
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #test_mapping (id INT, name NVARCHAR(50), value FLOAT)');
+
+# Create source with different column order
+statement ok
+CREATE TABLE source_reorder AS SELECT 3.5::DOUBLE AS value, 'Bob' AS name, 2 AS id;
+
+# Copy with reordered columns - should map by name, not position
+statement ok
+COPY source_reorder TO 'mssql://db//#test_mapping' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify - values should be correctly mapped by name
+query III
+SELECT id, name, value FROM mssql_scan('db', 'SELECT * FROM #test_mapping ORDER BY id');
+----
+2	Bob	3.5
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH db;
+```
+
+**Column Mapping Test Scenarios:**
+
+1. **Exact column match** - Source and target have same columns in same order (backward compatibility)
+2. **Subset of columns** - Source has fewer columns; missing target columns receive NULL
+3. **Column reordering** - Source columns in different order; mapped by name
+4. **Extra source columns** - Source has columns not in target; extra columns ignored
+5. **Combined subset + reorder** - Source has fewer columns in different order
+6. **Case-insensitive matching** - Source `id` matches target `ID`
+7. **No matching columns** - Error expected when no source columns match target
+8. **Multiple rows** - Verify mapping works correctly for multi-row inserts
+
+**Column Mapping Best Practices:**
+
+1. **Target columns allowing NULL**: Unmapped target columns must allow NULL values
+2. **At least one match required**: COPY fails if no source columns match any target columns
+3. **Use transactions for temp tables**: Temp table tests require transaction context
+4. **Verify with mssql_scan**: Use `mssql_scan()` to query temp tables within transactions
 
 ---
 

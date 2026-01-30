@@ -267,6 +267,41 @@ The `bcp` format for COPY TO supports these options:
 
 **Note**: The `REPLACE` option was chosen instead of `OVERWRITE` because DuckDB intercepts `OVERWRITE` as a built-in file operation option.
 
+## Column Mapping (COPY TO Existing Tables)
+
+When copying to an existing table with `CREATE_TABLE false`, the extension uses **name-based column mapping** instead of position-based matching:
+
+### Behavior
+
+- **Case-insensitive matching**: Source column `id` matches target column `ID` or `Id`
+- **Column reordering**: Source columns can be in any order; they're mapped by name to target columns
+- **Subset of columns**: Source can have fewer columns than target; unmapped target columns receive NULL
+- **Extra source columns**: Source columns not found in target are silently ignored
+- **At least one match required**: Error if no source columns match any target columns
+
+### Example
+
+```sql
+-- Target table: (id INT, name VARCHAR(50), value FLOAT)
+-- Source query: SELECT 1.5 AS value, 1 AS id
+
+COPY source TO 'mssql://db/dbo/target' (FORMAT 'bcp', CREATE_TABLE false);
+-- Result: id=1, name=NULL, value=1.5 (mapped by name, not position)
+```
+
+### Column Mapping Array
+
+Internally, a mapping array translates target positions to source positions:
+
+```
+Target: [id, name, value]  (3 columns)
+Source: [value, id]        (2 columns)
+
+mapping = [1, -1, 0]  // target[0]->source[1], target[1]->NULL, target[2]->source[0]
+```
+
+This mapping is computed in `TargetResolver::BuildColumnMapping()` and passed to `BCPRowEncoder::EncodeRow()` for value extraction during BCP packet construction.
+
 ## Cross-References
 
 - [TDS Protocol Layer](tds-protocol.md)
