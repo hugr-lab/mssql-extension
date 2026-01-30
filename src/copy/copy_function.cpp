@@ -315,8 +315,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 							 (unsigned long long)gstate->columns.size());
 
 				// Build column mapping from source to target
-				gstate->column_mapping =
-				    TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
+				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
 
 				// Check if we need to use column mapping (i.e., not a 1:1 positional match)
 				// Mapping is needed if: column counts differ, or any mapping != position
@@ -332,8 +331,8 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 
 				if (need_column_mapping) {
 					CopyDebugLog(1, "BCPCopyInitGlobal: using column mapping (source: %llu cols, target: %llu cols)",
-					             (unsigned long long)bdata.source_names.size(),
-					             (unsigned long long)gstate->columns.size());
+								 (unsigned long long)bdata.source_names.size(),
+								 (unsigned long long)gstate->columns.size());
 				}
 			} catch (...) {
 				// If we can't get target metadata (e.g., table was just created), use source types
@@ -398,8 +397,8 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		}
 
 		// Create BCP writer with optional column mapping
-		gstate->writer = make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns,
-		                                      gstate->column_mapping);
+		gstate->writer =
+			make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns, gstate->column_mapping);
 
 		// Send COLMETADATA token to start the BCP stream
 		gstate->writer->WriteColmetadata();

@@ -245,7 +245,7 @@ struct TargetResolver {
 	// @param target_columns Target table column metadata
 	// @return Vector of size target_columns.size() with source indices (-1 for missing)
 	static vector<int32_t> BuildColumnMapping(const vector<string> &source_names,
-	                                          const vector<BCPColumnMetadata> &target_columns);
+											  const vector<BCPColumnMetadata> &target_columns);
 
 	//===----------------------------------------------------------------------===//
 	// Column Metadata Generation

@@ -68,8 +68,8 @@ static double ElapsedMs(TimePoint start) {
 //===----------------------------------------------------------------------===//
 
 BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
-                     vector<int32_t> column_mapping)
-    : conn_(conn), target_(target), columns_(std::move(columns)), column_mapping_(std::move(column_mapping)) {
+					 vector<int32_t> column_mapping)
+	: conn_(conn), target_(target), columns_(std::move(columns)), column_mapping_(std::move(column_mapping)) {
 	// Pre-allocate buffer to reduce reallocation overhead
 	// Estimate: 100 bytes per column per row, reserve for 10K rows
 	// This will grow as needed but reduces initial reallocations

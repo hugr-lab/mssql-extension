@@ -42,7 +42,7 @@ public:
 	// @param columns Column metadata for encoding
 	// @param column_mapping Optional column mapping for name-based source-to-target mapping
 	BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
-	          vector<int32_t> column_mapping = {});
+			  vector<int32_t> column_mapping = {});
 
 	// Non-copyable
 	BCPWriter(const BCPWriter &) = delete;

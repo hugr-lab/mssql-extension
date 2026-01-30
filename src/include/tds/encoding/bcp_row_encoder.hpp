@@ -44,8 +44,8 @@ public:
 	// @param column_mapping Optional mapping: mapping[target_idx] = source_idx, or -1 for NULL
 	//                       If nullptr, assumes 1:1 positional mapping
 	static void EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx,
-	                      const vector<mssql::BCPColumnMetadata> &columns,
-	                      const vector<int32_t> *column_mapping = nullptr);
+						  const vector<mssql::BCPColumnMetadata> &columns,
+						  const vector<int32_t> *column_mapping = nullptr);
 
 	// Encode a single Value into buffer
 	// @param buffer Output buffer

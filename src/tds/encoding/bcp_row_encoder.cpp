@@ -42,15 +42,13 @@ static bool IsVectorNull(Vector &vec, idx_t row_idx) {
 //===----------------------------------------------------------------------===//
 
 void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx,
-                              const vector<mssql::BCPColumnMetadata> &columns,
-                              const vector<int32_t> *column_mapping) {
+							  const vector<mssql::BCPColumnMetadata> &columns, const vector<int32_t> *column_mapping) {
 	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
 		auto &col = columns[target_idx];
 
 		// Determine source column index
 		// If column_mapping is provided, use it; otherwise assume 1:1 positional mapping
-		int32_t source_idx =
-		    column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
+		int32_t source_idx = column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
 
 		// If source_idx is -1 or out of range, encode NULL for this target column
 		if (source_idx < 0 || static_cast<idx_t>(source_idx) >= chunk.ColumnCount()) {

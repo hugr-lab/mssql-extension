@@ -495,7 +495,7 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 	case LogicalTypeId::DECIMAL:
 	case LogicalTypeId::HUGEINT:
 		return target_lower == "decimal" || target_lower == "numeric" || target_lower == "money" ||
-		       target_lower == "smallmoney";
+			   target_lower == "smallmoney";
 
 	case LogicalTypeId::VARCHAR:
 		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
@@ -581,7 +581,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		if (it == target_columns.end()) {
 			// Source column not found in target - this is OK, we'll just ignore it
 			DebugLog(2, "ValidateExistingTableSchema: source column '%s' not in target (will be ignored)",
-			         source_names[i].c_str());
+					 source_names[i].c_str());
 			continue;
 		}
 
@@ -598,7 +598,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		}
 
 		DebugLog(3, "ValidateExistingTableSchema: column '%s' compatible (source: %s, target: %s)",
-		         source_names[i].c_str(), source_types[i].ToString().c_str(), target_type_name.c_str());
+				 source_names[i].c_str(), source_types[i].ToString().c_str(), target_type_name.c_str());
 	}
 
 	// At least one source column must match a target column
@@ -611,9 +611,10 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 			(unsigned long long)result.rows.size());
 	}
 
-	DebugLog(2, "ValidateExistingTableSchema: validated %llu/%llu source columns match target (target has %llu columns)",
-	         (unsigned long long)matched_columns, (unsigned long long)source_names.size(),
-	         (unsigned long long)result.rows.size());
+	DebugLog(2,
+			 "ValidateExistingTableSchema: validated %llu/%llu source columns match target (target has %llu columns)",
+			 (unsigned long long)matched_columns, (unsigned long long)source_names.size(),
+			 (unsigned long long)result.rows.size());
 }
 
 //===----------------------------------------------------------------------===//
@@ -845,7 +846,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 //===----------------------------------------------------------------------===//
 
 vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_names,
-                                                   const vector<BCPColumnMetadata> &target_columns) {
+												   const vector<BCPColumnMetadata> &target_columns) {
 	vector<int32_t> mapping;
 	mapping.reserve(target_columns.size());
 
@@ -862,16 +863,16 @@ vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_
 		if (it != source_name_to_idx.end()) {
 			mapping.push_back(it->second);
 			DebugLog(3, "BuildColumnMapping: target[%llu]='%s' -> source[%d]", (unsigned long long)target_idx,
-			         target_columns[target_idx].name.c_str(), it->second);
+					 target_columns[target_idx].name.c_str(), it->second);
 		} else {
-			mapping.push_back(-1);  // No source column for this target
+			mapping.push_back(-1);	// No source column for this target
 			DebugLog(3, "BuildColumnMapping: target[%llu]='%s' -> NULL (no source)", (unsigned long long)target_idx,
-			         target_columns[target_idx].name.c_str());
+					 target_columns[target_idx].name.c_str());
 		}
 	}
 
 	DebugLog(2, "BuildColumnMapping: mapped %llu source columns to %llu target columns",
-	         (unsigned long long)source_names.size(), (unsigned long long)target_columns.size());
+			 (unsigned long long)source_names.size(), (unsigned long long)target_columns.size());
 
 	return mapping;
 }
