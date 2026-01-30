@@ -30,7 +30,7 @@ CREATE TABLE data_v2 AS SELECT i::BIGINT AS new_id, ('Item ' || i)::VARCHAR AS n
 
 # OVERWRITE should drop old table and create new one with new schema
 statement ok
-COPY data_v2 TO 'mssql://db/dbo/copy_overwrite' (FORMAT 'bcp', OVERWRITE true);
+COPY data_v2 TO 'mssql://db/dbo/copy_overwrite' (FORMAT 'bcp', REPLACE true);
 
 # Verify new count
 query I

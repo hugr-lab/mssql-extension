@@ -61,8 +61,24 @@ static double ElapsedMs(TimePoint start) {
 // MSSQL Copy Function Registration
 //===----------------------------------------------------------------------===//
 
+// Declare supported COPY options for 'bcp' format
+static void BCPListCopyOptions(ClientContext &context, CopyOptionsInput &input) {
+	auto &copy_options = input.options;
+	// CREATE_TABLE: Create destination table if it doesn't exist (default: true)
+	copy_options["create_table"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
+	// OVERWRITE: Drop and recreate table if it exists (default: false)
+	copy_options["replace"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
+	// FLUSH_ROWS: Number of rows before flushing to SQL Server (default: 100000)
+	copy_options["flush_rows"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
+	// TABLOCK: Use table-level lock for better performance (default: true)
+	copy_options["tablock"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
+}
+
 void RegisterMSSQLCopyFunctions(ExtensionLoader &loader) {
 	CopyFunction bcp_copy("bcp");
+
+	// Set up the copy options callback
+	bcp_copy.copy_options = BCPListCopyOptions;
 
 	// Set up the copy-to callbacks
 	bcp_copy.copy_to_bind = mssql::BCPCopyBind;
@@ -165,13 +181,17 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 	bind_data->config = LoadBCPCopyConfig(context);
 
 	// Then let COPY options override
+	CopyDebugLog(2, "BCPCopyBind: parsing %llu options", (unsigned long long)input.info.options.size());
 	for (auto &option : input.info.options) {
 		auto loption = StringUtil::Lower(option.first);
+		CopyDebugLog(2, "BCPCopyBind: option '%s' (lower: '%s')", option.first.c_str(), loption.c_str());
 
 		if (loption == "create_table") {
 			bind_data->config.create_table = BooleanValue::Get(option.second[0]);
-		} else if (loption == "overwrite") {
+			CopyDebugLog(2, "BCPCopyBind: set create_table=%d", bind_data->config.create_table ? 1 : 0);
+		} else if (loption == "replace") {
 			bind_data->config.overwrite = BooleanValue::Get(option.second[0]);
+			CopyDebugLog(2, "BCPCopyBind: set replace=%d", bind_data->config.overwrite ? 1 : 0);
 		} else if (loption == "flush_rows") {
 			bind_data->config.flush_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
 		} else if (loption == "tablock") {

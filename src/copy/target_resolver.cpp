@@ -260,6 +260,9 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	DebugLog(2, "ValidateTarget: exists=%d, is_view=%d", table_exists, is_view);
 
 	// Handle different scenarios
+	DebugLog(1, "ValidateTarget: exists=%d, is_view=%d, config.overwrite=%d, config.create_table=%d",
+			 table_exists, is_view, config.overwrite ? 1 : 0, config.create_table ? 1 : 0);
+
 	if (table_exists) {
 		if (is_view) {
 			throw InvalidInputException("MSSQL COPY: Cannot COPY to a view. Target '%s' is a view.",
@@ -268,12 +271,12 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 		if (config.overwrite) {
 			// Drop and recreate
-			DebugLog(1, "ValidateTarget: OVERWRITE=true, dropping and recreating table");
+			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
 			CreateTable(conn, target, source_types, source_names);
 		} else {
 			// Table exists and we'll append - validate schema compatibility
-			DebugLog(2, "ValidateTarget: table exists, validating schema compatibility");
+			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
 			ValidateExistingTableSchema(conn, target, source_types, source_names);
 		}
 	} else {
@@ -450,7 +453,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 	if (result.rows.size() != source_types.size()) {
 		throw InvalidInputException(
 			"MSSQL COPY: Column count mismatch. Source has %llu columns, target table '%s' has %llu columns. "
-			"Use OVERWRITE=true to recreate the table with the new schema.",
+			"Use REPLACE=true to recreate the table with the new schema.",
 			(unsigned long long)source_types.size(), target.GetFullyQualifiedName(),
 			(unsigned long long)result.rows.size());
 	}
@@ -468,7 +471,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		if (!StringUtil::CIEquals(source_names[i], target_col_name)) {
 			throw InvalidInputException(
 				"MSSQL COPY: Column name mismatch at position %llu. Source has '%s', target table has '%s'. "
-				"Use OVERWRITE=true to recreate the table with the new schema.",
+				"Use REPLACE=true to recreate the table with the new schema.",
 				(unsigned long long)(i + 1), source_names[i], target_col_name);
 		}
 
@@ -478,7 +481,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		if (!compatible) {
 			throw InvalidInputException(
 				"MSSQL COPY: Type mismatch for column '%s'. Source type '%s' is not compatible with target type '%s'. "
-				"Use OVERWRITE=true to recreate the table with the new schema.",
+				"Use REPLACE=true to recreate the table with the new schema.",
 				source_names[i], source_types[i].ToString(), target_type_name);
 		}
 

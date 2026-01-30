@@ -46,12 +46,12 @@ SELECT id, name, value FROM db.dbo.copy_test1 WHERE id = 50;
 statement ok
 DROP TABLE IF EXISTS db.dbo.copy_test1;
 
-# Test 2: COPY with catalog.schema.table syntax (no URL prefix)
+# Test 2: COPY with catalog.schema.table syntax (quoted string, no URL prefix)
 statement ok
 DROP TABLE IF EXISTS db.dbo.copy_test2;
 
 statement ok
-COPY local_data TO db.dbo.copy_test2 (FORMAT 'bcp', CREATE_TABLE true);
+COPY local_data TO 'db.dbo.copy_test2' (FORMAT 'bcp', CREATE_TABLE true);
 
 # Verify row count
 query I

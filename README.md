@@ -521,8 +521,8 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
 -- Auto-create table (default: true)
 COPY data TO 'db.dbo.new_table' (FORMAT bcp, CREATE_TABLE true);
 
--- Overwrite existing table (drop and recreate)
-COPY data TO 'db.dbo.existing_table' (FORMAT bcp, OVERWRITE true);
+-- Replace existing table (drop and recreate)
+COPY data TO 'db.dbo.existing_table' (FORMAT bcp, REPLACE true);
 
 -- Control flush frequency (rows before committing to SQL Server)
 COPY data TO 'db.dbo.table' (FORMAT bcp, FLUSH_ROWS 500000);
