@@ -1,4 +1,5 @@
 #include "connection/mssql_settings.hpp"
+#include "copy/bcp_config.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/mssql_dml_config.hpp"
@@ -156,6 +157,36 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_ctas_text_type",
 							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
 							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
+
+	//===----------------------------------------------------------------------===//
+	// COPY/BCP Settings
+	//===----------------------------------------------------------------------===//
+
+	// mssql_copy_batch_rows - Maximum rows per BCP batch
+	config.AddExtensionOption("mssql_copy_batch_rows",
+							  "Maximum rows per BCP batch for COPY operations (default: 10000)", LogicalType::BIGINT,
+							  Value::BIGINT(MSSQL_DEFAULT_COPY_BATCH_ROWS), ValidatePositive, SetScope::GLOBAL);
+
+	// mssql_copy_max_batch_bytes - Maximum bytes per BCP batch
+	config.AddExtensionOption("mssql_copy_max_batch_bytes",
+							  "Maximum bytes per BCP batch for COPY operations (default: 32MB, minimum: 1MB)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_MAX_BATCH_BYTES), ValidatePositive,
+							  SetScope::GLOBAL);
+
+	// mssql_copy_flush_rows - Rows before flushing to SQL Server
+	// Controls memory usage on both DuckDB and SQL Server sides
+	// 0 = no intermediate flushes (WARNING: high memory usage for large datasets)
+	config.AddExtensionOption(
+		"mssql_copy_flush_rows",
+		"Rows before flushing to SQL Server during COPY (default: 100000, 0=no flush until end - high memory)",
+		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_FLUSH_ROWS), ValidateNonNegative, SetScope::GLOBAL);
+
+	// mssql_copy_tablock - Use TABLOCK hint for bulk load
+	// Enables table-level locking for better performance (15-30% faster)
+	// WARNING: Blocks other writers during COPY operation
+	config.AddExtensionOption("mssql_copy_tablock",
+							  "Use TABLOCK hint for COPY operations (default: true, improves performance 15-30%)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 }
 
 //===----------------------------------------------------------------------===//

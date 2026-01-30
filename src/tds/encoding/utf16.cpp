@@ -4,12 +4,72 @@ namespace duckdb {
 namespace tds {
 namespace encoding {
 
-std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
-	std::vector<uint8_t> result;
-	result.reserve(input.size() * 2);  // Minimum size for ASCII
+//===----------------------------------------------------------------------===//
+// Fast ASCII check - returns true if string is pure ASCII
+//===----------------------------------------------------------------------===//
+
+static inline bool IsAsciiString(const char *data, size_t len) {
+	// Process 8 bytes at a time for better performance
+	size_t i = 0;
+
+	// Check 8 bytes at a time using uint64_t
+	// High bit set in any byte means non-ASCII
+	const uint64_t *ptr64 = reinterpret_cast<const uint64_t *>(data);
+	const size_t chunks = len / 8;
+	for (size_t c = 0; c < chunks; c++) {
+		if (ptr64[c] & 0x8080808080808080ULL) {
+			return false;
+		}
+	}
+	i = chunks * 8;
+
+	// Check remaining bytes
+	for (; i < len; i++) {
+		if (static_cast<uint8_t>(data[i]) & 0x80) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Fast ASCII to UTF-16LE conversion (no decoding needed)
+//===----------------------------------------------------------------------===//
+
+static inline void AsciiToUtf16LE(const char *input, size_t len, std::vector<uint8_t> &result) {
+	// For ASCII, each byte becomes 2 bytes (byte + 0x00)
+	result.resize(len * 2);
+	uint8_t *out = result.data();
+
+	// Unroll loop for better performance
+	size_t i = 0;
+	for (; i + 4 <= len; i += 4) {
+		out[i * 2 + 0] = static_cast<uint8_t>(input[i + 0]);
+		out[i * 2 + 1] = 0;
+		out[i * 2 + 2] = static_cast<uint8_t>(input[i + 1]);
+		out[i * 2 + 3] = 0;
+		out[i * 2 + 4] = static_cast<uint8_t>(input[i + 2]);
+		out[i * 2 + 5] = 0;
+		out[i * 2 + 6] = static_cast<uint8_t>(input[i + 3]);
+		out[i * 2 + 7] = 0;
+	}
+
+	// Handle remaining bytes
+	for (; i < len; i++) {
+		out[i * 2 + 0] = static_cast<uint8_t>(input[i]);
+		out[i * 2 + 1] = 0;
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// General UTF-8 to UTF-16LE conversion (handles all Unicode)
+//===----------------------------------------------------------------------===//
+
+static void Utf8ToUtf16LEGeneral(const char *input, size_t input_len, std::vector<uint8_t> &result) {
+	result.reserve(input_len * 2);  // Minimum size for ASCII
 
 	size_t i = 0;
-	while (i < input.size()) {
+	while (i < input_len) {
 		uint32_t codepoint = 0;
 		uint8_t byte = static_cast<uint8_t>(input[i]);
 
@@ -20,20 +80,20 @@ std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
 			i += 1;
 		} else if ((byte & 0xE0) == 0xC0) {
 			// Two bytes: 110xxxxx 10xxxxxx
-			if (i + 1 >= input.size())
+			if (i + 1 >= input_len)
 				break;
 			codepoint = ((byte & 0x1F) << 6) | (static_cast<uint8_t>(input[i + 1]) & 0x3F);
 			i += 2;
 		} else if ((byte & 0xF0) == 0xE0) {
 			// Three bytes: 1110xxxx 10xxxxxx 10xxxxxx
-			if (i + 2 >= input.size())
+			if (i + 2 >= input_len)
 				break;
 			codepoint = ((byte & 0x0F) << 12) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
 						(static_cast<uint8_t>(input[i + 2]) & 0x3F);
 			i += 3;
 		} else if ((byte & 0xF8) == 0xF0) {
 			// Four bytes: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-			if (i + 3 >= input.size())
+			if (i + 3 >= input_len)
 				break;
 			codepoint = ((byte & 0x07) << 18) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
 						((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
@@ -64,7 +124,27 @@ std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
 		}
 		// Codepoints > 0x10FFFF are invalid, skip them
 	}
+}
 
+//===----------------------------------------------------------------------===//
+// Main UTF-16LE encoding function with fast ASCII path
+//===----------------------------------------------------------------------===//
+
+std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
+	std::vector<uint8_t> result;
+
+	if (input.empty()) {
+		return result;
+	}
+
+	// Fast path for ASCII strings (most common case)
+	if (IsAsciiString(input.data(), input.size())) {
+		AsciiToUtf16LE(input.data(), input.size(), result);
+		return result;
+	}
+
+	// Slow path for non-ASCII (full UTF-8 decoding)
+	Utf8ToUtf16LEGeneral(input.data(), input.size(), result);
 	return result;
 }
 
@@ -172,6 +252,87 @@ size_t Utf16LEByteLength(const std::string &input) {
 	}
 
 	return byte_count;
+}
+
+//===----------------------------------------------------------------------===//
+// Direct UTF-16LE encoding to output buffer (zero allocation hot path)
+//===----------------------------------------------------------------------===//
+
+size_t Utf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *output) {
+	if (input_len == 0) {
+		return 0;
+	}
+
+	// Fast path for ASCII strings
+	if (IsAsciiString(input, input_len)) {
+		// Direct ASCII to UTF-16LE conversion (unrolled)
+		size_t i = 0;
+		for (; i + 4 <= input_len; i += 4) {
+			output[i * 2 + 0] = static_cast<uint8_t>(input[i + 0]);
+			output[i * 2 + 1] = 0;
+			output[i * 2 + 2] = static_cast<uint8_t>(input[i + 1]);
+			output[i * 2 + 3] = 0;
+			output[i * 2 + 4] = static_cast<uint8_t>(input[i + 2]);
+			output[i * 2 + 5] = 0;
+			output[i * 2 + 6] = static_cast<uint8_t>(input[i + 3]);
+			output[i * 2 + 7] = 0;
+		}
+		for (; i < input_len; i++) {
+			output[i * 2 + 0] = static_cast<uint8_t>(input[i]);
+			output[i * 2 + 1] = 0;
+		}
+		return input_len * 2;
+	}
+
+	// Slow path: full UTF-8 to UTF-16LE conversion
+	size_t out_pos = 0;
+	size_t i = 0;
+	while (i < input_len) {
+		uint32_t codepoint = 0;
+		uint8_t byte = static_cast<uint8_t>(input[i]);
+
+		// Decode UTF-8
+		if ((byte & 0x80) == 0) {
+			codepoint = byte;
+			i += 1;
+		} else if ((byte & 0xE0) == 0xC0) {
+			if (i + 1 >= input_len)
+				break;
+			codepoint = ((byte & 0x1F) << 6) | (static_cast<uint8_t>(input[i + 1]) & 0x3F);
+			i += 2;
+		} else if ((byte & 0xF0) == 0xE0) {
+			if (i + 2 >= input_len)
+				break;
+			codepoint = ((byte & 0x0F) << 12) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 2]) & 0x3F);
+			i += 3;
+		} else if ((byte & 0xF8) == 0xF0) {
+			if (i + 3 >= input_len)
+				break;
+			codepoint = ((byte & 0x07) << 18) | ((static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
+						((static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
+						(static_cast<uint8_t>(input[i + 3]) & 0x3F);
+			i += 4;
+		} else {
+			i += 1;
+			continue;
+		}
+
+		// Encode to UTF-16LE
+		if (codepoint <= 0xFFFF) {
+			output[out_pos++] = static_cast<uint8_t>(codepoint & 0xFF);
+			output[out_pos++] = static_cast<uint8_t>((codepoint >> 8) & 0xFF);
+		} else if (codepoint <= 0x10FFFF) {
+			codepoint -= 0x10000;
+			uint16_t high = 0xD800 + ((codepoint >> 10) & 0x3FF);
+			uint16_t low = 0xDC00 + (codepoint & 0x3FF);
+			output[out_pos++] = static_cast<uint8_t>(high & 0xFF);
+			output[out_pos++] = static_cast<uint8_t>((high >> 8) & 0xFF);
+			output[out_pos++] = static_cast<uint8_t>(low & 0xFF);
+			output[out_pos++] = static_cast<uint8_t>((low >> 8) & 0xFF);
+		}
+	}
+	return out_pos;
 }
 
 }  // namespace encoding

@@ -1,0 +1,357 @@
+# name: test/sql/copy/copy_types.test
+# description: Test COPY TO MSSQL with all supported type mappings
+# group: [copy]
+
+require mssql
+
+# Skip if no MSSQL server available
+require-env MSSQL_TEST_DATABASE
+
+statement ok
+SET mssql_debug_level=1;
+
+# Attach to SQL Server
+statement ok
+ATTACH '${MSSQL_TEST_DATABASE}' AS sqlsrv (TYPE mssql);
+
+# ===========================================================================
+# Test 1: Integer types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_int_types');
+
+statement ok
+CREATE TABLE int_types AS SELECT
+    1::TINYINT AS tinyint_col,
+    -100::SMALLINT AS smallint_col,
+    123456::INTEGER AS int_col,
+    9223372036854775807::BIGINT AS bigint_col,
+    255::UTINYINT AS utinyint_col;
+
+statement ok
+COPY int_types TO 'mssql://sqlsrv/dbo/copy_int_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query IIIII
+SELECT tinyint_col, smallint_col, int_col, bigint_col, utinyint_col FROM sqlsrv.dbo.copy_int_types;
+----
+1	-100	123456	9223372036854775807	255
+
+statement ok
+DROP TABLE int_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_int_types');
+
+# ===========================================================================
+# Test 2: Floating-point types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_float_types');
+
+statement ok
+CREATE TABLE float_types AS SELECT
+    3.14159::FLOAT AS float_col,
+    2.718281828459045::DOUBLE AS double_col;
+
+statement ok
+COPY float_types TO 'mssql://sqlsrv/dbo/copy_float_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Note: Floating point comparison may have precision differences
+query I
+SELECT COUNT(*) FROM mssql_scan('sqlsrv', 'SELECT * FROM dbo.copy_float_types WHERE float_col > 3.14 AND float_col < 3.15');
+----
+1
+
+statement ok
+DROP TABLE float_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_float_types');
+
+# ===========================================================================
+# Test 3: Decimal types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_decimal_types');
+
+statement ok
+CREATE TABLE decimal_types AS SELECT
+    123.45::DECIMAL(10,2) AS decimal_col,
+    9999999.999::DECIMAL(18,3) AS large_decimal_col;
+
+statement ok
+COPY decimal_types TO 'mssql://sqlsrv/dbo/copy_decimal_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query RR
+SELECT decimal_col, large_decimal_col FROM sqlsrv.dbo.copy_decimal_types;
+----
+123.45	9999999.999
+
+statement ok
+DROP TABLE decimal_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_decimal_types');
+
+# ===========================================================================
+# Test 4: String types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_string_types');
+
+statement ok
+CREATE TABLE string_types AS SELECT
+    'Hello, World!' AS simple_string,
+    'Line 1' || chr(10) || 'Line 2' AS multiline_string,
+    '' AS empty_string,
+    'Unicode: ' || chr(228) || chr(246) || chr(252) AS unicode_string;
+
+statement ok
+COPY string_types TO 'mssql://sqlsrv/dbo/copy_string_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT simple_string FROM sqlsrv.dbo.copy_string_types;
+----
+Hello, World!
+
+query I
+SELECT LEN(empty_string) FROM mssql_scan('sqlsrv', 'SELECT LEN(empty_string) AS len FROM dbo.copy_string_types');
+----
+0
+
+statement ok
+DROP TABLE string_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_string_types');
+
+# ===========================================================================
+# Test 5: Boolean type
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_bool_types');
+
+statement ok
+CREATE TABLE bool_types AS SELECT
+    true AS true_val,
+    false AS false_val;
+
+statement ok
+COPY bool_types TO 'mssql://sqlsrv/dbo/copy_bool_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query II
+SELECT true_val, false_val FROM sqlsrv.dbo.copy_bool_types;
+----
+true	false
+
+statement ok
+DROP TABLE bool_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_bool_types');
+
+# ===========================================================================
+# Test 6: Date and Time types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_datetime_types');
+
+statement ok
+CREATE TABLE datetime_types AS SELECT
+    DATE '2024-06-15' AS date_col,
+    TIME '14:30:45.123456' AS time_col,
+    TIMESTAMP '2024-06-15 14:30:45.123456' AS timestamp_col;
+
+statement ok
+COPY datetime_types TO 'mssql://sqlsrv/dbo/copy_datetime_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT date_col FROM sqlsrv.dbo.copy_datetime_types;
+----
+2024-06-15
+
+statement ok
+DROP TABLE datetime_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_datetime_types');
+
+# ===========================================================================
+# Test 7: UUID type
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_uuid_types');
+
+statement ok
+CREATE TABLE uuid_types AS SELECT
+    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS uuid_col,
+    '00000000-0000-0000-0000-000000000000'::UUID AS zero_uuid;
+
+statement ok
+COPY uuid_types TO 'mssql://sqlsrv/dbo/copy_uuid_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+query II
+SELECT uuid_col, zero_uuid FROM sqlsrv.dbo.copy_uuid_types;
+----
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	00000000-0000-0000-0000-000000000000
+
+statement ok
+DROP TABLE uuid_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_uuid_types');
+
+# ===========================================================================
+# Test 8: Binary/BLOB type
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_binary_types');
+
+statement ok
+CREATE TABLE binary_types AS SELECT
+    '\xDEADBEEF'::BLOB AS binary_col,
+    '\x00'::BLOB AS single_byte;
+
+statement ok
+COPY binary_types TO 'mssql://sqlsrv/dbo/copy_binary_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify binary data length
+query I
+SELECT DATALENGTH(binary_col) FROM mssql_scan('sqlsrv', 'SELECT DATALENGTH(binary_col) AS len FROM dbo.copy_binary_types');
+----
+4
+
+statement ok
+DROP TABLE binary_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_binary_types');
+
+# ===========================================================================
+# Test 9: NULL values for all types
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_null_types');
+
+statement ok
+CREATE TABLE null_types AS SELECT
+    NULL::INTEGER AS int_null,
+    NULL::VARCHAR AS varchar_null,
+    NULL::DOUBLE AS double_null,
+    NULL::DATE AS date_null,
+    NULL::BOOLEAN AS bool_null,
+    NULL::UUID AS uuid_null;
+
+statement ok
+COPY null_types TO 'mssql://sqlsrv/dbo/copy_null_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify all NULLs
+query I
+SELECT COUNT(*) FROM mssql_scan('sqlsrv', 'SELECT * FROM dbo.copy_null_types WHERE int_null IS NULL AND varchar_null IS NULL AND double_null IS NULL');
+----
+1
+
+statement ok
+DROP TABLE null_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_null_types');
+
+# ===========================================================================
+# Test 10: Mixed types with NULLs in multiple rows
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_mixed_nulls');
+
+statement ok
+CREATE TABLE mixed_nulls AS
+SELECT 1 AS id, 100 AS int_val, 'hello' AS str_val, 1.5 AS float_val
+UNION ALL SELECT 2, NULL, 'world', 2.5
+UNION ALL SELECT 3, 300, NULL, 3.5
+UNION ALL SELECT 4, 400, 'test', NULL
+UNION ALL SELECT 5, NULL, NULL, NULL;
+
+statement ok
+COPY mixed_nulls TO 'mssql://sqlsrv/dbo/copy_mixed_nulls' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify row count
+query I
+SELECT COUNT(*) FROM mssql_scan('sqlsrv', 'SELECT COUNT(*) FROM dbo.copy_mixed_nulls');
+----
+5
+
+# Verify specific rows
+query IIII
+SELECT id, int_val, str_val, float_val FROM sqlsrv.dbo.copy_mixed_nulls WHERE id = 1;
+----
+1	100	hello	1.5
+
+query IIII
+SELECT id, int_val, str_val, float_val FROM sqlsrv.dbo.copy_mixed_nulls WHERE id = 5;
+----
+5	NULL	NULL	NULL
+
+statement ok
+DROP TABLE mixed_nulls;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_mixed_nulls');
+
+# ===========================================================================
+# Test 11: All types in a single table
+# ===========================================================================
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_all_types');
+
+statement ok
+CREATE TABLE all_types AS SELECT
+    1::TINYINT AS tinyint_col,
+    2::SMALLINT AS smallint_col,
+    3::INTEGER AS int_col,
+    4::BIGINT AS bigint_col,
+    1.5::FLOAT AS float_col,
+    2.5::DOUBLE AS double_col,
+    123.45::DECIMAL(10,2) AS decimal_col,
+    'hello world'::VARCHAR AS varchar_col,
+    '\xDEADBEEF'::BLOB AS blob_col,
+    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS uuid_col,
+    DATE '2024-01-15' AS date_col,
+    TIME '14:30:00' AS time_col,
+    TIMESTAMP '2024-01-15 14:30:00' AS timestamp_col,
+    true AS bool_col;
+
+statement ok
+COPY all_types TO 'mssql://sqlsrv/dbo/copy_all_types' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify data was copied
+query I
+SELECT COUNT(*) FROM mssql_scan('sqlsrv', 'SELECT COUNT(*) FROM dbo.copy_all_types');
+----
+1
+
+# Verify a few columns
+query III
+SELECT tinyint_col, int_col, bool_col FROM sqlsrv.dbo.copy_all_types;
+----
+1	3	true
+
+statement ok
+DROP TABLE all_types;
+
+statement ok
+CALL mssql_exec('sqlsrv', 'DROP TABLE IF EXISTS dbo.copy_all_types');
+
+# Detach
+statement ok
+DETACH sqlsrv;

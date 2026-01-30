@@ -29,6 +29,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+// MSG_NOSIGNAL prevents SIGPIPE on Linux; macOS uses SO_NOSIGPIPE instead
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #endif
 
 namespace duckdb {
@@ -134,7 +138,7 @@ static int CustomBioWrite(BIO *bio, const char *data, int len) {
 		return -1;
 	}
 #else
-	ssize_t ret = send(fd, data, static_cast<size_t>(len), 0);
+	ssize_t ret = send(fd, data, static_cast<size_t>(len), MSG_NOSIGNAL);
 	if (ret < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 			BIO_set_retry_write(bio);

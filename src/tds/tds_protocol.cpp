@@ -688,6 +688,49 @@ std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &
 	return packets;
 }
 
+std::vector<TdsPacket> TdsProtocol::BuildBulkLoadMultiPacket(const std::vector<uint8_t> &payload,
+															 size_t max_packet_size) {
+	std::vector<TdsPacket> packets;
+
+	if (payload.empty()) {
+		// Empty payload - return empty packets
+		return packets;
+	}
+
+	// TDS packet header is 8 bytes, so payload can be up to (max_packet_size - 8) bytes
+	size_t max_payload = max_packet_size - TDS_HEADER_SIZE;
+
+	// If it fits in a single packet, use single packet
+	if (payload.size() <= max_payload) {
+		TdsPacket packet(PacketType::BULK_LOAD);
+		packet.AppendPayload(payload);
+		packets.push_back(std::move(packet));
+		return packets;
+	}
+
+	// Split into multiple packets
+	size_t offset = 0;
+	while (offset < payload.size()) {
+		size_t chunk_size = std::min(max_payload, payload.size() - offset);
+		bool is_last = (offset + chunk_size >= payload.size());
+
+		TdsPacket packet(PacketType::BULK_LOAD);
+
+		// Set EOM flag only on last packet
+		if (!is_last) {
+			packet.SetEndOfMessage(false);
+		}
+
+		// Append this chunk of the payload
+		packet.AppendPayload(payload.data() + offset, chunk_size);
+
+		packets.push_back(std::move(packet));
+		offset += chunk_size;
+	}
+
+	return packets;
+}
+
 TdsPacket TdsProtocol::BuildAttention() {
 	TdsPacket packet(PacketType::ATTENTION);
 	// Single byte payload with 0xFF marker

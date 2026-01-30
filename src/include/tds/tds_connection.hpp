@@ -138,6 +138,11 @@ public:
 		return socket_.get();
 	}
 
+	// Get negotiated packet size (from ENVCHANGE during login)
+	uint32_t GetNegotiatedPacketSize() const {
+		return negotiated_packet_size_;
+	}
+
 private:
 	std::unique_ptr<TdsSocket> socket_;
 	std::atomic<ConnectionState> state_;
