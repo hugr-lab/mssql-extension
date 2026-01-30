@@ -248,6 +248,25 @@ src/
 | `mssql_ctas_text_type` | NVARCHAR | Text column type (NVARCHAR or VARCHAR) |
 | `mssql_ctas_drop_on_failure` | false | Drop table if INSERT phase fails |
 
+### COPY (BulkLoadBCP)
+| Setting | Default | Description |
+|---|---|---|
+| `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server (bounded memory) |
+| `mssql_copy_tablock` | true | Use TABLOCK hint for 15-30% faster bulk load |
+
+## COPY Function Options
+
+The `bcp` format for COPY TO supports these options:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `CREATE_TABLE` | BOOLEAN | true | Auto-create target table if it doesn't exist |
+| `REPLACE` | BOOLEAN | false | Drop and recreate table (replaces existing data) |
+| `FLUSH_ROWS` | BIGINT | 100000 | Rows before flushing (overrides setting) |
+| `TABLOCK` | BOOLEAN | true | Use TABLOCK hint (overrides setting) |
+
+**Note**: The `REPLACE` option was chosen instead of `OVERWRITE` because DuckDB intercepts `OVERWRITE` as a built-in file operation option.
+
 ## Cross-References
 
 - [TDS Protocol Layer](tds-protocol.md)
