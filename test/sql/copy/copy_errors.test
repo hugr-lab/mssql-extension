@@ -44,7 +44,7 @@ SELECT mssql_exec('db', 'CREATE TABLE dbo.type_mismatch (id varchar(10), name in
 statement error
 COPY test_data TO 'mssql://db/dbo/type_mismatch' (FORMAT 'bcp');
 ----
-not compatible
+type mismatch
 
 # Cleanup
 statement ok

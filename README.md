@@ -512,6 +512,17 @@ The COPY TO command supports two target formats:
 
 Both formats are equivalent and can be used interchangeably.
 
+#### Empty Schema Syntax for Temp Tables
+
+Temp tables can use an empty schema notation for clarity:
+
+| Format | Standard Syntax | Empty Schema Syntax |
+|--------|-----------------|---------------------|
+| **URL** | `mssql://catalog/#temp` | `mssql://catalog//#temp` |
+| **Catalog** | `catalog.#temp` | `catalog..#temp` |
+
+Both syntaxes are equivalent for temp tables. The empty schema syntax (`//` or `..`) explicitly shows there's no schema component.
+
 ### Basic COPY TO
 
 ```sql
@@ -569,11 +580,17 @@ COPY data TO 'sqlserver.#temp_table' (FORMAT 'bcp');
 SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
 COMMIT;
 
+-- Empty schema syntax (equivalent alternatives)
+BEGIN;
+COPY data TO 'mssql://sqlserver//#temp_table' (FORMAT 'bcp');  -- URL with empty schema
+COPY data TO 'sqlserver..#temp_table' (FORMAT 'bcp');          -- Catalog with empty schema
+COMMIT;
+
 -- Global temp table (visible to all sessions)
 COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 ```
 
-> **Note**: Temp tables have no schema component. Use `catalog.#table` or `mssql://catalog/#table` format.
+> **Note**: Temp tables have no schema component. Use `catalog.#table`, `catalog..#table`, `mssql://catalog/#table`, or `mssql://catalog//#table` format.
 
 ### COPY TO Settings
 

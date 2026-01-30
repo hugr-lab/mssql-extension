@@ -1,0 +1,113 @@
+# name: test/sql/copy/copy_existing_temp.test
+# description: Test COPY TO existing temporary tables with different types
+# group: [copy]
+
+require mssql
+
+# Skip if no test server available
+require-env MSSQL_TEST_SERVER
+
+statement ok
+ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+
+# Test 1: Copy to existing temp table with BIGINT column
+statement ok
+CREATE TABLE local_test AS SELECT i::BIGINT AS id FROM range(10) t(i);
+
+statement ok
+BEGIN;
+
+# Create temp table with specific SQL Server type
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #temp_bigint (id BIGINT)');
+
+# Copy to existing temp table - should use target column metadata
+statement ok
+COPY local_test TO 'mssql://db/#temp_bigint' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_bigint');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# Test 2: Copy to existing temp table with INT column (source is BIGINT)
+statement ok
+BEGIN;
+
+# Create temp table with INT type
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #temp_int (id INT)');
+
+# Copy BIGINT to INT - should use target column metadata
+statement ok
+COPY local_test TO 'mssql://db/#temp_int' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_int');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# Test 3: Copy to existing temp table with VARCHAR column
+statement ok
+CREATE TABLE local_varchar AS SELECT 'value_' || i::VARCHAR AS name FROM range(5) t(i);
+
+statement ok
+BEGIN;
+
+# Create temp table with specific VARCHAR size
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #temp_varchar (name VARCHAR(100))');
+
+# Copy VARCHAR to VARCHAR - should use target column metadata
+statement ok
+COPY local_varchar TO 'mssql://db/#temp_varchar' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_varchar');
+----
+5
+
+statement ok
+ROLLBACK;
+
+# Test 4: Copy to existing temp table with multiple columns
+statement ok
+CREATE TABLE local_multi AS SELECT i::BIGINT AS id, 'name_' || i::VARCHAR AS name, i::DOUBLE AS value FROM range(5) t(i);
+
+statement ok
+BEGIN;
+
+# Create temp table with specific types
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE #temp_multi (id INT, name NVARCHAR(50), value FLOAT)');
+
+# Copy to existing temp table with different types - should use target column metadata
+statement ok
+COPY local_multi TO 'mssql://db/#temp_multi' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_multi');
+----
+5
+
+statement ok
+ROLLBACK;
+
+# Cleanup
+statement ok
+DROP TABLE local_test;
+
+statement ok
+DROP TABLE local_varchar;
+
+statement ok
+DROP TABLE local_multi;
+
+statement ok
+DETACH db;

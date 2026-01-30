@@ -197,6 +197,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - In-memory (connection pool state, metadata cache) (023-pool-stats-validation)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), TDS BulkLoadBCP protocol (0x07), OpenSSL (via vcpkg for TLS) (024-mssql-copy-bcp)
 - SQL Server 2019+ (remote target), in-memory (batch buffering, connection pool state) (024-mssql-copy-bcp)
+- SQL Server 2019+ (remote target), in-memory (connection pool state) (025-bcp-improvements)
 
 ## Recent Changes
 - 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming

@@ -1,0 +1,138 @@
+# name: test/sql/copy/copy_connection_leak.test
+# description: Test COPY TO connection leak prevention on errors
+# group: [copy]
+
+require mssql
+
+# Skip if no test server available
+require-env MSSQL_TEST_SERVER
+
+statement ok
+ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+
+# Create test data
+statement ok
+CREATE TABLE test_data AS SELECT i AS id, 'row' || i::VARCHAR AS name FROM range(10) t(i);
+
+# Create data with type mismatch (VARCHAR for INT column)
+statement ok
+CREATE TABLE varchar_data AS SELECT 'not_a_number' AS id FROM range(5) t(i);
+
+#
+# T012: Test bind phase errors don't leak connections
+#
+
+# Store initial pool stats
+query IIII
+SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+10	1	0	1
+
+# Try COPY to non-existent catalog (should fail before connection acquired)
+statement error
+COPY test_data TO 'nonexistent_catalog.dbo.test' (FORMAT 'bcp');
+----
+not found
+
+# Verify pool stats unchanged
+query IIII
+SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+10	1	0	1
+
+#
+# T013: Test sink phase errors release connections
+#
+
+# Create a target table with INT column
+statement ok
+CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_table'', ''U'') IS NOT NULL DROP TABLE dbo.int_table');
+
+statement ok
+CALL mssql_exec('db', 'CREATE TABLE dbo.int_table (id INT)');
+
+# Get current pool stats
+query IIII
+SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+10	1	0	1
+
+# Try COPY with type mismatch (VARCHAR to INT) - should fail during sink
+statement error
+COPY varchar_data TO 'db.dbo.int_table' (FORMAT 'bcp', CREATE_TABLE false);
+----
+type mismatch
+
+# Verify connection was released (not leaked)
+query IIII
+SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+10	1	0	1
+
+# Cleanup
+statement ok
+CALL mssql_exec('db', 'DROP TABLE dbo.int_table');
+
+#
+# T014: Test finalize phase errors release connections
+#
+
+# This is harder to test directly - finalize errors typically occur during
+# network issues. We test that normal completion releases connections.
+
+# Get current pool stats
+query III
+SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+1	0	1
+
+# Run a successful COPY
+statement ok
+COPY test_data TO 'db.dbo.test_finalize' (FORMAT 'bcp', REPLACE true);
+
+# Verify connection was released after successful COPY
+query III
+SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+1	0	1
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.test_finalize;
+
+#
+# T015: Test multiple failed COPYs don't leak connections
+#
+
+# Store initial stats
+query III
+SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+1	0	1
+
+# Run 10 failing COPY operations
+loop i 0 10
+
+# Try to COPY to non-existent table with CREATE_TABLE=false
+statement error
+COPY test_data TO 'db.dbo.nonexistent_table_${i}' (FORMAT 'bcp', CREATE_TABLE false);
+----
+does not exist
+
+endloop
+
+# Verify no connections leaked after all failures
+query III
+SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+----
+1	0	1
+
+# Cleanup
+statement ok
+DROP TABLE test_data;
+
+statement ok
+DROP TABLE varchar_data;
+
+statement ok
+DETACH db;

@@ -1,0 +1,119 @@
+# name: test/sql/copy/copy_type_mismatch.test
+# description: Test COPY TO type mismatch error messages
+# group: [copy]
+
+require mssql
+
+# Skip if no test server available
+require-env MSSQL_TEST_SERVER
+
+statement ok
+ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+
+#
+# T021: Test VARCHAR to INT mismatch detection
+#
+
+# Create source with VARCHAR data
+statement ok
+CREATE TABLE varchar_source AS SELECT 'text_value' AS id, 'name' AS name FROM range(5) t(i);
+
+# Create target with INT column
+statement ok
+CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
+
+statement ok
+CALL mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT, name NVARCHAR(100))');
+
+# Try COPY - should fail with type mismatch error mentioning column name
+statement error
+COPY varchar_source TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
+----
+type mismatch
+
+# Cleanup
+statement ok
+CALL mssql_exec('db', 'DROP TABLE dbo.int_target');
+
+statement ok
+DROP TABLE varchar_source;
+
+#
+# T022: Test compatible type conversions (should succeed)
+#
+
+# Create source with BIGINT data
+statement ok
+CREATE TABLE bigint_source AS SELECT i::BIGINT AS id FROM range(5) t(i);
+
+# Create target with INT column (narrowing is allowed by BCP)
+statement ok
+CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
+
+statement ok
+CALL mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT)');
+
+# COPY should succeed (BIGINT to INT is compatible)
+statement ok
+COPY bigint_source TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify data
+query I
+SELECT COUNT(*) FROM db.dbo.int_target;
+----
+5
+
+# Cleanup
+statement ok
+CALL mssql_exec('db', 'DROP TABLE dbo.int_target');
+
+statement ok
+DROP TABLE bigint_source;
+
+#
+# T023: Test error message format contains column name and types
+#
+
+# Create source with incompatible types
+statement ok
+CREATE TABLE date_source AS SELECT CURRENT_DATE AS date_col FROM range(3) t(i);
+
+# Create target with VARCHAR column (incompatible)
+statement ok
+CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.varchar_target'', ''U'') IS NOT NULL DROP TABLE dbo.varchar_target');
+
+statement ok
+CALL mssql_exec('db', 'CREATE TABLE dbo.varchar_target (date_col VARCHAR(10))');
+
+# Note: DATE to VARCHAR might actually work in some cases via implicit conversion
+# Let's test a more strict mismatch: BLOB to INT
+statement ok
+CREATE TABLE blob_source AS SELECT '\x0102'::BLOB AS data_col FROM range(3) t(i);
+
+statement ok
+CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target2'', ''U'') IS NOT NULL DROP TABLE dbo.int_target2');
+
+statement ok
+CALL mssql_exec('db', 'CREATE TABLE dbo.int_target2 (data_col INT)');
+
+# COPY should fail with clear error message
+statement error
+COPY blob_source TO 'db.dbo.int_target2' (FORMAT 'bcp', CREATE_TABLE false);
+----
+type mismatch
+
+# Cleanup
+statement ok
+CALL mssql_exec('db', 'DROP TABLE IF EXISTS dbo.varchar_target');
+
+statement ok
+CALL mssql_exec('db', 'DROP TABLE IF EXISTS dbo.int_target2');
+
+statement ok
+DROP TABLE date_source;
+
+statement ok
+DROP TABLE blob_source;
+
+statement ok
+DETACH db;

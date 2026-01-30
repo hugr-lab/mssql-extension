@@ -1,0 +1,159 @@
+# name: test/sql/copy/copy_empty_schema.test
+# description: Test COPY TO with empty schema syntax for temp tables
+# group: [copy]
+
+require mssql
+
+# Skip if no test server available
+require-env MSSQL_TEST_SERVER
+
+statement ok
+ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+
+# Create test data
+statement ok
+CREATE TABLE test_data AS SELECT i AS id, 'row' || i::VARCHAR AS name FROM range(10) t(i);
+
+#
+# Test URL empty schema syntax for temp tables
+#
+
+# T003: URL empty schema for local temp table (mssql://catalog//#temp)
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'mssql://db//#test_url_empty' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #test_url_empty');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# T003: URL empty schema for global temp table (mssql://catalog//##global_temp)
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'mssql://db//##test_url_global' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM ##test_url_global');
+----
+10
+
+statement ok
+ROLLBACK;
+
+#
+# Test catalog empty schema syntax for temp tables
+#
+
+# T004: Catalog empty schema for local temp table (catalog..#temp)
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'db..#test_catalog_empty' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #test_catalog_empty');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# T004: Catalog empty schema for global temp table (catalog..##global_temp)
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'db..##test_catalog_global' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM ##test_catalog_global');
+----
+10
+
+statement ok
+ROLLBACK;
+
+#
+# Test backward compatibility - existing syntax still works
+#
+
+# T005: URL without schema for temp table (mssql://catalog/#temp) - should still work
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'mssql://db/#test_compat_url' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #test_compat_url');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# T005: Catalog single dot for temp table (catalog.#temp) - should still work
+statement ok
+BEGIN;
+
+statement ok
+COPY test_data TO 'db.#test_compat_catalog' (FORMAT 'bcp');
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #test_compat_catalog');
+----
+10
+
+statement ok
+ROLLBACK;
+
+# T005: Regular three-part name still works (catalog.schema.table)
+statement ok
+COPY test_data TO 'db.dbo.test_compat_regular' (FORMAT 'bcp', REPLACE true);
+
+query I
+SELECT COUNT(*) FROM db.dbo.test_compat_regular;
+----
+10
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.test_compat_regular;
+
+#
+# Test invalid syntax rejection
+#
+
+# T006: Empty schema for regular tables should fail
+statement error
+COPY test_data TO 'db..regular_table' (FORMAT 'bcp');
+----
+Empty schema only valid for temp tables
+
+# T006: URL empty schema for regular tables should fail
+statement error
+COPY test_data TO 'mssql://db//regular_table' (FORMAT 'bcp');
+----
+Empty schema only valid for temp tables
+
+# T006: Triple slash in URL should fail
+statement error
+COPY test_data TO 'mssql://db///table' (FORMAT 'bcp');
+----
+Invalid
+
+# Cleanup
+statement ok
+DROP TABLE test_data;
+
+statement ok
+DETACH db;
