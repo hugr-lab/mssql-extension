@@ -11,7 +11,7 @@ set(MSSQL_EXTENSION_VERSION "0.1.12")
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete)
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -77,6 +77,7 @@ set(EXTENSION_SOURCES
     src/tds/encoding/datetime_encoding.cpp
     src/tds/encoding/guid_encoding.cpp
     src/tds/encoding/type_converter.cpp
+    src/tds/encoding/bcp_row_encoder.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp
@@ -145,6 +146,11 @@ set(EXTENSION_SOURCES
     src/dml/ctas/mssql_ctas_executor.cpp
     src/dml/ctas/mssql_ctas_planner.cpp
     src/dml/ctas/mssql_physical_ctas.cpp
+    # COPY layer (BulkLoadBCP)
+    src/copy/bcp_config.cpp
+    src/copy/target_resolver.cpp
+    src/copy/bcp_writer.cpp
+    src/copy/copy_function.cpp
 )
 
 # Build static extension (linked into DuckDB)

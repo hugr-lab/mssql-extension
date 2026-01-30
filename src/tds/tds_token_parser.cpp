@@ -79,6 +79,7 @@ ParsedTokenType TokenParser::TryParseNext() {
 	}
 
 	uint8_t token_type = Current()[0];
+	TDS_PARSER_DEBUG(2, "TryParseNext: token_type=0x%02X, available=%zu", token_type, Available());
 
 	switch (static_cast<TokenType>(token_type)) {
 	case TokenType::COLMETADATA:

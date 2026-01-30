@@ -83,6 +83,14 @@ public:
 	// Build ATTENTION packet for cancellation
 	static TdsPacket BuildAttention();
 
+	// Build multiple BULK_LOAD packets for large data
+	// Returns vector of packets with proper continuation flags (EOM on last packet only)
+	// Parameters:
+	//   payload - raw BCP data (COLMETADATA + ROW tokens + DONE token)
+	//   max_packet_size - maximum TDS packet size (from server negotiation)
+	static std::vector<TdsPacket> BuildBulkLoadMultiPacket(const std::vector<uint8_t> &payload,
+														   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE);
+
 	// Parse DONE token to check for ATTENTION_ACK
 	static bool ParseDoneForAttentionAck(const std::vector<uint8_t> &data);
 

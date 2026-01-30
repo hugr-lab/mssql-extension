@@ -172,6 +172,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_dml_use_prepared` | true | Use prepared statements for DML |
 | `mssql_enable_statistics` | true | Enable statistics collection |
 | `mssql_statistics_cache_ttl_seconds` | 3600 | Statistics cache TTL |
+| `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server during COPY |
+| `mssql_copy_tablock` | true | Use TABLOCK hint for COPY (15-30% faster) |
 
 ## Extension Functions
 
@@ -184,3 +186,18 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_open(conn_string)` | Scalar | Open standalone diagnostic connection |
 | `mssql_close(handle)` | Scalar | Close diagnostic connection |
 | `mssql_ping(handle)` | Scalar | Test connection liveness |
+
+## Active Technologies
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library) (019-fix-winsock-init)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), existing TDS layer (specs 001-019) (020-multi-statement-scan)
+- In-memory (result streaming, connection pool state) (020-multi-statement-scan)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer (022-mssql-ctas)
+- SQL Server 2019+ (remote), in-memory (result streaming, connection pool state) (022-mssql-ctas)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (via vcpkg for TLS) (023-pool-stats-validation)
+- In-memory (connection pool state, metadata cache) (023-pool-stats-validation)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), TDS BulkLoadBCP protocol (0x07), OpenSSL (via vcpkg for TLS) (024-mssql-copy-bcp)
+- SQL Server 2019+ (remote target), in-memory (batch buffering, connection pool state) (024-mssql-copy-bcp)
+
+## Recent Changes
+- 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming
+- 019-fix-winsock-init: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library)

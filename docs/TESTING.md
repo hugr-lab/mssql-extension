@@ -232,6 +232,14 @@ test/
 │   │   ├── transaction_mssql_exec.test       # mssql_exec in transactions
 │   │   ├── transaction_mssql_scan.test       # mssql_scan in transactions
 │   │   └── transaction_rollback.test         # Rollback operations
+│   ├── copy/                       # COPY TO MSSQL (BulkLoadBCP) tests
+│   │   ├── copy_basic.test         # Basic COPY with URL and catalog syntax
+│   │   ├── copy_types.test         # Data type handling in COPY
+│   │   ├── copy_large.test         # Large dataset COPY performance
+│   │   ├── copy_errors.test        # Error handling (missing table, bad data)
+│   │   ├── copy_overwrite.test     # REPLACE option (drop and recreate)
+│   │   ├── copy_temp.test          # Session-scoped temp table COPY
+│   │   └── copy_transaction.test   # COPY within transactions
 │   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_exec.test             # mssql_exec() function tests
@@ -314,6 +322,7 @@ DETACH testdb;
 | `[mssql]` | MSSQL-specific tests (catalog, DML, transactions) | Yes |
 | `[dml]` | DML operations (INSERT/UPDATE/DELETE) | Yes |
 | `[transaction]` | Transaction management tests | Yes |
+| `[copy]` | COPY TO MSSQL (BulkLoadBCP) tests | Yes |
 
 ---
 
@@ -548,6 +557,93 @@ DETACH txdb;
 3. **Test both COMMIT and ROLLBACK** to verify atomicity
 4. **Tables need PRIMARY KEY** for UPDATE/DELETE within transactions
 5. **mssql_exec and mssql_scan work inside transactions** using the pinned connection
+
+### 8. Writing COPY Tests
+
+COPY tests verify bulk data transfer using the TDS BulkLoadBCP protocol:
+
+```sql
+# name: test/sql/copy/my_copy_test.test
+# description: Test COPY TO MSSQL functionality
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS copydb (TYPE mssql);
+
+# Create local source data
+statement ok
+CREATE TABLE local_source AS SELECT i::BIGINT AS id, ('Item ' || i)::VARCHAR AS name FROM range(1, 101) t(i);
+
+# Clean up target if exists
+statement ok
+DROP TABLE IF EXISTS copydb.dbo.copy_test_target;
+
+# Test COPY with CREATE_TABLE option
+statement ok
+COPY local_source TO 'mssql://copydb/dbo/copy_test_target' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify data was transferred
+query I
+SELECT COUNT(*) FROM copydb.dbo.copy_test_target;
+----
+100
+
+# Test REPLACE option (drop and recreate with new data)
+statement ok
+CREATE TABLE local_replace AS SELECT 1::BIGINT AS new_col;
+
+statement ok
+COPY local_replace TO 'mssql://copydb/dbo/copy_test_target' (FORMAT 'bcp', REPLACE true);
+
+query I
+SELECT COUNT(*) FROM copydb.dbo.copy_test_target;
+----
+1
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS copydb.dbo.copy_test_target;
+
+statement ok
+DROP TABLE local_source;
+
+statement ok
+DROP TABLE local_replace;
+
+statement ok
+DETACH copydb;
+```
+
+**COPY Test Best Practices:**
+
+1. **Use unique context names** - Prefix with `copy` (e.g., `copydb`, `copytx`)
+2. **Clean up target tables** - Use `DROP TABLE IF EXISTS` before and after tests
+3. **Test both URL and catalog syntax**:
+   - URL: `'mssql://catalog/schema/table'`
+   - Catalog: `'catalog.schema.table'`
+4. **Test temp tables within transactions** - Temp tables require transaction context:
+   ```sql
+   BEGIN;
+   COPY data TO 'mssql://db/#temp_table' (FORMAT 'bcp', CREATE_TABLE true);
+   SELECT * FROM mssql_scan('db', 'SELECT * FROM #temp_table');
+   COMMIT;
+   ```
+5. **Use mssql_scan for in-transaction verification** - Catalog metadata queries use separate connections, so use `mssql_scan` to verify data within a transaction
+
+**COPY Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `CREATE_TABLE` | BOOLEAN | true | Auto-create table if not exists |
+| `REPLACE` | BOOLEAN | false | Drop and recreate table |
+| `FLUSH_ROWS` | BIGINT | 100000 | Rows before flush (bounded memory) |
+| `TABLOCK` | BOOLEAN | true | Use TABLOCK for faster inserts |
+
+**Note**: Use `REPLACE` instead of `OVERWRITE` - DuckDB intercepts `OVERWRITE` as a built-in file operation.
 
 ---
 

@@ -25,6 +25,8 @@ typedef int socklen_t;
 #define SOCK_OPT_CONST_CAST(x) reinterpret_cast<const char *>(x)
 #define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
+// MSG_NOSIGNAL prevents SIGPIPE on Linux; Windows doesn't have SIGPIPE
+#define MSG_NOSIGNAL 0
 
 // One-time Winsock initialization (required before any socket API call on Windows)
 static std::once_flag winsock_init_flag;
@@ -45,6 +47,7 @@ static void InitializeWinsock() {
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -55,6 +58,11 @@ static void InitializeWinsock() {
 #define SOCK_OPT_CONST_CAST(x) (x)
 #define SOCK_BUF_CAST(x) (x)
 #define SOCK_BUF_CONST_CAST(x) (x)
+
+// MSG_NOSIGNAL prevents SIGPIPE on Linux; macOS uses SO_NOSIGPIPE instead
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #endif
 
 // Debug logging
@@ -232,6 +240,11 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 	int flag = 1;
 	setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, SOCK_OPT_CONST_CAST(&flag), sizeof(flag));
 
+#ifdef __APPLE__
+	// On macOS, set SO_NOSIGPIPE to prevent SIGPIPE on write to closed socket
+	setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, SOCK_OPT_CONST_CAST(&flag), sizeof(flag));
+#endif
+
 	// Set back to blocking mode for simpler I/O
 	SetNonBlocking(false);
 
@@ -351,8 +364,8 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 		// Send the wrapped packet
 		size_t total_sent = 0;
 		while (total_sent < tds_packet.size()) {
-			ssize_t sent =
-				send(socket_fd, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent), tds_packet.size() - total_sent, 0);
+			ssize_t sent = send(socket_fd, SOCK_BUF_CONST_CAST(tds_packet.data() + total_sent),
+								tds_packet.size() - total_sent, MSG_NOSIGNAL);
 			if (sent < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 					continue;
@@ -550,7 +563,7 @@ bool TdsSocket::Send(const uint8_t *data, size_t length) {
 	// Plain TCP send
 	size_t total_sent = 0;
 	while (total_sent < length) {
-		ssize_t sent = send(fd_, SOCK_BUF_CONST_CAST(data + total_sent), length - total_sent, 0);
+		ssize_t sent = send(fd_, SOCK_BUF_CONST_CAST(data + total_sent), length - total_sent, MSG_NOSIGNAL);
 		if (sent <= 0) {
 			if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				// Would block, wait and retry

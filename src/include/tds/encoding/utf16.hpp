@@ -33,6 +33,13 @@ std::string Utf16LEDecode(const std::vector<uint8_t> &data);
 /// @return Number of bytes needed for UTF-16LE encoding
 size_t Utf16LEByteLength(const std::string &input);
 
+/// Encode UTF-8 string directly to output buffer (avoids allocation)
+/// @param input UTF-8 encoded string data
+/// @param input_len Length of input string
+/// @param output Output buffer (must have capacity for at least input_len * 2 bytes)
+/// @return Number of bytes written to output
+size_t Utf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *output);
+
 }  // namespace encoding
 }  // namespace tds
 }  // namespace duckdb
