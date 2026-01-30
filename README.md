@@ -516,17 +516,17 @@ Both formats are equivalent and can be used interchangeably.
 
 ```sql
 -- Copy DuckDB table to SQL Server (URL format)
-COPY my_local_table TO 'mssql://sqlserver/dbo/target_table' (FORMAT bcp);
+COPY my_local_table TO 'mssql://sqlserver/dbo/target_table' (FORMAT 'bcp');
 
 -- Copy DuckDB table to SQL Server (catalog format)
-COPY my_local_table TO 'sqlserver.dbo.target_table' (FORMAT bcp);
+COPY my_local_table TO 'sqlserver.dbo.target_table' (FORMAT 'bcp');
 
 -- Copy query results to SQL Server
-COPY (SELECT * FROM source WHERE year = 2024) TO 'mssql://sqlserver/dbo/target_table' (FORMAT bcp);
+COPY (SELECT * FROM source WHERE year = 2024) TO 'mssql://sqlserver/dbo/target_table' (FORMAT 'bcp');
 
 -- Generate data and copy to SQL Server
 COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
-  TO 'sqlserver.dbo.million_rows' (FORMAT bcp);
+  TO 'sqlserver.dbo.million_rows' (FORMAT 'bcp');
 ```
 
 ### COPY TO Options
@@ -540,16 +540,16 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
 
 ```sql
 -- Auto-create table (default: true)
-COPY data TO 'mssql://sqlserver/dbo/new_table' (FORMAT bcp, CREATE_TABLE true);
+COPY data TO 'mssql://sqlserver/dbo/new_table' (FORMAT 'bcp', CREATE_TABLE true);
 
 -- Replace existing table (drop and recreate)
-COPY data TO 'mssql://sqlserver/dbo/existing_table' (FORMAT bcp, REPLACE true);
+COPY data TO 'mssql://sqlserver/dbo/existing_table' (FORMAT 'bcp', REPLACE true);
 
 -- Control flush frequency (rows before committing to SQL Server)
-COPY data TO 'sqlserver.dbo.table' (FORMAT bcp, FLUSH_ROWS 500000);
+COPY data TO 'sqlserver.dbo.table' (FORMAT 'bcp', FLUSH_ROWS 500000);
 
 -- Disable TABLOCK hint (allows concurrent access, slower)
-COPY data TO 'sqlserver.dbo.table' (FORMAT bcp, TABLOCK false);
+COPY data TO 'sqlserver.dbo.table' (FORMAT 'bcp', TABLOCK false);
 ```
 
 ### Temporary Tables
@@ -559,18 +559,18 @@ Temp tables are prefixed with `#` (local) or `##` (global). They require a trans
 ```sql
 -- Local temp table using URL format (session-scoped, requires transaction)
 BEGIN;
-COPY data TO 'mssql://sqlserver/#temp_table' (FORMAT bcp);
+COPY data TO 'mssql://sqlserver/#temp_table' (FORMAT 'bcp');
 SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
 COMMIT;
 
 -- Local temp table using catalog format
 BEGIN;
-COPY data TO 'sqlserver.#temp_table' (FORMAT bcp);
+COPY data TO 'sqlserver.#temp_table' (FORMAT 'bcp');
 SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
 COMMIT;
 
 -- Global temp table (visible to all sessions)
-COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT bcp);
+COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 ```
 
 > **Note**: Temp tables have no schema component. Use `catalog.#table` or `mssql://catalog/#table` format.
