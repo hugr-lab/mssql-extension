@@ -25,6 +25,8 @@ typedef int socklen_t;
 #define SOCK_OPT_CONST_CAST(x) reinterpret_cast<const char *>(x)
 #define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
+// MSG_NOSIGNAL prevents SIGPIPE on Linux; Windows doesn't have SIGPIPE
+#define MSG_NOSIGNAL 0
 
 // One-time Winsock initialization (required before any socket API call on Windows)
 static std::once_flag winsock_init_flag;
