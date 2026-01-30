@@ -501,14 +501,28 @@ SET mssql_ctas_drop_on_failure = true;
 
 High-performance bulk data transfer using the native TDS BulkLoadBCP protocol. Significantly faster than INSERT for large datasets.
 
+### Target Formats
+
+The COPY TO command supports two target formats:
+
+| Format | Syntax | Example |
+|--------|--------|---------|
+| **URL** | `mssql://catalog/schema/table` | `mssql://sqlserver/dbo/my_table` |
+| **Catalog** | `catalog.schema.table` | `sqlserver.dbo.my_table` |
+
+Both formats are equivalent and can be used interchangeably.
+
 ### Basic COPY TO
 
 ```sql
--- Copy DuckDB table to SQL Server
+-- Copy DuckDB table to SQL Server (URL format)
+COPY my_local_table TO 'mssql://sqlserver/dbo/target_table' (FORMAT bcp);
+
+-- Copy DuckDB table to SQL Server (catalog format)
 COPY my_local_table TO 'sqlserver.dbo.target_table' (FORMAT bcp);
 
 -- Copy query results to SQL Server
-COPY (SELECT * FROM source WHERE year = 2024) TO 'sqlserver.dbo.target_table' (FORMAT bcp);
+COPY (SELECT * FROM source WHERE year = 2024) TO 'mssql://sqlserver/dbo/target_table' (FORMAT bcp);
 
 -- Generate data and copy to SQL Server
 COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
@@ -517,32 +531,49 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
 
 ### COPY TO Options
 
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `CREATE_TABLE` | BOOLEAN | true | Auto-create target table if it doesn't exist |
+| `REPLACE` | BOOLEAN | false | Drop and recreate table (replaces existing data) |
+| `FLUSH_ROWS` | BIGINT | 100000 | Rows before flushing to SQL Server (overrides setting) |
+| `TABLOCK` | BOOLEAN | true | Use TABLOCK hint for faster bulk load (overrides setting) |
+
 ```sql
 -- Auto-create table (default: true)
-COPY data TO 'db.dbo.new_table' (FORMAT bcp, CREATE_TABLE true);
+COPY data TO 'mssql://sqlserver/dbo/new_table' (FORMAT bcp, CREATE_TABLE true);
 
 -- Replace existing table (drop and recreate)
-COPY data TO 'db.dbo.existing_table' (FORMAT bcp, REPLACE true);
+COPY data TO 'mssql://sqlserver/dbo/existing_table' (FORMAT bcp, REPLACE true);
 
 -- Control flush frequency (rows before committing to SQL Server)
-COPY data TO 'db.dbo.table' (FORMAT bcp, FLUSH_ROWS 500000);
+COPY data TO 'sqlserver.dbo.table' (FORMAT bcp, FLUSH_ROWS 500000);
 
 -- Disable TABLOCK hint (allows concurrent access, slower)
-COPY data TO 'db.dbo.table' (FORMAT bcp, TABLOCK false);
+COPY data TO 'sqlserver.dbo.table' (FORMAT bcp, TABLOCK false);
 ```
 
 ### Temporary Tables
 
+Temp tables are prefixed with `#` (local) or `##` (global). They require a transaction context to remain accessible.
+
 ```sql
--- Local temp table (session-scoped, requires transaction)
-BEGIN TRANSACTION;
-COPY data TO 'db.dbo.#temp_table' (FORMAT bcp);
-SELECT * FROM mssql_scan('db', 'SELECT * FROM #temp_table');
+-- Local temp table using URL format (session-scoped, requires transaction)
+BEGIN;
+COPY data TO 'mssql://sqlserver/#temp_table' (FORMAT bcp);
+SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
+COMMIT;
+
+-- Local temp table using catalog format
+BEGIN;
+COPY data TO 'sqlserver.#temp_table' (FORMAT bcp);
+SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #temp_table');
 COMMIT;
 
 -- Global temp table (visible to all sessions)
-COPY data TO 'db.dbo.##global_temp' (FORMAT bcp);
+COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT bcp);
 ```
+
+> **Note**: Temp tables have no schema component. Use `catalog.#table` or `mssql://catalog/#table` format.
 
 ### COPY TO Settings
 
