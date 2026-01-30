@@ -172,10 +172,6 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 			bind_data->config.create_table = BooleanValue::Get(option.second[0]);
 		} else if (loption == "overwrite") {
 			bind_data->config.overwrite = BooleanValue::Get(option.second[0]);
-		} else if (loption == "batch_rows") {
-			bind_data->config.batch_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
-		} else if (loption == "max_batch_bytes") {
-			bind_data->config.max_batch_bytes = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
 		} else if (loption == "flush_rows") {
 			bind_data->config.flush_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
 		} else if (loption == "tablock") {
@@ -184,16 +180,9 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		// Ignore unknown options (may be standard COPY options)
 	}
 
-	// Validate config
-	bind_data->config.Validate();
-
-	CopyDebugLog(1,
-				 "BCPCopyBind: config batch_rows=%llu, max_batch_bytes=%llu, flush_rows=%llu, create_table=%d, "
-				 "overwrite=%d",
-				 (unsigned long long)bind_data->config.batch_rows,
-				 (unsigned long long)bind_data->config.max_batch_bytes,
+	CopyDebugLog(1, "BCPCopyBind: config flush_rows=%llu, create_table=%d, overwrite=%d, tablock=%d",
 				 (unsigned long long)bind_data->config.flush_rows, bind_data->config.create_table ? 1 : 0,
-				 bind_data->config.overwrite ? 1 : 0);
+				 bind_data->config.overwrite ? 1 : 0, bind_data->config.tablock ? 1 : 0);
 
 	return std::move(bind_data);
 }

@@ -14,6 +14,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - TLS/SSL encrypted connections
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE
 - CREATE TABLE AS SELECT (CTAS) with streaming and type mapping
+- High-performance COPY TO via TDS BulkLoadBCP protocol
 - Transaction support: BEGIN/COMMIT/ROLLBACK with connection pinning
 - Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
@@ -495,6 +496,74 @@ SET mssql_ctas_drop_on_failure = true;
 - **Non-atomic**: DDL commits immediately; INSERT respects transactions
 - **Schema validation**: Target schema must exist before CTAS
 - **Batching**: Uses `mssql_insert_batch_size` setting for INSERT batches
+
+## COPY TO (Bulk Load)
+
+High-performance bulk data transfer using the native TDS BulkLoadBCP protocol. Significantly faster than INSERT for large datasets.
+
+### Basic COPY TO
+
+```sql
+-- Copy DuckDB table to SQL Server
+COPY my_local_table TO 'sqlserver.dbo.target_table' (FORMAT bcp);
+
+-- Copy query results to SQL Server
+COPY (SELECT * FROM source WHERE year = 2024) TO 'sqlserver.dbo.target_table' (FORMAT bcp);
+
+-- Generate data and copy to SQL Server
+COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
+  TO 'sqlserver.dbo.million_rows' (FORMAT bcp);
+```
+
+### COPY TO Options
+
+```sql
+-- Auto-create table (default: true)
+COPY data TO 'db.dbo.new_table' (FORMAT bcp, CREATE_TABLE true);
+
+-- Overwrite existing table (drop and recreate)
+COPY data TO 'db.dbo.existing_table' (FORMAT bcp, OVERWRITE true);
+
+-- Control flush frequency (rows before committing to SQL Server)
+COPY data TO 'db.dbo.table' (FORMAT bcp, FLUSH_ROWS 500000);
+
+-- Disable TABLOCK hint (allows concurrent access, slower)
+COPY data TO 'db.dbo.table' (FORMAT bcp, TABLOCK false);
+```
+
+### Temporary Tables
+
+```sql
+-- Local temp table (session-scoped, requires transaction)
+BEGIN TRANSACTION;
+COPY data TO 'db.dbo.#temp_table' (FORMAT bcp);
+SELECT * FROM mssql_scan('db', 'SELECT * FROM #temp_table');
+COMMIT;
+
+-- Global temp table (visible to all sessions)
+COPY data TO 'db.dbo.##global_temp' (FORMAT bcp);
+```
+
+### COPY TO Settings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mssql_copy_flush_rows` | BIGINT | 100000 | Rows before flushing to SQL Server (0 = flush at end only) |
+| `mssql_copy_tablock` | BOOLEAN | true | Use TABLOCK hint for 15-30% better performance |
+
+### Performance Characteristics
+
+- **Protocol**: Uses TDS BulkLoadBCP (packet type 0x07) for maximum throughput
+- **Streaming**: Bounded memory usage regardless of dataset size
+- **Throughput**: ~300K rows/s for simple rows, ~10K rows/s for wide rows (500+ chars × 10 columns)
+- **TABLOCK**: Enables table-level locking and minimal logging for faster inserts
+
+### COPY TO Behavior
+
+- **Auto-create**: Tables are created automatically with inferred schema (can be disabled)
+- **Type mapping**: DuckDB types mapped to SQL Server equivalents (VARCHAR→NVARCHAR, etc.)
+- **No RETURNING**: Use INSERT for cases requiring returned values
+- **Transaction support**: Works within transactions; temp tables require transaction context
 
 ## Data Modification (INSERT)
 
@@ -1148,7 +1217,7 @@ The following features are planned for future releases:
 | **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | ✅ Implemented |
 | **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
-| **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | Planned |
+| **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | ✅ Implemented |
 
 ### Feature Details
 

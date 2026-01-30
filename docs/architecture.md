@@ -20,10 +20,11 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 2. **Storage extension** (`RegisterMSSQLStorageExtension`) — `ATTACH ... TYPE mssql` support
 3. **Table functions** (`RegisterMSSQLFunctions`) — `mssql_scan` for raw SQL queries
 4. **Scalar functions** (`RegisterMSSQLExecFunction`) — `mssql_exec` for DDL/DML execution
-5. **Settings** (`RegisterMSSQLSettings`) — connection pool, statistics, DML tuning
+5. **Settings** (`RegisterMSSQLSettings`) — connection pool, statistics, DML, COPY tuning
 6. **Diagnostic functions** (`RegisterMSSQLDiagnosticFunctions`) — `mssql_open`, `mssql_close`, `mssql_ping`, `mssql_pool_stats`
 7. **Cache refresh** (`RegisterMSSQLRefreshCacheFunction`) — `mssql_refresh_cache`
-8. **Version function** — `mssql_version()`
+8. **COPY functions** (`RegisterMSSQLCopyFunctions`) — `bcp` format for COPY TO
+9. **Version function** — `mssql_version()`
 
 ## High-Level Component Diagram
 
@@ -52,6 +53,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 │  │   pushdown   │  │ - UPDATE     │  │ - Connection pinning     │    │
 │  │ - Projection │  │ - DELETE     │  │ - Transaction descriptor │    │
 │  │   pushdown   │  │ - CTAS       │  │                          │    │
+│  │              │  │ - COPY (BCP) │  │                          │    │
 │  └──────┬──────┘  └──────┬───────┘  └────────────┬─────────────┘    │
 │         │                │                        │                  │
 │  ┌──────┴────────────────┴────────────────────────┴─────────────┐    │
@@ -124,7 +126,8 @@ src/
 │   │   ├── datetime_encoding.cpp # Date/time wire format conversions
 │   │   ├── decimal_encoding.cpp  # DECIMAL/MONEY conversions
 │   │   ├── guid_encoding.cpp     # UNIQUEIDENTIFIER mixed-endian handling
-│   │   └── utf16.cpp             # UTF-16LE ↔ UTF-8 conversion
+│   │   ├── utf16.cpp             # UTF-16LE ↔ UTF-8 conversion (optimized ASCII path)
+│   │   └── bcp_row_encoder.cpp   # BCP row encoding for COPY operations
 │   └── tls/                      # TLS encryption
 │       ├── tds_tls_context.cpp   # OpenSSL context wrapper
 │       └── tds_tls_impl.cpp      # TLS handshake with custom BIO callbacks
@@ -164,6 +167,12 @@ src/
 │       ├── mssql_ctas_planner.cpp      # CTAS planning and type mapping
 │       ├── mssql_ctas_executor.cpp     # Two-phase execution (DDL + INSERT)
 │       └── mssql_physical_ctas.cpp     # DuckDB PhysicalOperator (Sink)
+│
+├── copy/                         # COPY TO via BulkLoadBCP
+│   ├── copy_function.cpp         # DuckDB COPY function callbacks (bind, sink, finalize)
+│   ├── bcp_writer.cpp            # BCP protocol writer (packet construction, streaming)
+│   ├── bcp_config.cpp            # Configuration loading from settings
+│   └── target_resolver.cpp       # Target URL/catalog parsing and table creation
 │
 └── include/                      # Headers (mirrors src/ structure)
 ```

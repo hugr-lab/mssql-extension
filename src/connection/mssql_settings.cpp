@@ -162,17 +162,6 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// COPY/BCP Settings
 	//===----------------------------------------------------------------------===//
 
-	// mssql_copy_batch_rows - Maximum rows per BCP batch
-	config.AddExtensionOption("mssql_copy_batch_rows",
-							  "Maximum rows per BCP batch for COPY operations (default: 10000)", LogicalType::BIGINT,
-							  Value::BIGINT(MSSQL_DEFAULT_COPY_BATCH_ROWS), ValidatePositive, SetScope::GLOBAL);
-
-	// mssql_copy_max_batch_bytes - Maximum bytes per BCP batch
-	config.AddExtensionOption("mssql_copy_max_batch_bytes",
-							  "Maximum bytes per BCP batch for COPY operations (default: 32MB, minimum: 1MB)",
-							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_MAX_BATCH_BYTES), ValidatePositive,
-							  SetScope::GLOBAL);
-
 	// mssql_copy_flush_rows - Rows before flushing to SQL Server
 	// Controls memory usage on both DuckDB and SQL Server sides
 	// 0 = no intermediate flushes (WARNING: high memory usage for large datasets)
