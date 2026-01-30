@@ -621,29 +621,29 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	// Release the writer
 	gdata.writer.reset();
 
-	// Handle connection release based on temp table status
-	if (bdata.target.IsTempTable()) {
-		// For temp tables, we need to keep the connection pinned to the transaction
-		// so subsequent queries can access the temp table.
+	// Note: BCPWriter::Finalize() already transitions connection back to Idle state
+
+	// Handle connection release based on transaction state
+	if (in_transaction) {
+		// In a transaction, keep connection pinned so subsequent operations
+		// (queries, COPY, DML) use the same transaction context.
 		// ConnectionProvider::ReleaseConnection is a no-op when in a transaction.
-		if (in_transaction) {
-			// Connection stays pinned - temp table will be accessible for subsequent queries
+		if (bdata.target.IsTempTable()) {
 			CopyDebugLog(1, "BCPCopyFinalize: temp table '%s' - connection stays pinned to transaction",
 						 bdata.target.table_name.c_str());
-			// Use ConnectionProvider which correctly handles transaction pinning (no-op in transaction)
-			ConnectionProvider::ReleaseConnection(context, mssql_catalog, gdata.connection);
 		} else {
-			// Not in transaction (auto-commit mode) - temp table will be lost when connection is released
+			CopyDebugLog(1, "BCPCopyFinalize: connection stays pinned to transaction");
+		}
+		ConnectionProvider::ReleaseConnection(context, mssql_catalog, gdata.connection);
+	} else {
+		// Not in transaction - release connection back to pool
+		if (bdata.target.IsTempTable()) {
 			CopyDebugLog(1,
 						 "WARNING: COPY to temp table '%s' in auto-commit mode. "
 						 "Temp table will be dropped when connection is released. "
 						 "Use BEGIN TRANSACTION to keep the temp table accessible.",
 						 bdata.target.table_name.c_str());
-			// Release connection back to pool - temp table will be lost
-			mssql_catalog.GetConnectionPool().Release(gdata.connection);
 		}
-	} else {
-		// For regular tables, always release the connection back to the pool
 		mssql_catalog.GetConnectionPool().Release(gdata.connection);
 	}
 

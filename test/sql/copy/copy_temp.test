@@ -1,0 +1,152 @@
+# name: test/sql/copy/copy_temp.test
+# description: Test COPY TO MSSQL with session-scoped temp tables
+# group: [copy]
+# Spec: 024-mssql-copy-bcp, User Story 2 - COPY to Session-Scoped Temp Table
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS copytemp (TYPE mssql);
+
+# =============================================================================
+# Test 1: COPY to temp table within transaction (keeps temp table accessible)
+# =============================================================================
+
+# Create local data
+statement ok
+CREATE TABLE temp_source AS SELECT i::BIGINT AS id, ('Item ' || i)::VARCHAR AS name FROM range(1, 11) t(i);
+
+# Start transaction to keep temp table accessible
+statement ok
+BEGIN;
+
+# COPY to temp table (CREATE_TABLE=true is default)
+statement ok
+COPY temp_source TO 'mssql://copytemp/#copy_temp_test' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify temp table is accessible within the same transaction
+# Use mssql_scan since temp tables require the pinned connection
+# Query returns one row with the count value - select that value directly
+query I
+SELECT cnt FROM mssql_scan('copytemp', 'SELECT COUNT(*) AS cnt FROM #copy_temp_test');
+----
+10
+
+# Verify data
+query II
+SELECT * FROM mssql_scan('copytemp', 'SELECT id, name FROM #copy_temp_test ORDER BY id') LIMIT 3;
+----
+1	Item 1
+2	Item 2
+3	Item 3
+
+# Commit to confirm data
+statement ok
+COMMIT;
+
+# Cleanup local table
+statement ok
+DROP TABLE temp_source;
+
+# =============================================================================
+# Test 2: COPY to temp table with REPLACE (drop and recreate)
+# =============================================================================
+
+# Create initial data
+statement ok
+CREATE TABLE temp_v1 AS SELECT 1::BIGINT AS old_col;
+
+# Start transaction
+statement ok
+BEGIN;
+
+# First COPY to create temp table
+statement ok
+COPY temp_v1 TO 'mssql://copytemp/#replace_temp' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify initial data
+query I
+SELECT * FROM mssql_scan('copytemp', 'SELECT old_col FROM #replace_temp');
+----
+1
+
+# Create new data with different schema
+statement ok
+CREATE TABLE temp_v2 AS SELECT i::BIGINT AS new_id, ('Name ' || i)::VARCHAR AS new_name FROM range(1, 6) t(i);
+
+# REPLACE should drop and recreate with new schema
+statement ok
+COPY temp_v2 TO 'mssql://copytemp/#replace_temp' (FORMAT 'bcp', REPLACE true);
+
+# Verify new schema and data
+query I
+SELECT cnt FROM mssql_scan('copytemp', 'SELECT COUNT(*) AS cnt FROM #replace_temp');
+----
+5
+
+query II
+SELECT * FROM mssql_scan('copytemp', 'SELECT new_id, new_name FROM #replace_temp WHERE new_id = 1');
+----
+1	Name 1
+
+statement ok
+COMMIT;
+
+# Cleanup
+statement ok
+DROP TABLE temp_v1;
+
+statement ok
+DROP TABLE temp_v2;
+
+# =============================================================================
+# Test 3: COPY to temp table with catalog.schema.table syntax
+# =============================================================================
+
+statement ok
+CREATE TABLE temp_cat_source AS SELECT i::BIGINT AS val FROM range(1, 4) t(i);
+
+statement ok
+BEGIN;
+
+# Use catalog syntax for temp table (just catalog.#table since no schema for temp tables)
+statement ok
+COPY temp_cat_source TO 'copytemp.#catalog_temp' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify data
+query I
+SELECT cnt FROM mssql_scan('copytemp', 'SELECT COUNT(*) AS cnt FROM #catalog_temp');
+----
+3
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE temp_cat_source;
+
+# =============================================================================
+# Test 4: Error when CREATE_TABLE=false and temp table doesn't exist
+# =============================================================================
+
+statement ok
+CREATE TABLE no_create_source AS SELECT 1::BIGINT AS x;
+
+statement ok
+BEGIN;
+
+statement error
+COPY no_create_source TO 'mssql://copytemp/#nonexistent_temp' (FORMAT 'bcp', CREATE_TABLE false);
+----
+does not exist
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP TABLE no_create_source;
+
+statement ok
+DETACH copytemp;

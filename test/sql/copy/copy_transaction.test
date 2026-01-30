@@ -1,0 +1,287 @@
+# name: test/sql/copy/copy_transaction.test
+# description: Test COPY TO MSSQL transaction behavior
+# group: [copy]
+# Spec: 024-mssql-copy-bcp, User Story 5 - Transaction-Safe COPY
+#
+# Note: Catalog metadata queries (table schema lookup) use separate connections,
+# so we use mssql_scan for in-transaction verification, which uses the pinned connection.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS copytx (TYPE mssql);
+
+# =============================================================================
+# Test 1: COPY within transaction - COMMIT persists data
+# =============================================================================
+
+# Create local data
+statement ok
+CREATE TABLE tx_local_data AS SELECT i::BIGINT AS id, ('Row ' || i)::VARCHAR AS name FROM range(1, 11) t(i);
+
+# Ensure target doesn't exist
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_tx_commit;
+
+# Start transaction
+statement ok
+BEGIN;
+
+# COPY local data to MSSQL within transaction
+statement ok
+COPY tx_local_data TO 'mssql://copytx/dbo/copy_tx_commit' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify data is visible within transaction using mssql_scan (uses pinned connection)
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_tx_commit');
+----
+10
+
+# Commit transaction
+statement ok
+COMMIT;
+
+# Verify data persists after commit using catalog query (now safe)
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_tx_commit;
+----
+10
+
+# Verify sample data
+query II
+SELECT id, name FROM copytx.dbo.copy_tx_commit WHERE id = 1;
+----
+1	Row 1
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_tx_commit;
+
+statement ok
+DROP TABLE tx_local_data;
+
+# =============================================================================
+# Test 2: COPY within transaction - ROLLBACK discards data
+# =============================================================================
+
+# Create local data
+statement ok
+CREATE TABLE tx_rollback_data AS SELECT i::BIGINT AS id FROM range(1, 6) t(i);
+
+# Ensure target doesn't exist
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_tx_rollback;
+
+# Start transaction
+statement ok
+BEGIN;
+
+# COPY local data to MSSQL (creates table)
+statement ok
+COPY tx_rollback_data TO 'mssql://copytx/dbo/copy_tx_rollback' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify data is visible within transaction using mssql_scan
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_tx_rollback');
+----
+5
+
+# Rollback transaction
+statement ok
+ROLLBACK;
+
+# After rollback, the table created in the transaction doesn't exist
+# DuckDB's catalog catches this before reaching SQL Server
+statement error
+SELECT COUNT(*) FROM copytx.dbo.copy_tx_rollback;
+----
+does not exist
+
+# Cleanup
+statement ok
+DROP TABLE tx_rollback_data;
+
+# =============================================================================
+# Test 3: Multiple COPY operations in single transaction
+# =============================================================================
+
+# Create local data
+statement ok
+CREATE TABLE multi_data_1 AS SELECT i::BIGINT AS val FROM range(1, 4) t(i);
+
+statement ok
+CREATE TABLE multi_data_2 AS SELECT (i * 10)::BIGINT AS val FROM range(1, 4) t(i);
+
+# Ensure targets don't exist
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_multi_1;
+
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_multi_2;
+
+# Start transaction
+statement ok
+BEGIN;
+
+# First COPY
+statement ok
+COPY multi_data_1 TO 'mssql://copytx/dbo/copy_multi_1' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Second COPY
+statement ok
+COPY multi_data_2 TO 'mssql://copytx/dbo/copy_multi_2' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify both using mssql_scan
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_multi_1');
+----
+3
+
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_multi_2');
+----
+3
+
+# Commit
+statement ok
+COMMIT;
+
+# Verify both persisted
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_multi_1;
+----
+3
+
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_multi_2;
+----
+3
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_multi_1;
+
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_multi_2;
+
+statement ok
+DROP TABLE multi_data_1;
+
+statement ok
+DROP TABLE multi_data_2;
+
+# =============================================================================
+# Test 4: COPY with REPLACE within transaction
+# =============================================================================
+
+# Create initial data
+statement ok
+CREATE TABLE replace_initial AS SELECT 1::BIGINT AS old_id;
+
+# Create table first (outside transaction)
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_tx_replace;
+
+statement ok
+COPY replace_initial TO 'mssql://copytx/dbo/copy_tx_replace' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Create new data with different schema
+statement ok
+CREATE TABLE replace_new AS SELECT i::BIGINT AS new_id, ('Name ' || i)::VARCHAR AS name FROM range(1, 6) t(i);
+
+# Start transaction
+statement ok
+BEGIN;
+
+# REPLACE within transaction
+statement ok
+COPY replace_new TO 'mssql://copytx/dbo/copy_tx_replace' (FORMAT 'bcp', REPLACE true);
+
+# Verify new data using mssql_scan
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_tx_replace');
+----
+5
+
+# Commit the replace
+statement ok
+COMMIT;
+
+# Verify persisted with new schema
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_tx_replace;
+----
+5
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_tx_replace;
+
+statement ok
+DROP TABLE replace_initial;
+
+statement ok
+DROP TABLE replace_new;
+
+# =============================================================================
+# Test 5: Append to existing table within transaction
+# =============================================================================
+
+# Create test table with initial data
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_append_test;
+
+statement ok
+CREATE TABLE append_init AS SELECT 1::BIGINT AS id;
+
+statement ok
+COPY append_init TO 'mssql://copytx/dbo/copy_append_test' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify initial data
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_append_test;
+----
+1
+
+# Create data to append
+statement ok
+CREATE TABLE append_data AS SELECT (i + 1)::BIGINT AS id FROM range(1, 4) t(i);
+
+# Start transaction
+statement ok
+BEGIN;
+
+# Append more data (CREATE_TABLE=false since table exists)
+statement ok
+COPY append_data TO 'mssql://copytx/dbo/copy_append_test' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Verify appended using mssql_scan (1 initial + 3 new = 4)
+query I
+SELECT cnt FROM mssql_scan('copytx', 'SELECT COUNT(*) AS cnt FROM dbo.copy_append_test');
+----
+4
+
+# Commit
+statement ok
+COMMIT;
+
+# Verify persisted
+query I
+SELECT COUNT(*) FROM copytx.dbo.copy_append_test;
+----
+4
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS copytx.dbo.copy_append_test;
+
+statement ok
+DROP TABLE append_init;
+
+statement ok
+DROP TABLE append_data;
+
+statement ok
+DETACH copytx;
