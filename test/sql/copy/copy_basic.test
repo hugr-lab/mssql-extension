@@ -1,0 +1,76 @@
+# name: test/sql/copy/copy_basic.test
+# description: Test basic COPY TO MSSQL via BCP protocol
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach to SQL Server
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# Create a local table with test data
+statement ok
+CREATE TABLE local_data AS SELECT
+    i::BIGINT AS id,
+    ('Name ' || i)::VARCHAR AS name,
+    (i * 1.5)::DOUBLE AS value
+FROM range(1, 101) t(i);
+
+# Test 1: COPY with CREATE_TABLE (auto-create)
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_test1;
+
+statement ok
+COPY local_data TO 'mssql://db/dbo/copy_test1' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify row count
+query I
+SELECT COUNT(*) FROM db.dbo.copy_test1;
+----
+100
+
+# Verify sample data
+query III
+SELECT id, name, value FROM db.dbo.copy_test1 WHERE id = 1;
+----
+1	Name 1	1.5
+
+query III
+SELECT id, name, value FROM db.dbo.copy_test1 WHERE id = 50;
+----
+50	Name 50	75.0
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_test1;
+
+# Test 2: COPY with catalog.schema.table syntax (no URL prefix)
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_test2;
+
+statement ok
+COPY local_data TO db.dbo.copy_test2 (FORMAT 'bcp', CREATE_TABLE true);
+
+# Verify row count
+query I
+SELECT COUNT(*) FROM db.dbo.copy_test2;
+----
+100
+
+# Verify sample data
+query III
+SELECT id, name, value FROM db.dbo.copy_test2 WHERE id = 1;
+----
+1	Name 1	1.5
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_test2;
+
+statement ok
+DROP TABLE local_data;
+
+statement ok
+DETACH db;

@@ -1,0 +1,57 @@
+# name: test/sql/copy/copy_errors.test
+# description: Test COPY TO MSSQL error handling
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+statement ok
+CREATE TABLE test_data AS SELECT 1::BIGINT AS id, 'test'::VARCHAR AS name;
+
+# Test 1: COPY to non-existent table without CREATE_TABLE should fail
+statement ok
+DROP TABLE IF EXISTS db.dbo.nonexistent_table;
+
+statement error
+COPY test_data TO 'mssql://db/dbo/nonexistent_table' (FORMAT 'bcp', CREATE_TABLE false);
+----
+does not exist
+
+# Test 2: COPY to non-existent catalog should fail
+statement error
+COPY test_data TO 'mssql://nonexistent_catalog/dbo/table' (FORMAT 'bcp');
+----
+does not exist
+
+# Test 3: Invalid URL format should fail
+statement error
+COPY test_data TO 'invalid_url' (FORMAT 'bcp');
+----
+mssql://
+
+# Test 4: Type mismatch without OVERWRITE should fail
+statement ok
+DROP TABLE IF EXISTS db.dbo.type_mismatch;
+
+# Use mssql_exec to create table with specific SQL Server types
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.type_mismatch (id varchar(10), name int)');
+
+statement error
+COPY test_data TO 'mssql://db/dbo/type_mismatch' (FORMAT 'bcp');
+----
+not compatible
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.type_mismatch;
+
+statement ok
+DROP TABLE test_data;
+
+statement ok
+DETACH db;

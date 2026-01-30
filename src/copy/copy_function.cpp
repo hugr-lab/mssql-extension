@@ -248,6 +248,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
 								   bdata.source_names);
 
+	// Invalidate catalog cache if table was created/dropped (non-temp tables only)
+	// This ensures the new table schema is visible for subsequent queries
+	if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
+		mssql_catalog.InvalidateMetadataCache();
+		CopyDebugLog(2, "BCPCopyInitGlobal: catalog cache invalidated after table creation/modification");
+	}
+
 	// Generate column metadata for BCP
 	gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
 

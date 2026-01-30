@@ -1,0 +1,63 @@
+# name: test/sql/copy/copy_large.test
+# description: Test COPY TO MSSQL with larger datasets
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# Test with 10K rows
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_10k;
+
+statement ok
+COPY (SELECT i::BIGINT AS id, ('Row ' || i)::VARCHAR AS name FROM range(10000) t(i))
+TO 'mssql://db/dbo/copy_10k' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT COUNT(*) FROM db.dbo.copy_10k;
+----
+10000
+
+# Verify first and last rows
+query II
+SELECT id, name FROM db.dbo.copy_10k WHERE id = 0;
+----
+0	Row 0
+
+query II
+SELECT id, name FROM db.dbo.copy_10k WHERE id = 9999;
+----
+9999	Row 9999
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_10k;
+
+# Test with multiple flushes (set low flush_rows)
+statement ok
+SET mssql_copy_flush_rows TO 1000;
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_flush;
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(5000) t(i))
+TO 'mssql://db/dbo/copy_flush' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT COUNT(*) FROM db.dbo.copy_flush;
+----
+5000
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_flush;
+
+# Reset setting
+statement ok
+RESET mssql_copy_flush_rows;
+
+statement ok
+DETACH db;

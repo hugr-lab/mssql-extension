@@ -1,0 +1,58 @@
+# name: test/sql/copy/copy_overwrite.test
+# description: Test COPY TO MSSQL with OVERWRITE option
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# Test 1: OVERWRITE replaces existing table with new schema
+statement ok
+CREATE TABLE data_v1 AS SELECT 1::BIGINT AS old_id;
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_overwrite;
+
+statement ok
+COPY data_v1 TO 'mssql://db/dbo/copy_overwrite' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT COUNT(*) FROM db.dbo.copy_overwrite;
+----
+1
+
+# Now create new data with different schema
+statement ok
+CREATE TABLE data_v2 AS SELECT i::BIGINT AS new_id, ('Item ' || i)::VARCHAR AS name FROM range(1, 26) t(i);
+
+# OVERWRITE should drop old table and create new one with new schema
+statement ok
+COPY data_v2 TO 'mssql://db/dbo/copy_overwrite' (FORMAT 'bcp', OVERWRITE true);
+
+# Verify new count
+query I
+SELECT COUNT(*) FROM db.dbo.copy_overwrite;
+----
+25
+
+# Verify new schema and data
+query II
+SELECT new_id, name FROM db.dbo.copy_overwrite WHERE new_id = 1;
+----
+1	Item 1
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_overwrite;
+
+statement ok
+DROP TABLE data_v1;
+
+statement ok
+DROP TABLE data_v2;
+
+statement ok
+DETACH db;
