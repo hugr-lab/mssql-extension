@@ -569,27 +569,29 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 				 (unsigned long long)rows_in_final_batch);
 
 	try {
-		// Only finalize if there are rows in the current batch
+		// Send final DONE token and finalize the BCP stream
+		// Note: We must ALWAYS send DONE and finalize, even if rows_in_final_batch == 0.
+		// After intermediate flushes, we restart BCP with ExecuteBatch + WriteColmetadata,
+		// leaving the connection in Executing state. We need DONE to close the stream
+		// and transition back to Idle so the connection can be reused.
 		if (rows_in_final_batch > 0) {
 			CopyDebugLog(1, "BCPCopyFinalize: sending final batch: %llu rows, buffer: %zu MB",
 						 (unsigned long long)rows_in_final_batch, gdata.writer->GetAccumulatorSize() / (1024 * 1024));
-
-			// Send DONE token for the final batch
-			gdata.writer->WriteDone(rows_in_final_batch);
-
-			CopyDebugLog(1, "BCPCopyFinalize: data sent, waiting for SQL Server to process...");
-
-			// Read server response and get confirmed row count
-			idx_t final_batch_confirmed = gdata.writer->Finalize();
-			gdata.rows_confirmed.fetch_add(final_batch_confirmed);
-
-			CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows",
-						 (unsigned long long)final_batch_confirmed);
-		} else if (previously_confirmed == 0) {
-			// No rows at all - still need to send empty completion
-			gdata.writer->WriteDone(0);
-			gdata.writer->Finalize();
+		} else {
+			CopyDebugLog(1, "BCPCopyFinalize: sending empty DONE to close BCP stream");
 		}
+
+		// Send DONE token for the final batch (even if 0 rows)
+		gdata.writer->WriteDone(rows_in_final_batch);
+
+		CopyDebugLog(1, "BCPCopyFinalize: data sent, waiting for SQL Server to process...");
+
+		// Read server response and get confirmed row count
+		idx_t final_batch_confirmed = gdata.writer->Finalize();
+		gdata.rows_confirmed.fetch_add(final_batch_confirmed);
+
+		CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows",
+					 (unsigned long long)final_batch_confirmed);
 
 		idx_t total_confirmed = gdata.rows_confirmed.load();
 		idx_t batches = gdata.batches_flushed.load() + (rows_in_final_batch > 0 ? 1 : 0);
