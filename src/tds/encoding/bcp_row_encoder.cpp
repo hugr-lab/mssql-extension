@@ -114,7 +114,27 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			break;
 		}
 		case LogicalTypeId::DECIMAL: {
-			EncodeDecimal(buffer, GetVectorValue<hugeint_t>(vec, row_idx), col.precision, col.scale);
+			// DuckDB stores DECIMAL in different internal types based on precision:
+			// precision <= 4: int16_t, <= 9: int32_t, <= 18: int64_t, > 18: hugeint_t
+			auto internal_type = vec.GetType().InternalType();
+			hugeint_t decimal_value;
+			switch (internal_type) {
+			case PhysicalType::INT16:
+				decimal_value = hugeint_t(GetVectorValue<int16_t>(vec, row_idx));
+				break;
+			case PhysicalType::INT32:
+				decimal_value = hugeint_t(GetVectorValue<int32_t>(vec, row_idx));
+				break;
+			case PhysicalType::INT64:
+				decimal_value = hugeint_t(GetVectorValue<int64_t>(vec, row_idx));
+				break;
+			case PhysicalType::INT128:
+				decimal_value = GetVectorValue<hugeint_t>(vec, row_idx);
+				break;
+			default:
+				throw InternalException("Unexpected physical type for DECIMAL: %s", TypeIdToString(internal_type));
+			}
+			EncodeDecimal(buffer, decimal_value, col.precision, col.scale);
 			break;
 		}
 		case LogicalTypeId::VARCHAR: {
