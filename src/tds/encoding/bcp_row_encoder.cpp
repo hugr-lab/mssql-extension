@@ -408,6 +408,22 @@ void BCPRowEncoder::EncodeNVarcharPLP(vector<uint8_t> &buffer, const string_t &v
 	size_t input_len = value.GetSize();
 	const char *input = value.GetData();
 
+	// Handle empty string: PLP with no chunks, just terminator
+	// PLP chunks must have length > 0, so empty string = no chunks
+	if (input_len == 0) {
+		// Write UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE)
+		constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
+		for (int i = 0; i < 8; i++) {
+			buffer.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
+		}
+		// Write terminator (4 bytes of 0x00) - no chunks for empty string
+		buffer.push_back(0x00);
+		buffer.push_back(0x00);
+		buffer.push_back(0x00);
+		buffer.push_back(0x00);
+		return;
+	}
+
 	// PLP format: 8 bytes (UNKNOWN_LEN) + 4 bytes (chunk len) + data + 4 bytes (terminator)
 	size_t start_pos = buffer.size();
 	size_t max_utf16_len = input_len * 2;
@@ -455,13 +471,17 @@ void BCPRowEncoder::EncodeBinaryPLP(vector<uint8_t> &buffer, const string_t &val
 		buffer.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
 	}
 
-	// Write single chunk: chunk length (4 bytes) + data
+	// Handle empty binary: PLP with no chunks, just terminator
+	// PLP chunks must have length > 0, so empty binary = no chunks
 	uint32_t chunk_len = static_cast<uint32_t>(value.GetSize());
-	for (int i = 0; i < 4; i++) {
-		buffer.push_back(static_cast<uint8_t>((chunk_len >> (i * 8)) & 0xFF));
+	if (chunk_len > 0) {
+		// Write single chunk: chunk length (4 bytes) + data
+		for (int i = 0; i < 4; i++) {
+			buffer.push_back(static_cast<uint8_t>((chunk_len >> (i * 8)) & 0xFF));
+		}
+		const uint8_t *data = reinterpret_cast<const uint8_t *>(value.GetData());
+		buffer.insert(buffer.end(), data, data + chunk_len);
 	}
-	const uint8_t *data = reinterpret_cast<const uint8_t *>(value.GetData());
-	buffer.insert(buffer.end(), data, data + chunk_len);
 
 	// Write terminator (4 bytes of 0x00) to signal end of PLP chunks
 	buffer.push_back(0x00);
