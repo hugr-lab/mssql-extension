@@ -78,4 +78,14 @@ MSSQLInsertConfig LoadInsertConfig(ClientContext &context);
 // DML configuration is defined in dml/mssql_dml_config.hpp
 // LoadDMLConfig() is declared there along with MSSQLDMLConfig struct
 
+//===----------------------------------------------------------------------===//
+// VARCHAR Encoding Configuration (Spec 026)
+//===----------------------------------------------------------------------===//
+
+// Default: convert VARCHAR(MAX) to NVARCHAR(MAX) for UTF-8 compatibility
+constexpr bool DEFAULT_CONVERT_VARCHAR_MAX = true;
+
+// Load VARCHAR(MAX) conversion setting
+bool LoadConvertVarcharMax(ClientContext &context);
+
 }  // namespace duckdb

@@ -1277,8 +1277,8 @@ Error: Unsupported SQL Server type: XML
 |----------|--------|-------|
 | macOS ARM64 | Primary development | Active development and testing |
 | Linux x86_64 | CI-validated | Automated builds and tests in CI |
-| Linux ARM64 | Not tested | Not built in CD pipeline |
-| Windows x64 | Not tested | Not built in CD pipeline |
+| Linux ARM64 | CI-validated | Automated builds and tests in CI |
+| Windows x64 | CI-validated | Automated builds and tests in CI |
 
 ## Roadmap
 
@@ -1321,11 +1321,52 @@ The following features are planned for future releases:
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 - **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
 
+### VARCHAR Encoding
+
+VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`) are automatically converted to NVARCHAR in generated queries to ensure proper UTF-8 decoding in DuckDB. This allows extended ASCII characters (é, ñ, ü, etc.) to be correctly returned.
+
+**Behavior:**
+
+| VARCHAR Length | Converted To | Notes |
+|----------------|--------------|-------|
+| VARCHAR(n) where n ≤ 4000 | NVARCHAR(n) | Full data preserved |
+| VARCHAR(n) where n > 4000 | NVARCHAR(4000) | Data may be truncated to 4000 characters |
+| VARCHAR(MAX) | NVARCHAR(MAX) | Converted by default; disable with `mssql_convert_varchar_max = false` |
+
+**VARCHAR Encoding Setting:**
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mssql_convert_varchar_max` | BOOLEAN | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries |
+
+When `mssql_convert_varchar_max = true` (default), VARCHAR(MAX) columns with non-UTF8 collations are converted to NVARCHAR(MAX), enabling proper UTF-8 handling for extended ASCII characters. This may halve the effective buffer capacity (from ~4096 to ~2048 characters) due to NVARCHAR's 2-byte encoding.
+
+To preserve the full buffer capacity at the cost of potential encoding errors with extended ASCII:
+
+```sql
+SET mssql_convert_varchar_max = false;
+```
+
+**Notes:**
+
+1. **Catalog queries only**: This conversion applies only to catalog-based queries (three-part naming like `db.schema.table`). When using `mssql_scan()` with raw SQL, you must manually add CAST expressions:
+
+```sql
+-- Without CAST: may fail with UTF-8 validation error for extended ASCII
+FROM mssql_scan('db', 'SELECT name FROM dbo.customers');
+
+-- With CAST: properly handles extended ASCII characters
+FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.customers');
+```
+
+2. **VARCHAR(MAX) buffer limits**: SQL Server has TDS buffer limits (~4096 bytes) for MAX types. When converted to NVARCHAR(MAX), the effective character count is halved since NVARCHAR uses 2 bytes per character. Use `SET mssql_convert_varchar_max = false` if you need maximum buffer capacity with ASCII-only data.
+
 ### Known Issues
 
 - Queries with unsupported types (XML, UDT, etc.) will fail
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
+- VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)
 
 ## License
 

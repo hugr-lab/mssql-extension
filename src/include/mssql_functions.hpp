@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "catalog/mssql_column_info.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -51,6 +52,9 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// Query will be generated at InitGlobal time based on column_ids
 	vector<LogicalType> all_types;	  // Types for all columns
 	vector<string> all_column_names;  // Names for all columns
+
+	// Extended column metadata for VARCHAR→NVARCHAR conversion (Spec 026)
+	vector<MSSQLColumnInfo> mssql_columns;
 
 	// Projected columns (set after InitGlobal based on column_ids)
 	vector<LogicalType> return_types;

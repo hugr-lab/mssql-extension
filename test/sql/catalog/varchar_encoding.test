@@ -1,0 +1,297 @@
+# name: test/sql/catalog/varchar_encoding.test
+# description: Integration tests for VARCHAR to NVARCHAR conversion (Spec 026)
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+#
+# Tests VARCHAR/CHAR columns with non-UTF8 collations (Latin1_General_CI_AS)
+# to verify extended ASCII characters are correctly decoded after NVARCHAR conversion.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the TestDB database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_enc (TYPE mssql);
+
+# =============================================================================
+# Setup: Create test table with non-UTF8 collation
+# =============================================================================
+
+# Drop if exists from previous run
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE IF EXISTS dbo.TestVarcharEncoding');
+
+# Create table with explicit Latin1 (non-UTF8) collation
+statement ok
+SELECT mssql_exec('testdb_enc', '
+CREATE TABLE dbo.TestVarcharEncoding (
+    id INT PRIMARY KEY,
+    ascii_text VARCHAR(100) COLLATE Latin1_General_CI_AS,
+    extended_ascii VARCHAR(100) COLLATE Latin1_General_CI_AS,
+    char_column CHAR(50) COLLATE Latin1_General_CI_AS,
+    unicode_text NVARCHAR(100),
+    nullable_varchar VARCHAR(50) COLLATE Latin1_General_CI_AS
+)');
+
+# Refresh catalog cache to see new table
+statement ok
+SELECT mssql_refresh_cache('testdb_enc');
+
+# Insert test data with extended ASCII via NCHAR codes (portable)
+# NCHAR(233) = é, NCHAR(241) = ñ, NCHAR(252) = ü, NCHAR(223) = ß
+statement ok
+SELECT mssql_exec('testdb_enc', '
+INSERT INTO dbo.TestVarcharEncoding (id, ascii_text, extended_ascii, char_column, unicode_text, nullable_varchar) VALUES
+(1, ''Hello World'', ''Caf'' + NCHAR(233) + '' r'' + NCHAR(233) + ''sum'' + NCHAR(233), ''Na'' + NCHAR(239) + ''ve se'' + NCHAR(241) + ''or'', N''Unicode: '' + NCHAR(19990) + NCHAR(30028), ''Test''),
+(2, ''ASCII only'', ''German: Gr'' + NCHAR(252) + NCHAR(223), ''El Ni'' + NCHAR(241) + ''o'', N''More Unicode'', NULL),
+(3, '''', '''', '''', N'''', '''')
+');
+
+# =============================================================================
+# User Story 1: VARCHAR with extended ASCII characters
+# =============================================================================
+
+# Test T013: VARCHAR with extended ASCII returns correct data
+query IT
+SELECT id, extended_ascii FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 1;
+----
+1	Café résumé
+
+# Test T014: CHAR with extended ASCII returns correct data
+query IT
+SELECT id, char_column FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 2;
+----
+2	El Niño
+
+# Test T015: NULL values preserved correctly
+query IT
+SELECT id, nullable_varchar FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 2;
+----
+2	NULL
+
+# =============================================================================
+# User Story 2: Mixed column types in same table
+# =============================================================================
+
+# Test T018: Mixed INT, VARCHAR, NVARCHAR table returns correct data
+query ITTT
+SELECT id, ascii_text, extended_ascii, unicode_text FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 1;
+----
+1	Hello World	Café résumé	Unicode: 世界
+
+# Test T019: Projection of specific columns works correctly
+query IT
+SELECT id, ascii_text FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 2;
+----
+2	ASCII only
+
+# =============================================================================
+# User Story 3: VARCHAR(MAX) handling
+# =============================================================================
+# By default, VARCHAR(MAX) is converted to NVARCHAR(MAX) for UTF-8 compatibility.
+# This can be disabled via SET mssql_convert_varchar_max = false to preserve
+# the 4096-byte TDS buffer capacity (at the cost of potential encoding issues).
+
+# Setup: Create test table with VARCHAR(MAX)
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE IF EXISTS dbo.TestVarcharMax');
+
+statement ok
+SELECT mssql_exec('testdb_enc', '
+CREATE TABLE dbo.TestVarcharMax (
+    id INT PRIMARY KEY,
+    max_text VARCHAR(MAX) COLLATE Latin1_General_CI_AS,
+    nullable_max VARCHAR(MAX) COLLATE Latin1_General_CI_AS
+)');
+
+# Refresh catalog cache to see new table
+statement ok
+SELECT mssql_refresh_cache('testdb_enc');
+
+# Insert test data with extended ASCII via CHAR codes
+# CHAR(233) = é, CHAR(241) = ñ
+statement ok
+SELECT mssql_exec('testdb_enc', '
+INSERT INTO dbo.TestVarcharMax (id, max_text, nullable_max) VALUES
+(1, ''Caf'' + CHAR(233) + '' text'', ''Value''),
+(2, REPLICATE(''a'' + CHAR(233), 1000), NULL),
+(3, NULL, NULL)
+');
+
+# Test T022: VARCHAR(MAX) with extended ASCII returns correct data (default: converted)
+query IT
+SELECT id, LEFT(max_text, 10) FROM testdb_enc.dbo.TestVarcharMax WHERE id = 1;
+----
+1	Café text
+
+# Test T022 continued: VARCHAR(MAX) returns full data
+# 1000 repetitions of "aé" = 2000 chars
+query II
+SELECT id, LEN(max_text) FROM testdb_enc.dbo.TestVarcharMax WHERE id = 2;
+----
+2	2000
+
+# Verify extended ASCII preserved in VARCHAR(MAX)
+query IT
+SELECT id, LEFT(max_text, 6) FROM testdb_enc.dbo.TestVarcharMax WHERE id = 2;
+----
+2	aéaéaé
+
+# Test T023: VARCHAR(MAX) preserves NULL values
+query IT
+SELECT id, nullable_max FROM testdb_enc.dbo.TestVarcharMax WHERE id = 2;
+----
+2	NULL
+
+query IT
+SELECT id, max_text FROM testdb_enc.dbo.TestVarcharMax WHERE id = 3;
+----
+3	NULL
+
+# Cleanup VARCHAR(MAX) test table
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE dbo.TestVarcharMax');
+
+# =============================================================================
+# User Story 3b: VARCHAR(MAX) with conversion disabled
+# =============================================================================
+# When mssql_convert_varchar_max = false, VARCHAR(MAX) is not converted.
+# This preserves the 4096-byte TDS buffer capacity but may cause encoding errors
+# with non-UTF8 extended ASCII characters.
+
+# Setup: Create test table for disabled conversion test
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE IF EXISTS dbo.TestVarcharMaxNoConv');
+
+statement ok
+SELECT mssql_exec('testdb_enc', '
+CREATE TABLE dbo.TestVarcharMaxNoConv (
+    id INT PRIMARY KEY,
+    max_text VARCHAR(MAX) COLLATE Latin1_General_CI_AS
+)');
+
+# Refresh catalog cache
+statement ok
+SELECT mssql_refresh_cache('testdb_enc');
+
+# Insert ASCII-safe data (no extended ASCII to avoid encoding errors)
+statement ok
+SELECT mssql_exec('testdb_enc', '
+INSERT INTO dbo.TestVarcharMaxNoConv (id, max_text) VALUES
+(1, ''ASCII only text''),
+(2, REPLICATE(''Test '', 800))
+');
+
+# Disable VARCHAR(MAX) conversion
+statement ok
+SET mssql_convert_varchar_max = false;
+
+# Test T024: VARCHAR(MAX) with conversion disabled returns ASCII data
+query IT
+SELECT id, LEFT(max_text, 15) FROM testdb_enc.dbo.TestVarcharMaxNoConv WHERE id = 1;
+----
+1	ASCII only text
+
+# Test T024 continued: VARCHAR(MAX) returns full data without conversion
+# 800 repetitions of "Test " = 4000 chars
+query II
+SELECT id, LEN(max_text) FROM testdb_enc.dbo.TestVarcharMaxNoConv WHERE id = 2;
+----
+2	4000
+
+# Re-enable VARCHAR(MAX) conversion for remaining tests
+statement ok
+SET mssql_convert_varchar_max = true;
+
+# Cleanup
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE dbo.TestVarcharMaxNoConv');
+
+# =============================================================================
+# User Story 4: Length boundary handling
+# =============================================================================
+
+# Setup: Create test table with various VARCHAR lengths
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE IF EXISTS dbo.TestVarcharLength');
+
+statement ok
+SELECT mssql_exec('testdb_enc', '
+CREATE TABLE dbo.TestVarcharLength (
+    id INT PRIMARY KEY,
+    varchar_4000 VARCHAR(4000) COLLATE Latin1_General_CI_AS,
+    varchar_8000 VARCHAR(8000) COLLATE Latin1_General_CI_AS
+)');
+
+# Refresh catalog cache to see new table
+statement ok
+SELECT mssql_refresh_cache('testdb_enc');
+
+# Insert test data with extended ASCII at boundary lengths
+# Use CHAR(233) = é for single-byte encoding in VARCHAR
+statement ok
+SELECT mssql_exec('testdb_enc', '
+INSERT INTO dbo.TestVarcharLength (id, varchar_4000, varchar_8000) VALUES
+(1, REPLICATE(''a'' + CHAR(233), 2000), REPLICATE(''b'' + CHAR(233), 2500))
+');
+
+# Test T026: VARCHAR(4000) column returns full 4000 characters
+# 2000 repetitions of "aé" = 4000 chars
+query II
+SELECT id, LEN(varchar_4000) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
+----
+1	4000
+
+# Verify extended ASCII preserved in VARCHAR(4000)
+query IT
+SELECT id, LEFT(varchar_4000, 6) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
+----
+1	aéaéaé
+
+# Test T027: VARCHAR(8000) with 5000 chars truncates to 4000 characters
+# Note: 2500 repetitions of "bé" = 5000 chars, but NVARCHAR(4000) truncates
+query II
+SELECT id, LEN(varchar_8000) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
+----
+1	4000
+
+# Verify extended ASCII preserved even after truncation
+query IT
+SELECT id, LEFT(varchar_8000, 6) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
+----
+1	bébébé
+
+# Cleanup length boundary test table
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE dbo.TestVarcharLength');
+
+# =============================================================================
+# Edge cases
+# =============================================================================
+
+# Empty string handling
+query ITT
+SELECT id, ascii_text, extended_ascii FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 3;
+----
+3	(empty)	(empty)
+
+# Multiple rows with extended ASCII
+query IT
+SELECT id, extended_ascii FROM testdb_enc.dbo.TestVarcharEncoding ORDER BY id;
+----
+1	Café résumé
+2	German: Grüß
+3	(empty)
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('testdb_enc', 'DROP TABLE dbo.TestVarcharEncoding');
+
+statement ok
+DETACH testdb_enc;
