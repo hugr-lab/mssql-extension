@@ -88,4 +88,14 @@ constexpr bool DEFAULT_CONVERT_VARCHAR_MAX = true;
 // Load VARCHAR(MAX) conversion setting
 bool LoadConvertVarcharMax(ClientContext &context);
 
+//===----------------------------------------------------------------------===//
+// CTAS BCP Configuration (Spec 027)
+//===----------------------------------------------------------------------===//
+
+// Default: use BCP protocol for CTAS data transfer (2-10x faster than INSERT)
+constexpr bool DEFAULT_CTAS_USE_BCP = true;
+
+// Load CTAS BCP setting
+bool LoadCTASUseBCP(ClientContext &context);
+
 }  // namespace duckdb

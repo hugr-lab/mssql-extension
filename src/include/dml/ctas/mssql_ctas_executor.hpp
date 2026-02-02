@@ -1,5 +1,7 @@
 #pragma once
 
+#include "copy/bcp_writer.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
@@ -8,6 +10,7 @@
 #include "tds/tds_connection.hpp"
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <chrono>
@@ -28,7 +31,8 @@ enum class CTASPhase {
 	PENDING,		   // Not started
 	DDL_EXECUTING,	   // CREATE TABLE in progress
 	DDL_DONE,		   // CREATE TABLE completed
-	INSERT_EXECUTING,  // INSERT batches in progress
+	INSERT_EXECUTING,  // INSERT batches in progress (legacy mode)
+	BCP_EXECUTING,	   // BCP protocol in progress (Spec 027)
 	COMPLETE,		   // Successfully completed
 	FAILED			   // Error occurred
 };
@@ -51,7 +55,7 @@ struct CTASExecutionState {
 	idx_t ddl_bytes = 0;
 	int64_t ddl_time_ms = 0;
 
-	// INSERT state (wraps existing executor)
+	// INSERT state (wraps existing executor, used when config.use_bcp = false)
 	MSSQLInsertTarget insert_target;  // Must remain valid for insert_executor's lifetime
 	MSSQLInsertConfig insert_config;  // Must remain valid for insert_executor's lifetime
 	unique_ptr<MSSQLInsertExecutor> insert_executor;
@@ -59,8 +63,16 @@ struct CTASExecutionState {
 	idx_t rows_inserted = 0;
 	int64_t insert_time_ms = 0;
 
+	//===----------------------------------------------------------------------===//
+	// BCP State (Spec 027) - used when config.use_bcp = true
+	//===----------------------------------------------------------------------===//
+	unique_ptr<BCPWriter> bcp_writer;
+	vector<BCPColumnMetadata> bcp_columns;
+	BCPCopyTarget bcp_target;
+	idx_t bcp_rows_in_batch = 0;  // Rows accumulated since last flush
+
 	// Connection (pinned for duration)
-	shared_ptr<tds::TdsConnection> connection;
+	std::shared_ptr<tds::TdsConnection> connection;
 
 	// Catalog reference for cache invalidation
 	MSSQLCatalog *catalog = nullptr;
@@ -90,8 +102,27 @@ struct CTASExecutionState {
 	// Check if schema exists in SQL Server
 	bool SchemaExists(ClientContext &context);
 
-	// Flush any remaining INSERT batches
+	// Flush any remaining INSERT batches (or BCP batch if in BCP mode)
 	void FlushInserts(ClientContext &context);
+
+	//===----------------------------------------------------------------------===//
+	// BCP Mode Methods (Spec 027)
+	//===----------------------------------------------------------------------===//
+
+	// Initialize BCP writer and column metadata
+	// Called from ExecuteDDL when config.use_bcp = true
+	void InitializeBCP(ClientContext &context);
+
+	// Execute INSERT BULK command to start BCP session
+	void ExecuteBCPInsert(ClientContext &context);
+
+	// Add a chunk of data in BCP mode
+	// @param context Client context
+	// @param chunk DataChunk to add
+	void AddChunkBCP(ClientContext &context, DataChunk &chunk);
+
+	// Flush current BCP batch and start a new one
+	void FlushBCP(ClientContext &context);
 
 	// Attempt cleanup DROP TABLE on failure
 	void AttemptCleanup(ClientContext &context);

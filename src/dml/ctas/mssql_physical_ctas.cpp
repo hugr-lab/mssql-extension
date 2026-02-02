@@ -93,20 +93,21 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
-	// Track rows produced
-	gstate.state.rows_produced += chunk.size();
-
-	// Execute INSERT batch using the insert executor
-	// The insert executor handles batching internally
+	// Execute data transfer using BCP or INSERT mode (Spec 027)
 	try {
-		if (gstate.state.insert_executor) {
+		if (gstate.state.config.use_bcp && gstate.state.bcp_writer) {
+			// BCP mode: delegate to AddChunkBCP
+			gstate.state.AddChunkBCP(context.client, chunk);
+		} else if (gstate.state.insert_executor) {
+			// Legacy INSERT mode
+			gstate.state.rows_produced += chunk.size();
 			idx_t rows_inserted = gstate.state.insert_executor->Execute(chunk);
 			gstate.state.rows_inserted += rows_inserted;
 		}
 	} catch (...) {
-		// INSERT phase failed - attempt cleanup if configured
+		// Data transfer phase failed - attempt cleanup if configured
 		gstate.state.phase = mssql::CTASPhase::FAILED;
-		gstate.state.error_message = "Insert phase failed";
+		gstate.state.error_message = gstate.state.config.use_bcp ? "BCP phase failed" : "Insert phase failed";
 
 		if (gstate.state.config.drop_on_failure) {
 			gstate.state.AttemptCleanup(context.client);

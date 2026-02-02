@@ -165,7 +165,7 @@ src/
 │   │   └── mssql_delete_statement.cpp
 │   └── ctas/                     # CREATE TABLE AS SELECT
 │       ├── mssql_ctas_planner.cpp      # CTAS planning and type mapping
-│       ├── mssql_ctas_executor.cpp     # Two-phase execution (DDL + INSERT)
+│       ├── mssql_ctas_executor.cpp     # Two-phase execution (DDL + BCP/INSERT)
 │       └── mssql_physical_ctas.cpp     # DuckDB PhysicalOperator (Sink)
 │
 ├── copy/                         # COPY TO via BulkLoadBCP
@@ -245,14 +245,15 @@ src/
 ### CTAS (CREATE TABLE AS SELECT)
 | Setting | Default | Description |
 |---|---|---|
+| `mssql_ctas_use_bcp` | true | Use BCP protocol for data transfer (2-10x faster than INSERT) |
 | `mssql_ctas_text_type` | NVARCHAR | Text column type (NVARCHAR or VARCHAR) |
-| `mssql_ctas_drop_on_failure` | false | Drop table if INSERT phase fails |
+| `mssql_ctas_drop_on_failure` | false | Drop table if data transfer phase fails |
 
 ### COPY (BulkLoadBCP)
 | Setting | Default | Description |
 |---|---|---|
 | `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server (bounded memory) |
-| `mssql_copy_tablock` | true | Use TABLOCK hint for 15-30% faster bulk load |
+| `mssql_copy_tablock` | false | Use TABLOCK hint for 15-30% faster bulk load (blocks concurrent access) |
 
 ## COPY Function Options
 

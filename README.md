@@ -478,10 +478,14 @@ DuckDB types are automatically mapped to SQL Server types:
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `mssql_ctas_use_bcp` | BOOLEAN | `true` | Use BCP protocol for data transfer (2-10x faster than INSERT) |
 | `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | Text column type: `NVARCHAR` or `VARCHAR` |
-| `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if INSERT phase fails |
+| `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if data transfer phase fails |
 
 ```sql
+-- Disable BCP for legacy INSERT mode (slower, but compatible)
+SET mssql_ctas_use_bcp = false;
+
 -- Use VARCHAR instead of NVARCHAR for text columns
 SET mssql_ctas_text_type = 'VARCHAR';
 
@@ -491,11 +495,12 @@ SET mssql_ctas_drop_on_failure = true;
 
 ### CTAS Behavior
 
-- **Two-phase execution**: CREATE TABLE DDL, then batched INSERT statements
+- **BCP mode (default)**: Uses TDS BulkLoadBCP protocol for 2-10x faster data transfer
+- **Two-phase execution**: CREATE TABLE DDL, then data transfer via BCP or INSERT
 - **Streaming**: Large result sets are streamed without full buffering
-- **Non-atomic**: DDL commits immediately; INSERT respects transactions
+- **Non-atomic**: DDL commits immediately; data transfer respects transactions
 - **Schema validation**: Target schema must exist before CTAS
-- **Batching**: Uses `mssql_insert_batch_size` setting for INSERT batches
+- **Legacy INSERT mode**: Set `mssql_ctas_use_bcp = false` to use batched INSERT statements
 
 ## COPY TO (Bulk Load)
 
@@ -597,7 +602,7 @@ COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `mssql_copy_flush_rows` | BIGINT | 100000 | Rows before flushing to SQL Server (0 = flush at end only) |
-| `mssql_copy_tablock` | BOOLEAN | true | Use TABLOCK hint for 15-30% better performance |
+| `mssql_copy_tablock` | BOOLEAN | false | Use TABLOCK hint for 15-30% better performance (blocks concurrent access) |
 
 ### Performance Characteristics
 

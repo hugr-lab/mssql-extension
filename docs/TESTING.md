@@ -179,7 +179,8 @@ test/
 │   │   ├── filter_pushdown.test    # Filter pushdown tests
 │   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests
-│   │   └── statistics.test         # Statistics provider tests
+│   │   ├── statistics.test         # Statistics provider tests
+│   │   └── varchar_encoding.test   # VARCHAR/NVARCHAR encoding tests
 │   ├── dml/                        # UPDATE and DELETE tests
 │   │   ├── delete_bulk.test        # Bulk DELETE tests
 │   │   ├── delete_composite_pk.test # DELETE with composite PK
@@ -194,6 +195,15 @@ test/
 │   │   ├── insert_errors.test      # INSERT error handling
 │   │   ├── insert_returning.test   # INSERT with RETURNING clause
 │   │   └── insert_types.test       # INSERT data type handling
+│   ├── ctas/                       # CREATE TABLE AS SELECT tests
+│   │   ├── ctas_basic.test         # Basic CTAS functionality
+│   │   ├── ctas_types.test         # Data type mapping in CTAS
+│   │   ├── ctas_bcp.test           # BCP mode (default) tests
+│   │   ├── ctas_insert_mode.test   # Legacy INSERT mode tests
+│   │   ├── ctas_large.test         # Large dataset CTAS
+│   │   ├── ctas_or_replace.test    # CREATE OR REPLACE tests
+│   │   ├── ctas_failure.test       # Error handling tests
+│   │   └── ctas_transaction.test   # CTAS within transactions
 │   ├── integration/                # Core integration tests
 │   │   ├── basic_queries.test      # Basic query functionality
 │   │   ├── connection_pool.test    # Connection pool tests
@@ -324,6 +334,7 @@ DETACH testdb;
 | `[dml]` | DML operations (INSERT/UPDATE/DELETE) | Yes |
 | `[transaction]` | Transaction management tests | Yes |
 | `[copy]` | COPY TO MSSQL (BulkLoadBCP) tests | Yes |
+| `[ctas]` | CREATE TABLE AS SELECT tests | Yes |
 
 ---
 
@@ -646,7 +657,95 @@ DETACH copydb;
 
 **Note**: Use `REPLACE` instead of `OVERWRITE` - DuckDB intercepts `OVERWRITE` as a built-in file operation.
 
-### 9. Writing Column Mapping Tests (COPY TO)
+### 9. Writing CTAS Tests
+
+CTAS (CREATE TABLE AS SELECT) tests verify creating SQL Server tables from DuckDB query results:
+
+```sql
+# name: test/sql/ctas/my_ctas_test.test
+# description: Test CTAS functionality
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_mytest (TYPE mssql);
+
+# Clean up target if exists
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_mytest.dbo.my_ctas_table;
+
+# Basic CTAS with BCP mode (default, faster)
+statement ok
+CREATE TABLE mssql_ctas_mytest.dbo.my_ctas_table AS
+SELECT i AS id, 'row_' || i::VARCHAR AS name
+FROM generate_series(1, 100) t(i);
+
+# Verify data transferred
+query I
+SELECT COUNT(*) FROM mssql_ctas_mytest.dbo.my_ctas_table;
+----
+100
+
+# Test legacy INSERT mode (disable BCP)
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+statement ok
+DROP TABLE mssql_ctas_mytest.dbo.my_ctas_table;
+
+statement ok
+CREATE TABLE mssql_ctas_mytest.dbo.my_ctas_table AS
+SELECT i AS id FROM generate_series(1, 50) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_mytest.dbo.my_ctas_table;
+----
+50
+
+# Restore default
+statement ok
+SET mssql_ctas_use_bcp = true;
+
+# Cleanup
+statement ok
+DROP TABLE mssql_ctas_mytest.dbo.my_ctas_table;
+
+statement ok
+DETACH mssql_ctas_mytest;
+```
+
+**CTAS Test Best Practices:**
+
+1. **Use unique context names** - Prefix with `mssql_ctas_` (e.g., `mssql_ctas_basic`, `mssql_ctas_types`)
+2. **Clean up tables** - Use `DROP TABLE IF EXISTS` before and after tests
+3. **Test both BCP and INSERT modes** - BCP is default; test INSERT with `SET mssql_ctas_use_bcp = false`
+4. **Test type mapping** - Verify DuckDB types map correctly to SQL Server
+5. **Test edge cases** - Zero rows, large datasets, NULL values, various types
+
+**CTAS Settings:**
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mssql_ctas_use_bcp` | BOOLEAN | true | Use BCP protocol (2-10x faster) |
+| `mssql_ctas_text_type` | VARCHAR | NVARCHAR | Text column type |
+| `mssql_ctas_drop_on_failure` | BOOLEAN | false | Drop table if data transfer fails |
+
+**CTAS Test Scenarios:**
+
+1. **Basic CTAS** - Create table from simple SELECT
+2. **Type mapping** - All supported DuckDB types → SQL Server types
+3. **Zero rows** - CTAS with empty result set
+4. **Large datasets** - 100K+ rows to test BCP batching
+5. **Expressions** - CTAS with computed columns
+6. **Local source** - CTAS from local DuckDB table
+7. **NULL values** - CTAS with nullable columns
+8. **OR REPLACE** - DROP and recreate existing table
+9. **Error handling** - Non-existent schema, existing table without OR REPLACE
+
+### 10. Writing Column Mapping Tests (COPY TO)
 
 When copying to existing tables with `CREATE_TABLE false`, the extension uses name-based column mapping:
 

@@ -42,8 +42,9 @@ struct BCPCopyConfig {
 	// - Reducing lock overhead (table lock vs row locks)
 	// - Enabling minimal logging in simple/bulk-logged recovery
 	// - Allowing more parallel server-side processing
-	// WARNING: Blocks other writers during COPY
-	bool tablock = true;
+	// WARNING: Blocks other readers/writers during COPY
+	// Default changed to false in Spec 027 for safer multi-user behavior
+	bool tablock = false;
 
 	// Check if data should be flushed to SQL Server
 	// Returns true when accumulated rows reach flush_rows threshold
