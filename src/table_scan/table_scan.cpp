@@ -5,6 +5,7 @@
 #include "table_scan/table_scan.hpp"
 #include <cstdlib>
 #include "connection/mssql_pool_manager.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -36,6 +37,62 @@ namespace mssql {
 
 // Forward declarations for internal functions
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+
+//------------------------------------------------------------------------------
+// VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
+//------------------------------------------------------------------------------
+
+// Check if column needs NVARCHAR conversion for UTF-8 compatibility
+// convert_varchar_max: if true, also convert VARCHAR(MAX) to NVARCHAR(MAX)
+static bool NeedsNVarcharConversion(const MSSQLColumnInfo &col, bool convert_varchar_max) {
+	// Only CHAR/VARCHAR need conversion (not NCHAR/NVARCHAR/NTEXT)
+	if (col.is_unicode) {
+		return false;  // Already Unicode
+	}
+	// Check if it's a text type (CHAR, VARCHAR, TEXT)
+	if (!MSSQLColumnInfo::IsTextType(col.sql_type_name)) {
+		return false;  // Not a string type
+	}
+	// Check if UTF-8 collation (safe to pass through)
+	if (col.is_utf8) {
+		return false;  // UTF-8 is safe
+	}
+	// VARCHAR(MAX) handling depends on setting
+	// When convert_varchar_max is false, skip to preserve TDS buffer capacity (4096 bytes)
+	// When true, convert to NVARCHAR(MAX) for UTF-8 compatibility
+	if (col.max_length == -1 && !convert_varchar_max) {
+		return false;  // MAX types - don't convert when setting is off
+	}
+	return true;  // Non-UTF8 CHAR/VARCHAR needs conversion
+}
+
+// Get NVARCHAR length specification for CAST
+// Returns "MAX" for VARCHAR(MAX), caps at 4000 for large VARCHAR
+static std::string GetNVarcharLength(int16_t max_length) {
+	if (max_length == -1) {
+		return "MAX";  // VARCHAR(MAX) → NVARCHAR(MAX)
+	}
+	if (max_length > 4000) {
+		return "4000";	// Truncate to NVARCHAR max non-MAX length
+	}
+	return std::to_string(max_length);
+}
+
+// Build column expression for SELECT, applying NVARCHAR conversion if needed
+// Returns either "[column]" or "CAST([column] AS NVARCHAR(n)) AS [column]"
+// convert_varchar_max: if true, also convert VARCHAR(MAX) to NVARCHAR(MAX)
+static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::string &col_name,
+										 bool convert_varchar_max) {
+	std::string escaped_name = "[" + FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
+
+	if (NeedsNVarcharConversion(col, convert_varchar_max)) {
+		std::string nvarchar_len = GetNVarcharLength(col.max_length);
+		MSSQL_SCAN_DEBUG_LOG(2, "  NVARCHAR conversion: %s (%s, len=%d) → NVARCHAR(%s)", col_name.c_str(),
+							 col.sql_type_name.c_str(), col.max_length, nvarchar_len.c_str());
+		return "CAST(" + escaped_name + " AS NVARCHAR(" + nvarchar_len + ")) AS " + escaped_name;
+	}
+	return escaped_name;
+}
 
 //------------------------------------------------------------------------------
 // Bind Function
@@ -103,6 +160,10 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
 	}
 
+	// Load VARCHAR(MAX) conversion setting (Spec 026)
+	bool convert_varchar_max = LoadConvertVarcharMax(context);
+	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: convert_varchar_max=%s", convert_varchar_max ? "true" : "false");
+
 	// Filter out special column identifiers and collect valid column indices
 	vector<column_t> valid_column_ids;
 	for (const auto &col_idx : column_ids) {
@@ -136,7 +197,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			if (!column_list.empty()) {
 				column_list += ", ";
 			}
-			column_list += "[" + FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
+			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
+			const auto &col_info = bind_data.mssql_columns[col_idx];
+			column_list += BuildColumnExpression(col_info, col_name, convert_varchar_max);
 			sql_column_names.push_back(col_name);
 		}
 
@@ -152,7 +215,16 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				if (!column_list.empty()) {
 					column_list += ", ";
 				}
-				column_list += "[" + FilterEncoder::EscapeBracketIdentifier(pk_col) + "]";
+				// Find column index for VARCHAR→NVARCHAR conversion (Spec 026)
+				idx_t pk_col_idx = 0;
+				for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
+					if (bind_data.all_column_names[i] == pk_col) {
+						pk_col_idx = i;
+						break;
+					}
+				}
+				const auto &col_info = bind_data.mssql_columns[pk_col_idx];
+				column_list += BuildColumnExpression(col_info, pk_col, convert_varchar_max);
 				sql_column_names.push_back(pk_col);
 				pk_columns_added = true;
 				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
@@ -201,7 +273,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				column_list += ", ";
 			}
 			column_t col_idx = valid_column_ids[i];
-			column_list += "[" + FilterEncoder::EscapeBracketIdentifier(bind_data.all_column_names[col_idx]) + "]";
+			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
+			const auto &col_info = bind_data.mssql_columns[col_idx];
+			column_list += BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max);
 			MSSQL_SCAN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i,
 								 bind_data.all_column_names[col_idx].c_str());
 		}

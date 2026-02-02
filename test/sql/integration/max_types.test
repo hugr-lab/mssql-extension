@@ -54,11 +54,25 @@ SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id =
 6	x	y
 
 # Test 7: Large values (verify PLP chunking works)
-# Note: Current PLP implementation has 4096 byte limit per chunk
+# Note: VARCHAR(MAX) is converted to NVARCHAR(MAX) by default, which halves buffer capacity
+# (NVARCHAR uses 2 bytes per char, so 4096 bytes = 2048 chars)
+query II
+SELECT id, LENGTH(col_varchar_max) FROM testdb.dbo.MaxTypes WHERE id = 7;
+----
+7	2048
+
+# Test 7b: Disable conversion to preserve full buffer capacity
+statement ok
+SET mssql_convert_varchar_max = false;
+
 query II
 SELECT id, LENGTH(col_varchar_max) FROM testdb.dbo.MaxTypes WHERE id = 7;
 ----
 7	4096
+
+# Re-enable conversion for remaining tests
+statement ok
+SET mssql_convert_varchar_max = true;
 
 # Test 8: Count all rows to verify all data readable
 query I

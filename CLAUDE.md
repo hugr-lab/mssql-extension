@@ -174,6 +174,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_statistics_cache_ttl_seconds` | 3600 | Statistics cache TTL |
 | `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server during COPY |
 | `mssql_copy_tablock` | true | Use TABLOCK hint for COPY (15-30% faster) |
+| `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
 
 ## Extension Functions
 
@@ -198,6 +199,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - C++17 (DuckDB extension standard) + DuckDB (main branch), TDS BulkLoadBCP protocol (0x07), OpenSSL (via vcpkg for TLS) (024-mssql-copy-bcp)
 - SQL Server 2019+ (remote target), in-memory (batch buffering, connection pool state) (024-mssql-copy-bcp)
 - SQL Server 2019+ (remote target), in-memory (connection pool state) (025-bcp-improvements)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), existing TDS protocol layer, OpenSSL (vcpkg) (026-varchar-nvarchar-conversion)
 
 ## Recent Changes
 - 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming

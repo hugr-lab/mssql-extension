@@ -93,6 +93,9 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 		catalog_bind_data->all_types.push_back(col.duckdb_type);
 	}
 
+	// Store extended column metadata for VARCHAR→NVARCHAR conversion (Spec 026)
+	catalog_bind_data->mssql_columns = mssql_columns_;
+
 	//===----------------------------------------------------------------------===//
 	// Primary Key / RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//
