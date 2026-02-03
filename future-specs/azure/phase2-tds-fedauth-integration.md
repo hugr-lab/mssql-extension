@@ -237,19 +237,26 @@ Feature Extension (when azure_secret present):
 | DBCC statistics | With permissions | Not available |
 | Transactions | Full support | Limited |
 
+### Test Strategy
+
+**Existing tests remain unchanged** - all tests in `test/sql/` continue to work with SQL Server authentication. No modifications to existing test files.
+
+**New Azure tests are separate** - all Azure-specific tests live in `test/sql/azure/` and are skipped when Azure credentials are not available.
+
 ### Test Categories
 
-| Category | Azure Required | Description |
-|----------|----------------|-------------|
-| Unit - FEDAUTH Encoding | No | Test token UTF-16LE encoding |
-| Unit - Secret Validation | No | Test azure_secret validation logic |
-| Integration - SQL Auth | No* | Verify existing SQL auth works |
-| Integration - Azure SQL | Yes | Full connection with service principal |
-| Integration - Azure CLI | Yes | Full connection with CLI credentials |
-| Integration - Fabric | Yes | Full connection to Fabric endpoint |
-| Integration - Catalog | Yes | Schema/table discovery |
-| Integration - DML | Yes | SELECT/INSERT/UPDATE/DELETE |
-| Integration - COPY | Yes | Bulk load operations |
+| Category | Location | Azure Required | Description |
+|----------|----------|----------------|-------------|
+| Unit - FEDAUTH Encoding | `test/cpp/` | No | Test token UTF-16LE encoding |
+| Unit - Secret Validation | `test/cpp/` | No | Test azure_secret validation logic |
+| Unit - Hostname Matching | `test/cpp/` | No | Test TLS hostname verification |
+| **Existing SQL Auth** | `test/sql/*` | No* | **Unchanged** - all existing tests |
+| Azure - Service Principal | `test/sql/azure/` | Yes | Connection with service principal |
+| Azure - CLI Auth | `test/sql/azure/` | Yes | Connection with CLI credentials |
+| Azure - Fabric | `test/sql/azure/` | Yes | Fabric Warehouse connection |
+| Azure - Catalog | `test/sql/azure/` | Yes | Schema/table discovery |
+| Azure - DML | `test/sql/azure/` | Yes | SELECT/INSERT/UPDATE/DELETE |
+| Azure - COPY | `test/sql/azure/` | Yes | Bulk load operations |
 
 *Requires SQL Server but not Azure
 
@@ -312,18 +319,26 @@ src/
 │   ├── tds/tds_connection.hpp    # ConnectionParams update
 │   └── mssql_platform.hpp        # IsAzureEndpoint(), IsFabricEndpoint()
 test/
-├── cpp/
-│   ├── test_fedauth_encoding.cpp
-│   ├── test_mssql_secret_azure.cpp
-│   └── test_hostname_verification.cpp  # TLS hostname matching
-└── sql/azure/
-    ├── sql_auth_regression.test
-    ├── azure_service_principal.test
-    ├── azure_cli_auth.test
-    ├── azure_error_handling.test
-    ├── azure_catalog.test
-    ├── azure_dml.test
-    └── fabric_warehouse.test
+├── cpp/                              # Unit tests (no Azure required)
+│   ├── test_fedauth_encoding.cpp     # FEDAUTH packet encoding
+│   ├── test_mssql_secret_azure.cpp   # azure_secret validation
+│   └── test_hostname_verification.cpp # TLS hostname matching
+└── sql/
+    ├── attach/                       # UNCHANGED - existing SQL auth tests
+    ├── catalog/                      # UNCHANGED - existing tests
+    ├── dml/                          # UNCHANGED - existing tests
+    ├── insert/                       # UNCHANGED - existing tests
+    ├── integration/                  # UNCHANGED - existing tests
+    ├── query/                        # UNCHANGED - existing tests
+    ├── ...                           # All other existing test dirs unchanged
+    └── azure/                        # NEW - Azure-specific tests (skipped if no creds)
+        ├── azure_service_principal.test
+        ├── azure_cli_auth.test
+        ├── azure_error_handling.test
+        ├── azure_catalog.test
+        ├── azure_dml.test
+        ├── azure_copy.test
+        └── fabric_warehouse.test
 ```
 
 ### Connection Parameters Update
