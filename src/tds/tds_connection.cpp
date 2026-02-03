@@ -405,8 +405,7 @@ bool TdsConnection::ExecuteBatch(const std::string &sql) {
 	// This was received via ENVCHANGE during LOGIN7
 	// Pass the transaction descriptor if one is set (from BEGIN TRANSACTION response)
 	const uint8_t *txn_desc = has_transaction_descriptor_ ? transaction_descriptor_ : nullptr;
-	std::vector<TdsPacket> packets =
-	    TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
+	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
 
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: using transaction descriptor: %s",
 						 has_transaction_descriptor_ ? "yes" : "no");
