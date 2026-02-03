@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database using connection string
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS maxtype_db (TYPE mssql);
 
 # ===========================================================================
 # Test MAX types using catalog (attached database)
@@ -19,70 +19,56 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS testdb (TYPE mssql);
 
 # Test 1: Query MaxTypes table - small values
 query ITT
-SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 1;
+SELECT id, col_varchar_max, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 1;
 ----
 1	small varchar	small nvarchar
 
 # Test 2: Empty strings
 query ITT
-SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 2;
+SELECT id, col_varchar_max, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 2;
 ----
 2	(empty)	(empty)
 
 # Test 3: NULL values
 query ITT
-SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 3;
+SELECT id, col_varchar_max, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 3;
 ----
 3	NULL	NULL
 
 # Test 4: Medium-sized values with unicode
 query ITT
-SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 4;
+SELECT id, col_varchar_max, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 4;
 ----
 4	Medium length varchar value that contains some text	Medium length nvarchar with unicode: café naïve résumé
 
 # Test 5: Values with special characters and unicode
 query IT
-SELECT id, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 5;
+SELECT id, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 5;
 ----
 5	nvarchar with unicode: 日本語 中文 한국어 العربية
 
 # Test 6: Single character values
 query ITT
-SELECT id, col_varchar_max, col_nvarchar_max FROM testdb.dbo.MaxTypes WHERE id = 6;
+SELECT id, col_varchar_max, col_nvarchar_max FROM maxtype_db.dbo.MaxTypes WHERE id = 6;
 ----
 6	x	y
 
 # Test 7: Large values (verify PLP chunking works)
-# Note: VARCHAR(MAX) is converted to NVARCHAR(MAX) by default, which halves buffer capacity
-# (NVARCHAR uses 2 bytes per char, so 4096 bytes = 2048 chars)
+# The init script creates 8000 character string: REPLICATE('A', 8000)
 query II
-SELECT id, LENGTH(col_varchar_max) FROM testdb.dbo.MaxTypes WHERE id = 7;
+SELECT id, LENGTH(col_varchar_max) FROM maxtype_db.dbo.MaxTypes WHERE id = 7;
 ----
-7	2048
-
-# Test 7b: Disable conversion to preserve full buffer capacity
-statement ok
-SET mssql_convert_varchar_max = false;
-
-query II
-SELECT id, LENGTH(col_varchar_max) FROM testdb.dbo.MaxTypes WHERE id = 7;
-----
-7	4096
-
-# Re-enable conversion for remaining tests
-statement ok
-SET mssql_convert_varchar_max = true;
+7	8000
 
 # Test 8: Count all rows to verify all data readable
 query I
-SELECT COUNT(*) FROM testdb.dbo.MaxTypes;
+SELECT COUNT(*) FROM maxtype_db.dbo.MaxTypes;
 ----
 7
 
 # Test 9: Verify VARBINARY(MAX) can be read (as blob)
 query II
-SELECT id, octet_length(col_varbinary_max) FROM testdb.dbo.MaxTypes WHERE id = 1;
+SELECT id, octet_length(col_varbinary_max) FROM maxtype_db.dbo.MaxTypes WHERE id = 1;
 ----
 1	5
 
@@ -92,17 +78,17 @@ SELECT id, octet_length(col_varbinary_max) FROM testdb.dbo.MaxTypes WHERE id = 1
 
 # Test 10: Query using mssql_scan
 query ITT
-SELECT * FROM mssql_scan('testdb', 'SELECT id, col_varchar_max, col_nvarchar_max FROM TestDB.dbo.MaxTypes WHERE id = 1');
+SELECT * FROM mssql_scan('maxtype_db', 'SELECT id, col_varchar_max, col_nvarchar_max FROM TestDB.dbo.MaxTypes WHERE id = 1');
 ----
 1	small varchar	small nvarchar
 
 # Test 11: Query large value using mssql_scan
 # NVARCHAR(MAX) limit is 4096 characters for TDS streaming
 query II
-SELECT * FROM mssql_scan('testdb', 'SELECT id, LEN(col_nvarchar_max) AS len FROM TestDB.dbo.MaxTypes WHERE id = 7');
+SELECT * FROM mssql_scan('maxtype_db', 'SELECT id, LEN(col_nvarchar_max) AS len FROM TestDB.dbo.MaxTypes WHERE id = 7');
 ----
 7	4000
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH maxtype_db;

@@ -1,0 +1,114 @@
+# name: test/sql/integration/ddl_ansi_settings.test
+# description: Integration tests for ANSI session options (required for DDL commands)
+# group: [integration]
+#
+# REQUIRES: SQL Server running on localhost:1433
+# Run with: make integration-test
+#
+# These tests verify that ANSI session options are properly initialized on new connections
+# via the fODBC flag in LOGIN7, enabling DDL commands like ALTER DATABASE.
+# Note: SQL Server 2017+ always has CONCAT_NULL_YIELDS_NULL behavior ON even if @@OPTIONS
+# doesn't show the bit set. We test actual behavior rather than @@OPTIONS bits.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach the database using connection string
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ansi_test_db (TYPE mssql);
+
+# Test 1: Verify CONCAT_NULL_YIELDS_NULL behavior is ON
+# With CONCAT_NULL_YIELDS_NULL ON, 'test' + NULL = NULL
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT CASE WHEN ''test'' + NULL IS NULL THEN 1 ELSE 0 END AS null_concat_works');
+----
+1
+
+# Test 2: Verify ANSI_WARNINGS is ON (bit 4 = 16 in @@OPTIONS)
+# This should be set by the fODBC flag in LOGIN7
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT CASE WHEN (@@OPTIONS & 16) = 16 THEN 1 ELSE 0 END AS ansi_warnings');
+----
+1
+
+# Test 3: Verify ANSI_PADDING is ON (bit 5 = 32 in @@OPTIONS)
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT CASE WHEN (@@OPTIONS & 32) = 32 THEN 1 ELSE 0 END AS ansi_padding');
+----
+1
+
+# Test 4: Execute a DDL command - ALTER DATABASE
+# This command requires proper ANSI settings to execute
+query I
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY SIMPLE') >= 0 AS ddl_success;
+----
+true
+
+# Test 5: Verify connection still works after DDL
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 100 AS after_ddl');
+----
+100
+
+# Test 6: Multiple queries in sequence to test connection pool behavior
+# First query
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 1 AS seq1');
+----
+1
+
+# Second query - connection may be reused from pool
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 2 AS seq2');
+----
+2
+
+# Verify DDL still works after pool reuse
+query I
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY SIMPLE') >= 0 AS ddl_after_reuse;
+----
+true
+
+# Test 7: Execute multiple queries to exercise connection pool
+# This helps test RESET_CONNECTION behavior when connections are reused
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 3 AS q1');
+----
+3
+
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 4 AS q2');
+----
+4
+
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 5 AS q3');
+----
+5
+
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 6 AS q4');
+----
+6
+
+query I
+SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 7 AS q5');
+----
+7
+
+# Verify DDL works after multiple queries (pool stress)
+query I
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY FULL') >= 0 AS ddl_after_stress;
+----
+true
+
+# Test 8: Test pool statistics show activity
+query I
+SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='ansi_test_db');
+----
+true
+
+# Cleanup
+statement ok
+DETACH ansi_test_db;

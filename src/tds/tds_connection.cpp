@@ -228,6 +228,7 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: authentication successful, spid=%d, packet_size=%d", spid_,
 						 negotiated_packet_size_);
+
 	return true;
 }
 

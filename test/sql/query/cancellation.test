@@ -15,30 +15,30 @@ require-env MSSQL_TEST_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS cancel_db (TYPE mssql);
 
 # Basic query that completes quickly (no cancellation needed)
 query I
-SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
+SELECT * FROM mssql_scan('cancel_db', 'SELECT 1 AS value');
 ----
 1
 
 # Test that multiple sequential queries work (connection pool reuse)
 query I
-SELECT * FROM mssql_scan('test_db', 'SELECT 2 AS value');
+SELECT * FROM mssql_scan('cancel_db', 'SELECT 2 AS value');
 ----
 2
 
 query I
-SELECT * FROM mssql_scan('test_db', 'SELECT 3 AS value');
+SELECT * FROM mssql_scan('cancel_db', 'SELECT 3 AS value');
 ----
 3
 
 # Interactive cancellation test (manual):
-# Run: SELECT * FROM mssql_scan('test_db', 'WAITFOR DELAY ''00:00:30''');
+# Run: SELECT * FROM mssql_scan('cancel_db', 'WAITFOR DELAY ''00:00:30''');
 # Press Ctrl+C during execution
 # Verify: Query cancelled within 2 seconds
 # Verify: Connection returned to pool (run another query)
 
 statement ok
-DETACH test_db;
+DETACH cancel_db;
