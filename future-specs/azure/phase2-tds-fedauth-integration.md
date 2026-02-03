@@ -112,11 +112,18 @@ A user needs to bulk load data into Azure SQL using COPY command.
 **TDS Protocol**:
 - **FR-001**: System MUST detect `azure_secret` in MSSQL secret and use Azure auth flow
 - **FR-002**: System MUST acquire token BEFORE sending LOGIN7 packet
-- **FR-003**: System MUST implement TDS FEDAUTH extension in PRELOGIN packet
-- **FR-004**: System MUST implement TDS FEDAUTH extension in LOGIN7 packet
-- **FR-005**: System MUST encode access token as UTF-16LE for TDS protocol
-- **FR-006**: System MUST handle FEDAUTHINFO server response
-- **FR-007**: System MUST fall back to SQL auth when no `azure_secret` present
+- **FR-003**: PRELOGIN MUST always be sent (both SQL and Azure auth paths)
+- **FR-004**: PRELOGIN MUST include FEDAUTHREQUIRED=0x01 option when using Azure auth
+- **FR-005**: System MUST implement TDS FEDAUTH extension in LOGIN7 packet
+- **FR-006**: System MUST encode access token as UTF-16LE for TDS protocol
+- **FR-007**: System MUST handle FEDAUTHINFO server response
+- **FR-008**: System MUST fall back to SQL auth when no `azure_secret` present
+
+**TLS Requirements**:
+- **FR-009**: TLS MUST be enabled for Azure endpoints (Azure SQL, Fabric)
+- **FR-010**: For Azure endpoints, hostname verification SHOULD be performed using OpenSSL
+- **FR-011**: For on-premises SQL Server, self-signed certificates MUST still be accepted (existing behavior)
+- **FR-012**: Hostname verification uses OpenSSL APIs only (no additional dependencies)
 
 **Data Operations**:
 - **FR-008**: Catalog operations MUST work with Azure-authenticated connections
@@ -158,10 +165,27 @@ Feature Extension (when azure_secret present):
 
 ### Authentication Flow
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Connection Request                            │
+│                    Connection Request                           │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ TCP Connect     │
+                    └─────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ PRELOGIN        │◄── Always sent (both auth paths)
+                    │ (negotiate TLS) │    Azure: + FEDAUTHREQUIRED=0x01
+                    └─────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │ TLS Handshake   │◄── Azure: verify hostname in cert
+                    │ (if encryption) │    On-prem: accept self-signed
+                    └─────────────────┘
                               │
                               ▼
                     ┌─────────────────┐
@@ -182,12 +206,6 @@ Feature Extension (when azure_secret present):
     ┌─────────────────┐                       │
     │ Acquire Azure   │                       │
     │ AD Token        │                       │
-    └─────────────────┘                       │
-              │                               │
-              ▼                               │
-    ┌─────────────────┐                       │
-    │ PRELOGIN with   │                       │
-    │ FEDAUTHREQUIRED │                       │
     └─────────────────┘                       │
               │                               │
               ▼                               ▼
@@ -273,7 +291,7 @@ Feature Extension (when azure_secret present):
 
 ### File Structure
 
-```
+```text
 src/
 ├── azure/
 │   ├── azure_fedauth.cpp         # FEDAUTH token encoding
@@ -281,7 +299,9 @@ src/
 ├── tds/
 │   ├── tds_protocol.cpp          # PRELOGIN & LOGIN7 FEDAUTH extensions
 │   ├── tds_connection.cpp        # Auth flow branching
-│   └── tds_token_parser.cpp      # FEDAUTHINFO response handling
+│   ├── tds_token_parser.cpp      # FEDAUTHINFO response handling
+│   └── tls/
+│       └── tls_context.cpp       # Add hostname verification for Azure
 ├── connection/
 │   └── mssql_connection_provider.cpp  # Read azure_secret from MSSQL secret
 ├── catalog/
@@ -290,11 +310,12 @@ src/
 │   ├── azure/azure_fedauth.hpp
 │   ├── tds/tds_types.hpp         # FEDAUTH constants
 │   ├── tds/tds_connection.hpp    # ConnectionParams update
-│   └── mssql_platform.hpp        # IsFabricEndpoint() utility
+│   └── mssql_platform.hpp        # IsAzureEndpoint(), IsFabricEndpoint()
 test/
 ├── cpp/
 │   ├── test_fedauth_encoding.cpp
-│   └── test_mssql_secret_azure.cpp
+│   ├── test_mssql_secret_azure.cpp
+│   └── test_hostname_verification.cpp  # TLS hostname matching
 └── sql/azure/
     ├── sql_auth_regression.test
     ├── azure_service_principal.test
@@ -323,6 +344,11 @@ struct ConnectionParams {
     // Azure authentication
     bool use_azure_auth = false;
     std::string azure_secret_name;
+
+    //! Returns true if connecting to Azure endpoint (for TLS hostname verification)
+    bool IsAzureEndpoint() const {
+        return mssql::IsAzureEndpoint(host);
+    }
 };
 
 } // namespace tds
@@ -374,9 +400,105 @@ bool IsFabricEndpoint(const std::string &host) {
            host.find(".pbidedicated.windows.net") != std::string::npos;
 }
 
+bool IsAzureEndpoint(const std::string &host) {
+    return host.find(".database.windows.net") != std::string::npos ||
+           IsFabricEndpoint(host);
+}
+
 } // namespace mssql
 } // namespace duckdb
 ```
+
+### TLS Hostname Verification (OpenSSL Only)
+
+For Azure endpoints, verify the server certificate hostname. Uses OpenSSL APIs only - no additional dependencies.
+
+```cpp
+// src/tds/tls/tls_context.cpp
+namespace duckdb {
+namespace tds {
+namespace tls {
+
+//! Configure hostname verification for Azure endpoints
+void ConfigureHostnameVerification(SSL *ssl, const std::string &host, bool is_azure) {
+    if (is_azure) {
+        // Enable hostname verification for Azure endpoints
+        // OpenSSL 1.1.0+ provides built-in hostname checking
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        SSL_set1_host(ssl, host.c_str());
+        SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
+    } else {
+        // On-premises: accept self-signed certificates (existing behavior)
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
+    }
+}
+
+//! Manual hostname verification for older OpenSSL versions
+bool VerifyHostname(X509 *cert, const std::string &host) {
+    // Check Subject Alternative Names (SAN) first
+    GENERAL_NAMES *san = static_cast<GENERAL_NAMES*>(
+        X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+
+    if (san) {
+        for (int i = 0; i < sk_GENERAL_NAME_num(san); i++) {
+            GENERAL_NAME *name = sk_GENERAL_NAME_value(san, i);
+            if (name->type == GEN_DNS) {
+                const char *dns_name = reinterpret_cast<const char*>(
+                    ASN1_STRING_get0_data(name->d.dNSName));
+                if (MatchHostname(host, dns_name)) {
+                    GENERAL_NAMES_free(san);
+                    return true;
+                }
+            }
+        }
+        GENERAL_NAMES_free(san);
+    }
+
+    // Fallback to Common Name (CN) - deprecated but some certs still use it
+    X509_NAME *subject = X509_get_subject_name(cert);
+    char cn[256];
+    if (X509_NAME_get_text_by_NID(subject, NID_commonName, cn, sizeof(cn)) > 0) {
+        return MatchHostname(host, cn);
+    }
+
+    return false;
+}
+
+//! Match hostname with wildcard support (e.g., *.database.windows.net)
+bool MatchHostname(const std::string &host, const std::string &pattern) {
+    if (pattern.empty() || host.empty()) {
+        return false;
+    }
+
+    // Exact match
+    if (pattern == host) {
+        return true;
+    }
+
+    // Wildcard match (*.example.com matches foo.example.com)
+    if (pattern.size() > 2 && pattern[0] == '*' && pattern[1] == '.') {
+        auto suffix = pattern.substr(1);  // .example.com
+        if (host.size() > suffix.size() &&
+            host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            // Ensure wildcard only matches single label (no dots before suffix)
+            auto prefix = host.substr(0, host.size() - suffix.size());
+            return prefix.find('.') == std::string::npos;
+        }
+    }
+
+    return false;
+}
+
+} // namespace tls
+} // namespace tds
+} // namespace duckdb
+```
+
+**Key Points**:
+- Azure endpoints (*.database.windows.net, *.fabric.microsoft.com): Verify hostname
+- On-premises SQL Server: Continue accepting self-signed certificates
+- Uses only OpenSSL APIs - no additional dependencies (azure-sdk, curl, etc.)
+- Supports wildcard certificates (*.database.windows.net)
 
 ### Skip Conditions for Azure Tests
 
