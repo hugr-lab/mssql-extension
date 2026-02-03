@@ -1,0 +1,135 @@
+# name: test/sql/ctas/ctas_bcp.test
+# description: Test CTAS with BCP protocol (default mode)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_bcp (TYPE mssql);
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_bcp.dbo.bcp_basic;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_bcp.dbo.bcp_zero_rows;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_bcp.dbo.bcp_tablock_test;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_bcp.dbo.bcp_large;
+
+# Test 1: BCP mode is on by default - verify via simple CTAS
+# This test exercises the BCP code path without explicitly setting the flag
+statement ok
+CREATE TABLE mssql_ctas_bcp.dbo.bcp_basic AS
+SELECT i AS id, 'bcp_row_' || i::VARCHAR AS name
+FROM generate_series(1, 100) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_bcp.dbo.bcp_basic;
+----
+100
+
+query IT
+SELECT * FROM mssql_ctas_bcp.dbo.bcp_basic WHERE id = 50;
+----
+50	bcp_row_50
+
+# Test 2: Zero-row CTAS with BCP mode
+# Edge case: table should be created with schema but no data
+statement ok
+CREATE TABLE mssql_ctas_bcp.dbo.bcp_zero_rows AS
+SELECT i AS id, 'never' AS name
+FROM generate_series(1, 10) t(i)
+WHERE false;
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_bcp.dbo.bcp_zero_rows;
+----
+0
+
+# Verify column types are correct even with no data
+query IT
+SELECT * FROM mssql_ctas_bcp.dbo.bcp_zero_rows LIMIT 0;
+----
+
+# Test 3: BCP with TABLOCK hint
+# Test that TABLOCK hint can be enabled for better performance
+statement ok
+SET mssql_copy_tablock = true;
+
+statement ok
+CREATE TABLE mssql_ctas_bcp.dbo.bcp_tablock_test AS
+SELECT i AS id, 'tablock_' || i::VARCHAR AS name
+FROM generate_series(1, 50) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_bcp.dbo.bcp_tablock_test;
+----
+50
+
+# Reset TABLOCK setting to default
+statement ok
+SET mssql_copy_tablock = false;
+
+# Test 4: Large dataset CTAS with BCP (100K+ rows)
+# This tests BCP batch flushing behavior with multiple batches
+statement ok
+CREATE TABLE mssql_ctas_bcp.dbo.bcp_large AS
+SELECT
+    i AS id,
+    'large_row_' || i::VARCHAR AS name,
+    i * 2 AS doubled,
+    i % 100 AS mod_100
+FROM generate_series(1, 150000) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_bcp.dbo.bcp_large;
+----
+150000
+
+# Verify data integrity at various points
+query ITII
+SELECT * FROM mssql_ctas_bcp.dbo.bcp_large WHERE id = 1;
+----
+1	large_row_1	2	1
+
+query ITII
+SELECT * FROM mssql_ctas_bcp.dbo.bcp_large WHERE id = 50000;
+----
+50000	large_row_50000	100000	0
+
+query ITII
+SELECT * FROM mssql_ctas_bcp.dbo.bcp_large WHERE id = 150000;
+----
+150000	large_row_150000	300000	0
+
+# Verify statistics
+query I
+SELECT COUNT(*) FROM mssql_ctas_bcp.dbo.bcp_large WHERE mod_100 = 0;
+----
+1500
+
+# Cleanup
+statement ok
+DROP TABLE mssql_ctas_bcp.dbo.bcp_basic;
+
+statement ok
+DROP TABLE mssql_ctas_bcp.dbo.bcp_zero_rows;
+
+statement ok
+DROP TABLE mssql_ctas_bcp.dbo.bcp_tablock_test;
+
+statement ok
+DROP TABLE mssql_ctas_bcp.dbo.bcp_large;
+
+statement ok
+DETACH mssql_ctas_bcp;

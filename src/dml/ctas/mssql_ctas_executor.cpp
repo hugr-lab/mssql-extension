@@ -1,6 +1,8 @@
 #include "dml/ctas/mssql_ctas_executor.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "copy/bcp_writer.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -85,42 +87,54 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 
 		phase = CTASPhase::DDL_DONE;
 
-		// Initialize insert executor for the DML phase
-		// Build MSSQLInsertTarget from our CTASColumnDef vector
-		// Store in member variable so it remains valid for insert_executor's lifetime
-		insert_target.catalog_name = target.catalog_name;
-		insert_target.schema_name = target.schema_name;
-		insert_target.table_name = target.table_name;
-		insert_target.has_identity_column = false;
-		insert_target.identity_column_index = 0;
-		insert_target.columns.clear();
-		insert_target.insert_column_indices.clear();
+		// Branch based on use_bcp setting (Spec 027)
+		if (config.use_bcp) {
+			// BCP mode: Initialize BCP writer and execute INSERT BULK
+			DebugLog(1, "Using BCP mode for data transfer (use_bcp=true)");
+			InitializeBCP(context);
+			ExecuteBCPInsert(context);
+			phase = CTASPhase::BCP_EXECUTING;
+		} else {
+			// Legacy INSERT mode
+			DebugLog(1, "Using INSERT mode for data transfer (use_bcp=false)");
 
-		for (idx_t i = 0; i < columns.size(); i++) {
-			MSSQLInsertColumn col;
-			col.name = columns[i].name;
-			col.duckdb_type = columns[i].duckdb_type;
-			col.mssql_type = columns[i].mssql_type;
-			col.is_identity = false;
-			col.is_nullable = columns[i].nullable;
-			col.has_default = false;
-			col.collation = "";
-			col.precision = 0;
-			col.scale = 0;
-			insert_target.columns.push_back(std::move(col));
-			insert_target.insert_column_indices.push_back(i);
+			// Initialize insert executor for the DML phase
+			// Build MSSQLInsertTarget from our CTASColumnDef vector
+			// Store in member variable so it remains valid for insert_executor's lifetime
+			insert_target.catalog_name = target.catalog_name;
+			insert_target.schema_name = target.schema_name;
+			insert_target.table_name = target.table_name;
+			insert_target.has_identity_column = false;
+			insert_target.identity_column_index = 0;
+			insert_target.columns.clear();
+			insert_target.insert_column_indices.clear();
+
+			for (idx_t i = 0; i < columns.size(); i++) {
+				MSSQLInsertColumn col;
+				col.name = columns[i].name;
+				col.duckdb_type = columns[i].duckdb_type;
+				col.mssql_type = columns[i].mssql_type;
+				col.is_identity = false;
+				col.is_nullable = columns[i].nullable;
+				col.has_default = false;
+				col.collation = "";
+				col.precision = 0;
+				col.scale = 0;
+				insert_target.columns.push_back(std::move(col));
+				insert_target.insert_column_indices.push_back(i);
+			}
+
+			// Build MSSQLInsertConfig from CTASConfig
+			// Store in member variable so it remains valid for insert_executor's lifetime
+			insert_config.batch_size = config.batch_size;
+			insert_config.max_rows_per_statement = config.max_rows_per_statement;
+			insert_config.max_sql_bytes = config.max_sql_bytes;
+			insert_config.use_returning_output = false;	 // CTAS never uses RETURNING
+
+			insert_executor = make_uniq<MSSQLInsertExecutor>(context, insert_target, insert_config);
+
+			phase = CTASPhase::INSERT_EXECUTING;
 		}
-
-		// Build MSSQLInsertConfig from CTASConfig
-		// Store in member variable so it remains valid for insert_executor's lifetime
-		insert_config.batch_size = config.batch_size;
-		insert_config.max_rows_per_statement = config.max_rows_per_statement;
-		insert_config.max_sql_bytes = config.max_sql_bytes;
-		insert_config.use_returning_output = false;	 // CTAS never uses RETURNING
-
-		insert_executor = make_uniq<MSSQLInsertExecutor>(context, insert_target, insert_config);
-
-		phase = CTASPhase::INSERT_EXECUTING;
 
 	} catch (std::exception &e) {
 		error_message = e.what();
@@ -203,23 +217,39 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 
 void CTASExecutionState::FlushInserts(ClientContext &context) {
-	if (!insert_executor) {
-		return;
-	}
+	// Branch based on mode (Spec 027)
+	if (config.use_bcp && bcp_writer) {
+		// BCP mode: flush remaining batch and finalize
+		auto insert_start = std::chrono::steady_clock::now();
 
-	auto insert_start = std::chrono::steady_clock::now();
+		try {
+			FlushBCP(context);
 
-	try {
-		insert_executor->Finalize();
+			auto insert_end = std::chrono::steady_clock::now();
+			insert_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(insert_end - insert_start).count();
 
-		auto insert_end = std::chrono::steady_clock::now();
-		insert_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(insert_end - insert_start).count();
+			DebugLog(1, "BCP finalized: %llu rows in %lld ms", (unsigned long long)rows_inserted, insert_time_ms);
 
-		DebugLog(1, "INSERT finalized: %llu rows in %lld ms", (unsigned long long)rows_inserted, insert_time_ms);
+		} catch (std::exception &e) {
+			error_message = e.what();
+			throw;
+		}
+	} else if (insert_executor) {
+		// Legacy INSERT mode
+		auto insert_start = std::chrono::steady_clock::now();
 
-	} catch (std::exception &e) {
-		error_message = e.what();
-		throw;
+		try {
+			insert_executor->Finalize();
+
+			auto insert_end = std::chrono::steady_clock::now();
+			insert_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(insert_end - insert_start).count();
+
+			DebugLog(1, "INSERT finalized: %llu rows in %lld ms", (unsigned long long)rows_inserted, insert_time_ms);
+
+		} catch (std::exception &e) {
+			error_message = e.what();
+			throw;
+		}
 	}
 }
 
@@ -301,6 +331,8 @@ string CTASExecutionState::GetPhaseName(CTASPhase phase) {
 		return "DDL_DONE";
 	case CTASPhase::INSERT_EXECUTING:
 		return "INSERT_EXECUTING";
+	case CTASPhase::BCP_EXECUTING:
+		return "BCP_EXECUTING";
 	case CTASPhase::COMPLETE:
 		return "COMPLETE";
 	case CTASPhase::FAILED:
@@ -332,6 +364,190 @@ void CTASObservability::Log(int level) const {
 	if (!success) {
 		fprintf(stderr, "  Failure phase: %s\n", failure_phase.c_str());
 		fprintf(stderr, "  Error: %s\n", error_message.c_str());
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// BCP Mode Implementation (Spec 027)
+//===----------------------------------------------------------------------===//
+
+void CTASExecutionState::InitializeBCP(ClientContext &context) {
+	DebugLog(1, "Initializing BCP for CTAS: %s", target.GetQualifiedName().c_str());
+
+	// Build BCPCopyTarget from CTASTarget
+	bcp_target.catalog_name = target.catalog_name;
+	bcp_target.schema_name = target.schema_name;
+	bcp_target.table_name = target.table_name;
+	bcp_target.DetectTempTable();
+
+	// Convert CTASColumnDef to BCPColumnMetadata using TargetResolver
+	vector<LogicalType> source_types;
+	vector<string> source_names;
+	for (const auto &col : columns) {
+		source_types.push_back(col.duckdb_type);
+		source_names.push_back(col.name);
+	}
+
+	// Use TargetResolver to generate proper BCP column metadata
+	bcp_columns = TargetResolver::GenerateColumnMetadata(source_types, source_names);
+
+	DebugLog(2, "BCP columns initialized: %llu columns", (unsigned long long)bcp_columns.size());
+}
+
+void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
+	DebugLog(1, "Executing INSERT BULK for BCP mode");
+
+	// Acquire a connection from the pool
+	auto &pool = catalog->GetConnectionPool();
+	connection = pool.Acquire();
+	if (!connection) {
+		throw IOException("CTAS BCP: Failed to acquire connection from pool");
+	}
+
+	try {
+		// Build INSERT BULK statement
+		// Format: INSERT BULK [schema].[table] (col1 type1, col2 type2, ...) [WITH (TABLOCK)]
+		string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
+
+		for (idx_t i = 0; i < bcp_columns.size(); i++) {
+			if (i > 0) {
+				insert_bulk += ", ";
+			}
+			// Column name must be bracketed for safety
+			insert_bulk += "[" + bcp_columns[i].name + "] ";
+			insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
+		}
+		insert_bulk += ")";
+
+		// Add TABLOCK hint if configured
+		if (config.bcp_tablock) {
+			insert_bulk += " WITH (TABLOCK)";
+			DebugLog(2, "BCP using TABLOCK hint");
+		}
+
+		DebugLog(2, "INSERT BULK: %s", insert_bulk.c_str());
+
+		// Execute INSERT BULK to put connection in BulkLoad mode
+		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
+
+		// Verify connection is now in correct state for BCP
+		// After INSERT BULK, connection should be in BulkLoad mode
+		connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
+
+		// Create BCPWriter
+		bcp_writer = make_uniq<BCPWriter>(*connection, bcp_target, bcp_columns);
+
+		// Write COLMETADATA token to start the bulk load
+		bcp_writer->WriteColmetadata();
+
+		DebugLog(1, "BCP session started, ready to receive data");
+
+	} catch (std::exception &e) {
+		// Release connection on failure
+		pool.Release(std::move(connection));
+		connection = nullptr;
+		throw;
+	}
+}
+
+void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
+	if (!bcp_writer) {
+		throw InternalException("CTAS BCP: BCPWriter not initialized");
+	}
+
+	idx_t chunk_rows = chunk.size();
+	if (chunk_rows == 0) {
+		return;
+	}
+
+	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk_rows,
+			 (unsigned long long)bcp_rows_in_batch);
+
+	// Write rows to BCP writer
+	idx_t written = bcp_writer->WriteRows(chunk);
+	bcp_rows_in_batch += written;
+	rows_produced += written;
+
+	// Check if we need to flush the batch
+	if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
+		DebugLog(1, "BCP batch threshold reached (%llu >= %llu), flushing", (unsigned long long)bcp_rows_in_batch,
+				 (unsigned long long)config.bcp_flush_rows);
+
+		// Flush current batch
+		idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
+		rows_inserted += confirmed;
+
+		// Reset for next batch
+		bcp_writer->ResetForNextBatch();
+		bcp_rows_in_batch = 0;
+
+		// Re-execute INSERT BULK for next batch
+		auto &pool = catalog->GetConnectionPool();
+		string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
+		for (idx_t i = 0; i < bcp_columns.size(); i++) {
+			if (i > 0) {
+				insert_bulk += ", ";
+			}
+			insert_bulk += "[" + bcp_columns[i].name + "] ";
+			insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
+		}
+		insert_bulk += ")";
+		if (config.bcp_tablock) {
+			insert_bulk += " WITH (TABLOCK)";
+		}
+
+		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
+		connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
+
+		// Write COLMETADATA for next batch
+		bcp_writer->WriteColmetadata();
+	}
+}
+
+void CTASExecutionState::FlushBCP(ClientContext &context) {
+	if (!bcp_writer) {
+		return;
+	}
+
+	DebugLog(1, "FlushBCP: finalizing with %llu rows in current batch", (unsigned long long)bcp_rows_in_batch);
+
+	try {
+		if (bcp_rows_in_batch > 0) {
+			// Flush final batch
+			idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
+			rows_inserted += confirmed;
+			bcp_rows_in_batch = 0;
+
+			DebugLog(1, "BCP final batch flushed: %llu rows confirmed", (unsigned long long)confirmed);
+		} else {
+			// No rows to flush - need to send empty DONE token
+			// Build DONE token and send
+			bcp_writer->WriteDone(0);
+			bcp_writer->Finalize();
+			DebugLog(1, "BCP completed with no additional rows");
+		}
+
+		// Release connection back to pool
+		if (connection) {
+			auto &pool = catalog->GetConnectionPool();
+			pool.Release(std::move(connection));
+			connection = nullptr;
+		}
+
+		// Clean up BCP writer
+		bcp_writer.reset();
+
+		DebugLog(1, "BCP completed: %llu total rows transferred", (unsigned long long)rows_inserted);
+
+	} catch (std::exception &e) {
+		// Release connection on failure
+		if (connection) {
+			auto &pool = catalog->GetConnectionPool();
+			pool.Release(std::move(connection));
+			connection = nullptr;
+		}
+		bcp_writer.reset();
+		throw;
 	}
 }
 

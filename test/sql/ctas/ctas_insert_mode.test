@@ -1,0 +1,108 @@
+# name: test/sql/ctas/ctas_insert_mode.test
+# description: Test CTAS with legacy INSERT mode (BCP disabled)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_insert (TYPE mssql);
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_insert.dbo.insert_basic;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_insert.dbo.insert_multirow;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_insert.dbo.insert_types;
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_insert.dbo.insert_large;
+
+# Disable BCP mode to use legacy INSERT batching
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+# Test 1: Basic CTAS with INSERT mode
+statement ok
+CREATE TABLE mssql_ctas_insert.dbo.insert_basic AS
+SELECT 1 AS id, 'insert_mode' AS name;
+
+query IT
+SELECT * FROM mssql_ctas_insert.dbo.insert_basic;
+----
+1	insert_mode
+
+# Test 2: Multi-row CTAS with INSERT mode
+statement ok
+CREATE TABLE mssql_ctas_insert.dbo.insert_multirow AS
+SELECT i AS id, 'row_' || i::VARCHAR AS name
+FROM generate_series(1, 50) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_insert.dbo.insert_multirow;
+----
+50
+
+query IT
+SELECT * FROM mssql_ctas_insert.dbo.insert_multirow WHERE id = 25;
+----
+25	row_25
+
+# Test 3: Various types with INSERT mode
+statement ok
+CREATE TABLE mssql_ctas_insert.dbo.insert_types AS
+SELECT
+    1::INTEGER AS col_int,
+    123456789012::BIGINT AS col_bigint,
+    42::SMALLINT AS col_smallint,
+    true AS col_bool,
+    3.14::FLOAT AS col_float,
+    2.71828::DOUBLE AS col_double,
+    123.45::DECIMAL(10, 2) AS col_decimal,
+    'test string' AS col_varchar,
+    DATE '2024-01-15' AS col_date;
+
+query I
+SELECT col_int FROM mssql_ctas_insert.dbo.insert_types;
+----
+1
+
+# Test 4: Larger dataset with INSERT mode (tests batch behavior)
+# INSERT mode is slower but should still work
+statement ok
+CREATE TABLE mssql_ctas_insert.dbo.insert_large AS
+SELECT i AS id, 'insert_' || i::VARCHAR AS name
+FROM generate_series(1, 2000) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql_ctas_insert.dbo.insert_large;
+----
+2000
+
+# Re-enable BCP mode (restore default)
+statement ok
+SET mssql_ctas_use_bcp = true;
+
+# Cleanup
+statement ok
+DROP TABLE mssql_ctas_insert.dbo.insert_basic;
+
+statement ok
+DROP TABLE mssql_ctas_insert.dbo.insert_multirow;
+
+statement ok
+DROP TABLE mssql_ctas_insert.dbo.insert_types;
+
+statement ok
+DROP TABLE mssql_ctas_insert.dbo.insert_large;
+
+statement ok
+DETACH mssql_ctas_insert;

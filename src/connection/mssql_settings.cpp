@@ -158,6 +158,12 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
 							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
 
+	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer
+	// BCP is 2-10x faster than batched INSERT statements
+	config.AddExtensionOption("mssql_ctas_use_bcp",
+							  "Use BCP protocol for CTAS data transfer (default: true, 2-10x faster than INSERT)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(DEFAULT_CTAS_USE_BCP), nullptr, SetScope::GLOBAL);
+
 	//===----------------------------------------------------------------------===//
 	// COPY/BCP Settings
 	//===----------------------------------------------------------------------===//
@@ -172,10 +178,12 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 
 	// mssql_copy_tablock - Use TABLOCK hint for bulk load
 	// Enables table-level locking for better performance (15-30% faster)
-	// WARNING: Blocks other writers during COPY operation
-	config.AddExtensionOption("mssql_copy_tablock",
-							  "Use TABLOCK hint for COPY operations (default: true, improves performance 15-30%)",
-							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	// WARNING: Blocks other readers/writers during COPY operation
+	// Default changed to false in Spec 027 for safer multi-user behavior
+	config.AddExtensionOption(
+		"mssql_copy_tablock",
+		"Use TABLOCK hint for COPY/BCP operations (default: false, set true for 15-30% performance)",
+		LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//
 	// VARCHAR Encoding Settings (Spec 026)
@@ -355,7 +363,7 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 		config.text_type = CTASConfig::ParseTextType(val.ToString());
 	}
 
-	// Inherit INSERT settings for batch insert phase
+	// Inherit INSERT settings for batch insert phase (when use_bcp = false)
 	if (context.TryGetCurrentSetting("mssql_insert_batch_size", val)) {
 		config.batch_size = static_cast<idx_t>(val.GetValue<int64_t>());
 	}
@@ -366,6 +374,24 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_insert_max_sql_bytes", val)) {
 		config.max_sql_bytes = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	//===----------------------------------------------------------------------===//
+	// BCP Mode Settings (Spec 027)
+	//===----------------------------------------------------------------------===//
+
+	// Load use_bcp setting (default: true)
+	if (context.TryGetCurrentSetting("mssql_ctas_use_bcp", val)) {
+		config.use_bcp = val.GetValue<bool>();
+	}
+
+	// Inherit BCP settings from COPY configuration
+	if (context.TryGetCurrentSetting("mssql_copy_flush_rows", val)) {
+		config.bcp_flush_rows = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_copy_tablock", val)) {
+		config.bcp_tablock = val.GetValue<bool>();
 	}
 
 	return config;
@@ -383,6 +409,18 @@ bool LoadConvertVarcharMax(ClientContext &context) {
 		return val.GetValue<bool>();
 	}
 	return DEFAULT_CONVERT_VARCHAR_MAX;
+}
+
+//===----------------------------------------------------------------------===//
+// CTAS BCP Configuration Loading (Spec 027)
+//===----------------------------------------------------------------------===//
+
+bool LoadCTASUseBCP(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_ctas_use_bcp", val)) {
+		return val.GetValue<bool>();
+	}
+	return DEFAULT_CTAS_USE_BCP;
 }
 
 }  // namespace duckdb

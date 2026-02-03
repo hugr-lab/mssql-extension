@@ -914,6 +914,13 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 			}
 		}
 
+		// Handle UBIGINT as DECIMAL(20,0)
+		if (source_types[i].id() == LogicalTypeId::UBIGINT) {
+			col.precision = 20;
+			col.scale = 0;
+			col.max_length = 9;	 // DECIMAL(20,0) needs 9 bytes
+		}
+
 		// Handle scale for time types
 		if (source_types[i].id() == LogicalTypeId::TIME || source_types[i].id() == LogicalTypeId::TIMESTAMP ||
 			source_types[i].id() == LogicalTypeId::TIMESTAMP_TZ) {
@@ -945,12 +952,20 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	case LogicalTypeId::SMALLINT:
 		return "smallint";
 
+	case LogicalTypeId::USMALLINT:
+		return "int";  // USMALLINT (0-65535) needs int (4 bytes)
+
 	case LogicalTypeId::INTEGER:
 		return "int";
 
+	case LogicalTypeId::UINTEGER:
+		return "bigint";  // UINTEGER (0-4B) needs bigint (8 bytes)
+
 	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:  // UBIGINT maps to bigint (may overflow for large values)
 		return "bigint";
+
+	case LogicalTypeId::UBIGINT:
+		return "decimal(20,0)";	 // UBIGINT (0-18e18) needs DECIMAL(20,0) for full range
 
 	case LogicalTypeId::FLOAT:
 		return "real";
@@ -1008,9 +1023,14 @@ uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
 	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::USMALLINT:
 	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::BIGINT:
 		return tds::TDS_TYPE_INTN;	// 0x26
+
+	case LogicalTypeId::UBIGINT:
+		return tds::TDS_TYPE_DECIMAL;  // 0x6A - UBIGINT needs DECIMAL(20,0) for full range
 
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
@@ -1065,11 +1085,20 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	case LogicalTypeId::SMALLINT:
 		return 2;
 
+	case LogicalTypeId::USMALLINT:
+		return 4;  // USMALLINT (0-65535) maps to int (4 bytes)
+
 	case LogicalTypeId::INTEGER:
 		return 4;
 
+	case LogicalTypeId::UINTEGER:
+		return 8;  // UINTEGER (0-4B) maps to bigint (8 bytes)
+
 	case LogicalTypeId::BIGINT:
 		return 8;
+
+	case LogicalTypeId::UBIGINT:
+		return 9;  // DECIMAL(20,0) - precision 20 needs 9 bytes storage
 
 	case LogicalTypeId::FLOAT:
 		return 4;
