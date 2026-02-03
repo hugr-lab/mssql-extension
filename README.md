@@ -552,7 +552,7 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
 | `CREATE_TABLE` | BOOLEAN | true | Auto-create target table if it doesn't exist |
 | `REPLACE` | BOOLEAN | false | Drop and recreate table (replaces existing data) |
 | `FLUSH_ROWS` | BIGINT | 100000 | Rows before flushing to SQL Server (overrides setting) |
-| `TABLOCK` | BOOLEAN | true | Use TABLOCK hint for faster bulk load (overrides setting) |
+| `TABLOCK` | BOOLEAN | false | Use TABLOCK hint for faster bulk load (overrides setting) |
 
 ```sql
 -- Auto-create table (default: true)
@@ -1061,7 +1061,7 @@ Queries involving unsupported types will raise an error.
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
 | `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
-| `mssql_min_connections`    | BIGINT  | 2       | ≥0    | Minimum connections to maintain          |
+| `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |
 | `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | Connection acquire timeout (seconds)     |
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
@@ -1090,7 +1090,7 @@ Queries involving unsupported types will raise an error.
 | ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
 | `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
 | `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
-| `mssql_dml_use_prepared`           | BOOLEAN | false    | -      | Use prepared statements for DML       |
+| `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Use prepared statements for DML       |
 
 ### Usage Examples
 
@@ -1107,6 +1107,80 @@ SET mssql_statistics_level = 2;
 -- Disable connection caching for debugging
 SET mssql_connection_cache = false;
 ```
+
+## Performance Tuning
+
+### Bulk Data Loading
+
+For loading large datasets into SQL Server, use COPY TO with BCP protocol:
+
+```sql
+-- Fastest: TABLOCK + large flush threshold
+SET mssql_copy_tablock = true;  -- 15-30% faster, but blocks concurrent access
+SET mssql_copy_flush_rows = 500000;  -- Fewer flushes = better throughput
+
+COPY large_dataset TO 'mssql://db/dbo/target' (FORMAT 'bcp');
+```
+
+| Scenario | Recommended Settings | Notes |
+|----------|---------------------|-------|
+| Single-user batch load | `TABLOCK=true`, `FLUSH_ROWS=500000` | Maximum throughput |
+| Multi-user environment | `TABLOCK=false` (default) | Allows concurrent access |
+| Memory-constrained | `FLUSH_ROWS=50000` | Lower memory on both sides |
+| Maximum reliability | `FLUSH_ROWS=100000` (default) | Balanced throughput/memory |
+
+### Connection Pool Tuning
+
+```sql
+-- High-concurrency workloads
+SET mssql_connection_limit = 20;  -- More connections (default: 10)
+SET mssql_min_connections = 5;    -- Pre-warm more connections (default: 0)
+
+-- Long-running analytics
+SET mssql_query_timeout = 0;      -- No timeout (default: 30s)
+SET mssql_idle_timeout = 600;     -- Keep connections longer (default: 300s)
+
+-- Debugging connection issues
+SET mssql_connection_cache = false;  -- Disable pooling for isolation
+```
+
+### INSERT vs COPY Performance
+
+| Method | Rows/sec | Best For |
+|--------|----------|----------|
+| Single INSERT | ~1K | Small single-row operations |
+| Batched INSERT | ~50K | INSERT with RETURNING clause |
+| COPY TO (BCP) | ~300K | Bulk loading without RETURNING |
+| COPY TO + TABLOCK | ~400K | Single-user bulk loading |
+
+```sql
+-- For bulk loads without RETURNING, always prefer COPY
+-- Instead of:
+INSERT INTO db.dbo.target SELECT * FROM large_source;
+
+-- Use:
+COPY (SELECT * FROM large_source) TO 'db.dbo.target' (FORMAT 'bcp');
+```
+
+### Query Optimization
+
+```sql
+-- Enable filter pushdown verification
+SET mssql_enable_statistics = true;  -- Default
+
+-- For complex queries, use mssql_scan with explicit SQL
+-- DuckDB will still optimize joins with local tables
+FROM mssql_scan('db', 'SELECT id, name FROM dbo.large_table WHERE region = ''US''')
+JOIN local_lookup USING (id);
+```
+
+### Memory Management
+
+| Setting | Impact | Recommendation |
+|---------|--------|----------------|
+| `mssql_copy_flush_rows` | SQL Server buffer memory | Increase for throughput, decrease for memory |
+| `mssql_insert_batch_size` | DuckDB batch memory | Keep at 1000 (SQL Server limit) |
+| `mssql_dml_batch_size` | UPDATE/DELETE memory | Decrease for wide tables |
 
 ## Contributing
 

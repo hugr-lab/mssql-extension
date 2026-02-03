@@ -159,11 +159,11 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_connection_limit` | 10 | Max connections per context |
 | `mssql_connection_timeout` | 30 | TCP timeout (seconds) |
 | `mssql_idle_timeout` | 300 | Idle connection timeout (seconds) |
-| `mssql_min_connections` | 1 | Min connections to maintain |
-| `mssql_acquire_timeout` | 10 | Connection acquire timeout (seconds) |
+| `mssql_min_connections` | 0 | Min connections to maintain |
+| `mssql_acquire_timeout` | 30 | Connection acquire timeout (seconds) |
 | `mssql_connection_cache` | true | Enable connection pooling |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
-| `mssql_insert_batch_size` | 500 | Rows per INSERT statement |
+| `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
 | `mssql_insert_max_sql_bytes` | 1MB | INSERT SQL size limit |
 | `mssql_insert_use_returning_output` | true | Use OUTPUT INSERTED for RETURNING |
@@ -171,7 +171,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_dml_max_parameters` | 2000 | Max parameters per UPDATE/DELETE statement |
 | `mssql_dml_use_prepared` | true | Use prepared statements for DML |
 | `mssql_enable_statistics` | true | Enable statistics collection |
-| `mssql_statistics_cache_ttl_seconds` | 3600 | Statistics cache TTL |
+| `mssql_statistics_cache_ttl_seconds` | 300 | Statistics cache TTL |
 | `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server during COPY |
 | `mssql_copy_tablock` | false | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access) |
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |

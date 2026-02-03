@@ -70,7 +70,7 @@ static void BCPListCopyOptions(ClientContext &context, CopyOptionsInput &input) 
 	copy_options["replace"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 	// FLUSH_ROWS: Number of rows before flushing to SQL Server (default: 100000)
 	copy_options["flush_rows"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
-	// TABLOCK: Use table-level lock for better performance (default: true)
+	// TABLOCK: Use table-level lock for better performance (default: false, from mssql_copy_tablock)
 	copy_options["tablock"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 }
 
