@@ -61,8 +61,9 @@ SELECT id, extended_ascii FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 1;
 1	Café résumé
 
 # Test T014: CHAR with extended ASCII returns correct data
+# Note: CHAR columns are padded with spaces (ANSI_PADDING ON), so we RTRIM
 query IT
-SELECT id, char_column FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 2;
+SELECT id, RTRIM(char_column) FROM testdb_enc.dbo.TestVarcharEncoding WHERE id = 2;
 ----
 2	El Niño
 

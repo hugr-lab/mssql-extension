@@ -235,9 +235,11 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendByte(flags1);
 
 	// Offset 25: OptionFlags2 (1 byte)
-	// Bit 1: ODBC (we're not ODBC)
+	// Bit 1 (0x02): fODBC - enables ODBC compatibility mode, which automatically
+	//                       sets ANSI session options (CONCAT_NULL_YIELDS_NULL,
+	//                       ANSI_WARNINGS, ANSI_NULLS, ANSI_PADDING, QUOTED_IDENTIFIER)
 	// Bit 7: INTEGRATED_SECURITY (not using)
-	uint8_t flags2 = 0x00;
+	uint8_t flags2 = 0x02;  // fODBC flag for ANSI compatibility
 	packet.AppendByte(flags2);
 
 	// Offset 26: TypeFlags (1 byte)

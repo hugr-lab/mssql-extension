@@ -303,6 +303,31 @@ mapping = [1, -1, 0]  // target[0]->source[1], target[1]->NULL, target[2]->sourc
 
 This mapping is computed in `TargetResolver::BuildColumnMapping()` and passed to `BCPRowEncoder::EncodeRow()` for value extraction during BCP packet construction.
 
+## ANSI Connection Initialization
+
+All connections to SQL Server are initialized with ANSI-compliant session options to ensure DDL commands and queries against indexed views work correctly.
+
+### fODBC Flag (LOGIN7)
+
+The LOGIN7 packet includes the `fODBC` flag (bit 1 of OptionFlags2 = `0x02`) which signals to SQL Server that the client is an ODBC-compatible application. This automatically enables:
+
+- `CONCAT_NULL_YIELDS_NULL ON` - String concatenation with NULL yields NULL
+- `ANSI_WARNINGS ON` - Warnings on NULL in aggregate functions and divide-by-zero
+- `ANSI_NULLS ON` - ANSI-compliant NULL comparison semantics
+- `ANSI_PADDING ON` - Trailing spaces preserved in character columns
+- `QUOTED_IDENTIFIER ON` - Double quotes for identifiers
+
+These options are required for:
+- DDL commands (`ALTER DATABASE`, `DBCC`, `BACKUP LOG`)
+- Queries against indexed views
+- Operations on computed column indexes
+- XML data type methods
+- Filtered index operations
+
+### Connection Pool Reset Handling
+
+When a connection is returned to the pool and later reused with the `RESET_CONNECTION` flag, session state is reset. However, SQL Server remembers the connection's ODBC mode (set via fODBC during LOGIN7) and automatically restores ANSI-compliant session options.
+
 ## Cross-References
 
 - [TDS Protocol Layer](tds-protocol.md)

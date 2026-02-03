@@ -11,43 +11,43 @@ require-env MSSQL_TEST_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS basic_db (TYPE mssql);
 
 # Test 1: Simple SELECT
 query I
-SELECT * FROM mssql_scan('testdb', 'SELECT 1 AS val');
+SELECT * FROM mssql_scan('basic_db', 'SELECT 1 AS val');
 ----
 1
 
 # Test 2: Multiple columns
 query II
-SELECT * FROM mssql_scan('testdb', 'SELECT 1 AS a, 2 AS b');
+SELECT * FROM mssql_scan('basic_db', 'SELECT 1 AS a, 2 AS b');
 ----
 1	2
 
 # Test 3: String data
 query I
-SELECT * FROM mssql_scan('testdb', 'SELECT ''Hello World'' AS greeting');
+SELECT * FROM mssql_scan('basic_db', 'SELECT ''Hello World'' AS greeting');
 ----
 Hello World
 
 # Test 4: Verify pool statistics show activity
 query I
-SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='testdb');
+SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='basic_db');
 ----
 true
 
 # Test 5: Connection reuse - multiple sequential queries
 query I
-SELECT * FROM mssql_scan('testdb', 'SELECT 10 AS val');
+SELECT * FROM mssql_scan('basic_db', 'SELECT 10 AS val');
 ----
 10
 
 query I
-SELECT * FROM mssql_scan('testdb', 'SELECT 20 AS val');
+SELECT * FROM mssql_scan('basic_db', 'SELECT 20 AS val');
 ----
 20
 
 # Cleanup
 statement ok
-DETACH testdb;
+DETACH basic_db;

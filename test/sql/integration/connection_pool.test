@@ -11,12 +11,12 @@ require-env MSSQL_TEST_DSN
 
 # Test 1: ATTACH creates a connection pool
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS pool_db (TYPE mssql);
 
 # Test 2: Pool statistics should be available for attached database
 query IIIIIIII
 SELECT
-    db = 'testdb',
+    db = 'pool_db',
     total_connections >= 0,
     idle_connections >= 0,
     active_connections >= 0,
@@ -24,7 +24,7 @@ SELECT
     connections_closed >= 0,
     acquire_count >= 0,
     acquire_timeout_count >= 0
-FROM mssql_pool_stats(context_name='testdb');
+FROM mssql_pool_stats(context_name='pool_db');
 ----
 true	true	true	true	true	true	true	true
 
@@ -51,26 +51,26 @@ SELECT current_setting('mssql_connection_limit');
 
 # Test 6: Detach should cleanup the pool
 statement ok
-DETACH testdb;
+DETACH pool_db;
 
 # Test 7: After detach, pool stats should return empty
 query I
-SELECT count(*) FROM mssql_pool_stats(context_name='testdb');
+SELECT count(*) FROM mssql_pool_stats(context_name='pool_db');
 ----
 0
 
 # Test 8: Re-attach with connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS testdb2 (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS pool_db2 (TYPE mssql);
 
 # Pool should be created for connection string attachment too
 query I
-SELECT total_connections >= 0 FROM mssql_pool_stats(context_name='testdb2');
+SELECT total_connections >= 0 FROM mssql_pool_stats(context_name='pool_db2');
 ----
 true
 
 statement ok
-DETACH testdb2;
+DETACH pool_db2;
 
 # Reset settings
 statement ok

@@ -11,11 +11,11 @@ require-env MSSQL_TEST_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS info_db (TYPE mssql);
 
 # Basic single-statement query works
 query I
-SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
+SELECT * FROM mssql_scan('info_db', 'SELECT 1 AS value');
 ----
 1
 
@@ -24,4 +24,4 @@ SELECT * FROM mssql_scan('test_db', 'SELECT 1 AS value');
 # This is tracked as a known limitation.
 
 statement ok
-DETACH test_db;
+DETACH info_db;

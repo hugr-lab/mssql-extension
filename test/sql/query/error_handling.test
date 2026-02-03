@@ -13,30 +13,29 @@ require-env MSSQL_TEST_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS test_db (TYPE mssql);
+ATTACH '${MSSQL_TEST_DSN}' AS errh_db (TYPE mssql);
 
 # Syntax error
 statement error
-SELECT * FROM mssql_scan('test_db', 'SELEC * FROM');
+SELECT * FROM mssql_scan('errh_db', 'SELEC * FROM');
 ----
 SQL Server error
 
 # Missing table
 statement error
-SELECT * FROM mssql_scan('test_db', 'SELECT * FROM nonexistent_table_xyz123');
+SELECT * FROM mssql_scan('errh_db', 'SELECT * FROM nonexistent_table_xyz123');
 ----
 SQL Server error
 
-# Division by zero - SQL Server returns NULL by default (not an error)
-# To get error, would need SET ARITHABORT ON
-query I
-SELECT * FROM mssql_scan('test_db', 'SELECT 1/0');
+# Division by zero - with ANSI_WARNINGS ON (via fODBC flag), this throws an error
+statement error
+SELECT * FROM mssql_scan('errh_db', 'SELECT 1/0');
 ----
-NULL
+Divide by zero
 
 # Invalid column in subquery
 statement error
-SELECT * FROM mssql_scan('test_db', 'SELECT nonexistent_column FROM (SELECT value FROM GENERATE_SERIES(1, 10)) x');
+SELECT * FROM mssql_scan('errh_db', 'SELECT nonexistent_column FROM (SELECT value FROM GENERATE_SERIES(1, 10)) x');
 ----
 SQL Server error
 
@@ -47,4 +46,4 @@ SELECT * FROM mssql_scan('unknown_context', 'SELECT 1');
 Unknown context
 
 statement ok
-DETACH test_db;
+DETACH errh_db;
