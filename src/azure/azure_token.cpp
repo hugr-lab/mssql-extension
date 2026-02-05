@@ -19,6 +19,12 @@
 #include <sstream>
 #include <vector>
 
+// Windows compatibility for popen/pclose
+#ifdef _WIN32
+#define popen _popen
+#define pclose _pclose
+#endif
+
 namespace duckdb {
 namespace mssql {
 namespace azure {

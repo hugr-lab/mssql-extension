@@ -185,6 +185,11 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
+
+# Hide all symbols except extension entry point to avoid multiple definition errors
+if(NOT WIN32)
+    target_compile_options(${EXTENSION_NAME} PRIVATE -fvisibility=hidden)
+endif()
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
@@ -198,6 +203,11 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
+
+# Hide all symbols except extension entry point to avoid multiple definition errors
+if(NOT WIN32)
+    target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -fvisibility=hidden)
+endif()
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
