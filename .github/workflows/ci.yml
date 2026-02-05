@@ -156,20 +156,10 @@ jobs:
         run: |
           mkdir -p build/release
           cd build/release
-
-          # Linux needs --allow-multiple-definition due to ODR issues with constexpr static members
-          # when linking DuckDB extensions as static libraries with GCC
-          EXTRA_LINKER_FLAGS=""
-          if [ "${{ matrix.platform.os }}" = "linux" ]; then
-            EXTRA_LINKER_FLAGS="-Wl,--allow-multiple-definition"
-          fi
-
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LINKER_FLAGS" \
-            -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINKER_FLAGS" \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \

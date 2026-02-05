@@ -11,10 +11,8 @@ set(MSSQL_EXTENSION_VERSION "0.1.15")
 # Project configuration
 project(${TARGET_NAME})
 
-# C++17 is required for Azure SDK and modern C++ features
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+# Note: Do NOT set CMAKE_CXX_STANDARD here - DuckDB's build system handles this.
+# Using CACHE FORCE would override DuckDB's settings and cause ODR issues.
 
 include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy src/include/azure)
 
