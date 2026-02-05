@@ -1,0 +1,99 @@
+# name: test/sql/ctas/ctas_auto_tablock.test
+# description: Test auto-TABLOCK for new tables (Issue #45)
+# group: [ctas]
+
+require mssql
+
+# Use the MSSQL connection from environment
+require-env MSSQL_TEST_CONNECTION_STRING
+
+statement ok
+ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
+
+# Clean up any existing test tables
+statement ok
+CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.AutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.AutoTablockTest');
+
+# =============================================================================
+# Test 1: CTAS new table (auto-TABLOCK should be applied)
+# Expected: Table created with auto-TABLOCK enabled for performance
+# Note: We can't directly verify TABLOCK from DuckDB, but we verify correct behavior
+# =============================================================================
+statement ok
+CREATE TABLE mssql.dbo.AutoTablockTest AS
+SELECT i AS id, 'value_' || i::VARCHAR AS name FROM range(1000) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.AutoTablockTest;
+----
+1000
+
+# =============================================================================
+# Test 2: CTAS OR REPLACE (auto-TABLOCK after drop+recreate)
+# Expected: After drop+recreate, auto-TABLOCK should be applied
+# =============================================================================
+statement ok
+CREATE OR REPLACE TABLE mssql.dbo.AutoTablockTest AS
+SELECT i AS id, 'replaced_' || i::VARCHAR AS name FROM range(500) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.AutoTablockTest;
+----
+500
+
+query T
+SELECT name FROM mssql.dbo.AutoTablockTest WHERE id = 0;
+----
+replaced_0
+
+# =============================================================================
+# Test 3: Explicit TABLOCK setting via mssql_copy_tablock
+# When user explicitly sets tablock=false, auto-TABLOCK should NOT override
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
+
+statement ok
+SET mssql_copy_tablock = false;
+
+statement ok
+CREATE TABLE mssql.dbo.AutoTablockTest AS
+SELECT i AS id, 'no_tablock_' || i::VARCHAR AS name FROM range(100) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.AutoTablockTest;
+----
+100
+
+# Reset setting
+statement ok
+RESET mssql_copy_tablock;
+
+# =============================================================================
+# Test 4: Explicit TABLOCK setting via mssql_copy_tablock = true
+# User explicitly enables TABLOCK
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
+
+statement ok
+SET mssql_copy_tablock = true;
+
+statement ok
+CREATE TABLE mssql.dbo.AutoTablockTest AS
+SELECT i AS id, 'with_tablock_' || i::VARCHAR AS name FROM range(100) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.AutoTablockTest;
+----
+100
+
+# Reset setting
+statement ok
+RESET mssql_copy_tablock;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');

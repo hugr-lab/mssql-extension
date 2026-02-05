@@ -46,6 +46,14 @@ struct CTASConfig {
 	// Provides 15-30% performance improvement but blocks concurrent reads
 	bool bcp_tablock = false;
 
+	// True if user explicitly set mssql_copy_tablock (vs using default)
+	// Used to determine if auto-TABLOCK should be applied for new tables
+	bool bcp_tablock_explicit = false;
+
+	// True if creating a brand-new table (table didn't exist or OR REPLACE dropped it)
+	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
+	bool is_new_table = false;
+
 	// Load configuration from client context
 	static CTASConfig Load(ClientContext &context);
 

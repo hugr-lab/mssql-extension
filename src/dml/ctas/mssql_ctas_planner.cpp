@@ -66,6 +66,9 @@ CTASTarget CTASPlanner::ExtractTarget(const LogicalCreateTable &op, MSSQLCatalog
 	target.on_conflict = base_info.on_conflict;
 	target.or_replace = (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT);
 
+	// Check for IF NOT EXISTS (Issue #44)
+	target.if_not_exists = (base_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT);
+
 	return target;
 }
 

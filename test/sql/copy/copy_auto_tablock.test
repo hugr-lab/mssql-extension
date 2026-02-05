@@ -1,0 +1,114 @@
+# name: test/sql/copy/copy_auto_tablock.test
+# description: Test auto-TABLOCK for COPY TO new tables (Issue #45)
+# group: [copy]
+
+require mssql
+
+# Use the MSSQL connection from environment
+require-env MSSQL_TEST_CONNECTION_STRING
+
+statement ok
+ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
+
+# Clean up any existing test tables
+statement ok
+CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.CopyAutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.CopyAutoTablockTest');
+
+# Create source data
+statement ok
+CREATE TABLE source_data AS SELECT i AS id, 'value_' || i::VARCHAR AS name FROM range(1000) t(i);
+
+# =============================================================================
+# Test 1: COPY TO new table (auto-TABLOCK should be applied)
+# Expected: Table created with auto-TABLOCK enabled for performance
+# =============================================================================
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+1000
+
+# =============================================================================
+# Test 2: COPY TO with REPLACE (auto-TABLOCK after drop+recreate)
+# Expected: After drop+recreate, auto-TABLOCK should be applied
+# =============================================================================
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, REPLACE true);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+1000
+
+# =============================================================================
+# Test 3: COPY TO existing table (no auto-TABLOCK - could have concurrent readers)
+# This append should work without TABLOCK since table already exists
+# =============================================================================
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, CREATE_TABLE false);
+
+# Should have 2000 rows now (1000 + 1000 appended)
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+2000
+
+# =============================================================================
+# Test 4: Explicit TABLOCK setting via COPY option
+# When user explicitly sets tablock=false, auto-TABLOCK should NOT override
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, TABLOCK false);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+1000
+
+# =============================================================================
+# Test 5: Explicit TABLOCK enabled via COPY option
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, TABLOCK true);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+1000
+
+# =============================================================================
+# Test 6: Explicit TABLOCK via setting (should override auto behavior)
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+
+statement ok
+SET mssql_copy_tablock = true;
+
+statement ok
+COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
+----
+1000
+
+statement ok
+RESET mssql_copy_tablock;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+
+statement ok
+DROP TABLE source_data;

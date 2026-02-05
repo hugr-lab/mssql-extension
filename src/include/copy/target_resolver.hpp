@@ -189,15 +189,16 @@ struct TargetResolver {
 	// - Checks if target is a table (not a view)
 	// - Handles CREATE_TABLE and OVERWRITE options
 	// - Validates schema compatibility if table exists
+	// - Sets config.is_new_table if table was created or recreated (Issue #45)
 	// @param context DuckDB client context
 	// @param conn TDS connection for SQL execution
 	// @param target The target to validate
-	// @param config COPY configuration options
+	// @param config COPY configuration options (is_new_table may be modified)
 	// @param source_types DuckDB types from the source query
 	// @param source_names Column names from the source query
 	// @throws InvalidInputException for validation failures
 	static void ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
-							   const BCPCopyConfig &config, const vector<LogicalType> &source_types,
+							   BCPCopyConfig &config, const vector<LogicalType> &source_types,
 							   const vector<string> &source_names);
 
 	//===----------------------------------------------------------------------===//

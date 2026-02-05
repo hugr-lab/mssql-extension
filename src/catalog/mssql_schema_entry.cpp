@@ -92,6 +92,37 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	auto &base_info = info.Base();
 	string table_name = base_info.table;
 
+	// Check if table already exists for IF NOT EXISTS / OR REPLACE handling (Issue #44)
+	if (!transaction.HasContext()) {
+		throw InternalException("Cannot execute CREATE TABLE without client context");
+	}
+
+	auto existing_entry = tables_.GetEntry(transaction.GetContext(), table_name);
+
+	// Handle OnCreateConflict modes
+	switch (base_info.on_conflict) {
+	case OnCreateConflict::IGNORE_ON_CONFLICT:
+		// IF NOT EXISTS: if table exists, return existing entry without error
+		if (existing_entry) {
+			return existing_entry;
+		}
+		break;
+
+	case OnCreateConflict::REPLACE_ON_CONFLICT: {
+		// OR REPLACE: drop existing table first
+		if (existing_entry) {
+			string drop_sql = MSSQLDDLTranslator::TranslateDropTable(name, table_name);
+			mssql_catalog.ExecuteDDL(transaction.GetContext(), drop_sql);
+		}
+		break;
+	}
+
+	case OnCreateConflict::ERROR_ON_CONFLICT:
+	default:
+		// Default behavior: error if table exists (handled by SQL Server)
+		break;
+	}
+
 	// Extract columns from the bound info
 	// BoundCreateTableInfo contains the resolved column definitions
 	auto &columns = base_info.columns;
@@ -103,11 +134,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints);
 
 	// Execute DDL on SQL Server
-	if (transaction.HasContext()) {
-		mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
-	} else {
-		throw InternalException("Cannot execute CREATE TABLE without client context");
-	}
+	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
 
 	// Point invalidation: invalidate schema's table list and local table set
 	mssql_catalog.InvalidateSchemaTableSet(name);

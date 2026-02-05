@@ -39,19 +39,39 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 	// Execute DDL phase immediately (CREATE TABLE or DROP + CREATE for OR REPLACE)
 	// This is done in GetGlobalSinkState to fail fast before any data is processed
 	try {
+		// Check if table exists and determine if this is a new table (Issue #45 - auto-TABLOCK)
+		bool table_existed = gstate->state.TableExists(context);
+
 		// Handle OR REPLACE: check if table exists and drop if needed
 		if (gstate->state.target.or_replace) {
-			if (gstate->state.TableExists(context)) {
+			if (table_existed) {
 				gstate->state.ExecuteDrop(context);
+				// After drop, this is effectively a new table
+				gstate->state.config.is_new_table = true;
+			} else {
+				// Table didn't exist - definitely new
+				gstate->state.config.is_new_table = true;
 			}
+		} else if (gstate->state.target.if_not_exists) {
+			// Handle IF NOT EXISTS: skip if table exists (Issue #44)
+			if (table_existed) {
+				// Table exists - mark as skipped and return early
+				gstate->state.phase = mssql::CTASPhase::SKIPPED;
+				gstate->state.LogMetrics();
+				return std::move(gstate);
+			}
+			// Table didn't exist - new table
+			gstate->state.config.is_new_table = true;
 		} else {
-			// Non-OR REPLACE: fail if table exists (FR-014)
-			if (gstate->state.TableExists(context)) {
+			// Non-OR REPLACE, non-IF NOT EXISTS: fail if table exists (FR-014)
+			if (table_existed) {
 				throw InvalidInputException(
 					"CTAS failed: table '%s' already exists. "
 					"Use CREATE OR REPLACE TABLE to overwrite.",
 					gstate->state.target.GetQualifiedName());
 			}
+			// Table didn't exist - new table
+			gstate->state.config.is_new_table = true;
 		}
 
 		// Validate schema exists (FR-009)
@@ -87,6 +107,11 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	// Thread-safe execution
 	std::lock_guard<std::mutex> lock(gstate.mutex);
+
+	// Skip if IF NOT EXISTS triggered skip (Issue #44)
+	if (gstate.state.phase == mssql::CTASPhase::SKIPPED) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 
 	// Skip empty chunks
 	if (chunk.size() == 0) {
@@ -132,6 +157,11 @@ SinkFinalizeType MSSQLPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event 
 
 	// Thread-safe finalization
 	std::lock_guard<std::mutex> lock(gstate.mutex);
+
+	// If skipped (IF NOT EXISTS and table existed), just return success (Issue #44)
+	if (gstate.state.phase == mssql::CTASPhase::SKIPPED) {
+		return SinkFinalizeType::READY;
+	}
 
 	try {
 		// Flush any remaining INSERT batches

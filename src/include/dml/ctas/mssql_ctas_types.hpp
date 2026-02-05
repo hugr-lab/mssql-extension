@@ -24,6 +24,9 @@ struct CTASTarget {
 	// CREATE OR REPLACE TABLE mode
 	bool or_replace = false;
 
+	// CREATE TABLE IF NOT EXISTS mode (silently succeed if table exists)
+	bool if_not_exists = false;
+
 	// ON CONFLICT behavior from DuckDB
 	OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 

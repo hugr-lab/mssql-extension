@@ -34,6 +34,7 @@ enum class CTASPhase {
 	INSERT_EXECUTING,  // INSERT batches in progress (legacy mode)
 	BCP_EXECUTING,	   // BCP protocol in progress (Spec 027)
 	COMPLETE,		   // Successfully completed
+	SKIPPED,		   // IF NOT EXISTS and table already exists (Issue #44)
 	FAILED			   // Error occurred
 };
 

@@ -16,6 +16,8 @@ BCPCopyConfig LoadBCPCopyConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_copy_tablock", val)) {
 		config.tablock = val.GetValue<bool>();
+		// Mark as explicitly set so auto-TABLOCK logic knows user preference
+		config.tablock_explicit = true;
 	}
 
 	return config;

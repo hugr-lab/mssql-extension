@@ -302,6 +302,7 @@ void CTASExecutionState::LogMetrics() const {
 	fprintf(stderr, "[MSSQL CTAS] Metrics:\n");
 	fprintf(stderr, "  Target: %s\n", target.GetQualifiedName().c_str());
 	fprintf(stderr, "  OR REPLACE: %s\n", target.or_replace ? "yes" : "no");
+	fprintf(stderr, "  IF NOT EXISTS: %s\n", target.if_not_exists ? "yes" : "no");
 	fprintf(stderr, "  DDL bytes: %llu\n", (unsigned long long)ddl_bytes);
 	fprintf(stderr, "  DDL time: %lld ms\n", (long long)ddl_time_ms);
 	fprintf(stderr, "  Rows produced: %llu\n", (unsigned long long)rows_produced);
@@ -335,6 +336,8 @@ string CTASExecutionState::GetPhaseName(CTASPhase phase) {
 		return "BCP_EXECUTING";
 	case CTASPhase::COMPLETE:
 		return "COMPLETE";
+	case CTASPhase::SKIPPED:
+		return "SKIPPED";
 	case CTASPhase::FAILED:
 		return "FAILED";
 	default:
@@ -397,6 +400,13 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	DebugLog(1, "Executing INSERT BULK for BCP mode");
 
+	// Apply auto-TABLOCK for new tables (Issue #45)
+	// If creating a new table and user didn't explicitly set tablock, enable it for performance
+	if (config.is_new_table && !config.bcp_tablock_explicit) {
+		config.bcp_tablock = true;
+		DebugLog(1, "Auto-TABLOCK enabled for new table (no concurrent readers)");
+	}
+
 	// Acquire a connection from the pool
 	auto &pool = catalog->GetConnectionPool();
 	connection = pool.Acquire();
@@ -419,7 +429,7 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 		}
 		insert_bulk += ")";
 
-		// Add TABLOCK hint if configured
+		// Add TABLOCK hint if configured (may be auto-enabled for new tables)
 		if (config.bcp_tablock) {
 			insert_bulk += " WITH (TABLOCK)";
 			DebugLog(2, "BCP using TABLOCK hint");

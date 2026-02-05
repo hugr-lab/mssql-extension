@@ -201,6 +201,8 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 			bind_data->config.flush_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
 		} else if (loption == "tablock") {
 			bind_data->config.tablock = BooleanValue::Get(option.second[0]);
+			// Mark as explicitly set so auto-TABLOCK knows not to override
+			bind_data->config.tablock_explicit = true;
 		}
 		// Ignore unknown options (may be standard COPY options)
 	}
@@ -345,6 +347,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			// Table was replaced or created, use source types
 			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
+		}
+
+		// Apply auto-TABLOCK for new tables (Issue #45)
+		// If creating a new table and user didn't explicitly set tablock, enable it for performance
+		if (bdata.config.is_new_table && !bdata.config.tablock_explicit) {
+			bdata.config.tablock = true;
+			CopyDebugLog(1, "BCPCopyInitGlobal: auto-TABLOCK enabled for new table (no concurrent readers)");
 		}
 
 		// Build and execute INSERT BULK statement

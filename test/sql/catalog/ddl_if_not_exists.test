@@ -1,0 +1,87 @@
+# name: test/sql/catalog/ddl_if_not_exists.test
+# description: Test CREATE TABLE IF NOT EXISTS DDL (Issue #44)
+# group: [catalog]
+
+require mssql
+
+# Use the MSSQL connection from environment
+require-env MSSQL_TEST_CONNECTION_STRING
+
+statement ok
+ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
+
+# Clean up any existing test tables
+statement ok
+CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.DDLIfNotExists'', ''U'') IS NOT NULL DROP TABLE dbo.DDLIfNotExists');
+
+# =============================================================================
+# Test 1: CREATE TABLE IF NOT EXISTS - table does not exist
+# Expected: Create the table
+# =============================================================================
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.DDLIfNotExists (
+    id INTEGER,
+    name VARCHAR
+);
+
+# Verify table exists by inserting and selecting
+statement ok
+INSERT INTO mssql.dbo.DDLIfNotExists VALUES (1, 'first');
+
+query IT
+SELECT * FROM mssql.dbo.DDLIfNotExists ORDER BY id;
+----
+1	first
+
+# =============================================================================
+# Test 2: CREATE TABLE IF NOT EXISTS - table already exists
+# Expected: Silently succeed without error
+# =============================================================================
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.DDLIfNotExists (
+    id INTEGER,
+    name VARCHAR,
+    extra_col BOOLEAN
+);
+
+# Verify original table is unchanged (original schema, original data)
+query IT
+SELECT * FROM mssql.dbo.DDLIfNotExists ORDER BY id;
+----
+1	first
+
+# =============================================================================
+# Test 3: CREATE TABLE (without IF NOT EXISTS) - table already exists
+# Expected: Error
+# =============================================================================
+statement error
+CREATE TABLE mssql.dbo.DDLIfNotExists (
+    id INTEGER
+);
+----
+already exists
+
+# =============================================================================
+# Test 4: CREATE OR REPLACE TABLE - replaces existing
+# Expected: Drop and recreate table with new schema
+# =============================================================================
+statement ok
+CREATE OR REPLACE TABLE mssql.dbo.DDLIfNotExists (
+    new_id BIGINT,
+    new_name VARCHAR
+);
+
+# Verify new schema (no data since it was recreated)
+statement ok
+INSERT INTO mssql.dbo.DDLIfNotExists VALUES (100, 'replaced');
+
+query IT
+SELECT * FROM mssql.dbo.DDLIfNotExists ORDER BY new_id;
+----
+100	replaced
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+statement ok
+DROP TABLE mssql.dbo.DDLIfNotExists;

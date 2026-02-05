@@ -1,0 +1,105 @@
+# name: test/sql/ctas/ctas_if_not_exists.test
+# description: Test CREATE TABLE AS IF NOT EXISTS behavior (Issue #44)
+# group: [ctas]
+
+require mssql
+
+# Use the MSSQL connection from environment
+require-env MSSQL_TEST_CONNECTION_STRING
+
+statement ok
+ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
+
+# Clean up any existing test tables
+statement ok
+CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.IfNotExistsTest'', ''U'') IS NOT NULL DROP TABLE dbo.IfNotExistsTest');
+
+# =============================================================================
+# Test 1: CREATE TABLE IF NOT EXISTS - table does not exist
+# Expected: Create table and insert data
+# =============================================================================
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.IfNotExistsTest AS
+SELECT 1 AS id, 'first' AS name;
+
+# Verify table was created with data
+query II
+SELECT id, name FROM mssql.dbo.IfNotExistsTest ORDER BY id;
+----
+1	first
+
+# =============================================================================
+# Test 2: CREATE TABLE IF NOT EXISTS - table already exists
+# Expected: Silently succeed without error, keep existing data
+# =============================================================================
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.IfNotExistsTest AS
+SELECT 2 AS id, 'second' AS name;
+
+# Verify original data is preserved (not overwritten)
+query II
+SELECT id, name FROM mssql.dbo.IfNotExistsTest ORDER BY id;
+----
+1	first
+
+# =============================================================================
+# Test 3: CREATE TABLE (without IF NOT EXISTS) - table already exists
+# Expected: Error
+# =============================================================================
+statement error
+CREATE TABLE mssql.dbo.IfNotExistsTest AS
+SELECT 3 AS id, 'third' AS name;
+----
+already exists
+
+# =============================================================================
+# Test 4: CREATE OR REPLACE TABLE - overwrites existing
+# Expected: Replace table with new data
+# =============================================================================
+statement ok
+CREATE OR REPLACE TABLE mssql.dbo.IfNotExistsTest AS
+SELECT 4 AS id, 'fourth' AS name;
+
+# Verify table was replaced
+query II
+SELECT id, name FROM mssql.dbo.IfNotExistsTest ORDER BY id;
+----
+4	fourth
+
+# =============================================================================
+# Test 5: IF NOT EXISTS with larger dataset
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');
+
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.IfNotExistsTest AS
+SELECT i AS id, 'row_' || i::VARCHAR AS name FROM range(100) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.IfNotExistsTest;
+----
+100
+
+# Try again with different data - should be skipped
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.IfNotExistsTest AS
+SELECT i AS id, 'different_' || i::VARCHAR AS name FROM range(50) t(i);
+
+# Count should still be 100, not 50
+query I
+SELECT COUNT(*) FROM mssql.dbo.IfNotExistsTest;
+----
+100
+
+# Verify data is still the original
+query T
+SELECT name FROM mssql.dbo.IfNotExistsTest WHERE id = 0;
+----
+row_0
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+statement ok
+CALL mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');

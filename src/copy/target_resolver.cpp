@@ -330,7 +330,7 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 //===----------------------------------------------------------------------===//
 
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
-									const BCPCopyConfig &config, const vector<LogicalType> &source_types,
+									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names) {
 	DebugLog(2, "ValidateTarget: checking %s", target.GetFullyQualifiedName().c_str());
 
@@ -377,6 +377,9 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	DebugLog(1, "ValidateTarget: exists=%d, is_view=%d, config.overwrite=%d, config.create_table=%d", table_exists,
 			 is_view, config.overwrite ? 1 : 0, config.create_table ? 1 : 0);
 
+	// Track whether we're creating a new table for auto-TABLOCK (Issue #45)
+	config.is_new_table = false;
+
 	if (table_exists) {
 		if (is_view) {
 			throw InvalidInputException("MSSQL COPY: Cannot COPY to a view. Target '%s' is a view.",
@@ -388,16 +391,22 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
 			CreateTable(conn, target, source_types, source_names);
+			// After drop+create, this is effectively a new table
+			config.is_new_table = true;
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
 			ValidateExistingTableSchema(conn, target, source_types, source_names);
+			// Appending to existing table, not a new table
+			config.is_new_table = false;
 		}
 	} else {
 		// Table doesn't exist
 		if (config.create_table) {
 			DebugLog(1, "ValidateTarget: CREATE_TABLE=true, creating table");
 			CreateTable(conn, target, source_types, source_names);
+			// Newly created table
+			config.is_new_table = true;
 		} else {
 			throw InvalidInputException(
 				"MSSQL COPY: Target table '%s' does not exist. "

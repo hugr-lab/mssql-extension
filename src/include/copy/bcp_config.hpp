@@ -46,6 +46,14 @@ struct BCPCopyConfig {
 	// Default changed to false in Spec 027 for safer multi-user behavior
 	bool tablock = false;
 
+	// True if user explicitly set tablock option (vs using default from settings)
+	// Used to determine if auto-TABLOCK should be applied for new tables
+	bool tablock_explicit = false;
+
+	// True if creating a brand-new table (table didn't exist or overwrite dropped it)
+	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
+	bool is_new_table = false;
+
 	// Check if data should be flushed to SQL Server
 	// Returns true when accumulated rows reach flush_rows threshold
 	bool ShouldFlushToServer(idx_t accumulated_rows) const {

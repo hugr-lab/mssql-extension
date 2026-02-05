@@ -392,6 +392,8 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_copy_tablock", val)) {
 		config.bcp_tablock = val.GetValue<bool>();
+		// Mark as explicitly set so auto-TABLOCK logic knows user preference
+		config.bcp_tablock_explicit = true;
 	}
 
 	return config;
