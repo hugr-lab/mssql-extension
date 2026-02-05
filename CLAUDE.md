@@ -228,6 +228,24 @@ The extension supports Azure AD authentication for Azure SQL Database and Micros
 
 See `AZURE.md` for user documentation.
 
+## Build Troubleshooting
+
+### ODR (One Definition Rule) Errors on Linux
+
+**Symptom:** Linux builds fail with "multiple definition of `duckdb::LogicalType::BIGINT`" and similar errors for constexpr static members.
+
+**Root Cause:** Setting `CMAKE_CXX_STANDARD` with `CACHE ... FORCE` in the extension's CMakeLists.txt overwrites DuckDB's C++ standard globally. This affects how GCC handles constexpr static members during linking, causing ODR violations.
+
+**What NOT to do in CMakeLists.txt:**
+```cmake
+# DO NOT USE - causes ODR errors on Linux:
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "..." FORCE)
+```
+
+**Solution:** Let DuckDB's build system handle the C++ standard. Do not override it globally. The extension code works with whatever standard DuckDB uses.
+
+**Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
+
 ## Recent Changes
 
 - 030-ctas-fixes: Fixed `CREATE TABLE IF NOT EXISTS` to silently succeed when table exists (Issue #44); auto-enable TABLOCK for new table creation for 15-30% performance improvement (Issue #45)
