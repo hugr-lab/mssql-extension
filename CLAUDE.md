@@ -242,7 +242,14 @@ See `AZURE.md` for user documentation.
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "..." FORCE)
 ```
 
-**Solution:** Let DuckDB's build system handle the C++ standard. Do not override it globally. The extension code works with whatever standard DuckDB uses.
+**Correct Solution:** Use `target_compile_features` to set C++17 per-target:
+```cmake
+# Set C++17 for extension targets only (not globally):
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
+```
+
+This allows our extension to use C++17 features (structured bindings, etc.) without affecting DuckDB's build settings.
 
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
