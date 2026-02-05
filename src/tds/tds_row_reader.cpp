@@ -156,6 +156,7 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 	case TDS_TYPE_DATE:
 	case TDS_TYPE_TIME:
 	case TDS_TYPE_DATETIME2:
+	case TDS_TYPE_DATETIMEOFFSET:
 	case TDS_TYPE_UNIQUEIDENTIFIER: {
 		if (length < 1)
 			return 0;
@@ -819,6 +820,14 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 
 	// DATETIME2 - has 1-byte length prefix
 	case TDS_TYPE_DATETIME2: {
+		if (length < 1)
+			return 0;
+		uint8_t data_length = data[0];
+		return length >= 1 + data_length ? 1 + data_length : 0;
+	}
+
+	// DATETIMEOFFSET - has 1-byte length prefix
+	case TDS_TYPE_DATETIMEOFFSET: {
 		if (length < 1)
 			return 0;
 		uint8_t data_length = data[0];

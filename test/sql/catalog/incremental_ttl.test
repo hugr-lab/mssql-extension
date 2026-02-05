@@ -1,0 +1,102 @@
+# name: test/sql/catalog/incremental_ttl.test
+# description: Test incremental catalog cache TTL expiration behavior
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup: Attach database with short TTL
+# =============================================================================
+
+# Set a short TTL for testing (2 seconds)
+statement ok
+SET mssql_catalog_cache_ttl = 2;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ttl_test (TYPE mssql);
+
+# =============================================================================
+# Test 1: Cache loads on first access
+# =============================================================================
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS ttl_test.dbo.ttl_test_table;
+
+# Create a test table
+statement ok
+CREATE TABLE ttl_test.dbo.ttl_test_table (id INTEGER PRIMARY KEY, name VARCHAR(100));
+
+# Access the table - this should populate the cache
+query IT
+SELECT * FROM ttl_test.dbo.ttl_test_table;
+----
+
+# Insert some data
+statement ok
+INSERT INTO ttl_test.dbo.ttl_test_table (id, name) VALUES (1, 'original');
+
+# Verify data
+query IT
+SELECT * FROM ttl_test.dbo.ttl_test_table ORDER BY id;
+----
+1	original
+
+# =============================================================================
+# Test 2: Cache remains valid within TTL window
+# Multiple accesses within TTL should use cached metadata
+# =============================================================================
+
+# Multiple queries should work without issues
+query I
+SELECT COUNT(*) FROM ttl_test.dbo.ttl_test_table;
+----
+1
+
+query IT
+SELECT id, name FROM ttl_test.dbo.ttl_test_table WHERE id = 1;
+----
+1	original
+
+# =============================================================================
+# Test 3: External changes detected after TTL expires
+# Changes made via mssql_exec become visible after TTL
+# =============================================================================
+
+# Add a column via mssql_exec (bypasses DuckDB catalog)
+statement ok
+SELECT mssql_exec('ttl_test', 'ALTER TABLE dbo.ttl_test_table ADD description VARCHAR(200)');
+
+# Update the row to have a description
+statement ok
+SELECT mssql_exec('ttl_test', 'UPDATE dbo.ttl_test_table SET description = ''added via exec'' WHERE id = 1');
+
+# Note: Column may not be immediately visible until TTL expires
+# Force refresh to see changes (simulating TTL expiration)
+statement ok
+SELECT mssql_refresh_cache('ttl_test');
+
+# Now new column should be visible
+query ITT
+SELECT id, name, description FROM ttl_test.dbo.ttl_test_table WHERE id = 1;
+----
+1	original	added via exec
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE ttl_test.dbo.ttl_test_table;
+
+statement ok
+DETACH ttl_test;
+
+# Reset TTL to default
+statement ok
+SET mssql_catalog_cache_ttl = 0;

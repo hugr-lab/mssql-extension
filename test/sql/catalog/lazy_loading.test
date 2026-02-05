@@ -1,0 +1,176 @@
+# name: test/sql/catalog/lazy_loading.test
+# description: Test incremental catalog cache with lazy loading and point invalidation
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup: Attach database
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS lazy_test (TYPE mssql);
+
+# =============================================================================
+# Test 1: Lazy loading - schema discovery on demand
+# After ATTACH, schemas should NOT be fully loaded until accessed
+# =============================================================================
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS lazy_test.dbo.lazy_test_table1;
+
+statement ok
+DROP TABLE IF EXISTS lazy_test.dbo.lazy_test_table2;
+
+# Create a test table - this should trigger lazy loading of dbo schema
+statement ok
+CREATE TABLE lazy_test.dbo.lazy_test_table1 (id INTEGER PRIMARY KEY, name VARCHAR(100));
+
+# Verify table is visible immediately (point invalidation worked)
+query IT
+SELECT * FROM lazy_test.dbo.lazy_test_table1 ORDER BY id;
+----
+
+# =============================================================================
+# Test 2: Point invalidation - CREATE TABLE
+# New tables should be visible without full cache refresh
+# =============================================================================
+
+# Create another table
+statement ok
+CREATE TABLE lazy_test.dbo.lazy_test_table2 (id INTEGER PRIMARY KEY, value DECIMAL(10,2));
+
+# Both tables should be visible
+query I
+SELECT COUNT(*) FROM (
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'dbo' AND table_name LIKE 'lazy_test_table%'
+) t;
+----
+2
+
+# =============================================================================
+# Test 3: Point invalidation - DROP TABLE
+# Dropped tables should disappear without full cache refresh
+# =============================================================================
+
+statement ok
+DROP TABLE lazy_test.dbo.lazy_test_table2;
+
+# Only one table should remain
+query I
+SELECT COUNT(*) FROM (
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'dbo' AND table_name LIKE 'lazy_test_table%'
+) t;
+----
+1
+
+# =============================================================================
+# Test 4: Point invalidation - ALTER TABLE ADD COLUMN
+# Column changes should be visible without full cache refresh
+# =============================================================================
+
+# Add a column
+statement ok
+ALTER TABLE lazy_test.dbo.lazy_test_table1 ADD description VARCHAR(200);
+
+# Verify column is visible by inserting and selecting data
+statement ok
+INSERT INTO lazy_test.dbo.lazy_test_table1 (id, name, description) VALUES (1, 'test', 'test description');
+
+query ITT
+SELECT id, name, description FROM lazy_test.dbo.lazy_test_table1 WHERE id = 1;
+----
+1	test	test description
+
+# =============================================================================
+# Test 5: Point invalidation - ALTER TABLE DROP COLUMN
+# Column removal should be reflected
+# =============================================================================
+
+statement ok
+ALTER TABLE lazy_test.dbo.lazy_test_table1 DROP COLUMN description;
+
+# Verify column is gone (only id and name remain)
+query IT
+SELECT id, name FROM lazy_test.dbo.lazy_test_table1 WHERE id = 1;
+----
+1	test
+
+# =============================================================================
+# Test 6: Manual cache refresh with mssql_refresh_cache()
+# =============================================================================
+
+# Create a table via mssql_exec (bypasses catalog integration)
+statement ok
+SELECT mssql_exec('lazy_test', 'CREATE TABLE dbo.lazy_test_external (ext_id INT PRIMARY KEY)');
+
+# Table might not be visible yet (created outside DuckDB DDL)
+# Refresh cache to make it visible
+statement ok
+SELECT mssql_refresh_cache('lazy_test');
+
+# Now table should be visible
+query I
+SELECT COUNT(*) FROM lazy_test.dbo.lazy_test_external;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE lazy_test.dbo.lazy_test_external;
+
+statement ok
+DROP TABLE lazy_test.dbo.lazy_test_table1;
+
+# =============================================================================
+# Test 7: Point invalidation - CREATE SCHEMA
+# New schemas should be visible without full cache refresh
+# =============================================================================
+
+# Create a new schema
+statement ok
+CREATE SCHEMA lazy_test.lazy_test_schema;
+
+# Create a table in the new schema to verify it exists
+statement ok
+CREATE TABLE lazy_test.lazy_test_schema.schema_test_table (id INTEGER PRIMARY KEY);
+
+# Verify table is accessible
+query I
+SELECT COUNT(*) FROM lazy_test.lazy_test_schema.schema_test_table;
+----
+0
+
+# =============================================================================
+# Test 8: Point invalidation - DROP SCHEMA
+# Dropped schemas should disappear without full cache refresh
+# =============================================================================
+
+# Cleanup table before dropping schema (SQL Server requires empty schema)
+statement ok
+DROP TABLE lazy_test.lazy_test_schema.schema_test_table;
+
+# Drop the schema
+statement ok
+DROP SCHEMA lazy_test.lazy_test_schema;
+
+# Verify schema is gone (creating a table in it should fail)
+statement error
+CREATE TABLE lazy_test.lazy_test_schema.should_fail (id INTEGER);
+----
+not found
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DETACH lazy_test;

@@ -152,10 +152,23 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 															OnEntryNotFound if_not_found) {
 	auto &name = schema_lookup.GetEntryName();
 
-	// Ensure metadata cache is loaded
+	// Ensure cache settings are loaded (sets TTL)
 	if (transaction.context) {
 		EnsureCacheLoaded(*transaction.context);
 	}
+
+	// Acquire connection to trigger lazy loading of schema list
+	if (!connection_pool_) {
+		throw InternalException("Connection pool not initialized");
+	}
+	auto connection = connection_pool_->Acquire();
+	if (!connection) {
+		throw IOException("Failed to acquire connection for schema lookup");
+	}
+
+	// Trigger lazy loading of schema list
+	metadata_cache_->EnsureSchemasLoaded(*connection);
+	connection_pool_->Release(std::move(connection));
 
 	// Check if schema exists in cache
 	if (!metadata_cache_->HasSchema(name)) {
@@ -170,10 +183,22 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 }
 
 void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	// Ensure cache is loaded
+	// Ensure cache is loaded (sets TTL)
 	EnsureCacheLoaded(context);
 
-	auto schema_names = metadata_cache_->GetSchemaNames();
+	// Acquire connection for lazy loading
+	if (!connection_pool_) {
+		throw InternalException("Connection pool not initialized");
+	}
+	auto connection = connection_pool_->Acquire();
+	if (!connection) {
+		throw IOException("Failed to acquire connection for schema scan");
+	}
+
+	auto schema_names = metadata_cache_->GetSchemaNames(*connection);
+
+	connection_pool_->Release(std::move(connection));
+
 	for (const auto &name : schema_names) {
 		auto &schema_entry = GetOrCreateSchemaEntry(name);
 		callback(schema_entry);
@@ -208,13 +233,8 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 		throw InternalException("Cannot execute CREATE SCHEMA without client context");
 	}
 
-	// Invalidate cache so the new schema is visible
-	InvalidateMetadataCache();
-
-	// Re-load and return the schema entry
-	if (transaction.HasContext()) {
-		EnsureCacheLoaded(transaction.GetContext());
-	}
+	// Point invalidation: invalidate schema list so new schema is visible
+	metadata_cache_->InvalidateAll();
 
 	return &GetOrCreateSchemaEntry(info.schema);
 }
@@ -228,8 +248,8 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Execute DDL on SQL Server
 	ExecuteDDL(context, tsql);
 
-	// Invalidate cache
-	InvalidateMetadataCache();
+	// Point invalidation: invalidate schema list
+	metadata_cache_->InvalidateAll();
 
 	// Remove the schema entry from our local cache
 	{
@@ -618,6 +638,20 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 	}
 }
 
+void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
+	// Invalidate the schema's table list in the metadata cache
+	if (metadata_cache_) {
+		metadata_cache_->InvalidateSchema(schema_name);
+	}
+
+	// Also invalidate the local schema entry's table set if it exists
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	auto it = schema_entries_.find(schema_name);
+	if (it != schema_entries_.end()) {
+		it->second->GetTableSet().Invalidate();
+	}
+}
+
 void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 	// Check if catalog integration is disabled
 	if (!catalog_enabled_) {
@@ -632,29 +666,51 @@ void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 		throw IOException("MSSQL connection pool not initialized - cannot refresh cache");
 	}
 
-	// Check if cache needs refresh
-	if (!metadata_cache_->NeedsRefresh() && !metadata_cache_->IsExpired()) {
-		return;
+	// Load cache TTL from settings and apply it
+	// Lazy loading will handle actual metadata loading on first access
+	int64_t cache_ttl = LoadCatalogCacheTTL(context);
+	metadata_cache_->SetTTL(cache_ttl);
+	metadata_cache_->SetDatabaseCollation(database_collation_);
+
+	// Note: No eager Refresh() call - lazy loading handles this
+	// Each cache level (schemas, tables, columns) loads independently on first access
+}
+
+void MSSQLCatalog::RefreshCache(ClientContext &context) {
+	// Check if catalog integration is disabled
+	if (!catalog_enabled_) {
+		throw CatalogException(
+			"MSSQL catalog '%s' is attached with catalog=false (catalog disabled). "
+			"Cache refresh not available. "
+			"Use mssql_scan('%s', 'SELECT ...') or mssql_exec('%s', 'SQL') for raw queries.",
+			context_name_, context_name_, context_name_);
 	}
 
-	// Load cache TTL from settings
+	if (!connection_pool_) {
+		throw IOException("MSSQL connection pool not initialized - cannot refresh cache");
+	}
+
+	// Load cache TTL from settings and apply it
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
 
-	// Acquire connection and refresh cache
+	// Acquire connection for full cache refresh
 	auto connection = connection_pool_->Acquire();
 	if (!connection) {
-		throw IOException("Failed to acquire connection for metadata refresh");
+		throw IOException("Failed to acquire connection for cache refresh");
 	}
 
-	try {
-		metadata_cache_->Refresh(*connection, database_collation_);
-	} catch (...) {
-		connection_pool_->Release(std::move(connection));
-		throw;
-	}
+	// Perform full eager cache refresh
+	metadata_cache_->Refresh(*connection, database_collation_);
 
+	// Release connection
 	connection_pool_->Release(std::move(connection));
+
+	// Invalidate all schema table sets to pick up any changes
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	for (auto &entry : schema_entries_) {
+		entry.second->GetTableSet().Invalidate();
+	}
 }
 
 }  // namespace duckdb
