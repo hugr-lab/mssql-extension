@@ -970,16 +970,6 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	uint16_t servername_offset = var_offset;
 	var_offset += servername_len * 2;
 
-	// Per MS-TDS 2.2.6.3, the Extension field (ibExtension) points to a DWORD
-	// that contains the actual offset to the feature extensions.
-	// Structure in variable data:
-	//   [strings...] [ExtensionDWORD(4)] [Database] [FeatureExtensions]
-	// The header's ibExtension points to the ExtensionDWORD.
-
-	// Extension DWORD location (after servername)
-	uint16_t extension_dword_offset = var_offset;
-	var_offset += 4;  // DWORD that will point to feature extensions
-
 	// CltIntName (unused) - points to same offset, length 0
 	uint16_t cltintname_offset = var_offset;
 
@@ -990,16 +980,29 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	uint16_t database_offset = var_offset;
 	var_offset += database_len * 2;
 
-	// Feature extensions start here
+	// SSPI, AtchDBFile, ChangePassword - all unused, point to current offset
+	uint16_t sspi_attrdb_chgpwd_offset = var_offset;
+
+	// Per MS-TDS 2.2.6.3 and go-mssqldb implementation:
+	// The Extension DWORD comes AFTER all variable strings.
+	// ibExtension points to this DWORD, cbExtension = 4 (size of DWORD).
+	// The DWORD contains the offset to the actual feature extensions.
+	// Feature extensions immediately follow the DWORD.
+	//
+	// Structure: [all strings] [DWORD] [FeatureExtensions]
+
+	uint16_t extension_dword_offset = var_offset;
+	var_offset += 4;  // DWORD that contains offset to feature extensions
+
+	// Feature extensions start immediately after the DWORD
 	uint32_t feature_ext_offset = var_offset;
 
-	// Feature extensions for Azure SQL:
-	// 1. AZURESQLSUPPORT (0x08): Required for Azure SQL
-	// 2. FEDAUTH (0x02): For authentication
-	// 3. TERMINATOR (0xFF)
+	// Feature extensions for Azure SQL (per go-mssqldb):
+	// 1. FEDAUTH (0x02): For authentication
+	// 2. TERMINATOR (0xFF)
+	// Note: AZURESQLSUPPORT is optional - we'll include it as go-mssqldb does
 
-	// AZURESQLSUPPORT extension: FeatureId(1) + FeatureDataLen(4) + Data(1)
-	// Total: 6 bytes
+	// AZURESQLSUPPORT extension: FeatureId(1) + FeatureDataLen(4) + Data(1) = 6 bytes
 	uint32_t azuresql_ext_len = 6;
 
 	// FEDAUTH extension: FeatureId(1) + FeatureDataLen(4) + FeatureData(variable)
@@ -1012,8 +1015,8 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;
 
 	// Total length calculation
-	// Fixed header (94) + variable strings + ExtensionDWORD(4) + database +
-	// AZURESQLSUPPORT extension (6) + FEDAUTH extension (fedauth_ext_len) + Terminator(1)
+	// var_offset includes: Fixed header (94) + all variable strings + ExtensionDWORD (4)
+	// Add: AZURESQLSUPPORT extension (6) + FEDAUTH extension + Terminator (1)
 	uint32_t total_length = var_offset + azuresql_ext_len + fedauth_ext_len + 1;
 
 	// Build fixed header (94 bytes)
@@ -1048,13 +1051,15 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	packet.AppendByte(flags2);
 
 	// Offset 26: TypeFlags (1 byte)
-	// Bit 4: fFedAuth - indicates FEDAUTH feature extension present
-	uint8_t type_flags = 0x10;  // fFedAuth bit
+	// Bit 4: fReadOnlyIntent - 0 for read/write, 1 for read-only
+	// For Azure SQL with FEDAUTH, use read/write by default
+	uint8_t type_flags = 0x00;  // Read/write intent
 	packet.AppendByte(type_flags);
 
 	// Offset 27: OptionFlags3 (1 byte)
 	// Bit 4: fExtension - indicates feature extension data is present (MS-TDS 2.2.6.3)
-	uint8_t flags3 = 0x10;  // fExtension (bit 4)
+	// Bit 5: fUnknownCollationHandling - client handles unknown collation (set by tedious)
+	uint8_t flags3 = 0x10 | 0x20;  // fExtension | fUnknownCollationHandling
 	packet.AppendByte(flags3);
 
 	// Offset 28: ClientTimeZone (4 bytes, LE)
@@ -1086,10 +1091,9 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	packet.AppendUInt16LE(servername_len);
 
 	// Extension - ibExtension points to the DWORD containing feature extension offset
-	// cbExtension is the length of extensions (not including the DWORD pointer itself)
-	uint16_t feature_ext_len = static_cast<uint16_t>(azuresql_ext_len + fedauth_ext_len + 1);  // AZURESQLSUPPORT + FEDAUTH + Terminator
+	// Per go-mssqldb: cbExtension = 4 (just the DWORD size, not including extension data)
 	packet.AppendUInt16LE(extension_dword_offset);
-	packet.AppendUInt16LE(feature_ext_len);
+	packet.AppendUInt16LE(4);  // cbExtension = 4 (DWORD size only)
 
 	// CltIntName (unused)
 	packet.AppendUInt16LE(cltintname_offset);
@@ -1108,16 +1112,16 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 		packet.AppendByte(0);
 	}
 
-	// SSPI (unused) - point to end of variable data
-	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	// SSPI (unused)
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
 	packet.AppendUInt16LE(0);
 
 	// AtchDBFile (unused)
-	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
 	packet.AppendUInt16LE(0);
 
 	// ChangePassword (unused)
-	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
 	packet.AppendUInt16LE(0);
 
 	// cbSSPILong (4 bytes)
@@ -1130,8 +1134,8 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	// HostName (UTF-16LE)
 	packet.AppendUTF16LE(host);
 
-	// UserName - empty for FEDAUTH
-	// Password - empty for FEDAUTH
+	// UserName - empty for FEDAUTH (no data written)
+	// Password - empty for FEDAUTH (no data written)
 
 	// AppName (UTF-16LE)
 	packet.AppendUTF16LE(app_name);
@@ -1139,21 +1143,25 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	// ServerName (UTF-16LE)
 	packet.AppendUTF16LE(host);
 
-	// ExtensionDWORD - points to the actual feature extension data
-	packet.AppendUInt32LE(feature_ext_offset);
-
-	// CltIntName - empty
-	// Language - empty
+	// CltIntName - empty (no data written)
+	// Language - empty (no data written)
 
 	// Database (UTF-16LE)
 	packet.AppendUTF16LE(database);
+
+	// SSPI - empty (no data written)
+	// AtchDBFile - empty (no data written)
+	// ChangePassword - empty (no data written)
+
+	// ExtensionDWORD - contains offset to feature extensions
+	// Per go-mssqldb: this DWORD comes after ALL variable strings
+	packet.AppendUInt32LE(feature_ext_offset);
 
 	// =====================================
 	// Feature Extensions
 	// =====================================
 
-	// AZURESQLSUPPORT extension (FeatureId 0x08)
-	// Required for Azure SQL connections
+	// AZURESQLSUPPORT extension (FeatureId 0x08) - for Azure SQL connections
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::AZURESQLSUPPORT));
 	packet.AppendUInt32LE(1);  // FeatureDataLen = 1
 	packet.AppendByte(0x01);   // FeatureData = enabled
