@@ -127,19 +127,6 @@ private:
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 						 const std::string &tenant_id_override = "");
 
-//===----------------------------------------------------------------------===//
-// AcquireTokenWithSDK - Acquire token using Azure SDK credentials
-//
-// Internal function that uses Azure SDK (ClientSecretCredential, AzureCliCredential, etc.)
-//
-// Parameters:
-//   info - Parsed Azure secret information
-//
-// Returns:
-//   TokenResult with access token on success, error message on failure
-//===----------------------------------------------------------------------===//
-TokenResult AcquireTokenWithSDK(const AzureSecretInfo &info);
-
 }  // namespace azure
 }  // namespace mssql
 }  // namespace duckdb

@@ -15,14 +15,6 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Allow multiple definitions for DuckDB constexpr static members (LogicalType::*, etc.)
-# This is needed on Linux because C++17 constexpr static members can cause ODR violations
-# when linking static extension libraries into shared libraries.
-# See: https://github.com/duckdb/duckdb/issues/XXX (common DuckDB extension issue)
-if(UNIX AND NOT APPLE)
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition" CACHE STRING "" FORCE)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-multiple-definition" CACHE STRING "" FORCE)
-endif()
 
 include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy src/include/azure)
 
@@ -77,12 +69,10 @@ message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
 message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
 
 # =============================================================================
-# Azure SDK for Azure AD authentication
+# CURL for Azure AD OAuth2 authentication
 # =============================================================================
-find_package(azure-identity-cpp CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
-message(STATUS "Azure SDK found for Azure AD authentication")
 message(STATUS "CURL found: ${CURL_VERSION_STRING}")
 
 # =============================================================================
@@ -193,7 +183,7 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
 if(NOT WIN32)
@@ -212,7 +202,7 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
 if(NOT WIN32)

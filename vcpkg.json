@@ -4,7 +4,7 @@
   "description": "DuckDB extension for Microsoft SQL Server using native TDS protocol",
   "dependencies": [
     "openssl",
-    "azure-identity-cpp"
+    "curl"
   ],
   "builtin-baseline": "5ee5eee0d3e9c6098b24d263e9099edcdcef6631",
   "overrides": [
