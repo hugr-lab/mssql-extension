@@ -136,6 +136,15 @@ Tests require these environment variables (automatically set by `make integratio
 | `MSSQL_TESTDB_URI` | (computed) | URI connection string for TestDB |
 | `MSSQL_TEST_DSN_TLS` | (not exported) | TLS URI string (export manually for TLS tests) |
 
+**Azure AD Test Environment Variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_APP_ID` | Azure AD application (client) ID for service principal tests |
+| `AZURE_TENANT_ID` | Azure AD tenant ID |
+| `AZURE_CLIENT_SECRET` | Azure AD client secret for service principal tests |
+| `AZURE_SQL_TEST_DSN` | Connection string to Azure SQL Database (for azure_lazy_loading.test) |
+
 **Debug Environment Variables:**
 
 | Variable | Values | Description |
@@ -174,9 +183,12 @@ test/
 │   │   ├── data_types.test         # Data type handling tests
 │   │   ├── datetimeoffset.test     # DATETIMEOFFSET type tests
 │   │   ├── ddl_alter.test          # ALTER TABLE tests
+│   │   ├── ddl_if_not_exists.test  # CREATE TABLE IF NOT EXISTS tests
 │   │   ├── ddl_schema.test         # CREATE/DROP SCHEMA tests
 │   │   ├── ddl_table.test          # CREATE/DROP TABLE tests
 │   │   ├── filter_pushdown.test    # Filter pushdown tests
+│   │   ├── incremental_ttl.test    # Incremental cache TTL expiration behavior
+│   │   ├── lazy_loading.test       # Lazy loading and point invalidation tests
 │   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests
 │   │   ├── statistics.test         # Statistics provider tests
@@ -196,17 +208,20 @@ test/
 │   │   ├── insert_returning.test   # INSERT with RETURNING clause
 │   │   └── insert_types.test       # INSERT data type handling
 │   ├── ctas/                       # CREATE TABLE AS SELECT tests
+│   │   ├── ctas_auto_tablock.test  # Auto-TABLOCK for new tables
 │   │   ├── ctas_basic.test         # Basic CTAS functionality
-│   │   ├── ctas_types.test         # Data type mapping in CTAS
 │   │   ├── ctas_bcp.test           # BCP mode (default) tests
+│   │   ├── ctas_failure.test       # Error handling tests
+│   │   ├── ctas_if_not_exists.test # CREATE TABLE IF NOT EXISTS
 │   │   ├── ctas_insert_mode.test   # Legacy INSERT mode tests
 │   │   ├── ctas_large.test         # Large dataset CTAS
 │   │   ├── ctas_or_replace.test    # CREATE OR REPLACE tests
-│   │   ├── ctas_failure.test       # Error handling tests
-│   │   └── ctas_transaction.test   # CTAS within transactions
+│   │   ├── ctas_transaction.test   # CTAS within transactions
+│   │   └── ctas_types.test         # Data type mapping in CTAS
 │   ├── integration/                # Core integration tests
 │   │   ├── basic_queries.test      # Basic query functionality
 │   │   ├── connection_pool.test    # Connection pool tests
+│   │   ├── ddl_ansi_settings.test  # ANSI session settings for DDL
 │   │   ├── diagnostic_functions.test # Diagnostic function tests
 │   │   ├── filter_pushdown.test    # Integration filter pushdown
 │   │   ├── large_data.test         # Large dataset handling
@@ -243,14 +258,24 @@ test/
 │   │   ├── transaction_mssql_scan.test       # mssql_scan in transactions
 │   │   └── transaction_rollback.test         # Rollback operations
 │   ├── copy/                       # COPY TO MSSQL (BulkLoadBCP) tests
+│   │   ├── copy_auto_tablock.test  # Auto-TABLOCK for new tables
 │   │   ├── copy_basic.test         # Basic COPY with URL and catalog syntax
-│   │   ├── copy_types.test         # Data type handling in COPY
-│   │   ├── copy_large.test         # Large dataset COPY performance
+│   │   ├── copy_column_mapping.test # Name-based column mapping tests
+│   │   ├── copy_connection_leak.test # Connection leak detection tests
+│   │   ├── copy_empty_schema.test  # Empty schema syntax tests
 │   │   ├── copy_errors.test        # Error handling (missing table, bad data)
+│   │   ├── copy_existing_temp.test # Existing temp table COPY tests
+│   │   ├── copy_large.test         # Large dataset COPY performance
 │   │   ├── copy_overwrite.test     # REPLACE option (drop and recreate)
 │   │   ├── copy_temp.test          # Session-scoped temp table COPY
 │   │   ├── copy_transaction.test   # COPY within transactions
-│   │   └── copy_column_mapping.test # Name-based column mapping tests
+│   │   ├── copy_type_mismatch.test # Type mismatch handling tests
+│   │   └── copy_types.test         # Data type handling in COPY
+│   ├── azure/                      # Azure AD authentication tests
+│   │   ├── azure_auth_test_function.test # mssql_azure_auth_test() function tests
+│   │   ├── azure_device_code.test  # Device code flow tests (interactive)
+│   │   ├── azure_lazy_loading.test # Lazy catalog loading with Azure SQL (requires AZURE_SQL_TEST_DSN)
+│   │   └── azure_secret_validation.test # Azure secret validation tests
 │   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_exec.test             # mssql_exec() function tests
@@ -335,6 +360,7 @@ DETACH testdb;
 | `[transaction]` | Transaction management tests | Yes |
 | `[copy]` | COPY TO MSSQL (BulkLoadBCP) tests | Yes |
 | `[ctas]` | CREATE TABLE AS SELECT tests | Yes |
+| `[azure]` | Azure AD authentication tests | No (requires Azure credentials) |
 
 ---
 
@@ -806,6 +832,66 @@ DETACH db;
 2. **At least one match required**: COPY fails if no source columns match any target columns
 3. **Use transactions for temp tables**: Temp table tests require transaction context
 4. **Verify with mssql_scan**: Use `mssql_scan()` to query temp tables within transactions
+
+### 11. Writing Azure AD Authentication Tests
+
+Azure AD tests verify token acquisition without requiring SQL Server connectivity:
+
+```sql
+# name: test/sql/azure/my_azure_test.test
+# description: Test Azure AD authentication
+# group: [azure]
+
+require mssql
+
+# Skip if Azure credentials not configured
+require-env AZURE_APP_ID
+
+# Create Azure secret for service principal
+statement ok
+CREATE SECRET azure_sp (
+    TYPE azure,
+    provider 'service_principal',
+    tenant_id '${AZURE_TENANT_ID}',
+    client_id '${AZURE_APP_ID}',
+    client_secret '${AZURE_CLIENT_SECRET}'
+);
+
+# Test token acquisition (no SQL Server connection needed)
+query I
+SELECT length(mssql_azure_auth_test('azure_sp')) > 100;
+----
+true
+
+# Cleanup
+statement ok
+DROP SECRET azure_sp;
+```
+
+**Azure AD Test Best Practices:**
+
+1. **Use `require-env AZURE_APP_ID`** - Tests are skipped when Azure credentials not configured
+2. **Test token acquisition only** - `mssql_azure_auth_test()` validates tokens without SQL Server
+3. **Keep tests in `test/sql/azure/`** - Separate from integration tests that require SQL Server
+4. **Group as `[azure]`** - Allows running Azure tests independently
+
+**Azure AD Authentication Methods:**
+
+| Method | Secret Type | Required Fields |
+|--------|-------------|-----------------|
+| Service Principal | `azure` | `provider='service_principal'`, `tenant_id`, `client_id`, `client_secret` |
+| Azure CLI | `azure` | `provider='credential_chain'`, `chain='cli'` |
+| Interactive | `azure` | `provider='credential_chain'`, `chain='interactive'`, `tenant_id` |
+
+**Azure AD Test Scenarios:**
+
+1. **Service principal auth** - Validate client credentials flow
+2. **Azure CLI auth** - Validate `az account get-access-token` integration
+3. **Interactive auth** - Validate device code flow (manual testing only)
+4. **Token caching** - Verify tokens are cached and reused
+5. **Error handling** - Invalid credentials, expired tokens, missing secrets
+
+See [AZURE.md](../AZURE.md) for complete Azure AD authentication documentation.
 
 ---
 

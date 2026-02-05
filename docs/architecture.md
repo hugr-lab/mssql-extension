@@ -42,7 +42,8 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐    │
 │  │  Catalog Integration (MSSQLCatalog, Schema, Table entries)   │    │
-│  │  - Metadata cache with TTL                                   │    │
+│  │  - Incremental cache with lazy loading and TTL               │    │
+│  │  - Point invalidation for DDL operations                     │    │
 │  │  - Statistics provider                                       │    │
 │  │  - Primary key / rowid support                               │    │
 │  └─────────────────────────┬────────────────────────────────────┘    │
@@ -90,6 +91,11 @@ src/
 ├── mssql_functions.cpp           # mssql_scan (table function), mssql_exec (scalar)
 ├── mssql_secret.cpp              # Secret type registration and validation
 ├── mssql_storage.cpp             # ATTACH mechanism, context manager
+│
+├── azure/                        # Azure AD authentication infrastructure
+│   ├── azure_token.cpp           # Token acquisition and caching
+│   ├── azure_device_code.cpp     # Interactive device code flow (RFC 8628)
+│   └── azure_secret_reader.cpp   # Azure secret parsing from DuckDB SecretManager
 │
 ├── catalog/                      # DuckDB catalog integration
 │   ├── mssql_catalog.cpp         # Catalog implementation (extends duckdb::Catalog)
@@ -202,6 +208,7 @@ src/
 | `mssql_ping` | Scalar | `(handle BIGINT) → BOOLEAN` | Test connection liveness |
 | `mssql_pool_stats` | Table | `(context VARCHAR?)` | Pool statistics |
 | `mssql_refresh_cache` | Scalar | `(catalog VARCHAR) → BOOLEAN` | Refresh metadata cache |
+| `mssql_azure_auth_test` | Scalar | `(secret VARCHAR, tenant? VARCHAR) → VARCHAR` | Test Azure AD token acquisition |
 | `mssql_version` | Scalar | `() → VARCHAR` | Extension version |
 
 ## Extension Settings
@@ -328,6 +335,42 @@ These options are required for:
 
 When a connection is returned to the pool and later reused with the `RESET_CONNECTION` flag, session state is reset. However, SQL Server remembers the connection's ODBC mode (set via fODBC during LOGIN7) and automatically restores ANSI-compliant session options.
 
+## Azure AD Authentication Infrastructure
+
+The extension includes Azure AD token acquisition infrastructure in `src/azure/`:
+
+```
+src/azure/
+├── azure_token.cpp           # Token acquisition and caching
+├── azure_device_code.cpp     # Interactive device code flow (RFC 8628)
+├── azure_secret_reader.cpp   # Azure secret parsing from DuckDB SecretManager
+└── include/azure/
+    ├── azure_token.hpp       # TokenCache, TokenResult, acquisition functions
+    ├── azure_device_code.hpp # Device code flow constants and functions
+    └── azure_secret_reader.hpp # AzureSecretInfo struct
+```
+
+### Authentication Methods
+
+| Method | Provider | Description |
+|--------|----------|-------------|
+| Service Principal | `service_principal` | Client credentials flow with client_id/client_secret |
+| Azure CLI | `credential_chain` (chain=`cli`) | Uses `az account get-access-token` |
+| Interactive | `credential_chain` (chain=`interactive`) | Device code flow with browser authentication |
+
+### Token Caching
+
+Tokens are cached globally in `TokenCache` (singleton) with:
+- Thread-safe access via mutex
+- 5-minute refresh margin before expiration
+- Cache key includes secret name and optional tenant override
+
+### Test Function
+
+`mssql_azure_auth_test(secret_name, tenant_id?)` validates Azure AD token acquisition without connecting to SQL Server. Useful for testing Azure credentials in isolation.
+
+See [AZURE.md](../AZURE.md) for complete usage documentation.
+
 ## Cross-References
 
 - [TDS Protocol Layer](tds-protocol.md)
@@ -336,3 +379,4 @@ When a connection is returned to the pool and later reused with the `RESET_CONNE
 - [Type Mapping](type-mapping.md)
 - [Query Execution & DML](query-execution.md)
 - [Transaction Management](transactions.md)
+- [Azure AD Authentication](../AZURE.md)

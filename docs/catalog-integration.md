@@ -169,7 +169,51 @@ void EnsureLoaded(ClientContext &context) {
 
 In-memory cache of schema, table, and column metadata with optional TTL-based expiration.
 
-### Cache State Machine
+### Incremental Cache with Lazy Loading
+
+The metadata cache uses a three-level lazy loading strategy to minimize SQL Server queries:
+
+```
+Level 1: Schema List
+  │ EnsureSchemasLoaded() - loads schema names from sys.schemas
+  ▼
+Level 2: Table List (per schema)
+  │ EnsureTablesLoaded(schema) - loads table names from sys.objects
+  ▼
+Level 3: Column Metadata (per table)
+    EnsureColumnsLoaded(schema, table) - loads columns from sys.columns
+```
+
+Each level has its own `CacheLoadState`:
+- `NOT_LOADED` (0) — never loaded or invalidated
+- `LOADING` (1) — currently being loaded (by another thread)
+- `LOADED` (2) — successfully loaded and valid
+- `STALE` (3) — TTL expired, needs refresh on next access
+
+### Lazy Loading Behavior
+
+1. **On ATTACH**: No metadata is loaded immediately
+2. **On first schema access**: Only schema list is loaded
+3. **On first table access**: Only that schema's table list is loaded
+4. **On first query**: Only that table's column metadata is loaded
+
+This reduces ATTACH time from seconds to milliseconds for databases with many schemas/tables.
+
+### Point Invalidation
+
+DDL operations trigger targeted cache invalidation instead of full refresh:
+
+| Operation | Invalidation |
+|-----------|--------------|
+| `CREATE TABLE` | `InvalidateSchema(schema)` — reload table list |
+| `DROP TABLE` | `InvalidateSchema(schema)` — reload table list |
+| `ALTER TABLE ADD/DROP COLUMN` | `InvalidateTable(schema, table)` — reload columns |
+| `CREATE SCHEMA` | `InvalidateAll()` — reload schema list |
+| `DROP SCHEMA` | `InvalidateAll()` — reload schema list |
+
+Point invalidation allows immediate visibility of changes without full cache refresh.
+
+### Global Cache State Machine (Backward Compatibility)
 
 ```
 EMPTY (initial)
@@ -194,9 +238,9 @@ LOADED
 - `STALE` (3) — TTL expired, needs refresh
 - `INVALID` (4) — manually invalidated
 
-### Refresh Process
+### Full Refresh Process
 
-`Refresh(TdsConnection, database_name)`:
+`Refresh(TdsConnection, database_name)` performs a full cache reload:
 1. Set state to `LOADING`
 2. Query `sys.schemas` for user schemas
 3. For each schema: query `sys.objects` for tables/views with row counts from `sys.partitions`
@@ -207,7 +251,7 @@ LOADED
 ### TTL Behavior
 
 - `ttl_seconds_ = 0` (default): manual refresh only via `mssql_refresh_cache()`
-- `ttl_seconds_ > 0`: automatic refresh when `IsExpired()` returns true
+- `ttl_seconds_ > 0`: automatic refresh when cache level's TTL expires
 
 ### Data Structures
 

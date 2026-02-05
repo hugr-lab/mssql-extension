@@ -1,0 +1,55 @@
+# name: test/sql/azure/azure_device_code.test
+# description: Test Device Code authentication error handling
+# group: [azure]
+
+require mssql
+
+require azure
+
+# Note: Interactive device code authentication cannot be fully tested in automated tests
+# because it requires user interaction (visiting URL, entering code).
+# These tests verify error handling and configuration validation only.
+
+# Test: Create Azure secret with interactive chain
+statement ok
+CREATE SECRET test_azure_interactive (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'interactive'
+);
+
+# Verify secret was created
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive';
+----
+1
+
+# Test: Create Azure secret with interactive chain and specific tenant
+statement ok
+CREATE OR REPLACE SECRET test_azure_interactive_tenant (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'interactive',
+    TENANT_ID 'common'
+);
+
+# Verify secret was created
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive_tenant';
+----
+1
+
+# Note: Testing mssql_azure_auth_test with interactive secrets would require
+# actual user interaction. In CI environments, this would hang waiting for input.
+#
+# Manual testing can be done with:
+# SELECT mssql_azure_auth_test('test_azure_interactive');
+# -- This will output: "To sign in, visit https://microsoft.com/devicelogin and enter code XXXXXX"
+# -- User must visit the URL and enter the code to complete authentication.
+
+# Clean up
+statement ok
+DROP SECRET IF EXISTS test_azure_interactive;
+
+statement ok
+DROP SECRET IF EXISTS test_azure_interactive_tenant;

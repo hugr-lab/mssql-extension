@@ -1,4 +1,5 @@
 #include "mssql_extension.hpp"
+#include "azure/azure_test_function.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
@@ -59,6 +60,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
 											 LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
+
+	// 10. Register Azure authentication test function
+	mssql::azure::RegisterAzureTestFunction(loader);
 }
 
 // Extension class methods
