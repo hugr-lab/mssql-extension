@@ -109,14 +109,10 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 		throw InternalException("Cannot execute CREATE TABLE without client context");
 	}
 
-	// Invalidate cache so the new table is visible
-	mssql_catalog.InvalidateMetadataCache();
+	// Point invalidation: invalidate schema's table list and local table set
+	mssql_catalog.InvalidateSchemaTableSet(name);
 
-	// Re-load the table entry from SQL Server
-	// First ensure cache is loaded
-	mssql_catalog.EnsureCacheLoaded(transaction.GetContext());
-
-	// Look up the newly created table
+	// Look up the newly created table (triggers lazy load of table list)
 	return tables_.GetEntry(transaction.GetContext(), table_name);
 }
 
@@ -297,8 +293,11 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
 
-	// Invalidate cache so the changes are visible
-	mssql_catalog.InvalidateMetadataCache();
+	// Point invalidation: invalidate the altered table's column metadata
+	mssql_catalog.GetMetadataCache().InvalidateTable(name, table_name);
+
+	// Invalidate the local table set cache to pick up column changes
+	mssql_catalog.InvalidateSchemaTableSet(name);
 }
 
 void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
@@ -313,8 +312,8 @@ void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		// Execute DDL on SQL Server
 		mssql_catalog.ExecuteDDL(context, tsql);
 
-		// Invalidate cache
-		mssql_catalog.InvalidateMetadataCache();
+		// Point invalidation: invalidate schema's table list and local table set
+		mssql_catalog.InvalidateSchemaTableSet(name);
 		return;
 	}
 

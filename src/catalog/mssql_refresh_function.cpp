@@ -103,12 +103,8 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 		// Get the MSSQL catalog
 		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
 
-		// Invalidate the cache to force a refresh
-		catalog.InvalidateMetadataCache();
-
-		// Reload the cache from SQL Server
-		// This will acquire a connection and query metadata
-		catalog.EnsureCacheLoaded(client_context);
+		// Perform full cache refresh (invalidates and reloads all metadata)
+		catalog.RefreshCache(client_context);
 
 		// Return true to indicate success
 		return true;

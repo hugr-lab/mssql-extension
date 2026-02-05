@@ -1,0 +1,150 @@
+# name: test/sql/azure/azure_lazy_loading.test
+# description: Test incremental catalog cache with Azure SQL Database
+# group: [azure]
+
+# Environment variables required:
+#   AZURE_SQL_TEST_DSN - Connection string to Azure SQL Database
+#   Example: Server=myserver.database.windows.net;Database=mydb;User Id=myuser;Password=mypassword;Encrypt=true;TrustServerCertificate=false
+
+require mssql
+
+require-env AZURE_SQL_TEST_DSN
+
+# =============================================================================
+# Setup: Attach Azure SQL Database
+# =============================================================================
+
+statement ok
+ATTACH '${AZURE_SQL_TEST_DSN}' AS azure_test (TYPE mssql);
+
+# =============================================================================
+# Test 1: Lazy loading - schema discovery on demand
+# Verify ATTACH completes without loading all metadata
+# =============================================================================
+
+# This should NOT trigger full metadata load
+statement ok
+SELECT 1;
+
+# List schemas (triggers lazy schema loading only)
+query I
+SELECT COUNT(*) > 0 FROM (
+    SELECT schema_name FROM information_schema.schemata
+    WHERE catalog_name = 'azure_test'
+) t;
+----
+1
+
+# =============================================================================
+# Test 2: Lazy loading - table metadata on demand
+# Query a specific table should only load that table's columns
+# =============================================================================
+
+# Cleanup any leftover test tables
+statement ok
+DROP TABLE IF EXISTS azure_test.dbo.azure_lazy_test;
+
+# Create a test table
+statement ok
+CREATE TABLE azure_test.dbo.azure_lazy_test (
+    id INTEGER PRIMARY KEY,
+    name NVARCHAR(100),
+    created_at DATETIME2
+);
+
+# Query the table - triggers lazy column loading for this table only
+query ITT
+SELECT * FROM azure_test.dbo.azure_lazy_test ORDER BY id;
+----
+
+# =============================================================================
+# Test 3: Point invalidation - CREATE/DROP TABLE
+# New/dropped tables visible without full cache refresh
+# =============================================================================
+
+# Insert test data
+statement ok
+INSERT INTO azure_test.dbo.azure_lazy_test (id, name, created_at)
+VALUES (1, 'Azure Test', CURRENT_TIMESTAMP);
+
+# Verify data
+query I
+SELECT COUNT(*) FROM azure_test.dbo.azure_lazy_test;
+----
+1
+
+# Create another table
+statement ok
+CREATE TABLE azure_test.dbo.azure_lazy_test2 (id INTEGER PRIMARY KEY);
+
+# Both tables should be visible
+query I
+SELECT COUNT(*) FROM (
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'dbo' AND table_name LIKE 'azure_lazy_test%'
+) t;
+----
+2
+
+# Drop second table
+statement ok
+DROP TABLE azure_test.dbo.azure_lazy_test2;
+
+# Only one table remains
+query I
+SELECT COUNT(*) FROM (
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'dbo' AND table_name LIKE 'azure_lazy_test%'
+) t;
+----
+1
+
+# =============================================================================
+# Test 4: Point invalidation - ALTER TABLE
+# Column changes visible without full cache refresh
+# =============================================================================
+
+# Add a column
+statement ok
+ALTER TABLE azure_test.dbo.azure_lazy_test ADD description NVARCHAR(200);
+
+# Verify new column works
+statement ok
+UPDATE azure_test.dbo.azure_lazy_test
+SET description = 'Added via ALTER TABLE'
+WHERE id = 1;
+
+query ITT
+SELECT id, name, description FROM azure_test.dbo.azure_lazy_test WHERE id = 1;
+----
+1	Azure Test	Added via ALTER TABLE
+
+# =============================================================================
+# Test 5: TTL expiration (with short TTL)
+# External changes detected after TTL
+# =============================================================================
+
+# Note: Full TTL expiration testing requires waiting for TTL
+# This test verifies mssql_refresh_cache works for manual refresh
+
+# Add column via mssql_exec (bypasses DuckDB DDL)
+statement ok
+SELECT mssql_exec('azure_test', 'ALTER TABLE dbo.azure_lazy_test ADD external_col INT');
+
+# Manual refresh to pick up change
+statement ok
+SELECT mssql_refresh_cache('azure_test');
+
+# Verify new column is accessible
+statement ok
+SELECT external_col FROM azure_test.dbo.azure_lazy_test LIMIT 1;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DROP TABLE azure_test.dbo.azure_lazy_test;
+
+statement ok
+DETACH azure_test;

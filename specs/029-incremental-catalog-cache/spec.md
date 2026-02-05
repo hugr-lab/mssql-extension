@@ -174,33 +174,31 @@ A user connects to Azure SQL Database using the incremental catalog cache. All l
 
 **TTL Management**:
 
-- **FR-006**: System MUST support separate TTL configuration for schema metadata (table lists)
-- **FR-007**: System MUST support separate TTL configuration for table metadata (columns)
-- **FR-008**: System MUST track last refresh timestamp at schema and table levels independently
-- **FR-009**: System MUST refresh only the stale metadata level on TTL expiration (not entire cache)
-- **FR-010**: When TTL = 0, system MUST disable automatic expiration (manual/DDL invalidation only)
+- **FR-006**: System MUST use existing `mssql_catalog_cache_ttl` setting for all cache levels
+- **FR-007**: System MUST track last refresh timestamp at schema and table levels independently
+- **FR-008**: System MUST refresh only the stale metadata level on TTL expiration (not entire cache)
+- **FR-009**: When TTL = 0, system MUST disable automatic expiration (manual/DDL invalidation only)
 
 **Point Invalidation**:
 
-- **FR-011**: `CREATE TABLE` via DuckDB Catalog MUST invalidate only the parent schema's table list
-- **FR-012**: `DROP TABLE` via DuckDB Catalog MUST remove table from cache and invalidate schema's table list
-- **FR-013**: `ALTER TABLE` via DuckDB Catalog MUST invalidate only the affected table's column metadata
-- **FR-014**: `CREATE SCHEMA` via DuckDB Catalog MUST add schema to cache without global refresh
-- **FR-015**: `DROP SCHEMA` via DuckDB Catalog MUST remove schema and its contents from cache
-- **FR-016**: Point invalidation MUST NOT be triggered by `mssql_exec()` (no SQL parsing)
+- **FR-010**: `CREATE TABLE` via DuckDB Catalog MUST invalidate only the parent schema's table list
+- **FR-011**: `DROP TABLE` via DuckDB Catalog MUST remove table from cache and invalidate schema's table list
+- **FR-012**: `ALTER TABLE` via DuckDB Catalog MUST invalidate only the affected table's column metadata
+- **FR-013**: `CREATE SCHEMA` via DuckDB Catalog MUST add schema to cache without global refresh
+- **FR-014**: `DROP SCHEMA` via DuckDB Catalog MUST remove schema and its contents from cache
+- **FR-015**: Point invalidation MUST NOT be triggered by `mssql_exec()` (no SQL parsing)
 
 **Compatibility**:
 
-- **FR-017**: System MUST maintain existing thread-safety guarantees in catalog cache
-- **FR-018**: System MUST maintain backward compatibility with existing `mssql_refresh_cache()` function
-- **FR-019**: Existing `mssql_catalog_cache_ttl` setting behavior MUST be preserved as default/fallback
+- **FR-016**: System MUST maintain existing thread-safety guarantees in catalog cache
+- **FR-017**: System MUST maintain backward compatibility with existing `mssql_refresh_cache()` function
 
 **Azure SQL Testing**:
 
-- **FR-020**: Integration tests MUST include Azure SQL Database tests when `AZURE_SQL_TEST_DSN` environment variable is defined
-- **FR-021**: Azure SQL tests MUST be skipped gracefully when `AZURE_SQL_TEST_DSN` is not configured
-- **FR-022**: Lazy loading behavior MUST be validated against Azure SQL Database metadata views
-- **FR-023**: TTL expiration and point invalidation MUST work correctly with Azure SQL Database
+- **FR-018**: Integration tests MUST include Azure SQL Database tests when `AZURE_SQL_TEST_DSN` environment variable is defined
+- **FR-019**: Azure SQL tests MUST be skipped gracefully when `AZURE_SQL_TEST_DSN` is not configured
+- **FR-020**: Lazy loading behavior MUST be validated against Azure SQL Database metadata views
+- **FR-021**: TTL expiration and point invalidation MUST work correctly with Azure SQL Database
 
 ### Key Entities
 
@@ -230,5 +228,5 @@ A user connects to Azure SQL Database using the incremental catalog cache. All l
 - DuckDB Catalog DDL operations (CREATE/DROP/ALTER TABLE, CREATE/DROP SCHEMA) call well-defined entry points in MSSQLSchemaEntry and MSSQLCatalog classes
 - The existing thread-safety mechanisms (mutexes for cache, schema entries, table sets) are sufficient for the incremental loading pattern
 - Users accept that `mssql_exec()` changes require manual cache refresh, as parsing arbitrary SQL is out of scope
-- Schema and table TTLs will use the same time unit (seconds) as the existing `mssql_catalog_cache_ttl` setting
+- The existing `mssql_catalog_cache_ttl` setting (seconds) applies to all cache levels with per-level timestamp tracking
 - External changes to SQL Server schema (via SSMS, other tools) are handled by TTL expiration or manual refresh, not real-time notifications

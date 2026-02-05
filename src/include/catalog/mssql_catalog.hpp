@@ -151,6 +151,13 @@ public:
 	// Invalidate the metadata cache (forces refresh on next access)
 	void InvalidateMetadataCache();
 
+	// Invalidate a specific schema's table set (point invalidation)
+	void InvalidateSchemaTableSet(const string &schema_name);
+
+	// Perform full cache refresh (for mssql_refresh_cache())
+	// Unlike EnsureCacheLoaded() which only sets TTL, this does eager full refresh
+	void RefreshCache(ClientContext &context);
+
 protected:
 	//===----------------------------------------------------------------------===//
 	// Protected Override (required by Catalog)

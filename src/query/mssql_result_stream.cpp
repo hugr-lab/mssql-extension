@@ -390,24 +390,19 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 }
 
 bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
-	MSSQL_DEBUG_LOG(1, "ReadMoreData: starting, timeout=%d", timeout_ms);
 	// Read TDS packet from connection (packet includes 8-byte header)
 	// We use the socket's ReceivePacket method to properly parse the header
 	auto *socket = connection_->GetSocket();
 	if (!socket) {
-		MSSQL_DEBUG_LOG(1, "ReadMoreData: socket is null!");
 		last_socket_error_ = "Socket is null";
 		return false;
 	}
-	MSSQL_DEBUG_LOG(1, "ReadMoreData: socket=%p, connected=%d", (void *)socket, socket->IsConnected());
 
 	tds::TdsPacket packet;
 	if (!socket->ReceivePacket(packet, timeout_ms)) {
 		last_socket_error_ = socket->GetLastError();
-		MSSQL_DEBUG_LOG(1, "ReadMoreData: ReceivePacket failed, error=%s", last_socket_error_.c_str());
 		return false;
 	}
-	MSSQL_DEBUG_LOG(1, "ReadMoreData: received packet, payload_size=%zu", packet.GetPayload().size());
 
 	// Feed only the payload to the parser (not the header)
 	const auto &payload = packet.GetPayload();
