@@ -318,7 +318,7 @@ jobs:
           echo "DuckDB Version: v1.4.4"
           echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
           echo "Platform: windows_amd64 (MSVC)"
-          echo "vcpkg Triplet: x64-windows-static-release"
+          echo "vcpkg Triplet: x64-windows-static-md (custom, dynamic CRT)"
           echo "============================================"
 
       - name: Setup vcpkg
@@ -333,9 +333,9 @@ jobs:
           path: |
             vcpkg/installed
             vcpkg/packages
-          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-windows-msvc-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-windows-msvc-x64-windows-static-release-
+            vcpkg-windows-msvc-x64-windows-static-md-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -350,8 +350,9 @@ jobs:
           cmake -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:RUNVCPKG_VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-release `
-            -DVCPKG_HOST_TRIPLET=x64-windows-static-release `
+            -DVCPKG_OVERLAY_TRIPLETS="$(Get-Location)/../../triplets" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_HOST_TRIPLET=x64-windows-static-md `
             -DVCPKG_MANIFEST_DIR="$(Get-Location)/../.." `
             -DDUCKDB_EXTENSION_CONFIGS="$(Get-Location)/../../extension_config.cmake" `
             ../../duckdb

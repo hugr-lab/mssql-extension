@@ -190,6 +190,12 @@ target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azur
 if(NOT WIN32)
     target_compile_options(${EXTENSION_NAME} PRIVATE -fvisibility=hidden)
 endif()
+
+# Allow multiple definitions for DuckDB const static members (LogicalType::*, etc.)
+# This is needed because Azure SDK pulls in headers that duplicate these constants
+if(UNIX AND NOT APPLE)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition")
+endif()
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
