@@ -135,6 +135,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - **Transaction support**: Connection pinning maps DuckDB transactions to SQL Server transactions via 8-byte ENVCHANGE descriptors. See `docs/transactions.md`.
 - **Catalog integration**: DuckDB Catalog/Schema/Table APIs with metadata cache (TTL-based), primary key discovery for rowid support.
 - **DML**: INSERT uses batched VALUES; UPDATE/DELETE use rowid-based VALUES JOIN pattern with deferred execution in transactions.
+- **DDL**: `CREATE TABLE IF NOT EXISTS` silently succeeds when table exists; `CREATE OR REPLACE TABLE` drops and recreates. Auto-TABLOCK enabled for new table creation (CTAS/COPY TO).
 - **Filter pushdown**: DuckDB filter expressions translated to T-SQL WHERE clauses. Function mapping for common string/date/arithmetic operations.
 - **DuckDB API compat**: Auto-detected at CMake time. `MSSQL_GETDATA_METHOD` macro handles GetData vs GetDataInternal.
 
@@ -173,7 +174,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_enable_statistics` | true | Enable statistics collection |
 | `mssql_statistics_cache_ttl_seconds` | 300 | Statistics cache TTL |
 | `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server during COPY |
-| `mssql_copy_tablock` | false | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access) |
+| `mssql_copy_tablock` | auto | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access). Auto-enabled for new tables when not explicitly set. |
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |
 | `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
 
@@ -204,5 +205,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - SQL Server 2019+ (remote target), in-memory (batch buffering) (027-ctas-bcp-integration)
 
 ## Recent Changes
+
+- 030-ctas-fixes: Fixed `CREATE TABLE IF NOT EXISTS` to silently succeed when table exists (Issue #44); auto-enable TABLOCK for new table creation for 15-30% performance improvement (Issue #45)
 - 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming
 - 019-fix-winsock-init: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library)

@@ -89,7 +89,7 @@
 - [x] T018 Run existing CTAS tests to verify backward compatibility
 - [x] T019 Run existing COPY tests to verify backward compatibility
 - [x] T020 Run clang-format on all modified files
-- [ ] T021 Update CLAUDE.md if new settings or behavior changes need documentation
+- [x] T021 Update CLAUDE.md if new settings or behavior changes need documentation
 
 ---
 
