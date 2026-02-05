@@ -299,7 +299,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
 			mssql_catalog.InvalidateSchemaTableSet(bdata.target.schema_name);
 			CopyDebugLog(2, "BCPCopyInitGlobal: schema '%s' table list invalidated after table creation/modification",
-			             bdata.target.schema_name.c_str());
+						 bdata.target.schema_name.c_str());
 		}
 
 		// Generate column metadata for BCP

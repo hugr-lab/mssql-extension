@@ -29,10 +29,10 @@ enum class MSSQLObjectType : uint8_t {
 //===----------------------------------------------------------------------===//
 
 enum class CacheLoadState : uint8_t {
-	NOT_LOADED = 0,  // Never loaded or invalidated
-	LOADING = 1,     // Currently being loaded (by another thread)
-	LOADED = 2,      // Successfully loaded and valid
-	STALE = 3        // TTL expired, needs refresh on next access
+	NOT_LOADED = 0,	 // Never loaded or invalidated
+	LOADING = 1,	 // Currently being loaded (by another thread)
+	LOADED = 2,		 // Successfully loaded and valid
+	STALE = 3		 // TTL expired, needs refresh on next access
 };
 
 //===----------------------------------------------------------------------===//
@@ -48,7 +48,7 @@ struct MSSQLTableMetadata {
 	// Incremental cache state for columns
 	CacheLoadState columns_load_state = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point columns_last_refresh;
-	mutable std::mutex load_mutex;  // Per-table loading synchronization
+	mutable std::mutex load_mutex;	// Per-table loading synchronization
 
 	// Default constructor
 	MSSQLTableMetadata() : object_type(MSSQLObjectType::TABLE), approx_row_count(0) {}
@@ -75,7 +75,7 @@ struct MSSQLSchemaMetadata {
 	// Incremental cache state for table list
 	CacheLoadState tables_load_state = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point tables_last_refresh;
-	mutable std::mutex load_mutex;  // Per-schema loading synchronization
+	mutable std::mutex load_mutex;	// Per-schema loading synchronization
 
 	// Default constructor
 	MSSQLSchemaMetadata() = default;
@@ -131,7 +131,7 @@ public:
 
 	// Get table metadata (triggers lazy loading of columns)
 	const MSSQLTableMetadata *GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
-	                                           const string &table_name);
+											   const string &table_name);
 
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);
@@ -181,8 +181,7 @@ public:
 	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
 
 	// Ensure column metadata for table is loaded
-	void EnsureColumnsLoaded(tds::TdsConnection &connection, const string &schema_name,
-	                         const string &table_name);
+	void EnsureColumnsLoaded(tds::TdsConnection &connection, const string &schema_name, const string &table_name);
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
@@ -239,7 +238,7 @@ private:
 	// Incremental cache state for schema list (catalog-level)
 	CacheLoadState schemas_load_state_ = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point schemas_last_refresh_;
-	mutable std::mutex schemas_mutex_;  // Schema list loading synchronization
+	mutable std::mutex schemas_mutex_;	// Schema list loading synchronization
 };
 
 }  // namespace duckdb
