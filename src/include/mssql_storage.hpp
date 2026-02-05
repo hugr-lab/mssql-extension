@@ -33,6 +33,23 @@ struct MSSQLConnectionInfo {
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
+	//===----------------------------------------------------------------------===//
+	// Azure AD Authentication (Phase 2 FEDAUTH)
+	//===----------------------------------------------------------------------===//
+	bool use_azure_auth = false;   // Use Azure AD authentication instead of SQL auth
+	string azure_secret_name;       // Name of the Azure secret for token acquisition
+
+	// Check if this connection targets an Azure endpoint
+	// Azure endpoints require Azure AD auth support and TLS hostname verification
+	bool IsAzureEndpoint() const;
+
+	// Check if this connection targets a Microsoft Fabric endpoint
+	// Fabric has limited feature support (e.g., DBCC commands not available)
+	bool IsFabricEndpoint() const;
+
+	// Check if this connection targets an Azure Synapse endpoint
+	bool IsSynapseEndpoint() const;
+
 	// Create from secret
 	static shared_ptr<MSSQLConnectionInfo> FromSecret(ClientContext &context, const string &secret_name);
 

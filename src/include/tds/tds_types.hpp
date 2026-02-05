@@ -61,6 +61,24 @@ enum class EncryptionOption : uint8_t {
 	ENCRYPT_REQ = 0x03
 };
 
+//===----------------------------------------------------------------------===//
+// LOGIN7 Feature Extension IDs (MS-TDS 2.2.7)
+//===----------------------------------------------------------------------===//
+// Feature extensions allow additional capabilities to be negotiated during login
+
+// Feature Extension IDs for LOGIN7 packet
+enum class FeatureExtId : uint8_t {
+	SESSIONRECOVERY = 0x01,  // Session recovery (not supported)
+	FEDAUTH = 0x02,          // Federated authentication (Azure AD)
+	COLUMNENCRYPTION = 0x04, // Always Encrypted (not supported)
+	GLOBALTRANSACTIONS = 0x05, // Global transactions (not supported)
+	AZURESQLSUPPORT = 0x08,  // Azure SQL support
+	DATACLASSIFICATION = 0x09, // Data classification (not supported)
+	UTF8SUPPORT = 0x0A,      // UTF-8 collation support
+	AZURESQLDNSCACHING = 0x0B, // Azure SQL DNS caching
+	TERMINATOR = 0xFF        // End of feature extensions
+};
+
 // TDS Token Types (response parsing)
 enum class TokenType : uint8_t {
 	TABNAME = 0x04,	 // Table name for browsable results
@@ -77,7 +95,8 @@ enum class TokenType : uint8_t {
 	NBCROW = 0xD2,	// Null Bitmap Compressed Row
 	RETURNSTATUS = 0x79,
 	ORDER = 0xA9,
-	RETURNVALUE = 0xAC
+	RETURNVALUE = 0xAC,
+	FEDAUTHINFO = 0xEE  // FEDAUTH info from server (Azure AD authentication)
 };
 
 // DONE Token Status Flags

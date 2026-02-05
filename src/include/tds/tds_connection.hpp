@@ -38,6 +38,15 @@ public:
 	bool Authenticate(const std::string &username, const std::string &password, const std::string &database,
 					  bool use_encrypt = false);
 
+	// Azure AD Authentication via FEDAUTH (T018/T020)
+	// Performs PRELOGIN with FEDAUTHREQUIRED and LOGIN7 with FEDAUTH feature extension
+	// Parameters:
+	//   database - initial database to connect to
+	//   fedauth_token - UTF-16LE encoded access token from Azure AD
+	//   use_encrypt - if true, enables TLS encryption (required for Azure)
+	bool AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
+	                             bool use_encrypt = true);
+
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state
 	bool IsAlive() const;
@@ -180,6 +189,10 @@ private:
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);
 	bool DoLogin7(const std::string &username, const std::string &password, const std::string &database);
+
+	// Azure AD FEDAUTH helpers (T018/T020)
+	bool DoPreloginWithFedAuth(bool use_encrypt);
+	bool DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token);
 };
 
 }  // namespace tds

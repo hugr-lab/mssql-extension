@@ -192,6 +192,139 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 	return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Azure AD FEDAUTH Authentication (T018/T020)
+//===----------------------------------------------------------------------===//
+
+bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
+                                            bool use_encrypt) {
+	// Must be in Authenticating state
+	if (state_.load() != ConnectionState::Authenticating) {
+		last_error_ = "Cannot authenticate: not in Authenticating state";
+		return false;
+	}
+
+	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: starting Azure AD authentication for db='%s', token_size=%zu",
+	                     database.c_str(), fedauth_token.size());
+
+	// Step 1: PRELOGIN handshake with FEDAUTHREQUIRED
+	if (!DoPreloginWithFedAuth(use_encrypt)) {
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Step 2: LOGIN7 with FEDAUTH feature extension
+	if (!DoLogin7WithFedAuth(database, fedauth_token)) {
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Success - transition to Idle
+	database_ = database;
+	state_.store(ConnectionState::Idle);
+	UpdateLastUsed();
+	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: Azure AD authentication successful");
+	return true;
+}
+
+bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt) {
+	MSSQL_CONN_DEBUG_LOG(1, "DoPreloginWithFedAuth: sending PRELOGIN with FEDAUTHREQUIRED");
+
+	// Build PRELOGIN packet with FEDAUTHREQUIRED option
+	TdsPacket prelogin = TdsProtocol::BuildPreloginWithFedAuth(use_encrypt, true /* fedauth_required */);
+	prelogin.SetPacketId(next_packet_id_++);
+
+	if (!socket_->SendPacket(prelogin)) {
+		last_error_ = "Failed to send PRELOGIN: " + socket_->GetLastError();
+		return false;
+	}
+
+	std::vector<uint8_t> response;
+	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+		last_error_ = "Failed to receive PRELOGIN response: " + socket_->GetLastError();
+		return false;
+	}
+
+	PreloginResponse prelogin_response = TdsProtocol::ParsePreloginResponse(response);
+	if (!prelogin_response.success) {
+		last_error_ = "PRELOGIN failed: " + prelogin_response.error_message;
+		return false;
+	}
+
+	MSSQL_CONN_DEBUG_LOG(1, "DoPreloginWithFedAuth: server version=%d.%d.%d, encryption=%d",
+	                     prelogin_response.version_major, prelogin_response.version_minor,
+	                     prelogin_response.version_build, static_cast<int>(prelogin_response.encryption));
+
+	// For Azure AD, encryption is typically required
+	if (use_encrypt) {
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_NOT_SUP) {
+			last_error_ = "TLS required for Azure AD but server does not support encryption";
+			return false;
+		}
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_OFF) {
+			last_error_ = "TLS required for Azure AD but server declined encryption";
+			return false;
+		}
+
+		// Enable TLS
+		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
+			return false;
+		}
+		tls_enabled_ = true;
+		MSSQL_CONN_DEBUG_LOG(1, "DoPreloginWithFedAuth: TLS enabled");
+	} else {
+		if (prelogin_response.encryption == EncryptionOption::ENCRYPT_REQ) {
+			last_error_ = "Server requires encryption but TLS not requested";
+			return false;
+		}
+		tls_enabled_ = false;
+	}
+
+	return true;
+}
+
+bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token) {
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: sending LOGIN7 with FEDAUTH token, db='%s', token_size=%zu",
+	                     database.c_str(), fedauth_token.size());
+
+	// Build LOGIN7 packet with FEDAUTH feature extension
+	TdsPacket login = TdsProtocol::BuildLogin7WithFedAuth(host_, database, fedauth_token, "DuckDB MSSQL Extension",
+	                                                      TDS_DEFAULT_PACKET_SIZE);
+	login.SetPacketId(next_packet_id_++);
+
+	if (!socket_->SendPacket(login)) {
+		last_error_ = "Failed to send LOGIN7: " + socket_->GetLastError();
+		return false;
+	}
+
+	std::vector<uint8_t> response;
+	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+		last_error_ = "Failed to receive LOGIN7 response: " + socket_->GetLastError();
+		return false;
+	}
+
+	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+	if (!login_response.success) {
+		if (login_response.error_number > 0) {
+			last_error_ = "Azure AD authentication failed (error " + std::to_string(login_response.error_number) +
+			              "): " + login_response.error_message;
+		} else {
+			last_error_ = "Azure AD authentication failed: " + login_response.error_message;
+		}
+		return false;
+	}
+
+	spid_ = login_response.spid;
+	negotiated_packet_size_ = login_response.negotiated_packet_size;
+	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: Azure AD login successful, spid=%d, packet_size=%d", spid_,
+	                     negotiated_packet_size_);
+
+	return true;
+}
+
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
 						 database.c_str());

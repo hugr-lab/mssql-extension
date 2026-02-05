@@ -41,6 +41,12 @@ public:
 	//                 if false, sends ENCRYPT_NOT_SUP (no encryption)
 	static TdsPacket BuildPrelogin(bool use_encrypt = false);
 
+	// Build PRELOGIN packet with FEDAUTHREQUIRED option for Azure AD authentication
+	// Parameters:
+	//   use_encrypt - if true, requests ENCRYPT_ON from server
+	//   fedauth_required - if true, includes FEDAUTHREQUIRED option (0x06)
+	static TdsPacket BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_required);
+
 	// Parse PRELOGIN response
 	static PreloginResponse ParsePreloginResponse(const std::vector<uint8_t> &data);
 
@@ -58,6 +64,19 @@ public:
 
 	// Parse LOGIN7 response (LOGINACK token and potential errors)
 	static LoginResponse ParseLoginResponse(const std::vector<uint8_t> &data);
+
+	// Build LOGIN7 packet with FEDAUTH feature extension for Azure AD authentication
+	// Parameters:
+	//   host - client hostname (for logging on server side)
+	//   database - initial database to connect to
+	//   fedauth_token - UTF-16LE encoded access token from Azure AD
+	//   app_name - application name (optional, for server logging)
+	//   packet_size - requested packet size (default 4096)
+	// Note: username/password not used with FEDAUTH - token replaces them
+	static TdsPacket BuildLogin7WithFedAuth(const std::string &host, const std::string &database,
+	                                        const std::vector<uint8_t> &fedauth_token,
+	                                        const std::string &app_name = "DuckDB MSSQL Extension",
+	                                        uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
 
 	// Build empty SQL_BATCH packet for ping
 	// This sends an empty batch which triggers a DONE response

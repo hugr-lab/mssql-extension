@@ -1,0 +1,71 @@
+# name: test/sql/azure/azure_service_principal.test
+# description: Test ATTACH to Azure SQL Database using service principal FEDAUTH
+# group: [azure]
+
+# This test requires Azure SQL Database credentials set via environment variables:
+# - AZURE_SQL_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
+# - AZURE_SQL_DATABASE: Database name
+# - AZURE_APP_ID: Service principal client ID
+# - AZURE_DIRECTORY_ID: Azure AD tenant ID
+# - AZURE_APP_SECRET: Service principal client secret
+
+require mssql
+
+# Skip if Azure SQL connection info not provided
+require-env AZURE_SQL_HOST
+
+require-env AZURE_SQL_DATABASE
+
+require-env AZURE_APP_ID
+
+require-env AZURE_DIRECTORY_ID
+
+require-env AZURE_APP_SECRET
+
+require azure
+
+# Create Azure secret for service principal authentication
+statement ok
+CREATE OR REPLACE SECRET azure_sp_secret (
+    TYPE azure,
+    PROVIDER service_principal,
+    TENANT_ID '${AZURE_DIRECTORY_ID}',
+    CLIENT_ID '${AZURE_APP_ID}',
+    CLIENT_SECRET '${AZURE_APP_SECRET}'
+);
+
+# Create MSSQL secret that uses Azure authentication
+statement ok
+CREATE OR REPLACE SECRET azure_sql_secret (
+    TYPE mssql,
+    HOST '${AZURE_SQL_HOST}',
+    PORT 1433,
+    DATABASE '${AZURE_SQL_DATABASE}',
+    azure_secret 'azure_sp_secret'
+);
+
+# ATTACH to Azure SQL Database using FEDAUTH
+statement ok
+ATTACH '' AS azuredb (TYPE mssql, SECRET azure_sql_secret);
+
+# Basic connectivity test - SELECT 1
+query I
+SELECT 1 FROM azuredb.mssql_scan(azuredb, 'SELECT 1 AS value');
+----
+1
+
+# Verify we can get connection info
+query I
+SELECT COUNT(*) >= 0 FROM mssql_pool_stats('azuredb');
+----
+true
+
+# Clean up
+statement ok
+DETACH azuredb;
+
+statement ok
+DROP SECRET IF EXISTS azure_sql_secret;
+
+statement ok
+DROP SECRET IF EXISTS azure_sp_secret;

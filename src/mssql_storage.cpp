@@ -11,6 +11,9 @@
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 #include "tds/tds_connection.hpp"
+#include "mssql_platform.hpp"
+#include "azure/azure_fedauth.hpp"
+#include "azure/azure_token.hpp"
 
 #include <cstdlib>
 
@@ -81,8 +84,33 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	}
 	// Default is true (catalog_enabled initialized to true in struct definition)
 
+	// Read optional azure_secret for Azure AD authentication (T015)
+	// When set, use FEDAUTH instead of SQL auth
+	auto azure_secret_val = kv_secret.TryGetValue("azure_secret");
+	if (!azure_secret_val.IsNull()) {
+		result->azure_secret_name = azure_secret_val.ToString();
+		result->use_azure_auth = !result->azure_secret_name.empty();
+	}
+	// Default: use_azure_auth = false (SQL auth)
+
 	result->connected = false;
 	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Endpoint Detection Helpers (T007)
+//===----------------------------------------------------------------------===//
+
+bool MSSQLConnectionInfo::IsAzureEndpoint() const {
+	return mssql::IsAzureEndpoint(host);
+}
+
+bool MSSQLConnectionInfo::IsFabricEndpoint() const {
+	return mssql::IsFabricEndpoint(host);
+}
+
+bool MSSQLConnectionInfo::IsSynapseEndpoint() const {
+	return mssql::IsSynapseEndpoint(host);
 }
 
 //===----------------------------------------------------------------------===//
@@ -508,6 +536,84 @@ static string TranslateConnectionError(const string &error, const string &host, 
 	return StringUtil::Format("Connection failed to %s:%d", host, port);
 }
 
+//===----------------------------------------------------------------------===//
+// Azure AD Connection Validation
+//===----------------------------------------------------------------------===//
+
+void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &info, int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1,
+	                        "ValidateAzureConnection: host=%s port=%d database=%s azure_secret=%s encrypt=%s timeout=%ds",
+	                        info.host.c_str(), info.port, info.database.c_str(), info.azure_secret_name.c_str(),
+	                        info.use_encrypt ? "yes" : "no", timeout_seconds);
+
+	// Acquire Azure AD token
+	auto token_result = mssql::azure::AcquireToken(context, info.azure_secret_name);
+	if (!token_result.success) {
+		throw InvalidInputException("MSSQL Azure AD authentication failed: %s", token_result.error_message);
+	}
+
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: token acquired successfully");
+
+	// Build FEDAUTH extension data (encodes token to UTF-16LE)
+	auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, info.azure_secret_name);
+	if (!fedauth_data.IsValid()) {
+		throw InvalidInputException("MSSQL Azure AD authentication failed: could not build FEDAUTH data");
+	}
+
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: FEDAUTH data built, token_size=%zu", fedauth_data.token_utf16le.size());
+
+	// Create a temporary connection to test Azure AD credentials
+	tds::TdsConnection conn;
+
+	// Attempt TCP connection
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: TCP connection FAILED - %s", error.c_str());
+		throw IOException("MSSQL Azure connection validation failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: TCP connection succeeded");
+
+	// Attempt Azure AD authentication (FEDAUTH)
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
+	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
+		conn.Close();
+		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication succeeded");
+
+	// Test query
+	if (info.use_encrypt) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: executing validation query (SELECT 1)...");
+		try {
+			if (!conn.ExecuteBatch("SELECT 1")) {
+				string error = conn.GetLastError();
+				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query FAILED - %s", error.c_str());
+				conn.Close();
+				throw InvalidInputException("MSSQL Azure connection validation failed: validation query failed: %s", error);
+			}
+			// Drain results
+			auto *socket = conn.GetSocket();
+			if (socket) {
+				std::vector<uint8_t> response;
+				socket->ReceiveMessage(response, 5000);
+				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+			}
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query succeeded");
+		} catch (const std::exception &e) {
+			string error = e.what();
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query FAILED with exception - %s", error.c_str());
+			conn.Close();
+			throw InvalidInputException("MSSQL Azure connection validation failed: %s", error);
+		}
+	}
+
+	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation complete");
+}
+
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
@@ -625,16 +731,34 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Validate connection before registering context or creating catalog
 	// This ensures we fail fast on invalid credentials
 	auto pool_config = LoadPoolConfig(context);
-	ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
+
+	// For Azure auth, we need to acquire token and use FEDAUTH validation
+	std::vector<uint8_t> fedauth_token_utf16le;
+	if (ctx->connection_info->use_azure_auth) {
+		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
+		// Acquire fresh token for the pool (the validation token may expire)
+		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
+		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
+	} else {
+		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
+	}
 
 	// Register context (only reached if validation succeeds)
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.RegisterContext(name, ctx);
 
 	// Create connection pool for this context
-	MssqlPoolManager::Instance().GetOrCreatePool(
-		name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
-		ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
+	if (ctx->connection_info->use_azure_auth) {
+		// Use Azure AD authentication pool
+		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
+			name, pool_config, ctx->connection_info->host, ctx->connection_info->port,
+			ctx->connection_info->database, fedauth_token_utf16le, ctx->connection_info->use_encrypt);
+	} else {
+		// Use SQL authentication pool
+		MssqlPoolManager::Instance().GetOrCreatePool(
+			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
+			ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
+	}
 
 	// Create MSSQLCatalog with connection info and access mode from options
 	// The catalog will use the connection pool to query SQL Server

@@ -166,6 +166,7 @@ set(EXTENSION_SOURCES
     src/azure/azure_token.cpp
     src/azure/azure_test_function.cpp
     src/azure/azure_device_code.cpp
+    src/azure/azure_fedauth.cpp
 )
 
 # Build static extension (linked into DuckDB)

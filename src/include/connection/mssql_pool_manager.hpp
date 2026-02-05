@@ -17,13 +17,24 @@ class MssqlPoolManager {
 public:
 	static MssqlPoolManager &Instance();
 
-	// Get or create a pool for a context
+	// Get or create a pool for a context (SQL authentication)
 	// Parameters:
 	//   use_encrypt - if true, enables TLS encryption for all connections in the pool
 	tds::ConnectionPool *GetOrCreatePool(const std::string &context_name, const MSSQLPoolConfig &config,
 										 const std::string &host, uint16_t port, const std::string &username,
 										 const std::string &password, const std::string &database,
 										 bool use_encrypt = false);
+
+	// Get or create a pool for a context (Azure AD authentication)
+	// Parameters:
+	//   fedauth_token_utf16le - pre-encoded UTF-16LE access token
+	//   use_encrypt - TLS encryption (required for Azure)
+	// Note: For Azure auth, token refresh is handled separately
+	tds::ConnectionPool *GetOrCreatePoolWithAzureAuth(const std::string &context_name, const MSSQLPoolConfig &config,
+	                                                  const std::string &host, uint16_t port,
+	                                                  const std::string &database,
+	                                                  const std::vector<uint8_t> &fedauth_token_utf16le,
+	                                                  bool use_encrypt = true);
 
 	// Get an existing pool (returns nullptr if not found)
 	tds::ConnectionPool *GetPool(const std::string &context_name);

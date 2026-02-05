@@ -869,5 +869,319 @@ std::string TdsProtocol::ExtractErrorMessage(const std::vector<uint8_t> &data) {
 	return "";
 }
 
+//===----------------------------------------------------------------------===//
+// FEDAUTH Protocol Methods (T016, T017)
+//===----------------------------------------------------------------------===//
+
+TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_required) {
+	TdsPacket packet(PacketType::PRELOGIN);
+
+	// Build option headers
+	// VERSION: 6 bytes
+	// ENCRYPTION: 1 byte
+	// FEDAUTHREQUIRED: 1 byte (when fedauth_required is true)
+	// TERMINATOR: 0 bytes
+
+	// Calculate headers size
+	// Each header is 5 bytes: option(1) + offset(2) + length(2)
+	// VERSION header (5) + ENCRYPTION header (5) + TERMINATOR (1) = 11 bytes without FEDAUTH
+	// With FEDAUTH: VERSION (5) + ENCRYPTION (5) + FEDAUTHREQUIRED (5) + TERMINATOR (1) = 16 bytes
+	uint16_t headers_size = fedauth_required ? 16 : 11;
+	uint16_t data_offset = headers_size;
+
+	// VERSION option header
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::VERSION));
+	packet.AppendUInt16BE(data_offset);  // offset
+	packet.AppendUInt16BE(6);            // length
+
+	// ENCRYPTION option header
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::ENCRYPTION));
+	packet.AppendUInt16BE(data_offset + 6);  // offset (after VERSION data)
+	packet.AppendUInt16BE(1);                // length
+
+	// FEDAUTHREQUIRED option header (if requested)
+	if (fedauth_required) {
+		packet.AppendByte(static_cast<uint8_t>(PreloginOption::FEDAUTHREQUIRED));
+		packet.AppendUInt16BE(data_offset + 7);  // offset (after ENCRYPTION data)
+		packet.AppendUInt16BE(1);                // length
+	}
+
+	// TERMINATOR
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::TERMINATOR));
+
+	// VERSION data: UL_VERSION (4 bytes) + US_SUBBUILD (2 bytes)
+	// We report as a generic TDS 7.4 client
+	packet.AppendByte(15);     // Major version (SQL Server 2019 = 15.x)
+	packet.AppendByte(0);      // Minor version
+	packet.AppendUInt16BE(0);  // Build number
+	packet.AppendUInt16BE(0);  // Sub-build number
+
+	// ENCRYPTION data: request encryption
+	// For Azure AD, we must use encryption
+	if (use_encrypt) {
+		packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_ON));
+	} else {
+		packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_NOT_SUP));
+	}
+
+	// FEDAUTHREQUIRED data (if included)
+	// MS-TDS: B_FEDAUTHREQUIRED = 0x01 when client requires FEDAUTH
+	if (fedauth_required) {
+		packet.AppendByte(0x01);  // FEDAUTH required
+	}
+
+	return packet;
+}
+
+TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std::string &database,
+                                              const std::vector<uint8_t> &fedauth_token,
+                                              const std::string &app_name, uint32_t packet_size) {
+	TdsPacket packet(PacketType::LOGIN7);
+
+	// LOGIN7 with FEDAUTH uses feature extensions (MS-TDS 2.2.7)
+	// Structure:
+	//   Fixed header (94 bytes)
+	//   Variable-length strings (HostName, AppName, ServerName, Database, etc.)
+	//   Feature extensions (pointed to by Extension field at offset 36)
+
+	// Calculate string offsets and lengths
+	uint16_t hostname_len = static_cast<uint16_t>(host.size());
+	uint16_t username_len = 0;   // No username with FEDAUTH
+	uint16_t password_len = 0;   // No password with FEDAUTH
+	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
+	uint16_t servername_len = static_cast<uint16_t>(host.size());
+	uint16_t database_len = static_cast<uint16_t>(database.size());
+
+	// Variable data starts at offset 94 (end of fixed header)
+	uint16_t var_offset = 94;
+
+	uint16_t hostname_offset = var_offset;
+	var_offset += hostname_len * 2;
+
+	uint16_t username_offset = var_offset;  // Empty for FEDAUTH
+	// var_offset += 0 (no username)
+
+	uint16_t password_offset = var_offset;  // Empty for FEDAUTH
+	// var_offset += 0 (no password)
+
+	uint16_t appname_offset = var_offset;
+	var_offset += appname_len * 2;
+
+	uint16_t servername_offset = var_offset;
+	var_offset += servername_len * 2;
+
+	// Per MS-TDS 2.2.6.3, the Extension field (ibExtension) points to a DWORD
+	// that contains the actual offset to the feature extensions.
+	// Structure in variable data:
+	//   [strings...] [ExtensionDWORD(4)] [Database] [FeatureExtensions]
+	// The header's ibExtension points to the ExtensionDWORD.
+
+	// Extension DWORD location (after servername)
+	uint16_t extension_dword_offset = var_offset;
+	var_offset += 4;  // DWORD that will point to feature extensions
+
+	// CltIntName (unused) - points to same offset, length 0
+	uint16_t cltintname_offset = var_offset;
+
+	// Language (unused) - points to same offset, length 0
+	uint16_t language_offset = var_offset;
+
+	// Database
+	uint16_t database_offset = var_offset;
+	var_offset += database_len * 2;
+
+	// Feature extensions start here
+	uint32_t feature_ext_offset = var_offset;
+
+	// Feature extensions for Azure SQL:
+	// 1. AZURESQLSUPPORT (0x08): Required for Azure SQL
+	// 2. FEDAUTH (0x02): For authentication
+	// 3. TERMINATOR (0xFF)
+
+	// AZURESQLSUPPORT extension: FeatureId(1) + FeatureDataLen(4) + Data(1)
+	// Total: 6 bytes
+	uint32_t azuresql_ext_len = 6;
+
+	// FEDAUTH extension: FeatureId(1) + FeatureDataLen(4) + FeatureData(variable)
+	// Per MS-TDS 2.2.7.1 and tedious implementation, FEDAUTH FeatureData format for SECURITYTOKEN:
+	//   LibraryAndEcho (1 byte): (library << 1) | echo - where library=0x01 for SECURITYTOKEN
+	//   TokenLen (4 bytes, LE): Length of the token
+	//   Token (variable): UTF-16LE encoded access token
+	// FeatureDataLen = 1 (LibraryAndEcho) + 4 (TokenLen) + token.size()
+	uint32_t fedauth_data_len = 5 + static_cast<uint32_t>(fedauth_token.size());
+	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;
+
+	// Total length calculation
+	// Fixed header (94) + variable strings + ExtensionDWORD(4) + database +
+	// AZURESQLSUPPORT extension (6) + FEDAUTH extension (fedauth_ext_len) + Terminator(1)
+	uint32_t total_length = var_offset + azuresql_ext_len + fedauth_ext_len + 1;
+
+	// Build fixed header (94 bytes)
+
+	// Offset 0: Length (4 bytes, LE)
+	packet.AppendUInt32LE(total_length);
+
+	// Offset 4: TDSVersion (4 bytes, LE)
+	packet.AppendUInt32LE(TDS_VERSION_7_4);
+
+	// Offset 8: PacketSize (4 bytes, LE)
+	packet.AppendUInt32LE(packet_size);
+
+	// Offset 12: ClientProgVer (4 bytes, LE)
+	packet.AppendUInt32LE(0x00000001);
+
+	// Offset 16: ClientPID (4 bytes, LE)
+	packet.AppendUInt32LE(static_cast<uint32_t>(GET_PID()));
+
+	// Offset 20: ConnectionID (4 bytes, LE)
+	packet.AppendUInt32LE(0);
+
+	// Offset 24: OptionFlags1 (1 byte)
+	// Bit 5: USE_DB
+	uint8_t flags1 = 0x20;  // USE_DB
+	packet.AppendByte(flags1);
+
+	// Offset 25: OptionFlags2 (1 byte)
+	// Bit 1: fODBC - ANSI compatibility
+	// Bit 7: INTEGRATED_SECURITY - NOT used, we use FEDAUTH instead
+	uint8_t flags2 = 0x02;  // fODBC only
+	packet.AppendByte(flags2);
+
+	// Offset 26: TypeFlags (1 byte)
+	// Bit 4: fFedAuth - indicates FEDAUTH feature extension present
+	uint8_t type_flags = 0x10;  // fFedAuth bit
+	packet.AppendByte(type_flags);
+
+	// Offset 27: OptionFlags3 (1 byte)
+	// Bit 4: fExtension - indicates feature extension data is present (MS-TDS 2.2.6.3)
+	uint8_t flags3 = 0x10;  // fExtension (bit 4)
+	packet.AppendByte(flags3);
+
+	// Offset 28: ClientTimeZone (4 bytes, LE)
+	packet.AppendUInt32LE(0);
+
+	// Offset 32: ClientLCID (4 bytes, LE)
+	packet.AppendUInt32LE(0x0409);  // en-US
+
+	// Offset 36-93: Offset/Length pairs for variable fields
+
+	// HostName
+	packet.AppendUInt16LE(hostname_offset);
+	packet.AppendUInt16LE(hostname_len);
+
+	// UserName (empty for FEDAUTH)
+	packet.AppendUInt16LE(username_offset);
+	packet.AppendUInt16LE(username_len);
+
+	// Password (empty for FEDAUTH)
+	packet.AppendUInt16LE(password_offset);
+	packet.AppendUInt16LE(password_len);
+
+	// AppName
+	packet.AppendUInt16LE(appname_offset);
+	packet.AppendUInt16LE(appname_len);
+
+	// ServerName
+	packet.AppendUInt16LE(servername_offset);
+	packet.AppendUInt16LE(servername_len);
+
+	// Extension - ibExtension points to the DWORD containing feature extension offset
+	// cbExtension is the length of extensions (not including the DWORD pointer itself)
+	uint16_t feature_ext_len = static_cast<uint16_t>(azuresql_ext_len + fedauth_ext_len + 1);  // AZURESQLSUPPORT + FEDAUTH + Terminator
+	packet.AppendUInt16LE(extension_dword_offset);
+	packet.AppendUInt16LE(feature_ext_len);
+
+	// CltIntName (unused)
+	packet.AppendUInt16LE(cltintname_offset);
+	packet.AppendUInt16LE(0);
+
+	// Language (unused)
+	packet.AppendUInt16LE(language_offset);
+	packet.AppendUInt16LE(0);
+
+	// Database
+	packet.AppendUInt16LE(database_offset);
+	packet.AppendUInt16LE(database_len);
+
+	// ClientID (6 bytes) - MAC address, zeros
+	for (int i = 0; i < 6; i++) {
+		packet.AppendByte(0);
+	}
+
+	// SSPI (unused) - point to end of variable data
+	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	packet.AppendUInt16LE(0);
+
+	// AtchDBFile (unused)
+	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	packet.AppendUInt16LE(0);
+
+	// ChangePassword (unused)
+	packet.AppendUInt16LE(static_cast<uint16_t>(feature_ext_offset));
+	packet.AppendUInt16LE(0);
+
+	// cbSSPILong (4 bytes)
+	packet.AppendUInt32LE(0);
+
+	// =====================================
+	// Variable data section
+	// =====================================
+
+	// HostName (UTF-16LE)
+	packet.AppendUTF16LE(host);
+
+	// UserName - empty for FEDAUTH
+	// Password - empty for FEDAUTH
+
+	// AppName (UTF-16LE)
+	packet.AppendUTF16LE(app_name);
+
+	// ServerName (UTF-16LE)
+	packet.AppendUTF16LE(host);
+
+	// ExtensionDWORD - points to the actual feature extension data
+	packet.AppendUInt32LE(feature_ext_offset);
+
+	// CltIntName - empty
+	// Language - empty
+
+	// Database (UTF-16LE)
+	packet.AppendUTF16LE(database);
+
+	// =====================================
+	// Feature Extensions
+	// =====================================
+
+	// AZURESQLSUPPORT extension (FeatureId 0x08)
+	// Required for Azure SQL connections
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::AZURESQLSUPPORT));
+	packet.AppendUInt32LE(1);  // FeatureDataLen = 1
+	packet.AppendByte(0x01);   // FeatureData = enabled
+
+	// FEDAUTH extension (MS-TDS 2.2.7.1)
+	// FeatureId: 0x02
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::FEDAUTH));
+
+	// FeatureDataLen (4 bytes, LE) = 4 (options) + token.size()
+	packet.AppendUInt32LE(fedauth_data_len);
+
+	// FEDAUTH Feature Data (per tedious implementation and MS-TDS 2.2.7.1):
+	//   LibraryAndEcho (1 byte): (LIBRARY_SECURITYTOKEN << 1) | echo
+	//     LIBRARY_SECURITYTOKEN = 0x01, no echo = 0x00
+	//     So: (0x01 << 1) | 0x00 = 0x02
+	//   TokenLen (4 bytes, LE): Length of the UTF-16LE token
+	//   Token (variable): UTF-16LE encoded access token
+	packet.AppendByte(0x02);  // (SECURITYTOKEN << 1) | no_echo = 0x02
+	packet.AppendUInt32LE(static_cast<uint32_t>(fedauth_token.size()));
+
+	// Token (UTF-16LE encoded access token)
+	packet.AppendPayload(fedauth_token);
+
+	// Feature terminator
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
+
+	return packet;
+}
+
 }  // namespace tds
 }  // namespace duckdb
