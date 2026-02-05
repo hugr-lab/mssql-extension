@@ -93,9 +93,7 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 				throw InvalidInputException("Secret '%s' is not an MSSQL secret", input);
 			}
 
-			// Use static_cast - we've already verified it's an MSSQL secret which is always KeyValueSecret
-			// This avoids dynamic_cast RTTI warnings when crossing extension boundaries on macOS
-			auto &kv_secret = static_cast<const KeyValueSecret &>(secret);
+			auto &kv_secret = dynamic_cast<const KeyValueSecret &>(secret);
 
 			auto host_val = kv_secret.TryGetValue(MSSQL_SECRET_HOST);
 			auto port_val = kv_secret.TryGetValue(MSSQL_SECRET_PORT);
@@ -173,7 +171,7 @@ TableFunction MSSQLPoolStatsFunction::GetFunction() {
 	// Create function with optional VARCHAR parameter
 	TableFunction func("mssql_pool_stats", {}, Execute, Bind, InitGlobal);
 	// Add overload with optional context_name parameter
-	func.named_parameters["context_name"] = LogicalType(LogicalTypeId::VARCHAR);
+	func.named_parameters["context_name"] = LogicalType::VARCHAR;
 	return func;
 }
 
@@ -192,33 +190,32 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	}
 
 	// Define output columns - db first, then stats
-	// Use LogicalType(LogicalTypeId::X) to avoid ODR violations with constexpr static members
 	names.emplace_back("db");
-	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+	return_types.emplace_back(LogicalType::VARCHAR);
 
 	names.emplace_back("total_connections");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("idle_connections");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("active_connections");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("connections_created");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("connections_closed");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("acquire_count");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("acquire_timeout_count");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	names.emplace_back("pinned_connections");
-	return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	return std::move(bind_data);
 }
@@ -286,22 +283,18 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	//   - Connection string: "Server=host,port;Database=db;User Id=user;Password=pass"
 	//   - URI format: "mssql://user:password@host:port/database"
 	//   - Secret name (for backward compatibility)
-	// Use LogicalType(LogicalTypeId::X) to avoid ODR violations with constexpr static members
 	ScalarFunctionSet open_func("mssql_open");
-	open_func.AddFunction(
-		ScalarFunction({LogicalType(LogicalTypeId::VARCHAR)}, LogicalType(LogicalTypeId::BIGINT), MSSQLOpenFunction));
+	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction));
 	loader.RegisterFunction(open_func);
 
 	// mssql_close(handle BIGINT) -> BOOLEAN
 	ScalarFunctionSet close_func("mssql_close");
-	close_func.AddFunction(
-		ScalarFunction({LogicalType(LogicalTypeId::BIGINT)}, LogicalType(LogicalTypeId::BOOLEAN), MSSQLCloseFunction));
+	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction));
 	loader.RegisterFunction(close_func);
 
 	// mssql_ping(handle BIGINT) -> BOOLEAN
 	ScalarFunctionSet ping_func("mssql_ping");
-	ping_func.AddFunction(
-		ScalarFunction({LogicalType(LogicalTypeId::BIGINT)}, LogicalType(LogicalTypeId::BOOLEAN), MSSQLPingFunction));
+	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);
 
 	// mssql_pool_stats(context_name VARCHAR) -> TABLE

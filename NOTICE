@@ -1,6 +1,11 @@
 ## Third-Party Licenses
 
-This project includes components from the Azure Identity SDK
-licensed under the Apache License, Version 2.0.
+This project uses the following third-party libraries:
 
-© Microsoft Corporation
+### OpenSSL
+Licensed under the Apache License 2.0.
+https://www.openssl.org/source/license.html
+
+### libcurl
+Licensed under a MIT/X derivative license.
+https://curl.se/docs/copyright.html

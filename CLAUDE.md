@@ -208,8 +208,25 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - SQL Server 2019+ (remote target), in-memory (connection pool state) (025-bcp-improvements)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), existing TDS protocol layer, OpenSSL (vcpkg) (026-varchar-nvarchar-conversion)
 - SQL Server 2019+ (remote target), in-memory (batch buffering) (027-ctas-bcp-integration)
-- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg for TLS/HTTP), DuckDB Azure extension (runtime) (001-azure-token-infrastructure)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg for TLS), libcurl (vcpkg for OAuth2 HTTP), DuckDB Azure extension (runtime, for Azure secret management) (001-azure-token-infrastructure)
 - In-memory (token cache, no persistence required) (001-azure-token-infrastructure)
+
+## Azure AD Authentication
+
+The extension supports Azure AD authentication for Azure SQL Database and Microsoft Fabric. Authentication is implemented using **libcurl** for OAuth2 token acquisition (no Azure SDK dependency for simpler builds).
+
+**Supported methods:**
+- **Service Principal**: Client credentials flow with tenant_id, client_id, client_secret
+- **Azure CLI**: Uses `az account get-access-token` for developers with `az login`
+- **Device Code Flow**: Interactive authentication for MFA-enabled accounts
+
+**Implementation files:**
+- `src/azure/azure_token.cpp` - OAuth2 token acquisition via libcurl
+- `src/azure/azure_device_code.cpp` - RFC 8628 device code flow
+- `src/azure/azure_secret_reader.cpp` - Reads Azure secrets from DuckDB Azure extension
+- `src/azure/azure_test_function.cpp` - `mssql_azure_auth_test()` function
+
+See `AZURE.md` for user documentation.
 
 ## Recent Changes
 
