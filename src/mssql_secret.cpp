@@ -12,8 +12,7 @@ namespace duckdb {
 string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput &input) {
 	// Check for azure_secret parameter first
 	auto azure_it = input.options.find(MSSQL_SECRET_AZURE_SECRET);
-	bool has_azure_secret = azure_it != input.options.end() &&
-	                        !azure_it->second.ToString().empty();
+	bool has_azure_secret = azure_it != input.options.end() && !azure_it->second.ToString().empty();
 
 	if (has_azure_secret) {
 		// Azure auth mode - validate Azure secret exists and is correct type
@@ -24,8 +23,8 @@ string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput
 			// Check if it exists but is wrong type
 			std::string actual_type = mssql::azure::GetAzureSecretType(context, azure_name);
 			if (!actual_type.empty()) {
-				return StringUtil::Format("Error: Secret '%s' is not an Azure secret (type: %s)",
-				                          azure_name, actual_type);
+				return StringUtil::Format("Error: Secret '%s' is not an Azure secret (type: %s)", azure_name,
+										  actual_type);
 			}
 			return StringUtil::Format("Error: Azure secret '%s' not found", azure_name);
 		}
@@ -37,7 +36,7 @@ string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput
 			auto it = input.options.find(field);
 			if (it == input.options.end()) {
 				return StringUtil::Format("Missing required field '%s'. Provide %s parameter when creating secret.",
-				                          field, field);
+										  field, field);
 			}
 			auto str_val = it->second.ToString();
 			if (str_val.empty()) {
@@ -57,14 +56,14 @@ string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput
 		}
 
 		// Check required string fields for SQL auth
-		const char *required_string_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE,
-		                                        MSSQL_SECRET_USER, MSSQL_SECRET_PASSWORD};
+		const char *required_string_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE, MSSQL_SECRET_USER,
+												MSSQL_SECRET_PASSWORD};
 
 		for (auto field : required_string_fields) {
 			auto it = input.options.find(field);
 			if (it == input.options.end()) {
 				return StringUtil::Format("Missing required field '%s'. Provide %s parameter when creating secret.",
-				                          field, field);
+										  field, field);
 			}
 			auto str_val = it->second.ToString();
 			if (str_val.empty()) {
@@ -116,8 +115,7 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 
 	// user/password are optional if azure_secret is provided
 	auto azure_it = input.options.find(MSSQL_SECRET_AZURE_SECRET);
-	bool has_azure_secret = azure_it != input.options.end() &&
-	                        !azure_it->second.ToString().empty();
+	bool has_azure_secret = azure_it != input.options.end() && !azure_it->second.ToString().empty();
 
 	if (has_azure_secret) {
 		result->TrySetValue(MSSQL_SECRET_AZURE_SECRET, input);
@@ -183,10 +181,11 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_DATABASE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_USER] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_PASSWORD] = LogicalType::VARCHAR;
-	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;      // Optional
-	create_func.named_parameters[MSSQL_SECRET_CATALOG] = LogicalType::BOOLEAN;          // Optional, defaults to true
-	create_func.named_parameters[MSSQL_SECRET_AZURE_SECRET] = LogicalType::VARCHAR;     // Optional, for Azure AD auth
-	create_func.named_parameters[MSSQL_SECRET_AZURE_TENANT_ID] = LogicalType::VARCHAR;  // Optional, tenant for interactive auth
+	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;	 // Optional
+	create_func.named_parameters[MSSQL_SECRET_CATALOG] = LogicalType::BOOLEAN;		 // Optional, defaults to true
+	create_func.named_parameters[MSSQL_SECRET_AZURE_SECRET] = LogicalType::VARCHAR;	 // Optional, for Azure AD auth
+	create_func.named_parameters[MSSQL_SECRET_AZURE_TENANT_ID] =
+		LogicalType::VARCHAR;  // Optional, tenant for interactive auth
 
 	loader.RegisterFunction(std::move(create_func));
 }

@@ -7,10 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "azure/azure_secret_reader.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/catalog/catalog_transaction.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -34,8 +34,8 @@ AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secre
 
 	// Check if it's an Azure secret
 	if (secret->GetType() != "azure") {
-		throw InvalidInputException("Error: Secret '%s' is not an Azure secret (type: %s)",
-		                            secret_name, secret->GetType());
+		throw InvalidInputException("Error: Secret '%s' is not an Azure secret (type: %s)", secret_name,
+									secret->GetType());
 	}
 
 	// Use static_cast - we've already verified it's an Azure secret which is always KeyValueSecret
@@ -75,8 +75,7 @@ AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secre
 	// Validate required fields per provider
 	if (info.provider == "service_principal") {
 		if (info.tenant_id.empty() || info.client_id.empty() || info.client_secret.empty()) {
-			throw InvalidInputException(
-			    "Service principal requires tenant_id, client_id, client_secret");
+			throw InvalidInputException("Service principal requires tenant_id, client_id, client_secret");
 		}
 	}
 
@@ -116,6 +115,6 @@ std::string GetAzureSecretType(ClientContext &context, const std::string &secret
 	return "";
 }
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

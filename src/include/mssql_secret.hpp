@@ -19,10 +19,10 @@ constexpr const char *MSSQL_SECRET_PORT = "port";
 constexpr const char *MSSQL_SECRET_DATABASE = "database";
 constexpr const char *MSSQL_SECRET_USER = "user";
 constexpr const char *MSSQL_SECRET_PASSWORD = "password";
-constexpr const char *MSSQL_SECRET_USE_ENCRYPT = "use_encrypt";        // Optional, defaults to true
-constexpr const char *MSSQL_SECRET_CATALOG = "catalog";                // Optional, defaults to true
-constexpr const char *MSSQL_SECRET_AZURE_SECRET = "azure_secret";      // Optional, for Azure AD auth
-constexpr const char *MSSQL_SECRET_AZURE_TENANT_ID = "azure_tenant_id"; // Optional, tenant for interactive auth
+constexpr const char *MSSQL_SECRET_USE_ENCRYPT = "use_encrypt";			 // Optional, defaults to true
+constexpr const char *MSSQL_SECRET_CATALOG = "catalog";					 // Optional, defaults to true
+constexpr const char *MSSQL_SECRET_AZURE_SECRET = "azure_secret";		 // Optional, for Azure AD auth
+constexpr const char *MSSQL_SECRET_AZURE_TENANT_ID = "azure_tenant_id";	 // Optional, tenant for interactive auth
 
 // Register MSSQL secret type and creation function
 void RegisterMSSQLSecretType(ExtensionLoader &loader);

@@ -9,9 +9,9 @@
 #include "azure/azure_device_code.hpp"
 #include "duckdb/common/exception.hpp"
 
+#include <curl/curl.h>
 #include <chrono>
 #include <cstring>
-#include <curl/curl.h>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -150,8 +150,7 @@ DeviceCodeResponse RequestDeviceCode(const std::string &tenant_id, const std::st
 	std::string effective_tenant = tenant_id.empty() ? AZURE_DEFAULT_TENANT : tenant_id;
 	std::string effective_client = client_id.empty() ? AZURE_INTERACTIVE_CLIENT_ID : client_id;
 
-	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" +
-	                  effective_tenant + "/oauth2/v2.0/devicecode";
+	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" + effective_tenant + "/oauth2/v2.0/devicecode";
 
 	// URL encode parameters using a temporary CURL handle
 	CURL *curl = curl_easy_init();
@@ -159,8 +158,7 @@ DeviceCodeResponse RequestDeviceCode(const std::string &tenant_id, const std::st
 		throw InvalidInputException("Failed to initialize CURL for URL encoding");
 	}
 
-	std::string body = "client_id=" + UrlEncode(curl, effective_client) +
-	                   "&scope=" + UrlEncode(curl, AZURE_SQL_SCOPE);
+	std::string body = "client_id=" + UrlEncode(curl, effective_client) + "&scope=" + UrlEncode(curl, AZURE_SQL_SCOPE);
 	curl_easy_cleanup(curl);
 
 	std::string response = HttpPost(url, body);
@@ -198,13 +196,12 @@ DeviceCodeResponse RequestDeviceCode(const std::string &tenant_id, const std::st
 // PollForToken
 //===----------------------------------------------------------------------===//
 
-TokenResult PollForToken(const std::string &tenant_id, const std::string &client_id,
-                         const std::string &device_code, int interval, int timeout) {
+TokenResult PollForToken(const std::string &tenant_id, const std::string &client_id, const std::string &device_code,
+						 int interval, int timeout) {
 	std::string effective_tenant = tenant_id.empty() ? AZURE_DEFAULT_TENANT : tenant_id;
 	std::string effective_client = client_id.empty() ? AZURE_INTERACTIVE_CLIENT_ID : client_id;
 
-	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" +
-	                  effective_tenant + "/oauth2/v2.0/token";
+	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" + effective_tenant + "/oauth2/v2.0/token";
 
 	// URL encode parameters using a temporary CURL handle
 	CURL *curl = curl_easy_init();
@@ -213,8 +210,8 @@ TokenResult PollForToken(const std::string &tenant_id, const std::string &client
 	}
 
 	std::string body = "grant_type=" + UrlEncode(curl, DEVICE_CODE_GRANT_TYPE) +
-	                   "&client_id=" + UrlEncode(curl, effective_client) +
-	                   "&device_code=" + UrlEncode(curl, device_code);
+					   "&client_id=" + UrlEncode(curl, effective_client) +
+					   "&device_code=" + UrlEncode(curl, device_code);
 	curl_easy_cleanup(curl);
 
 	auto start_time = std::chrono::steady_clock::now();
@@ -279,8 +276,8 @@ void DisplayDeviceCodeMessage(const DeviceCodeResponse &response) {
 	if (!response.message.empty()) {
 		std::cerr << response.message << std::endl;
 	} else {
-		std::cerr << "To sign in, visit " << response.verification_uri
-		          << " and enter code " << response.user_code << std::endl;
+		std::cerr << "To sign in, visit " << response.verification_uri << " and enter code " << response.user_code
+				  << std::endl;
 	}
 }
 
@@ -298,12 +295,10 @@ TokenResult AcquireInteractiveToken(const AzureSecretInfo &info) {
 	DisplayDeviceCodeMessage(device_code_response);
 
 	// Poll for token
-	return PollForToken(info.tenant_id, info.client_id,
-	                    device_code_response.device_code,
-	                    device_code_response.interval,
-	                    device_code_response.expires_in);
+	return PollForToken(info.tenant_id, info.client_id, device_code_response.device_code, device_code_response.interval,
+						device_code_response.expires_in);
 }
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

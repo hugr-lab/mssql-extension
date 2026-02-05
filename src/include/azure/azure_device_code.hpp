@@ -8,9 +8,9 @@
 
 #pragma once
 
+#include <string>
 #include "azure_secret_reader.hpp"
 #include "azure_token.hpp"
-#include <string>
 
 namespace duckdb {
 namespace mssql {
@@ -20,22 +20,22 @@ namespace azure {
 // DeviceCodeResponse - Response from Azure AD device code endpoint
 //===----------------------------------------------------------------------===//
 struct DeviceCodeResponse {
-	std::string device_code;      // Long code for token polling
-	std::string user_code;        // Short code displayed to user (e.g., "ABC123")
-	std::string verification_uri; // URL user visits (https://microsoft.com/devicelogin)
-	std::string message;          // Human-readable instructions for user
-	int expires_in;               // Seconds until device code expires (default: 900)
-	int interval;                 // Seconds to wait between polling requests
+	std::string device_code;	   // Long code for token polling
+	std::string user_code;		   // Short code displayed to user (e.g., "ABC123")
+	std::string verification_uri;  // URL user visits (https://microsoft.com/devicelogin)
+	std::string message;		   // Human-readable instructions for user
+	int expires_in;				   // Seconds until device code expires (default: 900)
+	int interval;				   // Seconds to wait between polling requests
 };
 
 //===----------------------------------------------------------------------===//
 // DeviceCodePollingState - State of device code polling
 //===----------------------------------------------------------------------===//
 struct DeviceCodePollingState {
-	bool pending;             // User hasn't completed login yet
-	bool success;             // Token was successfully acquired
-	std::string error;        // Error code if failed
-	std::string error_description; // Error description if failed
+	bool pending;					// User hasn't completed login yet
+	bool success;					// Token was successfully acquired
+	std::string error;				// Error code if failed
+	std::string error_description;	// Error description if failed
 };
 
 //===----------------------------------------------------------------------===//
@@ -66,8 +66,8 @@ DeviceCodeResponse RequestDeviceCode(const std::string &tenant_id, const std::st
 // Returns:
 //   TokenResult with access token on success, error message on failure/timeout
 //===----------------------------------------------------------------------===//
-TokenResult PollForToken(const std::string &tenant_id, const std::string &client_id,
-                         const std::string &device_code, int interval, int timeout);
+TokenResult PollForToken(const std::string &tenant_id, const std::string &client_id, const std::string &device_code,
+						 int interval, int timeout);
 
 //===----------------------------------------------------------------------===//
 // AcquireInteractiveToken - Main entry point for Device Code Flow
@@ -95,6 +95,6 @@ TokenResult AcquireInteractiveToken(const AzureSecretInfo &info);
 //===----------------------------------------------------------------------===//
 void DisplayDeviceCodeMessage(const DeviceCodeResponse &response);
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

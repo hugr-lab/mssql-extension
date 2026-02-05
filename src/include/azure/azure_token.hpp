@@ -8,12 +8,12 @@
 
 #pragma once
 
-#include "azure_secret_reader.hpp"
-#include "duckdb.hpp"
 #include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include "azure_secret_reader.hpp"
+#include "duckdb.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -30,14 +30,14 @@ constexpr const char *AZURE_AD_BASE_URL = "login.microsoftonline.com";
 constexpr const char *AZURE_SQL_SCOPE = "https://database.windows.net/.default";
 
 // Token refresh margin (seconds before expiration to trigger refresh)
-constexpr int64_t TOKEN_REFRESH_MARGIN_SECONDS = 300; // 5 minutes
+constexpr int64_t TOKEN_REFRESH_MARGIN_SECONDS = 300;  // 5 minutes
 
 // Default token lifetime if not specified (seconds)
-constexpr int64_t DEFAULT_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
+constexpr int64_t DEFAULT_TOKEN_LIFETIME_SECONDS = 3600;  // 1 hour
 
 // Device code flow constants
 constexpr int64_t DEVICE_CODE_DEFAULT_TIMEOUT_SECONDS = 900;  // 15 minutes (Azure AD default)
-constexpr int64_t DEVICE_CODE_DEFAULT_INTERVAL_SECONDS = 5;   // Default polling interval
+constexpr int64_t DEVICE_CODE_DEFAULT_INTERVAL_SECONDS = 5;	  // Default polling interval
 
 // Device code grant type
 constexpr const char *DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
@@ -58,8 +58,7 @@ struct TokenResult {
 	std::chrono::system_clock::time_point expires_at;
 
 	// Factory methods
-	static TokenResult Success(const std::string &token,
-	                           std::chrono::system_clock::time_point expiry) {
+	static TokenResult Success(const std::string &token, std::chrono::system_clock::time_point expiry) {
 		return {true, token, "", expiry};
 	}
 
@@ -95,7 +94,7 @@ public:
 
 	// Store a token in the cache
 	void SetToken(const std::string &secret_name, const std::string &token,
-	              std::chrono::system_clock::time_point expires_at);
+				  std::chrono::system_clock::time_point expires_at);
 
 	// Invalidate a specific token
 	void Invalidate(const std::string &secret_name);
@@ -126,7 +125,7 @@ private:
 //   TokenResult with access token on success, error message on failure
 //===----------------------------------------------------------------------===//
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
-                         const std::string &tenant_id_override = "");
+						 const std::string &tenant_id_override = "");
 
 //===----------------------------------------------------------------------===//
 // AcquireTokenWithSDK - Acquire token using Azure SDK credentials
@@ -141,6 +140,6 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 //===----------------------------------------------------------------------===//
 TokenResult AcquireTokenWithSDK(const AzureSecretInfo &info);
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

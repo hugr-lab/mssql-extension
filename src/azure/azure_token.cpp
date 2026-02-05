@@ -12,9 +12,9 @@
 #include "azure/azure_secret_reader.hpp"
 #include "duckdb/common/exception.hpp"
 
+#include <curl/curl.h>
 #include <array>
 #include <cstdio>
-#include <curl/curl.h>
 #include <memory>
 #include <sstream>
 #include <vector>
@@ -48,7 +48,7 @@ bool TokenCache::HasValidToken(const std::string &secret_name) {
 }
 
 void TokenCache::SetToken(const std::string &secret_name, const std::string &token,
-                          std::chrono::system_clock::time_point expires_at) {
+						  std::chrono::system_clock::time_point expires_at) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	cache_[secret_name] = CachedToken{token, expires_at};
 }
@@ -204,13 +204,13 @@ TokenResult AcquireTokenForServicePrincipal(const AzureSecretInfo &info) {
 		return TokenResult::Failure("Failed to initialize CURL");
 	}
 
-	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" +
-	                  info.tenant_id + "/oauth2/v2.0/token";
+	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" + info.tenant_id + "/oauth2/v2.0/token";
 
-	std::string body = "grant_type=client_credentials"
-	                   "&client_id=" + UrlEncode(curl, info.client_id) +
-	                   "&client_secret=" + UrlEncode(curl, info.client_secret) +
-	                   "&scope=" + UrlEncode(curl, AZURE_SQL_SCOPE);
+	std::string body =
+		"grant_type=client_credentials"
+		"&client_id=" +
+		UrlEncode(curl, info.client_id) + "&client_secret=" + UrlEncode(curl, info.client_secret) +
+		"&scope=" + UrlEncode(curl, AZURE_SQL_SCOPE);
 
 	std::string response;
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -266,8 +266,9 @@ TokenResult AcquireTokenForServicePrincipal(const AzureSecretInfo &info) {
 TokenResult AcquireTokenWithAzureCLI(const AzureSecretInfo &info) {
 	// Execute az account get-access-token command
 	// Note: az CLI uses --resource (not --scope) and doesn't want the /.default suffix
-	std::string command = "az account get-access-token --resource https://database.windows.net "
-	                      "--query accessToken -o tsv 2>&1";
+	std::string command =
+		"az account get-access-token --resource https://database.windows.net "
+		"--query accessToken -o tsv 2>&1";
 
 	std::array<char, 4096> buffer;
 	std::string result;
@@ -291,8 +292,7 @@ TokenResult AcquireTokenWithAzureCLI(const AzureSecretInfo &info) {
 	}
 
 	if (exit_code != 0) {
-		if (result.find("az login") != std::string::npos ||
-		    result.find("Please run 'az login'") != std::string::npos) {
+		if (result.find("az login") != std::string::npos || result.find("Please run 'az login'") != std::string::npos) {
 			return TokenResult::Failure("Azure CLI credentials expired. Run 'az login' to refresh.");
 		}
 		return TokenResult::Failure("Azure CLI error: " + result);
@@ -303,8 +303,7 @@ TokenResult AcquireTokenWithAzureCLI(const AzureSecretInfo &info) {
 	}
 
 	// Token from CLI - assume 1 hour expiry
-	auto expires_at = std::chrono::system_clock::now() +
-	                  std::chrono::seconds(DEFAULT_TOKEN_LIFETIME_SECONDS);
+	auto expires_at = std::chrono::system_clock::now() + std::chrono::seconds(DEFAULT_TOKEN_LIFETIME_SECONDS);
 	return TokenResult::Success(result, expires_at);
 }
 
@@ -316,7 +315,7 @@ static std::string ExtractErrorMessage(const std::exception &e) {
 	// DuckDB exceptions format as JSON via what() - extract the plain message
 	auto msg_pos = error_str.find("\"exception_message\":\"");
 	if (msg_pos != std::string::npos) {
-		auto start = msg_pos + 21; // length of "\"exception_message\":\""
+		auto start = msg_pos + 21;	// length of "\"exception_message\":\""
 		auto end = error_str.find("\"", start);
 		if (end != std::string::npos) {
 			return error_str.substr(start, end - start);
@@ -330,7 +329,7 @@ static std::string ExtractErrorMessage(const std::exception &e) {
 //===----------------------------------------------------------------------===//
 
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
-                         const std::string &tenant_id_override) {
+						 const std::string &tenant_id_override) {
 	// Check cache first (include tenant in cache key for interactive auth)
 	std::string cache_key = secret_name;
 	if (!tenant_id_override.empty()) {
@@ -339,9 +338,8 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 
 	std::string cached = TokenCache::Instance().GetToken(cache_key);
 	if (!cached.empty()) {
-		return TokenResult::Success(
-		    cached,
-		    std::chrono::system_clock::now() + std::chrono::hours(1)); // Approximate expiry
+		return TokenResult::Success(cached,
+									std::chrono::system_clock::now() + std::chrono::hours(1));	// Approximate expiry
 	}
 
 	try {
@@ -366,11 +364,13 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 				result = AcquireTokenWithAzureCLI(info);
 			} else {
 				result = TokenResult::Failure("Unsupported credential chain: " + info.chain +
-				                              ". Supported: cli, interactive");
+											  ". Supported: cli, interactive");
 			}
 		} else if (info.provider == "managed_identity") {
 			// Managed identity uses IMDS endpoint - simplified for now
-			result = TokenResult::Failure("Managed identity not yet implemented. Use service_principal or credential_chain with cli/interactive.");
+			result = TokenResult::Failure(
+				"Managed identity not yet implemented. Use service_principal or credential_chain with "
+				"cli/interactive.");
 		}
 
 		// Cache successful result
@@ -384,6 +384,6 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 	}
 }
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

@@ -8,8 +8,8 @@
 
 #pragma once
 
-#include "duckdb.hpp"
 #include <string>
+#include "duckdb.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -20,11 +20,11 @@ namespace azure {
 //===----------------------------------------------------------------------===//
 struct AzureSecretInfo {
 	std::string secret_name;
-	std::string provider;      // service_principal, credential_chain, managed_identity
-	std::string tenant_id;     // Required for service_principal, optional for others
-	std::string client_id;     // Required for service_principal, optional for managed_identity
-	std::string client_secret; // Required for service_principal only
-	std::string chain;         // For credential_chain: cli, env, managed_identity, interactive
+	std::string provider;		// service_principal, credential_chain, managed_identity
+	std::string tenant_id;		// Required for service_principal, optional for others
+	std::string client_id;		// Required for service_principal, optional for managed_identity
+	std::string client_secret;	// Required for service_principal only
+	std::string chain;			// For credential_chain: cli, env, managed_identity, interactive
 };
 
 //===----------------------------------------------------------------------===//
@@ -66,6 +66,6 @@ bool ValidateAzureSecretExists(ClientContext &context, const std::string &secret
 //===----------------------------------------------------------------------===//
 std::string GetAzureSecretType(ClientContext &context, const std::string &secret_name);
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

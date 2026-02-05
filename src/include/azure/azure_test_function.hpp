@@ -25,6 +25,6 @@ namespace azure {
 //===----------------------------------------------------------------------===//
 void RegisterAzureTestFunction(ExtensionLoader &loader);
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

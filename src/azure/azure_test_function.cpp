@@ -28,8 +28,8 @@ static std::string TruncateToken(const std::string &token) {
 		return token;
 	}
 
-	return token.substr(0, 10) + "..." + token.substr(token.length() - 3) +
-	       " [" + std::to_string(token.length()) + " chars]";
+	return token.substr(0, 10) + "..." + token.substr(token.length() - 3) + " [" + std::to_string(token.length()) +
+		   " chars]";
 }
 
 //===----------------------------------------------------------------------===//
@@ -38,21 +38,19 @@ static std::string TruncateToken(const std::string &token) {
 static void AzureAuthTestFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &secret_name_vec = args.data[0];
 
-	UnaryExecutor::Execute<string_t, string_t>(
-	    secret_name_vec, result, args.size(),
-	    [&](string_t secret_name) {
-		    auto &context = state.GetContext();
-		    std::string name = secret_name.GetString();
+	UnaryExecutor::Execute<string_t, string_t>(secret_name_vec, result, args.size(), [&](string_t secret_name) {
+		auto &context = state.GetContext();
+		std::string name = secret_name.GetString();
 
-		    // Acquire token (no tenant override)
-		    auto token_result = AcquireToken(context, name);
+		// Acquire token (no tenant override)
+		auto token_result = AcquireToken(context, name);
 
-		    if (token_result.success) {
-			    return StringVector::AddString(result, TruncateToken(token_result.access_token));
-		    } else {
-			    return StringVector::AddString(result, token_result.error_message);
-		    }
-	    });
+		if (token_result.success) {
+			return StringVector::AddString(result, TruncateToken(token_result.access_token));
+		} else {
+			return StringVector::AddString(result, token_result.error_message);
+		}
+	});
 }
 
 //===----------------------------------------------------------------------===//
@@ -63,21 +61,20 @@ static void AzureAuthTestFunctionWithTenant(DataChunk &args, ExpressionState &st
 	auto &tenant_vec = args.data[1];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    secret_name_vec, tenant_vec, result, args.size(),
-	    [&](string_t secret_name, string_t tenant_id) {
-		    auto &context = state.GetContext();
-		    std::string name = secret_name.GetString();
-		    std::string tenant = tenant_id.GetString();
+		secret_name_vec, tenant_vec, result, args.size(), [&](string_t secret_name, string_t tenant_id) {
+			auto &context = state.GetContext();
+			std::string name = secret_name.GetString();
+			std::string tenant = tenant_id.GetString();
 
-		    // Acquire token with tenant override for interactive auth
-		    auto token_result = AcquireToken(context, name, tenant);
+			// Acquire token with tenant override for interactive auth
+			auto token_result = AcquireToken(context, name, tenant);
 
-		    if (token_result.success) {
-			    return StringVector::AddString(result, TruncateToken(token_result.access_token));
-		    } else {
-			    return StringVector::AddString(result, token_result.error_message);
-		    }
-	    });
+			if (token_result.success) {
+				return StringVector::AddString(result, TruncateToken(token_result.access_token));
+			} else {
+				return StringVector::AddString(result, token_result.error_message);
+			}
+		});
 }
 
 //===----------------------------------------------------------------------===//
@@ -85,20 +82,19 @@ static void AzureAuthTestFunctionWithTenant(DataChunk &args, ExpressionState &st
 //===----------------------------------------------------------------------===//
 void RegisterAzureTestFunction(ExtensionLoader &loader) {
 	// Version 1: secret_name only
-	ScalarFunction func1("mssql_azure_auth_test",
-	                     {LogicalType::VARCHAR},  // secret_name
-	                     LogicalType::VARCHAR,    // return type
-	                     AzureAuthTestFunction);
+	ScalarFunction func1("mssql_azure_auth_test", {LogicalType::VARCHAR},  // secret_name
+						 LogicalType::VARCHAR,							   // return type
+						 AzureAuthTestFunction);
 	loader.RegisterFunction(func1);
 
 	// Version 2: secret_name + tenant_id (for interactive auth)
 	ScalarFunction func2("mssql_azure_auth_test",
-	                     {LogicalType::VARCHAR, LogicalType::VARCHAR},  // secret_name, tenant_id
-	                     LogicalType::VARCHAR,                          // return type
-	                     AzureAuthTestFunctionWithTenant);
+						 {LogicalType::VARCHAR, LogicalType::VARCHAR},	// secret_name, tenant_id
+						 LogicalType::VARCHAR,							// return type
+						 AzureAuthTestFunctionWithTenant);
 	loader.RegisterFunction(func2);
 }
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb
