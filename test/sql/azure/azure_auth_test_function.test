@@ -1,0 +1,59 @@
+# name: test/sql/azure/azure_auth_test_function.test
+# description: Test mssql_azure_auth_test() function
+# group: [azure]
+
+require mssql
+
+# Test: Empty secret name returns error
+query I
+SELECT mssql_azure_auth_test('');
+----
+Error: Secret name required
+
+# Test: Non-existent secret returns error
+query I
+SELECT mssql_azure_auth_test('nonexistent_azure_secret');
+----
+Error: Azure secret 'nonexistent_azure_secret' not found
+
+# Test: Azure extension required error (when Azure extension not loaded)
+# Note: This test assumes azure extension is NOT loaded
+# If azure is loaded, this will instead return "secret not found"
+# To properly test this, we would need to unload azure first
+
+# Test with actual Azure credentials requires environment variables
+# These tests are skipped if AZURE_APP_ID is not set
+
+require-env AZURE_APP_ID
+
+require-env AZURE_DIRECTORY_ID
+
+require-env AZURE_APP_SECRET
+
+require azure
+
+# Create Azure secret with service principal
+statement ok
+CREATE OR REPLACE SECRET test_azure_sp (
+    TYPE azure,
+    PROVIDER service_principal,
+    TENANT_ID '${AZURE_DIRECTORY_ID}',
+    CLIENT_ID '${AZURE_APP_ID}',
+    CLIENT_SECRET '${AZURE_APP_SECRET}'
+);
+
+# Test: Valid service principal credentials return truncated token
+# Token format: "eyJ0eXAi...xyz [N chars]"
+query I
+SELECT
+    CASE
+        WHEN mssql_azure_auth_test('test_azure_sp') LIKE 'eyJ%chars]' THEN 'token_acquired'
+        WHEN mssql_azure_auth_test('test_azure_sp') LIKE 'Error:%' THEN 'error'
+        ELSE 'unexpected'
+    END;
+----
+token_acquired
+
+# Clean up
+statement ok
+DROP SECRET IF EXISTS test_azure_sp;

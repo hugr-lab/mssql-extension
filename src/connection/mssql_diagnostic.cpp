@@ -93,7 +93,9 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 				throw InvalidInputException("Secret '%s' is not an MSSQL secret", input);
 			}
 
-			auto &kv_secret = dynamic_cast<const KeyValueSecret &>(secret);
+			// Use static_cast - we've already verified it's an MSSQL secret which is always KeyValueSecret
+			// This avoids dynamic_cast RTTI warnings when crossing extension boundaries on macOS
+			auto &kv_secret = static_cast<const KeyValueSecret &>(secret);
 
 			auto host_val = kv_secret.TryGetValue(MSSQL_SECRET_HOST);
 			auto port_val = kv_secret.TryGetValue(MSSQL_SECRET_PORT);

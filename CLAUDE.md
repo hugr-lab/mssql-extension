@@ -13,6 +13,7 @@ DuckDB extension for SQL Server via a custom TDS protocol implementation (no Fre
 
 ```text
 src/
+  azure/                # Azure AD authentication infrastructure
   catalog/              # DuckDB catalog integration + transaction manager
   connection/           # Connection pooling, provider, settings
   dml/                  # DML operations
@@ -28,7 +29,10 @@ src/
 test/
   sql/                  # SQLLogicTest files (require SQL Server for most)
     attach/             # ATTACH/DETACH tests
+    azure/              # Azure AD authentication tests (no SQL Server required)
     catalog/            # Catalog, DDL, filter pushdown, statistics
+    copy/               # COPY TO MSSQL (BulkLoadBCP) tests
+    ctas/               # CREATE TABLE AS SELECT tests
     dml/                # UPDATE and DELETE tests
     insert/             # INSERT tests
     integration/        # Core integration (pool, TLS, large data)
@@ -133,7 +137,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - **Custom TDS implementation**: No external TDS/ODBC library. TDS v7.4 protocol with PRELOGIN, LOGIN7, SQL_BATCH, ATTENTION packet types.
 - **Connection pool**: Thread-safe pool per attached database with idle timeout, background cleanup, configurable limits.
 - **Transaction support**: Connection pinning maps DuckDB transactions to SQL Server transactions via 8-byte ENVCHANGE descriptors. See `docs/transactions.md`.
-- **Catalog integration**: DuckDB Catalog/Schema/Table APIs with metadata cache (TTL-based), primary key discovery for rowid support.
+- **Catalog integration**: DuckDB Catalog/Schema/Table APIs with incremental metadata cache (lazy loading, TTL-based expiration, point invalidation), primary key discovery for rowid support.
 - **DML**: INSERT uses batched VALUES; UPDATE/DELETE use rowid-based VALUES JOIN pattern with deferred execution in transactions.
 - **DDL**: `CREATE TABLE IF NOT EXISTS` silently succeeds when table exists; `CREATE OR REPLACE TABLE` drops and recreates. Auto-TABLOCK enabled for new table creation (CTAS/COPY TO).
 - **Filter pushdown**: DuckDB filter expressions translated to T-SQL WHERE clauses. Function mapping for common string/date/arithmetic operations.
@@ -189,6 +193,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_open(conn_string)` | Scalar | Open standalone diagnostic connection |
 | `mssql_close(handle)` | Scalar | Close diagnostic connection |
 | `mssql_ping(handle)` | Scalar | Test connection liveness |
+| `mssql_azure_auth_test(secret, tenant?)` | Scalar | Test Azure AD token acquisition |
 
 ## Active Technologies
 - C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library) (019-fix-winsock-init)
@@ -203,6 +208,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - SQL Server 2019+ (remote target), in-memory (connection pool state) (025-bcp-improvements)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), existing TDS protocol layer, OpenSSL (vcpkg) (026-varchar-nvarchar-conversion)
 - SQL Server 2019+ (remote target), in-memory (batch buffering) (027-ctas-bcp-integration)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg for TLS/HTTP), DuckDB Azure extension (runtime) (001-azure-token-infrastructure)
+- In-memory (token cache, no persistence required) (001-azure-token-infrastructure)
 
 ## Recent Changes
 

@@ -1,0 +1,345 @@
+# Azure AD Authentication for MSSQL Extension
+
+This document describes how to use Azure Active Directory (Azure AD) authentication with the DuckDB MSSQL extension to connect to Azure SQL Database and Microsoft Fabric.
+
+## Prerequisites
+
+1. **DuckDB Azure Extension** - Required for Azure secret management
+2. **Azure Credentials** - Service principal, Azure CLI login, or interactive authentication
+
+## Quick Start
+
+```sql
+-- Install and load required extensions
+INSTALL azure;
+LOAD azure;
+INSTALL mssql FROM community;
+LOAD mssql;
+
+-- Create Azure secret with service principal
+CREATE SECRET my_azure_secret (
+    TYPE azure,
+    PROVIDER service_principal,
+    TENANT_ID 'your-tenant-id',
+    CLIENT_ID 'your-client-id',
+    CLIENT_SECRET 'your-client-secret'
+);
+
+-- Test the credentials
+SELECT mssql_azure_auth_test('my_azure_secret');
+-- Returns: eyJ0eXAiOi...xyz [1634 chars]
+
+-- Attach to Azure SQL Database
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
+    TYPE mssql,
+    AZURE_SECRET 'my_azure_secret'
+);
+```
+
+## Authentication Methods
+
+### 1. Service Principal (Recommended for Automation)
+
+Best for CI/CD pipelines, scheduled jobs, and server applications.
+
+```sql
+-- Create service principal secret
+CREATE SECRET azure_sp (
+    TYPE azure,
+    PROVIDER service_principal,
+    TENANT_ID 'your-tenant-id',
+    CLIENT_ID 'your-client-id',
+    CLIENT_SECRET 'your-client-secret'
+);
+
+-- Test credentials
+SELECT mssql_azure_auth_test('azure_sp');
+```
+
+**Required Azure Setup:**
+
+1. Register an application in Azure AD
+2. Create a client secret for the application
+3. Grant the application access to your Azure SQL Database:
+
+   ```sql
+   -- Run in Azure SQL Database
+   CREATE USER [your-app-name] FROM EXTERNAL PROVIDER;
+   ALTER ROLE db_datareader ADD MEMBER [your-app-name];
+   ALTER ROLE db_datawriter ADD MEMBER [your-app-name];
+   ```
+
+### 2. Azure CLI (Recommended for Development)
+
+Uses your existing Azure CLI login credentials.
+
+```sql
+-- Create credential chain secret with CLI
+CREATE SECRET azure_cli (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'cli'
+);
+
+-- Test credentials (requires 'az login' first)
+SELECT mssql_azure_auth_test('azure_cli');
+```
+
+**Prerequisites:**
+
+```bash
+# Install Azure CLI and login
+az login
+az account set --subscription "Your Subscription Name"
+```
+
+### 3. Interactive / Device Code Flow (For MFA)
+
+Best for interactive sessions where MFA is required.
+
+```sql
+-- Create credential chain secret with interactive auth
+CREATE SECRET azure_interactive (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'interactive'
+);
+
+-- Test with tenant_id (required for interactive auth)
+SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
+-- Output: To sign in, use a web browser to open https://microsoft.com/devicelogin
+--         and enter the code ABCD1234 to authenticate.
+```
+
+> **Note:** Interactive auth requires a `tenant_id` to be specified. You can either:
+>
+> 1. Pass it as the second argument to `mssql_azure_auth_test()`
+> 2. Use `azure_tenant_id` in the MSSQL secret (see below)
+> 3. Use Azure CLI (`az login`) which establishes tenant context automatically
+
+## Connection Examples
+
+### Azure SQL Database
+
+```sql
+-- Using service principal
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuresql (
+    TYPE mssql,
+    AZURE_SECRET 'azure_sp'
+);
+
+-- Query data
+SELECT * FROM azuresql.dbo.customers LIMIT 10;
+```
+
+### Microsoft Fabric Data Warehouse
+
+```sql
+-- Fabric connection string format
+ATTACH 'Server=xyz.datawarehouse.fabric.microsoft.com;Database=my_warehouse' AS fabric (
+    TYPE mssql,
+    AZURE_SECRET 'azure_sp'
+);
+
+-- Query Fabric tables
+SELECT * FROM fabric.dbo.sales_data;
+```
+
+### Azure SQL with TLS
+
+```sql
+-- Azure SQL always uses TLS, trust the certificate
+ATTACH 'Server=myserver.database.windows.net,1433;Database=mydb;Encrypt=True' AS azuresql (
+    TYPE mssql,
+    AZURE_SECRET 'azure_sp',
+    TRUST_SERVER_CERTIFICATE true
+);
+```
+
+## Testing Credentials
+
+The `mssql_azure_auth_test()` function validates Azure credentials without connecting to a database:
+
+```sql
+-- Test service principal
+SELECT mssql_azure_auth_test('my_secret_name');
+
+-- Successful output (truncated token):
+-- eyJ0eXAiOi...gJw [1634 chars]
+
+-- Error outputs:
+-- Error: Secret name required
+-- Error: Azure secret 'xyz' not found
+-- Error: Secret 'xyz' is not an Azure secret (type: postgres)
+-- Azure AD error: AADSTS7000215: Invalid client secret provided
+-- Azure CLI credentials expired. Run 'az login' to refresh.
+```
+
+## Token Caching
+
+Tokens are cached automatically with a 5-minute refresh margin:
+
+- Tokens are cached per secret name
+- Cache is thread-safe for concurrent queries
+- Tokens are refreshed automatically before expiration
+- Cache survives across multiple ATTACH/DETACH cycles
+
+```sql
+-- First call acquires token from Azure AD (~200ms)
+SELECT mssql_azure_auth_test('azure_sp');
+
+-- Subsequent calls use cached token (~0ms)
+SELECT mssql_azure_auth_test('azure_sp');
+```
+
+## Combining with MSSQL Secrets
+
+You can reference an Azure secret from an MSSQL secret:
+
+```sql
+-- Create Azure secret
+CREATE SECRET my_azure (
+    TYPE azure,
+    PROVIDER service_principal,
+    TENANT_ID 'your-tenant-id',
+    CLIENT_ID 'your-client-id',
+    CLIENT_SECRET 'your-client-secret'
+);
+
+-- Create MSSQL secret that references Azure secret
+CREATE SECRET azure_sql_conn (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    DATABASE 'mydb',
+    AZURE_SECRET 'my_azure'
+);
+
+-- Attach using the MSSQL secret
+ATTACH '' AS mydb (TYPE mssql, SECRET azure_sql_conn);
+```
+
+### Interactive Auth with MSSQL Secret
+
+For interactive authentication, you must provide a tenant ID. Since the Azure extension's
+credential_chain provider doesn't support tenant_id directly, use `azure_tenant_id` in the
+MSSQL secret:
+
+```sql
+-- Create Azure secret for interactive auth (no tenant_id needed here)
+CREATE SECRET my_azure_interactive (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'interactive'
+);
+
+-- Create MSSQL secret with tenant_id for interactive auth
+CREATE SECRET azure_sql_interactive (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    DATABASE 'mydb',
+    AZURE_SECRET 'my_azure_interactive',
+    AZURE_TENANT_ID 'your-tenant-id'  -- Required for interactive auth
+);
+
+-- Attach using the MSSQL secret (will prompt for device code login)
+ATTACH '' AS mydb (TYPE mssql, SECRET azure_sql_interactive);
+```
+
+## Troubleshooting
+
+### "Azure extension required for Azure authentication"
+
+```sql
+-- Install and load Azure extension first
+INSTALL azure;
+LOAD azure;
+```
+
+### "Azure secret 'xyz' not found"
+
+```sql
+-- Check existing secrets
+SELECT * FROM duckdb_secrets();
+
+-- Ensure secret was created with TYPE azure
+CREATE SECRET my_secret (
+    TYPE azure,  -- Must be 'azure'
+    PROVIDER service_principal,
+    ...
+);
+```
+
+### "AADSTS7000215: Invalid client secret provided"
+
+The client secret is incorrect or expired. Generate a new secret in Azure Portal:
+
+1. Go to Azure AD > App registrations > Your app
+2. Certificates & secrets > New client secret
+
+### "AADSTS700016: Application not found"
+
+The client ID (application ID) is incorrect:
+
+1. Go to Azure AD > App registrations
+2. Copy the correct Application (client) ID
+
+### "Azure CLI credentials expired"
+
+```bash
+# Re-authenticate with Azure CLI
+az login
+
+# Or for a specific tenant
+az login --tenant your-tenant-id
+```
+
+### "Device code flow timeout"
+
+The device code flow times out after 15 minutes. Start again:
+
+```sql
+-- Invalidate cached token and retry
+SELECT mssql_azure_auth_test('azure_interactive');
+```
+
+## Security Best Practices
+
+1. **Never commit secrets to source control** - Use environment variables or secret managers
+2. **Use service principals for production** - Avoid interactive auth in automated pipelines
+3. **Rotate secrets regularly** - Azure recommends rotating every 90 days
+4. **Use least privilege** - Grant only required database permissions
+5. **Enable Azure AD audit logs** - Monitor authentication attempts
+
+## Environment Variables
+
+For CI/CD, set credentials via environment variables:
+
+```bash
+export AZURE_TENANT_ID="your-tenant-id"
+export AZURE_CLIENT_ID="your-client-id"
+export AZURE_CLIENT_SECRET="your-client-secret"
+```
+
+```sql
+-- Use in DuckDB (requires azure extension environment provider)
+CREATE SECRET azure_env (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'env'
+);
+```
+
+## Supported Azure Services
+
+| Service | Connection String Format |
+| ------- | ------------------------ |
+| Azure SQL Database | `Server=name.database.windows.net;Database=dbname` |
+| Azure SQL Managed Instance | `Server=name.public.xyz.database.windows.net,3342;Database=dbname` |
+| Microsoft Fabric DW | `Server=xyz.datawarehouse.fabric.microsoft.com;Database=warehouse` |
+| Azure Synapse Serverless | `Server=name-ondemand.sql.azuresynapse.net;Database=dbname` |
+
+## See Also
+
+- [DuckDB Azure Extension](https://duckdb.org/docs/extensions/azure)
+- [Azure AD Authentication for Azure SQL](https://docs.microsoft.com/azure/azure-sql/database/authentication-aad-overview)
+- [Microsoft Fabric Documentation](https://docs.microsoft.com/fabric/)

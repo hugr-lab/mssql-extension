@@ -8,7 +8,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 
 - Native TDS protocol implementation (no external dependencies)
 - Stream query results directly into DuckDB without buffering
-- Full DuckDB catalog integration with three-part naming (`database.schema.table`)
+- Full DuckDB catalog integration with three-part naming and lazy metadata loading
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits and automatic session reset
 - TLS/SSL encrypted connections
@@ -18,6 +18,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Transaction support: BEGIN/COMMIT/ROLLBACK with connection pinning
 - Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
+- [Azure AD authentication](AZURE.md) (service principal, CLI, interactive device code flow)
 
 ## Quick Start
 
@@ -1446,6 +1447,24 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
 - VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)
+
+## Authentication
+
+This project uses the Azure Identity SDK (Apache License 2.0)
+for authentication with Microsoft Entra ID.
+
+Non-interactive flows (service principal, managed identity)
+are handled by the Azure Identity SDK. Interactive authentication
+is implemented using the OAuth 2.0 device code flow.
+
+See [AZURE.md](AZURE.md) for complete Azure AD authentication documentation.
+
+## Third-Party Licenses
+
+This project includes components from the Azure Identity SDK
+licensed under the Apache License, Version 2.0.
+
+© Microsoft Corporation
 
 ## License
 

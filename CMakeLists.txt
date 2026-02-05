@@ -11,7 +11,11 @@ set(MSSQL_EXTENSION_VERSION "0.1.15")
 # Project configuration
 project(${TARGET_NAME})
 
-include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy)
+# C++17 is required for Azure SDK and modern C++ features
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy src/include/azure)
 
 # Get DuckDB commit hash for version tracking
 execute_process(
@@ -62,6 +66,15 @@ find_package(OpenSSL REQUIRED)
 
 message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
 message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
+
+# =============================================================================
+# Azure SDK for Azure AD authentication
+# =============================================================================
+find_package(azure-identity-cpp CONFIG REQUIRED)
+find_package(CURL REQUIRED)
+
+message(STATUS "Azure SDK found for Azure AD authentication")
+message(STATUS "CURL found: ${CURL_VERSION_STRING}")
 
 # =============================================================================
 # Extension Sources
@@ -151,6 +164,11 @@ set(EXTENSION_SOURCES
     src/copy/target_resolver.cpp
     src/copy/bcp_writer.cpp
     src/copy/copy_function.cpp
+    # Azure AD authentication layer
+    src/azure/azure_secret_reader.cpp
+    src/azure/azure_token.cpp
+    src/azure/azure_test_function.cpp
+    src/azure/azure_device_code.cpp
 )
 
 # Build static extension (linked into DuckDB)
@@ -166,11 +184,11 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
-message(STATUS "Static extension configured with full TLS support (OpenSSL)")
+message(STATUS "Static extension configured with TLS (OpenSSL) and Azure AD authentication")
 
 # =============================================================================
 # Loadable Extension Configuration
@@ -179,7 +197,7 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Azure::azure-identity CURL::libcurl)
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
@@ -215,7 +233,7 @@ elseif(WIN32)
     message(STATUS "Loadable extension: Windows symbol export via .def file")
 endif()
 
-message(STATUS "Loadable extension configured with full TLS support (OpenSSL)")
+message(STATUS "Loadable extension configured with TLS (OpenSSL) and Azure AD authentication")
 
 # =============================================================================
 # Installation
