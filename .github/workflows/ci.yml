@@ -156,10 +156,20 @@ jobs:
         run: |
           mkdir -p build/release
           cd build/release
+
+          # Linux needs --allow-multiple-definition due to ODR issues with constexpr static members
+          # when linking DuckDB extensions as static libraries with GCC
+          EXTRA_LINKER_FLAGS=""
+          if [ "${{ matrix.platform.os }}" = "linux" ]; then
+            EXTRA_LINKER_FLAGS="-Wl,--allow-multiple-definition"
+          fi
+
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LINKER_FLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LINKER_FLAGS" \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
@@ -181,6 +191,13 @@ jobs:
         with:
           name: duckdb-cli-v1.4.4-${{ matrix.platform.id }}
           path: build/release/duckdb
+          if-no-files-found: error
+
+      - name: Upload unittest Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unittest-v1.4.4-${{ matrix.platform.id }}
+          path: build/release/test/unittest
           if-no-files-found: error
 
   # ============================================================================
@@ -518,6 +535,7 @@ jobs:
   # ============================================================================
   # Azure Test Job - Azure SQL Database and Fabric tests
   # Uses 'test' environment for secrets (AZURE_APP_ID, AZURE_APP_SECRET, etc.)
+  # Runs DuckDB unittest with [azure] test group
   # (Manual trigger only via workflow_dispatch)
   # ============================================================================
   azure-test:
@@ -530,23 +548,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download extension artifact
+      - name: Download unittest artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-linux_amd64
-          path: extension
-
-      - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: duckdb-cli-v1.4.4-linux_amd64
-          path: cli
+          name: unittest-v1.4.4-linux_amd64
+          path: test
 
       - name: Setup executables
         run: |
-          chmod +x cli/duckdb
+          chmod +x test/unittest
 
-      - name: Run Azure SQL tests
+      - name: Run Azure tests
         env:
           AZURE_SQL_TEST_DSN: ${{ secrets.AZURE_SQL_TEST_DSN }}
           AZURE_APP_ID: ${{ secrets.AZURE_APP_ID }}
@@ -556,46 +568,14 @@ jobs:
           AZURE_SQL_DB: ${{ secrets.AZURE_SQL_DB }}
         run: |
           echo "============================================"
-          echo "Running Azure SQL Database Tests"
+          echo "Running Azure Tests with unittest"
           echo "============================================"
-          echo "Host: $AZURE_SQL_DB_HOST"
-          echo "Database: $AZURE_SQL_DB"
-          echo "============================================"
-
-          # Run Azure-specific tests
-          ./cli/duckdb -unsigned -c "
-            LOAD 'extension/mssql.duckdb_extension';
-
-            -- Create Azure secret for service principal auth
-            CREATE SECRET azure_sp (
-              TYPE azure,
-              PROVIDER service_principal,
-              TENANT_ID '$AZURE_DIRECTORY_ID',
-              CLIENT_ID '$AZURE_APP_ID',
-              CLIENT_SECRET '$AZURE_APP_SECRET'
-            );
-
-            -- Test Azure auth token acquisition
-            SELECT mssql_azure_auth_test('azure_sp');
-          "
-
-          echo "Azure SQL tests completed!"
-
-      - name: Run Azure Fabric tests (optional)
-        if: ${{ secrets.AZURE_WH_HOST != '' }}
-        env:
-          AZURE_APP_ID: ${{ secrets.AZURE_APP_ID }}
-          AZURE_DIRECTORY_ID: ${{ secrets.AZURE_DIRECTORY_ID }}
-          AZURE_APP_SECRET: ${{ secrets.AZURE_APP_SECRET }}
-          AZURE_WH_HOST: ${{ secrets.AZURE_WH_HOST }}
-          AZURE_WH_NAME: ${{ secrets.AZURE_WH_NAME }}
-        run: |
-          echo "============================================"
-          echo "Running Azure Fabric Warehouse Tests"
-          echo "============================================"
-          echo "Host: $AZURE_WH_HOST"
-          echo "Warehouse: $AZURE_WH_NAME"
+          echo "AZURE_APP_ID is set: $([ -n \"$AZURE_APP_ID\" ] && echo 'yes' || echo 'no')"
+          echo "AZURE_DIRECTORY_ID is set: $([ -n \"$AZURE_DIRECTORY_ID\" ] && echo 'yes' || echo 'no')"
+          echo "AZURE_APP_SECRET is set: $([ -n \"$AZURE_APP_SECRET\" ] && echo 'yes' || echo 'no')"
           echo "============================================"
 
-          # Fabric tests would go here when FEDAUTH is implemented
-          echo "Fabric tests skipped - FEDAUTH not yet implemented"
+          # Run Azure test group
+          ./test/unittest "[azure]" --force-reload
+
+          echo "Azure tests completed!"
