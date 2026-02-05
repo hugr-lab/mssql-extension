@@ -135,6 +135,23 @@ A user creates or drops a schema via DuckDB's catalog DDL. Only the affected sch
 
 ---
 
+### User Story 9 - Azure SQL Database Compatibility (Priority: P2)
+
+A user connects to Azure SQL Database using the incremental catalog cache. All lazy loading and TTL features must work correctly with Azure SQL's metadata system views.
+
+**Why this priority**: Azure SQL Database is a key deployment target. The incremental cache must be validated against Azure SQL to ensure compatibility with cloud environments where connection latency makes lazy loading even more beneficial.
+
+**Independent Test**: Can be tested when `AZURE_SQL_TEST_DSN` environment variable is defined - tests are skipped otherwise. Validates lazy loading, TTL, and point invalidation against live Azure SQL Database.
+
+**Acceptance Scenarios**:
+
+1. **Given** `AZURE_SQL_TEST_DSN` is configured, **When** user attaches Azure SQL Database, **Then** lazy loading works identically to on-premises SQL Server
+2. **Given** Azure SQL connection, **When** user queries a specific table, **Then** only that table's columns are loaded from Azure metadata
+3. **Given** Azure SQL connection with schema TTL configured, **When** TTL expires, **Then** only the accessed schema is refreshed via Azure metadata queries
+4. **Given** Azure SQL connection, **When** user executes DDL via DuckDB Catalog, **Then** point invalidation works correctly
+
+---
+
 ### Edge Cases
 
 - What happens when a schema is accessed that doesn't exist? → Clear error message, no cache pollution
@@ -178,6 +195,13 @@ A user creates or drops a schema via DuckDB's catalog DDL. Only the affected sch
 - **FR-018**: System MUST maintain backward compatibility with existing `mssql_refresh_cache()` function
 - **FR-019**: Existing `mssql_catalog_cache_ttl` setting behavior MUST be preserved as default/fallback
 
+**Azure SQL Testing**:
+
+- **FR-020**: Integration tests MUST include Azure SQL Database tests when `AZURE_SQL_TEST_DSN` environment variable is defined
+- **FR-021**: Azure SQL tests MUST be skipped gracefully when `AZURE_SQL_TEST_DSN` is not configured
+- **FR-022**: Lazy loading behavior MUST be validated against Azure SQL Database metadata views
+- **FR-023**: TTL expiration and point invalidation MUST work correctly with Azure SQL Database
+
 ### Key Entities
 
 - **SchemaMetadata**: Represents cached schema with table list, loading state, and last refresh timestamp
@@ -198,6 +222,8 @@ A user creates or drops a schema via DuckDB's catalog DDL. Only the affected sch
 - **SC-007**: `DROP TABLE` via DuckDB removes table from cache in under 1 second without global refresh
 - **SC-008**: All existing catalog tests pass without modification (backward compatibility)
 - **SC-009**: Memory usage for catalog cache scales linearly with actually accessed tables, not total tables
+- **SC-010**: Azure SQL Database tests pass when `AZURE_SQL_TEST_DSN` is configured (lazy loading, TTL, point invalidation)
+- **SC-011**: Azure SQL tests are skipped without error when `AZURE_SQL_TEST_DSN` is not defined
 
 ## Assumptions
 
