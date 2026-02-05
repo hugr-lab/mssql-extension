@@ -15,6 +15,15 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Allow multiple definitions for DuckDB constexpr static members (LogicalType::*, etc.)
+# This is needed on Linux because C++17 constexpr static members can cause ODR violations
+# when linking static extension libraries into shared libraries.
+# See: https://github.com/duckdb/duckdb/issues/XXX (common DuckDB extension issue)
+if(UNIX AND NOT APPLE)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition" CACHE STRING "" FORCE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--allow-multiple-definition" CACHE STRING "" FORCE)
+endif()
+
 include_directories(src/include src/include/tds/tls src/include/catalog src/include/table_scan src/include/dml src/include/dml/insert src/include/dml/update src/include/dml/delete src/include/copy src/include/azure)
 
 # Get DuckDB commit hash for version tracking
@@ -191,11 +200,6 @@ if(NOT WIN32)
     target_compile_options(${EXTENSION_NAME} PRIVATE -fvisibility=hidden)
 endif()
 
-# Allow multiple definitions for DuckDB const static members (LogicalType::*, etc.)
-# This is needed because Azure SDK pulls in headers that duplicate these constants
-if(UNIX AND NOT APPLE)
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--allow-multiple-definition")
-endif()
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
