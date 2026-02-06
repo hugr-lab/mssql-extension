@@ -1,8 +1,10 @@
 #include "catalog/mssql_catalog.hpp"
+#include "azure/azure_token.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/ctas/mssql_ctas_planner.hpp"
@@ -157,18 +159,39 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		EnsureCacheLoaded(*transaction.context);
 	}
 
-	// Acquire connection to trigger lazy loading of schema list
+	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
+	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
+	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
+		return &GetOrCreateSchemaEntry(name);
+	}
+
+	// T013-T014 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
+	// This ensures schema lookups during INSERT in transaction use the pinned connection
 	if (!connection_pool_) {
 		throw InternalException("Connection pool not initialized");
 	}
-	auto connection = connection_pool_->Acquire();
+
+	std::shared_ptr<tds::TdsConnection> connection;
+	if (transaction.context) {
+		// Use ConnectionProvider for proper transaction handling
+		connection = ConnectionProvider::GetConnection(*transaction.context, *this);
+	} else {
+		// Fallback to direct pool access if no context available
+		connection = connection_pool_->Acquire();
+	}
 	if (!connection) {
 		throw IOException("Failed to acquire connection for schema lookup");
 	}
 
 	// Trigger lazy loading of schema list
 	metadata_cache_->EnsureSchemasLoaded(*connection);
-	connection_pool_->Release(std::move(connection));
+
+	// Release connection properly (no-op if pinned to transaction)
+	if (transaction.context) {
+		ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
+	} else {
+		connection_pool_->Release(std::move(connection));
+	}
 
 	// Check if schema exists in cache
 	if (!metadata_cache_->HasSchema(name)) {
@@ -186,18 +209,33 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	// Ensure cache is loaded (sets TTL)
 	EnsureCacheLoaded(context);
 
-	// Acquire connection for lazy loading
+	// T036 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection
+	// Fast path: If schemas are already loaded, get names without acquiring connection
+	vector<string> schema_names;
+	if (metadata_cache_->TryGetCachedSchemaNames(schema_names)) {
+		// Cache hit - iterate without connection
+		for (const auto &name : schema_names) {
+			auto &schema_entry = GetOrCreateSchemaEntry(name);
+			callback(schema_entry);
+		}
+		return;
+	}
+
+	// T015-T016 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
 	if (!connection_pool_) {
 		throw InternalException("Connection pool not initialized");
 	}
-	auto connection = connection_pool_->Acquire();
+
+	// Use ConnectionProvider for proper transaction handling
+	auto connection = ConnectionProvider::GetConnection(context, *this);
 	if (!connection) {
 		throw IOException("Failed to acquire connection for schema scan");
 	}
 
-	auto schema_names = metadata_cache_->GetSchemaNames(*connection);
+	schema_names = metadata_cache_->GetSchemaNames(*connection);
 
-	connection_pool_->Release(std::move(connection));
+	// Release connection properly (no-op if pinned to transaction)
+	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 
 	for (const auto &name : schema_names) {
 		auto &schema_entry = GetOrCreateSchemaEntry(name);
@@ -530,6 +568,12 @@ string MSSQLCatalog::GetDBPath() {
 //===----------------------------------------------------------------------===//
 
 void MSSQLCatalog::OnDetach(ClientContext &context) {
+	// T023 (FR-005): Invalidate cached Azure token on detach
+	// This ensures re-attach will acquire a fresh token, not use a stale cached one
+	if (connection_info_ && connection_info_->use_azure_auth && !connection_info_->azure_secret_name.empty()) {
+		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
+	}
+
 	// Remove connection pool for this context (shuts down and cleans up connections)
 	MssqlPoolManager::Instance().RemovePool(context_name_);
 

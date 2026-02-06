@@ -139,6 +139,10 @@ public:
 	// Check if table exists (reads cached state only, no lazy loading)
 	bool HasTable(const string &schema_name, const string &table_name);
 
+	// T036: Get schema names without connection if already loaded
+	// Returns true if schemas are loaded and names were populated, false otherwise
+	bool TryGetCachedSchemaNames(vector<string> &out_names);
+
 	//===----------------------------------------------------------------------===//
 	// Cache Management
 	//===----------------------------------------------------------------------===//

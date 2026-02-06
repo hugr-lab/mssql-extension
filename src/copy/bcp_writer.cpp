@@ -154,6 +154,8 @@ idx_t BCPWriter::Finalize() {
 	std::vector<uint8_t> response;
 	auto socket = conn_.GetSocket();
 	if (!socket) {
+		// T009: Close connection to ensure clean pool state
+		conn_.Close();
 		throw IOException("MSSQL: Connection socket is null");
 	}
 
@@ -161,6 +163,8 @@ idx_t BCPWriter::Finalize() {
 	auto start_recv = Clock::now();
 	BCPDebugLog(1, "Finalize: waiting for server response (timeout: 30s)...");
 	if (!socket->ReceiveMessage(response, 30000)) {
+		// T009: Close connection before throwing to prevent corrupted pool state
+		conn_.Close();
 		throw IOException("MSSQL: Failed to receive BCP response: " + socket->GetLastError());
 	}
 	double recv_ms = ElapsedMs(start_recv);
@@ -258,10 +262,15 @@ idx_t BCPWriter::Finalize() {
 		if (error_message.empty()) {
 			error_message = "Unknown SQL Server error during bulk load";
 		}
+		// T009 (FR-001): Close connection before throwing to prevent corrupted state in pool
+		// Without this, connection remains in Executing state and corrupts pool on Release()
+		conn_.Close();
 		throw InvalidInputException("MSSQL: BCP failed: %s", error_message);
 	}
 
 	if (!found_done) {
+		// T009: Close connection before throwing to prevent corrupted pool state
+		conn_.Close();
 		throw IOException("MSSQL: Did not receive DONE token in BCP response");
 	}
 
@@ -524,6 +533,8 @@ void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) 
 		// Send the packet with timing
 		auto start_pkt = Clock::now();
 		if (!socket->SendPacket(packet)) {
+			// T009: Close connection before throwing to prevent corrupted pool state
+			conn_.Close();
 			throw IOException("MSSQL: Failed to send BULK_LOAD packet %zu/%zu: %s", i + 1, packets.size(),
 							  socket->GetLastError().c_str());
 		}

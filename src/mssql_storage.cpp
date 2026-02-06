@@ -757,6 +757,14 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
 	}
 
+	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance
+	// Fabric endpoints don't support BCP/INSERT BULK, need fallback to INSERT
+	ctx->connection_info->is_fabric_endpoint = ctx->connection_info->IsFabricEndpoint();
+	if (ctx->connection_info->is_fabric_endpoint) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "Fabric endpoint detected: %s (BCP disabled, using INSERT fallback)",
+								ctx->connection_info->host.c_str());
+	}
+
 	// Validate connection before registering context or creating catalog
 	// This ensures we fail fast on invalid credentials
 	auto pool_config = LoadPoolConfig(context);
@@ -764,10 +772,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
 	if (ctx->connection_info->use_azure_auth) {
-		// Note: For Fabric/Azure SQL, we skip validation and let pool connections handle auth
-		// This avoids token/session conflicts that can occur with multiple sequential authentications
-		// The pool factory will test the connection when first needed
-		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: skipping validation, will validate on first pool connection");
+		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
+		// This ensures invalid credentials are detected immediately, not on first query
+		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
+		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
+
+		// Build FEDAUTH token for pool factory (uses validated credentials)
 		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
 	} else {

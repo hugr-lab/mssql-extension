@@ -1,7 +1,25 @@
 #include "tds/tds_connection_pool.hpp"
 
+#include <cstdlib>
+
 namespace duckdb {
 namespace tds {
+
+// Debug logging infrastructure (T005-T006)
+static int GetPoolDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_POOL_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                              \
+		if (GetPoolDebugLevel() >= lvl)                               \
+			fprintf(stderr, "[MSSQL POOL] " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
 
 ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory)
 	: context_name_(context_name),
@@ -57,7 +75,7 @@ void ConnectionPool::Shutdown() {
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
-	fprintf(stderr, "[MSSQL POOL] Acquire called on pool '%s'\n", context_name_.c_str());
+	MSSQL_POOL_DEBUG_LOG(1, "Acquire called on pool '%s'", context_name_.c_str());
 	if (shutdown_flag_.load()) {
 		return nullptr;
 	}
@@ -143,6 +161,18 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 			stats_.active_connections--;
 			break;
 		}
+	}
+
+	// T010: Validate connection state before returning to pool (FR-002)
+	// Connections must be in Idle state to be safely reused
+	if (conn->GetState() != ConnectionState::Idle) {
+		MSSQL_POOL_DEBUG_LOG(1, "Closing connection in non-Idle state: %d (pool '%s')",
+							 static_cast<int>(conn->GetState()), context_name_.c_str());
+		conn->Close();
+		stats_.connections_closed++;
+		stats_.total_connections--;
+		available_cv_.notify_one();
+		return;
 	}
 
 	// If caching disabled or connection is dead, close it

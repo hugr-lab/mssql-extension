@@ -1686,5 +1686,73 @@ TdsPacket TdsProtocol::BuildFedAuthToken(const std::vector<uint8_t> &token_utf16
 	return packet;
 }
 
+std::vector<TdsPacket> TdsProtocol::BuildFedAuthTokenMultiPacket(const std::vector<uint8_t> &token_utf16le,
+																 size_t max_packet_size,
+																 const std::vector<uint8_t> &nonce) {
+	std::vector<TdsPacket> packets;
+
+	// Build the full FEDAUTH_TOKEN payload first
+	// Format: DataLen (4) + TokenLen (4) + Token + Nonce (optional)
+	uint32_t token_len = static_cast<uint32_t>(token_utf16le.size());
+	uint32_t nonce_len = static_cast<uint32_t>(nonce.size());
+	uint32_t data_len = 4 + token_len + nonce_len;
+
+	std::vector<uint8_t> payload;
+	payload.reserve(8 + token_utf16le.size() + nonce.size());
+
+	// DataLen (4 bytes, LE)
+	payload.push_back(data_len & 0xFF);
+	payload.push_back((data_len >> 8) & 0xFF);
+	payload.push_back((data_len >> 16) & 0xFF);
+	payload.push_back((data_len >> 24) & 0xFF);
+
+	// TokenLen (4 bytes, LE)
+	payload.push_back(token_len & 0xFF);
+	payload.push_back((token_len >> 8) & 0xFF);
+	payload.push_back((token_len >> 16) & 0xFF);
+	payload.push_back((token_len >> 24) & 0xFF);
+
+	// Token
+	payload.insert(payload.end(), token_utf16le.begin(), token_utf16le.end());
+
+	// Nonce (if present)
+	if (!nonce.empty()) {
+		payload.insert(payload.end(), nonce.begin(), nonce.end());
+	}
+
+	// TDS packet header is 8 bytes, so max payload per packet is (max_packet_size - 8)
+	size_t max_payload = max_packet_size - TDS_HEADER_SIZE;
+
+	// If it fits in a single packet, use single packet
+	if (payload.size() <= max_payload) {
+		TdsPacket packet(PacketType::FEDAUTH_TOKEN);
+		packet.AppendPayload(payload);
+		packets.push_back(std::move(packet));
+		return packets;
+	}
+
+	// Split into multiple packets
+	size_t offset = 0;
+	while (offset < payload.size()) {
+		size_t chunk_size = std::min(max_payload, payload.size() - offset);
+		bool is_last = (offset + chunk_size >= payload.size());
+
+		TdsPacket packet(PacketType::FEDAUTH_TOKEN);
+
+		// Set EOM flag only on last packet
+		if (!is_last) {
+			packet.SetEndOfMessage(false);
+		}
+
+		// Append this chunk of the payload
+		packet.AppendPayload(payload.data() + offset, chunk_size);
+
+		packets.push_back(std::move(packet));
+		offset += chunk_size;
+	}
+
+	return packets;
+}
+
 }  // namespace tds
 }  // namespace duckdb

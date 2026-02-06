@@ -120,6 +120,17 @@ public:
 	static TdsPacket BuildFedAuthToken(const std::vector<uint8_t> &token_utf16le,
 									   const std::vector<uint8_t> &nonce = {});
 
+	// Build FEDAUTH_TOKEN packet(s) with automatic fragmentation for large tokens
+	// When token size + headers exceeds max_packet_size, splits into multiple TDS packets.
+	// Returns vector of packets with proper continuation flags (EOM only on last packet).
+	// Parameters:
+	//   token_utf16le - UTF-16LE encoded access token from Azure AD
+	//   max_packet_size - maximum TDS packet size (default 4096)
+	//   nonce - optional 32-byte nonce (can be empty)
+	static std::vector<TdsPacket> BuildFedAuthTokenMultiPacket(const std::vector<uint8_t> &token_utf16le,
+															   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE,
+															   const std::vector<uint8_t> &nonce = {});
+
 	// Build empty SQL_BATCH packet for ping
 	// This sends an empty batch which triggers a DONE response
 	static TdsPacket BuildPing();

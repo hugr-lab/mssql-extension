@@ -39,6 +39,11 @@ struct MSSQLConnectionInfo {
 	bool use_azure_auth = false;  // Use Azure AD authentication instead of SQL auth
 	string azure_secret_name;	  // Name of the Azure secret for token acquisition
 
+	//===----------------------------------------------------------------------===//
+	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
+	//===----------------------------------------------------------------------===//
+	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)
+
 	// Check if this connection targets an Azure endpoint
 	// Azure endpoints require Azure AD auth support and TLS hostname verification
 	bool IsAzureEndpoint() const;

@@ -146,6 +146,111 @@ When a transaction descriptor is active, SQL_BATCH packets include an ALL_HEADER
 - `ENVCHANGE` — environment changes (packet size, database, language, collation)
 - `ERROR` — login failed
 
+## FEDAUTH (Azure AD Authentication)
+
+The extension supports Azure AD authentication via the TDS FEDAUTH mechanism. Two workflows exist:
+
+### ADAL Workflow (Used for Azure SQL/Fabric)
+
+The ADAL workflow is a two-stage process used by Azure SQL Database and Microsoft Fabric:
+
+```
+Client                              Server
+  │                                    │
+  │──PRELOGIN (FEDAUTHREQUIRED=1)────▶│
+  │◀──PRELOGIN (FEDAUTHREQUIRED echo)──│
+  │                                    │
+  │──[TLS Handshake wrapped in PRELOGIN]──│
+  │                                    │
+  │──LOGIN7 (ADAL extension, no token)─▶│
+  │◀──FEDAUTHINFO (STS_URL, SPN)────────│
+  │                                    │
+  │   [Client acquires token from STS] │
+  │                                    │
+  │──FEDAUTH_TOKEN (access token)─────▶│
+  │◀──LOGINACK / ROUTING / ERROR───────│
+```
+
+**PRELOGIN with FEDAUTHREQUIRED**:
+- Option 0x06 (FEDAUTHREQUIRED) signals intent to use FEDAUTH
+- Server echoes the option back if it supports FEDAUTH
+- `fedauth_echo` flag in LOGIN7 must match server's response
+
+**LOGIN7 ADAL Extension**:
+- Feature extension ID: 0x02 (FEDAUTH)
+- Library type: 0x02 (ADAL)
+- Workflow: 0x01 (Password-based, used for CLI/SP/Interactive)
+- No token embedded — token sent separately after FEDAUTHINFO
+
+**FEDAUTHINFO Token (0xEE)**:
+- Sent by server after LOGIN7 with ADAL extension
+- Contains STS URL (e.g., `https://login.windows.net/<tenant>`)
+- Contains SPN (e.g., `https://database.windows.net/`)
+
+**FEDAUTH_TOKEN Packet (0x08)**:
+- Packet type 0x08, sent after receiving FEDAUTHINFO
+- Contains UTF-16LE encoded access token from Azure AD
+
+### FEDAUTH Token Packet Fragmentation
+
+Azure CLI tokens are larger than Service Principal tokens due to additional claims:
+- Service Principal tokens: ~1632 chars → ~3264 bytes UTF-16LE (fits in single packet)
+- Azure CLI tokens: ~2091 chars → ~4182 bytes UTF-16LE (exceeds 4096-byte packet limit)
+
+When the token exceeds `TDS_DEFAULT_PACKET_SIZE` (4096 bytes), it must be fragmented:
+
+```cpp
+std::vector<TdsPacket> BuildFedAuthTokenMultiPacket(
+    const std::vector<uint8_t> &token_utf16le,
+    size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE,
+    const std::vector<uint8_t> &nonce = {});
+```
+
+**Fragmentation rules**:
+- Payload format: `DataLen (4) + TokenLen (4) + Token + Nonce (optional)`
+- Max payload per packet: `max_packet_size - TDS_HEADER_SIZE` (4096 - 8 = 4088 bytes)
+- First packet(s): status = 0x00 (NORMAL, more packets follow)
+- Last packet: status = 0x01 (END_OF_MESSAGE)
+- All packets use type 0x08 (FEDAUTH_TOKEN)
+
+**Example for 4182-byte CLI token**:
+```
+Packet 1: type=0x08, status=0x00, len=4096, payload=4088 bytes
+Packet 2: type=0x08, status=0x01, len=110,  payload=102 bytes (remaining)
+```
+
+### Routing (Azure SQL Gateway)
+
+Azure SQL Database may redirect connections via ENVCHANGE type 20 (0x14):
+
+```
+ENVCHANGE Type 20 (Routing):
+  2 bytes: routing data length
+  1 byte:  protocol (0 = TCP)
+  2 bytes: port (little-endian)
+  2 bytes: server name length (chars)
+  N bytes: server name (UTF-16LE)
+```
+
+When routing occurs:
+1. Close current connection
+2. Connect to new server:port
+3. Repeat PRELOGIN/TLS/LOGIN7/FEDAUTH flow
+4. Up to 5 routing hops allowed
+
+### Endpoint Type Detection
+
+The extension detects Azure endpoint types for appropriate TLS behavior:
+
+| Endpoint Pattern | Type | TLS Hostname Verification |
+|-----------------|------|---------------------------|
+| `*.database.windows.net` | Azure SQL | Required |
+| `*.datawarehouse.fabric.microsoft.com` | Microsoft Fabric | Required |
+| `*.sql.azuresynapse.net` | Azure Synapse | Required |
+| Other | On-premises | Optional (self-signed allowed) |
+
+Detection via `IsAzureEndpoint()`, `IsFabricEndpoint()`, `IsSynapseEndpoint()` in `azure_fedauth.cpp`.
+
 ## Token Parsing
 
 `TokenParser` (`src/tds/tds_token_parser.cpp`) implements incremental token stream parsing. Data is fed in chunks and tokens are parsed as they become available.
