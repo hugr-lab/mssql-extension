@@ -632,6 +632,70 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation complete");
 }
 
+//===----------------------------------------------------------------------===//
+// Manual Token Connection Validation (Spec 032)
+//===----------------------------------------------------------------------===//
+
+void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
+                                   int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
+	                        info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
+	                        timeout_seconds);
+
+	// Create a temporary connection to test the pre-provided token
+	tds::TdsConnection conn;
+
+	// Attempt TCP connection
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection FAILED - %s", error.c_str());
+		throw IOException("MSSQL manual token connection validation failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection succeeded");
+
+	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
+	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
+		conn.Close();
+		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH succeeded");
+
+	// Test query
+	if (info.use_encrypt) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: executing validation query (SELECT 1)...");
+		try {
+			if (!conn.ExecuteBatch("SELECT 1")) {
+				string error = conn.GetLastError();
+				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED - %s",
+				                        error.c_str());
+				conn.Close();
+				throw InvalidInputException("MSSQL manual token connection validation failed: query failed: %s", error);
+			}
+			// Drain results
+			auto *socket = conn.GetSocket();
+			if (socket) {
+				std::vector<uint8_t> response;
+				socket->ReceiveMessage(response, 5000);
+				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+			}
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query succeeded");
+		} catch (const std::exception &e) {
+			string error = e.what();
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED with exception - %s",
+			                        error.c_str());
+			conn.Close();
+			throw InvalidInputException("MSSQL manual token connection validation failed: %s", error);
+		}
+	}
+
+	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation complete");
+}
+
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
@@ -805,8 +869,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
-		// Validate actual connection to server
-		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
+		// Validate actual connection to server using the pre-provided token
+		ValidateManualTokenConnection(*ctx->connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
 	} else if (ctx->connection_info->use_azure_auth) {
 		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
 		// This ensures invalid credentials are detected immediately, not on first query
