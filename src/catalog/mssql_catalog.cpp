@@ -1,4 +1,5 @@
 #include "catalog/mssql_catalog.hpp"
+#include "azure/azure_token.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
@@ -549,6 +550,12 @@ string MSSQLCatalog::GetDBPath() {
 //===----------------------------------------------------------------------===//
 
 void MSSQLCatalog::OnDetach(ClientContext &context) {
+	// T023 (FR-005): Invalidate cached Azure token on detach
+	// This ensures re-attach will acquire a fresh token, not use a stale cached one
+	if (connection_info_ && connection_info_->use_azure_auth && !connection_info_->azure_secret_name.empty()) {
+		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
+	}
+
 	// Remove connection pool for this context (shuts down and cleans up connections)
 	MssqlPoolManager::Instance().RemovePool(context_name_);
 
