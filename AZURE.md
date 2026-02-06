@@ -331,6 +331,26 @@ COPY (SELECT * FROM local_table) TO 'fabric.dbo.new_table' (FORMAT 'bcp');
 -- Error: Microsoft Fabric does not support INSERT BULK (BCP protocol).
 ```
 
+### VARCHAR(MAX) / NVARCHAR(MAX) Not Supported
+
+Fabric doesn't support `VARCHAR(MAX)` or `NVARCHAR(MAX)` data types. When using CTAS with string columns, you may see:
+
+```
+Error: The data type 'nvarchar(max)' is not supported in this edition of SQL Server.
+```
+
+**Workarounds:**
+
+1. **Cast to fixed-length strings** in your CTAS query:
+   ```sql
+   CREATE TABLE fabric.dbo.target AS
+   SELECT id, CAST(name AS VARCHAR(255)) AS name FROM source;
+   ```
+
+2. **Use Azure SQL Database** for tables with large text columns, then sync to Fabric
+
+3. **Pre-create the table** in Fabric with appropriate VARCHAR(n) types, then INSERT
+
 ### Performance Tips for Fabric
 
 1. Use CTAS instead of COPY TO
