@@ -1,0 +1,113 @@
+# name: test/sql/azure/azure_access_token.test
+# description: Test ATTACH to Azure SQL Database using ACCESS_TOKEN option (Spec 032)
+# group: [azure]
+
+# This test requires:
+# - AZURE_SQL_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
+# - AZURE_SQL_DATABASE: Database name
+# - AZURE_ACCESS_TOKEN: Pre-obtained Azure AD access token for https://database.windows.net/
+#
+# To get a token: az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+
+require mssql
+
+# Skip if Azure SQL connection info not provided
+require-env AZURE_SQL_HOST
+
+require-env AZURE_SQL_DATABASE
+
+require-env AZURE_ACCESS_TOKEN
+
+#===----------------------------------------------------------------------===#
+# Test: ACCESS_TOKEN in ATTACH statement (T022)
+#===----------------------------------------------------------------------===#
+
+statement ok
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS token_db (
+    TYPE mssql,
+    ACCESS_TOKEN '${AZURE_ACCESS_TOKEN}'
+);
+
+# Basic connectivity test
+query I
+SELECT 1 FROM mssql_scan('token_db', 'SELECT 1 AS value');
+----
+1
+
+# Clean up
+statement ok
+DETACH token_db;
+
+#===----------------------------------------------------------------------===#
+# Test: ACCESS_TOKEN in MSSQL secret (T023)
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE OR REPLACE SECRET mssql_token_secret (
+    TYPE mssql,
+    HOST '${AZURE_SQL_HOST}',
+    DATABASE '${AZURE_SQL_DATABASE}',
+    ACCESS_TOKEN '${AZURE_ACCESS_TOKEN}'
+);
+
+statement ok
+ATTACH '' AS token_secret_db (TYPE mssql, SECRET mssql_token_secret);
+
+# Basic connectivity test
+query I
+SELECT 1 FROM mssql_scan('token_secret_db', 'SELECT 1 AS value');
+----
+1
+
+# Verify pool stats
+query I
+SELECT COUNT(*) >= 0 FROM mssql_pool_stats('token_secret_db');
+----
+true
+
+# Clean up
+statement ok
+DETACH token_secret_db;
+
+statement ok
+DROP SECRET IF EXISTS mssql_token_secret;
+
+#===----------------------------------------------------------------------===#
+# Test: Invalid token format error message
+#===----------------------------------------------------------------------===#
+
+statement error
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS bad_token_db (
+    TYPE mssql,
+    ACCESS_TOKEN 'not_a_valid_jwt'
+);
+----
+Invalid access token format: unable to parse JWT
+
+#===----------------------------------------------------------------------===#
+# Test: Wrong audience error message
+#===----------------------------------------------------------------------===#
+
+# This is a JWT with audience https://graph.microsoft.com/ (wrong audience)
+# Header: {"alg":"none","typ":"JWT"} Payload: {"exp":4102444800,"aud":"https://graph.microsoft.com/"}
+statement error
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS wrong_aud_db (
+    TYPE mssql,
+    ACCESS_TOKEN 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImF1ZCI6Imh0dHBzOi8vZ3JhcGgubWljcm9zb2Z0LmNvbS8ifQ.sig'
+);
+----
+Access token audience
+
+#===----------------------------------------------------------------------===#
+# Test: Expired token error message
+#===----------------------------------------------------------------------===#
+
+# This is a JWT with correct audience but expired (exp: 2020-01-01)
+# Header: {"alg":"none","typ":"JWT"} Payload: {"exp":1577836800,"aud":"https://database.windows.net/"}
+statement error
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS expired_db (
+    TYPE mssql,
+    ACCESS_TOKEN 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjE1Nzc4MzY4MDAsImF1ZCI6Imh0dHBzOi8vZGF0YWJhc2Uud2luZG93cy5uZXQvIn0.sig'
+);
+----
+Access token expired at

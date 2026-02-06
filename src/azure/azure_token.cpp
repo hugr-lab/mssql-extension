@@ -200,6 +200,94 @@ static bool ChainContainsCLI(const std::string &chain) {
 	return false;
 }
 
+// Check if chain contains env (Spec 032 - User Story 2)
+static bool ChainContainsEnv(const std::string &chain) {
+	auto items = ParseChain(chain);
+	for (const auto &item : items) {
+		if (item == "env") {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Forward declaration for AcquireTokenFromEnv
+static TokenResult AcquireTokenForServicePrincipal(const AzureSecretInfo &info);
+
+//===----------------------------------------------------------------------===//
+// AcquireTokenFromEnv - Environment-based service principal (Spec 032)
+//===----------------------------------------------------------------------===//
+
+// Acquire token using Azure SDK environment variables:
+// - AZURE_TENANT_ID
+// - AZURE_CLIENT_ID
+// - AZURE_CLIENT_SECRET
+static TokenResult AcquireTokenFromEnv() {
+	// Read environment variables
+	const char *tenant_id = std::getenv("AZURE_TENANT_ID");
+	const char *client_id = std::getenv("AZURE_CLIENT_ID");
+	const char *client_secret = std::getenv("AZURE_CLIENT_SECRET");
+
+	// Build a helpful error message listing which vars are set and which are missing
+	std::vector<std::string> set_vars;
+	std::vector<std::string> missing_vars;
+
+	if (tenant_id && strlen(tenant_id) > 0) {
+		set_vars.push_back("AZURE_TENANT_ID");
+	} else {
+		missing_vars.push_back("AZURE_TENANT_ID");
+	}
+
+	if (client_id && strlen(client_id) > 0) {
+		set_vars.push_back("AZURE_CLIENT_ID");
+	} else {
+		missing_vars.push_back("AZURE_CLIENT_ID");
+	}
+
+	if (client_secret && strlen(client_secret) > 0) {
+		set_vars.push_back("AZURE_CLIENT_SECRET");
+	} else {
+		missing_vars.push_back("AZURE_CLIENT_SECRET");
+	}
+
+	// Check for missing variables
+	if (!missing_vars.empty()) {
+		std::string error_msg;
+		if (set_vars.empty()) {
+			// None are set
+			error_msg = "Environment variables AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET "
+			            "are not set. Required for credential_chain with 'env' provider.";
+		} else {
+			// Some are set, some are missing
+			std::string set_str, missing_str;
+			for (size_t i = 0; i < set_vars.size(); i++) {
+				if (i > 0)
+					set_str += " and ";
+				set_str += set_vars[i];
+			}
+			for (size_t i = 0; i < missing_vars.size(); i++) {
+				if (i > 0)
+					missing_str += " and ";
+				missing_str += missing_vars[i];
+			}
+			error_msg = "Environment variable" + std::string(missing_vars.size() > 1 ? "s " : " ") + missing_str +
+			            " not set. " + set_str + " " + (set_vars.size() > 1 ? "are" : "is") +
+			            " set but all three are required for credential_chain with 'env' provider.";
+		}
+		return TokenResult::Failure(error_msg);
+	}
+
+	// Build AzureSecretInfo from environment variables
+	AzureSecretInfo info;
+	info.provider = "service_principal";
+	info.tenant_id = tenant_id;
+	info.client_id = client_id;
+	info.client_secret = client_secret;
+
+	// Use the existing service principal flow
+	return AcquireTokenForServicePrincipal(info);
+}
+
 //===----------------------------------------------------------------------===//
 // AcquireTokenForServicePrincipal - Client credentials flow
 //===----------------------------------------------------------------------===//
@@ -363,14 +451,17 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 		if (info.provider == "service_principal") {
 			result = AcquireTokenForServicePrincipal(info);
 		} else if (info.provider == "credential_chain") {
-			// Check if this is interactive auth
-			if (ChainContainsInteractive(info.chain)) {
-				result = AcquireInteractiveToken(info);
+			// Check chains in priority order: env > cli > interactive
+			// This matches Azure SDK DefaultAzureCredential behavior
+			if (ChainContainsEnv(info.chain)) {
+				result = AcquireTokenFromEnv();
 			} else if (ChainContainsCLI(info.chain)) {
 				result = AcquireTokenWithAzureCLI(info);
+			} else if (ChainContainsInteractive(info.chain)) {
+				result = AcquireInteractiveToken(info);
 			} else {
 				result = TokenResult::Failure("Unsupported credential chain: " + info.chain +
-											  ". Supported: cli, interactive");
+											  ". Supported: env, cli, interactive");
 			}
 		} else if (info.provider == "managed_identity") {
 			// Managed identity uses IMDS endpoint - simplified for now
