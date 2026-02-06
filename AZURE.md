@@ -125,6 +125,10 @@ The `env` provider uses the same service principal credentials as Azure SDK's `D
 Best for interactive sessions where MFA is required.
 
 ```sql
+-- Install and load required extensions
+INSTALL azure;
+LOAD azure;
+
 -- Create credential chain secret with interactive auth
 CREATE SECRET azure_interactive (
     TYPE azure,
@@ -132,17 +136,45 @@ CREATE SECRET azure_interactive (
     CHAIN 'interactive'
 );
 
--- Test with tenant_id (required for interactive auth)
-SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
+-- Attach to Azure SQL or Fabric (will prompt for device code login)
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
+    TYPE mssql,
+    AZURE_SECRET 'azure_interactive'
+);
 -- Output: To sign in, use a web browser to open https://microsoft.com/devicelogin
 --         and enter the code ABCD1234 to authenticate.
+-- [Shows progress bar while waiting for authentication]
+
+-- Query data after authentication completes
+SHOW ALL TABLES;
 ```
 
-> **Note:** Interactive auth requires a `tenant_id` to be specified. You can either:
+**Example session with Microsoft Fabric:**
+
+```text
+D> ATTACH 'Server=xyz.datawarehouse.fabric.microsoft.com;Database=my_warehouse' AS fabric (
+       TYPE mssql,
+       AZURE_SECRET 'azure_interactive'
+   );
+To sign in, use a web browser to open the page https://microsoft.com/devicelogin
+and enter the code LYBT74YQB to authenticate.
+100% ▕████████████████████████████████████▏ (00:00:20.85 elapsed)
+
+D> SHOW ALL TABLES;
+┌──────────┬─────────┬────────────┬──────────────────┐
+│ database │ schema  │    name    │   column_names   │
+├──────────┼─────────┼────────────┼──────────────────┤
+│ fabric   │ dbo     │ Date       │ [DateID, Date..] │
+│ fabric   │ dbo     │ Geography  │ [GeographyID..]  │
+│ fabric   │ dbo     │ Trip       │ [DateID, Medal.] │
+└──────────┴─────────┴────────────┴──────────────────┘
+```
+
+> **Note:** For testing credentials without connecting, use `mssql_azure_auth_test()` with a tenant_id:
 >
-> 1. Pass it as the second argument to `mssql_azure_auth_test()`
-> 2. Use `azure_tenant_id` in the MSSQL secret (see below)
-> 3. Use Azure CLI (`az login`) which establishes tenant context automatically
+> ```sql
+> SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
+> ```
 
 ### 5. Manual Access Token (For External Token Management)
 
