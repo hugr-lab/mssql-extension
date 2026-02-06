@@ -141,9 +141,32 @@ Tests require these environment variables (automatically set by `make integratio
 | Variable | Description |
 |----------|-------------|
 | `AZURE_APP_ID` | Azure AD application (client) ID for service principal tests |
-| `AZURE_TENANT_ID` | Azure AD tenant ID |
-| `AZURE_CLIENT_SECRET` | Azure AD client secret for service principal tests |
+| `AZURE_DIRECTORY_ID` | Azure AD tenant (directory) ID |
+| `AZURE_APP_SECRET` | Azure AD client secret for service principal tests |
 | `AZURE_SQL_TEST_DSN` | Connection string to Azure SQL Database (for azure_lazy_loading.test) |
+| `AZURE_SQL_DB_HOST` | Azure SQL server hostname (e.g., myserver.database.windows.net) |
+| `AZURE_SQL_DB` | Azure SQL database name |
+
+**Azure SDK Standard Environment Variables (Spec 032):**
+
+These are the Azure SDK standard environment variable names, used by `credential_chain` with `'env'` provider:
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_TENANT_ID` | Azure AD tenant ID (same as AZURE_DIRECTORY_ID) |
+| `AZURE_CLIENT_ID` | Azure AD application (client) ID (same as AZURE_APP_ID) |
+| `AZURE_CLIENT_SECRET` | Azure AD client secret (same as AZURE_APP_SECRET) |
+
+**Pre-obtained Access Token (Spec 032):**
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_ACCESS_TOKEN` | Pre-obtained Azure AD JWT token for `ACCESS_TOKEN` tests |
+
+To obtain an access token manually:
+```bash
+az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+```
 
 **Debug Environment Variables:**
 
@@ -272,10 +295,13 @@ test/
 │   │   ├── copy_type_mismatch.test # Type mismatch handling tests
 │   │   └── copy_types.test         # Data type handling in COPY
 │   ├── azure/                      # Azure AD authentication tests
+│   │   ├── azure_access_token.test # ACCESS_TOKEN option tests (Spec 032)
 │   │   ├── azure_auth_test_function.test # mssql_azure_auth_test() function tests
 │   │   ├── azure_device_code.test  # Device code flow tests (interactive)
+│   │   ├── azure_env_provider.test # credential_chain 'env' provider tests (Spec 032)
 │   │   ├── azure_lazy_loading.test # Lazy catalog loading with Azure SQL (requires AZURE_SQL_TEST_DSN)
-│   │   └── azure_secret_validation.test # Azure secret validation tests
+│   │   ├── azure_secret_validation.test # Azure secret validation tests
+│   │   └── azure_service_principal.test # Service principal authentication tests
 │   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_exec.test             # mssql_exec() function tests
@@ -880,8 +906,10 @@ DROP SECRET azure_sp;
 | Method | Secret Type | Required Fields |
 |--------|-------------|-----------------|
 | Service Principal | `azure` | `provider='service_principal'`, `tenant_id`, `client_id`, `client_secret` |
+| Environment | `azure` | `provider='credential_chain'`, `chain='env'` (uses AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET env vars) |
 | Azure CLI | `azure` | `provider='credential_chain'`, `chain='cli'` |
 | Interactive | `azure` | `provider='credential_chain'`, `chain='interactive'`, `tenant_id` |
+| Manual Token | `mssql` or ATTACH | `ACCESS_TOKEN='<jwt>'` option (Spec 032) |
 
 **Azure AD Test Scenarios:**
 

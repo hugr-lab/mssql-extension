@@ -93,7 +93,34 @@ az login
 az account set --subscription "Your Subscription Name"
 ```
 
-### 3. Interactive / Device Code Flow (For MFA)
+### 3. Environment Variables (For CI/CD)
+
+Best for CI/CD pipelines using Azure SDK standard environment variables.
+
+```sql
+-- Create credential chain secret with env provider
+CREATE SECRET azure_env (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'env'
+);
+
+-- Test credentials (requires AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
+SELECT mssql_azure_auth_test('azure_env');
+```
+
+**Prerequisites:**
+
+```bash
+# Set Azure SDK standard environment variables
+export AZURE_TENANT_ID="your-tenant-id"
+export AZURE_CLIENT_ID="your-client-id"
+export AZURE_CLIENT_SECRET="your-client-secret"
+```
+
+The `env` provider uses the same service principal credentials as Azure SDK's `DefaultAzureCredential`. This makes it easy to use the same credentials across different Azure tools and SDKs.
+
+### 4. Interactive / Device Code Flow (For MFA)
 
 Best for interactive sessions where MFA is required.
 
@@ -116,6 +143,47 @@ SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
 > 1. Pass it as the second argument to `mssql_azure_auth_test()`
 > 2. Use `azure_tenant_id` in the MSSQL secret (see below)
 > 3. Use Azure CLI (`az login`) which establishes tenant context automatically
+
+### 5. Manual Access Token (For External Token Management)
+
+Best when you have your own token management system or need to use tokens from external sources.
+
+```sql
+-- Attach using a pre-obtained access token
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
+    TYPE mssql,
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
+);
+```
+
+**Prerequisites:**
+
+```bash
+# Obtain a token using Azure CLI
+az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+```
+
+**Token Requirements:**
+- Must be a valid JWT token for Azure SQL Database
+- Audience (`aud` claim) must be `https://database.windows.net/`
+- Token must not be expired (checked with 5-minute margin)
+
+**Using ACCESS_TOKEN in MSSQL Secret:**
+
+```sql
+-- Create MSSQL secret with access token
+CREATE SECRET mssql_token_auth (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    DATABASE 'mydb',
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
+);
+
+-- Attach using the secret
+ATTACH '' AS mydb (TYPE mssql, SECRET mssql_token_auth);
+```
+
+> **Note:** When using `ACCESS_TOKEN`, the token is validated at ATTACH time. If the token is expired or has an invalid audience, you'll get a clear error message.
 
 ## Connection Examples
 
@@ -326,7 +394,7 @@ SELECT mssql_azure_auth_test('azure_interactive');
 
 ## Environment Variables
 
-For CI/CD, set credentials via environment variables:
+For CI/CD, set credentials via Azure SDK standard environment variables:
 
 ```bash
 export AZURE_TENANT_ID="your-tenant-id"
@@ -335,13 +403,35 @@ export AZURE_CLIENT_SECRET="your-client-secret"
 ```
 
 ```sql
--- Use in DuckDB (requires azure extension environment provider)
+-- Use in DuckDB with credential_chain 'env' provider
 CREATE SECRET azure_env (
     TYPE azure,
     PROVIDER credential_chain,
     CHAIN 'env'
 );
+
+-- Attach to Azure SQL using env-based credentials
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuresql (
+    TYPE mssql,
+    AZURE_SECRET 'azure_env'
+);
 ```
+
+The `env` provider reads the standard Azure SDK environment variables, making it compatible with:
+- Azure SDK for Python, JavaScript, Go, Java, .NET
+- Azure CLI (when using service principal login)
+- GitHub Actions with Azure credentials
+- Azure DevOps pipelines
+
+**Chain Priority:**
+
+When using multiple providers in a chain (e.g., `CHAIN 'env;cli'`), the extension tries them in order:
+
+1. `env` — Environment variables
+2. `cli` — Azure CLI credentials
+3. `interactive` — Device code flow
+
+This matches Azure SDK's `DefaultAzureCredential` behavior.
 
 ## Microsoft Fabric Limitations
 

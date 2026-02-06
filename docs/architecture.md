@@ -359,6 +359,15 @@ src/tds/auth/
 | `GetFedAuthToken()` | Token acquisition (FEDAUTH only) |
 | `InvalidateToken()` | Force token refresh (FEDAUTH only) |
 | `IsTokenExpired()` | Check token validity (FEDAUTH only) |
+| `GetName()` | Returns strategy name for debugging |
+
+### Strategy Implementations
+
+| Strategy | File | Purpose |
+|----------|------|---------|
+| `SqlAuthStrategy` | `sql_auth_strategy.cpp` | SQL Server username/password auth |
+| `FedAuthStrategy` | `fedauth_strategy.cpp` | Azure AD via Azure secret (service principal, CLI, interactive) |
+| `ManualTokenAuthStrategy` | `manual_token_strategy.cpp` | Pre-provided Azure AD access token (Spec 032) |
 
 ### Configuration Structs
 
@@ -394,12 +403,32 @@ src/azure/
 ├── azure_device_code.cpp     # Interactive device code flow (RFC 8628)
 ├── azure_secret_reader.cpp   # Azure secret parsing from DuckDB SecretManager
 ├── azure_fedauth.cpp         # FEDAUTH data structures and endpoint detection
+├── jwt_parser.cpp            # JWT token validation (Spec 032)
 └── include/azure/
     ├── azure_token.hpp       # TokenCache, TokenResult, acquisition functions
     ├── azure_device_code.hpp # Device code flow constants and functions
     ├── azure_secret_reader.hpp # AzureSecretInfo struct
-    └── azure_fedauth.hpp     # FedAuthData, FedAuthLibrary, endpoint detection
+    ├── azure_fedauth.hpp     # FedAuthData, FedAuthLibrary, endpoint detection
+    └── jwt_parser.hpp        # JWT claims parsing and validation
 ```
+
+### JWT Token Validation (Spec 032)
+
+The `jwt_parser.cpp` module provides JWT validation for manually-provided access tokens:
+
+| Function | Purpose |
+|----------|---------|
+| `ParseJwtClaims()` | Extract claims from JWT payload (base64url decoding) |
+| `IsTokenExpired()` | Check if token is expired with configurable margin |
+| `FormatTimestamp()` | Format Unix timestamp for error messages |
+
+**JwtClaims struct:**
+- `exp` — Expiration timestamp (Unix seconds)
+- `aud` — Audience (resource URL, validated against `https://database.windows.net/`)
+- `oid` — Object ID (user/service principal)
+- `tid` — Tenant ID
+- `valid` — Parse success flag
+- `error` — Error message if parsing failed
 
 ### FEDAUTH Data Structures
 
@@ -417,8 +446,12 @@ src/azure/
 | Method | Provider | Description |
 |--------|----------|-------------|
 | Service Principal | `service_principal` | Client credentials flow with client_id/client_secret |
+| Environment | `credential_chain` (chain=`env`) | Uses AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET env vars (Spec 032) |
 | Azure CLI | `credential_chain` (chain=`cli`) | Uses `az account get-access-token` |
 | Interactive | `credential_chain` (chain=`interactive`) | Device code flow with browser authentication |
+| Manual Token | `ACCESS_TOKEN` option | Pre-provided JWT token in ATTACH or MSSQL secret (Spec 032) |
+
+**Chain priority order** (matches Azure SDK DefaultAzureCredential): `env` > `cli` > `interactive`
 
 ### Token Sizes and Fragmentation
 
