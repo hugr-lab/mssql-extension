@@ -24,6 +24,7 @@ src/
   query/                # Query execution and result streaming
   table_scan/           # Table scan with filter/projection pushdown
   tds/                  # TDS protocol implementation
+    auth/               # Authentication strategies (SQL auth, FEDAUTH)
     encoding/           # Type encoding (datetime, decimal, GUID, UTF-16)
     tls/                # TLS via OpenSSL with custom BIO callbacks
 test/

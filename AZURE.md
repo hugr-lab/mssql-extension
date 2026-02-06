@@ -293,6 +293,20 @@ az login
 az login --tenant your-tenant-id
 ```
 
+### "Connection reset by peer" with Azure CLI
+
+This error can occur if you're using an older version of the extension that doesn't support large token fragmentation. Azure CLI tokens (~2091 chars → ~4182 bytes UTF-16LE) exceed the default TDS packet size (4096 bytes) and require packet fragmentation.
+
+**Solution**: Update to version 0.1.11+ which includes the `BuildFedAuthTokenMultiPacket()` fix.
+
+**Token sizes by authentication method**:
+
+| Method            | Token Size (chars) | UTF-16LE Size | Packets Needed |
+|-------------------|-------------------|---------------|----------------|
+| Service Principal | ~1632             | ~3264 bytes   | 1              |
+| Azure CLI         | ~2091             | ~4182 bytes   | 2              |
+| Interactive       | ~2000+            | ~4000+ bytes  | 1-2            |
+
 ### "Device code flow timeout"
 
 The device code flow times out after 15 minutes. Start again:

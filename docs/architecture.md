@@ -335,6 +335,55 @@ These options are required for:
 
 When a connection is returned to the pool and later reused with the `RESET_CONNECTION` flag, session state is reset. However, SQL Server remembers the connection's ODBC mode (set via fODBC during LOGIN7) and automatically restores ANSI-compliant session options.
 
+## Authentication Strategy Pattern
+
+The extension uses a Strategy pattern for authentication, supporting both SQL Server auth and Azure AD FEDAUTH:
+
+```
+src/tds/auth/
+├── auth_strategy.hpp            # Abstract strategy interface
+├── auth_strategy_factory.hpp    # Factory for strategy creation
+├── sql_auth_strategy.hpp/.cpp   # SQL Server username/password auth
+└── fedauth_strategy.hpp/.cpp    # Azure AD FEDAUTH authentication
+```
+
+### Strategy Interface
+
+`AuthenticationStrategy` (abstract base) defines:
+
+| Method | Purpose |
+|--------|---------|
+| `RequiresFedAuth()` | Returns true for Azure AD auth |
+| `GetPreloginOptions()` | PRELOGIN configuration (encryption, FEDAUTHREQUIRED) |
+| `GetLogin7Options()` | LOGIN7 configuration (credentials, database) |
+| `GetFedAuthToken()` | Token acquisition (FEDAUTH only) |
+| `InvalidateToken()` | Force token refresh (FEDAUTH only) |
+| `IsTokenExpired()` | Check token validity (FEDAUTH only) |
+
+### Configuration Structs
+
+**PreloginOptions**:
+- `use_encrypt` — Request TLS encryption
+- `request_fedauth` — Include FEDAUTHREQUIRED option
+- `sni_hostname` — SNI hostname for Azure routing
+
+**Login7Options**:
+- `database`, `username`, `password` — Connection parameters
+- `fedauth_token_utf16le` — Pre-acquired token (for validation)
+- `include_fedauth_ext` — Include FEDAUTH extension in LOGIN7
+
+### Factory Pattern
+
+`AuthStrategyFactory::Create()` selects strategy based on `MSSQLConnectionInfo`:
+
+```cpp
+if (info.use_azure_auth) {
+    return CreateFedAuth(context, info.azure_secret_name, info.database, info.host, info.azure_tenant_id);
+} else {
+    return CreateSqlAuth(info.username, info.password, info.database, info.use_encrypt);
+}
+```
+
 ## Azure AD Authentication Infrastructure
 
 The extension includes Azure AD token acquisition infrastructure in `src/azure/`:
@@ -344,11 +393,24 @@ src/azure/
 ├── azure_token.cpp           # Token acquisition and caching
 ├── azure_device_code.cpp     # Interactive device code flow (RFC 8628)
 ├── azure_secret_reader.cpp   # Azure secret parsing from DuckDB SecretManager
+├── azure_fedauth.cpp         # FEDAUTH data structures and endpoint detection
 └── include/azure/
     ├── azure_token.hpp       # TokenCache, TokenResult, acquisition functions
     ├── azure_device_code.hpp # Device code flow constants and functions
-    └── azure_secret_reader.hpp # AzureSecretInfo struct
+    ├── azure_secret_reader.hpp # AzureSecretInfo struct
+    └── azure_fedauth.hpp     # FedAuthData, FedAuthLibrary, endpoint detection
 ```
+
+### FEDAUTH Data Structures
+
+**FedAuthLibrary** enum:
+- `SSPI` (0x01) — Windows integrated auth (not implemented)
+- `MSAL` (0x02) — ADAL/MSAL workflow
+- `SECURITY_TOKEN` (0x03) — Direct token embedding (deprecated)
+
+**FedAuthData** struct:
+- `library` — FedAuthLibrary enum value
+- `token_utf16le` — UTF-16LE encoded access token
 
 ### Authentication Methods
 
@@ -358,12 +420,28 @@ src/azure/
 | Azure CLI | `credential_chain` (chain=`cli`) | Uses `az account get-access-token` |
 | Interactive | `credential_chain` (chain=`interactive`) | Device code flow with browser authentication |
 
+### Token Sizes and Fragmentation
+
+Token sizes vary by authentication method:
+- **Service Principal**: ~1632 chars → ~3264 bytes UTF-16LE (fits in single 4096-byte TDS packet)
+- **Azure CLI**: ~2091 chars → ~4182 bytes UTF-16LE (requires packet fragmentation)
+
+When tokens exceed TDS packet size, `BuildFedAuthTokenMultiPacket()` splits them across multiple packets. See [TDS Protocol - FEDAUTH Token Packet Fragmentation](tds-protocol.md#fedauth-token-packet-fragmentation).
+
 ### Token Caching
 
 Tokens are cached globally in `TokenCache` (singleton) with:
 - Thread-safe access via mutex
-- 5-minute refresh margin before expiration
+- 5-minute refresh margin before expiration (`TOKEN_REFRESH_MARGIN_SECONDS`)
 - Cache key includes secret name and optional tenant override
+
+### Endpoint Detection
+
+Functions in `azure_fedauth.cpp` detect Azure endpoint types:
+- `IsAzureEndpoint()` — `*.database.windows.net`
+- `IsFabricEndpoint()` — `*.datawarehouse.fabric.microsoft.com`
+- `IsSynapseEndpoint()` — `*.sql.azuresynapse.net`
+- `RequiresHostnameVerification()` — Returns true for all Azure endpoints
 
 ### Test Function
 
