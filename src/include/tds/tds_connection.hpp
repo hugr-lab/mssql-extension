@@ -45,7 +45,7 @@ public:
 	//   fedauth_token - UTF-16LE encoded access token from Azure AD
 	//   use_encrypt - if true, enables TLS encryption (required for Azure)
 	bool AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
-	                             bool use_encrypt = true);
+								 bool use_encrypt = true);
 
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state

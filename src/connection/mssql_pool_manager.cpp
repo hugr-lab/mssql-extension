@@ -48,12 +48,9 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &contex
 	return ptr;
 }
 
-tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(const std::string &context_name,
-                                                                    const MSSQLPoolConfig &config,
-                                                                    const std::string &host, uint16_t port,
-                                                                    const std::string &database,
-                                                                    const std::vector<uint8_t> &fedauth_token_utf16le,
-                                                                    bool use_encrypt) {
+tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(
+	const std::string &context_name, const MSSQLPoolConfig &config, const std::string &host, uint16_t port,
+	const std::string &database, const std::vector<uint8_t> &fedauth_token_utf16le, bool use_encrypt) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 
 	// Check if pool already exists

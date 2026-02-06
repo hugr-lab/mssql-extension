@@ -19,8 +19,8 @@ namespace azure {
 //! FedAuth library identifier for LOGIN7 FEDAUTH extension
 //! Per MS-TDS 2.2.7.1 FEDAUTH Feature Extension
 enum class FedAuthLibrary : uint8_t {
-	SSPI = 0x01,           // Windows integrated authentication (not supported)
-	MSAL = 0x02,           // Azure AD via MSAL/ADAL library (our target)
+	SSPI = 0x01,		   // Windows integrated authentication (not supported)
+	MSAL = 0x02,		   // Azure AD via MSAL/ADAL library (our target)
 	SECURITY_TOKEN = 0x03  // Pre-acquired security token (not used)
 };
 

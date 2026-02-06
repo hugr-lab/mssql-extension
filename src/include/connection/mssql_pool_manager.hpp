@@ -31,10 +31,10 @@ public:
 	//   use_encrypt - TLS encryption (required for Azure)
 	// Note: For Azure auth, token refresh is handled separately
 	tds::ConnectionPool *GetOrCreatePoolWithAzureAuth(const std::string &context_name, const MSSQLPoolConfig &config,
-	                                                  const std::string &host, uint16_t port,
-	                                                  const std::string &database,
-	                                                  const std::vector<uint8_t> &fedauth_token_utf16le,
-	                                                  bool use_encrypt = true);
+													  const std::string &host, uint16_t port,
+													  const std::string &database,
+													  const std::vector<uint8_t> &fedauth_token_utf16le,
+													  bool use_encrypt = true);
 
 	// Get an existing pool (returns nullptr if not found)
 	tds::ConnectionPool *GetPool(const std::string &context_name);

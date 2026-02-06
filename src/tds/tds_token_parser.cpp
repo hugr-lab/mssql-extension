@@ -157,10 +157,9 @@ ParsedTokenType TokenParser::TryParseNext() {
 		}
 		{
 			// FEDAUTHINFO has 4-byte length (little-endian DWORD)
-			uint32_t token_length = static_cast<uint32_t>(Current()[1]) |
-			                        (static_cast<uint32_t>(Current()[2]) << 8) |
-			                        (static_cast<uint32_t>(Current()[3]) << 16) |
-			                        (static_cast<uint32_t>(Current()[4]) << 24);
+			uint32_t token_length = static_cast<uint32_t>(Current()[1]) | (static_cast<uint32_t>(Current()[2]) << 8) |
+									(static_cast<uint32_t>(Current()[3]) << 16) |
+									(static_cast<uint32_t>(Current()[4]) << 24);
 			if (Available() < 5 + token_length) {
 				return ParsedTokenType::NeedMoreData;
 			}

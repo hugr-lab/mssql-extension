@@ -538,14 +538,14 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 			return 0;
 		}
 		ctx_->last_error_code = 5;	// RECV_FAILED
-		ctx_->last_error = "Receive failed (SSL_ERROR_SYSCALL, ret=" + std::to_string(ret) + "): " +
-		                   std::string(strerror(sys_err)) + " (errno=" + std::to_string(sys_err) + ")";
+		ctx_->last_error = "Receive failed (SSL_ERROR_SYSCALL, ret=" + std::to_string(ret) +
+						   "): " + std::string(strerror(sys_err)) + " (errno=" + std::to_string(sys_err) + ")";
 #endif
 		return -1;
 	} else {
 		ctx_->last_error_code = 5;	// RECV_FAILED
-		ctx_->last_error = "Receive failed (ssl_error=" + std::to_string(ssl_error) + ", ret=" +
-		                   std::to_string(ret) + "): " + FormatOpenSSLError();
+		ctx_->last_error = "Receive failed (ssl_error=" + std::to_string(ssl_error) + ", ret=" + std::to_string(ret) +
+						   "): " + FormatOpenSSLError();
 		return -1;
 	}
 }

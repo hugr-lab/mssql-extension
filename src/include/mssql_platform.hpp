@@ -11,10 +11,10 @@ namespace mssql {
 
 //! Endpoint type for connection behavior (TLS, features)
 enum class EndpointType {
-	OnPremises,  // Traditional SQL Server (self-signed certs OK)
-	AzureSQL,    // Azure SQL Database (hostname verification required)
-	Fabric,      // Microsoft Fabric Warehouse (limited features)
-	Synapse      // Azure Synapse Analytics (similar to AzureSQL)
+	OnPremises,	 // Traditional SQL Server (self-signed certs OK)
+	AzureSQL,	 // Azure SQL Database (hostname verification required)
+	Fabric,		 // Microsoft Fabric Warehouse (limited features)
+	Synapse		 // Azure Synapse Analytics (similar to AzureSQL)
 };
 
 //===----------------------------------------------------------------------===//

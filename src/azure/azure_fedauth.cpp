@@ -8,10 +8,10 @@
 
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
-#include "mssql_platform.hpp"
-#include "tds/encoding/utf16.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "mssql_platform.hpp"
+#include "tds/encoding/utf16.hpp"
 
 #include <algorithm>
 
@@ -85,7 +85,7 @@ static bool ContainsIgnoreCase(const std::string &haystack, const std::string &n
 	}
 
 	auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-	                      [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); });
+						  [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); });
 	return it != haystack.end();
 }
 

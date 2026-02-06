@@ -36,8 +36,8 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	// Azure AD Authentication (Phase 2 FEDAUTH)
 	//===----------------------------------------------------------------------===//
-	bool use_azure_auth = false;   // Use Azure AD authentication instead of SQL auth
-	string azure_secret_name;       // Name of the Azure secret for token acquisition
+	bool use_azure_auth = false;  // Use Azure AD authentication instead of SQL auth
+	string azure_secret_name;	  // Name of the Azure secret for token acquisition
 
 	// Check if this connection targets an Azure endpoint
 	// Azure endpoints require Azure AD auth support and TLS hostname verification
@@ -58,7 +58,8 @@ struct MSSQLConnectionInfo {
 	// URI: "mssql://user:password@host:port/database?encrypt=true"
 	// Parameters:
 	//   azure_auth - if true, user/password are optional (Azure AD authentication via azure_secret)
-	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string, bool azure_auth = false);
+	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string,
+																bool azure_auth = false);
 
 	// Validate connection string format
 	// Returns: empty string if valid, error message if invalid

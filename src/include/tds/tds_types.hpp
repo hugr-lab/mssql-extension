@@ -69,15 +69,15 @@ enum class EncryptionOption : uint8_t {
 
 // Feature Extension IDs for LOGIN7 packet
 enum class FeatureExtId : uint8_t {
-	SESSIONRECOVERY = 0x01,  // Session recovery (not supported)
-	FEDAUTH = 0x02,          // Federated authentication (Azure AD)
-	COLUMNENCRYPTION = 0x04, // Always Encrypted (not supported)
-	GLOBALTRANSACTIONS = 0x05, // Global transactions (not supported)
-	AZURESQLSUPPORT = 0x08,  // Azure SQL support
-	DATACLASSIFICATION = 0x09, // Data classification (not supported)
-	UTF8SUPPORT = 0x0A,      // UTF-8 collation support
-	AZURESQLDNSCACHING = 0x0B, // Azure SQL DNS caching
-	TERMINATOR = 0xFF        // End of feature extensions
+	SESSIONRECOVERY = 0x01,		// Session recovery (not supported)
+	FEDAUTH = 0x02,				// Federated authentication (Azure AD)
+	COLUMNENCRYPTION = 0x04,	// Always Encrypted (not supported)
+	GLOBALTRANSACTIONS = 0x05,	// Global transactions (not supported)
+	AZURESQLSUPPORT = 0x08,		// Azure SQL support
+	DATACLASSIFICATION = 0x09,	// Data classification (not supported)
+	UTF8SUPPORT = 0x0A,			// UTF-8 collation support
+	AZURESQLDNSCACHING = 0x0B,	// Azure SQL DNS caching
+	TERMINATOR = 0xFF			// End of feature extensions
 };
 
 //===----------------------------------------------------------------------===//
@@ -85,19 +85,19 @@ enum class FeatureExtId : uint8_t {
 //===----------------------------------------------------------------------===//
 
 // FEDAUTH library types determine token acquisition flow
-constexpr uint8_t FEDAUTH_LIBRARY_LIVEID = 0x00;         // Live ID (not supported)
-constexpr uint8_t FEDAUTH_LIBRARY_SECURITYTOKEN = 0x01;  // Pre-acquired token embedded in LOGIN7
-constexpr uint8_t FEDAUTH_LIBRARY_ADAL = 0x02;           // ADAL flow: server provides STS URL, client sends token separately
+constexpr uint8_t FEDAUTH_LIBRARY_LIVEID = 0x00;		 // Live ID (not supported)
+constexpr uint8_t FEDAUTH_LIBRARY_SECURITYTOKEN = 0x01;	 // Pre-acquired token embedded in LOGIN7
+constexpr uint8_t FEDAUTH_LIBRARY_ADAL = 0x02;	// ADAL flow: server provides STS URL, client sends token separately
 
 // ADAL workflow types (used with FEDAUTH_LIBRARY_ADAL)
-constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_PASSWORD = 0x01;    // Username/password (Service Principal)
-constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_INTEGRATED = 0x02;  // Windows integrated
-constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_MSI = 0x03;         // Managed Identity
-constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_NONE = 0x04;        // No workflow (token already acquired)
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_PASSWORD = 0x01;	// Username/password (Service Principal)
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_INTEGRATED = 0x02;	// Windows integrated
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_MSI = 0x03;			// Managed Identity
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_NONE = 0x04;		// No workflow (token already acquired)
 
 // FEDAUTHINFO option IDs (inside FEDAUTHINFO token from server)
 constexpr uint8_t FEDAUTHINFO_OPT_STS_URL = 0x01;  // Security Token Service URL
-constexpr uint8_t FEDAUTHINFO_OPT_SPN = 0x02;      // Server Principal Name
+constexpr uint8_t FEDAUTHINFO_OPT_SPN = 0x02;	   // Server Principal Name
 
 // TDS Token Types (response parsing)
 enum class TokenType : uint8_t {
@@ -116,7 +116,7 @@ enum class TokenType : uint8_t {
 	RETURNSTATUS = 0x79,
 	ORDER = 0xA9,
 	RETURNVALUE = 0xAC,
-	FEDAUTHINFO = 0xEE  // FEDAUTH info from server (Azure AD authentication)
+	FEDAUTHINFO = 0xEE	// FEDAUTH info from server (Azure AD authentication)
 };
 
 // DONE Token Status Flags
