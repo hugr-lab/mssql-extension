@@ -537,10 +537,10 @@ void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string
 void MSSQLMetadataCache::InvalidateAll() {
 	std::lock_guard<std::mutex> lock(schemas_mutex_);
 	schemas_load_state_ = CacheLoadState::NOT_LOADED;
-	for (auto &[name, schema] : schemas_) {
-		schema.tables_load_state = CacheLoadState::NOT_LOADED;
-		for (auto &[tname, table] : schema.tables) {
-			table.columns_load_state = CacheLoadState::NOT_LOADED;
+	for (auto &schema_entry : schemas_) {
+		schema_entry.second.tables_load_state = CacheLoadState::NOT_LOADED;
+		for (auto &table_entry : schema_entry.second.tables) {
+			table_entry.second.columns_load_state = CacheLoadState::NOT_LOADED;
 		}
 	}
 	// Update backward-compat state
