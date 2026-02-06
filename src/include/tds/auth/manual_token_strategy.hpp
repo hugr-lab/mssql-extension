@@ -9,8 +9,8 @@
 
 #pragma once
 
-#include "tds/auth/auth_strategy.hpp"
 #include "azure/jwt_parser.hpp"
+#include "tds/auth/auth_strategy.hpp"
 
 #include <string>
 #include <vector>
@@ -74,10 +74,10 @@ public:
 	}
 
 private:
-	std::string raw_token_;				   // Original UTF-8 token
-	std::vector<uint8_t> token_utf16le_;   // Pre-encoded UTF-16LE for FEDAUTH
-	mssql::azure::JwtClaims claims_;	   // Parsed JWT claims
-	std::string database_;				   // Target database name
+	std::string raw_token_;				  // Original UTF-8 token
+	std::vector<uint8_t> token_utf16le_;  // Pre-encoded UTF-16LE for FEDAUTH
+	mssql::azure::JwtClaims claims_;	  // Parsed JWT claims
+	std::string database_;				  // Target database name
 };
 
 }  // namespace tds

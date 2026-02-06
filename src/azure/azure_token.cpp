@@ -255,8 +255,9 @@ static TokenResult AcquireTokenFromEnv() {
 		std::string error_msg;
 		if (set_vars.empty()) {
 			// None are set
-			error_msg = "Environment variables AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET "
-			            "are not set. Required for credential_chain with 'env' provider.";
+			error_msg =
+				"Environment variables AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET "
+				"are not set. Required for credential_chain with 'env' provider.";
 		} else {
 			// Some are set, some are missing
 			std::string set_str, missing_str;
@@ -271,8 +272,8 @@ static TokenResult AcquireTokenFromEnv() {
 				missing_str += missing_vars[i];
 			}
 			error_msg = "Environment variable" + std::string(missing_vars.size() > 1 ? "s " : " ") + missing_str +
-			            " not set. " + set_str + " " + (set_vars.size() > 1 ? "are" : "is") +
-			            " set but all three are required for credential_chain with 'env' provider.";
+						" not set. " + set_str + " " + (set_vars.size() > 1 ? "are" : "is") +
+						" set but all three are required for credential_chain with 'env' provider.";
 		}
 		return TokenResult::Failure(error_msg);
 	}

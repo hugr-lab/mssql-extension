@@ -21,15 +21,14 @@ namespace azure {
 //===----------------------------------------------------------------------===//
 
 struct JwtClaims {
-	int64_t exp;        // Expiration timestamp (Unix seconds)
-	std::string aud;    // Audience (resource URL)
-	std::string oid;    // Object ID (user/service principal)
-	std::string tid;    // Tenant ID
-	bool valid;         // Parse success flag
-	std::string error;  // Parse error message (if invalid)
+	int64_t exp;		// Expiration timestamp (Unix seconds)
+	std::string aud;	// Audience (resource URL)
+	std::string oid;	// Object ID (user/service principal)
+	std::string tid;	// Tenant ID
+	bool valid;			// Parse success flag
+	std::string error;	// Parse error message (if invalid)
 
-	JwtClaims() : exp(0), valid(false) {
-	}
+	JwtClaims() : exp(0), valid(false) {}
 };
 
 //===----------------------------------------------------------------------===//

@@ -8,31 +8,30 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/manual_token_strategy.hpp"
-#include "tds/encoding/utf16.hpp"
 #include "duckdb/common/exception.hpp"
+#include "tds/encoding/utf16.hpp"
 
 namespace duckdb {
 namespace tds {
 
 ManualTokenAuthStrategy::ManualTokenAuthStrategy(const std::string &access_token, const std::string &database)
-    : raw_token_(access_token), database_(database) {
-
+	: raw_token_(access_token), database_(database) {
 	// Parse and validate the JWT token
 	claims_ = mssql::azure::ParseJwtClaims(access_token);
 
 	if (!claims_.valid) {
 		throw InvalidInputException(
-		    "Invalid access token format: unable to parse JWT. %s. "
-		    "Ensure token is a valid Azure AD access token.",
-		    claims_.error);
+			"Invalid access token format: unable to parse JWT. %s. "
+			"Ensure token is a valid Azure AD access token.",
+			claims_.error);
 	}
 
 	// Validate audience - must be for Azure SQL Database
 	if (claims_.aud != mssql::azure::AZURE_SQL_AUDIENCE) {
 		throw InvalidInputException(
-		    "Access token audience '%s' does not match expected '%s'. "
-		    "Ensure token was requested for the correct resource.",
-		    claims_.aud, mssql::azure::AZURE_SQL_AUDIENCE);
+			"Access token audience '%s' does not match expected '%s'. "
+			"Ensure token was requested for the correct resource.",
+			claims_.aud, mssql::azure::AZURE_SQL_AUDIENCE);
 	}
 
 	// Pre-encode token as UTF-16LE for efficiency
@@ -41,28 +40,27 @@ ManualTokenAuthStrategy::ManualTokenAuthStrategy(const std::string &access_token
 
 PreloginOptions ManualTokenAuthStrategy::GetPreloginOptions() const {
 	PreloginOptions options;
-	options.use_encrypt = true;		   // Azure requires TLS
-	options.request_fedauth = true;	   // Request FEDAUTH support
-	options.sni_hostname.clear();	   // No SNI needed (token already acquired)
+	options.use_encrypt = true;		 // Azure requires TLS
+	options.request_fedauth = true;	 // Request FEDAUTH support
+	options.sni_hostname.clear();	 // No SNI needed (token already acquired)
 	return options;
 }
 
 Login7Options ManualTokenAuthStrategy::GetLogin7Options() const {
 	Login7Options options;
 	options.database = database_;
-	options.username.clear();		   // No username for FEDAUTH
-	options.password.clear();		   // No password for FEDAUTH
+	options.username.clear();  // No username for FEDAUTH
+	options.password.clear();  // No password for FEDAUTH
 	options.app_name = "DuckDB";
-	options.include_fedauth_ext = true;	   // Include FEDAUTH extension
+	options.include_fedauth_ext = true;	 // Include FEDAUTH extension
 	return options;
 }
 
 std::vector<uint8_t> ManualTokenAuthStrategy::GetFedAuthToken(const FedAuthInfo &info) {
 	// Check if token is expired before returning
 	if (IsTokenExpired()) {
-		throw InvalidInputException(
-		    "Access token expired at %s. Please provide a new token.",
-		    mssql::azure::FormatTimestamp(claims_.exp));
+		throw InvalidInputException("Access token expired at %s. Please provide a new token.",
+									mssql::azure::FormatTimestamp(claims_.exp));
 	}
 
 	// Return pre-encoded UTF-16LE token

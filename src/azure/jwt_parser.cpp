@@ -38,10 +38,10 @@ static int Base64CharToValue(char c) {
 		return c - '0' + 52;
 	}
 	if (c == '+' || c == '-') {
-		return 62;  // '-' is base64url variant of '+'
+		return 62;	// '-' is base64url variant of '+'
 	}
 	if (c == '/' || c == '_') {
-		return 63;  // '_' is base64url variant of '/'
+		return 63;	// '_' is base64url variant of '/'
 	}
 	return -1;
 }
@@ -56,7 +56,7 @@ static std::string Base64UrlDecode(const std::string &input) {
 	for (size_t i = 0; i < input.size(); ++i) {
 		char c = input[i];
 		if (c == '=') {
-			break;  // Padding
+			break;	// Padding
 		}
 
 		int char_val = Base64CharToValue(c);

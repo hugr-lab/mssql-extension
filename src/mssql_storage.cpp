@@ -1,7 +1,6 @@
 #include "mssql_storage.hpp"
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
-#include "tds/auth/auth_strategy_factory.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_pool_manager.hpp"
@@ -14,6 +13,7 @@
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 #include "mssql_platform.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
 #include "tds/tds_connection.hpp"
 
 #include <cstdlib>
@@ -637,10 +637,10 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 //===----------------------------------------------------------------------===//
 
 void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
-                                   int timeout_seconds) {
+								   int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
-	                        info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
-	                        timeout_seconds);
+							info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
+							timeout_seconds);
 
 	// Create a temporary connection to test the pre-provided token
 	tds::TdsConnection conn;
@@ -671,7 +671,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 			if (!conn.ExecuteBatch("SELECT 1")) {
 				string error = conn.GetLastError();
 				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED - %s",
-				                        error.c_str());
+										error.c_str());
 				conn.Close();
 				throw InvalidInputException("MSSQL manual token connection validation failed: query failed: %s", error);
 			}
@@ -686,7 +686,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 		} catch (const std::exception &e) {
 			string error = e.what();
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED with exception - %s",
-			                        error.c_str());
+									error.c_str());
 			conn.Close();
 			throw InvalidInputException("MSSQL manual token connection validation failed: %s", error);
 		}
@@ -862,8 +862,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
 
 		// Create auth strategy - this validates JWT format, audience, and expiration
-		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(
-		    ctx->connection_info->access_token, ctx->connection_info->database);
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(ctx->connection_info->access_token,
+																		 ctx->connection_info->database);
 
 		// Get the pre-encoded UTF-16LE token for pool creation
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
