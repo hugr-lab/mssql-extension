@@ -27,9 +27,9 @@ class TdsConnection;
 //===----------------------------------------------------------------------===//
 
 struct PreloginOptions {
-	bool use_encrypt = true;           // Request TLS encryption
-	bool request_fedauth = false;      // Include FEDAUTHREQUIRED option
-	std::string sni_hostname;          // SNI hostname for TLS (Azure routing)
+	bool use_encrypt = true;	   // Request TLS encryption
+	bool request_fedauth = false;  // Include FEDAUTHREQUIRED option
+	std::string sni_hostname;	   // SNI hostname for TLS (Azure routing)
 };
 
 //===----------------------------------------------------------------------===//
@@ -37,9 +37,9 @@ struct PreloginOptions {
 //===----------------------------------------------------------------------===//
 
 struct Login7Options {
-	std::string database;              // Target database name
-	std::string username;              // SQL auth username (empty for FEDAUTH)
-	std::string password;              // SQL auth password (empty for FEDAUTH)
+	std::string database;			   // Target database name
+	std::string username;			   // SQL auth username (empty for FEDAUTH)
+	std::string password;			   // SQL auth password (empty for FEDAUTH)
 	std::string app_name = "DuckDB";   // Application name
 	bool include_fedauth_ext = false;  // Include FEDAUTH feature extension
 };
@@ -49,8 +49,8 @@ struct Login7Options {
 //===----------------------------------------------------------------------===//
 
 struct FedAuthInfo {
-	std::string sts_url;               // Security Token Service URL
-	std::string spn;                   // Service Principal Name (resource)
+	std::string sts_url;  // Security Token Service URL
+	std::string spn;	  // Service Principal Name (resource)
 };
 
 //===----------------------------------------------------------------------===//
@@ -99,7 +99,9 @@ public:
 	virtual void InvalidateToken() {}
 
 	// Check if token is expired and needs refresh
-	virtual bool IsTokenExpired() const { return false; }
+	virtual bool IsTokenExpired() const {
+		return false;
+	}
 
 protected:
 	AuthenticationStrategy() = default;

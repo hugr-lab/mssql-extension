@@ -571,7 +571,8 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 		// Send all packets
 		for (size_t i = 0; i < token_packets.size(); i++) {
 			if (!socket_->SendPacket(token_packets[i])) {
-				last_error_ = "Failed to send FEDAUTH_TOKEN packet " + std::to_string(i) + ": " + socket_->GetLastError();
+				last_error_ =
+					"Failed to send FEDAUTH_TOKEN packet " + std::to_string(i) + ": " + socket_->GetLastError();
 				return false;
 			}
 		}

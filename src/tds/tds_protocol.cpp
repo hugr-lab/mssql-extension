@@ -1687,8 +1687,8 @@ TdsPacket TdsProtocol::BuildFedAuthToken(const std::vector<uint8_t> &token_utf16
 }
 
 std::vector<TdsPacket> TdsProtocol::BuildFedAuthTokenMultiPacket(const std::vector<uint8_t> &token_utf16le,
-                                                                  size_t max_packet_size,
-                                                                  const std::vector<uint8_t> &nonce) {
+																 size_t max_packet_size,
+																 const std::vector<uint8_t> &nonce) {
 	std::vector<TdsPacket> packets;
 
 	// Build the full FEDAUTH_TOKEN payload first

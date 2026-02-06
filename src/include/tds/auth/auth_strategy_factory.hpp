@@ -33,13 +33,13 @@ public:
 
 	// Create SQL Server auth strategy directly
 	static AuthStrategyPtr CreateSqlAuth(const std::string &username, const std::string &password,
-	                                     const std::string &database, bool use_encrypt = true);
+										 const std::string &database, bool use_encrypt = true);
 
 	// Create Azure FEDAUTH strategy directly
 	// Requires ClientContext for token acquisition
 	static AuthStrategyPtr CreateFedAuth(ClientContext &context, const std::string &secret_name,
-	                                     const std::string &database, const std::string &host,
-	                                     const std::string &tenant_override = "");
+										 const std::string &database, const std::string &host,
+										 const std::string &tenant_override = "");
 
 private:
 	// Build token acquirer function that uses DuckDB context

@@ -26,13 +26,13 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 }
 
 AuthStrategyPtr AuthStrategyFactory::CreateSqlAuth(const std::string &username, const std::string &password,
-                                                   const std::string &database, bool use_encrypt) {
+												   const std::string &database, bool use_encrypt) {
 	return std::make_shared<SqlServerAuthStrategy>(username, password, database, use_encrypt);
 }
 
 AuthStrategyPtr AuthStrategyFactory::CreateFedAuth(ClientContext &context, const std::string &secret_name,
-                                                   const std::string &database, const std::string &host,
-                                                   const std::string &tenant_override) {
+												   const std::string &database, const std::string &host,
+												   const std::string &tenant_override) {
 	auto strategy = std::make_shared<FedAuthStrategy>(secret_name, database, host, tenant_override);
 
 	// Set up token acquirer that uses the DuckDB context

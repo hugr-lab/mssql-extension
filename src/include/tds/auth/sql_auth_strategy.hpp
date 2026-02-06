@@ -21,7 +21,7 @@ namespace tds {
 class SqlServerAuthStrategy : public AuthenticationStrategy {
 public:
 	SqlServerAuthStrategy(const std::string &username, const std::string &password, const std::string &database,
-	                      bool use_encrypt = true);
+						  bool use_encrypt = true);
 
 	~SqlServerAuthStrategy() override = default;
 
@@ -29,9 +29,13 @@ public:
 	// AuthenticationStrategy Interface
 	//===----------------------------------------------------------------------===//
 
-	bool RequiresFedAuth() const override { return false; }
+	bool RequiresFedAuth() const override {
+		return false;
+	}
 
-	std::string GetName() const override { return "SqlServerAuth"; }
+	std::string GetName() const override {
+		return "SqlServerAuth";
+	}
 
 	PreloginOptions GetPreloginOptions() const override;
 

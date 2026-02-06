@@ -17,25 +17,24 @@ namespace duckdb {
 namespace tds {
 
 FedAuthStrategy::FedAuthStrategy(const std::string &secret_name, const std::string &database, const std::string &host,
-                                 const std::string &tenant_override)
-    : secret_name_(secret_name), database_(database), host_(host), tenant_override_(tenant_override) {
-}
+								 const std::string &tenant_override)
+	: secret_name_(secret_name), database_(database), host_(host), tenant_override_(tenant_override) {}
 
 PreloginOptions FedAuthStrategy::GetPreloginOptions() const {
 	PreloginOptions options;
-	options.use_encrypt = true;          // Azure requires TLS
-	options.request_fedauth = true;      // Request FEDAUTH support
-	options.sni_hostname = host_;        // SNI for Azure routing
+	options.use_encrypt = true;		 // Azure requires TLS
+	options.request_fedauth = true;	 // Request FEDAUTH support
+	options.sni_hostname = host_;	 // SNI for Azure routing
 	return options;
 }
 
 Login7Options FedAuthStrategy::GetLogin7Options() const {
 	Login7Options options;
 	options.database = database_;
-	options.username.clear();            // No username for FEDAUTH
-	options.password.clear();            // No password for FEDAUTH
+	options.username.clear();  // No username for FEDAUTH
+	options.password.clear();  // No password for FEDAUTH
 	options.app_name = "DuckDB";
-	options.include_fedauth_ext = true;  // Include FEDAUTH extension
+	options.include_fedauth_ext = true;	 // Include FEDAUTH extension
 	return options;
 }
 
@@ -63,7 +62,7 @@ void FedAuthStrategy::InvalidateToken() {
 bool FedAuthStrategy::IsTokenExpired() const {
 	// Check if token exists and is valid in cache
 	std::string cached = mssql::azure::TokenCache::Instance().GetToken(secret_name_);
-	return cached.empty();  // Empty means expired or not cached
+	return cached.empty();	// Empty means expired or not cached
 }
 
 void FedAuthStrategy::SetTokenAcquirer(TokenAcquirer acquirer) {

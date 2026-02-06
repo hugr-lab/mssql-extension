@@ -35,7 +35,7 @@ class FedAuthStrategy : public AuthenticationStrategy {
 public:
 	// Constructor with secret name and optional tenant override
 	FedAuthStrategy(const std::string &secret_name, const std::string &database, const std::string &host,
-	                const std::string &tenant_override = "");
+					const std::string &tenant_override = "");
 
 	~FedAuthStrategy() override = default;
 
@@ -43,9 +43,13 @@ public:
 	// AuthenticationStrategy Interface
 	//===----------------------------------------------------------------------===//
 
-	bool RequiresFedAuth() const override { return true; }
+	bool RequiresFedAuth() const override {
+		return true;
+	}
 
-	std::string GetName() const override { return "AzureFedAuth"; }
+	std::string GetName() const override {
+		return "AzureFedAuth";
+	}
 
 	PreloginOptions GetPreloginOptions() const override;
 
@@ -65,7 +69,9 @@ public:
 	void SetTokenAcquirer(TokenAcquirer acquirer);
 
 	// Get the secret name (for logging/debugging)
-	const std::string &GetSecretName() const { return secret_name_; }
+	const std::string &GetSecretName() const {
+		return secret_name_;
+	}
 
 private:
 	std::string secret_name_;
