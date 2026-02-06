@@ -213,6 +213,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - In-memory (token cache, no persistence required) (001-azure-token-infrastructure)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), libcurl (vcpkg for Azure OAuth2) (031-connection-fedauth-refactor)
 - In-memory (connection pool state, token cache) (031-connection-fedauth-refactor)
+- C++17 (DuckDB extension standard, but C++11 compatible for ODR) + libcurl (OAuth2 HTTP), OpenSSL (TLS), DuckDB Azure extension (secret management) (032-fedauth-token-provider)
+- In-memory token cache (TokenCache singleton) (032-fedauth-token-provider)
 
 ## Azure AD Authentication
 
@@ -251,7 +253,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 032-fedauth-token-provider: Added C++17 (DuckDB extension standard, but C++11 compatible for ODR) + libcurl (OAuth2 HTTP), OpenSSL (TLS), DuckDB Azure extension (secret management)
 - 031-connection-fedauth-refactor: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), libcurl (vcpkg for Azure OAuth2)
 
 - 030-ctas-fixes: Fixed `CREATE TABLE IF NOT EXISTS` to silently succeed when table exists (Issue #44); auto-enable TABLOCK for new table creation for 15-30% performance improvement (Issue #45)
-- 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming

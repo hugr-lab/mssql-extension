@@ -13,6 +13,7 @@
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 #include "mssql_platform.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
 #include "tds/tds_connection.hpp"
 
 #include <cstdlib>
@@ -84,12 +85,22 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	}
 	// Default is true (catalog_enabled initialized to true in struct definition)
 
+	// Read optional access_token for direct token authentication (Spec 032)
+	// Takes precedence over azure_secret
+	auto access_token_val = kv_secret.TryGetValue("access_token");
+	if (!access_token_val.IsNull()) {
+		result->access_token = access_token_val.ToString();
+		result->use_azure_auth = !result->access_token.empty();	 // Manual token uses FEDAUTH flow
+	}
+
 	// Read optional azure_secret for Azure AD authentication (T015)
-	// When set, use FEDAUTH instead of SQL auth
-	auto azure_secret_val = kv_secret.TryGetValue("azure_secret");
-	if (!azure_secret_val.IsNull()) {
-		result->azure_secret_name = azure_secret_val.ToString();
-		result->use_azure_auth = !result->azure_secret_name.empty();
+	// Only applies if access_token is not set
+	if (result->access_token.empty()) {
+		auto azure_secret_val = kv_secret.TryGetValue("azure_secret");
+		if (!azure_secret_val.IsNull()) {
+			result->azure_secret_name = azure_secret_val.ToString();
+			result->use_azure_auth = !result->azure_secret_name.empty();
+		}
 	}
 	// Default: use_azure_auth = false (SQL auth)
 
@@ -621,6 +632,70 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation complete");
 }
 
+//===----------------------------------------------------------------------===//
+// Manual Token Connection Validation (Spec 032)
+//===----------------------------------------------------------------------===//
+
+void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
+								   int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
+							info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
+							timeout_seconds);
+
+	// Create a temporary connection to test the pre-provided token
+	tds::TdsConnection conn;
+
+	// Attempt TCP connection
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection FAILED - %s", error.c_str());
+		throw IOException("MSSQL manual token connection validation failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection succeeded");
+
+	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
+	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
+		conn.Close();
+		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
+	}
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH succeeded");
+
+	// Test query
+	if (info.use_encrypt) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: executing validation query (SELECT 1)...");
+		try {
+			if (!conn.ExecuteBatch("SELECT 1")) {
+				string error = conn.GetLastError();
+				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED - %s",
+										error.c_str());
+				conn.Close();
+				throw InvalidInputException("MSSQL manual token connection validation failed: query failed: %s", error);
+			}
+			// Drain results
+			auto *socket = conn.GetSocket();
+			if (socket) {
+				std::vector<uint8_t> response;
+				socket->ReceiveMessage(response, 5000);
+				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+			}
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query succeeded");
+		} catch (const std::exception &e) {
+			string error = e.what();
+			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED with exception - %s",
+									error.c_str());
+			conn.Close();
+			throw InvalidInputException("MSSQL manual token connection validation failed: %s", error);
+		}
+	}
+
+	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation complete");
+}
+
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
@@ -700,10 +775,11 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
-	// Extract SECRET and azure_secret parameters (optional if connection string is provided)
+	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
 	string azure_secret_name;
+	string access_token;  // Spec 032: Direct Azure AD JWT token
 	bool catalog_option_specified = false;
 	bool catalog_enabled_option = true;	 // Default to true
 	for (auto it = options.options.begin(); it != options.options.end();) {
@@ -713,6 +789,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "azure_secret") {
 			azure_secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else if (lower_name == "access_token") {
+			// Spec 032: Parse ACCESS_TOKEN ATTACH option
+			access_token = it->second.ToString();
 			it = options.options.erase(it);
 		} else if (lower_name == "catalog") {
 			catalog_option_specified = true;
@@ -735,10 +815,16 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		ctx->connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
 	} else if (!connection_string.empty()) {
 		// Connection string provided - parse it
-		// If azure_secret is provided as option, allow missing user/password
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, !azure_secret_name.empty());
-		// Set azure_secret from ATTACH option if provided
-		if (!azure_secret_name.empty()) {
+		// If access_token or azure_secret is provided as option, allow missing user/password
+		bool azure_auth_option = !access_token.empty() || !azure_secret_name.empty();
+		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
+
+		// Set access_token from ATTACH option if provided (Spec 032: takes precedence)
+		if (!access_token.empty()) {
+			ctx->connection_info->access_token = access_token;
+			ctx->connection_info->use_azure_auth = true;
+		} else if (!azure_secret_name.empty()) {
+			// Set azure_secret from ATTACH option if provided
 			ctx->connection_info->azure_secret_name = azure_secret_name;
 			ctx->connection_info->use_azure_auth = true;
 		}
@@ -771,7 +857,21 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
-	if (ctx->connection_info->use_azure_auth) {
+	if (!ctx->connection_info->access_token.empty()) {
+		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
+		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
+
+		// Create auth strategy - this validates JWT format, audience, and expiration
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(ctx->connection_info->access_token,
+																		 ctx->connection_info->database);
+
+		// Get the pre-encoded UTF-16LE token for pool creation
+		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
+		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
+
+		// Validate actual connection to server using the pre-provided token
+		ValidateManualTokenConnection(*ctx->connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
+	} else if (ctx->connection_info->use_azure_auth) {
 		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
 		// This ensures invalid credentials are detected immediately, not on first query
 		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
@@ -789,8 +889,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	manager.RegisterContext(name, ctx);
 
 	// Create connection pool for this context
-	if (ctx->connection_info->use_azure_auth) {
-		// Use Azure AD authentication pool
+	if (!ctx->connection_info->access_token.empty() || ctx->connection_info->use_azure_auth) {
+		// Use Azure AD authentication pool (manual token or azure_secret)
 		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
 			fedauth_token_utf16le, ctx->connection_info->use_encrypt);

@@ -15,12 +15,18 @@ namespace duckdb {
 namespace tds {
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {
-	if (conn_info.use_azure_auth) {
+	// Priority: access_token > azure_secret > SQL auth (Spec 032)
+	if (!conn_info.access_token.empty()) {
+		// Manual token authentication (Spec 032)
+		return CreateManualToken(conn_info.access_token, conn_info.database);
+	} else if (conn_info.use_azure_auth) {
+		// Azure secret-based authentication
 		if (!context) {
 			throw std::runtime_error("AuthStrategyFactory: ClientContext required for Azure authentication");
 		}
 		return CreateFedAuth(*context, conn_info.azure_secret_name, conn_info.database, conn_info.host);
 	} else {
+		// SQL Server authentication
 		return CreateSqlAuth(conn_info.user, conn_info.password, conn_info.database, conn_info.use_encrypt);
 	}
 }
@@ -39,6 +45,12 @@ AuthStrategyPtr AuthStrategyFactory::CreateFedAuth(ClientContext &context, const
 	strategy->SetTokenAcquirer(BuildTokenAcquirer(context));
 
 	return strategy;
+}
+
+AuthStrategyPtr AuthStrategyFactory::CreateManualToken(const std::string &access_token, const std::string &database) {
+	// Spec 032: Create ManualTokenAuthStrategy with pre-provided token
+	// Token validation (JWT format, audience, expiration) is done in the constructor
+	return std::make_shared<ManualTokenAuthStrategy>(access_token, database);
 }
 
 TokenAcquirer AuthStrategyFactory::BuildTokenAcquirer(ClientContext &context) {

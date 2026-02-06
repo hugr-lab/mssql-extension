@@ -11,6 +11,7 @@
 
 #include "tds/auth/auth_strategy.hpp"
 #include "tds/auth/fedauth_strategy.hpp"
+#include "tds/auth/manual_token_strategy.hpp"
 #include "tds/auth/sql_auth_strategy.hpp"
 
 namespace duckdb {
@@ -40,6 +41,10 @@ public:
 	static AuthStrategyPtr CreateFedAuth(ClientContext &context, const std::string &secret_name,
 										 const std::string &database, const std::string &host,
 										 const std::string &tenant_override = "");
+
+	// Create manual token strategy from pre-provided JWT (Spec 032)
+	// Token is validated for format and audience at creation time
+	static AuthStrategyPtr CreateManualToken(const std::string &access_token, const std::string &database);
 
 private:
 	// Build token acquirer function that uses DuckDB context

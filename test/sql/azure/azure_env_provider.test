@@ -1,0 +1,100 @@
+# name: test/sql/azure/azure_env_provider.test
+# description: Test ATTACH to Azure SQL Database using environment-based service principal (Spec 032 - US2)
+# group: [azure]
+
+# This test requires Azure SDK standard environment variables:
+# - AZURE_TENANT_ID: Azure AD tenant ID
+# - AZURE_CLIENT_ID: Service principal application (client) ID
+# - AZURE_CLIENT_SECRET: Service principal client secret
+#
+# And Azure SQL connection info:
+# - AZURE_SQL_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
+# - AZURE_SQL_DATABASE: Database name
+#
+# These are the same environment variables used by Azure SDK (DefaultAzureCredential)
+# Set them before running:
+#   export AZURE_TENANT_ID="your-tenant-id"
+#   export AZURE_CLIENT_ID="your-app-id"
+#   export AZURE_CLIENT_SECRET="your-client-secret"
+
+require mssql
+
+require azure
+
+# Skip if Azure SQL connection info not provided
+require-env AZURE_SQL_HOST
+
+require-env AZURE_SQL_DATABASE
+
+# Skip if Azure env vars not set
+require-env AZURE_TENANT_ID
+
+require-env AZURE_CLIENT_ID
+
+require-env AZURE_CLIENT_SECRET
+
+#===----------------------------------------------------------------------===#
+# Test: Environment-based authentication with 'env' chain (T030)
+#===----------------------------------------------------------------------===#
+
+# Create Azure secret using credential_chain with 'env' provider
+statement ok
+CREATE OR REPLACE SECRET azure_env_secret (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'env'
+);
+
+# ATTACH using the env-based Azure secret
+statement ok
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS env_db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_env_secret'
+);
+
+# Basic connectivity test
+query I
+SELECT 1 FROM mssql_scan('env_db', 'SELECT 1 AS value');
+----
+1
+
+# Verify pool stats
+query I
+SELECT COUNT(*) >= 0 FROM mssql_pool_stats('env_db');
+----
+true
+
+# Clean up
+statement ok
+DETACH env_db;
+
+statement ok
+DROP SECRET IF EXISTS azure_env_secret;
+
+#===----------------------------------------------------------------------===#
+# Test: Combined env chain (env;cli) - falls back to CLI if env fails
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE OR REPLACE SECRET azure_env_cli_secret (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'env;cli'
+);
+
+statement ok
+ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS env_cli_db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_env_cli_secret'
+);
+
+query I
+SELECT 1 FROM mssql_scan('env_cli_db', 'SELECT 1 AS value');
+----
+1
+
+statement ok
+DETACH env_cli_db;
+
+statement ok
+DROP SECRET IF EXISTS azure_env_cli_secret;

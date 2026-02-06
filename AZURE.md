@@ -1,23 +1,35 @@
 # Azure AD Authentication for MSSQL Extension
 
-This document describes how to use Azure Active Directory (Azure AD) authentication with the DuckDB MSSQL extension to connect to Azure SQL Database and Microsoft Fabric.
+Connect to Azure SQL Database and Microsoft Fabric using Azure Active Directory authentication.
 
-## Prerequisites
+## Table of Contents
 
-1. **DuckDB Azure Extension** - Required for Azure secret management
-2. **Azure Credentials** - Service principal, Azure CLI login, or interactive authentication
+- [Quick Start](#quick-start)
+- [Authentication Methods](#authentication-methods)
+  - [Service Principal](#1-service-principal-recommended-for-automation)
+  - [Azure CLI](#2-azure-cli-recommended-for-development)
+  - [Environment Variables](#3-environment-variables-for-cicd)
+  - [Interactive (Device Code)](#4-interactive-device-code-flow)
+  - [Manual Access Token](#5-manual-access-token)
+- [Connection Examples](#connection-examples)
+- [Using MSSQL Secrets](#using-mssql-secrets)
+- [Troubleshooting](#troubleshooting)
+- [Microsoft Fabric](#microsoft-fabric)
+- [Reference](#reference)
+
+---
 
 ## Quick Start
 
 ```sql
--- Install and load required extensions
+-- 1. Install and load required extensions
 INSTALL azure;
 LOAD azure;
 INSTALL mssql FROM community;
 LOAD mssql;
 
--- Create Azure secret with service principal
-CREATE SECRET my_azure_secret (
+-- 2. Create Azure secret (service principal example)
+CREATE SECRET my_azure (
     TYPE azure,
     PROVIDER service_principal,
     TENANT_ID 'your-tenant-id',
@@ -25,16 +37,17 @@ CREATE SECRET my_azure_secret (
     CLIENT_SECRET 'your-client-secret'
 );
 
--- Test the credentials
-SELECT mssql_azure_auth_test('my_azure_secret');
--- Returns: eyJ0eXAiOi...xyz [1634 chars]
-
--- Attach to Azure SQL Database
+-- 3. Connect to Azure SQL Database
 ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
     TYPE mssql,
-    AZURE_SECRET 'my_azure_secret'
+    AZURE_SECRET 'my_azure'
 );
+
+-- 4. Query data
+SELECT * FROM azuredb.dbo.customers LIMIT 10;
 ```
+
+---
 
 ## Authentication Methods
 
@@ -43,7 +56,6 @@ ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
 Best for CI/CD pipelines, scheduled jobs, and server applications.
 
 ```sql
--- Create service principal secret
 CREATE SECRET azure_sp (
     TYPE azure,
     PROVIDER service_principal,
@@ -52,16 +64,17 @@ CREATE SECRET azure_sp (
     CLIENT_SECRET 'your-client-secret'
 );
 
--- Test credentials
-SELECT mssql_azure_auth_test('azure_sp');
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_sp'
+);
 ```
 
-**Required Azure Setup:**
+**Azure Setup Required:**
 
-1. Register an application in Azure AD
+1. Register an application in Azure AD (Entra ID)
 2. Create a client secret for the application
-3. Grant the application access to your Azure SQL Database:
-
+3. Grant database access:
    ```sql
    -- Run in Azure SQL Database
    CREATE USER [your-app-name] FROM EXTERNAL PROVIDER;
@@ -71,130 +84,149 @@ SELECT mssql_azure_auth_test('azure_sp');
 
 ### 2. Azure CLI (Recommended for Development)
 
-Uses your existing Azure CLI login credentials.
+Uses your existing `az login` credentials.
 
 ```sql
--- Create credential chain secret with CLI
 CREATE SECRET azure_cli (
     TYPE azure,
     PROVIDER credential_chain,
     CHAIN 'cli'
 );
 
--- Test credentials (requires 'az login' first)
-SELECT mssql_azure_auth_test('azure_cli');
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_cli'
+);
 ```
 
 **Prerequisites:**
 
 ```bash
-# Install Azure CLI and login
 az login
 az account set --subscription "Your Subscription Name"
 ```
 
-### 3. Interactive / Device Code Flow (For MFA)
+### 3. Environment Variables (For CI/CD)
 
-Best for interactive sessions where MFA is required.
+Uses Azure SDK standard environment variables—compatible with GitHub Actions, Azure DevOps, and all Azure SDKs.
+
+```bash
+# Set environment variables
+export AZURE_TENANT_ID="your-tenant-id"
+export AZURE_CLIENT_ID="your-client-id"
+export AZURE_CLIENT_SECRET="your-client-secret"
+```
 
 ```sql
--- Create credential chain secret with interactive auth
+CREATE SECRET azure_env (
+    TYPE azure,
+    PROVIDER credential_chain,
+    CHAIN 'env'
+);
+
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_env'
+);
+```
+
+### 4. Interactive (Device Code Flow)
+
+Best for interactive sessions, MFA-enabled accounts, and personal accounts.
+
+```sql
 CREATE SECRET azure_interactive (
     TYPE azure,
     PROVIDER credential_chain,
     CHAIN 'interactive'
 );
 
--- Test with tenant_id (required for interactive auth)
-SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_interactive'
+);
 -- Output: To sign in, use a web browser to open https://microsoft.com/devicelogin
 --         and enter the code ABCD1234 to authenticate.
 ```
 
-> **Note:** Interactive auth requires a `tenant_id` to be specified. You can either:
->
-> 1. Pass it as the second argument to `mssql_azure_auth_test()`
-> 2. Use `azure_tenant_id` in the MSSQL secret (see below)
-> 3. Use Azure CLI (`az login`) which establishes tenant context automatically
+**Example Session:**
+
+```text
+D> ATTACH 'Server=xyz.datawarehouse.fabric.microsoft.com;Database=my_warehouse' AS wh (
+       TYPE mssql, AZURE_SECRET 'azure_interactive'
+   );
+To sign in, use a web browser to open https://microsoft.com/devicelogin
+and enter the code LYBT74YQB to authenticate.
+100% ▕████████████████████████████████████▏ (00:00:20.85 elapsed)
+
+D> SHOW ALL TABLES;
+┌──────────┬─────────┬────────────┬──────────────────┐
+│ database │ schema  │    name    │   column_names   │
+├──────────┼─────────┼────────────┼──────────────────┤
+│ wh       │ dbo     │ Date       │ [DateID, Date..] │
+│ wh       │ dbo     │ Geography  │ [GeographyID..]  │
+│ wh       │ dbo     │ Trip       │ [DateID, Medal.] │
+└──────────┴─────────┴────────────┴──────────────────┘
+```
+
+### 5. Manual Access Token
+
+For external token management or pre-obtained tokens.
+
+```sql
+-- Direct token in ATTACH
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
+);
+```
+
+**Get a token:**
+
+```bash
+az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+```
+
+**Token Requirements:**
+- Audience must be `https://database.windows.net/`
+- Token must not be expired (validated with 5-minute margin)
+
+---
 
 ## Connection Examples
 
 ### Azure SQL Database
 
 ```sql
--- Using service principal
 ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuresql (
     TYPE mssql,
-    AZURE_SECRET 'azure_sp'
+    AZURE_SECRET 'my_azure'
 );
-
--- Query data
-SELECT * FROM azuresql.dbo.customers LIMIT 10;
 ```
 
 ### Microsoft Fabric Data Warehouse
 
 ```sql
--- Fabric connection string format
 ATTACH 'Server=xyz.datawarehouse.fabric.microsoft.com;Database=my_warehouse' AS fabric (
     TYPE mssql,
-    AZURE_SECRET 'azure_sp'
+    AZURE_SECRET 'my_azure'
 );
-
--- Query Fabric tables
-SELECT * FROM fabric.dbo.sales_data;
 ```
 
-### Azure SQL with TLS
+### Azure SQL Managed Instance
 
 ```sql
--- Azure SQL always uses TLS, trust the certificate
-ATTACH 'Server=myserver.database.windows.net,1433;Database=mydb;Encrypt=True' AS azuresql (
+ATTACH 'Server=myinstance.public.abc123.database.windows.net,3342;Database=mydb' AS mi (
     TYPE mssql,
-    AZURE_SECRET 'azure_sp',
-    TRUST_SERVER_CERTIFICATE true
+    AZURE_SECRET 'my_azure'
 );
 ```
 
-## Testing Credentials
+---
 
-The `mssql_azure_auth_test()` function validates Azure credentials without connecting to a database:
+## Using MSSQL Secrets
 
-```sql
--- Test service principal
-SELECT mssql_azure_auth_test('my_secret_name');
-
--- Successful output (truncated token):
--- eyJ0eXAiOi...gJw [1634 chars]
-
--- Error outputs:
--- Error: Secret name required
--- Error: Azure secret 'xyz' not found
--- Error: Secret 'xyz' is not an Azure secret (type: postgres)
--- Azure AD error: AADSTS7000215: Invalid client secret provided
--- Azure CLI credentials expired. Run 'az login' to refresh.
-```
-
-## Token Caching
-
-Tokens are cached automatically with a 5-minute refresh margin:
-
-- Tokens are cached per secret name
-- Cache is thread-safe for concurrent queries
-- Tokens are refreshed automatically before expiration
-- Cache survives across multiple ATTACH/DETACH cycles
-
-```sql
--- First call acquires token from Azure AD (~200ms)
-SELECT mssql_azure_auth_test('azure_sp');
-
--- Subsequent calls use cached token (~0ms)
-SELECT mssql_azure_auth_test('azure_sp');
-```
-
-## Combining with MSSQL Secrets
-
-You can reference an Azure secret from an MSSQL secret:
+You can store connection details and Azure credentials together in an MSSQL secret:
 
 ```sql
 -- Create Azure secret
@@ -206,7 +238,7 @@ CREATE SECRET my_azure (
     CLIENT_SECRET 'your-client-secret'
 );
 
--- Create MSSQL secret that references Azure secret
+-- Create MSSQL secret referencing Azure secret
 CREATE SECRET azure_sql_conn (
     TYPE mssql,
     HOST 'myserver.database.windows.net',
@@ -214,174 +246,157 @@ CREATE SECRET azure_sql_conn (
     AZURE_SECRET 'my_azure'
 );
 
--- Attach using the MSSQL secret
+-- Attach using just the MSSQL secret
 ATTACH '' AS mydb (TYPE mssql, SECRET azure_sql_conn);
 ```
 
-### Interactive Auth with MSSQL Secret
-
-For interactive authentication, you must provide a tenant ID. Since the Azure extension's
-credential_chain provider doesn't support tenant_id directly, use `azure_tenant_id` in the
-MSSQL secret:
+**With ACCESS_TOKEN:**
 
 ```sql
--- Create Azure secret for interactive auth (no tenant_id needed here)
-CREATE SECRET my_azure_interactive (
-    TYPE azure,
-    PROVIDER credential_chain,
-    CHAIN 'interactive'
-);
-
--- Create MSSQL secret with tenant_id for interactive auth
-CREATE SECRET azure_sql_interactive (
+CREATE SECRET mssql_token (
     TYPE mssql,
     HOST 'myserver.database.windows.net',
     DATABASE 'mydb',
-    AZURE_SECRET 'my_azure_interactive',
-    AZURE_TENANT_ID 'your-tenant-id'  -- Required for interactive auth
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
 );
 
--- Attach using the MSSQL secret (will prompt for device code login)
-ATTACH '' AS mydb (TYPE mssql, SECRET azure_sql_interactive);
+ATTACH '' AS mydb (TYPE mssql, SECRET mssql_token);
 ```
+
+---
 
 ## Troubleshooting
 
-### "Azure extension required for Azure authentication"
+### Common Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Azure extension required` | Azure extension not loaded | `INSTALL azure; LOAD azure;` |
+| `Azure secret 'xyz' not found` | Secret doesn't exist | Check `SELECT * FROM duckdb_secrets();` |
+| `AADSTS7000215: Invalid client secret` | Wrong or expired secret | Generate new secret in Azure Portal |
+| `AADSTS700016: Application not found` | Wrong client ID | Verify Application (client) ID in Azure AD |
+| `Azure CLI credentials expired` | CLI token expired | Run `az login` |
+| `Connection reset by peer` | Token too large (older versions) | Update to v0.1.11+ |
+| `Invalid access token format` | Malformed JWT | Verify token format |
+| `Access token audience` | Wrong token audience | Token must be for `https://database.windows.net/` |
+| `Access token expired` | Token has expired | Get a fresh token |
+
+### Testing Credentials
+
+Test your Azure credentials without connecting to a database:
 
 ```sql
--- Install and load Azure extension first
-INSTALL azure;
-LOAD azure;
+SELECT mssql_azure_auth_test('my_azure_secret');
+-- Returns: eyJ0eXAiOi...gJw [1634 chars]
+
+-- For interactive auth, pass tenant_id:
+SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
 ```
 
-### "Azure secret 'xyz' not found"
+### Token Caching
+
+Tokens are cached automatically:
+- Cache is per secret name, thread-safe
+- Tokens refresh automatically 5 minutes before expiration
+- First call: ~200ms (acquires from Azure AD)
+- Subsequent calls: ~0ms (uses cache)
+
+---
+
+## Microsoft Fabric
+
+Microsoft Fabric Data Warehouses have some differences from Azure SQL Database:
+
+### BCP Protocol Not Supported
+
+Fabric doesn't support the TDS `INSERT BULK` command. The extension handles this automatically:
+
+| Operation | Azure SQL | Microsoft Fabric |
+|-----------|-----------|------------------|
+| CTAS | BCP (fast) | INSERT fallback (auto) |
+| COPY TO | BCP (fast) | ❌ Not supported |
+| INSERT | Standard | Standard |
+| SELECT | Full support | Full support |
+
+**CTAS works on Fabric (auto-fallback):**
 
 ```sql
--- Check existing secrets
-SELECT * FROM duckdb_secrets();
-
--- Ensure secret was created with TYPE azure
-CREATE SECRET my_secret (
-    TYPE azure,  -- Must be 'azure'
-    PROVIDER service_principal,
-    ...
-);
-```
-
-### "AADSTS7000215: Invalid client secret provided"
-
-The client secret is incorrect or expired. Generate a new secret in Azure Portal:
-
-1. Go to Azure AD > App registrations > Your app
-2. Certificates & secrets > New client secret
-
-### "AADSTS700016: Application not found"
-
-The client ID (application ID) is incorrect:
-
-1. Go to Azure AD > App registrations
-2. Copy the correct Application (client) ID
-
-### "Azure CLI credentials expired"
-
-```bash
-# Re-authenticate with Azure CLI
-az login
-
-# Or for a specific tenant
-az login --tenant your-tenant-id
-```
-
-### "Connection reset by peer" with Azure CLI
-
-This error can occur if you're using an older version of the extension that doesn't support large token fragmentation. Azure CLI tokens (~2091 chars → ~4182 bytes UTF-16LE) exceed the default TDS packet size (4096 bytes) and require packet fragmentation.
-
-**Solution**: Update to version 0.1.11+ which includes the `BuildFedAuthTokenMultiPacket()` fix.
-
-**Token sizes by authentication method**:
-
-| Method            | Token Size (chars) | UTF-16LE Size | Packets Needed |
-|-------------------|-------------------|---------------|----------------|
-| Service Principal | ~1632             | ~3264 bytes   | 1              |
-| Azure CLI         | ~2091             | ~4182 bytes   | 2              |
-| Interactive       | ~2000+            | ~4000+ bytes  | 1-2            |
-
-### "Device code flow timeout"
-
-The device code flow times out after 15 minutes. Start again:
-
-```sql
--- Invalidate cached token and retry
-SELECT mssql_azure_auth_test('azure_interactive');
-```
-
-## Security Best Practices
-
-1. **Never commit secrets to source control** - Use environment variables or secret managers
-2. **Use service principals for production** - Avoid interactive auth in automated pipelines
-3. **Rotate secrets regularly** - Azure recommends rotating every 90 days
-4. **Use least privilege** - Grant only required database permissions
-5. **Enable Azure AD audit logs** - Monitor authentication attempts
-
-## Environment Variables
-
-For CI/CD, set credentials via environment variables:
-
-```bash
-export AZURE_TENANT_ID="your-tenant-id"
-export AZURE_CLIENT_ID="your-client-id"
-export AZURE_CLIENT_SECRET="your-client-secret"
-```
-
-```sql
--- Use in DuckDB (requires azure extension environment provider)
-CREATE SECRET azure_env (
-    TYPE azure,
-    PROVIDER credential_chain,
-    CHAIN 'env'
-);
-```
-
-## Microsoft Fabric Limitations
-
-Microsoft Fabric Data Warehouses have some limitations compared to Azure SQL Database:
-
-### No BCP/INSERT BULK Support
-
-Fabric doesn't support the TDS `INSERT BULK` command (BCP protocol). The extension handles this automatically:
-
-- **CTAS (CREATE TABLE AS SELECT)**: Auto-falls back to batched INSERT statements
-- **COPY TO MSSQL**: Not supported on Fabric - use CTAS instead
-
-```sql
--- This works on Fabric (auto-fallback to INSERT mode)
 CREATE TABLE fabric.dbo.new_table AS SELECT * FROM local_table;
+```
 
--- This will fail on Fabric with a clear error message
+**COPY TO fails on Fabric:**
+
+```sql
 COPY (SELECT * FROM local_table) TO 'fabric.dbo.new_table' (FORMAT 'bcp');
 -- Error: Microsoft Fabric does not support INSERT BULK (BCP protocol).
--- Use CREATE TABLE AS SELECT (CTAS) instead.
 ```
 
-### Performance Note
+### VARCHAR(MAX) / NVARCHAR(MAX) Not Supported
 
-Due to the INSERT fallback, bulk data transfers to Fabric are slower than to Azure SQL Database. For large data loads, consider:
+Fabric doesn't support `VARCHAR(MAX)` or `NVARCHAR(MAX)` data types. When using CTAS with string columns, you may see:
 
-1. Loading to Azure SQL Database first, then syncing to Fabric
-2. Using Fabric's native data ingestion tools (Data Factory, Dataflows)
-3. Breaking large loads into smaller batches
+```
+Error: The data type 'nvarchar(max)' is not supported in this edition of SQL Server.
+```
 
-## Supported Azure Services
+**Workarounds:**
 
-| Service | Connection String Format | BCP Support |
-| ------- | ------------------------ | ----------- |
-| Azure SQL Database | `Server=name.database.windows.net;Database=dbname` | ✅ Full |
-| Azure SQL Managed Instance | `Server=name.public.xyz.database.windows.net,3342;Database=dbname` | ✅ Full |
-| Microsoft Fabric DW | `Server=xyz.datawarehouse.fabric.microsoft.com;Database=warehouse` | ❌ INSERT fallback |
-| Azure Synapse Serverless | `Server=name-ondemand.sql.azuresynapse.net;Database=dbname` | ⚠️ Limited |
+1. **Cast to fixed-length strings** in your CTAS query:
+   ```sql
+   CREATE TABLE fabric.dbo.target AS
+   SELECT id, CAST(name AS VARCHAR(255)) AS name FROM source;
+   ```
 
-## See Also
+2. **Use Azure SQL Database** for tables with large text columns, then sync to Fabric
+
+3. **Pre-create the table** in Fabric with appropriate VARCHAR(n) types, then INSERT
+
+### Performance Tips for Fabric
+
+1. Use CTAS instead of COPY TO
+2. Break large loads into smaller batches
+3. Consider loading to Azure SQL first, then syncing to Fabric
+
+---
+
+## Reference
+
+### Supported Azure Services
+
+| Service | Connection Format | BCP Support |
+|---------|-------------------|-------------|
+| Azure SQL Database | `name.database.windows.net` | ✅ Full |
+| Azure SQL Managed Instance | `name.public.xyz.database.windows.net,3342` | ✅ Full |
+| Microsoft Fabric DW | `xyz.datawarehouse.fabric.microsoft.com` | ❌ INSERT fallback |
+| Azure Synapse Serverless | `name-ondemand.sql.azuresynapse.net` | ⚠️ Limited |
+
+### Chain Priority
+
+When using multiple providers (e.g., `CHAIN 'env;cli'`), they're tried in order:
+
+1. `env` — Environment variables
+2. `cli` — Azure CLI credentials
+3. `interactive` — Device code flow
+
+This matches Azure SDK's `DefaultAzureCredential` behavior.
+
+### Token Sizes
+
+| Method | Token Size | UTF-16LE Size | TDS Packets |
+|--------|-----------|---------------|-------------|
+| Service Principal | ~1632 chars | ~3264 bytes | 1 |
+| Azure CLI | ~2091 chars | ~4182 bytes | 2 |
+| Interactive | ~2000+ chars | ~4000+ bytes | 1-2 |
+
+### Security Best Practices
+
+1. **Never commit secrets to source control**
+2. **Use service principals for production** (not interactive auth)
+3. **Rotate secrets every 90 days**
+4. **Grant least privilege** database permissions
+5. **Enable Azure AD audit logs**
+
+### See Also
 
 - [DuckDB Azure Extension](https://duckdb.org/docs/extensions/azure)
 - [Azure AD Authentication for Azure SQL](https://docs.microsoft.com/azure/azure-sql/database/authentication-aad-overview)
