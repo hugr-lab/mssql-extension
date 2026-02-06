@@ -48,4 +48,5 @@ Thumbs.db
 # test output
 duckdb_unittest_tempdir/
 future-spec/
+future-specs/
 posts/

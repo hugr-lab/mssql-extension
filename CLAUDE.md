@@ -210,6 +210,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - SQL Server 2019+ (remote target), in-memory (batch buffering) (027-ctas-bcp-integration)
 - C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg for TLS), libcurl (vcpkg for OAuth2 HTTP), DuckDB Azure extension (runtime, for Azure secret management) (001-azure-token-infrastructure)
 - In-memory (token cache, no persistence required) (001-azure-token-infrastructure)
+- C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), libcurl (vcpkg for Azure OAuth2) (031-connection-fedauth-refactor)
+- In-memory (connection pool state, token cache) (031-connection-fedauth-refactor)
 
 ## Azure AD Authentication
 
@@ -248,7 +250,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 031-connection-fedauth-refactor: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), libcurl (vcpkg for Azure OAuth2)
 
 - 030-ctas-fixes: Fixed `CREATE TABLE IF NOT EXISTS` to silently succeed when table exists (Issue #44); auto-enable TABLOCK for new table creation for 15-30% performance improvement (Issue #45)
 - 024-mssql-copy-bcp: Added COPY TO MSSQL via TDS BulkLoadBCP protocol with URL/catalog syntax, temp table support, auto-create/overwrite options, and bounded-memory batch streaming
-- 019-fix-winsock-init: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library)
