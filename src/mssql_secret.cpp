@@ -10,11 +10,30 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput &input) {
-	// Check for azure_secret parameter first
+	// Check for access_token parameter first (Spec 032: takes precedence over azure_secret)
+	auto token_it = input.options.find(MSSQL_SECRET_ACCESS_TOKEN);
+	bool has_access_token = token_it != input.options.end() && !token_it->second.ToString().empty();
+
+	// Check for azure_secret parameter
 	auto azure_it = input.options.find(MSSQL_SECRET_AZURE_SECRET);
 	bool has_azure_secret = azure_it != input.options.end() && !azure_it->second.ToString().empty();
 
-	if (has_azure_secret) {
+	if (has_access_token) {
+		// Manual token auth mode (Spec 032) - only require host, port, database
+		// Token validation (JWT format, audience) is done at connection time
+		const char *required_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE};
+		for (auto field : required_fields) {
+			auto it = input.options.find(field);
+			if (it == input.options.end()) {
+				return StringUtil::Format("Missing required field '%s'. Provide %s parameter when creating secret.",
+										  field, field);
+			}
+			auto str_val = it->second.ToString();
+			if (str_val.empty()) {
+				return StringUtil::Format("Field '%s' cannot be empty.", field);
+			}
+		}
+	} else if (has_azure_secret) {
 		// Azure auth mode - validate Azure secret exists and is correct type
 		std::string azure_name = azure_it->second.ToString();
 
@@ -113,11 +132,19 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_PORT, input);
 	result->TrySetValue(MSSQL_SECRET_DATABASE, input);
 
-	// user/password are optional if azure_secret is provided
+	// user/password are optional if access_token or azure_secret is provided
+	auto token_it = input.options.find(MSSQL_SECRET_ACCESS_TOKEN);
+	bool has_access_token = token_it != input.options.end() && !token_it->second.ToString().empty();
+
 	auto azure_it = input.options.find(MSSQL_SECRET_AZURE_SECRET);
 	bool has_azure_secret = azure_it != input.options.end() && !azure_it->second.ToString().empty();
 
-	if (has_azure_secret) {
+	if (has_access_token) {
+		// Spec 032: Manual token authentication - store access_token
+		result->TrySetValue(MSSQL_SECRET_ACCESS_TOKEN, input);
+		// Mark access_token as redacted (hidden in duckdb_secrets() output)
+		result->redact_keys.insert(MSSQL_SECRET_ACCESS_TOKEN);
+	} else if (has_azure_secret) {
 		result->TrySetValue(MSSQL_SECRET_AZURE_SECRET, input);
 		// Also store azure_tenant_id if provided (required for interactive auth)
 		result->TrySetValue(MSSQL_SECRET_AZURE_TENANT_ID, input);
@@ -186,6 +213,8 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_AZURE_SECRET] = LogicalType::VARCHAR;	 // Optional, for Azure AD auth
 	create_func.named_parameters[MSSQL_SECRET_AZURE_TENANT_ID] =
 		LogicalType::VARCHAR;  // Optional, tenant for interactive auth
+	create_func.named_parameters[MSSQL_SECRET_ACCESS_TOKEN] =
+		LogicalType::VARCHAR;  // Optional, direct Azure AD JWT token (Spec 032)
 
 	loader.RegisterFunction(std::move(create_func));
 }

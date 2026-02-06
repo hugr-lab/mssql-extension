@@ -1,6 +1,7 @@
 #include "mssql_storage.hpp"
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_pool_manager.hpp"
@@ -84,12 +85,22 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	}
 	// Default is true (catalog_enabled initialized to true in struct definition)
 
+	// Read optional access_token for direct token authentication (Spec 032)
+	// Takes precedence over azure_secret
+	auto access_token_val = kv_secret.TryGetValue("access_token");
+	if (!access_token_val.IsNull()) {
+		result->access_token = access_token_val.ToString();
+		result->use_azure_auth = !result->access_token.empty();	 // Manual token uses FEDAUTH flow
+	}
+
 	// Read optional azure_secret for Azure AD authentication (T015)
-	// When set, use FEDAUTH instead of SQL auth
-	auto azure_secret_val = kv_secret.TryGetValue("azure_secret");
-	if (!azure_secret_val.IsNull()) {
-		result->azure_secret_name = azure_secret_val.ToString();
-		result->use_azure_auth = !result->azure_secret_name.empty();
+	// Only applies if access_token is not set
+	if (result->access_token.empty()) {
+		auto azure_secret_val = kv_secret.TryGetValue("azure_secret");
+		if (!azure_secret_val.IsNull()) {
+			result->azure_secret_name = azure_secret_val.ToString();
+			result->use_azure_auth = !result->azure_secret_name.empty();
+		}
 	}
 	// Default: use_azure_auth = false (SQL auth)
 
@@ -700,10 +711,11 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
-	// Extract SECRET and azure_secret parameters (optional if connection string is provided)
+	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
 	string azure_secret_name;
+	string access_token;  // Spec 032: Direct Azure AD JWT token
 	bool catalog_option_specified = false;
 	bool catalog_enabled_option = true;	 // Default to true
 	for (auto it = options.options.begin(); it != options.options.end();) {
@@ -713,6 +725,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "azure_secret") {
 			azure_secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else if (lower_name == "access_token") {
+			// Spec 032: Parse ACCESS_TOKEN ATTACH option
+			access_token = it->second.ToString();
 			it = options.options.erase(it);
 		} else if (lower_name == "catalog") {
 			catalog_option_specified = true;
@@ -735,10 +751,16 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		ctx->connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
 	} else if (!connection_string.empty()) {
 		// Connection string provided - parse it
-		// If azure_secret is provided as option, allow missing user/password
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, !azure_secret_name.empty());
-		// Set azure_secret from ATTACH option if provided
-		if (!azure_secret_name.empty()) {
+		// If access_token or azure_secret is provided as option, allow missing user/password
+		bool azure_auth_option = !access_token.empty() || !azure_secret_name.empty();
+		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
+
+		// Set access_token from ATTACH option if provided (Spec 032: takes precedence)
+		if (!access_token.empty()) {
+			ctx->connection_info->access_token = access_token;
+			ctx->connection_info->use_azure_auth = true;
+		} else if (!azure_secret_name.empty()) {
+			// Set azure_secret from ATTACH option if provided
 			ctx->connection_info->azure_secret_name = azure_secret_name;
 			ctx->connection_info->use_azure_auth = true;
 		}
@@ -771,7 +793,21 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
-	if (ctx->connection_info->use_azure_auth) {
+	if (!ctx->connection_info->access_token.empty()) {
+		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
+		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
+
+		// Create auth strategy - this validates JWT format, audience, and expiration
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(
+		    ctx->connection_info->access_token, ctx->connection_info->database);
+
+		// Get the pre-encoded UTF-16LE token for pool creation
+		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
+		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
+
+		// Validate actual connection to server
+		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
+	} else if (ctx->connection_info->use_azure_auth) {
 		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
 		// This ensures invalid credentials are detected immediately, not on first query
 		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
@@ -789,8 +825,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	manager.RegisterContext(name, ctx);
 
 	// Create connection pool for this context
-	if (ctx->connection_info->use_azure_auth) {
-		// Use Azure AD authentication pool
+	if (!ctx->connection_info->access_token.empty() || ctx->connection_info->use_azure_auth) {
+		// Use Azure AD authentication pool (manual token or azure_secret)
 		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
 			fedauth_token_utf16le, ctx->connection_info->use_encrypt);

@@ -40,6 +40,11 @@ struct MSSQLConnectionInfo {
 	string azure_secret_name;	  // Name of the Azure secret for token acquisition
 
 	//===----------------------------------------------------------------------===//
+	// Manual Token Authentication (Spec 032: FEDAUTH Token Provider Enhancements)
+	//===----------------------------------------------------------------------===//
+	string access_token;  // Pre-provided Azure AD JWT access token (takes precedence over azure_secret)
+
+	//===----------------------------------------------------------------------===//
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
 	//===----------------------------------------------------------------------===//
 	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)

@@ -96,9 +96,10 @@ set(EXTENSION_SOURCES
     src/tds/tds_connection.cpp
     src/tds/tds_connection_pool.cpp
     src/tds/tds_column_metadata.cpp
-    # TDS authentication strategies (Spec 031)
+    # TDS authentication strategies (Spec 031, Spec 032)
     src/tds/auth/sql_auth_strategy.cpp
     src/tds/auth/fedauth_strategy.cpp
+    src/tds/auth/manual_token_strategy.cpp
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
@@ -171,6 +172,7 @@ set(EXTENSION_SOURCES
     src/azure/azure_test_function.cpp
     src/azure/azure_device_code.cpp
     src/azure/azure_fedauth.cpp
+    src/azure/jwt_parser.cpp
 )
 
 # Build static extension (linked into DuckDB)
