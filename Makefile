@@ -11,10 +11,9 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 VCPKG_DIR := $(PROJ_DIR)vcpkg
 VCPKG_TOOLCHAIN := $(VCPKG_DIR)/scripts/buildsystems/vcpkg.cmake
 
-# Pass vcpkg toolchain and C++17 standard to all builds (if vcpkg exists)
-# C++17 is required to avoid ODR violations with DuckDB's constexpr static members on GCC
+# Pass vcpkg toolchain to all builds (if vcpkg exists)
 ifneq ($(wildcard $(VCPKG_TOOLCHAIN)),)
-    EXT_FLAGS := -DCMAKE_CXX_STANDARD=17 -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(PROJ_DIR)"
+    EXT_FLAGS := -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(PROJ_DIR)"
 endif
 
 # Include DuckDB extension CI tools (provides: set_duckdb_version, release, debug, test, etc.)
