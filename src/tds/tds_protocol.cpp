@@ -1,4 +1,6 @@
 #include "tds/tds_protocol.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include "tds/encoding/utf16.hpp"
@@ -9,6 +11,22 @@
 #include <unistd.h>
 #define GET_PID() getpid()
 #endif
+
+// Debug logging
+static int GetMssqlDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define MSSQL_PROTO_DEBUG_LOG(lvl, fmt, ...)                               \
+	do {                                                                   \
+		if (GetMssqlDebugLevel() >= lvl)                                   \
+			fprintf(stderr, "[MSSQL PROTO] " fmt "\n", ##__VA_ARGS__);     \
+	} while (0)
 
 namespace duckdb {
 namespace tds {
@@ -69,6 +87,7 @@ TdsPacket TdsProtocol::BuildPrelogin(bool use_encrypt) {
 PreloginResponse TdsProtocol::ParsePreloginResponse(const std::vector<uint8_t> &data) {
 	PreloginResponse response = {};
 	response.success = false;
+	response.fedauth_echo = false;
 
 	if (data.empty()) {
 		response.error_message = "Empty PRELOGIN response";
@@ -102,6 +121,12 @@ PreloginResponse TdsProtocol::ParsePreloginResponse(const std::vector<uint8_t> &
 		} else if (option == static_cast<uint8_t>(PreloginOption::ENCRYPTION)) {
 			if (offset < data.size()) {
 				response.encryption = static_cast<EncryptionOption>(data[offset]);
+			}
+		} else if (option == static_cast<uint8_t>(PreloginOption::FEDAUTHREQUIRED)) {
+			// Per MS-TDS and go-mssqldb: if server's FEDAUTHREQUIRED value is non-zero,
+			// client must echo it back in LOGIN7's FEDAUTH options byte (bit 0)
+			if (offset < data.size() && length >= 1) {
+				response.fedauth_echo = (data[offset] != 0);
 			}
 		}
 
@@ -229,9 +254,10 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendUInt32LE(0);
 
 	// Offset 24: OptionFlags1 (1 byte)
-	// Bit 5: USE_DB (switch to database on login)
-	// Bit 6: SET_LANG
-	uint8_t flags1 = 0x20;	// USE_DB
+	// Bit 5 (0x20): USE_DB - switch to database on login
+	// Bit 7 (0x80): SET_LANG - use language from login
+	// Per go-mssqldb: both flags are set (0xA0)
+	uint8_t flags1 = 0x20 | 0x80;  // USE_DB | SET_LANG
 	packet.AppendByte(flags1);
 
 	// Offset 25: OptionFlags2 (1 byte)
@@ -413,6 +439,7 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			// ProgName (variable)
 			// ProgVersion (4 bytes)
 
+			const uint8_t *loginack_end = ptr + len;
 			if (len >= 10) {
 				// Skip interface
 				ptr++;
@@ -429,7 +456,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			}
 
 			response.success = true;
-			return response;
+			// Don't return yet - continue parsing for ENVCHANGE (ROUTING, PACKETSIZE, etc.)
+			ptr = loginack_end;
 
 		} else if (token_type == static_cast<uint8_t>(TokenType::ERROR_TOKEN)) {
 			if (ptr + 2 > end)
@@ -480,6 +508,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				const uint8_t *env_data = ptr;
 				// ENVCHANGE type is first byte
 				uint8_t env_type = env_data[0];
+				// Debug: log ENVCHANGE type
+				MSSQL_PROTO_DEBUG_LOG(2, "ParseLoginResponse: ENVCHANGE type=%d, len=%d", env_type, len);
 				// Type 4 = PACKETSIZE
 				if (env_type == 4 && len >= 3) {
 					// NewValueLen (1 byte)
@@ -492,6 +522,71 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 						} catch (...) {
 							// Ignore parse errors
 						}
+					}
+				}
+				// Type 20 (0x14) = ROUTING (Azure SQL/Fabric gateway redirection)
+				else if (env_type == 20 && len >= 7) {
+					MSSQL_PROTO_DEBUG_LOG(1, "ParseLoginResponse: ROUTING ENVCHANGE detected, len=%d", len);
+					// ROUTING ENVCHANGE structure:
+					// Type (1 byte) = 20
+					// ValueLength (2 bytes, LE)
+					// Protocol (1 byte) - 0 = TCP
+					// ProtocolProperty (2 bytes, LE) - new port
+					// AlternateServer length (2 bytes, LE) - in characters
+					// AlternateServer (UTF-16LE)
+					// OldValue (2 bytes) = 0x0000
+
+					const uint8_t *routing_ptr = env_data + 1;
+					const uint8_t *routing_end = env_data + len;
+
+					if (routing_ptr + 2 > routing_end) {
+						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at value_len");
+						ptr += len;
+						continue;
+					}
+					// Skip ValueLength - already covered by outer len
+					uint16_t value_len = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
+					routing_ptr += 2;
+					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: value_len=%d", value_len);
+
+					if (routing_ptr + 1 > routing_end) {
+						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at protocol");
+						ptr += len;
+						continue;
+					}
+					uint8_t protocol = *routing_ptr++;
+					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: protocol=%d", protocol);
+					if (protocol != 0) {  // Only TCP (0) supported
+						MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: unsupported protocol %d, expected TCP (0)", protocol);
+						ptr += len;
+						continue;
+					}
+
+					if (routing_ptr + 2 > routing_end) {
+						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at port");
+						ptr += len;
+						continue;
+					}
+					response.routed_port = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
+					routing_ptr += 2;
+					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: port=%d", response.routed_port);
+
+					if (routing_ptr + 2 > routing_end) {
+						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: truncated at server_len");
+						ptr += len;
+						continue;
+					}
+					uint16_t server_len_chars = routing_ptr[0] | (static_cast<uint16_t>(routing_ptr[1]) << 8);
+					routing_ptr += 2;
+					MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server_len_chars=%d", server_len_chars);
+
+					if (routing_ptr + server_len_chars * 2 <= routing_end && server_len_chars > 0) {
+						response.routed_server = ReadUTF16LE(routing_ptr, server_len_chars);
+						response.has_routing = true;
+						MSSQL_PROTO_DEBUG_LOG(1, "ROUTING: parsed server=%s:%d",
+						                      response.routed_server.c_str(), response.routed_port);
+					} else {
+						MSSQL_PROTO_DEBUG_LOG(2, "ROUTING: server string out of bounds or empty");
 					}
 				}
 				ptr += len;
@@ -508,6 +603,64 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			} else {
 				break;
 			}
+		} else if (token_type == static_cast<uint8_t>(TokenType::FEDAUTHINFO)) {
+			// FEDAUTHINFO token (0xEE) - Azure AD sends STS URL and SPN
+			// This is received in ADAL workflow after sending LOGIN7
+			// Structure per MS-TDS and go-mssqldb:
+			//   TokenLength (4 bytes, DWORD, LE)
+			//   CountOfInfoIDs (4 bytes, DWORD, LE)
+			//   InfoIDs[]: FedAuthInfoID (1 byte) + DataLength (4 bytes) + DataOffset (4 bytes)
+			//   Data: UTF-16LE strings at offsets specified in InfoIDs
+			if (ptr + 4 > end)
+				break;
+
+			uint32_t token_len = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) |
+			                    (static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
+			ptr += 4;
+			MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: token_len=%u", token_len);
+
+			if (ptr + token_len > end || token_len < 4)
+				break;
+
+			const uint8_t *token_start = ptr;
+			const uint8_t *token_end = ptr + token_len;
+
+			// CountOfInfoIDs (4 bytes, LE)
+			uint32_t count = token_start[0] | (static_cast<uint32_t>(token_start[1]) << 8) |
+			                (static_cast<uint32_t>(token_start[2]) << 16) | (static_cast<uint32_t>(token_start[3]) << 24);
+			const uint8_t *info_ptr = token_start + 4;
+			MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: count=%u", count);
+
+			// Read InfoID entries
+			for (uint32_t i = 0; i < count && info_ptr + 9 <= token_end; i++) {
+				uint8_t info_id = info_ptr[0];
+				uint32_t data_len = info_ptr[1] | (static_cast<uint32_t>(info_ptr[2]) << 8) |
+				                   (static_cast<uint32_t>(info_ptr[3]) << 16) | (static_cast<uint32_t>(info_ptr[4]) << 24);
+				uint32_t data_offset = info_ptr[5] | (static_cast<uint32_t>(info_ptr[6]) << 8) |
+				                      (static_cast<uint32_t>(info_ptr[7]) << 16) | (static_cast<uint32_t>(info_ptr[8]) << 24);
+				info_ptr += 9;
+
+				MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: info_id=%d, data_len=%u, data_offset=%u", info_id, data_len, data_offset);
+
+				// Data is at token_start + data_offset
+				if (data_offset + data_len <= token_len) {
+					const uint8_t *opt_data = token_start + data_offset;
+					// Convert from UTF-16LE (data_len is in bytes, 2 bytes per char)
+					uint16_t char_count = data_len / 2;
+					std::string value = ReadUTF16LE(opt_data, char_count);
+
+					if (info_id == FEDAUTHINFO_OPT_STS_URL) {
+						response.sts_url = value;
+						MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: STS_URL=%s", value.c_str());
+					} else if (info_id == FEDAUTHINFO_OPT_SPN) {
+						response.server_spn = value;
+						MSSQL_PROTO_DEBUG_LOG(1, "FEDAUTHINFO: SPN=%s", value.c_str());
+					}
+				}
+			}
+
+			response.has_fedauth_info = true;
+			ptr = token_end;
 		} else {
 			// Unknown token - try to skip by reading length if available
 			// Most tokens have 2-byte length after token type
@@ -876,18 +1029,31 @@ std::string TdsProtocol::ExtractErrorMessage(const std::vector<uint8_t> &data) {
 TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_required) {
 	TdsPacket packet(PacketType::PRELOGIN);
 
-	// Build option headers
+	// Build option headers matching go-mssqldb structure exactly:
 	// VERSION: 6 bytes
 	// ENCRYPTION: 1 byte
+	// INSTOPT: 1 byte (null-terminated empty instance name)
+	// THREADID: 4 bytes (all zeros)
+	// MARS: 1 byte (disabled)
+	// TRACEID: 36 bytes (go-mssqldb sends this - 16 bytes connid + 16 bytes activityid + 4 bytes sequence)
 	// FEDAUTHREQUIRED: 1 byte (when fedauth_required is true)
 	// TERMINATOR: 0 bytes
 
 	// Calculate headers size
 	// Each header is 5 bytes: option(1) + offset(2) + length(2)
-	// VERSION header (5) + ENCRYPTION header (5) + TERMINATOR (1) = 11 bytes without FEDAUTH
-	// With FEDAUTH: VERSION (5) + ENCRYPTION (5) + FEDAUTHREQUIRED (5) + TERMINATOR (1) = 16 bytes
-	uint16_t headers_size = fedauth_required ? 16 : 11;
+	// VERSION(5) + ENCRYPTION(5) + INSTOPT(5) + THREADID(5) + MARS(5) + TRACEID(5) + TERMINATOR(1) = 31 bytes base
+	// With FEDAUTH: add FEDAUTHREQUIRED(5) = 36 bytes
+	uint16_t headers_size = fedauth_required ? 36 : 31;
 	uint16_t data_offset = headers_size;
+
+	// Data layout (after headers):
+	// VERSION: 6 bytes at data_offset
+	// ENCRYPTION: 1 byte at data_offset + 6
+	// INSTOPT: 1 byte at data_offset + 7
+	// THREADID: 4 bytes at data_offset + 8
+	// MARS: 1 byte at data_offset + 12
+	// TRACEID: 36 bytes at data_offset + 13
+	// FEDAUTHREQUIRED: 1 byte at data_offset + 49 (if included)
 
 	// VERSION option header
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::VERSION));
@@ -896,25 +1062,49 @@ TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_r
 
 	// ENCRYPTION option header
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::ENCRYPTION));
-	packet.AppendUInt16BE(data_offset + 6);  // offset (after VERSION data)
+	packet.AppendUInt16BE(data_offset + 6);  // offset
 	packet.AppendUInt16BE(1);                // length
+
+	// INSTOPT option header (instance name - empty, just null terminator)
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::INSTOPT));
+	packet.AppendUInt16BE(data_offset + 7);  // offset
+	packet.AppendUInt16BE(1);                // length (just the null terminator)
+
+	// THREADID option header
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::THREADID));
+	packet.AppendUInt16BE(data_offset + 8);  // offset
+	packet.AppendUInt16BE(4);                // length
+
+	// MARS option header
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::MARS));
+	packet.AppendUInt16BE(data_offset + 12);  // offset
+	packet.AppendUInt16BE(1);                 // length
+
+	// TRACEID option header (go-mssqldb sends this with connection/activity IDs)
+	packet.AppendByte(static_cast<uint8_t>(PreloginOption::TRACEID));
+	packet.AppendUInt16BE(data_offset + 13);  // offset
+	packet.AppendUInt16BE(36);                // length (16 + 16 + 4)
 
 	// FEDAUTHREQUIRED option header (if requested)
 	if (fedauth_required) {
 		packet.AppendByte(static_cast<uint8_t>(PreloginOption::FEDAUTHREQUIRED));
-		packet.AppendUInt16BE(data_offset + 7);  // offset (after ENCRYPTION data)
-		packet.AppendUInt16BE(1);                // length
+		packet.AppendUInt16BE(data_offset + 49);  // offset (after TRACEID)
+		packet.AppendUInt16BE(1);                 // length
 	}
 
 	// TERMINATOR
 	packet.AppendByte(static_cast<uint8_t>(PreloginOption::TERMINATOR));
 
-	// VERSION data: UL_VERSION (4 bytes) + US_SUBBUILD (2 bytes)
-	// We report as a generic TDS 7.4 client
-	packet.AppendByte(15);     // Major version (SQL Server 2019 = 15.x)
-	packet.AppendByte(0);      // Minor version
-	packet.AppendUInt16BE(0);  // Build number
-	packet.AppendUInt16BE(0);  // Sub-build number
+	// VERSION data: UL_VERSION (4 bytes LE) + US_SUBBUILD (2 bytes LE)
+	// Per go-mssqldb: uses driver version 1.9.0.6 (0x01090006)
+	// Format: byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24), 0, 0
+	// go-mssqldb outputs: 06 00 09 01 00 00
+	packet.AppendByte(0x06);  // v & 0xFF
+	packet.AppendByte(0x00);  // (v >> 8) & 0xFF
+	packet.AppendByte(0x09);  // (v >> 16) & 0xFF
+	packet.AppendByte(0x01);  // (v >> 24) & 0xFF
+	packet.AppendByte(0x00);  // sub-build low
+	packet.AppendByte(0x00);  // sub-build high
 
 	// ENCRYPTION data: request encryption
 	// For Azure AD, we must use encryption
@@ -923,6 +1113,34 @@ TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_r
 	} else {
 		packet.AppendByte(static_cast<uint8_t>(EncryptionOption::ENCRYPT_NOT_SUP));
 	}
+
+	// INSTOPT data: null-terminated empty instance name
+	packet.AppendByte(0x00);  // null terminator
+
+	// THREADID data: 4 bytes, all zeros (per go-mssqldb)
+	packet.AppendByte(0x00);
+	packet.AppendByte(0x00);
+	packet.AppendByte(0x00);
+	packet.AppendByte(0x00);
+
+	// MARS data: disabled (0)
+	packet.AppendByte(0x00);
+
+	// TRACEID data: 36 bytes (16 bytes connid + 16 bytes activityid + 4 bytes sequence)
+	// Use random UUIDs like go-mssqldb does
+	// For simplicity, use fixed random-looking values (connection will still be unique per socket)
+	// connid (16 bytes) - random UUID
+	packet.AppendByte(0x4d); packet.AppendByte(0x11); packet.AppendByte(0x08); packet.AppendByte(0x69);
+	packet.AppendByte(0x83); packet.AppendByte(0x05); packet.AppendByte(0x40); packet.AppendByte(0x4c);
+	packet.AppendByte(0x8d); packet.AppendByte(0x4c); packet.AppendByte(0x40); packet.AppendByte(0x8d);
+	packet.AppendByte(0x68); packet.AppendByte(0x05); packet.AppendByte(0x32); packet.AppendByte(0xcd);
+	// activityid (16 bytes) - random UUID
+	packet.AppendByte(0xe4); packet.AppendByte(0x56); packet.AppendByte(0xda); packet.AppendByte(0xab);
+	packet.AppendByte(0x27); packet.AppendByte(0xff); packet.AppendByte(0x42); packet.AppendByte(0x3d);
+	packet.AppendByte(0xa6); packet.AppendByte(0xb9); packet.AppendByte(0x88); packet.AppendByte(0x7b);
+	packet.AppendByte(0x29); packet.AppendByte(0x50); packet.AppendByte(0x6b); packet.AppendByte(0x81);
+	// sequence (4 bytes) - always 0
+	packet.AppendByte(0x00); packet.AppendByte(0x00); packet.AppendByte(0x00); packet.AppendByte(0x00);
 
 	// FEDAUTHREQUIRED data (if included)
 	// MS-TDS: B_FEDAUTHREQUIRED = 0x01 when client requires FEDAUTH
@@ -933,8 +1151,9 @@ TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_r
 	return packet;
 }
 
-TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std::string &database,
-                                              const std::vector<uint8_t> &fedauth_token,
+TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname, const std::string &server_name,
+                                              const std::string &database, const std::vector<uint8_t> &fedauth_token,
+                                              bool fedauth_echo,
                                               const std::string &app_name, uint32_t packet_size) {
 	TdsPacket packet(PacketType::LOGIN7);
 
@@ -943,13 +1162,17 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	//   Fixed header (94 bytes)
 	//   Variable-length strings (HostName, AppName, ServerName, Database, etc.)
 	//   Feature extensions (pointed to by Extension field at offset 36)
+	//
+	// Per go-mssqldb and MS-TDS spec:
+	//   HostName = client workstation name (identifies the client machine)
+	//   ServerName = TDS server name (may include instance name for routing)
 
 	// Calculate string offsets and lengths
-	uint16_t hostname_len = static_cast<uint16_t>(host.size());
+	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
 	uint16_t username_len = 0;   // No username with FEDAUTH
 	uint16_t password_len = 0;   // No password with FEDAUTH
 	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(host.size());
+	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
 	uint16_t database_len = static_cast<uint16_t>(database.size());
 
 	// Variable data starts at offset 94 (end of fixed header)
@@ -1000,24 +1223,21 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	// Feature extensions for Azure SQL (per go-mssqldb):
 	// 1. FEDAUTH (0x02): For authentication
 	// 2. TERMINATOR (0xFF)
-	// Note: AZURESQLSUPPORT is optional - we'll include it as go-mssqldb does
-
-	// AZURESQLSUPPORT extension: FeatureId(1) + FeatureDataLen(4) + Data(1) = 6 bytes
-	uint32_t azuresql_ext_len = 6;
+	// Note: go-mssqldb does NOT include AZURESQLSUPPORT, only FEDAUTH
 
 	// FEDAUTH extension: FeatureId(1) + FeatureDataLen(4) + FeatureData(variable)
-	// Per MS-TDS 2.2.7.1 and tedious implementation, FEDAUTH FeatureData format for SECURITYTOKEN:
-	//   LibraryAndEcho (1 byte): (library << 1) | echo - where library=0x01 for SECURITYTOKEN
-	//   TokenLen (4 bytes, LE): Length of the token
+	// Per go-mssqldb tds.go, FEDAUTH FeatureData format for SECURITYTOKEN:
+	//   Options (1 byte): (library << 1) | echo - where library=0x01 for SECURITYTOKEN
+	//   TokenLen (4 bytes, LE): Length of the UTF-16LE token
 	//   Token (variable): UTF-16LE encoded access token
-	// FeatureDataLen = 1 (LibraryAndEcho) + 4 (TokenLen) + token.size()
+	// FeatureDataLen = 1 (Options) + 4 (TokenLen) + token.size()
 	uint32_t fedauth_data_len = 5 + static_cast<uint32_t>(fedauth_token.size());
-	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;
+	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;  // FeatureId + FeatureDataLen + FeatureData
 
 	// Total length calculation
 	// var_offset includes: Fixed header (94) + all variable strings + ExtensionDWORD (4)
-	// Add: AZURESQLSUPPORT extension (6) + FEDAUTH extension + Terminator (1)
-	uint32_t total_length = var_offset + azuresql_ext_len + fedauth_ext_len + 1;
+	// Add: FEDAUTH extension + Terminator (1)
+	uint32_t total_length = var_offset + fedauth_ext_len + 1;
 
 	// Build fixed header (94 bytes)
 
@@ -1040,8 +1260,10 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	packet.AppendUInt32LE(0);
 
 	// Offset 24: OptionFlags1 (1 byte)
-	// Bit 5: USE_DB
-	uint8_t flags1 = 0x20;  // USE_DB
+	// Bit 5 (0x20): USE_DB - switch to database on login
+	// Bit 7 (0x80): SET_LANG - use language from login
+	// Per go-mssqldb: both flags are set (0xA0)
+	uint8_t flags1 = 0x20 | 0x80;  // USE_DB | SET_LANG
 	packet.AppendByte(flags1);
 
 	// Offset 25: OptionFlags2 (1 byte)
@@ -1057,9 +1279,9 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	packet.AppendByte(type_flags);
 
 	// Offset 27: OptionFlags3 (1 byte)
-	// Bit 4: fExtension - indicates feature extension data is present (MS-TDS 2.2.6.3)
-	// Bit 5: fUnknownCollationHandling - client handles unknown collation (set by tedious)
-	uint8_t flags3 = 0x10 | 0x20;  // fExtension | fUnknownCollationHandling
+	// Bit 4 (0x10): fExtension - indicates feature extension data is present (MS-TDS 2.2.6.3)
+	// Per go-mssqldb: only set fExtension for FEDAUTH, don't set reserved bits
+	uint8_t flags3 = 0x10;  // fExtension only
 	packet.AppendByte(flags3);
 
 	// Offset 28: ClientTimeZone (4 bytes, LE)
@@ -1131,8 +1353,8 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	// Variable data section
 	// =====================================
 
-	// HostName (UTF-16LE)
-	packet.AppendUTF16LE(host);
+	// HostName (UTF-16LE) - client workstation name
+	packet.AppendUTF16LE(client_hostname);
 
 	// UserName - empty for FEDAUTH (no data written)
 	// Password - empty for FEDAUTH (no data written)
@@ -1140,8 +1362,8 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	// AppName (UTF-16LE)
 	packet.AppendUTF16LE(app_name);
 
-	// ServerName (UTF-16LE)
-	packet.AppendUTF16LE(host);
+	// ServerName (UTF-16LE) - TDS server name (may include instance name)
+	packet.AppendUTF16LE(server_name);
 
 	// CltIntName - empty (no data written)
 	// Language - empty (no data written)
@@ -1158,28 +1380,25 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 	packet.AppendUInt32LE(feature_ext_offset);
 
 	// =====================================
-	// Feature Extensions
+	// Feature Extensions (per go-mssqldb)
 	// =====================================
-
-	// AZURESQLSUPPORT extension (FeatureId 0x08) - for Azure SQL connections
-	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::AZURESQLSUPPORT));
-	packet.AppendUInt32LE(1);  // FeatureDataLen = 1
-	packet.AppendByte(0x01);   // FeatureData = enabled
 
 	// FEDAUTH extension (MS-TDS 2.2.7.1)
 	// FeatureId: 0x02
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::FEDAUTH));
 
-	// FeatureDataLen (4 bytes, LE) = 4 (options) + token.size()
+	// FeatureDataLen (4 bytes, LE)
 	packet.AppendUInt32LE(fedauth_data_len);
 
-	// FEDAUTH Feature Data (per tedious implementation and MS-TDS 2.2.7.1):
-	//   LibraryAndEcho (1 byte): (LIBRARY_SECURITYTOKEN << 1) | echo
-	//     LIBRARY_SECURITYTOKEN = 0x01, no echo = 0x00
-	//     So: (0x01 << 1) | 0x00 = 0x02
+	// FEDAUTH Feature Data (per go-mssqldb tds.go featureExtFedAuth.toBytes()):
+	//   Options (1 byte): (FedAuthLibrary << 1) | FedAuthEcho
+	//     FedAuthLibrarySecurityToken = 0x01
+	//     FedAuthEcho = bit 0, set if server's FEDAUTHREQUIRED was non-zero
+	//     So: (0x01 << 1) | echo = 0x02 or 0x03
 	//   TokenLen (4 bytes, LE): Length of the UTF-16LE token
 	//   Token (variable): UTF-16LE encoded access token
-	packet.AppendByte(0x02);  // (SECURITYTOKEN << 1) | no_echo = 0x02
+	uint8_t fedauth_options = (0x01 << 1) | (fedauth_echo ? 1 : 0);  // SECURITYTOKEN | echo
+	packet.AppendByte(fedauth_options);
 	packet.AppendUInt32LE(static_cast<uint32_t>(fedauth_token.size()));
 
 	// Token (UTF-16LE encoded access token)
@@ -1187,6 +1406,253 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &host, const std
 
 	// Feature terminator
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
+
+	return packet;
+}
+
+TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, const std::string &server_name,
+                                           const std::string &database, bool fedauth_echo,
+                                           const std::string &app_name, uint32_t packet_size) {
+	TdsPacket packet(PacketType::LOGIN7);
+
+	// LOGIN7 with ADAL FEDAUTH workflow (per go-mssqldb implementation)
+	// ADAL flow: LOGIN7 contains small FEDAUTH extension (just options + workflow bytes)
+	// Server responds with FEDAUTHINFO token, client sends token in separate FEDAUTH_TOKEN packet
+
+	// Calculate string offsets and lengths
+	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
+	uint16_t username_len = 0;   // No username with FEDAUTH
+	uint16_t password_len = 0;   // No password with FEDAUTH
+	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
+	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
+	uint16_t database_len = static_cast<uint16_t>(database.size());
+
+	// Variable data starts at offset 94 (end of fixed header)
+	uint16_t var_offset = 94;
+
+	uint16_t hostname_offset = var_offset;
+	var_offset += hostname_len * 2;
+
+	uint16_t username_offset = var_offset;  // Empty for FEDAUTH
+	uint16_t password_offset = var_offset;  // Empty for FEDAUTH
+
+	uint16_t appname_offset = var_offset;
+	var_offset += appname_len * 2;
+
+	uint16_t servername_offset = var_offset;
+	var_offset += servername_len * 2;
+
+	uint16_t cltintname_offset = var_offset;
+	uint16_t language_offset = var_offset;
+
+	uint16_t database_offset = var_offset;
+	var_offset += database_len * 2;
+
+	uint16_t sspi_attrdb_chgpwd_offset = var_offset;
+
+	// Extension DWORD offset
+	uint16_t extension_dword_offset = var_offset;
+	var_offset += 4;  // DWORD pointing to feature extensions
+
+	// Feature extensions start here
+	uint32_t feature_ext_offset = var_offset;
+
+	// ADAL FEDAUTH extension is small: FeatureId(1) + FeatureDataLen(4) + Options(1) + Workflow(1)
+	// Total: 1 + 4 + 2 = 7 bytes, plus terminator = 8 bytes
+	uint32_t fedauth_data_len = 2;  // Options (1 byte) + Workflow (1 byte)
+	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;  // FeatureId + FeatureDataLen + FeatureData
+
+	// Total length = fixed header + variable strings + extension DWORD + FEDAUTH extension + terminator
+	uint32_t total_length = var_offset + fedauth_ext_len + 1;
+
+	// Build fixed header (94 bytes)
+
+	// Offset 0: Length (4 bytes, LE)
+	packet.AppendUInt32LE(total_length);
+
+	// Offset 4: TDSVersion (4 bytes, LE)
+	packet.AppendUInt32LE(TDS_VERSION_7_4);
+
+	// Offset 8: PacketSize (4 bytes, LE)
+	packet.AppendUInt32LE(packet_size);
+
+	// Offset 12: ClientProgVer (4 bytes, LE)
+	packet.AppendUInt32LE(0x00000001);
+
+	// Offset 16: ClientPID (4 bytes, LE)
+	packet.AppendUInt32LE(static_cast<uint32_t>(GET_PID()));
+
+	// Offset 20: ConnectionID (4 bytes, LE)
+	packet.AppendUInt32LE(0);
+
+	// Offset 24: OptionFlags1 (1 byte)
+	// Per go-mssqldb: USE_DB (0x20) | SET_LANG (0x80) = 0xA0
+	uint8_t flags1 = 0x20 | 0x80;  // USE_DB | SET_LANG
+	packet.AppendByte(flags1);
+
+	// Offset 25: OptionFlags2 (1 byte)
+	// Per go-mssqldb: fODBC (0x02) only
+	uint8_t flags2 = 0x02;  // fODBC
+	packet.AppendByte(flags2);
+
+	// Offset 26: TypeFlags (1 byte)
+	uint8_t type_flags = 0x00;  // Read/write intent
+	packet.AppendByte(type_flags);
+
+	// Offset 27: OptionFlags3 (1 byte)
+	// Per go-mssqldb debug output: OptionFlags3 = 0x00 in the login struct,
+	// but fExtension (0x10) is added in sendLogin() when feature extensions are present.
+	// The packet builder will set this correctly based on extension presence.
+	// NOTE: go-mssqldb shows 0x00 in debug but actually sends 0x10 in the wire packet.
+	uint8_t flags3 = 0x10;  // fExtension - indicates feature extension data is present
+	packet.AppendByte(flags3);
+
+	// Offset 28: ClientTimeZone (4 bytes, LE)
+	packet.AppendUInt32LE(0);
+
+	// Offset 32: ClientLCID (4 bytes, LE)
+	packet.AppendUInt32LE(0x0409);  // en-US
+
+	// Offset 36-93: Offset/Length pairs for variable fields
+
+	// HostName
+	packet.AppendUInt16LE(hostname_offset);
+	packet.AppendUInt16LE(hostname_len);
+
+	// UserName (empty for FEDAUTH)
+	packet.AppendUInt16LE(username_offset);
+	packet.AppendUInt16LE(username_len);
+
+	// Password (empty for FEDAUTH)
+	packet.AppendUInt16LE(password_offset);
+	packet.AppendUInt16LE(password_len);
+
+	// AppName
+	packet.AppendUInt16LE(appname_offset);
+	packet.AppendUInt16LE(appname_len);
+
+	// ServerName
+	packet.AppendUInt16LE(servername_offset);
+	packet.AppendUInt16LE(servername_len);
+
+	// Extension
+	packet.AppendUInt16LE(extension_dword_offset);
+	packet.AppendUInt16LE(4);  // cbExtension = 4 (DWORD size)
+
+	// CltIntName (unused)
+	packet.AppendUInt16LE(cltintname_offset);
+	packet.AppendUInt16LE(0);
+
+	// Language (unused)
+	packet.AppendUInt16LE(language_offset);
+	packet.AppendUInt16LE(0);
+
+	// Database
+	packet.AppendUInt16LE(database_offset);
+	packet.AppendUInt16LE(database_len);
+
+	// ClientID (6 bytes) - MAC address, zeros
+	for (int i = 0; i < 6; i++) {
+		packet.AppendByte(0);
+	}
+
+	// SSPI (unused)
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
+	packet.AppendUInt16LE(0);
+
+	// AtchDBFile (unused)
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
+	packet.AppendUInt16LE(0);
+
+	// ChangePassword (unused)
+	packet.AppendUInt16LE(sspi_attrdb_chgpwd_offset);
+	packet.AppendUInt16LE(0);
+
+	// cbSSPILong (4 bytes)
+	packet.AppendUInt32LE(0);
+
+	// =====================================
+	// Variable data section
+	// =====================================
+
+	// HostName (UTF-16LE)
+	packet.AppendUTF16LE(client_hostname);
+
+	// UserName - empty for FEDAUTH
+	// Password - empty for FEDAUTH
+
+	// AppName (UTF-16LE)
+	packet.AppendUTF16LE(app_name);
+
+	// ServerName (UTF-16LE)
+	packet.AppendUTF16LE(server_name);
+
+	// CltIntName - empty
+	// Language - empty
+
+	// Database (UTF-16LE)
+	packet.AppendUTF16LE(database);
+
+	// SSPI - empty
+	// AtchDBFile - empty
+	// ChangePassword - empty
+
+	// ExtensionDWORD - offset to feature extensions
+	packet.AppendUInt32LE(feature_ext_offset);
+
+	// =====================================
+	// Feature Extensions (ADAL FEDAUTH)
+	// =====================================
+
+	// FEDAUTH extension with ADAL workflow
+	// FeatureId: 0x02
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::FEDAUTH));
+
+	// FeatureDataLen (4 bytes, LE) = 2 (options + workflow)
+	packet.AppendUInt32LE(fedauth_data_len);
+
+	// FEDAUTH Feature Data for ADAL workflow (per go-mssqldb):
+	//   Options (1 byte): (FedAuthLibrary << 1) | FedAuthEcho
+	//     FedAuthLibraryADAL = 0x02
+	//     So: (0x02 << 1) | echo = 0x04 or 0x05
+	//   Workflow (1 byte): FedAuthADALWorkflowPassword = 0x01
+	uint8_t fedauth_options = (FEDAUTH_LIBRARY_ADAL << 1) | (fedauth_echo ? 1 : 0);
+	packet.AppendByte(fedauth_options);
+	packet.AppendByte(FEDAUTH_ADAL_WORKFLOW_PASSWORD);  // Service Principal uses Password workflow
+
+	// Feature terminator
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
+
+	return packet;
+}
+
+TdsPacket TdsProtocol::BuildFedAuthToken(const std::vector<uint8_t> &token_utf16le,
+                                         const std::vector<uint8_t> &nonce) {
+	TdsPacket packet(PacketType::FEDAUTH_TOKEN);
+
+	// FEDAUTH_TOKEN packet format (per go-mssqldb sendFedAuthInfo):
+	//   DataLen (4 bytes, LE): 4 + token_len + nonce_len
+	//   TokenLen (4 bytes, LE): length of UTF-16LE token
+	//   Token (variable): UTF-16LE encoded access token
+	//   Nonce (optional): 32-byte nonce if present
+
+	uint32_t token_len = static_cast<uint32_t>(token_utf16le.size());
+	uint32_t nonce_len = static_cast<uint32_t>(nonce.size());
+	uint32_t data_len = 4 + token_len + nonce_len;
+
+	// DataLen
+	packet.AppendUInt32LE(data_len);
+
+	// TokenLen
+	packet.AppendUInt32LE(token_len);
+
+	// Token
+	packet.AppendPayload(token_utf16le);
+
+	// Nonce (if present)
+	if (!nonce.empty()) {
+		packet.AppendPayload(nonce);
+	}
 
 	return packet;
 }
