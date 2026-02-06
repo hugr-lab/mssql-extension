@@ -517,9 +517,35 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		return 0;
 	} else if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
 		return 0;
+	} else if (ssl_error == SSL_ERROR_SYSCALL) {
+		// System call error - get the actual error
+#ifdef _WIN32
+		int sys_err = WSAGetLastError();
+		if (sys_err == 0 && ret == 0) {
+			// EOF - peer closed connection unexpectedly
+			ctx_->last_error_code = 7;	// PEER_CLOSED
+			ctx_->last_error = "Connection reset by peer (unexpected EOF during TLS read)";
+			return 0;
+		}
+		ctx_->last_error_code = 5;	// RECV_FAILED
+		ctx_->last_error = "Receive failed: syscall error " + std::to_string(sys_err);
+#else
+		int sys_err = errno;
+		if (sys_err == 0 && ret == 0) {
+			// EOF - peer closed connection unexpectedly
+			ctx_->last_error_code = 7;	// PEER_CLOSED
+			ctx_->last_error = "Connection reset by peer (unexpected EOF during TLS read)";
+			return 0;
+		}
+		ctx_->last_error_code = 5;	// RECV_FAILED
+		ctx_->last_error = "Receive failed (SSL_ERROR_SYSCALL, ret=" + std::to_string(ret) +
+						   "): " + std::string(strerror(sys_err)) + " (errno=" + std::to_string(sys_err) + ")";
+#endif
+		return -1;
 	} else {
 		ctx_->last_error_code = 5;	// RECV_FAILED
-		ctx_->last_error = "Receive failed: " + FormatOpenSSLError();
+		ctx_->last_error = "Receive failed (ssl_error=" + std::to_string(ssl_error) + ", ret=" + std::to_string(ret) +
+						   "): " + FormatOpenSSLError();
 		return -1;
 	}
 }

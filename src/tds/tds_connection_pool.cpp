@@ -57,6 +57,7 @@ void ConnectionPool::Shutdown() {
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
+	fprintf(stderr, "[MSSQL POOL] Acquire called on pool '%s'\n", context_name_.c_str());
 	if (shutdown_flag_.load()) {
 		return nullptr;
 	}

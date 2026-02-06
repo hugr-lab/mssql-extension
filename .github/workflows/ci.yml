@@ -190,6 +190,15 @@ jobs:
           path: build/release/test/unittest
           if-no-files-found: error
 
+      - name: Upload libduckdb Artifact (for unittest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libduckdb-v1.4.4-${{ matrix.platform.id }}
+          path: |
+            build/release/src/libduckdb.so
+            build/release/src/libduckdb.dylib
+          if-no-files-found: warn
+
   # ============================================================================
   # Smoke Test Job - Load-only test on all platforms
   # (Manual trigger only via workflow_dispatch)
@@ -544,12 +553,19 @@ jobs:
           name: unittest-v1.4.4-linux_amd64
           path: test
 
+      - name: Download libduckdb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libduckdb-v1.4.4-linux_amd64
+          path: lib
+
       - name: Setup executables
         run: |
           chmod +x test/unittest
 
       - name: Run Azure tests
         env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/lib
           AZURE_SQL_TEST_DSN: ${{ secrets.AZURE_SQL_TEST_DSN }}
           AZURE_APP_ID: ${{ secrets.AZURE_APP_ID }}
           AZURE_DIRECTORY_ID: ${{ secrets.AZURE_DIRECTORY_ID }}
@@ -563,6 +579,7 @@ jobs:
           echo "AZURE_APP_ID is set: $([ -n \"$AZURE_APP_ID\" ] && echo 'yes' || echo 'no')"
           echo "AZURE_DIRECTORY_ID is set: $([ -n \"$AZURE_DIRECTORY_ID\" ] && echo 'yes' || echo 'no')"
           echo "AZURE_APP_SECRET is set: $([ -n \"$AZURE_APP_SECRET\" ] && echo 'yes' || echo 'no')"
+          echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           echo "============================================"
 
           # Run Azure test group

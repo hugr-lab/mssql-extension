@@ -166,6 +166,7 @@ set(EXTENSION_SOURCES
     src/azure/azure_token.cpp
     src/azure/azure_test_function.cpp
     src/azure/azure_device_code.cpp
+    src/azure/azure_fedauth.cpp
 )
 
 # Build static extension (linked into DuckDB)
@@ -183,10 +184,6 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
 )
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
 
-# Require C++17 for this extension (uses structured bindings, etc.)
-# Use target_compile_features instead of global CMAKE_CXX_STANDARD to avoid ODR issues
-target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
-
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
@@ -200,9 +197,6 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
-
-# Require C++17 for this extension (uses structured bindings, etc.)
-target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
 if(NOT WIN32)

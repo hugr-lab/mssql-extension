@@ -48,6 +48,52 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &contex
 	return ptr;
 }
 
+tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(
+	const std::string &context_name, const MSSQLPoolConfig &config, const std::string &host, uint16_t port,
+	const std::string &database, const std::vector<uint8_t> &fedauth_token_utf16le, bool use_encrypt) {
+	std::lock_guard<std::mutex> lock(manager_mutex_);
+
+	// Check if pool already exists
+	auto it = pools_.find(context_name);
+	if (it != pools_.end()) {
+		return it->second.get();
+	}
+
+	// Create pool configuration
+	tds::PoolConfiguration pool_config;
+	pool_config.connection_limit = config.connection_limit;
+	pool_config.connection_cache = config.connection_cache;
+	pool_config.connection_timeout = config.connection_timeout;
+	pool_config.idle_timeout = config.idle_timeout;
+	pool_config.min_connections = config.min_connections;
+	pool_config.acquire_timeout = config.acquire_timeout;
+
+	// Create connection factory for Azure AD authentication
+	// Note: This captures the token by value. For token refresh, a separate mechanism is needed.
+	auto factory = [host, port, database, fedauth_token_utf16le, use_encrypt]() -> std::shared_ptr<tds::TdsConnection> {
+		auto conn = std::make_shared<tds::TdsConnection>();
+		if (!conn->Connect(host, port)) {
+			return nullptr;
+		}
+		// Use FEDAUTH authentication with pre-acquired token
+		if (!conn->AuthenticateWithFedAuth(database, fedauth_token_utf16le, use_encrypt)) {
+			return nullptr;
+		}
+
+		// Note: Warm-up query disabled - Fabric seems to have timing issues with pool connections
+		// The connection is returned in Idle state after authentication
+
+		return conn;
+	};
+
+	// Create the pool
+	std::unique_ptr<tds::ConnectionPool> pool(new tds::ConnectionPool(context_name, pool_config, factory));
+	auto *ptr = pool.get();
+	pools_[context_name] = std::move(pool);
+
+	return ptr;
+}
+
 tds::ConnectionPool *MssqlPoolManager::GetPool(const std::string &context_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 	auto it = pools_.find(context_name);

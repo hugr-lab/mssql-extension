@@ -270,7 +270,7 @@ bool TdsSocket::IsConnected() const {
 	return connected_ && fd_ >= 0;
 }
 
-bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
+bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string &sni_hostname) {
 	// For TDS 7.x, TLS handshake data must be wrapped in TDS PRELOGIN packets
 	// See MS-TDS spec: "If encryption was negotiated in TDS 7.x, the TDS client MUST
 	// initiate a TLS/SSL handshake, send to the server a TLS/SSL message obtained from
@@ -309,9 +309,13 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms) {
 		return false;
 	}
 
+	// Use provided SNI hostname or fall back to connection host
+	// Azure routing may require original hostname as SNI for session tracking
+	const std::string &effective_hostname = sni_hostname.empty() ? host_ : sni_hostname;
+
 	// Wrap the existing socket with hostname for SNI
-	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: wrapping socket with hostname=%s...", host_.c_str());
-	if (!tls_context_->WrapSocket(fd_, host_)) {
+	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: wrapping socket with hostname=%s...", effective_hostname.c_str());
+	if (!tls_context_->WrapSocket(fd_, effective_hostname)) {
 		last_error_ = "TLS socket wrap failed: " + tls_context_->GetLastError();
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - wrap: %s", last_error_.c_str());
 		tls_context_.reset();

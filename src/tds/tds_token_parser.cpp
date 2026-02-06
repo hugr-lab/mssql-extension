@@ -146,6 +146,28 @@ ParsedTokenType TokenParser::TryParseNext() {
 		}
 		return TryParseNext();	// Try next token
 
+	case TokenType::FEDAUTHINFO:
+		// FEDAUTHINFO (0xEE) - Azure AD authentication info from server (T019)
+		// This token has a 4-byte length (DWORD) unlike most other tokens
+		// MS-TDS 2.2.7.16: FEDAUTHINFO = TokenType(1) + TokenLength(4) + Data(variable)
+		// We just skip this token - the authentication info is not needed after successful login
+		TDS_PARSER_DEBUG(1, "Skipping FEDAUTHINFO token");
+		if (Available() < 5) {
+			return ParsedTokenType::NeedMoreData;
+		}
+		{
+			// FEDAUTHINFO has 4-byte length (little-endian DWORD)
+			uint32_t token_length = static_cast<uint32_t>(Current()[1]) | (static_cast<uint32_t>(Current()[2]) << 8) |
+									(static_cast<uint32_t>(Current()[3]) << 16) |
+									(static_cast<uint32_t>(Current()[4]) << 24);
+			if (Available() < 5 + token_length) {
+				return ParsedTokenType::NeedMoreData;
+			}
+			TDS_PARSER_DEBUG(1, "FEDAUTHINFO token: length=%u", token_length);
+			ConsumeBytes(5 + token_length);
+		}
+		return TryParseNext();	// Try next token
+
 	default:
 		// Unknown token - dump buffer for debugging
 		{

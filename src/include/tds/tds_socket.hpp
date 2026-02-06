@@ -37,8 +37,9 @@ public:
 	// Must be called after Connect() and before sending any encrypted data
 	// The packet_id parameter is used to continue the TDS packet sequence during TLS handshake
 	// (TLS handshake is wrapped in TDS PRELOGIN packets which need sequential packet IDs)
+	// Optional sni_hostname overrides the default (host_) for TLS SNI - useful for Azure routing
 	// Returns true on success, false on failure (check GetLastError())
-	bool EnableTls(uint8_t &packet_id, int timeout_ms = 30000);
+	bool EnableTls(uint8_t &packet_id, int timeout_ms = 30000, const std::string &sni_hostname = "");
 
 	// Check if TLS is currently enabled
 	bool IsTlsEnabled() const;
