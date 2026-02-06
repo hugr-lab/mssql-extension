@@ -234,7 +234,7 @@ See `AZURE.md` for user documentation.
 
 **Symptom:** Linux builds fail with "multiple definition of `duckdb::LogicalType::BIGINT`" and similar errors for constexpr static members.
 
-**Root Cause:** Setting `CMAKE_CXX_STANDARD` with `CACHE ... FORCE` in the extension's CMakeLists.txt overwrites DuckDB's C++ standard globally. This affects how GCC handles constexpr static members during linking, causing ODR violations.
+**Root Cause:** DuckDB defaults to C++11, but our extension uses C++17 features. When building `libduckdb.so` with the extension statically linked, the different handling of `constexpr static` members (external linkage in C++11 vs inline in C++17) causes ODR violations.
 
 **What NOT to do in CMakeLists.txt:**
 ```cmake
@@ -242,14 +242,23 @@ See `AZURE.md` for user documentation.
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "..." FORCE)
 ```
 
-**Correct Solution:** Use `target_compile_features` to set C++17 per-target:
+**Correct Solution:** For the extension-only targets, use `target_compile_features`:
 ```cmake
-# Set C++17 for extension targets only (not globally):
+# Set C++17 for extension targets only:
 target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 ```
 
-This allows our extension to use C++17 features (structured bindings, etc.) without affecting DuckDB's build settings.
+**For full builds (including libduckdb.so):** Pass `-DCMAKE_CXX_STANDARD=17` on the cmake command line:
+```bash
+cmake -G "Ninja" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_STANDARD=17 \
+  -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+  ../../duckdb
+```
+
+The Makefile includes this flag automatically via `EXT_FLAGS`.
 
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
