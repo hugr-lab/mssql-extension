@@ -528,41 +528,52 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: received FEDAUTHINFO, STS_URL='%s', SPN='%s'",
 							 login_response.sts_url.c_str(), login_response.server_spn.c_str());
 
-		// Step 3: Send token in FEDAUTH_TOKEN packet
-		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: sending FEDAUTH_TOKEN packet, token_size=%zu",
+		// Step 3: Send token in FEDAUTH_TOKEN packet(s)
+		// Use multi-packet function to handle large tokens that exceed TDS packet size limit
+		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: sending FEDAUTH_TOKEN packet(s), token_size=%zu",
 							 fedauth_token.size());
 
-		TdsPacket token_packet = TdsProtocol::BuildFedAuthToken(fedauth_token);
+		std::vector<TdsPacket> token_packets = TdsProtocol::BuildFedAuthTokenMultiPacket(fedauth_token);
 		// Per go-mssqldb: packet sequence resets to 1 for each new message type
-		token_packet.SetPacketId(1);
+		uint8_t packet_id = 1;
+		for (auto &pkt : token_packets) {
+			pkt.SetPacketId(packet_id++);
+		}
 
-		// Debug: dump complete FEDAUTH_TOKEN packet (header + first 20 bytes of payload)
-		if (GetMssqlDebugLevel() >= 2) {
-			auto serialized = token_packet.Serialize();
+		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: FEDAUTH_TOKEN split into %zu packet(s)", token_packets.size());
+
+		// Debug: dump first FEDAUTH_TOKEN packet (header + first 20 bytes of payload)
+		if (GetMssqlDebugLevel() >= 2 && !token_packets.empty()) {
+			auto serialized = token_packets[0].Serialize();
 			std::string hex_header;
 			for (size_t i = 0; i < std::min<size_t>(8, serialized.size()); i++) {
 				char buf[4];
 				snprintf(buf, sizeof(buf), "%02x ", serialized[i]);
 				hex_header += buf;
 			}
-			MSSQL_CONN_DEBUG_LOG(
-				2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN TDS header: %s (type=0x%02x, status=0x%02x, len=%d, pktid=%d)",
-				hex_header.c_str(), static_cast<uint8_t>(token_packet.GetType()),
-				static_cast<uint8_t>(token_packet.GetStatus()), token_packet.GetLength(), token_packet.GetPacketId());
+			MSSQL_CONN_DEBUG_LOG(2,
+								 "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] TDS header: %s (type=0x%02x, status=0x%02x, "
+								 "len=%d, pktid=%d)",
+								 hex_header.c_str(), static_cast<uint8_t>(token_packets[0].GetType()),
+								 static_cast<uint8_t>(token_packets[0].GetStatus()), token_packets[0].GetLength(),
+								 token_packets[0].GetPacketId());
 
-			const auto &payload = token_packet.GetPayload();
+			const auto &payload = token_packets[0].GetPayload();
 			std::string hex_dump;
 			for (size_t i = 0; i < std::min<size_t>(20, payload.size()); i++) {
 				char buf[4];
 				snprintf(buf, sizeof(buf), "%02x ", payload[i]);
 				hex_dump += buf;
 			}
-			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN payload (first 20): %s", hex_dump.c_str());
+			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] payload (first 20): %s", hex_dump.c_str());
 		}
 
-		if (!socket_->SendPacket(token_packet)) {
-			last_error_ = "Failed to send FEDAUTH_TOKEN: " + socket_->GetLastError();
-			return false;
+		// Send all packets
+		for (size_t i = 0; i < token_packets.size(); i++) {
+			if (!socket_->SendPacket(token_packets[i])) {
+				last_error_ = "Failed to send FEDAUTH_TOKEN packet " + std::to_string(i) + ": " + socket_->GetLastError();
+				return false;
+			}
 		}
 
 		MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN sent, waiting for LOGINACK...");
