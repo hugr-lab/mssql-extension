@@ -232,6 +232,16 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	// Check write access
 	mssql_catalog.CheckWriteAccess("COPY TO");
 
+	// T042 (Bug 0.7): Check for Fabric endpoint - BCP/INSERT BULK is not supported
+	const auto &conn_info = mssql_catalog.GetConnectionInfo();
+	if (conn_info.is_fabric_endpoint) {
+		throw NotImplementedException(
+			"MSSQL COPY: Microsoft Fabric does not support INSERT BULK (BCP protocol). "
+			"Use CREATE TABLE AS SELECT (CTAS) instead, which auto-falls back to INSERT mode: "
+			"CREATE TABLE %s AS SELECT ... FROM source_table;",
+			bdata.target.GetFullyQualifiedName());
+	}
+
 	// Acquire a connection from the pool
 	// For BCP, we need an exclusive connection that will remain in Executing state
 	CopyDebugLog(2, "BCPCopyInitGlobal: acquiring connection from pool");

@@ -6,8 +6,26 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace duckdb {
 namespace mssql {
+
+//===----------------------------------------------------------------------===//
+// Debug Logging (T045)
+//===----------------------------------------------------------------------===//
+
+static int GetCTASPlannerDebugLevel() {
+	const char *env = std::getenv("MSSQL_DEBUG");
+	return env ? std::atoi(env) : 0;
+}
+
+#define CTAS_PLANNER_DEBUG_LOG(lvl, fmt, ...)                                                                          \
+	do {                                                                                                               \
+		if (GetCTASPlannerDebugLevel() >= lvl)                                                                         \
+			fprintf(stderr, "[MSSQL CTAS] " fmt "\n", ##__VA_ARGS__);                                                   \
+	} while (0)
 
 //===----------------------------------------------------------------------===//
 // CTASPlanner::Plan
@@ -17,6 +35,14 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 									LogicalCreateTable &op, PhysicalOperator &child_plan) {
 	// Load CTAS configuration from settings
 	CTASConfig config = CTASConfig::Load(context);
+
+	// T042-T045 (Bug 0.7): Check for Fabric endpoint and disable BCP if detected
+	// Microsoft Fabric doesn't support INSERT BULK/BCP protocol
+	const auto &conn_info = catalog.GetConnectionInfo();
+	if (conn_info.is_fabric_endpoint && config.use_bcp) {
+		CTAS_PLANNER_DEBUG_LOG(1, "Fabric endpoint detected, disabling BCP mode (INSERT BULK not supported)");
+		config.use_bcp = false;
+	}
 
 	// Extract target table information
 	CTASTarget target = ExtractTarget(op, catalog);
