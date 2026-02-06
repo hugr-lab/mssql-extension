@@ -273,7 +273,7 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 	return result;
 }
 
-string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_string) {
+string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_string, bool azure_auth) {
 	if (connection_string.empty()) {
 		return "Connection string cannot be empty.";
 	}
@@ -293,11 +293,14 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	if (params.find("database") == params.end()) {
 		return "Missing 'Database' in connection string.";
 	}
-	if (params.find("user") == params.end()) {
-		return "Missing 'User Id' in connection string.";
-	}
-	if (params.find("password") == params.end()) {
-		return "Missing 'Password' in connection string.";
+	// User/password are only required for SQL authentication, not Azure AD
+	if (!azure_auth) {
+		if (params.find("user") == params.end()) {
+			return "Missing 'User Id' in connection string.";
+		}
+		if (params.find("password") == params.end()) {
+			return "Missing 'Password' in connection string.";
+		}
 	}
 
 	// Validate server format (host or host,port)
@@ -318,9 +321,9 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	return "";	// Valid
 }
 
-shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const string &connection_string) {
+shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const string &connection_string, bool azure_auth) {
 	// Validate first
-	string error = ValidateConnectionString(connection_string);
+	string error = ValidateConnectionString(connection_string, azure_auth);
 	if (!error.empty()) {
 		throw InvalidInputException("MSSQL Error: %s", error);
 	}
@@ -693,13 +696,23 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
-	// Extract SECRET parameter (optional if connection string is provided)
-	// Remove it from options so DuckDB's StorageOptions doesn't reject it as unrecognized
+	// Extract SECRET and azure_secret parameters (optional if connection string is provided)
+	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
+	string azure_secret_name;
+	bool catalog_option_specified = false;
+	bool catalog_enabled_option = true;  // Default to true
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
 			secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else if (lower_name == "azure_secret") {
+			azure_secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else if (lower_name == "catalog") {
+			catalog_option_specified = true;
+			catalog_enabled_option = it->second.GetValue<bool>();
 			it = options.options.erase(it);
 		} else {
 			++it;
@@ -718,7 +731,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		ctx->connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
 	} else if (!connection_string.empty()) {
 		// Connection string provided - parse it
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string);
+		// If azure_secret is provided as option, allow missing user/password
+		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, !azure_secret_name.empty());
+		// Set azure_secret from ATTACH option if provided
+		if (!azure_secret_name.empty()) {
+			ctx->connection_info->azure_secret_name = azure_secret_name;
+			ctx->connection_info->use_azure_auth = true;
+		}
 	} else {
 		// Neither SECRET nor connection string provided
 		throw InvalidInputException(
@@ -728,6 +747,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			name, name);
 	}
 
+	// Apply CATALOG option from ATTACH if specified (overrides connection string/secret value)
+	if (catalog_option_specified) {
+		ctx->connection_info->catalog_enabled = catalog_enabled_option;
+		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
+	}
+
 	// Validate connection before registering context or creating catalog
 	// This ensures we fail fast on invalid credentials
 	auto pool_config = LoadPoolConfig(context);
@@ -735,8 +760,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
 	if (ctx->connection_info->use_azure_auth) {
-		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
-		// Acquire fresh token for the pool (the validation token may expire)
+		// Note: For Fabric/Azure SQL, we skip validation and let pool connections handle auth
+		// This avoids token/session conflicts that can occur with multiple sequential authentications
+		// The pool factory will test the connection when first needed
+		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: skipping validation, will validate on first pool connection");
 		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
 	} else {

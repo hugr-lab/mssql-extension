@@ -408,8 +408,9 @@ void test_login7_with_fedauth_has_extension() {
 	std::cout << "\n=== Test: LOGIN7 with FEDAUTH Extension (Azure Auth) ===" << std::endl;
 
 	// Build FEDAUTH LOGIN7
+	// client_hostname = workstation name, server_name = TDS server address
 	std::vector<uint8_t> fake_token = {0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00};  // "test"
-	auto packet = tds::TdsProtocol::BuildLogin7WithFedAuth("testhost", "testdb", fake_token);
+	auto packet = tds::TdsProtocol::BuildLogin7WithFedAuth("testworkstation", "testserver", "testdb", fake_token);
 	const auto &payload = packet.GetPayload();
 
 	ASSERT_TRUE(payload.size() >= 28);

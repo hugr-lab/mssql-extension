@@ -82,6 +82,10 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(const std::s
 		if (!conn->AuthenticateWithFedAuth(database, fedauth_token_utf16le, use_encrypt)) {
 			return nullptr;
 		}
+
+		// Note: Warm-up query disabled - Fabric seems to have timing issues with pool connections
+		// The connection is returned in Idle state after authentication
+
 		return conn;
 	};
 

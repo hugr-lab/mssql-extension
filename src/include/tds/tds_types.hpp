@@ -16,6 +16,7 @@ enum class PacketType : uint8_t {
 	TABULAR_RESULT = 4,	 // Server response
 	ATTENTION = 6,		 // Cancel signal
 	BULK_LOAD = 7,		 // Bulk data
+	FEDAUTH_TOKEN = 8,	 // Federated authentication token (Azure AD)
 	TRANSACTION = 14,	 // Transaction management
 	LOGIN7 = 16,		 // Login request
 	SSPI = 17,			 // Windows authentication
@@ -78,6 +79,25 @@ enum class FeatureExtId : uint8_t {
 	AZURESQLDNSCACHING = 0x0B, // Azure SQL DNS caching
 	TERMINATOR = 0xFF        // End of feature extensions
 };
+
+//===----------------------------------------------------------------------===//
+// FEDAUTH Library and Workflow Constants (MS-TDS 2.2.7.1)
+//===----------------------------------------------------------------------===//
+
+// FEDAUTH library types determine token acquisition flow
+constexpr uint8_t FEDAUTH_LIBRARY_LIVEID = 0x00;         // Live ID (not supported)
+constexpr uint8_t FEDAUTH_LIBRARY_SECURITYTOKEN = 0x01;  // Pre-acquired token embedded in LOGIN7
+constexpr uint8_t FEDAUTH_LIBRARY_ADAL = 0x02;           // ADAL flow: server provides STS URL, client sends token separately
+
+// ADAL workflow types (used with FEDAUTH_LIBRARY_ADAL)
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_PASSWORD = 0x01;    // Username/password (Service Principal)
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_INTEGRATED = 0x02;  // Windows integrated
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_MSI = 0x03;         // Managed Identity
+constexpr uint8_t FEDAUTH_ADAL_WORKFLOW_NONE = 0x04;        // No workflow (token already acquired)
+
+// FEDAUTHINFO option IDs (inside FEDAUTHINFO token from server)
+constexpr uint8_t FEDAUTHINFO_OPT_STS_URL = 0x01;  // Security Token Service URL
+constexpr uint8_t FEDAUTHINFO_OPT_SPN = 0x02;      // Server Principal Name
 
 // TDS Token Types (response parsing)
 enum class TokenType : uint8_t {

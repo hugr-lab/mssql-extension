@@ -186,12 +186,30 @@ private:
 	// Connection reset flag — when true, next SQL_BATCH sets RESET_CONNECTION in TDS header
 	bool needs_reset_ = false;
 
+	// FEDAUTH echo flag — set during PRELOGIN if server's FEDAUTHREQUIRED was non-zero
+	// Per MS-TDS: client must echo this value back in LOGIN7's FEDAUTH options byte (bit 0)
+	bool fedauth_echo_ = false;
+
+	// Routing info from ENVCHANGE type 20 (Azure SQL/Fabric gateway redirection)
+	// Set during LOGIN7 response parsing if server requests routing
+	bool has_routing_ = false;
+	std::string routed_server_;
+	uint16_t routed_port_ = 0;
+
+	// TDS ServerName for LOGIN7 - may differ from host_ when routing includes instance name
+	// Format: "hostname" or "hostname\instance" (instance name is for TDS protocol, not DNS)
+	std::string tds_server_name_;
+
+	// Original gateway hostname for TLS SNI after routing (Azure Fabric session tracking)
+	std::string original_sni_hostname_;
+
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);
 	bool DoLogin7(const std::string &username, const std::string &password, const std::string &database);
 
 	// Azure AD FEDAUTH helpers (T018/T020)
-	bool DoPreloginWithFedAuth(bool use_encrypt);
+	// Optional sni_hostname overrides default for TLS SNI (for Azure routing)
+	bool DoPreloginWithFedAuth(bool use_encrypt, const std::string &sni_hostname = "");
 	bool DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token);
 };
 

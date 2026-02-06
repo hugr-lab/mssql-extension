@@ -173,6 +173,10 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 			result.error_message = "Query timeout";
 			connection.SendAttention();
 			connection.WaitForAttentionAck(5000);
+			// State is reset by WaitForAttentionAck on success, or we should mark it disconnected
+			if (connection.GetState() == tds::ConnectionState::Executing) {
+				connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
+			}
 			return result;
 		}
 
@@ -185,6 +189,8 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 		if (!socket->ReceivePacket(packet, recv_timeout)) {
 			result.success = false;
 			result.error_message = "Failed to receive TDS packet: " + socket->GetLastError();
+			// Mark connection as disconnected since we can't trust it after a receive error
+			connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
 			return result;
 		}
 
@@ -234,6 +240,10 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 					// Callback requested stop - cancel query
 					connection.SendAttention();
 					connection.WaitForAttentionAck(5000);
+					// Ensure connection is in proper state
+					if (connection.GetState() == tds::ConnectionState::Executing) {
+						connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
+					}
 					return result;
 				}
 				break;

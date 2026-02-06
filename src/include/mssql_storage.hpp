@@ -56,11 +56,15 @@ struct MSSQLConnectionInfo {
 	// Create from connection string (ADO.NET format or URI format)
 	// ADO.NET: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
 	// URI: "mssql://user:password@host:port/database?encrypt=true"
-	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string);
+	// Parameters:
+	//   azure_auth - if true, user/password are optional (Azure AD authentication via azure_secret)
+	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string, bool azure_auth = false);
 
 	// Validate connection string format
 	// Returns: empty string if valid, error message if invalid
-	static string ValidateConnectionString(const string &connection_string);
+	// Parameters:
+	//   azure_auth - if true, user/password are optional (Azure AD authentication via azure_secret)
+	static string ValidateConnectionString(const string &connection_string, bool azure_auth = false);
 
 	// Check if string is a URI format (mssql://...)
 	static bool IsUriFormat(const string &str);

@@ -14,6 +14,7 @@ struct PreloginResponse {
 	uint8_t version_minor;
 	uint16_t version_build;
 	EncryptionOption encryption;
+	bool fedauth_echo;  // True if server's FEDAUTHREQUIRED was non-zero (must echo in LOGIN7)
 	bool success;
 	std::string error_message;
 };
@@ -28,6 +29,16 @@ struct LoginResponse {
 	std::string error_message;
 	uint32_t error_number;
 	uint32_t negotiated_packet_size;  // Server-negotiated packet size from ENVCHANGE
+
+	// Routing info from ENVCHANGE type 20 (Azure SQL/Fabric gateway redirection)
+	bool has_routing = false;		  // True if server requested routing
+	std::string routed_server;		  // New server hostname to connect to
+	uint16_t routed_port = 0;		  // New port to connect to
+
+	// FEDAUTHINFO token data (for ADAL workflow)
+	bool has_fedauth_info = false;    // True if FEDAUTHINFO token was received
+	std::string sts_url;              // Security Token Service URL from server
+	std::string server_spn;           // Server Principal Name from server
 };
 
 // TDS Protocol message builders and parsers
@@ -65,18 +76,49 @@ public:
 	// Parse LOGIN7 response (LOGINACK token and potential errors)
 	static LoginResponse ParseLoginResponse(const std::vector<uint8_t> &data);
 
-	// Build LOGIN7 packet with FEDAUTH feature extension for Azure AD authentication
+	// Build LOGIN7 packet with FEDAUTH feature extension for Azure AD authentication (DEPRECATED)
+	// This uses SecurityToken flow which embeds token directly in LOGIN7.
+	// For Microsoft Fabric, use BuildLogin7WithADAL instead.
 	// Parameters:
-	//   host - client hostname (for logging on server side)
+	//   client_hostname - client workstation name (for server logging, e.g., "MyWorkstation")
+	//   server_name - TDS server name (may include instance name, e.g., "host" or "host\instance")
 	//   database - initial database to connect to
 	//   fedauth_token - UTF-16LE encoded access token from Azure AD
+	//   fedauth_echo - if true, set echo bit in FEDAUTH options (server's FEDAUTHREQUIRED was non-zero)
 	//   app_name - application name (optional, for server logging)
 	//   packet_size - requested packet size (default 4096)
 	// Note: username/password not used with FEDAUTH - token replaces them
-	static TdsPacket BuildLogin7WithFedAuth(const std::string &host, const std::string &database,
-	                                        const std::vector<uint8_t> &fedauth_token,
+	static TdsPacket BuildLogin7WithFedAuth(const std::string &client_hostname, const std::string &server_name,
+	                                        const std::string &database, const std::vector<uint8_t> &fedauth_token,
+	                                        bool fedauth_echo = false,
 	                                        const std::string &app_name = "DuckDB MSSQL Extension",
 	                                        uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+
+	// Build LOGIN7 packet with ADAL FEDAUTH workflow for Azure AD authentication
+	// This uses ADAL flow: LOGIN7 contains small FEDAUTH extension, server responds with
+	// FEDAUTHINFO token containing STS URL, then client sends token in separate FEDAUTH_TOKEN packet.
+	// This is the flow required by Microsoft Fabric.
+	// Parameters:
+	//   client_hostname - client workstation name (for server logging, e.g., "MyWorkstation")
+	//   server_name - TDS server name (may include instance name, e.g., "host" or "host\instance")
+	//   database - initial database to connect to
+	//   fedauth_echo - if true, set echo bit in FEDAUTH options (server's FEDAUTHREQUIRED was non-zero)
+	//   app_name - application name (optional, for server logging)
+	//   packet_size - requested packet size (default 4096)
+	// Note: Token is NOT included - will be sent in separate FEDAUTH_TOKEN packet after receiving FEDAUTHINFO
+	static TdsPacket BuildLogin7WithADAL(const std::string &client_hostname, const std::string &server_name,
+	                                     const std::string &database, bool fedauth_echo = false,
+	                                     const std::string &app_name = "DuckDB MSSQL Extension",
+	                                     uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+
+	// Build FEDAUTH_TOKEN packet to send access token after receiving FEDAUTHINFO
+	// Used in ADAL workflow: server sends FEDAUTHINFO with STS URL, client fetches token,
+	// then sends it via this packet.
+	// Parameters:
+	//   token_utf16le - UTF-16LE encoded access token from Azure AD
+	//   nonce - optional 32-byte nonce (can be empty)
+	static TdsPacket BuildFedAuthToken(const std::vector<uint8_t> &token_utf16le,
+	                                   const std::vector<uint8_t> &nonce = {});
 
 	// Build empty SQL_BATCH packet for ping
 	// This sends an empty batch which triggers a DONE response

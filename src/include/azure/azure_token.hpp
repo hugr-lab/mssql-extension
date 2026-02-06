@@ -27,7 +27,9 @@ namespace azure {
 constexpr const char *AZURE_AD_BASE_URL = "login.microsoftonline.com";
 
 // Resource scope for Azure SQL Database
-constexpr const char *AZURE_SQL_SCOPE = "https://database.windows.net/.default";
+// Note: The trailing slash is required - audience must be "https://database.windows.net/"
+// Using "https://database.windows.net//.default" produces correct audience with trailing slash
+constexpr const char *AZURE_SQL_SCOPE = "https://database.windows.net//.default";
 
 // Token refresh margin (seconds before expiration to trigger refresh)
 constexpr int64_t TOKEN_REFRESH_MARGIN_SECONDS = 300;  // 5 minutes
