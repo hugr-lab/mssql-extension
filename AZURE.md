@@ -329,14 +329,43 @@ CREATE SECRET azure_env (
 );
 ```
 
+## Microsoft Fabric Limitations
+
+Microsoft Fabric Data Warehouses have some limitations compared to Azure SQL Database:
+
+### No BCP/INSERT BULK Support
+
+Fabric doesn't support the TDS `INSERT BULK` command (BCP protocol). The extension handles this automatically:
+
+- **CTAS (CREATE TABLE AS SELECT)**: Auto-falls back to batched INSERT statements
+- **COPY TO MSSQL**: Not supported on Fabric - use CTAS instead
+
+```sql
+-- This works on Fabric (auto-fallback to INSERT mode)
+CREATE TABLE fabric.dbo.new_table AS SELECT * FROM local_table;
+
+-- This will fail on Fabric with a clear error message
+COPY (SELECT * FROM local_table) TO 'fabric.dbo.new_table' (FORMAT 'bcp');
+-- Error: Microsoft Fabric does not support INSERT BULK (BCP protocol).
+-- Use CREATE TABLE AS SELECT (CTAS) instead.
+```
+
+### Performance Note
+
+Due to the INSERT fallback, bulk data transfers to Fabric are slower than to Azure SQL Database. For large data loads, consider:
+
+1. Loading to Azure SQL Database first, then syncing to Fabric
+2. Using Fabric's native data ingestion tools (Data Factory, Dataflows)
+3. Breaking large loads into smaller batches
+
 ## Supported Azure Services
 
-| Service | Connection String Format |
-| ------- | ------------------------ |
-| Azure SQL Database | `Server=name.database.windows.net;Database=dbname` |
-| Azure SQL Managed Instance | `Server=name.public.xyz.database.windows.net,3342;Database=dbname` |
-| Microsoft Fabric DW | `Server=xyz.datawarehouse.fabric.microsoft.com;Database=warehouse` |
-| Azure Synapse Serverless | `Server=name-ondemand.sql.azuresynapse.net;Database=dbname` |
+| Service | Connection String Format | BCP Support |
+| ------- | ------------------------ | ----------- |
+| Azure SQL Database | `Server=name.database.windows.net;Database=dbname` | ✅ Full |
+| Azure SQL Managed Instance | `Server=name.public.xyz.database.windows.net,3342;Database=dbname` | ✅ Full |
+| Microsoft Fabric DW | `Server=xyz.datawarehouse.fabric.microsoft.com;Database=warehouse` | ❌ INSERT fallback |
+| Azure Synapse Serverless | `Server=name-ondemand.sql.azuresynapse.net;Database=dbname` | ⚠️ Limited |
 
 ## See Also
 

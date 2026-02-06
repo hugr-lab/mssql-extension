@@ -15,10 +15,10 @@ static int GetPoolDebugLevel() {
 	return level;
 }
 
-#define MSSQL_POOL_DEBUG_LOG(lvl, fmt, ...)                                                                            \
-	do {                                                                                                               \
-		if (GetPoolDebugLevel() >= lvl)                                                                                \
-			fprintf(stderr, "[MSSQL POOL] " fmt "\n", ##__VA_ARGS__);                                                  \
+#define MSSQL_POOL_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                              \
+		if (GetPoolDebugLevel() >= lvl)                               \
+			fprintf(stderr, "[MSSQL POOL] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
 ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory)
@@ -167,7 +167,7 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 	// Connections must be in Idle state to be safely reused
 	if (conn->GetState() != ConnectionState::Idle) {
 		MSSQL_POOL_DEBUG_LOG(1, "Closing connection in non-Idle state: %d (pool '%s')",
-		                     static_cast<int>(conn->GetState()), context_name_.c_str());
+							 static_cast<int>(conn->GetState()), context_name_.c_str());
 		conn->Close();
 		stats_.connections_closed++;
 		stats_.total_connections--;

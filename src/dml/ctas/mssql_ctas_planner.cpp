@@ -21,10 +21,10 @@ static int GetCTASPlannerDebugLevel() {
 	return env ? std::atoi(env) : 0;
 }
 
-#define CTAS_PLANNER_DEBUG_LOG(lvl, fmt, ...)                                                                          \
-	do {                                                                                                               \
-		if (GetCTASPlannerDebugLevel() >= lvl)                                                                         \
-			fprintf(stderr, "[MSSQL CTAS] " fmt "\n", ##__VA_ARGS__);                                                   \
+#define CTAS_PLANNER_DEBUG_LOG(lvl, fmt, ...)                         \
+	do {                                                              \
+		if (GetCTASPlannerDebugLevel() >= lvl)                        \
+			fprintf(stderr, "[MSSQL CTAS] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
 //===----------------------------------------------------------------------===//
