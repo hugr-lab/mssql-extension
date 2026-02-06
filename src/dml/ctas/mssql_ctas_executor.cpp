@@ -282,8 +282,10 @@ void CTASExecutionState::AttemptCleanup(ClientContext &context) {
 
 void CTASExecutionState::InvalidateCache() {
 	if (catalog) {
-		catalog->InvalidateMetadataCache();
-		DebugLog(2, "Catalog cache invalidated");
+		// T037 (Bug 0.2): Use point invalidation instead of full cache invalidation
+		// Only invalidate the specific schema's table list, not the entire cache
+		catalog->InvalidateSchemaTableSet(target.schema_name);
+		DebugLog(2, "Catalog cache invalidated for schema '%s'", target.schema_name.c_str());
 	}
 }
 

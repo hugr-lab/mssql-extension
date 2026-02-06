@@ -193,6 +193,32 @@ bool MSSQLMetadataCache::HasTable(const string &schema_name, const string &table
 	return schema_it->second.tables.find(table_name) != schema_it->second.tables.end();
 }
 
+bool MSSQLMetadataCache::TryGetCachedSchemaNames(vector<string> &out_names) {
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+
+	// T036: Return cached schema names only if schemas are loaded and not expired
+	if (schemas_load_state_ != CacheLoadState::LOADED) {
+		return false;
+	}
+
+	// Check TTL expiration
+	if (ttl_seconds_ > 0) {
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - schemas_last_refresh_).count();
+		if (elapsed >= ttl_seconds_) {
+			return false;  // Expired, need to reload
+		}
+	}
+
+	// Populate output with cached schema names
+	out_names.clear();
+	out_names.reserve(schemas_.size());
+	for (const auto &pair : schemas_) {
+		out_names.push_back(pair.first);
+	}
+	return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Cache Management
 //===----------------------------------------------------------------------===//

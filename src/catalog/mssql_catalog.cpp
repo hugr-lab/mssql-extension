@@ -159,6 +159,12 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		EnsureCacheLoaded(*transaction.context);
 	}
 
+	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
+	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
+	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
+		return &GetOrCreateSchemaEntry(name);
+	}
+
 	// T013-T014 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
 	// This ensures schema lookups during INSERT in transaction use the pinned connection
 	if (!connection_pool_) {
@@ -203,6 +209,18 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	// Ensure cache is loaded (sets TTL)
 	EnsureCacheLoaded(context);
 
+	// T036 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection
+	// Fast path: If schemas are already loaded, get names without acquiring connection
+	vector<string> schema_names;
+	if (metadata_cache_->TryGetCachedSchemaNames(schema_names)) {
+		// Cache hit - iterate without connection
+		for (const auto &name : schema_names) {
+			auto &schema_entry = GetOrCreateSchemaEntry(name);
+			callback(schema_entry);
+		}
+		return;
+	}
+
 	// T015-T016 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
 	if (!connection_pool_) {
 		throw InternalException("Connection pool not initialized");
@@ -214,7 +232,7 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 		throw IOException("Failed to acquire connection for schema scan");
 	}
 
-	auto schema_names = metadata_cache_->GetSchemaNames(*connection);
+	schema_names = metadata_cache_->GetSchemaNames(*connection);
 
 	// Release connection properly (no-op if pinned to transaction)
 	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
