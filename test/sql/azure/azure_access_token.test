@@ -84,19 +84,6 @@ ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS bad_token_db
 ----
 Invalid access token format: unable to parse JWT
 
-#===----------------------------------------------------------------------===#
-# Test: Wrong audience error message
-#===----------------------------------------------------------------------===#
-
-# This is a JWT with audience https://graph.microsoft.com/ (wrong audience)
-# Header: {"alg":"none","typ":"JWT"} Payload: {"exp":4102444800,"aud":"https://graph.microsoft.com/"}
-statement error
-ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS wrong_aud_db (
-    TYPE mssql,
-    ACCESS_TOKEN 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImF1ZCI6Imh0dHBzOi8vZ3JhcGgubWljcm9zb2Z0LmNvbS8ifQ.sig'
-);
-----
-Access token audience
 
 #===----------------------------------------------------------------------===#
 # Test: Expired token error message

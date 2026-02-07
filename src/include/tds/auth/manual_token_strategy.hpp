@@ -29,14 +29,14 @@ namespace tds {
 // Key differences from FedAuthStrategy:
 // - No token acquirer function (token is pre-provided)
 // - Cannot refresh tokens (can_refresh = false)
-// - Validates token format and audience at construction time
+// - Validates token format at construction time (audience validated by server)
 // - Returns clear error message when token expires
 //
 class ManualTokenAuthStrategy : public AuthenticationStrategy {
 public:
 	// Construct from a raw JWT access token
 	// Validates token format and parses claims
-	// Throws InvalidInputException if token is malformed or has wrong audience
+	// Throws InvalidInputException if token is malformed
 	explicit ManualTokenAuthStrategy(const std::string &access_token, const std::string &database);
 
 	//===----------------------------------------------------------------------===//

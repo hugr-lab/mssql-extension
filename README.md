@@ -1447,17 +1447,7 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
 - VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)
-
-## Authentication
-
-This project uses the Azure Identity SDK (Apache License 2.0)
-for authentication with Microsoft Entra ID.
-
-Non-interactive flows (service principal, managed identity)
-are handled by the Azure Identity SDK. Interactive authentication
-is implemented using the OAuth 2.0 device code flow.
-
-See [AZURE.md](AZURE.md) for complete Azure AD authentication documentation.
+- NVARCHAR(max) and VARCHAR(max) columns are not supported in the Microsoft Fabric Warehouse
 
 ## Third-Party Licenses
 

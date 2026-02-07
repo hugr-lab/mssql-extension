@@ -26,13 +26,9 @@ ManualTokenAuthStrategy::ManualTokenAuthStrategy(const std::string &access_token
 			claims_.error);
 	}
 
-	// Validate audience - must be for Azure SQL Database
-	if (claims_.aud != mssql::azure::AZURE_SQL_AUDIENCE) {
-		throw InvalidInputException(
-			"Access token audience '%s' does not match expected '%s'. "
-			"Ensure token was requested for the correct resource.",
-			claims_.aud, mssql::azure::AZURE_SQL_AUDIENCE);
-	}
+	// No audience validation - the server will reject tokens with wrong audience.
+	// Different token providers use different audience formats (with/without trailing slash),
+	// e.g. Fabric notebooks return "https://database.windows.net" without trailing slash.
 
 	// Pre-encode token as UTF-16LE for efficiency
 	token_utf16le_ = encoding::Utf16LEEncode(access_token);
