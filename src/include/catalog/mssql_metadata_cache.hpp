@@ -130,9 +130,15 @@ public:
 	// Get tables/views in a schema (triggers lazy loading of table list)
 	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
 
-	// Get table metadata (triggers lazy loading of columns)
+	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
+	// Does NOT load all tables in the schema. Returns nullptr if the table doesn't exist.
 	const MSSQLTableMetadata *GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
 											   const string &table_name);
+
+	// Load all table metadata for a schema in one bulk query.
+	// If all tables already have columns loaded (e.g. from preload), returns from cache.
+	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
+	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
 
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);
@@ -204,8 +210,7 @@ public:
 	// Ensure table list for schema is loaded
 	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
 
-	// Ensure column metadata for table is loaded
-	void EnsureColumnsLoaded(tds::TdsConnection &connection, const string &schema_name, const string &table_name);
+
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
@@ -232,6 +237,10 @@ public:
 
 	// Iterate all loaded tables, calling callback(schema_name, table_name, approx_row_count)
 	void ForEachTable(const std::function<void(const string &, const string &, idx_t)> &callback) const;
+
+	// Iterate all loaded tables in a specific schema, calling callback(table_name, table_metadata)
+	void ForEachTableInSchema(const string &schema_name,
+							  const std::function<void(const string &, const MSSQLTableMetadata &)> &callback) const;
 
 	// Get column metadata load state for table
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;

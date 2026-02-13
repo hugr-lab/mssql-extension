@@ -92,11 +92,8 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 }
 
 void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
-	CATALOG_DEBUG(1, "Scan('%s') — loading table names (no columns)", schema_.name.c_str());
-	// Step 1: Ensure table names are loaded (no column queries)
-	EnsureNamesLoaded(context);
+	CATALOG_DEBUG(1, "Scan('%s') — bulk loading all table metadata", schema_.name.c_str());
 
-	// Step 2: For each known name, ensure entry exists (loads columns on demand)
 	auto &catalog = schema_.GetMSSQLCatalog();
 	auto &cache = catalog.GetMetadataCache();
 	auto &pool = catalog.GetConnectionPool();
@@ -107,29 +104,33 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 		throw IOException("Failed to acquire connection for table scan");
 	}
 
-	CATALOG_DEBUG(1, "Scan('%s') — iterating %zu known tables, loading columns per table",
-				 schema_.name.c_str(), known_table_names_.size());
-	std::lock_guard<std::mutex> lock(entry_mutex_);
-	for (const auto &table_name : known_table_names_) {
-		// Skip if already loaded
-		if (entries_.find(table_name) != entries_.end()) {
-			callback(*entries_[table_name]);
-			continue;
-		}
-
-		// Load columns for this table and create entry
-		auto table_meta = cache.GetTableMetadata(*connection, schema_.name, table_name);
-		if (table_meta) {
-			auto entry = CreateTableEntry(*table_meta);
-			if (entry) {
-				auto &ref = *entry;
-				entries_[entry->name] = std::move(entry);
-				callback(ref);
-			}
-		}
-	}
+	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
+	cache.LoadAllTableMetadata(*connection, schema_.name);
 
 	pool.Release(std::move(connection));
+
+	// Build entries from fully-loaded cache
+	std::lock_guard<std::mutex> lock(entry_mutex_);
+
+	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+		// Update known_table_names_
+		known_table_names_.insert(table_name);
+
+		// Skip if already loaded as entry
+		if (entries_.find(table_name) != entries_.end()) {
+			callback(*entries_[table_name]);
+			return;
+		}
+
+		auto entry = CreateTableEntry(table_meta);
+		if (entry) {
+			auto &ref = *entry;
+			entries_[entry->name] = std::move(entry);
+			callback(ref);
+		}
+	});
+
+	names_loaded_.store(true);
 	is_fully_loaded_.store(true);
 }
 
@@ -151,7 +152,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 		throw IOException("Failed to acquire connection for table loading");
 	}
 
-	// Get metadata for this specific table (triggers lazy column loading)
+	// Get metadata for this specific table only (does NOT load all tables in schema)
 	auto table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
 
 	pool.Release(std::move(connection));

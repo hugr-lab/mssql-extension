@@ -54,6 +54,28 @@ WHERE o.type IN ('U', 'V')
 ORDER BY o.name
 )";
 
+// Single-table metadata query: loads object type, row count, and all columns for ONE table
+// in a single round trip. Used by GetTableMetadata() to avoid loading all tables in schema.
+static const char *SINGLE_TABLE_METADATA_SQL_TEMPLATE = R"(
+SELECT
+    o.type AS object_type,
+    ISNULL(p.rows, 0) AS approx_rows,
+    c.name AS column_name,
+    c.column_id,
+    t.name AS type_name,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    ISNULL(c.collation_name, '') AS collation_name
+FROM sys.objects o
+INNER JOIN sys.columns c ON c.object_id = o.object_id
+JOIN sys.types t ON c.user_type_id = t.user_type_id
+LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
+WHERE o.object_id = OBJECT_ID('%s')
+ORDER BY c.column_id
+)";
+
 // Bulk metadata query: loads ALL schemas, tables, and columns in one round trip
 // Used by mssql_preload_catalog() to avoid per-table column discovery queries
 // Results are ordered by schema_name, object_name, column_id for streaming group-by parse
@@ -134,6 +156,19 @@ JOIN sys.types t ON c.user_type_id = t.user_type_id
 WHERE c.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
 )";
+
+//===----------------------------------------------------------------------===//
+// TTL Helper
+//===----------------------------------------------------------------------===//
+
+static bool IsTTLExpired(const std::chrono::steady_clock::time_point &last_refresh, int64_t ttl_seconds) {
+	if (ttl_seconds <= 0) {
+		return false;  // TTL disabled
+	}
+	auto now = std::chrono::steady_clock::now();
+	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_refresh).count();
+	return elapsed >= ttl_seconds;
+}
 
 //===----------------------------------------------------------------------===//
 // Helper: Execute metadata query using MSSQLSimpleQuery
@@ -260,20 +295,105 @@ vector<string> MSSQLMetadataCache::GetTableNames(tds::TdsConnection &connection,
 }
 
 const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection,
-															   const string &schema_name, const string &table_name) {
-	// Trigger lazy loading of schemas, tables, and columns
-	EnsureColumnsLoaded(connection, schema_name, table_name);
+																	 const string &schema_name,
+																	 const string &table_name) {
+	// Only load schemas (fast — just schema names, no tables)
+	EnsureSchemasLoaded(connection);
 
 	std::lock_guard<std::mutex> lock(schemas_mutex_);
+
+	// Ensure schema entry exists
 	auto schema_it = schemas_.find(schema_name);
 	if (schema_it == schemas_.end()) {
+		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — schema not found", schema_name.c_str(), table_name.c_str());
 		return nullptr;
 	}
-	auto table_it = schema_it->second.tables.find(table_name);
-	if (table_it == schema_it->second.tables.end()) {
+
+	auto &schema = schema_it->second;
+
+	// Check if table already cached with columns loaded
+	auto table_it = schema.tables.find(table_name);
+	if (table_it != schema.tables.end() &&
+		table_it->second.columns_load_state == CacheLoadState::LOADED &&
+		!IsTTLExpired(table_it->second.columns_last_refresh, ttl_seconds_)) {
+		CACHE_DEBUG(2, "GetTableMetadata('%s.%s') — cache hit (%zu columns)",
+					schema_name.c_str(), table_name.c_str(), table_it->second.columns.size());
+		return &table_it->second;
+	}
+
+	// Single-table query: load object type + columns in one round trip
+	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loading from SQL Server (single query)",
+				schema_name.c_str(), table_name.c_str());
+
+	string full_name = "[" + schema_name + "].[" + table_name + "]";
+	string query = StringUtil::Format(SINGLE_TABLE_METADATA_SQL_TEMPLATE, full_name);
+
+	MSSQLTableMetadata table_meta;
+	table_meta.name = table_name;
+	bool first_row = true;
+
+	ExecuteMetadataQuery(connection, query, [this, &table_meta, &first_row](const vector<string> &values) {
+		if (values.size() < 10) {
+			return;
+		}
+
+		// First row: extract object type and row count
+		if (first_row) {
+			first_row = false;
+			if (!values[0].empty() && values[0][0] == 'V') {
+				table_meta.object_type = MSSQLObjectType::VIEW;
+			} else {
+				table_meta.object_type = MSSQLObjectType::TABLE;
+			}
+			try {
+				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
+			} catch (...) {
+				table_meta.approx_row_count = 0;
+			}
+		}
+
+		// Parse column info
+		string col_name = values[2];
+		int32_t col_id = 0;
+		try { col_id = static_cast<int32_t>(std::stoi(values[3])); } catch (...) {}
+		string type_name = values[4];
+		int16_t max_len = 0;
+		try { max_len = static_cast<int16_t>(std::stoi(values[5])); } catch (...) {}
+		uint8_t prec = 0;
+		try { prec = static_cast<uint8_t>(std::stoi(values[6])); } catch (...) {}
+		uint8_t scl = 0;
+		try { scl = static_cast<uint8_t>(std::stoi(values[7])); } catch (...) {}
+		bool nullable = (values[8] == "1" || values[8] == "true" || values[8] == "True");
+		string collation = values[9];
+
+		MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+								 database_collation_);
+		table_meta.columns.push_back(std::move(col_info));
+	});
+
+	// If no rows returned, table doesn't exist
+	if (first_row) {
+		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — table not found on SQL Server",
+					schema_name.c_str(), table_name.c_str());
 		return nullptr;
 	}
-	return &table_it->second;
+
+	// Cache the result
+	auto now = std::chrono::steady_clock::now();
+	table_meta.columns_load_state = CacheLoadState::LOADED;
+	table_meta.columns_last_refresh = now;
+
+	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns",
+				schema_name.c_str(), table_name.c_str(), table_meta.columns.size());
+
+	// Insert or replace: if entry already exists (e.g. invalidated), overwrite it
+	auto existing_it = schema.tables.find(table_name);
+	if (existing_it != schema.tables.end()) {
+		existing_it->second = std::move(table_meta);
+		return &existing_it->second;
+	}
+	auto result = schema.tables.emplace(table_name, std::move(table_meta));
+	return &result.first->second;
 }
 
 bool MSSQLMetadataCache::HasSchema(const string &schema_name) {
@@ -317,6 +437,133 @@ bool MSSQLMetadataCache::TryGetCachedSchemaNames(vector<string> &out_names) {
 		out_names.push_back(pair.first);
 	}
 	return true;
+}
+
+void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name) {
+	EnsureSchemasLoaded(connection);
+
+	// Check if all tables in this schema already have columns loaded
+	{
+		std::lock_guard<std::mutex> lock(schemas_mutex_);
+		auto schema_it = schemas_.find(schema_name);
+		if (schema_it == schemas_.end()) {
+			CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — schema not found", schema_name.c_str());
+			return;
+		}
+
+		auto &schema = schema_it->second;
+
+		// If tables are loaded and all have columns loaded (not invalidated), use cache
+		if (schema.tables_load_state == CacheLoadState::LOADED) {
+			bool all_columns_loaded = true;
+			for (const auto &table_pair : schema.tables) {
+				if (table_pair.second.columns_load_state != CacheLoadState::LOADED ||
+					IsTTLExpired(table_pair.second.columns_last_refresh, ttl_seconds_)) {
+					all_columns_loaded = false;
+					break;
+				}
+			}
+			if (all_columns_loaded && !schema.tables.empty()) {
+				CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — all %zu tables already loaded",
+							schema_name.c_str(), schema.tables.size());
+				return;
+			}
+		}
+	}
+
+	// Bulk load all tables + columns for this schema in one query
+	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — bulk loading from SQL Server", schema_name.c_str());
+
+	string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
+
+	// Streaming group-by parse (same as BulkLoadAll but for one schema)
+	string current_table;
+	MSSQLTableMetadata *current_table_meta = nullptr;
+	idx_t table_count = 0;
+	idx_t column_count = 0;
+
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it == schemas_.end()) {
+		return;
+	}
+	auto &schema = schema_it->second;
+
+	// Clear old table entries — bulk reload replaces everything
+	schema.tables.clear();
+
+	ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
+		if (values.size() < 12) {
+			return;
+		}
+
+		string row_table = values[1];
+		string row_type = values[2];
+		string row_approx_rows = values[3];
+		string col_name = values[4];
+		string col_id_str = values[5];
+		string type_name = values[6];
+		string max_len_str = values[7];
+		string prec_str = values[8];
+		string scale_str = values[9];
+		string nullable_str = values[10];
+		string collation = values[11];
+
+		// Apply table filter
+		if (filter_ && !filter_->MatchesTable(row_table)) {
+			return;
+		}
+
+		// New table group?
+		if (row_table != current_table) {
+			current_table = row_table;
+
+			MSSQLTableMetadata table_meta;
+			table_meta.name = current_table;
+			if (!row_type.empty() && row_type[0] == 'V') {
+				table_meta.object_type = MSSQLObjectType::VIEW;
+			} else {
+				table_meta.object_type = MSSQLObjectType::TABLE;
+			}
+			try {
+				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+			} catch (...) {
+				table_meta.approx_row_count = 0;
+			}
+			schema.tables.emplace(current_table, std::move(table_meta));
+			auto table_it = schema.tables.find(current_table);
+			current_table_meta = &table_it->second;
+			table_count++;
+		}
+
+		// Parse column
+		int32_t col_id = 0;
+		try { col_id = static_cast<int32_t>(std::stoi(col_id_str)); } catch (...) {}
+		int16_t max_len = 0;
+		try { max_len = static_cast<int16_t>(std::stoi(max_len_str)); } catch (...) {}
+		uint8_t prec = 0;
+		try { prec = static_cast<uint8_t>(std::stoi(prec_str)); } catch (...) {}
+		uint8_t scl = 0;
+		try { scl = static_cast<uint8_t>(std::stoi(scale_str)); } catch (...) {}
+		bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+
+		MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+								 database_collation_);
+		current_table_meta->columns.push_back(std::move(col_info));
+		column_count++;
+	});
+
+	// Mark all tables as loaded
+	auto now = std::chrono::steady_clock::now();
+	schema.tables_load_state = CacheLoadState::LOADED;
+	schema.tables_last_refresh = now;
+	for (auto &table_pair : schema.tables) {
+		table_pair.second.columns_load_state = CacheLoadState::LOADED;
+		table_pair.second.columns_last_refresh = now;
+	}
+
+	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loaded %zu tables, %zu columns in one query",
+				schema_name.c_str(), table_count, column_count);
 }
 
 //===----------------------------------------------------------------------===//
@@ -472,6 +719,19 @@ void MSSQLMetadataCache::ForEachTable(const std::function<void(const string &, c
 	}
 }
 
+void MSSQLMetadataCache::ForEachTableInSchema(
+		const string &schema_name,
+		const std::function<void(const string &, const MSSQLTableMetadata &)> &callback) const {
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it == schemas_.end()) {
+		return;
+	}
+	for (const auto &table_pair : schema_it->second.tables) {
+		callback(table_pair.first, table_pair.second);
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Cache Management
 //===----------------------------------------------------------------------===//
@@ -575,18 +835,6 @@ const string &MSSQLMetadataCache::GetDatabaseCollation() const {
 }
 
 //===----------------------------------------------------------------------===//
-// TTL Helper (T009)
-//===----------------------------------------------------------------------===//
-
-static bool IsTTLExpired(const std::chrono::steady_clock::time_point &last_refresh, int64_t ttl_seconds) {
-	if (ttl_seconds <= 0) {
-		return false;  // TTL disabled
-	}
-	auto now = std::chrono::steady_clock::now();
-	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_refresh).count();
-	return elapsed >= ttl_seconds;
-}
-
 //===----------------------------------------------------------------------===//
 // Incremental Cache Loading - Lazy Loading (T010-T012)
 //===----------------------------------------------------------------------===//
@@ -711,96 +959,6 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 	}
 }
 
-void MSSQLMetadataCache::EnsureColumnsLoaded(tds::TdsConnection &connection, const string &schema_name,
-											 const string &table_name) {
-	// First ensure tables are loaded for this schema
-	EnsureTablesLoaded(connection, schema_name);
-
-	// Find schema and table
-	auto schema_it = schemas_.find(schema_name);
-	if (schema_it == schemas_.end()) {
-		return;	 // Schema doesn't exist
-	}
-
-	auto table_it = schema_it->second.tables.find(table_name);
-	if (table_it == schema_it->second.tables.end()) {
-		return;	 // Table doesn't exist
-	}
-
-	MSSQLTableMetadata &table = table_it->second;
-
-	// Fast path: already loaded and not expired
-	if (table.columns_load_state == CacheLoadState::LOADED && !IsTTLExpired(table.columns_last_refresh, ttl_seconds_)) {
-		CACHE_DEBUG(2, "EnsureColumnsLoaded('%s.%s') — already loaded (%zu columns)",
-					schema_name.c_str(), table_name.c_str(), table.columns.size());
-		return;
-	}
-	CACHE_DEBUG(1, "EnsureColumnsLoaded('%s.%s') — loading columns from SQL Server",
-				schema_name.c_str(), table_name.c_str());
-
-	// Slow path: acquire table's lock and double-check
-	std::lock_guard<std::mutex> lock(table.load_mutex);
-
-	// Double-check after acquiring lock
-	if (table.columns_load_state == CacheLoadState::LOADED && !IsTTLExpired(table.columns_last_refresh, ttl_seconds_)) {
-		return;
-	}
-
-	// Mark as loading
-	table.columns_load_state = CacheLoadState::LOADING;
-
-	try {
-		// Clear existing columns
-		table.columns.clear();
-
-		// Build fully qualified object name
-		string full_name = "[" + schema_name + "].[" + table_name + "]";
-		string query = StringUtil::Format(COLUMN_DISCOVERY_SQL_TEMPLATE, full_name);
-
-		ExecuteMetadataQuery(connection, query, [this, &table](const vector<string> &values) {
-			if (values.size() >= 8) {
-				string col_name = values[0];
-				int32_t col_id = 0;
-				try {
-					col_id = static_cast<int32_t>(std::stoi(values[1]));
-				} catch (...) {
-				}
-				string type_name = values[2];
-				int16_t max_len = 0;
-				try {
-					max_len = static_cast<int16_t>(std::stoi(values[3]));
-				} catch (...) {
-				}
-				uint8_t prec = 0;
-				try {
-					prec = static_cast<uint8_t>(std::stoi(values[4]));
-				} catch (...) {
-				}
-				uint8_t scl = 0;
-				try {
-					scl = static_cast<uint8_t>(std::stoi(values[5]));
-				} catch (...) {
-				}
-				bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
-				string collation = values[7];
-
-				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-										 database_collation_);
-				table.columns.push_back(std::move(col_info));
-			}
-		});
-
-		// Update state
-		CACHE_DEBUG(1, "EnsureColumnsLoaded('%s.%s') — loaded %zu columns",
-					schema_name.c_str(), table_name.c_str(), table.columns.size());
-		table.columns_load_state = CacheLoadState::LOADED;
-		table.columns_last_refresh = std::chrono::steady_clock::now();
-	} catch (...) {
-		table.columns_load_state = CacheLoadState::NOT_LOADED;
-		throw;
-	}
-}
-
 //===----------------------------------------------------------------------===//
 // Point Invalidation (T034, T040, T043)
 //===----------------------------------------------------------------------===//
@@ -810,6 +968,11 @@ void MSSQLMetadataCache::InvalidateSchema(const string &schema_name) {
 	auto it = schemas_.find(schema_name);
 	if (it != schemas_.end()) {
 		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
+		// Also invalidate all cached table column metadata in this schema
+		// so that GetTableMetadata re-fetches columns from SQL Server
+		for (auto &table_pair : it->second.tables) {
+			table_pair.second.columns_load_state = CacheLoadState::NOT_LOADED;
+		}
 	}
 }
 
