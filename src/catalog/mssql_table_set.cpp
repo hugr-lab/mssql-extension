@@ -4,6 +4,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -115,10 +116,16 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 	pool.Release(std::move(connection));
 
-	// Build entries from fully-loaded cache
+	// Build entries from fully-loaded cache and pre-populate statistics.
+	// Pre-populating statistics avoids 200K+ individual DMV queries when
+	// duckdb_tables() calls GetStorageInfo() on each table entry.
+	auto &stats_provider = catalog.GetStatisticsProvider();
 	std::lock_guard<std::mutex> lock(entry_mutex_);
 
 	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+		// Pre-populate statistics cache with approx_row_count from bulk metadata
+		stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+
 		// Update known_table_names_
 		known_table_names_.insert(table_name);
 
