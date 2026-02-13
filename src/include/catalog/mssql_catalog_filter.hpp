@@ -38,9 +38,13 @@ public:
 	const string &GetSchemaPattern() const;
 	const string &GetTablePattern() const;
 
-	// Try to convert regex pattern to SQL LIKE clause.
-	// Returns SQL LIKE expression (e.g. "s.name LIKE 'dbo'") or empty string if not convertible.
-	// Simple patterns (literals, .*, anchors) are convertible; complex regex is not.
+	// Try to convert regex pattern to SQL WHERE clause.
+	// Returns SQL expression or empty string if not convertible.
+	// Supported patterns:
+	//   Simple: ^dbo$ → "col LIKE 'dbo'"
+	//   Wildcard: ^tbl_.* → "col LIKE 'tbl_%'"
+	//   Alternation (IN): ^(a|b|c)$ → "col IN ('a', 'b', 'c')"
+	//   Alternation (OR): ^(tbl_.*|fact_.*) → "(col LIKE 'tbl_%' OR col LIKE 'fact_%')"
 	static string TryRegexToSQLLike(const string &pattern, const string &column_expr);
 
 private:
