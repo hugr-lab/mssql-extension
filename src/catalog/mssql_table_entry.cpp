@@ -154,29 +154,37 @@ unique_ptr<BaseStatistics> MSSQLTableEntry::GetStatistics(ClientContext &context
 TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	TableStorageInfo info;
 
-	// Try to get fresh row count from statistics provider
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto &mssql_schema = GetMSSQLSchema();
 
+	// Fast path: use cached approx_row_count if available (e.g. from BulkLoadAll / preload)
+	// This avoids acquiring a connection + DMV query per table during SHOW ALL TABLES
+	auto &stats_provider = mssql_catalog.GetStatisticsProvider();
+	idx_t cached_row_count = 0;
+	if (stats_provider.TryGetCachedRowCount(mssql_schema.name, name, cached_row_count)) {
+		info.cardinality = cached_row_count;
+		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)",
+					   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)cached_row_count);
+		return info;
+	}
+
+	// Slow path: acquire connection and query DMV for fresh statistics
 	try {
 		auto &pool = mssql_catalog.GetConnectionPool();
 		auto connection = pool.Acquire();
 
 		if (connection) {
-			auto &stats_provider = mssql_catalog.GetStatisticsProvider();
 			idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
 			info.cardinality = row_count;
 			pool.Release(std::move(connection));
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
 						   name.c_str(), (unsigned long long)row_count);
 		} else {
-			// Fallback to cached row count if connection fails
 			info.cardinality = approx_row_count_;
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
 						   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
 		}
 	} catch (...) {
-		// Fallback to cached row count on any error
 		info.cardinality = approx_row_count_;
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)", mssql_schema.name.c_str(),
 					   name.c_str(), (unsigned long long)approx_row_count_);

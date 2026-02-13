@@ -230,6 +230,9 @@ public:
 	// Get table list load state for schema
 	CacheLoadState GetTablesState(const string &schema_name) const;
 
+	// Iterate all loaded tables, calling callback(schema_name, table_name, approx_row_count)
+	void ForEachTable(const std::function<void(const string &, const string &, idx_t)> &callback) const;
+
 	// Get column metadata load state for table
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;
 

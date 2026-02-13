@@ -64,6 +64,13 @@ public:
 	//! Invalidate all cached statistics
 	void InvalidateAll();
 
+	//! Pre-populate the cache with row counts (e.g. from BulkLoadAll)
+	//! Avoids per-table DMV queries when cardinality is already known
+	void PreloadRowCount(const string &schema_name, const string &table_name, idx_t row_count);
+
+	//! Try to get cached row count without connection (returns false if no valid cache entry)
+	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, idx_t &out_row_count);
+
 	//! Set the cache TTL
 	void SetCacheTTL(int64_t seconds);
 

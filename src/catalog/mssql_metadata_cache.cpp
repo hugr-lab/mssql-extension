@@ -463,6 +463,15 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	last_refresh_ = now;
 }
 
+void MSSQLMetadataCache::ForEachTable(const std::function<void(const string &, const string &, idx_t)> &callback) const {
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+	for (const auto &schema_pair : schemas_) {
+		for (const auto &table_pair : schema_pair.second.tables) {
+			callback(schema_pair.first, table_pair.first, table_pair.second.approx_row_count);
+		}
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Cache Management
 //===----------------------------------------------------------------------===//

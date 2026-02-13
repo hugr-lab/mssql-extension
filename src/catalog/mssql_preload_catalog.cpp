@@ -3,6 +3,7 @@
 
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -122,6 +123,13 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 		cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
 
 		pool.Release(std::move(connection));
+
+		// Pre-populate statistics cache with approx_row_count from bulk load
+		// This avoids per-table DMV queries when DuckDB calls GetStorageInfo()
+		auto &stats_provider = catalog.GetStatisticsProvider();
+		cache.ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
+			stats_provider.PreloadRowCount(schema, table, row_count);
+		});
 
 		// Build status message
 		string status;
