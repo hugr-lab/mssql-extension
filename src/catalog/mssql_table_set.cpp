@@ -105,7 +105,12 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	}
 
 	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
-	cache.LoadAllTableMetadata(*connection, schema_.name);
+	try {
+		cache.LoadAllTableMetadata(*connection, schema_.name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
 
 	pool.Release(std::move(connection));
 
@@ -153,7 +158,13 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 	}
 
 	// Get metadata for this specific table only (does NOT load all tables in schema)
-	auto table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+	const MSSQLTableMetadata *table_meta;
+	try {
+		table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
 
 	pool.Release(std::move(connection));
 
@@ -228,7 +239,13 @@ void MSSQLTableSet::EnsureNamesLoaded(ClientContext &context) {
 	}
 
 	// Only loads table names (fast, no column queries)
-	auto table_names = cache.GetTableNames(*connection, schema_.name);
+	vector<string> table_names;
+	try {
+		table_names = cache.GetTableNames(*connection, schema_.name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
 
 	pool.Release(std::move(connection));
 

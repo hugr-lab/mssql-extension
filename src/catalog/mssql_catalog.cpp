@@ -202,8 +202,17 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		throw IOException("Failed to acquire connection for schema lookup");
 	}
 
-	// Trigger lazy loading of schema list
-	metadata_cache_->EnsureSchemasLoaded(*connection);
+	// Trigger lazy loading of schema list (ensure connection released on exception)
+	try {
+		metadata_cache_->EnsureSchemasLoaded(*connection);
+	} catch (...) {
+		if (transaction.context) {
+			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
+		} else {
+			connection_pool_->Release(std::move(connection));
+		}
+		throw;
+	}
 
 	// Release connection properly (no-op if pinned to transaction)
 	if (transaction.context) {
@@ -251,7 +260,12 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 		throw IOException("Failed to acquire connection for schema scan");
 	}
 
-	schema_names = metadata_cache_->GetSchemaNames(*connection);
+	try {
+		schema_names = metadata_cache_->GetSchemaNames(*connection);
+	} catch (...) {
+		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
+		throw;
+	}
 
 	// Release connection properly (no-op if pinned to transaction)
 	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));

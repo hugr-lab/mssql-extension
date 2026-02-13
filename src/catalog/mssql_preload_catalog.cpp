@@ -116,11 +116,16 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 			throw IOException("mssql_preload_catalog: failed to acquire connection");
 		}
 
-		// Execute bulk preload
+		// Execute bulk preload (ensure connection is returned to pool even on exception)
 		idx_t schema_count = 0;
 		idx_t table_count = 0;
 		idx_t column_count = 0;
-		cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
+		try {
+			cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
+		} catch (...) {
+			pool.Release(std::move(connection));
+			throw;
+		}
 
 		pool.Release(std::move(connection));
 

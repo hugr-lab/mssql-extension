@@ -74,38 +74,7 @@ WHERE o.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
 )";
 
-// Bulk metadata query: loads ALL schemas, tables, and columns in one round trip
-// Used by mssql_preload_catalog() to avoid per-table column discovery queries
-// Results are ordered by schema_name, object_name, column_id for streaming group-by parse
-// Note: ORDER BY is appended dynamically after optional filter clauses
-static const char *BULK_METADATA_SQL = R"(
-SELECT
-    s.name AS schema_name,
-    o.name AS object_name,
-    o.type AS object_type,
-    ISNULL(p.rows, 0) AS approx_rows,
-    c.name AS column_name,
-    c.column_id,
-    t.name AS type_name,
-    c.max_length,
-    c.precision,
-    c.scale,
-    c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name
-FROM sys.schemas s
-INNER JOIN sys.objects o ON o.schema_id = s.schema_id
-INNER JOIN sys.columns c ON c.object_id = o.object_id
-JOIN sys.types t ON c.user_type_id = t.user_type_id
-LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
-WHERE s.schema_id NOT IN (3, 4)
-  AND s.principal_id != 0
-  AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
-                     'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
-                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
-  AND o.type IN ('U', 'V')
-  AND o.is_ms_shipped = 0)";
-
-// Same query but scoped to a single schema
+// Bulk metadata query scoped to a single schema
 // Note: ORDER BY is appended dynamically after optional filter clauses
 static const char *BULK_METADATA_SCHEMA_SQL_TEMPLATE = R"(
 SELECT
@@ -174,6 +143,11 @@ using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
 static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
 							int timeout_ms) {
+	// Log the query being executed (truncated for readability)
+	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s",
+				timeout_ms, sql.c_str(), sql.size() > 120 ? "..." : "");
+
+	auto start = std::chrono::steady_clock::now();
 	auto result = MSSQLSimpleQuery::ExecuteWithCallback(
 		connection, sql,
 		[&callback](const std::vector<std::string> &row) {
@@ -188,9 +162,16 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 		},
 		timeout_ms);
 
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - start).count();
+
 	if (result.HasError()) {
+		CACHE_DEBUG(1, "RunMetadataQuery: FAILED after %lldms — %s",
+					(long long)elapsed, result.error_message.c_str());
 		throw IOException("Metadata query failed: %s", result.error_message);
 	}
+
+	CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
 }
 
 //===----------------------------------------------------------------------===//
@@ -582,140 +563,149 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 
 void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const string &schema_name,
 									 idx_t &schema_count, idx_t &table_count, idx_t &column_count) {
-	std::lock_guard<std::mutex> lock(schemas_mutex_);
-
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
 
-	// Build query — optionally scoped to a single schema
-	string sql;
-	if (schema_name.empty()) {
-		sql = BULK_METADATA_SQL;
+	// Determine which schemas to load.
+	// When schema_name is empty, we iterate per-schema instead of one massive cross-schema
+	// query. This avoids SQL Server tempdb sort spills on large catalogs (200K+ tables)
+	// where the ORDER BY s.name, o.name, c.column_id on millions of rows exceeds the
+	// memory grant and causes non-linear performance degradation.
+	vector<string> schemas_to_load;
+	if (!schema_name.empty()) {
+		schemas_to_load.push_back(schema_name);
 	} else {
-		sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
-	}
-
-	// Push filters to SQL Server if convertible to LIKE
-	if (filter_) {
-		if (filter_->HasSchemaFilter()) {
+		// Load schema names first (fast, lightweight query — no lock needed yet)
+		string schema_sql = SCHEMA_DISCOVERY_SQL;
+		if (filter_ && filter_->HasSchemaFilter()) {
 			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
 			if (!like_clause.empty()) {
-				sql += " AND " + like_clause;
+				schema_sql += " AND " + like_clause;
 			}
 		}
-		if (filter_->HasTableFilter()) {
+		schema_sql += "\nORDER BY s.name";
+
+		RunMetadataQuery(connection, schema_sql, [&](const vector<string> &values) {
+			if (!values.empty()) {
+				schemas_to_load.push_back(values[0]);
+			}
+		}, metadata_timeout_ms_);
+
+		CACHE_DEBUG(1, "BulkLoadAll: discovered %zu schemas to load", schemas_to_load.size());
+	}
+
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+
+	// Load metadata per schema — each query sorts only within one schema,
+	// keeping the result set small enough to avoid tempdb spills
+	for (const auto &target_schema : schemas_to_load) {
+		// Ensure schema entry exists
+		auto schema_it = schemas_.find(target_schema);
+		if (schema_it == schemas_.end()) {
+			schemas_.emplace(target_schema, MSSQLSchemaMetadata(target_schema));
+			schema_it = schemas_.find(target_schema);
+			schema_count++;
+		}
+		auto &schema = schema_it->second;
+
+		// Build per-schema query
+		string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, target_schema);
+
+		// Push table filter to SQL Server if convertible to LIKE
+		if (filter_ && filter_->HasTableFilter()) {
 			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
 			if (!like_clause.empty()) {
 				sql += " AND " + like_clause;
 			}
 		}
-	}
-	sql += "\nORDER BY s.name, o.name, c.column_id";
+		sql += "\nORDER BY s.name, o.name, c.column_id";
 
-	// Streaming group-by parse: rows are ordered by schema_name, object_name, column_id
-	// Track current schema and table to detect group boundaries
-	string current_schema;
-	string current_table;
-	MSSQLSchemaMetadata *current_schema_meta = nullptr;
-	MSSQLTableMetadata *current_table_meta = nullptr;
+		// Streaming group-by parse for this schema
+		string current_table;
+		MSSQLTableMetadata *current_table_meta = nullptr;
+		idx_t schema_tables = 0;
+		idx_t schema_columns = 0;
 
-	ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
-		if (values.size() < 12) {
-			return;
-		}
-
-		string row_schema = values[0];
-		string row_table = values[1];
-		string row_type = values[2];
-		string row_approx_rows = values[3];
-		string col_name = values[4];
-		string col_id_str = values[5];
-		string type_name = values[6];
-		string max_len_str = values[7];
-		string prec_str = values[8];
-		string scale_str = values[9];
-		string nullable_str = values[10];
-		string collation = values[11];
-
-		// Apply filters
-		if (filter_) {
-			if (!filter_->MatchesSchema(row_schema)) {
+		ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
+			if (values.size() < 12) {
 				return;
 			}
-			if (!filter_->MatchesTable(row_table)) {
+
+			string row_table = values[1];
+			string row_type = values[2];
+			string row_approx_rows = values[3];
+			string col_name = values[4];
+			string col_id_str = values[5];
+			string type_name = values[6];
+			string max_len_str = values[7];
+			string prec_str = values[8];
+			string scale_str = values[9];
+			string nullable_str = values[10];
+			string collation = values[11];
+
+			// Apply table filter
+			if (filter_ && !filter_->MatchesTable(row_table)) {
 				return;
 			}
-		}
 
-		// New schema group?
-		if (row_schema != current_schema) {
-			current_schema = row_schema;
-			current_table.clear();
-			current_table_meta = nullptr;
+			// New table group?
+			if (row_table != current_table) {
+				current_table = row_table;
 
-			// Get or create schema entry
-			auto schema_it = schemas_.find(current_schema);
-			if (schema_it == schemas_.end()) {
-				schemas_.emplace(current_schema, MSSQLSchemaMetadata(current_schema));
-				schema_it = schemas_.find(current_schema);
-				schema_count++;
-			}
-			current_schema_meta = &schema_it->second;
-		}
+				auto &tables = schema.tables;
+				auto table_it = tables.find(current_table);
+				if (table_it == tables.end()) {
+					MSSQLTableMetadata table_meta;
+					table_meta.name = current_table;
 
-		// New table group?
-		if (row_table != current_table) {
-			current_table = row_table;
+					// Object type
+					if (!row_type.empty() && row_type[0] == 'V') {
+						table_meta.object_type = MSSQLObjectType::VIEW;
+					} else {
+						table_meta.object_type = MSSQLObjectType::TABLE;
+					}
 
-			// Get or create table entry
-			auto &tables = current_schema_meta->tables;
-			auto table_it = tables.find(current_table);
-			if (table_it == tables.end()) {
-				MSSQLTableMetadata table_meta;
-				table_meta.name = current_table;
+					// Approximate row count
+					try {
+						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+					} catch (...) {
+						table_meta.approx_row_count = 0;
+					}
 
-				// Object type
-				if (!row_type.empty() && row_type[0] == 'V') {
-					table_meta.object_type = MSSQLObjectType::VIEW;
+					tables.emplace(current_table, std::move(table_meta));
+					table_it = tables.find(current_table);
+					schema_tables++;
+					table_count++;
 				} else {
-					table_meta.object_type = MSSQLObjectType::TABLE;
+					// Table already exists (e.g. columns loaded by a prior single-table query).
+					// Clear columns to avoid duplicates, since we're reloading from bulk query.
+					table_it->second.columns.clear();
 				}
-
-				// Approximate row count
-				try {
-					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
-				} catch (...) {
-					table_meta.approx_row_count = 0;
-				}
-
-				tables.emplace(current_table, std::move(table_meta));
-				table_it = tables.find(current_table);
-				table_count++;
-			} else {
-				// Table already exists (e.g. columns loaded by a prior single-table query).
-				// Clear columns to avoid duplicates, since we're reloading from bulk query.
-				table_it->second.columns.clear();
+				current_table_meta = &table_it->second;
 			}
-			current_table_meta = &table_it->second;
-		}
 
-		// Parse column info
-		int32_t col_id = 0;
-		try { col_id = static_cast<int32_t>(std::stoi(col_id_str)); } catch (...) {}
-		int16_t max_len = 0;
-		try { max_len = static_cast<int16_t>(std::stoi(max_len_str)); } catch (...) {}
-		uint8_t prec = 0;
-		try { prec = static_cast<uint8_t>(std::stoi(prec_str)); } catch (...) {}
-		uint8_t scl = 0;
-		try { scl = static_cast<uint8_t>(std::stoi(scale_str)); } catch (...) {}
-		bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+			// Parse column info
+			int32_t col_id = 0;
+			try { col_id = static_cast<int32_t>(std::stoi(col_id_str)); } catch (...) {}
+			int16_t max_len = 0;
+			try { max_len = static_cast<int16_t>(std::stoi(max_len_str)); } catch (...) {}
+			uint8_t prec = 0;
+			try { prec = static_cast<uint8_t>(std::stoi(prec_str)); } catch (...) {}
+			uint8_t scl = 0;
+			try { scl = static_cast<uint8_t>(std::stoi(scale_str)); } catch (...) {}
+			bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
 
-		MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-								 database_collation_);
-		current_table_meta->columns.push_back(std::move(col_info));
-		column_count++;
-	});
+			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+									 database_collation_);
+			current_table_meta->columns.push_back(std::move(col_info));
+			schema_columns++;
+			column_count++;
+		});
+
+		CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns",
+					target_schema.c_str(), (unsigned long long)schema_tables, (unsigned long long)schema_columns);
+	}
 
 	// Mark all load states as LOADED
 	auto now = std::chrono::steady_clock::now();
