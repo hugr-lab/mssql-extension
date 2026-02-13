@@ -1453,6 +1453,7 @@ The following features are planned for future releases:
 
 - **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
 - **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
+- **Updating primary key columns**: UPDATE cannot modify primary key columns (used for row identification)
 - **Windows Authentication**: Only SQL Server authentication is supported
 - **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures

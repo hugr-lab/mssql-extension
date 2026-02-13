@@ -20,11 +20,12 @@ namespace azure {
 //===----------------------------------------------------------------------===//
 struct AzureSecretInfo {
 	std::string secret_name;
-	std::string provider;		// service_principal, credential_chain, managed_identity
+	std::string provider;		// service_principal, credential_chain, managed_identity, access_token
 	std::string tenant_id;		// Required for service_principal, optional for others
 	std::string client_id;		// Required for service_principal, optional for managed_identity
 	std::string client_secret;	// Required for service_principal only
 	std::string chain;			// For credential_chain: cli, env, managed_identity, interactive
+	std::string access_token;	// For access_token provider: pre-provided JWT token (Issue #57)
 };
 
 //===----------------------------------------------------------------------===//
