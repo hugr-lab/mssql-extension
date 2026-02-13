@@ -23,8 +23,8 @@ constexpr const char *MSSQL_SECRET_USE_ENCRYPT = "use_encrypt";			 // Optional, 
 constexpr const char *MSSQL_SECRET_CATALOG = "catalog";					 // Optional, defaults to true
 constexpr const char *MSSQL_SECRET_AZURE_SECRET = "azure_secret";		 // Optional, for Azure AD auth
 constexpr const char *MSSQL_SECRET_AZURE_TENANT_ID = "azure_tenant_id";	 // Optional, tenant for interactive auth
-constexpr const char *MSSQL_SECRET_ACCESS_TOKEN = "access_token";  // Optional, direct Azure AD JWT token (Spec 032)
-constexpr const char *MSSQL_SECRET_SCHEMA_FILTER = "schema_filter";  // Optional, regex schema visibility filter
+constexpr const char *MSSQL_SECRET_ACCESS_TOKEN = "access_token";	 // Optional, direct Azure AD JWT token (Spec 032)
+constexpr const char *MSSQL_SECRET_SCHEMA_FILTER = "schema_filter";	 // Optional, regex schema visibility filter
 constexpr const char *MSSQL_SECRET_TABLE_FILTER = "table_filter";	 // Optional, regex table visibility filter
 
 // Register MSSQL secret type and creation function

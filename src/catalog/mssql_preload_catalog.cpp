@@ -80,74 +80,76 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 
 	auto &catalog_names = args.data[0];
 
-	UnaryExecutor::Execute<string_t, string_t>(catalog_names, result, args.size(), [&](string_t catalog_str) -> string_t {
-		string catalog_name = bind_data.catalog_name;
-		if (catalog_name.empty()) {
-			catalog_name = catalog_str.GetString();
-		}
+	UnaryExecutor::Execute<string_t, string_t>(
+		catalog_names, result, args.size(), [&](string_t catalog_str) -> string_t {
+			string catalog_name = bind_data.catalog_name;
+			if (catalog_name.empty()) {
+				catalog_name = catalog_str.GetString();
+			}
 
-		auto &client_context = state.GetContext();
+			auto &client_context = state.GetContext();
 
-		// Get the MSSQL context
-		auto &manager = MSSQLContextManager::Get(*client_context.db);
-		auto ctx = manager.GetContext(catalog_name);
-		if (!ctx) {
-			throw InvalidInputException(
-				"mssql_preload_catalog: catalog '%s' not found. "
-				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-				catalog_name, catalog_name);
-		}
+			// Get the MSSQL context
+			auto &manager = MSSQLContextManager::Get(*client_context.db);
+			auto ctx = manager.GetContext(catalog_name);
+			if (!ctx) {
+				throw InvalidInputException(
+					"mssql_preload_catalog: catalog '%s' not found. "
+					"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+					catalog_name, catalog_name);
+			}
 
-		if (!ctx->attached_db) {
-			throw InvalidInputException("mssql_preload_catalog: catalog '%s' has no attached database", catalog_name);
-		}
+			if (!ctx->attached_db) {
+				throw InvalidInputException("mssql_preload_catalog: catalog '%s' has no attached database",
+											catalog_name);
+			}
 
-		// Get the MSSQL catalog
-		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
-		auto &cache = catalog.GetMetadataCache();
-		auto &pool = catalog.GetConnectionPool();
+			// Get the MSSQL catalog
+			auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
+			auto &cache = catalog.GetMetadataCache();
+			auto &pool = catalog.GetConnectionPool();
 
-		// Ensure cache settings are loaded
-		catalog.EnsureCacheLoaded(client_context);
+			// Ensure cache settings are loaded
+			catalog.EnsureCacheLoaded(client_context);
 
-		// Acquire connection
-		auto connection = pool.Acquire();
-		if (!connection) {
-			throw IOException("mssql_preload_catalog: failed to acquire connection");
-		}
+			// Acquire connection
+			auto connection = pool.Acquire();
+			if (!connection) {
+				throw IOException("mssql_preload_catalog: failed to acquire connection");
+			}
 
-		// Execute bulk preload (ensure connection is returned to pool even on exception)
-		idx_t schema_count = 0;
-		idx_t table_count = 0;
-		idx_t column_count = 0;
-		try {
-			cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
-		} catch (...) {
+			// Execute bulk preload (ensure connection is returned to pool even on exception)
+			idx_t schema_count = 0;
+			idx_t table_count = 0;
+			idx_t column_count = 0;
+			try {
+				cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
+			} catch (...) {
+				pool.Release(std::move(connection));
+				throw;
+			}
+
 			pool.Release(std::move(connection));
-			throw;
-		}
 
-		pool.Release(std::move(connection));
+			// Pre-populate statistics cache with approx_row_count from bulk load
+			// This avoids per-table DMV queries when DuckDB calls GetStorageInfo()
+			auto &stats_provider = catalog.GetStatisticsProvider();
+			cache.ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
+				stats_provider.PreloadRowCount(schema, table, row_count);
+			});
 
-		// Pre-populate statistics cache with approx_row_count from bulk load
-		// This avoids per-table DMV queries when DuckDB calls GetStorageInfo()
-		auto &stats_provider = catalog.GetStatisticsProvider();
-		cache.ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
-			stats_provider.PreloadRowCount(schema, table, row_count);
+			// Build status message
+			string status;
+			if (bind_data.schema_name.empty()) {
+				status = StringUtil::Format("Preloaded %llu schemas, %llu tables, %llu columns", schema_count,
+											table_count, column_count);
+			} else {
+				status = StringUtil::Format("Preloaded schema '%s': %llu tables, %llu columns", bind_data.schema_name,
+											table_count, column_count);
+			}
+
+			return StringVector::AddString(result, status);
 		});
-
-		// Build status message
-		string status;
-		if (bind_data.schema_name.empty()) {
-			status = StringUtil::Format("Preloaded %llu schemas, %llu tables, %llu columns",
-										schema_count, table_count, column_count);
-		} else {
-			status = StringUtil::Format("Preloaded schema '%s': %llu tables, %llu columns",
-										bind_data.schema_name, table_count, column_count);
-		}
-
-		return StringVector::AddString(result, status);
-	});
 }
 
 //===----------------------------------------------------------------------===//

@@ -78,12 +78,12 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	MSSQLSchemaEntry &schema_;									  // Parent schema
+	MSSQLSchemaEntry &schema_;	// Parent schema
 
 	// Level 1: Table names only (fast, no column queries)
-	std::unordered_set<string> known_table_names_;				  // Names of all tables in schema
-	std::atomic<bool> names_loaded_;							  // True when table names are loaded
-	std::mutex names_mutex_;									  // Names loading synchronization
+	std::unordered_set<string> known_table_names_;	// Names of all tables in schema
+	std::atomic<bool> names_loaded_;				// True when table names are loaded
+	std::mutex names_mutex_;						// Names loading synchronization
 
 	// Level 2: Full entries with columns (created on demand)
 	std::atomic<bool> is_fully_loaded_;							  // True when ALL tables are loaded

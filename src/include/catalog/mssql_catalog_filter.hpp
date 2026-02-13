@@ -56,4 +56,4 @@ private:
 	bool has_table_filter_ = false;
 };
 
-} // namespace duckdb
+}  // namespace duckdb

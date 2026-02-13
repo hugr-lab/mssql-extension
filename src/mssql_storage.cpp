@@ -809,8 +809,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string access_token;  // Spec 032: Direct Azure AD JWT token
 	bool catalog_option_specified = false;
 	bool catalog_enabled_option = true;	 // Default to true
-	string schema_filter_option;		   // Spec 033: ATTACH-level schema filter
-	string table_filter_option;			   // Spec 033: ATTACH-level table filter
+	string schema_filter_option;		 // Spec 033: ATTACH-level schema filter
+	string table_filter_option;			 // Spec 033: ATTACH-level table filter
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
 	for (auto it = options.options.begin(); it != options.options.end();) {

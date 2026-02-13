@@ -105,7 +105,7 @@ void MSSQLStatisticsProvider::PreloadRowCount(const string &schema_name, const s
 }
 
 bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
-													idx_t &out_row_count) {
+												   idx_t &out_row_count) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto key = BuildCacheKey(schema_name, table_name);
 	auto it = cache_.find(key);

@@ -160,8 +160,8 @@ public:
 	// @param schema_count Output: number of schemas loaded
 	// @param table_count Output: number of tables loaded
 	// @param column_count Output: number of columns loaded
-	void BulkLoadAll(tds::TdsConnection &connection, const string &schema_name,
-					 idx_t &schema_count, idx_t &table_count, idx_t &column_count);
+	void BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count, idx_t &table_count,
+					 idx_t &column_count);
 
 	//===----------------------------------------------------------------------===//
 	// Cache Management
@@ -215,8 +215,6 @@ public:
 
 	// Ensure table list for schema is loaded
 	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
-
-
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation

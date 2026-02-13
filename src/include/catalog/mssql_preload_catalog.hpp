@@ -10,7 +10,7 @@ namespace duckdb {
 
 struct MSSQLPreloadCatalogBindData : public FunctionData {
 	string catalog_name;
-	string schema_name;  // Optional: limit preload to specific schema
+	string schema_name;	 // Optional: limit preload to specific schema
 
 	MSSQLPreloadCatalogBindData(string catalog_name_p, string schema_name_p)
 		: catalog_name(std::move(catalog_name_p)), schema_name(std::move(schema_name_p)) {}
