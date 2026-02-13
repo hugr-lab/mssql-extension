@@ -107,6 +107,8 @@ CREATE SECRET secret_name (
 | `password`    | VARCHAR | Yes      | Password (hidden in duckdb_secrets)  |
 | `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: true) |
 | `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
+| `schema_filter` | VARCHAR | No     | Regex pattern to filter visible schemas (case-insensitive partial match) |
+| `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
 
 Attach using the secret:
 
@@ -220,6 +222,42 @@ With catalog disabled:
 - Schema browsing via `duckdb_schemas()`, `duckdb_tables()` is not available
 - Three-part naming (`db.schema.table`) is not available
 - Use `mssql_scan()` for all queries instead
+
+### Catalog Filters
+
+For large databases with thousands of schemas or tables, you can filter which objects are visible to DuckDB using regex patterns. This significantly reduces metadata loading time and memory usage.
+
+#### Using Secret
+
+```sql
+CREATE SECRET erp_db (
+    TYPE mssql,
+    host 'erp-server.example.com',
+    port 1433,
+    database 'ERP',
+    user 'readonly',
+    password 'Password123',
+    schema_filter '^(dbo|sales|inventory)$',  -- Only these schemas
+    table_filter '^(Order|Product|Customer)'   -- Tables starting with these prefixes
+);
+
+ATTACH '' AS erp (TYPE mssql, SECRET erp_db);
+```
+
+#### Using Connection String
+
+```sql
+ATTACH 'Server=erp-server,1433;Database=ERP;User Id=sa;Password=pass;SchemaFilter=^dbo$;TableFilter=^Order'
+    AS erp (TYPE mssql);
+```
+
+#### Filter Behavior
+
+- Filters use case-insensitive regex partial match (C++ `std::regex_search`)
+- Use `^` and `$` anchors for exact matching: `^dbo$` matches only "dbo"
+- Without anchors, `dbo` matches "dbo", "dbo_archive", "test_dbo", etc.
+- Filters apply to catalog browsing, schema scans, and metadata loading
+- `mssql_scan()` and `mssql_exec()` bypass filters (raw SQL access)
 
 ### Connection Validation
 
@@ -988,6 +1026,24 @@ SELECT mssql_refresh_cache('sqlserver');
 - Non-existent catalog throws an error
 - Catalog that is not an MSSQL type throws an error
 
+### mssql_preload_catalog()
+
+Bulk-load all metadata (schemas, tables, columns) for an attached MSSQL catalog in a single operation. This is useful for large databases where you want to avoid per-table metadata queries during subsequent queries.
+
+**Signature:** `mssql_preload_catalog(catalog_name VARCHAR [, schema_name VARCHAR]) -> VARCHAR`
+
+```sql
+-- Preload all schemas
+SELECT mssql_preload_catalog('sqlserver');
+-- Returns: 'Preloaded 5 schemas, 120 tables, 890 columns'
+
+-- Preload a specific schema only
+SELECT mssql_preload_catalog('sqlserver', 'dbo');
+-- Returns: 'Preloaded schema 'dbo': 80 tables, 650 columns'
+```
+
+The function loads metadata per-schema to avoid SQL Server tempdb sort spills on large databases. Statistics (approximate row counts) are also pre-populated to avoid per-table DMV queries.
+
 ## Type Mapping
 
 ### Numeric Types
@@ -1058,13 +1114,14 @@ Queries involving unsupported types will raise an error.
 
 | Setting                    | Type    | Default | Range | Description                              |
 | -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
-| `mssql_connection_limit`   | BIGINT  | 10      | ≥1    | Max connections per attached database    |
+| `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
 | `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |
 | `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | Connection acquire timeout (seconds)     |
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
+| `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
 
 ### Statistics Settings
@@ -1134,7 +1191,7 @@ COPY large_dataset TO 'mssql://db/dbo/target' (FORMAT 'bcp');
 
 ```sql
 -- High-concurrency workloads
-SET mssql_connection_limit = 20;  -- More connections (default: 10)
+SET mssql_connection_limit = 100; -- More connections (default: 64)
 SET mssql_min_connections = 5;    -- Pre-warm more connections (default: 0)
 
 -- Long-running analytics

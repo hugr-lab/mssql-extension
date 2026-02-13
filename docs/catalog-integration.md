@@ -8,6 +8,7 @@ The catalog layer integrates with DuckDB's catalog system to expose SQL Server s
 duckdb::Catalog
   └── MSSQLCatalog
         ├── MSSQLMetadataCache (metadata with TTL)
+        ├── MSSQLCatalogFilter (regex-based visibility)
         ├── MSSQLStatisticsProvider (row count cache)
         └── schema_entries_: Map<name, MSSQLSchemaEntry>
 
@@ -55,6 +56,8 @@ Top-level catalog for an attached MSSQL database. One instance per `ATTACH ... T
 | `EnsureCacheLoaded(context)` | Load or refresh metadata cache if needed |
 | `InvalidateMetadataCache()` | Force cache refresh on next access |
 | `GetMetadataCache()` | Direct cache access |
+| `GetCatalogFilter()` | Access catalog visibility filter |
+| `GetStatisticsProvider()` | Access statistics provider |
 
 ### Schema Lookup Flow
 
@@ -149,19 +152,26 @@ struct PrimaryKeyInfo {
 
 **Files**: `src/catalog/mssql_table_set.cpp`, `src/include/catalog/mssql_table_set.hpp`
 
-Lazy-loaded collection of table entries per schema. Uses double-checked locking for thread-safe initialization.
+Lazy-loaded collection of table entries per schema. Implements multi-level lazy loading to avoid loading all tables at once.
 
-```cpp
-void EnsureLoaded(ClientContext &context) {
-    if (is_loaded_.load()) return;        // Fast path (atomic)
-    std::lock_guard<std::mutex> lock(load_mutex_);
-    if (is_loaded_.load()) return;        // Slow path
-    LoadEntries(context);
-    is_loaded_.store(true);
-}
-```
+### Entry Access Strategy
 
-`LoadEntries()` reads table metadata from `MSSQLMetadataCache` and creates `MSSQLTableEntry` for each table/view.
+`GetEntry(name)` uses a cascading lookup to minimize SQL Server round trips:
+
+1. **Cache hit** — check `entries_` map (fast path)
+2. **Already attempted** — check `attempted_tables_` set (avoid retries)
+3. **Fully loaded** — if `is_fully_loaded_`, table doesn't exist
+4. **Table filter** — check `MSSQLCatalogFilter` (skip filtered-out tables)
+5. **Known names** — if `names_loaded_` and name not in `known_table_names_`, table doesn't exist
+6. **Load single entry** — `LoadSingleEntry()` queries only this table's metadata
+
+### Table Name Preloading
+
+`EnsureNamesLoaded()` loads only table names (no column metadata) for a schema using a lightweight query. This populates `known_table_names_` which acts as a negative lookup cache — if a table name isn't in this set, it doesn't exist and we skip the expensive column query.
+
+### Bulk Scan
+
+`Scan()` triggers `LoadAllTableMetadata()` which loads all tables and columns for the schema from cache (or SQL Server if not cached). This is used for `duckdb_tables()` and similar catalog browsing queries.
 
 ## MSSQLMetadataCache
 
@@ -290,6 +300,60 @@ Caches row count statistics from `sys.dm_db_partition_stats` with configurable T
 
 Statistics are keyed by `"schema.table"` and expire after `cache_ttl_seconds_` (default 300s).
 
+## MSSQLCatalogFilter
+
+**Files**: `src/catalog/mssql_catalog_filter.cpp`, `src/include/catalog/mssql_catalog_filter.hpp`
+
+Regex-based visibility filter for schemas and tables. Configured via `schema_filter` and `table_filter` parameters in secrets, connection strings, or ATTACH options.
+
+### Configuration Sources
+
+Filters can be specified in multiple places (ATTACH options override secret/connection string values):
+
+| Source | Schema Key | Table Key |
+|--------|-----------|-----------|
+| MSSQL Secret | `schema_filter` | `table_filter` |
+| ADO.NET Connection String | `SchemaFilter` | `TableFilter` |
+| URI Query Parameters | `schema_filter` | `table_filter` |
+| ATTACH Options | `schema_filter` | `table_filter` |
+
+### Filter Matching
+
+- Uses C++ `std::regex` with `std::regex_constants::icase` (case-insensitive)
+- Matching is via `std::regex_search` (partial match — pattern doesn't need to match the entire name)
+- Use `^` and `$` anchors for exact matching: `^dbo$` matches only "dbo"
+
+### SQL Server-Side Optimization
+
+When possible, regex patterns are converted to SQL Server `LIKE` clauses via `TryRegexToSQLLike()` to filter at the SQL Server level rather than client-side. Simple patterns like `^dbo$` become `s.name = N'dbo'`, and `^(dbo|sales)$` becomes `s.name IN (N'dbo', N'sales')`.
+
+### Integration Points
+
+- `MSSQLCatalog::LookupSchema()` — filters schema lookups
+- `MSSQLCatalog::ScanSchemas()` — filters schema enumeration
+- `MSSQLTableSet::GetEntry()` — filters table lookups
+- `MSSQLMetadataCache::Refresh()` — adds SQL WHERE clauses to metadata queries
+
+## Bulk Preload (mssql_preload_catalog)
+
+**Files**: `src/catalog/mssql_preload_catalog.cpp`, `src/include/catalog/mssql_preload_catalog.hpp`
+
+The `mssql_preload_catalog(catalog_name [, schema_name])` scalar function triggers `MSSQLMetadataCache::BulkLoadAll()` to load all schemas, tables, and columns in bulk.
+
+### Per-Schema Iteration Strategy
+
+`BulkLoadAll()` uses a per-schema iteration strategy instead of a single cross-schema query:
+
+1. **Discover schemas** — lightweight query against `sys.schemas`
+2. **Per-schema bulk query** — for each schema, load all tables and columns using `BULK_METADATA_SCHEMA_SQL_TEMPLATE`
+3. **Streaming parse** — results are parsed row-by-row, building `MSSQLTableMetadata` entries
+
+This avoids SQL Server tempdb sort spills that occur when `ORDER BY s.name, o.name, c.column_id` operates on millions of rows in a single cross-schema query. Each per-schema query sorts only within one schema's data, which fits in SQL Server's memory grant.
+
+### Statistics Pre-Population
+
+After bulk loading, `mssql_preload_catalog()` also pre-populates the statistics cache with approximate row counts from the bulk query. This avoids per-table DMV queries when DuckDB calls `GetStorageInfo()`.
+
 ## Data Flow
 
 ### Metadata Discovery
@@ -313,8 +377,10 @@ LookupSchema() → EnsureCacheLoaded()
   └─ Create MSSQLSchemaEntry → MSSQLTableSet
 
 MSSQLTableSet::GetEntry(table_name)
-  ├─ EnsureLoaded() → LoadEntries() from cache
-  └─ Create MSSQLTableEntry per table
+  ├─ Check entries_ cache (fast path)
+  ├─ Check catalog filter (skip filtered-out tables)
+  ├─ Check known_table_names_ (negative lookup cache)
+  └─ LoadSingleEntry() → load only this table's metadata
 
 MSSQLTableEntry::GetScanFunction()
   ├─ EnsurePKLoaded() → Query sys.key_constraints

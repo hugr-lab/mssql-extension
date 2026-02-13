@@ -162,7 +162,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `mssql_connection_limit` | 10 | Max connections per context |
+| `mssql_connection_limit` | 64 | Max connections per context |
 | `mssql_connection_timeout` | 30 | TCP timeout (seconds) |
 | `mssql_idle_timeout` | 300 | Idle connection timeout (seconds) |
 | `mssql_min_connections` | 0 | Min connections to maintain |
@@ -172,7 +172,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
-| `mssql_insert_max_sql_bytes` | 1MB | INSERT SQL size limit |
+| `mssql_insert_max_sql_bytes` | 8MB (8388608) | INSERT SQL size limit |
 | `mssql_insert_use_returning_output` | true | Use OUTPUT INSERTED for RETURNING |
 | `mssql_dml_batch_size` | 500 | Rows per UPDATE/DELETE batch |
 | `mssql_dml_max_parameters` | 2000 | Max parameters per UPDATE/DELETE statement |
