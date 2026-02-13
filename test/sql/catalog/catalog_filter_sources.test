@@ -1,0 +1,511 @@
+# name: test/sql/catalog/catalog_filter_sources.test
+# description: Test catalog filters via connection strings (ADO.NET/URI) and secrets
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - ADO.NET connection string to TestDB
+#   MSSQL_TESTDB_URI - URI connection string to TestDB
+#   MSSQL_TEST_HOST, MSSQL_TEST_PORT, MSSQL_TEST_USER, MSSQL_TEST_PASS
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TESTDB_URI
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+# =============================================================================
+# Setup: Create test tables in dbo and a separate schema
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cfs_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = ''cfs_other'') EXEC(''CREATE SCHEMA cfs_other'')');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'IF OBJECT_ID(''dbo.cfs_orders'') IS NOT NULL DROP TABLE dbo.cfs_orders');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'IF OBJECT_ID(''dbo.cfs_products'') IS NOT NULL DROP TABLE dbo.cfs_products');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'IF OBJECT_ID(''cfs_other.cfs_items'') IS NOT NULL DROP TABLE cfs_other.cfs_items');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'CREATE TABLE dbo.cfs_orders (id INT PRIMARY KEY, total DECIMAL(10,2))');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'CREATE TABLE dbo.cfs_products (id INT PRIMARY KEY, name NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'CREATE TABLE cfs_other.cfs_items (id INT PRIMARY KEY, label NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'INSERT INTO dbo.cfs_orders VALUES (1, 99.99)');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'INSERT INTO dbo.cfs_products VALUES (1, N''Widget'')');
+
+statement ok
+SELECT mssql_exec('cfs_setup', 'INSERT INTO cfs_other.cfs_items VALUES (1, N''Item1'')');
+
+statement ok
+DETACH cfs_setup;
+
+# =============================================================================
+# Test 1: ADO.NET connection string — table_filter
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS ado_tf (TYPE mssql);
+
+# Matching table should be queryable
+query IR
+SELECT id, total FROM ado_tf.dbo.cfs_orders;
+----
+1	99.99
+
+# Non-matching table should not be visible
+statement error
+SELECT * FROM ado_tf.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH ado_tf;
+
+# =============================================================================
+# Test 2: ADO.NET connection string — schema_filter
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Schema_Filter=^dbo$' AS ado_sf (TYPE mssql);
+
+# dbo tables should be visible
+query IR
+SELECT id, total FROM ado_sf.dbo.cfs_orders;
+----
+1	99.99
+
+# Non-dbo schema should not be visible
+statement error
+SELECT * FROM ado_sf.cfs_other.cfs_items;
+----
+does not exist
+
+statement ok
+DETACH ado_sf;
+
+# =============================================================================
+# Test 3: ADO.NET connection string — both filters combined
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Schema_Filter=^dbo$;Table_Filter=^cfs_orders$' AS ado_both (TYPE mssql);
+
+query IR
+SELECT id, total FROM ado_both.dbo.cfs_orders;
+----
+1	99.99
+
+# Table doesn't match table_filter
+statement error
+SELECT * FROM ado_both.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH ado_both;
+
+# =============================================================================
+# Test 4: ADO.NET — alternative key names (SchemaFilter, TableFilter)
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};SchemaFilter=^dbo$;TableFilter=^cfs_orders$' AS ado_alt (TYPE mssql);
+
+query IR
+SELECT id, total FROM ado_alt.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM ado_alt.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH ado_alt;
+
+# =============================================================================
+# Test 5: URI connection string — table_filter
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_URI}?table_filter=^cfs_orders$' AS uri_tf (TYPE mssql);
+
+query IR
+SELECT id, total FROM uri_tf.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM uri_tf.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH uri_tf;
+
+# =============================================================================
+# Test 6: URI connection string — schema_filter
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_URI}?schema_filter=^dbo$' AS uri_sf (TYPE mssql);
+
+query IR
+SELECT id, total FROM uri_sf.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM uri_sf.cfs_other.cfs_items;
+----
+does not exist
+
+statement ok
+DETACH uri_sf;
+
+# =============================================================================
+# Test 7: URI connection string — both filters combined
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_URI}?schema_filter=^dbo$&table_filter=^cfs_orders$' AS uri_both (TYPE mssql);
+
+query IR
+SELECT id, total FROM uri_both.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM uri_both.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH uri_both;
+
+# =============================================================================
+# Test 8: Secret — table_filter
+# =============================================================================
+
+statement ok
+CREATE SECRET cfs_secret_tf (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    table_filter '^cfs_orders$'
+);
+
+statement ok
+ATTACH '' AS sec_tf (TYPE mssql, SECRET cfs_secret_tf);
+
+query IR
+SELECT id, total FROM sec_tf.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM sec_tf.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH sec_tf;
+
+statement ok
+DROP SECRET cfs_secret_tf;
+
+# =============================================================================
+# Test 9: Secret — schema_filter
+# =============================================================================
+
+statement ok
+CREATE SECRET cfs_secret_sf (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    schema_filter '^dbo$'
+);
+
+statement ok
+ATTACH '' AS sec_sf (TYPE mssql, SECRET cfs_secret_sf);
+
+query IR
+SELECT id, total FROM sec_sf.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM sec_sf.cfs_other.cfs_items;
+----
+does not exist
+
+statement ok
+DETACH sec_sf;
+
+statement ok
+DROP SECRET cfs_secret_sf;
+
+# =============================================================================
+# Test 10: Secret — both filters combined
+# =============================================================================
+
+statement ok
+CREATE SECRET cfs_secret_both (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    schema_filter '^dbo$',
+    table_filter '^cfs_orders$'
+);
+
+statement ok
+ATTACH '' AS sec_both (TYPE mssql, SECRET cfs_secret_both);
+
+query IR
+SELECT id, total FROM sec_both.dbo.cfs_orders;
+----
+1	99.99
+
+statement error
+SELECT * FROM sec_both.dbo.cfs_products;
+----
+does not exist
+
+statement ok
+DETACH sec_both;
+
+statement ok
+DROP SECRET cfs_secret_both;
+
+# =============================================================================
+# Test 11: ATTACH parameter overrides connection string filter
+# =============================================================================
+
+# Connection string has table_filter=^cfs_orders$, but ATTACH overrides to ^cfs_products$
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS override_test (TYPE mssql, table_filter '^cfs_products$');
+
+# cfs_products should be visible (ATTACH override wins)
+query IT
+SELECT id, name FROM override_test.dbo.cfs_products;
+----
+1	Widget
+
+# cfs_orders should NOT be visible (overridden by ATTACH)
+statement error
+SELECT * FROM override_test.dbo.cfs_orders;
+----
+does not exist
+
+statement ok
+DETACH override_test;
+
+# =============================================================================
+# Test 12: ATTACH parameter overrides secret filter
+# =============================================================================
+
+statement ok
+CREATE SECRET cfs_secret_override (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    table_filter '^cfs_orders$'
+);
+
+# Secret has table_filter=^cfs_orders$, ATTACH overrides to ^cfs_products$
+statement ok
+ATTACH '' AS sec_override (TYPE mssql, SECRET cfs_secret_override, table_filter '^cfs_products$');
+
+query IT
+SELECT id, name FROM sec_override.dbo.cfs_products;
+----
+1	Widget
+
+statement error
+SELECT * FROM sec_override.dbo.cfs_orders;
+----
+does not exist
+
+statement ok
+DETACH sec_override;
+
+statement ok
+DROP SECRET cfs_secret_override;
+
+# =============================================================================
+# Test 13: Alternation pattern — table_filter with ^(a|b)$
+# =============================================================================
+
+# Should match cfs_orders and cfs_products but not cfs_items
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS alt_test (TYPE mssql, table_filter '^(cfs_orders|cfs_products)$');
+
+query IR
+SELECT id, total FROM alt_test.dbo.cfs_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM alt_test.dbo.cfs_products;
+----
+1	Widget
+
+# cfs_items should not be visible (different schema but also not in filter)
+statement error
+SELECT * FROM alt_test.cfs_other.cfs_items;
+----
+does not exist
+
+statement ok
+DETACH alt_test;
+
+# =============================================================================
+# Test 14: Alternation pattern — schema_filter with ^(dbo|cfs_other)$
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS alt_schema (TYPE mssql, schema_filter '^(dbo|cfs_other)$');
+
+query IR
+SELECT id, total FROM alt_schema.dbo.cfs_orders;
+----
+1	99.99
+
+query IT
+SELECT id, label FROM alt_schema.cfs_other.cfs_items;
+----
+1	Item1
+
+statement ok
+DETACH alt_schema;
+
+# =============================================================================
+# Test 15: Alternation in ADO.NET connection string
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^(cfs_orders|cfs_products)$' AS ado_alt (TYPE mssql);
+
+query IR
+SELECT id, total FROM ado_alt.dbo.cfs_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM ado_alt.dbo.cfs_products;
+----
+1	Widget
+
+statement ok
+DETACH ado_alt;
+
+# =============================================================================
+# Test 16: Alternation in URI connection string
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_URI}?table_filter=^(cfs_orders|cfs_products)$' AS uri_alt (TYPE mssql);
+
+query IR
+SELECT id, total FROM uri_alt.dbo.cfs_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM uri_alt.dbo.cfs_products;
+----
+1	Widget
+
+statement ok
+DETACH uri_alt;
+
+# =============================================================================
+# Test 17: Alternation in secret
+# =============================================================================
+
+statement ok
+CREATE SECRET cfs_secret_alt (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    table_filter '^(cfs_orders|cfs_products)$'
+);
+
+statement ok
+ATTACH '' AS sec_alt (TYPE mssql, SECRET cfs_secret_alt);
+
+query IR
+SELECT id, total FROM sec_alt.dbo.cfs_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM sec_alt.dbo.cfs_products;
+----
+1	Widget
+
+statement ok
+DETACH sec_alt;
+
+statement ok
+DROP SECRET cfs_secret_alt;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cfs_cleanup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cfs_cleanup', 'DROP TABLE dbo.cfs_orders');
+
+statement ok
+SELECT mssql_exec('cfs_cleanup', 'DROP TABLE dbo.cfs_products');
+
+statement ok
+SELECT mssql_exec('cfs_cleanup', 'DROP TABLE cfs_other.cfs_items');
+
+statement ok
+SELECT mssql_exec('cfs_cleanup', 'DROP SCHEMA cfs_other');
+
+statement ok
+DETACH cfs_cleanup;

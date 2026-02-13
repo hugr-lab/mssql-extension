@@ -1,38 +1,88 @@
 #include "catalog/mssql_table_set.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "duckdb/common/exception.hpp"
 
+// Debug logging for catalog operations
+static int GetCatalogDebugLevel() {
+	static int level = -1;
+	if (level == -1) {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		level = env ? std::atoi(env) : 0;
+	}
+	return level;
+}
+
+#define CATALOG_DEBUG(lvl, fmt, ...)                                     \
+	do {                                                                 \
+		if (GetCatalogDebugLevel() >= lvl)                               \
+			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__); \
+	} while (0)
+
 namespace duckdb {
 
-MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema) : schema_(schema), is_fully_loaded_(false) {}
+MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
+	: schema_(schema), names_loaded_(false), is_fully_loaded_(false) {}
 
 //===----------------------------------------------------------------------===//
 // Entry Access
 //===----------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const string &name) {
-	// First check if already cached
+	CATALOG_DEBUG(2, "GetEntry('%s.%s')", schema_.name.c_str(), name.c_str());
+	// 1. Check cached entries (fast path)
 	{
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
 		if (it != entries_.end()) {
+			CATALOG_DEBUG(2, "  -> cache hit for '%s'", name.c_str());
 			return it->second.get();
 		}
 
 		// If we've already tried to load this table and it wasn't found, return nullptr
 		if (attempted_tables_.find(name) != attempted_tables_.end()) {
+			CATALOG_DEBUG(2, "  -> already attempted, not found");
 			return nullptr;
 		}
 	}
 
-	// If fully loaded and not found, table doesn't exist
+	// 2. If fully loaded and not found, table doesn't exist
 	if (is_fully_loaded_.load()) {
+		CATALOG_DEBUG(2, "  -> fully loaded, table not found");
 		return nullptr;
 	}
 
-	// Try to load just this single table
+	// 3. Check table filter — filtered-out tables return not found
+	{
+		auto &catalog = schema_.GetMSSQLCatalog();
+		auto &filter = catalog.GetCatalogFilter();
+		if (filter.HasTableFilter() && !filter.MatchesTable(name)) {
+			CATALOG_DEBUG(2, "  -> filtered out by table_filter");
+			std::lock_guard<std::mutex> elock(entry_mutex_);
+			attempted_tables_.insert(name);
+			return nullptr;
+		}
+	}
+
+	// 4. Check names list — if names loaded and name not in list, table doesn't exist
+	//    This avoids an expensive round trip to SQL Server for nonexistent tables
+	if (names_loaded_.load()) {
+		std::lock_guard<std::mutex> nlock(names_mutex_);
+		if (known_table_names_.find(name) == known_table_names_.end()) {
+			CATALOG_DEBUG(2, "  -> not in known_table_names_ (%zu names loaded)", known_table_names_.size());
+			std::lock_guard<std::mutex> elock(entry_mutex_);
+			attempted_tables_.insert(name);
+			return nullptr;
+		}
+	}
+
+	// 5. Load single entry with full metadata (columns included)
+	CATALOG_DEBUG(1, "  -> loading columns for '%s.%s' (single table)", schema_.name.c_str(), name.c_str());
 	if (LoadSingleEntry(context, name)) {
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
@@ -40,17 +90,61 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 			return it->second.get();
 		}
 	}
-
 	return nullptr;
 }
 
 void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
-	EnsureLoaded(context);
+	CATALOG_DEBUG(1, "Scan('%s') — bulk loading all table metadata", schema_.name.c_str());
 
-	std::lock_guard<std::mutex> lock(entry_mutex_);
-	for (const auto &pair : entries_) {
-		callback(*pair.second);
+	auto &catalog = schema_.GetMSSQLCatalog();
+	auto &cache = catalog.GetMetadataCache();
+	auto &pool = catalog.GetConnectionPool();
+
+	catalog.EnsureCacheLoaded(context);
+	auto connection = pool.Acquire();
+	if (!connection) {
+		throw IOException("Failed to acquire connection for table scan");
 	}
+
+	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
+	try {
+		cache.LoadAllTableMetadata(*connection, schema_.name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
+
+	pool.Release(std::move(connection));
+
+	// Build entries from fully-loaded cache and pre-populate statistics.
+	// Pre-populating statistics avoids 200K+ individual DMV queries when
+	// duckdb_tables() calls GetStorageInfo() on each table entry.
+	auto &stats_provider = catalog.GetStatisticsProvider();
+	std::lock_guard<std::mutex> lock(entry_mutex_);
+
+	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+		// Pre-populate statistics cache with approx_row_count from bulk metadata
+		stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+
+		// Update known_table_names_
+		known_table_names_.insert(table_name);
+
+		// Skip if already loaded as entry
+		if (entries_.find(table_name) != entries_.end()) {
+			callback(*entries_[table_name]);
+			return;
+		}
+
+		auto entry = CreateTableEntry(table_meta);
+		if (entry) {
+			auto &ref = *entry;
+			entries_[entry->name] = std::move(entry);
+			callback(ref);
+		}
+	});
+
+	names_loaded_.store(true);
+	is_fully_loaded_.store(true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -71,8 +165,14 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 		throw IOException("Failed to acquire connection for table loading");
 	}
 
-	// Get metadata for this specific table (triggers lazy column loading)
-	auto table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+	// Get metadata for this specific table only (does NOT load all tables in schema)
+	const MSSQLTableMetadata *table_meta;
+	try {
+		table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
 
 	pool.Release(std::move(connection));
 
@@ -95,49 +195,6 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 	return false;
 }
 
-void MSSQLTableSet::LoadEntries(ClientContext &context) {
-	auto &catalog = schema_.GetMSSQLCatalog();
-	auto &cache = catalog.GetMetadataCache();
-	auto &pool = catalog.GetConnectionPool();
-
-	// Ensure cache settings are loaded (sets TTL)
-	catalog.EnsureCacheLoaded(context);
-
-	// Acquire connection for lazy loading
-	auto connection = pool.Acquire();
-	if (!connection) {
-		throw IOException("Failed to acquire connection for table loading");
-	}
-
-	// Get table names from cache (triggers lazy loading of table list)
-	auto table_names = cache.GetTableNames(*connection, schema_.name);
-
-	std::lock_guard<std::mutex> lock(entry_mutex_);
-	// Don't clear entries_ - preserve already-loaded tables
-	// But we need to load any tables we haven't seen yet
-
-	for (const auto &table_name : table_names) {
-		// Skip if already loaded
-		if (entries_.find(table_name) != entries_.end()) {
-			continue;
-		}
-
-		// GetTableMetadata triggers lazy column loading
-		auto table_meta = cache.GetTableMetadata(*connection, schema_.name, table_name);
-		if (!table_meta) {
-			continue;
-		}
-
-		// Create table entry
-		auto entry = CreateTableEntry(*table_meta);
-		if (entry) {
-			entries_[entry->name] = std::move(entry);
-		}
-	}
-
-	pool.Release(std::move(connection));
-}
-
 bool MSSQLTableSet::IsLoaded() const {
 	return is_fully_loaded_.load();
 }
@@ -145,10 +202,15 @@ bool MSSQLTableSet::IsLoaded() const {
 void MSSQLTableSet::Invalidate() {
 	std::lock_guard<std::mutex> lock(load_mutex_);
 	is_fully_loaded_.store(false);
+	names_loaded_.store(false);
 	{
-		std::lock_guard<std::mutex> entry_lock(entry_mutex_);
+		std::lock_guard<std::mutex> elock(entry_mutex_);
 		entries_.clear();
 		attempted_tables_.clear();
+	}
+	{
+		std::lock_guard<std::mutex> nlock(names_mutex_);
+		known_table_names_.clear();
 	}
 }
 
@@ -160,19 +222,47 @@ unique_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMeta
 	return make_uniq<MSSQLTableEntry>(schema_.catalog, schema_, metadata);
 }
 
-void MSSQLTableSet::EnsureLoaded(ClientContext &context) {
-	// Double-checked locking pattern
-	if (is_fully_loaded_.load()) {
+void MSSQLTableSet::EnsureNamesLoaded(ClientContext &context) {
+	// Fast path: names already loaded
+	if (names_loaded_.load()) {
+		CATALOG_DEBUG(2, "EnsureNamesLoaded('%s') — already loaded", schema_.name.c_str());
+		return;
+	}
+	CATALOG_DEBUG(1, "EnsureNamesLoaded('%s') — loading table names from SQL Server", schema_.name.c_str());
+
+	// Double-checked locking
+	std::lock_guard<std::mutex> lock(names_mutex_);
+	if (names_loaded_.load()) {
 		return;
 	}
 
-	std::lock_guard<std::mutex> lock(load_mutex_);
-	if (is_fully_loaded_.load()) {
-		return;
+	auto &catalog = schema_.GetMSSQLCatalog();
+	auto &cache = catalog.GetMetadataCache();
+	auto &pool = catalog.GetConnectionPool();
+
+	catalog.EnsureCacheLoaded(context);
+	auto connection = pool.Acquire();
+	if (!connection) {
+		throw IOException("Failed to acquire connection for table name loading");
 	}
 
-	LoadEntries(context);
-	is_fully_loaded_.store(true);
+	// Only loads table names (fast, no column queries)
+	vector<string> table_names;
+	try {
+		table_names = cache.GetTableNames(*connection, schema_.name);
+	} catch (...) {
+		pool.Release(std::move(connection));
+		throw;
+	}
+
+	pool.Release(std::move(connection));
+
+	for (const auto &name : table_names) {
+		known_table_names_.insert(name);
+	}
+	CATALOG_DEBUG(1, "EnsureNamesLoaded('%s') — loaded %zu table names (no column queries)", schema_.name.c_str(),
+				  known_table_names_.size());
+	names_loaded_.store(true);
 }
 
 }  // namespace duckdb

@@ -1,0 +1,94 @@
+===================================================================
+Benchmark Results: Spec 033 — Fix Catalog Scan & Add Object Filters
+===================================================================
+Date: 2026-02-13
+Branch: 033-fix-catalog-scan
+Commit: e769e6c
+Database: BenchmarkDB (200K tables: 100K per schema, 2 schemas)
+Schemas: bench_alpha, bench_beta
+Columns per table: 11-30 (variable), ~21 avg → 2.1M columns per schema
+
+===================================================================
+BEFORE fixes (first benchmark, commit b626379)
+===================================================================
+
+Scenario 1: ATTACH (no filters) + SELECT one table
+  ATTACH (no filters):          1,039 ms
+  SELECT from one table:       25,130 ms  ← scans ALL 200K tables' columns
+
+Root cause: Every SELECT triggered LoadAllTableMetadata for the entire
+schema (100K tables), issuing per-table column queries. With 200K tables
+across 2 schemas, even a single SELECT was blocked.
+
+===================================================================
+AFTER fixes — with SCHEMA_FILTER (final benchmark, commit e769e6c)
+===================================================================
+
+Settings:
+  SET mssql_metadata_timeout = 600;
+  SCHEMA_FILTER '^bench_alpha$'
+
+Scenario: ATTACH + preload + SHOW ALL TABLES
+
+  Operation                            Wall Time    Details
+  -----------------------------------  ----------   --------------------------
+  SET mssql_metadata_timeout = 600     0.000s       Local setting
+  CREATE SECRET                        0.000s       Local metadata
+  ATTACH with SCHEMA_FILTER            0.026s       Deferred catalog loading
+  mssql_preload_catalog('bench')      15.427s       1 schema, 100K tables, 2.1M columns
+  SHOW ALL TABLES                      3.129s       100K rows (DuckDB formatting)
+
+Throughput:
+  Tables/sec:   ~6,500
+  Columns/sec: ~136,000
+
+===================================================================
+Key improvements (Spec 033)
+===================================================================
+
+1. Lazy catalog loading
+   - ATTACH no longer triggers full metadata scan
+   - Schemas, tables, and columns loaded on demand
+   - ATTACH dropped from 1,039ms → 26ms (40x faster)
+
+2. Server-side LIKE filtering (TryRegexToSQLLike)
+   - SCHEMA_FILTER/TABLE_FILTER regex pushed to SQL Server as LIKE
+   - Reduces data transfer: only matching schemas/tables returned
+   - Applied to: EnsureSchemasLoaded, EnsureTablesLoaded,
+     LoadAllTableMetadata, BulkLoadAll, LoadSchemas, LoadTables
+
+3. Bulk metadata loading (mssql_preload_catalog)
+   - Single SQL query loads all schemas + tables + columns
+   - Streaming group-by parse: no intermediate storage
+   - 100K tables with 2.1M columns in 15.4s (one round trip)
+
+4. TLS receive timeout fix (SO_RCVTIMEO)
+   - Replaced broken poll()+SSL_read() pattern
+   - poll() falsely reports "ready" for TLS protocol data
+   - SSL_read() then blocks indefinitely waiting for app data
+   - Now uses SO_RCVTIMEO socket option for reliable timeout
+   - Previously: 200K unfiltered preload hung forever over TLS
+   - Now: properly times out per mssql_metadata_timeout setting
+
+5. Configurable metadata timeout (mssql_metadata_timeout)
+   - New DuckDB setting, default 300s (5 min)
+   - Large catalogs (100K+ tables) may need 600s
+   - SET mssql_metadata_timeout = 0 for no timeout
+
+===================================================================
+Comparison: SELECT one table (no preload)
+===================================================================
+
+  Before (b626379):  25,130 ms  (eager full-schema column scan)
+  After  (de8fd9c):      24 ms  (lazy single-table column load)
+  Speedup:            ~1,047x
+
+===================================================================
+Test suite
+===================================================================
+
+  Total tests:   111
+  Passed:         92
+  Failed:          0
+  Skipped:        19 (Azure/TLS env vars not configured)
+  Assertions:  2,462

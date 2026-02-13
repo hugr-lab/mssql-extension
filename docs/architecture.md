@@ -23,8 +23,9 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 5. **Settings** (`RegisterMSSQLSettings`) — connection pool, statistics, DML, COPY tuning
 6. **Diagnostic functions** (`RegisterMSSQLDiagnosticFunctions`) — `mssql_open`, `mssql_close`, `mssql_ping`, `mssql_pool_stats`
 7. **Cache refresh** (`RegisterMSSQLRefreshCacheFunction`) — `mssql_refresh_cache`
-8. **COPY functions** (`RegisterMSSQLCopyFunctions`) — `bcp` format for COPY TO
-9. **Version function** — `mssql_version()`
+8. **Catalog preload** (`RegisterMSSQLPreloadCatalogFunction`) — `mssql_preload_catalog`
+9. **COPY functions** (`RegisterMSSQLCopyFunctions`) — `bcp` format for COPY TO
+10. **Version function** — `mssql_version()`
 
 ## High-Level Component Diagram
 
@@ -109,7 +110,9 @@ src/
 │   ├── mssql_transaction.cpp     # MSSQLTransaction and MSSQLTransactionManager
 │   ├── mssql_ddl_translator.cpp  # DDL statement translation
 │   ├── mssql_table_function.cpp  # Table scan function bindings
-│   └── mssql_refresh_function.cpp # mssql_refresh_cache() implementation
+│   ├── mssql_refresh_function.cpp # mssql_refresh_cache() implementation
+│   ├── mssql_preload_catalog.cpp # mssql_preload_catalog() bulk preload
+│   └── mssql_catalog_filter.cpp  # Regex-based schema/table visibility filter
 │
 ├── connection/                   # Connection pooling and settings
 │   ├── mssql_pool_manager.cpp    # Global pool registry (singleton)
@@ -208,6 +211,7 @@ src/
 | `mssql_ping` | Scalar | `(handle BIGINT) → BOOLEAN` | Test connection liveness |
 | `mssql_pool_stats` | Table | `(context VARCHAR?)` | Pool statistics |
 | `mssql_refresh_cache` | Scalar | `(catalog VARCHAR) → BOOLEAN` | Refresh metadata cache |
+| `mssql_preload_catalog` | Scalar | `(catalog VARCHAR, schema? VARCHAR) → VARCHAR` | Bulk-load all metadata per-schema |
 | `mssql_azure_auth_test` | Scalar | `(secret VARCHAR, tenant? VARCHAR) → VARCHAR` | Test Azure AD token acquisition |
 | `mssql_version` | Scalar | `() → VARCHAR` | Extension version |
 
@@ -228,12 +232,14 @@ src/
 | Setting | Default | Description |
 |---|---|---|
 | `mssql_catalog_cache_ttl` | 0 | Metadata TTL in seconds (0 = manual refresh) |
+| `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
 
 ### Statistics
 | Setting | Default | Description |
 |---|---|---|
 | `mssql_enable_statistics` | true | Expose row count to optimizer |
 | `mssql_statistics_level` | 0 | 0=rowcount, 1=histogram, 2=NDV |
+| `mssql_statistics_use_dbcc` | false | Use DBCC SHOW_STATISTICS (requires permissions) |
 | `mssql_statistics_cache_ttl_seconds` | 300 | Statistics cache TTL |
 
 ### INSERT Tuning
@@ -248,6 +254,7 @@ src/
 |---|---|---|
 | `mssql_dml_batch_size` | 500 | Rows per UPDATE/DELETE batch |
 | `mssql_dml_max_parameters` | 2000 | Max SQL parameters per statement |
+| `mssql_dml_use_prepared` | true | Use prepared statements for DML |
 
 ### CTAS (CREATE TABLE AS SELECT)
 | Setting | Default | Description |

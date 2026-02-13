@@ -160,29 +160,39 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 	tds::TokenParser parser;
 	std::vector<tds::ColumnMetadata> columns;
 
-	// Calculate deadline
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	// timeout_ms <= 0 means no timeout (wait indefinitely)
+	bool has_timeout = (timeout_ms > 0);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(has_timeout ? timeout_ms : 0);
 
 	// Read and parse response using proper TDS packet framing
 	bool done = false;
 	while (!done) {
-		// Check timeout
-		auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			result.success = false;
-			result.error_message = "Query timeout";
-			connection.SendAttention();
-			connection.WaitForAttentionAck(5000);
-			// State is reset by WaitForAttentionAck on success, or we should mark it disconnected
-			if (connection.GetState() == tds::ConnectionState::Executing) {
-				connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
+		// Check timeout (only if timeout is configured)
+		if (has_timeout) {
+			auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				result.success = false;
+				result.error_message = "Query timeout";
+				SIMPLE_QUERY_DEBUG(1, "ExecuteWithCallback: TIMEOUT after %dms", timeout_ms);
+				connection.SendAttention();
+				connection.WaitForAttentionAck(5000);
+				// State is reset by WaitForAttentionAck on success, or we should mark it disconnected
+				if (connection.GetState() == tds::ConnectionState::Executing) {
+					connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
+				}
+				return result;
 			}
-			return result;
 		}
 
-		// Calculate remaining time
-		auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-		int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
+		// Calculate remaining time for socket receive
+		int recv_timeout;
+		if (has_timeout) {
+			auto now = std::chrono::steady_clock::now();
+			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+			recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
+		} else {
+			recv_timeout = 30000;  // No timeout: use 30s chunks for SO_RCVTIMEO (allows interrupt)
+		}
 
 		// Read TDS packet (properly framed with 8-byte header)
 		tds::TdsPacket packet;

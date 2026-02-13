@@ -175,6 +175,13 @@ az account get-access-token --resource https://database.windows.net/ --query acc
 | `MSSQL_DEBUG` | `1`, `2`, `3` | TDS protocol debug level (1=basic, 3=trace) |
 | `MSSQL_DML_DEBUG` | `1` | Enable DML operation debugging (INSERT/UPDATE/DELETE) |
 
+**Metadata Settings (can be SET in test SQL):**
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
+| `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL in seconds (0 = manual refresh) |
+
 To run tests manually with custom environment:
 
 ```bash
@@ -212,6 +219,9 @@ test/
 │   │   ├── filter_pushdown.test    # Filter pushdown tests
 │   │   ├── incremental_ttl.test    # Incremental cache TTL expiration behavior
 │   │   ├── lazy_loading.test       # Lazy loading and point invalidation tests
+│   │   ├── catalog_filter.test    # Catalog filter (schema_filter/table_filter) tests
+│   │   ├── catalog_filter_sources.test # Catalog filter configuration source tests
+│   │   ├── preload_catalog.test   # mssql_preload_catalog() bulk preload tests
 │   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests
 │   │   ├── statistics.test         # Statistics provider tests

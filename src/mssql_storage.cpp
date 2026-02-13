@@ -2,6 +2,7 @@
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
@@ -103,6 +104,16 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 		}
 	}
 	// Default: use_azure_auth = false (SQL auth)
+
+	// Read optional catalog visibility filters (Spec 033)
+	auto schema_filter_val = kv_secret.TryGetValue("schema_filter");
+	if (!schema_filter_val.IsNull()) {
+		result->schema_filter = schema_filter_val.ToString();
+	}
+	auto table_filter_val = kv_secret.TryGetValue("table_filter");
+	if (!table_filter_val.IsNull()) {
+		result->table_filter = table_filter_val.ToString();
+	}
 
 	result->connected = false;
 	return result;
@@ -226,6 +237,10 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["encrypt"] = value;
 				} else if (lower_key == "trustservercertificate") {
 					result["trustservercertificate"] = value;
+				} else if (lower_key == "schema_filter" || lower_key == "schemafilter") {
+					result["schema_filter"] = value;
+				} else if (lower_key == "table_filter" || lower_key == "tablefilter") {
+					result["table_filter"] = value;
 				} else {
 					result[key] = value;
 				}
@@ -276,6 +291,10 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["encrypt"] = value;
 		} else if (lower_key == "trustservercertificate") {
 			result["trustservercertificate"] = value;
+		} else if (lower_key == "schemafilter" || lower_key == "schema_filter") {
+			result["schema_filter"] = value;
+		} else if (lower_key == "tablefilter" || lower_key == "table_filter") {
+			result["table_filter"] = value;
 		} else {
 			result[key] = value;
 		}
@@ -408,6 +427,14 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 		result->catalog_enabled = (catalog_val == "yes" || catalog_val == "true" || catalog_val == "1");
 	}
 	// Default is true (catalog_enabled initialized to true in struct definition)
+
+	// Parse optional catalog visibility filters from connection string (Spec 033)
+	if (params.find("schema_filter") != params.end()) {
+		result->schema_filter = params["schema_filter"];
+	}
+	if (params.find("table_filter") != params.end()) {
+		result->table_filter = params["table_filter"];
+	}
 
 	result->connected = false;
 	return result;
@@ -782,6 +809,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string access_token;  // Spec 032: Direct Azure AD JWT token
 	bool catalog_option_specified = false;
 	bool catalog_enabled_option = true;	 // Default to true
+	string schema_filter_option;		 // Spec 033: ATTACH-level schema filter
+	string table_filter_option;			 // Spec 033: ATTACH-level table filter
+	bool schema_filter_specified = false;
+	bool table_filter_specified = false;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -797,6 +828,14 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		} else if (lower_name == "catalog") {
 			catalog_option_specified = true;
 			catalog_enabled_option = it->second.GetValue<bool>();
+			it = options.options.erase(it);
+		} else if (lower_name == "schema_filter") {
+			schema_filter_option = it->second.ToString();
+			schema_filter_specified = true;
+			it = options.options.erase(it);
+		} else if (lower_name == "table_filter") {
+			table_filter_option = it->second.ToString();
+			table_filter_specified = true;
 			it = options.options.erase(it);
 		} else {
 			++it;
@@ -841,6 +880,23 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	if (catalog_option_specified) {
 		ctx->connection_info->catalog_enabled = catalog_enabled_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
+	}
+
+	// Apply catalog visibility filters from ATTACH options (Spec 033)
+	// ATTACH options override connection string and secret values
+	if (schema_filter_specified) {
+		auto error = MSSQLCatalogFilter::ValidatePattern(schema_filter_option);
+		if (!error.empty()) {
+			throw InvalidInputException("MSSQL ATTACH error: %s", error);
+		}
+		ctx->connection_info->schema_filter = schema_filter_option;
+	}
+	if (table_filter_specified) {
+		auto error = MSSQLCatalogFilter::ValidatePattern(table_filter_option);
+		if (!error.empty()) {
+			throw InvalidInputException("MSSQL ATTACH error: %s", error);
+		}
+		ctx->connection_info->table_filter = table_filter_option;
 	}
 
 	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance

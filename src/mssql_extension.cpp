@@ -1,5 +1,6 @@
 #include "mssql_extension.hpp"
 #include "azure/azure_test_function.hpp"
+#include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
@@ -53,15 +54,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 7. Register mssql_refresh_cache function
 	RegisterMSSQLRefreshCacheFunction(loader);
 
-	// 8. Register COPY functions (bcp format)
+	// 8. Register mssql_preload_catalog function
+	RegisterMSSQLPreloadCatalogFunction(loader);
+
+	// 9. Register COPY functions (bcp format)
 	RegisterMSSQLCopyFunctions(loader);
 
-	// 9. Register utility functions (mssql_version)
+	// 10. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
 											 LogicalType::VARCHAR, MssqlVersionFunction);
 	loader.RegisterFunction(mssql_version_func);
 
-	// 10. Register Azure authentication test function
+	// 11. Register Azure authentication test function
 	mssql::azure::RegisterAzureTestFunction(loader);
 }
 

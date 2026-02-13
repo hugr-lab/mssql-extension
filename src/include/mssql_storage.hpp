@@ -45,6 +45,12 @@ struct MSSQLConnectionInfo {
 	string access_token;  // Pre-provided Azure AD JWT access token (takes precedence over azure_secret)
 
 	//===----------------------------------------------------------------------===//
+	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
+	//===----------------------------------------------------------------------===//
+	string schema_filter;  // Regex pattern for schema visibility (empty = all visible)
+	string table_filter;   // Regex pattern for table/view visibility (empty = all visible)
+
+	//===----------------------------------------------------------------------===//
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
 	//===----------------------------------------------------------------------===//
 	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)

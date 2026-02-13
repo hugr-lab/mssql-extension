@@ -55,6 +55,17 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	int64_t cache_ttl = 0;	// Default: manual refresh only
 	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl);
 
+	// Configure catalog visibility filters from connection info (Spec 033)
+	if (!connection_info_->schema_filter.empty()) {
+		catalog_filter_.SetSchemaFilter(connection_info_->schema_filter);
+	}
+	if (!connection_info_->table_filter.empty()) {
+		catalog_filter_.SetTableFilter(connection_info_->table_filter);
+	}
+	if (catalog_filter_.HasFilters()) {
+		metadata_cache_->SetFilter(&catalog_filter_);
+	}
+
 	// Create statistics provider with default TTL (will be configured from settings later)
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
 }
@@ -159,6 +170,14 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		EnsureCacheLoaded(*transaction.context);
 	}
 
+	// Check schema filter — filtered-out schemas return not found (Spec 033)
+	if (catalog_filter_.HasSchemaFilter() && !catalog_filter_.MatchesSchema(name)) {
+		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+			throw CatalogException("Schema '%s' not found in MSSQL database", name);
+		}
+		return nullptr;
+	}
+
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
 	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
@@ -183,8 +202,17 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		throw IOException("Failed to acquire connection for schema lookup");
 	}
 
-	// Trigger lazy loading of schema list
-	metadata_cache_->EnsureSchemasLoaded(*connection);
+	// Trigger lazy loading of schema list (ensure connection released on exception)
+	try {
+		metadata_cache_->EnsureSchemasLoaded(*connection);
+	} catch (...) {
+		if (transaction.context) {
+			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
+		} else {
+			connection_pool_->Release(std::move(connection));
+		}
+		throw;
+	}
 
 	// Release connection properly (no-op if pinned to transaction)
 	if (transaction.context) {
@@ -232,7 +260,12 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 		throw IOException("Failed to acquire connection for schema scan");
 	}
 
-	schema_names = metadata_cache_->GetSchemaNames(*connection);
+	try {
+		schema_names = metadata_cache_->GetSchemaNames(*connection);
+	} catch (...) {
+		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
+		throw;
+	}
 
 	// Release connection properly (no-op if pinned to transaction)
 	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
@@ -609,6 +642,10 @@ const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
 	return *connection_info_;
 }
 
+const MSSQLCatalogFilter &MSSQLCatalog::GetCatalogFilter() const {
+	return catalog_filter_;
+}
+
 const string &MSSQLCatalog::GetContextName() const {
 	return context_name_;
 }
@@ -714,6 +751,7 @@ void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 	// Lazy loading will handle actual metadata loading on first access
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 	metadata_cache_->SetDatabaseCollation(database_collation_);
 
 	// Note: No eager Refresh() call - lazy loading handles this
@@ -734,9 +772,10 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 		throw IOException("MSSQL connection pool not initialized - cannot refresh cache");
 	}
 
-	// Load cache TTL from settings and apply it
+	// Load cache TTL and metadata timeout from settings
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 
 	// Acquire connection for full cache refresh
 	auto connection = connection_pool_->Acquire();

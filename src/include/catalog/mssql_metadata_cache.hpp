@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "tds/tds_connection_pool.hpp"
 
@@ -129,9 +130,15 @@ public:
 	// Get tables/views in a schema (triggers lazy loading of table list)
 	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
 
-	// Get table metadata (triggers lazy loading of columns)
+	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
+	// Does NOT load all tables in the schema. Returns nullptr if the table doesn't exist.
 	const MSSQLTableMetadata *GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
 											   const string &table_name);
+
+	// Load all table metadata for a schema in one bulk query.
+	// If all tables already have columns loaded (e.g. from preload), returns from cache.
+	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
+	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
 
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);
@@ -142,6 +149,19 @@ public:
 	// T036: Get schema names without connection if already loaded
 	// Returns true if schemas are loaded and names were populated, false otherwise
 	bool TryGetCachedSchemaNames(vector<string> &out_names);
+
+	//===----------------------------------------------------------------------===//
+	// Bulk Catalog Preload (Spec 033: US5)
+	//===----------------------------------------------------------------------===//
+
+	// Load all metadata in a single SQL Server round trip
+	// @param connection TDS connection to use
+	// @param schema_name If non-empty, limit bulk load to this schema only
+	// @param schema_count Output: number of schemas loaded
+	// @param table_count Output: number of tables loaded
+	// @param column_count Output: number of columns loaded
+	void BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count, idx_t &table_count,
+					 idx_t &column_count);
 
 	//===----------------------------------------------------------------------===//
 	// Cache Management
@@ -162,11 +182,23 @@ public:
 	// Get cache state
 	MSSQLCacheState GetState() const;
 
+	// Set catalog filter (applied to schema/table discovery results)
+	void SetFilter(const MSSQLCatalogFilter *filter);
+
+	// Get catalog filter
+	const MSSQLCatalogFilter *GetFilter() const;
+
 	// Set TTL (0 = manual refresh only)
 	void SetTTL(int64_t ttl_seconds);
 
 	// Get TTL
 	int64_t GetTTL() const;
+
+	// Set metadata query timeout in seconds (0 = no timeout)
+	void SetMetadataTimeout(int timeout_seconds);
+
+	// Get metadata query timeout in milliseconds
+	int GetMetadataTimeoutMs() const;
 
 	// Set database default collation
 	void SetDatabaseCollation(const string &collation);
@@ -183,9 +215,6 @@ public:
 
 	// Ensure table list for schema is loaded
 	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
-
-	// Ensure column metadata for table is loaded
-	void EnsureColumnsLoaded(tds::TdsConnection &connection, const string &schema_name, const string &table_name);
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
@@ -210,6 +239,13 @@ public:
 	// Get table list load state for schema
 	CacheLoadState GetTablesState(const string &schema_name) const;
 
+	// Iterate all loaded tables, calling callback(schema_name, table_name, approx_row_count)
+	void ForEachTable(const std::function<void(const string &, const string &, idx_t)> &callback) const;
+
+	// Iterate all loaded tables in a specific schema, calling callback(table_name, table_metadata)
+	void ForEachTableInSchema(const string &schema_name,
+							  const std::function<void(const string &, const MSSQLTableMetadata &)> &callback) const;
+
 	// Get column metadata load state for table
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;
 
@@ -228,15 +264,21 @@ private:
 	void LoadColumns(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
 					 MSSQLTableMetadata &table_metadata);
 
+	// Execute metadata query with configured timeout (metadata_timeout_ms_)
+	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
+	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback);
+
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
 	mutable std::mutex mutex_;							  // Thread-safety for global operations
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
+	const MSSQLCatalogFilter *filter_ = nullptr;		  // Optional visibility filter (owned by MSSQLCatalog)
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
 	int64_t ttl_seconds_;								  // Cache TTL (0 = manual only)
+	int metadata_timeout_ms_ = 300000;					  // Metadata query timeout in ms (default 5 min)
 	string database_collation_;							  // Database default collation
 
 	// Incremental cache state for schema list (catalog-level)

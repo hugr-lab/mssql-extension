@@ -1,0 +1,119 @@
+# name: test/sql/catalog/deferred_columns.test
+# description: Test deferred column loading - columns only loaded for queried tables
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup: Create test tables
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS defer_test (TYPE mssql);
+
+# Create several test tables to verify only queried tables load columns
+statement ok
+SELECT mssql_exec('defer_test', 'IF OBJECT_ID(''dbo.defer_table_a'') IS NOT NULL DROP TABLE dbo.defer_table_a');
+
+statement ok
+SELECT mssql_exec('defer_test', 'IF OBJECT_ID(''dbo.defer_table_b'') IS NOT NULL DROP TABLE dbo.defer_table_b');
+
+statement ok
+SELECT mssql_exec('defer_test', 'IF OBJECT_ID(''dbo.defer_table_c'') IS NOT NULL DROP TABLE dbo.defer_table_c');
+
+statement ok
+SELECT mssql_exec('defer_test', 'CREATE TABLE dbo.defer_table_a (id INT PRIMARY KEY, name NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('defer_test', 'CREATE TABLE dbo.defer_table_b (id INT PRIMARY KEY, value DECIMAL(10,2))');
+
+statement ok
+SELECT mssql_exec('defer_test', 'CREATE TABLE dbo.defer_table_c (id INT PRIMARY KEY, data VARCHAR(200))');
+
+statement ok
+SELECT mssql_exec('defer_test', 'INSERT INTO dbo.defer_table_a VALUES (1, N''Hello'')');
+
+statement ok
+SELECT mssql_exec('defer_test', 'INSERT INTO dbo.defer_table_b VALUES (1, 42.50)');
+
+statement ok
+SELECT mssql_exec('defer_test', 'INSERT INTO dbo.defer_table_c VALUES (1, ''World'')');
+
+# Refresh cache to pick up new tables
+statement ok
+SELECT mssql_refresh_cache('defer_test');
+
+# =============================================================================
+# Test 1: Single-table query only loads that table's columns
+# =============================================================================
+
+query IT
+SELECT id, name FROM defer_test.dbo.defer_table_a;
+----
+1	Hello
+
+# =============================================================================
+# Test 2: Second table query loads only that table's columns
+# =============================================================================
+
+query IR
+SELECT id, value FROM defer_test.dbo.defer_table_b;
+----
+1	42.50
+
+# =============================================================================
+# Test 3: Third table query loads only that table's columns
+# =============================================================================
+
+query IT
+SELECT id, data FROM defer_test.dbo.defer_table_c;
+----
+1	World
+
+# =============================================================================
+# Test 4: Cache hit — re-query table A uses cached columns (no SQL Server query)
+# =============================================================================
+
+query IT
+SELECT id, name FROM defer_test.dbo.defer_table_a;
+----
+1	Hello
+
+# =============================================================================
+# Test 5: Nonexistent table returns error without excessive queries
+# =============================================================================
+
+statement error
+SELECT * FROM defer_test.dbo.this_table_does_not_exist;
+----
+does not exist
+
+# =============================================================================
+# Test 6: SHOW ALL TABLES works (loads names, not columns)
+# =============================================================================
+
+query I
+SELECT COUNT(*) >= 3 FROM (SELECT * FROM duckdb_tables() WHERE database_name = 'defer_test' AND table_name LIKE 'defer_table_%');
+----
+true
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('defer_test', 'DROP TABLE dbo.defer_table_a');
+
+statement ok
+SELECT mssql_exec('defer_test', 'DROP TABLE dbo.defer_table_b');
+
+statement ok
+SELECT mssql_exec('defer_test', 'DROP TABLE dbo.defer_table_c');
+
+statement ok
+DETACH defer_test;

@@ -94,6 +94,28 @@ void MSSQLStatisticsProvider::InvalidateAll() {
 	cache_.clear();
 }
 
+void MSSQLStatisticsProvider::PreloadRowCount(const string &schema_name, const string &table_name, idx_t row_count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto key = BuildCacheKey(schema_name, table_name);
+	MSSQLTableStatistics stats;
+	stats.row_count = row_count;
+	stats.fetched_at = std::chrono::steady_clock::now();
+	stats.is_valid = true;
+	cache_[key] = stats;
+}
+
+bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
+												   idx_t &out_row_count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto key = BuildCacheKey(schema_name, table_name);
+	auto it = cache_.find(key);
+	if (it != cache_.end() && IsCacheValid(it->second)) {
+		out_row_count = it->second.row_count;
+		return true;
+	}
+	return false;
+}
+
 void MSSQLStatisticsProvider::SetCacheTTL(int64_t seconds) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	cache_ttl_seconds_ = seconds;

@@ -68,6 +68,13 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_QUERY_TIMEOUT), ValidateNonNegative,
 							  SetScope::GLOBAL);
 
+	// mssql_metadata_timeout - Metadata query timeout in seconds (0 = no timeout)
+	// Large catalogs (100K+ tables) may need several minutes for bulk metadata discovery
+	config.AddExtensionOption(
+		"mssql_metadata_timeout",
+		"Metadata query timeout in seconds (default: 300, 0 = no timeout). Increase for very large catalogs",
+		LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_METADATA_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_catalog_cache_ttl - Metadata cache TTL in seconds (0 = manual refresh only)
 	config.AddExtensionOption("mssql_catalog_cache_ttl", "Metadata cache TTL in seconds (0 = manual refresh only)",
 							  LogicalType::BIGINT,
@@ -235,6 +242,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 		config.query_timeout = static_cast<int>(val.GetValue<int64_t>());
 	}
 
+	if (context.TryGetCurrentSetting("mssql_metadata_timeout", val)) {
+		config.metadata_timeout = static_cast<int>(val.GetValue<int64_t>());
+	}
+
 	return config;
 }
 
@@ -252,6 +263,14 @@ int LoadQueryTimeout(ClientContext &context) {
 		return static_cast<int>(val.GetValue<int64_t>());
 	}
 	return tds::DEFAULT_QUERY_TIMEOUT;	// Default: 30 seconds
+}
+
+int LoadMetadataTimeout(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_metadata_timeout", val)) {
+		return static_cast<int>(val.GetValue<int64_t>());
+	}
+	return tds::DEFAULT_METADATA_TIMEOUT;  // Default: 300 seconds
 }
 
 //===----------------------------------------------------------------------===//

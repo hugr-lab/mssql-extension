@@ -162,16 +162,17 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `mssql_connection_limit` | 10 | Max connections per context |
+| `mssql_connection_limit` | 64 | Max connections per context |
 | `mssql_connection_timeout` | 30 | TCP timeout (seconds) |
 | `mssql_idle_timeout` | 300 | Idle connection timeout (seconds) |
 | `mssql_min_connections` | 0 | Min connections to maintain |
 | `mssql_acquire_timeout` | 30 | Connection acquire timeout (seconds) |
 | `mssql_connection_cache` | true | Enable connection pooling |
+| `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
-| `mssql_insert_max_sql_bytes` | 1MB | INSERT SQL size limit |
+| `mssql_insert_max_sql_bytes` | 8MB (8388608) | INSERT SQL size limit |
 | `mssql_insert_use_returning_output` | true | Use OUTPUT INSERTED for RETURNING |
 | `mssql_dml_batch_size` | 500 | Rows per UPDATE/DELETE batch |
 | `mssql_dml_max_parameters` | 2000 | Max parameters per UPDATE/DELETE statement |
@@ -183,6 +184,15 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |
 | `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
 
+## ATTACH Options & Secret Parameters (Catalog Filters)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `schema_filter` | VARCHAR | Regex pattern to filter visible schemas (case-insensitive, partial match via `regex_search`) |
+| `table_filter` | VARCHAR | Regex pattern to filter visible tables/views (case-insensitive, partial match via `regex_search`) |
+
+Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableFilter`), URI query parameters, and MSSQL secrets. ATTACH options override secret/connection string values.
+
 ## Extension Functions
 
 | Function | Type | Description |
@@ -191,6 +201,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_exec(context, sql)` | Scalar | Execute T-SQL, return affected row count |
 | `mssql_pool_stats([context])` | Table | View connection pool statistics |
 | `mssql_refresh_cache(context)` | Scalar | Refresh metadata cache |
+| `mssql_preload_catalog(context [, schema])` | Scalar | Bulk-load all metadata in one round trip |
 | `mssql_open(conn_string)` | Scalar | Open standalone diagnostic connection |
 | `mssql_close(handle)` | Scalar | Close diagnostic connection |
 | `mssql_ping(handle)` | Scalar | Test connection liveness |
@@ -215,6 +226,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - In-memory (connection pool state, token cache) (031-connection-fedauth-refactor)
 - C++17 (DuckDB extension standard, but C++11 compatible for ODR) + libcurl (OAuth2 HTTP), OpenSSL (TLS), DuckDB Azure extension (secret management) (032-fedauth-token-provider)
 - In-memory token cache (TokenCache singleton) (032-fedauth-token-provider)
+- C++17 (C++11-compatible for ODR with DuckDB) + DuckDB (main branch), OpenSSL (vcpkg), TDS protocol layer (033-fix-catalog-scan)
+- In-memory metadata cache (`MSSQLMetadataCache`) (033-fix-catalog-scan)
 
 ## Azure AD Authentication
 
@@ -253,7 +266,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 033-fix-catalog-scan: Added C++17 (C++11-compatible for ODR with DuckDB) + DuckDB (main branch), OpenSSL (vcpkg), TDS protocol layer
 - 032-fedauth-token-provider: Added C++17 (DuckDB extension standard, but C++11 compatible for ODR) + libcurl (OAuth2 HTTP), OpenSSL (TLS), DuckDB Azure extension (secret management)
 - 031-connection-fedauth-refactor: Added C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), libcurl (vcpkg for Azure OAuth2)
 
-- 030-ctas-fixes: Fixed `CREATE TABLE IF NOT EXISTS` to silently succeed when table exists (Issue #44); auto-enable TABLOCK for new table creation for 15-30% performance improvement (Issue #45)
