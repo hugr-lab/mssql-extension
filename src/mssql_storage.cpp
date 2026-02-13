@@ -986,7 +986,6 @@ void RegisterMSSQLStorageExtension(ExtensionLoader &loader) {
 	auto storage_ext = make_shared_ptr<StorageExtension>();
 	storage_ext->attach = MSSQLAttach;
 	storage_ext->create_transaction_manager = MSSQLCreateTransactionManager;
-
 	StorageExtension::Register(config, "mssql", std::move(storage_ext));
 }
 
