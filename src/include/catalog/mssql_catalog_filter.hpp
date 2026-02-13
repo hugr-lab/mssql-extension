@@ -38,6 +38,11 @@ public:
 	const string &GetSchemaPattern() const;
 	const string &GetTablePattern() const;
 
+	// Try to convert regex pattern to SQL LIKE clause.
+	// Returns SQL LIKE expression (e.g. "s.name LIKE 'dbo'") or empty string if not convertible.
+	// Simple patterns (literals, .*, anchors) are convertible; complex regex is not.
+	static string TryRegexToSQLLike(const string &pattern, const string &column_expr);
+
 private:
 	string schema_pattern_;
 	string table_pattern_;

@@ -194,6 +194,12 @@ public:
 	// Get TTL
 	int64_t GetTTL() const;
 
+	// Set metadata query timeout in seconds (0 = no timeout)
+	void SetMetadataTimeout(int timeout_seconds);
+
+	// Get metadata query timeout in milliseconds
+	int GetMetadataTimeoutMs() const;
+
 	// Set database default collation
 	void SetDatabaseCollation(const string &collation);
 
@@ -260,6 +266,10 @@ private:
 	void LoadColumns(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
 					 MSSQLTableMetadata &table_metadata);
 
+	// Execute metadata query with configured timeout (metadata_timeout_ms_)
+	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
+	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback);
+
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
@@ -270,6 +280,7 @@ private:
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
 	int64_t ttl_seconds_;								  // Cache TTL (0 = manual only)
+	int metadata_timeout_ms_ = 300000;					  // Metadata query timeout in ms (default 5 min)
 	string database_collation_;							  // Database default collation
 
 	// Incremental cache state for schema list (catalog-level)

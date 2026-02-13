@@ -737,6 +737,7 @@ void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 	// Lazy loading will handle actual metadata loading on first access
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 	metadata_cache_->SetDatabaseCollation(database_collation_);
 
 	// Note: No eager Refresh() call - lazy loading handles this
@@ -757,9 +758,10 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 		throw IOException("MSSQL connection pool not initialized - cannot refresh cache");
 	}
 
-	// Load cache TTL from settings and apply it
+	// Load cache TTL and metadata timeout from settings
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 
 	// Acquire connection for full cache refresh
 	auto connection = connection_pool_->Acquire();

@@ -28,6 +28,7 @@ namespace duckdb {
 
 // Query to discover all user schemas (including empty ones)
 // Excludes system schemas: INFORMATION_SCHEMA (3), sys (4), and other built-in schemas
+// Note: ORDER BY is appended dynamically after optional filter clauses
 static const char *SCHEMA_DISCOVERY_SQL = R"(
 SELECT s.name AS schema_name
 FROM sys.schemas s
@@ -35,12 +36,11 @@ WHERE s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
                      'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
-                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
-ORDER BY s.name
-)";
+                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter'))";
 
 // Query to discover tables and views in a schema
 // Uses simple string replacement for schema_name (safe for schema names)
+// Note: ORDER BY is appended dynamically after optional filter clauses
 static const char *TABLE_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     o.name AS object_name,
@@ -50,9 +50,7 @@ FROM sys.objects o
 LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
-  AND SCHEMA_NAME(o.schema_id) = '%s'
-ORDER BY o.name
-)";
+  AND SCHEMA_NAME(o.schema_id) = '%s')";
 
 // Single-table metadata query: loads object type, row count, and all columns for ONE table
 // in a single round trip. Used by GetTableMetadata() to avoid loading all tables in schema.
@@ -79,6 +77,7 @@ ORDER BY c.column_id
 // Bulk metadata query: loads ALL schemas, tables, and columns in one round trip
 // Used by mssql_preload_catalog() to avoid per-table column discovery queries
 // Results are ordered by schema_name, object_name, column_id for streaming group-by parse
+// Note: ORDER BY is appended dynamically after optional filter clauses
 static const char *BULK_METADATA_SQL = R"(
 SELECT
     s.name AS schema_name,
@@ -104,11 +103,10 @@ WHERE s.schema_id NOT IN (3, 4)
                      'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
   AND o.type IN ('U', 'V')
-  AND o.is_ms_shipped = 0
-ORDER BY s.name, o.name, c.column_id
-)";
+  AND o.is_ms_shipped = 0)";
 
 // Same query but scoped to a single schema
+// Note: ORDER BY is appended dynamically after optional filter clauses
 static const char *BULK_METADATA_SCHEMA_SQL_TEMPLATE = R"(
 SELECT
     s.name AS schema_name,
@@ -135,9 +133,7 @@ WHERE s.schema_id NOT IN (3, 4)
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
   AND o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
-  AND s.name = '%s'
-ORDER BY s.name, o.name, c.column_id
-)";
+  AND s.name = '%s')";
 
 // Query to discover columns in a table/view
 // Note: ISNULL is used for collation_name to avoid NBCROW parsing issues with NULL values
@@ -176,9 +172,11 @@ static bool IsTTLExpired(const std::chrono::steady_clock::time_point &last_refre
 
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
-static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback) {
-	auto result =
-		MSSQLSimpleQuery::ExecuteWithCallback(connection, sql, [&callback](const std::vector<std::string> &row) {
+static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+							int timeout_ms) {
+	auto result = MSSQLSimpleQuery::ExecuteWithCallback(
+		connection, sql,
+		[&callback](const std::vector<std::string> &row) {
 			// Convert std::vector to duckdb::vector
 			vector<string> duckdb_row;
 			duckdb_row.reserve(row.size());
@@ -187,7 +185,8 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 			}
 			callback(duckdb_row);
 			return true;  // continue processing
-		});
+		},
+		timeout_ms);
 
 	if (result.HasError()) {
 		throw IOException("Metadata query failed: %s", result.error_message);
@@ -476,6 +475,17 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 
 	string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
 
+	// Push table filter to SQL Server if convertible to LIKE
+	if (filter_ && filter_->HasTableFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+			CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — server-side table filter: %s",
+						schema_name.c_str(), like_clause.c_str());
+		}
+	}
+	sql += "\nORDER BY s.name, o.name, c.column_id";
+
 	// Streaming group-by parse (same as BulkLoadAll but for one schema)
 	string current_table;
 	MSSQLTableMetadata *current_table_meta = nullptr;
@@ -562,8 +572,8 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 		table_pair.second.columns_last_refresh = now;
 	}
 
-	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loaded %zu tables, %zu columns in one query",
-				schema_name.c_str(), table_count, column_count);
+	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loaded %llu tables, %llu columns in one query",
+				schema_name.c_str(), (unsigned long long)table_count, (unsigned long long)column_count);
 }
 
 //===----------------------------------------------------------------------===//
@@ -585,6 +595,23 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	} else {
 		sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
 	}
+
+	// Push filters to SQL Server if convertible to LIKE
+	if (filter_) {
+		if (filter_->HasSchemaFilter()) {
+			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+			if (!like_clause.empty()) {
+				sql += " AND " + like_clause;
+			}
+		}
+		if (filter_->HasTableFilter()) {
+			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+			if (!like_clause.empty()) {
+				sql += " AND " + like_clause;
+			}
+		}
+	}
+	sql += "\nORDER BY s.name, o.name, c.column_id";
 
 	// Streaming group-by parse: rows are ordered by schema_name, object_name, column_id
 	// Track current schema and table to detect group boundaries
@@ -834,6 +861,19 @@ const string &MSSQLMetadataCache::GetDatabaseCollation() const {
 	return database_collation_;
 }
 
+void MSSQLMetadataCache::SetMetadataTimeout(int timeout_seconds) {
+	metadata_timeout_ms_ = timeout_seconds > 0 ? timeout_seconds * 1000 : 0;
+}
+
+int MSSQLMetadataCache::GetMetadataTimeoutMs() const {
+	return metadata_timeout_ms_;
+}
+
+void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql,
+											  MSSQLMetadataCache::MetadataRowCallback callback) {
+	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_);
+}
+
 //===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
 // Incremental Cache Loading - Lazy Loading (T010-T012)
@@ -863,7 +903,18 @@ void MSSQLMetadataCache::EnsureSchemasLoaded(tds::TdsConnection &connection) {
 		schemas_.clear();
 
 		// Load schema names only (no tables/columns)
-		ExecuteMetadataQuery(connection, SCHEMA_DISCOVERY_SQL, [this](const vector<string> &values) {
+		string schema_sql = SCHEMA_DISCOVERY_SQL;
+		// Push schema filter to SQL Server if convertible to LIKE
+		if (filter_ && filter_->HasSchemaFilter()) {
+			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+			if (!like_clause.empty()) {
+				schema_sql += " AND " + like_clause;
+				CACHE_DEBUG(1, "EnsureSchemasLoaded — server-side schema filter: %s", like_clause.c_str());
+			}
+		}
+		schema_sql += "\nORDER BY s.name";
+
+		ExecuteMetadataQuery(connection, schema_sql, [this](const vector<string> &values) {
 			if (!values.empty()) {
 				string schema_name = values[0];
 				// Create schema with only name - tables NOT loaded (tables_load_state = NOT_LOADED)
@@ -921,6 +972,16 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 
 		// Build query with schema name
 		string query = StringUtil::Format(TABLE_DISCOVERY_SQL_TEMPLATE, schema_name);
+		// Push table filter to SQL Server if convertible to LIKE
+		if (filter_ && filter_->HasTableFilter()) {
+			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+			if (!like_clause.empty()) {
+				query += " AND " + like_clause;
+				CACHE_DEBUG(1, "EnsureTablesLoaded('%s') — server-side table filter: %s",
+							schema_name.c_str(), like_clause.c_str());
+			}
+		}
+		query += "\nORDER BY o.name";
 
 		ExecuteMetadataQuery(connection, query, [&schema](const vector<string> &values) {
 			if (values.size() >= 3) {
@@ -1038,7 +1099,17 @@ CacheLoadState MSSQLMetadataCache::GetColumnsState(const string &schema_name, co
 //===----------------------------------------------------------------------===//
 
 void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
-	ExecuteMetadataQuery(connection, SCHEMA_DISCOVERY_SQL, [this](const vector<string> &values) {
+	string sql = SCHEMA_DISCOVERY_SQL;
+	// Push schema filter to SQL Server if convertible to LIKE
+	if (filter_ && filter_->HasSchemaFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+		}
+	}
+	sql += "\nORDER BY s.name";
+
+	ExecuteMetadataQuery(connection, sql, [this](const vector<string> &values) {
 		if (!values.empty()) {
 			string schema_name = values[0];
 			MSSQLSchemaMetadata schema_meta;
@@ -1051,6 +1122,14 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string &schema_name) {
 	// Build query with schema name (safe: schema names are identifiers, not user input)
 	string query = StringUtil::Format(TABLE_DISCOVERY_SQL_TEMPLATE, schema_name);
+	// Push table filter to SQL Server if convertible to LIKE
+	if (filter_ && filter_->HasTableFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			query += " AND " + like_clause;
+		}
+	}
+	query += "\nORDER BY o.name";
 
 	auto &schema_meta = schemas_[schema_name];
 

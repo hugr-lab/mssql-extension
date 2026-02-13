@@ -97,4 +97,122 @@ const string &MSSQLCatalogFilter::GetTablePattern() const {
 	return table_pattern_;
 }
 
+//===----------------------------------------------------------------------===//
+// Regex → SQL LIKE Conversion
+//===----------------------------------------------------------------------===//
+
+string MSSQLCatalogFilter::TryRegexToSQLLike(const string &pattern, const string &column_expr) {
+	if (pattern.empty()) {
+		return "";
+	}
+
+	// Walk through the regex pattern and try to build a LIKE pattern
+	string like_pattern;
+	bool anchored_start = false;
+	bool anchored_end = false;
+	size_t i = 0;
+	size_t len = pattern.size();
+
+	// Check for start anchor
+	if (i < len && pattern[i] == '^') {
+		anchored_start = true;
+		i++;
+	}
+
+	while (i < len) {
+		char c = pattern[i];
+
+		// Check for end anchor
+		if (c == '$' && i == len - 1) {
+			anchored_end = true;
+			i++;
+			continue;
+		}
+
+		// Wildcard: .* → %
+		if (c == '.' && i + 1 < len && pattern[i + 1] == '*') {
+			like_pattern += '%';
+			i += 2;
+			continue;
+		}
+
+		// Wildcard: .+ → _%
+		if (c == '.' && i + 1 < len && pattern[i + 1] == '+') {
+			like_pattern += "_%";
+			i += 2;
+			continue;
+		}
+
+		// Single char wildcard: . → _
+		if (c == '.') {
+			like_pattern += '_';
+			i++;
+			continue;
+		}
+
+		// Escape sequences: \. \* etc → literal character
+		if (c == '\\' && i + 1 < len) {
+			char next = pattern[i + 1];
+			// Known escape sequences that produce a literal
+			if (next == '.' || next == '*' || next == '+' || next == '?' ||
+				next == '[' || next == ']' || next == '(' || next == ')' ||
+				next == '{' || next == '}' || next == '|' || next == '^' ||
+				next == '$' || next == '\\') {
+				// Escape LIKE special chars
+				if (next == '%' || next == '_' || next == '[') {
+					like_pattern += '[';
+					like_pattern += next;
+					like_pattern += ']';
+				} else {
+					like_pattern += next;
+				}
+				i += 2;
+				continue;
+			}
+			// Unknown escape (e.g. \d, \w) — not convertible
+			return "";
+		}
+
+		// Non-convertible regex constructs
+		if (c == '[' || c == '(' || c == '{' || c == '|' || c == '?' || c == '+' || c == '*') {
+			return "";
+		}
+
+		// Escape LIKE special chars in literal text
+		if (c == '%' || c == '_') {
+			like_pattern += '[';
+			like_pattern += c;
+			like_pattern += ']';
+		} else {
+			like_pattern += c;
+		}
+		i++;
+	}
+
+	// Build the final LIKE expression
+	// If not anchored at start, add leading %
+	// If not anchored at end, add trailing %
+	string full_like;
+	if (!anchored_start) {
+		full_like = "%" + like_pattern;
+	} else {
+		full_like = like_pattern;
+	}
+	if (!anchored_end) {
+		full_like += "%";
+	}
+
+	// Escape single quotes in the LIKE pattern for SQL injection safety
+	string escaped;
+	for (char c : full_like) {
+		if (c == '\'') {
+			escaped += "''";
+		} else {
+			escaped += c;
+		}
+	}
+
+	return column_expr + " LIKE '" + escaped + "'";
+}
+
 } // namespace duckdb

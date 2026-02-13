@@ -205,6 +205,7 @@ constexpr int DEFAULT_CONNECTION_TIMEOUT = 30;
 constexpr int DEFAULT_IDLE_TIMEOUT = 300;
 constexpr int DEFAULT_ACQUIRE_TIMEOUT = 30;
 constexpr int DEFAULT_QUERY_TIMEOUT = 30;
+constexpr int DEFAULT_METADATA_TIMEOUT = 300;  // 5 minutes for large catalog queries
 constexpr int CANCELLATION_TIMEOUT = 5;
 
 // Default pool settings

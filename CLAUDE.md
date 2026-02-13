@@ -168,6 +168,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_min_connections` | 0 | Min connections to maintain |
 | `mssql_acquire_timeout` | 30 | Connection acquire timeout (seconds) |
 | `mssql_connection_cache` | true | Enable connection pooling |
+| `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |

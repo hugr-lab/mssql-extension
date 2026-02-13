@@ -478,28 +478,20 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		return -1;
 	}
 
-	// If timeout specified, wait for data first
+	// Set SO_RCVTIMEO on the underlying socket so that SSL_read() will also
+	// time out when waiting for data.  poll()/select() alone is not sufficient
+	// because poll() may return "ready" for TLS protocol data while the actual
+	// application-level response has not yet arrived, causing SSL_read() to
+	// block indefinitely.
 	if (timeout_ms > 0) {
 #ifdef _WIN32
-		fd_set read_fds;
-		FD_ZERO(&read_fds);
-		FD_SET(ctx_->socket_fd, &read_fds);
+		DWORD tv = static_cast<DWORD>(timeout_ms);
+		setsockopt(ctx_->socket_fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&tv), sizeof(tv));
+#else
 		struct timeval tv;
 		tv.tv_sec = timeout_ms / 1000;
 		tv.tv_usec = (timeout_ms % 1000) * 1000;
-		int ready = select(ctx_->socket_fd + 1, &read_fds, nullptr, nullptr, &tv);
-		if (ready <= 0) {
-			return 0;
-		}
-#else
-		struct pollfd pfd;
-		pfd.fd = ctx_->socket_fd;
-		pfd.events = POLLIN;
-		pfd.revents = 0;
-		int ready = poll(&pfd, 1, timeout_ms);
-		if (ready <= 0) {
-			return 0;
-		}
+		setsockopt(ctx_->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 	}
 
@@ -521,6 +513,10 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		// System call error - get the actual error
 #ifdef _WIN32
 		int sys_err = WSAGetLastError();
+		if (sys_err == WSAETIMEDOUT || sys_err == WSAEWOULDBLOCK) {
+			// SO_RCVTIMEO fired inside SSL_read — treat as timeout
+			return 0;
+		}
 		if (sys_err == 0 && ret == 0) {
 			// EOF - peer closed connection unexpectedly
 			ctx_->last_error_code = 7;	// PEER_CLOSED
@@ -531,6 +527,10 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		ctx_->last_error = "Receive failed: syscall error " + std::to_string(sys_err);
 #else
 		int sys_err = errno;
+		if (sys_err == EAGAIN || sys_err == EWOULDBLOCK) {
+			// SO_RCVTIMEO fired inside SSL_read — treat as timeout
+			return 0;
+		}
 		if (sys_err == 0 && ret == 0) {
 			// EOF - peer closed connection unexpectedly
 			ctx_->last_error_code = 7;	// PEER_CLOSED
