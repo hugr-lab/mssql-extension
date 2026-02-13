@@ -68,6 +68,54 @@ SELECT mssql_azure_auth_test('my_interactive_azure');
    └───────────────────────────────────────────┘
    ```
 
+### Step 4: Attach to Azure SQL Database
+
+```sql
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS azuredb (
+    TYPE mssql,
+    AZURE_SECRET 'my_interactive_azure'
+);
+
+SELECT * FROM azuredb.dbo.my_table LIMIT 10;
+```
+
+### Alternative: Using Access Token from Azure CLI
+
+You can obtain an access token using the Azure CLI and use it directly:
+
+```bash
+# Login to Azure (if not already logged in)
+az login
+
+# Obtain an access token for Azure SQL Database
+az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+```
+
+Then use the token in DuckDB:
+
+```sql
+LOAD mssql;
+
+-- Option A: Direct token in ATTACH
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    ACCESS_TOKEN 'eyJ0eXAiOi...paste-token-here'
+);
+
+-- Option B: Create a reusable secret with token
+CREATE SECRET my_token (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    PORT 1433,
+    DATABASE 'mydb',
+    ACCESS_TOKEN 'eyJ0eXAiOi...paste-token-here'
+);
+
+ATTACH '' AS db (TYPE mssql, SECRET my_token);
+```
+
+**Note:** Azure CLI tokens expire after approximately 1 hour. Use `az account get-access-token` to obtain a fresh token when needed.
+
 ## Error Scenarios to Test
 
 ### 1. Device Code Expired (15-minute timeout)

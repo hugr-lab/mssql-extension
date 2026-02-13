@@ -230,6 +230,8 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 - In-memory metadata cache (`MSSQLMetadataCache`) (033-fix-catalog-scan)
 - C++17 (DuckDB extension standard, C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (6,275 commits ahead of v1.4.4), OpenSSL (vcpkg), libcurl (vcpkg) (034-duckdb-v15-upgrade)
 - N/A (remote SQL Server via TDS protocol) (034-duckdb-v15-upgrade)
+- C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (extension API) (035-ddl-schema-support)
+- C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata + DuckDB extension API, OpenSSL (vcpkg), libcurl (vcpkg) (036-azure-token-docs)
 
 ## Azure AD Authentication
 
@@ -268,7 +270,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 036-azure-token-docs: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata + DuckDB extension API, OpenSSL (vcpkg), libcurl (vcpkg)
+- 035-ddl-schema-support: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (extension API)
 - 034-duckdb-v15-upgrade: Added C++17 (DuckDB extension standard, C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (6,275 commits ahead of v1.4.4), OpenSSL (vcpkg), libcurl (vcpkg)
-- 033-fix-catalog-scan: Added C++17 (C++11-compatible for ODR with DuckDB) + DuckDB (main branch), OpenSSL (vcpkg), TDS protocol layer
-- 032-fedauth-token-provider: Added C++17 (DuckDB extension standard, but C++11 compatible for ODR) + libcurl (OAuth2 HTTP), OpenSSL (TLS), DuckDB Azure extension (secret management)
 

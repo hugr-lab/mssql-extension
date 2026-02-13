@@ -191,6 +191,52 @@ az account get-access-token --resource https://database.windows.net/ --query acc
 - Audience must be `https://database.windows.net/`
 - Token must not be expired (validated with 5-minute margin)
 
+### 6. Reusable Access Token (via Azure Secret)
+
+Store a pre-obtained token in an Azure secret and reuse it across multiple connections.
+
+```sql
+-- Create Azure secret with pre-provided token
+CREATE SECRET my_token (
+    TYPE azure,
+    PROVIDER access_token,
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
+);
+
+-- Reuse the same token for multiple databases
+ATTACH 'Server=server1.database.windows.net;Database=db1' AS db1 (
+    TYPE mssql,
+    AZURE_SECRET 'my_token'
+);
+ATTACH 'Server=server2.database.windows.net;Database=db2' AS db2 (
+    TYPE mssql,
+    AZURE_SECRET 'my_token'
+);
+```
+
+You can also combine it with an MSSQL secret:
+
+```sql
+CREATE SECRET my_token (
+    TYPE azure,
+    PROVIDER access_token,
+    ACCESS_TOKEN 'eyJ0eXAiOi...your-jwt-token'
+);
+
+CREATE SECRET azure_sql_conn (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    DATABASE 'mydb',
+    AZURE_SECRET 'my_token'
+);
+
+ATTACH '' AS mydb (TYPE mssql, SECRET azure_sql_conn);
+```
+
+**When to use this over direct ACCESS_TOKEN:**
+- You need to connect to multiple servers/databases with the same token
+- You want to manage the token separately from connection details
+
 ---
 
 ## Connection Examples

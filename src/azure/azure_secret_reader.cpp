@@ -72,10 +72,20 @@ AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secre
 		info.chain = chain_val.ToString();
 	}
 
+	// Read access_token for access_token provider (Issue #57)
+	auto access_token_val = kv_secret.TryGetValue("access_token");
+	if (!access_token_val.IsNull()) {
+		info.access_token = access_token_val.ToString();
+	}
+
 	// Validate required fields per provider
 	if (info.provider == "service_principal") {
 		if (info.tenant_id.empty() || info.client_id.empty() || info.client_secret.empty()) {
 			throw InvalidInputException("Service principal requires tenant_id, client_id, client_secret");
+		}
+	} else if (info.provider == "access_token") {
+		if (info.access_token.empty()) {
+			throw InvalidInputException("access_token provider requires ACCESS_TOKEN parameter");
 		}
 	}
 

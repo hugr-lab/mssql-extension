@@ -449,7 +449,11 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 		TokenResult result = TokenResult::Failure("Unknown provider: " + info.provider);
 
 		// Choose authentication method based on provider
-		if (info.provider == "service_principal") {
+		if (info.provider == "access_token") {
+			// Issue #57: Pre-provided token - return directly, no HTTP/CLI needed
+			auto expires_at = std::chrono::system_clock::now() + std::chrono::seconds(DEFAULT_TOKEN_LIFETIME_SECONDS);
+			result = TokenResult::Success(info.access_token, expires_at);
+		} else if (info.provider == "service_principal") {
 			result = AcquireTokenForServicePrincipal(info);
 		} else if (info.provider == "credential_chain") {
 			// Check chains in priority order: env > cli > interactive
