@@ -294,15 +294,24 @@ MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name
 optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	CheckWriteAccess("CREATE SCHEMA");
 
+	if (!transaction.HasContext()) {
+		throw InternalException("Cannot execute CREATE SCHEMA without client context");
+	}
+
+	// Handle IF NOT EXISTS: check if schema already exists (Issue #54)
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.schema);
+		auto existing = LookupSchema(transaction, lookup, OnEntryNotFound::RETURN_NULL);
+		if (existing) {
+			return existing.get();
+		}
+	}
+
 	// Generate T-SQL for CREATE SCHEMA
 	string tsql = MSSQLDDLTranslator::TranslateCreateSchema(info.schema);
 
 	// Execute DDL on SQL Server
-	if (transaction.HasContext()) {
-		ExecuteDDL(transaction.GetContext(), tsql);
-	} else {
-		throw InternalException("Cannot execute CREATE SCHEMA without client context");
-	}
+	ExecuteDDL(transaction.GetContext(), tsql);
 
 	// Point invalidation: invalidate schema list so new schema is visible
 	metadata_cache_->InvalidateAll();
@@ -312,6 +321,16 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 
 void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	CheckWriteAccess("DROP SCHEMA");
+
+	// Handle IF EXISTS: check if schema exists before attempting DROP (Issue #54)
+	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+		CatalogTransaction cat_transaction = GetCatalogTransaction(context);
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.name);
+		auto existing = LookupSchema(cat_transaction, lookup, OnEntryNotFound::RETURN_NULL);
+		if (!existing) {
+			return;
+		}
+	}
 
 	// Generate T-SQL for DROP SCHEMA
 	string tsql = MSSQLDDLTranslator::TranslateDropSchema(info.name);

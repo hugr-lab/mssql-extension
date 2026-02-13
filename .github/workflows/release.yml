@@ -37,7 +37,7 @@ jobs:
   # Build Job - Build extension for all platform/version combinations
   # ============================================================================
   build:
-    name: Build (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
+    name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: lint
     strategy:
@@ -68,10 +68,6 @@ jobs:
             runner: windows-latest
             docker_available: false
 
-        duckdb_version:
-          - '1.4.3'
-          - '1.4.4'
-
     steps:
       - uses: actions/checkout@v4
 
@@ -85,23 +81,22 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
           echo "Extension version: $EXT_VERSION"
 
-      - name: Fetch DuckDB sources
+      - name: Checkout DuckDB submodule
+        shell: bash
+        run: |
+          git submodule update --init --recursive duckdb
+
+      - name: Log build metadata
         id: duckdb
         shell: bash
         run: |
-          chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh "${{ matrix.duckdb_version }}")
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
-
-      - name: Log build metadata
-        shell: bash
-        run: |
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
           echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
-          echo "DuckDB Version: ${{ matrix.duckdb_version }}"
-          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
           echo "Platform: ${{ matrix.platform.id }}"
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
@@ -126,9 +121,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-${{ github.sha }}
+          key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-
+            ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
             ccache-${{ matrix.platform.id }}-
 
       - name: Cache ccache (Windows)
@@ -136,9 +131,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/AppData/Local/ccache
-          key: ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-${{ github.sha }}
+          key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ matrix.platform.id }}-${{ matrix.duckdb_version }}-
+            ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
             ccache-${{ matrix.platform.id }}-
 
       - name: Configure ccache
@@ -209,7 +204,7 @@ jobs:
       - name: Rename artifact
         shell: bash
         run: |
-          ARTIFACT_NAME="mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          ARTIFACT_NAME="mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension"
           cp build/release/extension/mssql/mssql.duckdb_extension "$ARTIFACT_NAME"
           echo "Created artifact: $ARTIFACT_NAME"
           ls -la "$ARTIFACT_NAME"
@@ -217,15 +212,15 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
-          path: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension
+          name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
+          path: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact (Unix)
         if: matrix.platform.os != 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
@@ -233,7 +228,7 @@ jobs:
         if: matrix.platform.os == 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb.exe
           if-no-files-found: error
 
@@ -241,7 +236,7 @@ jobs:
   # Smoke Test Job - Verify extension loads correctly
   # ============================================================================
   smoke-test:
-    name: Smoke Test (${{ matrix.platform.id }}, DuckDB ${{ matrix.duckdb_version }})
+    name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
     strategy:
@@ -272,10 +267,6 @@ jobs:
             runner: windows-latest
             docker_available: false
 
-        duckdb_version:
-          - '1.4.3'
-          - '1.4.4'
-
     steps:
       - uses: actions/checkout@v4
 
@@ -290,13 +281,13 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
 
       - name: Setup executables (Unix)
@@ -307,7 +298,7 @@ jobs:
         shell: bash
         run: |
           # DuckDB derives extension name from filename - must be named mssql.duckdb_extension
-          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-${{ matrix.platform.id }}.duckdb_extension"
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension"
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
 
@@ -336,15 +327,9 @@ jobs:
   # (SQL Server Docker image doesn't support ARM64)
   # ============================================================================
   integration-test:
-    name: Integration Test (linux_amd64, DuckDB ${{ matrix.duckdb_version }})
+    name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: smoke-test
-    strategy:
-      fail-fast: false
-      matrix:
-        duckdb_version:
-          - '1.4.3'
-          - '1.4.4'
 
     services:
       sqlserver:
@@ -374,13 +359,13 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-linux_amd64
+          name: mssql-${{ steps.version.outputs.ext_version }}-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.duckdb_version }}-linux_amd64
+          name: duckdb-cli-linux_amd64
           path: cli
 
       - name: Setup executables
@@ -391,7 +376,7 @@ jobs:
       - name: Rename extension for loading
         run: |
           # DuckDB derives extension name from filename - must be named mssql.duckdb_extension
-          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-duckdb-${{ matrix.duckdb_version }}-linux_amd64.duckdb_extension"
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-linux_amd64.duckdb_extension"
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
 
@@ -457,20 +442,19 @@ jobs:
           body: |
             ## MSSQL Extension ${{ steps.version.outputs.tag }}
 
+            Built against DuckDB v1.5 (variegata).
+
             ### Downloads
 
-            Download the extension for your platform and DuckDB version:
-
-            | Platform | DuckDB 1.4.2 | DuckDB 1.4.3 | DuckDB 1.4.4 |
-            |----------|--------------|--------------|--------------|
-            | Linux x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-linux_amd64.duckdb_extension) |
-            | Linux ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-linux_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-linux_arm64.duckdb_extension) |
-            | macOS ARM64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-osx_arm64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-osx_arm64.duckdb_extension) |
-            | Windows x64 | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.2-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.3-windows_amd64.duckdb_extension) | [Download](mssql-${{ steps.version.outputs.ext_version }}-duckdb-1.4.4-windows_amd64.duckdb_extension) |
+            | Platform | Download |
+            |----------|----------|
+            | Linux x64 | `mssql-${{ steps.version.outputs.ext_version }}-linux_amd64.duckdb_extension` |
+            | Linux ARM64 | `mssql-${{ steps.version.outputs.ext_version }}-linux_arm64.duckdb_extension` |
+            | macOS ARM64 | `mssql-${{ steps.version.outputs.ext_version }}-osx_arm64.duckdb_extension` |
+            | Windows x64 | `mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension` |
 
             ### Verification
 
-            Verify downloads using SHA256 checksums:
             ```bash
             sha256sum -c SHA256SUMS.txt
             ```
@@ -478,6 +462,6 @@ jobs:
             ### Installation
 
             ```sql
-            INSTALL 'path/to/mssql-${{ steps.version.outputs.ext_version }}-duckdb-<VERSION>-<PLATFORM>.duckdb_extension';
+            INSTALL 'path/to/mssql-${{ steps.version.outputs.ext_version }}-<PLATFORM>.duckdb_extension';
             LOAD mssql;
             ```

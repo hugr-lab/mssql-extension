@@ -87,20 +87,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.4
-        id: duckdb
+      - name: Checkout DuckDB submodule
         run: |
-          chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
-          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+          git submodule update --init --recursive duckdb
 
       - name: Log build metadata
+        id: duckdb
         run: |
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
+          DUCKDB_BRANCH=$(git -C duckdb branch --show-current 2>/dev/null || git config -f .gitmodules submodule.duckdb.branch 2>/dev/null || echo "unknown")
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.4"
-          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "DuckDB Branch: $DUCKDB_BRANCH"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
           echo "Platform: ${{ matrix.platform.id }}"
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
@@ -172,28 +173,28 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-${{ matrix.platform.id }}
+          name: mssql-extension-${{ matrix.platform.id }}
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
       - name: Upload unittest Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: unittest-v1.4.4-${{ matrix.platform.id }}
+          name: unittest-${{ matrix.platform.id }}
           path: build/release/test/unittest
           if-no-files-found: error
 
       - name: Upload libduckdb Artifact (for unittest)
         uses: actions/upload-artifact@v4
         with:
-          name: libduckdb-v1.4.4-${{ matrix.platform.id }}
+          name: libduckdb-${{ matrix.platform.id }}
           path: |
             build/release/src/libduckdb.so
             build/release/src/libduckdb.dylib
@@ -228,13 +229,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-${{ matrix.platform.id }}
+          name: mssql-extension-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-${{ matrix.platform.id }}
+          name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
 
       - name: Setup executables
@@ -285,13 +286,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-linux_amd64
+          name: mssql-extension-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-linux_amd64
+          name: duckdb-cli-linux_amd64
           path: cli
 
       - name: Setup executables
@@ -322,22 +323,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.4
+      - name: Checkout DuckDB submodule
+        shell: bash
+        run: |
+          git submodule update --init --recursive duckdb
+
+      - name: Log build metadata
         id: duckdb
         shell: bash
         run: |
-          chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
-
-      - name: Log build metadata
-        shell: bash
-        run: |
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.4"
-          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
           echo "Platform: windows_amd64 (MSVC)"
           echo "vcpkg Triplet: x64-windows-static-release"
           echo "============================================"
@@ -382,14 +382,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-windows_amd64_msvc
+          name: mssql-extension-windows_amd64_msvc
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-windows_amd64_msvc
+          name: duckdb-cli-windows_amd64_msvc
           path: build/release/duckdb.exe
           if-no-files-found: error
 
@@ -409,22 +409,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch DuckDB v1.4.4
+      - name: Checkout DuckDB submodule
+        shell: bash
+        run: |
+          git submodule update --init --recursive duckdb
+
+      - name: Log build metadata
         id: duckdb
         shell: bash
         run: |
-          chmod +x scripts/ci/fetch_duckdb.sh
-          DUCKDB_COMMIT=$(scripts/ci/fetch_duckdb.sh 1.4.4)
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
           echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
-
-      - name: Log build metadata
-        shell: bash
-        run: |
           echo "============================================"
           echo "Build Metadata"
           echo "============================================"
-          echo "DuckDB Version: v1.4.4"
-          echo "DuckDB Commit: ${{ steps.duckdb.outputs.commit }}"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
           echo "Platform: windows_amd64 (MinGW)"
           echo "vcpkg Triplet: x64-mingw-static"
           echo "============================================"
@@ -480,14 +479,14 @@ jobs:
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-windows_amd64_mingw
+          name: mssql-extension-windows_amd64_mingw
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-windows_amd64_mingw
+          name: duckdb-cli-windows_amd64_mingw
           path: build/release/duckdb.exe
           if-no-files-found: error
 
@@ -515,13 +514,13 @@ jobs:
       - name: Download extension artifact
         uses: actions/download-artifact@v4
         with:
-          name: mssql-extension-v1.4.4-${{ matrix.config.artifact_suffix }}
+          name: mssql-extension-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: duckdb-cli-v1.4.4-${{ matrix.config.artifact_suffix }}
+          name: duckdb-cli-${{ matrix.config.artifact_suffix }}
           path: cli
 
       - name: Run load-only smoke test
@@ -550,13 +549,13 @@ jobs:
       - name: Download unittest artifact
         uses: actions/download-artifact@v4
         with:
-          name: unittest-v1.4.4-linux_amd64
+          name: unittest-linux_amd64
           path: test
 
       - name: Download libduckdb artifact
         uses: actions/download-artifact@v4
         with:
-          name: libduckdb-v1.4.4-linux_amd64
+          name: libduckdb-linux_amd64
           path: lib
 
       - name: Setup executables

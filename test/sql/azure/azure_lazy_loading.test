@@ -49,7 +49,7 @@ statement ok
 CREATE TABLE azure_test.dbo.azure_lazy_test (
     id INTEGER PRIMARY KEY,
     name NVARCHAR(100),
-    created_at DATETIME2
+    created_at TIMESTAMP
 );
 
 # Query the table - triggers lazy column loading for this table only
