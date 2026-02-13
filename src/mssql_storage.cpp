@@ -983,11 +983,11 @@ void RegisterMSSQLStorageExtension(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 
-	auto storage_ext = make_uniq<StorageExtension>();
+	auto storage_ext = make_shared_ptr<StorageExtension>();
 	storage_ext->attach = MSSQLAttach;
 	storage_ext->create_transaction_manager = MSSQLCreateTransactionManager;
 
-	config.storage_extensions["mssql"] = std::move(storage_ext);
+	StorageExtension::Register(config, "mssql", std::move(storage_ext));
 }
 
 }  // namespace duckdb

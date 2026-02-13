@@ -12,15 +12,7 @@
 #include "dml/mssql_dml_config.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-
-// Forward declaration for GetData compatibility
-#ifndef MSSQL_GETDATA_METHOD
-#if DUCKDB_MAJOR_VERSION == 1 && DUCKDB_MINOR_VERSION >= 3
-#define MSSQL_GETDATA_METHOD GetData
-#else
-#define MSSQL_GETDATA_METHOD GetData
-#endif
-#endif
+#include "mssql_compat.hpp"
 
 namespace duckdb {
 
