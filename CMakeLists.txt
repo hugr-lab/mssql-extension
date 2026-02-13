@@ -6,7 +6,7 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 # Extension version - update this when creating a new release tag
-set(MSSQL_EXTENSION_VERSION "0.1.17")
+set(MSSQL_EXTENSION_VERSION "0.1.18")
 
 # Project configuration
 project(${TARGET_NAME})
