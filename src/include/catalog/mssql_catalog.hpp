@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -113,6 +114,9 @@ public:
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;
 
+	// Get catalog filter
+	const MSSQLCatalogFilter &GetCatalogFilter() const;
+
 	// Ensure cache is loaded (refresh if needed)
 	void EnsureCacheLoaded(ClientContext &context);
 
@@ -187,6 +191,7 @@ private:
 	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
 	AccessMode access_mode_;											  // READ_ONLY enforced
 	bool catalog_enabled_;												  // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;									  // Regex visibility filter
 	shared_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider

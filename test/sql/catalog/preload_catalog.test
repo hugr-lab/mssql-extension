@@ -1,0 +1,94 @@
+# name: test/sql/catalog/preload_catalog.test
+# description: Test mssql_preload_catalog() bulk metadata loading function
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS preload_test (TYPE mssql);
+
+# Create some tables for preloading
+statement ok
+SELECT mssql_exec('preload_test', 'IF OBJECT_ID(''dbo.preload_table1'') IS NOT NULL DROP TABLE dbo.preload_table1');
+
+statement ok
+SELECT mssql_exec('preload_test', 'IF OBJECT_ID(''dbo.preload_table2'') IS NOT NULL DROP TABLE dbo.preload_table2');
+
+statement ok
+SELECT mssql_exec('preload_test', 'CREATE TABLE dbo.preload_table1 (id INT PRIMARY KEY, name NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('preload_test', 'CREATE TABLE dbo.preload_table2 (id INT PRIMARY KEY, value DECIMAL(10,2))');
+
+statement ok
+SELECT mssql_exec('preload_test', 'INSERT INTO dbo.preload_table1 VALUES (1, N''Preloaded'')');
+
+statement ok
+SELECT mssql_exec('preload_test', 'INSERT INTO dbo.preload_table2 VALUES (1, 123.45)');
+
+statement ok
+SELECT mssql_refresh_cache('preload_test');
+
+# =============================================================================
+# Test 1: Basic preload returns status message
+# =============================================================================
+
+query I
+SELECT mssql_preload_catalog('preload_test') LIKE 'Preloaded%';
+----
+true
+
+# =============================================================================
+# Test 2: After preload, queries use cached data (no additional metadata queries)
+# =============================================================================
+
+query IT
+SELECT id, name FROM preload_test.dbo.preload_table1;
+----
+1	Preloaded
+
+query IR
+SELECT id, value FROM preload_test.dbo.preload_table2;
+----
+1	123.45
+
+# =============================================================================
+# Test 3: Preload with schema argument scopes to one schema
+# =============================================================================
+
+# Refresh first to clear cache
+statement ok
+SELECT mssql_refresh_cache('preload_test');
+
+query I
+SELECT mssql_preload_catalog('preload_test', 'dbo') LIKE 'Preloaded schema%';
+----
+true
+
+# dbo tables should still be queryable
+query IT
+SELECT id, name FROM preload_test.dbo.preload_table1;
+----
+1	Preloaded
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('preload_test', 'DROP TABLE dbo.preload_table1');
+
+statement ok
+SELECT mssql_exec('preload_test', 'DROP TABLE dbo.preload_table2');
+
+statement ok
+DETACH preload_test;

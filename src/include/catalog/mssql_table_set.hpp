@@ -20,12 +20,12 @@ class MSSQLTableEntry;
 //===----------------------------------------------------------------------===//
 // MSSQLTableSet - Lazy-loaded set of tables/views in a schema
 //
-// Supports two loading strategies:
-// 1. Single-table loading: GetEntry loads only the requested table
-// 2. Full loading: Scan loads all tables in the schema
+// Uses two-level loading to avoid eagerly loading column metadata:
+// Level 1 (Names): EnsureNamesLoaded() loads only table names (fast, no column queries)
+// Level 2 (Entries): GetEntry() creates entries on-demand with full columns
 //
-// This enables fast queries on specific tables while still supporting
-// information_schema queries that need to enumerate all tables.
+// This enables fast queries on specific tables in large databases (65K+ tables)
+// while still supporting SHOW TABLES and information_schema queries.
 //===----------------------------------------------------------------------===//
 
 class MSSQLTableSet {
@@ -53,9 +53,6 @@ public:
 	// Entry Loading
 	//===----------------------------------------------------------------------===//
 
-	// Load ALL entries from metadata cache (for Scan operations)
-	void LoadEntries(ClientContext &context);
-
 	// Load a single table entry by name (for GetEntry operations)
 	// Returns true if the table exists and was loaded, false otherwise
 	bool LoadSingleEntry(ClientContext &context, const string &name);
@@ -74,14 +71,21 @@ private:
 	// Create table entry from metadata
 	unique_ptr<MSSQLTableEntry> CreateTableEntry(const MSSQLTableMetadata &metadata);
 
-	// Ensure ALL entries are loaded (called by Scan)
-	void EnsureLoaded(ClientContext &context);
+	// Ensure table names are loaded (no column queries, fast)
+	void EnsureNamesLoaded(ClientContext &context);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
 	MSSQLSchemaEntry &schema_;									  // Parent schema
+
+	// Level 1: Table names only (fast, no column queries)
+	std::unordered_set<string> known_table_names_;				  // Names of all tables in schema
+	std::atomic<bool> names_loaded_;							  // True when table names are loaded
+	std::mutex names_mutex_;									  // Names loading synchronization
+
+	// Level 2: Full entries with columns (created on demand)
 	std::atomic<bool> is_fully_loaded_;							  // True when ALL tables are loaded
 	std::mutex load_mutex_;										  // Loading synchronization
 	std::mutex entry_mutex_;									  // Entry access synchronization

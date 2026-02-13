@@ -179,6 +179,10 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 		result->secret_map[MSSQL_SECRET_CATALOG] = Value::BOOLEAN(true);
 	}
 
+	// Handle optional catalog visibility filters (Spec 033)
+	result->TrySetValue(MSSQL_SECRET_SCHEMA_FILTER, input);
+	result->TrySetValue(MSSQL_SECRET_TABLE_FILTER, input);
+
 	// Mark password as redacted (hidden in duckdb_secrets() output)
 	result->redact_keys.insert(MSSQL_SECRET_PASSWORD);
 
@@ -215,6 +219,10 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 		LogicalType::VARCHAR;  // Optional, tenant for interactive auth
 	create_func.named_parameters[MSSQL_SECRET_ACCESS_TOKEN] =
 		LogicalType::VARCHAR;  // Optional, direct Azure AD JWT token (Spec 032)
+	create_func.named_parameters[MSSQL_SECRET_SCHEMA_FILTER] =
+		LogicalType::VARCHAR;  // Optional, regex schema visibility filter (Spec 033)
+	create_func.named_parameters[MSSQL_SECRET_TABLE_FILTER] =
+		LogicalType::VARCHAR;  // Optional, regex table visibility filter (Spec 033)
 
 	loader.RegisterFunction(std::move(create_func));
 }

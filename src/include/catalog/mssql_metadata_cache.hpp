@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "tds/tds_connection_pool.hpp"
 
@@ -144,6 +145,19 @@ public:
 	bool TryGetCachedSchemaNames(vector<string> &out_names);
 
 	//===----------------------------------------------------------------------===//
+	// Bulk Catalog Preload (Spec 033: US5)
+	//===----------------------------------------------------------------------===//
+
+	// Load all metadata in a single SQL Server round trip
+	// @param connection TDS connection to use
+	// @param schema_name If non-empty, limit bulk load to this schema only
+	// @param schema_count Output: number of schemas loaded
+	// @param table_count Output: number of tables loaded
+	// @param column_count Output: number of columns loaded
+	void BulkLoadAll(tds::TdsConnection &connection, const string &schema_name,
+					 idx_t &schema_count, idx_t &table_count, idx_t &column_count);
+
+	//===----------------------------------------------------------------------===//
 	// Cache Management
 	//===----------------------------------------------------------------------===//
 
@@ -161,6 +175,12 @@ public:
 
 	// Get cache state
 	MSSQLCacheState GetState() const;
+
+	// Set catalog filter (applied to schema/table discovery results)
+	void SetFilter(const MSSQLCatalogFilter *filter);
+
+	// Get catalog filter
+	const MSSQLCatalogFilter *GetFilter() const;
 
 	// Set TTL (0 = manual refresh only)
 	void SetTTL(int64_t ttl_seconds);
@@ -234,6 +254,7 @@ private:
 
 	mutable std::mutex mutex_;							  // Thread-safety for global operations
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
+	const MSSQLCatalogFilter *filter_ = nullptr;		  // Optional visibility filter (owned by MSSQLCatalog)
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
 	int64_t ttl_seconds_;								  // Cache TTL (0 = manual only)

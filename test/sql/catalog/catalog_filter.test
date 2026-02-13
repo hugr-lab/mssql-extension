@@ -1,0 +1,188 @@
+# name: test/sql/catalog/catalog_filter.test
+# description: Test schema_filter and table_filter regex-based object visibility
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup: Create test tables and schemas
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filter_setup (TYPE mssql);
+
+# Create test schema
+statement ok
+SELECT mssql_exec('filter_setup', 'IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = ''filter_test_schema'') EXEC(''CREATE SCHEMA filter_test_schema'')');
+
+# Create tables in dbo
+statement ok
+SELECT mssql_exec('filter_setup', 'IF OBJECT_ID(''dbo.filter_orders'') IS NOT NULL DROP TABLE dbo.filter_orders');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'IF OBJECT_ID(''dbo.filter_products'') IS NOT NULL DROP TABLE dbo.filter_products');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'IF OBJECT_ID(''filter_test_schema.filter_items'') IS NOT NULL DROP TABLE filter_test_schema.filter_items');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'CREATE TABLE dbo.filter_orders (id INT PRIMARY KEY, total DECIMAL(10,2))');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'CREATE TABLE dbo.filter_products (id INT PRIMARY KEY, name NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'CREATE TABLE filter_test_schema.filter_items (id INT PRIMARY KEY, label NVARCHAR(100))');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'INSERT INTO dbo.filter_orders VALUES (1, 99.99)');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'INSERT INTO dbo.filter_products VALUES (1, N''Widget'')');
+
+statement ok
+SELECT mssql_exec('filter_setup', 'INSERT INTO filter_test_schema.filter_items VALUES (1, N''Item1'')');
+
+statement ok
+DETACH filter_setup;
+
+# =============================================================================
+# Test 1: table_filter limits visible tables
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt1 (TYPE mssql, table_filter '^filter_orders$');
+
+# Matching table should be queryable
+query IR
+SELECT id, total FROM filt1.dbo.filter_orders;
+----
+1	99.99
+
+# Non-matching table should not be found
+statement error
+SELECT * FROM filt1.dbo.filter_products;
+----
+does not exist
+
+statement ok
+DETACH filt1;
+
+# =============================================================================
+# Test 2: schema_filter limits visible schemas
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt2 (TYPE mssql, schema_filter '^dbo$');
+
+# dbo tables should be visible
+query IR
+SELECT id, total FROM filt2.dbo.filter_orders;
+----
+1	99.99
+
+# Non-dbo schema should not be visible
+statement error
+SELECT * FROM filt2.filter_test_schema.filter_items;
+----
+does not exist
+
+statement ok
+DETACH filt2;
+
+# =============================================================================
+# Test 3: No filters = all visible
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt3 (TYPE mssql);
+
+query IR
+SELECT id, total FROM filt3.dbo.filter_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM filt3.dbo.filter_products;
+----
+1	Widget
+
+query IT
+SELECT id, label FROM filt3.filter_test_schema.filter_items;
+----
+1	Item1
+
+statement ok
+DETACH filt3;
+
+# =============================================================================
+# Test 4: Invalid regex fails at ATTACH
+# =============================================================================
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt_bad (TYPE mssql, table_filter '[invalid');
+----
+Invalid regex
+
+# =============================================================================
+# Test 5: Partial match pattern (regex_search, not regex_match)
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt5 (TYPE mssql, table_filter 'filter_');
+
+# Both filter_ tables should match (partial match)
+query IR
+SELECT id, total FROM filt5.dbo.filter_orders;
+----
+1	99.99
+
+query IT
+SELECT id, name FROM filt5.dbo.filter_products;
+----
+1	Widget
+
+statement ok
+DETACH filt5;
+
+# =============================================================================
+# Test 6: Case insensitivity
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filt6 (TYPE mssql, table_filter '^FILTER_ORDERS$');
+
+query IR
+SELECT id, total FROM filt6.dbo.filter_orders;
+----
+1	99.99
+
+statement ok
+DETACH filt6;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS filter_cleanup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('filter_cleanup', 'DROP TABLE dbo.filter_orders');
+
+statement ok
+SELECT mssql_exec('filter_cleanup', 'DROP TABLE dbo.filter_products');
+
+statement ok
+SELECT mssql_exec('filter_cleanup', 'DROP TABLE filter_test_schema.filter_items');
+
+statement ok
+SELECT mssql_exec('filter_cleanup', 'DROP SCHEMA filter_test_schema');
+
+statement ok
+DETACH filter_cleanup;
