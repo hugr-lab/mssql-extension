@@ -163,8 +163,8 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	idx_t cached_row_count = 0;
 	if (stats_provider.TryGetCachedRowCount(mssql_schema.name, name, cached_row_count)) {
 		info.cardinality = cached_row_count;
-		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)",
-					   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)cached_row_count);
+		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)", mssql_schema.name.c_str(),
+					   name.c_str(), (unsigned long long)cached_row_count);
 		return info;
 	}
 

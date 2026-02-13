@@ -1,11 +1,11 @@
 #include "catalog/mssql_table_set.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "duckdb/common/exception.hpp"
-#include <cstdio>
-#include <cstdlib>
 
 // Debug logging for catalog operations
 static int GetCatalogDebugLevel() {
@@ -17,15 +17,16 @@ static int GetCatalogDebugLevel() {
 	return level;
 }
 
-#define CATALOG_DEBUG(lvl, fmt, ...)                                        \
-	do {                                                                   \
-		if (GetCatalogDebugLevel() >= lvl)                                 \
-			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__);   \
+#define CATALOG_DEBUG(lvl, fmt, ...)                                     \
+	do {                                                                 \
+		if (GetCatalogDebugLevel() >= lvl)                               \
+			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
 namespace duckdb {
 
-MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema) : schema_(schema), names_loaded_(false), is_fully_loaded_(false) {}
+MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
+	: schema_(schema), names_loaded_(false), is_fully_loaded_(false) {}
 
 //===----------------------------------------------------------------------===//
 // Entry Access
@@ -252,8 +253,8 @@ void MSSQLTableSet::EnsureNamesLoaded(ClientContext &context) {
 	for (const auto &name : table_names) {
 		known_table_names_.insert(name);
 	}
-	CATALOG_DEBUG(1, "EnsureNamesLoaded('%s') — loaded %zu table names (no column queries)",
-				 schema_.name.c_str(), known_table_names_.size());
+	CATALOG_DEBUG(1, "EnsureNamesLoaded('%s') — loaded %zu table names (no column queries)", schema_.name.c_str(),
+				  known_table_names_.size());
 	names_loaded_.store(true);
 }
 

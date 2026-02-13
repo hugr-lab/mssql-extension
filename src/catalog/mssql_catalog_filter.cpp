@@ -10,12 +10,12 @@ namespace duckdb {
 
 string MSSQLCatalogFilter::ValidatePattern(const string &pattern) {
 	if (pattern.empty()) {
-		return "";  // Empty pattern is valid (means no filter)
+		return "";	// Empty pattern is valid (means no filter)
 	}
 	try {
 		std::regex test_regex(pattern, std::regex::icase);
 		(void)test_regex;
-		return "";  // Valid
+		return "";	// Valid
 	} catch (const std::regex_error &e) {
 		return StringUtil::Format("Invalid regex pattern '%s': %s", pattern, e.what());
 	}
@@ -152,10 +152,9 @@ static string ConvertSinglePatternToLike(const string &pattern, const string &co
 		// Escape sequences: \. \* etc → literal character
 		if (c == '\\' && i + 1 < len) {
 			char next = pattern[i + 1];
-			if (next == '.' || next == '*' || next == '+' || next == '?' ||
-				next == '[' || next == ']' || next == '(' || next == ')' ||
-				next == '{' || next == '}' || next == '|' || next == '^' ||
-				next == '$' || next == '\\') {
+			if (next == '.' || next == '*' || next == '+' || next == '?' || next == '[' || next == ']' || next == '(' ||
+				next == ')' || next == '{' || next == '}' || next == '|' || next == '^' || next == '$' ||
+				next == '\\') {
 				if (next == '%' || next == '_' || next == '[') {
 					like_pattern += '[';
 					like_pattern += next;
@@ -166,7 +165,7 @@ static string ConvertSinglePatternToLike(const string &pattern, const string &co
 				i += 2;
 				continue;
 			}
-			return "";  // Unknown escape (\d, \w, etc.)
+			return "";	// Unknown escape (\d, \w, etc.)
 		}
 
 		// Non-convertible regex constructs
@@ -246,8 +245,8 @@ static bool SplitAlternatives(const string &s, vector<string> &out) {
 static bool IsPlainLiteral(const string &s) {
 	for (size_t i = 0; i < s.size(); i++) {
 		char c = s[i];
-		if (c == '.' || c == '*' || c == '+' || c == '?' || c == '[' || c == ']' ||
-			c == '(' || c == ')' || c == '{' || c == '}' || c == '|' || c == '\\') {
+		if (c == '.' || c == '*' || c == '+' || c == '?' || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' ||
+			c == '}' || c == '|' || c == '\\') {
 			return false;
 		}
 	}
@@ -370,7 +369,7 @@ string MSSQLCatalogFilter::TryRegexToSQLLike(const string &pattern, const string
 
 			string converted = ConvertSinglePatternToLike(full_alt, column_expr);
 			if (converted.empty()) {
-				return "";  // Give up on entire pattern
+				return "";	// Give up on entire pattern
 			}
 			sql_parts.push_back(converted);
 		}
@@ -390,4 +389,4 @@ string MSSQLCatalogFilter::TryRegexToSQLLike(const string &pattern, const string
 	return ConvertSinglePatternToLike(pattern, column_expr);
 }
 
-} // namespace duckdb
+}  // namespace duckdb
