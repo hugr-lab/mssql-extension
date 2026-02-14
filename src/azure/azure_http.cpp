@@ -22,8 +22,7 @@ namespace azure {
 namespace httplib = duckdb_httplib_openssl;
 
 HttpResponse HttpPost(const std::string &host, const std::string &path,
-                      const std::map<std::string, std::string> &params,
-                      int timeout_seconds) {
+					  const std::map<std::string, std::string> &params, int timeout_seconds) {
 	httplib::SSLClient client(host);
 	client.set_connection_timeout(timeout_seconds);
 	client.set_read_timeout(timeout_seconds);
@@ -49,9 +48,8 @@ HttpResponse HttpPost(const std::string &host, const std::string &path,
 	return response;
 }
 
-HttpResponse HttpPost(const std::string &host, const std::string &path,
-                      const std::string &body, const std::string &content_type,
-                      int timeout_seconds) {
+HttpResponse HttpPost(const std::string &host, const std::string &path, const std::string &body,
+					  const std::string &content_type, int timeout_seconds) {
 	httplib::SSLClient client(host);
 	client.set_connection_timeout(timeout_seconds);
 	client.set_read_timeout(timeout_seconds);
@@ -75,6 +73,6 @@ std::string UrlEncode(const std::string &value) {
 	return httplib::encode_query_component(value);
 }
 
-} // namespace azure
-} // namespace mssql
-} // namespace duckdb
+}  // namespace azure
+}  // namespace mssql
+}  // namespace duckdb

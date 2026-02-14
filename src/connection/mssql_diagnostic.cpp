@@ -101,8 +101,7 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 			auto user_val = kv_secret.TryGetValue(MSSQL_SECRET_USER);
 			auto password_val = kv_secret.TryGetValue(MSSQL_SECRET_PASSWORD);
 
-			if (host_val.IsNull() || database_val.IsNull() || user_val.IsNull() ||
-				password_val.IsNull()) {
+			if (host_val.IsNull() || database_val.IsNull() || user_val.IsNull() || password_val.IsNull()) {
 				throw InvalidInputException("Secret '%s' is missing required fields", input);
 			}
 
