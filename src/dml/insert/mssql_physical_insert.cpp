@@ -99,7 +99,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 // Source Implementation (for returning results)
 //===----------------------------------------------------------------------===//
 
-SourceResultType MSSQLPhysicalInsert::MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
+SourceResultType MSSQLPhysicalInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 														   OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLInsertGlobalSinkState>();
 

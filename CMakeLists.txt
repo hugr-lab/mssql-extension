@@ -32,32 +32,6 @@ endif()
 message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_HASH}")
 
 # =============================================================================
-# DuckDB API Compatibility (Auto-detected)
-# =============================================================================
-# DuckDB nightly (main) renamed PhysicalOperator::GetData to GetDataInternal.
-# We auto-detect this by checking if GetDataInternal exists in the header.
-set(DUCKDB_PHYSICAL_OPERATOR_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include/duckdb/execution/physical_operator.hpp")
-if(EXISTS "${DUCKDB_PHYSICAL_OPERATOR_HEADER}")
-    file(READ "${DUCKDB_PHYSICAL_OPERATOR_HEADER}" PHYSICAL_OPERATOR_CONTENT)
-    string(FIND "${PHYSICAL_OPERATOR_CONTENT}" "GetDataInternal" GETDATA_INTERNAL_POS)
-    if(GETDATA_INTERNAL_POS GREATER -1)
-        set(MSSQL_DUCKDB_NIGHTLY_DETECTED TRUE)
-    else()
-        set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
-    endif()
-else()
-    message(WARNING "DuckDB physical_operator.hpp not found, assuming stable API")
-    set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
-endif()
-
-if(MSSQL_DUCKDB_NIGHTLY_DETECTED)
-    message(STATUS "Detected DuckDB nightly API (GetDataInternal)")
-    add_compile_definitions(MSSQL_DUCKDB_NIGHTLY=1)
-else()
-    message(STATUS "Detected DuckDB stable API (GetData)")
-endif()
-
-# =============================================================================
 # OpenSSL for TLS support
 # =============================================================================
 set(OPENSSL_USE_STATIC_LIBS ON)

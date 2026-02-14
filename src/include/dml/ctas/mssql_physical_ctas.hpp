@@ -7,7 +7,6 @@
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "mssql_compat.hpp"
 
 namespace duckdb {
 
@@ -97,7 +96,7 @@ public:
 	// Source Interface (for returning row count)
 	//===----------------------------------------------------------------------===//
 
-	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 										  OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {

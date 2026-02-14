@@ -196,7 +196,7 @@ SinkFinalizeType MSSQLPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event 
 // Source Implementation (for returning row count)
 //===----------------------------------------------------------------------===//
 
-SourceResultType MSSQLPhysicalCreateTableAs::MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
+SourceResultType MSSQLPhysicalCreateTableAs::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 																  OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLCTASGlobalSinkState>();
 
