@@ -210,10 +210,9 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32 AND MSVC)
     # MSVC: static OpenSSL needs Windows system libraries
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
-    # OpenSSL static lib requires UCRT symbols (__imp__time64, __imp_strncpy, __imp_strspn).
-    # With /MD these come from ucrt.lib (import lib), but the loadable extension (DLL) may not
-    # get them automatically. /DEFAULTLIB:ucrt adds the import lib without pulling in libucrt.lib.
-    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE "/DEFAULTLIB:ucrt")
+    # OpenSSL static lib embeds /DEFAULTLIB:libucrt (static CRT) which conflicts with
+    # our /MD (dynamic CRT = ucrt.lib). Suppress the static version to avoid LNK2005.
+    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE "/NODEFAULTLIB:libucrt")
 endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
