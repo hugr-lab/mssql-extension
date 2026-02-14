@@ -189,7 +189,8 @@ target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32 AND MSVC)
     # MSVC: static OpenSSL needs Windows system libraries
-    target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
+    # ucrt provides __imp__time64, __imp_strncpy, __imp_strspn required by OpenSSL
+    target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32 ucrt)
 endif()
 
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
@@ -208,7 +209,9 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32 AND MSVC)
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
+    # MSVC: static OpenSSL needs Windows system libraries + UCRT for CRT imports
+    # The loadable extension (DLL) needs explicit ucrt since default libs may be stripped
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32 ucrt)
 endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
