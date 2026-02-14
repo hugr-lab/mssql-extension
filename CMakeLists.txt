@@ -103,6 +103,8 @@ set(EXTENSION_SOURCES
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
+    # Windows POSIX compat (MSVC only, empty on other platforms)
+    src/tds/tds_win32_compat.cpp
     # TLS layer (OpenSSL)
     src/tds/tls/tds_tls_impl.cpp
     src/tds/tls/tds_tls_context.cpp
@@ -191,6 +193,11 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
+if(WIN32 AND MSVC)
+    # MSVC: static libcurl/OpenSSL need Windows system libraries
+    target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32 wldap32 normaliz)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE CURL_STATICLIB)
+endif()
 
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
@@ -205,6 +212,10 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${OPENSSL_INCLUDE_DIR}
 )
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
+if(WIN32 AND MSVC)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32 wldap32 normaliz)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CURL_STATICLIB)
+endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
 if(NOT WIN32)

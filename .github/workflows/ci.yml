@@ -23,7 +23,7 @@ on:
         default: false
         type: boolean
       run_azure_tests:
-        description: 'Run Azure SQL/Fabric tests (requires run_build)'
+        description: 'Run Azure SQL/Fabric tests (requires run_build, use on feature branches only)'
         required: false
         default: false
         type: boolean
@@ -540,7 +540,7 @@ jobs:
     name: Azure Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_azure_tests }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_azure_tests && github.ref != 'refs/heads/main' }}
     environment: test
 
     steps:
