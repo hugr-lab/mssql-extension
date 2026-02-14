@@ -65,7 +65,8 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
 	result->host = kv_secret.TryGetValue("host").ToString();
-	result->port = static_cast<uint16_t>(kv_secret.TryGetValue("port").GetValue<int32_t>());
+	auto port_val = kv_secret.TryGetValue("port");
+	result->port = port_val.IsNull() ? 1433 : static_cast<uint16_t>(port_val.GetValue<int32_t>());
 	result->database = kv_secret.TryGetValue("database").ToString();
 	result->user = kv_secret.TryGetValue("user").ToString();
 	result->password = kv_secret.TryGetValue("password").ToString();

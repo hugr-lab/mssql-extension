@@ -6,7 +6,7 @@ require mssql
 
 # T067: Test mssql_pool_stats on nonexistent context returns empty result
 query I
-SELECT count(*) FROM mssql_pool_stats(context_name='nonexistent_context');
+SELECT count(*) FROM mssql_pool_stats('nonexistent_context');
 ----
 0
 

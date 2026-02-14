@@ -59,13 +59,13 @@ SELECT * FROM mssql_scan('canceldb', 'SELECT 30 AS val');
 
 # Verify pool statistics show connection reuse
 query I
-SELECT acquire_count >= 7 FROM mssql_pool_stats(context_name='canceldb');
+SELECT acquire_count >= 7 FROM mssql_pool_stats('canceldb');
 ----
 true
 
 # Test 6: Verify no acquire timeouts occurred
 query I
-SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='canceldb');
+SELECT acquire_timeout_count FROM mssql_pool_stats('canceldb');
 ----
 0
 

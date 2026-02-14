@@ -4,18 +4,18 @@
 // azure_token.cpp
 //
 // Azure AD token acquisition and caching implementation
-// Uses libcurl for HTTP requests (no Azure SDK dependency)
+// Uses DuckDB's bundled httplib for HTTP requests (no Azure SDK dependency)
 //===----------------------------------------------------------------------===//
 
 #include "azure/azure_token.hpp"
 #include "azure/azure_device_code.hpp"
+#include "azure/azure_http.hpp"
 #include "azure/azure_secret_reader.hpp"
 #include "duckdb/common/exception.hpp"
 
-#include <curl/curl.h>
 #include <array>
 #include <cstdio>
-#include <memory>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -67,28 +67,6 @@ void TokenCache::Invalidate(const std::string &secret_name) {
 void TokenCache::Clear() {
 	std::lock_guard<std::mutex> lock(mutex_);
 	cache_.clear();
-}
-
-//===----------------------------------------------------------------------===//
-// CURL Helper Functions
-//===----------------------------------------------------------------------===//
-
-// Callback function for CURL to write response data
-static size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *response) {
-	size_t total_size = size * nmemb;
-	response->append(static_cast<char *>(contents), total_size);
-	return total_size;
-}
-
-// URL encode a string using CURL
-static std::string UrlEncode(CURL *curl, const std::string &value) {
-	char *encoded = curl_easy_escape(curl, value.c_str(), static_cast<int>(value.length()));
-	if (!encoded) {
-		return value;
-	}
-	std::string result(encoded);
-	curl_free(encoded);
-	return result;
 }
 
 // Parse JSON string value (simple parser for known Azure AD responses)
@@ -294,58 +272,35 @@ static TokenResult AcquireTokenFromEnv() {
 //===----------------------------------------------------------------------===//
 
 TokenResult AcquireTokenForServicePrincipal(const AzureSecretInfo &info) {
-	CURL *curl = curl_easy_init();
-	if (!curl) {
-		return TokenResult::Failure("Failed to initialize CURL");
+	std::string path = "/" + info.tenant_id + "/oauth2/v2.0/token";
+
+	std::map<std::string, std::string> params;
+	params["grant_type"] = "client_credentials";
+	params["client_id"] = info.client_id;
+	params["client_secret"] = info.client_secret;
+	params["scope"] = AZURE_SQL_SCOPE;
+
+	auto response = HttpPost(AZURE_AD_BASE_URL, path, params);
+
+	if (!response.error.empty()) {
+		return TokenResult::Failure("HTTP request failed: " + response.error);
 	}
 
-	std::string url = "https://" + std::string(AZURE_AD_BASE_URL) + "/" + info.tenant_id + "/oauth2/v2.0/token";
-
-	std::string body =
-		"grant_type=client_credentials"
-		"&client_id=" +
-		UrlEncode(curl, info.client_id) + "&client_secret=" + UrlEncode(curl, info.client_secret) +
-		"&scope=" + UrlEncode(curl, AZURE_SQL_SCOPE);
-
-	std::string response;
-	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-	curl_easy_setopt(curl, CURLOPT_POST, 1L);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-
-	struct curl_slist *headers = nullptr;
-	headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-	CURLcode res = curl_easy_perform(curl);
-
-	long http_code = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-
-	if (res != CURLE_OK) {
-		return TokenResult::Failure("HTTP request failed: " + std::string(curl_easy_strerror(res)));
-	}
-
-	if (http_code != 200) {
-		std::string error = ParseJsonString(response, "error");
-		std::string error_desc = ParseJsonString(response, "error_description");
+	if (response.status != 200) {
+		std::string error = ParseJsonString(response.body, "error");
+		std::string error_desc = ParseJsonString(response.body, "error_description");
 		if (!error_desc.empty()) {
 			return TokenResult::Failure("Azure AD error: " + error_desc);
 		}
-		return TokenResult::Failure("HTTP error " + std::to_string(http_code));
+		return TokenResult::Failure("HTTP error " + std::to_string(response.status));
 	}
 
-	std::string access_token = ParseJsonString(response, "access_token");
+	std::string access_token = ParseJsonString(response.body, "access_token");
 	if (access_token.empty()) {
 		return TokenResult::Failure("No access token in response");
 	}
 
-	int expires_in = ParseJsonInt(response, "expires_in");
+	int expires_in = ParseJsonInt(response.body, "expires_in");
 	if (expires_in == 0) {
 		expires_in = static_cast<int>(DEFAULT_TOKEN_LIFETIME_SECONDS);
 	}

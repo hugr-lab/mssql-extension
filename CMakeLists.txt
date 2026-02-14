@@ -32,32 +32,6 @@ endif()
 message(STATUS "Building MSSQL extension against DuckDB commit: ${DUCKDB_COMMIT_HASH}")
 
 # =============================================================================
-# DuckDB API Compatibility (Auto-detected)
-# =============================================================================
-# DuckDB nightly (main) renamed PhysicalOperator::GetData to GetDataInternal.
-# We auto-detect this by checking if GetDataInternal exists in the header.
-set(DUCKDB_PHYSICAL_OPERATOR_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include/duckdb/execution/physical_operator.hpp")
-if(EXISTS "${DUCKDB_PHYSICAL_OPERATOR_HEADER}")
-    file(READ "${DUCKDB_PHYSICAL_OPERATOR_HEADER}" PHYSICAL_OPERATOR_CONTENT)
-    string(FIND "${PHYSICAL_OPERATOR_CONTENT}" "GetDataInternal" GETDATA_INTERNAL_POS)
-    if(GETDATA_INTERNAL_POS GREATER -1)
-        set(MSSQL_DUCKDB_NIGHTLY_DETECTED TRUE)
-    else()
-        set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
-    endif()
-else()
-    message(WARNING "DuckDB physical_operator.hpp not found, assuming stable API")
-    set(MSSQL_DUCKDB_NIGHTLY_DETECTED FALSE)
-endif()
-
-if(MSSQL_DUCKDB_NIGHTLY_DETECTED)
-    message(STATUS "Detected DuckDB nightly API (GetDataInternal)")
-    add_compile_definitions(MSSQL_DUCKDB_NIGHTLY=1)
-else()
-    message(STATUS "Detected DuckDB stable API (GetData)")
-endif()
-
-# =============================================================================
 # OpenSSL for TLS support
 # =============================================================================
 set(OPENSSL_USE_STATIC_LIBS ON)
@@ -65,13 +39,6 @@ find_package(OpenSSL REQUIRED)
 
 message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
 message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
-
-# =============================================================================
-# CURL for Azure AD OAuth2 authentication
-# =============================================================================
-find_package(CURL REQUIRED)
-
-message(STATUS "CURL found: ${CURL_VERSION_STRING}")
 
 # =============================================================================
 # Extension Sources
@@ -103,8 +70,6 @@ set(EXTENSION_SOURCES
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
-    # Windows POSIX compat (MSVC only, empty on other platforms)
-    src/tds/tds_win32_compat.cpp
     # TLS layer (OpenSSL)
     src/tds/tls/tds_tls_impl.cpp
     src/tds/tls/tds_tls_context.cpp
@@ -171,6 +136,7 @@ set(EXTENSION_SOURCES
     src/copy/bcp_writer.cpp
     src/copy/copy_function.cpp
     # Azure AD authentication layer
+    src/azure/azure_http.cpp
     src/azure/azure_secret_reader.cpp
     src/azure/azure_token.cpp
     src/azure/azure_test_function.cpp
@@ -190,31 +156,34 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # =============================================================================
 target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
+target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32 AND MSVC)
-    # MSVC: static libcurl/OpenSSL need Windows system libraries
-    target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32 wldap32 normaliz)
-    target_compile_definitions(${EXTENSION_NAME} PRIVATE CURL_STATICLIB)
+    # MSVC: static OpenSSL needs Windows system libraries
+    target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
-message(STATUS "Static extension configured with TLS (OpenSSL) and Azure AD authentication")
+message(STATUS "Static extension configured with TLS (OpenSSL) and Azure AD authentication (httplib)")
 
 # =============================================================================
 # Loadable Extension Configuration
 # =============================================================================
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/tds/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib
     ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32 AND MSVC)
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32 wldap32 normaliz)
-    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CURL_STATICLIB)
+    # MSVC: static OpenSSL needs Windows system libraries
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors
@@ -256,7 +225,7 @@ elseif(WIN32)
     message(STATUS "Loadable extension: Windows symbol export via .def file")
 endif()
 
-message(STATUS "Loadable extension configured with TLS (OpenSSL) and Azure AD authentication")
+message(STATUS "Loadable extension configured with TLS (OpenSSL) and Azure AD authentication (httplib)")
 
 # =============================================================================
 # Installation

@@ -12,7 +12,6 @@
 #include "dml/mssql_dml_config.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "mssql_compat.hpp"
 
 namespace duckdb {
 
@@ -70,8 +69,8 @@ public:
 	}
 
 	//! Source interface - return the row count
-	SourceResultType MSSQL_GETDATA_METHOD(ExecutionContext &context, DataChunk &chunk,
-										  OperatorSourceInput &input) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+									 OperatorSourceInput &input) const override;
 
 private:
 	//! Target table metadata

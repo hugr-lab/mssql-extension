@@ -232,10 +232,12 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 - N/A (remote SQL Server via TDS protocol) (034-duckdb-v15-upgrade)
 - C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (extension API) (035-ddl-schema-support)
 - C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata + DuckDB extension API, OpenSSL (vcpkg), libcurl (vcpkg) (036-azure-token-docs)
+- C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), cpp-httplib (bundled in DuckDB third_party) (037-replace-libcurl-httplib)
+- N/A (in-memory token cache, no change) (037-replace-libcurl-httplib)
 
 ## Azure AD Authentication
 
-The extension supports Azure AD authentication for Azure SQL Database and Microsoft Fabric. Authentication is implemented using **libcurl** for OAuth2 token acquisition (no Azure SDK dependency for simpler builds).
+The extension supports Azure AD authentication for Azure SQL Database and Microsoft Fabric. Authentication is implemented using DuckDB's bundled **cpp-httplib** (with OpenSSL) for OAuth2 token acquisition (no Azure SDK or libcurl dependency).
 
 **Supported methods:**
 - **Service Principal**: Client credentials flow with tenant_id, client_id, client_secret
@@ -243,7 +245,8 @@ The extension supports Azure AD authentication for Azure SQL Database and Micros
 - **Device Code Flow**: Interactive authentication for MFA-enabled accounts
 
 **Implementation files:**
-- `src/azure/azure_token.cpp` - OAuth2 token acquisition via libcurl
+- `src/azure/azure_http.cpp` - HTTP client wrapper (single httplib compilation unit)
+- `src/azure/azure_token.cpp` - OAuth2 token acquisition
 - `src/azure/azure_device_code.cpp` - RFC 8628 device code flow
 - `src/azure/azure_secret_reader.cpp` - Reads Azure secrets from DuckDB Azure extension
 - `src/azure/azure_test_function.cpp` - `mssql_azure_auth_test()` function
@@ -270,7 +273,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 037-replace-libcurl-httplib: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), cpp-httplib (bundled in DuckDB third_party)
 - 036-azure-token-docs: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata + DuckDB extension API, OpenSSL (vcpkg), libcurl (vcpkg)
 - 035-ddl-schema-support: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (extension API)
-- 034-duckdb-v15-upgrade: Added C++17 (DuckDB extension standard, C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (6,275 commits ahead of v1.4.4), OpenSSL (vcpkg), libcurl (vcpkg)
 

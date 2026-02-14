@@ -43,7 +43,7 @@ SELECT * FROM (
 
 # Check that pool handled the queries
 query I
-SELECT acquire_count >= 4 FROM mssql_pool_stats(context_name='db');
+SELECT acquire_count >= 4 FROM mssql_pool_stats('db');
 ----
 true
 

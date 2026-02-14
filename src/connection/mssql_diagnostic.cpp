@@ -101,13 +101,12 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 			auto user_val = kv_secret.TryGetValue(MSSQL_SECRET_USER);
 			auto password_val = kv_secret.TryGetValue(MSSQL_SECRET_PASSWORD);
 
-			if (host_val.IsNull() || port_val.IsNull() || database_val.IsNull() || user_val.IsNull() ||
-				password_val.IsNull()) {
+			if (host_val.IsNull() || database_val.IsNull() || user_val.IsNull() || password_val.IsNull()) {
 				throw InvalidInputException("Secret '%s' is missing required fields", input);
 			}
 
 			host = host_val.ToString();
-			port = static_cast<uint16_t>(port_val.GetValue<int64_t>());
+			port = port_val.IsNull() ? 1433 : static_cast<uint16_t>(port_val.GetValue<int64_t>());
 			database = database_val.ToString();
 			user = user_val.ToString();
 			password = password_val.ToString();
@@ -167,22 +166,27 @@ void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 // mssql_pool_stats table function
 //===----------------------------------------------------------------------===//
 
-TableFunction MSSQLPoolStatsFunction::GetFunction() {
-	// Create function with optional VARCHAR parameter
-	TableFunction func("mssql_pool_stats", {}, Execute, Bind, InitGlobal);
-	// Add overload with optional context_name parameter
-	func.named_parameters["context_name"] = LogicalType::VARCHAR;
-	return func;
+TableFunctionSet MSSQLPoolStatsFunction::GetFunctionSet() {
+	TableFunctionSet set("mssql_pool_stats");
+
+	// Overload 1: no arguments (all pools)
+	TableFunction no_args("mssql_pool_stats", {}, Execute, Bind, InitGlobal);
+	set.AddFunction(no_args);
+
+	// Overload 2: positional VARCHAR argument: mssql_pool_stats('db')
+	TableFunction with_arg("mssql_pool_stats", {LogicalType::VARCHAR}, Execute, Bind, InitGlobal);
+	set.AddFunction(with_arg);
+
+	return set;
 }
 
 unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
 													  vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<MSSQLPoolStatsBindData>();
 
-	// Check if context_name parameter was provided
-	auto it = input.named_parameters.find("context_name");
-	if (it != input.named_parameters.end() && !it->second.IsNull()) {
-		bind_data->context_name = it->second.GetValue<string>();
+	// Check for positional argument
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		bind_data->context_name = input.inputs[0].GetValue<string>();
 		bind_data->all_pools = false;
 	} else {
 		bind_data->context_name = "";
@@ -297,8 +301,8 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);
 
-	// mssql_pool_stats(context_name VARCHAR) -> TABLE
-	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunction());
+	// mssql_pool_stats([context_name] VARCHAR) -> TABLE
+	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunctionSet());
 }
 
 }  // namespace duckdb
