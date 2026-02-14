@@ -105,7 +105,7 @@ true
 
 # Test 8: Test pool statistics show activity
 query I
-SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='ansi_test_db');
+SELECT connections_created >= 1 FROM mssql_pool_stats('ansi_test_db');
 ----
 true
 

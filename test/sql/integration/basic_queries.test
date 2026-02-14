@@ -33,7 +33,7 @@ Hello World
 
 # Test 4: Verify pool statistics show activity
 query I
-SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='basic_db');
+SELECT connections_created >= 1 FROM mssql_pool_stats('basic_db');
 ----
 true
 

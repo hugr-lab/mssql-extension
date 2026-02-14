@@ -84,7 +84,7 @@ struct MssqlPoolStatsGlobalState : public GlobalTableFunctionState {
 
 class MSSQLPoolStatsFunction {
 public:
-	static TableFunction GetFunction();
+	static TableFunctionSet GetFunctionSet();
 
 private:
 	static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,

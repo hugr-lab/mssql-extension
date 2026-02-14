@@ -27,7 +27,7 @@ SELECT * FROM mssql_scan('limitdb', 'SELECT 1 AS val');
 
 # Verify connection was created
 query I
-SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='limitdb');
+SELECT connections_created >= 1 FROM mssql_pool_stats('limitdb');
 ----
 true
 
@@ -44,7 +44,7 @@ SELECT * FROM mssql_scan('limitdb', 'SELECT 3 AS val');
 
 # Verify connection reuse (should have created only 1 connection for sequential queries)
 query I
-SELECT connections_created FROM mssql_pool_stats(context_name='limitdb');
+SELECT connections_created FROM mssql_pool_stats('limitdb');
 ----
 1
 
@@ -66,7 +66,7 @@ SELECT * FROM mssql_scan('limitdb', 'SELECT 6 AS val');
 
 # Verify still only 1 connection created (reuse working)
 query I
-SELECT connections_created FROM mssql_pool_stats(context_name='limitdb');
+SELECT connections_created FROM mssql_pool_stats('limitdb');
 ----
 1
 
@@ -78,13 +78,13 @@ SELECT current_setting('mssql_connection_limit');
 
 # Test 6: Pool stats after usage
 query I
-SELECT acquire_count >= 6 FROM mssql_pool_stats(context_name='limitdb');
+SELECT acquire_count >= 6 FROM mssql_pool_stats('limitdb');
 ----
 true
 
 # Test 7: No timeouts should have occurred (sequential queries)
 query I
-SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='limitdb');
+SELECT acquire_timeout_count FROM mssql_pool_stats('limitdb');
 ----
 0
 

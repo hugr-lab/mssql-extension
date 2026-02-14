@@ -112,13 +112,13 @@ SELECT SUM(total) FROM (
 
 # Verify pool was used efficiently
 query I
-SELECT connections_created <= 16 FROM mssql_pool_stats(context_name='paralleldb');
+SELECT connections_created <= 16 FROM mssql_pool_stats('paralleldb');
 ----
 true
 
 # Verify no timeouts occurred
 query I
-SELECT acquire_timeout_count FROM mssql_pool_stats(context_name='paralleldb');
+SELECT acquire_timeout_count FROM mssql_pool_stats('paralleldb');
 ----
 0
 

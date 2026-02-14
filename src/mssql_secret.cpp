@@ -91,22 +91,20 @@ string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput
 		}
 	}
 
-	// Check port field (always required)
+	// Check port field (optional, defaults to 1433)
 	auto port_it = input.options.find(MSSQL_SECRET_PORT);
-	if (port_it == input.options.end()) {
-		return "Missing required field 'port'. Provide port parameter when creating secret.";
-	}
+	if (port_it != input.options.end()) {
+		// Validate port range if provided
+		int64_t port_value;
+		try {
+			port_value = port_it->second.GetValue<int64_t>();
+		} catch (...) {
+			return StringUtil::Format("Port must be a valid integer. Got: %s", port_it->second.ToString());
+		}
 
-	// Validate port range
-	int64_t port_value;
-	try {
-		port_value = port_it->second.GetValue<int64_t>();
-	} catch (...) {
-		return StringUtil::Format("Port must be a valid integer. Got: %s", port_it->second.ToString());
-	}
-
-	if (port_value < 1 || port_value > 65535) {
-		return StringUtil::Format("Port must be between 1 and 65535. Got: %lld", port_value);
+		if (port_value < 1 || port_value > 65535) {
+			return StringUtil::Format("Port must be between 1 and 65535. Got: %lld", port_value);
+		}
 	}
 
 	return "";	// Valid

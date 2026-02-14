@@ -103,7 +103,7 @@ SELECT * FROM mssql_scan('db', 'SELECT 5 AS seq5');
 
 # Pool should still have only 1 connection (reuse)
 query I
-SELECT connections_created FROM mssql_pool_stats(context_name='db');
+SELECT connections_created FROM mssql_pool_stats('db');
 ----
 1
 

@@ -60,7 +60,7 @@ SELECT * FROM mssql_scan('tls_pool_db', 'SELECT 1 AS val');
 
 # Check pool statistics - connection should be created
 query I
-SELECT connections_created >= 1 FROM mssql_pool_stats(context_name='tls_pool_db');
+SELECT connections_created >= 1 FROM mssql_pool_stats('tls_pool_db');
 ----
 true
 

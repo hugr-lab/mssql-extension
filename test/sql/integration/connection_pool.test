@@ -24,13 +24,13 @@ SELECT
     connections_closed >= 0,
     acquire_count >= 0,
     acquire_timeout_count >= 0
-FROM mssql_pool_stats(context_name='pool_db');
+FROM mssql_pool_stats('pool_db');
 ----
 true	true	true	true	true	true	true	true
 
 # Test 3: Pool statistics for non-existent context should return empty
 query I
-SELECT count(*) FROM mssql_pool_stats(context_name='nonexistent_context');
+SELECT count(*) FROM mssql_pool_stats('nonexistent_context');
 ----
 0
 
@@ -55,7 +55,7 @@ DETACH pool_db;
 
 # Test 7: After detach, pool stats should return empty
 query I
-SELECT count(*) FROM mssql_pool_stats(context_name='pool_db');
+SELECT count(*) FROM mssql_pool_stats('pool_db');
 ----
 0
 
@@ -65,7 +65,7 @@ ATTACH '${MSSQL_TEST_DSN}' AS pool_db2 (TYPE mssql);
 
 # Pool should be created for connection string attachment too
 query I
-SELECT total_connections >= 0 FROM mssql_pool_stats(context_name='pool_db2');
+SELECT total_connections >= 0 FROM mssql_pool_stats('pool_db2');
 ----
 true
 
