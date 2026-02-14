@@ -100,7 +100,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-														   OperatorSourceInput &input) const {
+													  OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLInsertGlobalSinkState>();
 
 	// Thread-safe access

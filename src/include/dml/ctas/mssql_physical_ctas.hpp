@@ -97,7 +97,7 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-										  OperatorSourceInput &input) const override;
+									 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;

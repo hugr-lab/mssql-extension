@@ -64,7 +64,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalDelete::GetLocalSinkState(ExecutionConte
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalDelete::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-														   OperatorSourceInput &input) const {
+													  OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 

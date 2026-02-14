@@ -70,7 +70,7 @@ public:
 
 	//! Source interface - return the row count
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-										  OperatorSourceInput &input) const override;
+									 OperatorSourceInput &input) const override;
 
 private:
 	//! Target table metadata

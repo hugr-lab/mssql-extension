@@ -1,0 +1,29 @@
+[14:07:42] === BENCHMARK: Testing against BenchmarkDB ===
+[14:07:42] Table count: 200000 (100000 per schema)
+[14:07:42] Schemas: bench_alpha, bench_beta
+[14:07:42] DuckDB: ./build/release/duckdb
+
+========================================================================
+SCENARIO 1: Attach (no filters) → SELECT one table → preload
+========================================================================
+
+  => 1a. ATTACH (no filters): 1610 ms
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+  => 1b. SELECT from one table: 1042 ms
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌───────┬─────────┬─────────┬───────┬───────────┬───────────────┬───────┬─────────┬───────────┬───────┬───────────────┬─────────┐
+│  id   │  col_1  │  col_2  │ col_3 │   col_4   │     col_5     │ col_6 │  col_7  │   col_8   │ col_9 │    col_10     │ col_11  │
+│ int32 │ varchar │ varchar │ int32 │ timestamp │ decimal(18,4) │ int32 │ varchar │ timestamp │ int32 │ decimal(18,4) │ varchar │
+├───────┼─────────┼─────────┼───────┼───────────┼───────────────┼───────┼─────────┼───────────┼───────┼───────────────┼─────────┤
+│     1 │ hello   │ world   │  NULL │ NULL      │          NULL │  NULL │ NULL    │ NULL      │  NULL │          NULL │ NULL    │
+└───────┴─────────┴─────────┴───────┴───────────┴───────────────┴───────┴─────────┴───────────┴───────┴───────────────┴─────────┘

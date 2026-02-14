@@ -197,7 +197,7 @@ SinkFinalizeType MSSQLPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event 
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalCreateTableAs::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-																  OperatorSourceInput &input) const {
+															 OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLCTASGlobalSinkState>();
 
 	// Thread-safe access

@@ -64,7 +64,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalUpdate::GetLocalSinkState(ExecutionConte
 //===----------------------------------------------------------------------===//
 
 SourceResultType MSSQLPhysicalUpdate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-														   OperatorSourceInput &input) const {
+													  OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
