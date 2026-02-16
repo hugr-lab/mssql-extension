@@ -161,8 +161,8 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-if(WIN32 AND MSVC)
-    # MSVC: static OpenSSL needs Windows system libraries
+if(WIN32)
+    # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
@@ -181,8 +181,8 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-if(WIN32 AND MSVC)
-    # MSVC: static OpenSSL needs Windows system libraries
+if(WIN32)
+    # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
