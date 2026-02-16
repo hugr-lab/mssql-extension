@@ -53,7 +53,7 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	// ORDER BY Pushdown (Spec 039)
 	//===----------------------------------------------------------------------===//
-	int8_t order_pushdown = -1; // -1 = not specified (use global setting), 0 = disabled, 1 = enabled
+	int8_t order_pushdown = -1;	 // -1 = not specified (use global setting), 0 = disabled, 1 = enabled
 
 	//===----------------------------------------------------------------------===//
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)

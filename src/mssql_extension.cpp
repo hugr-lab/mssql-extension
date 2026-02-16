@@ -8,12 +8,12 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
-#include "duckdb/main/config.hpp"
-#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "table_scan/mssql_optimizer.hpp"
 
 namespace duckdb {

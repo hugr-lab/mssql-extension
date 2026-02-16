@@ -11,14 +11,14 @@
 
 #include "table_scan/mssql_optimizer.hpp"
 #include <cstdlib>
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -34,11 +34,11 @@ static int GetOptimizerDebugLevel() {
 	return level;
 }
 
-#define MSSQL_OPT_DEBUG(lvl, fmt, ...)                                        \
-	do {                                                                      \
-		if (GetOptimizerDebugLevel() >= lvl) {                                \
-			fprintf(stderr, "[MSSQL OPTIMIZER] " fmt "\n", ##__VA_ARGS__);    \
-		}                                                                     \
+#define MSSQL_OPT_DEBUG(lvl, fmt, ...)                                     \
+	do {                                                                   \
+		if (GetOptimizerDebugLevel() >= lvl) {                             \
+			fprintf(stderr, "[MSSQL OPTIMIZER] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                  \
 	} while (0)
 
 namespace duckdb {
@@ -110,8 +110,7 @@ static MSSQLScanInfo FindMSSQLScan(unique_ptr<LogicalOperator> &node) {
 // Helper: Resolve a column reference expression to a table column index
 // Handles both BOUND_REF (positional) and BOUND_COLUMN_REF (table.column binding)
 //------------------------------------------------------------------------------
-static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get,
-                               idx_t &out_col_ids_index) {
+static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get, idx_t &out_col_ids_index) {
 	auto &col_ids = get.GetColumnIds();
 
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
@@ -128,8 +127,7 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get,
 		// Match against the Get's table_index and find column in GetColumnIds
 		if (col_ref.binding.table_index != get.table_index) {
 			MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF table_index %llu != get.table_index %llu",
-			                (unsigned long long)col_ref.binding.table_index,
-			                (unsigned long long)get.table_index);
+							(unsigned long long)col_ref.binding.table_index, (unsigned long long)get.table_index);
 			return false;
 		}
 		// column_index maps to position in GetColumnIds
@@ -151,17 +149,14 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get,
 // ordering node and the Get, ORDER BY refs point to projection outputs
 // and we must resolve through the Projection's expressions.
 //------------------------------------------------------------------------------
-static bool ResolveOrderExpression(const Expression &expr,
-                                   const LogicalGet &get,
-                                   const LogicalProjection *projection,
-                                   const MSSQLCatalogScanBindData &bind_data,
-                                   string &out_fragment, string &out_source_column,
-                                   idx_t &out_table_col_idx) {
+static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get, const LogicalProjection *projection,
+								   const MSSQLCatalogScanBindData &bind_data, string &out_fragment,
+								   string &out_source_column, idx_t &out_table_col_idx) {
 	const Expression *resolve_expr = &expr;
 	auto &col_ids = get.GetColumnIds();
 
-	MSSQL_OPT_DEBUG(2, "  ResolveOrderExpression: expr class=%d, has_projection=%s",
-	                (int)expr.GetExpressionClass(), projection ? "yes" : "no");
+	MSSQL_OPT_DEBUG(2, "  ResolveOrderExpression: expr class=%d, has_projection=%s", (int)expr.GetExpressionClass(),
+					projection ? "yes" : "no");
 
 	// If there's a projection, try to resolve through it
 	if (projection) {
@@ -171,7 +166,7 @@ static bool ResolveOrderExpression(const Expression &expr,
 			if (ref.index < projection->expressions.size()) {
 				resolve_expr = projection->expressions[ref.index].get();
 				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_REF[%llu] through projection -> class=%d",
-				                (unsigned long long)ref.index, (int)resolve_expr->GetExpressionClass());
+								(unsigned long long)ref.index, (int)resolve_expr->GetExpressionClass());
 			} else {
 				return false;
 			}
@@ -181,18 +176,18 @@ static bool ResolveOrderExpression(const Expression &expr,
 			auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 			// If binding matches projection's table_index, look through projection
 			if (col_ref.binding.table_index == projection->table_index &&
-			    col_ref.binding.column_index < projection->expressions.size()) {
+				col_ref.binding.column_index < projection->expressions.size()) {
 				resolve_expr = projection->expressions[col_ref.binding.column_index].get();
 				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_COLUMN_REF[%llu.%llu] through projection -> class=%d",
-				                (unsigned long long)col_ref.binding.table_index,
-				                (unsigned long long)col_ref.binding.column_index,
-				                (int)resolve_expr->GetExpressionClass());
+								(unsigned long long)col_ref.binding.table_index,
+								(unsigned long long)col_ref.binding.column_index,
+								(int)resolve_expr->GetExpressionClass());
 			}
 			// If binding matches Get's table_index, resolve directly against Get (skip projection)
 			else if (col_ref.binding.table_index == get.table_index) {
 				MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF[%llu.%llu] references Get directly",
-				                (unsigned long long)col_ref.binding.table_index,
-				                (unsigned long long)col_ref.binding.column_index);
+								(unsigned long long)col_ref.binding.table_index,
+								(unsigned long long)col_ref.binding.column_index);
 				// resolve_expr stays as &expr, handled below
 			}
 		}
@@ -222,15 +217,14 @@ static bool ResolveOrderExpression(const Expression &expr,
 		}
 
 		if (mapping->expected_args != 1 || func_expr.children.size() != 1) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu",
-			                func_expr.function.name.c_str(), func_expr.children.size());
+			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu", func_expr.function.name.c_str(),
+							func_expr.children.size());
 			return false;
 		}
 
 		idx_t inner_col_ids_index;
 		if (!ResolveColumnIndex(*func_expr.children[0], get, inner_col_ids_index)) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref",
-			                func_expr.function.name.c_str());
+			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref", func_expr.function.name.c_str());
 			return false;
 		}
 
@@ -259,8 +253,7 @@ static bool ResolveOrderExpression(const Expression &expr,
 //------------------------------------------------------------------------------
 // Helper: Validate NULL ordering compatibility with SQL Server
 //------------------------------------------------------------------------------
-static bool IsNullOrderCompatible(OrderType order_type, OrderByNullType null_order,
-                                  bool is_nullable) {
+static bool IsNullOrderCompatible(OrderType order_type, OrderByNullType null_order, bool is_nullable) {
 	// If column is NOT NULL, NULL ordering is irrelevant
 	if (!is_nullable) {
 		return true;
@@ -279,11 +272,9 @@ static bool IsNullOrderCompatible(OrderType order_type, OrderByNullType null_ord
 //------------------------------------------------------------------------------
 // Core: Process ORDER BY nodes and build pushdown clause
 //------------------------------------------------------------------------------
-static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders,
-                                 const LogicalGet &get,
-                                 const LogicalProjection *projection,
-                                 MSSQLCatalogScanBindData &bind_data,
-                                 string &out_order_clause) {
+static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const LogicalGet &get,
+								 const LogicalProjection *projection, MSSQLCatalogScanBindData &bind_data,
+								 string &out_order_clause) {
 	string order_clause;
 	idx_t pushed_count = 0;
 
@@ -294,10 +285,10 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders,
 		string fragment;
 		string source_column;
 		idx_t table_col_idx;
-		if (!ResolveOrderExpression(*order.expression, get, projection, bind_data,
-		                            fragment, source_column, table_col_idx)) {
+		if (!ResolveOrderExpression(*order.expression, get, projection, bind_data, fragment, source_column,
+									table_col_idx)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: cannot push (unsupported expression)", (unsigned long long)i);
-			break; // Stop at first non-pushable column (prefix only)
+			break;	// Stop at first non-pushable column (prefix only)
 		}
 
 		// Validate NULL ordering
@@ -307,9 +298,9 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders,
 		}
 
 		if (!IsNullOrderCompatible(order.type, order.null_order, is_nullable)) {
-			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL order mismatch for nullable column %s",
-			                (unsigned long long)i, source_column.c_str());
-			break; // Stop at first incompatible column
+			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL order mismatch for nullable column %s", (unsigned long long)i,
+							source_column.c_str());
+			break;	// Stop at first incompatible column
 		}
 
 		// Add direction suffix
@@ -320,8 +311,7 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders,
 		order_clause += fragment + direction;
 		pushed_count++;
 
-		MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: pushed %s%s", (unsigned long long)i,
-		                fragment.c_str(), direction.c_str());
+		MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: pushed %s%s", (unsigned long long)i, fragment.c_str(), direction.c_str());
 	}
 
 	out_order_clause = order_clause;
@@ -352,13 +342,12 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 	}
 
 	MSSQL_OPT_DEBUG(1, "Detected LogicalOrder -> %sLogicalGet(mssql_catalog_scan) for %s.%s",
-	                scan_info.projection ? "Projection -> " : "",
-	                bind_data.schema_name.c_str(), bind_data.table_name.c_str());
+					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
+					bind_data.table_name.c_str());
 
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection,
-	                                   bind_data, order_clause);
+	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
@@ -375,7 +364,7 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 		plan = std::move(plan->children[0]);
 	} else {
 		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu columns) - keeping LogicalOrder",
-		                (unsigned long long)pushed, (unsigned long long)order.orders.size());
+						(unsigned long long)pushed, (unsigned long long)order.orders.size());
 	}
 }
 
@@ -421,13 +410,12 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 	}
 
 	MSSQL_OPT_DEBUG(1, "Detected LogicalLimit -> LogicalOrder -> %sLogicalGet(mssql_catalog_scan) for %s.%s",
-	                scan_info.projection ? "Projection -> " : "",
-	                bind_data.schema_name.c_str(), bind_data.table_name.c_str());
+					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
+					bind_data.table_name.c_str());
 
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection,
-	                                   bind_data, order_clause);
+	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
@@ -441,13 +429,13 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 	if (pushed == order.orders.size()) {
 		idx_t limit_val = limit.limit_val.GetConstantValue();
 		bind_data.top_n = static_cast<int64_t>(limit_val);
-		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s",
-		                (unsigned long long)limit_val, order_clause.c_str());
+		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s", (unsigned long long)limit_val,
+						order_clause.c_str());
 		// Replace LIMIT -> ORDER -> [Projection ->] GET with [Projection ->] GET
 		plan = std::move(limit_child->children[0]);
 	} else {
 		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu) - keeping LIMIT and ORDER",
-		                (unsigned long long)pushed, (unsigned long long)order.orders.size());
+						(unsigned long long)pushed, (unsigned long long)order.orders.size());
 	}
 }
 
@@ -481,13 +469,12 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 	}
 
 	MSSQL_OPT_DEBUG(1, "Detected LogicalTopN -> %sLogicalGet(mssql_catalog_scan) for %s.%s",
-	                scan_info.projection ? "Projection -> " : "",
-	                bind_data.schema_name.c_str(), bind_data.table_name.c_str());
+					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
+					bind_data.table_name.c_str());
 
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(top_n.orders, *scan_info.get, scan_info.projection,
-	                                   bind_data, order_clause);
+	idx_t pushed = ProcessOrderByNodes(top_n.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
@@ -500,12 +487,12 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 	// Full pushdown: replace TopN with its child (Projection -> GET or just GET)
 	if (pushed == top_n.orders.size()) {
 		bind_data.top_n = static_cast<int64_t>(top_n.limit);
-		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s",
-		                (unsigned long long)top_n.limit, order_clause.c_str());
+		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s", (unsigned long long)top_n.limit,
+						order_clause.c_str());
 		plan = std::move(plan->children[0]);
 	} else {
-		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu) - keeping LogicalTopN",
-		                (unsigned long long)pushed, (unsigned long long)top_n.orders.size());
+		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu) - keeping LogicalTopN", (unsigned long long)pushed,
+						(unsigned long long)top_n.orders.size());
 	}
 }
 
@@ -524,4 +511,4 @@ void MSSQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	}
 }
 
-} // namespace duckdb
+}  // namespace duckdb

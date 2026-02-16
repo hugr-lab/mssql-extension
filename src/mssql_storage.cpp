@@ -815,7 +815,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string table_filter_option;			 // Spec 033: ATTACH-level table filter
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
-	int8_t order_pushdown_option = -1;   // Spec 039: ORDER BY pushdown (-1=unset)
+	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
