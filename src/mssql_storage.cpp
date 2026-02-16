@@ -192,8 +192,9 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 		rest = rest.substr(0, query_pos);
 	}
 
-	// Extract user:password (before @)
-	auto at_pos = rest.find('@');
+	// Extract user:password (before last @)
+	// Use rfind to support passwords containing unencoded '@' characters
+	auto at_pos = rest.rfind('@');
 	if (at_pos != string::npos) {
 		string user_pass = rest.substr(0, at_pos);
 		rest = rest.substr(at_pos + 1);
