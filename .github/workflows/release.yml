@@ -34,7 +34,7 @@ jobs:
           find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
 
   # ============================================================================
-  # Build Job - Build extension for all platform/version combinations
+  # Build Job - Build extension for Unix platforms
   # ============================================================================
   build:
     name: Build (${{ matrix.platform.id }})
@@ -60,12 +60,6 @@ jobs:
             os: osx
             arch: arm64
             runner: macos-14
-            docker_available: false
-
-          - id: windows_amd64
-            os: windows
-            arch: amd64
-            runner: windows-latest
             docker_available: false
 
     steps:
@@ -101,8 +95,7 @@ jobs:
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
 
-      - name: Setup Ninja and ccache (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Setup Ninja and ccache
         run: |
           if [ "${{ matrix.platform.os }}" = "osx" ]; then
             brew install ninja ccache
@@ -111,26 +104,11 @@ jobs:
             sudo apt-get install -y ninja-build ccache
           fi
 
-      - name: Setup Ninja (Windows)
-        if: matrix.platform.os == 'windows'
-        run: choco install ninja ccache
-
       # Cache ccache to speed up compilation
-      - name: Cache ccache (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
-            ccache-${{ matrix.platform.id }}-
-
-      - name: Cache ccache (Windows)
-        if: matrix.platform.os == 'windows'
-        uses: actions/cache@v4
-        with:
-          path: ~/AppData/Local/ccache
           key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-
@@ -148,11 +126,7 @@ jobs:
         run: |
           if [ ! -d "vcpkg" ]; then
             git clone https://github.com/microsoft/vcpkg.git
-            if [ "${{ matrix.platform.os }}" = "windows" ]; then
-              ./vcpkg/bootstrap-vcpkg.bat
-            else
-              ./vcpkg/bootstrap-vcpkg.sh
-            fi
+            ./vcpkg/bootstrap-vcpkg.sh
           fi
 
       # Cache vcpkg installed packages
@@ -166,8 +140,7 @@ jobs:
           restore-keys: |
             vcpkg-${{ matrix.platform.id }}-
 
-      - name: Build Release (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Build Release
         run: |
           mkdir -p build/release
           cd build/release
@@ -176,24 +149,6 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
-            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
-            ../../duckdb
-          cmake --build . --config Release
-
-      - name: Build Release (Windows)
-        if: matrix.platform.os == 'windows'
-        shell: bash
-        run: |
-          mkdir -p build/release
-          cd build/release
-          cmake -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=x64-mingw-static \
-            -DVCPKG_HOST_TRIPLET=x64-mingw-static \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
@@ -218,24 +173,271 @@ jobs:
           path: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension
           if-no-files-found: error
 
-      - name: Upload DuckDB CLI artifact (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Upload DuckDB CLI artifact
         uses: actions/upload-artifact@v4
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
-      - name: Upload DuckDB CLI artifact (Windows)
-        if: matrix.platform.os == 'windows'
+  # ============================================================================
+  # Build Windows (MSVC) - Matches community-extensions CI configuration
+  # ============================================================================
+  build-windows-msvc:
+    name: Build (windows_amd64)
+    runs-on: windows-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+          echo "Extension version: $EXT_VERSION"
+
+      - name: Checkout DuckDB submodule
+        shell: bash
+        run: |
+          git submodule update --init --recursive duckdb
+
+      - name: Log build metadata
+        id: duckdb
+        shell: bash
+        run: |
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
+          echo "Platform: windows_amd64 (MSVC)"
+          echo "vcpkg Triplet: x64-windows-static-release"
+          echo "============================================"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-msvc-x64-windows-static-release-
+
+      - name: Setup Visual Studio Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup ccache
+        shell: bash
+        run: |
+          choco install ccache ninja
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ccache
+          key: ccache-windows_amd64-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
+          restore-keys: |
+            ccache-windows_amd64-${{ steps.duckdb.outputs.commit }}-
+            ccache-windows_amd64-
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/release
+          Push-Location build/release
+          cmake -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_TOOLCHAIN_FILE="$env:RUNVCPKG_VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-release `
+            -DVCPKG_HOST_TRIPLET=x64-windows-static-release `
+            -DVCPKG_MANIFEST_DIR="$(Get-Location)/../.." `
+            -DDUCKDB_EXTENSION_CONFIGS="$(Get-Location)/../../extension_config.cmake" `
+            ../../duckdb
+          cmake --build . --config Release
+          Pop-Location
+
+      - name: Show ccache stats
+        shell: bash
+        run: ccache -s
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          ARTIFACT_NAME="mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension"
+          cp build/release/extension/mssql/mssql.duckdb_extension "$ARTIFACT_NAME"
+          echo "Created artifact: $ARTIFACT_NAME"
+          ls -la "$ARTIFACT_NAME"
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: duckdb-cli-${{ matrix.platform.id }}
+          name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64
+          path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-windows_amd64
           path: build/release/duckdb.exe
           if-no-files-found: error
 
   # ============================================================================
-  # Smoke Test Job - Verify extension loads correctly
+  # Build Windows (MinGW) - Matches community-extensions CI configuration
+  # ============================================================================
+  build-windows-mingw:
+    name: Build (windows_amd64_mingw)
+    runs-on: windows-latest
+    needs: lint
+    env:
+      CC: gcc
+      CXX: g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+          echo "Extension version: $EXT_VERSION"
+
+      - name: Checkout DuckDB submodule
+        shell: bash
+        run: |
+          git submodule update --init --recursive duckdb
+
+      - name: Log build metadata
+        id: duckdb
+        shell: bash
+        run: |
+          DUCKDB_COMMIT=$(git -C duckdb rev-parse HEAD)
+          echo "commit=$DUCKDB_COMMIT" >> $GITHUB_OUTPUT
+          echo "============================================"
+          echo "Build Metadata"
+          echo "============================================"
+          echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
+          echo "DuckDB Commit: $DUCKDB_COMMIT"
+          echo "Platform: windows_amd64_mingw (MinGW)"
+          echo "vcpkg Triplet: x64-mingw-static"
+          echo "============================================"
+
+      # Setup Rtools 4.2 for MinGW compiler
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'devel'
+          update-rtools: true
+          rtools-version: '42'
+
+      - name: Setup rtools gcc for vcpkg
+        shell: bash
+        run: |
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/gcc.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-gcc.exe
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/g++.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-g++.exe
+          echo "C:/rtools42/x86_64-w64-mingw32.static.posix/bin" >> $GITHUB_PATH
+          echo "C:/rtools42/usr/bin" >> $GITHUB_PATH
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-mingw-x64-mingw-static-
+
+      - name: Setup ccache
+        shell: bash
+        run: |
+          choco install ccache ninja
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ccache
+          key: ccache-windows_amd64_mingw-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
+          restore-keys: |
+            ccache-windows_amd64_mingw-${{ steps.duckdb.outputs.commit }}-
+            ccache-windows_amd64_mingw-
+
+      - name: Build Release
+        shell: bash
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNVCPKG_VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-mingw-static \
+            -DVCPKG_HOST_TRIPLET=x64-mingw-static \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Show ccache stats
+        shell: bash
+        run: ccache -s
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          ARTIFACT_NAME="mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw.duckdb_extension"
+          cp build/release/extension/mssql/mssql.duckdb_extension "$ARTIFACT_NAME"
+          echo "Created artifact: $ARTIFACT_NAME"
+          ls -la "$ARTIFACT_NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw
+          path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw.duckdb_extension
+          if-no-files-found: error
+
+      - name: Upload DuckDB CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-cli-windows_amd64_mingw
+          path: build/release/duckdb.exe
+          if-no-files-found: error
+
+  # ============================================================================
+  # Smoke Test Job - Verify extension loads correctly (Unix)
   # ============================================================================
   smoke-test:
     name: Smoke Test (${{ matrix.platform.id }})
@@ -263,12 +465,6 @@ jobs:
             runner: macos-14
             docker_available: false
 
-          - id: windows_amd64
-            os: windows
-            arch: amd64
-            runner: windows-latest
-            docker_available: false
-
     steps:
       - uses: actions/checkout@v4
 
@@ -292,8 +488,7 @@ jobs:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
 
-      - name: Setup executables (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Setup executables
         run: chmod +x cli/duckdb
 
       - name: Rename extension for loading
@@ -304,25 +499,61 @@ jobs:
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
 
-      - name: Run load-only smoke test (Unix)
-        if: matrix.platform.os != 'windows'
+      - name: Run load-only smoke test
         run: |
           chmod +x scripts/ci/smoke_test.sh
           scripts/ci/smoke_test.sh ./cli/duckdb extension/mssql.duckdb_extension
 
-      - name: Run load-only smoke test (Windows)
-        if: matrix.platform.os == 'windows'
+  # ============================================================================
+  # Smoke Test Job - Windows (MSVC and MinGW)
+  # ============================================================================
+  smoke-test-windows:
+    name: Smoke Test (${{ matrix.config.id }})
+    runs-on: windows-latest
+    needs: [build-windows-msvc, build-windows-mingw]
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - id: windows_amd64
+            artifact_suffix: windows_amd64
+          - id: windows_amd64_mingw
+            artifact_suffix: windows_amd64_mingw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract extension version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXT_VERSION="${TAG#v}"
+          echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.config.artifact_suffix }}
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: duckdb-cli-${{ matrix.config.artifact_suffix }}
+          path: cli
+
+      - name: Rename extension for loading
+        shell: bash
+        run: |
+          VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.config.artifact_suffix }}.duckdb_extension"
+          mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
+          ls -la extension/
+
+      - name: Run load-only smoke test
         shell: pwsh
         run: |
           .\cli\duckdb.exe --unsigned -c "LOAD 'extension/mssql.duckdb_extension'; SELECT mssql_version();"
-
-      - name: Log integration test status
-        if: matrix.platform.docker_available == false
-        run: |
-          echo "============================================"
-          echo "Integration test skipped - Docker not available on ${{ matrix.platform.id }}"
-          echo "Load-only smoke test passed successfully"
-          echo "============================================"
 
   # ============================================================================
   # Integration Test Job - Full SQL Server tests on Linux x64 only
@@ -398,7 +629,7 @@ jobs:
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [smoke-test, integration-test]
+    needs: [smoke-test, smoke-test-windows, integration-test]
     permissions:
       contents: write
     steps:
@@ -453,7 +684,8 @@ jobs:
             | Linux x64 | `mssql-${{ steps.version.outputs.ext_version }}-linux_amd64.duckdb_extension` |
             | Linux ARM64 | `mssql-${{ steps.version.outputs.ext_version }}-linux_arm64.duckdb_extension` |
             | macOS ARM64 | `mssql-${{ steps.version.outputs.ext_version }}-osx_arm64.duckdb_extension` |
-            | Windows x64 | `mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension` |
+            | Windows x64 (MSVC) | `mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension` |
+            | Windows x64 (MinGW) | `mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw.duckdb_extension` |
 
             ### Verification
 
