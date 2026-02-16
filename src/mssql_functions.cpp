@@ -258,10 +258,14 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->table_name = table_name;
 	result->all_types = all_types;
 	result->all_column_names = all_column_names;
+	result->mssql_columns = mssql_columns;
 	result->return_types = return_types;
 	result->column_names = column_names;
 	result->result_stream_id = result_stream_id;
 	result->complex_filter_where_clause = complex_filter_where_clause;
+	// ORDER BY pushdown fields (Spec 039)
+	result->order_by_clause = order_by_clause;
+	result->top_n = top_n;
 	// RowId support fields
 	result->rowid_requested = rowid_requested;
 	result->pk_column_names = pk_column_names;

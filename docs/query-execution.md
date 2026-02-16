@@ -47,6 +47,32 @@ Table scans are implemented as DuckDB table functions. When a query references a
 
 Only requested columns are included in the generated SELECT statement. The column list is determined during the bind phase from DuckDB's column requirements.
 
+### ORDER BY Pushdown (Experimental)
+
+`MSSQLOptimizer` (`src/table_scan/mssql_optimizer.cpp`) is a custom `OptimizerExtension` that detects ORDER BY and TOP N patterns above MSSQL catalog scans and pushes them down to SQL Server.
+
+**Controlled by:**
+- Global setting `mssql_order_pushdown` (default: `false`) — checked first; if `true`, pushdown is enabled
+- ATTACH option `order_pushdown` — checked second; `true` enables pushdown, `false` is a no-op
+
+**Supported patterns:**
+
+| DuckDB Plan Pattern | SQL Server Output | Notes |
+|---|---|---|
+| `LogicalOrder → LogicalGet` | `SELECT ... ORDER BY col ASC/DESC` | Simple ORDER BY |
+| `LogicalTopN → LogicalGet` | `SELECT TOP N ... ORDER BY col` | Merged ORDER BY + LIMIT |
+| `LogicalLimit → LogicalOrder → LogicalGet` | `SELECT TOP N ... ORDER BY col` | Separate LIMIT + ORDER |
+
+Projections between ORDER BY and GET are handled transparently (column references are resolved through the projection).
+
+**Supported ORDER BY expressions:**
+- Simple column references (e.g., `ORDER BY name`)
+- Single-argument function expressions with known mappings (e.g., `ORDER BY year(created_date)`)
+
+**NULL ordering validation:** SQL Server defaults to NULLS FIRST for ASC and NULLS LAST for DESC. If the DuckDB query requests a different null ordering on a nullable column, pushdown is skipped for that column and all subsequent columns (prefix-only pushdown).
+
+**Partial pushdown:** When only a prefix of ORDER BY columns can be pushed, the extension pushes the prefix to SQL Server and keeps the full ORDER BY in DuckDB for correctness.
+
 ### Scan Execution Flow
 
 ```

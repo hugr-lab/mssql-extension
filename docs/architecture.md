@@ -55,7 +55,8 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 │  │   pushdown   │  │ - UPDATE     │  │ - Connection pinning     │    │
 │  │ - Projection │  │ - DELETE     │  │ - Transaction descriptor │    │
 │  │   pushdown   │  │ - CTAS       │  │                          │    │
-│  │              │  │ - COPY (BCP) │  │                          │    │
+│  │ - ORDER BY   │  │ - COPY (BCP) │  │                          │    │
+│  │   pushdown*  │  │              │  │                          │    │
 │  └──────┬──────┘  └──────┬───────┘  └────────────┬─────────────┘    │
 │         │                │                        │                  │
 │  ┌──────┴────────────────┴────────────────────────┴─────────────┐    │
@@ -146,13 +147,14 @@ src/
 │   ├── mssql_result_stream.cpp   # Streaming result handling
 │   └── mssql_simple_query.cpp    # Simple query execution for mssql_exec
 │
-├── table_scan/                   # Table scan and filter pushdown
+├── table_scan/                   # Table scan and filter/order pushdown
 │   ├── table_scan.cpp            # Main table scan operator
 │   ├── table_scan_bind.cpp       # Bind phase (schema determination)
 │   ├── table_scan_execute.cpp    # Execution phase
 │   ├── table_scan_state.cpp      # Scan state management
 │   ├── filter_encoder.cpp        # DuckDB expressions → T-SQL WHERE
-│   └── function_mapping.cpp      # DuckDB functions → SQL Server functions
+│   ├── function_mapping.cpp      # DuckDB functions → SQL Server functions
+│   └── mssql_optimizer.cpp       # ORDER BY/TOP N pushdown optimizer (experimental)
 │
 ├── dml/                          # Data Modification Language
 │   ├── mssql_rowid_extractor.cpp # PK extraction from rowid values
@@ -268,6 +270,13 @@ src/
 |---|---|---|
 | `mssql_copy_flush_rows` | 100000 | Rows before flushing to SQL Server (bounded memory) |
 | `mssql_copy_tablock` | false | Use TABLOCK hint for 15-30% faster bulk load (blocks concurrent access) |
+
+### ORDER BY Pushdown (Experimental)
+| Setting | Default | Description |
+|---|---|---|
+| `mssql_order_pushdown` | false | Enable ORDER BY pushdown to SQL Server |
+
+ORDER BY pushdown can also be enabled per-database via the `order_pushdown` ATTACH option. The global setting is checked first; if `true`, pushdown is enabled. The ATTACH option is checked second; `true` enables pushdown, `false` is a no-op (does not override global `true`).
 
 ## COPY Function Options
 

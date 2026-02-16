@@ -305,7 +305,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
 	string full_table_name = "[" + FilterEncoder::EscapeBracketIdentifier(bind_data.schema_name) + "].[" +
 							 FilterEncoder::EscapeBracketIdentifier(bind_data.table_name) + "]";
-	string query = "SELECT " + column_list + " FROM " + full_table_name;
+
+	// Build SELECT prefix (with optional TOP N from ORDER BY + LIMIT pushdown, Spec 039)
+	string select_prefix = "SELECT ";
+	if (bind_data.top_n > 0) {
+		select_prefix += "TOP " + std::to_string(bind_data.top_n) + " ";
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: TOP %lld pushdown", (long long)bind_data.top_n);
+	}
+	string query = select_prefix + column_list + " FROM " + full_table_name;
 
 	// Build WHERE clause from filter pushdown
 	// Combine: simple filters (from FilterEncoder::Encode) + complex filters (from pushdown_complex_filter)
@@ -350,6 +357,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	}
 
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: needs_duckdb_filter=%s", needs_duckdb_filter ? "true" : "false");
+
+	// Append ORDER BY clause from optimizer pushdown (Spec 039)
+	if (!bind_data.order_by_clause.empty()) {
+		query += " ORDER BY " + bind_data.order_by_clause;
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: ORDER BY pushdown: %s", bind_data.order_by_clause.c_str());
+	}
 
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
