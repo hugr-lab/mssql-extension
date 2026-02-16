@@ -273,7 +273,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 038-fix-datetime2-uri-parsing: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg)
 - 037-replace-libcurl-httplib: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), cpp-httplib (bundled in DuckDB third_party)
 - 036-azure-token-docs: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata + DuckDB extension API, OpenSSL (vcpkg), libcurl (vcpkg)
-- 035-ddl-schema-support: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB v1.5-variegata (extension API)
 

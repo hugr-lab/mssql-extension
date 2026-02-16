@@ -26,9 +26,24 @@ date_t DateTimeEncoding::ConvertDate(const uint8_t *data) {
 	return date_t(days - DAYS_FROM_0001_TO_EPOCH);
 }
 
+// Convert time ticks to microseconds based on scale
+// Time is stored in units of 10^(-scale) seconds, we need microseconds (10^(-6) seconds)
+// microseconds = ticks * 10^(6 - scale)
+static int64_t TimeTicksToMicroseconds(int64_t ticks, uint8_t scale) {
+	if (scale <= 6) {
+		int64_t multiplier = 1;
+		for (int i = 0; i < 6 - scale; i++) {
+			multiplier *= 10;
+		}
+		return ticks * multiplier;
+	}
+	// Scale 7: 100-nanosecond ticks, divide by 10
+	return ticks / 10;
+}
+
 dtime_t DateTimeEncoding::ConvertTime(const uint8_t *data, uint8_t scale) {
 	// TIME: 3-5 bytes depending on scale
-	// Value is in 100-nanosecond units
+	// Value is in units of 10^(-scale) seconds
 	size_t len = GetTimeByteLength(scale);
 
 	int64_t ticks = 0;
@@ -36,8 +51,7 @@ dtime_t DateTimeEncoding::ConvertTime(const uint8_t *data, uint8_t scale) {
 		ticks |= static_cast<int64_t>(data[i]) << (i * 8);
 	}
 
-	// Convert from 100ns units to microseconds
-	int64_t microseconds = ticks / 10;
+	int64_t microseconds = TimeTicksToMicroseconds(ticks, scale);
 
 	return dtime_t(microseconds);
 }
@@ -61,9 +75,9 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 
 timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t *data, uint8_t scale) {
 	// DATETIME2: time (3-5 bytes) + date (3 bytes)
+	// Time is stored in units of 10^(-scale) seconds
 	size_t time_len = GetTimeByteLength(scale);
 
-	// Read time (100ns units)
 	int64_t time_ticks = 0;
 	for (size_t i = 0; i < time_len; i++) {
 		time_ticks |= static_cast<int64_t>(data[i]) << (i * 8);
@@ -76,8 +90,7 @@ timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t *data, uint8_t scal
 	// Convert to days since 1970-01-01
 	int32_t unix_days = days - DAYS_FROM_0001_TO_EPOCH;
 
-	// Convert time to microseconds (from 100ns units)
-	int64_t microseconds = time_ticks / 10;
+	int64_t microseconds = TimeTicksToMicroseconds(time_ticks, scale);
 
 	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
 }
@@ -126,21 +139,7 @@ timestamp_t DateTimeEncoding::ConvertDatetimeOffset(const uint8_t *data, uint8_t
 	// Convert to days since 1970-01-01
 	int32_t unix_days = days - DAYS_FROM_0001_TO_EPOCH;
 
-	// Convert time ticks to microseconds based on scale
-	// Time is in units of 10^(-scale) seconds, we need microseconds (10^(-6) seconds)
-	// microseconds = ticks * 10^(6-scale)
-	int64_t microseconds;
-	if (scale <= 6) {
-		// Multiply for scales 0-6
-		int64_t multiplier = 1;
-		for (int i = 0; i < 6 - scale; i++) {
-			multiplier *= 10;
-		}
-		microseconds = time_ticks * multiplier;
-	} else {
-		// Divide for scale 7
-		microseconds = time_ticks / 10;
-	}
+	int64_t microseconds = TimeTicksToMicroseconds(time_ticks, scale);
 
 	// Calculate UTC timestamp directly (time is already in UTC)
 	int64_t utc_timestamp = static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds;

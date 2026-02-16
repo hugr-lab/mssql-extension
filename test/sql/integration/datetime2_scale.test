@@ -1,0 +1,55 @@
+# name: test/sql/integration/datetime2_scale.test
+# description: Test datetime2 with various scales read correctly
+# group: [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_cache=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dt2test (TYPE mssql);
+
+# Create test table with datetime2 columns of various scales
+statement ok
+SELECT mssql_exec('dt2test', '
+IF OBJECT_ID(''dbo.TestDatetime2Scale'', ''U'') IS NOT NULL DROP TABLE dbo.TestDatetime2Scale;
+CREATE TABLE dbo.TestDatetime2Scale (
+    id INT PRIMARY KEY,
+    dt2_s0 DATETIME2(0),
+    dt2_s3 DATETIME2(3),
+    dt2_s7 DATETIME2(7)
+);
+INSERT INTO dbo.TestDatetime2Scale VALUES
+    (1, ''2020-04-04 12:12:48'', ''2020-04-04 12:12:48.123'', ''2020-04-04 12:12:48.1234567'');
+');
+
+statement ok
+SELECT mssql_refresh_cache('dt2test');
+
+# Test datetime2(0) - the reported bug case (issue #73)
+query II
+SELECT id, dt2_s0 FROM dt2test.dbo.TestDatetime2Scale WHERE id = 1;
+----
+1	2020-04-04 12:12:48
+
+# Test datetime2(3) - millisecond precision
+query II
+SELECT id, dt2_s3 FROM dt2test.dbo.TestDatetime2Scale WHERE id = 1;
+----
+1	2020-04-04 12:12:48.123
+
+# Test datetime2(7) - 100ns precision (truncated to microseconds in DuckDB)
+query II
+SELECT id, dt2_s7 FROM dt2test.dbo.TestDatetime2Scale WHERE id = 1;
+----
+1	2020-04-04 12:12:48.123456
+
+# Cleanup
+statement ok
+SELECT mssql_exec('dt2test', 'DROP TABLE IF EXISTS dbo.TestDatetime2Scale;');
+
+statement ok
+DETACH dt2test;
