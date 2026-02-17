@@ -11,6 +11,8 @@
 
 #include "table_scan/mssql_optimizer.hpp"
 #include <cstdlib>
+#include <unordered_set>
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -319,6 +321,139 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 }
 
 //------------------------------------------------------------------------------
+// Helper: Collect Get column_ids positions referenced by an expression tree
+//
+// Walks the expression tree and adds any BOUND_REF index values to the set.
+// These indices correspond to positions in LogicalGet::column_ids.
+// Used to determine which Get columns a Projection expression actually needs.
+//------------------------------------------------------------------------------
+static void CollectGetReferences(const Expression &expr, unordered_set<idx_t> &refs) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_REF: {
+		auto &ref = expr.Cast<BoundReferenceExpression>();
+		refs.insert(ref.index);
+		return;
+	}
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		// BOUND_COLUMN_REF in a Projection expression may reference Get positions
+		// but we can't resolve without table_index matching, so conservatively skip
+		return;
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &func = expr.Cast<BoundFunctionExpression>();
+		for (auto &child : func.children) {
+			CollectGetReferences(*child, refs);
+		}
+		return;
+	}
+	case ExpressionClass::BOUND_CAST: {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		CollectGetReferences(*cast.child, refs);
+		return;
+	}
+	default:
+		return;
+	}
+}
+
+//------------------------------------------------------------------------------
+// Helper: Prune trailing ORDER-BY-only columns after full ORDER BY pushdown
+//
+// When ORDER BY is fully pushed to SQL Server, columns that existed only for
+// sorting are no longer needed. The projection_map from LogicalOrder tells us
+// which child output positions the parent actually references.
+//
+// Safety: only prunes trailing positions (beyond max_needed). Non-trailing
+// unused positions would shift indices and break parent bindings.
+//------------------------------------------------------------------------------
+static void TryPruneOrderByOnlyColumns(const vector<idx_t> &projection_map, MSSQLScanInfo &scan_info) {
+	// Empty projection_map means everything is referenced (identity pass-through)
+	if (projection_map.empty()) {
+		MSSQL_OPT_DEBUG(2, "Projection pruning: skipped (empty projection_map = all referenced)");
+		return;
+	}
+
+	// Build set of needed positions and find the maximum
+	unordered_set<idx_t> needed_positions(projection_map.begin(), projection_map.end());
+	idx_t max_needed = 0;
+	for (auto pos : projection_map) {
+		if (pos > max_needed) {
+			max_needed = pos;
+		}
+	}
+
+	// Check that ALL unused positions are trailing (beyond max_needed)
+	// If any unused position is non-trailing, abort — truncation would shift indices
+	auto &col_ids = scan_info.get->GetColumnIds();
+	idx_t child_output_count = scan_info.projection ? scan_info.projection->expressions.size() : col_ids.size();
+
+	for (idx_t i = 0; i < child_output_count; i++) {
+		if (needed_positions.find(i) == needed_positions.end() && i <= max_needed) {
+			MSSQL_OPT_DEBUG(1, "Projection pruning: ABORTED (non-trailing unused position %llu, max_needed=%llu)",
+							(unsigned long long)i, (unsigned long long)max_needed);
+			return;
+		}
+	}
+
+	// All unused positions are trailing — safe to truncate
+	idx_t new_size = max_needed + 1;
+	idx_t pruned_count = child_output_count - new_size;
+	if (pruned_count == 0) {
+		MSSQL_OPT_DEBUG(2, "Projection pruning: no trailing columns to prune");
+		return;
+	}
+
+	if (scan_info.projection) {
+		// Case B: ORDER -> Projection -> Get
+		// Truncate Projection expressions
+		idx_t old_proj_size = scan_info.projection->expressions.size();
+		scan_info.projection->expressions.resize(new_size);
+		MSSQL_OPT_DEBUG(1, "Projection pruning: truncated Projection expressions %llu -> %llu",
+						(unsigned long long)old_proj_size, (unsigned long long)new_size);
+
+		// Now check if any Get column_ids positions are no longer referenced
+		// by the remaining Projection expressions
+		unordered_set<idx_t> get_refs;
+		for (idx_t i = 0; i < scan_info.projection->expressions.size(); i++) {
+			CollectGetReferences(*scan_info.projection->expressions[i], get_refs);
+		}
+
+		// Find max referenced Get position
+		idx_t max_get_ref = 0;
+		for (auto ref : get_refs) {
+			if (ref > max_get_ref) {
+				max_get_ref = ref;
+			}
+		}
+
+		// Check if unreferenced Get positions are trailing
+		auto &mut_col_ids = scan_info.get->GetMutableColumnIds();
+		bool can_truncate_get = true;
+		for (idx_t i = 0; i < mut_col_ids.size(); i++) {
+			if (get_refs.find(i) == get_refs.end() && i <= max_get_ref) {
+				can_truncate_get = false;
+				break;
+			}
+		}
+
+		if (can_truncate_get && max_get_ref + 1 < mut_col_ids.size()) {
+			idx_t old_get_size = mut_col_ids.size();
+			mut_col_ids.resize(max_get_ref + 1);
+			MSSQL_OPT_DEBUG(1, "Projection pruning: truncated Get column_ids %llu -> %llu",
+							(unsigned long long)old_get_size, (unsigned long long)(max_get_ref + 1));
+		}
+	} else {
+		// Case A: ORDER -> Get (no Projection)
+		// Directly truncate Get column_ids
+		auto &mut_col_ids = scan_info.get->GetMutableColumnIds();
+		idx_t old_size = mut_col_ids.size();
+		mut_col_ids.resize(new_size);
+		MSSQL_OPT_DEBUG(1, "Projection pruning: truncated Get column_ids %llu -> %llu", (unsigned long long)old_size,
+						(unsigned long long)new_size);
+	}
+}
+
+//------------------------------------------------------------------------------
 // Pattern: LogicalOrder -> [Projection ->] LogicalGet (simple ORDER BY)
 //------------------------------------------------------------------------------
 static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
@@ -360,8 +495,17 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 
 	// Full pushdown: remove LogicalOrder from plan, keep Projection if present
 	if (pushed == order.orders.size()) {
+		// Capture projection_map BEFORE destroying LogicalOrder
+		vector<idx_t> projection_map = order.projection_map;
+
 		MSSQL_OPT_DEBUG(1, "Full ORDER BY pushdown - removing LogicalOrder from plan");
 		plan = std::move(plan->children[0]);
+
+		// Re-locate scan_info after plan mutation (plan now points to child)
+		auto pruned_scan_info = FindMSSQLScan(plan);
+		if (pruned_scan_info.get) {
+			TryPruneOrderByOnlyColumns(projection_map, pruned_scan_info);
+		}
 	} else {
 		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu columns) - keeping LogicalOrder",
 						(unsigned long long)pushed, (unsigned long long)order.orders.size());

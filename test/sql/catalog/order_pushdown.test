@@ -345,14 +345,71 @@ statement ok
 DETACH opd_nn;
 
 # =============================================================================
-# Cleanup
+# Test 14: Projection pruning - ORDER on non-output column
+# ORDER BY score but only SELECT id, name → score should be pruned from scan
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_prune (TYPE mssql, order_pushdown true);
+
+# score is used only for ORDER BY, not in output — should be pruned after pushdown
+query IT
+SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+----
+8	Hank
+4	Diana
+1	Alice
+6	Frank
+3	Charlie
+7	Grace
+
+# =============================================================================
+# Test 15: Projection pruning - ORDER column also in output (no pruning expected)
+# ORDER BY score and score is in SELECT → no columns should be pruned
+# =============================================================================
+
+query ITI
+SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+----
+8	Hank	70
+4	Diana	78
+1	Alice	85
+6	Frank	88
+3	Charlie	92
+7	Grace	95
+
+# =============================================================================
+# Test 16: Projection pruning - multiple ORDER columns, some prunable
+# ORDER BY category, score but only SELECT id, name, category
+# score is order-only, category is in both output and ORDER
+# =============================================================================
+
+query ITT
+SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC, score DESC;
+----
+7	Grace	A
+3	Charlie	A
+1	Alice	A
+6	Frank	B
+8	Hank	C
+
+# =============================================================================
+# Test 17: LIMIT + ORDER on output column (existing pattern, no pruning applies)
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd_prune.dbo.order_pushdown_test ORDER BY id ASC LIMIT 3;
+----
+1	Alice
+2	Bob
+3	Charlie
 
 statement ok
-DETACH opd4;
+DETACH opd_prune;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
 
 # Final cleanup: drop test table
 statement ok
