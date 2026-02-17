@@ -408,6 +408,78 @@ statement ok
 DETACH opd_prune;
 
 # =============================================================================
+# Test 18: JOIN + ORDER BY (pushdown blocked by JOIN)
+# When a JOIN sits between ORDER BY and the MSSQL scan, pushdown is skipped.
+# Results must still be correct (DuckDB handles the sort).
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_join (TYPE mssql, order_pushdown true);
+
+# Create a local DuckDB table to join against
+statement ok
+CREATE TEMPORARY TABLE opd_join_local AS
+  SELECT * FROM (VALUES (1,'First'),(3,'Third'),(5,'Fifth'),(7,'Seventh')) AS t(id,label);
+
+# Plain JOIN — pushdown blocked, DuckDB sorts locally
+query ITIT
+SELECT m.id, m.name, m.score, j.label
+FROM opd_join.dbo.order_pushdown_test m
+JOIN opd_join_local j ON m.id = j.id
+WHERE m.score IS NOT NULL
+ORDER BY m.score DESC LIMIT 3;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+1	Alice	85	First
+
+# =============================================================================
+# Test 19: CTE pre-sort + JOIN
+# The CTE inner query (SELECT ... ORDER BY ... LIMIT) can get pushdown,
+# then the outer JOIN runs locally in DuckDB.
+# =============================================================================
+
+query ITIT
+WITH top_scores AS (
+    SELECT id, name, score FROM opd_join.dbo.order_pushdown_test
+    WHERE score IS NOT NULL ORDER BY score DESC LIMIT 3
+)
+SELECT t.id, t.name, t.score, j.label
+FROM top_scores t LEFT JOIN opd_join_local j ON t.id = j.id
+ORDER BY t.score DESC;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+6	Frank	88	NULL
+
+# =============================================================================
+# Test 20: Materialized CTE + JOIN
+# DuckDB materializes the CTE first (ORDER BY pushdown applies inside),
+# then joins the materialized result locally.
+# =============================================================================
+
+query ITIT
+WITH top_scores AS MATERIALIZED (
+    SELECT id, name, score FROM opd_join.dbo.order_pushdown_test
+    WHERE score IS NOT NULL ORDER BY score DESC LIMIT 4
+)
+SELECT t.id, t.name, t.score, j.label
+FROM top_scores t LEFT JOIN opd_join_local j ON t.id = j.id
+ORDER BY t.score DESC;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+6	Frank	88	NULL
+1	Alice	85	First
+
+# Cleanup JOIN tests
+statement ok
+DROP TABLE IF EXISTS opd_join_local;
+
+statement ok
+DETACH opd_join;
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 
