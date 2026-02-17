@@ -51,6 +51,11 @@ struct MSSQLConnectionInfo {
 	string table_filter;   // Regex pattern for table/view visibility (empty = all visible)
 
 	//===----------------------------------------------------------------------===//
+	// ORDER BY Pushdown (Spec 039)
+	//===----------------------------------------------------------------------===//
+	int8_t order_pushdown = -1;	 // -1 = not specified (use global setting), 0 = disabled, 1 = enabled
+
+	//===----------------------------------------------------------------------===//
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
 	//===----------------------------------------------------------------------===//
 	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)

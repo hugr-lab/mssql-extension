@@ -1,0 +1,119 @@
+[10:55:06] === BENCHMARK: ORDER BY / TOP N pushdown (100M rows) ===
+[10:55:06] Database: OrderBenchDB | Rows: ~100000000 | Iterations: 1
+[10:55:06] DuckDB: ./build/release/duckdb
+
+========================================================================
+SCENARIO 1: TOP 100 — most common real-world pattern (indexed column)
+  SELECT order_id, customer_id, order_date, total_amount
+  FROM orders ORDER BY order_date DESC LIMIT 100
+========================================================================
+
+  1a. Pushdown OFF (scan 100M rows, sort, take 100)        min=34173  avg=34173  max=34173 ms  (n=1)
+  1b. Pushdown ON  (SELECT TOP 100 ... ORDER BY, IX_orders_date)  min= 1039  avg= 1039  max= 1039 ms  (n=1)
+
+========================================================================
+SCENARIO 2: TOP 50 with WHERE filter (index seek + TOP)
+  SELECT order_id, customer_id, total_amount
+  FROM orders WHERE status = 'Shipped'
+  ORDER BY order_date DESC LIMIT 50
+========================================================================
+
+  2a. Pushdown OFF (scan + filter ~17M rows + sort + limit)  min=12077  avg=12077  max=12077 ms  (n=1)
+  2b. Pushdown ON  (WHERE + TOP 50 ORDER BY, IX_orders_status_date)  min= 1036  avg= 1036  max= 1036 ms  (n=1)
+
+========================================================================
+SCENARIO 3: TOP 20 on non-output column (projection pruning)
+  SELECT order_id, customer_id, product_name
+  FROM orders ORDER BY total_amount DESC LIMIT 20
+  (total_amount used for ORDER only — pruned from scan after pushdown)
+========================================================================
+
+  3a. Pushdown OFF (scan 100M rows + total_amount, sort, take 20)  min=40104  avg=40104  max=40104 ms  (n=1)
+  3b. Pushdown ON  (TOP 20 ORDER BY, total_amount pruned)  min= 1037  avg= 1037  max= 1037 ms  (n=1)
+
+========================================================================
+SCENARIO 4: TOP 10000 — large LIMIT, streaming benefit
+  SELECT order_id, customer_id, order_date, status, total_amount
+  FROM orders ORDER BY order_date DESC LIMIT 10000
+========================================================================
+
+  4a. Pushdown OFF (scan 100M, sort, take 10K)             min=51343  avg=51343  max=51343 ms  (n=1)
+  4b. Pushdown ON  (SELECT TOP 10000 ... ORDER BY)         min= 1043  avg= 1043  max= 1043 ms  (n=1)
+
+========================================================================
+SCENARIO 5: Multi-column ORDER BY + LIMIT (composite index)
+  SELECT order_id, region, category, total_amount
+  FROM orders ORDER BY region, category, total_amount DESC LIMIT 1000
+========================================================================
+
+  5a. Pushdown OFF (scan 100M, multi-col sort, take 1K)    min=50114  avg=50114  max=50114 ms  (n=1)
+  5b. Pushdown ON  (TOP 1000 ORDER BY, IX_orders_region_cat)  min= 8061  avg= 8061  max= 8061 ms  (n=1)
+
+========================================================================
+SCENARIO 6: ORDER BY non-output column, no LIMIT (projection pruning)
+  SELECT order_id, customer_id
+  FROM orders WHERE status = 'Cancelled'
+  ORDER BY total_amount DESC
+  (total_amount only for sorting — should be pruned; ~17M row subset)
+========================================================================
+
+  6a. Pushdown OFF (scan + filter + sort on total_amount)  min=11068  avg=11068  max=11068 ms  (n=1)
+  6b. Pushdown ON  (ORDER BY pushed, total_amount pruned)  min=12082  avg=12082  max=12082 ms  (n=1)
+
+========================================================================
+SCENARIO 7: No usable index (ORDER BY notes — no index)
+  SELECT order_id, notes FROM orders
+  WHERE notes IS NOT NULL ORDER BY notes ASC LIMIT 100
+  (pushdown still avoids DuckDB sort, but SQL Server does full sort)
+========================================================================
+
+  7a. Pushdown OFF (scan + filter + sort in DuckDB)        min=25068  avg=25068  max=25068 ms  (n=1)
+  7b. Pushdown ON  (SQL Server sorts ~20M rows, no index)  min=25061  avg=25061  max=25061 ms  (n=1)
+
+========================================================================
+SCENARIO 8: TOP 100 by customer (high cardinality seek)
+  SELECT order_id, order_date, total_amount
+  FROM orders WHERE customer_id = 42
+  ORDER BY order_date DESC LIMIT 100
+========================================================================
+
+  8a. Pushdown OFF (scan 100M, filter ~1K rows, sort, limit)  min= 1030  avg= 1030  max= 1030 ms  (n=1)
+  8b. Pushdown ON  (TOP 100, IX_orders_customer seek)      min= 1034  avg= 1034  max= 1034 ms  (n=1)
+
+========================================================================
+SCENARIO 9: Plain JOIN + ORDER BY + LIMIT (pushdown blocked by JOIN)
+  Local CTAS from MSSQL aggregation, then JOIN + ORDER BY + LIMIT
+  JOIN blocks ORDER BY pushdown — both OFF/ON should perform similarly.
+========================================================================
+
+  9a. Pushdown OFF (JOIN blocks pushdown — baseline)     min=63234  avg=63234  max=63234 ms  (n=1)
+  9b. Pushdown ON  (JOIN blocks pushdown — same perf)    min=59240  avg=59240  max=59240 ms  (n=1)
+
+========================================================================
+SCENARIO 10: CTE pre-sort + JOIN (CTE inner query may get pushdown)
+  CTE pre-sorts/filters MSSQL side with ORDER BY + LIMIT,
+  then joins locally against customer_summary.
+========================================================================
+
+  10a. Pushdown OFF (CTE not pushed, scan 100M + sort)     min=65172  avg=65172  max=65172 ms  (n=1)
+  10b. Pushdown ON  (CTE TOP 1000 pushed to SQL Server)    min=27089  avg=27089  max=27089 ms  (n=1)
+
+========================================================================
+SCENARIO 11: CTE AS NOT MATERIALIZED + JOIN (DuckDB inlines CTE)
+  DuckDB inlines the CTE (default behavior) — pushdown depends on
+  whether the optimizer can see through to the MSSQL scan.
+========================================================================
+
+  11a. Pushdown OFF (NOT MATERIALIZED, inlined CTE)        min=61150  avg=61150  max=61150 ms  (n=1)
+  11b. Pushdown ON  (NOT MATERIALIZED, inlined CTE)        min=22076  avg=22076  max=22076 ms  (n=1)
+
+========================================================================
+SCENARIO 12: CTE AS MATERIALIZED + JOIN (DuckDB materializes first)
+  DuckDB materializes the CTE first, then joins.
+  ORDER BY pushdown applies inside the materialized CTE.
+========================================================================
+
+  12a. Pushdown OFF (MATERIALIZED CTE, no pushdown)        min=55143  avg=55143  max=55143 ms  (n=1)
+  12b. Pushdown ON  (MATERIALIZED CTE, pushdown inside)    min=23082  avg=23082  max=23082 ms  (n=1)
+
+[11:05:58] === BENCHMARK complete ===

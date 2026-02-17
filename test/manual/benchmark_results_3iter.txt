@@ -1,0 +1,83 @@
+[09:33:15] === BENCHMARK: ORDER BY / TOP N pushdown (100M rows) ===
+[09:33:15] Database: OrderBenchDB | Rows: ~100000000 | Iterations: 3
+[09:33:15] DuckDB: ./build/release/duckdb
+
+========================================================================
+SCENARIO 1: TOP 100 — most common real-world pattern (indexed column)
+  SELECT order_id, customer_id, order_date, total_amount
+  FROM orders ORDER BY order_date DESC LIMIT 100
+========================================================================
+
+  1a. Pushdown OFF (scan 100M rows, sort, take 100)        min=30087  avg=31099  max=33111 ms  (n=3)
+  1b. Pushdown ON  (SELECT TOP 100 ... ORDER BY, IX_orders_date)  min= 1034  avg= 1037  max= 1039 ms  (n=3)
+
+========================================================================
+SCENARIO 2: TOP 50 with WHERE filter (index seek + TOP)
+  SELECT order_id, customer_id, total_amount
+  FROM orders WHERE status = 'Shipped'
+  ORDER BY order_date DESC LIMIT 50
+========================================================================
+
+  2a. Pushdown OFF (scan + filter ~17M rows + sort + limit)  min=12069  avg=12072  max=12074 ms  (n=3)
+  2b. Pushdown ON  (WHERE + TOP 50 ORDER BY, IX_orders_status_date)  min= 1038  avg= 1038  max= 1039 ms  (n=3)
+
+========================================================================
+SCENARIO 3: TOP 20 on non-output column (projection pruning)
+  SELECT order_id, customer_id, product_name
+  FROM orders ORDER BY total_amount DESC LIMIT 20
+  (total_amount used for ORDER only — pruned from scan after pushdown)
+========================================================================
+
+  3a. Pushdown OFF (scan 100M rows + total_amount, sort, take 20)  min=37090  avg=38425  max=40117 ms  (n=3)
+  3b. Pushdown ON  (TOP 20 ORDER BY, total_amount pruned)  min= 1032  avg= 1034  max= 1037 ms  (n=3)
+
+========================================================================
+SCENARIO 4: TOP 10000 — large LIMIT, streaming benefit
+  SELECT order_id, customer_id, order_date, status, total_amount
+  FROM orders ORDER BY order_date DESC LIMIT 10000
+========================================================================
+
+  4a. Pushdown OFF (scan 100M, sort, take 10K)             min=48252  avg=49261  max=50236 ms  (n=3)
+  4b. Pushdown ON  (SELECT TOP 10000 ... ORDER BY)         min= 1032  avg= 1036  max= 1039 ms  (n=3)
+
+========================================================================
+SCENARIO 5: Multi-column ORDER BY + LIMIT (composite index)
+  SELECT order_id, region, category, total_amount
+  FROM orders ORDER BY region, category, total_amount DESC LIMIT 1000
+========================================================================
+
+  5a. Pushdown OFF (scan 100M, multi-col sort, take 1K)    min=47113  avg=47448  max=48117 ms  (n=3)
+  5b. Pushdown ON  (TOP 1000 ORDER BY, IX_orders_region_cat)  min= 6050  avg= 7385  max= 9060 ms  (n=3)
+
+========================================================================
+SCENARIO 6: ORDER BY non-output column, no LIMIT (projection pruning)
+  SELECT order_id, customer_id
+  FROM orders WHERE status = 'Cancelled'
+  ORDER BY total_amount DESC
+  (total_amount only for sorting — should be pruned; ~17M row subset)
+========================================================================
+
+  6a. Pushdown OFF (scan + filter + sort on total_amount)  min=10056  avg=10399  max=11076 ms  (n=3)
+  6b. Pushdown ON  (ORDER BY pushed, total_amount pruned)  min=12074  avg=12076  max=12080 ms  (n=3)
+
+========================================================================
+SCENARIO 7: No usable index (ORDER BY notes — no index)
+  SELECT order_id, notes FROM orders
+  WHERE notes IS NOT NULL ORDER BY notes ASC LIMIT 100
+  (pushdown still avoids DuckDB sort, but SQL Server does full sort)
+========================================================================
+
+  7a. Pushdown OFF (scan + filter + sort in DuckDB)        min=25068  avg=25075  max=25079 ms  (n=3)
+  7b. Pushdown ON  (SQL Server sorts ~20M rows, no index)  min=22085  avg=23752  max=25085 ms  (n=3)
+
+========================================================================
+SCENARIO 8: TOP 100 by customer (high cardinality seek)
+  SELECT order_id, order_date, total_amount
+  FROM orders WHERE customer_id = 42
+  ORDER BY order_date DESC LIMIT 100
+========================================================================
+
+  8a. Pushdown OFF (scan 100M, filter ~1K rows, sort, limit)  min= 1031  avg= 1037  max= 1042 ms  (n=3)
+  8b. Pushdown ON  (TOP 100, IX_orders_customer seek)      min= 1038  avg= 1039  max= 1040 ms  (n=3)
+
+[09:46:25] === BENCHMARK complete ===

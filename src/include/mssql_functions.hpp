@@ -70,6 +70,13 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// represented as simple TableFilter objects
 	mutable string complex_filter_where_clause;
 
+	// ORDER BY pushdown (Spec 039)
+	// Set by MSSQLOptimizer when ORDER BY can be pushed to SQL Server
+	mutable string order_by_clause;
+	// TOP N pushdown: when ORDER BY + LIMIT are both fully pushable
+	// 0 = no TOP (default), >0 = SELECT TOP N
+	int64_t top_n = 0;
+
 	//===----------------------------------------------------------------------===//
 	// RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//

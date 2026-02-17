@@ -815,6 +815,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string table_filter_option;			 // Spec 033: ATTACH-level table filter
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
+	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -838,6 +839,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		} else if (lower_name == "table_filter") {
 			table_filter_option = it->second.ToString();
 			table_filter_specified = true;
+			it = options.options.erase(it);
+		} else if (lower_name == "order_pushdown") {
+			order_pushdown_option = it->second.GetValue<bool>() ? 1 : 0;
 			it = options.options.erase(it);
 		} else {
 			++it;
@@ -876,6 +880,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			"With secret: ATTACH '' AS %s (TYPE mssql, SECRET <secret_name>)\n"
 			"With connection string: ATTACH 'Server=host;Database=db;User Id=user;Password=pass' AS %s (TYPE mssql)",
 			name, name);
+	}
+
+	// Apply ORDER BY pushdown option from ATTACH if specified (Spec 039)
+	if (order_pushdown_option >= 0) {
+		ctx->connection_info->order_pushdown = order_pushdown_option;
+		MSSQL_STORAGE_DEBUG_LOG(1, "ORDER_PUSHDOWN option from ATTACH: %s", order_pushdown_option ? "true" : "false");
 	}
 
 	// Apply CATALOG option from ATTACH if specified (overrides connection string/secret value)

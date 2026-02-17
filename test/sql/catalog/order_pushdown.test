@@ -1,0 +1,494 @@
+# name: test/sql/catalog/order_pushdown.test
+# description: Test ORDER BY pushdown to SQL Server (Spec 039)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Setup: Create test table with various column types using DuckDB syntax
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_setup (TYPE mssql);
+
+# Clean up any previous test table
+statement ok
+DROP TABLE IF EXISTS opd_setup.dbo.order_pushdown_test;
+
+# Create table using DuckDB syntax
+statement ok
+CREATE TABLE opd_setup.dbo.order_pushdown_test (
+    id INT,
+    name VARCHAR,
+    score INT,
+    created_date DATE,
+    category VARCHAR
+);
+
+# Insert test data using DuckDB syntax
+statement ok
+INSERT INTO opd_setup.dbo.order_pushdown_test VALUES
+(1, 'Alice', 85, '2023-01-15', 'A'),
+(2, 'Bob', NULL, '2023-03-20', 'B'),
+(3, 'Charlie', 92, '2022-06-10', 'A'),
+(4, 'Diana', 78, '2024-11-05', NULL),
+(5, 'Eve', NULL, '2022-02-28', 'C'),
+(6, 'Frank', 88, '2023-07-04', 'B'),
+(7, 'Grace', 95, '2024-01-01', 'A'),
+(8, 'Hank', 70, '2023-09-15', 'C');
+
+statement ok
+DETACH opd_setup;
+
+# =============================================================================
+# Test 1 (T013/US5): Configuration control - default disabled
+# =============================================================================
+
+# Default: pushdown disabled
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd1 (TYPE mssql);
+
+# Should work normally (ORDER BY done by DuckDB)
+query IT
+SELECT id, name FROM opd1.dbo.order_pushdown_test ORDER BY id ASC;
+----
+1	Alice
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+7	Grace
+8	Hank
+
+statement ok
+DETACH opd1;
+
+# =============================================================================
+# Test 2 (T013/US5): Configuration control - setting enabled
+# =============================================================================
+
+statement ok
+SET mssql_order_pushdown = true;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd2 (TYPE mssql);
+
+# With pushdown enabled, ORDER BY should be pushed to SQL Server
+query IT
+SELECT id, name FROM opd2.dbo.order_pushdown_test ORDER BY id ASC;
+----
+1	Alice
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+7	Grace
+8	Hank
+
+statement ok
+DETACH opd2;
+
+statement ok
+SET mssql_order_pushdown = false;
+
+# =============================================================================
+# Test 3 (T013/US5): Configuration control - ATTACH option overrides setting
+# =============================================================================
+
+# Global setting disabled, but ATTACH option enables it
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd3 (TYPE mssql, order_pushdown true);
+
+query IT
+SELECT id, name FROM opd3.dbo.order_pushdown_test ORDER BY id ASC;
+----
+1	Alice
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+7	Grace
+8	Hank
+
+statement ok
+DETACH opd3;
+
+# Global setting enabled, ATTACH option false is a no-op (pushdown still active)
+statement ok
+SET mssql_order_pushdown = true;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd3b (TYPE mssql, order_pushdown false);
+
+query IT
+SELECT id, name FROM opd3b.dbo.order_pushdown_test ORDER BY id ASC;
+----
+1	Alice
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+7	Grace
+8	Hank
+
+statement ok
+DETACH opd3b;
+
+statement ok
+SET mssql_order_pushdown = false;
+
+# =============================================================================
+# Test 4 (T019/US1): Simple ORDER BY pushdown - single column ASC
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC;
+----
+1	Alice
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+7	Grace
+8	Hank
+
+# =============================================================================
+# Test 5 (T019/US1): Simple ORDER BY pushdown - single column DESC
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC;
+----
+8	Hank
+7	Grace
+6	Frank
+5	Eve
+4	Diana
+3	Charlie
+2	Bob
+1	Alice
+
+# =============================================================================
+# Test 6 (T019/US1): Simple ORDER BY pushdown - multi-column
+# =============================================================================
+
+query ITT
+SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC, name ASC;
+----
+1	Alice	A
+3	Charlie	A
+7	Grace	A
+2	Bob	B
+6	Frank	B
+5	Eve	C
+8	Hank	C
+
+# =============================================================================
+# Test 7 (T027/US3): TOP N pushdown - ORDER BY + LIMIT
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id ASC LIMIT 3;
+----
+1	Alice
+2	Bob
+3	Charlie
+
+# =============================================================================
+# Test 8 (T027/US3): TOP N pushdown - ORDER BY DESC + LIMIT
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC LIMIT 2;
+----
+8	Hank
+7	Grace
+
+# =============================================================================
+# Test 9 (T022/US2): Partial pushdown - first column pushable, second not
+# Results should still be correct (DuckDB does final sort)
+# =============================================================================
+
+query ITI
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC, score * 2 DESC;
+----
+1	Alice	85
+3	Charlie	92
+4	Diana	78
+6	Frank	88
+7	Grace	95
+8	Hank	70
+
+# =============================================================================
+# Test 10 (T030/US4): Function expression pushdown - YEAR()
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY year(created_date) ASC, id ASC;
+----
+3	Charlie
+5	Eve
+1	Alice
+2	Bob
+6	Frank
+8	Hank
+4	Diana
+7	Grace
+
+# =============================================================================
+# Test 11 (T031): Non-MSSQL table regression - DuckDB local table unaffected
+# =============================================================================
+
+statement ok
+CREATE TABLE local_test AS SELECT * FROM range(5) t(id);
+
+query I
+SELECT id FROM local_test ORDER BY id DESC;
+----
+4
+3
+2
+1
+0
+
+statement ok
+DROP TABLE local_test;
+
+# =============================================================================
+# Test 12 (T032): NULL ordering edge case - nullable column with non-default
+# null order should skip pushdown (DuckDB handles sort)
+# =============================================================================
+
+# Nullable column + ASC NULLS LAST does NOT match SQL Server default (ASC NULLS FIRST)
+# Pushdown should be skipped, but results must still be correct
+query ITI
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST;
+----
+8	Hank	70
+4	Diana	78
+1	Alice	85
+6	Frank	88
+3	Charlie	92
+7	Grace	95
+2	Bob	NULL
+5	Eve	NULL
+
+# Nullable column + DESC NULLS FIRST does NOT match SQL Server default (DESC NULLS LAST)
+query ITI
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score DESC NULLS FIRST;
+----
+2	Bob	NULL
+5	Eve	NULL
+7	Grace	95
+3	Charlie	92
+6	Frank	88
+1	Alice	85
+4	Diana	78
+8	Hank	70
+
+# =============================================================================
+# Test 13 (T032): NULL ordering edge case - NOT NULL column should always push
+# =============================================================================
+
+statement ok
+DETACH opd4;
+
+# Create table with NOT NULL column
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_nn (TYPE mssql, order_pushdown true);
+
+statement ok
+DROP TABLE IF EXISTS opd_nn.dbo.order_pushdown_nn;
+
+statement ok
+CREATE TABLE opd_nn.dbo.order_pushdown_nn (
+    id INT NOT NULL,
+    value INT NOT NULL
+);
+
+statement ok
+INSERT INTO opd_nn.dbo.order_pushdown_nn VALUES (1, 30), (2, 10), (3, 20);
+
+# NOT NULL column with NULLS LAST should still push (NULL order irrelevant for NOT NULL)
+query II
+SELECT id, value FROM opd_nn.dbo.order_pushdown_nn ORDER BY value ASC NULLS LAST;
+----
+2	10
+3	20
+1	30
+
+# NOT NULL column with NULLS FIRST + DESC should still push
+query II
+SELECT id, value FROM opd_nn.dbo.order_pushdown_nn ORDER BY value DESC NULLS FIRST;
+----
+1	30
+3	20
+2	10
+
+statement ok
+DROP TABLE IF EXISTS opd_nn.dbo.order_pushdown_nn;
+
+statement ok
+DETACH opd_nn;
+
+# =============================================================================
+# Test 14: Projection pruning - ORDER on non-output column
+# ORDER BY score but only SELECT id, name → score should be pruned from scan
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_prune (TYPE mssql, order_pushdown true);
+
+# score is used only for ORDER BY, not in output — should be pruned after pushdown
+query IT
+SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+----
+8	Hank
+4	Diana
+1	Alice
+6	Frank
+3	Charlie
+7	Grace
+
+# =============================================================================
+# Test 15: Projection pruning - ORDER column also in output (no pruning expected)
+# ORDER BY score and score is in SELECT → no columns should be pruned
+# =============================================================================
+
+query ITI
+SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+----
+8	Hank	70
+4	Diana	78
+1	Alice	85
+6	Frank	88
+3	Charlie	92
+7	Grace	95
+
+# =============================================================================
+# Test 16: Projection pruning - multiple ORDER columns, some prunable
+# ORDER BY category, score but only SELECT id, name, category
+# score is order-only, category is in both output and ORDER
+# =============================================================================
+
+query ITT
+SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC, score DESC;
+----
+7	Grace	A
+3	Charlie	A
+1	Alice	A
+6	Frank	B
+8	Hank	C
+
+# =============================================================================
+# Test 17: LIMIT + ORDER on output column (existing pattern, no pruning applies)
+# =============================================================================
+
+query IT
+SELECT id, name FROM opd_prune.dbo.order_pushdown_test ORDER BY id ASC LIMIT 3;
+----
+1	Alice
+2	Bob
+3	Charlie
+
+statement ok
+DETACH opd_prune;
+
+# =============================================================================
+# Test 18: JOIN + ORDER BY (pushdown blocked by JOIN)
+# When a JOIN sits between ORDER BY and the MSSQL scan, pushdown is skipped.
+# Results must still be correct (DuckDB handles the sort).
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_join (TYPE mssql, order_pushdown true);
+
+# Create a local DuckDB table to join against
+statement ok
+CREATE TEMPORARY TABLE opd_join_local AS
+  SELECT * FROM (VALUES (1,'First'),(3,'Third'),(5,'Fifth'),(7,'Seventh')) AS t(id,label);
+
+# Plain JOIN — pushdown blocked, DuckDB sorts locally
+query ITIT
+SELECT m.id, m.name, m.score, j.label
+FROM opd_join.dbo.order_pushdown_test m
+JOIN opd_join_local j ON m.id = j.id
+WHERE m.score IS NOT NULL
+ORDER BY m.score DESC LIMIT 3;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+1	Alice	85	First
+
+# =============================================================================
+# Test 19: CTE pre-sort + JOIN
+# The CTE inner query (SELECT ... ORDER BY ... LIMIT) can get pushdown,
+# then the outer JOIN runs locally in DuckDB.
+# =============================================================================
+
+query ITIT
+WITH top_scores AS (
+    SELECT id, name, score FROM opd_join.dbo.order_pushdown_test
+    WHERE score IS NOT NULL ORDER BY score DESC LIMIT 3
+)
+SELECT t.id, t.name, t.score, j.label
+FROM top_scores t LEFT JOIN opd_join_local j ON t.id = j.id
+ORDER BY t.score DESC;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+6	Frank	88	NULL
+
+# =============================================================================
+# Test 20: Materialized CTE + JOIN
+# DuckDB materializes the CTE first (ORDER BY pushdown applies inside),
+# then joins the materialized result locally.
+# =============================================================================
+
+query ITIT
+WITH top_scores AS MATERIALIZED (
+    SELECT id, name, score FROM opd_join.dbo.order_pushdown_test
+    WHERE score IS NOT NULL ORDER BY score DESC LIMIT 4
+)
+SELECT t.id, t.name, t.score, j.label
+FROM top_scores t LEFT JOIN opd_join_local j ON t.id = j.id
+ORDER BY t.score DESC;
+----
+7	Grace	95	Seventh
+3	Charlie	92	Third
+6	Frank	88	NULL
+1	Alice	85	First
+
+# Cleanup JOIN tests
+statement ok
+DROP TABLE IF EXISTS opd_join_local;
+
+statement ok
+DETACH opd_join;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+# Final cleanup: drop test table
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS opd_cleanup (TYPE mssql);
+
+statement ok
+DROP TABLE IF EXISTS opd_cleanup.dbo.order_pushdown_test;
+
+statement ok
+DETACH opd_cleanup;

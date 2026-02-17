@@ -8,10 +8,13 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
+#include "table_scan/mssql_optimizer.hpp"
 
 namespace duckdb {
 
@@ -67,6 +70,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 11. Register Azure authentication test function
 	mssql::azure::RegisterAzureTestFunction(loader);
+
+	// 12. Register optimizer extension for ORDER BY pushdown (Spec 039)
+	auto &db = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(db);
+	OptimizerExtension mssql_optimizer;
+	mssql_optimizer.optimize_function = MSSQLOptimizer::Optimize;
+	OptimizerExtension::Register(config, std::move(mssql_optimizer));
 }
 
 // Extension class methods

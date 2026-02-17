@@ -19,6 +19,7 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
 - [Azure AD authentication](AZURE.md) (service principal, CLI, interactive device code flow)
+- **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
 ## Quick Start
 
@@ -375,6 +376,33 @@ Supported filter operations for pushdown:
 - DuckDB-specific functions: `list_contains()`, `regexp_matches()`
 
 Note: `LIKE 'prefix%'` patterns are optimized by DuckDB into range comparisons which ARE pushed down.
+
+### ORDER BY Pushdown (Experimental)
+
+When enabled, ORDER BY clauses on simple column references and supported functions are pushed to SQL Server, avoiding a local sort in DuckDB. Combined ORDER BY + LIMIT is pushed as `SELECT TOP N ... ORDER BY ...`.
+
+This feature is **disabled by default** and must be explicitly enabled:
+
+```sql
+-- Enable globally
+SET mssql_order_pushdown = true;
+
+-- Or per-database via ATTACH option
+ATTACH 'Server=...' AS db (TYPE mssql, order_pushdown true);
+```
+
+**Setting precedence:** The global setting is checked first; if `true`, pushdown is enabled. The ATTACH option is checked second; `true` enables pushdown, `false` is a no-op (does not override global `true`).
+
+**Supported expressions:**
+- Simple column references: `ORDER BY name ASC`, `ORDER BY id DESC`
+- Single-argument functions: `ORDER BY year(date_col)`
+- Multi-column: `ORDER BY category ASC, name DESC`
+- Combined with LIMIT: `ORDER BY id ASC LIMIT 10` → `SELECT TOP 10 ... ORDER BY [id] ASC`
+
+**Limitations:**
+- NULL ordering must match SQL Server defaults (ASC = NULLS FIRST, DESC = NULLS LAST); mismatched null ordering falls back to DuckDB
+- Only prefix pushdown: stops at first non-pushable column
+- Expressions like `ORDER BY col * 2` are not pushed
 
 ### Row Identity (rowid)
 
@@ -1132,6 +1160,14 @@ Queries involving unsupported types will raise an error.
 | `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
 | `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |
 | `mssql_statistics_cache_ttl_seconds` | BIGINT | 300    | ≥0    | Statistics cache TTL (seconds)        |
+
+### ORDER BY Pushdown Settings (Experimental)
+
+| Setting                            | Type    | Default | Range | Description                           |
+| ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
+| `mssql_order_pushdown`             | BOOLEAN | false   | -     | Enable ORDER BY pushdown to SQL Server |
+
+The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY Pushdown](#order-by-pushdown-experimental) for details.
 
 ### INSERT Settings
 
