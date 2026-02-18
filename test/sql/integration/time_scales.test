@@ -1,0 +1,85 @@
+# name: test/sql/integration/time_scales.test
+# description: Test TIME with various scales read correctly
+# group: [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_cache=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS time_test (TYPE mssql);
+
+# Create test table with TIME columns of various scales
+statement ok
+SELECT mssql_exec('time_test', '
+IF OBJECT_ID(''dbo.TestTimeScale'', ''U'') IS NOT NULL DROP TABLE dbo.TestTimeScale;
+CREATE TABLE dbo.TestTimeScale (
+    id INT PRIMARY KEY,
+    t_s0 TIME(0) NOT NULL,
+    t_s3 TIME(3) NOT NULL,
+    t_s7 TIME(7) NOT NULL
+);
+INSERT INTO dbo.TestTimeScale VALUES
+    (1, ''13:45:30'', ''13:45:30.123'', ''13:45:30.1234567''),
+    (2, ''00:00:00'', ''00:00:00.000'', ''00:00:00.0000000''),
+    (3, ''23:59:59'', ''23:59:59.999'', ''23:59:59.9999999'');
+');
+
+statement ok
+SELECT mssql_refresh_cache('time_test');
+
+# Test TIME(0) - second-level precision
+query II
+SELECT id, t_s0 FROM time_test.dbo.TestTimeScale WHERE id = 1;
+----
+1	13:45:30
+
+query II
+SELECT id, t_s0 FROM time_test.dbo.TestTimeScale WHERE id = 2;
+----
+2	00:00:00
+
+query II
+SELECT id, t_s0 FROM time_test.dbo.TestTimeScale WHERE id = 3;
+----
+3	23:59:59
+
+# Test TIME(3) - millisecond precision
+query II
+SELECT id, t_s3 FROM time_test.dbo.TestTimeScale WHERE id = 1;
+----
+1	13:45:30.123
+
+query II
+SELECT id, t_s3 FROM time_test.dbo.TestTimeScale WHERE id = 3;
+----
+3	23:59:59.999
+
+# Test TIME(7) - 100ns precision (truncated to microseconds in DuckDB)
+query II
+SELECT id, t_s7 FROM time_test.dbo.TestTimeScale WHERE id = 1;
+----
+1	13:45:30.123456
+
+query II
+SELECT id, t_s7 FROM time_test.dbo.TestTimeScale WHERE id = 3;
+----
+3	23:59:59.999999
+
+# Test all scales together
+query IIII
+SELECT id, t_s0, t_s3, t_s7 FROM time_test.dbo.TestTimeScale ORDER BY id;
+----
+1	13:45:30	13:45:30.123	13:45:30.123456
+2	00:00:00	00:00:00	00:00:00
+3	23:59:59	23:59:59.999	23:59:59.999999
+
+# Cleanup
+statement ok
+SELECT mssql_exec('time_test', 'DROP TABLE IF EXISTS dbo.TestTimeScale;');
+
+statement ok
+DETACH time_test;

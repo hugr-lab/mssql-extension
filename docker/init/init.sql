@@ -301,6 +301,59 @@ PRINT 'NullableTypes table created';
 GO
 
 -- =============================================================================
+-- Table 5b: NullableDatetimeScales (forces NBCROW with all datetime scale variants)
+-- Many nullable columns guarantee SQL Server uses NBCROW encoding (token 0xD2)
+-- =============================================================================
+CREATE TABLE dbo.NullableDatetimeScales (
+    id INT NOT NULL PRIMARY KEY,
+    -- TIME at different scales (byte lengths: 3, 4, 5)
+    col_time_s0       TIME(0) NULL,
+    col_time_s3       TIME(3) NULL,
+    col_time_s7       TIME(7) NULL,
+    -- DATETIME2 at different scales (byte lengths: 6, 7, 8)
+    col_datetime2_s0  DATETIME2(0) NULL,
+    col_datetime2_s3  DATETIME2(3) NULL,
+    col_datetime2_s7  DATETIME2(7) NULL,
+    -- DATETIMEOFFSET at different scales (byte lengths: 8, 9, 10)
+    col_dto_s0        DATETIMEOFFSET(0) NULL,
+    col_dto_s3        DATETIMEOFFSET(3) NULL,
+    col_dto_s7        DATETIMEOFFSET(7) NULL,
+    -- Padding nullable columns to ensure NBCROW encoding
+    pad_01 INT NULL, pad_02 INT NULL, pad_03 INT NULL,
+    pad_04 INT NULL, pad_05 INT NULL, pad_06 INT NULL,
+    pad_07 INT NULL, pad_08 INT NULL, pad_09 INT NULL,
+    pad_10 INT NULL, pad_11 INT NULL, pad_12 INT NULL
+);
+GO
+
+-- Row 1: All non-null with known values
+INSERT INTO dbo.NullableDatetimeScales (id, col_time_s0, col_time_s3, col_time_s7, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7, col_dto_s0, col_dto_s3, col_dto_s7)
+VALUES (1, '13:45:30', '13:45:30.123', '13:45:30.1234567', '2024-06-15 13:45:30', '2024-06-15 13:45:30.123', '2024-06-15 13:45:30.1234567', '2024-06-15 13:45:30 +05:30', '2024-06-15 13:45:30.123 +05:30', '2024-06-15 13:45:30.1234567 +05:30');
+GO
+
+-- Row 2: All datetime columns null (tests null bitmap for datetime types)
+INSERT INTO dbo.NullableDatetimeScales (id) VALUES (2);
+GO
+
+-- Row 3: Mixed null/non-null (alternating)
+INSERT INTO dbo.NullableDatetimeScales (id, col_time_s0, col_time_s3, col_time_s7, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7, col_dto_s0, col_dto_s3, col_dto_s7)
+VALUES (3, '00:00:00', NULL, '23:59:59.9999999', NULL, '2024-01-01 00:00:00.000', NULL, '2024-01-01 00:00:00 -08:00', NULL, '2024-12-31 23:59:59.9999999 +00:00');
+GO
+
+-- Row 4: Only DATETIMEOFFSET columns non-null (others null)
+INSERT INTO dbo.NullableDatetimeScales (id, col_dto_s0, col_dto_s3, col_dto_s7)
+VALUES (4, '1900-01-01 00:00:00 +00:00', '1900-01-01 00:00:00.000 +00:00', '1900-01-01 00:00:00.0000000 +00:00');
+GO
+
+-- Row 5: All non-null with different timezone offsets
+INSERT INTO dbo.NullableDatetimeScales (id, col_time_s0, col_time_s3, col_time_s7, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7, col_dto_s0, col_dto_s3, col_dto_s7)
+VALUES (5, '12:00:00', '12:00:00.500', '12:00:00.5000000', '2024-06-15 12:00:00', '2024-06-15 12:00:00.500', '2024-06-15 12:00:00.5000000', '2024-06-15 12:00:00 -08:00', '2024-06-15 12:00:00.500 -08:00', '2024-06-15 12:00:00.5000000 +00:00');
+GO
+
+PRINT 'NullableDatetimeScales table created';
+GO
+
+-- =============================================================================
 -- Table 6: test.test table (for backward compatibility with existing tests)
 -- =============================================================================
 CREATE TABLE test.test (
