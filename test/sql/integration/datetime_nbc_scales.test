@@ -1,0 +1,112 @@
+# name: test/sql/integration/datetime_nbc_scales.test
+# description: Test all datetime types at various scales via NBCROW encoding
+# group: [integration]
+#
+# Uses NullableDatetimeScales table from docker/init/init.sql
+# This table has 21 nullable columns to force NBCROW encoding
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_cache=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS nbc_scales (TYPE mssql);
+
+# =============================================================================
+# Test 1: TIME at all scales via NBCROW
+# =============================================================================
+
+# Row 1: All non-null
+query IIII
+SELECT id, col_time_s0, col_time_s3, col_time_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
+----
+1	13:45:30	13:45:30.123	13:45:30.123456
+
+# Row 2: All null
+query IIII
+SELECT id, col_time_s0, col_time_s3, col_time_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 2;
+----
+2	NULL	NULL	NULL
+
+# Row 3: Mixed null/non-null
+query IIII
+SELECT id, col_time_s0, col_time_s3, col_time_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 3;
+----
+3	00:00:00	NULL	23:59:59.999999
+
+# =============================================================================
+# Test 2: DATETIME2 at all scales via NBCROW
+# =============================================================================
+
+# Row 1: All non-null
+query IIII
+SELECT id, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
+----
+1	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.123456
+
+# Row 2: All null
+query IIII
+SELECT id, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 2;
+----
+2	NULL	NULL	NULL
+
+# Row 3: Mixed null/non-null
+query IIII
+SELECT id, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 3;
+----
+3	NULL	2024-01-01 00:00:00	NULL
+
+# =============================================================================
+# Test 3: DATETIMEOFFSET at all scales via NBCROW (the bug fix from issue #78)
+# =============================================================================
+
+# Row 1: 2024-06-15 13:45:30 +05:30 -> UTC: 2024-06-15 08:15:30
+query IIII
+SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
+----
+1	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
+
+# Row 2: All null
+query IIII
+SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 2;
+----
+2	NULL	NULL	NULL
+
+# Row 3: Mixed null/non-null - negative offset
+# dto_s0: 2024-01-01 00:00:00 -08:00 -> UTC: 2024-01-01 08:00:00
+# dto_s7: 2024-12-31 23:59:59.9999999 +00:00 -> UTC same
+query IIII
+SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 3;
+----
+3	2024-01-01 08:00:00+00	NULL	2024-12-31 23:59:59.999999+00
+
+# Row 4: Only DATETIMEOFFSET columns non-null, zero offset
+query IIII
+SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 4;
+----
+4	1900-01-01 00:00:00+00	1900-01-01 00:00:00+00	1900-01-01 00:00:00+00
+
+# Row 5: Negative offset
+# dto_s0: 2024-06-15 12:00:00 -08:00 -> UTC: 2024-06-15 20:00:00
+# dto_s3: 2024-06-15 12:00:00.500 -08:00 -> UTC: 2024-06-15 20:00:00.500
+# dto_s7: 2024-06-15 12:00:00.5 +00:00 -> UTC same
+query IIII
+SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 5;
+----
+5	2024-06-15 20:00:00+00	2024-06-15 20:00:00.5+00	2024-06-15 12:00:00.5+00
+
+# =============================================================================
+# Test 4: All datetime columns together for a single row (full NBCROW parse)
+# =============================================================================
+
+query IIIIIIIIII
+SELECT id, col_time_s0, col_time_s3, col_time_s7, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
+----
+1	13:45:30	13:45:30.123	13:45:30.123456	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.123456	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
+
+# Cleanup
+statement ok
+DETACH nbc_scales;

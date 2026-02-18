@@ -1,0 +1,133 @@
+# name: test/sql/catalog/datetimeoffset_nbc.test
+# description: Integration tests for DATETIMEOFFSET in NBCROW encoding (issue #78)
+# group: [sql]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_cache=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS nbc_dto (TYPE mssql);
+
+# =============================================================================
+# Setup: Create table with many nullable columns to force NBCROW encoding
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('nbc_dto', '
+IF OBJECT_ID(''dbo.TestDtoNbc'', ''U'') IS NOT NULL DROP TABLE dbo.TestDtoNbc;
+CREATE TABLE dbo.TestDtoNbc (
+    id INT NOT NULL PRIMARY KEY,
+    dto_s0 DATETIMEOFFSET(0) NULL,
+    dto_s3 DATETIMEOFFSET(3) NULL,
+    dto_s7 DATETIMEOFFSET(7) NULL,
+    -- Padding nullable columns to guarantee NBCROW
+    p01 INT NULL, p02 INT NULL, p03 INT NULL, p04 INT NULL,
+    p05 INT NULL, p06 INT NULL, p07 INT NULL, p08 INT NULL,
+    p09 INT NULL, p10 INT NULL, p11 INT NULL, p12 INT NULL,
+    p13 INT NULL, p14 INT NULL, p15 INT NULL, p16 INT NULL
+);
+INSERT INTO dbo.TestDtoNbc (id, dto_s0, dto_s3, dto_s7) VALUES
+    (1, ''2024-06-15 13:45:30 +05:30'', ''2024-06-15 13:45:30.123 +05:30'', ''2024-06-15 13:45:30.1234567 +05:30''),
+    (2, NULL, NULL, NULL),
+    (3, ''1900-01-01 00:00:00 -08:00'', ''1900-01-01 00:00:00.000 -08:00'', ''1900-01-01 00:00:00.0000000 -08:00''),
+    (4, ''2024-12-31 23:59:59 +00:00'', ''2024-12-31 23:59:59.999 +00:00'', ''2024-12-31 23:59:59.9999999 +00:00''),
+    (5, NULL, ''2024-06-15 12:00:00.500 +00:00'', NULL);
+');
+
+statement ok
+SELECT mssql_refresh_cache('nbc_dto');
+
+# =============================================================================
+# Test 1: DATETIMEOFFSET(0) via NBCROW - second-level precision
+# =============================================================================
+
+# Row 1: 2024-06-15 13:45:30 +05:30 -> UTC: 2024-06-15 08:15:30
+query IT
+SELECT id, dto_s0 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 1;
+----
+1	2024-06-15 08:15:30+00
+
+# Row 3: 1900-01-01 00:00:00 -08:00 -> UTC: 1900-01-01 08:00:00
+query IT
+SELECT id, dto_s0 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 3;
+----
+3	1900-01-01 08:00:00+00
+
+# Row 4: 2024-12-31 23:59:59 +00:00 -> UTC same
+query IT
+SELECT id, dto_s0 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 4;
+----
+4	2024-12-31 23:59:59+00
+
+# =============================================================================
+# Test 2: DATETIMEOFFSET(3) via NBCROW - millisecond precision
+# =============================================================================
+
+query IT
+SELECT id, dto_s3 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123+00
+
+query IT
+SELECT id, dto_s3 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 4;
+----
+4	2024-12-31 23:59:59.999+00
+
+# =============================================================================
+# Test 3: DATETIMEOFFSET(7) via NBCROW - microsecond precision (truncated from 100ns)
+# =============================================================================
+
+query IT
+SELECT id, dto_s7 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123456+00
+
+query IT
+SELECT id, dto_s7 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 4;
+----
+4	2024-12-31 23:59:59.999999+00
+
+# =============================================================================
+# Test 4: NULL handling in NBCROW
+# =============================================================================
+
+# Row 2: all DTO columns NULL
+query ITTT
+SELECT id, dto_s0, dto_s3, dto_s7 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 2;
+----
+2	NULL	NULL	NULL
+
+# Row 5: mixed NULL/non-NULL
+query ITTT
+SELECT id, dto_s0, dto_s3, dto_s7 FROM nbc_dto.dbo.TestDtoNbc WHERE id = 5;
+----
+5	NULL	2024-06-15 12:00:00.5+00	NULL
+
+# =============================================================================
+# Test 5: SELECT * to exercise full NBCROW parsing with all columns
+# =============================================================================
+
+query ITTT
+SELECT id, dto_s0, dto_s3, dto_s7 FROM nbc_dto.dbo.TestDtoNbc WHERE id <= 4 ORDER BY id;
+----
+1	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
+2	NULL	NULL	NULL
+3	1900-01-01 08:00:00+00	1900-01-01 08:00:00+00	1900-01-01 08:00:00+00
+4	2024-12-31 23:59:59+00	2024-12-31 23:59:59.999+00	2024-12-31 23:59:59.999999+00
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('nbc_dto', 'DROP TABLE IF EXISTS dbo.TestDtoNbc;');
+
+statement ok
+DETACH nbc_dto;

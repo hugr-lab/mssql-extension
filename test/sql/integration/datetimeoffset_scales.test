@@ -1,0 +1,88 @@
+# name: test/sql/integration/datetimeoffset_scales.test
+# description: Test DATETIMEOFFSET with various scales read correctly (ROW path)
+# group: [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_cache=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dto_scale (TYPE mssql);
+
+# Create test table with DATETIMEOFFSET columns of various scales
+statement ok
+SELECT mssql_exec('dto_scale', '
+IF OBJECT_ID(''dbo.TestDtoScale'', ''U'') IS NOT NULL DROP TABLE dbo.TestDtoScale;
+CREATE TABLE dbo.TestDtoScale (
+    id INT PRIMARY KEY,
+    dto_s0 DATETIMEOFFSET(0) NOT NULL,
+    dto_s3 DATETIMEOFFSET(3) NOT NULL,
+    dto_s7 DATETIMEOFFSET(7) NOT NULL
+);
+INSERT INTO dbo.TestDtoScale VALUES
+    (1, ''2024-06-15 13:45:30 +05:30'', ''2024-06-15 13:45:30.123 +05:30'', ''2024-06-15 13:45:30.1234567 +05:30''),
+    (2, ''1900-01-01 00:00:00 -08:00'', ''1900-01-01 00:00:00.000 -08:00'', ''1900-01-01 00:00:00.0000000 -08:00''),
+    (3, ''2024-12-31 23:59:59 +00:00'', ''2024-12-31 23:59:59.999 +00:00'', ''2024-12-31 23:59:59.9999999 +00:00'');
+');
+
+statement ok
+SELECT mssql_refresh_cache('dto_scale');
+
+# Test DATETIMEOFFSET(0) - second-level precision
+# Row 1: 2024-06-15 13:45:30 +05:30 -> UTC: 2024-06-15 08:15:30
+query IT
+SELECT id, dto_s0 FROM dto_scale.dbo.TestDtoScale WHERE id = 1;
+----
+1	2024-06-15 08:15:30+00
+
+# Row 2: 1900-01-01 00:00:00 -08:00 -> UTC: 1900-01-01 08:00:00
+query IT
+SELECT id, dto_s0 FROM dto_scale.dbo.TestDtoScale WHERE id = 2;
+----
+2	1900-01-01 08:00:00+00
+
+# Row 3: 2024-12-31 23:59:59 +00:00 -> UTC same
+query IT
+SELECT id, dto_s0 FROM dto_scale.dbo.TestDtoScale WHERE id = 3;
+----
+3	2024-12-31 23:59:59+00
+
+# Test DATETIMEOFFSET(3) - millisecond precision
+query IT
+SELECT id, dto_s3 FROM dto_scale.dbo.TestDtoScale WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123+00
+
+query IT
+SELECT id, dto_s3 FROM dto_scale.dbo.TestDtoScale WHERE id = 3;
+----
+3	2024-12-31 23:59:59.999+00
+
+# Test DATETIMEOFFSET(7) - 100ns precision (truncated to microseconds in DuckDB)
+query IT
+SELECT id, dto_s7 FROM dto_scale.dbo.TestDtoScale WHERE id = 1;
+----
+1	2024-06-15 08:15:30.123456+00
+
+query IT
+SELECT id, dto_s7 FROM dto_scale.dbo.TestDtoScale WHERE id = 3;
+----
+3	2024-12-31 23:59:59.999999+00
+
+# Test all scales together
+query ITTT
+SELECT id, dto_s0, dto_s3, dto_s7 FROM dto_scale.dbo.TestDtoScale ORDER BY id;
+----
+1	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
+2	1900-01-01 08:00:00+00	1900-01-01 08:00:00+00	1900-01-01 08:00:00+00
+3	2024-12-31 23:59:59+00	2024-12-31 23:59:59.999+00	2024-12-31 23:59:59.999999+00
+
+# Cleanup
+statement ok
+SELECT mssql_exec('dto_scale', 'DROP TABLE IF EXISTS dbo.TestDtoScale;');
+
+statement ok
+DETACH dto_scale;

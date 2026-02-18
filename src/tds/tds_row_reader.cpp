@@ -725,6 +725,17 @@ size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_id
 		return 1 + data_length;
 	}
 
+	// DATETIMEOFFSET - has 1-byte length prefix in NBC rows
+	case TDS_TYPE_DATETIMEOFFSET: {
+		if (length < 1)
+			return 0;
+		uint8_t data_length = data[0];
+		if (length < 1 + data_length)
+			return 0;
+		value.assign(data + 1, data + 1 + data_length);
+		return 1 + data_length;
+	}
+
 	// UNIQUEIDENTIFIER - has 1-byte length prefix in NBC rows (0 or 16)
 	case TDS_TYPE_UNIQUEIDENTIFIER: {
 		if (length < 1)
