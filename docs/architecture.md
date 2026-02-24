@@ -73,7 +73,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 │  │  - TdsPacket / TdsProtocol (packet construction/parsing)      │    │
 │  │  - TokenParser (incremental token stream processing)          │    │
 │  │  - RowReader (row value extraction)                           │    │
-│  │  - Encoding subsystem (type conversion, UTF-16, datetime)     │    │
+│  │  - Encoding subsystem (type conversion, UTF-16, datetime, XML) │    │
 │  └──────────────────────────────────────────────────────────────┘    │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘

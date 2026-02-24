@@ -109,11 +109,24 @@ Bytes 8-15: Data4 (big-endian, as-is)
 
 `GuidEncoding::ReorderGuidBytes()` converts to standard big-endian format before creating the DuckDB `hugeint_t` UUID representation.
 
+### XML Type
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| XML | 0xF1 | PLP encoding (UTF-16LE) | VARCHAR | UTF-16LE → UTF-8, up to 2 GB |
+
+XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, identical to NVARCHAR(MAX). The column metadata includes a SCHEMA_PRESENT flag byte (and optional XML schema info if schema-bound).
+
+**Read path**: XML columns are decoded via the same `ReadPLPType()` + `Utf16LEDecode()` code path as NVARCHAR(MAX).
+
+**Write path (BCP/COPY TO)**: SQL Server rejects the native XML type (0xF1) in INSERT BULK / BCP COLMETADATA. The extension remaps XML columns to NVARCHAR(MAX) in the BCP wire format — SQL Server auto-converts NVARCHAR data to XML on the target column. No practical length limitation: NVARCHAR(MAX) supports up to 2 GB, same as XML.
+
+**DML guard**: INSERT (via SQL literals) and UPDATE (via VALUES JOIN) explicitly reject XML columns with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits (~3-4 MB) while XML documents can be up to 2 GB.
+
 ### Unsupported Types
 
 | SQL Server Type | TDS Type ID | Reason |
 |---|---|---|
-| XML | 0xF1 | Complex nested structure |
 | UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID) | 0xF0 | User-defined CLR types |
 | SQL_VARIANT | 0x62 | Dynamic type container |
 | IMAGE | 0x22 | Deprecated (use VARBINARY(MAX)) |
@@ -122,7 +135,7 @@ Bytes 8-15: Data4 (big-endian, as-is)
 
 Unsupported types produce the error:
 ```
-MSSQL Error: Unsupported SQL Server type 'XML' (0xF1) for column 'col_name'.
+MSSQL Error: Unsupported SQL Server type '<TYPE>' (0x<ID>) for column 'col_name'.
 Consider casting to VARCHAR or excluding this column.
 ```
 
@@ -134,7 +147,7 @@ Consider casting to VARCHAR or excluding this column.
 | Nullable variant (INTN, FLOATN, BITN) | Length byte = 0 |
 | Variable-length (VARCHAR, VARBINARY) | Length = 0xFFFF |
 | DECIMAL/NUMERIC | Length byte = 0 |
-| PLP types (MAX) | Total length = 0xFFFFFFFFFFFFFFFF |
+| PLP types (MAX, XML) | Total length = 0xFFFFFFFFFFFFFFFF |
 
 SQL Server uses nullable variant types (INTN, FLOATN, etc.) for columns declared as nullable. Fixed types like INT/BIT are only used when the column is NOT NULL.
 

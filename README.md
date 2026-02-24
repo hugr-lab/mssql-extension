@@ -1122,12 +1122,18 @@ The function loads metadata per-schema to avoid SQL Server tempdb sort spills on
 | SQL Server Type     | DuckDB Type    | Notes                        |
 | ------------------- | -------------- | ---------------------------- |
 | `UNIQUEIDENTIFIER`  | `UUID`         | 128-bit GUID                 |
+| `XML`               | `VARCHAR`      | PLP encoding, UTF-16LE decoded to UTF-8, up to 2 GB |
+
+**XML type notes:**
+- **SELECT**: XML columns are read via the same PLP + UTF-16LE code path as NVARCHAR(MAX)
+- **COPY TO (BCP)**: Supported — XML is remapped to NVARCHAR(MAX) on the wire (SQL Server auto-converts)
+- **CTAS**: Supported via BCP protocol
+- **INSERT/UPDATE via SQL literals**: Not supported — XML documents can be up to 2 GB, exceeding SQL literal size limits. Use COPY TO with BCP protocol instead
 
 ### Unsupported Types
 
 The following SQL Server types are not currently supported:
 
-- `XML`
 - `UDT` (User-Defined Types)
 - `SQL_VARIANT`
 - `IMAGE` (deprecated)
@@ -1425,7 +1431,7 @@ Error: TLS handshake failed
 ### Type Conversion Error
 
 ```text
-Error: Unsupported SQL Server type: XML
+Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 ```
 
 **Solutions:**
@@ -1537,7 +1543,8 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 
 ### Known Issues
 
-- Queries with unsupported types (XML, UDT, etc.) will fail
+- Queries with unsupported types (UDT, SQL_VARIANT, etc.) will fail
+- XML columns cannot be used in INSERT/UPDATE via SQL literals — use COPY TO with BCP protocol
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
 - VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)

@@ -305,6 +305,11 @@ test/
 │   │   ├── copy_transaction.test   # COPY within transactions
 │   │   ├── copy_type_mismatch.test # Type mismatch handling tests
 │   │   └── copy_types.test         # Data type handling in COPY
+│   ├── xml/                         # XML data type tests
+│   │   ├── xml_read.test           # XML SELECT, NULL, Unicode, large PLP, mixed columns
+│   │   ├── xml_nbc.test            # XML with NBC (Null Bitmap Compression) row format
+│   │   ├── xml_copy_bcp.test       # XML COPY TO via BCP protocol (BCP remaps XML to NVARCHAR(MAX))
+│   │   └── xml_dml_error.test      # DML guard: INSERT/UPDATE reject XML with error
 │   ├── azure/                      # Azure AD authentication tests
 │   │   ├── azure_access_token.test # ACCESS_TOKEN option tests (Spec 032)
 │   │   ├── azure_auth_test_function.test # mssql_azure_auth_test() function tests
@@ -397,6 +402,7 @@ DETACH testdb;
 | `[transaction]` | Transaction management tests | Yes |
 | `[copy]` | COPY TO MSSQL (BulkLoadBCP) tests | Yes |
 | `[ctas]` | CREATE TABLE AS SELECT tests | Yes |
+| `[xml]` | XML data type tests | Yes |
 | `[azure]` | Azure AD authentication tests | No (requires Azure credentials) |
 
 ---
@@ -414,6 +420,7 @@ DETACH testdb;
 - **Rowid tests** → `test/sql/rowid/`
 - **TDS protocol tests** → `test/sql/tds_connection/`
 - **Transaction tests** → `test/sql/transaction/`
+- **XML type tests** → `test/sql/xml/`
 
 ### 2. Create Test File
 
@@ -969,6 +976,7 @@ See [AZURE.md](../AZURE.md) for complete Azure AD authentication documentation.
 | `TxTestLogs` | 0 | Transaction test: mssql_exec logging (IDENTITY PK) |
 | `TxTestCounter` | 2 | Transaction test: numeric UPDATE operations |
 | `tx_test` | 3 | Multi-connection transaction isolation tests |
+| `XmlTestTable` | 6 | XML type tests: simple, NULL, empty, Unicode, large PLP, mixed |
 
 ### Tables in Other Schemas
 
