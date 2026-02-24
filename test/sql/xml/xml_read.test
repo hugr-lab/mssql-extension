@@ -1,0 +1,105 @@
+# name: test/sql/xml/xml_read.test
+# description: Test reading XML data type columns from SQL Server
+# group: [xml]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS xml_db (TYPE mssql);
+
+# ===========================================================================
+# Test 1: SELECT simple XML document (FR-001)
+# ===========================================================================
+
+query IT
+SELECT id, xml_col FROM xml_db.dbo.XmlTestTable WHERE id = 1;
+----
+1	<root><item id="1">Hello</item></root>
+
+# ===========================================================================
+# Test 2: SELECT NULL XML value (FR-002)
+# ===========================================================================
+
+query IT
+SELECT id, xml_col FROM xml_db.dbo.XmlTestTable WHERE id = 2;
+----
+2	NULL
+
+# ===========================================================================
+# Test 3: SELECT empty XML element (edge case)
+# ===========================================================================
+
+query IT
+SELECT id, xml_col FROM xml_db.dbo.XmlTestTable WHERE id = 3;
+----
+3	<root/>
+
+# ===========================================================================
+# Test 4: SELECT XML with Unicode (FR-003)
+# ===========================================================================
+
+query I
+SELECT id FROM xml_db.dbo.XmlTestTable WHERE id = 4 AND xml_col IS NOT NULL;
+----
+4
+
+# Verify Unicode content is present
+query I
+SELECT length(xml_col) > 0 FROM xml_db.dbo.XmlTestTable WHERE id = 4;
+----
+true
+
+# ===========================================================================
+# Test 5: SELECT large XML (PLP multi-chunk) (FR-004)
+# Length check: 1000 * len('<item>data</item>') = 17000, plus '<root>' + '</root>' = 13
+# ===========================================================================
+
+query I
+SELECT length(xml_col) > 10000 FROM xml_db.dbo.XmlTestTable WHERE id = 5;
+----
+true
+
+# ===========================================================================
+# Test 6: SELECT * from mixed table (XML + other types) (SC-006)
+# ===========================================================================
+
+query ITT
+SELECT id, xml_col, name FROM xml_db.dbo.XmlTestTable WHERE id = 1;
+----
+1	<root><item id="1">Hello</item></root>	simple
+
+# ===========================================================================
+# Test 7: SELECT with WHERE on non-XML column (filter pushdown)
+# ===========================================================================
+
+query IT
+SELECT id, name FROM xml_db.dbo.XmlTestTable WHERE name = 'simple';
+----
+1	simple
+
+# ===========================================================================
+# Test 8: COUNT(*) on table with XML columns (aggregation)
+# ===========================================================================
+
+query I
+SELECT count(*) FROM xml_db.dbo.XmlTestTable;
+----
+6
+
+# ===========================================================================
+# Test 9: SELECT XML column via mssql_scan() (raw query path)
+# ===========================================================================
+
+query T
+SELECT xml_col FROM mssql_scan('xml_db', 'SELECT xml_col FROM dbo.XmlTestTable WHERE id = 1');
+----
+<root><item id="1">Hello</item></root>
+
+# Cleanup
+statement ok
+DETACH xml_db;

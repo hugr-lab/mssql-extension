@@ -159,6 +159,12 @@ string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
 	case tds::TDS_TYPE_DATETIMEOFFSET:
 		return "datetimeoffset(" + std::to_string(scale) + ")";
 
+	case tds::TDS_TYPE_XML:
+		// SQL Server rejects XML type in INSERT BULK.
+		// Send as nvarchar(max) — auto-converts to XML on the target column.
+		// No length limitation: nvarchar(max) supports up to 2 GB, same as XML.
+		return "nvarchar(max)";
+
 	default:
 		// Fallback to DuckDB type-based declaration
 		return TargetResolver::GetSQLServerTypeDeclaration(duckdb_type);
@@ -508,7 +514,8 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 
 	case LogicalTypeId::VARCHAR:
 		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
-			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext";
+			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" ||
+			   target_lower == "xml";
 
 	case LogicalTypeId::BLOB:
 		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
@@ -667,6 +674,8 @@ static uint8_t SQLServerTypeToTDSToken(const string &type_name) {
 		return tds::TDS_TYPE_DATETIME2;
 	} else if (type_lower == "datetimeoffset") {
 		return tds::TDS_TYPE_DATETIMEOFFSET;
+	} else if (type_lower == "xml") {
+		return tds::TDS_TYPE_XML;
 	}
 
 	// Default to NVARCHAR for unknown types
@@ -739,6 +748,8 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 4;
 	} else if (type_lower == "datetimeoffset") {
 		return 10;
+	} else if (type_lower == "xml") {
+		return 0xFFFF;  // PLP indicator
 	}
 
 	// Default

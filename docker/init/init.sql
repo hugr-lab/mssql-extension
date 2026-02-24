@@ -688,6 +688,31 @@ PRINT 'Rowid test tables created (RowidTestInt, RowidTestBigint, RowidTestVarcha
 GO
 
 -- =============================================================================
+-- XML data type tests
+-- =============================================================================
+IF OBJECT_ID('dbo.XmlTestTable', 'U') IS NOT NULL DROP TABLE dbo.XmlTestTable;
+GO
+
+CREATE TABLE dbo.XmlTestTable (
+    id INT NOT NULL PRIMARY KEY,
+    xml_col XML NULL,
+    name NVARCHAR(100) NULL
+);
+GO
+
+INSERT INTO dbo.XmlTestTable VALUES
+(1, '<root><item id="1">Hello</item></root>', 'simple'),
+(2, NULL, 'null_xml'),
+(3, '<root/>', 'empty_element'),
+(4, '<doc><p>Unicode: привет мир 你好世界</p></doc>', 'unicode'),
+(5, '<root>' + REPLICATE(CAST('<item>data</item>' AS NVARCHAR(MAX)), 1000) + '</root>', 'large_xml'),
+(6, '', 'empty_string');
+GO
+
+PRINT 'XmlTestTable created';
+GO
+
+-- =============================================================================
 -- Views
 -- =============================================================================
 CREATE VIEW dbo.LargeTableView AS

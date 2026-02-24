@@ -1,0 +1,109 @@
+# name: test/sql/xml/xml_copy_bcp.test
+# description: Test COPY TO existing SQL Server table with XML column via BCP protocol
+# group: [xml]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS xml_bcp_db (TYPE mssql);
+
+# ===========================================================================
+# Setup: Create a target table with XML column for COPY TO tests
+# ===========================================================================
+
+statement ok
+SELECT mssql_exec('xml_bcp_db', '
+IF OBJECT_ID(''dbo.XmlCopyTarget'', ''U'') IS NOT NULL DROP TABLE dbo.XmlCopyTarget;
+CREATE TABLE dbo.XmlCopyTarget (
+    id INT NOT NULL PRIMARY KEY,
+    xml_col XML NULL,
+    name NVARCHAR(100) NULL
+)');
+
+# ===========================================================================
+# Test 1: COPY simple XML data to existing table (FR-006)
+# ===========================================================================
+
+statement ok
+CREATE TABLE xml_source AS SELECT
+    1 AS id,
+    '<root><item>test</item></root>' AS xml_col,
+    'copy_test' AS name;
+
+statement ok
+COPY xml_source TO 'mssql://xml_bcp_db/dbo/XmlCopyTarget' (FORMAT 'bcp');
+
+# Read back and verify
+query ITT
+SELECT id, xml_col, name FROM xml_bcp_db.dbo.XmlCopyTarget WHERE id = 1;
+----
+1	<root><item>test</item></root>	copy_test
+
+statement ok
+DROP TABLE xml_source;
+
+# ===========================================================================
+# Test 2: COPY NULL XML value (FR-002 round-trip)
+# ===========================================================================
+
+statement ok
+CREATE TABLE xml_null_source AS SELECT
+    2 AS id,
+    NULL::VARCHAR AS xml_col,
+    'null_test' AS name;
+
+statement ok
+COPY xml_null_source TO 'mssql://xml_bcp_db/dbo/XmlCopyTarget' (FORMAT 'bcp');
+
+query ITT
+SELECT id, xml_col, name FROM xml_bcp_db.dbo.XmlCopyTarget WHERE id = 2;
+----
+2	NULL	null_test
+
+statement ok
+DROP TABLE xml_null_source;
+
+# ===========================================================================
+# Test 3: COPY Unicode XML data (FR-003 round-trip)
+# ===========================================================================
+
+statement ok
+CREATE TABLE xml_unicode_source AS SELECT
+    3 AS id,
+    '<doc><text>Unicode: café résumé</text></doc>' AS xml_col,
+    'unicode_test' AS name;
+
+statement ok
+COPY xml_unicode_source TO 'mssql://xml_bcp_db/dbo/XmlCopyTarget' (FORMAT 'bcp');
+
+query I
+SELECT id FROM xml_bcp_db.dbo.XmlCopyTarget WHERE id = 3 AND xml_col IS NOT NULL;
+----
+3
+
+statement ok
+DROP TABLE xml_unicode_source;
+
+# ===========================================================================
+# Test 4: Read back all copied data to verify round-trip (SC-002)
+# ===========================================================================
+
+query I
+SELECT count(*) FROM xml_bcp_db.dbo.XmlCopyTarget;
+----
+3
+
+# ===========================================================================
+# Cleanup
+# ===========================================================================
+
+statement ok
+SELECT mssql_exec('xml_bcp_db', 'DROP TABLE IF EXISTS dbo.XmlCopyTarget');
+
+statement ok
+DETACH xml_bcp_db;

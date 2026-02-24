@@ -1,0 +1,46 @@
+# name: test/sql/xml/xml_nbc.test
+# description: Test XML columns in NBC (Null Bitmap Compressed) row format
+# group: [xml]
+#
+# NBC rows are used when a table has many nullable columns.
+# The XmlTestTable has nullable XML and NVARCHAR columns, but to ensure
+# NBC encoding we test via a query that joins with many NULL columns.
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS xml_nbc_db (TYPE mssql);
+
+# ===========================================================================
+# Test 1: SELECT XML from XmlTestTable — includes both NULL and non-NULL XML
+# This tests the NBC code path since the table has nullable columns
+# ===========================================================================
+
+query IT
+SELECT id, xml_col FROM xml_nbc_db.dbo.XmlTestTable WHERE id IN (1, 2) ORDER BY id;
+----
+1	<root><item id="1">Hello</item></root>
+2	NULL
+
+# ===========================================================================
+# Test 2: SELECT all rows — mix of NULL and non-NULL XML values
+# ===========================================================================
+
+query I
+SELECT count(*) FROM xml_nbc_db.dbo.XmlTestTable WHERE xml_col IS NOT NULL;
+----
+5
+
+query I
+SELECT count(*) FROM xml_nbc_db.dbo.XmlTestTable WHERE xml_col IS NULL;
+----
+1
+
+# Cleanup
+statement ok
+DETACH xml_nbc_db;

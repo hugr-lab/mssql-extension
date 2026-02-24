@@ -1,5 +1,6 @@
 #include "dml/update/mssql_update_statement.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -52,6 +53,13 @@ MSSQLDMLBatch MSSQLUpdateStatement::Build(const vector<vector<Value>> &pk_values
 
 		// Add update values (serialized as literals)
 		for (idx_t col_idx = 0; col_idx < update_values[row_idx].size(); col_idx++) {
+			// Reject XML columns — SQL literal serialization cannot handle XML's 2 GB limit
+			if (target_.update_columns[col_idx].mssql_type == "xml") {
+				throw InvalidInputException(
+					"MSSQL Error: XML column '%s' cannot be used in UPDATE via SQL literals. "
+					"Use COPY TO with BCP protocol instead (FORMAT bcp).",
+					target_.update_columns[col_idx].name.c_str());
+			}
 			sql += ", ";
 			const auto &col_type = target_.update_columns[col_idx].duckdb_type;
 			sql += MSSQLValueSerializer::Serialize(update_values[row_idx][col_idx], col_type);

@@ -1,0 +1,103 @@
+# name: test/sql/xml/xml_dml_error.test
+# description: Test INSERT/UPDATE error messages for XML columns
+# group: [xml]
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS xml_dml_db (TYPE mssql);
+
+# ===========================================================================
+# Setup: Create test table with XML and non-XML columns
+# ===========================================================================
+
+statement ok
+SELECT mssql_exec('xml_dml_db', '
+IF OBJECT_ID(''dbo.XmlDmlTest'', ''U'') IS NOT NULL DROP TABLE dbo.XmlDmlTest;
+CREATE TABLE dbo.XmlDmlTest (
+    id INT NOT NULL PRIMARY KEY,
+    xml_col XML NULL,
+    name NVARCHAR(100) NULL
+)');
+
+# Insert initial data for update tests
+statement ok
+SELECT mssql_exec('xml_dml_db', 'INSERT INTO dbo.XmlDmlTest VALUES (1, ''<root/>'', ''test'')');
+
+# ===========================================================================
+# Test 1: INSERT targeting XML column errors (FR-008)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+----
+XML column
+
+# ===========================================================================
+# Test 2: Error message mentions column name (FR-011)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+----
+xml_col
+
+# ===========================================================================
+# Test 3: Error message recommends COPY TO (FR-011)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+----
+COPY TO
+
+# ===========================================================================
+# Test 4: UPDATE setting XML column value errors (FR-009)
+# ===========================================================================
+
+statement error
+UPDATE xml_dml_db.dbo.XmlDmlTest SET xml_col = '<new/>' WHERE id = 1;
+----
+XML column
+
+# ===========================================================================
+# Test 5: INSERT into non-XML columns succeeds (FR-010)
+# Note: We insert only into id and name columns, leaving xml_col as NULL
+# ===========================================================================
+
+statement ok
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, name) VALUES (20, 'no_xml');
+
+# Verify the insert worked
+query IT
+SELECT id, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 20;
+----
+20	no_xml
+
+# ===========================================================================
+# Test 6: UPDATE on non-XML columns succeeds (FR-010)
+# ===========================================================================
+
+statement ok
+UPDATE xml_dml_db.dbo.XmlDmlTest SET name = 'updated' WHERE id = 1;
+
+# Verify the update worked
+query IT
+SELECT id, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 1;
+----
+1	updated
+
+# ===========================================================================
+# Cleanup
+# ===========================================================================
+
+statement ok
+SELECT mssql_exec('xml_dml_db', 'DROP TABLE IF EXISTS dbo.XmlDmlTest');
+
+statement ok
+DETACH xml_dml_db;

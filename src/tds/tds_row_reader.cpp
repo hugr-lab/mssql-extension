@@ -164,6 +164,10 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
+	// XML (always PLP)
+	case TDS_TYPE_XML:
+		return SkipPLPType(data, length);
+
 	// Variable-length (2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
@@ -215,6 +219,10 @@ size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, 
 	case TDS_TYPE_MONEYN:
 	case TDS_TYPE_DATETIMEN:
 		return ReadNullableFixedType(data, length, col.type_id, col.max_length, value, is_null);
+
+	// XML (always PLP)
+	case TDS_TYPE_XML:
+		return ReadPLPType(data, length, value, is_null);
 
 	// Variable-length types
 	case TDS_TYPE_BIGCHAR:
@@ -474,10 +482,10 @@ size_t RowReader::ReadGuidType(const uint8_t *data, size_t length, std::vector<u
 	return 1 + 16;
 }
 
-// PLP_NULL marker: 0xFFFFFFFFFFFFFFFE
-static constexpr uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFEULL;
-// PLP_UNKNOWN marker: 0xFFFFFFFFFFFFFFFF (unknown total length)
-static constexpr uint64_t PLP_UNKNOWN_MARKER = 0xFFFFFFFFFFFFFFFFULL;
+// PLP_NULL marker: 0xFFFFFFFFFFFFFFFF (all bits set = null value)
+static constexpr uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
+// PLP_UNKNOWN marker: 0xFFFFFFFFFFFFFFFE (unknown total length, chunks follow)
+static constexpr uint64_t PLP_UNKNOWN_MARKER = 0xFFFFFFFFFFFFFFFEULL;
 
 // Debug logging for PLP parsing
 static int GetPLPDebugLevel() {
@@ -667,6 +675,10 @@ size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_id
 		return 1 + actual_length;
 	}
 
+	// XML (always PLP)
+	case TDS_TYPE_XML:
+		return ReadPLPType(data, length, value, is_null);
+
 	// Variable-length types still have 2-byte length prefix (or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
 	case TDS_TYPE_BIGVARCHAR:
@@ -784,6 +796,10 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 		uint8_t actual_length = data[0];
 		return length >= 1 + actual_length ? 1 + actual_length : 0;
 	}
+
+	// XML (always PLP)
+	case TDS_TYPE_XML:
+		return SkipPLPType(data, length);
 
 	// Variable-length (still have 2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:

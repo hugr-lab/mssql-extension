@@ -116,6 +116,10 @@ bool ColumnMetadata::IsNullableVariant() const {
 }
 
 bool ColumnMetadata::IsPLPType() const {
+	// XML is always PLP regardless of max_length
+	if (type_id == TDS_TYPE_XML) {
+		return true;
+	}
 	// PLP (Partially Length-Prefixed) encoding is used for MAX types
 	// where max_length == 0xFFFF (65535)
 	if (max_length != 0xFFFF) {
@@ -346,6 +350,37 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 			return false;
 		column.scale = data[offset++];
 		break;
+
+	// XML type: 1 byte SCHEMA_PRESENT flag, optional schema info
+	case TDS_TYPE_XML: {
+		column.max_length = 0xFFFF;  // PLP indicator (XML is always PLP)
+		if (offset >= length)
+			return false;
+		uint8_t schema_present = data[offset++];
+		if (schema_present) {
+			// Skip XML schema info: dbname (B_VARCHAR) + owning_schema (B_VARCHAR) + collection (US_VARCHAR)
+			// B_VARCHAR: 1 byte char count + UTF-16LE chars
+			for (int i = 0; i < 2; i++) {
+				if (offset >= length)
+					return false;
+				uint8_t char_count = data[offset++];
+				size_t byte_len = char_count * 2;
+				if (offset + byte_len > length)
+					return false;
+				offset += byte_len;
+			}
+			// US_VARCHAR: 2 byte char count + UTF-16LE chars
+			if (offset + 2 > length)
+				return false;
+			uint16_t char_count = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+			offset += 2;
+			size_t byte_len = char_count * 2;
+			if (offset + byte_len > length)
+				return false;
+			offset += byte_len;
+		}
+		break;
+	}
 
 	default:
 		throw std::runtime_error("Unsupported SQL Server type: " + column.GetTypeName());

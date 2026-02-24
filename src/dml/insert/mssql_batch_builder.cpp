@@ -64,6 +64,14 @@ vector<string> MSSQLBatchBuilder::SerializeRow(DataChunk &chunk, idx_t row_index
 		auto col_idx = target_.insert_column_indices[i];
 		const auto &col = target_.columns[col_idx];
 
+		// Reject XML columns — SQL literal serialization cannot handle XML's 2 GB limit
+		if (col.mssql_type == "xml") {
+			throw InvalidInputException(
+				"MSSQL Error: XML column '%s' cannot be used in INSERT via SQL literals. "
+				"Use COPY TO with BCP protocol instead (FORMAT bcp).",
+				col.name.c_str());
+		}
+
 		// Get vector from chunk (assumes chunk columns match insert_column_indices order)
 		auto &vector = chunk.data[i];
 		auto literal = MSSQLValueSerializer::SerializeFromVector(vector, row_index, col.duckdb_type);

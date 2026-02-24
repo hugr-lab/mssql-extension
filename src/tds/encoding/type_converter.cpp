@@ -115,8 +115,11 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 		return LogicalType::UUID;
 
-	// Unsupported types
+	// XML -> VARCHAR (PLP + UTF-16LE, same as NVARCHAR(MAX))
 	case TDS_TYPE_XML:
+		return LogicalType::VARCHAR;
+
+	// Unsupported types
 	case TDS_TYPE_UDT:
 	case TDS_TYPE_SQL_VARIANT:
 	case TDS_TYPE_IMAGE:
@@ -164,6 +167,7 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_DATETIMEN:
 	case TDS_TYPE_DATETIMEOFFSET:
 	case TDS_TYPE_UNIQUEIDENTIFIER:
+	case TDS_TYPE_XML:
 		return true;
 	default:
 		return false;
@@ -289,6 +293,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_BIGVARCHAR:
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
+	case TDS_TYPE_XML:
 		ConvertString(value, column, vector, row_idx);
 		break;
 
@@ -415,7 +420,7 @@ void TypeConverter::ConvertString(const std::vector<uint8_t> &value, const Colum
 
 	// NCHAR/NVARCHAR are UTF-16LE, need conversion
 	auto decode_start = std::chrono::steady_clock::now();
-	if (column.type_id == TDS_TYPE_NCHAR || column.type_id == TDS_TYPE_NVARCHAR) {
+	if (column.type_id == TDS_TYPE_NCHAR || column.type_id == TDS_TYPE_NVARCHAR || column.type_id == TDS_TYPE_XML) {
 		str = Utf16LEDecode(value.data(), value.size());
 	} else {
 		// CHAR/VARCHAR are single-byte (respect collation for encoding, but typically CP1252/UTF-8)

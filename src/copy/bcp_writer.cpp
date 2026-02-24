@@ -408,6 +408,18 @@ void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 			WriteUInt8(buffer, 16);
 			break;
 
+		case tds::TDS_TYPE_XML:  // 0xF1
+			// SQL Server rejects XML type (0xF1) in BCP COLMETADATA.
+			// Rewrite as NVARCHAR(MAX) — SQL Server auto-converts to XML on the target column.
+			// No length limitation: nvarchar(max) supports up to 2 GB, same as XML.
+			buffer.back() = tds::TDS_TYPE_NVARCHAR;
+			WriteUInt16LE(buffer, 0xFFFF);  // MAX indicator
+			// Collation (5 bytes)
+			for (int i = 0; i < 5; i++) {
+				WriteUInt8(buffer, col.collation[i]);
+			}
+			break;
+
 		case tds::TDS_TYPE_DATE:  // 0x28
 			// No additional metadata
 			break;
