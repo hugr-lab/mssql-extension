@@ -121,7 +121,7 @@ XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, ident
 
 **Write path (BCP/COPY TO)**: SQL Server rejects the native XML type (0xF1) in INSERT BULK / BCP COLMETADATA. The extension remaps XML columns to NVARCHAR(MAX) in the BCP wire format — SQL Server auto-converts NVARCHAR data to XML on the target column. No practical length limitation: NVARCHAR(MAX) supports up to 2 GB, same as XML.
 
-**DML guard**: INSERT (via SQL literals) and UPDATE (via VALUES JOIN) explicitly reject XML columns with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits (~3-4 MB) while XML documents can be up to 2 GB.
+**DML (INSERT/UPDATE via SQL literals)**: Small XML values (up to 4096 bytes serialized) are allowed. Larger values are rejected with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits while XML documents can be up to 2 GB.
 
 ### Unsupported Types
 

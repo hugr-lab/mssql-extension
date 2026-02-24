@@ -1128,7 +1128,7 @@ The function loads metadata per-schema to avoid SQL Server tempdb sort spills on
 - **SELECT**: XML columns are read via the same PLP + UTF-16LE code path as NVARCHAR(MAX)
 - **COPY TO (BCP)**: Supported — XML is remapped to NVARCHAR(MAX) on the wire (SQL Server auto-converts)
 - **CTAS**: Supported via BCP protocol
-- **INSERT/UPDATE via SQL literals**: Not supported — XML documents can be up to 2 GB, exceeding SQL literal size limits. Use COPY TO with BCP protocol instead
+- **INSERT/UPDATE via SQL literals**: Supported for small values (up to 4096 bytes). Larger XML values error with a recommendation to use COPY TO with BCP protocol
 
 ### Unsupported Types
 
@@ -1544,7 +1544,7 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 ### Known Issues
 
 - Queries with unsupported types (UDT, SQL_VARIANT, etc.) will fail
-- XML columns cannot be used in INSERT/UPDATE via SQL literals — use COPY TO with BCP protocol
+- XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
 - VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)

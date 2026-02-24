@@ -1,5 +1,5 @@
 # name: test/sql/xml/xml_dml_error.test
-# description: Test INSERT/UPDATE error messages for XML columns
+# description: Test INSERT/UPDATE behavior for XML columns (small OK, large errors)
 # group: [xml]
 #
 # REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
@@ -25,72 +25,101 @@ CREATE TABLE dbo.XmlDmlTest (
     name NVARCHAR(100) NULL
 )');
 
+statement ok
+SELECT mssql_refresh_cache('xml_dml_db');
+
 # Insert initial data for update tests
 statement ok
 SELECT mssql_exec('xml_dml_db', 'INSERT INTO dbo.XmlDmlTest VALUES (1, ''<root/>'', ''test'')');
 
 # ===========================================================================
-# Test 1: INSERT targeting XML column errors (FR-008)
+# Test 1: INSERT with small XML value succeeds (FR-008)
 # ===========================================================================
 
-statement error
-INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+statement ok
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data>hello</data>', 'small_xml');
+
+# Verify the insert worked
+query ITT
+SELECT id, xml_col, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 10;
 ----
-XML column
+10	<data>hello</data>	small_xml
 
 # ===========================================================================
-# Test 2: Error message mentions column name (FR-011)
+# Test 2: UPDATE with small XML value succeeds (FR-009)
 # ===========================================================================
 
-statement error
-INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+statement ok
+UPDATE xml_dml_db.dbo.XmlDmlTest SET xml_col = '<updated>new value</updated>' WHERE id = 1;
+
+# Verify the update worked
+query IT
+SELECT id, xml_col FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 1;
 ----
-xml_col
+1	<updated>new value</updated>
 
 # ===========================================================================
-# Test 3: Error message recommends COPY TO (FR-011)
+# Test 3: INSERT with NULL XML value succeeds
 # ===========================================================================
 
-statement error
-INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (10, '<data/>', 'test');
+statement ok
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (11, NULL, 'null_xml');
+
+query IT
+SELECT id, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 11;
 ----
-COPY TO
+11	null_xml
 
 # ===========================================================================
-# Test 4: UPDATE setting XML column value errors (FR-009)
-# ===========================================================================
-
-statement error
-UPDATE xml_dml_db.dbo.XmlDmlTest SET xml_col = '<new/>' WHERE id = 1;
-----
-XML column
-
-# ===========================================================================
-# Test 5: INSERT into non-XML columns succeeds (FR-010)
-# Note: We insert only into id and name columns, leaving xml_col as NULL
+# Test 4: INSERT into non-XML columns succeeds (FR-010)
 # ===========================================================================
 
 statement ok
 INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, name) VALUES (20, 'no_xml');
 
-# Verify the insert worked
 query IT
 SELECT id, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 20;
 ----
 20	no_xml
 
 # ===========================================================================
-# Test 6: UPDATE on non-XML columns succeeds (FR-010)
+# Test 5: UPDATE on non-XML columns succeeds (FR-010)
 # ===========================================================================
 
 statement ok
-UPDATE xml_dml_db.dbo.XmlDmlTest SET name = 'updated' WHERE id = 1;
+UPDATE xml_dml_db.dbo.XmlDmlTest SET name = 'updated_name' WHERE id = 1;
 
-# Verify the update worked
 query IT
 SELECT id, name FROM xml_dml_db.dbo.XmlDmlTest WHERE id = 1;
 ----
-1	updated
+1	updated_name
+
+# ===========================================================================
+# Test 6: INSERT with large XML value errors (FR-008, >4096 bytes)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (30, '<root>' || repeat('<item>This is a padding element to generate a large XML document that exceeds the 4096 byte limit</item>', 50) || '</root>', 'large_xml');
+----
+too large
+
+# ===========================================================================
+# Test 7: Error message mentions column name (FR-011)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (31, '<root>' || repeat('<item>This is a padding element to generate a large XML document that exceeds the 4096 byte limit</item>', 50) || '</root>', 'large_xml');
+----
+xml_col
+
+# ===========================================================================
+# Test 8: Error message recommends COPY TO (FR-011)
+# ===========================================================================
+
+statement error
+INSERT INTO xml_dml_db.dbo.XmlDmlTest (id, xml_col, name) VALUES (32, '<root>' || repeat('<item>This is a padding element to generate a large XML document that exceeds the 4096 byte limit</item>', 50) || '</root>', 'large_xml');
+----
+COPY TO
 
 # ===========================================================================
 # Cleanup
