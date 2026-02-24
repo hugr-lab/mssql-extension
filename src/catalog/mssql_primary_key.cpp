@@ -55,7 +55,7 @@ JOIN sys.columns c
     ON ic.object_id = c.object_id
     AND ic.column_id = c.column_id
 JOIN sys.types t
-    ON c.user_type_id = t.user_type_id
+    ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 WHERE kc.type = 'PK'
     AND kc.parent_object_id = OBJECT_ID('%s')
 ORDER BY ic.key_ordinal

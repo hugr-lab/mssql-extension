@@ -1,0 +1,150 @@
+# name: test/sql/catalog/udt_type_alias.test
+# description: Test that User-Defined Type (UDT) aliases are correctly resolved to base types
+# group: [mssql]
+#
+# Regression test for issue #81: UDT aliases caused "Expected vector of type INT32,
+# but found vector of type VARCHAR" because metadata queries joined sys.types on
+# user_type_id instead of system_type_id, returning the alias name instead of the
+# base type name.
+#
+# REQUIRES: SQL Server running with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_udt (TYPE mssql);
+
+# =============================================================================
+# Setup: Create UDT aliases and a test table using them
+# =============================================================================
+
+# Clean up from previous test runs (types can't be dropped if table exists)
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TABLE IF EXISTS dbo.UdtTestTable');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.StatusCode');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.Price');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.Flag');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.ShortName');
+
+# Create UDT aliases for non-string base types (these are the ones that trigger the bug)
+statement ok
+SELECT mssql_exec('mssql_udt', 'CREATE TYPE dbo.StatusCode FROM int');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'CREATE TYPE dbo.Price FROM decimal(18, 4)');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'CREATE TYPE dbo.Flag FROM bit');
+
+# Also test a string-based UDT (this one didn't crash before, but should still work)
+statement ok
+SELECT mssql_exec('mssql_udt', 'CREATE TYPE dbo.ShortName FROM nvarchar(100)');
+
+# Create table using UDT aliases
+statement ok
+SELECT mssql_exec('mssql_udt', '
+CREATE TABLE dbo.UdtTestTable (
+    id int NOT NULL PRIMARY KEY,
+    status dbo.StatusCode NOT NULL,
+    price dbo.Price NULL,
+    is_active dbo.Flag NOT NULL,
+    label dbo.ShortName NULL
+)');
+
+# Insert test data
+statement ok
+SELECT mssql_exec('mssql_udt', '
+INSERT INTO dbo.UdtTestTable (id, status, price, is_active, label)
+VALUES (1, 42, 99.9900, 1, N''Test Item''),
+       (2, 0, NULL, 0, NULL),
+       (3, -1, 123.4567, 1, N''Another'')
+');
+
+# Refresh cache to pick up new table
+statement ok
+SELECT mssql_refresh_cache('mssql_udt');
+
+# =============================================================================
+# Test: SELECT from table with UDT columns (this was the crash in issue #81)
+# =============================================================================
+
+# Test 1: Select all columns — should not crash with type mismatch
+query IIRBR
+SELECT * FROM mssql_udt.dbo.UdtTestTable ORDER BY id;
+----
+1	42	99.9900	true	Test Item
+2	0	NULL	false	NULL
+3	-1	123.4567	true	Another
+
+# Test 2: Select individual UDT columns
+query I
+SELECT status FROM mssql_udt.dbo.UdtTestTable WHERE id = 1;
+----
+42
+
+query R
+SELECT price FROM mssql_udt.dbo.UdtTestTable WHERE id = 1;
+----
+99.9900
+
+query B
+SELECT is_active FROM mssql_udt.dbo.UdtTestTable WHERE id = 1;
+----
+true
+
+# Test 3: Filter pushdown on UDT columns
+query I
+SELECT id FROM mssql_udt.dbo.UdtTestTable WHERE status = 42;
+----
+1
+
+query I
+SELECT id FROM mssql_udt.dbo.UdtTestTable WHERE is_active = true ORDER BY id;
+----
+1
+3
+
+# Test 4: Aggregation on UDT columns
+query R
+SELECT SUM(price) FROM mssql_udt.dbo.UdtTestTable;
+----
+223.4467
+
+query I
+SELECT COUNT(*) FROM mssql_udt.dbo.UdtTestTable WHERE status >= 0;
+----
+2
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TABLE IF EXISTS dbo.UdtTestTable');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.StatusCode');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.Price');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.Flag');
+
+statement ok
+SELECT mssql_exec('mssql_udt', 'DROP TYPE IF EXISTS dbo.ShortName');
+
+statement ok
+DETACH mssql_udt;

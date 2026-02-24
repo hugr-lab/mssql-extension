@@ -557,7 +557,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		column_sql = StringUtil::Format(
 			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id "
+			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
@@ -565,7 +565,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		column_sql = StringUtil::Format(
 			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.user_type_id = t.user_type_id "
+			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());
@@ -767,7 +767,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		column_sql = StringUtil::Format(
 			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id "
+			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
@@ -775,7 +775,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		column_sql = StringUtil::Format(
 			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.user_type_id = t.user_type_id "
+			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());
