@@ -514,8 +514,7 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 
 	case LogicalTypeId::VARCHAR:
 		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
-			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" ||
-			   target_lower == "xml";
+			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml";
 
 	case LogicalTypeId::BLOB:
 		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
@@ -749,7 +748,7 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 	} else if (type_lower == "datetimeoffset") {
 		return 10;
 	} else if (type_lower == "xml") {
-		return 0xFFFF;  // PLP indicator
+		return 0xFFFF;	// PLP indicator
 	}
 
 	// Default

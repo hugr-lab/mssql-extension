@@ -353,7 +353,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 
 	// XML type: 1 byte SCHEMA_PRESENT flag, optional schema info
 	case TDS_TYPE_XML: {
-		column.max_length = 0xFFFF;  // PLP indicator (XML is always PLP)
+		column.max_length = 0xFFFF;	 // PLP indicator (XML is always PLP)
 		if (offset >= length)
 			return false;
 		uint8_t schema_present = data[offset++];
