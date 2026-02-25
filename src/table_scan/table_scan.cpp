@@ -85,6 +85,14 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 										 bool convert_varchar_max) {
 	std::string escaped_name = "[" + FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
 
+	// Unsupported SQL Server types (geometry, hierarchyid, sql_variant, CLR UDTs, etc.)
+	// must be CAST to NVARCHAR(MAX) so SQL Server sends text instead of native wire format
+	if (col.is_cast_required) {
+		MSSQL_SCAN_DEBUG_LOG(2, "  CAST required: %s (%s) → NVARCHAR(MAX)", col_name.c_str(),
+							 col.sql_type_name.c_str());
+		return "CAST(" + escaped_name + " AS NVARCHAR(MAX)) AS " + escaped_name;
+	}
+
 	if (NeedsNVarcharConversion(col, convert_varchar_max)) {
 		std::string nvarchar_len = GetNVarcharLength(col.max_length);
 		MSSQL_SCAN_DEBUG_LOG(2, "  NVARCHAR conversion: %s (%s, len=%d) → NVARCHAR(%s)", col_name.c_str(),

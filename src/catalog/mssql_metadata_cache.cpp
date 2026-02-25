@@ -60,7 +60,7 @@ SELECT
     ISNULL(p.rows, 0) AS approx_rows,
     c.name AS column_name,
     c.column_id,
-    t.name AS type_name,
+    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -68,7 +68,7 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
-JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
+LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
 WHERE o.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
@@ -84,7 +84,7 @@ SELECT
     ISNULL(p.rows, 0) AS approx_rows,
     c.name AS column_name,
     c.column_id,
-    t.name AS type_name,
+    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -93,7 +93,7 @@ SELECT
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
-JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
+LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
 WHERE s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
@@ -110,14 +110,14 @@ static const char *COLUMN_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     c.name AS column_name,
     c.column_id,
-    t.name AS type_name,
+    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name
 FROM sys.columns c
-JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
+LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 WHERE c.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
 )";

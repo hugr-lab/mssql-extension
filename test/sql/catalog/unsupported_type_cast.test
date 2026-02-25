@@ -1,0 +1,98 @@
+# name: test/sql/catalog/unsupported_type_cast.test
+# description: Test that unsupported SQL Server types (hierarchyid, sql_variant) are auto-CAST to NVARCHAR(MAX)
+# group: [mssql]
+#
+# When a column uses a SQL Server type that has no native TDS decoder (e.g., hierarchyid,
+# sql_variant, geometry, CLR UDTs), the extension maps it to VARCHAR in the catalog and
+# wraps it with CAST([col] AS NVARCHAR(MAX)) in the pushdown SELECT to ensure SQL Server
+# sends text instead of the native wire format.
+#
+# REQUIRES: SQL Server running with TestDB initialized
+# Run with: make integration-test
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Attach database
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_cast (TYPE mssql);
+
+# =============================================================================
+# Setup: Create table with unsupported types
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql_cast', 'DROP TABLE IF EXISTS dbo.UnsupportedTypeCast');
+
+statement ok
+SELECT mssql_exec('mssql_cast', '
+CREATE TABLE dbo.UnsupportedTypeCast (
+    id int NOT NULL PRIMARY KEY,
+    h hierarchyid NULL,
+    v sql_variant NULL
+)');
+
+statement ok
+SELECT mssql_exec('mssql_cast', '
+INSERT INTO dbo.UnsupportedTypeCast (id, h, v)
+VALUES (1, ''/1/'', CAST(42 AS sql_variant)),
+       (2, ''/1/2/'', CAST(N''hello'' AS sql_variant)),
+       (3, NULL, NULL)
+');
+
+# Refresh cache to pick up new table
+statement ok
+SELECT mssql_refresh_cache('mssql_cast');
+
+# =============================================================================
+# Test: SELECT columns with unsupported types — should return VARCHAR data
+# =============================================================================
+
+# Test 1: Select all columns — unsupported types come back as text
+query ITT
+SELECT * FROM mssql_cast.dbo.UnsupportedTypeCast ORDER BY id;
+----
+1	/1/	42
+2	/1/2/	hello
+3	NULL	NULL
+
+# Test 2: Select individual unsupported columns
+query T
+SELECT h FROM mssql_cast.dbo.UnsupportedTypeCast WHERE id = 1;
+----
+/1/
+
+query T
+SELECT v FROM mssql_cast.dbo.UnsupportedTypeCast WHERE id = 2;
+----
+hello
+
+# Test 3: NULL handling for unsupported types
+query TT
+SELECT h, v FROM mssql_cast.dbo.UnsupportedTypeCast WHERE id = 3;
+----
+NULL	NULL
+
+# Test 4: Filter on regular column still works with unsupported types in projection
+query IT
+SELECT id, h FROM mssql_cast.dbo.UnsupportedTypeCast WHERE id >= 2 ORDER BY id;
+----
+2	/1/2/
+3	NULL
+
+# Test 5: Count works (no unsupported type data transferred)
+query I
+SELECT COUNT(*) FROM mssql_cast.dbo.UnsupportedTypeCast;
+----
+3
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql_cast', 'DROP TABLE IF EXISTS dbo.UnsupportedTypeCast');
+
+statement ok
+DETACH mssql_cast;

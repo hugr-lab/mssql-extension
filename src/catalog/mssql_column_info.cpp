@@ -13,7 +13,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 	  is_nullable(true),
 	  is_case_sensitive(false),
 	  is_unicode(false),
-	  is_utf8(false) {}
+	  is_utf8(false),
+	  is_cast_required(false) {}
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 								 uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
@@ -39,6 +40,9 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 
 	// Map to DuckDB type
 	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale);
+
+	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown
+	is_cast_required = !IsKnownSQLServerType(sql_type_name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -188,6 +192,24 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 //===----------------------------------------------------------------------===//
 // Type Checks
 //===----------------------------------------------------------------------===//
+
+bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+
+	// All types explicitly handled in MapSQLServerTypeToDuckDB
+	return lower_type == "bit" || lower_type == "tinyint" || lower_type == "smallint" || lower_type == "int" ||
+		   lower_type == "bigint" || lower_type == "real" || lower_type == "float" || lower_type == "decimal" ||
+		   lower_type == "numeric" || lower_type == "money" || lower_type == "smallmoney" || lower_type == "char" ||
+		   lower_type == "varchar" || lower_type == "text" || lower_type == "nchar" || lower_type == "nvarchar" ||
+		   lower_type == "ntext" || lower_type == "date" || lower_type == "time" || lower_type == "datetime" ||
+		   lower_type == "datetime2" || lower_type == "smalldatetime" || lower_type == "datetimeoffset" ||
+		   lower_type == "binary" || lower_type == "varbinary" || lower_type == "image" ||
+		   lower_type == "uniqueidentifier" ||
+		   // XML has dedicated TDS-level support (0xF1) and works without CAST
+		   lower_type == "xml";
+}
 
 bool MSSQLColumnInfo::IsTextType(const string &sql_type_name) {
 	string lower_type = sql_type_name;

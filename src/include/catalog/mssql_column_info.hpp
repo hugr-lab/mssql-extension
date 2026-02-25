@@ -30,6 +30,7 @@ struct MSSQLColumnInfo {
 	bool is_case_sensitive;	 // Derived from collation (_CS_ or _BIN)
 	bool is_unicode;		 // True for NVARCHAR/NCHAR/NTEXT
 	bool is_utf8;			 // Derived from collation (_UTF8)
+	bool is_cast_required;	 // Unsupported type: needs CAST to NVARCHAR(MAX)
 
 	// Default constructor
 	MSSQLColumnInfo();
@@ -47,6 +48,9 @@ struct MSSQLColumnInfo {
 	// Map SQL Server type to DuckDB LogicalType
 	static LogicalType MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length, uint8_t precision,
 												uint8_t scale);
+
+	// Check if SQL Server type is natively supported (has explicit mapping or TDS-level support)
+	static bool IsKnownSQLServerType(const string &sql_type_name);
 
 	// Check if type is a text type that has collation
 	static bool IsTextType(const string &sql_type_name);
