@@ -81,7 +81,7 @@ SELECT mssql_refresh_cache('mssql_udt');
 # =============================================================================
 
 # Test 1: Select all columns — should not crash with type mismatch
-query IIRBR
+query IIRTR
 SELECT * FROM mssql_udt.dbo.UdtTestTable ORDER BY id;
 ----
 1	42	99.9900	true	Test Item
@@ -99,7 +99,7 @@ SELECT price FROM mssql_udt.dbo.UdtTestTable WHERE id = 1;
 ----
 99.9900
 
-query B
+query T
 SELECT is_active FROM mssql_udt.dbo.UdtTestTable WHERE id = 1;
 ----
 true
