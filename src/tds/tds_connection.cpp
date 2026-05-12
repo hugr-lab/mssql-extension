@@ -686,11 +686,19 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		return false;
 	}
 
-	// Step 3: LOGIN7 with SSPI field populated.
-	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), db='%s'",
-						 initial_blob.size(), database.c_str());
-	TdsPacket login = TdsProtocol::BuildLogin7WithSSPI(host_, tds_server_name_.empty() ? host_ : tds_server_name_,
-													   database, initial_blob, "DuckDB MSSQL Extension",
+	// Step 3: LOGIN7 with SSPI field populated. The HostName field is the
+	// CLIENT workstation name (per [MS-TDS] 2.2.6.4 -- surfaces in
+	// sys.dm_exec_sessions.host_name, sp_who, audit logs); the ServerName
+	// field is the destination. Passing host_ (the destination) into both
+	// positions makes DBA tooling see every connection as if the server were
+	// connecting to itself. spec 042 ultrareview bug_029.
+	const std::string client_hostname = GetClientHostname();
+	MSSQL_CONN_DEBUG_LOG(1,
+						 "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
+						 initial_blob.size(), client_hostname.c_str(), database.c_str());
+	TdsPacket login = TdsProtocol::BuildLogin7WithSSPI(client_hostname,
+													   tds_server_name_.empty() ? host_ : tds_server_name_, database,
+													   initial_blob, "DuckDB MSSQL Extension",
 													   TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 	if (!socket_->SendPacket(login)) {

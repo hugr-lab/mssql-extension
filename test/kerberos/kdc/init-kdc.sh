@@ -33,11 +33,25 @@ if [[ ! -f /var/lib/krb5kdc/principal ]]; then
     # randkey: generate random long-term key; we never need a password for SPNs.
     kadmin.local -q "addprinc -randkey ${SERVICE_PRINCIPAL}@${REALM}"
 
-    # Export the service principal's keytab so the SQL Server container can
-    # decrypt service tickets. The shared 'keytabs' volume makes this visible
-    # at /var/opt/mssql/secrets/mssql.keytab inside the sql container.
+    # Also register the port-less hostbased-service variant. Clients using
+    # GSS_C_NT_HOSTBASED_SERVICE (no port info in the SPN) end up here, while
+    # clients using the principal-name form land on the port-suffixed variant.
+    # Registering both makes the test KDC robust against both client paths.
+    # spec 042 ultrareview bug_015.
+    SERVICE_PRINCIPAL_HOSTBASED="${SERVICE_PRINCIPAL%:*}"  # strip ":1433"
+    if [[ "${SERVICE_PRINCIPAL_HOSTBASED}" != "${SERVICE_PRINCIPAL}" ]]; then
+        echo "[init-kdc] also creating hostbased variant ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}"
+        kadmin.local -q "addprinc -randkey ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}"
+    fi
+
+    # Export both variants into a single keytab so the SQL Server container
+    # can decrypt service tickets for either form. The shared 'keytabs' volume
+    # makes this visible at /var/opt/mssql/secrets/mssql.keytab inside sql.
     echo "[init-kdc] exporting service keytab to ${KEYTAB_OUT}"
     kadmin.local -q "ktadd -k ${KEYTAB_OUT} ${SERVICE_PRINCIPAL}@${REALM}"
+    if [[ "${SERVICE_PRINCIPAL_HOSTBASED}" != "${SERVICE_PRINCIPAL}" ]]; then
+        kadmin.local -q "ktadd -k ${KEYTAB_OUT} ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}"
+    fi
     chmod 644 "${KEYTAB_OUT}"
 else
     echo "[init-kdc] realm already exists at /var/lib/krb5kdc; skipping create"
@@ -46,6 +60,10 @@ else
     if [[ ! -s "${KEYTAB_OUT}" ]]; then
         echo "[init-kdc] keytab missing; re-exporting"
         kadmin.local -q "ktadd -k ${KEYTAB_OUT} ${SERVICE_PRINCIPAL}@${REALM}"
+        SERVICE_PRINCIPAL_HOSTBASED="${SERVICE_PRINCIPAL%:*}"
+        if [[ "${SERVICE_PRINCIPAL_HOSTBASED}" != "${SERVICE_PRINCIPAL}" ]]; then
+            kadmin.local -q "ktadd -k ${KEYTAB_OUT} ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}" || true
+        fi
         chmod 644 "${KEYTAB_OUT}"
     fi
 fi

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unistd.h>	 // getpid
 
 // macOS's bundled GSS framework is a Heimdal-based subset that does NOT
 // expose gss_acquire_cred_from / gss_key_value_set_desc or the full krb5.h
@@ -180,6 +181,17 @@ Krb5Authenticator::Krb5Authenticator(Krb5Config config) : config_(std::move(conf
 			"Use credential-cache mode (kinit) instead, or build on Linux with libkrb5-dev.");
 #endif
 	} else {
+		// CredCache mode. Reject User Id without Password / keytab -- otherwise
+		// the user-supplied principal is silently ignored and we authenticate
+		// as whoever owns the ambient ccache. spec 042 ultrareview bug_022.
+		if (!config_.raw_username.empty()) {
+			throw std::runtime_error(
+				"MSSQL Kerberos auth: 'User Id' with authenticator=krb5 requires either "
+				"'krb5-keytabfile' (service account) or a Password supplied via MSSQL secret "
+				"(raw credentials). Credential-cache mode does not use User Id -- it "
+				"authenticates as whoever ran 'kinit'. Run 'kinit " +
+				config_.raw_username + "' first, then drop the User Id from the connection string.");
+		}
 		mode_ = Krb5CredentialMode::CredCache;
 	}
 
@@ -189,21 +201,29 @@ Krb5Authenticator::Krb5Authenticator(Krb5Config config) : config_(std::move(conf
 			"from the host before constructing Krb5Authenticator.");
 	}
 
-	// Apply per-connection krb5.conf override via env. Must happen before
-	// any GSSAPI / krb5 call. Threaded clients running multiple parallel
-	// ATTACHes with different krb5.conf overrides are out of scope -- this
-	// is a process-global setting.
+	// Validate per-connection override file paths at construction time so
+	// errors surface fast. The overrides themselves are applied at credential
+	// acquisition time via gss_acquire_cred_from cred_store elements (per
+	// instance, not via setenv) -- avoids the process-global thread-safety
+	// trap noted in spec 042 ultrareview bug_005.
+	if (!config_.configfile.empty() && !FileIsReadable(config_.configfile)) {
+		throw std::runtime_error("MSSQL Kerberos auth: krb5.conf '" + config_.configfile +
+								 "' is not readable.");
+	}
+
+#if !defined(MSSQL_KRB5_HAS_MIT_EXTENSIONS)
 	if (!config_.configfile.empty()) {
-		if (FileIsReadable(config_.configfile)) {
-			setenv("KRB5_CONFIG", config_.configfile.c_str(), /*overwrite=*/1);
-		} else {
-			throw std::runtime_error("MSSQL Kerberos auth: krb5.conf '" + config_.configfile +
-									 "' is not readable.");
-		}
+		throw std::runtime_error(
+			"MSSQL Kerberos auth: krb5-configfile override is not supported on this platform "
+			"(macOS GSS framework lacks the required MIT extensions). Set the KRB5_CONFIG "
+			"environment variable in the parent process instead, or build on Linux.");
 	}
 	if (!config_.credcachefile.empty()) {
-		setenv("KRB5CCNAME", config_.credcachefile.c_str(), /*overwrite=*/1);
+		throw std::runtime_error(
+			"MSSQL Kerberos auth: krb5-credcachefile override is not supported on this platform. "
+			"Set the KRB5CCNAME environment variable in the parent process instead, or build on Linux.");
 	}
+#endif
 }
 
 Krb5Authenticator::~Krb5Authenticator() {
@@ -254,10 +274,53 @@ void Krb5Authenticator::AcquireCredentials() {
 
 	switch (mode_) {
 	case Krb5CredentialMode::CredCache:
-		// Use the default credentials -- GSS_C_NO_CREDENTIAL on gss_init_sec_context
-		// later. No acquisition needed here; the kernel ccache lookup happens
-		// inside the mech.
+#if defined(MSSQL_KRB5_HAS_MIT_EXTENSIONS)
+		// When the user supplied a per-connection ccache or krb5.conf override,
+		// route through gss_acquire_cred_from with explicit cred_store elements
+		// instead of GSS_C_NO_CREDENTIAL. This avoids the process-global setenv
+		// race (spec 042 ultrareview bug_005) and keeps overrides scoped to
+		// this authenticator instance.
+		if (!config_.credcachefile.empty() || !config_.configfile.empty()) {
+			std::vector<gss_key_value_element_desc> elements;
+			if (!config_.credcachefile.empty()) {
+				gss_key_value_element_desc e;
+				e.key = "ccache";
+				e.value = config_.credcachefile.c_str();
+				elements.push_back(e);
+			}
+			if (!config_.configfile.empty()) {
+				// MIT 1.17+ accepts "config" as a cred_store key for per-acquire
+				// krb5.conf overrides. Older versions ignore unknown keys
+				// silently; documented behaviour, no failure.
+				gss_key_value_element_desc e;
+				e.key = "config";
+				e.value = config_.configfile.c_str();
+				elements.push_back(e);
+			}
+			gss_key_value_set_desc cred_store;
+			cred_store.count = static_cast<OM_uint32>(elements.size());
+			cred_store.elements = elements.data();
+
+			gss_OID_set_desc mech_set;
+			mech_set.count = 1;
+			mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
+			major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
+										  &cred_store, &cred_, nullptr, nullptr);
+			if (GSS_ERROR(major)) {
+				ThrowGssError("gss_acquire_cred_from (ccache override)", major, minor);
+			}
+		} else {
+			// No override -- use the default credentials. GSS_C_NO_CREDENTIAL
+			// makes gss_init_sec_context look up the ccache through the
+			// process environment (KRB5CCNAME / /tmp/krb5cc_<uid>) at the
+			// mech level, with no process-global state mutation by us.
+			cred_ = GSS_C_NO_CREDENTIAL;
+		}
+#else
+		// macOS / no MIT extensions: only the default ccache is reachable.
+		// The constructor has already rejected any per-connection overrides.
 		cred_ = GSS_C_NO_CREDENTIAL;
+#endif
 		break;
 
 #if defined(MSSQL_KRB5_HAS_MIT_EXTENSIONS)
@@ -344,9 +407,11 @@ void Krb5Authenticator::AcquireCredentials() {
 			throw std::runtime_error("MSSQL Kerberos auth failed: " + err);
 		}
 
-		// Store creds in a MEMORY ccache keyed on the principal so multiple
-		// concurrent raw-mode connections don't trample each other.
-		std::string ccname = std::string("MEMORY:mssql_raw_") + principal_str;
+		// Store creds in a MEMORY ccache keyed on principal+pid so concurrent
+		// raw-mode connections don't trample each other and the name doesn't
+		// collide across processes.
+		std::string ccname = std::string("MEMORY:mssql_raw_") + principal_str + "_" +
+							 std::to_string(static_cast<long long>(getpid()));
 		krb5_ccache cc = nullptr;
 		kerr = krb5_cc_resolve(kctx, ccname.c_str(), &cc);
 		if (kerr) {
@@ -355,12 +420,25 @@ void Krb5Authenticator::AcquireCredentials() {
 			krb5_free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_resolve failed");
 		}
-		krb5_cc_initialize(kctx, cc, client);
-		krb5_cc_store_cred(kctx, cc, &creds);
+		kerr = krb5_cc_initialize(kctx, cc, client);
+		if (kerr) {
+			krb5_cc_close(kctx, cc);
+			krb5_free_cred_contents(kctx, &creds);
+			krb5_free_principal(kctx, client);
+			krb5_free_context(kctx);
+			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_initialize failed (code " +
+									 std::to_string(static_cast<int>(kerr)) + ")");
+		}
+		kerr = krb5_cc_store_cred(kctx, cc, &creds);
+		if (kerr) {
+			krb5_cc_destroy(kctx, cc);	// closes the handle and unlinks from MEMORY: registry
+			krb5_free_cred_contents(kctx, &creds);
+			krb5_free_principal(kctx, client);
+			krb5_free_context(kctx);
+			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_store_cred failed (code " +
+									 std::to_string(static_cast<int>(kerr)) + ")");
+		}
 		krb5_cc_close(kctx, cc);
-		krb5_free_cred_contents(kctx, &creds);
-		krb5_free_principal(kctx, client);
-		krb5_free_context(kctx);
 
 		gss_key_value_element_desc elements[1];
 		elements[0].key = "ccache";
@@ -375,6 +453,22 @@ void Krb5Authenticator::AcquireCredentials() {
 
 		major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
 									  &cred_store, &cred_, nullptr, nullptr);
+
+		// Now that GSSAPI has its own internal copy of the credentials,
+		// destroy the temporary MEMORY ccache. Without this, the entry
+		// stays in the process-global MIT MEMORY: registry until process
+		// exit -- spec 042 ultrareview merged_bug_002. Re-resolve by name
+		// (krb5_cc_close above invalidates the original handle).
+		{
+			krb5_ccache cc_to_destroy = nullptr;
+			if (krb5_cc_resolve(kctx, ccname.c_str(), &cc_to_destroy) == 0 && cc_to_destroy) {
+				krb5_cc_destroy(kctx, cc_to_destroy);
+			}
+		}
+		krb5_free_cred_contents(kctx, &creds);
+		krb5_free_principal(kctx, client);
+		krb5_free_context(kctx);
+
 		if (GSS_ERROR(major)) {
 			ThrowGssError("gss_acquire_cred_from (raw ccache)", major, minor);
 		}
@@ -383,15 +477,23 @@ void Krb5Authenticator::AcquireCredentials() {
 #endif	// MSSQL_KRB5_HAS_MIT_EXTENSIONS
 	}
 
-	// Import target SPN. We use GSS_C_NT_HOSTBASED_SERVICE which expects
-	// the "@" separator form ("MSSQLSvc@host.example.com"), NOT the slash
-	// form. Using the wrong name type or separator silently produces a
-	// ticket the server cannot decrypt -- this is a well-documented FreeTDS
-	// pitfall (see spec 042 research.md R2).
+	// Import target SPN. There are two valid syntaxes (spec 042 R2):
+	//   * Hostbased-service:  "MSSQLSvc@host.example.com"     -> name type 2
+	//   * Krb5 principal:     "MSSQLSvc/host.example.com:1433" -> name type
+	//                                                             krb5-principal
+	//
+	// We pick the name type based on whether the SPN contains a '/'. The
+	// hostbased-service form is what GSSAPI canonicalizes via krb5.conf
+	// rules -- it cannot carry a port. The principal-name form is verbatim:
+	// what AD has registered is what the KDC will issue a ticket for, which
+	// is what SQL Server can decrypt. Using the wrong type silently produces
+	// a ticket the server cannot decrypt (well-documented FreeTDS pitfall).
 	gss_buffer_desc spn_buf;
 	spn_buf.value = const_cast<char *>(config_.spn.c_str());
 	spn_buf.length = config_.spn.size();
-	major = gss_import_name(&minor, &spn_buf, kHostBasedServiceOid, &target_name_);
+	const bool is_principal_form = config_.spn.find('/') != std::string::npos;
+	gss_OID spn_name_type = is_principal_form ? kKrb5PrincipalNameOid : kHostBasedServiceOid;
+	major = gss_import_name(&minor, &spn_buf, spn_name_type, &target_name_);
 	if (GSS_ERROR(major)) {
 		ThrowGssError("gss_import_name (SPN)", major, minor);
 	}

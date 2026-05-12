@@ -23,31 +23,45 @@ namespace tds {
 
 namespace {
 
-// Spec 042 R2: Derive default SPN of the form "MSSQLSvc@<fqdn>". The @ separator
-// is critical -- GSS_C_NT_HOSTBASED_SERVICE expects @, not /. The mech rewrites
-// internally to "MSSQLSvc/<fqdn>:<port>" before querying the KDC.
+// Spec 042 R2: derive the SPN. SQL Server SPNs in AD are registered in the
+// canonical form "MSSQLSvc/<fqdn>:<port>" (or ":<instance>" for named
+// instances). Passing the port-less hostbased-service form to GSSAPI -- as
+// the previous implementation did -- silently strips the port and fails on
+// any KDC that registered only the port-suffixed variant (which includes the
+// bundled test KDC and any non-default-port production deployment).
 //
-// If the user overrode service_principal_name explicitly, we honor that
-// verbatim -- they may have a custom SPN registered against a specific
-// service account.
+// We therefore route through Krb5Authenticator in the "principal-name" form
+// (slash + colon + port) whenever we know the port, and fall back to the
+// hostbased-service form only when the user explicitly omitted port info.
+// The authenticator's gss_import_name call picks the name type based on
+// whether the SPN contains a '/' (see krb5_authenticator.cpp).
+//
+// service_principal_name (if supplied) is honored verbatim -- the user knows
+// their AD registration. We accept all three syntaxes:
+//   "MSSQLSvc/host:1433"           -> used verbatim, principal-name type
+//   "MSSQLSvc/host:1433@REALM"     -> realm trimmed, principal-name type
+//   "MSSQLSvc@host"                -> used verbatim, hostbased-service type
 static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 	if (!info.service_principal_name.empty()) {
-		// Accept either MSSQLSvc/host:port (canonical form) or
-		// MSSQLSvc@host (already in hostbased form). If the user gave the
-		// canonical slash form, rewrite to @ form for GSSAPI.
 		const std::string &spn = info.service_principal_name;
 		auto slash = spn.find('/');
-		if (slash != std::string::npos && spn.find('@') == std::string::npos) {
-			// "MSSQLSvc/host:port" -> "MSSQLSvc@host"
-			auto host_start = slash + 1;
-			auto colon = spn.find(':', host_start);
-			std::string host_part = (colon == std::string::npos) ? spn.substr(host_start)
-																 : spn.substr(host_start, colon - host_start);
-			return spn.substr(0, slash) + "@" + host_part;
+		auto at = spn.find('@');
+		if (slash != std::string::npos) {
+			// Canonical slash form. If it ends in @REALM, strip the realm --
+			// gss_import_name with GSS_KRB5_NT_PRINCIPAL_NAME does its own
+			// realm lookup (and double-realm causes KRB5_PARSE_MALFORMED on
+			// some MIT versions).
+			if (at != std::string::npos && at > slash) {
+				return spn.substr(0, at);
+			}
+			return spn;
 		}
+		// Hostbased form (@) -- pass through unchanged.
 		return spn;
 	}
-	return std::string("MSSQLSvc@") + info.host;
+	// No override: build the canonical "MSSQLSvc/<fqdn>:<port>" form so the
+	// SPN matches what SQL Server registers in AD by default.
+	return std::string("MSSQLSvc/") + info.host + ":" + std::to_string(info.port);
 }
 
 }  // namespace
@@ -63,12 +77,15 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 		kc.keytabfile = conn_info.krb5_keytabfile;
 		kc.credcachefile = conn_info.krb5_credcachefile;
 		kc.realm = conn_info.krb5_realm;
-		kc.raw_username = conn_info.user;	  // raw mode reads user/password from these fields
-		kc.raw_password = conn_info.password;  // (validator rejects this combo for Trusted_Connection; allowed via authenticator=krb5)
-		if (conn_info.krb5_dnslookupkdc != -1) {
-			kc.dns_lookup_kdc_specified = true;
-			kc.dns_lookup_kdc_value = (conn_info.krb5_dnslookupkdc != 0);
-		}
+		// raw_username / raw_password are populated for keytab-mode principal
+		// (User Id is the AD principal) and for raw-credentials mode (Password
+		// is the AD password). Raw mode is SECRET-ONLY: the validator in
+		// mssql_storage.cpp rejects Password in any connection string for
+		// integrated auth, so this path is only reachable when info came from
+		// an MSSQL secret. Per spec 042 ultrareview bug_004 the goal is to
+		// keep cleartext passwords out of connection-string logs.
+		kc.raw_username = conn_info.user;
+		kc.raw_password = conn_info.password;
 		auto authn = std::make_shared<Krb5Authenticator>(std::move(kc));
 		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database, "IntegratedAuth(krb5)",
 														conn_info.use_encrypt);

@@ -73,6 +73,16 @@ ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes;User Id=alice;
 'Password' cannot be combined
 
 #
+# Test 7b: Explicit authenticator=krb5 + Password also rejected -- raw mode
+#           is SECRET-only to keep passwords out of connection-string logs.
+#           spec 042 ultrareview bug_004.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5;User Id=alice;Password=secret' AS ia_t7b (TYPE mssql);
+----
+'Password' cannot be combined
+
+#
 # Test 8: SQL auth still works at the parser level (regression).
 #         Will fail later at the TCP / login layer because no server is here.
 #

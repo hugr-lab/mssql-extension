@@ -82,7 +82,6 @@ struct MSSQLConnectionInfo {
 	string krb5_credcachefile;		// Path to a ccache override (else KRB5CCNAME / default)
 	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
 	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
-	int8_t krb5_dnslookupkdc = -1;	// -1 = krb5.conf default; 0 = no; 1 = yes
 
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)

@@ -148,15 +148,6 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->krb5_credcachefile = get_str("krb5_credcachefile");
 	result->krb5_realm = get_str("krb5_realm");
 	result->service_principal_name = get_str("service_principal_name");
-	auto dns_val = kv_secret.TryGetValue("krb5_dnslookupkdc");
-	if (!dns_val.IsNull()) {
-		try {
-			result->krb5_dnslookupkdc = dns_val.GetValue<bool>() ? 1 : 0;
-		} catch (...) {
-			auto v = StringUtil::Lower(dns_val.ToString());
-			result->krb5_dnslookupkdc = (v == "yes" || v == "true" || v == "1") ? 1 : 0;
-		}
-	}
 
 	result->connected = false;
 	return result;
@@ -296,10 +287,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["krb5_credcachefile"] = value;
 				} else if (lower_key == "krb5-realm" || lower_key == "krb5_realm") {
 					result["krb5_realm"] = value;
-				} else if (lower_key == "krb5-dnslookupkdc" || lower_key == "krb5_dnslookupkdc") {
-					result["krb5_dnslookupkdc"] = value;
 				} else if (lower_key == "service_principal_name" || lower_key == "service-principal-name" ||
-						   lower_key == "serviceprincipalname") {
+					   lower_key == "serviceprincipalname") {
 					result["service_principal_name"] = value;
 				} else if (lower_key == "trusted_connection" || lower_key == "trustedconnection" ||
 						   lower_key == "trusted-connection") {
@@ -372,8 +361,6 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["krb5_credcachefile"] = value;
 		} else if (lower_key == "krb5-realm" || lower_key == "krb5_realm") {
 			result["krb5_realm"] = value;
-		} else if (lower_key == "krb5-dnslookupkdc" || lower_key == "krb5_dnslookupkdc") {
-			result["krb5_dnslookupkdc"] = value;
 		} else if (lower_key == "service_principal_name" || lower_key == "service-principal-name" ||
 				   lower_key == "serviceprincipalname" || lower_key == "service principal name") {
 			result["service_principal_name"] = value;
@@ -686,11 +673,6 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 		result->krb5_credcachefile = get("krb5_credcachefile");
 		result->krb5_realm = get("krb5_realm");
 		result->service_principal_name = get("service_principal_name");
-		auto dns_it = params.find("krb5_dnslookupkdc");
-		if (dns_it != params.end()) {
-			auto v = StringUtil::Lower(dns_it->second);
-			result->krb5_dnslookupkdc = (v == "yes" || v == "true" || v == "1") ? 1 : 0;
-		}
 	}
 
 	result->connected = false;

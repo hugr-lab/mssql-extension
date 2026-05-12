@@ -65,8 +65,6 @@ struct Krb5Config {
 	std::string realm;			   // AD realm for raw / keytab modes (uppercased)
 	std::string raw_username;	   // Principal for raw mode (without @REALM is OK)
 	std::string raw_password;	   // Cleartext password for raw mode
-	bool dns_lookup_kdc_specified = false;	// If true, override krb5.conf default
-	bool dns_lookup_kdc_value = true;		// Effective value when specified
 };
 
 //===----------------------------------------------------------------------===//
