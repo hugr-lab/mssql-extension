@@ -80,9 +80,9 @@
 
 - [ ] **T022** [US1] Replace the "not yet implemented" stub in `TdsConnection::Login()` (T014) with the real SSPI continuation loop. Read `0xED` token → call `NextBytes` → if non-empty, send SSPI Message packet (`PacketType::SSPI = 0x11`) → repeat. Terminate on `LOGINACK` + `DONE` or `ERROR` token.
 
-- [ ] **T023** [US1] Build the containerized KDC in `docker/kerberos/`: `Dockerfile`, `krb5.conf`, `init-kdc.sh`. Register `alice@EXAMPLE.COM` (password `alicepw`) and `MSSQLSvc/sqlserver-krb:1433@EXAMPLE.COM`. Export the SPN key to a keytab mounted into the SQL Server container.
+- [ ] **T023** [US1] Build the three-service compose stack under `test/kerberos/`: `docker-compose.yml`, `kdc/Dockerfile`, `kdc/krb5.conf`, `kdc/init-kdc.sh`. KDC registers principals `testuser@EXAMPLE.COM` (password `testpass`) and `MSSQLSvc/sql.example.com:1433@EXAMPLE.COM`; exports the SPN key to a keytab mounted into the `sql` service.
 
-- [ ] **T024** [US1] Add `docker/sql-server-kerberos/init.sql` and a `docker-compose.kerberos.yml` that brings up both KDC and a Kerberos-configured SQL Server. New `Makefile` target `docker-kerberos-up`. CI matrix gets a `MSSQL_KERBEROS_TEST=1` axis.
+- [ ] **T024** [US1] Add `test/kerberos/sql/init.sql` (SQL logins mapped to AD principals), `test/kerberos/test-client/Dockerfile` (Ubuntu + `krb5-user` + extension), and `test/kerberos/test-client/run-tests.sh` (driver that runs `kinit testuser@EXAMPLE.COM <<< 'testpass'` then executes the `[kerberos]`-tagged test suite). Update CI to set `MSSQL_KERBEROS_TEST=1` when this stack is available.
 
 - [ ] **T025** [P] [US1] Write `test/sql/integrated_auth/krb5_basic.test`. Five cases: ATTACH with `Trusted_Connection=yes`, basic SELECT, JOIN across tables, transaction commit/rollback, `mssql_pool_stats()` after concurrent queries. Tagged `[kerberos]`.
 
@@ -94,7 +94,7 @@
 
 - [ ] **T029** [P] [US1] Write `test/sql/integrated_auth/conflicts.test`. Three negative cases: `Trusted_Connection=yes;User Id=alice`; `Trusted_Connection=yes` + Azure secret reference; `authenticator=krb5;authenticator=winsspi`. Each must produce a clear ATTACH-time error.
 
-- [ ] **T030** [US4] Write `test/sql/integrated_auth/krb5_raw.test`. Raw-credentials mode: `authenticator=krb5;User Id=alice;Password=alicepw;krb5-realm=EXAMPLE.COM`. Verify query succeeds, and that wrong-password produces the expected `"preauthentication failed"` error.
+- [ ] **T030** [US4] Write `test/sql/integrated_auth/krb5_raw.test`. Raw-credentials mode: `authenticator=krb5;User Id=testuser;Password=testpass;krb5-realm=EXAMPLE.COM`. Verify query succeeds, and that wrong-password produces the expected `"preauthentication failed"` error.
 
 **Checkpoint**: POSIX Kerberos auth fully functional. v1 MVP shippable for Linux/macOS users.
 

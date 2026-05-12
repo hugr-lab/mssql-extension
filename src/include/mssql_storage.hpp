@@ -21,6 +21,22 @@
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
+// AuthMethod - Authentication method selector (Spec 042)
+//
+// Default SQL. The existing use_azure_auth / access_token booleans/strings
+// remain and are kept in sync with this enum during parsing for backwards
+// compatibility - call sites that have not migrated to the enum continue
+// to work unchanged.
+//===----------------------------------------------------------------------===//
+enum class AuthMethod : uint8_t {
+	SQL = 0,		   // SQL Server username/password (existing default)
+	AZURE_AD = 1,	   // FEDAUTH via Azure secret (existing)
+	MANUAL_TOKEN = 2,  // Pre-provided JWT access token (Spec 032)
+	KRB5 = 3,		   // Integrated Auth via system GSSAPI (POSIX, Spec 042)
+	WINSSPI = 4		   // Integrated Auth via secur32.dll (Windows, Spec 042)
+};
+
+//===----------------------------------------------------------------------===//
 // MSSQLConnectionInfo - Connection parameters extracted from secret or connection string
 //===----------------------------------------------------------------------===//
 struct MSSQLConnectionInfo {
@@ -32,6 +48,16 @@ struct MSSQLConnectionInfo {
 	bool use_encrypt = true;  // Enable TLS encryption (default: true for security)
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
+
+	//===----------------------------------------------------------------------===//
+	// Authentication method (Spec 042)
+	//
+	// New code paths SHOULD switch on auth_method. Existing booleans below
+	// (use_azure_auth, access_token) are maintained in parallel and kept in
+	// sync by the connection-string / secret parsers - do not remove them
+	// until call sites are migrated.
+	//===----------------------------------------------------------------------===//
+	AuthMethod auth_method = AuthMethod::SQL;
 
 	//===----------------------------------------------------------------------===//
 	// Azure AD Authentication (Phase 2 FEDAUTH)

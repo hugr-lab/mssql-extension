@@ -158,18 +158,35 @@ These are surfaced from the strategy's `InitialBytes()` / `NextBytes()` (throw `
 
 ## R9: Test infrastructure — containerized KDC
 
-**Decision**: Add a second Docker container (`docker/kerberos/`) running MIT KDC alongside the existing SQL Server container. The KDC is configured with realm `EXAMPLE.COM`, a SQL Server SPN registered, and a test principal `alice@EXAMPLE.COM` with a known password. Tests use a per-test ccache by setting `KRB5CCNAME` and run `kinit -k -t /keytabs/alice.keytab alice@EXAMPLE.COM` before each test.
+**Decision**: Self-contained three-container compose stack under `test/kerberos/`. No real Active Directory required.
 
-**Rationale**: This is the only way to write deterministic integration tests for Kerberos. CI runners cannot rely on an external AD. MIT KDC in a container is the standard pattern — see `microsoft/go-mssqldb`'s `.github/workflows/kerberos.yml` for the same pattern.
+**Stack** (per maintainer-provided design):
 
-**Files**:
-- `docker/kerberos/Dockerfile` — `FROM ubuntu:24.04`, installs `krb5-kdc krb5-admin-server`, copies a pre-baked `kdc.conf` and a startup script
-- `docker/kerberos/krb5.conf` — single realm `EXAMPLE.COM`, KDC = container hostname
-- `docker/kerberos/init-kdc.sh` — `kdb5_util create -s -P masterpw`, `kadmin.local -q "addprinc -pw password alice@EXAMPLE.COM"`, etc.
-- `docker/sql-server-kerberos/init.sql` — registers the SPN, creates a test database
-- New `make` target `make docker-kerberos-up` — brings up both containers with a shared network
+| Service | Image / Base | Role |
+|---------|--------------|------|
+| `kdc` | MIT Kerberos on Ubuntu | Realm `EXAMPLE.COM`. Principals: `testuser@EXAMPLE.COM` (password `testpass`) and `MSSQLSvc/sql.example.com:1433@EXAMPLE.COM` (random key, exported to a keytab mounted into `sql`). |
+| `sql` | `mcr.microsoft.com/mssql/server:2022-latest` | SQL Server configured to authenticate against `kdc`. Service keytab at `/var/opt/mssql/secrets/mssql.keytab`. |
+| `test-client` | Ubuntu + `krb5-user` + the built `mssql.duckdb_extension` | Runs the integration test suite. |
 
-**Tests**: `test/sql/integrated_auth/krb5_basic.test` and friends. Tagged `[kerberos]`, skipped unless `MSSQL_KERBEROS_TEST=1`.
+**Rationale**: Self-contained — no external AD, no host-level Kerberos config required. Standard pattern (mirrors `microsoft/go-mssqldb`'s `.github/workflows/kerberos.yml`).
+
+**Files** (created in T023–T024):
+- `test/kerberos/docker-compose.yml` — defines all three services on a shared network with `sql.example.com` hostname for the SQL Server container
+- `test/kerberos/kdc/Dockerfile`, `kdc/krb5.conf`, `kdc/init-kdc.sh` — KDC bring-up
+- `test/kerberos/sql/init.sql` — registers SQL Server logins mapped to the AD principal
+- `test/kerberos/test-client/Dockerfile`, `test-client/run-tests.sh` — test driver
+
+**Test workflow**:
+
+```bash
+cd test/kerberos
+docker-compose up -d
+docker-compose exec test-client kinit testuser@EXAMPLE.COM <<< 'testpass'
+docker-compose exec test-client ./run-tests.sh
+docker-compose down
+```
+
+**Tests**: `test/sql/integrated_auth/krb5_basic.test` and friends, tagged `[kerberos]` and skipped unless `MSSQL_KERBEROS_TEST=1`. The test SPN is `MSSQLSvc/sql.example.com:1433`; tests using URI/connection-string form use `sql.example.com` as the host.
 
 ## R10: Channel binding (EPA) — v1 stub
 

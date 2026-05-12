@@ -88,11 +88,17 @@ test/
 └── cpp/
     └── test_integrated_auth_parsing.cpp # NEW - unit tests for ParseConnectionString / ParseUri / FromSecret with new keys
 
-docker/
-└── kerberos/                            # NEW
-    ├── Dockerfile                       # MIT KDC on ubuntu:24.04
-    ├── krb5.conf                        # Test realm EXAMPLE.COM
-    └── init-kdc.sh                      # kdb5_util create + addprinc
+test/kerberos/                           # NEW - three-container compose stack
+├── docker-compose.yml                   # kdc + sql + test-client on shared network
+├── kdc/
+│   ├── Dockerfile                       # MIT Kerberos on Ubuntu
+│   ├── krb5.conf                        # Realm EXAMPLE.COM
+│   └── init-kdc.sh                      # kdb5_util create + addprinc testuser, MSSQLSvc/sql.example.com:1433
+├── sql/
+│   └── init.sql                         # SQL logins mapped to AD principals
+└── test-client/
+    ├── Dockerfile                       # Ubuntu + krb5-user + mssql.duckdb_extension
+    └── run-tests.sh                     # Driver: kinit + run [kerberos]-tagged tests
 
 docs/
 ├── architecture.md                      # MODIFY - update Authentication Strategy Pattern section
@@ -204,15 +210,22 @@ endif()
 
 ## Integration Tests
 
-### Containerized KDC (`docker/kerberos/`)
+### Containerized KDC (`test/kerberos/`)
 
-A new `make docker-kerberos-up` brings up:
+Three-service `docker-compose` stack — no external Active Directory required:
 
-- **`kdc`** container — MIT KDC on `ubuntu:24.04`, realm `EXAMPLE.COM`, principals `alice@EXAMPLE.COM` (password `alicepw`) and `MSSQLSvc/sqlserver:1433@EXAMPLE.COM` (random key, exported to keytab).
-- **`sqlserver-krb`** container — extends the existing SQL Server container. Joined-equivalent: the KDC's keytab for the SQL Server SPN is mounted at `/var/opt/mssql/secrets/mssql.keytab`. `mssql.conf` sets `network.kerberoskeytabfile`.
-- **`client`** container (CI only) — runs the extension's integration tests with `KRB5_CONFIG=/test/krb5.conf` pointing at the KDC.
+- **`kdc`** — MIT Kerberos KDC on Ubuntu, realm `EXAMPLE.COM`. Principals: `testuser@EXAMPLE.COM` (password `testpass`) and `MSSQLSvc/sql.example.com:1433@EXAMPLE.COM` (random key, exported to a keytab mounted into the `sql` service).
+- **`sql`** — `mcr.microsoft.com/mssql/server:2022-latest` configured to authenticate against `kdc`. Service keytab mounted at `/var/opt/mssql/secrets/mssql.keytab`.
+- **`test-client`** — Ubuntu container with the built `mssql.duckdb_extension`, `krb5-user`, and a `run-tests.sh` driver. The test harness runs `kinit testuser@EXAMPLE.COM <<< 'testpass'` before each test and uses isolated per-test ccaches via `KRB5CCNAME`.
 
-Tests run with `kinit` issued by the test harness before each test; `KRB5CCNAME=FILE:/tmp/test_ccache_<pid>` to isolate state.
+Local run:
+```bash
+cd test/kerberos
+docker-compose up -d
+docker-compose exec test-client kinit testuser@EXAMPLE.COM <<< 'testpass'
+docker-compose exec test-client ./run-tests.sh
+docker-compose down
+```
 
 ### Test Files (under `test/sql/integrated_auth/`)
 
@@ -220,8 +233,8 @@ Tests run with `kinit` issued by the test harness before each test; `KRB5CCNAME=
 
 | File | Description | Validates |
 |------|-------------|-----------|
-| `krb5_basic.test` | `kinit alice@EXAMPLE.COM` + ATTACH `Trusted_Connection=yes` + `SELECT TOP 1 name FROM sys.tables` | FR-001, FR-002, FR-006, SC-001 |
-| `krb5_keytab.test` | ATTACH with `krb5-keytabfile=/keytabs/alice.keytab;User Id=alice;krb5-realm=EXAMPLE.COM` (no ccache present); verify query works | FR-004, SC-003 |
+| `krb5_basic.test` | `kinit testuser@EXAMPLE.COM` + ATTACH `Trusted_Connection=yes` to `sql.example.com` + `SELECT TOP 1 name FROM sys.tables` | FR-001, FR-002, FR-006, SC-001 |
+| `krb5_keytab.test` | ATTACH with `krb5-keytabfile=/keytabs/testuser.keytab;User Id=alice;krb5-realm=EXAMPLE.COM` (no ccache present); verify query works | FR-004, SC-003 |
 | `krb5_pool.test` | 20 concurrent queries on a Kerberos-attached database; verify `mssql_pool_stats()` shows reuse | FR-011, SC-006 |
 | `krb5_errors.test` | (a) no ccache → `"no credentials cache"`; (b) `kinit` then `kdestroy` → `"ticket expired"` or `"no credentials"`; (c) wrong SPN via `service_principal_name` override → `"server principal unknown"` | SC-005 |
 | `trusted_connection_alias.test` | `Trusted_Connection=yes` and `Integrated Security=SSPI` and `Integrated Security=true` all resolve identically; in CI on POSIX, all three should ATTACH successfully | FR-002 |

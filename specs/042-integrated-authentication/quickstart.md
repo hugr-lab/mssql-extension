@@ -213,11 +213,12 @@ GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=OFF"
 # Run parser unit tests (no SQL Server, no KDC)
 GEN=ninja make test
 
-# Bring up Kerberos integration test infrastructure
-make docker-kerberos-up
-
-# Run Kerberos integration tests
-MSSQL_KERBEROS_TEST=1 GEN=ninja make integration-test
+# Bring up Kerberos integration test infrastructure (self-contained, no AD required)
+cd test/kerberos
+docker-compose up -d
+docker-compose exec test-client kinit testuser@EXAMPLE.COM <<< 'testpass'
+docker-compose exec test-client ./run-tests.sh
+docker-compose down
 ```
 
 ## File-by-file summary of what this feature adds
@@ -239,9 +240,10 @@ MSSQL_KERBEROS_TEST=1 GEN=ninja make integration-test
 | `src/mssql_secret.cpp` | MODIFY — extend secret schema | ~40 lines |
 | `src/include/mssql_storage.hpp` | MODIFY — `AuthMethod` enum + krb5 fields | ~30 lines |
 | `CMakeLists.txt` | MODIFY — `ENABLE_KRB5`, library discovery | ~25 lines |
-| `docker/kerberos/` | NEW — Dockerfile + krb5.conf + init script | ~80 lines |
-| `docker-compose.kerberos.yml` | NEW — compose file for KDC + SQL Server + client | ~40 lines |
-| `Makefile` | MODIFY — `docker-kerberos-up` target | ~10 lines |
+| `test/kerberos/docker-compose.yml` | NEW — three-service compose (kdc, sql, test-client) | ~40 lines |
+| `test/kerberos/kdc/` | NEW — Dockerfile + krb5.conf + init-kdc.sh | ~80 lines |
+| `test/kerberos/sql/init.sql` | NEW — SQL logins mapped to AD principals | ~20 lines |
+| `test/kerberos/test-client/` | NEW — Dockerfile + run-tests.sh | ~40 lines |
 | `test/cpp/test_integrated_auth_parsing.cpp` | NEW — connection-string unit tests | ~200 lines |
 | `test/sql/integrated_auth/*.test` | NEW — six integration test files | ~250 lines total |
 | `README.md` | MODIFY — remove Windows-auth limitation; add section; add table rows | ~50 lines |
