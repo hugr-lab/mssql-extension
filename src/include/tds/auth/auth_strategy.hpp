@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "tds/auth/iauthenticator.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -102,6 +104,21 @@ public:
 	// Check if token is expired and needs refresh
 	virtual bool IsTokenExpired() const {
 		return false;
+	}
+
+	//===----------------------------------------------------------------------===//
+	// Multi-round authenticator (Integrated Auth: Kerberos / SSPI)
+	// Spec 042: specs/042-integrated-authentication/
+	//===----------------------------------------------------------------------===//
+
+	// Return a multi-round IAuthenticator for SPNEGO/Kerberos exchanges, or
+	// nullptr for single-shot strategies (SQL auth, FEDAUTH).
+	//
+	// When non-null, TdsConnection::Login() embeds InitialBytes() in
+	// LOGIN7.SSPI, sets OptionFlags2.fIntSecurity, and drives the
+	// continuation loop on 0xED SSPI tokens. See spec 042 R1.
+	virtual AuthenticatorPtr GetAuthenticator() {
+		return nullptr;
 	}
 
 protected:

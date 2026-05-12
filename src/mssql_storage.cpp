@@ -93,6 +93,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!access_token_val.IsNull()) {
 		result->access_token = access_token_val.ToString();
 		result->use_azure_auth = !result->access_token.empty();	 // Manual token uses FEDAUTH flow
+		if (!result->access_token.empty()) {
+			result->auth_method = AuthMethod::MANUAL_TOKEN;	 // Spec 042: keep enum in sync
+		}
 	}
 
 	// Read optional azure_secret for Azure AD authentication (T015)
@@ -102,9 +105,12 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 		if (!azure_secret_val.IsNull()) {
 			result->azure_secret_name = azure_secret_val.ToString();
 			result->use_azure_auth = !result->azure_secret_name.empty();
+			if (!result->azure_secret_name.empty()) {
+				result->auth_method = AuthMethod::AZURE_AD;	 // Spec 042: keep enum in sync
+			}
 		}
 	}
-	// Default: use_azure_auth = false (SQL auth)
+	// Default: use_azure_auth = false (SQL auth), auth_method = SQL
 
 	// Read optional catalog visibility filters (Spec 033)
 	auto schema_filter_val = kv_secret.TryGetValue("schema_filter");
@@ -868,10 +874,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		if (!access_token.empty()) {
 			ctx->connection_info->access_token = access_token;
 			ctx->connection_info->use_azure_auth = true;
+			ctx->connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
 		} else if (!azure_secret_name.empty()) {
 			// Set azure_secret from ATTACH option if provided
 			ctx->connection_info->azure_secret_name = azure_secret_name;
 			ctx->connection_info->use_azure_auth = true;
+			ctx->connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
 		}
 	} else {
 		// Neither SECRET nor connection string provided

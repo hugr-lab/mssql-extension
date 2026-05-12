@@ -558,14 +558,11 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 								 static_cast<uint8_t>(token_packets[0].GetStatus()), token_packets[0].GetLength(),
 								 token_packets[0].GetPacketId());
 
+			// Do NOT log token payload bytes - even partial hex of the JWT is a credential
+			// leak per security audit. Log size only.
 			const auto &payload = token_packets[0].GetPayload();
-			std::string hex_dump;
-			for (size_t i = 0; i < std::min<size_t>(20, payload.size()); i++) {
-				char buf[4];
-				snprintf(buf, sizeof(buf), "%02x ", payload[i]);
-				hex_dump += buf;
-			}
-			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] payload (first 20): %s", hex_dump.c_str());
+			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] payload size=%zu bytes (contents redacted)",
+								 payload.size());
 		}
 
 		// Send all packets
