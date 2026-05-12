@@ -236,6 +236,11 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 - N/A (in-memory token cache, no change) (037-replace-libcurl-httplib)
 - C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer (039-order-pushdown)
 - C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), custom TDS protocol layer (040-fix-datetimeoffset-nbc)
+- 042-integrated-authentication: Added integrated authentication (Kerberos on POSIX, SSPI on Windows)
+  - POSIX: system GSSAPI (libgssapi_krb5 on Linux, GSS.framework on macOS via `-framework GSS`)
+  - Windows: secur32.dll (Phase 4 — not yet implemented)
+  - Connection-string keys (verbatim from `microsoft/go-mssqldb`): `authenticator`, `krb5-configfile`, `krb5-keytabfile`, `krb5-credcachefile`, `krb5-realm`, `service_principal_name`
+  - Aliases: `Trusted_Connection=yes`, `Integrated Security=SSPI/true`
 
 ## Azure AD Authentication
 
@@ -254,6 +259,69 @@ The extension supports Azure AD authentication for Azure SQL Database and Micros
 - `src/azure/azure_test_function.cpp` - `mssql_azure_auth_test()` function
 
 See `AZURE.md` for user documentation.
+
+## Integrated Authentication (Kerberos / SSPI)
+
+POSIX Kerberos and Windows SSPI integrated authentication, shipped via spec 042.
+
+**Supported credential modes (POSIX):**
+- **CredCache** (default): uses `kinit` ticket from `KRB5CCNAME` / `/tmp/krb5cc_<uid>`. Works on Linux and macOS.
+- **Keytab**: `krb5-keytabfile=/path/to.keytab` + `User Id=svc@REALM`. Linux only (MIT Kerberos extensions required).
+- **Raw**: secret-only — cleartext passwords are **never** accepted from a connection string. Linux only.
+
+**Implementation files:**
+- `src/include/tds/auth/iauthenticator.hpp` — three-method interface (`InitialBytes` / `NextBytes` / `Free`), modeled on `microsoft/go-mssqldb`'s `integratedauth.IntegratedAuthenticator`
+- `src/tds/auth/krb5_authenticator.{hpp,cpp}` — GSSAPI implementation (POSIX, compiled when `MSSQL_ENABLE_KRB5` is defined)
+- `src/tds/auth/winsspi_authenticator.{hpp,cpp}` — Windows SSPI implementation (Phase 4, not yet present)
+- `src/include/tds/auth/integrated_auth_strategy.hpp` — adapter wrapping `IAuthenticator` in the existing `AuthenticationStrategy` interface
+- `src/tds/auth/auth_strategy_factory.cpp` — `AuthStrategyFactory::Create` dispatches `KRB5` / `WINSSPI` based on `info.auth_method`
+- `src/tds/tds_connection.cpp` `AuthenticateIntegrated()` — SPNEGO continuation loop on `0xED` SSPI tokens
+- `src/tds/tds_protocol.cpp` `BuildLogin7WithSSPI` + `BuildSSPIMessage` — LOGIN7 with `fIntSecurity` bit (0x80) + SSPI Message packet type 0x11
+- `src/connection/mssql_pool_manager.cpp` `GetOrCreatePoolWithIntegratedAuth` — pool factory builds a fresh authenticator per connection so kinit-refreshed tickets are picked up
+
+**Test infrastructure:** `test/kerberos/` — self-contained docker-compose stack (KDC + SQL Server + test-client). No real Active Directory required:
+
+```bash
+cd test/kerberos
+docker compose up -d --build
+docker compose exec test-client /run-tests.sh
+docker compose down -v
+```
+
+The test KDC's realm is `EXAMPLE.COM`, principal is `testuser@EXAMPLE.COM` (password `testpass`), SPN is `MSSQLSvc/sql.example.com:1433`. The test-client uses a multi-stage Dockerfile that builds the extension inside Linux, so the stack works on macOS hosts too.
+
+**Platform matrix:**
+
+| Platform | CredCache | Keytab | Raw | Status |
+|---|---|---|---|---|
+| Linux x86_64 / ARM64 | yes | yes | yes (secret only) | Phase 3 shipped |
+| macOS ARM64 | yes | rejected at construction | rejected at construction | Phase 3 shipped |
+| Windows x64 | n/a | n/a | n/a | Phase 4 pending |
+
+**Connection-string surface (verbatim from `microsoft/go-mssqldb`):**
+
+| Key | Purpose |
+|---|---|
+| `authenticator=krb5` / `authenticator=winsspi` | Explicit form |
+| `Trusted_Connection=yes` | pyodbc alias — resolves to `krb5` on POSIX, `winsspi` on Windows |
+| `Integrated Security=SSPI` / `Integrated Security=true` | ADO.NET alias — same resolution |
+| `krb5-configfile=/path/to/krb5.conf` | Per-connection krb5.conf override (Linux only, via cred_store `config` element) |
+| `krb5-keytabfile=/path/to/file.keytab` | Selects keytab mode |
+| `krb5-credcachefile=FILE:/path` | ccache override (Linux only, via cred_store `ccache` element) |
+| `krb5-realm=REALM.COM` | Required for keytab when User Id lacks `@REALM` |
+| `service_principal_name=MSSQLSvc/host:port` | Override default SPN derivation |
+
+All also accepted on `CREATE SECRET` (with underscore naming: `krb5_keytabfile`, etc.).
+
+**Key design decisions (do NOT re-litigate — these were settled during ultrareview):**
+- Raw mode is **SECRET-ONLY**. The validator unconditionally rejects `Password` in any connection string when integrated auth is selected. Defends against cleartext passwords in connection-string logs.
+- `User Id` requires either a keytab or a Password (in a secret). CredCache mode rejects bare `User Id` — was silently authenticating as the ambient ccache holder before fix.
+- Default SPN form is `MSSQLSvc/<fqdn>:<port>` (canonical Kerberos principal-name form, matches AD default registration). `Krb5Authenticator` picks the `gss_import_name` name type based on whether the SPN contains `/`.
+- No `setenv()` for per-connection overrides — uses `gss_acquire_cred_from` with cred_store elements (`ccache`, `config`). Thread-safe vs concurrent `getenv` on worker threads.
+- macOS uses `GSS.framework` (Heimdal-derived subset) which lacks MIT extensions for keytab/raw modes; `Krb5Authenticator` constructor rejects those modes on macOS with a clear error pointing at the Linux container path.
+- GSSAPI OIDs (SPNEGO, Kerberos, hostbased-service, krb5-principal-name) are **constructed inline** as `gss_OID_desc` literals — macOS's `GSS.framework` declares `GSS_C_NT_HOSTBASED_SERVICE` etc. as `extern gss_OID` in the header but does NOT export the symbols. Inline DER bytes avoid the link dependency on every platform.
+
+See `Kerberos.md` for end-user documentation.
 
 ## Build Troubleshooting
 
@@ -275,6 +343,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 042-integrated-authentication: Added Kerberos (POSIX) integrated authentication via system GSSAPI. SPNEGO + LOGIN7 `fIntSecurity` bit + 0xED SSPI continuation tokens. Self-contained test stack at `test/kerberos/`. Phase 4 (Windows SSPI) deferred.
 - 041-xml-type-support: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer
 - 040-fix-datetimeoffset-nbc: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), custom TDS protocol layer
 - 039-order-pushdown: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer

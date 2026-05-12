@@ -353,17 +353,59 @@ When a connection is returned to the pool and later reused with the `RESET_CONNE
 
 ## Authentication Strategy Pattern
 
-The extension uses a Strategy pattern for authentication, supporting both SQL Server auth and Azure AD FEDAUTH:
+The extension uses a Strategy pattern for authentication, supporting SQL Server
+auth, Azure AD FEDAUTH, and (spec 042) Kerberos / SSPI integrated authentication:
 
 ```
 src/tds/auth/
-├── auth_strategy.hpp            # Abstract strategy interface
-├── auth_strategy_factory.hpp    # Factory for strategy creation
-├── sql_auth_strategy.hpp/.cpp   # SQL Server username/password auth
-└── fedauth_strategy.hpp/.cpp    # Azure AD FEDAUTH authentication
+├── iauthenticator.hpp                    # NEW (spec 042) — multi-round IAuthenticator
+│                                         #   interface; NO DuckDB headers
+├── auth_strategy.hpp                     # Single-shot AuthenticationStrategy interface
+├── auth_strategy_factory.hpp             # Factory for strategy creation
+├── sql_auth_strategy.hpp/.cpp            # SQL Server username/password auth
+├── fedauth_strategy.hpp/.cpp             # Azure AD FEDAUTH authentication
+├── manual_token_strategy.hpp/.cpp        # Pre-acquired Azure AD JWT (Spec 032)
+├── integrated_auth_strategy.hpp          # NEW (spec 042) — wraps an IAuthenticator
+│                                         #   in the AuthenticationStrategy interface
+└── krb5_authenticator.hpp/.cpp           # NEW (spec 042) — POSIX GSSAPI IAuthenticator
+                                          #   (compiled when MSSQL_ENABLE_KRB5=1)
 ```
 
-### Strategy Interface
+### Two layered interfaces
+
+Two distinct interfaces operate at different granularities:
+
+```
+                     ┌─────────────────────────────────────┐
+                     │  AuthenticationStrategy             │
+                     │  (single-shot — for SQL auth, FEDAUTH) │
+                     │   GetPreloginOptions / GetLogin7Options │
+                     │   GetFedAuthToken / GetName / ...   │
+                     │   GetAuthenticator() -> IAuthenticator?│
+                     └────────────────┬────────────────────┘
+                                      │
+                  ┌───────────────────┼───────────────────────┐
+                  │                   │                       │
+        ┌─────────▼────────┐ ┌────────▼───────┐  ┌────────────▼────────────────┐
+        │ SqlAuthStrategy  │ │ FedAuthStrategy│  │ IntegratedAuthStrategy      │
+        │  (no auth'r)     │ │  (no auth'r)   │  │  GetAuthenticator() => IAu  │
+        └──────────────────┘ └────────────────┘  └──────────────┬──────────────┘
+                                                                │
+                                                ┌───────────────▼─────────────┐
+                                                │  IAuthenticator (spec 042)  │
+                                                │   InitialBytes / NextBytes  │
+                                                │   Free / SetChannelBinding  │
+                                                │   (multi-round SPNEGO)      │
+                                                └───────────────┬─────────────┘
+                                                                │
+                                                ┌───────────────┼─────────────────┐
+                                        ┌───────▼─────────┐ ┌───▼──────────────────┐
+                                        │ Krb5Authenticator│ │ WinSspiAuthenticator│
+                                        │  (POSIX GSSAPI)  │ │  (Windows, Phase 4) │
+                                        └─────────────────┘ └──────────────────────┘
+```
+
+### Strategy Interface (single-shot)
 
 `AuthenticationStrategy` (abstract base) defines:
 
@@ -376,14 +418,45 @@ src/tds/auth/
 | `InvalidateToken()` | Force token refresh (FEDAUTH only) |
 | `IsTokenExpired()` | Check token validity (FEDAUTH only) |
 | `GetName()` | Returns strategy name for debugging |
+| `GetAuthenticator()` | Returns an `IAuthenticator` for multi-round auth, or `nullptr` (spec 042) |
+
+### IAuthenticator Interface (multi-round) — Spec 042
+
+`IAuthenticator` is a separate, smaller interface for protocols that need
+multi-round negotiation (SPNEGO / Kerberos / SSPI). Three methods, modeled
+verbatim on `microsoft/go-mssqldb`'s `integratedauth.IntegratedAuthenticator`:
+
+| Method | Purpose |
+|--------|---------|
+| `InitialBytes()` | First SPNEGO blob to embed in LOGIN7's SSPI field |
+| `NextBytes(server_blob)` | Continuation round; empty return = client done |
+| `Free()` | Release native auth context handles (idempotent) |
+| `SetChannelBinding(cb)` | Optional EPA support (v1 no-op) |
+
+`TdsConnection::AuthenticateIntegrated()` drives the loop: send LOGIN7 with
+`InitialBytes()`, read `0xED` SSPI tokens from the server, feed each blob into
+`NextBytes()`, send the result in an SSPI Message packet (type 0x11), repeat
+until the server returns LOGINACK + DONE.
+
+**Important:** `src/include/tds/auth/iauthenticator.hpp` MUST NOT include any
+DuckDB headers. The TDS auth layer is designed to be reusable outside DuckDB.
+Standard library types (`std::vector`, `std::runtime_error`) only.
 
 ### Strategy Implementations
 
-| Strategy | File | Purpose |
-|----------|------|---------|
-| `SqlAuthStrategy` | `sql_auth_strategy.cpp` | SQL Server username/password auth |
-| `FedAuthStrategy` | `fedauth_strategy.cpp` | Azure AD via Azure secret (service principal, CLI, interactive) |
-| `ManualTokenAuthStrategy` | `manual_token_strategy.cpp` | Pre-provided Azure AD access token (Spec 032) |
+| Strategy | File | Purpose | Multi-round? |
+|----------|------|---------|---|
+| `SqlAuthStrategy` | `sql_auth_strategy.cpp` | SQL Server username/password auth | No |
+| `FedAuthStrategy` | `fedauth_strategy.cpp` | Azure AD via Azure secret (service principal, CLI, interactive) | No (single token) |
+| `ManualTokenAuthStrategy` | `manual_token_strategy.cpp` | Pre-provided Azure AD access token (Spec 032) | No |
+| `IntegratedAuthStrategy` | `integrated_auth_strategy.hpp` | Wraps an `IAuthenticator` (spec 042) | **Yes** |
+
+### IAuthenticator Implementations (spec 042)
+
+| Authenticator | File | Platform | Status |
+|---|---|---|---|
+| `Krb5Authenticator` | `krb5_authenticator.cpp` | POSIX (Linux + macOS), via system GSSAPI | Phase 3 shipped |
+| `WinSspiAuthenticator` | `winsspi_authenticator.cpp` | Windows, via `secur32.dll` Negotiate package | Phase 4 pending |
 
 ### Configuration Structs
 
@@ -399,15 +472,47 @@ src/tds/auth/
 
 ### Factory Pattern
 
-`AuthStrategyFactory::Create()` selects strategy based on `MSSQLConnectionInfo`:
+`AuthStrategyFactory::Create()` dispatches on `info.auth_method`:
 
 ```cpp
-if (info.use_azure_auth) {
-    return CreateFedAuth(context, info.azure_secret_name, info.database, info.host, info.azure_tenant_id);
-} else {
-    return CreateSqlAuth(info.username, info.password, info.database, info.use_encrypt);
+if (info.auth_method == AuthMethod::KRB5) {
+    auto authn = std::make_shared<Krb5Authenticator>(BuildKrb5Config(info));
+    return std::make_shared<IntegratedAuthStrategy>(authn, info.database, "IntegratedAuth(krb5)", info.use_encrypt);
 }
+if (info.auth_method == AuthMethod::WINSSPI) {
+    // Phase 4 - throw "not yet implemented"
+}
+if (!info.access_token.empty()) {
+    return CreateManualToken(info.access_token, info.database);
+}
+if (info.use_azure_auth) {
+    return CreateFedAuth(context, info.azure_secret_name, info.database, info.host);
+}
+return CreateSqlAuth(info.user, info.password, info.database, info.use_encrypt);
 ```
+
+### Spec 042 design decisions (don't re-litigate)
+
+These were settled during ultrareview for spec 042:
+
+- **Raw mode is SECRET-ONLY** — cleartext `Password` is rejected in any
+  connection string when `authenticator=krb5`. Defends against cleartext
+  passwords leaking into connection-string logs.
+- **`User Id` requires keytab or password in a secret** — bare `User Id` in
+  ccache mode is rejected (was silently authenticating as the ambient ccache
+  holder before fix).
+- **Default SPN form is canonical `MSSQLSvc/<fqdn>:<port>`** — matches AD's
+  default registration. `Krb5Authenticator` picks the `gss_import_name` name
+  type based on whether the SPN contains `/`.
+- **No `setenv()` for per-connection overrides** — uses `gss_acquire_cred_from`
+  with `cred_store` elements (`ccache`, `config`). Thread-safe vs concurrent
+  `getenv` on worker threads.
+- **macOS `GSS.framework`** lacks MIT extensions for keytab and raw modes;
+  `Krb5Authenticator` constructor rejects those modes on macOS at construction
+  time with a clear error pointing at the Linux container path.
+- **Well-known GSS OIDs are constructed inline** as `gss_OID_desc` literals —
+  macOS declares `GSS_C_NT_HOSTBASED_SERVICE` etc. as `extern gss_OID` in the
+  header but does NOT export the symbols from the framework binary.
 
 ## Azure AD Authentication Infrastructure
 

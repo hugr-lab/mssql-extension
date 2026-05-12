@@ -11,6 +11,8 @@ This guide provides comprehensive instructions for testing the DuckDB MSSQL Exte
 5. [Writing New Tests](#writing-new-tests)
 6. [Test Data Reference](#test-data-reference)
 7. [Troubleshooting](#troubleshooting)
+8. [Kerberos Tests (spec 042)](#kerberos-tests-spec-042)
+9. [CI/CD Integration](#cicd-integration)
 
 ---
 
@@ -1149,6 +1151,94 @@ build/release/test/unittest "[sql]" --force-reload -d yes
 # Show all output including passing tests
 build/release/test/unittest "[sql]" --force-reload -s
 ```
+
+---
+
+## Kerberos Tests (spec 042)
+
+Kerberos / Integrated Authentication tests run against a self-contained
+docker-compose stack at `test/kerberos/` — no real Active Directory required.
+
+### Quick start
+
+```bash
+cd test/kerberos
+docker compose up -d --build         # multi-stage build, ~5 min first time
+docker compose exec test-client /run-tests.sh
+docker compose down -v               # -v clears the keytabs volume
+```
+
+The `/run-tests.sh` smoke driver:
+
+1. `kinit testuser@EXAMPLE.COM` — acquires a TGT.
+2. `klist` — shows the TGT.
+3. ATTACH via `Trusted_Connection=yes` — pyodbc alias path.
+4. ATTACH via explicit `authenticator=krb5` — go-mssqldb alias path.
+5. `kdestroy` + ATTACH — negative case; expects the GSSAPI "no credentials" error.
+
+### Stack components
+
+| Service | Role |
+|---|---|
+| `kdc` | MIT Kerberos KDC, realm `EXAMPLE.COM`. Principals `testuser@EXAMPLE.COM` (password `testpass`) and `MSSQLSvc/sql.example.com:1433`. Exports the service keytab into the shared `keytabs` volume. |
+| `sql` | Custom image extending `mcr.microsoft.com/mssql/server:2022-latest`. Pre-wires `mssql.conf` with the keytab path and runs `init.sql` once at startup (creates `TestDB`, `dbo.test`, and the `EXAMPLE.COM\testuser` login mapping). |
+| `test-client` | Ubuntu + `krb5-user` + `libgssapi-krb5-2` + DuckDB CLI + the extension. Built via a **multi-stage Dockerfile** so the extension compiles inside Linux — works regardless of host OS. |
+
+### SQLLogicTest files
+
+Tagged `[kerberos]` and gated on `MSSQL_KERBEROS_TEST=1`:
+
+```bash
+# Inside the test-client container, after kinit:
+MSSQL_KERBEROS_TEST=1 build/release/test/unittest "[kerberos]" --force-reload
+```
+
+| File | Validates |
+|---|---|
+| `test/sql/integrated_auth/parsing.test` | Parser surface — runs without the KDC stack (`[mssql]` group, no `[kerberos]` tag) |
+| `test/sql/integrated_auth/krb5_basic.test` | End-to-end ATTACH via credential cache; both alias forms; URI form; mssql_scan raw query |
+
+### Running interactively
+
+For experimentation inside the test-client container:
+
+```bash
+docker compose exec test-client bash
+
+# Inside the container:
+kinit testuser@EXAMPLE.COM    # password: testpass
+klist
+duckdb --unsigned
+> LOAD '/home/tester/mssql.duckdb_extension';
+> ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS k (TYPE mssql);
+> SELECT * FROM k.dbo.test;
+> DETACH k;
+```
+
+### Testing on WSL2 (Ubuntu under Windows)
+
+Same as Linux — the docker stack works under WSL2 with Docker Desktop's WSL2
+integration enabled. Two WSL2-specific gotchas:
+
+1. **Clock skew after laptop sleep** — Kerberos rejects with `KRB5KRB_AP_ERR_SKEW`
+   if drift exceeds 5 minutes. Install `chrony` or run `sudo hwclock -s`.
+2. **No SSO with Windows logon** — WSL2's ccache is separate from Windows.
+   `kinit` inside WSL2 even if Windows has a TGT.
+
+See [Kerberos.md](../Kerberos.md#wsl2-ubuntu-under-windows) for the full WSL2 setup.
+
+### Common Kerberos test failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `TestDB' does not exist` on ATTACH | `init.sql` hasn't finished — healthcheck race | `docker compose ps` — wait for `sql` to be `healthy` (verifies TestDB exists, not just master) |
+| `Server principal '...' not registered` | Keytab volume out of sync | `docker compose restart sql` to pick up freshly-exported keytab |
+| `Clock skew too great` | Host clock drifted | Restart Docker Desktop or `docker compose down && docker compose up -d` |
+| `Login failed for user 'EXAMPLE.COM\testuser'` | Kerberos succeeded but SQL Server login mapping missing | Re-run init.sql: `docker compose exec sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -i /init/init.sql` |
+| `extension is not a Linux ELF binary` at build time | Host-built `.duckdb_extension` accidentally COPY'd into the container | The Dockerfile is multi-stage on purpose — don't bypass the in-container build |
+| Build OOM inside Docker (`cannot allocate memory`) | DuckDB compile needs ~4GB | The Dockerfile sets `CMAKE_BUILD_PARALLEL_LEVEL=2` to cap parallelism; if still failing, raise Docker Desktop's memory limit |
+
+See `test/kerberos/README.md` for the full layout and additional troubleshooting.
 
 ---
 
