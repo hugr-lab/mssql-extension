@@ -4,6 +4,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include "tds/auth/iauthenticator.hpp"
 #include "tds_platform.hpp"
 #include "tds_protocol.hpp"
 #include "tds_socket.hpp"
@@ -46,6 +47,19 @@ public:
 	//   use_encrypt - if true, enables TLS encryption (required for Azure)
 	bool AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
 								 bool use_encrypt = true);
+
+	// Integrated Authentication via Kerberos / SSPI -- Spec 042
+	// Performs PRELOGIN, then LOGIN7 with the SPNEGO blob in the SSPI field, then
+	// drives the multi-round continuation loop via 0xED tokens.
+	// Parameters:
+	//   database     - initial database to connect to
+	//   authenticator - IAuthenticator implementation (Krb5Authenticator on POSIX,
+	//                   WinSspiAuthenticator on Windows). The Phase 2 scaffold
+	//                   errors out unless a real implementation is supplied; the
+	//                   real implementations land in Phase 3 / 4.
+	//   use_encrypt  - if true, enables TLS encryption (typical for production)
+	bool AuthenticateIntegrated(const std::string &database, std::shared_ptr<tds::IAuthenticator> authenticator,
+								bool use_encrypt = true);
 
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state

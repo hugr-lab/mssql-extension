@@ -146,6 +146,24 @@ ParsedTokenType TokenParser::TryParseNext() {
 		}
 		return TryParseNext();	// Try next token
 
+	case TokenType::SSPI:
+		// SSPI (0xED) - Integrated Auth continuation token (Spec 042; [MS-TDS] 2.2.7.21)
+		// Standard 1+2+data layout: TokenType(1) + USHORT length(2) + Data(variable)
+		// In normal query streams this should never appear; only during LOGIN it does,
+		// and the LOGIN response parser handles it explicitly. Skip here defensively.
+		if (Available() < 3) {
+			return ParsedTokenType::NeedMoreData;
+		}
+		{
+			uint16_t token_length = static_cast<uint16_t>(Current()[1]) | (static_cast<uint16_t>(Current()[2]) << 8);
+			if (Available() < 3 + token_length) {
+				return ParsedTokenType::NeedMoreData;
+			}
+			TDS_PARSER_DEBUG(1, "Skipping SSPI token (unexpected outside LOGIN); length=%u", token_length);
+			ConsumeBytes(3 + token_length);
+		}
+		return TryParseNext();
+
 	case TokenType::FEDAUTHINFO:
 		// FEDAUTHINFO (0xEE) - Azure AD authentication info from server (T019)
 		// This token has a 4-byte length (DWORD) unlike most other tokens

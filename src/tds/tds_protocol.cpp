@@ -385,6 +385,183 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	return packet;
 }
 
+//===----------------------------------------------------------------------===//
+// BuildLogin7WithSSPI - Integrated Authentication (Kerberos / SSPI) -- Spec 042
+//
+// Layout matches BuildLogin7 exactly except:
+//   * OptionFlags2 has bit 7 (fIntSecurity / 0x80) set, in addition to fODBC.
+//   * UserName / Password fields have length 0 and contribute no bytes.
+//   * The SSPI field at offset 36+offset_pair_index*4 carries the initial SPNEGO
+//     blob from IAuthenticator::InitialBytes(). For blobs > 65 535 bytes, cbSSPI
+//     is set to 0xFFFF and the real length is written into cbSSPILong at offset 86.
+//
+// See [MS-TDS] 2.2.6.4 and spec 042 research.md R1.
+//===----------------------------------------------------------------------===//
+TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
+										   const std::string &database,
+										   const std::vector<uint8_t> &sspi_initial_blob,
+										   const std::string &app_name, uint32_t packet_size) {
+	TdsPacket packet(PacketType::LOGIN7);
+
+	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
+	uint16_t username_len = 0;	// integrated auth: not used
+	uint16_t password_len = 0;	// integrated auth: not used
+	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
+	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
+	uint16_t database_len = static_cast<uint16_t>(database.size());
+
+	// SSPI blob length handling: cbSSPI is 16-bit; for blobs > 65535 bytes,
+	// cbSSPI is sentinel 0xFFFF and cbSSPILong (32-bit at offset 86) holds the
+	// real length. ibSSPI still points to the start of the blob in either case.
+	uint32_t sspi_blob_total = static_cast<uint32_t>(sspi_initial_blob.size());
+	uint16_t sspi_short_len = (sspi_blob_total > 0xFFFF) ? 0xFFFF : static_cast<uint16_t>(sspi_blob_total);
+	uint32_t sspi_long_len = (sspi_blob_total > 0xFFFF) ? sspi_blob_total : 0;
+
+	// Variable data starts at offset 94 (end of fixed header)
+	uint16_t var_offset = 94;
+	uint16_t hostname_offset = var_offset;
+	var_offset += hostname_len * 2;
+
+	uint16_t username_offset = var_offset;	// length 0, no bytes contributed
+	uint16_t password_offset = var_offset;
+	uint16_t appname_offset = var_offset;
+	var_offset += appname_len * 2;
+
+	uint16_t servername_offset = var_offset;
+	var_offset += servername_len * 2;
+
+	uint16_t unused1_offset = var_offset;
+	uint16_t cltintname_offset = var_offset;
+	uint16_t language_offset = var_offset;
+
+	uint16_t database_offset = var_offset;
+	var_offset += database_len * 2;
+
+	// SSPI blob position
+	uint16_t sspi_offset = var_offset;
+	var_offset += sspi_blob_total;
+
+	uint16_t atchdb_offset = var_offset;
+	uint16_t changepass_offset = var_offset;
+
+	uint32_t total_length = var_offset;
+
+	// Fixed header (94 bytes)
+
+	// Length (4 bytes)
+	packet.AppendUInt32LE(total_length);
+	// TDSVersion
+	packet.AppendUInt32LE(TDS_VERSION_7_4);
+	// PacketSize
+	packet.AppendUInt32LE(packet_size);
+	// ClientProgVer
+	packet.AppendUInt32LE(0x00000001);
+	// ClientPID
+	packet.AppendUInt32LE(static_cast<uint32_t>(GET_PID()));
+	// ConnectionID
+	packet.AppendUInt32LE(0);
+
+	// OptionFlags1: USE_DB | SET_LANG
+	uint8_t flags1 = 0x20 | 0x80;
+	packet.AppendByte(flags1);
+
+	// OptionFlags2: fODBC | fIntSecurity (Spec 042)
+	// Bit 1 (0x02): fODBC - ANSI compatibility
+	// Bit 7 (0x80): fIntSecurity - Integrated Auth, server reads SSPI field instead of user/pwd
+	uint8_t flags2 = 0x02 | 0x80;
+	packet.AppendByte(flags2);
+
+	// TypeFlags
+	packet.AppendByte(0x00);
+	// OptionFlags3
+	packet.AppendByte(0x00);
+	// ClientTimeZone
+	packet.AppendUInt32LE(0);
+	// ClientLCID
+	packet.AppendUInt32LE(0x0409);	// en-US
+
+	// Variable-length field offset/length pairs
+
+	packet.AppendUInt16LE(hostname_offset);
+	packet.AppendUInt16LE(hostname_len);
+
+	packet.AppendUInt16LE(username_offset);
+	packet.AppendUInt16LE(username_len);
+
+	packet.AppendUInt16LE(password_offset);
+	packet.AppendUInt16LE(password_len);
+
+	packet.AppendUInt16LE(appname_offset);
+	packet.AppendUInt16LE(appname_len);
+
+	packet.AppendUInt16LE(servername_offset);
+	packet.AppendUInt16LE(servername_len);
+
+	// Unused/Extension
+	packet.AppendUInt16LE(unused1_offset);
+	packet.AppendUInt16LE(0);
+
+	// CltIntName
+	packet.AppendUInt16LE(cltintname_offset);
+	packet.AppendUInt16LE(0);
+
+	// Language
+	packet.AppendUInt16LE(language_offset);
+	packet.AppendUInt16LE(0);
+
+	// Database
+	packet.AppendUInt16LE(database_offset);
+	packet.AppendUInt16LE(database_len);
+
+	// ClientID (6 bytes)
+	for (int i = 0; i < 6; i++) {
+		packet.AppendByte(0);
+	}
+
+	// SSPI offset / cbSSPI
+	packet.AppendUInt16LE(sspi_offset);
+	packet.AppendUInt16LE(sspi_short_len);
+
+	// AtchDBFile
+	packet.AppendUInt16LE(atchdb_offset);
+	packet.AppendUInt16LE(0);
+
+	// ChangePassword
+	packet.AppendUInt16LE(changepass_offset);
+	packet.AppendUInt16LE(0);
+
+	// cbSSPILong (4 bytes) - real length when sspi_short_len == 0xFFFF
+	packet.AppendUInt32LE(sspi_long_len);
+
+	// Variable data section
+	packet.AppendUTF16LE(client_hostname);
+	// username / password fields contribute zero bytes
+	packet.AppendUTF16LE(app_name);
+	packet.AppendUTF16LE(server_name);
+	packet.AppendUTF16LE(database);
+
+	// SSPI initial blob (raw bytes, NOT UTF-16)
+	if (!sspi_initial_blob.empty()) {
+		packet.AppendPayload(sspi_initial_blob);
+	}
+
+	return packet;
+}
+
+//===----------------------------------------------------------------------===//
+// BuildSSPIMessage - SSPI continuation packet (Spec 042)
+//
+// [MS-TDS] 2.2.6.16: a single packet of type 0x11 whose payload is the
+// raw GSSAPI/SSPI blob from IAuthenticator::NextBytes().
+//===----------------------------------------------------------------------===//
+TdsPacket TdsProtocol::BuildSSPIMessage(const std::vector<uint8_t> &sspi_blob) {
+	TdsPacket packet(PacketType::SSPI);
+	if (!sspi_blob.empty()) {
+		packet.AppendPayload(sspi_blob);
+	}
+	return packet;
+}
+
 std::string TdsProtocol::ReadUTF16LE(const uint8_t *data, size_t char_count) {
 	std::string result;
 	result.reserve(char_count);
@@ -665,6 +842,23 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 
 			response.has_fedauth_info = true;
 			ptr = token_end;
+		} else if (token_type == static_cast<uint8_t>(TokenType::SSPI)) {
+			// SSPI token (0xED) -- Integrated Auth continuation, Spec 042
+			// [MS-TDS] 2.2.7.21: TokenType(1) + USHORT length(2) + Data(variable)
+			if (ptr + 2 > end) {
+				break;
+			}
+			uint16_t blob_len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
+			ptr += 2;
+			if (ptr + blob_len > end) {
+				MSSQL_PROTO_DEBUG_LOG(1, "SSPI token truncated: claim=%u, available=%zu", blob_len,
+									  static_cast<size_t>(end - ptr));
+				break;
+			}
+			MSSQL_PROTO_DEBUG_LOG(1, "SSPI token: blob_len=%u", blob_len);
+			response.has_sspi_token = true;
+			response.sspi_token.assign(ptr, ptr + blob_len);
+			ptr += blob_len;
 		} else {
 			// Unknown token - try to skip by reading length if available
 			// Most tokens have 2-byte length after token type
