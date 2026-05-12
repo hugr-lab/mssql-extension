@@ -672,7 +672,9 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	try {
 		initial_blob = authenticator->InitialBytes();
 	} catch (const std::exception &e) {
-		last_error_ = std::string("MSSQL Kerberos auth failed: ") + e.what();
+		// Authenticator already prefixes with "MSSQL Kerberos auth failed:";
+		// just propagate verbatim to avoid double-prefixing.
+		last_error_ = e.what();
 		state_.store(ConnectionState::Disconnected);
 		socket_->Close();
 		return false;
@@ -742,7 +744,8 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		try {
 			next_blob = authenticator->NextBytes(login_response.sspi_token);
 		} catch (const std::exception &e) {
-			last_error_ = std::string("MSSQL Kerberos auth failed during continuation: ") + e.what();
+			// Authenticator already prefixes; just propagate verbatim.
+			last_error_ = e.what();
 			state_.store(ConnectionState::Disconnected);
 			socket_->Close();
 			return false;

@@ -1054,6 +1054,56 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 }
 
 //===----------------------------------------------------------------------===//
+// ValidateIntegratedAuthConnection -- Spec 042
+//
+// Build a fresh Krb5Authenticator (or WinSspiAuthenticator in Phase 4) via the
+// strategy factory, run a full ATTACH-time login, then close the connection.
+// Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
+// instead of at first query.
+//===----------------------------------------------------------------------===//
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
+							info.host.c_str(), info.port, info.database.c_str(),
+							static_cast<int>(info.auth_method), timeout_seconds);
+
+	tds::TdsConnection conn;
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
+		throw IOException("MSSQL connection validation failed: %s", translated);
+	}
+
+	// Build the strategy; this triggers Krb5Authenticator construction (which
+	// validates the keytab/realm/etc. early).
+	std::shared_ptr<tds::AuthenticationStrategy> strategy;
+	try {
+		strategy = tds::AuthStrategyFactory::Create(info);
+	} catch (const std::exception &e) {
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: %s", e.what());
+	}
+	if (!strategy) {
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: failed to construct integrated-auth strategy");
+	}
+	auto authenticator = strategy->GetAuthenticator();
+	if (!authenticator) {
+		conn.Close();
+		throw InvalidInputException(
+			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
+	}
+
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: %s", error);
+	}
+
+	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: success");
+}
+
+//===----------------------------------------------------------------------===//
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
@@ -1207,14 +1257,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
 	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
 			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
-		// Spec 042 Phase 2 scaffold: the parser and LOGIN7 plumbing are in place,
-		// but the GSSAPI / SSPI backends ship in Phase 3 / 4. Surface a clear
-		// fail-fast error so users see the planned message instead of a generic
-		// connect failure.
-		throw InvalidInputException(
-			"MSSQL Error: Integrated authentication (Kerberos / SSPI) is parsed but the authentication backend "
-			"is not yet implemented in this build. Tracked in spec 042 Phase 3 / 4 (POSIX Krb5 / Windows SSPI). "
-			"Use SQL authentication or Azure AD in the meantime.");
+		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
+		// time so credential / SPN / clock-skew errors surface immediately.
+		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
+		ValidateIntegratedAuthConnection(*ctx->connection_info, pool_config.connection_timeout);
 	} else {
 		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
 	}
@@ -1229,6 +1275,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
 			fedauth_token_utf16le, ctx->connection_info->use_encrypt);
+	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
+			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
+		// Spec 042: Integrated Authentication pool. Each new pool connection
+		// builds a fresh authenticator so kinit-refreshed tickets are picked up.
+		MssqlPoolManager::Instance().GetOrCreatePoolWithIntegratedAuth(name, pool_config, *ctx->connection_info);
 	} else {
 		// Use SQL authentication pool
 		MssqlPoolManager::Instance().GetOrCreatePool(

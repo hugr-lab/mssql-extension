@@ -182,6 +182,10 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 // Throws IOException or InvalidInputException with descriptive error on failure
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
+// Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
+// so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
+
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);
 
