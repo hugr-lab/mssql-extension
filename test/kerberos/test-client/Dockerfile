@@ -29,6 +29,11 @@ COPY . /src/
 
 # Build the extension. ENABLE_KRB5=ON is the default; we set it explicitly so
 # the test stack always exercises the Kerberos path.
+#
+# CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on
+# hosts with low Docker memory limits (DuckDB's compile is heap-heavy --
+# 4-way parallel needs ~8GB; 2-way fits in ~4GB).
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2
 RUN GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON"
 
 # ----------------------------------------------------------------------------
