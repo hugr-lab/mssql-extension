@@ -41,6 +41,52 @@ message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
 message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
 
 # =============================================================================
+# Integrated Authentication (Kerberos / SSPI) — Spec 042
+#
+# POSIX: dynamic link to system libgssapi_krb5 (Linux) / GSS.framework (macOS)
+# Windows: link secur32.dll (Windows SDK)
+# Auto-detected — if libraries are missing on POSIX the build still succeeds
+# without integrated-auth support, and Trusted_Connection=yes / authenticator=krb5
+# produce a "compiled without Kerberos support" error per FR-012.
+# =============================================================================
+option(ENABLE_KRB5 "Enable Kerberos / SSPI integrated authentication" ON)
+
+set(MSSQL_KRB5_AVAILABLE FALSE)
+set(MSSQL_SSPI_AVAILABLE FALSE)
+
+if(ENABLE_KRB5)
+    if(WIN32)
+        # SSPI ships with the OS. secur32.lib is in the Windows SDK.
+        set(MSSQL_SSPI_AVAILABLE TRUE)
+        message(STATUS "Integrated Auth: Windows SSPI enabled (secur32)")
+    elseif(APPLE)
+        find_library(MSSQL_GSS_FRAMEWORK GSS)
+        if(MSSQL_GSS_FRAMEWORK)
+            set(MSSQL_KRB5_AVAILABLE TRUE)
+            message(STATUS "Integrated Auth: macOS Kerberos enabled (${MSSQL_GSS_FRAMEWORK})")
+        else()
+            message(WARNING "Integrated Auth: GSS.framework not found on macOS; Kerberos disabled")
+        endif()
+    else()
+        # Linux + other POSIX: prefer pkg-config, fall back gracefully if missing.
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(MSSQL_GSSAPI krb5-gssapi)
+            if(MSSQL_GSSAPI_FOUND)
+                set(MSSQL_KRB5_AVAILABLE TRUE)
+                message(STATUS "Integrated Auth: Linux Kerberos enabled (GSSAPI ${MSSQL_GSSAPI_VERSION})")
+            else()
+                message(WARNING "Integrated Auth: pkg-config could not locate krb5-gssapi; install libkrb5-dev to enable")
+            endif()
+        else()
+            message(WARNING "Integrated Auth: pkg-config not found; Linux Kerberos discovery skipped")
+        endif()
+    endif()
+else()
+    message(STATUS "Integrated Auth: disabled (ENABLE_KRB5=OFF)")
+endif()
+
+# =============================================================================
 # Extension Sources
 # =============================================================================
 set(EXTENSION_SOURCES
@@ -167,6 +213,21 @@ if(WIN32)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
+# Integrated Authentication (Spec 042) — compile defines + link libs per platform
+if(MSSQL_SSPI_AVAILABLE)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_ENABLE_SSPI=1)
+    target_link_libraries(${EXTENSION_NAME} secur32)
+endif()
+if(MSSQL_KRB5_AVAILABLE)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_ENABLE_KRB5=1)
+    if(APPLE)
+        target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
+    else()
+        target_include_directories(${EXTENSION_NAME} PRIVATE ${MSSQL_GSSAPI_INCLUDE_DIRS})
+        target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSSAPI_LIBRARIES})
+    endif()
+endif()
+
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
@@ -185,6 +246,21 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
+endif()
+
+# Integrated Authentication (Spec 042) — compile defines + link libs per platform
+if(MSSQL_SSPI_AVAILABLE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_ENABLE_SSPI=1)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} secur32)
+endif()
+if(MSSQL_KRB5_AVAILABLE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_ENABLE_KRB5=1)
+    if(APPLE)
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
+    else()
+        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${MSSQL_GSSAPI_INCLUDE_DIRS})
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSSAPI_LIBRARIES})
+    endif()
 endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors

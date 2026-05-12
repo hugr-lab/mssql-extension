@@ -71,6 +71,20 @@ struct MSSQLConnectionInfo {
 	string access_token;  // Pre-provided Azure AD JWT access token (takes precedence over azure_secret)
 
 	//===----------------------------------------------------------------------===//
+	// Integrated Authentication / Kerberos (Spec 042)
+	//
+	// All optional. Key names mirror microsoft/go-mssqldb integratedauth verbatim
+	// (hyphenated in connection strings; underscored in secret fields per existing
+	// convention).
+	//===----------------------------------------------------------------------===//
+	string krb5_configfile;			// Path to a krb5.conf override (else system default)
+	string krb5_keytabfile;			// Path to a keytab; selects keytab credential mode
+	string krb5_credcachefile;		// Path to a ccache override (else KRB5CCNAME / default)
+	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
+	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
+	int8_t krb5_dnslookupkdc = -1;	// -1 = krb5.conf default; 0 = no; 1 = yes
+
+	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//
 	string schema_filter;  // Regex pattern for schema visibility (empty = all visible)

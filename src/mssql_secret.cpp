@@ -18,7 +18,29 @@ string ValidateMSSQLSecretFields(ClientContext &context, const CreateSecretInput
 	auto azure_it = input.options.find(MSSQL_SECRET_AZURE_SECRET);
 	bool has_azure_secret = azure_it != input.options.end() && !azure_it->second.ToString().empty();
 
-	if (has_access_token) {
+	// Spec 042: Check for Integrated Authentication
+	auto auth_it = input.options.find(MSSQL_SECRET_AUTHENTICATOR);
+	bool has_authenticator = auth_it != input.options.end() && !auth_it->second.ToString().empty();
+	if (has_authenticator) {
+		auto auth_value = StringUtil::Lower(auth_it->second.ToString());
+		if (auth_value != "krb5" && auth_value != "winsspi") {
+			return StringUtil::Format(
+				"Unsupported 'authenticator' value '%s'. Supported: krb5 (POSIX), winsspi (Windows).",
+				auth_it->second.ToString());
+		}
+		if (has_access_token || has_azure_secret) {
+			return "'authenticator' cannot be combined with access_token / azure_secret. Choose one auth method.";
+		}
+		// Integrated auth mode - only require host + database (and we don't require user/password)
+		const char *required_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE};
+		for (auto field : required_fields) {
+			auto it = input.options.find(field);
+			if (it == input.options.end() || it->second.ToString().empty()) {
+				return StringUtil::Format("Missing required field '%s'.", field);
+			}
+		}
+		// Skip the access_token / azure_secret / SQL-auth branches below
+	} else if (has_access_token) {
 		// Manual token auth mode (Spec 032) - only require host, port, database
 		// Token validation (JWT format, audience) is done at connection time
 		const char *required_fields[] = {MSSQL_SECRET_HOST, MSSQL_SECRET_DATABASE};
@@ -181,6 +203,15 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_SCHEMA_FILTER, input);
 	result->TrySetValue(MSSQL_SECRET_TABLE_FILTER, input);
 
+	// Spec 042: Integrated Authentication fields (all optional, no secrets to redact)
+	result->TrySetValue(MSSQL_SECRET_AUTHENTICATOR, input);
+	result->TrySetValue(MSSQL_SECRET_KRB5_CONFIGFILE, input);
+	result->TrySetValue(MSSQL_SECRET_KRB5_KEYTABFILE, input);
+	result->TrySetValue(MSSQL_SECRET_KRB5_CREDCACHEFILE, input);
+	result->TrySetValue(MSSQL_SECRET_KRB5_REALM, input);
+	result->TrySetValue(MSSQL_SECRET_KRB5_DNSLOOKUPKDC, input);
+	result->TrySetValue(MSSQL_SECRET_SPN, input);
+
 	// Mark password as redacted (hidden in duckdb_secrets() output)
 	result->redact_keys.insert(MSSQL_SECRET_PASSWORD);
 
@@ -221,6 +252,15 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 		LogicalType::VARCHAR;  // Optional, regex schema visibility filter (Spec 033)
 	create_func.named_parameters[MSSQL_SECRET_TABLE_FILTER] =
 		LogicalType::VARCHAR;  // Optional, regex table visibility filter (Spec 033)
+
+	// Spec 042: Integrated Authentication (Kerberos / SSPI), all optional
+	create_func.named_parameters[MSSQL_SECRET_AUTHENTICATOR] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_KRB5_CONFIGFILE] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_KRB5_KEYTABFILE] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_KRB5_CREDCACHEFILE] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_KRB5_REALM] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_KRB5_DNSLOOKUPKDC] = LogicalType::BOOLEAN;
+	create_func.named_parameters[MSSQL_SECRET_SPN] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(std::move(create_func));
 }
