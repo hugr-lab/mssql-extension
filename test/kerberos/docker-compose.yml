@@ -1,0 +1,113 @@
+# Spec 042 -- Integrated Authentication (Kerberos / SSPI) test infrastructure.
+#
+# Three-service stack. No real Active Directory required.
+#
+#   kdc         MIT Kerberos KDC, realm EXAMPLE.COM
+#   sql         SQL Server 2022, joined-equivalent via a service keytab
+#   test-client Ubuntu + krb5-user + the built mssql.duckdb_extension
+#
+# Usage (from this directory):
+#   docker compose up -d --build
+#   docker compose exec test-client kinit testuser@EXAMPLE.COM <<< 'testpass'
+#   docker compose exec test-client ./run-tests.sh
+#   docker compose down -v
+#
+# All three containers share an internal network. The SQL Server is
+# reachable at sql.example.com:1433 from inside test-client. The KDC is
+# reachable at kdc.example.com:88 (TCP+UDP).
+
+services:
+  kdc:
+    build: ./kdc
+    container_name: mssql-kerb-kdc
+    hostname: kdc.example.com
+    networks:
+      kerb_net:
+        aliases:
+          - kdc.example.com
+    environment:
+      KRB5_REALM: EXAMPLE.COM
+      KRB5_KDC_HOST: kdc.example.com
+      ADMIN_PASSWORD: adminpw
+      USER_PRINCIPAL: testuser
+      USER_PASSWORD: testpass
+      SERVICE_PRINCIPAL: MSSQLSvc/sql.example.com:1433
+      KEYTAB_OUT: /export/mssql.keytab
+    volumes:
+      - keytabs:/export
+    # KDC listens on 88 (TCP+UDP) and kadmin on 749. We don't publish them to
+    # the host -- only containers on kerb_net need access.
+    expose:
+      - "88/tcp"
+      - "88/udp"
+      - "749/tcp"
+    healthcheck:
+      test: ["CMD-SHELL", "kadmin.local -q 'listprincs' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  sql:
+    # Custom build: bakes in the keytab path in mssql.conf and an entrypoint
+    # wrapper that runs init.sql once the server is up. The stock image has
+    # no init-script convention so the mounted /init/init.sql was previously
+    # silently ignored.
+    build:
+      context: ./sql
+    container_name: mssql-kerb-sql
+    hostname: sql.example.com
+    networks:
+      kerb_net:
+        aliases:
+          - sql.example.com
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "TestPassword1"
+      MSSQL_PID: Developer
+    volumes:
+      - keytabs:/var/opt/mssql/secrets
+    # We don't publish 1433 to the host either; the test-client talks to it
+    # over the internal network as sql.example.com:1433.
+    expose:
+      - "1433/tcp"
+    depends_on:
+      kdc:
+        condition: service_healthy
+    # Healthcheck verifies that init.sql has run (TestDB exists), not just
+    # that SQL Server is reachable. Otherwise the test-client could start
+    # querying before TestDB exists.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q \"IF DB_ID('TestDB') IS NULL RAISERROR('init pending', 16, 1); SELECT 1;\" >/dev/null 2>&1"
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  test-client:
+    build:
+      context: ../..
+      dockerfile: test/kerberos/test-client/Dockerfile
+    container_name: mssql-kerb-client
+    hostname: client.example.com
+    networks:
+      - kerb_net
+    volumes:
+      - ./test-client/krb5.conf:/etc/krb5.conf:ro
+      - ./test-client/run-tests.sh:/run-tests.sh:ro
+      - keytabs:/keytabs:ro
+      - ../sql:/test-sql:ro
+    working_dir: /home/tester
+    depends_on:
+      sql:
+        condition: service_healthy
+    # Keep alive so the user can `docker compose exec` into it.
+    command: ["sleep", "infinity"]
+
+volumes:
+  keytabs:
+
+networks:
+  kerb_net:
+    driver: bridge

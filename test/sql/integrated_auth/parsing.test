@@ -1,53 +1,55 @@
 # name: test/sql/integrated_auth/parsing.test
-# description: Phase 2 of spec 042 - parse Integrated Auth connection-string surface
-#              and surface clear fail-fast errors (parser + conflicts + not-yet-implemented).
+# description: Spec 042 -- connection-string surface for Integrated Auth.
+#              Parses the new keys and verifies conflict detection. Does NOT
+#              require a SQL Server, KDC, or network -- the validator runs
+#              client-side before any TCP / GSSAPI call.
 # group: [mssql]
 #
-# Notes:
-#   - These tests do NOT require a SQL Server, KDC, or any network. The parser
-#     and conflict validator run client-side before any TCP I/O. The Phase 2
-#     scaffold throws a clear "not yet implemented" InvalidInputException for
-#     Trusted_Connection=yes / authenticator=krb5 / authenticator=winsspi.
-#   - Phase 3 will replace the "not yet implemented" cases with real Kerberos
-#     authentication driven by the test/kerberos/ docker-compose stack.
+# Test categories:
+#   * Parser conflict detection (assertions on substring) -- these stay
+#     deterministic because the validator returns before any network I/O.
+#   * Acceptance of new keys (statement error with no substring) -- the
+#     ATTACH eventually fails somewhere (DNS, TCP, or GSSAPI no-ccache),
+#     we just confirm the parser didn't reject the syntax.
+#   * Secret-creation validation (substring match on validator error).
 
 require mssql
 
 #
-# Test 1: Trusted_Connection=yes alone errors with "not yet implemented"
-#          but ONLY after parsing succeeds (no missing-user/password complaint).
+# Test 1: Trusted_Connection=yes is accepted by the parser
+#         (will fail later -- TCP to sql.example.com or GSSAPI no ccache).
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes' AS ia_t1 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 2: Integrated Security=SSPI alias resolves to integrated auth.
+# Test 2: Integrated Security=SSPI alias accepted by parser.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;Integrated Security=SSPI' AS ia_t2 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 3: Integrated Security=true alias resolves to integrated auth.
+# Test 3: Integrated Security=true alias accepted by parser.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;Integrated Security=true' AS ia_t3 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 4: Explicit authenticator=krb5 (POSIX form).
+# Test 4: Explicit authenticator=krb5 accepted by parser.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5' AS ia_t4 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 5: Unsupported authenticator value gives a specific error.
+# Test 5: Unsupported authenticator value -- specific parser error.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;authenticator=ntlm' AS ia_t5 (TYPE mssql);
@@ -55,7 +57,7 @@ ATTACH 'Server=sql.example.com;Database=db;authenticator=ntlm' AS ia_t5 (TYPE ms
 Unsupported authenticator 'ntlm'
 
 #
-# Test 6: Trusted_Connection + User Id conflict detected at parse time.
+# Test 6: Trusted_Connection + User Id conflict.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes;User Id=alice' AS ia_t6 (TYPE mssql);
@@ -71,9 +73,18 @@ ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes;User Id=alice;
 'Password' cannot be combined
 
 #
-# Test 8: SQL auth still works unchanged (regression).
-#          We can't actually connect (no server in this test) but the parser
-#          should not complain about user/password being missing.
+# Test 7b: Explicit authenticator=krb5 + Password also rejected -- raw mode
+#           is SECRET-only to keep passwords out of connection-string logs.
+#           spec 042 ultrareview bug_004.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5;User Id=alice;Password=secret' AS ia_t7b (TYPE mssql);
+----
+'Password' cannot be combined
+
+#
+# Test 8: SQL auth still works at the parser level (regression).
+#         Will fail later at the TCP / login layer because no server is here.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;User Id=alice;Password=secret' AS ia_t8 (TYPE mssql);
@@ -86,26 +97,26 @@ MSSQL connection validation failed
 statement error
 ATTACH 'mssql://sql.example.com/db?authenticator=krb5' AS ia_t9 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 10: krb5-keytabfile parameter is accepted (doesn't crash the parser).
+# Test 10: krb5-keytabfile parameter accepted by parser.
 #
 statement error
 ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5;krb5-keytabfile=/etc/krb5.keytab;User Id=svc@EXAMPLE.COM' AS ia_t10 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 11: service_principal_name override parses cleanly.
+# Test 11: service_principal_name override accepted by parser.
 #
 statement error
 ATTACH 'Server=10.0.0.5;Database=db;Trusted_Connection=yes;service_principal_name=MSSQLSvc/sql.example.com:1433' AS ia_t11 (TYPE mssql);
 ----
-Integrated authentication
+MSSQL
 
 #
-# Test 12: Secret-based integrated auth -- validate the schema accepts the keys.
+# Test 12: Secret-based integrated auth round-trip.
 #
 statement ok
 CREATE SECRET ia_secret_kerb (
@@ -121,7 +132,7 @@ CREATE SECRET ia_secret_kerb (
 statement error
 ATTACH '' AS ia_t12 (TYPE mssql, SECRET ia_secret_kerb);
 ----
-Integrated authentication
+MSSQL
 
 statement ok
 DROP SECRET ia_secret_kerb;

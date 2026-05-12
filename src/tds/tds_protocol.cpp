@@ -417,32 +417,49 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	uint16_t sspi_short_len = (sspi_blob_total > 0xFFFF) ? 0xFFFF : static_cast<uint16_t>(sspi_blob_total);
 	uint32_t sspi_long_len = (sspi_blob_total > 0xFFFF) ? sspi_blob_total : 0;
 
-	// Variable data starts at offset 94 (end of fixed header)
-	uint16_t var_offset = 94;
-	uint16_t hostname_offset = var_offset;
+	// Variable data starts at offset 94 (end of fixed header). var_offset is
+	// 32-bit because the SPNEGO+Kerberos blob alone can exceed 64 KB for users
+	// in many AD groups (Microsoft documents PAC sizes up to 1 MB) -- a
+	// uint16_t accumulator wraps mod 65 536 and produces a corrupted LOGIN7
+	// Length header. spec 042 ultrareview bug_032.
+	//
+	// Individual offsets that precede the SSPI region fit in 16 bits (all the
+	// UTF-16 fields combined are tiny). The total length and the SSPI blob
+	// itself are the 32-bit values.
+	uint32_t var_offset = 94;
+	uint16_t hostname_offset = static_cast<uint16_t>(var_offset);
 	var_offset += hostname_len * 2;
 
-	uint16_t username_offset = var_offset;	// length 0, no bytes contributed
-	uint16_t password_offset = var_offset;
-	uint16_t appname_offset = var_offset;
+	uint16_t username_offset = static_cast<uint16_t>(var_offset);  // length 0
+	uint16_t password_offset = static_cast<uint16_t>(var_offset);
+	uint16_t appname_offset = static_cast<uint16_t>(var_offset);
 	var_offset += appname_len * 2;
 
-	uint16_t servername_offset = var_offset;
+	uint16_t servername_offset = static_cast<uint16_t>(var_offset);
 	var_offset += servername_len * 2;
 
-	uint16_t unused1_offset = var_offset;
-	uint16_t cltintname_offset = var_offset;
-	uint16_t language_offset = var_offset;
+	uint16_t unused1_offset = static_cast<uint16_t>(var_offset);
+	uint16_t cltintname_offset = static_cast<uint16_t>(var_offset);
+	uint16_t language_offset = static_cast<uint16_t>(var_offset);
 
-	uint16_t database_offset = var_offset;
+	uint16_t database_offset = static_cast<uint16_t>(var_offset);
 	var_offset += database_len * 2;
 
-	// SSPI blob position
-	uint16_t sspi_offset = var_offset;
+	// SSPI blob position. The OFFSET (ibSSPI) is 16-bit per the TDS spec --
+	// blobs cannot start past 64 KB into the LOGIN7 record. That's fine: the
+	// only thing big about LOGIN7 is the SSPI blob itself, and it comes after
+	// all small UTF-16 fields. We assert defensively in case future field
+	// additions push the offset past the limit.
+	if (var_offset > 0xFFFF) {
+		throw std::runtime_error("LOGIN7 SSPI offset exceeds 65535 bytes -- pre-SSPI fields too large");
+	}
+	uint16_t sspi_offset = static_cast<uint16_t>(var_offset);
 	var_offset += sspi_blob_total;
 
-	uint16_t atchdb_offset = var_offset;
-	uint16_t changepass_offset = var_offset;
+	// AtchDBFile / ChangePassword have length 0 so their offset isn't read
+	// by the server; clamp to keep the wire format clean.
+	uint16_t atchdb_offset = static_cast<uint16_t>(var_offset > 0xFFFF ? 0xFFFF : var_offset);
+	uint16_t changepass_offset = atchdb_offset;
 
 	uint32_t total_length = var_offset;
 

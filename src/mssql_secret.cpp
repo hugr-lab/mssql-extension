@@ -209,7 +209,6 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_KRB5_KEYTABFILE, input);
 	result->TrySetValue(MSSQL_SECRET_KRB5_CREDCACHEFILE, input);
 	result->TrySetValue(MSSQL_SECRET_KRB5_REALM, input);
-	result->TrySetValue(MSSQL_SECRET_KRB5_DNSLOOKUPKDC, input);
 	result->TrySetValue(MSSQL_SECRET_SPN, input);
 
 	// Mark password as redacted (hidden in duckdb_secrets() output)
@@ -259,7 +258,6 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_KRB5_KEYTABFILE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_KRB5_CREDCACHEFILE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_KRB5_REALM] = LogicalType::VARCHAR;
-	create_func.named_parameters[MSSQL_SECRET_KRB5_DNSLOOKUPKDC] = LogicalType::BOOLEAN;
 	create_func.named_parameters[MSSQL_SECRET_SPN] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(std::move(create_func));

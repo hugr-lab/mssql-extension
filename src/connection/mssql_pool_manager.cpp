@@ -1,5 +1,10 @@
 #include "connection/mssql_pool_manager.hpp"
 
+#include "mssql_storage.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
+
+#include <cstdio>
+
 namespace duckdb {
 
 MssqlPoolManager &MssqlPoolManager::Instance() {
@@ -91,6 +96,75 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(
 	auto *ptr = pool.get();
 	pools_[context_name] = std::move(pool);
 
+	return ptr;
+}
+
+tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithIntegratedAuth(const std::string &context_name,
+																		 const MSSQLPoolConfig &config,
+																		 const MSSQLConnectionInfo &info) {
+	std::lock_guard<std::mutex> lock(manager_mutex_);
+
+	auto it = pools_.find(context_name);
+	if (it != pools_.end()) {
+		return it->second.get();
+	}
+
+	tds::PoolConfiguration pool_config;
+	pool_config.connection_limit = config.connection_limit;
+	pool_config.connection_cache = config.connection_cache;
+	pool_config.connection_timeout = config.connection_timeout;
+	pool_config.idle_timeout = config.idle_timeout;
+	pool_config.min_connections = config.min_connections;
+	pool_config.acquire_timeout = config.acquire_timeout;
+
+	// Copy info into the factory closure -- each new connection re-acquires Kerberos
+	// credentials, so a ticket renewed via kinit is picked up on the next pool fill.
+	//
+	// spec 042 ultrareview bug_001: when the authenticator throws or the
+	// LOGIN7 round trip fails (expired TGT, KDC outage, keytab rotated mid-
+	// session, etc.), the verbatim GSSAPI status + actionable hint from
+	// Krb5Authenticator::HintForMinor is the most useful thing we can show
+	// the user. The previous implementation discarded those errors and the
+	// pool surfaced only a generic "failed to acquire connection". We now
+	// log them via the existing MSSQL_CONN_DEBUG_LOG and stderr so users
+	// running with MSSQL_DEBUG=1 (or any time, on stderr) see the real
+	// reason a pool refill failed.
+	MSSQLConnectionInfo info_copy = info;
+	auto factory = [info_copy]() -> std::shared_ptr<tds::TdsConnection> {
+		auto conn = std::make_shared<tds::TdsConnection>();
+		if (!conn->Connect(info_copy.host, info_copy.port)) {
+			fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n", info_copy.host.c_str(),
+					static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
+			return nullptr;
+		}
+		// Build a fresh strategy / authenticator for this connection so
+		// gss_init_sec_context state is independent across pool connections.
+		std::shared_ptr<tds::AuthenticationStrategy> strategy;
+		try {
+			strategy = tds::AuthStrategyFactory::Create(info_copy);
+		} catch (const std::exception &e) {
+			fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
+			return nullptr;
+		}
+		if (!strategy) {
+			fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
+			return nullptr;
+		}
+		auto authenticator = strategy->GetAuthenticator();
+		if (!authenticator) {
+			fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
+			return nullptr;
+		}
+		if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt)) {
+			fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
+			return nullptr;
+		}
+		return conn;
+	};
+
+	std::unique_ptr<tds::ConnectionPool> pool(new tds::ConnectionPool(context_name, pool_config, factory));
+	auto *ptr = pool.get();
+	pools_[context_name] = std::move(pool);
 	return ptr;
 }
 

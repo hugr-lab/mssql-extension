@@ -82,7 +82,6 @@ struct MSSQLConnectionInfo {
 	string krb5_credcachefile;		// Path to a ccache override (else KRB5CCNAME / default)
 	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
 	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
-	int8_t krb5_dnslookupkdc = -1;	// -1 = krb5.conf default; 0 = no; 1 = yes
 
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
@@ -181,6 +180,10 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 // Validate connection by attempting to connect and authenticate
 // Throws IOException or InvalidInputException with descriptive error on failure
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
+
+// Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
+// so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);

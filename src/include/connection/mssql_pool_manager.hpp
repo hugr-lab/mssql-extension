@@ -36,6 +36,17 @@ public:
 													  const std::vector<uint8_t> &fedauth_token_utf16le,
 													  bool use_encrypt = true);
 
+	// Get or create a pool for a context (Integrated Authentication: Kerberos / SSPI).
+	// Spec 042.
+	//
+	// Each new connection in the pool builds a fresh IAuthenticator instance via
+	// AuthStrategyFactory::Create(info), so credential refresh happens naturally on
+	// every connection acquisition (kinit ticket refresh, etc.). The MSSQLConnectionInfo
+	// is captured by value into the factory closure.
+	tds::ConnectionPool *GetOrCreatePoolWithIntegratedAuth(const std::string &context_name,
+														   const MSSQLPoolConfig &config,
+														   const struct MSSQLConnectionInfo &info);
+
 	// Get an existing pool (returns nullptr if not found)
 	tds::ConnectionPool *GetPool(const std::string &context_name);
 

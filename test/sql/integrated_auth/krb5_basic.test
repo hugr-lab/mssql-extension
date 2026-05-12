@@ -1,0 +1,65 @@
+# name: test/sql/integrated_auth/krb5_basic.test
+# description: Spec 042 -- Kerberos credential-cache mode end-to-end.
+#              Requires the test/kerberos/ docker-compose stack running and
+#              `kinit testuser@EXAMPLE.COM <<< 'testpass'` executed in the
+#              test-client container.
+# group: [kerberos]
+
+require mssql
+
+require-env MSSQL_KERBEROS_TEST
+
+#
+# Test 1: ATTACH via Trusted_Connection=yes (pyodbc-style alias).
+#
+statement ok
+ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kdb (TYPE mssql);
+
+#
+# Test 2: Basic SELECT through the catalog.
+#
+query IT
+SELECT id, name FROM kdb.dbo.test ORDER BY id;
+----
+1	kerb-row-A
+2	kerb-row-B
+3	kerb-row-C
+
+#
+# Test 3: COUNT(*) through mssql_scan (raw query path).
+#
+query I
+SELECT * FROM mssql_scan('kdb', 'SELECT COUNT(*) AS n FROM dbo.test');
+----
+3
+
+statement ok
+DETACH kdb;
+
+#
+# Test 4: ATTACH via explicit authenticator=krb5 (go-mssqldb form).
+#
+statement ok
+ATTACH 'Server=sql.example.com,1433;Database=TestDB;authenticator=krb5;Encrypt=yes;TrustServerCertificate=yes' AS kdb2 (TYPE mssql);
+
+query IT
+SELECT id, name FROM kdb2.dbo.test ORDER BY id LIMIT 1;
+----
+1	kerb-row-A
+
+statement ok
+DETACH kdb2;
+
+#
+# Test 5: URI form.
+#
+statement ok
+ATTACH 'mssql://sql.example.com:1433/TestDB?authenticator=krb5&encrypt=true' AS kdb3 (TYPE mssql);
+
+query I
+SELECT COUNT(*) FROM kdb3.dbo.test;
+----
+3
+
+statement ok
+DETACH kdb3;
