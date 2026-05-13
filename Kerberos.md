@@ -549,6 +549,18 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
   cryptographically verified by the KDC. `TrustServerCertificate=yes` only
   affects TLS certificate validation — it does not weaken Kerberos.
 
+#### Operational security checklist
+
+| Item | Why | How to verify |
+|---|---|---|
+| Credential cache file is `0600` | The TGT in `/tmp/krb5cc_<uid>` is a bearer credential for your AD principal — anyone who can read the file can impersonate you for the TGT's lifetime. | `ls -la /tmp/krb5cc_$UID` (MIT default is `0600`; verify after any custom `KRB5CCNAME` config). For `DIR:` / `KEYRING:persistent:` ccache types, check the equivalent ACL. |
+| Keytab files are `0600` and owned by the service account | A keytab is the password equivalent — anyone who can read it can impersonate the principal until the keys are rotated. | `find / -name '*.keytab' 2>/dev/null -exec ls -la {} \;` |
+| `KRB5_TRACE` is not set in production | MIT Kerberos writes ticket-acquisition trace (principal names, key versions, ticket flags) to the path in `KRB5_TRACE`. Useful for debugging, dangerous if forgotten. | `env \| grep KRB5_TRACE` — should be empty |
+| `MSSQL_DEBUG` is unset (or `0`) in production | Our extension logs auth flow timing, SPN, host, and pool factory errors to stderr at level 1–3. Sizes and metadata only (no token contents — verified by audit), but reveals operational signal. | `env \| grep MSSQL_DEBUG` — should be empty |
+| Coredumps disabled for the DuckDB process | If the process crashes, the coredump contains in-memory cleartext tokens, ccache contents, and TGS session keys. | `ulimit -c 0` before launching DuckDB, or `prlimit --core=0 -p <pid>` on a running process. For systemd-managed services: `LimitCORE=0` in the unit file. |
+| Connection strings with passwords don't reach shell history | `duckdb -c "ATTACH '...;Password=...' ..."` writes the password to `~/.bash_history` and exposes it in `ps auxw` to other users for the duration of the process. | Use `CREATE SECRET` + `ATTACH '' AS db (TYPE mssql, SECRET <name>)` instead, or wrap the ATTACH in a heredoc (`duckdb --unsigned <<'EOF'\n…\nEOF`). For Kerberos this is moot — `Trusted_Connection=yes` carries no secret. |
+| `duckdb_secrets()` does not expose the password | The `password` field is registered as a redacted secret key in DuckDB's SecretManager and shows as `***` instead of the cleartext. | `SELECT name, secret_string FROM duckdb_secrets() WHERE type='mssql';` |
+
 ### See Also
 
 - [AZURE.md](AZURE.md) — Azure AD authentication (Entra ID, Service Principal,
