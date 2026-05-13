@@ -10,6 +10,7 @@ End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
 - [Credential Modes](#credential-modes)
 - [Connection Examples](#connection-examples)
 - [Using MSSQL Secrets](#using-mssql-secrets)
+- [Diagnostic function: `mssql_kerberos_auth_test`](#diagnostic-function-mssql_kerberos_auth_test)
 - [Troubleshooting](#troubleshooting)
 - [Running the test stack locally](#running-the-test-stack-locally)
 - [Reference](#reference)
@@ -299,6 +300,104 @@ Note the underscore convention in secret fields vs hyphens in connection strings
 — this matches the project's existing convention (`schema_filter` in secrets,
 `schema-filter` in connection strings).
 
+## Diagnostic function: `mssql_kerberos_auth_test`
+
+Test the Kerberos auth path **without actually connecting to SQL Server**.
+Parallels `mssql_azure_auth_test` for Azure AD. Useful for confirming that
+`/etc/krb5.conf` is reachable from the DuckDB process, the ccache has a
+valid TGT, the SPN resolves through the KDC, and `gss_init_sec_context`
+produces a non-empty SPNEGO blob — none of which `kinit` + `klist` alone
+verify.
+
+Three overloads:
+
+```sql
+-- 1. Smoke test against a host, default port 1433, default ccache.
+--    Derives SPN = MSSQLSvc/<host>:1433.
+SELECT mssql_kerberos_auth_test('sqlhost.corp.example.com');
+
+-- 2. Explicit port (named-instance / non-1433 deployments).
+--    Derives SPN = MSSQLSvc/<host>:<port>.
+SELECT mssql_kerberos_auth_test('sqlhost.corp.example.com', 1433);
+
+-- 3. Against a configured MSSQL secret -- exercises the FULL Krb5Config
+--    path (honors keytab, krb5-realm, service_principal_name override,
+--    etc.) exactly the way an ATTACH against the same secret would.
+SELECT mssql_kerberos_auth_test_secret('my_kerb_secret');
+```
+
+### Success output
+
+One-line status string:
+
+```text
+OK: principal=alice@CORP.EXAMPLE.COM, spn=MSSQLSvc/sqlhost.corp.example.com:1433, mech=SPNEGO, token_size=1834 bytes
+```
+
+The values reveal the same things an experienced SRE would check manually:
+
+- `principal=...` — what `klist` reports as the default principal in the
+  ccache (or `<no ticket>` if the ccache is empty). On macOS this shows
+  `<macOS: run klist>` because GSS.framework doesn't export the krb5_cc_*
+  extensions; run `klist` from the shell to see the principal there.
+- `spn=...` — the exact service principal name the KDC was asked for.
+  Compare to `setspn -L DOMAIN\sqlservice` on a Windows admin host.
+- `mech=SPNEGO` — confirms the mechanism is right (SQL Server expects
+  SPNEGO, not raw Kerberos).
+- `token_size=...` — sanity check that the blob isn't suspiciously small
+  (a 100-byte token usually means SPNEGO couldn't establish the underlying
+  Kerberos mech).
+
+### Failure output
+
+The function returns the verbatim error message — same wording that
+ATTACH-time validation would produce, including the actionable hint from
+the GSSAPI status taxonomy. Examples:
+
+```text
+-- No kinit yet
+MSSQL Kerberos auth failed: gss_acquire_cred: ... No credentials cache file found.
+(Hint: no credentials cache. Run 'kinit <user>@<REALM>' first.)
+
+-- SPN missing from AD
+MSSQL Kerberos auth failed: gss_init_sec_context: ... Server not found in Kerberos database
+(Hint: server SPN not registered. Verify with 'setspn -L <account>' on Windows admin host.)
+
+-- Clock skew
+MSSQL Kerberos auth failed: gss_init_sec_context: ... Clock skew too great
+(Hint: clock skew between client and KDC exceeds 5 minutes. Sync system clock via ntp/chrony.)
+
+-- Wrong secret type
+MSSQL Kerberos auth test: secret 'sql_pwd' is not configured for Kerberos (authenticator != 'krb5').
+Add authenticator 'krb5' to the secret.
+
+-- Build without Kerberos support
+MSSQL Kerberos auth test: this build of the mssql extension was compiled without
+Kerberos support (MSSQL_ENABLE_KRB5 was not defined). Rebuild with -DENABLE_KRB5=ON.
+```
+
+### When to use each variant
+
+| Goal | Function |
+|---|---|
+| Quick "can I auth at all?" check | `mssql_kerberos_auth_test('host')` |
+| Verifying a non-default port resolves the right SPN | `mssql_kerberos_auth_test('host', 12345)` |
+| Validating a keytab / SPN override before ATTACH | `mssql_kerberos_auth_test_secret('secret_name')` |
+| Pre-flighting a CI pipeline (service account + keytab) | `mssql_kerberos_auth_test_secret(...)` then ATTACH |
+
+### Limitations
+
+- Tests the **client-side** GSSAPI flow only. It does NOT confirm that
+  SQL Server itself will accept the ticket (the server-side mapping
+  `EXAMPLE.COM\testuser` → SQL login needs `setspn`-style work that's
+  outside the extension's scope).
+- A pass here + ATTACH failure → almost always a server-side login
+  mapping issue (run `init.sql`-style `CREATE LOGIN [REALM\user] FROM
+  WINDOWS` on the SQL Server side).
+- A fail here + working `kinit` → `mssql_kerberos_auth_test` exposes a
+  bug in your config that `kinit` didn't catch (wrong SPN, wrong realm
+  resolution, etc.).
+
 ## Troubleshooting
 
 ### Common Errors
@@ -449,6 +548,18 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
 - Kerberos itself provides mutual authentication: the server identity is
   cryptographically verified by the KDC. `TrustServerCertificate=yes` only
   affects TLS certificate validation — it does not weaken Kerberos.
+
+#### Operational security checklist
+
+| Item | Why | How to verify |
+|---|---|---|
+| Credential cache file is `0600` | The TGT in `/tmp/krb5cc_<uid>` is a bearer credential for your AD principal — anyone who can read the file can impersonate you for the TGT's lifetime. | `ls -la /tmp/krb5cc_$UID` (MIT default is `0600`; verify after any custom `KRB5CCNAME` config). For `DIR:` / `KEYRING:persistent:` ccache types, check the equivalent ACL. |
+| Keytab files are `0600` and owned by the service account | A keytab is the password equivalent — anyone who can read it can impersonate the principal until the keys are rotated. | `find / -name '*.keytab' 2>/dev/null -exec ls -la {} \;` |
+| `KRB5_TRACE` is not set in production | MIT Kerberos writes ticket-acquisition trace (principal names, key versions, ticket flags) to the path in `KRB5_TRACE`. Useful for debugging, dangerous if forgotten. | `env \| grep KRB5_TRACE` — should be empty |
+| `MSSQL_DEBUG` is unset (or `0`) in production | Our extension logs auth flow timing, SPN, host, and pool factory errors to stderr at level 1–3. Sizes and metadata only (no token contents — verified by audit), but reveals operational signal. | `env \| grep MSSQL_DEBUG` — should be empty |
+| Coredumps disabled for the DuckDB process | If the process crashes, the coredump contains in-memory cleartext tokens, ccache contents, and TGS session keys. | `ulimit -c 0` before launching DuckDB, or `prlimit --core=0 -p <pid>` on a running process. For systemd-managed services: `LimitCORE=0` in the unit file. |
+| Connection strings with passwords don't reach shell history | `duckdb -c "ATTACH '...;Password=...' ..."` writes the password to `~/.bash_history` and exposes it in `ps auxw` to other users for the duration of the process. | Use `CREATE SECRET` + `ATTACH '' AS db (TYPE mssql, SECRET <name>)` instead, or wrap the ATTACH in a heredoc (`duckdb --unsigned <<'EOF'\n…\nEOF`). For Kerberos this is moot — `Trusted_Connection=yes` carries no secret. |
+| `duckdb_secrets()` does not expose the password | The `password` field is registered as a redacted secret key in DuckDB's SecretManager and shows as `***` instead of the cleartext. | `SELECT name, secret_string FROM duckdb_secrets() WHERE type='mssql';` |
 
 ### See Also
 

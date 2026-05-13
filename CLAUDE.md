@@ -206,6 +206,8 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_close(handle)` | Scalar | Close diagnostic connection |
 | `mssql_ping(handle)` | Scalar | Test connection liveness |
 | `mssql_azure_auth_test(secret, tenant?)` | Scalar | Test Azure AD token acquisition |
+| `mssql_kerberos_auth_test(host [, port])` | Scalar | Test POSIX Kerberos auth path (spec 042); returns OK + SPN / principal / token size, or verbatim GSSAPI error |
+| `mssql_kerberos_auth_test_secret(secret_name)` | Scalar | Same but reads keytab / SPN-override / etc. from an MSSQL secret |
 
 ## Active Technologies
 - C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library) (019-fix-winsock-init)
@@ -278,6 +280,7 @@ POSIX Kerberos and Windows SSPI integrated authentication, shipped via spec 042.
 - `src/tds/tds_connection.cpp` `AuthenticateIntegrated()` — SPNEGO continuation loop on `0xED` SSPI tokens
 - `src/tds/tds_protocol.cpp` `BuildLogin7WithSSPI` + `BuildSSPIMessage` — LOGIN7 with `fIntSecurity` bit (0x80) + SSPI Message packet type 0x11
 - `src/connection/mssql_pool_manager.cpp` `GetOrCreatePoolWithIntegratedAuth` — pool factory builds a fresh authenticator per connection so kinit-refreshed tickets are picked up
+- `src/tds/auth/krb5_test_function.cpp` — registers `mssql_kerberos_auth_test(host[, port])` and `mssql_kerberos_auth_test_secret(secret_name)` scalar functions. Mirrors `mssql_azure_auth_test` for Azure; exercises `Krb5Authenticator::InitialBytes()` without connecting to SQL Server. Compiled with a no-op fallback so the functions are always registered (returns "compiled without Kerberos support" when `MSSQL_ENABLE_KRB5` is undefined).
 
 **Test infrastructure:** `test/kerberos/` — self-contained docker-compose stack (KDC + SQL Server + test-client). No real Active Directory required:
 

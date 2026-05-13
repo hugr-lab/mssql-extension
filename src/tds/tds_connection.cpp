@@ -1075,17 +1075,26 @@ bool TdsConnection::ExecuteBatch(const std::string &sql) {
 								 i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
 								 static_cast<unsigned>(packet.GetStatus()), packet.GetLength(),
 								 packet.GetPayload().size(), packet.IsEndOfMessage(), packet.GetPacketId());
-			// Dump full packet header and first bytes of payload for debugging
+			// Dump packet framing (TDS header + ALL_HEADERS) only -- this is what's
+			// needed to debug packet boundaries / MARS / transaction descriptors.
+			// We deliberately stop at 30 bytes (8-byte TDS header + 22-byte
+			// ALL_HEADERS = full framing metadata, ZERO bytes of SQL text), so an
+			// admin who enables MSSQL_DEBUG=3 cannot accidentally capture a
+			// fragment of inline SQL containing credentials (e.g. `CREATE LOGIN
+			// ... PASSWORD '...'`). See spec 042 security follow-up.
 			if (i == 0 && GetMssqlDebugLevel() >= 3) {
 				std::vector<uint8_t> serialized = packet.Serialize();
 				std::string hex_dump;
-				// Dump header (8 bytes) + first 42 bytes of payload = 50 bytes total
-				for (size_t j = 0; j < std::min<size_t>(50, serialized.size()); j++) {
+				constexpr size_t kHeaderFramingBytes = 30;	// TDS header (8) + ALL_HEADERS (22)
+				for (size_t j = 0; j < std::min<size_t>(kHeaderFramingBytes, serialized.size()); j++) {
 					char buf[4];
 					snprintf(buf, sizeof(buf), "%02x ", serialized[j]);
 					hex_dump += buf;
 				}
-				MSSQL_CONN_DEBUG_LOG(3, "ExecuteBatch: packet bytes (header+payload, first 50): %s", hex_dump.c_str());
+				MSSQL_CONN_DEBUG_LOG(3,
+									 "ExecuteBatch: packet framing (TDS hdr + ALL_HEADERS, first %zu bytes): %s "
+									 "(SQL text deliberately omitted)",
+									 kHeaderFramingBytes, hex_dump.c_str());
 			}
 			if (!socket_->SendPacket(packet)) {
 				last_error_ = "Failed to send SQL_BATCH: " + socket_->GetLastError();

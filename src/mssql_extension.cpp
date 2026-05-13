@@ -1,5 +1,6 @@
 #include "mssql_extension.hpp"
 #include "azure/azure_test_function.hpp"
+#include "tds/auth/krb5_test_function.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "connection/mssql_diagnostic.hpp"
@@ -71,7 +72,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 11. Register Azure authentication test function
 	mssql::azure::RegisterAzureTestFunction(loader);
 
-	// 12. Register optimizer extension for ORDER BY pushdown (Spec 039)
+	// 12. Register Kerberos authentication test function (spec 042).
+	//     Always registered; on builds without MSSQL_ENABLE_KRB5 it returns a
+	//     clear "compiled without Kerberos support" message instead of being absent.
+	mssql::krb5::RegisterKrb5TestFunction(loader);
+
+	// 13. Register optimizer extension for ORDER BY pushdown (Spec 039)
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	OptimizerExtension mssql_optimizer;
