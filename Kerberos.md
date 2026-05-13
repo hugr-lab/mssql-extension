@@ -70,8 +70,43 @@ Minimal `/etc/krb5.conf`:
 
 ### Windows
 
-**Phase 4 is not yet shipped.** Windows SSPI support is on the roadmap (`secur32.dll`
-+ the `Negotiate` package). Until it lands, use [WSL2 Ubuntu](#wsl2-ubuntu-under-windows).
+Native Windows SSPI via `secur32.dll`'s Negotiate package. Uses the current
+Windows logon session — no `kinit` needed. Same connection-string surface as
+POSIX:
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com,1433;Database=YourDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes'
+    AS db (TYPE mssql);
+```
+
+Or the explicit form:
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com,1433;Database=YourDB;authenticator=winsspi;Encrypt=yes;TrustServerCertificate=yes'
+    AS db (TYPE mssql);
+```
+
+`Trusted_Connection=yes` and `Integrated Security=SSPI` both resolve to
+`authenticator=winsspi` on Windows; on POSIX they resolve to
+`authenticator=krb5`. The behavior is the same — your machine's existing
+authentication credentials are used.
+
+**Prerequisites:**
+
+- Domain-joined Windows host (or sufficient privileges to acquire a Kerberos
+  TGT for the target realm).
+- SQL Server's SPN registered in AD with the canonical
+  `MSSQLSvc/<fqdn>:<port>` form. Verify with `setspn -L DOMAIN\sqlservice`
+  from an admin PowerShell.
+- No build-time dependencies — `secur32.lib` is part of the Windows SDK.
+
+**Limitations:**
+
+- Only credential-cache mode (current logon session). Keytab and raw-credentials
+  modes are POSIX-only.
+- Negotiate falls back to NTLM transparently when the KDC isn't reachable for
+  the target SPN. If you require Kerberos-only authentication, ensure the SPN
+  is registered correctly so the fallback is never triggered.
 
 ### WSL2 (Ubuntu under Windows)
 
@@ -532,7 +567,7 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
 |---|---|---|---|---|
 | Linux x86_64 / ARM64 | yes | yes | yes (secret only) | Phase 3 shipped |
 | macOS ARM64 | yes | rejected | rejected | Phase 3 shipped |
-| Windows x64 | n/a | n/a | n/a | Phase 4 pending |
+| Windows x64 | yes (logon session) | n/a (use logon session) | n/a (use logon session) | Phase 4 shipped |
 | WSL2 Ubuntu | yes | yes | yes (secret only) | Same as Linux |
 
 ### Security notes

@@ -212,9 +212,12 @@ set(EXTENSION_SOURCES
 
 # Spec 042: conditional inclusion of the platform-specific integrated-auth
 # authenticator. POSIX gets krb5_authenticator.cpp when GSSAPI is discovered;
-# Windows gets winsspi_authenticator.cpp (Phase 4).
+# Windows gets winsspi_authenticator.cpp via secur32.dll (Phase 4).
 if(MSSQL_KRB5_AVAILABLE)
     list(APPEND EXTENSION_SOURCES src/tds/auth/krb5_authenticator.cpp)
+endif()
+if(MSSQL_SSPI_AVAILABLE)
+    list(APPEND EXTENSION_SOURCES src/tds/auth/winsspi_authenticator.cpp)
 endif()
 
 # Build static extension (linked into DuckDB)

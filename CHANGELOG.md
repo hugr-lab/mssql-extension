@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Windows SSPI** integrated authentication (spec 042 Phase 4). `WinSspiAuthenticator`
+  via `secur32.dll`'s Negotiate package. Uses the current Windows logon session — no
+  `kinit` needed. Same connection-string surface as POSIX (`Trusted_Connection=yes` /
+  `authenticator=winsspi`). Mirrors the structure of `Krb5Authenticator`; shares the
+  `IAuthenticator` interface and the SPNEGO continuation loop in
+  `TdsConnection::AuthenticateIntegrated`. Linked against `secur32.lib` from the
+  Windows SDK — no third-party dependency.
+
 - **Integrated Authentication (Kerberos)** for POSIX hosts (spec 042, phases 1-3).
   Adds the `IAuthenticator` multi-round interface, parser support for the
   `microsoft/go-mssqldb` connection-string surface, LOGIN7 `fIntSecurity`
