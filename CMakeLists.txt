@@ -69,14 +69,23 @@ if(ENABLE_KRB5)
         endif()
     else()
         # Linux + other POSIX: prefer pkg-config, fall back gracefully if missing.
+        # Need both krb5-gssapi (for gss_* symbols) AND krb5 (for krb5_*
+        # symbols used by raw-credentials mode -- krb5_init_context,
+        # krb5_get_init_creds_password, krb5_get_error_message, etc.).
+        # libkrb5 does NOT come in transitively via krb5-gssapi.pc on at
+        # least Ubuntu 24.04 -- linking only -lgssapi_krb5 produces
+        # "undefined reference to symbol 'krb5_free_error_message@@krb5_3_MIT'".
         find_package(PkgConfig QUIET)
         if(PkgConfig_FOUND)
             pkg_check_modules(MSSQL_GSSAPI krb5-gssapi)
-            if(MSSQL_GSSAPI_FOUND)
+            pkg_check_modules(MSSQL_KRB5_BASE krb5)
+            if(MSSQL_GSSAPI_FOUND AND MSSQL_KRB5_BASE_FOUND)
                 set(MSSQL_KRB5_AVAILABLE TRUE)
-                message(STATUS "Integrated Auth: Linux Kerberos enabled (GSSAPI ${MSSQL_GSSAPI_VERSION})")
-            else()
+                message(STATUS "Integrated Auth: Linux Kerberos enabled (GSSAPI ${MSSQL_GSSAPI_VERSION}, krb5 ${MSSQL_KRB5_BASE_VERSION})")
+            elseif(NOT MSSQL_GSSAPI_FOUND)
                 message(WARNING "Integrated Auth: pkg-config could not locate krb5-gssapi; install libkrb5-dev to enable")
+            else()
+                message(WARNING "Integrated Auth: krb5-gssapi found but base krb5 missing; install libkrb5-dev to enable")
             endif()
         else()
             message(WARNING "Integrated Auth: pkg-config not found; Linux Kerberos discovery skipped")
@@ -230,8 +239,14 @@ if(MSSQL_KRB5_AVAILABLE)
     if(APPLE)
         target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
     else()
-        target_include_directories(${EXTENSION_NAME} PRIVATE ${MSSQL_GSSAPI_INCLUDE_DIRS})
-        target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSSAPI_LIBRARIES})
+        # Order matters: krb5 (base) AFTER gssapi_krb5 so the linker resolves
+        # gssapi's references to krb5 symbols, then the krb5 SONAME is added
+        # to NEEDED. Without the explicit -lkrb5 the link fails with
+        # 'undefined reference to symbol krb5_free_error_message'.
+        target_include_directories(${EXTENSION_NAME} PRIVATE
+            ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
+        target_link_libraries(${EXTENSION_NAME}
+            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
     endif()
 endif()
 
@@ -265,8 +280,10 @@ if(MSSQL_KRB5_AVAILABLE)
     if(APPLE)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
     else()
-        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${MSSQL_GSSAPI_INCLUDE_DIRS})
-        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSSAPI_LIBRARIES})
+        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
+            ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
+        target_link_libraries(${LOADABLE_EXTENSION_NAME}
+            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
     endif()
 endif()
 
