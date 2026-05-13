@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Windows SSPI (`winsspi` authenticator) is Phase 4 — pending. WSL2 Ubuntu
     is the supported testing path on Windows in the meantime.
 
+### Fixed
+
+- Linux build with Kerberos enabled now links `libkrb5` explicitly. Previous
+  builds failed at the link step with `undefined reference to symbol
+  'krb5_free_error_message'` on distros where `krb5-gssapi.pc` doesn't
+  transitively pull in `libkrb5` (Ubuntu 24.04 is the documented case).
+  Affects spec 042 raw-credentials mode users on Linux only — macOS uses
+  `GSS.framework` which bundles all symbols. Configure-time warnings now
+  cite both Debian (`libkrb5-dev`) and RHEL (`krb5-devel`) package names.
+
 ### Security
 
 - Hardened FEDAUTH JWT debug logging: `tds_connection.cpp` previously
