@@ -159,20 +159,37 @@ bool MSSQLConnectionInfo::IsConnectionString(const string &str) {
 	return IsConnectionStringImpl(str);
 }
 
-// URL decode a string (handles %XX encoding)
+// URL decode a string (handles %XX encoding).
+//
+// Spec 043 FR-010 / FR-011 / Q1 Clarification: malformed escapes are
+// passed through literally (deterministic). A `%` is only consumed when
+// followed by EXACTLY TWO hex digits (case-insensitive). Anything else —
+// `%`, `%X`, `%XG`, trailing `%` — is emitted verbatim and the parser
+// advances one character. The previous sscanf-based implementation
+// silently consumed an invalid second character when the first was hex
+// (e.g. `%aG` produced byte 0x0a and dropped the `G`); this is fixed
+// here. Locale-independent — uses ASCII hex check, no setlocale/sscanf.
+static inline bool IsHexDigit(char c) {
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+
+static inline int HexVal(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+	return 10 + (c - 'a');  // c in [a..f] guaranteed by caller
+}
+
 static string UrlDecode(const string &str) {
 	string result;
 	result.reserve(str.size());
-	for (size_t i = 0; i < str.size(); i++) {
-		if (str[i] == '%' && i + 2 < str.size()) {
-			int hex_val = 0;
-			if (sscanf(str.substr(i + 1, 2).c_str(), "%x", &hex_val) == 1) {
-				result += static_cast<char>(hex_val);
-				i += 2;
-				continue;
-			}
+	for (size_t i = 0; i < str.size();) {
+		if (str[i] == '%' && i + 2 < str.size() && IsHexDigit(str[i + 1]) && IsHexDigit(str[i + 2])) {
+			result.push_back(static_cast<char>((HexVal(str[i + 1]) << 4) | HexVal(str[i + 2])));
+			i += 3;
+		} else {
+			result.push_back(str[i]);
+			i += 1;
 		}
-		result += str[i];
 	}
 	return result;
 }
@@ -253,31 +270,111 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 	return result;
 }
 
+// Tokenize a connection string into `key=value` pairs.
+//
+// Spec 043 FR-012: honor ADO.NET-style `{...}` quoting around values so
+// that a `;` inside a quoted value does not split the pair. Inside braces
+// a literal `}` is escaped as `}}`. Outside braces, behavior is the same
+// as `Split(...; ';')`. `"..."` / `'...'` quoting is intentionally out of
+// scope for spec 043.
+//
+// Returns trimmed key/value pairs; brace markers are stripped from the
+// returned value but every inner character (including `;`, `=`, raw `{`,
+// and the post-`}}` literal `}`) is preserved verbatim.
+struct ConnStringPair {
+	string key;
+	string value;
+};
+
+static std::vector<ConnStringPair> TokenizeConnectionString(const string &cs) {
+	std::vector<ConnStringPair> out;
+	const size_t n = cs.size();
+	size_t i = 0;
+	while (i < n) {
+		// Skip leading whitespace + stray separators.
+		while (i < n && (cs[i] == ';' || cs[i] == ' ' || cs[i] == '\t')) {
+			i++;
+		}
+		if (i >= n) {
+			break;
+		}
+
+		// Read key up to '=' (no quoting on the key side).
+		const size_t key_start = i;
+		while (i < n && cs[i] != '=' && cs[i] != ';') {
+			i++;
+		}
+		if (i >= n || cs[i] != '=') {
+			// Malformed pair (no '='); skip to next ';'.
+			while (i < n && cs[i] != ';') {
+				i++;
+			}
+			continue;
+		}
+		string key = cs.substr(key_start, i - key_start);
+		StringUtil::Trim(key);
+		i++;  // consume '='
+
+		// Skip whitespace before value.
+		while (i < n && (cs[i] == ' ' || cs[i] == '\t')) {
+			i++;
+		}
+
+		string value;
+		if (i < n && cs[i] == '{') {
+			// Brace-quoted value: read until matching unescaped '}'. Inside
+			// braces, `}}` is a literal `}`.
+			i++;  // consume opening '{'
+			while (i < n) {
+				if (cs[i] == '}') {
+					if (i + 1 < n && cs[i + 1] == '}') {
+						value.push_back('}');
+						i += 2;
+						continue;
+					}
+					i++;  // consume closing '}'
+					break;
+				}
+				value.push_back(cs[i]);
+				i++;
+			}
+			// Skip optional trailing whitespace + ';'.
+			while (i < n && (cs[i] == ' ' || cs[i] == '\t')) {
+				i++;
+			}
+			if (i < n && cs[i] == ';') {
+				i++;
+			}
+		} else {
+			// Unquoted value: read up to ';'. Trim trailing whitespace.
+			const size_t val_start = i;
+			while (i < n && cs[i] != ';') {
+				i++;
+			}
+			value = cs.substr(val_start, i - val_start);
+			StringUtil::Trim(value);
+			if (i < n && cs[i] == ';') {
+				i++;
+			}
+		}
+
+		if (key.empty()) {
+			continue;
+		}
+		out.push_back({std::move(key), std::move(value)});
+	}
+	return out;
+}
+
 // Parse key=value pairs from connection string
 // Format: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
+// Supports ADO.NET-style {...} value quoting (spec 043 FR-012).
 static case_insensitive_map_t<string> ParseConnectionString(const string &connection_string) {
 	case_insensitive_map_t<string> result;
 
-	// Split by semicolon
-	auto parts = StringUtil::Split(connection_string, ';');
-	for (auto &part : parts) {
-		// Trim whitespace (Trim modifies in place)
-		string trimmed = part;
-		StringUtil::Trim(trimmed);
-		if (trimmed.empty()) {
-			continue;
-		}
-
-		// Split by first '='
-		auto eq_pos = trimmed.find('=');
-		if (eq_pos == string::npos) {
-			continue;  // Skip invalid parts
-		}
-
-		string key = trimmed.substr(0, eq_pos);
-		string value = trimmed.substr(eq_pos + 1);
-		StringUtil::Trim(key);
-		StringUtil::Trim(value);
+	for (auto &pair : TokenizeConnectionString(connection_string)) {
+		const string &key = pair.key;
+		const string &value = pair.value;
 
 		// Normalize key names
 		auto lower_key = StringUtil::Lower(key);

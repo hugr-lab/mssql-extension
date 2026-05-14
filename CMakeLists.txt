@@ -41,6 +41,14 @@ message(STATUS "TLS using OpenSSL version: ${OPENSSL_VERSION}")
 message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
 
 # =============================================================================
+# simdutf for SIMD-accelerated UTF-8 / UTF-16LE transcoding
+# Used by the LOGIN7 non-ASCII fix (spec 043); bulk consumer migration in 044.
+# Statically linked via the project's existing vcpkg static triplets.
+# =============================================================================
+find_package(simdutf CONFIG REQUIRED)
+message(STATUS "simdutf: located via vcpkg (target simdutf::simdutf)")
+
+# =============================================================================
 # Extension Sources
 # =============================================================================
 set(EXTENSION_SOURCES
@@ -50,6 +58,7 @@ set(EXTENSION_SOURCES
     src/mssql_functions.cpp
     # Encoding utilities (in tds namespace)
     src/tds/encoding/utf16.cpp
+    src/tds/encoding/simdutf_wrappers.cpp
     src/tds/encoding/decimal_encoding.cpp
     src/tds/encoding/datetime_encoding.cpp
     src/tds/encoding/guid_encoding.cpp
@@ -162,6 +171,7 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${EXTENSION_NAME} simdutf::simdutf)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
@@ -182,6 +192,7 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} simdutf::simdutf)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
