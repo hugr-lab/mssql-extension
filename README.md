@@ -1599,10 +1599,17 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 
 ## Third-Party Licenses
 
-This project includes components from the Azure Identity SDK
-licensed under the Apache License, Version 2.0.
+The hugr-lab/mssql-extension release binaries statically link the
+following third-party components:
 
-© Microsoft Corporation
+- **OpenSSL** (TLS / cryptography), licensed under the Apache
+  License, Version 2.0. © The OpenSSL Project Authors and
+  contributors. Version pinned via `vcpkg.json`.
+  License text: [LICENSES/openssl-LICENSE.txt](LICENSES/openssl-LICENSE.txt)
+- The **simdutf** library (Unicode transcoding via SIMD), used
+  under the MIT License option of its dual Apache-2.0/MIT
+  licensing. © Daniel Lemire and simdutf contributors.
+  License text: [LICENSES/simdutf-LICENSE-MIT.txt](LICENSES/simdutf-LICENSE-MIT.txt)
 
 ## License
 

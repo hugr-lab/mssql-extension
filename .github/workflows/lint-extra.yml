@@ -1,0 +1,46 @@
+name: Lint (yaml)
+
+# yamllint on workflows and top-level YAML. Catches real YAML errors that
+# tooling like clang-format wouldn't notice.
+#
+# NOTE: shellcheck / hadolint / codespell are intentionally NOT in this PR.
+# The first CI run surfaced real pre-existing findings in vendored /
+# scaffolding files (SC2046/SC2155 in .specify/scripts/bash, DL3029/DL3008/
+# DL3015 in docker/Dockerfile.build, real typos in src/). Adding them as
+# required checks before cleanup would block unrelated PRs; adding them as
+# continue-on-error still leaves the checks page red. The right move is to
+# fix the findings in dedicated follow-up PRs and bring the linters in
+# alongside the fixes.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-extra-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install yamllint
+        run: pip install --user yamllint==1.35.1
+      - name: Run yamllint
+        run: |
+          # Relaxed ruleset: GHA workflow files trip strict 'truthy' and
+          # 'line-length' rules constantly. We only care about real errors.
+          yamllint \
+            -d '{extends: relaxed, rules: {line-length: disable, truthy: disable, comments: disable}}' \
+            .github/ \
+            $(find . -maxdepth 3 -name '*.yml' -not -path './duckdb/*' -not -path './vcpkg/*' -not -path './.github/*' -not -path './build/*' -not -path './.git/*')

@@ -1,0 +1,80 @@
+name: CodeQL
+
+# C/C++ static analysis via GitHub-native CodeQL. Catches CVE-class bugs
+# (use-after-free, taint flow into format strings, crypto misuse, OOB reads).
+# Free for public repos. CodeQL traces a real CMake build so the analysis
+# sees the actual translation units, not a stub.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'extension_config.cmake'
+      - '.github/workflows/codeql.yml'
+  schedule:
+    # Weekly scan against main so newly-added CodeQL queries (Microsoft ships
+    # them roughly monthly) get applied without waiting for the next PR.
+    - cron: '32 4 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (C/C++)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout DuckDB submodule
+        run: git submodule update --init --recursive duckdb
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          # security-extended adds queries beyond the default suite that are
+          # high-signal for native code (e.g. CWE-119, CWE-416, CWE-787).
+          queries: security-extended
+
+      - name: Setup Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Setup vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+
+      - name: Build (CodeQL traces compiler invocations)
+        run: |
+          mkdir -p build/release
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            ../../duckdb
+          cmake --build . --config Release
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: cpp

@@ -1,0 +1,175 @@
+# name: test/sql/integration/non_ascii_connection_formats.test
+# description: Spec 043 US3 — non-ASCII credentials round-trip identically
+#              through all three accepted connection-string formats (URI,
+#              ADO.NET key/value, DuckDB secret), with ADO.NET {...} quoting
+#              honored. Also covers FR-023 (encrypt=true|false).
+# group: [mssql] [integration]
+#
+# REQUIRES: SQL Server running (via `make docker-up`)
+# Connection parameters come from MSSQL_TEST_* env vars exported by the
+# project Makefile. No hardcoded host/port — the URI / ADO.NET strings
+# are constructed from ${MSSQL_TEST_HOST} and ${MSSQL_TEST_PORT}.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+# ============================================================================
+# Bootstrap: ensure spec043_user_ru and spec043_user_braces exist (idempotent).
+# ============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS bootstrap_admin (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bootstrap_admin', '
+    IF SUSER_ID(''spec043_user_ru'') IS NULL
+    BEGIN
+        CREATE LOGIN [spec043_user_ru]
+            WITH PASSWORD = N''Тест123!'',
+            CHECK_POLICY = OFF,
+            CHECK_EXPIRATION = OFF;
+    END
+');
+
+statement ok
+SELECT mssql_exec('bootstrap_admin', '
+    IF DATABASE_PRINCIPAL_ID(''spec043_user_ru'') IS NULL
+    BEGIN
+        CREATE USER [spec043_user_ru] FOR LOGIN [spec043_user_ru];
+        EXEC sp_addrolemember ''db_datareader'', ''spec043_user_ru'';
+    END
+');
+
+# Login with ADO.NET-{quoted}-style password containing both ';' and non-ASCII.
+statement ok
+SELECT mssql_exec('bootstrap_admin', '
+    IF SUSER_ID(''spec043_user_braces'') IS NULL
+    BEGIN
+        CREATE LOGIN [spec043_user_braces]
+            WITH PASSWORD = N''Тест;123!'',
+            CHECK_POLICY = OFF,
+            CHECK_EXPIRATION = OFF;
+    END
+');
+
+statement ok
+SELECT mssql_exec('bootstrap_admin', '
+    IF DATABASE_PRINCIPAL_ID(''spec043_user_braces'') IS NULL
+    BEGIN
+        CREATE USER [spec043_user_braces] FOR LOGIN [spec043_user_braces];
+        EXEC sp_addrolemember ''db_datareader'', ''spec043_user_braces'';
+    END
+');
+
+statement ok
+DETACH bootstrap_admin;
+
+# ============================================================================
+# Format 1: mssql:// URI with percent-encoded non-ASCII password.
+# Encrypt=true and Encrypt=false (FR-023).
+# %D0%A2%D0%B5%D1%81%D1%82 = "Тест", %31%32%33%21 is left as "123!" literally.
+# ============================================================================
+
+statement ok
+ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB?encrypt=true&trustservercertificate=true' AS mssql_uri_tls (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('mssql_uri_tls', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_uri_tls;
+
+statement ok
+ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB?encrypt=false' AS mssql_uri_plain (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('mssql_uri_plain', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_uri_plain;
+
+# ============================================================================
+# Format 2: ADO.NET key/value with literal non-ASCII bytes.
+# Encrypt=true and Encrypt=false (FR-023).
+# ============================================================================
+
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=true;TrustServerCertificate=true' AS mssql_ado_tls (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('mssql_ado_tls', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_ado_tls;
+
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=false' AS mssql_ado_plain (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('mssql_ado_plain', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_ado_plain;
+
+# ============================================================================
+# Format 3: DuckDB secret with non-ASCII password (FR-014 by use).
+# ============================================================================
+
+statement ok
+CREATE OR REPLACE SECRET spec043_secret_ru (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'TestDB',
+    "user" 'spec043_user_ru',
+    password 'Тест123!',
+    use_encrypt false
+);
+
+statement ok
+ATTACH '' AS mssql_secret_ru (TYPE mssql, SECRET spec043_secret_ru);
+
+query I
+SELECT * FROM mssql_scan('mssql_secret_ru', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_secret_ru;
+
+statement ok
+DROP SECRET spec043_secret_ru;
+
+# ============================================================================
+# Format 4: ADO.NET with {...} quoted value containing ';' (FR-012).
+# Password is "Тест;123!"; without {...} quoting the parser would split on
+# the inner ';' and the wrong bytes would reach the LOGIN7 builder.
+# ============================================================================
+
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_braces;Password={Тест;123!};Encrypt=false' AS mssql_braces (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('mssql_braces', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH mssql_braces;

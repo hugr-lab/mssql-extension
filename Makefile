@@ -169,6 +169,39 @@ test-simple-query:
 	@echo ""
 	build/test/test_simple_query
 
+# Spec 043: LOGIN7 non-ASCII fix + simdutf wrapper unit tests
+# Pure in-memory test — does NOT need SQL Server or TLS. Uses the simdutf
+# library already built into the debug/release tree by vcpkg.
+LOGIN7_TEST_SOURCES := \
+    src/tds/tds_packet.cpp \
+    src/tds/tds_protocol.cpp \
+    src/tds/tds_types.cpp \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/simdutf_wrappers.cpp
+
+LOGIN7_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
+LOGIN7_TEST_VCPKG_TRIPLET := $(shell ls $(LOGIN7_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
+LOGIN7_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+LOGIN7_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+    -I $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/include
+LOGIN7_TEST_LIBS := -L $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
+
+test-login7-encoding: debug
+	@echo "Building LOGIN7 + simdutf wrapper unit test..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
+	    test/cpp/test_login7_encoding.cpp \
+	    $(LOGIN7_TEST_SOURCES) \
+	    $(LOGIN7_TEST_LIBS) \
+	    -o build/test/test_login7_encoding
+	@echo ""
+	@echo "Running LOGIN7 + simdutf unit test..."
+	build/test/test_login7_encoding
+
 # Show help
 help:
 	@echo "DuckDB MSSQL Extension Build System"
