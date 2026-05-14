@@ -49,16 +49,22 @@ static std::string LookupCurrentPrincipal() {
 	// User principal name (alice@CORP.EXAMPLE.COM) is the closest analog to
 	// the kinit ccache principal we report on POSIX. Falls back to NameSamCompatible
 	// (DOMAIN\user) on machines where the UPN isn't set on the account.
+	// Note: we use &buf[0] / &utf8[0] (not .data()) for writable pointers because
+	// this project is pinned to C++11 for ODR compat with DuckDB, and
+	// std::wstring::data() / std::string::data() returned only const T* until
+	// C++17. The buffers are pre-sized non-empty before each &[0] is taken, so
+	// the addresses are valid storage. Calls reading from the buffer
+	// (WideCharToMultiByte's LPCWCH source) can keep using .data().
 	ULONG size = 0;
 	GetUserNameExW(NameUserPrincipal, nullptr, &size);
 	if (size > 0) {
 		std::wstring buf(size, L'\0');
-		if (GetUserNameExW(NameUserPrincipal, buf.data(), &size)) {
+		if (GetUserNameExW(NameUserPrincipal, &buf[0], &size)) {
 			buf.resize(size);
 			int needed = WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, nullptr, 0, nullptr, nullptr);
 			if (needed > 0) {
 				std::string utf8(needed - 1, '\0');
-				WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, utf8.data(), needed, nullptr, nullptr);
+				WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, &utf8[0], needed, nullptr, nullptr);
 				return utf8;
 			}
 		}
@@ -68,12 +74,12 @@ static std::string LookupCurrentPrincipal() {
 	GetUserNameExW(NameSamCompatible, nullptr, &size);
 	if (size > 0) {
 		std::wstring buf(size, L'\0');
-		if (GetUserNameExW(NameSamCompatible, buf.data(), &size)) {
+		if (GetUserNameExW(NameSamCompatible, &buf[0], &size)) {
 			buf.resize(size);
 			int needed = WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, nullptr, 0, nullptr, nullptr);
 			if (needed > 0) {
 				std::string utf8(needed - 1, '\0');
-				WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, utf8.data(), needed, nullptr, nullptr);
+				WideCharToMultiByte(CP_UTF8, 0, buf.data(), -1, &utf8[0], needed, nullptr, nullptr);
 				return utf8;
 			}
 		}
