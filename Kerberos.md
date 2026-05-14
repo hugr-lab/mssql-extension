@@ -14,6 +14,7 @@ End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
 - [Diagnostic function: `mssql_winsspi_auth_test` (Windows)](#diagnostic-function-mssql_winsspi_auth_test-windows)
 - [Troubleshooting](#troubleshooting)
 - [Running the test stack locally](#running-the-test-stack-locally)
+- [Running the Windows SSPI test suite](#running-the-windows-sspi-test-suite)
 - [Reference](#reference)
 
 ## Quick Start
@@ -600,6 +601,68 @@ duckdb --unsigned
 ```
 
 See `test/kerberos/README.md` for the full layout and troubleshooting.
+
+## Running the Windows SSPI test suite
+
+The POSIX `test/kerberos/` docker-compose stack has no Windows analog —
+SSPI requires a real Windows logon session against a real KDC, which a
+container can't provide. The Windows test surface is a sqllogictest file
+that runs manually on a domain-joined Windows host:
+
+**Suite:** `test/sql/integrated_auth/winsspi_basic.test` — four cases
+covering `Trusted_Connection=yes` ATTACH, catalog SELECT, raw
+`mssql_scan`, and the explicit `authenticator=winsspi` form.
+
+**Gated on three env vars** so it's a no-op in normal CI:
+
+| Env var | Purpose |
+|---|---|
+| `MSSQL_WINSSPI_TEST=1` | Opt-in switch |
+| `MSSQL_TEST_HOST` | SQL Server hostname (FQDN) |
+| `MSSQL_TEST_DB` | Database to ATTACH (any DB you can read works) |
+
+**Run via the helper script** (recommended):
+
+```powershell
+.\scripts\ci\winsspi_test.ps1 -SqlHost sqlhost.corp.example.com -Database master
+```
+
+The script verifies `klist` shows a TGT, sets the env vars, and runs
+`unittest.exe` against the suite. The `unittest.exe` either comes from a
+local `make` build (`build\release\test\unittest.exe`) or from the
+`unittest-windows_amd64` artifact of a green CI run.
+
+**Or directly:**
+
+```powershell
+$env:MSSQL_WINSSPI_TEST = "1"
+$env:MSSQL_TEST_HOST    = "sqlhost.corp.example.com"
+$env:MSSQL_TEST_DB      = "master"
+
+.\build\release\test\unittest.exe test\sql\integrated_auth\winsspi_basic.test
+```
+
+**Pre-flight with the diagnostic function first.** Cheaper to debug a SPN
+or credential issue via `mssql_winsspi_auth_test` than via a failing
+sqllogictest:
+
+```powershell
+duckdb.exe --unsigned -c "
+  LOAD 'C:\duckdb\ext\mssql.duckdb_extension';
+  SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com');
+"
+```
+
+If that returns `OK: ...`, the SSPI handshake works and any
+sqllogictest failure is on the SQL Server side (login mapping,
+permissions). If it returns an error, fix the client-side problem first.
+
+**Why this isn't automated in CI.** GitHub-hosted Windows runners aren't
+domain-joined and can't be made to be. A self-hosted Windows runner
+joined to an Entra Domain Services managed domain would work but adds
+~$140/mo Azure cost and a maintenance surface that only pays off once
+there's a second Windows contributor. Until then: maintainer manual
+smoke test before merging Windows-touching PRs.
 
 ## Reference
 
