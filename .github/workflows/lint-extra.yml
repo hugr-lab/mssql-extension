@@ -1,0 +1,107 @@
+name: Lint (shell, yaml, docker, spelling)
+
+# Auxiliary lint pass beyond clang-format. Each job is small and parallel so
+# total wall time is dominated by ubuntu-latest spin-up, not the linters
+# themselves.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-extra-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          # Default severity. Bump to "warning" if "style" produces noise.
+          SHELLCHECK_OPTS: -e SC1091
+        with:
+          scandir: '.'
+          # Skip vendored / submodule directories explicitly. shellcheck
+          # follows symlinks by default; the explicit ignore list keeps
+          # the run deterministic.
+          ignore_paths: >-
+            duckdb
+            vcpkg
+            build
+            .git
+
+  hadolint:
+    name: hadolint (Dockerfiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find Dockerfiles
+        id: find
+        run: |
+          set -euo pipefail
+          # Print one path per line; hadolint-action consumes the list.
+          dockerfiles="$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) \
+            -not -path './duckdb/*' \
+            -not -path './vcpkg/*' \
+            -not -path './build/*' \
+            -not -path './.git/*' | sort)"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$dockerfiles" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          printf 'Dockerfiles to lint:\n%s\n' "$dockerfiles"
+      - name: Run hadolint on each Dockerfile
+        if: steps.find.outputs.files != ''
+        run: |
+          set -e
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "::group::hadolint $f"
+            docker run --rm -i hadolint/hadolint:latest hadolint - < "$f"
+            echo "::endgroup::"
+          done <<< "${{ steps.find.outputs.files }}"
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install yamllint
+        run: pip install --user yamllint==1.35.1
+      - name: Run yamllint
+        run: |
+          # Relaxed ruleset: GHA workflow files trip strict 'truthy' and
+          # 'line-length' rules constantly. We only care about real errors.
+          yamllint \
+            -d '{extends: relaxed, rules: {line-length: disable, truthy: disable, comments: disable}}' \
+            .github/ \
+            $(find . -maxdepth 3 -name '*.yml' -not -path './duckdb/*' -not -path './vcpkg/*' -not -path './.github/*' -not -path './build/*' -not -path './.git/*')
+
+  codespell:
+    name: codespell
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run codespell
+        uses: codespell-project/actions-codespell@v2
+        with:
+          # Skip vendored directories and binary-ish files. The ignore-words
+          # list is empty for now; add false-positive identifiers (e.g.
+          # "crate", "nd") here if they crop up.
+          skip: '*.lock,*.svg,duckdb,vcpkg,build,.git,*.bin'
+          check_filenames: true
+          check_hidden: false
