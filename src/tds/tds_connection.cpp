@@ -696,10 +696,9 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	MSSQL_CONN_DEBUG_LOG(1,
 						 "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
 						 initial_blob.size(), client_hostname.c_str(), database.c_str());
-	TdsPacket login = TdsProtocol::BuildLogin7WithSSPI(client_hostname,
-													   tds_server_name_.empty() ? host_ : tds_server_name_, database,
-													   initial_blob, "DuckDB MSSQL Extension",
-													   TDS_DEFAULT_PACKET_SIZE);
+	TdsPacket login =
+		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
+										 initial_blob, "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 	if (!socket_->SendPacket(login)) {
 		last_error_ = "Failed to send LOGIN7 (integrated): " + socket_->GetLastError();
@@ -709,7 +708,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	}
 
 	// Step 4: Continuation loop on 0xED SSPI tokens.
-	constexpr int MAX_SSPI_ROUNDS = 8;  // SPNEGO with cross-realm trust typically 2-3 rounds
+	constexpr int MAX_SSPI_ROUNDS = 8;	// SPNEGO with cross-realm trust typically 2-3 rounds
 	for (int round = 0; round < MAX_SSPI_ROUNDS; round++) {
 		std::vector<uint8_t> response;
 		if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {

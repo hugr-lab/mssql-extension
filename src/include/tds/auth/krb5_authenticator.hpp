@@ -58,13 +58,13 @@ enum class Krb5CredentialMode {
 // keytab path is given, the constructor selects Raw mode.
 //===----------------------------------------------------------------------===//
 struct Krb5Config {
-	std::string spn;			   // MSSQLSvc@<fqdn>  (NOTE: @ not /)
-	std::string configfile;		   // /etc/krb5.conf override (KRB5_CONFIG)
-	std::string keytabfile;		   // Path to keytab; selects Keytab mode
-	std::string credcachefile;	   // ccache path override (KRB5CCNAME)
-	std::string realm;			   // AD realm for raw / keytab modes (uppercased)
-	std::string raw_username;	   // Principal for raw mode (without @REALM is OK)
-	std::string raw_password;	   // Cleartext password for raw mode
+	std::string spn;			// MSSQLSvc@<fqdn>  (NOTE: @ not /)
+	std::string configfile;		// /etc/krb5.conf override (KRB5_CONFIG)
+	std::string keytabfile;		// Path to keytab; selects Keytab mode
+	std::string credcachefile;	// ccache path override (KRB5CCNAME)
+	std::string realm;			// AD realm for raw / keytab modes (uppercased)
+	std::string raw_username;	// Principal for raw mode (without @REALM is OK)
+	std::string raw_password;	// Cleartext password for raw mode
 };
 
 //===----------------------------------------------------------------------===//

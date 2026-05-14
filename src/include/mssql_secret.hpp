@@ -32,8 +32,8 @@ constexpr const char *MSSQL_SECRET_AUTHENTICATOR = "authenticator";			   // krb5
 constexpr const char *MSSQL_SECRET_KRB5_CONFIGFILE = "krb5_configfile";		   // /etc/krb5.conf override
 constexpr const char *MSSQL_SECRET_KRB5_KEYTABFILE = "krb5_keytabfile";		   // Selects keytab credential mode
 constexpr const char *MSSQL_SECRET_KRB5_CREDCACHEFILE = "krb5_credcachefile";  // ccache path override
-constexpr const char *MSSQL_SECRET_KRB5_REALM = "krb5_realm";			// AD realm (uppercased)
-constexpr const char *MSSQL_SECRET_SPN = "service_principal_name";		// Override default SPN derivation
+constexpr const char *MSSQL_SECRET_KRB5_REALM = "krb5_realm";				   // AD realm (uppercased)
+constexpr const char *MSSQL_SECRET_SPN = "service_principal_name";			   // Override default SPN derivation
 
 // Register MSSQL secret type and creation function
 void RegisterMSSQLSecretType(ExtensionLoader &loader);

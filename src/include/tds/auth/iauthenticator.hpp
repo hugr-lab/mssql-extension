@@ -86,8 +86,7 @@ public:
 	// Optional: install channel binding data for EPA. Default no-op.
 	// Servers that require EPA will reject the connection with a specific
 	// error when this is not implemented; that escalation lives in v2.
-	virtual void SetChannelBinding(const ChannelBindings & /*cb*/) {
-	}
+	virtual void SetChannelBinding(const ChannelBindings & /*cb*/) {}
 
 protected:
 	IAuthenticator() = default;

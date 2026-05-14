@@ -398,8 +398,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 // See [MS-TDS] 2.2.6.4 and spec 042 research.md R1.
 //===----------------------------------------------------------------------===//
 TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
-										   const std::string &database,
-										   const std::vector<uint8_t> &sspi_initial_blob,
+										   const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
 										   const std::string &app_name, uint32_t packet_size) {
 	TdsPacket packet(PacketType::LOGIN7);
 

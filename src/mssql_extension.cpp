@@ -1,6 +1,5 @@
 #include "mssql_extension.hpp"
 #include "azure/azure_test_function.hpp"
-#include "tds/auth/krb5_test_function.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "connection/mssql_diagnostic.hpp"
@@ -16,6 +15,7 @@
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/mssql_optimizer.hpp"
+#include "tds/auth/krb5_test_function.hpp"
 
 namespace duckdb {
 

@@ -288,7 +288,7 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 				} else if (lower_key == "krb5-realm" || lower_key == "krb5_realm") {
 					result["krb5_realm"] = value;
 				} else if (lower_key == "service_principal_name" || lower_key == "service-principal-name" ||
-					   lower_key == "serviceprincipalname") {
+						   lower_key == "serviceprincipalname") {
 					result["service_principal_name"] = value;
 				} else if (lower_key == "trusted_connection" || lower_key == "trustedconnection" ||
 						   lower_key == "trusted-connection") {
@@ -1045,8 +1045,8 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 //===----------------------------------------------------------------------===//
 void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
-							info.host.c_str(), info.port, info.database.c_str(),
-							static_cast<int>(info.auth_method), timeout_seconds);
+							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
+							timeout_seconds);
 
 	tds::TdsConnection conn;
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {

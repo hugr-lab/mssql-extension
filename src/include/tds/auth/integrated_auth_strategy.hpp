@@ -24,13 +24,12 @@ namespace tds {
 
 class IntegratedAuthStrategy : public AuthenticationStrategy {
 public:
-	IntegratedAuthStrategy(std::shared_ptr<IAuthenticator> authenticator, std::string database, std::string display_name,
-						   bool use_encrypt = true)
+	IntegratedAuthStrategy(std::shared_ptr<IAuthenticator> authenticator, std::string database,
+						   std::string display_name, bool use_encrypt = true)
 		: authenticator_(std::move(authenticator)),
 		  database_(std::move(database)),
 		  display_name_(std::move(display_name)),
-		  use_encrypt_(use_encrypt) {
-	}
+		  use_encrypt_(use_encrypt) {}
 
 	bool RequiresFedAuth() const override {
 		return false;

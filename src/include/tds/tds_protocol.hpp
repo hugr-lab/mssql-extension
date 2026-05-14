@@ -41,8 +41,8 @@ struct LoginResponse {
 	std::string server_spn;			// Server Principal Name from server
 
 	// SSPI token data (Spec 042 -- Integrated Auth continuation)
-	bool has_sspi_token = false;		 // True if a 0xED SSPI token appeared in this response
-	std::vector<uint8_t> sspi_token;	 // Raw blob from the server for IAuthenticator::NextBytes()
+	bool has_sspi_token = false;	  // True if a 0xED SSPI token appeared in this response
+	std::vector<uint8_t> sspi_token;  // Raw blob from the server for IAuthenticator::NextBytes()
 };
 
 // TDS Protocol message builders and parsers

@@ -13,13 +13,13 @@
 
 #if defined(MSSQL_ENABLE_KRB5)
 
-#include <cstdlib>
+#include <unistd.h>	 // getpid
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <unistd.h>	 // getpid
 
 // macOS's bundled GSS framework is a Heimdal-based subset that does NOT
 // expose gss_acquire_cred_from / gss_key_value_set_desc or the full krb5.h
@@ -63,21 +63,22 @@ static const gss_OID kKrb5Oid = const_cast<gss_OID>(&kKrb5OidDesc);
 // macOS's GSS framework declares GSS_C_NT_HOSTBASED_SERVICE as an extern
 // gss_OID but does not export the symbol from the framework binary, so we
 // construct the OID locally to keep the build portable.
-static const gss_OID_desc kHostBasedServiceOidDesc = {10, const_cast<char *>("\x2a\x86\x48\x86\xf7\x12\x01\x02\x01\x04")};
+static const gss_OID_desc kHostBasedServiceOidDesc = {10,
+													  const_cast<char *>("\x2a\x86\x48\x86\xf7\x12\x01\x02\x01\x04")};
 static const gss_OID kHostBasedServiceOid = const_cast<gss_OID>(&kHostBasedServiceOidDesc);
 
 // Kerberos principal name type OID: 1.2.840.113554.1.2.2.1 (RFC 1964 2.1.1).
 // Same problem as above on macOS: GSS_KRB5_NT_PRINCIPAL_NAME is declared in
 // the header but not exported.
 static const gss_OID_desc kKrb5PrincipalNameOidDesc = {10,
-														const_cast<char *>("\x2a\x86\x48\x86\xf7\x12\x01\x02\x02\x01")};
+													   const_cast<char *>("\x2a\x86\x48\x86\xf7\x12\x01\x02\x02\x01")};
 static const gss_OID kKrb5PrincipalNameOid = const_cast<gss_OID>(&kKrb5PrincipalNameOidDesc);
 
 // Append a gss_display_status message chain (for one of major / minor) into out.
 static void AppendGssStatusMessages(uint32_t code, int code_type, gss_OID mech, std::string &out) {
 	OM_uint32 msg_ctx = 0;
 	gss_buffer_desc msg_buf;
-	int safety = 0;  // bound the loop so a misbehaving mech can't spin
+	int safety = 0;	 // bound the loop so a misbehaving mech can't spin
 	do {
 		std::memset(&msg_buf, 0, sizeof(msg_buf));
 		OM_uint32 minor_ignored = 0;
@@ -207,8 +208,7 @@ Krb5Authenticator::Krb5Authenticator(Krb5Config config) : config_(std::move(conf
 	// instance, not via setenv) -- avoids the process-global thread-safety
 	// trap noted in spec 042 ultrareview bug_005.
 	if (!config_.configfile.empty() && !FileIsReadable(config_.configfile)) {
-		throw std::runtime_error("MSSQL Kerberos auth: krb5.conf '" + config_.configfile +
-								 "' is not readable.");
+		throw std::runtime_error("MSSQL Kerberos auth: krb5.conf '" + config_.configfile + "' is not readable.");
 	}
 
 #if !defined(MSSQL_KRB5_HAS_MIT_EXTENSIONS)
@@ -356,8 +356,8 @@ void Krb5Authenticator::AcquireCredentials() {
 		mech_set.count = 1;
 		mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
 
-		major = gss_acquire_cred_from(&minor, desired_name, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
-									  &cred_store, &cred_, nullptr, nullptr);
+		major = gss_acquire_cred_from(&minor, desired_name, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
+									  &cred_, nullptr, nullptr);
 		if (desired_name != GSS_C_NO_NAME) {
 			OM_uint32 d = 0;
 			gss_release_name(&d, &desired_name);
@@ -394,8 +394,8 @@ void Krb5Authenticator::AcquireCredentials() {
 
 		krb5_creds creds;
 		std::memset(&creds, 0, sizeof(creds));
-		kerr = krb5_get_init_creds_password(kctx, &creds, client, config_.raw_password.c_str(), nullptr, nullptr,
-											0, nullptr, nullptr);
+		kerr = krb5_get_init_creds_password(kctx, &creds, client, config_.raw_password.c_str(), nullptr, nullptr, 0,
+											nullptr, nullptr);
 		if (kerr) {
 			krb5_free_principal(kctx, client);
 			const char *kmsg = krb5_get_error_message(kctx, kerr);
@@ -410,8 +410,8 @@ void Krb5Authenticator::AcquireCredentials() {
 		// Store creds in a MEMORY ccache keyed on principal+pid so concurrent
 		// raw-mode connections don't trample each other and the name doesn't
 		// collide across processes.
-		std::string ccname = std::string("MEMORY:mssql_raw_") + principal_str + "_" +
-							 std::to_string(static_cast<long long>(getpid()));
+		std::string ccname =
+			std::string("MEMORY:mssql_raw_") + principal_str + "_" + std::to_string(static_cast<long long>(getpid()));
 		krb5_ccache cc = nullptr;
 		kerr = krb5_cc_resolve(kctx, ccname.c_str(), &cc);
 		if (kerr) {
@@ -451,8 +451,8 @@ void Krb5Authenticator::AcquireCredentials() {
 		mech_set.count = 1;
 		mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
 
-		major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
-									  &cred_store, &cred_, nullptr, nullptr);
+		major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
+									  &cred_, nullptr, nullptr);
 
 		// Now that GSSAPI has its own internal copy of the credentials,
 		// destroy the temporary MEMORY ccache. Without this, the entry

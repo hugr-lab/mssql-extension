@@ -155,9 +155,9 @@ static void Krb5TestSecret(DataChunk &args, ExpressionState &state, Vector &resu
 			return StringVector::AddString(result, std::string("MSSQL Kerberos auth test: ") + e.what());
 		}
 		if (info->auth_method != AuthMethod::KRB5) {
-			return StringVector::AddString(
-				result, std::string("MSSQL Kerberos auth test: secret '") + name +
-							"' is not configured for Kerberos (authenticator != 'krb5'). Add authenticator 'krb5' to the secret.");
+			return StringVector::AddString(result, std::string("MSSQL Kerberos auth test: secret '") + name +
+													   "' is not configured for Kerberos (authenticator != 'krb5'). "
+													   "Add authenticator 'krb5' to the secret.");
 		}
 
 		tds::Krb5Config cfg;
