@@ -112,30 +112,30 @@ std::string Utf16LeToUtf8(const std::vector<uint8_t> &le_bytes) {
 
 int g_failures = 0;
 
-#define CHECK_EQ(actual, expected, label)                                                            \
-	do {                                                                                             \
-		if (!((actual) == (expected))) {                                                             \
-			std::cerr << "FAIL: " << label << " expected=" << (expected) << " actual=" << (actual)   \
-			          << " (line " << __LINE__ << ")" << std::endl;                                  \
-			g_failures++;                                                                            \
-		}                                                                                            \
+#define CHECK_EQ(actual, expected, label)                                                                       \
+	do {                                                                                                        \
+		if (!((actual) == (expected))) {                                                                        \
+			std::cerr << "FAIL: " << label << " expected=" << (expected) << " actual=" << (actual) << " (line " \
+					  << __LINE__ << ")" << std::endl;                                                          \
+			g_failures++;                                                                                       \
+		}                                                                                                       \
 	} while (0)
 
-#define CHECK_STR_EQ(actual, expected, label)                                                        \
-	do {                                                                                             \
-		if (!((actual) == (expected))) {                                                             \
-			std::cerr << "FAIL: " << label << " expected=\"" << (expected) << "\" actual=\""         \
-			          << (actual) << "\" (line " << __LINE__ << ")" << std::endl;                    \
-			g_failures++;                                                                            \
-		}                                                                                            \
+#define CHECK_STR_EQ(actual, expected, label)                                                            \
+	do {                                                                                                 \
+		if (!((actual) == (expected))) {                                                                 \
+			std::cerr << "FAIL: " << label << " expected=\"" << (expected) << "\" actual=\"" << (actual) \
+					  << "\" (line " << __LINE__ << ")" << std::endl;                                    \
+			g_failures++;                                                                                \
+		}                                                                                                \
 	} while (0)
 
-#define CHECK_TRUE(cond, label)                                                                      \
-	do {                                                                                             \
-		if (!(cond)) {                                                                               \
-			std::cerr << "FAIL: " << label << " (line " << __LINE__ << ")" << std::endl;             \
-			g_failures++;                                                                            \
-		}                                                                                            \
+#define CHECK_TRUE(cond, label)                                                          \
+	do {                                                                                 \
+		if (!(cond)) {                                                                   \
+			std::cerr << "FAIL: " << label << " (line " << __LINE__ << ")" << std::endl; \
+			g_failures++;                                                                \
+		}                                                                                \
 	} while (0)
 
 struct Fixture {
@@ -147,14 +147,14 @@ struct Fixture {
 const std::vector<Fixture> &PerFieldFixtures() {
 	// (label, UTF-8 input, expected UTF-16 code-unit count)
 	static const std::vector<Fixture> fixtures = {
-	    {"empty", "", 0},
-	    {"ascii_basic", "TestPassword1", 13},
-	    {"cyrillic_test123", "Тест123!", 8},          // 4 cyrillic (2 bytes each in UTF-8) + 4 ASCII
-	    {"cyrillic_baza", "База", 4},                 // 4 cyrillic letters
-	    {"latin_umlaut", "jürgen", 6},                // 6 chars; ü = 2 UTF-8 bytes, 1 UTF-16 code unit
-	    {"latin_umlaut_2024", "Ünlaut$2024", 11},
-	    {"cjk_short", "東京", 2},
-	    {"emoji_surrogate", "\xF0\x9F\x94\x92secure!", 9}};  // 🔒 = 1 codepoint = 2 UTF-16 units + "secure!"
+		{"empty", "", 0},
+		{"ascii_basic", "TestPassword1", 13},
+		{"cyrillic_test123", "Тест123!", 8},  // 4 cyrillic (2 bytes each in UTF-8) + 4 ASCII
+		{"cyrillic_baza", "База", 4},		  // 4 cyrillic letters
+		{"latin_umlaut", "jürgen", 6},		  // 6 chars; ü = 2 UTF-8 bytes, 1 UTF-16 code unit
+		{"latin_umlaut_2024", "Ünlaut$2024", 11},
+		{"cjk_short", "東京", 2},
+		{"emoji_surrogate", "\xF0\x9F\x94\x92secure!", 9}};	 // 🔒 = 1 codepoint = 2 UTF-16 units + "secure!"
 	return fixtures;
 }
 
@@ -171,7 +171,7 @@ void RoundTripBuildLogin7(const Fixture &fixture) {
 	// Exercise each variable field one at a time by swapping the fixture
 	// into that slot while keeping the others ASCII.
 	auto run_one = [&](const char *slot_name, const std::string &h, const std::string &u, const std::string &p,
-	                   const std::string &a, const std::string &dbname, uint16_t expected_cch_field) {
+					   const std::string &a, const std::string &dbname, uint16_t expected_cch_field) {
 		auto packet = TdsProtocol::BuildLogin7(h, u, p, dbname, a, /*packet_size=*/4096);
 		ParsedLogin7 parsed = ParseLogin7Packet(packet.GetPayload());
 
@@ -218,7 +218,7 @@ void TestBuildLogin7FixtureMatrix() {
 void TestIbContiguity() {
 	std::cout << "[2] ib* monotonicity for non-ASCII LOGIN7 payload..." << std::endl;
 	auto packet = TdsProtocol::BuildLogin7(/*host=*/"localhost", /*user=*/"jürgen", /*pwd=*/"Тест123!",
-	                                       /*db=*/"База", /*app=*/"DuckDB", /*packet_size=*/4096);
+										   /*db=*/"База", /*app=*/"DuckDB", /*packet_size=*/4096);
 	ParsedLogin7 p = ParseLogin7Packet(packet.GetPayload());
 
 	// HostName starts at offset 94 (immediately after fixed header).
@@ -272,7 +272,7 @@ void TestFieldLengthCap() {
 	// 65 surrogate-pair emoji => 130 UTF-16 code units => over cap.
 	std::string emoji_too_long;
 	for (int i = 0; i < 65; i++) {
-		emoji_too_long.append("\xF0\x9F\x94\x92");  // 🔒 per repeat (4 UTF-8 bytes / 2 UTF-16 units)
+		emoji_too_long.append("\xF0\x9F\x94\x92");	// 🔒 per repeat (4 UTF-8 bytes / 2 UTF-16 units)
 	}
 	threw = false;
 	try {
@@ -333,43 +333,43 @@ void TestAsciiRegression() {
 
 const std::vector<std::string> &SimdutfFixtures() {
 	static const std::vector<std::string> fixtures = {
-	    "",                              // empty
-	    "a",                             // single ASCII
-	    "Hello, world!",                 // pure ASCII
-	    "TestPassword1",                 // ASCII at LOGIN7-ish length
-	    std::string(64, 'A'),            // 64 ASCII
-	    std::string(127, 'B'),           // near-cap ASCII
-	    "ü",                             // single Latin-1 supplement
-	    "Ünlaut$2024",                   // mixed
-	    "jürgen",                        // mixed name
-	    "naïve café",                    // Latin extended
-	    "Тест",                          // Cyrillic
-	    "Тест123!",                      // Cyrillic + ASCII
-	    "База",                          // Cyrillic
-	    "Пароль",                        // Cyrillic
-	    "Привет, мир!",                  // Cyrillic phrase
-	    "Здравствуй, мир!",              // longer Cyrillic
-	    "Ελληνικά",                      // Greek
-	    "العربية",                       // Arabic
-	    "עברית",                         // Hebrew
-	    "日本",                          // CJK
-	    "東京",                          // CJK
-	    "中文测试",                      // CJK 4 chars
-	    "한국어",                        // Hangul
-	    "ไทย",                           // Thai
-	    "\xF0\x9F\x94\x92",              // 🔒 single emoji
-	    "\xF0\x9F\x94\x92secure!",       // emoji + ASCII
-	    "\xF0\x9F\x98\x80",              // 😀
-	    "abc\xE6\x9D\xB1xyz",            // mixed ASCII / CJK
-	    "Σ∞∂∇",                          // math symbols
-	    "𝄞music"                         // 𝄞 (U+1D11E) surrogate pair + ASCII
+		"",							// empty
+		"a",						// single ASCII
+		"Hello, world!",			// pure ASCII
+		"TestPassword1",			// ASCII at LOGIN7-ish length
+		std::string(64, 'A'),		// 64 ASCII
+		std::string(127, 'B'),		// near-cap ASCII
+		"ü",						// single Latin-1 supplement
+		"Ünlaut$2024",				// mixed
+		"jürgen",					// mixed name
+		"naïve café",				// Latin extended
+		"Тест",						// Cyrillic
+		"Тест123!",					// Cyrillic + ASCII
+		"База",						// Cyrillic
+		"Пароль",					// Cyrillic
+		"Привет, мир!",				// Cyrillic phrase
+		"Здравствуй, мир!",			// longer Cyrillic
+		"Ελληνικά",					// Greek
+		"العربية",					// Arabic
+		"עברית",					// Hebrew
+		"日本",						// CJK
+		"東京",						// CJK
+		"中文测试",					// CJK 4 chars
+		"한국어",					// Hangul
+		"ไทย",						// Thai
+		"\xF0\x9F\x94\x92",			// 🔒 single emoji
+		"\xF0\x9F\x94\x92secure!",	// emoji + ASCII
+		"\xF0\x9F\x98\x80",			// 😀
+		"abc\xE6\x9D\xB1xyz",		// mixed ASCII / CJK
+		"Σ∞∂∇",						// math symbols
+		"𝄞music"					// 𝄞 (U+1D11E) surrogate pair + ASCII
 	};
 	return fixtures;
 }
 
 void TestSimdutfByteEquivalence() {
 	std::cout << "[6] simdutf wrapper byte-equivalent to legacy on " << SimdutfFixtures().size() << " fixtures..."
-	          << std::endl;
+			  << std::endl;
 	for (const auto &input : SimdutfFixtures()) {
 		// Encode direction
 		const auto legacy = encoding::Utf16LEEncode(input);
@@ -378,7 +378,7 @@ void TestSimdutfByteEquivalence() {
 
 		// Byte-length helper
 		CHECK_EQ(encoding::Utf16LEByteLength(input), encoding::SimdutfUtf16LEByteLength(input),
-		         std::string("byte-length mismatch for input: ") + input);
+				 std::string("byte-length mismatch for input: ") + input);
 
 		// Direct-encode helper writes to caller buffer
 		std::vector<uint8_t> buf_legacy(input.size() * 4, 0);
@@ -408,9 +408,13 @@ void TestSimdutfInvalidInputFallback() {
 	// Adjacent string literals are concatenated; this stops the \xNN escape
 	// from greedily consuming following hex letters.
 	const std::vector<std::string> invalid = {
-	    "\xC0\xC1" "invalid",        // overlong / invalid leading bytes
-	    "abc" "\x80" "def",          // lone continuation byte
-	    "\xE0\x80" "valid_following" // truncated 3-byte
+		"\xC0\xC1"
+		"invalid",	// overlong / invalid leading bytes
+		"abc"
+		"\x80"
+		"def",	// lone continuation byte
+		"\xE0\x80"
+		"valid_following"  // truncated 3-byte
 	};
 	for (const auto &s : invalid) {
 		bool threw = false;

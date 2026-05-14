@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
-#include "tds/encoding/utf16.hpp"
 #include "tds/encoding/simdutf_wrappers.hpp"
+#include "tds/encoding/utf16.hpp"
 #ifdef _WIN32
 #include <process.h>
 #define GET_PID() _getpid()
@@ -60,8 +60,7 @@ struct Login7VarField {
 //     to this field and advances the running offset by the encoded
 //     byte length.
 static Login7VarField EncodeLogin7VarField(const char *field_name, const std::string &utf8_text,
-                                            uint16_t &cumulative_ib_offset,
-                                            bool obfuscate_password = false) {
+										   uint16_t &cumulative_ib_offset, bool obfuscate_password = false) {
 	Login7VarField result;
 	result.ib = cumulative_ib_offset;
 
@@ -72,8 +71,8 @@ static Login7VarField EncodeLogin7VarField(const char *field_name, const std::st
 	const size_t code_units = result.utf16le_bytes.size() / 2;
 	if (code_units > LOGIN7_MAX_FIELD_CODE_UNITS) {
 		throw std::runtime_error(std::string("LOGIN7 field ") + field_name +
-		                         " exceeds the TDS limit of 128 UTF-16 code units (got " +
-		                         std::to_string(code_units) + ")");
+								 " exceeds the TDS limit of 128 UTF-16 code units (got " + std::to_string(code_units) +
+								 ")");
 	}
 	result.cch = static_cast<uint16_t>(code_units);
 
@@ -223,7 +222,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	Login7VarField field_username = EncodeLogin7VarField("UserName", username, var_offset);
 	Login7VarField field_password = EncodeLogin7VarField("Password", password, var_offset, /*obfuscate_password=*/true);
 	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
-	Login7VarField field_servername = EncodeLogin7VarField("ServerName", host, var_offset);  // ServerName mirrors host
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", host, var_offset);	 // ServerName mirrors host
 
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields

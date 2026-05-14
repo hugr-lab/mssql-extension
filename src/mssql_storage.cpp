@@ -174,9 +174,11 @@ static inline bool IsHexDigit(char c) {
 }
 
 static inline int HexVal(char c) {
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-	return 10 + (c - 'a');  // c in [a..f] guaranteed by caller
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'A' && c <= 'F')
+		return 10 + (c - 'A');
+	return 10 + (c - 'a');	// c in [a..f] guaranteed by caller
 }
 
 static string UrlDecode(const string &str) {
