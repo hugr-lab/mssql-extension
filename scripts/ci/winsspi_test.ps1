@@ -30,6 +30,7 @@ param(
     [string]$TestFile = "test\sql\integrated_auth\winsspi_basic.test"
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $UnittestExe)) {
@@ -45,9 +46,23 @@ if (-not (Test-Path $TestFile)) {
     Write-Error "Test file not found: $TestFile"
 }
 
+if (-not (Get-Command klist -ErrorAction SilentlyContinue)) {
+    Write-Error @"
+klist not found on PATH. This script needs to run on a Windows host with the
+Kerberos client tools available (the native klist.exe ships with a
+domain-joined Windows install; MIT Kerberos for Windows provides an
+alternative). Log in as a domain user from a Windows machine and re-run.
+"@
+}
+
 Write-Host "[winsspi-test] verifying Kerberos ticket..." -ForegroundColor Cyan
 $klist = & klist 2>&1
-if ($LASTEXITCODE -ne 0 -or $klist -notmatch "krbtgt") {
+# Note: `& klist` returns its output as a string ARRAY. PowerShell's -match
+# against an array filters to the matching elements; wrapping in parens
+# evaluates that filter to a truthy value iff at least one line matches.
+# Plain `$klist -notmatch "krbtgt"` would mis-fire whenever any non-krbtgt
+# line exists (almost always), so we use the parenthesised positive form.
+if ($LASTEXITCODE -ne 0 -or -not ($klist -match "krbtgt")) {
     Write-Warning @"
 klist did not report a krbtgt entry. The Windows SSPI tests need a valid Kerberos
 ticket in the current logon session. If this is unexpected:
@@ -62,6 +77,7 @@ $env:MSSQL_TEST_HOST    = $SqlHost
 $env:MSSQL_TEST_DB      = $Database
 
 Write-Host "[winsspi-test] running $TestFile against $SqlHost / $Database..." -ForegroundColor Cyan
+Write-Host "[winsspi-test] command: $UnittestExe $TestFile" -ForegroundColor DarkGray
 & $UnittestExe $TestFile
 $exit = $LASTEXITCODE
 
