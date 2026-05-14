@@ -40,9 +40,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <security.h>
 #include <sspi.h>
+#include <windows.h>
 
 namespace duckdb {
 namespace tds {

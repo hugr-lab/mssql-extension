@@ -11,6 +11,7 @@ End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
 - [Connection Examples](#connection-examples)
 - [Using MSSQL Secrets](#using-mssql-secrets)
 - [Diagnostic function: `mssql_kerberos_auth_test`](#diagnostic-function-mssql_kerberos_auth_test)
+- [Diagnostic function: `mssql_winsspi_auth_test` (Windows)](#diagnostic-function-mssql_winsspi_auth_test-windows)
 - [Troubleshooting](#troubleshooting)
 - [Running the test stack locally](#running-the-test-stack-locally)
 - [Reference](#reference)
@@ -432,6 +433,70 @@ Kerberos support (MSSQL_ENABLE_KRB5 was not defined). Rebuild with -DENABLE_KRB5
 - A fail here + working `kinit` → `mssql_kerberos_auth_test` exposes a
   bug in your config that `kinit` didn't catch (wrong SPN, wrong realm
   resolution, etc.).
+
+## Diagnostic function: `mssql_winsspi_auth_test` (Windows)
+
+The Windows SSPI peer of `mssql_kerberos_auth_test`. Same idea: exercises
+the client-side handshake (`AcquireCredentialsHandleW` +
+`InitializeSecurityContextW`, Negotiate package) **without** connecting to
+SQL Server. Useful for confirming the current logon session has a valid
+ticket, the SPN resolves, and Negotiate produces a non-empty token.
+
+Three overloads:
+
+```sql
+-- 1. Smoke test against a host, default port 1433.
+SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com');
+
+-- 2. Explicit port.
+SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com', 1433);
+
+-- 3. Explicit SPN -- override default MSSQLSvc/<host>:<port> derivation.
+SELECT mssql_winsspi_auth_test_spn('MSSQLSvc/sqlcluster.corp.example.com:1433');
+```
+
+### Success output
+
+```text
+OK: principal=alice@CORP.EXAMPLE.COM, spn=MSSQLSvc/sqlhost.corp.example.com:1433, mech=Negotiate, token_size=1652 bytes
+```
+
+`principal` here is the current logon session's UPN (via
+`GetUserNameEx(NameUserPrincipal)`); falls back to `DOMAIN\user` if the UPN
+isn't set on the account. `mech=Negotiate` is the SSPI package name —
+Negotiate transparently selects Kerberos when the SPN resolves through AD
+and falls back to NTLM otherwise, which is why we report it explicitly.
+
+### Failure output
+
+The function returns the verbatim error message from
+`winsspi_authenticator.cpp`, wrapping `FormatMessageW` plus the SSPI status
+code. Common cases:
+
+```text
+-- SPN not registered for this server
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x80090303, The specified target is unknown or unreachable.
+(Hint: SPN not found in Active Directory. Verify with 'setspn -L domain\sqlsvc'.)
+
+-- No domain credentials in the current session
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x8009030E, No credentials are available in the security package.
+(Hint: log in as a domain user, or run 'runas /netonly' against domain creds.)
+
+-- Clock skew
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x80090324, The clocks on the client and server machines are skewed.
+(Hint: sync system clock; typical tolerance is ±5 minutes.)
+```
+
+### Function availability
+
+- On Windows builds: real implementation, exercises SSPI Negotiate.
+- On Linux / macOS builds: returns a clear "wrong platform — use
+  `mssql_kerberos_auth_test` on POSIX" message. Registered unconditionally
+  so the function exists on every platform and gives consistent diagnostics
+  rather than "function does not exist".
 
 ## Troubleshooting
 

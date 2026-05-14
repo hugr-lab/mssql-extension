@@ -132,6 +132,7 @@ set(EXTENSION_SOURCES
     src/tds/auth/manual_token_strategy.cpp
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/auth/krb5_test_function.cpp
+    src/tds/auth/winsspi_test_function.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
     # TLS layer (OpenSSL)

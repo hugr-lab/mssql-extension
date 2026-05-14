@@ -104,8 +104,8 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 		WinSspiConfig wc;
 		wc.spn = DeriveSpn(conn_info);
 		auto authn = std::make_shared<WinSspiAuthenticator>(std::move(wc));
-		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database,
-														"IntegratedAuth(winsspi)", conn_info.use_encrypt);
+		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database, "IntegratedAuth(winsspi)",
+														conn_info.use_encrypt);
 #else
 		throw std::runtime_error(
 			"MSSQL Error: Windows SSPI authentication requires a Windows build of the extension. "

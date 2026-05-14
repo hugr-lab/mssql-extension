@@ -51,9 +51,9 @@ static std::wstring Utf8ToWide(const std::string &utf8) {
 // into a system-allocated buffer that we must LocalFree.
 static std::string FormatSspiStatus(SECURITY_STATUS status) {
 	LPWSTR buf = nullptr;
-	DWORD len = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-								   FORMAT_MESSAGE_IGNORE_INSERTS,
-							   nullptr, static_cast<DWORD>(status), 0, reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
+	DWORD len =
+		FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+					   nullptr, static_cast<DWORD>(status), 0, reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
 	std::string result;
 	if (len > 0 && buf) {
 		// Convert wide -> UTF-8 for the std::string error.
@@ -83,19 +83,24 @@ static std::string FormatSspiStatus(SECURITY_STATUS status) {
 static const char *HintForSspiStatus(SECURITY_STATUS status) {
 	switch (status) {
 	case SEC_E_NO_CREDENTIALS:
-		return "(Hint: no Windows credentials available. Log in to a domain account before running DuckDB, or use SQL authentication.)";
+		return "(Hint: no Windows credentials available. Log in to a domain account before running DuckDB, or use SQL "
+			   "authentication.)";
 	case SEC_E_CONTEXT_EXPIRED:
 		return "(Hint: Kerberos ticket expired. Log out and back in, or run 'klist purge && klist tgt' to refresh.)";
 	case SEC_E_TARGET_UNKNOWN:
 		return "(Hint: server SPN not registered. Verify with 'setspn -L <account>' on a Windows admin host.)";
 	case SEC_E_TIME_SKEW:
-		return "(Hint: clock skew between client and KDC exceeds 5 minutes. Sync system clock via Windows Time service: 'w32tm /resync'.)";
+		return "(Hint: clock skew between client and KDC exceeds 5 minutes. Sync system clock via Windows Time "
+			   "service: 'w32tm /resync'.)";
 	case SEC_E_NO_AUTHENTICATING_AUTHORITY:
-		return "(Hint: KDC / domain controller unreachable. Verify network connectivity and DNS resolution for the target realm.)";
+		return "(Hint: KDC / domain controller unreachable. Verify network connectivity and DNS resolution for the "
+			   "target realm.)";
 	case SEC_E_WRONG_PRINCIPAL:
-		return "(Hint: SPN mismatch -- the SPN your client requested does not match the SPN registered for the SQL Server account.)";
+		return "(Hint: SPN mismatch -- the SPN your client requested does not match the SPN registered for the SQL "
+			   "Server account.)";
 	case SEC_E_LOGON_DENIED:
-		return "(Hint: authentication denied -- check that your domain account is enabled and has access to the target server.)";
+		return "(Hint: authentication denied -- check that your domain account is enabled and has access to the target "
+			   "server.)";
 	default:
 		return nullptr;
 	}
@@ -151,11 +156,11 @@ void WinSspiAuthenticator::AcquireCredentials() {
 	// initiating a connection (vs accepting one as a server).
 	TimeStamp expiry;
 	SECURITY_STATUS status = AcquireCredentialsHandleW(
-		/*pszPrincipal=*/nullptr,				   // use default principal (logon session)
+		/*pszPrincipal=*/nullptr,  // use default principal (logon session)
 		/*pszPackage=*/const_cast<LPWSTR>(kNegotiatePackage),
 		/*fCredentialUse=*/SECPKG_CRED_OUTBOUND,
-		/*pvLogonId=*/nullptr,					   // no specific logon ID
-		/*pAuthData=*/nullptr,					   // use default creds
+		/*pvLogonId=*/nullptr,	// no specific logon ID
+		/*pAuthData=*/nullptr,	// use default creds
 		/*pGetKeyFn=*/nullptr,
 		/*pvGetKeyArgument=*/nullptr,
 		/*phCredential=*/&cred_,
@@ -263,7 +268,8 @@ std::vector<uint8_t> WinSspiAuthenticator::InitialBytes() {
 	if (blob.empty() && !complete_) {
 		throw std::runtime_error(
 			"MSSQL Kerberos auth failed: SSPI returned an empty initial SPNEGO token. "
-			"This is unexpected from the Negotiate package; check that the Windows logon session has Kerberos enabled.");
+			"This is unexpected from the Negotiate package; check that the Windows logon session has Kerberos "
+			"enabled.");
 	}
 	return blob;
 }
