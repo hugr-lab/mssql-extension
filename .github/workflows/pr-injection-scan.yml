@@ -1,0 +1,82 @@
+name: PR Prompt-Injection Scan
+
+# Defends AI reviewers (e.g. /ultrareview, future @claude-review bots,
+# Copilot Workspace) from prompt-injection attacks hidden in PR content.
+#
+# Trigger: pull_request_target. This runs the workflow file as it exists on
+# main (NOT the PR's version), with secrets and write permissions. We
+# deliberately do NOT check out the PR's code -- the script fetches PR text
+# via the GitHub API and treats it as inert strings.
+#
+# Permissions:
+#   contents: read         -- needed for gh api against the repo
+#   pull-requests: write   -- so the scanner can leave annotations
+#   issues: read           -- comment fetch (PR comments are issue comments)
+#
+# Cost: cold start ~3 min (pip + HuggingFace model download). Cached runs
+# ~30 s. Scan itself runs in seconds for typical PR sizes.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+  # Manual re-run for triage after editing PR body / comments. Pass the
+  # PR number as the input.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to scan'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+concurrency:
+  group: pr-injection-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan PR prose for prompt injection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # We only need the .github/ tree from main, not submodules.
+      - name: Checkout main (NOT the PR)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          submodules: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install llm-guard
+        run: |
+          # Pin to a known-good release. llm-guard ships frequent breaking
+          # changes; pinning keeps the scanner reproducible across runs.
+          pip install --upgrade pip
+          pip install 'llm-guard==0.3.16'
+
+      - name: Cache HuggingFace model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-prompt-injection-v2
+
+      - name: Run injection scanner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          # Override the defaults via repository variables if these turn out
+          # noisy in practice -- e.g. set INJECTION_WARN_THRESHOLD=0.7 to
+          # silence prose findings.
+          INJECTION_WARN_THRESHOLD: ${{ vars.INJECTION_WARN_THRESHOLD || '0.5' }}
+          INJECTION_FAIL_THRESHOLD: ${{ vars.INJECTION_FAIL_THRESHOLD || '0.9' }}
+        run: python .github/scripts/scan_pr_injection.py
