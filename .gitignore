@@ -45,6 +45,8 @@ Thumbs.db
 .env
 .env.local
 
+.cache/clangd
+
 # test output
 duckdb_unittest_tempdir/
 future-spec/
