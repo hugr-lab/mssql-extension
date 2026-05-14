@@ -75,7 +75,7 @@ size_t LegacyUtf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *o
 
 }  // namespace testing
 
-#endif  // MSSQL_BENCH_BUILD
+#endif	// MSSQL_BENCH_BUILD
 
 }  // namespace encoding
 }  // namespace tds
