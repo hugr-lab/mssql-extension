@@ -5,7 +5,9 @@
 # (verify with `klist`) against any AD-joined SQL Server you have access to.
 #
 # Usage:
-#   .\scripts\ci\winsspi_test.ps1 -Host sqlhost.corp.example.com -Database master
+#   .\scripts\ci\winsspi_test.ps1 -SqlHost sqlhost.corp.example.com -Database master
+#
+# (-SqlHost, not -Host -- $Host is a PowerShell automatic variable for the host UI.)
 #
 # Optional:
 #   -UnittestExe   path to unittest.exe (default: build\release\test\unittest.exe)
