@@ -477,13 +477,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
@@ -532,13 +532,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.config.artifact_suffix }}
           path: cli
@@ -590,13 +590,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-linux_amd64
           path: cli
@@ -644,7 +644,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 

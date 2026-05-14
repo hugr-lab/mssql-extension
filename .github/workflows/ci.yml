@@ -227,13 +227,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
@@ -284,13 +284,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-linux_amd64
           path: cli
@@ -512,13 +512,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.config.artifact_suffix }}
           path: cli
@@ -547,13 +547,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download unittest artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: unittest-linux_amd64
           path: test
 
       - name: Download libduckdb artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: libduckdb-linux_amd64
           path: lib
