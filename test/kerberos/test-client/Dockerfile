@@ -47,6 +47,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         krb5-user libgssapi-krb5-2 libssl3 \
         ca-certificates curl unzip \
+        file \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the DuckDB CLI matching the extension's API. We pull the official
