@@ -54,7 +54,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
+          # No `cache: pip` -- that mode requires a requirements.txt or
+          # pyproject.toml in the repo, which we don't have. The one inline
+          # `pip install llm-guard` is cheap enough to repeat on each run.
 
       - name: Install llm-guard
         run: |
