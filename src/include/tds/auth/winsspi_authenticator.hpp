@@ -40,9 +40,15 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// IMPORTANT: include order matters here. <security.h> and <sspi.h> reference
+// types (CHAR, LONG, etc.) declared in <windows.h>, so windows.h MUST come
+// first. clang-format's alphabetical SortIncludes would re-sort these and
+// break the build, so the block is fenced.
+// clang-format off
+#include <windows.h>
 #include <security.h>
 #include <sspi.h>
-#include <windows.h>
+// clang-format on
 
 namespace duckdb {
 namespace tds {
