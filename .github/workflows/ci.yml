@@ -171,28 +171,28 @@ jobs:
         run: ccache -s
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-${{ matrix.platform.id }}
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
       - name: Upload unittest Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unittest-${{ matrix.platform.id }}
           path: build/release/test/unittest
           if-no-files-found: error
 
       - name: Upload libduckdb Artifact (for unittest)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libduckdb-${{ matrix.platform.id }}
           path: |
@@ -380,14 +380,14 @@ jobs:
           Pop-Location
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-windows_amd64_msvc
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_msvc
           path: build/release/duckdb.exe
@@ -477,14 +477,14 @@ jobs:
           cmake --build . --config Release
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-windows_amd64_mingw
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_mingw
           path: build/release/duckdb.exe
