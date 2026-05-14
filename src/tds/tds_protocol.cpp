@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "tds/encoding/simdutf_wrappers.hpp"
 #include "tds/encoding/utf16.hpp"
 #ifdef _WIN32
 #include <process.h>
@@ -30,6 +31,61 @@ static int GetMssqlDebugLevel() {
 
 namespace duckdb {
 namespace tds {
+
+// MS-TDS §2.2.6.4 caps each variable LOGIN7 string field at 128 UTF-16
+// code units. Spec 043 FR-008 enforces this in the helper below.
+static constexpr size_t LOGIN7_MAX_FIELD_CODE_UNITS = 128;
+
+// LOGIN7 variable-field encoding result. Holds the UTF-16LE bytes
+// (already obfuscated when this is the password field), the UTF-16
+// code-unit count for the `cch*` slot in the fixed header, and the
+// `ib*` offset assigned to the field in the variable-data region.
+struct Login7VarField {
+	std::vector<uint8_t> utf16le_bytes;
+	uint16_t cch;
+	uint16_t ib;
+};
+
+// Encode one variable LOGIN7 string field from UTF-8.
+//
+// Spec 043 FR-001..FR-008. The helper owns:
+//   * UTF-8 -> UTF-16LE conversion via the simdutf wrapper (FR-033).
+//   * The 128-UTF-16-code-unit cap check (FR-008). On overflow throws
+//     `std::runtime_error` with the exact wording mandated by the spec.
+//     The TDS layer is DuckDB-free; the exception propagates upward
+//     and surfaces to the user at ATTACH/connect time.
+//   * The TDS password obfuscation (FR-003) when `obfuscate_password`
+//     is true — applied to the encoded UTF-16LE bytes after conversion.
+//   * `cumulative_ib_offset` bookkeeping: returns the offset assigned
+//     to this field and advances the running offset by the encoded
+//     byte length.
+static Login7VarField EncodeLogin7VarField(const char *field_name, const std::string &utf8_text,
+										   uint16_t &cumulative_ib_offset, bool obfuscate_password = false) {
+	Login7VarField result;
+	result.ib = cumulative_ib_offset;
+
+	if (!utf8_text.empty()) {
+		result.utf16le_bytes = encoding::SimdutfUtf16LEEncode(utf8_text);
+	}
+
+	const size_t code_units = result.utf16le_bytes.size() / 2;
+	if (code_units > LOGIN7_MAX_FIELD_CODE_UNITS) {
+		throw std::runtime_error(std::string("LOGIN7 field ") + field_name +
+								 " exceeds the TDS limit of 128 UTF-16 code units (got " + std::to_string(code_units) +
+								 ")");
+	}
+	result.cch = static_cast<uint16_t>(code_units);
+
+	if (obfuscate_password) {
+		for (auto &byte : result.utf16le_bytes) {
+			byte = static_cast<uint8_t>(((byte << 4) & 0xF0) | ((byte >> 4) & 0x0F));
+			byte ^= 0xA5;
+		}
+	}
+
+	cumulative_ib_offset = static_cast<uint16_t>(cumulative_ib_offset + result.utf16le_bytes.size());
+	return result;
+}
 
 // PRELOGIN option offsets in the packet
 struct PreloginOptionHeader {
@@ -154,83 +210,39 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
 	TdsPacket packet(PacketType::LOGIN7);
 
-	// LOGIN7 fixed header is 94 bytes
-	// After that come variable-length strings
+	// LOGIN7 fixed header is 94 bytes; variable-length strings follow.
+	// Per MS-TDS §2.2.6.4, every variable string field is recorded by a
+	// (ib*, cch*) pair where ib* is the byte offset into the packet and
+	// cch* is the UTF-16 code-unit count (NOT the UTF-8 byte count).
+	// Spec 043 FR-001..FR-002 fixes the v0.1.18 confusion of these two
+	// numbers via the EncodeLogin7VarField helper.
 
-	// Calculate string offsets and lengths
-	// Strings are stored as UTF-16LE, so length = chars, not bytes
-	// Offset points to position in packet (after the 94-byte header relative to start of LOGIN7 data)
-
-	uint16_t hostname_len = static_cast<uint16_t>(host.size());
-	uint16_t username_len = static_cast<uint16_t>(username.size());
-	uint16_t password_len = static_cast<uint16_t>(password.size());
-	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(host.size());  // Server name same as host
-	uint16_t database_len = static_cast<uint16_t>(database.size());
-
-	// Variable data starts at offset 94 (end of fixed header)
 	uint16_t var_offset = 94;
+	Login7VarField field_hostname = EncodeLogin7VarField("HostName", host, var_offset);
+	Login7VarField field_username = EncodeLogin7VarField("UserName", username, var_offset);
+	Login7VarField field_password = EncodeLogin7VarField("Password", password, var_offset, /*obfuscate_password=*/true);
+	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", host, var_offset);	 // ServerName mirrors host
 
-	uint16_t hostname_offset = var_offset;
-	uint16_t username_offset = hostname_offset + hostname_len * 2;
-	uint16_t password_offset = username_offset + username_len * 2;
-	uint16_t appname_offset = password_offset + password_len * 2;
-	uint16_t servername_offset = appname_offset + appname_len * 2;
-	uint16_t unused_offset = servername_offset + servername_len * 2;  // CltIntName (unused)
-	uint16_t language_offset = unused_offset;						  // Language (unused)
-	uint16_t database_offset = language_offset;						  // Database follows unused fields
-	// Actually, database follows in the sequence
-
-	// Recalculate properly
-	// Fields in order: HostName, UserName, Password, AppName, ServerName, Unused, CltIntName, Language, Database, SSPI,
-	// AtchDBFile, ChangePassword We only use HostName, UserName, Password, AppName, ServerName, Database Others have
-	// length 0
-
-	var_offset = 94;
-	hostname_offset = var_offset;
-	var_offset += hostname_len * 2;
-
-	username_offset = var_offset;
-	var_offset += username_len * 2;
-
-	password_offset = var_offset;
-	var_offset += password_len * 2;
-
-	appname_offset = var_offset;
-	var_offset += appname_len * 2;
-
-	servername_offset = var_offset;
-	var_offset += servername_len * 2;
-
-	// Unused field (ExtensionOffset in newer versions)
+	// Unused / extension / CltIntName / Language all have length 0 and share
+	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields
+	// still carry an ib* pointing to the next-available byte position).
 	uint16_t unused1_offset = var_offset;
 	uint16_t unused1_len = 0;
-
-	// CltIntName (client interface name - unused)
 	uint16_t cltintname_offset = var_offset;
 	uint16_t cltintname_len = 0;
-
-	// Language (unused)
 	uint16_t language_off = var_offset;
 	uint16_t language_len = 0;
 
-	// Database
-	database_offset = var_offset;
-	var_offset += database_len * 2;
+	Login7VarField field_database = EncodeLogin7VarField("Database", database, var_offset);
 
-	// SSPI (unused)
 	uint16_t sspi_offset = var_offset;
 	uint16_t sspi_len = 0;
-
-	// AtchDBFile (unused)
 	uint16_t atchdb_offset = var_offset;
 	uint16_t atchdb_len = 0;
-
-	// ChangePassword (unused)
 	uint16_t changepass_offset = var_offset;
 	uint16_t changepass_len = 0;
 
-	// Total length
 	uint32_t total_length = var_offset;
 
 	// Build fixed header (94 bytes)
@@ -306,24 +318,24 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// cbSSPILong (4)
 
 	// HostName
-	packet.AppendUInt16LE(hostname_offset);
-	packet.AppendUInt16LE(hostname_len);
+	packet.AppendUInt16LE(field_hostname.ib);
+	packet.AppendUInt16LE(field_hostname.cch);
 
 	// UserName
-	packet.AppendUInt16LE(username_offset);
-	packet.AppendUInt16LE(username_len);
+	packet.AppendUInt16LE(field_username.ib);
+	packet.AppendUInt16LE(field_username.cch);
 
 	// Password
-	packet.AppendUInt16LE(password_offset);
-	packet.AppendUInt16LE(password_len);
+	packet.AppendUInt16LE(field_password.ib);
+	packet.AppendUInt16LE(field_password.cch);
 
 	// AppName
-	packet.AppendUInt16LE(appname_offset);
-	packet.AppendUInt16LE(appname_len);
+	packet.AppendUInt16LE(field_appname.ib);
+	packet.AppendUInt16LE(field_appname.cch);
 
 	// ServerName
-	packet.AppendUInt16LE(servername_offset);
-	packet.AppendUInt16LE(servername_len);
+	packet.AppendUInt16LE(field_servername.ib);
+	packet.AppendUInt16LE(field_servername.cch);
 
 	// Unused/Extension (offset, length = 0)
 	packet.AppendUInt16LE(unused1_offset);
@@ -338,8 +350,8 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendUInt16LE(language_len);
 
 	// Database
-	packet.AppendUInt16LE(database_offset);
-	packet.AppendUInt16LE(database_len);
+	packet.AppendUInt16LE(field_database.ib);
+	packet.AppendUInt16LE(field_database.cch);
 
 	// ClientID (6 bytes) - MAC address, we use zeros
 	for (int i = 0; i < 6; i++) {
@@ -361,26 +373,14 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// cbSSPILong (4 bytes) - long SSPI length, 0 for us
 	packet.AppendUInt32LE(0);
 
-	// Now append variable data
-
-	// HostName (UTF-16LE)
-	packet.AppendUTF16LE(host);
-
-	// UserName (UTF-16LE)
-	packet.AppendUTF16LE(username);
-
-	// Password (encoded, then as UTF-16LE-ish)
-	std::vector<uint8_t> encoded_password = EncodePassword(password);
-	packet.AppendPayload(encoded_password);
-
-	// AppName (UTF-16LE)
-	packet.AppendUTF16LE(app_name);
-
-	// ServerName (UTF-16LE)
-	packet.AppendUTF16LE(host);
-
-	// Database (UTF-16LE)
-	packet.AppendUTF16LE(database);
+	// Variable data: each field's UTF-16LE bytes were produced by
+	// EncodeLogin7VarField above. Password bytes are already obfuscated.
+	packet.AppendPayload(field_hostname.utf16le_bytes);
+	packet.AppendPayload(field_username.utf16le_bytes);
+	packet.AppendPayload(field_password.utf16le_bytes);
+	packet.AppendPayload(field_appname.utf16le_bytes);
+	packet.AppendPayload(field_servername.utf16le_bytes);
+	packet.AppendPayload(field_database.utf16le_bytes);
 
 	return packet;
 }
@@ -1197,31 +1197,17 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	//   HostName = client workstation name (identifies the client machine)
 	//   ServerName = TDS server name (may include instance name for routing)
 
-	// Calculate string offsets and lengths
-	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
-	uint16_t username_len = 0;	// No username with FEDAUTH
-	uint16_t password_len = 0;	// No password with FEDAUTH
-	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
-	uint16_t database_len = static_cast<uint16_t>(database.size());
-
-	// Variable data starts at offset 94 (end of fixed header)
+	// Spec 043: every variable LOGIN7 string field is encoded via the
+	// EncodeLogin7VarField helper so UTF-8 -> UTF-16LE conversion and
+	// cch*/ib* bookkeeping use UTF-16 code-unit counts, not UTF-8 byte
+	// counts. FEDAUTH does not send username/password so those fields
+	// stay empty (helper returns cch=0 and emits zero bytes).
 	uint16_t var_offset = 94;
-
-	uint16_t hostname_offset = var_offset;
-	var_offset += hostname_len * 2;
-
-	uint16_t username_offset = var_offset;	// Empty for FEDAUTH
-	// var_offset += 0 (no username)
-
-	uint16_t password_offset = var_offset;	// Empty for FEDAUTH
-	// var_offset += 0 (no password)
-
-	uint16_t appname_offset = var_offset;
-	var_offset += appname_len * 2;
-
-	uint16_t servername_offset = var_offset;
-	var_offset += servername_len * 2;
+	Login7VarField field_hostname = EncodeLogin7VarField("HostName", client_hostname, var_offset);
+	Login7VarField field_username = EncodeLogin7VarField("UserName", "", var_offset);
+	Login7VarField field_password = EncodeLogin7VarField("Password", "", var_offset);
+	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", server_name, var_offset);
 
 	// CltIntName (unused) - points to same offset, length 0
 	uint16_t cltintname_offset = var_offset;
@@ -1229,9 +1215,7 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Language (unused) - points to same offset, length 0
 	uint16_t language_offset = var_offset;
 
-	// Database
-	uint16_t database_offset = var_offset;
-	var_offset += database_len * 2;
+	Login7VarField field_database = EncodeLogin7VarField("Database", database, var_offset);
 
 	// SSPI, AtchDBFile, ChangePassword - all unused, point to current offset
 	uint16_t sspi_attrdb_chgpwd_offset = var_offset;
@@ -1323,24 +1307,24 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Offset 36-93: Offset/Length pairs for variable fields
 
 	// HostName
-	packet.AppendUInt16LE(hostname_offset);
-	packet.AppendUInt16LE(hostname_len);
+	packet.AppendUInt16LE(field_hostname.ib);
+	packet.AppendUInt16LE(field_hostname.cch);
 
 	// UserName (empty for FEDAUTH)
-	packet.AppendUInt16LE(username_offset);
-	packet.AppendUInt16LE(username_len);
+	packet.AppendUInt16LE(field_username.ib);
+	packet.AppendUInt16LE(field_username.cch);
 
 	// Password (empty for FEDAUTH)
-	packet.AppendUInt16LE(password_offset);
-	packet.AppendUInt16LE(password_len);
+	packet.AppendUInt16LE(field_password.ib);
+	packet.AppendUInt16LE(field_password.cch);
 
 	// AppName
-	packet.AppendUInt16LE(appname_offset);
-	packet.AppendUInt16LE(appname_len);
+	packet.AppendUInt16LE(field_appname.ib);
+	packet.AppendUInt16LE(field_appname.cch);
 
 	// ServerName
-	packet.AppendUInt16LE(servername_offset);
-	packet.AppendUInt16LE(servername_len);
+	packet.AppendUInt16LE(field_servername.ib);
+	packet.AppendUInt16LE(field_servername.cch);
 
 	// Extension - ibExtension points to the DWORD containing feature extension offset
 	// Per go-mssqldb: cbExtension = 4 (just the DWORD size, not including extension data)
@@ -1356,8 +1340,8 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	packet.AppendUInt16LE(0);
 
 	// Database
-	packet.AppendUInt16LE(database_offset);
-	packet.AppendUInt16LE(database_len);
+	packet.AppendUInt16LE(field_database.ib);
+	packet.AppendUInt16LE(field_database.cch);
 
 	// ClientID (6 bytes) - MAC address, zeros
 	for (int i = 0; i < 6; i++) {
@@ -1380,26 +1364,14 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	packet.AppendUInt32LE(0);
 
 	// =====================================
-	// Variable data section
+	// Variable data section (encoded UTF-16LE bytes from the helper)
 	// =====================================
-
-	// HostName (UTF-16LE) - client workstation name
-	packet.AppendUTF16LE(client_hostname);
-
-	// UserName - empty for FEDAUTH (no data written)
-	// Password - empty for FEDAUTH (no data written)
-
-	// AppName (UTF-16LE)
-	packet.AppendUTF16LE(app_name);
-
-	// ServerName (UTF-16LE) - TDS server name (may include instance name)
-	packet.AppendUTF16LE(server_name);
-
-	// CltIntName - empty (no data written)
-	// Language - empty (no data written)
-
-	// Database (UTF-16LE)
-	packet.AppendUTF16LE(database);
+	packet.AppendPayload(field_hostname.utf16le_bytes);
+	// UserName / Password are empty for FEDAUTH (zero bytes).
+	packet.AppendPayload(field_appname.utf16le_bytes);
+	packet.AppendPayload(field_servername.utf16le_bytes);
+	// CltIntName / Language remain empty (zero bytes).
+	packet.AppendPayload(field_database.utf16le_bytes);
 
 	// SSPI - empty (no data written)
 	// AtchDBFile - empty (no data written)
@@ -1449,34 +1421,20 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	// ADAL flow: LOGIN7 contains small FEDAUTH extension (just options + workflow bytes)
 	// Server responds with FEDAUTHINFO token, client sends token in separate FEDAUTH_TOKEN packet
 
-	// Calculate string offsets and lengths
-	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
-	uint16_t username_len = 0;	// No username with FEDAUTH
-	uint16_t password_len = 0;	// No password with FEDAUTH
-	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
-	uint16_t database_len = static_cast<uint16_t>(database.size());
-
-	// Variable data starts at offset 94 (end of fixed header)
+	// Spec 043: encode every variable LOGIN7 string field via the helper
+	// so cch* / ib* use UTF-16 code units, not UTF-8 byte counts. ADAL
+	// FEDAUTH carries no username/password.
 	uint16_t var_offset = 94;
-
-	uint16_t hostname_offset = var_offset;
-	var_offset += hostname_len * 2;
-
-	uint16_t username_offset = var_offset;	// Empty for FEDAUTH
-	uint16_t password_offset = var_offset;	// Empty for FEDAUTH
-
-	uint16_t appname_offset = var_offset;
-	var_offset += appname_len * 2;
-
-	uint16_t servername_offset = var_offset;
-	var_offset += servername_len * 2;
+	Login7VarField field_hostname = EncodeLogin7VarField("HostName", client_hostname, var_offset);
+	Login7VarField field_username = EncodeLogin7VarField("UserName", "", var_offset);
+	Login7VarField field_password = EncodeLogin7VarField("Password", "", var_offset);
+	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", server_name, var_offset);
 
 	uint16_t cltintname_offset = var_offset;
 	uint16_t language_offset = var_offset;
 
-	uint16_t database_offset = var_offset;
-	var_offset += database_len * 2;
+	Login7VarField field_database = EncodeLogin7VarField("Database", database, var_offset);
 
 	uint16_t sspi_attrdb_chgpwd_offset = var_offset;
 
@@ -1546,24 +1504,24 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	// Offset 36-93: Offset/Length pairs for variable fields
 
 	// HostName
-	packet.AppendUInt16LE(hostname_offset);
-	packet.AppendUInt16LE(hostname_len);
+	packet.AppendUInt16LE(field_hostname.ib);
+	packet.AppendUInt16LE(field_hostname.cch);
 
 	// UserName (empty for FEDAUTH)
-	packet.AppendUInt16LE(username_offset);
-	packet.AppendUInt16LE(username_len);
+	packet.AppendUInt16LE(field_username.ib);
+	packet.AppendUInt16LE(field_username.cch);
 
 	// Password (empty for FEDAUTH)
-	packet.AppendUInt16LE(password_offset);
-	packet.AppendUInt16LE(password_len);
+	packet.AppendUInt16LE(field_password.ib);
+	packet.AppendUInt16LE(field_password.cch);
 
 	// AppName
-	packet.AppendUInt16LE(appname_offset);
-	packet.AppendUInt16LE(appname_len);
+	packet.AppendUInt16LE(field_appname.ib);
+	packet.AppendUInt16LE(field_appname.cch);
 
 	// ServerName
-	packet.AppendUInt16LE(servername_offset);
-	packet.AppendUInt16LE(servername_len);
+	packet.AppendUInt16LE(field_servername.ib);
+	packet.AppendUInt16LE(field_servername.cch);
 
 	// Extension
 	packet.AppendUInt16LE(extension_dword_offset);
@@ -1578,8 +1536,8 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	packet.AppendUInt16LE(0);
 
 	// Database
-	packet.AppendUInt16LE(database_offset);
-	packet.AppendUInt16LE(database_len);
+	packet.AppendUInt16LE(field_database.ib);
+	packet.AppendUInt16LE(field_database.cch);
 
 	// ClientID (6 bytes) - MAC address, zeros
 	for (int i = 0; i < 6; i++) {
@@ -1602,30 +1560,15 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	packet.AppendUInt32LE(0);
 
 	// =====================================
-	// Variable data section
+	// Variable data section (UTF-16LE bytes via the helper)
 	// =====================================
-
-	// HostName (UTF-16LE)
-	packet.AppendUTF16LE(client_hostname);
-
-	// UserName - empty for FEDAUTH
-	// Password - empty for FEDAUTH
-
-	// AppName (UTF-16LE)
-	packet.AppendUTF16LE(app_name);
-
-	// ServerName (UTF-16LE)
-	packet.AppendUTF16LE(server_name);
-
-	// CltIntName - empty
-	// Language - empty
-
-	// Database (UTF-16LE)
-	packet.AppendUTF16LE(database);
-
-	// SSPI - empty
-	// AtchDBFile - empty
-	// ChangePassword - empty
+	packet.AppendPayload(field_hostname.utf16le_bytes);
+	// UserName / Password empty.
+	packet.AppendPayload(field_appname.utf16le_bytes);
+	packet.AppendPayload(field_servername.utf16le_bytes);
+	// CltIntName / Language empty.
+	packet.AppendPayload(field_database.utf16le_bytes);
+	// SSPI / AtchDBFile / ChangePassword empty.
 
 	// ExtensionDWORD - offset to feature extensions
 	packet.AppendUInt32LE(feature_ext_offset);

@@ -275,12 +275,14 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 043-refactoring-foundation: Added C++ (C++11-compatible ABI) + DuckDB (main branch), simdutf (vcpkg, statically linked, MIT) for LOGIN7 non-ASCII fix; OpenSSL unchanged
 - 041-xml-type-support: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer
 - 040-fix-datetimeoffset-nbc: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), custom TDS protocol layer
 - 039-order-pushdown: Added C++17 (C++11-compatible for ODR on Linux) + DuckDB (main branch), OpenSSL (vcpkg), existing TDS protocol layer
 
 
 <!-- SPECKIT START -->
-For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
+Active spec: 043-refactoring-foundation. See implementation plan at
+`specs/043-refactoring-foundation/plan.md` for technical context,
+research findings, data model, contracts, and quickstart.
 <!-- SPECKIT END -->

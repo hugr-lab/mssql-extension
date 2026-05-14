@@ -1,4 +1,7 @@
 #include "tds/tds_packet.hpp"
+
+#include "tds/encoding/simdutf_wrappers.hpp"
+
 #include <cstring>
 #include <stdexcept>
 
@@ -56,12 +59,18 @@ void TdsPacket::AppendString(const std::string &str) {
 }
 
 void TdsPacket::AppendUTF16LE(const std::string &str) {
-	// Simple ASCII to UTF-16LE conversion
-	// For full Unicode support, would need proper conversion
-	for (char c : str) {
-		payload_.push_back(static_cast<uint8_t>(c));
-		payload_.push_back(0);	// High byte for ASCII chars
-	}
+	// Spec 043: full UTF-8 -> UTF-16LE conversion via simdutf (validate +
+	// SIMD fast path) with legacy fallback on invalid UTF-8. Replaces the
+	// prior ASCII-only byte-by-byte loop which silently emitted garbage
+	// for any non-ASCII input.
+	//
+	// Note: all current LOGIN7 builders bypass this method and call
+	// EncodeLogin7VarField + AppendPayload directly because they also
+	// need the UTF-16 code-unit count for the LOGIN7 fixed header. This
+	// method is preserved as a generic public helper for any future
+	// caller that needs unprefixed UTF-16LE bytes.
+	const auto bytes = encoding::SimdutfUtf16LEEncode(str);
+	payload_.insert(payload_.end(), bytes.begin(), bytes.end());
 }
 
 void TdsPacket::ClearPayload() {
