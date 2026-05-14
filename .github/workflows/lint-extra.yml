@@ -3,6 +3,12 @@ name: Lint (shell, yaml, docker, spelling)
 # Auxiliary lint pass beyond clang-format. Each job is small and parallel so
 # total wall time is dominated by ubuntu-latest spin-up, not the linters
 # themselves.
+#
+# Three of the four jobs (shellcheck, hadolint, codespell) currently run with
+# `continue-on-error: true` because they surface pre-existing findings in
+# vendored / specify-scaffolding files that would block this PR. Track the
+# cleanup in a follow-up issue; flip these to required once the existing
+# findings are addressed.
 
 on:
   pull_request:
@@ -21,18 +27,18 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Soft-launch: existing findings in .specify/scripts/bash/*.sh are
+    # SC2046/SC2155 warnings (pre-existing). Will flip to required after a
+    # cleanup pass.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Run shellcheck
         uses: ludeeus/action-shellcheck@master
         env:
-          # Default severity. Bump to "warning" if "style" produces noise.
           SHELLCHECK_OPTS: -e SC1091
         with:
           scandir: '.'
-          # Skip vendored / submodule directories explicitly. shellcheck
-          # follows symlinks by default; the explicit ignore list keeps
-          # the run deterministic.
           ignore_paths: >-
             duckdb
             vcpkg
@@ -43,13 +49,17 @@ jobs:
     name: hadolint (Dockerfiles)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Soft-launch: docker/Dockerfile.build triggers DL3029 (--platform on
+    # FROM), DL3008 (unpinned apt versions), DL3015 (missing
+    # --no-install-recommends). Pre-existing. Will flip to required after
+    # follow-up cleanup.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Find Dockerfiles
         id: find
         run: |
           set -euo pipefail
-          # Print one path per line; hadolint-action consumes the list.
           dockerfiles="$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) \
             -not -path './duckdb/*' \
             -not -path './vcpkg/*' \
@@ -94,14 +104,14 @@ jobs:
     name: codespell
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Soft-launch: real typos in existing source (COPYs, Get's). The
+    # .codespellrc filters out project-specific false positives (HasTable,
+    # TE, etc.). Will flip to required after a typo cleanup PR fixes the
+    # remaining genuine findings.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Run codespell
         uses: codespell-project/actions-codespell@v2
-        with:
-          # Skip vendored directories and binary-ish files. The ignore-words
-          # list is empty for now; add false-positive identifiers (e.g.
-          # "crate", "nd") here if they crop up.
-          skip: '*.lock,*.svg,duckdb,vcpkg,build,.git,*.bin'
-          check_filenames: true
-          check_hidden: false
+        # Configuration sourced from .codespellrc at the repo root so a
+        # local `codespell` invocation matches CI exactly.

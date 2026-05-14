@@ -3,6 +3,12 @@ name: Security Scan
 # Secret scanning + dependency posture. Runs on every PR and on a weekly
 # schedule against main so freshly-published advisories surface even when
 # there's no PR traffic.
+#
+# Uses TruffleHog rather than gitleaks because gitleaks-action requires a
+# paid license for organization repos as of 2023 (see
+# https://github.com/gitleaks/gitleaks-action#-announcement). TruffleHog OSS
+# is free for organizations and finds the same class of high-entropy secrets
+# plus a verifier layer that culls false positives.
 
 on:
   push:
@@ -19,23 +25,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gitleaks:
-    name: Secret scan (gitleaks)
+  trufflehog:
+    name: Secret scan (TruffleHog)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history so gitleaks can scan every commit on the PR, not
-          # just the tip. Required for detecting secrets that were committed
-          # and then "deleted" in a later commit.
+          # Full history so TruffleHog can scan every commit on the PR /
+          # branch, not just the tip. Required for detecting secrets that
+          # were committed and then "deleted" in a follow-up commit.
           fetch-depth: 0
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No license env -- the action is free for public repos.
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
-          GITLEAKS_ENABLE_SUMMARY: true
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # On PRs: scan from the base ref to HEAD (only new commits).
+          # On push to main / schedule: scan the entire repo history. The
+          # action handles the base/head args based on the event.
+          extra_args: --only-verified

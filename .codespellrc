@@ -1,0 +1,9 @@
+[codespell]
+# Project-specific false positives:
+#   * HasTable, hasTable -- DuckDB Catalog/Schema API method name
+#   * TE                  -- common abbreviation that hits in identifiers
+#   * crate               -- not used in this C++ project, but a common
+#                            collision in shared infra
+#   * nd                  -- collides with "2nd"/"3rd" in comments
+ignore-words-list = HasTable,hastable,TE,te,crate,nd
+skip = *.lock,*.svg,duckdb,vcpkg,build,.git,*.bin,*.pdf
