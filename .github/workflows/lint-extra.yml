@@ -1,14 +1,16 @@
-name: Lint (shell, yaml, docker, spelling)
+name: Lint (yaml)
 
-# Auxiliary lint pass beyond clang-format. Each job is small and parallel so
-# total wall time is dominated by ubuntu-latest spin-up, not the linters
-# themselves.
+# yamllint on workflows and top-level YAML. Catches real YAML errors that
+# tooling like clang-format wouldn't notice.
 #
-# Three of the four jobs (shellcheck, hadolint, codespell) currently run with
-# `continue-on-error: true` because they surface pre-existing findings in
-# vendored / specify-scaffolding files that would block this PR. Track the
-# cleanup in a follow-up issue; flip these to required once the existing
-# findings are addressed.
+# NOTE: shellcheck / hadolint / codespell are intentionally NOT in this PR.
+# The first CI run surfaced real pre-existing findings in vendored /
+# scaffolding files (SC2046/SC2155 in .specify/scripts/bash, DL3029/DL3008/
+# DL3015 in docker/Dockerfile.build, real typos in src/). Adding them as
+# required checks before cleanup would block unrelated PRs; adding them as
+# continue-on-error still leaves the checks page red. The right move is to
+# fix the findings in dedicated follow-up PRs and bring the linters in
+# alongside the fixes.
 
 on:
   pull_request:
@@ -23,63 +25,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  shellcheck:
-    name: shellcheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Soft-launch: existing findings in .specify/scripts/bash/*.sh are
-    # SC2046/SC2155 warnings (pre-existing). Will flip to required after a
-    # cleanup pass.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run shellcheck
-        uses: ludeeus/action-shellcheck@master
-        env:
-          SHELLCHECK_OPTS: -e SC1091
-        with:
-          scandir: '.'
-          ignore_paths: >-
-            duckdb
-            vcpkg
-            build
-            .git
-
-  hadolint:
-    name: hadolint (Dockerfiles)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Soft-launch: docker/Dockerfile.build triggers DL3029 (--platform on
-    # FROM), DL3008 (unpinned apt versions), DL3015 (missing
-    # --no-install-recommends). Pre-existing. Will flip to required after
-    # follow-up cleanup.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Find Dockerfiles
-        id: find
-        run: |
-          set -euo pipefail
-          dockerfiles="$(find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) \
-            -not -path './duckdb/*' \
-            -not -path './vcpkg/*' \
-            -not -path './build/*' \
-            -not -path './.git/*' | sort)"
-          echo "files<<EOF" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "$dockerfiles" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-          printf 'Dockerfiles to lint:\n%s\n' "$dockerfiles"
-      - name: Run hadolint on each Dockerfile
-        if: steps.find.outputs.files != ''
-        run: |
-          set -e
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            echo "::group::hadolint $f"
-            docker run --rm -i hadolint/hadolint:latest hadolint - < "$f"
-            echo "::endgroup::"
-          done <<< "${{ steps.find.outputs.files }}"
-
   yamllint:
     name: yamllint
     runs-on: ubuntu-latest
@@ -99,19 +44,3 @@ jobs:
             -d '{extends: relaxed, rules: {line-length: disable, truthy: disable, comments: disable}}' \
             .github/ \
             $(find . -maxdepth 3 -name '*.yml' -not -path './duckdb/*' -not -path './vcpkg/*' -not -path './.github/*' -not -path './build/*' -not -path './.git/*')
-
-  codespell:
-    name: codespell
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Soft-launch: real typos in existing source (COPYs, Get's). The
-    # .codespellrc filters out project-specific false positives (HasTable,
-    # TE, etc.). Will flip to required after a typo cleanup PR fixes the
-    # remaining genuine findings.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run codespell
-        uses: codespell-project/actions-codespell@v2
-        # Configuration sourced from .codespellrc at the repo root so a
-        # local `codespell` invocation matches CI exactly.
