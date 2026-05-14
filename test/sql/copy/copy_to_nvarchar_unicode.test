@@ -1,0 +1,56 @@
+# name: test/sql/copy/copy_to_nvarchar_unicode.test
+# description: Spec 044 regression — round-trip mixed-Unicode NVARCHAR values through COPY TO MSSQL (BCP) and assert byte-identical retrieval via SELECT
+# group: [copy] [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# Source data covers the four payload classes the codec consolidation
+# spec (044) cares about: ASCII fast path, BMP Cyrillic / accented
+# Latin, CJK ideographs, and non-BMP emoji (surrogate-pair).
+
+statement ok
+CREATE TABLE codec_unicode_src AS SELECT * FROM (VALUES
+    (1, 'ASCII row plain'),
+    (2, 'Привет мир — Cyrillic'),
+    (3, 'Ünlaut Áéí ñ — accented Latin'),
+    (4, '中文测试 — CJK ideograph'),
+    (5, '🔒 emoji surrogate 🔑'),
+    (6, 'Mixed: Привет 中文 🔒 done')
+) AS t(id, name);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.codec_unicode_rt;
+
+# Drive the BCP encode hot path (bcp_row_encoder.cpp + bcp_writer.cpp)
+# with the mixed-Unicode payload. CREATE_TABLE auto-creates the target
+# with NVARCHAR(N) columns.
+statement ok
+COPY codec_unicode_src TO 'mssql://db/dbo/codec_unicode_rt' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Round-trip assertion: every row's UTF-8 text reads back byte-identical
+# to the input. The read path goes through type_converter.cpp's NVARCHAR
+# decode (line 424 in the legacy file), which spec 044 also migrated.
+query IT
+SELECT id, name FROM db.dbo.codec_unicode_rt ORDER BY id;
+----
+1	ASCII row plain
+2	Привет мир — Cyrillic
+3	Ünlaut Áéí ñ — accented Latin
+4	中文测试 — CJK ideograph
+5	🔒 emoji surrogate 🔑
+6	Mixed: Привет 中文 🔒 done
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS db.dbo.codec_unicode_rt;
+
+statement ok
+DROP TABLE codec_unicode_src;
+
+statement ok
+DETACH db;

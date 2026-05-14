@@ -14,14 +14,18 @@
 //
 // Compile manually (no CI hook yet):
 //   c++ -std=c++17 -Isrc/include -Iduckdb/src/include \
-//       -DMSSQL_TLS_STUB=1 \
+//       -DMSSQL_TLS_STUB=1 -DMSSQL_BENCH_BUILD \
 //       test/cpp/test_login7_encoding.cpp \
 //       src/tds/tds_packet.cpp \
 //       src/tds/tds_protocol.cpp \
 //       src/tds/encoding/utf16.cpp \
-//       src/tds/encoding/simdutf_wrappers.cpp \
 //       -lsimdutf \
 //       -o build/test/test_login7_encoding
+//
+// MSSQL_BENCH_BUILD exposes the private legacy hand-rolled converter via the
+// tds::encoding::testing::LegacyUtf16LE* re-export so the simdutf-vs-legacy
+// equivalence assertions can compare both implementations. The production
+// extension is built without this flag.
 //
 // Run:
 //   ./build/test/test_login7_encoding
@@ -34,7 +38,6 @@
 #include <string>
 #include <vector>
 
-#include "tds/encoding/simdutf_wrappers.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_protocol.hpp"
@@ -371,28 +374,32 @@ void TestSimdutfByteEquivalence() {
 	std::cout << "[6] simdutf wrapper byte-equivalent to legacy on " << SimdutfFixtures().size() << " fixtures..."
 			  << std::endl;
 	for (const auto &input : SimdutfFixtures()) {
-		// Encode direction
-		const auto legacy = encoding::Utf16LEEncode(input);
-		const auto simd = encoding::SimdutfUtf16LEEncode(input);
+		// Encode direction. Post-spec-044 the public `Utf16LE*` symbols are
+		// simdutf-backed; the legacy hand-rolled implementation is reachable
+		// only via the test-only `encoding::testing::LegacyUtf16LE*` re-export
+		// (gated by MSSQL_BENCH_BUILD at compile time).
+		const auto legacy = encoding::testing::LegacyUtf16LEEncode(input);
+		const auto simd = encoding::Utf16LEEncode(input);
 		CHECK_TRUE(legacy == simd, std::string("encode mismatch for input: ") + input);
 
 		// Byte-length helper
-		CHECK_EQ(encoding::Utf16LEByteLength(input), encoding::SimdutfUtf16LEByteLength(input),
+		CHECK_EQ(encoding::testing::LegacyUtf16LEByteLength(input), encoding::Utf16LEByteLength(input),
 				 std::string("byte-length mismatch for input: ") + input);
 
 		// Direct-encode helper writes to caller buffer
 		std::vector<uint8_t> buf_legacy(input.size() * 4, 0);
 		std::vector<uint8_t> buf_simd(input.size() * 4, 0);
-		const size_t n_legacy = encoding::Utf16LEEncodeDirect(input.data(), input.size(), buf_legacy.data());
-		const size_t n_simd = encoding::SimdutfUtf16LEEncodeDirect(input.data(), input.size(), buf_simd.data());
+		const size_t n_legacy =
+			encoding::testing::LegacyUtf16LEEncodeDirect(input.data(), input.size(), buf_legacy.data());
+		const size_t n_simd = encoding::Utf16LEEncodeDirect(input.data(), input.size(), buf_simd.data());
 		CHECK_EQ(n_legacy, n_simd, std::string("direct-encode size mismatch for input: ") + input);
 		buf_legacy.resize(n_legacy);
 		buf_simd.resize(n_simd);
 		CHECK_TRUE(buf_legacy == buf_simd, std::string("direct-encode bytes mismatch for input: ") + input);
 
 		// Decode direction
-		const auto round_legacy = encoding::Utf16LEDecode(legacy.data(), legacy.size());
-		const auto round_simd = encoding::SimdutfUtf16LEDecode(simd.data(), simd.size());
+		const auto round_legacy = encoding::testing::LegacyUtf16LEDecode(legacy.data(), legacy.size());
+		const auto round_simd = encoding::Utf16LEDecode(simd.data(), simd.size());
 		CHECK_STR_EQ(round_legacy, input, std::string("legacy round-trip: ") + input);
 		CHECK_STR_EQ(round_simd, input, std::string("simdutf round-trip: ") + input);
 	}
@@ -420,14 +427,14 @@ void TestSimdutfInvalidInputFallback() {
 		bool threw = false;
 		std::vector<uint8_t> simd;
 		try {
-			simd = encoding::SimdutfUtf16LEEncode(s);
+			simd = encoding::Utf16LEEncode(s);
 		} catch (...) {
 			threw = true;
 		}
-		CHECK_TRUE(!threw, "SimdutfUtf16LEEncode does not throw on invalid UTF-8");
-		// Fallback: output must be bit-identical to the legacy converter on
-		// the same invalid input.
-		const auto legacy = encoding::Utf16LEEncode(s);
+		CHECK_TRUE(!threw, "Utf16LEEncode does not throw on invalid UTF-8");
+		// Fallback: output must be bit-identical to the private legacy
+		// hand-rolled converter on the same invalid input.
+		const auto legacy = encoding::testing::LegacyUtf16LEEncode(s);
 		CHECK_TRUE(simd == legacy, "invalid-UTF-8 fallback matches legacy output");
 	}
 }

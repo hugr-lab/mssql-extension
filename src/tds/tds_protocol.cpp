@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
-#include "tds/encoding/simdutf_wrappers.hpp"
 #include "tds/encoding/utf16.hpp"
 #ifdef _WIN32
 #include <process.h>
@@ -65,7 +64,7 @@ static Login7VarField EncodeLogin7VarField(const char *field_name, const std::st
 	result.ib = cumulative_ib_offset;
 
 	if (!utf8_text.empty()) {
-		result.utf16le_bytes = encoding::SimdutfUtf16LEEncode(utf8_text);
+		result.utf16le_bytes = encoding::Utf16LEEncode(utf8_text);
 	}
 
 	const size_t code_units = result.utf16le_bytes.size() / 2;
