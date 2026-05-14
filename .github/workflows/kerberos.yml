@@ -1,0 +1,79 @@
+name: Kerberos Integration
+
+# Spec 042: brings up the self-contained docker-compose stack at test/kerberos/
+# (MIT KDC + SQL Server + multi-stage test-client that builds the extension
+# inside Linux) and runs the end-to-end Kerberos auth test. Validates the POSIX
+# integrated-auth path automatically on every PR that touches auth code.
+
+on:
+  pull_request:
+    paths:
+      - 'src/tds/auth/**'
+      - 'src/include/tds/auth/**'
+      - 'src/tds/tds_protocol.cpp'
+      - 'src/tds/tds_connection.cpp'
+      - 'src/tds/tds_token_parser.cpp'
+      - 'src/include/tds/tds_types.hpp'
+      - 'src/mssql_storage.cpp'
+      - 'src/mssql_secret.cpp'
+      - 'src/include/mssql_storage.hpp'
+      - 'src/connection/mssql_pool_manager.cpp'
+      - 'CMakeLists.txt'
+      - 'test/kerberos/**'
+      - 'test/sql/integrated_auth/**'
+      - '.github/workflows/kerberos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: kerberos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kerberos-stack:
+    name: Kerberos end-to-end (KDC + SQL Server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show docker / compose versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Build and start Kerberos test stack
+        working-directory: test/kerberos
+        run: |
+          docker compose up -d --build --wait --wait-timeout 1800
+
+      - name: Show service status
+        if: always()
+        working-directory: test/kerberos
+        run: docker compose ps
+
+      - name: Run Kerberos integration tests
+        working-directory: test/kerberos
+        run: docker compose exec -T test-client /run-tests.sh
+
+      - name: Dump KDC logs on failure
+        if: failure()
+        working-directory: test/kerberos
+        run: docker compose logs kdc
+
+      - name: Dump SQL Server logs on failure
+        if: failure()
+        working-directory: test/kerberos
+        run: docker compose logs sql
+
+      - name: Dump test-client logs on failure
+        if: failure()
+        working-directory: test/kerberos
+        run: docker compose logs test-client
+
+      - name: Tear down
+        if: always()
+        working-directory: test/kerberos
+        run: docker compose down -v
