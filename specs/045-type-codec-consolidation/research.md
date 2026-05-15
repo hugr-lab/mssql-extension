@@ -79,13 +79,13 @@ without ambiguity:
 
 ## R2. Namespace and file naming
 
-**Decision**: `namespace duckdb::codec::<family>` for per-family modules.
+**Decision**: `namespace duckdb::mssql::codec::<family>` for per-family modules.
 Files: `src/codec/<family>_codec.{cpp,hpp}`, with headers at
 `src/include/codec/<family>_codec.hpp`. Shared headers at
 `src/include/codec/{type_family,literal_context,literal_format}.hpp`.
 
 **Rationale**: Consistent with CLAUDE.md "Namespace Prefix Rule" — names
-inside `duckdb::codec::*` are already scoped, so no `MSSQL` prefix is
+inside `duckdb::mssql::codec::*` are already scoped, so no `MSSQL` prefix is
 needed on classes/functions. The `_codec.cpp` suffix on per-family
 files (rather than just `integer.cpp`) reads more clearly when these
 files appear in stack traces and grep output, and matches the existing
@@ -426,7 +426,7 @@ or `src/tds/encoding/utf16.{cpp,hpp}`.
 | # | Decision                                                                          |
 |---|-----------------------------------------------------------------------------------|
 | R1 | 9-family taxonomy validated; Money is scan-decode-only; HUGEINT in Integer family with Decimal-forward; XML aliases to String. |
-| R2 | `namespace duckdb::codec::<family>`, files `src/codec/<family>_codec.{cpp,hpp}` and `src/include/codec/<family>_codec.hpp`. |
+| R2 | `namespace duckdb::mssql::codec::<family>`, files `src/codec/<family>_codec.{cpp,hpp}` and `src/include/codec/<family>_codec.hpp`. |
 | R3 | `FamilyFromTdsType(uint8_t)` and `FamilyFromLogicalType(const LogicalType&)` — both pure-function switches. No `max_length` parameter needed. |
 | R4 | `LiteralContext { Filter, InsertValues }` — divergence narrower than spec implied; HUGEINT and DECIMAL filter literals become correctness fixes (add to FR-020 amendment). |
 | R5 | Issue #91 root-cause hunt deferred to String family migration (Phase 8); pre/post byte trace committed as SC-002a evidence. |

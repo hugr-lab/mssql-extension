@@ -92,7 +92,7 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT: {
 		mssql::CTASConfig default_cfg;
-		return codec::integer::FormatDdlTypeName(type, default_cfg, codec::DdlContext::CreateTable);
+		return mssql::codec::integer::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
 	}
 
 	case LogicalTypeId::FLOAT:
@@ -349,7 +349,7 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
-		return codec::integer::FormatDdlTypeName(type, config, codec::DdlContext::CtasCreateTable);
+		return mssql::codec::integer::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::FLOAT:
 		return "REAL";	// 32-bit float
@@ -396,7 +396,7 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return "UNIQUEIDENTIFIER";
 
 	// Unsupported types - CTAS must fail with clear error (FR-012)
-	// HUGEINT/UHUGEINT now route through codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)
+	// HUGEINT/UHUGEINT now route through mssql::codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)
 	// in both DDL contexts; cases above this point handled by the unified Integer arm.
 	case LogicalTypeId::INTERVAL:
 		throw NotImplementedException(

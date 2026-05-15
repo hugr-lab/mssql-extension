@@ -22,6 +22,7 @@
 #include "duckdb/common/exception.hpp"
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 namespace {
@@ -85,4 +86,5 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 }
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

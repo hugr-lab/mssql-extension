@@ -103,7 +103,7 @@ codebase).
   LogicalTypeId → TypeFamily** for BCP encode + literal text + DDL
   name. Each family lives in one module
   (`src/codec/<family>_codec.{hpp,cpp}`) that exposes the 4 operations
-  as free functions in a `duckdb::codec::<family>` namespace.
+  as free functions in a `duckdb::mssql::codec::<family>` namespace.
   See §Architecture below.
 - Q: Should batch APIs (one call per DataChunk, not per row) be
   introduced now? → A: No. Per-row stays. Batch is a separate spec
@@ -416,7 +416,7 @@ with a clear "exceeds column capacity" error (not a confusing
   utility modules).
 - **FR-002**: Each family MUST have one source file pair
   (`src/codec/<family>_codec.{hpp,cpp}`) exposing four free
-  functions in `namespace duckdb::codec::<family>`:
+  functions in `namespace duckdb::mssql::codec::<family>`:
   - `void DecodeFromTds(const std::vector<uint8_t> &bytes,
     const tds::ColumnMetadata &col, Vector &out, idx_t row);`
   - `void EncodeToBcp(Vector &in, idx_t row,
@@ -701,7 +701,7 @@ with a clear "exceeds column capacity" error (not a confusing
   per CLAUDE.md naming conventions.
 - **FR-042**: Per-family functions are PascalCase
   (`DecodeFromTds`, `EncodeToBcp`, `FormatSqlLiteral`,
-  `FormatDdlTypeName`), in `namespace duckdb::codec::<family>`,
+  `FormatDdlTypeName`), in `namespace duckdb::mssql::codec::<family>`,
   per CLAUDE.md "duckdb::-rooted namespace, no prefix" convention.
 
 ### Key Entities

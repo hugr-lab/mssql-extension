@@ -34,8 +34,8 @@ using duckdb::hugeint_t;
 using duckdb::HugeIntValue;
 using duckdb::LogicalType;
 using duckdb::Value;
-using duckdb::codec::DdlContext;
-using duckdb::codec::LiteralContext;
+using duckdb::mssql::codec::DdlContext;
+using duckdb::mssql::codec::LiteralContext;
 
 namespace {
 
@@ -74,9 +74,10 @@ void TestFormatSqlLiteralByteIdentity() {
 	};
 
 	for (const auto &sample : samples) {
-		auto filter = duckdb::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
+		auto filter =
+			duckdb::mssql::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
 		auto insert =
-			duckdb::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
+			duckdb::mssql::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
 		CHECK_EQ(filter, insert);
 	}
 }
@@ -84,24 +85,24 @@ void TestFormatSqlLiteralByteIdentity() {
 void TestFormatSqlLiteralHugeIntFix() {
 	std::cout << "Test: HUGEINT literal renders as decimal digits (FR-020 (b))\n";
 
-	auto small = duckdb::codec::integer::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT,
-														  LiteralContext::Filter);
+	auto small = duckdb::mssql::codec::integer::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT,
+																 LiteralContext::Filter);
 	CHECK_EQ(small, std::string("42"));
 
-	auto neg = duckdb::codec::integer::FormatSqlLiteral(Value::HUGEINT(duckdb::Hugeint::Negate(hugeint_t(0, 100))),
-														LogicalType::HUGEINT, LiteralContext::Filter);
+	auto neg = duckdb::mssql::codec::integer::FormatSqlLiteral(
+		Value::HUGEINT(duckdb::Hugeint::Negate(hugeint_t(0, 100))), LogicalType::HUGEINT, LiteralContext::Filter);
 	CHECK_EQ(neg, std::string("-100"));
 }
 
 void TestFormatSqlLiteralUBigInt() {
 	std::cout << "Test: UBIGINT literal uses CAST(... AS DECIMAL(20,0)) when > INT64_MAX\n";
 
-	auto small =
-		duckdb::codec::integer::FormatSqlLiteral(Value::UBIGINT(100), LogicalType::UBIGINT, LiteralContext::Filter);
+	auto small = duckdb::mssql::codec::integer::FormatSqlLiteral(Value::UBIGINT(100), LogicalType::UBIGINT,
+																 LiteralContext::Filter);
 	CHECK_EQ(small, std::string("100"));
 
-	auto large = duckdb::codec::integer::FormatSqlLiteral(Value::UBIGINT(static_cast<uint64_t>(INT64_MAX) + 1),
-														  LogicalType::UBIGINT, LiteralContext::InsertValues);
+	auto large = duckdb::mssql::codec::integer::FormatSqlLiteral(Value::UBIGINT(static_cast<uint64_t>(INT64_MAX) + 1),
+																 LogicalType::UBIGINT, LiteralContext::InsertValues);
 	CHECK_EQ(large, std::string("CAST(9223372036854775808 AS DECIMAL(20,0))"));
 }
 
@@ -116,8 +117,8 @@ void TestFormatDdlTypeNameByteIdentity() {
 
 	duckdb::mssql::CTASConfig cfg;
 	for (const auto &t : types) {
-		auto create = duckdb::codec::integer::FormatDdlTypeName(t, cfg, DdlContext::CreateTable);
-		auto ctas = duckdb::codec::integer::FormatDdlTypeName(t, cfg, DdlContext::CtasCreateTable);
+		auto create = duckdb::mssql::codec::integer::FormatDdlTypeName(t, cfg, DdlContext::CreateTable);
+		auto ctas = duckdb::mssql::codec::integer::FormatDdlTypeName(t, cfg, DdlContext::CtasCreateTable);
 		CHECK_EQ(create, ctas);
 	}
 }
@@ -126,27 +127,27 @@ void TestFormatDdlTypeNameExpectedShapes() {
 	std::cout << "Test: FormatDdlTypeName returns SQL Server-canonical type names\n";
 
 	duckdb::mssql::CTASConfig cfg;
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::TINYINT, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::TINYINT, cfg, DdlContext::CreateTable),
 			 std::string("TINYINT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::UTINYINT, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::UTINYINT, cfg, DdlContext::CreateTable),
 			 std::string("TINYINT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::SMALLINT, cfg, DdlContext::CtasCreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::SMALLINT, cfg, DdlContext::CtasCreateTable),
 			 std::string("SMALLINT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::USMALLINT, cfg, DdlContext::CtasCreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::USMALLINT, cfg, DdlContext::CtasCreateTable),
 			 std::string("INT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::INTEGER, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::INTEGER, cfg, DdlContext::CreateTable),
 			 std::string("INT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::UINTEGER, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::UINTEGER, cfg, DdlContext::CreateTable),
 			 std::string("BIGINT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::BIGINT, cfg, DdlContext::CtasCreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::BIGINT, cfg, DdlContext::CtasCreateTable),
 			 std::string("BIGINT"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::UBIGINT, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::UBIGINT, cfg, DdlContext::CreateTable),
 			 std::string("DECIMAL(20,0)"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::HUGEINT, cfg, DdlContext::CreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::HUGEINT, cfg, DdlContext::CreateTable),
 			 std::string("DECIMAL(38,0)"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::HUGEINT, cfg, DdlContext::CtasCreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::HUGEINT, cfg, DdlContext::CtasCreateTable),
 			 std::string("DECIMAL(38,0)"));
-	CHECK_EQ(duckdb::codec::integer::FormatDdlTypeName(LogicalType::UHUGEINT, cfg, DdlContext::CtasCreateTable),
+	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::UHUGEINT, cfg, DdlContext::CtasCreateTable),
 			 std::string("DECIMAL(38,0)"));
 }
 
@@ -163,8 +164,8 @@ void TestEstimateLiteralSizeUpperBound() {
 	};
 
 	for (const auto &s : samples) {
-		auto literal = duckdb::codec::integer::FormatSqlLiteral(s.first, s.second, LiteralContext::InsertValues);
-		auto bound = duckdb::codec::integer::EstimateLiteralSize(s.second);
+		auto literal = duckdb::mssql::codec::integer::FormatSqlLiteral(s.first, s.second, LiteralContext::InsertValues);
+		auto bound = duckdb::mssql::codec::integer::EstimateLiteralSize(s.second);
 		if (literal.size() > bound) {
 			++failures;
 			std::cerr << "FAIL upper bound: type=" << s.second.ToString() << " literal=" << literal
@@ -176,8 +177,8 @@ void TestEstimateLiteralSizeUpperBound() {
 void TestNullLiteral() {
 	std::cout << "Test: NULL Value renders as \"NULL\"\n";
 
-	auto null_lit = duckdb::codec::integer::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER,
-															 LiteralContext::Filter);
+	auto null_lit = duckdb::mssql::codec::integer::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER,
+																	LiteralContext::Filter);
 	CHECK_EQ(null_lit, std::string("NULL"));
 }
 

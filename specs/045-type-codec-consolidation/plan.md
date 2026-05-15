@@ -22,7 +22,7 @@ hierarchy would either burden the hot path or under-use the abstraction.
 Instead, two free dispatch helpers (`FamilyFromTdsType`,
 `FamilyFromLogicalType`) map both axes onto one 9-value `TypeFamily`
 enum, and each call site dispatches by enum value to family-module free
-functions in `namespace duckdb::codec::<family>`.
+functions in `namespace duckdb::mssql::codec::<family>`.
 
 Spec 045 also closes [issue #91](https://github.com/hugr-lab/mssql-extension/issues/91)
 (BCP `nvarchar(N)` length validation) inside the String family module:

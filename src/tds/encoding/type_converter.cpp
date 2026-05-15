@@ -265,7 +265,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_INT:
 	case TDS_TYPE_BIGINT:
 	case TDS_TYPE_INTN:
-		codec::integer::DecodeFromTds(value, column, vector, row_idx);
+		mssql::codec::integer::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_BIT:

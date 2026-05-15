@@ -94,7 +94,7 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 		case LogicalTypeId::UINTEGER:
 		case LogicalTypeId::BIGINT:
 		case LogicalTypeId::UBIGINT: {
-			codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
+			mssql::codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
 		case LogicalTypeId::FLOAT: {
@@ -201,7 +201,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::UBIGINT:
-		codec::integer::EncodeToBcp(value, col, buffer);
+		mssql::codec::integer::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::FLOAT:
 		EncodeFloat(buffer, value.GetValue<float>());

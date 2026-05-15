@@ -36,6 +36,7 @@ class BCPColumnMetadata;
 struct CTASConfig;
 }  // namespace mssql
 
+namespace mssql {
 namespace codec {
 namespace binary {
 
@@ -47,4 +48,5 @@ size_t EstimateLiteralSize(const LogicalType &type);
 
 }  // namespace binary
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

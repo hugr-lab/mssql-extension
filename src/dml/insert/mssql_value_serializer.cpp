@@ -299,7 +299,7 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::FLOAT:
 		return SerializeFloat(FloatValue::Get(value));

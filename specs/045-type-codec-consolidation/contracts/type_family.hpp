@@ -26,6 +26,7 @@
 #include <cstdint>
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 enum class TypeFamily : uint8_t {
@@ -66,4 +67,5 @@ TypeFamily FamilyFromTdsType(uint8_t tds_type_id);
 TypeFamily FamilyFromLogicalType(const LogicalType &type);
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

@@ -14,6 +14,7 @@
 #include "tds/tds_types.hpp"
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 TypeFamily FamilyFromTdsType(uint8_t tds_type_id) {
@@ -124,4 +125,5 @@ TypeFamily FamilyFromLogicalType(const LogicalType &type) {
 }
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

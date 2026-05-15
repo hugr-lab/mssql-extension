@@ -29,6 +29,7 @@
 #include <string>
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 // Format a DuckDB Value as a T-SQL literal in the given context.
@@ -42,4 +43,5 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 size_t EstimateLiteralSize(const LogicalType &type);
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

@@ -27,6 +27,7 @@
 #include <cstdint>
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 enum class LiteralContext : uint8_t {
@@ -35,4 +36,5 @@ enum class LiteralContext : uint8_t {
 };
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

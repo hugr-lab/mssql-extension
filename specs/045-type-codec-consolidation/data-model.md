@@ -178,7 +178,7 @@ codec layer.
 ## Entity: Per-Family Codec Module
 
 **Definition**: A self-contained `.cpp`+`.hpp` pair under `src/codec/`
-exposing four free functions in `namespace duckdb::codec::<family>`.
+exposing four free functions in `namespace duckdb::mssql::codec::<family>`.
 
 **Naming**: `src/codec/<family>_codec.cpp`,
 `src/include/codec/<family>_codec.hpp`. Family names are
@@ -188,7 +188,7 @@ lowercase: `boolean`, `integer`, `float`, `decimal`, `money`,
 **Standard family interface** (canonical — see also `contracts/`):
 
 ```cpp
-namespace duckdb::codec::<family> {
+namespace duckdb::mssql::codec::<family> {
 
 // Scan decode (per row, hot path). Fills one row of `out` from the
 // raw TDS wire bytes. ColumnMetadata supplies precision/scale/scale/etc.
@@ -215,7 +215,7 @@ std::string FormatDdlTypeName(const LogicalType &type,
 // Optional helper (FR-014 / research.md R7).
 size_t EstimateLiteralSize(const LogicalType &type);
 
-}  // namespace duckdb::codec::<family>
+}  // namespace duckdb::mssql::codec::<family>
 ```
 
 **Cardinality of per-family ops actually implemented**:
@@ -302,7 +302,7 @@ size_t EstimateLiteralSize(const LogicalType &type);  // optional
    ┌──────────────────────────────────────────────────┐
    │  Per-Family Module  (one per family value)       │
    │  src/codec/<family>_codec.{cpp,hpp}              │
-   │  namespace duckdb::codec::<family>               │
+   │  namespace duckdb::mssql::codec::<family>               │
    │                                                  │
    │   DecodeFromTds  (hot, called per row)           │
    │   EncodeToBcp    (hot, called per row)           │
@@ -348,7 +348,7 @@ size_t EstimateLiteralSize(const LogicalType &type);  // optional
 - **FR-001 / FR-040**: `src/codec/` is a NEW top-level source dir. ✅
   (no nesting under `src/tds/`).
 - **FR-002**: Per-family modules expose the four standard ops as free
-  functions in `namespace duckdb::codec::<family>`. ✅ (canonical
+  functions in `namespace duckdb::mssql::codec::<family>`. ✅ (canonical
   interface above; Money is the only family that implements fewer than
   all four, by design).
 - **FR-003**: `LiteralContext` enum defined in

@@ -46,7 +46,7 @@ using duckdb::hugeint_t;
 using duckdb::LogicalType;
 using duckdb::NotImplementedException;
 using duckdb::Value;
-using duckdb::codec::LiteralContext;
+using duckdb::mssql::codec::LiteralContext;
 
 namespace {
 
@@ -85,17 +85,17 @@ void TestNullRoutingViaDispatcher() {
 	std::cout << "Test: NULL dispatches as \"NULL\" in both contexts (any family)\n";
 
 	// Integer (migrated) — NULL handled by dispatcher early-return.
-	auto null_int_filter =
-		duckdb::codec::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER, LiteralContext::Filter);
-	auto null_int_insert = duckdb::codec::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER,
-														   LiteralContext::InsertValues);
+	auto null_int_filter = duckdb::mssql::codec::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER,
+																  LiteralContext::Filter);
+	auto null_int_insert = duckdb::mssql::codec::FormatSqlLiteral(Value(LogicalType::INTEGER), LogicalType::INTEGER,
+																  LiteralContext::InsertValues);
 	CHECK_EQ(null_int_filter, std::string("NULL"));
 	CHECK_EQ(null_int_insert, std::string("NULL"));
 
 	// Boolean (not yet migrated) — dispatcher's NULL fast-path still
 	// short-circuits before the throw-stub.
-	auto null_bool_filter =
-		duckdb::codec::FormatSqlLiteral(Value(LogicalType::BOOLEAN), LogicalType::BOOLEAN, LiteralContext::Filter);
+	auto null_bool_filter = duckdb::mssql::codec::FormatSqlLiteral(Value(LogicalType::BOOLEAN), LogicalType::BOOLEAN,
+																   LiteralContext::Filter);
 	CHECK_EQ(null_bool_filter, std::string("NULL"));
 }
 
@@ -119,12 +119,12 @@ void TestIntegerFamilyDispatcherParity() {
 	};
 
 	for (const auto &sample : samples) {
-		auto filter = duckdb::codec::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
-		auto insert = duckdb::codec::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
+		auto filter = duckdb::mssql::codec::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
+		auto insert = duckdb::mssql::codec::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
 		auto direct_filter =
-			duckdb::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
+			duckdb::mssql::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::Filter);
 		auto direct_insert =
-			duckdb::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
+			duckdb::mssql::codec::integer::FormatSqlLiteral(sample.first, sample.second, LiteralContext::InsertValues);
 		CHECK_EQ(filter, insert);
 		CHECK_EQ(filter, direct_filter);
 		CHECK_EQ(insert, direct_insert);
@@ -134,32 +134,32 @@ void TestIntegerFamilyDispatcherParity() {
 void TestDispatcherHugeIntFix() {
 	std::cout << "Test: HUGEINT through dispatcher renders bare digits (FR-020 (b))\n";
 
-	auto small =
-		duckdb::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT, LiteralContext::Filter);
+	auto small = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT,
+														LiteralContext::Filter);
 	CHECK_EQ(small, std::string("42"));
 
-	auto neg = duckdb::codec::FormatSqlLiteral(Value::HUGEINT(duckdb::Hugeint::Negate(hugeint_t(0, 100))),
-											   LogicalType::HUGEINT, LiteralContext::Filter);
+	auto neg = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(duckdb::Hugeint::Negate(hugeint_t(0, 100))),
+													  LogicalType::HUGEINT, LiteralContext::Filter);
 	CHECK_EQ(neg, std::string("-100"));
 
 	// Both contexts produce identical output — pre-spec-045 the Filter
 	// context fell into a N'<digits>' default arm.
-	auto filter = duckdb::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 9876543210ULL)), LogicalType::HUGEINT,
-												  LiteralContext::Filter);
-	auto insert = duckdb::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 9876543210ULL)), LogicalType::HUGEINT,
-												  LiteralContext::InsertValues);
+	auto filter = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 9876543210ULL)),
+														 LogicalType::HUGEINT, LiteralContext::Filter);
+	auto insert = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 9876543210ULL)),
+														 LogicalType::HUGEINT, LiteralContext::InsertValues);
 	CHECK_EQ(filter, insert);
 }
 
 void TestDispatcherEstimateLiteralSize() {
 	std::cout << "Test: dispatcher EstimateLiteralSize routes to per-family bound\n";
 
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::TINYINT), static_cast<size_t>(4));
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::SMALLINT), static_cast<size_t>(6));
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::INTEGER), static_cast<size_t>(11));
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::BIGINT), static_cast<size_t>(20));
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::UBIGINT), static_cast<size_t>(50));
-	CHECK_EQ(duckdb::codec::EstimateLiteralSize(LogicalType::HUGEINT), static_cast<size_t>(45));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::TINYINT), static_cast<size_t>(4));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::SMALLINT), static_cast<size_t>(6));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::INTEGER), static_cast<size_t>(11));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BIGINT), static_cast<size_t>(20));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UBIGINT), static_cast<size_t>(50));
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::HUGEINT), static_cast<size_t>(45));
 }
 
 void TestUnmigratedFamiliesThrow() {
@@ -167,17 +167,17 @@ void TestUnmigratedFamiliesThrow() {
 
 	// Sanity check: each non-Integer family throws on a non-null value.
 	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN, LiteralContext::Filter));
+		duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter));
+		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter));
+		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::codec::FormatSqlLiteral(Value("hello"), LogicalType::VARCHAR, LiteralContext::Filter));
+		duckdb::mssql::codec::FormatSqlLiteral(Value("hello"), LogicalType::VARCHAR, LiteralContext::Filter));
 
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::codec::EstimateLiteralSize(LogicalType::BOOLEAN));
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::codec::EstimateLiteralSize(LogicalType::FLOAT));
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::codec::EstimateLiteralSize(LogicalType::VARCHAR));
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN));
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::FLOAT));
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::VARCHAR));
 }
 
 }  // namespace
