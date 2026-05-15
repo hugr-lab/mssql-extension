@@ -118,6 +118,9 @@ set(EXTENSION_SOURCES
     src/tds/encoding/guid_encoding.cpp
     src/tds/encoding/type_converter.cpp
     src/tds/encoding/bcp_row_encoder.cpp
+    # Codec layer (spec 045) — per-type-family modules. Files added in Phase 2
+    # (T009..T011) when the foundational dispatch helpers + per-family stubs
+    # are created. Section header kept here for navigation clarity.
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp

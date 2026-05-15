@@ -1,0 +1,22 @@
+spec-045 branch base on main: 14fdc634a9460d6a9722ea2109936e120a7a9cbb
+title: feat(auth): Integrated Authentication — Kerberos on POSIX, SSPI scaffold (spec 042)
+
+This is the "main-at-spec-045-kickoff" SHA referenced by FR-020, SC-002,
+and SC-002a. It is the commit on `main` from which the
+`045-type-codec-consolidation` branch was created (after merges of #98
+and #109). All "byte-identical output" guarantees and "expected to fail
+on baseline" assertions for the three correctness-fix regression tests
+(`copy_nvarchar_length_validation.test`, `filter_pushdown_hugeint.test`,
+`filter_pushdown_decimal.test`) are measured against a binary built
+from THIS sha.
+
+To reproduce the pre-fix behavior locally:
+  git worktree add /tmp/spec045-baseline 14fdc634
+  cd /tmp/spec045-baseline && GEN=ninja make release
+  # then build/release/duckdb is the baseline binary
+
+Per-family golden fixture captures (FR-033) reference this SHA in their
+provenance comments. If `main` advances during the spec-045
+implementation (3-6 weeks), individual family migrations MAY re-capture
+fixtures against a newer SHA — but the regression-test gate (SC-002a)
+stays bound to the original 14fdc634 baseline for traceable evidence.
