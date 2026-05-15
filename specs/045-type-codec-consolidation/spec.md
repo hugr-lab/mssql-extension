@@ -444,12 +444,18 @@ with a clear "exceeds column capacity" error (not a confusing
   ```
   Plus two free helpers:
   ```
-  TypeFamily FamilyFromTdsType(uint8_t tds_type_id, uint8_t max_length);
+  TypeFamily FamilyFromTdsType(uint8_t tds_type_id);
   TypeFamily FamilyFromLogicalType(const LogicalType &type);
   ```
   These functions absorb the existing type-grouping logic from the
   5 dispatch sites' switches. After spec 045, every dispatch site's
   switch is `switch (FamilyFromXxx(...))` with one case per family.
+  The `max_length` parameter is intentionally absent from
+  `FamilyFromTdsType` — variable-length integer sizing (TDS_TYPE_INTN
+  with max_length 1/2/4/8) is resolved inside the Integer family's
+  `DecodeFromTds` via the value's `bytes.size()`, not at the family-
+  selection level. Plus the spec 045 plan-phase research (research.md
+  R3) confirms this simplification has no downstream cost.
 
 **Migration of the 5 dispatch sites**
 
@@ -484,10 +490,22 @@ with a clear "exceeds column capacity" error (not a confusing
   responsibilities (`filter_encoder` keeps the filter tree walker;
   `mssql_value_serializer` keeps the multi-row VALUES batching
   logic).
-- **FR-013**: `src/catalog/mssql_ddl_translator.cpp:MapLogicalTypeToCTAS`
-  MUST be rewritten as `switch (FamilyFromLogicalType(type))` calling
-  `codec::<family>::FormatDdlTypeName(...)`. Per-type DDL type-name
-  branches MUST move into the family modules.
+- **FR-013**: BOTH `src/catalog/mssql_ddl_translator.cpp:MapTypeToSQLServer`
+  (general DDL path) AND `MapLogicalTypeToCTAS` (CTAS path) MUST be
+  rewritten as `switch (FamilyFromLogicalType(type))` calling
+  `codec::<family>::FormatDdlTypeName(type, config, ctx)`. Per-type
+  DDL type-name branches MUST move into the family modules. The two
+  legacy mappers diverge in subtle ways (HUGEINT throws in
+  `MapLogicalTypeToCTAS` but returns `DECIMAL(38,0)` in
+  `MapTypeToSQLServer`; TIMESTAMP renders as `DATETIME2(6)` in the
+  former vs `DATETIME2(7)` in the latter; VARCHAR consults
+  `config.text_type` only in the CTAS path; INTERVAL appears only in
+  `MapTypeToSQLServer`); these divergences are made explicit via a
+  new `enum class DdlContext { CreateTable, CtasCreateTable };`
+  defined in `src/include/codec/type_family.hpp`. Family modules
+  dispatch on this enum where (and only where) the two contexts
+  genuinely differ. See `data-model.md` "DdlContext" entity for the
+  full divergence catalog.
 - **FR-014**: `EstimateSerializedSize` in
   `mssql_value_serializer.cpp` MAY remain in its current location
   (it's a heuristic for buffer sizing, not a correctness path) OR
@@ -495,15 +513,40 @@ with a clear "exceeds column capacity" error (not a confusing
   The spec implementer chooses based on whether the move improves
   reviewability.
 
-**Behavior preservation (with one explicit exception)**
+**Behavior preservation (with three explicit exceptions)**
 
 - **FR-020**: Every public observable behavior of the 5 dispatch
   sites MUST be byte-identical to `main`-at-spec-045-kickoff for
   all inputs the existing test suite exercises, **EXCEPT** for the
-  bug fix mandated by FR-023 (issue #91). The migration is a
-  refactor with one targeted bug fix that surfaces naturally as the
-  String family takes ownership of NVARCHAR length-validation
-  responsibility.
+  three correctness fixes that surface naturally as the codec
+  layer consolidates:
+  - **(a)** FR-023 — issue #91 NVARCHAR length validation in the
+    BCP encode path. Inputs that pre-spec-045 incorrectly rejected
+    now succeed. The String family takes ownership of NVARCHAR
+    length-validation responsibility.
+  - **(b)** HUGEINT filter literal correctness fix. Pre-spec-045,
+    `filter_encoder.cpp:ValueToSQLLiteral` lacks an explicit
+    HUGEINT case and falls through to the `default` arm, emitting
+    `N'<hugeint-as-string>'` — which SQL Server interprets as a
+    string literal, not a number, causing filter pushdown to
+    silently match 0 rows. Post-spec-045 the literal renders as
+    `<unquoted decimal>` via `codec::integer::FormatSqlLiteral`
+    (using the existing `mssql_value_serializer.cpp:Serialize`
+    HUGEINT path's `SerializeDecimal(value, 38, 0)` rendering).
+    Regression test: `test/sql/catalog/filter_pushdown_hugeint.test`.
+  - **(c)** DECIMAL filter literal precision-preservation fix.
+    Pre-spec-045, `filter_encoder.cpp:ValueToSQLLiteral`'s DECIMAL
+    case calls `value.ToString()` which can lose internal-storage
+    precision/scale information. Post-spec-045 the literal uses
+    the PhysicalType-aware path (`GetValueUnsafe<T>()` per
+    `PhysicalType::INT16/INT32/INT64/INT128`) that
+    `mssql_value_serializer.cpp:Serialize` already uses for INSERT
+    VALUES. Regression test: `test/sql/catalog/filter_pushdown_decimal.test`.
+
+  All three fixes align with constitution principle III
+  (Correctness over Convenience) and are testable as discrete
+  regression-tests-that-fail-on-baseline-and-pass-on-spec-045-HEAD.
+  No other behavior changes are introduced.
 - **FR-021**: The wire-protocol contracts MUST NOT change. SQL
   Server cannot tell the difference between the pre-spec-045 and
   post-spec-045 binary on the wire **for any input that succeeded
@@ -628,14 +671,21 @@ with a clear "exceeds column capacity" error (not a confusing
   helper bodies moving OUT into family modules.
 - **SC-002**: Zero behavior regressions: every test that passed
   on `main`-at-spec-045-kickoff passes on the spec-045 PR HEAD.
-  Strict gate. (Exception: the bug-fix regression test from
-  FR-031a is **expected to fail** on `main`-at-spec-045-kickoff
-  and **expected to pass** on the spec-045 PR HEAD — see SC-002a.)
-- **SC-002a**: Issue #91 closed by `test/sql/copy/copy_nvarchar_length_validation.test`
-  passing on the spec-045 PR HEAD. The same test MUST fail on the
-  pre-spec-045 baseline (`main` at spec-045-kickoff) to prove the
-  bug was real and is now fixed. Captured pre/post diff committed
-  in `specs/045-type-codec-consolidation/issue_91_repro.md`.
+  Strict gate. (Exception: the three bug-fix regression tests
+  from FR-020 (a)/(b)/(c) and FR-031a are **expected to fail** on
+  `main`-at-spec-045-kickoff and **expected to pass** on the
+  spec-045 PR HEAD — see SC-002a.)
+- **SC-002a**: Three correctness fixes closed by their respective
+  regression tests passing on the spec-045 PR HEAD and **failing**
+  on the pre-spec-045 baseline:
+  - Issue #91 → `test/sql/copy/copy_nvarchar_length_validation.test`
+  - HUGEINT filter literal → `test/sql/catalog/filter_pushdown_hugeint.test`
+  - DECIMAL filter literal → `test/sql/catalog/filter_pushdown_decimal.test`
+
+  Captured pre/post evidence committed under
+  `specs/045-type-codec-consolidation/issue_91_repro.md`,
+  `filter_pushdown_hugeint_repro.md`, and
+  `filter_pushdown_decimal_repro.md`.
 - **SC-003**: 100% of family golden-fixture tests pass. Each
   family's `test/cpp/codec/test_<family>_codec.cpp` PASS verdict
   is required.
@@ -704,13 +754,14 @@ with a clear "exceeds column capacity" error (not a confusing
   TIMESTAMP_TZ → DATETIMEOFFSET, nested types → JSON fallback).
   These are correctness changes that change behavior; spec 045 is
   primarily a refactor. Type-mapping fixes belong to subsequent
-  specs that each handle one mapping. **Exception**: the one
-  behavior-changing fix that DOES belong in spec 045 is issue
-  #91 (NVARCHAR length validation in BCP encode) — see FR-023 /
-  User Story 5 / SC-002a. That fix lives inside the String family
-  module which spec 045 introduces, so it falls in scope
-  naturally and is testable as a discrete unit. No other bug
-  fixes piggyback on spec 045.
+  specs that each handle one mapping. **Exceptions** (three
+  behavior-changing fixes that DO belong in spec 045): see FR-020
+  (a)/(b)/(c) — issue #91 NVARCHAR length validation, HUGEINT
+  filter literal correctness, DECIMAL filter literal precision
+  preservation. All three surface naturally from the consolidation
+  (each fix lives inside the family module that spec 045 already
+  introduces) and are testable as discrete regression-test units.
+  No other bug fixes piggyback on spec 045.
 - **`VariantCodec` for XML / SQL_VARIANT / UDT**. XML is already a
   String-family subtype; SQL_VARIANT and UDT remain unsupported
   (current behavior). A VARIANT codec is a separate feature spec.
