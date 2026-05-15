@@ -20,6 +20,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Build simdutf from source. Spec 044 made find_package(simdutf CONFIG REQUIRED)
+# unconditional in CMakeLists.txt; the main CI build gets it via vcpkg, but
+# this Dockerfile uses plain apt + cmake (faster than spinning up vcpkg). Ubuntu
+# 24.04 doesn't ship libsimdutf-dev, so we build a pinned tag from upstream and
+# install into /usr/local where the next find_package call will pick it up.
+# Static + tests/benchmarks off keeps the install tiny (just a .a + headers +
+# the CMake config) and avoids a runtime libsimdutf.so dependency.
+ARG SIMDUTF_VERSION=v8.2.0
+RUN git clone --depth 1 --branch "${SIMDUTF_VERSION}" https://github.com/simdutf/simdutf.git /tmp/simdutf \
+    && cmake -S /tmp/simdutf -B /tmp/simdutf/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSIMDUTF_TESTS=OFF \
+        -DSIMDUTF_BENCHMARKS=OFF \
+        -DSIMDUTF_TOOLS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && cmake --build /tmp/simdutf/build --target install \
+    && rm -rf /tmp/simdutf
+
 WORKDIR /src
 
 # Copy the whole repo (build context = repo root). The .git directory is
