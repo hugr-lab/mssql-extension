@@ -308,7 +308,7 @@ test-literal-format: debug
 	    -o build/test/test_literal_format
 	@echo ""
 	@echo "Running shared literal_format test..."
-	build/test/test_literal_format
+	$(CODEC_TEST_RPATH) build/test/test_literal_format
 
 # Show help
 help:

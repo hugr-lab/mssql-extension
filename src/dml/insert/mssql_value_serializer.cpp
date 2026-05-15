@@ -2,7 +2,7 @@
 #include <cmath>
 #include <iomanip>
 #include <sstream>
-#include "codec/integer_codec.hpp"
+#include "codec/literal_format.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -299,7 +299,7 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
-		return codec::integer::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::FLOAT:
 		return SerializeFloat(FloatValue::Get(value));

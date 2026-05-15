@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include "codec/integer_codec.hpp"
+#include "codec/literal_format.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -145,7 +145,7 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
-		return codec::integer::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:

@@ -3,21 +3,21 @@
 //
 // codec/literal_format.cpp
 //
-// Phase-2 shell. The body is the canonical 9-arm dispatcher; each arm
-// currently throws NotImplementedException because no family has been
-// migrated yet. As each family lands its codec module (Phase 3 -> US1
-// Integer, Phase 4 -> US2 wires call sites, Phase 5 -> US5 String,
-// Phase 6 -> US3 remaining families), its arm in this switch is
+// Canonical 9-arm dispatcher. As each family migrates, its arm is
 // replaced with a direct call into codec::<family>::FormatSqlLiteral.
 //
-// Nothing in production calls codec::FormatSqlLiteral yet — Phase 4
-// (filter_encoder.cpp:ValueToSQLLiteral and
-// mssql_value_serializer.cpp:Serialize one-liner rewrite) is the first
-// caller, and it lands only after the Integer arm is real.
+// Phase 4 (US2) — Integer arm wired. Other 8 arms still throw
+// NotImplementedException; they remain unreachable in production until
+// the corresponding family migration phase lands the dispatch-site
+// rewrites that route through this dispatcher. Today only the Integer
+// arms of filter_encoder.cpp and mssql_value_serializer.cpp route
+// through codec::FormatSqlLiteral; the other arms still call into
+// legacy per-type code in their dispatch sites.
 //===----------------------------------------------------------------------===//
 
 #include "codec/literal_format.hpp"
 
+#include "codec/integer_codec.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -34,7 +34,6 @@ namespace {
 }  // namespace
 
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx) {
-	(void)ctx;
 	if (v.IsNull()) {
 		return "NULL";
 	}
@@ -42,7 +41,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Boolean:
 		ThrowFamilyNotMigrated("Boolean", type);
 	case TypeFamily::Integer:
-		ThrowFamilyNotMigrated("Integer", type);
+		return integer::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Float:
 		ThrowFamilyNotMigrated("Float", type);
 	case TypeFamily::Decimal:
@@ -66,7 +65,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Boolean:
 		ThrowFamilyNotMigrated("Boolean", type);
 	case TypeFamily::Integer:
-		ThrowFamilyNotMigrated("Integer", type);
+		return integer::EstimateLiteralSize(type);
 	case TypeFamily::Float:
 		ThrowFamilyNotMigrated("Float", type);
 	case TypeFamily::Decimal:
