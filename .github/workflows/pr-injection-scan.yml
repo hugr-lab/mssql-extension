@@ -45,7 +45,7 @@ jobs:
     steps:
       # We only need the .github/ tree from main, not submodules.
       - name: Checkout main (NOT the PR)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           submodules: false
