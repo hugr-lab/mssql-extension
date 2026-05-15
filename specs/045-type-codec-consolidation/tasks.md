@@ -20,11 +20,11 @@
 
 **Purpose**: Create the `src/codec/` skeleton + build-system wiring so subsequent family migrations have a place to land.
 
-- [ ] T001 Create directories `src/codec/` and `src/include/codec/` at repo root
-- [ ] T002 [P] Update `CMakeLists.txt` to add `src/codec/*.cpp` to `EXTENSION_SOURCES` and `src/include/codec/` to include path
-- [ ] T003 [P] Update `Makefile` to add per-family manual test targets (pattern: `test-codec-<family>` similar to `test-login7-encoding`)
-- [ ] T004 [P] Create `specs/045-type-codec-consolidation/golden/` with empty subdirectories for the 9 families (`boolean/`, `integer/`, `float/`, `decimal/`, `money/`, `string/`, `binary/`, `datetime/`, `uuid/`)
-- [ ] T005 [P] Capture and tag baseline binary at spec-045-kickoff commit for SC-002a pre/post comparison: build `./build/release/duckdb` from `main` HEAD and copy to `specs/045-type-codec-consolidation/baseline/mssql.duckdb_extension` (will be deleted after spec lands; tracked via `.gitignore` exception OR by note in `golden/baseline_sha.txt` capturing the SHA only)
+- [X] T001 Create directories `src/codec/` and `src/include/codec/` at repo root
+- [X] T002 [P] Update `CMakeLists.txt` to add `src/codec/*.cpp` to `EXTENSION_SOURCES` and `src/include/codec/` to include path (section header added; file paths appended in T011 when stubs land)
+- [X] T003 [P] Update `Makefile` to add per-family manual test targets (`test-codec-%` pattern target + `test-literal-format` target)
+- [X] T004 [P] Create `specs/045-type-codec-consolidation/golden/` with empty subdirectories for the 9 families (`boolean/`, `integer/`, `float/`, `decimal/`, `money/`, `string/`, `binary/`, `datetime/`, `uuid/`)
+- [X] T005 [P] Document spec-045-kickoff baseline SHA (`14fdc634`) under `golden/baseline_sha.txt` for SC-002a evidence (skipped binary capture — built ad-hoc from the documented SHA when needed)
 
 **Checkpoint**: New directory skeleton present; CMake builds clean (no source files yet, just paths).
 
