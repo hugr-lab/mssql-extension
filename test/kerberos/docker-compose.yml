@@ -86,6 +86,10 @@ services:
       start_period: 30s
 
   test-client:
+    # CI pre-builds this tag with buildx + GHA cache, then `docker compose up`
+    # (no --build) reuses it. Local users keep the original behaviour because
+    # compose builds the image on first run when the tag is missing.
+    image: kerberos-test-client:latest
     build:
       context: ../..
       dockerfile: test/kerberos/test-client/Dockerfile

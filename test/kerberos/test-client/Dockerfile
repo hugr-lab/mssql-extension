@@ -6,6 +6,14 @@
 # that Linux DuckDB cannot LOAD (the magic bytes don't match ELF).
 #
 # Build context = repo root (set via docker-compose.yml `build.context: ../..`).
+#
+# Caching:
+#   * apt + simdutf layers above the `COPY . /src/` line are deterministic and
+#     get reused across CI runs via buildx + GHA cache (see kerberos.yml).
+#   * The compile step uses a BuildKit cache mount for /ccache so an
+#     incremental rebuild after a small source change reuses object files.
+#     The mount is local to the runner and not persisted across CI runs by
+#     default; locally it survives between `docker compose build` invocations.
 
 # ----------------------------------------------------------------------------
 # Stage 1: build the extension. Linux/glibc, matches the runtime stage's libc.
@@ -17,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git pkg-config \
         libssl-dev libkrb5-dev \
-        ca-certificates curl \
+        ca-certificates curl ccache \
     && rm -rf /var/lib/apt/lists/*
 
 # Build simdutf from source. Spec 044 made find_package(simdutf CONFIG REQUIRED)
@@ -52,12 +60,19 @@ COPY . /src/
 # CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on
 # hosts with low Docker memory limits (DuckDB's compile is heap-heavy --
 # 4-way parallel needs ~8GB; 2-way fits in ~4GB).
-ENV CMAKE_BUILD_PARALLEL_LEVEL=2
-RUN GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON"
+#
+# ccache is wired through CMake's *_COMPILER_LAUNCHER hooks. The cache dir
+# lives in a BuildKit cache mount so it survives between layer rebuilds.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CCACHE_DIR=/ccache \
+    CCACHE_MAXSIZE=1G
+RUN --mount=type=cache,target=/ccache \
+    GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" \
+    && ccache --show-stats
 
 # ----------------------------------------------------------------------------
 # Stage 2: runtime test-client. krb5-user for kinit, libgssapi for runtime,
-# DuckDB CLI from the official release tarball.
+# DuckDB CLI is the one we built in stage 1 (see version-stamp note below).
 # ----------------------------------------------------------------------------
 FROM ubuntu:24.04
 
