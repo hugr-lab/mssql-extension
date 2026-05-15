@@ -1,0 +1,47 @@
+# Float/Double edge-case behaviour (spec 045 / Phase 6 sub-phase 2)
+#
+# These cases drive the unit-test assertions and document the
+# post-migration semantics for inputs at the IEEE 754 boundaries.
+#
+# (1) NaN / +Inf / -Inf — REJECTED at the codec layer
+#
+#     FormatSqlLiteral on NaN / ±Inf throws InvalidInputException with
+#     a clear message. This applies to BOTH LiteralContext values per
+#     the FR-020 (b) byte-identity invariant.
+#
+#     Pre-spec-045 the Filter context did NOT reject — it called
+#     value.ToString() which rendered "nan" / "inf" / "-inf" into the
+#     generated WHERE clause, and SQL Server rejected the query with an
+#     opaque parse error. Post-spec-045 the codec rejects client-side
+#     with the column-context-aware error (mirroring the spec 045 Phase 5
+#     NVARCHAR-length client-side hardening, FR-023).
+#
+#     EncodeToBcp does NOT reject NaN / Inf — the BCP wire format is
+#     pure IEEE 754, and SQL Server's FLOAT / REAL columns store NaN /
+#     ±Inf with no further validation. Only the literal-rendering path
+#     rejects (because the literal must be parseable T-SQL).
+#
+# (2) Subnormal / denormal values — preserved with full precision
+#
+#     std::ostringstream with setprecision(9) for float / setprecision(17)
+#     for double round-trips subnormals correctly. No special handling
+#     beyond the standard formatter.
+#
+# (3) Integer-valued floats — .0 suffix forced
+#
+#     A value like 5.0 (float) would normally render as "5". The
+#     formatter checks for '.', 'e', 'E' in the rendered string and
+#     appends ".0" if none are present. This ensures SQL Server parses
+#     the literal as floating-point, not as a bare integer.
+#
+# (4) Negative zero — preserved
+#
+#     -0.0f renders as "-0.0" (the setprecision formatter preserves the
+#     sign bit; the .0-suffix check sees the '.' is missing in "-0" and
+#     appends ".0" to get "-0.0").
+#
+# (5) Range boundaries (FLT_MAX, FLT_MIN, DBL_MAX, DBL_MIN)
+#
+#     setprecision(9) for float / setprecision(17) for double is the
+#     IEEE 754 round-trip-safe digit count, so these all serialize
+#     losslessly.

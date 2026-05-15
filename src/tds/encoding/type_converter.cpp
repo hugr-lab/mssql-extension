@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "codec/boolean_codec.hpp"
+#include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
@@ -278,7 +279,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_REAL:
 	case TDS_TYPE_FLOAT:
 	case TDS_TYPE_FLOATN:
-		ConvertFloat(value, column, vector, row_idx);
+		mssql::codec::float_family::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_DECIMAL:
@@ -330,19 +331,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
-	}
-}
-
-void TypeConverter::ConvertFloat(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								 idx_t row_idx) {
-	if (value.size() == 4) {
-		float f = 0;
-		std::memcpy(&f, value.data(), 4);
-		FlatVector::GetData<float>(vector)[row_idx] = f;
-	} else if (value.size() == 8) {
-		double d = 0;
-		std::memcpy(&d, value.data(), 8);
-		FlatVector::GetData<double>(vector)[row_idx] = d;
 	}
 }
 

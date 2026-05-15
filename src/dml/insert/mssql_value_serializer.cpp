@@ -285,10 +285,8 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::FLOAT:
-		return SerializeFloat(FloatValue::Get(value));
-
 	case LogicalTypeId::DOUBLE:
-		return SerializeDouble(DoubleValue::Get(value));
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::DECIMAL: {
 		auto width = DecimalType::GetWidth(type);

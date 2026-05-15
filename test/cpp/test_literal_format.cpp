@@ -200,16 +200,41 @@ void TestBooleanFamilyDispatcherWired() {
 	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN), static_cast<size_t>(1));
 }
 
+void TestFloatFamilyDispatcherWired() {
+	std::cout << "Test: Float dispatcher arm routes to codec::float_family (Phase 6 sub-phase 2)\n";
+
+	auto via_dispatch_f =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter);
+	auto via_dispatch_f_i =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::InsertValues);
+	CHECK_EQ(via_dispatch_f, std::string("1.5"));
+	CHECK_EQ(via_dispatch_f, via_dispatch_f_i);
+
+	auto via_dispatch_d =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter);
+	auto via_dispatch_d_i =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::InsertValues);
+	CHECK_EQ(via_dispatch_d, std::string("2.5"));
+	CHECK_EQ(via_dispatch_d, via_dispatch_d_i);
+
+	// EstimateLiteralSize routes through the dispatcher for FLOAT and DOUBLE.
+	auto bound_f = duckdb::mssql::codec::EstimateLiteralSize(LogicalType::FLOAT);
+	auto bound_d = duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DOUBLE);
+	if (bound_f == 0 || bound_d == 0) {
+		++failures;
+		std::cerr << "FAIL: Float/Double EstimateLiteralSize returned 0\n";
+	}
+}
+
 void TestUnmigratedFamiliesThrow() {
 	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
 
-	// Sanity check: families NOT yet migrated still throw.
-	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter));
-	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter));
-
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::FLOAT));
+	// Sanity check: families NOT yet migrated still throw. Decimal /
+	// Money / Binary / DateTime / Uuid land in subsequent Phase-6
+	// sub-phases.
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BLOB));
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DATE));
+	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID));
 }
 
 }  // namespace
@@ -221,6 +246,7 @@ int main() {
 	TestDispatcherEstimateLiteralSize();
 	TestStringFamilyDispatcherWired();
 	TestBooleanFamilyDispatcherWired();
+	TestFloatFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

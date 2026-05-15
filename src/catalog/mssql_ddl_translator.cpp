@@ -1,5 +1,6 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -100,10 +101,10 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	}
 
 	case LogicalTypeId::FLOAT:
-		return "REAL";	// 32-bit float
-
-	case LogicalTypeId::DOUBLE:
-		return "FLOAT";	 // 64-bit float in SQL Server
+	case LogicalTypeId::DOUBLE: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::float_family::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::DECIMAL: {
 		// Get precision and scale, clamp to SQL Server limits
@@ -355,10 +356,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return mssql::codec::integer::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::FLOAT:
-		return "REAL";	// 32-bit float
-
 	case LogicalTypeId::DOUBLE:
-		return "FLOAT";	 // 64-bit float in SQL Server
+		return mssql::codec::float_family::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::DECIMAL: {
 		// Get precision and scale, clamp to SQL Server limits (FR-017)

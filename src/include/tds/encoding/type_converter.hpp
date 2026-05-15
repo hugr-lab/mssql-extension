@@ -36,10 +36,7 @@ public:
 	static std::string GetTypeName(uint8_t type_id);
 
 private:
-	// Type-specific converters (Boolean migrated to codec::boolean — spec 045 Phase 6)
-	static void ConvertFloat(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							 idx_t row_idx);
-
+	// Type-specific converters (Boolean + Float migrated to codec — spec 045 Phase 6)
 	static void ConvertDecimal(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
 							   idx_t row_idx);
 

@@ -1,6 +1,7 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
 #include "codec/boolean_codec.hpp"
+#include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "copy/target_resolver.hpp"
@@ -99,12 +100,9 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			mssql::codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
-		case LogicalTypeId::FLOAT: {
-			EncodeFloat(buffer, GetVectorValue<float>(vec, row_idx));
-			break;
-		}
+		case LogicalTypeId::FLOAT:
 		case LogicalTypeId::DOUBLE: {
-			EncodeDouble(buffer, GetVectorValue<double>(vec, row_idx));
+			mssql::codec::float_family::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
 		case LogicalTypeId::DECIMAL: {
@@ -201,10 +199,8 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		mssql::codec::integer::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::FLOAT:
-		EncodeFloat(buffer, value.GetValue<float>());
-		break;
 	case LogicalTypeId::DOUBLE:
-		EncodeDouble(buffer, value.GetValue<double>());
+		mssql::codec::float_family::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::DECIMAL:
 		EncodeDecimal(buffer, value.GetValue<hugeint_t>(), col.precision, col.scale);

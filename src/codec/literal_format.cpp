@@ -6,16 +6,17 @@
 // Canonical 9-arm dispatcher. As each family migrates, its arm is
 // replaced with a direct call into codec::<family>::FormatSqlLiteral.
 //
-// Phase 6 (US3 sub-phase 1) — Boolean arm wired. Integer and String arms
-// landed in Phase 4/Phase 5. The remaining 6 arms still throw
-// NotImplementedException; they are unreachable in production until the
-// corresponding family migration phase lands the dispatch-site rewrites
-// that route through this dispatcher.
+// Phase 6 (US3 sub-phases 1-2) — Boolean and Float arms wired. Integer
+// and String arms landed in Phase 4/Phase 5. The remaining 5 arms still
+// throw NotImplementedException; they are unreachable in production
+// until the corresponding family migration phase lands the dispatch-site
+// rewrites that route through this dispatcher.
 //===----------------------------------------------------------------------===//
 
 #include "codec/literal_format.hpp"
 
 #include "codec/boolean_codec.hpp"
+#include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
@@ -44,7 +45,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Integer:
 		return integer::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Float:
-		ThrowFamilyNotMigrated("Float", type);
+		return float_family::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Decimal:
 		ThrowFamilyNotMigrated("Decimal", type);
 	case TypeFamily::Money:
@@ -68,7 +69,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Integer:
 		return integer::EstimateLiteralSize(type);
 	case TypeFamily::Float:
-		ThrowFamilyNotMigrated("Float", type);
+		return float_family::EstimateLiteralSize(type);
 	case TypeFamily::Decimal:
 		ThrowFamilyNotMigrated("Decimal", type);
 	case TypeFamily::Money:

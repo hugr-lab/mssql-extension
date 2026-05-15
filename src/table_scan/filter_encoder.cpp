@@ -138,7 +138,7 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
-		return value.ToString();
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::DECIMAL:
 		return value.ToString();

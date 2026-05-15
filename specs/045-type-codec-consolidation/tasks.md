@@ -164,11 +164,18 @@
 
 ### Family 2 of 7: Float
 
-- [ ] T061 [P] [US3] Capture Float golden fixtures under `golden/float/` (include subnormal, infinity, NaN edge values)
-- [ ] T062 [P] [US3] Write `test/cpp/codec/test_float_codec.cpp` (manual `make test-codec-float` target). **Fails initially.**
-- [ ] T063 [US3] Implement `codec::float_family::*` in `src/codec/float_codec.cpp` (namespace name `float_family` because `float` is a keyword — note this in plan.md if needed, OR use `floats` per stylistic choice; choose at impl time). Mirrors current `ConvertFloat`, `EncodeFloat`/`EncodeDouble`, Float filter+INSERT literal, DDL `"REAL"`/`"FLOAT"` logic.
-- [ ] T064 [US3] Migrate 5 dispatch sites' Float/Double arms. Delete `ConvertFloat`, `EncodeFloat`, `EncodeDouble`, `SerializeFloat`, `SerializeDouble` private helpers. Wire `literal_format.cpp` Float arm.
-- [ ] T065 [US3] Run `make test-codec-float` + `make test` + clang-format-14 — verify green
+- [X] T061 [P] [US3] Captured Float golden fixtures under `golden/float/` — README + decode_cases.txt + encode_cases.txt + literal_cases.txt + ddl_cases.txt + edge_cases.txt (NaN/+Inf/-Inf/subnormal documentation).
+- [X] T062 [P] [US3] Wrote `test/cpp/codec/test_float_codec.cpp`. 8 test groups covering Filter==InsertValues byte-identity (float + double), integer-valued `.0` suffix, NaN/+Inf/-Inf rejection (both contexts), FormatDdlTypeName byte-identity (FLOAT→REAL, DOUBLE→FLOAT), EstimateLiteralSize sanity, NULL routing, dispatcher routing.
+- [X] T063 [US3] Implemented `codec::float_family::*` in `src/codec/float_codec.cpp`. `DecodeFromTds` (4→float, 8→double), `EncodeToBcp` (Vector + Value overloads — type-dispatched on LogicalTypeId), `FormatSqlLiteral` (ValidateFiniteOrThrow + setprecision(9/17) + `.0`-suffix; identical in both LiteralContext values per FR-020 (b)), `FormatDdlTypeName` ("REAL"/"FLOAT", byte-identical in both DdlContext per FR-027/028), `EstimateLiteralSize` (20/30).
+- [X] T064 [US3] Migrated 5 dispatch sites' FLOAT/DOUBLE arms:
+  - `src/tds/encoding/type_converter.cpp`: REAL/FLOAT/FLOATN → `mssql::codec::float_family::DecodeFromTds`. Deleted `TypeConverter::ConvertFloat` body + header decl.
+  - `src/tds/encoding/bcp_row_encoder.cpp`: both FLOAT/DOUBLE arms in `EncodeRow` (Vector) AND `EncodeValue` (Value) → `mssql::codec::float_family::EncodeToBcp`. Kept `BCPRowEncoder::EncodeFloat` / `EncodeDouble` bodies (test/cpp/test_bcp_row_encoder.cpp exercises them).
+  - `src/table_scan/filter_encoder.cpp`: FLOAT/DOUBLE arm → `codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter)`. **Behavior change**: pre-spec-045 the Filter context used `value.ToString()` (locale-dependent, no `.0` suffix on integer-valued floats, silently allowed NaN/Inf strings into the WHERE clause); post-Phase 6 sub-phase 2 the Filter and InsertValues contexts produce byte-identical output per FR-020 (b), and NaN/Inf are rejected client-side with a clear message — same defensive pattern as Phase 5's FR-023 NVARCHAR hardening.
+  - `src/dml/insert/mssql_value_serializer.cpp`: FLOAT/DOUBLE arm → `mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues)`. Kept `SerializeFloat` / `SerializeDouble` / `ValidateFloatValue` bodies (test/cpp/test_value_serializer.cpp exercises them).
+  - `src/catalog/mssql_ddl_translator.cpp`: FLOAT/DOUBLE arms in BOTH `MapTypeToSQLServer` AND `MapLogicalTypeToCTAS` → `mssql::codec::float_family::FormatDdlTypeName(type, cfg, ctx)`.
+  - Wired `src/codec/literal_format.cpp` Float arm. Updated phase-header comment.
+  - Updated `test/cpp/test_literal_format.cpp`: added `TestFloatFamilyDispatcherWired`, removed FLOAT/DOUBLE from `TestUnmigratedFamiliesThrow`. The throw-test now targets Binary/DateTime/Uuid (still unmigrated).
+- [X] T065 [US3] `make test-codec-float` PASS (8 groups). `make test-codec-boolean`/`integer`/`string` still PASS. `make test-literal-format` PASS (8 groups). Integration sweep against running SQL Server: [ctas] 16/16 PASS (508 assertions), [insert] 12/12 PASS (304 assertions), [catalog] 44/44 PASS (2050 assertions), [dml] 12/12 PASS (450 assertions), [transaction] 12/12 PASS (400 assertions). clang-format-14 sweep applied to 11 touched files.
 
 ### Family 3 of 7: Decimal
 

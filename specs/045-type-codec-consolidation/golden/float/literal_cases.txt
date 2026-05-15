@@ -1,0 +1,26 @@
+# Float/Double → SQL literal cases (post-spec-045 unified form)
+# format: type | value | ctx | expected_text
+# Notes:
+#   - Per FR-020 (b) the Filter and InsertValues contexts produce
+#     BYTE-IDENTICAL output. Pre-spec-045 they diverged: Filter used
+#     value.ToString() (locale-dependent, no .0 suffix on integers);
+#     InsertValues used SerializeFloat/SerializeDouble with the unified
+#     formatter below. Post-spec-045 both contexts route to
+#     codec::float_family::FormatSqlLiteral.
+#   - The unified formatter:
+#       1. Throws InvalidInputException if value is NaN or ±Inf
+#       2. Uses std::ostringstream with setprecision(9) for FLOAT and
+#          setprecision(17) for DOUBLE
+#       3. Appends ".0" if the rendered text has no '.', 'e', or 'E'
+#         (to force SQL Server to parse as floating-point not integer)
+FLOAT  | 0.0   | Filter        | 0.0
+FLOAT  | 0.0   | InsertValues  | 0.0
+FLOAT  | 1.0   | Filter        | 1.0
+FLOAT  | 1.0   | InsertValues  | 1.0
+FLOAT  | -1.0  | Filter        | -1.0
+FLOAT  | 3.14  | Filter        | 3.1400001  # setprecision(9) — exact float repr
+DOUBLE | 0.0   | Filter        | 0.0
+DOUBLE | 1.5   | Filter        | 1.5
+DOUBLE | 1.5   | InsertValues  | 1.5
+DOUBLE | -2.5  | Filter        | -2.5
+DOUBLE | 3.14  | Filter        | 3.1400000000000001  # setprecision(17) — exact double repr
