@@ -157,14 +157,27 @@ SELECT * FROM mssql_ctas_types.dbo.ctas_decimal_precision;
 12345678901234567890.12345
 
 # =============================================================================
-# Unsupported Types - Should Error
+# Unsupported / Restricted Types
 # =============================================================================
+#
+# Per spec 045 Phase 3 (FR-025 / FR-028 DDL unification): HUGEINT and UHUGEINT
+# now map to DECIMAL(38,0) in BOTH the CREATE-TABLE and CTAS DDL contexts. The
+# DDL phase therefore succeeds; the BCP data-insert phase still throws until
+# the Decimal family migration lands (spec 045 Phase 6 / T069). The expected
+# error text matches the BCP NotImplementedException, which contains "HUGEINT".
 
-# HUGEINT is unsupported
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
+# HUGEINT — DDL maps to DECIMAL(38,0); BCP encoding pending (spec 045 Phase 6)
 statement error
-CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 170141183460469231731687303715884105727::HUGEINT AS val;
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 99999999999999999999999999999999999999::HUGEINT AS val;
 ----
 HUGEINT
+
+# CTAS partially created the table at DDL phase; drop it before the next case.
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
 # INTERVAL is unsupported
 statement error
@@ -172,11 +185,17 @@ CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT INTERVAL '1 day' AS val;
 ----
 INTERVAL
 
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
 # LIST is unsupported
 statement error
 CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT [1, 2, 3] AS val;
 ----
 LIST
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
 # STRUCT is unsupported
 statement error
@@ -184,11 +203,17 @@ CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT {'a': 1, 'b': 2} AS val;
 ----
 STRUCT
 
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
 # MAP is unsupported
 statement error
 CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT MAP {'key': 'value'} AS val;
 ----
 MAP
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
 # =============================================================================
 # Cleanup

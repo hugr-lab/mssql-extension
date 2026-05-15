@@ -1,5 +1,6 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/integer_codec.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -85,42 +86,15 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			EncodeBit(buffer, GetVectorValue<bool>(vec, row_idx));
 			break;
 		}
-		case LogicalTypeId::TINYINT: {
-			EncodeInt8(buffer, GetVectorValue<int8_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			EncodeUInt8(buffer, GetVectorValue<uint8_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::SMALLINT: {
-			EncodeInt16(buffer, GetVectorValue<int16_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			// USMALLINT (0-65535) needs 4 bytes (int) to fit without overflow
-			EncodeInt32(buffer, static_cast<int32_t>(GetVectorValue<uint16_t>(vec, row_idx)));
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			EncodeInt32(buffer, GetVectorValue<int32_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::UINTEGER: {
-			// UINTEGER (0-4B) needs 8 bytes (bigint) to fit without overflow
-			EncodeInt64(buffer, static_cast<int64_t>(GetVectorValue<uint32_t>(vec, row_idx)));
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			EncodeInt64(buffer, GetVectorValue<int64_t>(vec, row_idx));
-			break;
-		}
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::BIGINT:
 		case LogicalTypeId::UBIGINT: {
-			// UBIGINT (0-18e18) uses DECIMAL(20,0) to handle full range
-			// Use two-argument constructor hugeint_t(upper=0, lower=val) to avoid
-			// sign issues when val > INT64_MAX (the single-arg constructor takes int64_t)
-			uint64_t val = GetVectorValue<uint64_t>(vec, row_idx);
-			EncodeDecimal(buffer, hugeint_t(0, val), col.precision, col.scale);
+			codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
 		case LogicalTypeId::FLOAT: {
@@ -220,33 +194,15 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		EncodeBit(buffer, value.GetValue<bool>());
 		break;
 	case LogicalTypeId::TINYINT:
-		EncodeInt8(buffer, value.GetValue<int8_t>());
-		break;
 	case LogicalTypeId::UTINYINT:
-		EncodeUInt8(buffer, value.GetValue<uint8_t>());
-		break;
 	case LogicalTypeId::SMALLINT:
-		EncodeInt16(buffer, value.GetValue<int16_t>());
-		break;
 	case LogicalTypeId::USMALLINT:
-		EncodeInt32(buffer, static_cast<int32_t>(value.GetValue<uint16_t>()));
-		break;
 	case LogicalTypeId::INTEGER:
-		EncodeInt32(buffer, value.GetValue<int32_t>());
-		break;
 	case LogicalTypeId::UINTEGER:
-		EncodeInt64(buffer, static_cast<int64_t>(value.GetValue<uint32_t>()));
-		break;
 	case LogicalTypeId::BIGINT:
-		EncodeInt64(buffer, value.GetValue<int64_t>());
+	case LogicalTypeId::UBIGINT:
+		codec::integer::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::UBIGINT: {
-		// Use two-argument constructor hugeint_t(upper=0, lower=val) to avoid
-		// sign issues when val > INT64_MAX
-		uint64_t val = value.GetValue<uint64_t>();
-		EncodeDecimal(buffer, hugeint_t(0, val), col.precision, col.scale);
-		break;
-	}
 	case LogicalTypeId::FLOAT:
 		EncodeFloat(buffer, value.GetValue<float>());
 		break;

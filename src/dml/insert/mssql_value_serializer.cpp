@@ -2,6 +2,7 @@
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include "codec/integer_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -290,33 +291,15 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 		return SerializeBoolean(BooleanValue::Get(value));
 
 	case LogicalTypeId::TINYINT:
-		return SerializeInteger(TinyIntValue::Get(value));
-
 	case LogicalTypeId::SMALLINT:
-		return SerializeInteger(SmallIntValue::Get(value));
-
 	case LogicalTypeId::INTEGER:
-		return SerializeInteger(IntegerValue::Get(value));
-
 	case LogicalTypeId::BIGINT:
-		return SerializeInteger(BigIntValue::Get(value));
-
 	case LogicalTypeId::UTINYINT:
-		return SerializeInteger(static_cast<int64_t>(UTinyIntValue::Get(value)));
-
 	case LogicalTypeId::USMALLINT:
-		return SerializeInteger(static_cast<int64_t>(USmallIntValue::Get(value)));
-
 	case LogicalTypeId::UINTEGER:
-		return SerializeInteger(static_cast<int64_t>(UIntegerValue::Get(value)));
-
 	case LogicalTypeId::UBIGINT:
-		return SerializeUBigInt(UBigIntValue::Get(value));
-
-	case LogicalTypeId::HUGEINT: {
-		auto hugeint_val = HugeIntValue::Get(value);
-		return SerializeDecimal(hugeint_val, 38, 0);
-	}
+	case LogicalTypeId::HUGEINT:
+		return codec::integer::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::FLOAT:
 		return SerializeFloat(FloatValue::Get(value));

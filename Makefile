@@ -251,7 +251,11 @@ CODEC_TEST_VCPKG_TRIPLET := $(shell ls $(CODEC_TEST_VCPKG_INSTALLED) 2>/dev/null
 CODEC_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 CODEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
     -I $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/include
-CODEC_TEST_LIBS := -L $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
+# Link against built libduckdb.dylib (built by `make debug`) for Value/Vector/hugeint
+# symbols. Tests run with DYLD_LIBRARY_PATH set so the loader can find it.
+CODEC_TEST_LIBS := -L $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf \
+    -L build/debug/src -lduckdb
+CODEC_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
 CODEC_TEST_ENCODING_SOURCES := \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
@@ -281,7 +285,7 @@ test-codec-%: debug
 	    -o build/test/test_$*_codec
 	@echo ""
 	@echo "Running codec unit test for $*..."
-	build/test/test_$*_codec
+	$(CODEC_TEST_RPATH) build/test/test_$*_codec
 
 # Shared literal_format dispatcher test (covers LiteralContext divergence cases)
 test-literal-format: debug

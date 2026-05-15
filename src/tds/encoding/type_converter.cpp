@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include "codec/integer_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -264,7 +265,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_INT:
 	case TDS_TYPE_BIGINT:
 	case TDS_TYPE_INTN:
-		ConvertInteger(value, column, vector, row_idx);
+		codec::integer::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_BIT:
@@ -327,38 +328,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
-	}
-}
-
-void TypeConverter::ConvertInteger(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								   idx_t row_idx) {
-	size_t len = value.size();
-
-	switch (len) {
-	case 1:
-		// SQL Server TINYINT is unsigned (0-255), use uint8_t
-		FlatVector::GetData<uint8_t>(vector)[row_idx] = value[0];
-		break;
-	case 2: {
-		int16_t v = 0;
-		std::memcpy(&v, value.data(), 2);
-		FlatVector::GetData<int16_t>(vector)[row_idx] = v;
-		break;
-	}
-	case 4: {
-		int32_t v = 0;
-		std::memcpy(&v, value.data(), 4);
-		FlatVector::GetData<int32_t>(vector)[row_idx] = v;
-		break;
-	}
-	case 8: {
-		int64_t v = 0;
-		std::memcpy(&v, value.data(), 8);
-		FlatVector::GetData<int64_t>(vector)[row_idx] = v;
-		break;
-	}
-	default:
-		throw InvalidInputException("Invalid integer length: %d", len);
 	}
 }
 

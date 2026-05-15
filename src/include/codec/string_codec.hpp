@@ -44,8 +44,8 @@ struct CTASConfig;
 namespace codec {
 namespace string {
 
-void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, std::vector<uint8_t> &buf);
+void DecodeFromTds(const duckdb::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx);
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
 size_t EstimateLiteralSize(const LogicalType &type);

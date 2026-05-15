@@ -1,4 +1,5 @@
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/integer_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/exception.hpp"
@@ -81,29 +82,18 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 		return "BIT";
 
 	case LogicalTypeId::TINYINT:
-		return "TINYINT";
-
 	case LogicalTypeId::SMALLINT:
-		return "SMALLINT";
-
 	case LogicalTypeId::INTEGER:
-		return "INT";
-
 	case LogicalTypeId::BIGINT:
-		return "BIGINT";
-
 	case LogicalTypeId::UTINYINT:
-		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
-		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
-
 	case LogicalTypeId::USMALLINT:
-		return "INT";  // Wider to fit full range
-
 	case LogicalTypeId::UINTEGER:
-		return "BIGINT";  // Wider to fit full range
-
 	case LogicalTypeId::UBIGINT:
-		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT: {
+		mssql::CTASConfig default_cfg;
+		return codec::integer::FormatDdlTypeName(type, default_cfg, codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::FLOAT:
 		return "REAL";	// 32-bit float
@@ -147,10 +137,6 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";
-
-	case LogicalTypeId::HUGEINT:
-		// DuckDB HUGEINT is 128-bit, SQL Server max is DECIMAL(38,0)
-		return "DECIMAL(38,0)";
 
 	case LogicalTypeId::INTERVAL:
 		// SQL Server doesn't have interval type, store as string
@@ -354,29 +340,16 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return "BIT";
 
 	case LogicalTypeId::TINYINT:
-		return "TINYINT";
-
 	case LogicalTypeId::SMALLINT:
-		return "SMALLINT";
-
 	case LogicalTypeId::INTEGER:
-		return "INT";
-
 	case LogicalTypeId::BIGINT:
-		return "BIGINT";
-
 	case LogicalTypeId::UTINYINT:
-		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
-		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
-
 	case LogicalTypeId::USMALLINT:
-		return "INT";  // Wider to fit full range
-
 	case LogicalTypeId::UINTEGER:
-		return "BIGINT";  // Wider to fit full range
-
 	case LogicalTypeId::UBIGINT:
-		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		return codec::integer::FormatDdlTypeName(type, config, codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::FLOAT:
 		return "REAL";	// 32-bit float
@@ -423,16 +396,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return "UNIQUEIDENTIFIER";
 
 	// Unsupported types - CTAS must fail with clear error (FR-012)
-	case LogicalTypeId::HUGEINT:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type HUGEINT. "
-			"Consider casting to DECIMAL(38,0) in your SELECT query.");
-
-	case LogicalTypeId::UHUGEINT:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type UHUGEINT. "
-			"Consider casting to DECIMAL(38,0) in your SELECT query.");
-
+	// HUGEINT/UHUGEINT now route through codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)
+	// in both DDL contexts; cases above this point handled by the unified Integer arm.
 	case LogicalTypeId::INTERVAL:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type INTERVAL. "

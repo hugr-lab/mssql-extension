@@ -37,9 +37,6 @@ public:
 
 private:
 	// Type-specific converters
-	static void ConvertInteger(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							   idx_t row_idx);
-
 	static void ConvertBoolean(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
 
 	static void ConvertFloat(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
