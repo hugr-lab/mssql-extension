@@ -16,11 +16,14 @@
 //     literal. Same result in InsertValues.
 //   - EstimateLiteralSize routing — dispatcher returns the per-family
 //     upper bound for Integer types.
-//   - Unmigrated families (Boolean/Float/Decimal/Money/String/Binary/
-//     DateTime/Uuid) currently throw NotImplementedException. The
-//     dispatch sites (filter_encoder.cpp, mssql_value_serializer.cpp)
-//     don't route those families through the dispatcher yet — they will
-//     once Phase 5/6 family migrations land.
+//   - String family (Phase 5 / US5) — VARCHAR samples route through the
+//     dispatcher and produce N'<escaped>' for both contexts. NULL VARCHAR
+//     short-circuits to "NULL". INTERVAL also routes through String.
+//   - Unmigrated families (Boolean/Float/Decimal/Money/Binary/DateTime/
+//     Uuid) currently throw NotImplementedException. The dispatch sites
+//     (filter_encoder.cpp, mssql_value_serializer.cpp) don't route those
+//     families through the dispatcher yet — they will once Phase 6
+//     family migrations land.
 //
 // Build & run:
 //   GEN=ninja make debug
@@ -162,22 +165,37 @@ void TestDispatcherEstimateLiteralSize() {
 	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::HUGEINT), static_cast<size_t>(45));
 }
 
+void TestStringFamilyDispatcherWired() {
+	std::cout << "Test: String dispatcher arm routes to codec::string (Phase 5 / US5)\n";
+
+	auto filter = duckdb::mssql::codec::FormatSqlLiteral(Value("hello"), LogicalType::VARCHAR, LiteralContext::Filter);
+	auto insert =
+		duckdb::mssql::codec::FormatSqlLiteral(Value("hello"), LogicalType::VARCHAR, LiteralContext::InsertValues);
+	CHECK_EQ(filter, std::string("N'hello'"));
+	CHECK_EQ(filter, insert);
+
+	// EstimateLiteralSize routes to codec::string::EstimateLiteralSize which
+	// returns the wrapper overhead constant.
+	auto bound = duckdb::mssql::codec::EstimateLiteralSize(LogicalType::VARCHAR);
+	if (bound == 0) {
+		++failures;
+		std::cerr << "FAIL: dispatcher String EstimateLiteralSize returned 0\n";
+	}
+}
+
 void TestUnmigratedFamiliesThrow() {
 	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
 
-	// Sanity check: each non-Integer family throws on a non-null value.
+	// Sanity check: families NOT yet migrated still throw.
 	CHECK_THROWS_NOT_IMPLEMENTED(
 		duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
 		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
 		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter));
-	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::mssql::codec::FormatSqlLiteral(Value("hello"), LogicalType::VARCHAR, LiteralContext::Filter));
 
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN));
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::FLOAT));
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::VARCHAR));
 }
 
 }  // namespace
@@ -187,6 +205,7 @@ int main() {
 	TestIntegerFamilyDispatcherParity();
 	TestDispatcherHugeIntFix();
 	TestDispatcherEstimateLiteralSize();
+	TestStringFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

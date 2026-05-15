@@ -6,18 +6,16 @@
 // Canonical 9-arm dispatcher. As each family migrates, its arm is
 // replaced with a direct call into codec::<family>::FormatSqlLiteral.
 //
-// Phase 4 (US2) — Integer arm wired. Other 8 arms still throw
-// NotImplementedException; they remain unreachable in production until
-// the corresponding family migration phase lands the dispatch-site
-// rewrites that route through this dispatcher. Today only the Integer
-// arms of filter_encoder.cpp and mssql_value_serializer.cpp route
-// through codec::FormatSqlLiteral; the other arms still call into
-// legacy per-type code in their dispatch sites.
+// Phase 5 (US5) — Integer and String arms wired. The other 7 arms still
+// throw NotImplementedException; they remain unreachable in production
+// until the corresponding family migration phase lands the dispatch-site
+// rewrites that route through this dispatcher.
 //===----------------------------------------------------------------------===//
 
 #include "codec/literal_format.hpp"
 
 #include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -50,7 +48,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Money:
 		ThrowFamilyNotMigrated("Money", type);
 	case TypeFamily::String:
-		ThrowFamilyNotMigrated("String", type);
+		return string::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Binary:
 		ThrowFamilyNotMigrated("Binary", type);
 	case TypeFamily::DateTime:
@@ -74,7 +72,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Money:
 		ThrowFamilyNotMigrated("Money", type);
 	case TypeFamily::String:
-		ThrowFamilyNotMigrated("String", type);
+		return string::EstimateLiteralSize(type);
 	case TypeFamily::Binary:
 		ThrowFamilyNotMigrated("Binary", type);
 	case TypeFamily::DateTime:

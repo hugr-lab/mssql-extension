@@ -1025,6 +1025,10 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	case LogicalTypeId::HUGEINT:
 		return "decimal(38,0)";	 // HUGEINT maps to max precision decimal
 
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: INTERVAL stored as canonical Interval::ToString text in NVARCHAR(50).
+		return "nvarchar(50)";
+
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for SQL Server: %s", duckdb_type.ToString());
 	}
@@ -1082,6 +1086,10 @@ uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return tds::TDS_TYPE_DATETIMEOFFSET;  // 0x2B
+
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: INTERVAL travels as NVARCHAR text on the BCP wire.
+		return tds::TDS_TYPE_NVARCHAR;	// 0xE7
 
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for TDS: %s", duckdb_type.ToString());
@@ -1155,6 +1163,10 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 
 	case LogicalTypeId::HUGEINT:
 		return 17;	// Max decimal size for HUGEINT
+
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: nvarchar(50) = 100 UTF-16LE bytes of capacity.
+		return 100;
 
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for max_length: %s", duckdb_type.ToString());

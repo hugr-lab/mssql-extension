@@ -126,11 +126,6 @@ public:
 	static std::string ValueToSQLLiteral(const Value &value, const LogicalType &type);
 
 	/**
-	 * Escape string for T-SQL string literal (doubles single quotes).
-	 */
-	static std::string EscapeStringLiteral(const std::string &str);
-
-	/**
 	 * Escape identifier for T-SQL bracket notation (doubles right brackets).
 	 */
 	static std::string EscapeBracketIdentifier(const std::string &identifier);

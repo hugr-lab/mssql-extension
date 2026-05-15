@@ -1,5 +1,6 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/exception.hpp"
@@ -114,10 +115,8 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	}
 
 	case LogicalTypeId::VARCHAR: {
-		// Check for collation info to determine length
-		// Default to NVARCHAR for Unicode safety
-		// DuckDB VARCHAR maps to NVARCHAR in SQL Server
-		return "NVARCHAR(MAX)";	 // Default to MAX for unbounded strings
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::string::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
 	}
 
 	case LogicalTypeId::BLOB:
@@ -138,9 +137,10 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";
 
-	case LogicalTypeId::INTERVAL:
-		// SQL Server doesn't have interval type, store as string
-		return "NVARCHAR(100)";
+	case LogicalTypeId::INTERVAL: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::string::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	default:
 		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type", type.ToString());
@@ -369,13 +369,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
 	}
 
-	case LogicalTypeId::VARCHAR: {
-		// CTAS-specific: respect text_type setting (FR-013)
-		if (config.text_type == mssql::CTASTextType::VARCHAR) {
-			return "VARCHAR(MAX)";
-		}
-		return "NVARCHAR(MAX)";	 // Default to NVARCHAR for Unicode safety
-	}
+	case LogicalTypeId::VARCHAR:
+		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::BLOB:
 		return "VARBINARY(MAX)";
@@ -398,10 +393,10 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 	// Unsupported types - CTAS must fail with clear error (FR-012)
 	// HUGEINT/UHUGEINT now route through mssql::codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)
 	// in both DDL contexts; cases above this point handled by the unified Integer arm.
+	// INTERVAL now routes through mssql::codec::string (FR-026) and maps to NVARCHAR(50) in
+	// both DDL contexts; pre-spec-045 CTAS threw NotImplementedException here.
 	case LogicalTypeId::INTERVAL:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type INTERVAL. "
-			"SQL Server has no equivalent. Consider casting to VARCHAR.");
+		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::LIST:
 		throw NotImplementedException(

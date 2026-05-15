@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <sstream>
 #include "codec/literal_format.hpp"
+#include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -158,24 +159,6 @@ string MSSQLValueSerializer::SerializeDecimal(const hugeint_t &value, uint8_t wi
 // String Serialization
 //===----------------------------------------------------------------------===//
 
-string MSSQLValueSerializer::SerializeString(const string_t &value) {
-	// Always use N'...' Unicode literal for proper collation handling
-	string result = "N'";
-	const char *data = value.GetData();
-	idx_t length = value.GetSize();
-
-	for (idx_t i = 0; i < length; i++) {
-		char c = data[i];
-		if (c == '\'') {
-			result += "''";
-		} else {
-			result += c;
-		}
-	}
-	result += "'";
-	return result;
-}
-
 //===----------------------------------------------------------------------===//
 // Blob Serialization
 //===----------------------------------------------------------------------===//
@@ -329,7 +312,8 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	}
 
 	case LogicalTypeId::VARCHAR:
-		return SerializeString(StringValue::Get(value));
+	case LogicalTypeId::INTERVAL:
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::BLOB:
 		return SerializeBlob(StringValue::Get(value));
@@ -413,9 +397,14 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 
 	case LogicalTypeId::VARCHAR: {
 		auto str_val = StringValue::Get(value);
-		// N'...' + escaping (worst case doubles length)
-		return 3 + str_val.size() * 2;
+		// Per-type wrapper overhead from the codec layer + worst-case escape
+		// (every char could be a doubled single quote).
+		return mssql::codec::string::EstimateLiteralSize(type) + str_val.size() * 2;
 	}
+	case LogicalTypeId::INTERVAL:
+		// INTERVAL renders as N'<Interval::ToString>'. The longest canonical
+		// form for any valid DuckDB interval fits comfortably in ~64 bytes.
+		return mssql::codec::string::EstimateLiteralSize(type) + 64;
 
 	case LogicalTypeId::BLOB: {
 		auto blob_val = StringValue::Get(value);

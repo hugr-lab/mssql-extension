@@ -99,9 +99,9 @@ TypeFamily FamilyFromLogicalType(const LogicalType &type) {
 
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::INTERVAL:
-		// INTERVAL has no scan decode / BCP encode / literal support;
-		// it is handled inside String family for DDL only, returning
-		// NVARCHAR(100) per current MapTypeToSQLServer behavior.
+		// INTERVAL is handled inside String family. Post-spec-045 (FR-026)
+		// both DDL contexts return NVARCHAR(50); BCP encode and FormatSqlLiteral
+		// route the canonical Interval::ToString form through the NVARCHAR path.
 		return TypeFamily::String;
 
 	case LogicalTypeId::BLOB:

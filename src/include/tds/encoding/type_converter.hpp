@@ -48,9 +48,6 @@ private:
 	static void ConvertMoney(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
 							 idx_t row_idx);
 
-	static void ConvertString(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							  idx_t row_idx);
-
 	static void ConvertBinary(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
 
 	static void ConvertDate(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);

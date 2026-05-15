@@ -1,6 +1,7 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
 #include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -129,15 +130,10 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			EncodeDecimal(buffer, decimal_value, col.precision, col.scale);
 			break;
 		}
-		case LogicalTypeId::VARCHAR: {
-			auto str_val = GetVectorValue<string_t>(vec, row_idx);
-			if (col.IsPLPType()) {
-				EncodeNVarcharPLP(buffer, str_val);
-			} else {
-				EncodeNVarchar(buffer, str_val);
-			}
+		case LogicalTypeId::VARCHAR:
+		case LogicalTypeId::INTERVAL:
+			mssql::codec::string::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
 		case LogicalTypeId::BLOB: {
 			auto blob_val = GetVectorValue<string_t>(vec, row_idx);
 			if (col.IsPLPType()) {
@@ -213,11 +209,8 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		EncodeDecimal(buffer, value.GetValue<hugeint_t>(), col.precision, col.scale);
 		break;
 	case LogicalTypeId::VARCHAR:
-		if (col.IsPLPType()) {
-			EncodeNVarcharPLP(buffer, string_t(value.ToString()));
-		} else {
-			EncodeNVarchar(buffer, string_t(value.ToString()));
-		}
+	case LogicalTypeId::INTERVAL:
+		mssql::codec::string::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::BLOB:
 		if (col.IsPLPType()) {
@@ -347,30 +340,6 @@ void BCPRowEncoder::EncodeDecimal(vector<uint8_t> &buffer, const hugeint_t &valu
 }
 
 //===----------------------------------------------------------------------===//
-// Unicode String (NVARCHARTYPE 0xE7)
-//===----------------------------------------------------------------------===//
-
-void BCPRowEncoder::EncodeNVarchar(vector<uint8_t> &buffer, const string_t &value) {
-	// Optimized: encode directly to buffer without intermediate allocation
-	size_t input_len = value.GetSize();
-	const char *input = value.GetData();
-
-	// Reserve space: 2 bytes for length + max UTF-16 size (input_len * 2 for ASCII, may be less for non-ASCII)
-	size_t start_pos = buffer.size();
-	buffer.resize(start_pos + 2 + input_len * 2);
-
-	// Encode directly to buffer (skip 2 bytes for length prefix)
-	size_t utf16_len = Utf16LEEncodeDirect(input, input_len, buffer.data() + start_pos + 2);
-
-	// Write actual length
-	buffer[start_pos] = static_cast<uint8_t>(utf16_len & 0xFF);
-	buffer[start_pos + 1] = static_cast<uint8_t>((utf16_len >> 8) & 0xFF);
-
-	// Shrink buffer to actual size (in case non-ASCII used less space)
-	buffer.resize(start_pos + 2 + utf16_len);
-}
-
-//===----------------------------------------------------------------------===//
 // Binary Data (BIGVARBINARYTYPE 0xA5)
 //===----------------------------------------------------------------------===//
 
@@ -389,66 +358,6 @@ void BCPRowEncoder::EncodeBinary(vector<uint8_t> &buffer, const string_t &value)
 //===----------------------------------------------------------------------===//
 // PLP (Partially Length-prefixed) Encoding for MAX types
 //===----------------------------------------------------------------------===//
-
-void BCPRowEncoder::EncodeNVarcharPLP(vector<uint8_t> &buffer, const string_t &value) {
-	// Optimized: encode directly to buffer without intermediate allocation
-	size_t input_len = value.GetSize();
-	const char *input = value.GetData();
-
-	// Handle empty string: PLP with no chunks, just terminator
-	// PLP chunks must have length > 0, so empty string = no chunks
-	if (input_len == 0) {
-		// Write UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE)
-		constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
-		for (int i = 0; i < 8; i++) {
-			buffer.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
-		}
-		// Write terminator (4 bytes of 0x00) - no chunks for empty string
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		return;
-	}
-
-	// PLP format: 8 bytes (UNKNOWN_LEN) + 4 bytes (chunk len) + data + 4 bytes (terminator)
-	size_t start_pos = buffer.size();
-	size_t max_utf16_len = input_len * 2;
-	buffer.resize(start_pos + 8 + 4 + max_utf16_len + 4);
-
-	uint8_t *out = buffer.data() + start_pos;
-
-	// Write UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE)
-	constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
-	for (int i = 0; i < 8; i++) {
-		out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
-	}
-	out += 8;
-
-	// Reserve 4 bytes for chunk length (will fill in after encoding)
-	uint8_t *chunk_len_ptr = out;
-	out += 4;
-
-	// Encode UTF-16 directly
-	size_t utf16_len = Utf16LEEncodeDirect(input, input_len, out);
-	out += utf16_len;
-
-	// Write actual chunk length
-	uint32_t chunk_len = static_cast<uint32_t>(utf16_len);
-	chunk_len_ptr[0] = static_cast<uint8_t>(chunk_len & 0xFF);
-	chunk_len_ptr[1] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
-	chunk_len_ptr[2] = static_cast<uint8_t>((chunk_len >> 16) & 0xFF);
-	chunk_len_ptr[3] = static_cast<uint8_t>((chunk_len >> 24) & 0xFF);
-
-	// Write terminator (4 bytes of 0x00)
-	out[0] = 0x00;
-	out[1] = 0x00;
-	out[2] = 0x00;
-	out[3] = 0x00;
-
-	// Shrink buffer to actual size
-	buffer.resize(start_pos + 8 + 4 + utf16_len + 4);
-}
 
 void BCPRowEncoder::EncodeBinaryPLP(vector<uint8_t> &buffer, const string_t &value) {
 	// Use UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE) instead of actual length

@@ -79,18 +79,6 @@ public:
 	// sign: 0x00=negative, 0x01=non-negative
 	static void EncodeDecimal(vector<uint8_t> &buffer, const hugeint_t &value, uint8_t precision, uint8_t scale);
 
-	// Unicode string (NVARCHARTYPE 0xE7) - standard USHORT length prefix
-	// Wire format: [length:2 LE] [utf16le_bytes]
-	// NULL: [0xFFFF]
-	// Use for nvarchar(n) where n <= 4000
-	static void EncodeNVarchar(vector<uint8_t> &buffer, const string_t &value);
-
-	// Unicode string (NVARCHARTYPE 0xE7) - PLP (Partially Length-prefixed) format
-	// Wire format: [total_length:8 LE] [chunk_length:4 LE] [chunk_data] [terminator:4 = 0x00000000]
-	// NULL: [0xFFFFFFFFFFFFFFFF]
-	// Use for nvarchar(max) when max_length == 0xFFFF
-	static void EncodeNVarcharPLP(vector<uint8_t> &buffer, const string_t &value);
-
 	// Binary data (BIGVARBINARYTYPE 0xA5) - standard USHORT length prefix
 	// Wire format: [length:2 LE] [bytes]
 	// NULL: [0xFFFF]

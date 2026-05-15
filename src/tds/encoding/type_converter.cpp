@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -295,7 +296,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_XML:
-		ConvertString(value, column, vector, row_idx);
+		mssql::codec::string::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_BIGBINARY:
@@ -379,46 +380,6 @@ void TypeConverter::ConvertMoney(const std::vector<uint8_t> &value, const Column
 		FlatVector::GetData<int64_t>(vector)[row_idx] = static_cast<int64_t>(int_value.lower);
 	} else {
 		throw InvalidInputException("Invalid MONEY length: %d", value.size());
-	}
-}
-
-void TypeConverter::ConvertString(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								  idx_t row_idx) {
-	auto start = std::chrono::steady_clock::now();
-	std::string str;
-
-	// NCHAR/NVARCHAR are UTF-16LE, need conversion
-	auto decode_start = std::chrono::steady_clock::now();
-	if (column.type_id == TDS_TYPE_NCHAR || column.type_id == TDS_TYPE_NVARCHAR || column.type_id == TDS_TYPE_XML) {
-		str = Utf16LEDecode(value.data(), value.size());
-	} else {
-		// CHAR/VARCHAR are single-byte (respect collation for encoding, but typically CP1252/UTF-8)
-		str = std::string(reinterpret_cast<const char *>(value.data()), value.size());
-	}
-	auto decode_end = std::chrono::steady_clock::now();
-
-	// Trim trailing spaces for CHAR/NCHAR
-	if (column.type_id == TDS_TYPE_BIGCHAR || column.type_id == TDS_TYPE_NCHAR) {
-		size_t end = str.find_last_not_of(' ');
-		if (end != std::string::npos) {
-			str.erase(end + 1);
-		} else {
-			str.clear();  // All spaces
-		}
-	}
-
-	auto add_start = std::chrono::steady_clock::now();
-	FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, str);
-	auto add_end = std::chrono::steady_clock::now();
-
-	auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(add_end - start).count();
-	auto decode_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-	auto add_us = std::chrono::duration_cast<std::chrono::microseconds>(add_end - add_start).count();
-
-	// Log only for large strings (>100 bytes) at debug level 2
-	if (value.size() > 100) {
-		MSSQL_TC_DEBUG_LOG(2, "ConvertString: len=%zu, total=%ldus, decode=%ldus, addstr=%ldus", value.size(),
-						   (long)total_us, (long)decode_us, (long)add_us);
 	}
 }
 

@@ -86,9 +86,6 @@ public:
 	// Decimal: preserves scale, returns decimal literal
 	static string SerializeDecimal(const hugeint_t &value, uint8_t width, uint8_t scale);
 
-	// String: returns N'escaped_string' (Unicode literal)
-	static string SerializeString(const string_t &value);
-
 	// Blob: returns 0x hex encoding
 	static string SerializeBlob(const string_t &value);
 
