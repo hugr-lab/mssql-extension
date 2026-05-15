@@ -65,25 +65,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         krb5-user libgssapi-krb5-2 libssl3 \
-        ca-certificates curl unzip \
+        ca-certificates \
         file \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the DuckDB CLI matching the extension's API. We pull the official
-# DuckDB binary so the test client doesn't depend on the host having duckdb
-# installed.
-ARG DUCKDB_VERSION=v1.4.3
-RUN ARCH="$(dpkg --print-architecture)" \
-    && case "${ARCH}" in \
-         amd64) URL_SUFFIX="linux-amd64" ;; \
-         arm64) URL_SUFFIX="linux-arm64" ;; \
-         *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;; \
-       esac \
-    && curl -fSL -o /tmp/duckdb.zip \
-        "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${URL_SUFFIX}.zip" \
-    && unzip /tmp/duckdb.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/duckdb \
-    && rm /tmp/duckdb.zip
+# Copy the DuckDB CLI built alongside the extension in the builder stage.
+# Using the official release tarball would mismatch the extension's stamped
+# DuckDB version: `git describe --tags --long` inside the shallow-cloned
+# `duckdb/` submodule has no reachable tag and falls back to the dummy
+# `v0.0.1`, which then refuses to LOAD into a CLI that reports `v1.4.x`.
+# The DuckDB build emits `build/release/duckdb` next to the extension, so
+# the two are guaranteed to come from the same source tree.
+COPY --from=builder /src/build/release/duckdb /usr/local/bin/duckdb
+RUN chmod +x /usr/local/bin/duckdb
 
 # Copy the extension from the Linux build stage. Sanity-check it's an ELF so
 # any future Dockerfile change that breaks the multi-stage chain fails loudly
