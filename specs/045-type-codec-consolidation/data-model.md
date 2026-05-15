@@ -102,8 +102,12 @@ contracts/literal_format.hpp.
 
 ## Entity: `DdlContext`
 
-**Definition**: A 2-value enum distinguishing general CREATE TABLE
-type-name mapping vs CREATE TABLE AS SELECT type-name mapping.
+**Definition**: A 2-value enum nominally distinguishing general
+CREATE TABLE type-name mapping from CREATE TABLE AS SELECT type-name
+mapping. **Post-spec-045 both contexts produce byte-identical output
+for the same (LogicalType, CTASConfig) inputs** (FR-028); the enum is
+retained for API uniformity and future per-context DDL hints (e.g.,
+identity columns, partition columns).
 
 **Header**: `src/include/codec/type_family.hpp` (co-located with
 `TypeFamily`; small enough to share the header)
@@ -119,33 +123,55 @@ enum class DdlContext : uint8_t {
 }  // namespace duckdb::codec
 ```
 
-**Divergence catalog** (from research.md R8):
+**Pre-spec-045 divergences (reconciled in spec 045)** (from
+research.md R8):
 
-| Type      | CreateTable                                           | CtasCreateTable                                                                |
-|-----------|-------------------------------------------------------|--------------------------------------------------------------------------------|
-| HUGEINT   | `"DECIMAL(38,0)"`                                     | `throw NotImplementedException("CTAS does not support DuckDB type HUGEINT...")` |
-| TIMESTAMP | `"DATETIME2(6)"`                                      | `"DATETIME2(7)"`                                                               |
-| VARCHAR   | `"NVARCHAR(MAX)"` always                              | `config.text_type == VARCHAR ? "VARCHAR(MAX)" : "NVARCHAR(MAX)"`               |
-| INTERVAL  | `"NVARCHAR(100)"` (lossy fallback)                    | `throw NotImplementedException` (no implicit lossy fallback for CTAS)          |
+| Type        | Pre-spec-045 CreateTable               | Pre-spec-045 CtasCreateTable                     | **Post-spec-045 (both)**                         |
+|-------------|----------------------------------------|--------------------------------------------------|--------------------------------------------------|
+| HUGEINT     | `"DECIMAL(38,0)"`                      | throws (`CTAS does not support DuckDB type HUGEINT`) | `"DECIMAL(38,0)"` + runtime overflow warning |
+| UHUGEINT    | falls through to `default:` throw      | throws (explicit message)                         | `"DECIMAL(38,0)"` + runtime overflow warning |
+| TIMESTAMP   | `"DATETIME2(6)"`                       | `"DATETIME2(7)"`                                  | `"DATETIME2(6)"` (exact match to DuckDB μs)  |
+| TIMESTAMP_MS  | falls through to `default:` throw    | falls through to `default:` throw                 | `"DATETIME2(3)"` (new per-precision arm)     |
+| TIMESTAMP_NS  | falls through to `default:` throw    | falls through to `default:` throw                 | `"DATETIME2(7)"` (closest fit; lossy 2 digits)|
+| TIMESTAMP_SEC | falls through to `default:` throw    | falls through to `default:` throw                 | `"DATETIME2(0)"` (new per-precision arm)     |
+| TIMESTAMP_TZ  | `"DATETIMEOFFSET(7)"`                | `"DATETIMEOFFSET(7)"`                             | `"DATETIMEOFFSET(7)"` (unchanged)            |
+| VARCHAR     | `"NVARCHAR(MAX)"` (hard-coded)         | `config.text_type == VARCHAR ? "VARCHAR(MAX)" : "NVARCHAR(MAX)"` | `cfg.text_type == VARCHAR ? "VARCHAR(MAX)" : "NVARCHAR(MAX)"` (both contexts consult config) |
+| INTERVAL    | `"NVARCHAR(100)"` (lossy fallback)     | throws (explicit message)                          | `"NVARCHAR(50)"` (canonical string form fits)|
 
-All other types render identically across both contexts.
+All other types (BOOLEAN, signed/unsigned integers TINYINT..BIGINT,
+UBIGINT, FLOAT, DOUBLE, DECIMAL, BLOB, DATE, TIME, UUID) render
+identically across both contexts in both pre- and post-spec-045 code.
+
+**Runtime overflow policy for HUGEINT/UHUGEINT (FR-025)**:
+`codec::decimal::EncodeToBcp` detects values exceeding the
+DECIMAL(38,0) representable range (±10^38 − 1), writes a saturated
+value (clamped to the range boundary), and emits a stderr warning
+tagged `[MSSQL CODEC] HUGEINT overflow: column <name>, value
+<hugeint>`. This is the "log-and-continue" policy — failing the
+whole batch on a single overflow row would be more disruptive than
+truncating one cell.
 
 ---
 
 ## Entity: `CTASConfig` / `DdlConfig`
 
 **Definition**: Configuration struct already exists at
-`src/include/dml/mssql_ctas_config.hpp` (or similar) for CTAS-specific
-options. Spec 045 **does not introduce a new struct**; it reuses
-`CTASConfig` and passes it to `FormatDdlTypeName`.
+`src/include/dml/mssql_ctas_config.hpp` (or similar). Spec 045 **does
+not introduce a new struct**; it reuses `CTASConfig` and passes it to
+`FormatDdlTypeName` in BOTH DDL contexts (post-spec-045 the general
+DDL path also honors the config — see FR-027 / FR-028).
 
 **Used field**:
 - `text_type` (enum `CTASTextType { NVARCHAR, VARCHAR }`) — consulted
-  by `codec::string::FormatDdlTypeName` when `DdlContext::CtasCreateTable`.
+  by `codec::string::FormatDdlTypeName` in BOTH DDL contexts. Default
+  is `NVARCHAR` (Unicode safe).
 
-For `DdlContext::CreateTable`, the `CTASConfig` parameter is
-default-constructed (its `text_type` field unused). This is a minor
-"unused parameter" cost; cleaner than introducing a new wrapper.
+For callers of `MapTypeToSQLServer` that do not have a `CTASConfig`
+in hand, the function constructs a default `CTASConfig{}` internally
+before calling the family-module `FormatDdlTypeName`. This preserves
+the public function signature (`string MapTypeToSQLServer(const
+LogicalType&)`) while threading the unified config through the new
+codec layer.
 
 ---
 

@@ -40,9 +40,15 @@ enum class TypeFamily : uint8_t {
 	Uuid,
 };
 
+// Post-spec-045 both DdlContext values produce byte-identical T-SQL for
+// the same (LogicalType, CTASConfig) inputs (FR-024..FR-028). The enum
+// is retained for API uniformity across family `FormatDdlTypeName`
+// signatures and for future per-context DDL hints (e.g., identity
+// columns, partition columns, computed columns). Spec-045 family
+// modules MAY ignore the parameter — mark `(void)ctx;` if unused.
 enum class DdlContext : uint8_t {
-	CreateTable,	  // general DDL (MapTypeToSQLServer): HUGEINT -> DECIMAL(38,0), TIMESTAMP -> DATETIME2(6)
-	CtasCreateTable,  // CTAS DDL (MapLogicalTypeToCTAS): HUGEINT throws, TIMESTAMP -> DATETIME2(7)
+	CreateTable,	  // general DDL via MSSQLDDLTranslator::MapTypeToSQLServer
+	CtasCreateTable,  // CTAS DDL via MSSQLDDLTranslator::MapLogicalTypeToCTAS
 };
 
 // Maps a TDS wire type id to its TypeFamily. Used by scan decode.

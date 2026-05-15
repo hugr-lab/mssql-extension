@@ -495,17 +495,21 @@ with a clear "exceeds column capacity" error (not a confusing
   rewritten as `switch (FamilyFromLogicalType(type))` calling
   `codec::<family>::FormatDdlTypeName(type, config, ctx)`. Per-type
   DDL type-name branches MUST move into the family modules. The two
-  legacy mappers diverge in subtle ways (HUGEINT throws in
+  legacy mappers diverge in 5 specific cases (HUGEINT throws in
   `MapLogicalTypeToCTAS` but returns `DECIMAL(38,0)` in
   `MapTypeToSQLServer`; TIMESTAMP renders as `DATETIME2(6)` in the
   former vs `DATETIME2(7)` in the latter; VARCHAR consults
   `config.text_type` only in the CTAS path; INTERVAL appears only in
-  `MapTypeToSQLServer`); these divergences are made explicit via a
-  new `enum class DdlContext { CreateTable, CtasCreateTable };`
-  defined in `src/include/codec/type_family.hpp`. Family modules
-  dispatch on this enum where (and only where) the two contexts
-  genuinely differ. See `data-model.md` "DdlContext" entity for the
-  full divergence catalog.
+  `MapTypeToSQLServer`; UHUGEINT throws explicitly only in
+  `MapLogicalTypeToCTAS`). **Post-spec-045 these 5 divergences are
+  reconciled into one unified mapping** (FR-024 through FR-028) so
+  both DDL contexts produce byte-identical T-SQL for the same
+  (LogicalType, CTASConfig) inputs. The `enum class DdlContext`
+  parameter is retained in family-module signatures for API
+  uniformity and future per-context DDL hints (e.g., partition
+  columns, identity columns), but family `FormatDdlTypeName`
+  implementations ignore `ctx` in spec 045. See `data-model.md`
+  "DdlContext" entity for the reconciled mapping table.
 - **FR-014**: `EstimateSerializedSize` in
   `mssql_value_serializer.cpp` MAY remain in its current location
   (it's a heuristic for buffer sizing, not a correctness path) OR
@@ -518,8 +522,8 @@ with a clear "exceeds column capacity" error (not a confusing
 - **FR-020**: Every public observable behavior of the 5 dispatch
   sites MUST be byte-identical to `main`-at-spec-045-kickoff for
   all inputs the existing test suite exercises, **EXCEPT** for the
-  three correctness fixes that surface naturally as the codec
-  layer consolidates:
+  four correctness/consolidation fixes that surface naturally as the
+  codec layer consolidates:
   - **(a)** FR-023 — issue #91 NVARCHAR length validation in the
     BCP encode path. Inputs that pre-spec-045 incorrectly rejected
     now succeed. The String family takes ownership of NVARCHAR
@@ -542,8 +546,21 @@ with a clear "exceeds column capacity" error (not a confusing
     `PhysicalType::INT16/INT32/INT64/INT128`) that
     `mssql_value_serializer.cpp:Serialize` already uses for INSERT
     VALUES. Regression test: `test/sql/catalog/filter_pushdown_decimal.test`.
+  - **(d)** DDL unification across both translator contexts
+    (`MapTypeToSQLServer` and `MapLogicalTypeToCTAS`). Pre-spec-045
+    the two mappers diverge on 5 types and TIMESTAMP_NS/MS/SEC are
+    not handled by either mapper (fall through to default throw,
+    so cannot be the type of a CREATE TABLE / CTAS column).
+    Post-spec-045 both contexts produce byte-identical T-SQL,
+    per-precision TIMESTAMP variants are mapped explicitly, and
+    HUGEINT/UHUGEINT/INTERVAL all map transparently in both
+    contexts (no more silent-feature-gap between CREATE TABLE and
+    CTAS). Specifics: FR-024..028. Regression tests:
+    `test/sql/ctas/ctas_hugeint_unified.test`,
+    `test/sql/ctas/ctas_interval_unified.test`,
+    `test/sql/catalog/ddl_timestamp_precision.test`.
 
-  All three fixes align with constitution principle III
+  All four fixes align with constitution principle III
   (Correctness over Convenience) and are testable as discrete
   regression-tests-that-fail-on-baseline-and-pass-on-spec-045-HEAD.
   No other behavior changes are introduced.
@@ -576,6 +593,63 @@ with a clear "exceeds column capacity" error (not a confusing
   report, a string with 530 UTF-8 bytes but only 500 characters
   must successfully insert into an `nvarchar(500)` column
   (1000-byte UTF-16LE capacity).
+
+**DDL unification (FR-020 (d) implementation specifics)**
+
+- **FR-024**: `codec::datetime::FormatDdlTypeName` MUST map the four
+  TIMESTAMP precision variants explicitly: TIMESTAMP →
+  `DATETIME2(6)` (μs, matches DuckDB native), TIMESTAMP_MS →
+  `DATETIME2(3)`, TIMESTAMP_NS → `DATETIME2(7)` (closest fit;
+  DuckDB ns precision exceeds SQL Server's 100-ns max — documented
+  lossy by 2 decimal digits), TIMESTAMP_SEC → `DATETIME2(0)`. Both
+  DDL contexts return these values. Pre-spec-045 TIMESTAMP_MS/NS/SEC
+  fall through to the `default` arm in both translator functions
+  and throw `NotImplementedException` — so CREATE TABLE / CTAS
+  columns of these types are currently impossible. Post-spec-045
+  they work.
+- **FR-025**: `codec::integer::FormatDdlTypeName` (HUGEINT) and
+  `codec::decimal::FormatDdlTypeName` (UHUGEINT case if it routes
+  here via Integer-family forward) MUST return `DECIMAL(38,0)` in
+  both DDL contexts. Pre-spec-045 `MapLogicalTypeToCTAS` throws on
+  HUGEINT / UHUGEINT; post-spec-045 it maps transparently.
+  Runtime overflow on the BCP encode side is detected in
+  `codec::decimal::EncodeToBcp`: when a HUGEINT or UHUGEINT value
+  exceeds the DECIMAL(38,0) representable range (±10^38 − 1), the
+  encoder emits a warning to stderr (tagged `[MSSQL CODEC]
+  HUGEINT overflow: column <name>, value <hugeint>`) AND continues
+  by writing the saturated value (clamped to ±(10^38 − 1)) so the
+  row does not fail the whole batch. This matches the
+  "log-and-continue" policy used by other lossy numeric paths.
+- **FR-026**: `codec::string::FormatDdlTypeName` (INTERVAL case)
+  MUST return `NVARCHAR(50)` in both DDL contexts. Pre-spec-045
+  `MapTypeToSQLServer` returns `NVARCHAR(100)` and
+  `MapLogicalTypeToCTAS` throws. Post-spec-045 both contexts unify
+  on 50 — DuckDB's canonical INTERVAL string form (e.g.,
+  `"83 days 4 hours 27 minutes 53.123456 seconds"`) fits in 50
+  characters for all reasonable interval values. The DuckDB-side
+  conversion to string uses `Value::IntervalToString` (existing
+  helper) and is invoked by the BCP encoder when serializing an
+  INTERVAL column to a NVARCHAR(50) wire type.
+- **FR-027**: `codec::string::FormatDdlTypeName` (VARCHAR case)
+  MUST consult `cfg.text_type` in BOTH DDL contexts and return
+  `VARCHAR(MAX)` for `CTASTextType::VARCHAR`, else `NVARCHAR(MAX)`.
+  Pre-spec-045 only `MapLogicalTypeToCTAS` checks this config;
+  `MapTypeToSQLServer` hard-codes `NVARCHAR(MAX)`. Post-spec-045 the
+  general DDL path also honors the config — both contexts behave
+  uniformly. (Length preservation for parsed-but-ignored
+  `VARCHAR(N)` declarations is OUT OF SCOPE — DuckDB's `LogicalType`
+  does not carry length info for VARCHAR, so it cannot be propagated
+  to the SQL Server type name. Spec 046+ may add a global
+  `mssql_default_varchar_length` extension setting if needed.)
+- **FR-028**: After all family migrations land, the following
+  invariant MUST hold: for every supported `LogicalType` T and
+  `CTASConfig` C, `MSSQLDDLTranslator::MapTypeToSQLServer(T)` and
+  `MSSQLDDLTranslator::MapLogicalTypeToCTAS(T, C)` return strings
+  that are byte-identical (taking C into account for the latter;
+  `MapTypeToSQLServer` uses a default-constructed `CTASConfig`).
+  This is verified by a dedicated SQLLogicTest
+  `test/sql/catalog/ddl_unification.test` that iterates over the
+  type matrix and asserts equality.
 
 **Testing**
 
@@ -671,21 +745,34 @@ with a clear "exceeds column capacity" error (not a confusing
   helper bodies moving OUT into family modules.
 - **SC-002**: Zero behavior regressions: every test that passed
   on `main`-at-spec-045-kickoff passes on the spec-045 PR HEAD.
-  Strict gate. (Exception: the three bug-fix regression tests
-  from FR-020 (a)/(b)/(c) and FR-031a are **expected to fail** on
-  `main`-at-spec-045-kickoff and **expected to pass** on the
-  spec-045 PR HEAD — see SC-002a.)
-- **SC-002a**: Three correctness fixes closed by their respective
-  regression tests passing on the spec-045 PR HEAD and **failing**
-  on the pre-spec-045 baseline:
+  Strict gate. (Exception: the four bug-fix / consolidation
+  regression tests from FR-020 (a)/(b)/(c)/(d) and FR-031a are
+  **expected to fail** on `main`-at-spec-045-kickoff and
+  **expected to pass** on the spec-045 PR HEAD — see SC-002a.)
+- **SC-002a**: Four correctness/consolidation fixes closed by their
+  respective regression tests passing on the spec-045 PR HEAD and
+  **failing** on the pre-spec-045 baseline:
   - Issue #91 → `test/sql/copy/copy_nvarchar_length_validation.test`
   - HUGEINT filter literal → `test/sql/catalog/filter_pushdown_hugeint.test`
   - DECIMAL filter literal → `test/sql/catalog/filter_pushdown_decimal.test`
+  - DDL unification → three tests:
+    - `test/sql/ctas/ctas_hugeint_unified.test` (CTAS column of
+      DuckDB HUGEINT now succeeds; was: throws)
+    - `test/sql/ctas/ctas_interval_unified.test` (CTAS column of
+      DuckDB INTERVAL now succeeds; was: throws)
+    - `test/sql/catalog/ddl_timestamp_precision.test` (CREATE TABLE
+      with TIMESTAMP_NS / TIMESTAMP_MS / TIMESTAMP_SEC column now
+      succeeds with the precision-aware DATETIME2(N) target; was:
+      throws)
+  - DDL unification invariant → `test/sql/catalog/ddl_unification.test`
+    (asserts byte-identity of MapTypeToSQLServer vs
+    MapLogicalTypeToCTAS for every supported LogicalType)
 
   Captured pre/post evidence committed under
   `specs/045-type-codec-consolidation/issue_91_repro.md`,
-  `filter_pushdown_hugeint_repro.md`, and
-  `filter_pushdown_decimal_repro.md`.
+  `filter_pushdown_hugeint_repro.md`,
+  `filter_pushdown_decimal_repro.md`, and
+  `ddl_unification_repro.md`.
 - **SC-003**: 100% of family golden-fixture tests pass. Each
   family's `test/cpp/codec/test_<family>_codec.cpp` PASS verdict
   is required.
@@ -749,19 +836,23 @@ with a clear "exceeds column capacity" error (not a confusing
   contracts.
 - **`TdsReader` / `TdsWriter` wrapper classes**. The current
   `std::vector<uint8_t>&` byte buffer API stays.
-- **Type-mapping additions** (UUID round-trip via UNIQUEIDENTIFIER
-  the spec-044 source doc proposed, HUGEINT → DECIMAL(38,0),
-  TIMESTAMP_TZ → DATETIMEOFFSET, nested types → JSON fallback).
+- **Type-mapping additions beyond the four documented in FR-020**.
+  Nested types → JSON fallback, parsed `VARCHAR(N)` length
+  preservation (requires DuckDB-level metadata extension), UUID
+  round-trip semantics, and similar additions are out of scope.
   These are correctness changes that change behavior; spec 045 is
-  primarily a refactor. Type-mapping fixes belong to subsequent
-  specs that each handle one mapping. **Exceptions** (three
+  primarily a refactor + four targeted fixes. Type-mapping
+  additions belong to subsequent specs. **Exceptions** (four
   behavior-changing fixes that DO belong in spec 045): see FR-020
-  (a)/(b)/(c) — issue #91 NVARCHAR length validation, HUGEINT
+  (a)/(b)/(c)/(d) — issue #91 NVARCHAR length validation, HUGEINT
   filter literal correctness, DECIMAL filter literal precision
-  preservation. All three surface naturally from the consolidation
-  (each fix lives inside the family module that spec 045 already
-  introduces) and are testable as discrete regression-test units.
-  No other bug fixes piggyback on spec 045.
+  preservation, and DDL unification across both translator
+  contexts (with per-precision TIMESTAMP support, HUGEINT/UHUGEINT
+  /INTERVAL transparent mapping, and VARCHAR config-driven path).
+  All four surface naturally from the consolidation (each fix
+  lives inside the family module that spec 045 already introduces)
+  and are testable as discrete regression-test units. No other bug
+  fixes piggyback on spec 045.
 - **`VariantCodec` for XML / SQL_VARIANT / UDT**. XML is already a
   String-family subtype; SQL_VARIANT and UDT remain unsupported
   (current behavior). A VARIANT codec is a separate feature spec.

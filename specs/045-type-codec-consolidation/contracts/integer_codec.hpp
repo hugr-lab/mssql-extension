@@ -14,8 +14,11 @@
 // Special handling within Integer:
 //   - HUGEINT BCP encode forwards to codec::decimal::EncodeToBcp with
 //     (precision=38, scale=0). HUGEINT DDL forwards to
-//     codec::decimal::FormatDdlTypeName for CreateTable, throws for
-//     CtasCreateTable (per existing MapLogicalTypeToCTAS behavior).
+//     codec::decimal::FormatDdlTypeName in BOTH DdlContext values
+//     (post-spec-045 unification: both contexts return
+//     "DECIMAL(38,0)"; CtasCreateTable no longer throws). Runtime
+//     overflow at BCP encode emits a warning and writes the
+//     saturated value (FR-025).
 //   - UBIGINT BCP encode also forwards to codec::decimal::EncodeToBcp
 //     with (precision=20, scale=0) because BCP wire has no UNSIGNED
 //     BIGINT.

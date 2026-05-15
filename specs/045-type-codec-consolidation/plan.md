@@ -232,13 +232,23 @@ their current locations (only their bodies shrink).
 **Note on `mssql_ddl_translator.cpp`**: spec.md mentions
 `MapLogicalTypeToCTAS` as the single DDL mapper. Inspection during
 Phase 0 found a SECOND mapper — `MapTypeToSQLServer` (lines 78-162) —
-which subtly diverges from `MapLogicalTypeToCTAS` on HUGEINT (throws
-vs `DECIMAL(38,0)`), TIMESTAMP scale (6 vs 7), and adds an INTERVAL
-arm. The Phase 1 design (data-model.md) captures both mappers as call
-sites of `codec::<family>::FormatDdlTypeName`, parameterized by
-`DdlContext` (analogous to `LiteralContext`) so the two divergences
-become explicit. This is a minor refinement of the spec — not a scope
-expansion — and is documented in research.md.
+which subtly diverges from `MapLogicalTypeToCTAS` on 5 types (HUGEINT
+throws vs `DECIMAL(38,0)`, UHUGEINT throws-with-message vs default
+throw, TIMESTAMP scale 6 vs 7, VARCHAR config-driven only in CTAS,
+INTERVAL stringified in CreateTable only) **and** silently lacks
+DDL arms for TIMESTAMP_MS/NS/SEC (both mappers fall through to
+default-throw, making columns of these types impossible in CREATE
+TABLE / CTAS).
+
+**Scope decision (post-Phase-2 user feedback)**: spec.md now treats
+DDL unification as the 4th in-scope behavior change (FR-020 (d) +
+FR-024..028). Both mappers MUST produce byte-identical T-SQL
+post-spec-045, per-precision TIMESTAMP variants are added, HUGEINT/
+UHUGEINT/INTERVAL map transparently in both contexts, and VARCHAR
+consults `CTASConfig.text_type` in both contexts. The `DdlContext`
+enum is retained for future per-context DDL hints but is functionally
+a no-op in spec 045 family modules. See spec.md FR-013, FR-020 (d),
+FR-024..028, and data-model.md "DdlContext" reconciled-mapping table.
 
 ## Complexity Tracking
 
