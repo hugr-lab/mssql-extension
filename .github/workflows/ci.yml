@@ -48,7 +48,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check clang-format
         run: |
@@ -85,7 +85,7 @@ jobs:
             vcpkg_triplet: arm64-osx
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout DuckDB submodule
         run: |
@@ -117,7 +117,7 @@ jobs:
 
       # Cache ccache to speed up compilation
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -140,7 +140,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -171,28 +171,28 @@ jobs:
         run: ccache -s
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-${{ matrix.platform.id }}
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
           if-no-files-found: error
 
       - name: Upload unittest Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unittest-${{ matrix.platform.id }}
           path: build/release/test/unittest
           if-no-files-found: error
 
       - name: Upload libduckdb Artifact (for unittest)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libduckdb-${{ matrix.platform.id }}
           path: |
@@ -224,16 +224,16 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
@@ -281,16 +281,16 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-linux_amd64
           path: cli
@@ -321,7 +321,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout DuckDB submodule
         shell: bash
@@ -349,7 +349,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -380,14 +380,14 @@ jobs:
           Pop-Location
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-windows_amd64_msvc
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_msvc
           path: build/release/duckdb.exe
@@ -407,7 +407,7 @@ jobs:
       CXX: g++
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout DuckDB submodule
         shell: bash
@@ -450,7 +450,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -477,14 +477,14 @@ jobs:
           cmake --build . --config Release
 
       - name: Upload Extension Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-extension-windows_amd64_mingw
           path: build/release/extension/mssql/mssql.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_mingw
           path: build/release/duckdb.exe
@@ -509,16 +509,16 @@ jobs:
             artifact_suffix: windows_amd64_mingw
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download extension artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-extension-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.config.artifact_suffix }}
           path: cli
@@ -544,16 +544,16 @@ jobs:
     environment: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download unittest artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: unittest-linux_amd64
           path: test
 
       - name: Download libduckdb artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: libduckdb-linux_amd64
           path: lib

@@ -45,16 +45,18 @@ jobs:
     steps:
       # We only need the .github/ tree from main, not submodules.
       - name: Checkout main (NOT the PR)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           submodules: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-          cache: pip
+          # No `cache: pip` -- that mode requires a requirements.txt or
+          # pyproject.toml in the repo, which we don't have. The one inline
+          # `pip install llm-guard` is cheap enough to repeat on each run.
 
       - name: Install llm-guard
         run: |
@@ -64,7 +66,7 @@ jobs:
           pip install 'llm-guard==0.3.16'
 
       - name: Cache HuggingFace model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: hf-prompt-injection-v2

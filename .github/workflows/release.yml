@@ -25,7 +25,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check clang-format
         run: |
@@ -63,7 +63,7 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -106,7 +106,7 @@ jobs:
 
       # Cache ccache to speed up compilation
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -131,7 +131,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -167,14 +167,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
           path: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
@@ -189,7 +189,7 @@ jobs:
     needs: lint
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -226,7 +226,7 @@ jobs:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -249,7 +249,7 @@ jobs:
           ccache -z
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/AppData/Local/ccache
           key: ccache-windows_amd64-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -288,14 +288,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64
           path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64
           path: build/release/duckdb.exe
@@ -313,7 +313,7 @@ jobs:
       CXX: g++
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -365,7 +365,7 @@ jobs:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             vcpkg/installed
@@ -383,7 +383,7 @@ jobs:
           ccache -z
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/AppData/Local/ccache
           key: ccache-windows_amd64_mingw-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -423,14 +423,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw
           path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_mingw
           path: build/release/duckdb.exe
@@ -466,7 +466,7 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -477,13 +477,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: cli
@@ -521,7 +521,7 @@ jobs:
             artifact_suffix: windows_amd64_mingw
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -532,13 +532,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.config.artifact_suffix }}
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-${{ matrix.config.artifact_suffix }}
           path: cli
@@ -580,7 +580,7 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -590,13 +590,13 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-linux_amd64
           path: extension
 
       - name: Download DuckDB CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: duckdb-cli-linux_amd64
           path: cli
@@ -633,7 +633,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract extension version from tag
         id: version
@@ -644,7 +644,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
