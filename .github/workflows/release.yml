@@ -167,14 +167,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}
           path: mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.platform.id }}.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-${{ matrix.platform.id }}
           path: build/release/duckdb
@@ -288,14 +288,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64
           path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64
           path: build/release/duckdb.exe
@@ -423,14 +423,14 @@ jobs:
           ls -la "$ARTIFACT_NAME"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw
           path: mssql-${{ steps.version.outputs.ext_version }}-windows_amd64_mingw.duckdb_extension
           if-no-files-found: error
 
       - name: Upload DuckDB CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: duckdb-cli-windows_amd64_mingw
           path: build/release/duckdb.exe
