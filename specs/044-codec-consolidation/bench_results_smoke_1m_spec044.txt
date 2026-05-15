@@ -1,0 +1,22 @@
+# bench_codec_e2e output
+# date: 2026-05-15T07:25:02+02:00
+# duckdb_bin: /Users/vgribanov/projects/hugr-lab/mssql-extension/build/release/duckdb
+# host: localhost:1433/TestDB
+# row_count: 1000000
+# insert_rows: 100000
+step	seconds	row_count	notes
+ddl_create_tables	1.050	-	create two target tables
+generate_source	0.268	1000000	duckdb temp table
+insert_values	11.118	100000	LIMIT 100000 (codec amortized per batch)
+ctas_bcp	7.086	1000000	default mssql_ctas_use_bcp=true
+copy_bcp	7.076	1000000	COPY TO MSSQL via BCP
+select_count	1.045	1	smoke check (no NVARCHAR scan)
+select_full	2.054	1000000	primary read-side signal (NVARCHAR scan decode)
+
+# end of bench_codec_e2e
+# uname: Darwin 25.2.0 arm64
+# cpu_model: Apple M4 Max
+# cores: 16
+# ram_gb: unknown
+# docker: Docker version 28.5.1, build e180ab8
+# sql_server_image: sha256:bf438d7104f861f5e1e1ba14b063d60a5bd883964b3c9b3b3c0064536177baa5

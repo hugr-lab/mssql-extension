@@ -58,7 +58,6 @@ set(EXTENSION_SOURCES
     src/mssql_functions.cpp
     # Encoding utilities (in tds namespace)
     src/tds/encoding/utf16.cpp
-    src/tds/encoding/simdutf_wrappers.cpp
     src/tds/encoding/decimal_encoding.cpp
     src/tds/encoding/datetime_encoding.cpp
     src/tds/encoding/guid_encoding.cpp
