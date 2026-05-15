@@ -176,12 +176,11 @@ LOGIN7_TEST_SOURCES := \
     src/tds/tds_packet.cpp \
     src/tds/tds_protocol.cpp \
     src/tds/tds_types.cpp \
-    src/tds/encoding/utf16.cpp \
-    src/tds/encoding/simdutf_wrappers.cpp
+    src/tds/encoding/utf16.cpp
 
 LOGIN7_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
 LOGIN7_TEST_VCPKG_TRIPLET := $(shell ls $(LOGIN7_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
-LOGIN7_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+LOGIN7_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
 LOGIN7_TEST_INCLUDES := -I src/include -I duckdb/src/include \
     -I $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/include
 LOGIN7_TEST_LIBS := -L $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
@@ -201,6 +200,36 @@ test-login7-encoding: debug
 	@echo ""
 	@echo "Running LOGIN7 + simdutf unit test..."
 	build/test/test_login7_encoding
+
+# Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
+# Manual target; NOT part of `make test` or any CI workflow.
+# Requires `make debug` first to populate build/debug/vcpkg_installed.
+BENCH_UTF16_VCPKG_INSTALLED := build/release/vcpkg_installed
+BENCH_UTF16_VCPKG_TRIPLET := $(shell ls $(BENCH_UTF16_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
+BENCH_UTF16_SOURCES := src/tds/encoding/utf16.cpp
+BENCH_UTF16_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
+BENCH_UTF16_INCLUDES := -I src/include -I duckdb/src/include \
+    -I $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET)/include
+# Link against the RELEASE simdutf (optimized SIMD path). The debug build
+# of simdutf disables intrinsics and is dramatically slower; using it for
+# a perf benchmark would be misleading.
+BENCH_UTF16_LIBS := -L $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET)/lib -lsimdutf
+
+bench-utf16: release
+	@echo "Building UTF-16 codec microbenchmark (spec 044)..."
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(BENCH_UTF16_FLAGS) $(BENCH_UTF16_INCLUDES) \
+	    test/cpp/bench_utf16.cpp \
+	    $(BENCH_UTF16_SOURCES) \
+	    $(BENCH_UTF16_LIBS) \
+	    -o build/test/bench_utf16
+	@echo ""
+	@echo "Running UTF-16 codec microbenchmark..."
+	build/test/bench_utf16
 
 # Show help
 help:

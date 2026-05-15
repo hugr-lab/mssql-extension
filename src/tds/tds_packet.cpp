@@ -1,6 +1,6 @@
 #include "tds/tds_packet.hpp"
 
-#include "tds/encoding/simdutf_wrappers.hpp"
+#include "tds/encoding/utf16.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -69,7 +69,7 @@ void TdsPacket::AppendUTF16LE(const std::string &str) {
 	// need the UTF-16 code-unit count for the LOGIN7 fixed header. This
 	// method is preserved as a generic public helper for any future
 	// caller that needs unprefixed UTF-16LE bytes.
-	const auto bytes = encoding::SimdutfUtf16LEEncode(str);
+	const auto bytes = encoding::Utf16LEEncode(str);
 	payload_.insert(payload_.end(), bytes.begin(), bytes.end());
 }
 
