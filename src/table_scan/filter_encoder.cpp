@@ -123,7 +123,7 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return value.GetValue<bool>() ? "1" : "0";
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:

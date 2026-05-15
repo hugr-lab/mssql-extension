@@ -1,4 +1,5 @@
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/boolean_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -79,8 +80,10 @@ string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {
 
 string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return "BIT";
+	case LogicalTypeId::BOOLEAN: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::boolean::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:
@@ -337,7 +340,7 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const mssql::CTASConfig &config) {
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return "BIT";
+		return mssql::codec::boolean::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:

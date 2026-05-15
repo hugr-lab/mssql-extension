@@ -1,0 +1,13 @@
+# BIT/BITN decode cases — TDS wire byte → DuckDB bool
+# format: hex_bytes | expected_bool
+# Notes:
+#   - The legacy ConvertBoolean rule is: !bytes.empty() && bytes[0] != 0
+#   - Empty input is defensive-decoded to false (the caller is expected to
+#     handle NBC/null bits BEFORE calling DecodeFromTds; this is an
+#     inherited defensive fallback).
+00 | false
+01 | true
+FF | true
+7F | true
+80 | true
+   | false

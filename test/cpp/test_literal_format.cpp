@@ -183,18 +183,32 @@ void TestStringFamilyDispatcherWired() {
 	}
 }
 
+void TestBooleanFamilyDispatcherWired() {
+	std::cout << "Test: Boolean dispatcher arm routes to codec::boolean (Phase 6 sub-phase 1)\n";
+
+	auto filter_t =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN, LiteralContext::Filter);
+	auto insert_t = duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN,
+														   LiteralContext::InsertValues);
+	CHECK_EQ(filter_t, std::string("1"));
+	CHECK_EQ(filter_t, insert_t);
+
+	auto filter_f =
+		duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(false), LogicalType::BOOLEAN, LiteralContext::Filter);
+	CHECK_EQ(filter_f, std::string("0"));
+
+	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN), static_cast<size_t>(1));
+}
+
 void TestUnmigratedFamiliesThrow() {
 	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
 
 	// Sanity check: families NOT yet migrated still throw.
 	CHECK_THROWS_NOT_IMPLEMENTED(
-		duckdb::mssql::codec::FormatSqlLiteral(Value::BOOLEAN(true), LogicalType::BOOLEAN, LiteralContext::Filter));
-	CHECK_THROWS_NOT_IMPLEMENTED(
 		duckdb::mssql::codec::FormatSqlLiteral(Value::FLOAT(1.5f), LogicalType::FLOAT, LiteralContext::Filter));
 	CHECK_THROWS_NOT_IMPLEMENTED(
 		duckdb::mssql::codec::FormatSqlLiteral(Value::DOUBLE(2.5), LogicalType::DOUBLE, LiteralContext::Filter));
 
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN));
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::FLOAT));
 }
 
@@ -206,6 +220,7 @@ int main() {
 	TestDispatcherHugeIntFix();
 	TestDispatcherEstimateLiteralSize();
 	TestStringFamilyDispatcherWired();
+	TestBooleanFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

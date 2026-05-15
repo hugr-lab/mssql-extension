@@ -149,11 +149,18 @@
 
 ### Family 1 of 7: Boolean
 
-- [ ] T056 [P] [US3] Capture Boolean golden fixtures under `golden/boolean/`
-- [ ] T057 [P] [US3] Write `test/cpp/codec/test_boolean_codec.cpp` (manual `make test-codec-boolean` target). **Fails initially.**
-- [ ] T058 [US3] Implement `codec::boolean::*` (all 4 ops) in `src/codec/boolean_codec.cpp` mirroring current `ConvertBoolean` / `EncodeBit` / Boolean filter+INSERT literal / DDL `"BIT"` logic
-- [ ] T059 [US3] Migrate 5 dispatch sites' Boolean arms to call `codec::boolean::*`. Delete `ConvertBoolean`, `EncodeBit` private helpers. Update `literal_format.cpp` Boolean arm to direct call.
-- [ ] T060 [US3] Run `make test-codec-boolean` + `make test` + clang-format-14 sweep — verify all green
+- [X] T056 [P] [US3] Captured Boolean golden fixtures under `golden/boolean/` — README + decode_cases.txt + encode_cases.txt + literal_cases.txt + ddl_cases.txt. Honest mode (per Phase-6 plan question): committed actual text-format expected-output files (not the deferred-placeholder approach used for Integer/String).
+- [X] T057 [P] [US3] Wrote `test/cpp/codec/test_boolean_codec.cpp`. 5 test groups covering FormatSqlLiteral Filter==InsertValues byte-identity (FR-020 (b)), dispatcher routing, FormatDdlTypeName CreateTable==CtasCreateTable byte-identity (FR-027/028), EstimateLiteralSize sanity, NULL → "NULL" via dispatcher. `make test-codec-boolean` initially fails because Phase-2 stub + literal_format dispatcher Boolean arm throws — passes after T058/T059.
+- [X] T058 [US3] Implemented `codec::boolean::*` in `src/codec/boolean_codec.cpp`. `DecodeFromTds` (`!bytes.empty() && bytes[0] != 0`), `EncodeToBcp` (Vector + Value overloads — both push 0x01 length prefix + 0x00/0x01 value), `FormatSqlLiteral` ("1" / "0", ctx-independent per FR-020 (b)), `FormatDdlTypeName` ("BIT", cfg/ctx-independent per FR-027/028), `EstimateLiteralSize` (= 1). Fixed Phase-2 stub header signatures (DecodeFromTds takes `std::vector` not `duckdb::vector`; added Value overload for EncodeToBcp) to match the dispatch site interface.
+- [X] T059 [US3] Migrated 5 dispatch sites' Boolean arms:
+  - `src/tds/encoding/type_converter.cpp`: BIT/BITN → `mssql::codec::boolean::DecodeFromTds`. Deleted `TypeConverter::ConvertBoolean` body + header declaration.
+  - `src/tds/encoding/bcp_row_encoder.cpp`: both BOOLEAN arms (`EncodeRow` Vector path + `EncodeValue` Value path) → `mssql::codec::boolean::EncodeToBcp`. Kept `BCPRowEncoder::EncodeBit` body (test/cpp/test_bcp_row_encoder.cpp still exercises it — same Phase-3 pattern).
+  - `src/table_scan/filter_encoder.cpp`: BOOLEAN arm → `codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter)`.
+  - `src/dml/insert/mssql_value_serializer.cpp`: BOOLEAN arm → `mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues)`. Kept `SerializeBoolean` body (test/cpp/test_value_serializer.cpp still exercises it).
+  - `src/catalog/mssql_ddl_translator.cpp`: BOOLEAN arm in BOTH `MapTypeToSQLServer` AND `MapLogicalTypeToCTAS` → `mssql::codec::boolean::FormatDdlTypeName(type, cfg, ctx)`.
+  - Wired `src/codec/literal_format.cpp` Boolean arm to `boolean::FormatSqlLiteral` and `boolean::EstimateLiteralSize`. Updated phase-header comment.
+  - Updated `test/cpp/test_literal_format.cpp`: added `TestBooleanFamilyDispatcherWired` group, removed BOOLEAN from `TestUnmigratedFamiliesThrow`.
+- [X] T060 [US3] `make test-codec-boolean` PASS (5 groups). `make test-literal-format` PASS (7 groups). Integration sweep against running SQL Server: [ctas] 16/16 PASS (508 assertions), [insert] 12/12 PASS (304 assertions), [catalog] 44/44 PASS (2050 assertions), [dml] 12/12 PASS (450 assertions), [transaction] 12/12 PASS (400 assertions). Unit tests `make test`: 122/127 PASS — the 5 failures are the pre-existing "Context 'db' already exists" sqllogictest infra issue inherited from Phase 5 baseline (not a Boolean regression). clang-format-14 sweep applied to 11 touched files.
 
 ### Family 2 of 7: Float
 

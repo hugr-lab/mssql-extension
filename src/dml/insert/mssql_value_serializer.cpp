@@ -271,7 +271,7 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	auto &type = value.type();
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return SerializeBoolean(BooleanValue::Get(value));
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:

@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include "codec/boolean_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
@@ -271,7 +272,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	case TDS_TYPE_BIT:
 	case TDS_TYPE_BITN:
-		ConvertBoolean(value, vector, row_idx);
+		mssql::codec::boolean::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_REAL:
@@ -330,11 +331,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
 	}
-}
-
-void TypeConverter::ConvertBoolean(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
-	bool b = !value.empty() && value[0] != 0;
-	FlatVector::GetData<bool>(vector)[row_idx] = b;
 }
 
 void TypeConverter::ConvertFloat(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,

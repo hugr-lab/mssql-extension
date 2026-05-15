@@ -1,5 +1,6 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/boolean_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "copy/target_resolver.hpp"
@@ -84,7 +85,7 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 		// Using GetVectorValue to handle both flat and constant vectors
 		switch (col.duckdb_type.id()) {
 		case LogicalTypeId::BOOLEAN: {
-			EncodeBit(buffer, GetVectorValue<bool>(vec, row_idx));
+			mssql::codec::boolean::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
 		case LogicalTypeId::TINYINT:
@@ -187,7 +188,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		EncodeBit(buffer, value.GetValue<bool>());
+		mssql::codec::boolean::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
