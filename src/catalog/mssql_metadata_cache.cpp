@@ -305,10 +305,26 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 	string full_name = "[" + schema_name + "].[" + table_name + "]";
 	string query = StringUtil::Format(SINGLE_TABLE_METADATA_SQL_TEMPLATE, full_name);
 
-	MSSQLTableMetadata table_meta;
+	// Populate the cache slot in place so we never take the address of a stack
+	// local that gets moved out. GCC's -Wreturn-local-addr can't prove the
+	// lambda's `&table_meta` capture doesn't escape via the std::function
+	// inside ExecuteMetadataQuery, so it flagged this as a false-positive
+	// even though both return paths returned addresses of map elements (post
+	// std::move). Building directly in the map sidesteps the analysis and
+	// avoids one move per call.
+	//
+	// C++11-compatible: erase any stale entry first, then emplace a fresh
+	// default-constructed one. Schema mutex is held for the duration so
+	// partial state isn't visible to other threads.
+	// (NOTE: insert_or_assign is C++17; the project targets C++11 for ODR
+	//  compat with DuckDB.)
+	schema.tables.erase(table_name);
+	auto insert_result = schema.tables.emplace(table_name, MSSQLTableMetadata());
+	auto slot_it = insert_result.first;
+	MSSQLTableMetadata &table_meta = slot_it->second;
 	table_meta.name = table_name;
-	bool first_row = true;
 
+	bool first_row = true;
 	ExecuteMetadataQuery(connection, query, [this, &table_meta, &first_row](const vector<string> &values) {
 		if (values.size() < 10) {
 			return;
@@ -360,29 +376,22 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 		table_meta.columns.push_back(std::move(col_info));
 	});
 
-	// If no rows returned, table doesn't exist
+	// If no rows returned, table doesn't exist -- roll back the slot we inserted.
 	if (first_row) {
+		schema.tables.erase(slot_it);
 		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — table not found on SQL Server", schema_name.c_str(),
 					table_name.c_str());
 		return nullptr;
 	}
 
-	// Cache the result
-	auto now = std::chrono::steady_clock::now();
+	// Cache the result (slot is already in the map)
 	table_meta.columns_load_state = CacheLoadState::LOADED;
-	table_meta.columns_last_refresh = now;
+	table_meta.columns_last_refresh = std::chrono::steady_clock::now();
 
 	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns", schema_name.c_str(), table_name.c_str(),
 				table_meta.columns.size());
 
-	// Insert or replace: if entry already exists (e.g. invalidated), overwrite it
-	auto existing_it = schema.tables.find(table_name);
-	if (existing_it != schema.tables.end()) {
-		existing_it->second = std::move(table_meta);
-		return &existing_it->second;
-	}
-	auto result = schema.tables.emplace(table_name, std::move(table_meta));
-	return &result.first->second;
+	return &table_meta;
 }
 
 bool MSSQLMetadataCache::HasSchema(const string &schema_name) {

@@ -558,14 +558,11 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 								 static_cast<uint8_t>(token_packets[0].GetStatus()), token_packets[0].GetLength(),
 								 token_packets[0].GetPacketId());
 
+			// Do NOT log token payload bytes - even partial hex of the JWT is a credential
+			// leak per security audit. Log size only.
 			const auto &payload = token_packets[0].GetPayload();
-			std::string hex_dump;
-			for (size_t i = 0; i < std::min<size_t>(20, payload.size()); i++) {
-				char buf[4];
-				snprintf(buf, sizeof(buf), "%02x ", payload[i]);
-				hex_dump += buf;
-			}
-			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] payload (first 20): %s", hex_dump.c_str());
+			MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: FEDAUTH_TOKEN[0] payload size=%zu bytes (contents redacted)",
+								 payload.size());
 		}
 
 		// Send all packets
@@ -631,6 +628,161 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 						 negotiated_packet_size_);
 
 	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// AuthenticateIntegrated -- Spec 042 (Phase 2 scaffolding)
+//
+// Drives the SPNEGO / Kerberos / SSPI login flow:
+//   1. PRELOGIN (encryption negotiation; same as SQL auth)
+//   2. LOGIN7 with fIntSecurity bit set and InitialBytes() in SSPI field
+//   3. While server returns a 0xED SSPI token: call NextBytes(blob), if the
+//      returned blob is non-empty send it in an SSPI Message packet and read
+//      the next response.
+//   4. Terminate on LOGINACK + DONE, surfacing any 0xAA ERROR token verbatim.
+//
+// Phase 2 wires the loop and validates the LOGIN7 builder + 0xED parser.
+// Phase 3/4 provides the concrete Krb5Authenticator / WinSspiAuthenticator
+// implementations. Without one, this returns a clear error per FR-012.
+//===----------------------------------------------------------------------===//
+bool TdsConnection::AuthenticateIntegrated(const std::string &database,
+										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt) {
+	if (state_.load() != ConnectionState::Authenticating) {
+		last_error_ = "Cannot authenticate: not in Authenticating state";
+		return false;
+	}
+	if (!authenticator) {
+		last_error_ =
+			"MSSQL Error: This build of the mssql extension was compiled without Kerberos / SSPI support. "
+			"Rebuild with -DENABLE_KRB5=ON or use SQL authentication.";
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Step 1: PRELOGIN (encryption only; integrated auth does NOT set FEDAUTHREQUIRED)
+	if (!DoPrelogin(use_encrypt)) {
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Step 2: Initial SPNEGO blob from the authenticator.
+	std::vector<uint8_t> initial_blob;
+	try {
+		initial_blob = authenticator->InitialBytes();
+	} catch (const std::exception &e) {
+		// Authenticator already prefixes with "MSSQL Kerberos auth failed:";
+		// just propagate verbatim to avoid double-prefixing.
+		last_error_ = e.what();
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+	if (initial_blob.empty()) {
+		last_error_ = "MSSQL Kerberos auth failed: authenticator returned empty initial SPNEGO blob";
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Step 3: LOGIN7 with SSPI field populated. The HostName field is the
+	// CLIENT workstation name (per [MS-TDS] 2.2.6.4 -- surfaces in
+	// sys.dm_exec_sessions.host_name, sp_who, audit logs); the ServerName
+	// field is the destination. Passing host_ (the destination) into both
+	// positions makes DBA tooling see every connection as if the server were
+	// connecting to itself. spec 042 ultrareview bug_029.
+	const std::string client_hostname = GetClientHostname();
+	MSSQL_CONN_DEBUG_LOG(1,
+						 "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
+						 initial_blob.size(), client_hostname.c_str(), database.c_str());
+	TdsPacket login =
+		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
+										 initial_blob, "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
+	login.SetPacketId(next_packet_id_++);
+	if (!socket_->SendPacket(login)) {
+		last_error_ = "Failed to send LOGIN7 (integrated): " + socket_->GetLastError();
+		state_.store(ConnectionState::Disconnected);
+		socket_->Close();
+		return false;
+	}
+
+	// Step 4: Continuation loop on 0xED SSPI tokens.
+	constexpr int MAX_SSPI_ROUNDS = 8;	// SPNEGO with cross-realm trust typically 2-3 rounds
+	for (int round = 0; round < MAX_SSPI_ROUNDS; round++) {
+		std::vector<uint8_t> response;
+		if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+			last_error_ = "Failed to receive LOGIN7 response (integrated): " + socket_->GetLastError();
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+
+		LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+		if (login_response.success) {
+			spid_ = login_response.spid;
+			negotiated_packet_size_ = login_response.negotiated_packet_size;
+			MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: success after %d round(s), spid=%d, packet_size=%d",
+								 round + 1, spid_, negotiated_packet_size_);
+			database_ = database;
+			state_.store(ConnectionState::Idle);
+			UpdateLastUsed();
+			authenticator->Free();
+			return true;
+		}
+
+		if (!login_response.has_sspi_token) {
+			// No continuation requested and no LOGINACK -- server rejected the auth.
+			if (login_response.error_number > 0) {
+				last_error_ = "MSSQL Kerberos auth rejected by server (error " +
+							  std::to_string(login_response.error_number) + "): " + login_response.error_message;
+			} else if (!login_response.error_message.empty()) {
+				last_error_ = "MSSQL Kerberos auth rejected: " + login_response.error_message;
+			} else {
+				last_error_ = "MSSQL Kerberos auth rejected by server (no SSPI token, no LOGINACK)";
+			}
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+
+		// Continue the SPNEGO negotiation.
+		std::vector<uint8_t> next_blob;
+		try {
+			next_blob = authenticator->NextBytes(login_response.sspi_token);
+		} catch (const std::exception &e) {
+			// Authenticator already prefixes; just propagate verbatim.
+			last_error_ = e.what();
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+
+		if (next_blob.empty()) {
+			// SPNEGO complete on our side but server hasn't sent LOGINACK yet --
+			// just read the next message in the next loop iteration.
+			MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- authenticator complete, awaiting LOGINACK",
+								 round + 1);
+			continue;
+		}
+
+		MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- sending continuation blob (%zu bytes)", round + 1,
+							 next_blob.size());
+		TdsPacket sspi_msg = TdsProtocol::BuildSSPIMessage(next_blob);
+		sspi_msg.SetPacketId(next_packet_id_++);
+		if (!socket_->SendPacket(sspi_msg)) {
+			last_error_ = "Failed to send SSPI continuation: " + socket_->GetLastError();
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+	}
+
+	last_error_ = "MSSQL Kerberos auth failed: SPNEGO did not converge in " + std::to_string(MAX_SSPI_ROUNDS) +
+				  " rounds (possible cross-realm misconfiguration)";
+	state_.store(ConnectionState::Disconnected);
+	socket_->Close();
+	return false;
 }
 
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
@@ -922,17 +1074,26 @@ bool TdsConnection::ExecuteBatch(const std::string &sql) {
 								 i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
 								 static_cast<unsigned>(packet.GetStatus()), packet.GetLength(),
 								 packet.GetPayload().size(), packet.IsEndOfMessage(), packet.GetPacketId());
-			// Dump full packet header and first bytes of payload for debugging
+			// Dump packet framing (TDS header + ALL_HEADERS) only -- this is what's
+			// needed to debug packet boundaries / MARS / transaction descriptors.
+			// We deliberately stop at 30 bytes (8-byte TDS header + 22-byte
+			// ALL_HEADERS = full framing metadata, ZERO bytes of SQL text), so an
+			// admin who enables MSSQL_DEBUG=3 cannot accidentally capture a
+			// fragment of inline SQL containing credentials (e.g. `CREATE LOGIN
+			// ... PASSWORD '...'`). See spec 042 security follow-up.
 			if (i == 0 && GetMssqlDebugLevel() >= 3) {
 				std::vector<uint8_t> serialized = packet.Serialize();
 				std::string hex_dump;
-				// Dump header (8 bytes) + first 42 bytes of payload = 50 bytes total
-				for (size_t j = 0; j < std::min<size_t>(50, serialized.size()); j++) {
+				constexpr size_t kHeaderFramingBytes = 30;	// TDS header (8) + ALL_HEADERS (22)
+				for (size_t j = 0; j < std::min<size_t>(kHeaderFramingBytes, serialized.size()); j++) {
 					char buf[4];
 					snprintf(buf, sizeof(buf), "%02x ", serialized[j]);
 					hex_dump += buf;
 				}
-				MSSQL_CONN_DEBUG_LOG(3, "ExecuteBatch: packet bytes (header+payload, first 50): %s", hex_dump.c_str());
+				MSSQL_CONN_DEBUG_LOG(3,
+									 "ExecuteBatch: packet framing (TDS hdr + ALL_HEADERS, first %zu bytes): %s "
+									 "(SQL text deliberately omitted)",
+									 kHeaderFramingBytes, hex_dump.c_str());
 			}
 			if (!socket_->SendPacket(packet)) {
 				last_error_ = "Failed to send SQL_BATCH: " + socket_->GetLastError();

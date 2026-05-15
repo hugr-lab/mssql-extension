@@ -49,6 +49,61 @@ find_package(simdutf CONFIG REQUIRED)
 message(STATUS "simdutf: located via vcpkg (target simdutf::simdutf)")
 
 # =============================================================================
+# Integrated Authentication (Kerberos / SSPI) — Spec 042
+#
+# POSIX: dynamic link to system libgssapi_krb5 (Linux) / GSS.framework (macOS)
+# Windows: link secur32.dll (Windows SDK)
+# Auto-detected — if libraries are missing on POSIX the build still succeeds
+# without integrated-auth support, and Trusted_Connection=yes / authenticator=krb5
+# produce a "compiled without Kerberos support" error per FR-012.
+# =============================================================================
+option(ENABLE_KRB5 "Enable Kerberos / SSPI integrated authentication" ON)
+
+set(MSSQL_KRB5_AVAILABLE FALSE)
+set(MSSQL_SSPI_AVAILABLE FALSE)
+
+if(ENABLE_KRB5)
+    if(WIN32)
+        # SSPI ships with the OS. secur32.lib is in the Windows SDK.
+        set(MSSQL_SSPI_AVAILABLE TRUE)
+        message(STATUS "Integrated Auth: Windows SSPI enabled (secur32)")
+    elseif(APPLE)
+        find_library(MSSQL_GSS_FRAMEWORK GSS)
+        if(MSSQL_GSS_FRAMEWORK)
+            set(MSSQL_KRB5_AVAILABLE TRUE)
+            message(STATUS "Integrated Auth: macOS Kerberos enabled (${MSSQL_GSS_FRAMEWORK})")
+        else()
+            message(WARNING "Integrated Auth: GSS.framework not found on macOS; Kerberos disabled")
+        endif()
+    else()
+        # Linux + other POSIX: prefer pkg-config, fall back gracefully if missing.
+        # Need both krb5-gssapi (for gss_* symbols) AND krb5 (for krb5_*
+        # symbols used by raw-credentials mode -- krb5_init_context,
+        # krb5_get_init_creds_password, krb5_get_error_message, etc.).
+        # libkrb5 does NOT come in transitively via krb5-gssapi.pc on at
+        # least Ubuntu 24.04 -- linking only -lgssapi_krb5 produces
+        # "undefined reference to symbol 'krb5_free_error_message@@krb5_3_MIT'".
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(MSSQL_GSSAPI krb5-gssapi)
+            pkg_check_modules(MSSQL_KRB5_BASE krb5)
+            if(MSSQL_GSSAPI_FOUND AND MSSQL_KRB5_BASE_FOUND)
+                set(MSSQL_KRB5_AVAILABLE TRUE)
+                message(STATUS "Integrated Auth: Linux Kerberos enabled (GSSAPI ${MSSQL_GSSAPI_VERSION}, krb5 ${MSSQL_KRB5_BASE_VERSION})")
+            elseif(NOT MSSQL_GSSAPI_FOUND)
+                message(WARNING "Integrated Auth: pkg-config could not locate krb5-gssapi; install Kerberos development headers (libkrb5-dev on Debian/Ubuntu, krb5-devel on RHEL/Fedora) to enable")
+            else()
+                message(WARNING "Integrated Auth: krb5-gssapi found but base krb5 missing; install Kerberos development headers (libkrb5-dev on Debian/Ubuntu, krb5-devel on RHEL/Fedora) to enable")
+            endif()
+        else()
+            message(WARNING "Integrated Auth: pkg-config not found; Linux Kerberos discovery skipped")
+        endif()
+    endif()
+else()
+    message(STATUS "Integrated Auth: disabled (ENABLE_KRB5=OFF)")
+endif()
+
+# =============================================================================
 # Extension Sources
 # =============================================================================
 set(EXTENSION_SOURCES
@@ -71,11 +126,12 @@ set(EXTENSION_SOURCES
     src/tds/tds_connection.cpp
     src/tds/tds_connection_pool.cpp
     src/tds/tds_column_metadata.cpp
-    # TDS authentication strategies (Spec 031, Spec 032)
+    # TDS authentication strategies (Spec 031, Spec 032, Spec 042)
     src/tds/auth/sql_auth_strategy.cpp
     src/tds/auth/fedauth_strategy.cpp
     src/tds/auth/manual_token_strategy.cpp
     src/tds/auth/auth_strategy_factory.cpp
+    src/tds/auth/krb5_test_function.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
     # TLS layer (OpenSSL)
@@ -154,6 +210,13 @@ set(EXTENSION_SOURCES
     src/azure/jwt_parser.cpp
 )
 
+# Spec 042: conditional inclusion of the platform-specific integrated-auth
+# authenticator. POSIX gets krb5_authenticator.cpp when GSSAPI is discovered;
+# Windows gets winsspi_authenticator.cpp (Phase 4).
+if(MSSQL_KRB5_AVAILABLE)
+    list(APPEND EXTENSION_SOURCES src/tds/auth/krb5_authenticator.cpp)
+endif()
+
 # Build static extension (linked into DuckDB)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 
@@ -176,6 +239,27 @@ if(WIN32)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
 endif()
 
+# Integrated Authentication (Spec 042) — compile defines + link libs per platform
+if(MSSQL_SSPI_AVAILABLE)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_ENABLE_SSPI=1)
+    target_link_libraries(${EXTENSION_NAME} secur32)
+endif()
+if(MSSQL_KRB5_AVAILABLE)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_ENABLE_KRB5=1)
+    if(APPLE)
+        target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
+    else()
+        # Order matters: krb5 (base) AFTER gssapi_krb5 so the linker resolves
+        # gssapi's references to krb5 symbols, then the krb5 SONAME is added
+        # to NEEDED. Without the explicit -lkrb5 the link fails with
+        # 'undefined reference to symbol krb5_free_error_message'.
+        target_include_directories(${EXTENSION_NAME} PRIVATE
+            ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
+        target_link_libraries(${EXTENSION_NAME}
+            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
+    endif()
+endif()
+
 # Extension version (overrides DuckDB's git-hash-based EXT_VERSION_MSSQL)
 target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_VERSION="${MSSQL_EXTENSION_VERSION}")
 
@@ -195,6 +279,23 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} simdutf::simdutf)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
+endif()
+
+# Integrated Authentication (Spec 042) — compile defines + link libs per platform
+if(MSSQL_SSPI_AVAILABLE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_ENABLE_SSPI=1)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} secur32)
+endif()
+if(MSSQL_KRB5_AVAILABLE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_ENABLE_KRB5=1)
+    if(APPLE)
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
+    else()
+        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
+            ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
+        target_link_libraries(${LOADABLE_EXTENSION_NAME}
+            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
+    endif()
 endif()
 
 # Hide all symbols except extension entry point to avoid multiple definition errors

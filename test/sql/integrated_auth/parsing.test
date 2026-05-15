@@ -1,0 +1,167 @@
+# name: test/sql/integrated_auth/parsing.test
+# description: Spec 042 -- connection-string surface for Integrated Auth.
+#              Parses the new keys and verifies conflict detection. Does NOT
+#              require a SQL Server, KDC, or network -- the validator runs
+#              client-side before any TCP / GSSAPI call.
+# group: [mssql]
+#
+# Test categories:
+#   * Parser conflict detection (assertions on substring) -- these stay
+#     deterministic because the validator returns before any network I/O.
+#   * Acceptance of new keys (statement error with no substring) -- the
+#     ATTACH eventually fails somewhere (DNS, TCP, or GSSAPI no-ccache),
+#     we just confirm the parser didn't reject the syntax.
+#   * Secret-creation validation (substring match on validator error).
+
+require mssql
+
+#
+# Test 1: Trusted_Connection=yes is accepted by the parser
+#         (will fail later -- TCP to sql.example.com or GSSAPI no ccache).
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes' AS ia_t1 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 2: Integrated Security=SSPI alias accepted by parser.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;Integrated Security=SSPI' AS ia_t2 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 3: Integrated Security=true alias accepted by parser.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;Integrated Security=true' AS ia_t3 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 4: Explicit authenticator=krb5 accepted by parser.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5' AS ia_t4 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 5: Unsupported authenticator value -- specific parser error.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=ntlm' AS ia_t5 (TYPE mssql);
+----
+Unsupported authenticator 'ntlm'
+
+#
+# Test 6: Trusted_Connection + User Id conflict.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes;User Id=alice' AS ia_t6 (TYPE mssql);
+----
+cannot be combined
+
+#
+# Test 7: Trusted_Connection + Password conflict.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;Trusted_Connection=yes;User Id=alice;Password=secret' AS ia_t7 (TYPE mssql);
+----
+'Password' cannot be combined
+
+#
+# Test 7b: Explicit authenticator=krb5 + Password also rejected -- raw mode
+#           is SECRET-only to keep passwords out of connection-string logs.
+#           spec 042 ultrareview bug_004.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5;User Id=alice;Password=secret' AS ia_t7b (TYPE mssql);
+----
+'Password' cannot be combined
+
+#
+# Test 8: SQL auth still works at the parser level (regression).
+#         Will fail later at the TCP / login layer because no server is here.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;User Id=alice;Password=secret' AS ia_t8 (TYPE mssql);
+----
+MSSQL connection validation failed
+
+#
+# Test 9: URI form for integrated auth.
+#
+statement error
+ATTACH 'mssql://sql.example.com/db?authenticator=krb5' AS ia_t9 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 10: krb5-keytabfile parameter accepted by parser.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=krb5;krb5-keytabfile=/etc/krb5.keytab;User Id=svc@EXAMPLE.COM' AS ia_t10 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 11: service_principal_name override accepted by parser.
+#
+statement error
+ATTACH 'Server=10.0.0.5;Database=db;Trusted_Connection=yes;service_principal_name=MSSQLSvc/sql.example.com:1433' AS ia_t11 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 12: Secret-based integrated auth round-trip.
+#
+statement ok
+CREATE SECRET ia_secret_kerb (
+    TYPE mssql,
+    host 'sql.example.com',
+    port 1433,
+    database 'AdventureWorks',
+    authenticator 'krb5',
+    krb5_realm 'EXAMPLE.COM',
+    service_principal_name 'MSSQLSvc/sql.example.com:1433'
+);
+
+statement error
+ATTACH '' AS ia_t12 (TYPE mssql, SECRET ia_secret_kerb);
+----
+MSSQL
+
+statement ok
+DROP SECRET ia_secret_kerb;
+
+#
+# Test 13: Secret with unsupported authenticator rejected at CREATE SECRET time.
+#
+statement error
+CREATE SECRET ia_secret_bad (
+    TYPE mssql,
+    host 'sql.example.com',
+    port 1433,
+    database 'AdventureWorks',
+    authenticator 'ntlm'
+);
+----
+Unsupported 'authenticator' value
+
+#
+# Test 14: Secret with authenticator + access_token rejected (conflict).
+#
+statement error
+CREATE SECRET ia_secret_conflict (
+    TYPE mssql,
+    host 'sql.example.com',
+    port 1433,
+    database 'AdventureWorks',
+    authenticator 'krb5',
+    access_token 'eyJ.dummy.token'
+);
+----
+'authenticator' cannot be combined

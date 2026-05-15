@@ -104,12 +104,20 @@ CREATE SECRET secret_name (
 | `host`        | VARCHAR | Yes      | SQL Server hostname or IP address    |
 | `port`        | INTEGER | Yes      | TCP port (1-65535, default: 1433)    |
 | `database`    | VARCHAR | Yes      | Database name                        |
-| `user`        | VARCHAR | Yes      | SQL Server username                  |
-| `password`    | VARCHAR | Yes      | Password (hidden in duckdb_secrets)  |
+| `user`        | VARCHAR | Yes\*    | SQL Server username (\*not required for `authenticator='krb5'` ccache mode or Azure AD) |
+| `password`    | VARCHAR | Yes\*    | Password (hidden in `duckdb_secrets()`; required only for SQL auth + Kerberos raw mode) |
 | `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: true) |
 | `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
 | `schema_filter` | VARCHAR | No     | Regex pattern to filter visible schemas (case-insensitive partial match) |
 | `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
+| `azure_secret`  | VARCHAR | No     | Name of an Azure secret (DuckDB Azure extension) for Azure AD auth — see [AZURE.md](AZURE.md) |
+| `access_token`  | VARCHAR | No     | Pre-acquired Azure AD JWT (hidden in `duckdb_secrets()`) — see [AZURE.md](AZURE.md) |
+| `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows; pending) — Kerberos / SSPI integrated auth, see [Kerberos.md](Kerberos.md) |
+| `krb5_configfile`    | VARCHAR | No | Per-secret `/etc/krb5.conf` override (Linux only) |
+| `krb5_keytabfile`    | VARCHAR | No | Path to a keytab — selects keytab credential mode (Linux only) |
+| `krb5_credcachefile` | VARCHAR | No | ccache path override (Linux only) |
+| `krb5_realm`         | VARCHAR | No | AD realm (UPPERCASE) — required for keytab and raw modes |
+| `service_principal_name` | VARCHAR | No | SPN override, e.g. `MSSQLSvc/sqlhost.example.com:1433` |
 
 Attach using the secret:
 
@@ -135,6 +143,14 @@ ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
 | `User Id`                   | `Uid`, `User`                        |
 | `Password`                  | `Pwd`                                |
 | `Encrypt`                   | `Use Encryption for Data`, `TrustServerCertificate` |
+| `Trusted_Connection`        | `Trusted Connection`, `TrustedConnection` (yes/true/SSPI/1 -> Kerberos on POSIX, SSPI on Windows; see [Kerberos.md](Kerberos.md)) |
+| `Integrated Security`       | `IntegratedSecurity`, `Integrated_Security` (same resolution as `Trusted_Connection`) |
+| `authenticator`             | `krb5` or `winsspi` (see [Kerberos.md](Kerberos.md)) |
+| `krb5-keytabfile`           | `krb5_keytabfile` (path to keytab; selects keytab mode, Linux only) |
+| `krb5-configfile`           | `krb5_configfile` (per-connection `/etc/krb5.conf` override, Linux only) |
+| `krb5-credcachefile`        | `krb5_credcachefile` (ccache path override, Linux only) |
+| `krb5-realm`                | `krb5_realm` (AD realm, UPPERCASE) |
+| `service_principal_name`    | `service-principal-name`, `serviceprincipalname` (SPN override) |
 
 #### URI Format
 
@@ -144,6 +160,37 @@ ATTACH 'mssql://user:password@host:port/database?encrypt=true'
 ```
 
 URI format supports URL-encoded components for special characters in credentials.
+
+### Integrated Authentication (Kerberos / SSPI)
+
+POSIX users with an Active-Directory-joined SQL Server can authenticate via
+Kerberos after running `kinit`. The simplest form (pyodbc-compatible alias):
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com;Database=YourDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes'
+    AS db (TYPE mssql);
+```
+
+Or the explicit `microsoft/go-mssqldb` form:
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com;Database=YourDB;authenticator=krb5;Encrypt=yes'
+    AS db (TYPE mssql);
+```
+
+Three credential modes are supported on POSIX:
+
+- **Credential cache** (default) — uses a `kinit` ticket. Works on Linux and macOS.
+- **Keytab** — `krb5-keytabfile=/path` + `User Id=svc@REALM`. Linux only.
+- **Raw credentials** — username + password + realm via `CREATE SECRET` only (not connection string, to keep cleartext out of logs). Linux only.
+
+Windows SSPI is Phase 4 of spec 042 — pending. On Windows, use WSL2 Ubuntu in
+the meantime: it's a real Linux kernel with MIT Kerberos and the full POSIX
+path works inside it.
+
+See [Kerberos.md](Kerberos.md) for prerequisites, full connection-string
+reference, the bundled docker-compose test stack (no real AD required),
+troubleshooting (including WSL2 specifics), and SPN verification.
 
 ### TLS/SSL Configuration
 
@@ -1496,7 +1543,7 @@ The following features are planned for future releases:
 - **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
 - **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
 - **Updating primary key columns**: UPDATE cannot modify primary key columns (used for row identification)
-- **Windows Authentication**: Only SQL Server authentication is supported
+- **Windows SSPI**: Phase 4 of spec 042 (pending). POSIX Kerberos via `Trusted_Connection=yes` IS supported on Linux and macOS — see [Kerberos.md](Kerberos.md). On Windows, use WSL2 Ubuntu in the meantime; the full POSIX Kerberos path works inside WSL2.
 - **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 - **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`

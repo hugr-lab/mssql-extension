@@ -39,6 +39,10 @@ struct LoginResponse {
 	bool has_fedauth_info = false;	// True if FEDAUTHINFO token was received
 	std::string sts_url;			// Security Token Service URL from server
 	std::string server_spn;			// Server Principal Name from server
+
+	// SSPI token data (Spec 042 -- Integrated Auth continuation)
+	bool has_sspi_token = false;	  // True if a 0xED SSPI token appeared in this response
+	std::vector<uint8_t> sspi_token;  // Raw blob from the server for IAuthenticator::NextBytes()
 };
 
 // TDS Protocol message builders and parsers
@@ -93,6 +97,35 @@ public:
 											bool fedauth_echo = false,
 											const std::string &app_name = "DuckDB MSSQL Extension",
 											uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+
+	// Build LOGIN7 packet for Integrated Authentication (Kerberos / SSPI) -- Spec 042
+	//
+	// Sets OptionFlags2.fIntSecurity (bit 7, 0x80), leaves username/password empty,
+	// and writes the initial SPNEGO blob into the LOGIN7.SSPI field at offset 36/38
+	// (cbSSPILong at offset 86 when sspi_initial_blob.size() > 65535).
+	//
+	// Parameters:
+	//   client_hostname     - client workstation name (for server logging)
+	//   server_name         - TDS server name (may include instance, e.g. "host" or "host\instance")
+	//   database            - initial database to connect to
+	//   sspi_initial_blob   - first SPNEGO output blob from IAuthenticator::InitialBytes()
+	//   app_name            - application name (optional)
+	//   packet_size         - requested packet size (default 4096)
+	//
+	// Note: username/password are NOT used; identity is conveyed inside the SSPI blob.
+	static TdsPacket BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
+										 const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
+										 const std::string &app_name = "DuckDB MSSQL Extension",
+										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+
+	// Build SSPI Message continuation packet -- Spec 042
+	//
+	// Packet type 0x11 ("SSPI Message", [MS-TDS] 2.2.6.16). Used during the
+	// SPNEGO continuation loop after the initial LOGIN7: server sends 0xED SSPI
+	// token, client computes next blob via IAuthenticator::NextBytes() and
+	// returns it in this packet. Payload is the raw GSSAPI/SSPI output blob,
+	// not UTF-16 encoded.
+	static TdsPacket BuildSSPIMessage(const std::vector<uint8_t> &sspi_blob);
 
 	// Build LOGIN7 packet with ADAL FEDAUTH workflow for Azure AD authentication
 	// This uses ADAL flow: LOGIN7 contains small FEDAUTH extension, server responds with

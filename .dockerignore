@@ -1,0 +1,35 @@
+# Spec 042: keep the test/kerberos/ multi-stage build context lean so the
+# `docker compose up --build` cycle is fast. Without this, COPY . /src/ would
+# pull in every host build artifact (~hundreds of MB of object files), local
+# git submodule caches, IDE state, and the worktree-tracking dir.
+
+# Host-side build artifacts -- the test-client rebuilds inside the container
+build/
+.cache/
+.ccache/
+
+# Worktree / IDE
+.worktrees/
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Git internals -- the build doesn't need .git for compiling. We do need the
+# submodules' own .git dirs (those are inside duckdb/ and extension-ci-tools/)
+# because the CMake build queries them for version info. Exclude only the
+# top-level .git via a more specific pattern.
+/.git/
+/.gitignore
+
+# Local secrets
+.env
+.env.local
+*.pem
+*.key
+*.crt
+
+# Docker artifacts
+**/Dockerfile~
+docker-compose.override.yml

@@ -93,6 +93,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!access_token_val.IsNull()) {
 		result->access_token = access_token_val.ToString();
 		result->use_azure_auth = !result->access_token.empty();	 // Manual token uses FEDAUTH flow
+		if (!result->access_token.empty()) {
+			result->auth_method = AuthMethod::MANUAL_TOKEN;	 // Spec 042: keep enum in sync
+		}
 	}
 
 	// Read optional azure_secret for Azure AD authentication (T015)
@@ -102,9 +105,12 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 		if (!azure_secret_val.IsNull()) {
 			result->azure_secret_name = azure_secret_val.ToString();
 			result->use_azure_auth = !result->azure_secret_name.empty();
+			if (!result->azure_secret_name.empty()) {
+				result->auth_method = AuthMethod::AZURE_AD;	 // Spec 042: keep enum in sync
+			}
 		}
 	}
-	// Default: use_azure_auth = false (SQL auth)
+	// Default: use_azure_auth = false (SQL auth), auth_method = SQL
 
 	// Read optional catalog visibility filters (Spec 033)
 	auto schema_filter_val = kv_secret.TryGetValue("schema_filter");
@@ -115,6 +121,33 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!table_filter_val.IsNull()) {
 		result->table_filter = table_filter_val.ToString();
 	}
+
+	// Spec 042: Integrated Authentication fields
+	auto auth_val = kv_secret.TryGetValue("authenticator");
+	if (!auth_val.IsNull()) {
+		auto auth_str = StringUtil::Lower(auth_val.ToString());
+		if (!auth_str.empty()) {
+			if (auth_str == "krb5") {
+				result->auth_method = AuthMethod::KRB5;
+			} else if (auth_str == "winsspi") {
+				result->auth_method = AuthMethod::WINSSPI;
+			} else {
+				throw InvalidInputException(
+					"MSSQL Error: Secret '%s' has unsupported 'authenticator' value '%s'. "
+					"Supported: krb5 (POSIX), winsspi (Windows).",
+					secret_name, auth_str);
+			}
+		}
+	}
+	auto get_str = [&](const char *k) -> string {
+		auto v = kv_secret.TryGetValue(k);
+		return v.IsNull() ? string() : v.ToString();
+	};
+	result->krb5_configfile = get_str("krb5_configfile");
+	result->krb5_keytabfile = get_str("krb5_keytabfile");
+	result->krb5_credcachefile = get_str("krb5_credcachefile");
+	result->krb5_realm = get_str("krb5_realm");
+	result->service_principal_name = get_str("service_principal_name");
 
 	result->connected = false;
 	return result;
@@ -262,6 +295,26 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["schema_filter"] = value;
 				} else if (lower_key == "table_filter" || lower_key == "tablefilter") {
 					result["table_filter"] = value;
+				} else if (lower_key == "authenticator") {
+					// Spec 042: krb5 / winsspi (go-mssqldb names)
+					result["authenticator"] = StringUtil::Lower(value);
+				} else if (lower_key == "krb5-configfile" || lower_key == "krb5_configfile") {
+					result["krb5_configfile"] = value;
+				} else if (lower_key == "krb5-keytabfile" || lower_key == "krb5_keytabfile") {
+					result["krb5_keytabfile"] = value;
+				} else if (lower_key == "krb5-credcachefile" || lower_key == "krb5_credcachefile") {
+					result["krb5_credcachefile"] = value;
+				} else if (lower_key == "krb5-realm" || lower_key == "krb5_realm") {
+					result["krb5_realm"] = value;
+				} else if (lower_key == "service_principal_name" || lower_key == "service-principal-name" ||
+						   lower_key == "serviceprincipalname") {
+					result["service_principal_name"] = value;
+				} else if (lower_key == "trusted_connection" || lower_key == "trustedconnection" ||
+						   lower_key == "trusted-connection") {
+					result["trusted_connection"] = value;
+				} else if (lower_key == "integrated_security" || lower_key == "integratedsecurity" ||
+						   lower_key == "integrated-security") {
+					result["integrated_security"] = value;
 				} else {
 					result[key] = value;
 				}
@@ -396,12 +449,170 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["schema_filter"] = value;
 		} else if (lower_key == "tablefilter" || lower_key == "table_filter") {
 			result["table_filter"] = value;
+		} else if (lower_key == "authenticator") {
+			// Spec 042: krb5 / winsspi (go-mssqldb names)
+			result["authenticator"] = StringUtil::Lower(value);
+		} else if (lower_key == "krb5-configfile" || lower_key == "krb5_configfile") {
+			result["krb5_configfile"] = value;
+		} else if (lower_key == "krb5-keytabfile" || lower_key == "krb5_keytabfile") {
+			result["krb5_keytabfile"] = value;
+		} else if (lower_key == "krb5-credcachefile" || lower_key == "krb5_credcachefile") {
+			result["krb5_credcachefile"] = value;
+		} else if (lower_key == "krb5-realm" || lower_key == "krb5_realm") {
+			result["krb5_realm"] = value;
+		} else if (lower_key == "service_principal_name" || lower_key == "service-principal-name" ||
+				   lower_key == "serviceprincipalname" || lower_key == "service principal name") {
+			result["service_principal_name"] = value;
+		} else if (lower_key == "trusted_connection" || lower_key == "trustedconnection" ||
+				   lower_key == "trusted connection" || lower_key == "trusted-connection") {
+			// pyodbc / mssql-jdbc canonical alias
+			result["trusted_connection"] = value;
+		} else if (lower_key == "integrated_security" || lower_key == "integratedsecurity" ||
+				   lower_key == "integrated security" || lower_key == "integrated-security") {
+			// ADO.NET canonical alias
+			result["integrated_security"] = value;
 		} else {
 			result[key] = value;
 		}
 	}
 
 	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Integrated Authentication helpers (Spec 042)
+//===----------------------------------------------------------------------===//
+
+// Truthy check for Trusted_Connection / Integrated Security values.
+// pyodbc accepts: yes / true / 1 / SSPI (the last only for Integrated Security)
+static bool IsTrustedConnectionEnabled(const string &raw_value) {
+	auto v = StringUtil::Lower(raw_value);
+	return v == "yes" || v == "true" || v == "1" || v == "sspi";
+}
+
+// Resolve Trusted_Connection / Integrated Security aliases into an authenticator
+// value. On POSIX returns "krb5"; on Windows "winsspi". Returns empty if no
+// integrated auth is requested.
+//
+// The result is the canonical authenticator name; if the user supplied
+// `authenticator=...` explicitly, that takes precedence and is returned as-is
+// (downcased by the parsers already).
+static string ResolveIntegratedAuth(const case_insensitive_map_t<string> &params) {
+	auto auth_it = params.find("authenticator");
+	if (auth_it != params.end() && !auth_it->second.empty()) {
+		return auth_it->second;	 // already lowercased
+	}
+	auto trusted_it = params.find("trusted_connection");
+	if (trusted_it != params.end() && IsTrustedConnectionEnabled(trusted_it->second)) {
+#ifdef _WIN32
+		return "winsspi";
+#else
+		return "krb5";
+#endif
+	}
+	auto integ_it = params.find("integrated_security");
+	if (integ_it != params.end() && IsTrustedConnectionEnabled(integ_it->second)) {
+#ifdef _WIN32
+		return "winsspi";
+#else
+		return "krb5";
+#endif
+	}
+	return "";
+}
+
+// Map an authenticator string to the AuthMethod enum. Empty => SQL.
+// Throws InvalidInputException for unrecognized values so the user gets a
+// clear error instead of a silent fallback to SQL auth.
+static AuthMethod AuthenticatorToMethod(const string &name) {
+	if (name.empty()) {
+		return AuthMethod::SQL;
+	}
+	if (name == "krb5") {
+		return AuthMethod::KRB5;
+	}
+	if (name == "winsspi") {
+		return AuthMethod::WINSSPI;
+	}
+	throw InvalidInputException(
+		"MSSQL Error: Unsupported authenticator '%s'. Supported values: krb5 (POSIX), winsspi (Windows). "
+		"For Azure AD use an MSSQL secret with azure_secret or access_token.",
+		name);
+}
+
+// Validate conflicts between integrated-auth requests and other credential
+// modes. Returns an empty string if no conflict, or an error message otherwise.
+//
+// Semantics (matches pyodbc / mssql-jdbc):
+//   * Trusted_Connection=yes / Integrated Security=SSPI are mutually exclusive
+//     with User Id and Password. Users who need a principal name for keytab or
+//     raw-creds modes must use the explicit form: authenticator=krb5 + User Id.
+//   * authenticator=krb5 / authenticator=winsspi may carry a User Id (interpreted
+//     as the Kerberos principal for keytab / raw modes; ignored by cred-cache
+//     mode). Password is still rejected -- raw-creds mode must go through an
+//     MSSQL secret so the password isn't echoed in connection-string logs.
+static string ValidateAuthConflicts(const case_insensitive_map_t<string> &params, bool azure_auth_option) {
+	auto authenticator = ResolveIntegratedAuth(params);
+	bool integrated = !authenticator.empty();
+
+	bool has_user = params.find("user") != params.end() && !params.at("user").empty();
+	bool has_password = params.find("password") != params.end() && !params.at("password").empty();
+	bool has_azure = azure_auth_option;	 // ATTACH-provided access_token / azure_secret
+
+	// Was integrated auth requested via the pyodbc-style aliases (Trusted_Connection
+	// / Integrated Security), as opposed to the explicit authenticator=... form?
+	bool requested_via_alias = false;
+	{
+		auto t_it = params.find("trusted_connection");
+		if (t_it != params.end() && IsTrustedConnectionEnabled(t_it->second)) {
+			requested_via_alias = true;
+		}
+		auto i_it = params.find("integrated_security");
+		if (i_it != params.end() && IsTrustedConnectionEnabled(i_it->second)) {
+			requested_via_alias = true;
+		}
+	}
+
+	if (integrated) {
+		if (has_password) {
+			return "'Password' cannot be combined with 'Trusted_Connection' / 'authenticator=krb5'. "
+				   "Use a Kerberos credential cache (kinit), a keytab via 'krb5-keytabfile', "
+				   "or place raw credentials in an MSSQL secret.";
+		}
+		if (has_user && requested_via_alias) {
+			return "'User Id' cannot be combined with 'Trusted_Connection' / 'Integrated Security'. "
+				   "If you need to supply a principal for keytab or raw-credentials mode, use the explicit "
+				   "form: authenticator=krb5;User Id=<principal>.";
+		}
+		if (has_azure) {
+			return "'Trusted_Connection' / 'authenticator=krb5' cannot be combined with Azure AD "
+				   "authentication (access_token or azure_secret). Choose one auth method.";
+		}
+#ifdef _WIN32
+		if (authenticator == "krb5") {
+			return "'authenticator=krb5' is only supported on POSIX. Use 'authenticator=winsspi' or "
+				   "'Trusted_Connection=yes' on Windows.";
+		}
+#else
+		if (authenticator == "winsspi") {
+			return "'authenticator=winsspi' is only supported on Windows. Use 'authenticator=krb5' or "
+				   "'Trusted_Connection=yes' on POSIX.";
+		}
+#endif
+	}
+
+	// Trusted_Connection + Integrated Security must agree if both supplied
+	auto t_it = params.find("trusted_connection");
+	auto i_it = params.find("integrated_security");
+	if (t_it != params.end() && i_it != params.end()) {
+		bool t_on = IsTrustedConnectionEnabled(t_it->second);
+		bool i_on = IsTrustedConnectionEnabled(i_it->second);
+		if (t_on != i_on) {
+			return "'Trusted_Connection' and 'Integrated Security' specify conflicting values.";
+		}
+	}
+
+	return "";
 }
 
 string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_string, bool azure_auth) {
@@ -424,8 +635,17 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 	if (params.find("database") == params.end()) {
 		return "Missing 'Database' in connection string.";
 	}
-	// User/password are only required for SQL authentication, not Azure AD
-	if (!azure_auth) {
+
+	// Spec 042: Resolve Integrated Auth aliases and check conflicts before
+	// requiring user/password.
+	bool integrated_auth = !ResolveIntegratedAuth(params).empty();
+	string conflict = ValidateAuthConflicts(params, azure_auth);
+	if (!conflict.empty()) {
+		return conflict;
+	}
+
+	// User/password are only required for SQL authentication
+	if (!azure_auth && !integrated_auth) {
 		if (params.find("user") == params.end()) {
 			return "Missing 'User Id' in connection string.";
 		}
@@ -535,6 +755,23 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	}
 	if (params.find("table_filter") != params.end()) {
 		result->table_filter = params["table_filter"];
+	}
+
+	// Spec 042: Integrated Authentication parameters
+	{
+		string authenticator = ResolveIntegratedAuth(params);
+		if (!authenticator.empty()) {
+			result->auth_method = AuthenticatorToMethod(authenticator);
+		}
+		auto get = [&](const char *k) -> string {
+			auto it = params.find(k);
+			return it == params.end() ? string() : it->second;
+		};
+		result->krb5_configfile = get("krb5_configfile");
+		result->krb5_keytabfile = get("krb5_keytabfile");
+		result->krb5_credcachefile = get("krb5_credcachefile");
+		result->krb5_realm = get("krb5_realm");
+		result->service_principal_name = get("service_principal_name");
 	}
 
 	result->connected = false;
@@ -898,6 +1135,56 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 }
 
 //===----------------------------------------------------------------------===//
+// ValidateIntegratedAuthConnection -- Spec 042
+//
+// Build a fresh Krb5Authenticator (or WinSspiAuthenticator in Phase 4) via the
+// strategy factory, run a full ATTACH-time login, then close the connection.
+// Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
+// instead of at first query.
+//===----------------------------------------------------------------------===//
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
+							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
+							timeout_seconds);
+
+	tds::TdsConnection conn;
+	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
+		string error = conn.GetLastError();
+		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
+		throw IOException("MSSQL connection validation failed: %s", translated);
+	}
+
+	// Build the strategy; this triggers Krb5Authenticator construction (which
+	// validates the keytab/realm/etc. early).
+	std::shared_ptr<tds::AuthenticationStrategy> strategy;
+	try {
+		strategy = tds::AuthStrategyFactory::Create(info);
+	} catch (const std::exception &e) {
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: %s", e.what());
+	}
+	if (!strategy) {
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: failed to construct integrated-auth strategy");
+	}
+	auto authenticator = strategy->GetAuthenticator();
+	if (!authenticator) {
+		conn.Close();
+		throw InvalidInputException(
+			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
+	}
+
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt)) {
+		string error = conn.GetLastError();
+		conn.Close();
+		throw InvalidInputException("MSSQL connection validation failed: %s", error);
+	}
+
+	conn.Close();
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: success");
+}
+
+//===----------------------------------------------------------------------===//
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
@@ -967,10 +1254,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		if (!access_token.empty()) {
 			ctx->connection_info->access_token = access_token;
 			ctx->connection_info->use_azure_auth = true;
+			ctx->connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
 		} else if (!azure_secret_name.empty()) {
 			// Set azure_secret from ATTACH option if provided
 			ctx->connection_info->azure_secret_name = azure_secret_name;
 			ctx->connection_info->use_azure_auth = true;
+			ctx->connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
 		}
 	} else {
 		// Neither SECRET nor connection string provided
@@ -1047,6 +1336,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Build FEDAUTH token for pool factory (uses validated credentials)
 		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
+	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
+			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
+		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
+		// time so credential / SPN / clock-skew errors surface immediately.
+		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
+		ValidateIntegratedAuthConnection(*ctx->connection_info, pool_config.connection_timeout);
 	} else {
 		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
 	}
@@ -1061,6 +1356,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
 			fedauth_token_utf16le, ctx->connection_info->use_encrypt);
+	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
+			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
+		// Spec 042: Integrated Authentication pool. Each new pool connection
+		// builds a fresh authenticator so kinit-refreshed tickets are picked up.
+		MssqlPoolManager::Instance().GetOrCreatePoolWithIntegratedAuth(name, pool_config, *ctx->connection_info);
 	} else {
 		// Use SQL authentication pool
 		MssqlPoolManager::Instance().GetOrCreatePool(

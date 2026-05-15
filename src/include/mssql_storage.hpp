@@ -21,6 +21,22 @@
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
+// AuthMethod - Authentication method selector (Spec 042)
+//
+// Default SQL. The existing use_azure_auth / access_token booleans/strings
+// remain and are kept in sync with this enum during parsing for backwards
+// compatibility - call sites that have not migrated to the enum continue
+// to work unchanged.
+//===----------------------------------------------------------------------===//
+enum class AuthMethod : uint8_t {
+	SQL = 0,		   // SQL Server username/password (existing default)
+	AZURE_AD = 1,	   // FEDAUTH via Azure secret (existing)
+	MANUAL_TOKEN = 2,  // Pre-provided JWT access token (Spec 032)
+	KRB5 = 3,		   // Integrated Auth via system GSSAPI (POSIX, Spec 042)
+	WINSSPI = 4		   // Integrated Auth via secur32.dll (Windows, Spec 042)
+};
+
+//===----------------------------------------------------------------------===//
 // MSSQLConnectionInfo - Connection parameters extracted from secret or connection string
 //===----------------------------------------------------------------------===//
 struct MSSQLConnectionInfo {
@@ -34,6 +50,16 @@ struct MSSQLConnectionInfo {
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
 	//===----------------------------------------------------------------------===//
+	// Authentication method (Spec 042)
+	//
+	// New code paths SHOULD switch on auth_method. Existing booleans below
+	// (use_azure_auth, access_token) are maintained in parallel and kept in
+	// sync by the connection-string / secret parsers - do not remove them
+	// until call sites are migrated.
+	//===----------------------------------------------------------------------===//
+	AuthMethod auth_method = AuthMethod::SQL;
+
+	//===----------------------------------------------------------------------===//
 	// Azure AD Authentication (Phase 2 FEDAUTH)
 	//===----------------------------------------------------------------------===//
 	bool use_azure_auth = false;  // Use Azure AD authentication instead of SQL auth
@@ -43,6 +69,19 @@ struct MSSQLConnectionInfo {
 	// Manual Token Authentication (Spec 032: FEDAUTH Token Provider Enhancements)
 	//===----------------------------------------------------------------------===//
 	string access_token;  // Pre-provided Azure AD JWT access token (takes precedence over azure_secret)
+
+	//===----------------------------------------------------------------------===//
+	// Integrated Authentication / Kerberos (Spec 042)
+	//
+	// All optional. Key names mirror microsoft/go-mssqldb integratedauth verbatim
+	// (hyphenated in connection strings; underscored in secret fields per existing
+	// convention).
+	//===----------------------------------------------------------------------===//
+	string krb5_configfile;			// Path to a krb5.conf override (else system default)
+	string krb5_keytabfile;			// Path to a keytab; selects keytab credential mode
+	string krb5_credcachefile;		// Path to a ccache override (else KRB5CCNAME / default)
+	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
+	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
 
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
@@ -141,6 +180,10 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 // Validate connection by attempting to connect and authenticate
 // Throws IOException or InvalidInputException with descriptive error on failure
 void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
+
+// Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
+// so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);
