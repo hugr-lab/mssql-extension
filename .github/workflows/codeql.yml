@@ -35,14 +35,37 @@ jobs:
       contents: read
       security-events: write
 
+    env:
+      # Route vcpkg's binary cache through GitHub Actions' built-in cache so
+      # OpenSSL / libcurl / simdutf etc. aren't rebuilt from source on every
+      # run. Cold runs save ~10-15 min; warm runs save the entire vcpkg-install
+      # phase. Note: ccache is intentionally NOT used here because it
+      # short-circuits compiler invocations and CodeQL's tracer would miss
+      # those translation units, leaving holes in the analysis.
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          submodules: recursive
+        # We intentionally do NOT pass submodules: recursive here. The default
+        # `submodules: false` is paired with an explicit duckdb-only init
+        # below, which avoids cloning `extension-ci-tools` (used only by the
+        # project Makefile, not by the direct cmake build CodeQL drives).
 
       - name: Checkout DuckDB submodule
+        # --recursive picks up DuckDB's own third_party/* submodules that the
+        # build needs (parquet decoders, etc.). extension-ci-tools is skipped.
         run: git submodule update --init --recursive duckdb
+
+      - name: Expose GitHub Actions cache env vars for vcpkg x-gha provider
+        # vcpkg's x-gha binary-source provider needs ACTIONS_CACHE_URL and
+        # ACTIONS_RUNTIME_TOKEN. GitHub injects them into actions/* steps but
+        # not into plain `run:` steps, so we re-export them via the toolkit.
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -63,6 +86,12 @@ jobs:
           ./vcpkg/bootstrap-vcpkg.sh
 
       - name: Build (CodeQL traces compiler invocations)
+        # We restrict the build to the loadable mssql extension target rather
+        # than the default ALL_BUILD. DuckDB's static lib is still pulled in
+        # as a build dependency, but we skip parquet_loadable_extension,
+        # core_functions_loadable_extension, the unittest binary, and the
+        # static-link variant -- none of which contain mssql sources CodeQL
+        # needs to analyze. ~15-20% wall-time saving on a typical run.
         run: |
           mkdir -p build/release
           cd build/release
@@ -72,7 +101,7 @@ jobs:
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
-          cmake --build . --config Release
+          cmake --build . --config Release --target mssql_loadable_extension
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
