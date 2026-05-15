@@ -296,6 +296,70 @@ byte-identical to pre-migration for a 20+ type matrix.
 
 ---
 
+### User Story 5 — Fix BCP nvarchar length-validation bug (issue #91) (Priority: P1)
+
+A user with `COPY (SELECT ... AS state) TO 'mssql://db/dbo/MyTable'
+(FORMAT 'bcp', CREATE_TABLE false)` against an existing
+`nvarchar(N)` column on SQL Server hits
+`Invalid Input Error: MSSQL: BCP failed: Received an invalid
+column length from the bcp client for colid N` even when the
+string fits in `N` UCS-2 characters but has more than `N` UTF-8
+bytes (e.g., 500 ASCII-plus-Cyrillic mix in nvarchar(500)).
+
+After spec 045's String family migration, the NVARCHAR encode
+path validates length against the column's UTF-16LE byte capacity
+(`col.max_length` in COLMETADATA = N*2 bytes for nvarchar(N)), not
+against the UTF-8 byte length of the DuckDB-side input. The fix
+naturally lands inside `codec::string::EncodeToBcp` because spec
+045's design puts all NVARCHAR-related encoding/validation logic
+into one place.
+
+**Why this priority**: P1 because (a) it's an active user-reported
+bug ([issue #91](https://github.com/hugr-lab/mssql-extension/issues/91)),
+(b) the workaround the user posted is wasteful (truncates to ~125
+characters for an nvarchar(500) column to be safe on emoji),
+(c) the String family migration is the natural and inevitable
+moment to fix this — the migration moves all relevant logic into
+one module where the invariant is testable in isolation.
+
+**Independent Test**: New SQLLogicTest
+`test/sql/copy/copy_nvarchar_length_validation.test` that
+reproduces the issue's scenario: `LEFT(repeat('ñ' || 'a', 250),
+500)` (500 chars / ~750 UTF-8 bytes / 1000 UTF-16 bytes) into
+`nvarchar(500)` succeeds and round-trips. Plus emoji edge case:
+8 ASCII + 4 emoji (= 12 UCS-2 code units = 24 UTF-16 bytes) into
+`nvarchar(20)` should succeed; 8 ASCII + 8 emoji (= 16 UCS-2
+code units = 32 UTF-16 bytes) into the same column should fail
+with a clear "exceeds column capacity" error (not a confusing
+"invalid column length from bcp client" wire error).
+
+**Acceptance Scenarios**:
+
+1. **Given** an `nvarchar(500)` SQL Server column and a DuckDB
+   VARCHAR value with 500 Unicode characters but >500 UTF-8 bytes
+   (e.g., mix of ASCII and 2-byte UTF-8 characters), **When** the
+   user runs `COPY ... (FORMAT 'bcp', CREATE_TABLE false)`,
+   **Then** the row is inserted successfully and reads back
+   byte-identical.
+2. **Given** an `nvarchar(20)` column (40-byte UTF-16LE capacity)
+   and a DuckDB VARCHAR with 8 ASCII + 4 emoji
+   characters (= 16 UCS-2 code units = 32 UTF-16LE bytes; fits
+   within 40-byte capacity), **When** copied via BCP, **Then**
+   the row is inserted successfully and round-trips byte-identical.
+3. **Given** the same `nvarchar(20)` column and a DuckDB VARCHAR
+   with 8 ASCII + 8 emoji characters (= 24 UCS-2 code units = 48
+   UTF-16LE bytes; exceeds the 40-byte capacity), **When** copied
+   via BCP, **Then** the operation fails with a String-family
+   error message that names the column and the observed-vs-allowed
+   UCS-2 code-unit count — NOT a generic "Received an invalid
+   column length from the bcp client" passthrough from SQL Server.
+4. **Given** the user's exact reproducer from issue #91 (500
+   ASCII-plus-Cyrillic-mix characters), **When** copied,
+   **Then** the operation succeeds without requiring the
+   `trunc_bytes` macro workaround.
+
+---
+
 ### Edge Cases
 
 - **TDS_TYPE_INTN with variable max_length**: Already handled in
@@ -431,19 +495,44 @@ byte-identical to pre-migration for a 20+ type matrix.
   The spec implementer chooses based on whether the move improves
   reviewability.
 
-**Behavior preservation**
+**Behavior preservation (with one explicit exception)**
 
 - **FR-020**: Every public observable behavior of the 5 dispatch
   sites MUST be byte-identical to `main`-at-spec-045-kickoff for
-  all inputs the existing test suite exercises. The migration is
-  a refactor, not a semantic change.
+  all inputs the existing test suite exercises, **EXCEPT** for the
+  bug fix mandated by FR-023 (issue #91). The migration is a
+  refactor with one targeted bug fix that surfaces naturally as the
+  String family takes ownership of NVARCHAR length-validation
+  responsibility.
 - **FR-021**: The wire-protocol contracts MUST NOT change. SQL
   Server cannot tell the difference between the pre-spec-045 and
-  post-spec-045 binary on the wire.
+  post-spec-045 binary on the wire **for any input that succeeded
+  pre-spec-045**. Inputs that pre-spec-045 incorrectly rejected
+  (per FR-023) MAY now succeed.
 - **FR-022**: Edge cases documented in §Edge Cases (above) MUST
   be preserved as documented. UTINYINT-vs-TINYINT asymmetry,
   UBIGINT-as-DECIMAL, GUID middle-endian, TIMESTAMP_TZ context
   divergence — all of these survive the migration.
+- **FR-023**: **Fix issue #91** (BCP COPY TO compares UTF-8 byte
+  length against nvarchar character length). The String family
+  module's `EncodeToBcp` implementation MUST validate cell length
+  against the column's TDS wire byte capacity (`col.max_length`
+  for non-PLP NVARCHAR columns; PLP for MAX) on the UTF-16LE
+  encoded byte count — NOT on the UTF-8 byte count of the
+  DuckDB-side input. The current code in
+  `src/tds/encoding/bcp_row_encoder.cpp:EncodeNVarchar` and the
+  COLMETADATA construction in `src/copy/target_resolver.cpp`
+  appear to handle this correctly on paper (sys.columns
+  `max_length` for nvarchar(N) is N*2 bytes; we write that into
+  COLMETADATA; we send the actual UTF-16LE byte count as cell
+  prefix). The bug exists in a path that has not yet been
+  isolated. The String family migration is the natural place to
+  hunt it down because the migration moves all length-related
+  logic for NVARCHAR into one module where the invariant can be
+  verified with a dedicated test (FR-031a). Per the issue
+  report, a string with 530 UTF-8 bytes but only 500 characters
+  must successfully insert into an `nvarchar(500)` column
+  (1000-byte UTF-16LE capacity).
 
 **Testing**
 
@@ -454,6 +543,18 @@ byte-identical to pre-migration for a 20+ type matrix.
   operations on golden fixtures (input → expected output) and
   asserts byte/string equality. Manual targets in the Makefile
   (`make test-codec-<family>`) similar to `test-login7-encoding`.
+- **FR-031a**: A new SQLLogicTest
+  `test/sql/copy/copy_nvarchar_length_validation.test` MUST cover
+  issue #91 per User Story 5: (a) 500 mixed ASCII+Cyrillic chars
+  into nvarchar(500) succeeds and round-trips byte-identical;
+  (b) ASCII + small number of emoji into a small nvarchar(N) column
+  succeeds while UCS-2 code units fit within the column capacity;
+  (c) input that genuinely exceeds the column's UCS-2 capacity
+  fails with a String-family-emitted error message naming the
+  column and the observed-vs-allowed code-unit count (not a
+  passthrough server error). This test MUST fail on the
+  pre-spec-045 baseline binary (proving the bug is real) and pass
+  on the spec-045 String-family-migrated binary.
 - **FR-031**: A new C++ unit test `test/cpp/test_literal_format.cpp`
   MUST cover the `LiteralContext` divergence cases (TIMESTAMP_TZ,
   HUGEINT, ENUM if applicable). For each fixture, both contexts
@@ -527,7 +628,14 @@ byte-identical to pre-migration for a 20+ type matrix.
   helper bodies moving OUT into family modules.
 - **SC-002**: Zero behavior regressions: every test that passed
   on `main`-at-spec-045-kickoff passes on the spec-045 PR HEAD.
-  Strict gate.
+  Strict gate. (Exception: the bug-fix regression test from
+  FR-031a is **expected to fail** on `main`-at-spec-045-kickoff
+  and **expected to pass** on the spec-045 PR HEAD — see SC-002a.)
+- **SC-002a**: Issue #91 closed by `test/sql/copy/copy_nvarchar_length_validation.test`
+  passing on the spec-045 PR HEAD. The same test MUST fail on the
+  pre-spec-045 baseline (`main` at spec-045-kickoff) to prove the
+  bug was real and is now fixed. Captured pre/post diff committed
+  in `specs/045-type-codec-consolidation/issue_91_repro.md`.
 - **SC-003**: 100% of family golden-fixture tests pass. Each
   family's `test/cpp/codec/test_<family>_codec.cpp` PASS verdict
   is required.
@@ -594,9 +702,15 @@ byte-identical to pre-migration for a 20+ type matrix.
 - **Type-mapping additions** (UUID round-trip via UNIQUEIDENTIFIER
   the spec-044 source doc proposed, HUGEINT → DECIMAL(38,0),
   TIMESTAMP_TZ → DATETIMEOFFSET, nested types → JSON fallback).
-  These are CORRECTNESS changes that change behavior; spec 045 is
-  strictly a REFACTOR that preserves behavior. Type-mapping fixes
-  belong to subsequent specs that each handle one mapping.
+  These are correctness changes that change behavior; spec 045 is
+  primarily a refactor. Type-mapping fixes belong to subsequent
+  specs that each handle one mapping. **Exception**: the one
+  behavior-changing fix that DOES belong in spec 045 is issue
+  #91 (NVARCHAR length validation in BCP encode) — see FR-023 /
+  User Story 5 / SC-002a. That fix lives inside the String family
+  module which spec 045 introduces, so it falls in scope
+  naturally and is testable as a discrete unit. No other bug
+  fixes piggyback on spec 045.
 - **`VariantCodec` for XML / SQL_VARIANT / UDT**. XML is already a
   String-family subtype; SQL_VARIANT and UDT remain unsupported
   (current behavior). A VARIANT codec is a separate feature spec.
