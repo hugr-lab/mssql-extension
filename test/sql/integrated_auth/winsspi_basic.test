@@ -1,0 +1,53 @@
+# name: test/sql/integrated_auth/winsspi_basic.test
+# description: Spec 042 Phase 4 -- Windows SSPI smoke test against a domain-joined
+#              SQL Server. Skipped unless MSSQL_WINSSPI_TEST=1 because CI runners
+#              aren't domain-joined; runs manually on a real Windows host.
+# group: [winsspi]
+
+require mssql
+
+require-env MSSQL_WINSSPI_TEST
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_DB
+
+#
+# Test 1: ATTACH via Trusted_Connection=yes (pyodbc-style alias).
+#         Resolves to authenticator=winsspi on Windows.
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST};Database=${MSSQL_TEST_DB};Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS wsspi (TYPE mssql);
+
+#
+# Test 2: Basic SELECT through the catalog.
+#
+query I
+SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE database_name = 'wsspi';
+----
+true
+
+#
+# Test 3: Raw query path via mssql_scan.
+#
+query I
+SELECT * FROM mssql_scan('wsspi', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+DETACH wsspi;
+
+#
+# Test 4: ATTACH via explicit authenticator=winsspi (go-mssqldb form).
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST};Database=${MSSQL_TEST_DB};authenticator=winsspi;Encrypt=yes;TrustServerCertificate=yes' AS wsspi2 (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('wsspi2', 'SELECT @@VERSION AS v');
+----
+<REGEX>:.*Microsoft.*
+
+statement ok
+DETACH wsspi2;

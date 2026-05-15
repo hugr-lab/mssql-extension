@@ -132,6 +132,7 @@ set(EXTENSION_SOURCES
     src/tds/auth/manual_token_strategy.cpp
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/auth/krb5_test_function.cpp
+    src/tds/auth/winsspi_test_function.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
     # TLS layer (OpenSSL)
@@ -212,9 +213,12 @@ set(EXTENSION_SOURCES
 
 # Spec 042: conditional inclusion of the platform-specific integrated-auth
 # authenticator. POSIX gets krb5_authenticator.cpp when GSSAPI is discovered;
-# Windows gets winsspi_authenticator.cpp (Phase 4).
+# Windows gets winsspi_authenticator.cpp via secur32.dll (Phase 4).
 if(MSSQL_KRB5_AVAILABLE)
     list(APPEND EXTENSION_SOURCES src/tds/auth/krb5_authenticator.cpp)
+endif()
+if(MSSQL_SSPI_AVAILABLE)
+    list(APPEND EXTENSION_SOURCES src/tds/auth/winsspi_authenticator.cpp)
 endif()
 
 # Build static extension (linked into DuckDB)

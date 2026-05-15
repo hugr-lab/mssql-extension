@@ -16,6 +16,10 @@
 #include "tds/auth/krb5_authenticator.hpp"
 #endif
 
+#if defined(MSSQL_ENABLE_SSPI)
+#include "tds/auth/winsspi_authenticator.hpp"
+#endif
+
 #include <string>
 
 namespace duckdb {
@@ -96,10 +100,18 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 #endif
 	}
 	if (conn_info.auth_method == AuthMethod::WINSSPI) {
-		// Phase 4 will provide WinSspiAuthenticator. For now, error out cleanly.
+#if defined(MSSQL_ENABLE_SSPI)
+		WinSspiConfig wc;
+		wc.spn = DeriveSpn(conn_info);
+		auto authn = std::make_shared<WinSspiAuthenticator>(std::move(wc));
+		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database, "IntegratedAuth(winsspi)",
+														conn_info.use_encrypt);
+#else
 		throw std::runtime_error(
-			"MSSQL Error: Windows SSPI authentication is not yet implemented in this build (spec 042 Phase 4). "
-			"Use SQL authentication or Azure AD in the meantime.");
+			"MSSQL Error: Windows SSPI authentication requires a Windows build of the extension. "
+			"On POSIX hosts, use 'authenticator=krb5' (or 'Trusted_Connection=yes' which auto-resolves "
+			"to krb5 on POSIX) after running 'kinit'.");
+#endif
 	}
 
 	// Priority for non-integrated paths: access_token > azure_secret > SQL auth (Spec 032)

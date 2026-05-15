@@ -165,3 +165,36 @@ CREATE SECRET ia_secret_conflict (
 );
 ----
 'authenticator' cannot be combined
+
+#
+# Test 15: authenticator=winsspi accepted by parser (spec 042 Phase 4).
+#         On POSIX builds the validator rejects with a clear platform-mismatch
+#         error. On Windows builds the ATTACH proceeds into SSPI -- expected to
+#         fail TCP / auth depending on environment, but the parser must not
+#         block it. We assert any MSSQL error -- the wording is platform-specific.
+#
+statement error
+ATTACH 'Server=sql.example.com;Database=db;authenticator=winsspi' AS ia_t15 (TYPE mssql);
+----
+MSSQL
+
+#
+# Test 16: Secret with authenticator=winsspi accepted by validator.
+#         Same wording assertion as test 15 -- platform-dependent error path.
+#
+statement ok
+CREATE SECRET ia_secret_winsspi (
+    TYPE mssql,
+    host 'sql.example.com',
+    port 1433,
+    database 'AdventureWorks',
+    authenticator 'winsspi'
+);
+
+statement error
+ATTACH '' AS ia_t16 (TYPE mssql, SECRET ia_secret_winsspi);
+----
+MSSQL
+
+statement ok
+DROP SECRET ia_secret_winsspi;
