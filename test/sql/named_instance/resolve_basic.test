@@ -1,0 +1,27 @@
+# name: test/sql/named_instance/resolve_basic.test
+# description: Spec 045 - ATTACH against a named instance resolves via SQL Browser
+# group: [mssql]
+#
+# This test runs inside the test/named-instance/ docker stack where:
+#   - mock-browser advertises TESTINST -> sql.example.com:11433
+#   - sql.example.com is a real SQL Server listening on 11433
+#   - run-tests.sh exports MSSQL_TEST_HOST=browser.example.com etc.
+#
+# A passing test proves the resolver translated browser.example.com\TESTINST
+# into the correct TCP target (sql.example.com:11433), not 1433 by default.
+
+require mssql
+
+require-env NAMED_INSTANCE_TEST
+
+statement ok
+ATTACH 'Server=browser.example.com\TESTINST;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS db (TYPE mssql);
+
+# The probe row was inserted by sql/init.sql
+query II
+SELECT id, payload FROM db.dbo.Probe;
+----
+1	spec045 lives
+
+statement ok
+DETACH db;

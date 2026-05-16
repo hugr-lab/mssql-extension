@@ -102,5 +102,60 @@ fi
 echo "[run-tests] step 5: resolver self-tests (unit tests baked into binary)"
 "${RESOLVER}"
 
+# ----------------------------------------------------------------------------
+# Phase 3 end-to-end tests via the DuckDB CLI + mssql extension.
+# These exercise the ATTACH path so the spec 045 plumbing (parse host\instance,
+# invoke resolver, populate LOGIN7 ServerName) is covered end-to-end.
+# ----------------------------------------------------------------------------
+EXT=/home/tester/mssql.duckdb_extension
+DUCKDB=$(command -v duckdb || true)
+
+if [[ -z "${DUCKDB}" || ! -f "${EXT}" ]]; then
+    echo "[run-tests] DuckDB CLI or extension missing -- skipping Phase 3 end-to-end tests"
+    echo "[run-tests] ALL SMOKE TESTS PASSED"
+    exit 0
+fi
+
+echo "[run-tests] step 6: ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE}; ...' end-to-end"
+out=$("${DUCKDB}" --unsigned -noheader -list <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS db (TYPE mssql);
+SELECT id, payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec045 lives" || {
+    echo "  FAIL: probe row not returned via named-instance ATTACH" >&2
+    exit 6
+}
+echo "  PASS"
+
+echo "[run-tests] step 7: ATTACH explicit ,port bypasses Browser"
+out=$("${DUCKDB}" --unsigned -noheader -list <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=${SQL_HOST}\\${INSTANCE},${EXPECTED_PORT};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS db (TYPE mssql);
+SELECT payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec045 lives" || {
+    echo "  FAIL: probe row not returned via explicit-port ATTACH" >&2
+    exit 7
+}
+echo "  PASS"
+
+echo "[run-tests] step 8: unknown instance fails with InstanceNotFound at ATTACH time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\NONESUCH;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "not found on host" || {
+    echo "  FAIL: expected 'not found on host' error, got: ${out}" >&2
+    exit 8
+}
+echo "  PASS"
+
 echo ""
 echo "[run-tests] ALL SMOKE TESTS PASSED"

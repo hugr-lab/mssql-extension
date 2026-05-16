@@ -50,6 +50,20 @@ struct MSSQLConnectionInfo {
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
 	//===----------------------------------------------------------------------===//
+	// Named-Instance Resolution (Spec 045)
+	//
+	// When the user writes `Server=host\instance` the parser extracts the instance
+	// name here. The TDS layer composes LOGIN7's ServerName as `host\instance`
+	// (matching what every other SQL Server client does); the connect target
+	// host/port are the values above, with port resolved via SQL Server Browser
+	// (UDP 1434) when no explicit port is supplied.
+	//
+	// Empty string means "no instance specified" (the default case, host == default
+	// instance on the standard 1433 port or whatever explicit port the user gave).
+	//===----------------------------------------------------------------------===//
+	string instance_name;
+
+	//===----------------------------------------------------------------------===//
 	// Authentication method (Spec 042)
 	//
 	// New code paths SHOULD switch on auth_method. Existing booleans below
@@ -114,12 +128,18 @@ struct MSSQLConnectionInfo {
 	static shared_ptr<MSSQLConnectionInfo> FromSecret(ClientContext &context, const string &secret_name);
 
 	// Create from connection string (ADO.NET format or URI format)
-	// ADO.NET: "Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes/no"
-	// URI: "mssql://user:password@host:port/database?encrypt=true"
+	// ADO.NET: "Server=host[\instance][,port];Database=db;User Id=user;Password=pass;Encrypt=yes/no"
+	// URI: "mssql://user:password@host[%5Cinstance][:port]/database?encrypt=true"
 	// Parameters:
 	//   azure_auth - if true, user/password are optional (Azure AD authentication via azure_secret)
+	//   context    - optional; when non-null and the connection string uses a named-instance form
+	//                without an explicit port, the resolver looks up
+	//                `mssql_named_instance_resolution` and `mssql_browser_timeout_seconds`
+	//                from this context's settings. When null, defaults are used
+	//                (resolution enabled, 3s timeout).
 	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string,
-																bool azure_auth = false);
+																bool azure_auth = false,
+																ClientContext *context = nullptr);
 
 	// Validate connection string format
 	// Returns: empty string if valid, error message if invalid

@@ -66,8 +66,10 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 
 		// Check if input is a connection string (URI or ADO.NET format)
 		if (MSSQLConnectionInfo::IsUriFormat(input) || MSSQLConnectionInfo::IsConnectionString(input)) {
-			// Parse connection string directly
-			auto conn_info = MSSQLConnectionInfo::FromConnectionString(input);
+			// Parse connection string directly. Pass the ClientContext so the
+			// Spec 045 named-instance resolver can read its settings.
+			auto &diag_context = state.GetContext();
+			auto conn_info = MSSQLConnectionInfo::FromConnectionString(input, false, &diag_context);
 			host = conn_info->host;
 			port = conn_info->port;
 			database = conn_info->database;

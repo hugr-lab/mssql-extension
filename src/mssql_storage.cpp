@@ -4,6 +4,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
+#include "connection/instance_resolver.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -654,10 +655,14 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 		}
 	}
 
-	// Validate server format (host or host,port)
+	// Validate server format (host[\instance][,port])
 	auto server = params["server"];
+
+	// Split off explicit ,port first (instance name is between host and the comma).
+	string host_part = server;
 	auto comma_pos = server.find(',');
 	if (comma_pos != string::npos) {
+		host_part = server.substr(0, comma_pos);
 		auto port_str = server.substr(comma_pos + 1);
 		try {
 			int port = std::stoi(port_str);
@@ -669,11 +674,37 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 		}
 	}
 
+	// Spec 045: split host\instance and validate the instance-name grammar at parse time.
+	// SQL Server's own constraint is [A-Za-z0-9_$#]{1,16} (verified against the SSMS
+	// installer regex). Rejecting empty + out-of-grammar names here gives a clear error
+	// message before we try to resolve over UDP and time out 3 seconds later.
+	auto backslash_pos = host_part.find('\\');
+	if (backslash_pos != string::npos) {
+		if (backslash_pos == 0) {
+			return "Server parameter starts with backslash; expected 'host\\instance'.";
+		}
+		string instance = host_part.substr(backslash_pos + 1);
+		if (instance.empty()) {
+			return "Server parameter has empty instance name after backslash.";
+		}
+		if (instance.size() > 16) {
+			return StringUtil::Format("Instance name '%s' is longer than 16 characters.", instance);
+		}
+		for (char c : instance) {
+			bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+					  c == '$' || c == '#';
+			if (!ok) {
+				return StringUtil::Format(
+					"Instance name '%s' contains invalid character '%c'; allowed: [A-Za-z0-9_$#].", instance, c);
+			}
+		}
+	}
+
 	return "";	// Valid
 }
 
 shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const string &connection_string,
-																		  bool azure_auth) {
+																		  bool azure_auth, ClientContext *context) {
 	// Validate first
 	string error = ValidateConnectionString(connection_string, azure_auth);
 	if (!error.empty()) {
@@ -690,15 +721,58 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
 
-	// Parse server (host,port or just host)
+	// Parse server (host[\instance][,port])
 	auto server = params["server"];
+	bool explicit_port_given = false;
+	string host_part = server;
 	auto comma_pos = server.find(',');
 	if (comma_pos != string::npos) {
-		result->host = server.substr(0, comma_pos);
+		host_part = server.substr(0, comma_pos);
 		result->port = static_cast<uint16_t>(std::stoi(server.substr(comma_pos + 1)));
+		explicit_port_given = true;
 	} else {
-		result->host = server;
 		result->port = 1433;  // Default MSSQL port
+	}
+
+	// Spec 045: split host\instance. Grammar was already validated in
+	// ValidateConnectionString; just split here.
+	auto backslash_pos = host_part.find('\\');
+	if (backslash_pos != string::npos) {
+		result->host = host_part.substr(0, backslash_pos);
+		result->instance_name = host_part.substr(backslash_pos + 1);
+	} else {
+		result->host = host_part;
+	}
+
+	// Spec 045 FR-002: explicit ,port wins; do NOT contact SQL Browser. The instance
+	// name is still carried through to LOGIN7 ServerName via result->instance_name.
+	// FR-012: setting `mssql_named_instance_resolution=false` rejects host\instance at
+	// parse time with a clear error pointing the user at the explicit-port escape hatch.
+	if (!result->instance_name.empty() && !explicit_port_given) {
+		bool resolution_enabled = true;
+		int browser_timeout = 3;
+		if (context) {
+			Value val;
+			if (context->TryGetCurrentSetting("mssql_named_instance_resolution", val)) {
+				resolution_enabled = val.GetValue<bool>();
+			}
+			if (context->TryGetCurrentSetting("mssql_browser_timeout_seconds", val)) {
+				int64_t t = val.GetValue<int64_t>();
+				if (t > 0) {
+					browser_timeout = static_cast<int>(t);
+				}
+			}
+		}
+		if (!resolution_enabled) {
+			throw InvalidInputException(
+				"MSSQL Error: named-instance resolution is disabled "
+				"(mssql_named_instance_resolution=false); use Server=host,port to bypass SQL Server Browser.");
+		}
+		auto rr = mssql::InstanceResolver::Resolve(result->host, result->instance_name, browser_timeout);
+		if (!rr.ok) {
+			throw IOException("MSSQL Error: %s", rr.error.message);
+		}
+		result->port = rr.port;
 	}
 
 	result->database = params["database"];
@@ -1080,6 +1154,12 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	}
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection succeeded");
 
+	// Spec 045: LOGIN7 ServerName mirrors the user-typed "host\instance" form
+	// for named-instance connects.
+	if (!info.instance_name.empty()) {
+		conn.SetTdsServerName(info.host + "\\" + info.instance_name);
+	}
+
 	// Attempt authentication
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
@@ -1248,7 +1328,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Connection string provided - parse it
 		// If access_token or azure_secret is provided as option, allow missing user/password
 		bool azure_auth_option = !access_token.empty() || !azure_secret_name.empty();
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
+		ctx->connection_info =
+			MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option, &context);
 
 		// Set access_token from ATTACH option if provided (Spec 032: takes precedence)
 		if (!access_token.empty()) {
@@ -1355,7 +1436,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Use Azure AD authentication pool (manual token or azure_secret)
 		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
-			fedauth_token_utf16le, ctx->connection_info->use_encrypt);
+			fedauth_token_utf16le, ctx->connection_info->use_encrypt, ctx->connection_info->instance_name);
 	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
 			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
 		// Spec 042: Integrated Authentication pool. Each new pool connection
@@ -1365,7 +1446,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Use SQL authentication pool
 		MssqlPoolManager::Instance().GetOrCreatePool(
 			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
-			ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
+			ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt,
+			ctx->connection_info->instance_name);
 	}
 
 	// Create MSSQLCatalog with connection info and access mode from options

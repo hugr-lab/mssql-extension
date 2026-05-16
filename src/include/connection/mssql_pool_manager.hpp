@@ -19,22 +19,29 @@ public:
 
 	// Get or create a pool for a context (SQL authentication)
 	// Parameters:
-	//   use_encrypt - if true, enables TLS encryption for all connections in the pool
+	//   use_encrypt   - if true, enables TLS encryption for all connections in the pool
+	//   instance_name - Spec 045: when non-empty, each connection's LOGIN7 ServerName
+	//                   field is set to "host\instance_name" (matching every other
+	//                   SQL Server client). Empty means default instance (pre-spec-045
+	//                   behaviour, ServerName == host).
 	tds::ConnectionPool *GetOrCreatePool(const std::string &context_name, const MSSQLPoolConfig &config,
 										 const std::string &host, uint16_t port, const std::string &username,
 										 const std::string &password, const std::string &database,
-										 bool use_encrypt = false);
+										 bool use_encrypt = false, const std::string &instance_name = "");
 
 	// Get or create a pool for a context (Azure AD authentication)
 	// Parameters:
 	//   fedauth_token_utf16le - pre-encoded UTF-16LE access token
 	//   use_encrypt - TLS encryption (required for Azure)
+	//   instance_name - Spec 045: see GetOrCreatePool. Azure SQL doesn't use named
+	//                   instances in practice but the parameter is accepted for
+	//                   symmetry with the SQL-auth factory.
 	// Note: For Azure auth, token refresh is handled separately
 	tds::ConnectionPool *GetOrCreatePoolWithAzureAuth(const std::string &context_name, const MSSQLPoolConfig &config,
 													  const std::string &host, uint16_t port,
 													  const std::string &database,
 													  const std::vector<uint8_t> &fedauth_token_utf16le,
-													  bool use_encrypt = true);
+													  bool use_encrypt = true, const std::string &instance_name = "");
 
 	// Get or create a pool for a context (Integrated Authentication: Kerberos / SSPI).
 	// Spec 042.
