@@ -47,15 +47,30 @@ result=$("${RESOLVER}" --resolve "${BROWSER_HOST}" "${BROWSER_PORT}" "${INSTANCE
 echo "  resolver output: ${result}"
 
 case "${result}" in
-    "OK port=${EXPECTED_PORT}")
+    "OK host="*"port=${EXPECTED_PORT}")
         echo "  PASS"
         ;;
-    "OK port="*)
+    "OK host="*"port="*)
         echo "  FAIL: resolved to wrong port (expected ${EXPECTED_PORT})" >&2
         exit 3
         ;;
     *)
         echo "  FAIL: resolver did not succeed" >&2
+        exit 3
+        ;;
+esac
+
+# Also verify the advertised host points at the SQL Server container, not
+# at the mock-browser host (this is the two-hostname semantics check that
+# the original Phase 2 test missed -- the resolver used to discard the
+# advertised ServerName and just return the port, so the caller would
+# connect to browser.example.com:11433 instead of sql.example.com:11433).
+case "${result}" in
+    "OK host=${SQL_HOST}"*)
+        echo "  PASS -- advertised host is ${SQL_HOST} (not the mock browser host)"
+        ;;
+    *)
+        echo "  FAIL: resolver advertised host doesn't match ${SQL_HOST}; got: ${result}" >&2
         exit 3
         ;;
 esac

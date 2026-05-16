@@ -514,7 +514,14 @@ ResolveResult ResolveCore(const std::string &raw_host, uint16_t browser_port, co
 				oss << "instance '" << instance << "' exists on " << host << " but TCP transport is disabled";
 				return ResolveResult::Failure(ResolveError::Kind::TcpDisabled, oss.str());
 			}
-			return ResolveResult::Success(r.tcp_port);
+			// Honour the advertised ServerName from the SVR_RESP. Browser
+			// is allowed to point the client at a different host than
+			// itself (failover-cluster scenarios, two-hostname test
+			// layout). Fall back to the queried host when the response
+			// didn't include a ServerName field (defensive; real SQL
+			// Server always emits it).
+			std::string advertised_host = r.server_name.empty() ? host : r.server_name;
+			return ResolveResult::Success(std::move(advertised_host), r.tcp_port);
 		}
 	}
 

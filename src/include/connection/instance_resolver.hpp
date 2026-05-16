@@ -63,19 +63,27 @@ struct ResolveError {
 };
 
 //===----------------------------------------------------------------------===//
-// ResolveResult - success carries the resolved TCP port; failure carries the
-// typed error. Returned by InstanceResolver::Resolve. C++11-clean (no
-// std::variant / std::expected dependency).
+// ResolveResult - success carries the resolved TCP host + port; failure
+// carries the typed error. Returned by InstanceResolver::Resolve.
+// C++11-clean (no std::variant / std::expected dependency).
+//
+// Note: `host` may differ from the host argument that was passed to
+// Resolve(). SQL Server Browser is allowed to advertise the engine on a
+// different hostname than the one running Browser itself (failover
+// cluster, two-hostname test layout, etc.). When the advertised
+// ServerName is empty the resolver falls back to the queried host.
 //===----------------------------------------------------------------------===//
 
 struct ResolveResult {
 	bool ok;
+	std::string host;	 // valid when ok == true; advertised ServerName from SVR_RESP
 	uint16_t port;		 // valid when ok == true
 	ResolveError error;	 // valid when ok == false
 
-	static ResolveResult Success(uint16_t p) {
+	static ResolveResult Success(std::string h, uint16_t p) {
 		ResolveResult r;
 		r.ok = true;
+		r.host = std::move(h);
 		r.port = p;
 		return r;
 	}

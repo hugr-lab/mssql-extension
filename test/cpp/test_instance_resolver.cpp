@@ -327,6 +327,7 @@ void TestResolveHappyPath() {
 	EXPECT(r.ok, "Resolve returned ok");
 	if (r.ok) {
 		EXPECT_EQ(r.port, static_cast<uint16_t>(11433), "resolved port");
+		EXPECT_EQ(r.host, std::string("HOST"), "advertised host from SVR_RESP ServerName");
 	} else {
 		std::cerr << "    error: " << r.error.message << std::endl;
 	}
@@ -465,7 +466,7 @@ int RunCliResolve(int argc, char **argv) {
 
 	auto r = InstanceResolver::ResolveForTest(host, static_cast<uint16_t>(browser_port_int), instance, timeout);
 	if (r.ok) {
-		std::cout << "OK port=" << r.port << std::endl;
+		std::cout << "OK host=" << r.host << " port=" << r.port << std::endl;
 		return 0;
 	}
 	const char *kind = "Unknown";
