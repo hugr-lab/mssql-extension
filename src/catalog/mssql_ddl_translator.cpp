@@ -6,6 +6,7 @@
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/type_family.hpp"
 #include "codec/uuid_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
@@ -14,6 +15,47 @@
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 
 namespace duckdb {
+
+namespace {
+
+// Single canonical DDL type-name dispatcher (spec 045 Phase 7 — FR-028).
+// Both MapTypeToSQLServer (CreateTable) and MapLogicalTypeToCTAS (CtasCreateTable)
+// share this body: family modules emit byte-identical strings for either ctx.
+// FamilyFromLogicalType throws NotImplementedException for unsupported types
+// (LIST/STRUCT/MAP/UNION/ENUM/BIT/ARRAY — caller may pre-filter for friendlier
+// CTAS-specific error messages).
+string DispatchDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, mssql::codec::DdlContext ctx) {
+	switch (mssql::codec::FamilyFromLogicalType(type)) {
+	case mssql::codec::TypeFamily::Boolean:
+		return mssql::codec::boolean::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Integer:
+		return mssql::codec::integer::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Float:
+		return mssql::codec::float_family::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Decimal:
+		return mssql::codec::decimal::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Money:
+		// DuckDB has no MONEY LogicalType; FamilyFromLogicalType never returns
+		// Money. Money is decode-only (from SQL Server MONEY/SMALLMONEY tokens,
+		// surfaced as DuckDB DECIMAL). If we ever reach this arm, the type-family
+		// mapping has a bug.
+		throw InternalException(
+			"DDL dispatcher reached Money arm for DuckDB type '%s' — "
+			"Money family is decode-only and has no LogicalType mapping",
+			type.ToString());
+	case mssql::codec::TypeFamily::String:
+		return mssql::codec::string::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Binary:
+		return mssql::codec::binary::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::DateTime:
+		return mssql::codec::datetime::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Uuid:
+		return mssql::codec::uuid::FormatDdlTypeName(type, cfg, ctx);
+	}
+	throw InternalException("Unreachable: unhandled TypeFamily in DDL dispatcher for '%s'", type.ToString());
+}
+
+}  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // DDLOperation to String
@@ -84,70 +126,10 @@ string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::boolean::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UHUGEINT: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::integer::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::float_family::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::DECIMAL: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::decimal::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::VARCHAR: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::string::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::GEOMETRY: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::binary::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::datetime::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::UUID: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::uuid::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	case LogicalTypeId::INTERVAL: {
-		mssql::CTASConfig default_cfg;
-		return mssql::codec::string::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
-	}
-
-	default:
+	try {
+		return DispatchDdlTypeName(type, mssql::CTASConfig{}, mssql::codec::DdlContext::CreateTable);
+	} catch (const NotImplementedException &) {
+		// Preserve legacy non-CTAS error message for unsupported types.
 		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type", type.ToString());
 	}
 }
@@ -340,92 +322,45 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const mssql::CTASConfig &config) {
+	// Pre-filter known-unsupported nested types with CTAS-specific friendly errors.
+	// All supported types route through the shared dispatcher (FR-028 byte-identity
+	// with MapTypeToSQLServer for the same LogicalType).
 	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return mssql::codec::boolean::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UHUGEINT:
-		return mssql::codec::integer::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-		return mssql::codec::float_family::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::DECIMAL:
-		return mssql::codec::decimal::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::VARCHAR:
-		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::GEOMETRY:
-		return mssql::codec::binary::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return mssql::codec::datetime::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	case LogicalTypeId::UUID:
-		return mssql::codec::uuid::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
-	// Unsupported types - CTAS must fail with clear error (FR-012)
-	// HUGEINT/UHUGEINT now route through mssql::codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)
-	// in both DDL contexts; cases above this point handled by the unified Integer arm.
-	// INTERVAL now routes through mssql::codec::string (FR-026) and maps to NVARCHAR(50) in
-	// both DDL contexts; pre-spec-045 CTAS threw NotImplementedException here.
-	case LogicalTypeId::INTERVAL:
-		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
-
 	case LogicalTypeId::LIST:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type LIST. "
 			"SQL Server has no array type. Consider flattening or serializing to JSON.");
-
 	case LogicalTypeId::STRUCT:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type STRUCT. "
 			"SQL Server has no struct type. Consider flattening or serializing to JSON.");
-
 	case LogicalTypeId::MAP:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type MAP. "
 			"SQL Server has no map type. Consider serializing to JSON.");
-
 	case LogicalTypeId::UNION:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type UNION. "
 			"SQL Server has no union type. Consider normalizing the data.");
-
 	case LogicalTypeId::ENUM:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type ENUM. "
 			"Consider casting to VARCHAR or INTEGER.");
-
 	case LogicalTypeId::BIT:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type BIT. "
 			"Consider using BOOLEAN or BLOB.");
-
 	case LogicalTypeId::ARRAY:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type ARRAY. "
 			"SQL Server has no array type. Consider flattening or serializing to JSON.");
-
 	default:
+		break;
+	}
+
+	try {
+		return DispatchDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
+	} catch (const NotImplementedException &) {
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type '%s'. "
 			"No SQL Server equivalent exists.",
