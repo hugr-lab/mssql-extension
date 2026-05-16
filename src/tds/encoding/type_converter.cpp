@@ -12,12 +12,11 @@
 #include "codec/integer_codec.hpp"
 #include "codec/money_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/uuid_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
-#include "duckdb/common/types/uuid.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 #include "tds/encoding/decimal_encoding.hpp"
-#include "tds/encoding/guid_encoding.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_types.hpp"
 
@@ -333,17 +332,12 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		break;
 
 	case TDS_TYPE_UNIQUEIDENTIFIER:
-		ConvertGuid(value, vector, row_idx);
+		mssql::codec::uuid::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
 	}
-}
-
-void TypeConverter::ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
-	hugeint_t guid = GuidEncoding::ConvertGuid(value.data());
-	FlatVector::GetData<hugeint_t>(vector)[row_idx] = guid;
 }
 
 //===----------------------------------------------------------------------===//
@@ -440,11 +434,9 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 	case TDS_TYPE_MONEYN:
 		rendered = mssql::codec::decimal::RenderMoneyAsString(value);
 		break;
-	case TDS_TYPE_UNIQUEIDENTIFIER: {
-		hugeint_t guid = GuidEncoding::ConvertGuid(value.data());
-		rendered = UUID::ToString(guid);
+	case TDS_TYPE_UNIQUEIDENTIFIER:
+		rendered = mssql::codec::uuid::RenderAsString(value);
 		break;
-	}
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
 		rendered = mssql::codec::binary::RenderAsString(value);

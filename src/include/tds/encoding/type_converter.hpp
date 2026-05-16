@@ -36,8 +36,7 @@ public:
 	static std::string GetTypeName(uint8_t type_id);
 
 private:
-	// Type-specific converters (Boolean + Float + Decimal + Money + Binary + DateTime migrated to codec — spec 045
-	// Phase 6)
+	// Type-specific converters (all 9 type families migrated to codec — spec 045 Phase 6 complete)
 
 	// Issue #89 fallback: render a non-string TDS value as a string and write into a VARCHAR
 	// destination vector. Used when catalog-declared type (VARCHAR) disagrees with the runtime
@@ -47,8 +46,6 @@ private:
 
 	// True if the TDS type tag is a character type (no fallback rendering needed).
 	static bool IsStringTdsType(uint8_t type_id);
-
-	static void ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
 };
 
 }  // namespace encoding

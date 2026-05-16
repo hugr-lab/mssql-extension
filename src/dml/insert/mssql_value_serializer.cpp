@@ -279,11 +279,8 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	case LogicalTypeId::GEOMETRY:
 		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
-	case LogicalTypeId::UUID: {
-		// UUID is stored as hugeint_t
-		auto uuid_val = value.GetValue<hugeint_t>();
-		return SerializeUUID(uuid_val);
-	}
+	case LogicalTypeId::UUID:
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIME:
@@ -361,7 +358,7 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 		return mssql::codec::EstimateLiteralSize(type);
 
 	case LogicalTypeId::UUID:
-		return 38;	// 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+		return mssql::codec::EstimateLiteralSize(type);
 
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIME:

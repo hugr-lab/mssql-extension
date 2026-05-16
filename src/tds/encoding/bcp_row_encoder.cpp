@@ -7,6 +7,7 @@
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/uuid_codec.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -120,10 +121,9 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 		case LogicalTypeId::GEOMETRY:
 			mssql::codec::binary::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		case LogicalTypeId::UUID: {
-			EncodeGUID(buffer, GetVectorValue<hugeint_t>(vec, row_idx));
+		case LogicalTypeId::UUID:
+			mssql::codec::uuid::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
 		case LogicalTypeId::DATE:
 		case LogicalTypeId::TIME:
 		case LogicalTypeId::TIMESTAMP:
@@ -181,7 +181,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		mssql::codec::binary::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::UUID:
-		EncodeGUID(buffer, value.GetValue<hugeint_t>());
+		mssql::codec::uuid::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIME:

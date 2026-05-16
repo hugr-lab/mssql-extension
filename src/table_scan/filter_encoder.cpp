@@ -156,9 +156,8 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
-	case LogicalTypeId::UUID: {
-		return "'" + value.ToString() + "'";
-	}
+	case LogicalTypeId::UUID:
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::GEOMETRY:

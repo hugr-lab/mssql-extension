@@ -6,13 +6,11 @@
 // Canonical 9-arm dispatcher. As each family migrates, its arm is
 // replaced with a direct call into codec::<family>::FormatSqlLiteral.
 //
-// Phase 6 (US3 sub-phases 1-6) — Boolean, Float, Decimal, Binary, DateTime
-// arms wired. Integer and String arms landed in Phase 4/Phase 5. Money is
+// Phase 6 (US3 sub-phases 1-7) — Boolean, Float, Decimal, Binary, DateTime,
+// Uuid arms wired. Integer and String arms landed in Phase 4/Phase 5. Money is
 // scan-decode-only (no FormatSqlLiteral); Money values route through the
-// Decimal family at the LogicalType level. Remaining 1 arm (Uuid) still
-// throws NotImplementedException; it is unreachable in production until
-// the Uuid sub-phase lands the dispatch-site rewrites that route through
-// this dispatcher.
+// Decimal family at the LogicalType level. All 9 families now route through
+// this dispatcher; Phase 7 will sweep the dispatch sites and unify DDL.
 //===----------------------------------------------------------------------===//
 
 #include "codec/literal_format.hpp"
@@ -25,6 +23,7 @@
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
+#include "codec/uuid_codec.hpp"
 #include "duckdb/common/exception.hpp"
 
 namespace duckdb {
@@ -62,7 +61,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::DateTime:
 		return datetime::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Uuid:
-		ThrowFamilyNotMigrated("Uuid", type);
+		return uuid::FormatSqlLiteral(v, type, ctx);
 	}
 	throw InternalException("codec::FormatSqlLiteral: unreachable (TypeFamily enum exhausted)");
 }
@@ -86,7 +85,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::DateTime:
 		return datetime::EstimateLiteralSize(type);
 	case TypeFamily::Uuid:
-		ThrowFamilyNotMigrated("Uuid", type);
+		return uuid::EstimateLiteralSize(type);
 	}
 	throw InternalException("codec::EstimateLiteralSize: unreachable (TypeFamily enum exhausted)");
 }

@@ -19,10 +19,11 @@
 //   - String family (Phase 5 / US5) — VARCHAR samples route through the
 //     dispatcher and produce N'<escaped>' for both contexts. NULL VARCHAR
 //     short-circuits to "NULL". INTERVAL also routes through String.
-//   - Unmigrated families (Uuid) currently throw NotImplementedException.
-//     The dispatch sites (filter_encoder.cpp, mssql_value_serializer.cpp)
-//     don't route Uuid through the dispatcher yet — they will once the
-//     Phase 6 Uuid sub-phase migration lands.
+//   - Uuid family (Phase 6 sub-phase 7) — UUID samples route through the
+//     dispatcher and produce '<canonical>' for both contexts. NULL UUID
+//     short-circuits to "NULL". All 9 families now migrated; only Money
+//     remains a throw-stub at the dispatcher level (Money has no
+//     LogicalType peer — values arrive as DECIMAL(19,4)).
 //
 // Build & run:
 //   GEN=ninja make debug
@@ -291,19 +292,25 @@ void TestDateTimeFamilyDispatcherWired() {
 	}
 }
 
-void TestUnmigratedFamiliesThrow() {
-	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
+void TestUuidFamilyDispatcherWired() {
+	std::cout << "Test: Uuid dispatcher arm routes to codec::uuid (Phase 6 sub-phase 7)\n";
 
-	// Sanity check: families NOT yet migrated still throw. Only Uuid remains
-	// after Phase-6 sub-phase 6 (DateTime).
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID));
+	// NULL UUID → "NULL" via dispatcher short-circuit (no codec call).
+	CHECK_EQ(
+		duckdb::mssql::codec::FormatSqlLiteral(Value(LogicalType::UUID), LogicalType::UUID, LiteralContext::Filter),
+		std::string("NULL"));
 
-	// MONEY (DuckDB has no MONEY type; codec::money is decode-only fence —
-	// FormatSqlLiteral / EstimateLiteralSize remain undefined). Confirm the
-	// dispatcher still throws for Money family. There's no LogicalType that
-	// maps to TypeFamily::Money so this assertion is implicit — when MONEY
-	// values arrive on the wire they decode into DECIMAL(19,4) vectors and
-	// surface through the Decimal family.
+	auto v = Value::UUID(std::string("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
+	auto filter = duckdb::mssql::codec::FormatSqlLiteral(v, LogicalType::UUID, LiteralContext::Filter);
+	auto insert = duckdb::mssql::codec::FormatSqlLiteral(v, LogicalType::UUID, LiteralContext::InsertValues);
+	CHECK_EQ(filter, std::string("'6ba7b810-9dad-11d1-80b4-00c04fd430c8'"));
+	CHECK_EQ(filter, insert);  // FR-022 byte-identity
+
+	// EstimateLiteralSize routes through the dispatcher.
+	if (duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID) < 38u) {
+		++failures;
+		std::cerr << "FAIL: UUID EstimateLiteralSize returned < 38\n";
+	}
 }
 
 }  // namespace
@@ -319,7 +326,7 @@ int main() {
 	TestDecimalFamilyDispatcherWired();
 	TestBinaryFamilyDispatcherWired();
 	TestDateTimeFamilyDispatcherWired();
-	TestUnmigratedFamiliesThrow();
+	TestUuidFamilyDispatcherWired();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";

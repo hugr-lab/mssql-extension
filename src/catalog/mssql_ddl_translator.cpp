@@ -6,6 +6,7 @@
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/uuid_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/exception.hpp"
@@ -136,8 +137,10 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 		return mssql::codec::datetime::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
 	}
 
-	case LogicalTypeId::UUID:
-		return "UNIQUEIDENTIFIER";
+	case LogicalTypeId::UUID: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::uuid::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::INTERVAL: {
 		mssql::CTASConfig default_cfg;
@@ -377,7 +380,7 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return mssql::codec::datetime::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::UUID:
-		return "UNIQUEIDENTIFIER";
+		return mssql::codec::uuid::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	// Unsupported types - CTAS must fail with clear error (FR-012)
 	// HUGEINT/UHUGEINT now route through mssql::codec::integer (FR-025/FR-028) and map to DECIMAL(38,0)

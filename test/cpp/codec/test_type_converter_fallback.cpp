@@ -190,6 +190,20 @@ void TestNullIntoVarcharVector() {
 	}
 }
 
+void TestUuidIntoVarcharVector() {
+	std::cout << "Test: UNIQUEIDENTIFIER TDS bytes into VARCHAR vector — renders canonical lowercase form\n";
+
+	// Wire (TDS mixed-endian) for 6ba7b810-9dad-11d1-80b4-00c04fd430c8 (RFC 4122 §3 example).
+	std::vector<uint8_t> wire = {0x10, 0xB8, 0xA7, 0x6B, 0xAD, 0x9D, 0xD1, 0x11,
+								 0x80, 0xB4, 0x00, 0xC0, 0x4F, 0xD4, 0x30, 0xC8};
+	auto col = MakeColumn(duckdb::tds::TDS_TYPE_UNIQUEIDENTIFIER);
+
+	duckdb::Vector vec(LogicalType::VARCHAR, 1);
+	TypeConverter::ConvertValue(wire, /*is_null*/ false, col, vec, 0);
+
+	CHECK_EQ(ReadVectorString(vec, 0), std::string("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
+}
+
 void TestStringIntoVarcharVectorTakesNormalPath() {
 	std::cout << "Test: NVARCHAR TDS into VARCHAR vector — uses codec::string (not fallback)\n";
 
@@ -214,6 +228,7 @@ int main() {
 	TestMoneyIntoVarcharVector();
 	TestBitIntoVarcharVector();
 	TestNullIntoVarcharVector();
+	TestUuidIntoVarcharVector();
 	TestStringIntoVarcharVectorTakesNormalPath();
 
 	if (failures > 0) {
