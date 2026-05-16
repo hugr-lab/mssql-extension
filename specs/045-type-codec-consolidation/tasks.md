@@ -251,6 +251,40 @@
 
 ---
 
+## Phase 7.5: Per-type switch consolidation (scope expansion)
+
+**Origin**: User feedback during Phase 6 close-out — "I want ALL per-type switches moved into codec. Goal: adding a new DuckDB type should require changes ONLY in `src/codec/`, plus maybe a couple of other places. BCP / INSERT / SCAN must always share common logic with a single canonical source of truth." (verbatim, paraphrased from Russian).
+
+A grep audit across `src/` found ~664 `case LogicalTypeId::` arms outside `src/codec/` — the biggest cluster being `src/copy/target_resolver.cpp` (~93 arms across 3 functions that duplicate codec knowledge: `GetTDSTypeToken`, `GetTDSMaxLength`, `IsCompatibleSourceType`). The legitimate remainder is in `src/tds/` (low-level wire parsing keyed by TDS token, not by `LogicalTypeId`).
+
+This phase extends spec 045 beyond the originally-planned 5 dispatch sites to cover the remaining per-DuckDB-type knowledge, so the "one place per family" invariant holds across the whole extension.
+
+**Goal**: After Phase 7.5, adding a new DuckDB type requires changes ONLY in `src/codec/<X>_codec.{cpp,hpp}` (encode/decode/literal/DDL/wire-token/length/compat) plus one new arm in `tds_row_reader.cpp` (TDS wire dispatch keyed by wire-token, not by LogicalType). Test-only helpers move out of production source.
+
+**Independent Test**: `grep -rEn 'case LogicalTypeId::' src/ --include='*.cpp'` outside `src/codec/` returns ≤ 15 matches (vs ~664 baseline; legitimate remainder = the 5 dispatch sites' single TypeFamily switches + `tds_row_reader` TDS-token dispatch + a small handful of edge cases documented in `loc_audit.md`).
+
+### Implementation for Phase 7.5
+
+- [X] T097a Category A: Delete dead `MSSQLValueSerializer` private helpers — `SerializeBoolean/Integer/UBigInt/Float/Double/UUID/Date/Time/Timestamp/TimestampTZ` + `ValidateFloatValue` (11 functions, all unreachable after Phase 6's dispatcher rewrite). Verified via grep: only references outside the file are comment headers in the orphan `test/cpp/test_value_serializer.cpp` (not wired into build); every real call site uses public `Serialize(value, type)` which routes through `codec::FormatSqlLiteral`. NaN/Inf rejection preserved (lives in `codec::float_family`, `float_codec.cpp:71-78`). KEEP `SerializeDecimal` (codec delegates here for hugeint+scale → fixed-point rendering, single source of truth). Net diff: −197 LOC. Commit `2aa5df1` (chore(045) Phase 6 close-out).
+- [ ] T097b Category B: Move test-only `BCPRowEncoder` helpers INTO `test/cpp/test_bcp_row_encoder.cpp` as private static fixtures. List: `EncodeInt8`, `EncodeInt16`, `EncodeInt32`, `EncodeInt64`, `EncodeUInt8`, `EncodeDouble`, `EncodeGUID`, `EncodeNullFixed`, `EncodeNullVariable`, `EncodeNullGUID`, `EncodeNullDateTime`. After the move, delete the corresponding declarations from `bcp_row_encoder.hpp`. KEEP in production (used by the actual BCP encode dispatcher or by codec families): `EncodeBit`, `EncodeFloat`, `EncodeDecimal`, `EncodeBinary`, `EncodeBinaryPLP`, `EncodeDate`, `EncodeTime`, `EncodeDatetime2`, `EncodeDatetimeOffset`, `EncodeNullPLP` (called from EncodeRow lines 65/80/145), `TimestampToDatetime2Components` (called from EncodeDatetime2/Offset). Expected: bcp_row_encoder.cpp 578 → ~430 LOC (−26%).
+- [ ] T097c Migrate `src/copy/target_resolver.cpp` 3 per-LogicalType functions through the codec API. Add to **each** `codec::<X>` family (Boolean, Integer, Float, Decimal, Money, String, Binary, DateTime, Uuid) the following methods:
+  - `uint8_t GetBcpTdsToken(const LogicalType &type)` — returns the wire-format token (e.g., `TDS_TYPE_NVARCHAR`) the BCP encoder uses for this DuckDB type.
+  - `uint32_t GetBcpMaxLength(const LogicalType &type, const mssql::BCPColumnMetadata &col)` — returns the BCP COLMETADATA max-length value.
+  - `bool IsCompatibleWithSqlServerType(const LogicalType &type, const std::string &sql_type_name)` — returns true if this DuckDB type can be COPY-targeted at a column with the given SQL Server type name.
+
+  Then rewrite the 3 target_resolver functions as one-line family-dispatch switches keyed on `codec::FamilyFromLogicalType(type)`. Expected: target_resolver.cpp ~1100 → ~700 LOC (−36%).
+- [ ] T097d Update spec 045 `tasks.md` (this file) + `data-model.md` to reflect the new family-method surface (T097c adds 3 methods per family × 9 families = 27 new entries in the family-method table). Update `contracts/codec_family_interface.md` accordingly.
+- [ ] T097e Audit gate: `grep -rEn 'case LogicalTypeId::' src/ --include='*.cpp' | grep -v 'src/codec/'` — expect ≤ 15 matches (the 5 dispatch sites' family switches + a few documented edge cases). Document the breakdown in `specs/045-type-codec-consolidation/per_type_switch_audit.md`.
+- [ ] T097f clang-format-14 sweep + run all codec/integration tests.
+
+**Concomitant fixes** (out of spec 045 scope but landed on this branch):
+
+- `3af8c79 fix(utf16): IsAsciiString — replace raw uint64_t cast with memcpy` — UBSan was crashing on debug-build `ctas_types.test` (misaligned 8-byte load in pre-spec-043 SWAR fast path). Pre-existing latent bug, unblocked by spec-045 debug iteration. memcpy-based version folds to identical instruction; no perf cost. Repro: `make debug && ./build/debug/test/unittest test/sql/ctas/ctas_types.test` (pre-fix: SIGABRT at utf16.cpp:50; post-fix: 63/63 PASS).
+
+**Checkpoint**: Per-DuckDB-type knowledge fully consolidated in `src/codec/`. Test-only legacy helpers live in test files. `target_resolver.cpp` routes through codec dispatch. Pre-Phase-8 audit ready.
+
+---
+
 ## Phase 8: Polish & Cross-Cutting Concerns
 
 **Purpose**: Final hygiene, performance verification, audit gates, PR description, docs.
@@ -282,7 +316,8 @@
 - **US5 Issue #91 + String (Phase 5)**: Depends on Foundational and US2 (US2 ensured the filter/INSERT call sites already go through `codec::FormatSqlLiteral`; Phase 5 just rewires the String arm).
 - **US3 Remaining families (Phase 6)**: Each sub-family depends on Foundational. They can land **in any order** after Foundational + US1 + US2. Decimal subphase has an internal dependency: HUGEINT-from-Integer routes through `codec::decimal::EncodeToBcp` (T016 stub returns from Integer to Decimal), so Decimal SHOULD migrate before Integer's HUGEINT path is fully exercised — BUT for the byte-identical golden-fixture test on Integer, the legacy `EncodeDecimal` still works as a fallback during the lag.
 - **US4 DDL final (Phase 7)**: Depends on ALL 9 families being migrated (the DDL dispatcher rewrite requires each family's `FormatDdlTypeName` exists).
-- **Polish (Phase 8)**: Depends on US4 complete (LOC/audit gates need final state).
+- **Phase 7.5 (scope expansion — per-type switch consolidation)**: Depends on US4 (the 5-site dispatch unification must be done before extending the pattern to additional sites). Independent within itself — T097a/b are file-local refactors, T097c is the substantive new work (target_resolver migration + new family-method surface).
+- **Polish (Phase 8)**: Depends on Phase 7.5 complete (LOC/audit gates count the post-7.5 state — including target_resolver reduction).
 
 ### Family-Internal Dependencies (within Phase 6)
 
