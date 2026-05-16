@@ -2,7 +2,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include "codec/boolean_codec.hpp"
+#include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
@@ -262,6 +265,16 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		return;
 	}
 
+	// Issue #89: catalog vs runtime type divergence. SQL Server views can project a column
+	// at a different type than sys.columns reports (typically via CAST/CONVERT inside the
+	// view definition). When the destination vector was allocated as VARCHAR from the catalog
+	// but TDS sends back a non-string type, render the value as a string instead of crashing
+	// inside FlatVector::GetData<T> with a vector-type assertion.
+	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id)) {
+		WriteAsStringFallback(value, column, vector, row_idx);
+		return;
+	}
+
 	switch (column.type_id) {
 	case TDS_TYPE_TINYINT:
 	case TDS_TYPE_SMALLINT:
@@ -284,7 +297,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	case TDS_TYPE_DECIMAL:
 	case TDS_TYPE_NUMERIC:
-		ConvertDecimal(value, column, vector, row_idx);
+		mssql::codec::decimal::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_MONEY:
@@ -331,22 +344,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
-	}
-}
-
-void TypeConverter::ConvertDecimal(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								   idx_t row_idx) {
-	hugeint_t int_value = DecimalEncoding::ConvertDecimal(value.data(), value.size());
-
-	// DuckDB DECIMAL uses different storage based on precision
-	if (column.precision <= 4) {
-		FlatVector::GetData<int16_t>(vector)[row_idx] = static_cast<int16_t>(int_value.lower);
-	} else if (column.precision <= 9) {
-		FlatVector::GetData<int32_t>(vector)[row_idx] = static_cast<int32_t>(int_value.lower);
-	} else if (column.precision <= 18) {
-		FlatVector::GetData<int64_t>(vector)[row_idx] = static_cast<int64_t>(int_value.lower);
-	} else {
-		FlatVector::GetData<hugeint_t>(vector)[row_idx] = int_value;
 	}
 }
 
@@ -422,6 +419,116 @@ void TypeConverter::ConvertDatetimeOffset(const std::vector<uint8_t> &value, con
 void TypeConverter::ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
 	hugeint_t guid = GuidEncoding::ConvertGuid(value.data());
 	FlatVector::GetData<hugeint_t>(vector)[row_idx] = guid;
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #89 — VARCHAR fallback for catalog-vs-runtime type divergence
+//===----------------------------------------------------------------------===//
+
+bool TypeConverter::IsStringTdsType(uint8_t type_id) {
+	switch (type_id) {
+	case TDS_TYPE_BIGCHAR:
+	case TDS_TYPE_BIGVARCHAR:
+	case TDS_TYPE_NCHAR:
+	case TDS_TYPE_NVARCHAR:
+	case TDS_TYPE_XML:
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+namespace {
+
+std::string FormatIntegerFallback(const std::vector<uint8_t> &value) {
+	// Mirror codec::integer::DecodeFromTds size-dispatch — TINYINT is unsigned (0-255),
+	// SMALLINT/INT/BIGINT are signed.
+	switch (value.size()) {
+	case 1:
+		return std::to_string(static_cast<unsigned int>(value[0]));
+	case 2: {
+		int16_t v = 0;
+		std::memcpy(&v, value.data(), 2);
+		return std::to_string(v);
+	}
+	case 4: {
+		int32_t v = 0;
+		std::memcpy(&v, value.data(), 4);
+		return std::to_string(v);
+	}
+	case 8: {
+		int64_t v = 0;
+		std::memcpy(&v, value.data(), 8);
+		return std::to_string(v);
+	}
+	default:
+		throw InvalidInputException("VARCHAR fallback: unexpected integer length %zu", value.size());
+	}
+}
+
+std::string FormatFloatFallback(const std::vector<uint8_t> &value) {
+	std::ostringstream oss;
+	if (value.size() == 4) {
+		float f = 0;
+		std::memcpy(&f, value.data(), 4);
+		oss << std::setprecision(9) << f;
+	} else if (value.size() == 8) {
+		double d = 0;
+		std::memcpy(&d, value.data(), 8);
+		oss << std::setprecision(17) << d;
+	} else {
+		throw InvalidInputException("VARCHAR fallback: unexpected float length %zu", value.size());
+	}
+	return oss.str();
+}
+
+}  // namespace
+
+void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, const ColumnMetadata &column,
+										  Vector &vector, idx_t row_idx) {
+	std::string rendered;
+	switch (column.type_id) {
+	case TDS_TYPE_TINYINT:
+	case TDS_TYPE_SMALLINT:
+	case TDS_TYPE_INT:
+	case TDS_TYPE_BIGINT:
+	case TDS_TYPE_INTN:
+		rendered = FormatIntegerFallback(value);
+		break;
+	case TDS_TYPE_BIT:
+	case TDS_TYPE_BITN:
+		rendered = (!value.empty() && value[0] != 0) ? "1" : "0";
+		break;
+	case TDS_TYPE_REAL:
+	case TDS_TYPE_FLOAT:
+	case TDS_TYPE_FLOATN:
+		rendered = FormatFloatFallback(value);
+		break;
+	case TDS_TYPE_DECIMAL:
+	case TDS_TYPE_NUMERIC:
+		rendered = mssql::codec::decimal::RenderAsString(value, column.precision, column.scale);
+		break;
+	case TDS_TYPE_MONEY:
+	case TDS_TYPE_SMALLMONEY:
+	case TDS_TYPE_MONEYN:
+		rendered = mssql::codec::decimal::RenderMoneyAsString(value);
+		break;
+	case TDS_TYPE_UNIQUEIDENTIFIER: {
+		hugeint_t guid = GuidEncoding::ConvertGuid(value.data());
+		rendered = UUID::ToString(guid);
+		break;
+	}
+	default:
+		throw InvalidInputException(
+			"MSSQL: catalog reported VARCHAR for this column but SQL Server returned TDS type 0x%02X — "
+			"this typically happens with VIEWs that CAST/CONVERT a column to a different type. "
+			"Workaround: re-attach the database after the view definition changed, or use mssql_scan() "
+			"with an explicit CAST in the query.",
+			column.type_id);
+	}
+	FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, rendered);
 }
 
 }  // namespace encoding

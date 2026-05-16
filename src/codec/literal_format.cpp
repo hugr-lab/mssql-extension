@@ -16,6 +16,7 @@
 #include "codec/literal_format.hpp"
 
 #include "codec/boolean_codec.hpp"
+#include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
@@ -47,7 +48,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Float:
 		return float_family::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Decimal:
-		ThrowFamilyNotMigrated("Decimal", type);
+		return decimal::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Money:
 		ThrowFamilyNotMigrated("Money", type);
 	case TypeFamily::String:
@@ -71,7 +72,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Float:
 		return float_family::EstimateLiteralSize(type);
 	case TypeFamily::Decimal:
-		ThrowFamilyNotMigrated("Decimal", type);
+		return decimal::EstimateLiteralSize(type);
 	case TypeFamily::Money:
 		ThrowFamilyNotMigrated("Money", type);
 	case TypeFamily::String:

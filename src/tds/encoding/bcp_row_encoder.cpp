@@ -1,6 +1,7 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
 #include "codec/boolean_codec.hpp"
+#include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
@@ -106,27 +107,7 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			break;
 		}
 		case LogicalTypeId::DECIMAL: {
-			// DuckDB stores DECIMAL in different internal types based on precision:
-			// precision <= 4: int16_t, <= 9: int32_t, <= 18: int64_t, > 18: hugeint_t
-			auto internal_type = vec.GetType().InternalType();
-			hugeint_t decimal_value;
-			switch (internal_type) {
-			case PhysicalType::INT16:
-				decimal_value = hugeint_t(GetVectorValue<int16_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT32:
-				decimal_value = hugeint_t(GetVectorValue<int32_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT64:
-				decimal_value = hugeint_t(GetVectorValue<int64_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT128:
-				decimal_value = GetVectorValue<hugeint_t>(vec, row_idx);
-				break;
-			default:
-				throw InternalException("Unexpected physical type for DECIMAL: %s", TypeIdToString(internal_type));
-			}
-			EncodeDecimal(buffer, decimal_value, col.precision, col.scale);
+			mssql::codec::decimal::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		}
 		case LogicalTypeId::VARCHAR:
@@ -203,7 +184,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		mssql::codec::float_family::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::DECIMAL:
-		EncodeDecimal(buffer, value.GetValue<hugeint_t>(), col.precision, col.scale);
+		mssql::codec::decimal::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::INTERVAL:

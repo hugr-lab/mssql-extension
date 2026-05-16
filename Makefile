@@ -287,6 +287,27 @@ test-codec-%: debug
 	@echo "Running codec unit test for $*..."
 	$(CODEC_TEST_RPATH) build/test/test_$*_codec
 
+# TypeConverter VARCHAR-fallback test (issue #89 regression — spec 045 Phase 6 sub-phase 3).
+# Exercises the "catalog says VARCHAR but TDS returns non-string" path that views with
+# CAST/CONVERT can trigger.
+test-type-converter-fallback: debug
+	@echo "Building TypeConverter VARCHAR-fallback test..."
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/codec/test_type_converter_fallback.cpp \
+	    src/tds/encoding/type_converter.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_type_converter_fallback
+	@echo ""
+	@echo "Running TypeConverter VARCHAR-fallback test..."
+	$(CODEC_TEST_RPATH) build/test/test_type_converter_fallback
+
 # Shared literal_format dispatcher test (covers LiteralContext divergence cases)
 test-literal-format: debug
 	@echo "Building shared literal_format test..."

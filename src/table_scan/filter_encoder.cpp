@@ -141,7 +141,7 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::DECIMAL:
-		return value.ToString();
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::INTERVAL:

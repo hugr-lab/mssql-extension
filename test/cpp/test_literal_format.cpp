@@ -200,6 +200,30 @@ void TestBooleanFamilyDispatcherWired() {
 	CHECK_EQ(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BOOLEAN), static_cast<size_t>(1));
 }
 
+void TestDecimalFamilyDispatcherWired() {
+	std::cout << "Test: Decimal dispatcher arm routes to codec::decimal (Phase 6 sub-phase 3)\n";
+
+	auto v = Value::DECIMAL(static_cast<int16_t>(1234), 4, 2);
+	auto filter = duckdb::mssql::codec::FormatSqlLiteral(v, v.type(), LiteralContext::Filter);
+	auto insert = duckdb::mssql::codec::FormatSqlLiteral(v, v.type(), LiteralContext::InsertValues);
+	CHECK_EQ(filter, std::string("12.34"));
+	CHECK_EQ(filter, insert);
+
+	// HUGEINT also routes through Decimal codec (FR-025).
+	auto huge_filter = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT,
+															  LiteralContext::Filter);
+	auto huge_insert = duckdb::mssql::codec::FormatSqlLiteral(Value::HUGEINT(hugeint_t(0, 42)), LogicalType::HUGEINT,
+															  LiteralContext::InsertValues);
+	CHECK_EQ(huge_filter, std::string("42"));
+	CHECK_EQ(huge_filter, huge_insert);
+
+	auto bound = duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DECIMAL(19, 4));
+	if (bound == 0) {
+		++failures;
+		std::cerr << "FAIL: Decimal EstimateLiteralSize returned 0\n";
+	}
+}
+
 void TestFloatFamilyDispatcherWired() {
 	std::cout << "Test: Float dispatcher arm routes to codec::float_family (Phase 6 sub-phase 2)\n";
 
@@ -235,6 +259,13 @@ void TestUnmigratedFamiliesThrow() {
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BLOB));
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DATE));
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID));
+
+	// MONEY (DuckDB has no MONEY type; codec::money is decode-only fence —
+	// FormatSqlLiteral / EstimateLiteralSize remain undefined). Confirm the
+	// dispatcher still throws for Money family. There's no LogicalType that
+	// maps to TypeFamily::Money so this assertion is implicit — when MONEY
+	// values arrive on the wire they decode into DECIMAL(19,4) vectors and
+	// surface through the Decimal family.
 }
 
 }  // namespace
@@ -247,6 +278,7 @@ int main() {
 	TestStringFamilyDispatcherWired();
 	TestBooleanFamilyDispatcherWired();
 	TestFloatFamilyDispatcherWired();
+	TestDecimalFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

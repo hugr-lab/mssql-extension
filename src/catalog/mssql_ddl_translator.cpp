@@ -1,5 +1,6 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
@@ -107,15 +108,8 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	}
 
 	case LogicalTypeId::DECIMAL: {
-		// Get precision and scale, clamp to SQL Server limits
-		uint8_t width, scale;
-		type.GetDecimalProperties(width, scale);
-		// SQL Server: precision 1-38, scale 0-precision
-		uint8_t precision = width > 38 ? 38 : width;
-		if (scale > precision) {
-			scale = precision;
-		}
-		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::decimal::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
 	}
 
 	case LogicalTypeId::VARCHAR: {
@@ -359,17 +353,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 	case LogicalTypeId::DOUBLE:
 		return mssql::codec::float_family::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
-	case LogicalTypeId::DECIMAL: {
-		// Get precision and scale, clamp to SQL Server limits (FR-017)
-		uint8_t width, scale;
-		type.GetDecimalProperties(width, scale);
-		// SQL Server: precision 1-38, scale 0-precision
-		uint8_t precision = width > 38 ? 38 : width;
-		if (scale > precision) {
-			scale = precision;
-		}
-		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
-	}
+	case LogicalTypeId::DECIMAL:
+		return mssql::codec::decimal::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::VARCHAR:
 		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
