@@ -14,7 +14,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 	  is_case_sensitive(false),
 	  is_unicode(false),
 	  is_utf8(false),
-	  is_cast_required(false) {}
+	  is_cast_required(false),
+	  is_geometry(false) {}
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 								 uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
@@ -41,7 +42,18 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	// Map to DuckDB type
 	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale);
 
-	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown
+	// Detect geometry/geography UDTs — table scan rewrites these to .STAsBinary()
+	// so the wire delivers OGC WKB bytes (varbinary(max)) instead of MS's
+	// proprietary Spatial Type Binary Format. Catalog reports LogicalType::GEOMETRY().
+	{
+		string lower_type = sql_type_name;
+		std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+					   [](unsigned char c) { return std::tolower(c); });
+		is_geometry = (lower_type == "geometry" || lower_type == "geography");
+	}
+
+	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown.
+	// Geometry/geography are "known" (we handle them via STAsBinary rewrite), not auto-CAST.
 	is_cast_required = !IsKnownSQLServerType(sql_type_name);
 }
 
@@ -185,6 +197,13 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		return LogicalType::UUID;
 	}
 
+	// Spatial types — geometry and geography both arrive via STAsBinary() rewrite
+	// (see is_geometry handling in the constructor + table_scan::BuildColumnExpression).
+	// DuckDB's first-class GEOMETRY type stores WKB bytes — same physical storage as BLOB.
+	if (lower_type == "geometry" || lower_type == "geography") {
+		return LogicalType::GEOMETRY();
+	}
+
 	// Default to VARCHAR for unknown types
 	return LogicalType::VARCHAR;
 }
@@ -208,7 +227,9 @@ bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 		   lower_type == "binary" || lower_type == "varbinary" || lower_type == "image" ||
 		   lower_type == "uniqueidentifier" ||
 		   // XML has dedicated TDS-level support (0xF1) and works without CAST
-		   lower_type == "xml";
+		   lower_type == "xml" ||
+		   // Spatial UDTs — handled by table-scan rewrite to STAsBinary() (spec 045 / sub-phase 5).
+		   lower_type == "geometry" || lower_type == "geography";
 }
 
 bool MSSQLColumnInfo::IsTextType(const string &sql_type_name) {

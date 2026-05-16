@@ -85,7 +85,17 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 										 bool convert_varchar_max) {
 	std::string escaped_name = "[" + FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
 
-	// Unsupported SQL Server types (geometry, hierarchyid, sql_variant, CLR UDTs, etc.)
+	// Geometry/geography UDTs: rewrite to .STAsBinary() so the wire delivers OGC WKB
+	// (varbinary(max)) instead of MS's proprietary Spatial Type Binary Format. The
+	// result lands in a LogicalType::GEOMETRY() vector via the Binary codec (shared
+	// string_t storage with BLOB). See codec/binary_codec.cpp + type_family.cpp.
+	if (col.is_geometry) {
+		MSSQL_SCAN_DEBUG_LOG(2, "  Geometry rewrite: %s (%s) → STAsBinary()", col_name.c_str(),
+							 col.sql_type_name.c_str());
+		return escaped_name + ".STAsBinary() AS " + escaped_name;
+	}
+
+	// Unsupported SQL Server types (hierarchyid, sql_variant, CLR UDTs, etc.)
 	// must be CAST to NVARCHAR(MAX) so SQL Server sends text instead of native wire format
 	if (col.is_cast_required) {
 		MSSQL_SCAN_DEBUG_LOG(2, "  CAST required: %s (%s) → NVARCHAR(MAX)", col_name.c_str(),

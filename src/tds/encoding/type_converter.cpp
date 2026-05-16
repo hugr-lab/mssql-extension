@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -317,7 +318,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
-		ConvertBinary(value, vector, row_idx);
+		mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_DATE:
@@ -346,11 +347,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
 	}
-}
-
-void TypeConverter::ConvertBinary(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
-	FlatVector::GetData<string_t>(vector)[row_idx] =
-		StringVector::AddStringOrBlob(vector, reinterpret_cast<const char *>(value.data()), value.size());
 }
 
 void TypeConverter::ConvertDate(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
@@ -504,6 +500,10 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 		rendered = UUID::ToString(guid);
 		break;
 	}
+	case TDS_TYPE_BIGBINARY:
+	case TDS_TYPE_BIGVARBINARY:
+		rendered = mssql::codec::binary::RenderAsString(value);
+		break;
 	default:
 		throw InvalidInputException(
 			"MSSQL: catalog reported VARCHAR for this column but SQL Server returned TDS type 0x%02X — "

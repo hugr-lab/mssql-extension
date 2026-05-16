@@ -1,5 +1,6 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -114,15 +115,10 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 		case LogicalTypeId::INTERVAL:
 			mssql::codec::string::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		case LogicalTypeId::BLOB: {
-			auto blob_val = GetVectorValue<string_t>(vec, row_idx);
-			if (col.IsPLPType()) {
-				EncodeBinaryPLP(buffer, blob_val);
-			} else {
-				EncodeBinary(buffer, blob_val);
-			}
+		case LogicalTypeId::BLOB:
+		case LogicalTypeId::GEOMETRY:
+			mssql::codec::binary::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
 		case LogicalTypeId::UUID: {
 			EncodeGUID(buffer, GetVectorValue<hugeint_t>(vec, row_idx));
 			break;
@@ -191,11 +187,8 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		mssql::codec::string::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::BLOB:
-		if (col.IsPLPType()) {
-			EncodeBinaryPLP(buffer, string_t(value.GetValueUnsafe<string>()));
-		} else {
-			EncodeBinary(buffer, string_t(value.GetValueUnsafe<string>()));
-		}
+	case LogicalTypeId::GEOMETRY:
+		mssql::codec::binary::EncodeToBcp(value, col, buffer);
 		break;
 	case LogicalTypeId::UUID:
 		EncodeGUID(buffer, value.GetValue<hugeint_t>());

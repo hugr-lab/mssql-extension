@@ -159,27 +159,7 @@ string MSSQLValueSerializer::SerializeDecimal(const hugeint_t &value, uint8_t wi
 // String Serialization
 //===----------------------------------------------------------------------===//
 
-//===----------------------------------------------------------------------===//
-// Blob Serialization
-//===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::SerializeBlob(const string_t &value) {
-	// 0x hex encoding
-	const char *data = value.GetData();
-	idx_t length = value.GetSize();
-
-	string result = "0x";
-	result.reserve(2 + length * 2);
-
-	static const char hex_chars[] = "0123456789ABCDEF";
-	for (idx_t i = 0; i < length; i++) {
-		unsigned char byte = static_cast<unsigned char>(data[i]);
-		result += hex_chars[byte >> 4];
-		result += hex_chars[byte & 0x0F];
-	}
-
-	return result;
-}
+// Blob serialization migrated to codec::binary (spec 045 Phase 6 sub-phase 5).
 
 //===----------------------------------------------------------------------===//
 // UUID Serialization
@@ -296,7 +276,8 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::BLOB:
-		return SerializeBlob(StringValue::Get(value));
+	case LogicalTypeId::GEOMETRY:
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	case LogicalTypeId::UUID: {
 		// UUID is stored as hugeint_t
@@ -386,11 +367,9 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 		// form for any valid DuckDB interval fits comfortably in ~64 bytes.
 		return mssql::codec::string::EstimateLiteralSize(type) + 64;
 
-	case LogicalTypeId::BLOB: {
-		auto blob_val = StringValue::Get(value);
-		// 0x + 2 hex chars per byte
-		return 2 + blob_val.size() * 2;
-	}
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::GEOMETRY:
+		return mssql::codec::EstimateLiteralSize(type);
 
 	case LogicalTypeId::UUID:
 		return 38;	// 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'

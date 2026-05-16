@@ -169,17 +169,9 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 		return "'" + value.ToString() + "'";
 	}
 
-	case LogicalTypeId::BLOB: {
-		// Convert blob to hex string for SQL Server
-		auto blob_val = value.GetValueUnsafe<string_t>();
-		std::string hex = "0x";
-		for (idx_t i = 0; i < blob_val.GetSize(); i++) {
-			char buf[3];
-			snprintf(buf, sizeof(buf), "%02X", (unsigned char)blob_val.GetData()[i]);
-			hex += buf;
-		}
-		return hex;
-	}
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::GEOMETRY:
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	default:
 		// For other types, try ToString and quote as string. Routes through the

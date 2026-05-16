@@ -86,8 +86,7 @@ public:
 	// Decimal: preserves scale, returns decimal literal
 	static string SerializeDecimal(const hugeint_t &value, uint8_t width, uint8_t scale);
 
-	// Blob: returns 0x hex encoding
-	static string SerializeBlob(const string_t &value);
+	// Blob serialization migrated to codec::binary (spec 045 Phase 6 sub-phase 5).
 
 	// UUID: returns string literal 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 	static string SerializeUUID(const hugeint_t &value);

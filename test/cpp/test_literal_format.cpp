@@ -250,13 +250,25 @@ void TestFloatFamilyDispatcherWired() {
 	}
 }
 
+void TestBinaryFamilyDispatcherWired() {
+	std::cout << "Test: Binary dispatcher arm routes to codec::binary (Phase 6 sub-phase 5)\n";
+	std::string payload(1, (char)0xff);
+	auto value = Value::BLOB_RAW(payload);
+	auto filter =
+		duckdb::mssql::codec::FormatSqlLiteral(value, LogicalType::BLOB, duckdb::mssql::codec::LiteralContext::Filter);
+	CHECK_EQ(filter, std::string("0xFF"));
+	// GEOMETRY also routes through the Binary family (same TypeFamily mapping).
+	auto geo_value = Value::BLOB_RAW(payload);
+	auto geo_out = duckdb::mssql::codec::FormatSqlLiteral(geo_value, LogicalType::GEOMETRY(),
+														  duckdb::mssql::codec::LiteralContext::InsertValues);
+	CHECK_EQ(geo_out, std::string("0xFF"));
+}
+
 void TestUnmigratedFamiliesThrow() {
 	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
 
-	// Sanity check: families NOT yet migrated still throw. Decimal /
-	// Money / Binary / DateTime / Uuid land in subsequent Phase-6
-	// sub-phases.
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::BLOB));
+	// Sanity check: families NOT yet migrated still throw. DateTime / Uuid
+	// land in subsequent Phase-6 sub-phases.
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DATE));
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID));
 
@@ -279,6 +291,7 @@ int main() {
 	TestBooleanFamilyDispatcherWired();
 	TestFloatFamilyDispatcherWired();
 	TestDecimalFamilyDispatcherWired();
+	TestBinaryFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

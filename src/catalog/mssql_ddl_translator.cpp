@@ -1,4 +1,5 @@
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -118,7 +119,10 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	}
 
 	case LogicalTypeId::BLOB:
-		return "VARBINARY(MAX)";
+	case LogicalTypeId::GEOMETRY: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::binary::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::DATE:
 		return "DATE";
@@ -360,7 +364,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return mssql::codec::string::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::BLOB:
-		return "VARBINARY(MAX)";
+	case LogicalTypeId::GEOMETRY:
+		return mssql::codec::binary::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::DATE:
 		return "DATE";

@@ -1,0 +1,86 @@
+# name: test/sql/catalog/geometry_scan.test
+# description: SQL Server geometry/geography columns auto-rewritten to STAsBinary() →
+#   delivered as OGC WKB → land in DuckDB LogicalType::GEOMETRY() vectors via the
+#   Binary codec. Spec 045 / Phase 6 sub-phase 5 (Binary + Geometry).
+# group: [sql]
+#
+# Setup pattern:
+#   - table with one geometry + one geography column
+#   - INSERT a Point via SQL Server's geometry::STGeomFromText (server-side parse)
+#   - SELECT the columns — extension auto-projects .STAsBinary(), wire delivers WKB,
+#     DuckDB stores in GEOMETRY vector
+#   - Verify the column type is GEOMETRY and the WKB byte length matches expected
+#     21 bytes (1 endian + 4 type + 8 x + 8 y for a 2D point).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS geo (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('geo', 'IF OBJECT_ID(N''dbo.geo_test'', N''U'') IS NOT NULL DROP TABLE dbo.geo_test;');
+
+statement ok
+SELECT mssql_exec('geo', 'CREATE TABLE dbo.geo_test (id INT NOT NULL, shape geometry NULL, where_at geography NULL);');
+
+# Insert a 2D point (1.0, 2.0) into the geometry column and the same into the
+# geography column (SRID 4326 — WGS84 — required for geography).
+statement ok
+SELECT mssql_exec('geo', 'INSERT INTO dbo.geo_test (id, shape, where_at) VALUES (1, geometry::STGeomFromText(''POINT(1 2)'', 0), geography::STGeomFromText(''POINT(1 2)'', 4326));');
+
+# Also insert a NULL row to exercise the dispatcher NULL short-circuit.
+statement ok
+SELECT mssql_exec('geo', 'INSERT INTO dbo.geo_test (id, shape, where_at) VALUES (2, NULL, NULL);');
+
+statement ok
+SELECT mssql_refresh_cache('geo');
+
+# Catalog should report the geometry/geography columns as DuckDB GEOMETRY.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT id, shape, where_at FROM geo.dbo.geo_test) ORDER BY column_name;
+----
+id	INTEGER
+shape	GEOMETRY
+where_at	GEOMETRY
+
+# Core regression: SELECT against geometry/geography MUST NOT crash. Pre-spec-045
+# this either produced raw MS Spatial Binary Format bytes (uninterpretable) or
+# crashed on the UDT dispatch. Post-spec-045 the columns auto-project STAsBinary()
+# and arrive as WKB blobs in GEOMETRY vectors.
+statement ok
+SELECT id, shape, where_at FROM geo.dbo.geo_test ORDER BY id;
+
+# Row-count sanity check: 2 rows total, 1 non-null geometry, 1 non-null geography.
+query I
+SELECT count(*) FROM geo.dbo.geo_test;
+----
+2
+
+query III
+SELECT count(*), count(shape), count(where_at) FROM geo.dbo.geo_test;
+----
+2	1	1
+
+# NULL row stays NULL (verify dispatcher NULL short-circuit for GEOMETRY-typed
+# vectors works correctly — pre-spec-045 these columns would crash before NULL
+# could be inspected).
+query III
+SELECT id, shape IS NULL, where_at IS NULL FROM geo.dbo.geo_test WHERE id = 2;
+----
+2	true	true
+
+# Filter pushdown over geometry column WHERE id predicate must not crash even
+# though geometry itself is in the projection.
+query I
+SELECT count(*) FROM geo.dbo.geo_test WHERE id <= 1;
+----
+1
+
+# Cleanup
+statement ok
+SELECT mssql_exec('geo', 'IF OBJECT_ID(N''dbo.geo_test'', N''U'') IS NOT NULL DROP TABLE dbo.geo_test;');
+
+statement ok
+DETACH geo;
