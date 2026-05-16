@@ -92,6 +92,13 @@ void SplitAndResolveInstance(const string &raw_host, bool explicit_port_given, C
 	if (!rr.ok) {
 		throw IOException("MSSQL Error: %s", rr.error.message);
 	}
+	// Honour the host the Browser advertised. In most deployments this equals
+	// the host we queried (Browser runs on the same machine as the engine),
+	// but in failover-cluster / two-hostname setups Browser can point the
+	// client at a different host - every other MC-SQLR client honours this.
+	if (!rr.host.empty()) {
+		result.host = rr.host;
+	}
 	result.port = rr.port;
 }
 
