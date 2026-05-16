@@ -810,9 +810,15 @@ MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
 
 void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
 	lock_guard<mutex> guard(lock);
-	if (contexts.find(name) != contexts.end()) {
-		throw CatalogException("MSSQL Error: Context '%s' already exists. Use a different name or DETACH first.", name);
-	}
+	// We do NOT throw if `name` is already in the map: DuckDB's catalog deduplicates
+	// `ATTACH AS <name>` within a single DatabaseInstance before MSSQLAttach is ever
+	// called. Reaching here with a populated `name` slot means the previous owning
+	// DatabaseInstance was destroyed without going through MSSQLCatalog::OnDetach
+	// (typical for sqllogictest's `--force-reload`, or any process shutdown without
+	// an explicit DETACH) AND the OS reused that DatabaseInstance's address for the
+	// new one — `g_context_managers` is keyed by `DatabaseInstance*`, so the stale
+	// manager came back via Get(). Silently evict the dead entry so the new attach
+	// can proceed. Symmetric pool cleanup is handled in MSSQLAttach prologue.
 	contexts[name] = std::move(ctx);
 }
 
@@ -1190,6 +1196,12 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
+	// Sweep any stale pool registered under this name from a previous DatabaseInstance
+	// at the same memory address (see RegisterContext comment for the full picture).
+	// A leftover pool may hold half-broken TDS connections (e.g. BCP mid-stream
+	// abort never sent ATTENTION); rebuilding it gives the new attach a clean slate.
+	MssqlPoolManager::Instance().RemovePool(name);
+
 	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
