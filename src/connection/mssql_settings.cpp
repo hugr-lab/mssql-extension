@@ -58,10 +58,9 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 
 	// mssql_named_instance_resolution - Enable host\instance resolution via SQL Browser (spec 045)
 	// Escape hatch for environments that strip outbound UDP 1434.
-	config.AddExtensionOption(
-		"mssql_named_instance_resolution",
-		"Enable SQL Server Browser (UDP 1434) resolution of host\\instance connection strings",
-		LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("mssql_named_instance_resolution",
+							  "Enable SQL Server Browser (UDP 1434) resolution of host\\instance connection strings",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
 	// mssql_idle_timeout - Idle connection timeout in seconds
 	config.AddExtensionOption("mssql_idle_timeout", "Idle connection timeout in seconds (0 = no timeout)",

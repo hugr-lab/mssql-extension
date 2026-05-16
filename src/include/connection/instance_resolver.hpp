@@ -52,14 +52,14 @@ struct BrowserInstance {
 
 struct ResolveError {
 	enum class Kind {
-		Unreachable,		// UDP timeout (after the one retry) or send error
-		InstanceNotFound,	// Browser responded but the requested instance was absent
-		TcpDisabled,		// Instance found, but TCP transport disabled on it
-		Malformed,			// Browser returned bytes we couldn't parse
+		Unreachable,	   // UDP timeout (after the one retry) or send error
+		InstanceNotFound,  // Browser responded but the requested instance was absent
+		TcpDisabled,	   // Instance found, but TCP transport disabled on it
+		Malformed,		   // Browser returned bytes we couldn't parse
 	};
 
 	Kind kind;
-	std::string message;	// Human-readable, includes host + instance + diagnostic
+	std::string message;  // Human-readable, includes host + instance + diagnostic
 };
 
 //===----------------------------------------------------------------------===//
@@ -70,8 +70,8 @@ struct ResolveError {
 
 struct ResolveResult {
 	bool ok;
-	uint16_t port;			// valid when ok == true
-	ResolveError error;		// valid when ok == false
+	uint16_t port;		 // valid when ok == true
+	ResolveError error;	 // valid when ok == false
 
 	static ResolveResult Success(uint16_t p) {
 		ResolveResult r;
@@ -131,8 +131,8 @@ public:
 	// Test seam: same as Resolve, but lets the caller override the UDP port
 	// (so a unit test can spin a loopback listener on an ephemeral port).
 	// Not for production use.
-	static ResolveResult ResolveForTest(const std::string &host, uint16_t browser_port,
-	                                    const std::string &instance, int timeout_seconds);
+	static ResolveResult ResolveForTest(const std::string &host, uint16_t browser_port, const std::string &instance,
+										int timeout_seconds);
 };
 
 }  // namespace mssql

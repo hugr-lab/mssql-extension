@@ -73,7 +73,7 @@ std::string HexDump(const uint8_t *data, std::size_t len, std::size_t max_bytes 
 		out += buf;
 	}
 	if (!out.empty()) {
-		out.pop_back();  // trailing space
+		out.pop_back();	 // trailing space
 	}
 	if (len > max_bytes) {
 		out += " ... (";
@@ -209,14 +209,15 @@ std::vector<BrowserInstance> ParseBrowserResponse(const uint8_t *data, std::size
 	// Header: opcode (1 byte) + size (LE u16) + body.
 	if (len < 3) {
 		std::ostringstream oss;
-		oss << "malformed SQL Browser response: too short (" << len << " bytes; need at least 3); hex: " << HexDump(data, len);
+		oss << "malformed SQL Browser response: too short (" << len
+			<< " bytes; need at least 3); hex: " << HexDump(data, len);
 		throw std::runtime_error(oss.str());
 	}
 
 	if (data[0] != 0x05) {
 		std::ostringstream oss;
 		oss << "malformed SQL Browser response: unexpected opcode 0x" << std::hex << static_cast<int>(data[0])
-		    << " (expected 0x05); hex: " << HexDump(data, len);
+			<< " (expected 0x05); hex: " << HexDump(data, len);
 		throw std::runtime_error(oss.str());
 	}
 
@@ -229,7 +230,7 @@ std::vector<BrowserInstance> ParseBrowserResponse(const uint8_t *data, std::size
 	if (advertised > available) {
 		std::ostringstream oss;
 		oss << "malformed SQL Browser response: advertised size " << advertised << " exceeds payload " << available
-		    << "; hex: " << HexDump(data, len);
+			<< "; hex: " << HexDump(data, len);
 		throw std::runtime_error(oss.str());
 	}
 
@@ -354,7 +355,7 @@ std::vector<ResolvedAddr> ResolveAddresses(const std::string &host, uint16_t por
 		a.socktype = rp->ai_socktype;
 		a.protocol = rp->ai_protocol;
 		a.addr.assign(reinterpret_cast<uint8_t *>(rp->ai_addr),
-		              reinterpret_cast<uint8_t *>(rp->ai_addr) + rp->ai_addrlen);
+					  reinterpret_cast<uint8_t *>(rp->ai_addr) + rp->ai_addrlen);
 		out.push_back(std::move(a));
 	}
 	::freeaddrinfo(result);
@@ -365,7 +366,7 @@ std::vector<ResolvedAddr> ResolveAddresses(const std::string &host, uint16_t por
 // Sets timed_out = true if the timeout fired, leaves it false on other
 // failures (logged into err_out).
 bool SendAndRecvOnce(const ResolvedAddr &addr, const std::vector<uint8_t> &req, int timeout_seconds,
-                     std::vector<uint8_t> &resp_out, bool &timed_out, std::string &err_out) {
+					 std::vector<uint8_t> &resp_out, bool &timed_out, std::string &err_out) {
 	timed_out = false;
 	sock_t s = ::socket(addr.family, addr.socktype, addr.protocol);
 	if (s == SOCK_INVALID) {
@@ -386,7 +387,7 @@ bool SendAndRecvOnce(const ResolvedAddr &addr, const std::vector<uint8_t> &req, 
 	// recv would just block until timeout. ECONNREFUSED is a much faster
 	// "Browser not running" signal than waiting 3 seconds.
 	if (::connect(s, reinterpret_cast<const struct sockaddr *>(addr.addr.data()),
-	              static_cast<socklen_t>(addr.addr.size())) != 0) {
+				  static_cast<socklen_t>(addr.addr.size())) != 0) {
 		err_out = "UDP connect() failed";
 		CLOSE_SOCKET(s);
 		return false;
@@ -444,7 +445,7 @@ bool SendAndRecvOnce(const ResolvedAddr &addr, const std::vector<uint8_t> &req, 
 }
 
 ResolveResult ResolveCore(const std::string &raw_host, uint16_t browser_port, const std::string &instance,
-                          int timeout_seconds) {
+						  int timeout_seconds) {
 	const std::string host = NormaliseHost(raw_host);
 
 	std::string err;
@@ -507,7 +508,8 @@ ResolveResult ResolveCore(const std::string &raw_host, uint16_t browser_port, co
 	if (!records.empty()) {
 		oss << "; available: ";
 		for (std::size_t i = 0; i < records.size(); ++i) {
-			if (i > 0) oss << ", ";
+			if (i > 0)
+				oss << ", ";
 			oss << records[i].instance_name;
 		}
 	} else {
@@ -523,7 +525,7 @@ ResolveResult InstanceResolver::Resolve(const std::string &host, const std::stri
 }
 
 ResolveResult InstanceResolver::ResolveForTest(const std::string &host, uint16_t browser_port,
-                                               const std::string &instance, int timeout_seconds) {
+											   const std::string &instance, int timeout_seconds) {
 	return ResolveCore(host, browser_port, instance, timeout_seconds);
 }
 

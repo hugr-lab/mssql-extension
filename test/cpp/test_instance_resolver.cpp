@@ -40,36 +40,38 @@ namespace {
 
 int g_failures = 0;
 
-#define EXPECT(cond, msg)                                                                                              \
-	do {                                                                                                               \
-		if (!(cond)) {                                                                                                 \
-			std::cerr << "  FAIL: " << (msg) << " (" << __FILE__ << ":" << __LINE__ << ")" << std::endl;               \
-			++g_failures;                                                                                              \
-		}                                                                                                              \
+#define EXPECT(cond, msg)                                                                                \
+	do {                                                                                                 \
+		if (!(cond)) {                                                                                   \
+			std::cerr << "  FAIL: " << (msg) << " (" << __FILE__ << ":" << __LINE__ << ")" << std::endl; \
+			++g_failures;                                                                                \
+		}                                                                                                \
 	} while (0)
 
-#define EXPECT_EQ(a, b, msg)                                                                                           \
-	do {                                                                                                               \
-		auto va = (a);                                                                                                 \
-		auto vb = (b);                                                                                                 \
-		if (!(va == vb)) {                                                                                             \
-			std::cerr << "  FAIL: " << (msg) << " — got '" << va << "' expected '" << vb << "' (" << __FILE__ << ":"   \
-			          << __LINE__ << ")" << std::endl;                                                                 \
-			++g_failures;                                                                                              \
-		}                                                                                                              \
+#define EXPECT_EQ(a, b, msg)                                                                                         \
+	do {                                                                                                             \
+		auto va = (a);                                                                                               \
+		auto vb = (b);                                                                                               \
+		if (!(va == vb)) {                                                                                           \
+			std::cerr << "  FAIL: " << (msg) << " — got '" << va << "' expected '" << vb << "' (" << __FILE__ << ":" \
+					  << __LINE__ << ")" << std::endl;                                                               \
+			++g_failures;                                                                                            \
+		}                                                                                                            \
 	} while (0)
 
-#define EXPECT_THROWS(stmt, msg)                                                                                       \
-	do {                                                                                                               \
-		bool threw = false;                                                                                            \
-		try {                                                                                                          \
-			stmt;                                                                                                      \
-		} catch (const std::runtime_error &) { threw = true; }                                                         \
-		if (!threw) {                                                                                                  \
-			std::cerr << "  FAIL: expected runtime_error — " << (msg) << " (" << __FILE__ << ":" << __LINE__ << ")"    \
-			          << std::endl;                                                                                    \
-			++g_failures;                                                                                              \
-		}                                                                                                              \
+#define EXPECT_THROWS(stmt, msg)                                                                                    \
+	do {                                                                                                            \
+		bool threw = false;                                                                                         \
+		try {                                                                                                       \
+			stmt;                                                                                                   \
+		} catch (const std::runtime_error &) {                                                                      \
+			threw = true;                                                                                           \
+		}                                                                                                           \
+		if (!threw) {                                                                                               \
+			std::cerr << "  FAIL: expected runtime_error — " << (msg) << " (" << __FILE__ << ":" << __LINE__ << ")" \
+					  << std::endl;                                                                                 \
+			++g_failures;                                                                                           \
+		}                                                                                                           \
 	} while (0)
 
 //===--------------------------------------------------------------------===//
@@ -79,7 +81,7 @@ int g_failures = 0;
 //===--------------------------------------------------------------------===//
 std::vector<uint8_t> BuildResp(const std::string &body) {
 	std::vector<uint8_t> body_bytes(body.begin(), body.end());
-	body_bytes.push_back(0x00);  // trailing NUL
+	body_bytes.push_back(0x00);	 // trailing NUL
 	std::vector<uint8_t> out;
 	out.reserve(3 + body_bytes.size());
 	out.push_back(0x05);
@@ -98,7 +100,8 @@ void TestSingleInstanceAllFields() {
 	auto pkt = BuildResp("ServerName;SQLHOST;InstanceName;SS2022;IsClustered;No;Version;15.0.4123.1;tcp;1433;;");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT_EQ(rs[0].server_name, std::string("SQLHOST"), "ServerName");
 	EXPECT_EQ(rs[0].instance_name, std::string("SS2022"), "InstanceName");
 	EXPECT_EQ(rs[0].version, std::string("15.0.4123.1"), "Version");
@@ -109,12 +112,13 @@ void TestSingleInstanceAllFields() {
 
 void TestMultipleInstances() {
 	std::cout << "TestMultipleInstances" << std::endl;
-	auto pkt =
-	    BuildResp("ServerName;HOST;InstanceName;SS2019;IsClustered;No;Version;14.0.0.1;tcp;1434;;"
-	              "ServerName;HOST;InstanceName;SS2022;IsClustered;Yes;Version;15.0.0.1;tcp;1435;;");
+	auto pkt = BuildResp(
+		"ServerName;HOST;InstanceName;SS2019;IsClustered;No;Version;14.0.0.1;tcp;1434;;"
+		"ServerName;HOST;InstanceName;SS2022;IsClustered;Yes;Version;15.0.0.1;tcp;1435;;");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 2u, "two records");
-	if (rs.size() < 2) return;
+	if (rs.size() < 2)
+		return;
 	EXPECT_EQ(rs[0].instance_name, std::string("SS2019"), "first instance");
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(1434), "first port");
 	EXPECT(!rs[0].is_clustered, "first not clustered");
@@ -126,20 +130,24 @@ void TestMultipleInstances() {
 void TestUnknownFieldsIgnored() {
 	std::cout << "TestUnknownFieldsIgnored" << std::endl;
 	// Real SQL Browser emits np (named pipes) and may emit rpc, via, etc.
-	auto pkt = BuildResp("ServerName;H;InstanceName;X;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;tcp;14000;rpc;1;;");
+	auto pkt = BuildResp(
+		"ServerName;H;InstanceName;X;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;tcp;14000;rpc;1;;");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record despite extra fields");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(14000), "tcp parsed past np field");
 }
 
 void TestTcpDisabled() {
 	std::cout << "TestTcpDisabled" << std::endl;
 	// Instance with TCP turned off entirely - no 'tcp' field at all.
-	auto pkt = BuildResp("ServerName;H;InstanceName;PIPESONLY;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;;");
+	auto pkt =
+		BuildResp("ServerName;H;InstanceName;PIPESONLY;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;;");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT(!rs[0].tcp_enabled, "tcp_enabled false when no tcp field");
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(0), "tcp_port zero when disabled");
 }
@@ -149,7 +157,8 @@ void TestEmptyTcpValue() {
 	auto pkt = BuildResp("ServerName;H;InstanceName;X;IsClustered;No;Version;15.0;tcp;;;");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT(!rs[0].tcp_enabled, "tcp_enabled false when tcp value empty");
 }
 
@@ -159,7 +168,8 @@ void TestNoTrailingDoubleSemicolon() {
 	auto pkt = BuildResp("ServerName;H;InstanceName;X;IsClustered;No;Version;15.0;tcp;1433");
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record despite missing record terminator");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(1433), "tcp parsed without trailing ;;");
 }
 
@@ -183,7 +193,7 @@ void TestTruncatedHeader() {
 
 void TestWrongOpcode() {
 	std::cout << "TestWrongOpcode" << std::endl;
-	uint8_t pkt[] = {0x04, 0x05, 0x00, 'x', 'y', 'z', 0x00, 0x00};  // 0x04 is CLNT_UCAST_INST (request opcode)
+	uint8_t pkt[] = {0x04, 0x05, 0x00, 'x', 'y', 'z', 0x00, 0x00};	// 0x04 is CLNT_UCAST_INST (request opcode)
 	EXPECT_THROWS({ ParseBrowserResponse(pkt, sizeof(pkt)); }, "opcode != 0x05");
 }
 
@@ -213,7 +223,8 @@ void TestBodyWithoutNul() {
 	pkt.insert(pkt.end(), body.begin(), body.end());
 	auto rs = ParseBrowserResponse(pkt.data(), pkt.size());
 	EXPECT_EQ(rs.size(), 1u, "one record without trailing NUL");
-	if (rs.empty()) return;
+	if (rs.empty())
+		return;
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(1500), "port parsed without NUL terminator");
 }
 
@@ -235,7 +246,8 @@ public:
 
 	MockBrowser(Mode m, std::vector<uint8_t> response) : mode_(m), response_(std::move(response)) {
 		sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-		if (sock_ < 0) throw std::runtime_error("mock: socket() failed");
+		if (sock_ < 0)
+			throw std::runtime_error("mock: socket() failed");
 
 		struct sockaddr_in addr;
 		std::memset(&addr, 0, sizeof(addr));
@@ -270,7 +282,8 @@ public:
 			::sendto(s, "x", 1, 0, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
 			::close(s);
 		}
-		if (thread_.joinable()) thread_.join();
+		if (thread_.joinable())
+			thread_.join();
 		::close(sock_);
 	}
 
@@ -285,8 +298,10 @@ private:
 			struct sockaddr_in peer;
 			socklen_t plen = sizeof(peer);
 			ssize_t n = ::recvfrom(sock_, buf, sizeof(buf), 0, reinterpret_cast<struct sockaddr *>(&peer), &plen);
-			if (n < 0 || stop_.load()) break;
-			if (mode_ == Mode::Silent) continue;
+			if (n < 0 || stop_.load())
+				break;
+			if (mode_ == Mode::Silent)
+				continue;
 			if (mode_ == Mode::Garbage) {
 				uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
 				::sendto(sock_, garbage, sizeof(garbage), 0, reinterpret_cast<struct sockaddr *>(&peer), plen);
@@ -336,7 +351,8 @@ void TestResolveInstanceNotFound() {
 
 void TestResolveTcpDisabled() {
 	std::cout << "TestResolveTcpDisabled" << std::endl;
-	auto resp = BuildResp("ServerName;H;InstanceName;PIPESONLY;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;;");
+	auto resp =
+		BuildResp("ServerName;H;InstanceName;PIPESONLY;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;;");
 	MockBrowser mock(MockBrowser::Mode::Respond, std::move(resp));
 	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "PIPESONLY", 2);
 	EXPECT(!r.ok, "Resolve returned failure");
@@ -379,21 +395,35 @@ void TestNormaliseLocalAliases() {
 	// connection refused. The important thing is the host name didn't fail
 	// DNS, which would be a different error category.
 	EXPECT(r.error.message.find("(local)") == std::string::npos ||
-	           r.error.message.find("DNS lookup failed") == std::string::npos,
-	       "(local) was normalised before DNS");
+			   r.error.message.find("DNS lookup failed") == std::string::npos,
+		   "(local) was normalised before DNS");
 }
 
 #else  // _WIN32
 
-void TestResolveHappyPath() { std::cout << "TestResolveHappyPath (skipped on Windows)" << std::endl; }
-void TestResolveCaseInsensitive() { std::cout << "TestResolveCaseInsensitive (skipped on Windows)" << std::endl; }
-void TestResolveInstanceNotFound() { std::cout << "TestResolveInstanceNotFound (skipped on Windows)" << std::endl; }
-void TestResolveTcpDisabled() { std::cout << "TestResolveTcpDisabled (skipped on Windows)" << std::endl; }
-void TestResolveMalformedResponse() { std::cout << "TestResolveMalformedResponse (skipped on Windows)" << std::endl; }
-void TestResolveSilentBrowser() { std::cout << "TestResolveSilentBrowser (skipped on Windows)" << std::endl; }
-void TestNormaliseLocalAliases() { std::cout << "TestNormaliseLocalAliases (skipped on Windows)" << std::endl; }
+void TestResolveHappyPath() {
+	std::cout << "TestResolveHappyPath (skipped on Windows)" << std::endl;
+}
+void TestResolveCaseInsensitive() {
+	std::cout << "TestResolveCaseInsensitive (skipped on Windows)" << std::endl;
+}
+void TestResolveInstanceNotFound() {
+	std::cout << "TestResolveInstanceNotFound (skipped on Windows)" << std::endl;
+}
+void TestResolveTcpDisabled() {
+	std::cout << "TestResolveTcpDisabled (skipped on Windows)" << std::endl;
+}
+void TestResolveMalformedResponse() {
+	std::cout << "TestResolveMalformedResponse (skipped on Windows)" << std::endl;
+}
+void TestResolveSilentBrowser() {
+	std::cout << "TestResolveSilentBrowser (skipped on Windows)" << std::endl;
+}
+void TestNormaliseLocalAliases() {
+	std::cout << "TestNormaliseLocalAliases (skipped on Windows)" << std::endl;
+}
 
-#endif  // _WIN32
+#endif	// _WIN32
 
 }  // namespace
 
@@ -414,7 +444,8 @@ void TestNormaliseLocalAliases() { std::cout << "TestNormaliseLocalAliases (skip
 //===--------------------------------------------------------------------===//
 int RunCliResolve(int argc, char **argv) {
 	if (argc < 5 || argc > 6) {
-		std::cerr << "usage: " << argv[0] << " --resolve <host> <browser_port> <instance> [timeout_seconds]" << std::endl;
+		std::cerr << "usage: " << argv[0] << " --resolve <host> <browser_port> <instance> [timeout_seconds]"
+				  << std::endl;
 		return 2;
 	}
 	std::string host = argv[2];
@@ -425,7 +456,8 @@ int RunCliResolve(int argc, char **argv) {
 	}
 	std::string instance = argv[4];
 	int timeout = (argc == 6) ? std::atoi(argv[5]) : 3;
-	if (timeout <= 0) timeout = 3;
+	if (timeout <= 0)
+		timeout = 3;
 
 	auto r = InstanceResolver::ResolveForTest(host, static_cast<uint16_t>(browser_port_int), instance, timeout);
 	if (r.ok) {
