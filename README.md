@@ -161,6 +161,55 @@ ATTACH 'mssql://user:password@host:port/database?encrypt=true'
 
 URI format supports URL-encoded components for special characters in credentials.
 
+#### Named Instances (`host\instance`)
+
+Windows SQL Server installs often run multiple instances side-by-side (e.g.
+`SS2019`, `SS2022`, `SQLEXPRESS`), each on a dynamic TCP port chosen at
+service startup. Use the standard `host\instance` syntax — the extension
+queries SQL Server Browser on UDP 1434 to resolve the current port before
+connecting (spec 045):
+
+```sql
+-- ADO.NET form (most common)
+ATTACH 'Server=localhost\SS2022;Database=AdventureWorks;User Id=sa;Password=...;TrustServerCertificate=yes'
+    AS adw (TYPE mssql);
+
+-- URI form -- backslash MUST be URL-encoded as %5C
+ATTACH 'mssql://sa:secret@localhost%5CSS2022/AdventureWorks?trustservercertificate=yes'
+    AS adw (TYPE mssql);
+
+-- Secret form
+CREATE SECRET ss2022 (
+    TYPE mssql,
+    host 'localhost\SS2022',
+    database 'AdventureWorks',
+    user 'sa',
+    password 'secret'
+);
+ATTACH '' AS adw (TYPE mssql, SECRET ss2022);
+```
+
+Explicit `,port` short-circuits the Browser query (useful when the instance
+listens on a fixed port or when UDP 1434 is firewalled). The instance name
+still flows through to LOGIN7 `ServerName`:
+
+```sql
+ATTACH 'Server=localhost\SS2022,5022;Database=AdventureWorks;User Id=sa;Password=...;TrustServerCertificate=yes'
+    AS adw (TYPE mssql);
+```
+
+Two settings control the resolver:
+
+| Setting                           | Default | Purpose                                                                          |
+|-----------------------------------|---------|----------------------------------------------------------------------------------|
+| `mssql_browser_timeout_seconds`   | `3`     | UDP receive timeout per attempt (one retry, so worst-case wait ~2x this).        |
+| `mssql_named_instance_resolution` | `true`  | Set `false` to reject `host\instance` at parse time (forces explicit-port form). |
+
+Works on Linux, macOS, and Windows. See
+[specs/045-named-instance-resolution/quickstart.md](specs/045-named-instance-resolution/quickstart.md)
+for the full reference (error categories, manual repro for issue #77,
+docker test stack).
+
 ### Integrated Authentication (Kerberos / SSPI)
 
 POSIX users with an Active-Directory-joined SQL Server can authenticate via

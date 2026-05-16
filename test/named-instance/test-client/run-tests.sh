@@ -157,5 +157,60 @@ echo "${out}" | grep -qi "not found on host" || {
 }
 echo "  PASS"
 
+echo "[run-tests] step 9: mssql_named_instance_resolution=false rejects host\\instance at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+SET mssql_named_instance_resolution=false;
+ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "named-instance resolution is disabled" || {
+    echo "  FAIL: expected 'named-instance resolution is disabled' error, got: ${out}" >&2
+    exit 9
+}
+echo "  PASS"
+
+echo "[run-tests] step 10: bad instance grammar rejected at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\bad-instance;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "invalid character" || {
+    echo "  FAIL: expected 'invalid character' error, got: ${out}" >&2
+    exit 10
+}
+echo "  PASS"
+
+echo "[run-tests] step 11: empty instance name rejected at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "empty instance name" || {
+    echo "  FAIL: expected 'empty instance name' error, got: ${out}" >&2
+    exit 11
+}
+echo "  PASS"
+
+echo "[run-tests] step 12: secret-form host\\instance is resolved (review finding I1)"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF
+LOAD '${EXT}';
+CREATE SECRET spec045 (TYPE mssql, host '${BROWSER_HOST}\\${INSTANCE}', database 'NamedInstTest', user 'sa', password 'TestPassword1', use_encrypt false);
+ATTACH '' AS db (TYPE mssql, SECRET spec045);
+SELECT payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec045 lives" || {
+    echo "  FAIL: secret-form host\\instance ATTACH did not return probe row" >&2
+    exit 12
+}
+echo "  PASS"
+
 echo ""
 echo "[run-tests] ALL SMOKE TESTS PASSED"

@@ -7,6 +7,96 @@
 #include "connection/instance_resolver.hpp"
 #include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
+
+namespace duckdb {
+
+namespace {
+
+//===----------------------------------------------------------------------===//
+// SplitAndResolveInstance - shared helper for spec 045 named-instance
+// resolution. Used by both FromConnectionString and FromSecret so the secret
+// path doesn't silently lose the host\instance handling.
+//
+// Mutates result->host (always set), result->instance_name (set iff input
+// contains a backslash), and result->port (overwritten with the resolved
+// value when the resolver runs).
+//
+// Throws InvalidInputException on:
+//   - instance grammar violations (empty, > 16 chars, non-grammar character)
+//   - mssql_named_instance_resolution=false combined with host\instance
+// Throws IOException on resolver failures (Browser unreachable, instance
+// not found, TCP transport disabled, malformed response).
+//===----------------------------------------------------------------------===//
+void SplitAndResolveInstance(const string &raw_host, bool explicit_port_given, ClientContext *context,
+							 MSSQLConnectionInfo &result) {
+	auto backslash_pos = raw_host.find('\\');
+	if (backslash_pos == string::npos) {
+		result.host = raw_host;
+		return;
+	}
+
+	// Grammar validation (FR-010). ValidateConnectionString runs the same checks
+	// in the connection-string path; this helper enforces them again for the secret
+	// path (which doesn't go through the validator).
+	if (backslash_pos == 0) {
+		throw InvalidInputException("MSSQL Error: host starts with backslash; expected 'host\\instance'.");
+	}
+	string instance = raw_host.substr(backslash_pos + 1);
+	if (instance.empty()) {
+		throw InvalidInputException("MSSQL Error: empty instance name after backslash in host.");
+	}
+	if (instance.size() > 16) {
+		throw InvalidInputException("MSSQL Error: Instance name '%s' is longer than 16 characters.", instance);
+	}
+	for (char c : instance) {
+		bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '$' ||
+				  c == '#';
+		if (!ok) {
+			throw InvalidInputException(
+				"MSSQL Error: Instance name '%s' contains invalid character '%c'; allowed: [A-Za-z0-9_$#].", instance,
+				c);
+		}
+	}
+
+	result.host = raw_host.substr(0, backslash_pos);
+	result.instance_name = instance;
+
+	// FR-002: explicit port wins; the instance still flows through to LOGIN7
+	// ServerName via result.instance_name.
+	if (explicit_port_given) {
+		return;
+	}
+
+	bool resolution_enabled = true;
+	int browser_timeout = 3;
+	if (context) {
+		Value val;
+		if (context->TryGetCurrentSetting("mssql_named_instance_resolution", val)) {
+			resolution_enabled = val.GetValue<bool>();
+		}
+		if (context->TryGetCurrentSetting("mssql_browser_timeout_seconds", val)) {
+			int64_t t = val.GetValue<int64_t>();
+			if (t > 0) {
+				browser_timeout = static_cast<int>(t);
+			}
+		}
+	}
+	if (!resolution_enabled) {
+		throw InvalidInputException(
+			"MSSQL Error: named-instance resolution is disabled for '%s\\%s' "
+			"(mssql_named_instance_resolution=false); use Server=host,port "
+			"to bypass SQL Server Browser.",
+			result.host, instance);
+	}
+	auto rr = mssql::InstanceResolver::Resolve(result.host, instance, browser_timeout);
+	if (!rr.ok) {
+		throw IOException("MSSQL Error: %s", rr.error.message);
+	}
+	result.port = rr.port;
+}
+
+}  // namespace
+}  // namespace duckdb
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -65,9 +155,13 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	auto &kv_secret = static_cast<const KeyValueSecret &>(*secret);
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
-	result->host = kv_secret.TryGetValue("host").ToString();
+	// Spec 045: secret-form host may be "host\instance". Same parse + resolver
+	// invocation as the connection-string path (review finding I1).
+	string raw_host = kv_secret.TryGetValue("host").ToString();
 	auto port_val = kv_secret.TryGetValue("port");
-	result->port = port_val.IsNull() ? 1433 : static_cast<uint16_t>(port_val.GetValue<int32_t>());
+	bool explicit_port_given = !port_val.IsNull();
+	result->port = explicit_port_given ? static_cast<uint16_t>(port_val.GetValue<int32_t>()) : 1433;
+	SplitAndResolveInstance(raw_host, explicit_port_given, &context, *result);
 	result->database = kv_secret.TryGetValue("database").ToString();
 	result->user = kv_secret.TryGetValue("user").ToString();
 	result->password = kv_secret.TryGetValue("password").ToString();
@@ -721,7 +815,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
 
-	// Parse server (host[\instance][,port])
+	// Parse server (host[\instance][,port]). The host\instance split, grammar
+	// re-check, and resolver invocation all live in SplitAndResolveInstance so
+	// FromSecret can share them (spec 045 review finding I1).
 	auto server = params["server"];
 	bool explicit_port_given = false;
 	string host_part = server;
@@ -733,47 +829,7 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	} else {
 		result->port = 1433;  // Default MSSQL port
 	}
-
-	// Spec 045: split host\instance. Grammar was already validated in
-	// ValidateConnectionString; just split here.
-	auto backslash_pos = host_part.find('\\');
-	if (backslash_pos != string::npos) {
-		result->host = host_part.substr(0, backslash_pos);
-		result->instance_name = host_part.substr(backslash_pos + 1);
-	} else {
-		result->host = host_part;
-	}
-
-	// Spec 045 FR-002: explicit ,port wins; do NOT contact SQL Browser. The instance
-	// name is still carried through to LOGIN7 ServerName via result->instance_name.
-	// FR-012: setting `mssql_named_instance_resolution=false` rejects host\instance at
-	// parse time with a clear error pointing the user at the explicit-port escape hatch.
-	if (!result->instance_name.empty() && !explicit_port_given) {
-		bool resolution_enabled = true;
-		int browser_timeout = 3;
-		if (context) {
-			Value val;
-			if (context->TryGetCurrentSetting("mssql_named_instance_resolution", val)) {
-				resolution_enabled = val.GetValue<bool>();
-			}
-			if (context->TryGetCurrentSetting("mssql_browser_timeout_seconds", val)) {
-				int64_t t = val.GetValue<int64_t>();
-				if (t > 0) {
-					browser_timeout = static_cast<int>(t);
-				}
-			}
-		}
-		if (!resolution_enabled) {
-			throw InvalidInputException(
-				"MSSQL Error: named-instance resolution is disabled "
-				"(mssql_named_instance_resolution=false); use Server=host,port to bypass SQL Server Browser.");
-		}
-		auto rr = mssql::InstanceResolver::Resolve(result->host, result->instance_name, browser_timeout);
-		if (!rr.ok) {
-			throw IOException("MSSQL Error: %s", rr.error.message);
-		}
-		result->port = rr.port;
-	}
+	SplitAndResolveInstance(host_part, explicit_port_given, context, *result);
 
 	result->database = params["database"];
 	result->user = params["user"];
