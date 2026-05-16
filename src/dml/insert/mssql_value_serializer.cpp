@@ -1,18 +1,8 @@
 #include "dml/insert/mssql_value_serializer.hpp"
-#include <cmath>
-#include <iomanip>
-#include <sstream>
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/operator/cast_operators.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/date.hpp"
-#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
-#include "duckdb/common/types/time.hpp"
-#include "duckdb/common/types/timestamp.hpp"
-#include "duckdb/common/types/uuid.hpp"
 
 namespace duckdb {
 
@@ -44,72 +34,6 @@ string MSSQLValueSerializer::EscapeString(const string &value) {
 			result.push_back('\'');
 		}
 		result.push_back(c);
-	}
-	return result;
-}
-
-//===----------------------------------------------------------------------===//
-// Boolean Serialization
-//===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::SerializeBoolean(bool value) {
-	return value ? "1" : "0";
-}
-
-//===----------------------------------------------------------------------===//
-// Integer Serialization
-//===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::SerializeInteger(int64_t value) {
-	return std::to_string(value);
-}
-
-string MSSQLValueSerializer::SerializeUBigInt(uint64_t value) {
-	// Values that fit in int64_t can be serialized directly
-	if (value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-		return std::to_string(value);
-	}
-	// Larger values need CAST to DECIMAL(20,0) since SQL Server BIGINT is signed
-	return StringUtil::Format("CAST(%llu AS DECIMAL(20,0))", value);
-}
-
-//===----------------------------------------------------------------------===//
-// Float/Double Serialization
-//===----------------------------------------------------------------------===//
-
-void MSSQLValueSerializer::ValidateFloatValue(double value) {
-	if (std::isnan(value)) {
-		throw InvalidInputException("NaN values are not supported for SQL Server INSERT");
-	}
-	if (std::isinf(value)) {
-		throw InvalidInputException("Infinity values are not supported for SQL Server INSERT");
-	}
-}
-
-string MSSQLValueSerializer::SerializeFloat(float value) {
-	ValidateFloatValue(static_cast<double>(value));
-
-	std::ostringstream oss;
-	oss << std::setprecision(9) << value;
-	string result = oss.str();
-
-	// Ensure result has decimal point or exponent for SQL Server to treat as float
-	if (result.find('.') == string::npos && result.find('e') == string::npos && result.find('E') == string::npos) {
-		result += ".0";
-	}
-	return result;
-}
-
-string MSSQLValueSerializer::SerializeDouble(double value) {
-	ValidateFloatValue(value);
-
-	std::ostringstream oss;
-	oss << std::setprecision(17) << value;
-	string result = oss.str();
-
-	// Ensure result has decimal point or exponent
-	if (result.find('.') == string::npos && result.find('e') == string::npos && result.find('E') == string::npos) {
-		result += ".0";
 	}
 	return result;
 }
@@ -153,88 +77,6 @@ string MSSQLValueSerializer::SerializeDecimal(const hugeint_t &value, uint8_t wi
 	}
 
 	return result;
-}
-
-//===----------------------------------------------------------------------===//
-// String Serialization
-//===----------------------------------------------------------------------===//
-
-// Blob serialization migrated to codec::binary (spec 045 Phase 6 sub-phase 5).
-
-//===----------------------------------------------------------------------===//
-// UUID Serialization
-//===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::SerializeUUID(const hugeint_t &value) {
-	// UUID stored as hugeint, convert to standard format
-	auto uuid_str = UUID::ToString(value);
-	return "'" + uuid_str + "'";
-}
-
-//===----------------------------------------------------------------------===//
-// Date/Time Serialization
-//===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::SerializeDate(date_t value) {
-	// ISO format: 'YYYY-MM-DD'
-	int32_t year, month, day;
-	Date::Convert(value, year, month, day);
-	return StringUtil::Format("'%04d-%02d-%02d'", year, month, day);
-}
-
-string MSSQLValueSerializer::SerializeTime(dtime_t value) {
-	// ISO format with fractional seconds: 'HH:MM:SS.fffffff'
-	int32_t hour, min, sec, micros;
-	Time::Convert(value, hour, min, sec, micros);
-
-	// Convert microseconds to 100-nanosecond units (7 decimal places)
-	int32_t nanos100 = micros * 10;
-
-	return StringUtil::Format("'%02d:%02d:%02d.%07d'", hour, min, sec, nanos100);
-}
-
-string MSSQLValueSerializer::SerializeTimestamp(timestamp_t value) {
-	// CAST('YYYY-MM-DDTHH:MM:SS.fffffff' AS DATETIME2(7))
-	date_t date_part;
-	dtime_t time_part;
-	Timestamp::Convert(value, date_part, time_part);
-
-	int32_t year, month, day;
-	Date::Convert(date_part, year, month, day);
-
-	int32_t hour, min, sec, micros;
-	Time::Convert(time_part, hour, min, sec, micros);
-
-	// Convert microseconds to 100-nanosecond units
-	int32_t nanos100 = micros * 10;
-
-	return StringUtil::Format("CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d' AS DATETIME2(7))", year, month, day, hour, min,
-							  sec, nanos100);
-}
-
-string MSSQLValueSerializer::SerializeTimestampTZ(timestamp_t value, int32_t offset_seconds) {
-	// CAST('YYYY-MM-DDTHH:MM:SS.fffffff+HH:MM' AS DATETIMEOFFSET(7))
-	date_t date_part;
-	dtime_t time_part;
-	Timestamp::Convert(value, date_part, time_part);
-
-	int32_t year, month, day;
-	Date::Convert(date_part, year, month, day);
-
-	int32_t hour, min, sec, micros;
-	Time::Convert(time_part, hour, min, sec, micros);
-
-	// Convert microseconds to 100-nanosecond units
-	int32_t nanos100 = micros * 10;
-
-	// Format timezone offset
-	char sign = offset_seconds >= 0 ? '+' : '-';
-	int32_t abs_offset = std::abs(offset_seconds);
-	int32_t offset_hours = abs_offset / 3600;
-	int32_t offset_mins = (abs_offset % 3600) / 60;
-
-	return StringUtil::Format("CAST('%04d-%02d-%02dT%02d:%02d:%02d.%07d%c%02d:%02d' AS DATETIMEOFFSET(7))", year, month,
-							  day, hour, min, sec, nanos100, sign, offset_hours, offset_mins);
 }
 
 //===----------------------------------------------------------------------===//

@@ -8,17 +8,18 @@
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
-// MSSQLValueSerializer - Converts DuckDB values to T-SQL literal strings
+// MSSQLValueSerializer - Thin wrapper around the codec literal layer
 //
-// This class provides static methods to convert DuckDB values into T-SQL
-// literal strings suitable for embedding in SQL statements.
+// Public entry points (Serialize / SerializeFromVector / EstimateSerializedSize)
+// dispatch every per-type case through mssql::codec::FormatSqlLiteral so the
+// INSERT / UPDATE / DELETE paths share a single canonical SQL-literal renderer
+// with the filter pushdown path (spec 045 — type codec consolidation).
 //
-// Key design decisions:
-// - All strings use N'...' Unicode literals for server-side collation handling
-// - Single quotes are escaped by doubling: ' → ''
-// - Identifiers are bracket-quoted: name → [name], with ] → ]]
-// - NaN and Infinity values are rejected (SQL Server doesn't support them)
-// - UBIGINT uses CAST to DECIMAL(20,0) to handle values > BIGINT max
+// What remains here:
+//   - Identifier / string escaping helpers (still T-SQL specific).
+//   - SerializeDecimal: hugeint+scale → fixed-point string, kept as a public
+//     helper because codec::decimal::FormatSqlLiteral delegates here for the
+//     core rendering (single source of truth).
 //===----------------------------------------------------------------------===//
 
 class MSSQLValueSerializer {
@@ -62,52 +63,12 @@ public:
 	// @return Escaped string with ' → ''
 	static string EscapeString(const string &value);
 
-	//===----------------------------------------------------------------------===//
-	// Type-Specific Serializers
-	//===----------------------------------------------------------------------===//
-
-	// Boolean: returns "0" or "1" (BIT type)
-	static string SerializeBoolean(bool value);
-
-	// Integer types: returns decimal string
-	static string SerializeInteger(int64_t value);
-
-	// UBIGINT: uses CAST to DECIMAL(20,0) for values > BIGINT max
-	static string SerializeUBigInt(uint64_t value);
-
-	// Float: returns decimal or scientific notation
-	// @throws InvalidInputException for NaN or Infinity
-	static string SerializeFloat(float value);
-
-	// Double: returns decimal or scientific notation
-	// @throws InvalidInputException for NaN or Infinity
-	static string SerializeDouble(double value);
-
-	// Decimal: preserves scale, returns decimal literal
+	// Decimal serializer kept as a public helper: codec::decimal::FormatSqlLiteral
+	// delegates here for the hugeint+scale → fixed-point rendering (single
+	// canonical source). All other per-type Serialize<X> helpers were deleted in
+	// spec 045 Phase 6 close-out — INSERT literal rendering goes exclusively
+	// through codec::FormatSqlLiteral now.
 	static string SerializeDecimal(const hugeint_t &value, uint8_t width, uint8_t scale);
-
-	// Blob serialization migrated to codec::binary (spec 045 Phase 6 sub-phase 5).
-
-	// UUID: returns string literal 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-	static string SerializeUUID(const hugeint_t &value);
-
-	// Date: returns ISO date literal 'YYYY-MM-DD'
-	static string SerializeDate(date_t value);
-
-	// Time: returns ISO time literal 'HH:MM:SS.fffffff'
-	static string SerializeTime(dtime_t value);
-
-	// Timestamp: returns CAST('YYYY-MM-DDTHH:MM:SS.fffffff' AS DATETIME2(7))
-	static string SerializeTimestamp(timestamp_t value);
-
-	// Timestamp with timezone: returns CAST('...' AS DATETIMEOFFSET(7))
-	// @param value UTC timestamp
-	// @param offset_seconds Timezone offset in seconds
-	static string SerializeTimestampTZ(timestamp_t value, int32_t offset_seconds);
-
-private:
-	// Helper to check for NaN/Inf and throw if found
-	static void ValidateFloatValue(double value);
 };
 
 }  // namespace duckdb
