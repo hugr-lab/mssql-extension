@@ -1,0 +1,61 @@
+# Money decode — TDS MONEY/SMALLMONEY/MONEYN wire → DuckDB scaled integer
+#
+# Format:
+#   <wire-LE-hex> | <storage> | <expected-scaled-int>
+#
+# Wire-LE-hex: space-separated bytes (no 0x prefix). Length determines dispatch:
+#   8 bytes → MONEY  (hugeint storage,  DECIMAL(19,4))
+#   4 bytes → SMALLMONEY (int64 storage, DECIMAL(10,4))
+# Storage column documents which FlatVector::GetData<T>() the decoder writes.
+# Expected is the scaled integer DuckDB stores (e.g. 1.5000 → 15000).
+#
+# MONEY (8 bytes) on-wire is high-int32-LE first, then low-int32-LE:
+#   bytes 0..3 = (int32_t)(value >> 32)   little-endian
+#   bytes 4..7 = (int32_t)(value & 0xFFFFFFFF) little-endian
+#   value = (int64_t)high << 32 | (uint32_t)low
+#
+# SMALLMONEY (4 bytes) is a plain int32_t LE.
+
+# === MONEY (8 bytes) — hugeint storage ===
+# Value 0.0000 (scaled 0)
+00 00 00 00 00 00 00 00|hugeint|0
+
+# Value 1.5000 (scaled 15000); high=0, low=15000 (0x00003a98)
+00 00 00 00 98 3a 00 00|hugeint|15000
+
+# Value 100.0000 (scaled 1000000); high=0, low=1000000 (0x000f4240)
+00 00 00 00 40 42 0f 00|hugeint|1000000
+
+# Value -1.5000 (scaled -15000 = 0xFFFFFFFFFFFFC568); high=0xFFFFFFFF, low=0xFFFFC568
+ff ff ff ff 68 c5 ff ff|hugeint|-15000
+
+# Value 9999999999.9999 (scaled 99999999999999 = 0x00005AF3107A3FFF)
+# high=0x00005AF3 → LE bytes f3 5a 00 00
+# low=0x107A3FFF → LE bytes ff 3f 7a 10
+f3 5a 00 00 ff 3f 7a 10|hugeint|99999999999999
+
+# Max positive: 922337203685477.5807 (scaled INT64_MAX = 0x7FFFFFFFFFFFFFFF)
+# high=0x7FFFFFFF → LE bytes ff ff ff 7f
+# low=0xFFFFFFFF → LE bytes ff ff ff ff
+ff ff ff 7f ff ff ff ff|hugeint|9223372036854775807
+
+# Min negative: -922337203685477.5808 (scaled INT64_MIN = 0x8000000000000000)
+# high=0x80000000 → LE bytes 00 00 00 80
+# low=0x00000000 → LE bytes 00 00 00 00
+00 00 00 80 00 00 00 00|hugeint|-9223372036854775808
+
+# === SMALLMONEY (4 bytes) — int64 storage ===
+# Value 0.0000
+00 00 00 00|int64|0
+
+# Value 1.5000 (scaled 15000 = 0x00003a98)
+98 3a 00 00|int64|15000
+
+# Value -1.5000 (scaled -15000 = 0xFFFFC568)
+68 c5 ff ff|int64|-15000
+
+# Max positive: 214748.3647 (scaled INT32_MAX = 0x7FFFFFFF)
+ff ff ff 7f|int64|2147483647
+
+# Min negative: -214748.3648 (scaled INT32_MIN = 0x80000000)
+00 00 00 80|int64|-2147483648

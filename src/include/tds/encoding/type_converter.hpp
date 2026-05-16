@@ -36,9 +36,7 @@ public:
 	static std::string GetTypeName(uint8_t type_id);
 
 private:
-	// Type-specific converters (Boolean + Float + Decimal migrated to codec — spec 045 Phase 6)
-	static void ConvertMoney(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							 idx_t row_idx);
+	// Type-specific converters (Boolean + Float + Decimal + Money migrated to codec — spec 045 Phase 6)
 
 	// Issue #89 fallback: render a non-string TDS value as a string and write into a VARCHAR
 	// destination vector. Used when catalog-declared type (VARCHAR) disagrees with the runtime

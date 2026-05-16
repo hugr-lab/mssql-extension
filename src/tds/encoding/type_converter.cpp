@@ -8,6 +8,7 @@
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
+#include "codec/money_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -303,7 +304,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_MONEY:
 	case TDS_TYPE_SMALLMONEY:
 	case TDS_TYPE_MONEYN:
-		ConvertMoney(value, column, vector, row_idx);
+		mssql::codec::money::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_BIGCHAR:
@@ -344,23 +345,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
-	}
-}
-
-void TypeConverter::ConvertMoney(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								 idx_t row_idx) {
-	hugeint_t int_value;
-
-	if (value.size() == 8) {
-		// MONEY (8 bytes) -> DECIMAL(19,4) requires hugeint_t storage
-		int_value = DecimalEncoding::ConvertMoney(value.data());
-		FlatVector::GetData<hugeint_t>(vector)[row_idx] = int_value;
-	} else if (value.size() == 4) {
-		// SMALLMONEY (4 bytes) -> DECIMAL(10,4) fits in int64_t
-		int_value = DecimalEncoding::ConvertSmallMoney(value.data());
-		FlatVector::GetData<int64_t>(vector)[row_idx] = static_cast<int64_t>(int_value.lower);
-	} else {
-		throw InvalidInputException("Invalid MONEY length: %d", value.size());
 	}
 }
 

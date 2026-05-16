@@ -19,7 +19,7 @@
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/common/vector.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,7 +41,7 @@ namespace mssql {
 namespace codec {
 namespace money {
 
-void DecodeFromTds(const duckdb::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx);
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
