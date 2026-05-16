@@ -157,8 +157,105 @@ std::string FormatTzOffset(int32_t offset_seconds) {
 }  // namespace
 
 //===----------------------------------------------------------------------===//
+// Shared TIMESTAMP_* helpers — used by both DecodeFromTds (wire bytes → native
+// target unit) and EncodeToBcp (native source unit → wire components).
+//
+// DuckDB stores each TIMESTAMP_* variant as an int64 in the type's native unit
+// (TIMESTAMP_SEC=seconds, TIMESTAMP_MS=ms, TIMESTAMP=µs, TIMESTAMP_NS=ns); all
+// share the `timestamp_t` physical wrapper, the unit is carried by the
+// LogicalType. We do all encoding / decoding math at the variant's native
+// precision so DATETIME2(7) ↔ TIMESTAMP_NS round-trips losslessly.
+//===----------------------------------------------------------------------===//
+
+constexpr int64_t SECONDS_PER_DAY = 86400LL;
+constexpr int32_t DAYS_FROM_0001_TO_EPOCH = 719162;
+
+int64_t TicksPerSecondFor(LogicalTypeId id) {
+	switch (id) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+		return 1LL;
+	case LogicalTypeId::TIMESTAMP_MS:
+		return 1000LL;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return 1000000LL;
+	case LogicalTypeId::TIMESTAMP_NS:
+		return 1000000000LL;
+	default:
+		throw InternalException("TicksPerSecondFor: not a TIMESTAMP variant");
+	}
+}
+
+int64_t Pow10(uint8_t exp) {
+	int64_t out = 1;
+	for (uint8_t i = 0; i < exp; i++) {
+		out *= 10;
+	}
+	return out;
+}
+
+void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, uint8_t target_scale,
+								uint64_t &time_value, uint32_t &date_value) {
+	int64_t source_per_sec = TicksPerSecondFor(source_type);
+	int64_t source_per_day = source_per_sec * SECONDS_PER_DAY;
+
+	int64_t days, sub_day_ticks;
+	if (raw_ticks >= 0) {
+		days = raw_ticks / source_per_day;
+		sub_day_ticks = raw_ticks % source_per_day;
+	} else {
+		days = (raw_ticks - source_per_day + 1) / source_per_day;
+		sub_day_ticks = raw_ticks - days * source_per_day;
+	}
+	date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
+
+	int64_t target_per_sec = Pow10(target_scale);
+	if (target_per_sec >= source_per_sec) {
+		// Upscale (e.g. TIMESTAMP_MS → DATETIME2(7)) — exact.
+		time_value = static_cast<uint64_t>(sub_day_ticks * (target_per_sec / source_per_sec));
+	} else {
+		// Downscale (e.g. TIMESTAMP_NS → DATETIME2(3)) — integer truncation.
+		time_value = static_cast<uint64_t>(sub_day_ticks / (source_per_sec / target_per_sec));
+	}
+}
+
+//===----------------------------------------------------------------------===//
 // DecodeFromTds
 //===----------------------------------------------------------------------===//
+
+// Convert a DATETIME2 wire payload (variable-length time portion + 3-byte date)
+// directly into the target DuckDB TIMESTAMP_* variant's native int64 unit,
+// bypassing the µs-intermediate that ConvertDatetime2 hard-codes. This is
+// lossless whenever target precision ≥ wire precision (DATETIME2(7) → TIMESTAMP_NS
+// preserves every 100-ns tick; DATETIME2(3) → TIMESTAMP_MS preserves every ms).
+int64_t Datetime2WireToNativeUnit(const uint8_t *data, size_t time_len, uint8_t wire_scale, LogicalTypeId target_type) {
+	int64_t time_ticks = 0;
+	for (size_t i = 0; i < time_len; i++) {
+		time_ticks |= static_cast<int64_t>(data[i]) << (i * 8);
+	}
+	int32_t days = static_cast<int32_t>(data[time_len]) | (static_cast<int32_t>(data[time_len + 1]) << 8) |
+				   (static_cast<int32_t>(data[time_len + 2]) << 16);
+	int32_t unix_days = days - DAYS_FROM_0001_TO_EPOCH;
+
+	int64_t wire_per_sec = Pow10(wire_scale);
+	int64_t target_per_sec = TicksPerSecondFor(target_type);
+
+	int64_t sub_day_ticks;
+	if (target_per_sec >= wire_per_sec) {
+		sub_day_ticks = time_ticks * (target_per_sec / wire_per_sec);
+	} else {
+		sub_day_ticks = time_ticks / (wire_per_sec / target_per_sec);
+	}
+	return static_cast<int64_t>(unix_days) * SECONDS_PER_DAY * target_per_sec + sub_day_ticks;
+}
+
+size_t Datetime2TimeByteLen(uint8_t scale) {
+	if (scale <= 2)
+		return 3;
+	if (scale <= 4)
+		return 4;
+	return 5;
+}
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
 	switch (col.type_id) {
@@ -173,6 +270,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		return;
 	}
 	case TDS_TYPE_DATETIME: {
+		// DATETIME wire (~3 ms precision) always decodes to TIMESTAMP (µs).
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
 		FlatVector::GetData<timestamp_t>(out)[row] = ts;
 		return;
@@ -183,12 +281,17 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		return;
 	}
 	case TDS_TYPE_DATETIME2: {
-		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime2(bytes.data(), col.scale);
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		// Convert wire bytes directly into the target's native unit (TIMESTAMP_S /
+		// TIMESTAMP_MS / TIMESTAMP / TIMESTAMP_NS) so the µs-bottleneck doesn't
+		// drop precision on DATETIME2(7) → TIMESTAMP_NS round-trips.
+		size_t time_len = Datetime2TimeByteLen(col.scale);
+		int64_t native = Datetime2WireToNativeUnit(bytes.data(), time_len, col.scale, out.GetType().id());
+		FlatVector::GetData<timestamp_t>(out)[row] = timestamp_t(native);
 		return;
 	}
 	case TDS_TYPE_DATETIMEN: {
-		// Length-dispatched: 4 → smalldatetime, 8 → datetime.
+		// Length-dispatched: 4 → smalldatetime, 8 → datetime. Both have fixed
+		// precision below µs so always decode to TIMESTAMP.
 		timestamp_t ts;
 		if (bytes.size() == 8) {
 			ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
@@ -201,6 +304,8 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		return;
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
+		// DuckDB has no nanosecond TZ type; catalog always maps DATETIMEOFFSET
+		// to TIMESTAMP_TZ (µs). Existing decoder returns UTC µs which fits.
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes.data(), col.scale);
 		FlatVector::GetData<timestamp_t>(out)[row] = ts;
 		return;
@@ -225,13 +330,23 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-		tds::encoding::BCPRowEncoder::EncodeDatetime2(buf, GetVectorValue<timestamp_t>(in, row), col.scale);
+	case LogicalTypeId::TIMESTAMP_SEC: {
+		uint64_t time_value;
+		uint32_t date_value;
+		ComputeDatetime2Components(GetVectorValue<timestamp_t>(in, row).value, col.duckdb_type.id(), col.scale,
+								   time_value, date_value);
+		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 		return;
-	case LogicalTypeId::TIMESTAMP_TZ:
-		// DuckDB stores TIMESTAMP_TZ as UTC; offset 0 on the wire.
-		tds::encoding::BCPRowEncoder::EncodeDatetimeOffset(buf, GetVectorValue<timestamp_t>(in, row), 0, col.scale);
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// DuckDB stores TIMESTAMP_TZ as UTC µs; offset 0 on the wire.
+		uint64_t time_value;
+		uint32_t date_value;
+		ComputeDatetime2Components(GetVectorValue<timestamp_t>(in, row).value, LogicalTypeId::TIMESTAMP_TZ, col.scale,
+								   time_value, date_value);
+		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
 		return;
+	}
 	default:
 		throw NotImplementedException("codec::datetime::EncodeToBcp: unexpected DuckDB type '%s'",
 									  col.duckdb_type.ToString());
@@ -258,12 +373,22 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-		tds::encoding::BCPRowEncoder::EncodeDatetime2(buf, TimestampValue::Get(value), col.scale);
+	case LogicalTypeId::TIMESTAMP_SEC: {
+		uint64_t time_value;
+		uint32_t date_value;
+		ComputeDatetime2Components(TimestampValue::Get(value).value, col.duckdb_type.id(), col.scale, time_value,
+								   date_value);
+		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 		return;
-	case LogicalTypeId::TIMESTAMP_TZ:
-		tds::encoding::BCPRowEncoder::EncodeDatetimeOffset(buf, TimestampValue::Get(value), 0, col.scale);
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		uint64_t time_value;
+		uint32_t date_value;
+		ComputeDatetime2Components(TimestampValue::Get(value).value, LogicalTypeId::TIMESTAMP_TZ, col.scale, time_value,
+								   date_value);
+		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
 		return;
+	}
 	default:
 		throw NotImplementedException("codec::datetime::EncodeToBcp(Value): unexpected DuckDB type '%s'",
 									  col.duckdb_type.ToString());
@@ -273,6 +398,32 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 //===----------------------------------------------------------------------===//
 // FormatSqlLiteral
 //===----------------------------------------------------------------------===//
+
+// Render any TIMESTAMP_* variant's raw int64 directly into the 7-digit ISO
+// CAST-form ("YYYY-MM-DDTHH:MM:SS.fffffff") at the source's native precision.
+// Bypasses the µs-only `Timestamp::Convert` / `Time::Convert` chain so
+// TIMESTAMP_NS sends every 100-ns tick to the server.
+static std::string FormatTimestampIsoTFromSource(int64_t raw, LogicalTypeId source) {
+	uint64_t time_value;  // ticks at scale 7 (100 ns)
+	uint32_t date_value;  // days since 0001-01-01
+	ComputeDatetime2Components(raw, source, /*target_scale=*/7, time_value, date_value);
+
+	int32_t unix_days = static_cast<int32_t>(date_value) - DAYS_FROM_0001_TO_EPOCH;
+	date_t d(unix_days);
+	int32_t y, mo, day;
+	Date::Convert(d, y, mo, day);
+
+	// time_value is in 100-ns ticks since midnight.
+	constexpr int64_t HUNDRED_NS_PER_SEC = 10000000LL;
+	int64_t sec_in_day = static_cast<int64_t>(time_value) / HUNDRED_NS_PER_SEC;
+	int64_t hundred_ns = static_cast<int64_t>(time_value) % HUNDRED_NS_PER_SEC;
+	int32_t h = static_cast<int32_t>(sec_in_day / 3600);
+	int32_t mi = static_cast<int32_t>((sec_in_day % 3600) / 60);
+	int32_t s = static_cast<int32_t>(sec_in_day % 60);
+
+	return StringUtil::Format("%04d-%02d-%02dT%02d:%02d:%02d.%07lld", y, mo, day, h, mi, s,
+							  static_cast<long long>(hundred_ns));
+}
 
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext /*ctx*/) {
 	if (v.IsNull()) {
@@ -287,12 +438,11 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return "CAST('" + FormatTimestampIsoT(TimestampValue::Get(v)) + "' AS DATETIME2(7))";
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		// DuckDB stores TIMESTAMP_TZ as UTC internally; emit offset +00:00.
-		auto ts = TimestampValue::Get(v);
-		return "CAST('" + FormatTimestampIsoT(ts) + FormatTzOffset(0) + "' AS DATETIMEOFFSET(7))";
-	}
+		return "CAST('" + FormatTimestampIsoTFromSource(TimestampValue::Get(v).value, type.id()) + "' AS DATETIME2(7))";
+	case LogicalTypeId::TIMESTAMP_TZ:
+		// DuckDB stores TIMESTAMP_TZ as UTC µs internally; emit offset +00:00.
+		return "CAST('" + FormatTimestampIsoTFromSource(TimestampValue::Get(v).value, LogicalTypeId::TIMESTAMP_TZ) +
+			   FormatTzOffset(0) + "' AS DATETIMEOFFSET(7))";
 	default:
 		throw InvalidInputException("codec::datetime::FormatSqlLiteral: unexpected DuckDB type '%s'", type.ToString());
 	}

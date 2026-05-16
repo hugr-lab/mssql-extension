@@ -430,12 +430,8 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 	}
 }
 
-void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uint8_t scale) {
-	// DATETIME2: time (3-5 bytes) + date (3 bytes)
-	uint64_t time_value;
-	uint32_t date_value;
-	TimestampToDatetime2Components(ts, scale, time_value, date_value);
-
+void BCPRowEncoder::EncodeDatetime2Raw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value,
+									   uint8_t scale) {
 	uint8_t time_size = GetTimeByteSize(scale);
 	uint8_t total_size = time_size + 3;
 
@@ -452,31 +448,36 @@ void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uin
 	buffer.push_back(static_cast<uint8_t>((date_value >> 16) & 0xFF));
 }
 
-void BCPRowEncoder::EncodeDatetimeOffset(vector<uint8_t> &buffer, timestamp_t ts, int16_t offset_minutes,
-										 uint8_t scale) {
-	// DATETIMEOFFSET: time (3-5 bytes) + date (3 bytes) + offset (2 bytes signed)
+void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uint8_t scale) {
 	uint64_t time_value;
 	uint32_t date_value;
 	TimestampToDatetime2Components(ts, scale, time_value, date_value);
+	EncodeDatetime2Raw(buffer, time_value, date_value, scale);
+}
 
+void BCPRowEncoder::EncodeDatetimeOffsetRaw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value,
+											int16_t offset_minutes, uint8_t scale) {
 	uint8_t time_size = GetTimeByteSize(scale);
 	uint8_t total_size = time_size + 3 + 2;
 
 	buffer.push_back(total_size);
 
-	// Write time portion (little-endian)
 	for (uint8_t i = 0; i < time_size; i++) {
 		buffer.push_back(static_cast<uint8_t>((time_value >> (i * 8)) & 0xFF));
 	}
-
-	// Write date portion (3 bytes little-endian)
 	buffer.push_back(static_cast<uint8_t>(date_value & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((date_value >> 8) & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((date_value >> 16) & 0xFF));
-
-	// Write offset (2 bytes signed little-endian)
 	buffer.push_back(static_cast<uint8_t>(offset_minutes & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((offset_minutes >> 8) & 0xFF));
+}
+
+void BCPRowEncoder::EncodeDatetimeOffset(vector<uint8_t> &buffer, timestamp_t ts, int16_t offset_minutes,
+										 uint8_t scale) {
+	uint64_t time_value;
+	uint32_t date_value;
+	TimestampToDatetime2Components(ts, scale, time_value, date_value);
+	EncodeDatetimeOffsetRaw(buffer, time_value, date_value, offset_minutes, scale);
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,0 +1,135 @@
+# name: test/sql/catalog/ddl_timestamp_precision.test
+# description: spec 045 FR-024 regression — TIMESTAMP_MS/NS/SEC map to
+#              DATETIME2(3)/(7)/(0) in both CREATE TABLE and CTAS contexts.
+#              Pre-spec-045 these threw NotImplementedException at DDL time.
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db_tspre (TYPE mssql);
+
+statement ok
+DROP TABLE IF EXISTS db_tspre.dbo.ts_precision_create;
+
+statement ok
+DROP TABLE IF EXISTS db_tspre.dbo.ts_precision_ctas;
+
+# -----------------------------------------------------------------------------
+# Plain CREATE TABLE path (MapTypeToSQLServer)
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE db_tspre.dbo.ts_precision_create (
+    col_ms  TIMESTAMP_MS,
+    col_ns  TIMESTAMP_NS,
+    col_sec TIMESTAMP_S,
+    col_ts  TIMESTAMP,
+    col_tz  TIMESTAMP WITH TIME ZONE
+);
+
+# Verify SQL Server-side column types via sys.columns.
+# Expected mapping (spec 045 FR-024 + FR-027):
+#   TIMESTAMP_MS  → DATETIME2(3)
+#   TIMESTAMP_NS  → DATETIME2(7)
+#   TIMESTAMP_S → DATETIME2(0)
+#   TIMESTAMP     → DATETIME2(6)
+#   TIMESTAMP_TZ  → DATETIMEOFFSET(7)
+query TTI
+SELECT name, type_name, scale
+FROM mssql_scan('db_tspre', '
+    SELECT c.name AS name, t.name AS type_name, c.scale AS scale
+    FROM sys.columns c
+    JOIN sys.types t ON c.system_type_id = t.system_type_id AND t.user_type_id = t.system_type_id
+    WHERE c.object_id = OBJECT_ID(''dbo.ts_precision_create'')
+    ORDER BY c.column_id
+');
+----
+col_ms	datetime2	3
+col_ns	datetime2	7
+col_sec	datetime2	0
+col_ts	datetime2	6
+col_tz	datetimeoffset	7
+
+# -----------------------------------------------------------------------------
+# CTAS path (MapLogicalTypeToCTAS)
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE db_tspre.dbo.ts_precision_ctas AS
+SELECT
+    TIMESTAMP_MS '2024-01-15 10:30:45.123'           AS col_ms,
+    TIMESTAMP_NS '2024-01-15 10:30:45.1234567'       AS col_ns,
+    TIMESTAMP_S  '2024-01-15 10:30:45'               AS col_sec,
+    TIMESTAMP    '2024-01-15 10:30:45.123456'        AS col_ts,
+    TIMESTAMPTZ  '2024-01-15 10:30:45+00'            AS col_tz;
+
+# CTAS-created columns must match the plain-CREATE-TABLE columns byte-for-byte
+# (FR-028 — both DDL contexts share the dispatcher).
+query TTI
+SELECT name, type_name, scale
+FROM mssql_scan('db_tspre', '
+    SELECT c.name AS name, t.name AS type_name, c.scale AS scale
+    FROM sys.columns c
+    JOIN sys.types t ON c.system_type_id = t.system_type_id AND t.user_type_id = t.system_type_id
+    WHERE c.object_id = OBJECT_ID(''dbo.ts_precision_ctas'')
+    ORDER BY c.column_id
+');
+----
+col_ms	datetime2	3
+col_ns	datetime2	7
+col_sec	datetime2	0
+col_ts	datetime2	6
+col_tz	datetimeoffset	7
+
+# -----------------------------------------------------------------------------
+# BCP encode round-trip — verify on the server side that no precision was
+# silently truncated by the BCP encoder. mssql_scan + server-side CONVERT
+# bypasses any decoder-side rounding so we observe exactly what landed on disk.
+# -----------------------------------------------------------------------------
+
+query TTTTT
+SELECT * FROM mssql_scan('db_tspre', '
+    SELECT CONVERT(NVARCHAR(40), col_ms,  121) AS col_ms,
+           CONVERT(NVARCHAR(40), col_ns,  121) AS col_ns,
+           CONVERT(NVARCHAR(40), col_sec, 121) AS col_sec,
+           CONVERT(NVARCHAR(40), col_ts,  121) AS col_ts,
+           CONVERT(NVARCHAR(40), col_tz,  121) AS col_tz
+    FROM dbo.ts_precision_ctas
+');
+----
+2024-01-15 10:30:45.123	2024-01-15 10:30:45.1234567	2024-01-15 10:30:45	2024-01-15 10:30:45.123456	2024-01-15 10:30:45.0000000 +00:00
+
+# -----------------------------------------------------------------------------
+# Type-transparent read-back — DATETIME2(scale) maps to the narrowest DuckDB
+# TIMESTAMP_* variant that holds the full wire precision losslessly:
+#   DATETIME2(0)  → TIMESTAMP_S
+#   DATETIME2(3)  → TIMESTAMP_MS
+#   DATETIME2(6)  → TIMESTAMP
+#   DATETIME2(7)  → TIMESTAMP_NS
+# Values round-trip byte-for-byte (no µs-bottleneck precision loss).
+# -----------------------------------------------------------------------------
+
+query TTTTTTTT
+SELECT typeof(col_ms), col_ms,
+       typeof(col_ns), col_ns,
+       typeof(col_sec), col_sec,
+       typeof(col_ts), col_ts
+FROM db_tspre.dbo.ts_precision_ctas;
+----
+TIMESTAMP_MS	2024-01-15 10:30:45.123	TIMESTAMP_NS	2024-01-15 10:30:45.1234567	TIMESTAMP_S	2024-01-15 10:30:45	TIMESTAMP	2024-01-15 10:30:45.123456
+
+# -----------------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------------
+
+statement ok
+DROP TABLE db_tspre.dbo.ts_precision_create;
+
+statement ok
+DROP TABLE db_tspre.dbo.ts_precision_ctas;
+
+statement ok
+DETACH db_tspre;

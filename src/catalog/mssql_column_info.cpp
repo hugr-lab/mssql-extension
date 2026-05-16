@@ -180,10 +180,33 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	if (lower_type == "time") {
 		return LogicalType::TIME;
 	}
-	if (lower_type == "datetime" || lower_type == "datetime2" || lower_type == "smalldatetime") {
+	if (lower_type == "datetime" || lower_type == "smalldatetime") {
+		// Fixed wire precision (~3 ms for DATETIME, 1 min for SMALLDATETIME) —
+		// always fits in DuckDB's µs TIMESTAMP.
 		return LogicalType::TIMESTAMP;
 	}
+	if (lower_type == "datetime2") {
+		// Pick the narrowest DuckDB TIMESTAMP variant that can losslessly hold
+		// the column's wire precision (spec 045 — type round-trip transparency).
+		// scale 0       → TIMESTAMP_S  (seconds)
+		// scale 1-3     → TIMESTAMP_MS (milliseconds)
+		// scale 4-6     → TIMESTAMP    (microseconds — DuckDB native)
+		// scale 7       → TIMESTAMP_NS (DuckDB ns can hold 100-ns wire ticks losslessly)
+		if (scale == 0) {
+			return LogicalType::TIMESTAMP_S;
+		}
+		if (scale <= 3) {
+			return LogicalType::TIMESTAMP_MS;
+		}
+		if (scale <= 6) {
+			return LogicalType::TIMESTAMP;
+		}
+		return LogicalType::TIMESTAMP_NS;
+	}
 	if (lower_type == "datetimeoffset") {
+		// DuckDB has no nanosecond-precision time-zone-aware type; collapse to
+		// µs TIMESTAMP_TZ regardless of source scale (lossless for ≤6, drops
+		// the trailing digit for scale 7).
 		return LogicalType::TIMESTAMP_TZ;
 	}
 
