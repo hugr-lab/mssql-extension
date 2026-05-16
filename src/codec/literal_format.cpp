@@ -6,19 +6,20 @@
 // Canonical 9-arm dispatcher. As each family migrates, its arm is
 // replaced with a direct call into codec::<family>::FormatSqlLiteral.
 //
-// Phase 6 (US3 sub-phases 1-5) — Boolean, Float, Decimal, Binary arms
-// wired. Integer and String arms landed in Phase 4/Phase 5. Money is
+// Phase 6 (US3 sub-phases 1-6) — Boolean, Float, Decimal, Binary, DateTime
+// arms wired. Integer and String arms landed in Phase 4/Phase 5. Money is
 // scan-decode-only (no FormatSqlLiteral); Money values route through the
-// Decimal family at the LogicalType level. Remaining 2 arms (DateTime,
-// Uuid) still throw NotImplementedException; they are unreachable in
-// production until the corresponding family migration phase lands the
-// dispatch-site rewrites that route through this dispatcher.
+// Decimal family at the LogicalType level. Remaining 1 arm (Uuid) still
+// throws NotImplementedException; it is unreachable in production until
+// the Uuid sub-phase lands the dispatch-site rewrites that route through
+// this dispatcher.
 //===----------------------------------------------------------------------===//
 
 #include "codec/literal_format.hpp"
 
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
@@ -59,7 +60,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Binary:
 		return binary::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::DateTime:
-		ThrowFamilyNotMigrated("DateTime", type);
+		return datetime::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Uuid:
 		ThrowFamilyNotMigrated("Uuid", type);
 	}
@@ -83,7 +84,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Binary:
 		return binary::EstimateLiteralSize(type);
 	case TypeFamily::DateTime:
-		ThrowFamilyNotMigrated("DateTime", type);
+		return datetime::EstimateLiteralSize(type);
 	case TypeFamily::Uuid:
 		ThrowFamilyNotMigrated("Uuid", type);
 	}

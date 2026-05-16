@@ -19,11 +19,10 @@
 //   - String family (Phase 5 / US5) — VARCHAR samples route through the
 //     dispatcher and produce N'<escaped>' for both contexts. NULL VARCHAR
 //     short-circuits to "NULL". INTERVAL also routes through String.
-//   - Unmigrated families (Boolean/Float/Decimal/Money/Binary/DateTime/
-//     Uuid) currently throw NotImplementedException. The dispatch sites
-//     (filter_encoder.cpp, mssql_value_serializer.cpp) don't route those
-//     families through the dispatcher yet — they will once Phase 6
-//     family migrations land.
+//   - Unmigrated families (Uuid) currently throw NotImplementedException.
+//     The dispatch sites (filter_encoder.cpp, mssql_value_serializer.cpp)
+//     don't route Uuid through the dispatcher yet — they will once the
+//     Phase 6 Uuid sub-phase migration lands.
 //
 // Build & run:
 //   GEN=ninja make debug
@@ -36,7 +35,10 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include <cassert>
@@ -264,12 +266,36 @@ void TestBinaryFamilyDispatcherWired() {
 	CHECK_EQ(geo_out, std::string("0xFF"));
 }
 
+void TestDateTimeFamilyDispatcherWired() {
+	std::cout << "Test: DateTime dispatcher arm routes to codec::datetime (Phase 6 sub-phase 6)\n";
+	// DATE / TIME / TIMESTAMP / TIMESTAMP_TZ all surface through the same
+	// dispatcher arm; spot-check a few wire-distinct cases.
+	auto date_v = Value::DATE(duckdb::Date::FromDate(2024, 1, 15));
+	auto date_filter = duckdb::mssql::codec::FormatSqlLiteral(date_v, LogicalType::DATE, LiteralContext::Filter);
+	auto date_insert = duckdb::mssql::codec::FormatSqlLiteral(date_v, LogicalType::DATE, LiteralContext::InsertValues);
+	CHECK_EQ(date_filter, std::string("'2024-01-15'"));
+	CHECK_EQ(date_filter, date_insert);
+
+	auto ts =
+		duckdb::Timestamp::FromDatetime(duckdb::Date::FromDate(2024, 1, 15), duckdb::Time::FromTime(14, 30, 0, 0));
+	auto ts_v = Value::TIMESTAMP(ts);
+	auto ts_filter = duckdb::mssql::codec::FormatSqlLiteral(ts_v, LogicalType::TIMESTAMP, LiteralContext::Filter);
+	auto ts_insert = duckdb::mssql::codec::FormatSqlLiteral(ts_v, LogicalType::TIMESTAMP, LiteralContext::InsertValues);
+	CHECK_EQ(ts_filter, ts_insert);
+
+	// EstimateLiteralSize routes through the dispatcher.
+	if (duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DATE) == 0 ||
+		duckdb::mssql::codec::EstimateLiteralSize(LogicalType::TIMESTAMP_TZ) == 0) {
+		++failures;
+		std::cerr << "FAIL: DateTime EstimateLiteralSize returned 0\n";
+	}
+}
+
 void TestUnmigratedFamiliesThrow() {
 	std::cout << "Test: unmigrated family arms still throw NotImplementedException\n";
 
-	// Sanity check: families NOT yet migrated still throw. DateTime / Uuid
-	// land in subsequent Phase-6 sub-phases.
-	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::DATE));
+	// Sanity check: families NOT yet migrated still throw. Only Uuid remains
+	// after Phase-6 sub-phase 6 (DateTime).
 	CHECK_THROWS_NOT_IMPLEMENTED(duckdb::mssql::codec::EstimateLiteralSize(LogicalType::UUID));
 
 	// MONEY (DuckDB has no MONEY type; codec::money is decode-only fence —
@@ -292,6 +318,7 @@ int main() {
 	TestFloatFamilyDispatcherWired();
 	TestDecimalFamilyDispatcherWired();
 	TestBinaryFamilyDispatcherWired();
+	TestDateTimeFamilyDispatcherWired();
 	TestUnmigratedFamiliesThrow();
 
 	if (failures > 0) {

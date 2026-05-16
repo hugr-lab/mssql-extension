@@ -6,6 +6,7 @@
 #include <sstream>
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
@@ -322,22 +323,13 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		break;
 
 	case TDS_TYPE_DATE:
-		ConvertDate(value, vector, row_idx);
-		break;
-
 	case TDS_TYPE_TIME:
-		ConvertTime(value, column, vector, row_idx);
-		break;
-
 	case TDS_TYPE_DATETIME:
 	case TDS_TYPE_SMALLDATETIME:
 	case TDS_TYPE_DATETIME2:
 	case TDS_TYPE_DATETIMEN:
-		ConvertDateTime(value, column, vector, row_idx);
-		break;
-
 	case TDS_TYPE_DATETIMEOFFSET:
-		ConvertDatetimeOffset(value, column, vector, row_idx);
+		mssql::codec::datetime::DecodeFromTds(value, column, vector, row_idx);
 		break;
 
 	case TDS_TYPE_UNIQUEIDENTIFIER:
@@ -347,53 +339,6 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	default:
 		throw InvalidInputException("Type conversion not implemented for type 0x%02X", column.type_id);
 	}
-}
-
-void TypeConverter::ConvertDate(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
-	date_t d = DateTimeEncoding::ConvertDate(value.data());
-	FlatVector::GetData<date_t>(vector)[row_idx] = d;
-}
-
-void TypeConverter::ConvertTime(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-								idx_t row_idx) {
-	dtime_t t = DateTimeEncoding::ConvertTime(value.data(), column.scale);
-	FlatVector::GetData<dtime_t>(vector)[row_idx] = t;
-}
-
-void TypeConverter::ConvertDateTime(const std::vector<uint8_t> &value, const ColumnMetadata &column, Vector &vector,
-									idx_t row_idx) {
-	timestamp_t ts;
-
-	switch (column.type_id) {
-	case TDS_TYPE_DATETIME:
-		ts = DateTimeEncoding::ConvertDatetime(value.data());
-		break;
-	case TDS_TYPE_SMALLDATETIME:
-		ts = DateTimeEncoding::ConvertSmallDatetime(value.data());
-		break;
-	case TDS_TYPE_DATETIME2:
-		ts = DateTimeEncoding::ConvertDatetime2(value.data(), column.scale);
-		break;
-	case TDS_TYPE_DATETIMEN:
-		if (value.size() == 8) {
-			ts = DateTimeEncoding::ConvertDatetime(value.data());
-		} else if (value.size() == 4) {
-			ts = DateTimeEncoding::ConvertSmallDatetime(value.data());
-		} else {
-			throw InvalidInputException("Invalid DATETIMEN length: %d", value.size());
-		}
-		break;
-	default:
-		throw InvalidInputException("Unexpected datetime type: 0x%02X", column.type_id);
-	}
-
-	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
-}
-
-void TypeConverter::ConvertDatetimeOffset(const std::vector<uint8_t> &value, const ColumnMetadata &column,
-										  Vector &vector, idx_t row_idx) {
-	timestamp_t ts = DateTimeEncoding::ConvertDatetimeOffset(value.data(), column.scale);
-	FlatVector::GetData<timestamp_t>(vector)[row_idx] = ts;
 }
 
 void TypeConverter::ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx) {
@@ -503,6 +448,15 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
 		rendered = mssql::codec::binary::RenderAsString(value);
+		break;
+	case TDS_TYPE_DATE:
+	case TDS_TYPE_TIME:
+	case TDS_TYPE_DATETIME:
+	case TDS_TYPE_SMALLDATETIME:
+	case TDS_TYPE_DATETIME2:
+	case TDS_TYPE_DATETIMEN:
+	case TDS_TYPE_DATETIMEOFFSET:
+		rendered = mssql::codec::datetime::RenderAsString(value, column);
 		break;
 	default:
 		throw InvalidInputException(

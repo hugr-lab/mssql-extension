@@ -1,6 +1,7 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
@@ -125,16 +126,15 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 	}
 
 	case LogicalTypeId::DATE:
-		return "DATE";
-
 	case LogicalTypeId::TIME:
-		return "TIME(7)";  // Maximum precision
-
 	case LogicalTypeId::TIMESTAMP:
-		return "DATETIME2(6)";	// Microsecond precision
-
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return "DATETIMEOFFSET(7)";	 // With timezone
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		mssql::CTASConfig default_cfg;
+		return mssql::codec::datetime::FormatDdlTypeName(type, default_cfg, mssql::codec::DdlContext::CreateTable);
+	}
 
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";
@@ -368,16 +368,13 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 		return mssql::codec::binary::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::DATE:
-		return "DATE";
-
 	case LogicalTypeId::TIME:
-		return "TIME(7)";  // Maximum precision
-
 	case LogicalTypeId::TIMESTAMP:
-		return "DATETIME2(7)";	// Maximum precision (100 nanoseconds)
-
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return "DATETIMEOFFSET(7)";	 // With timezone
+		return mssql::codec::datetime::FormatDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
 
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";

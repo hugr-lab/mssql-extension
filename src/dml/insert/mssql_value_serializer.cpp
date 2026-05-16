@@ -286,24 +286,13 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	}
 
 	case LogicalTypeId::DATE:
-		return SerializeDate(DateValue::Get(value));
-
 	case LogicalTypeId::TIME:
-		return SerializeTime(TimeValue::Get(value));
-
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return SerializeTimestamp(TimestampValue::Get(value));
-
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		// For TIMESTAMP_TZ, we need to handle the timezone offset
-		// DuckDB stores TIMESTAMP_TZ as UTC timestamp internally
-		auto ts = TimestampValue::Get(value);
-		// Default to UTC (0 offset) - the server will handle conversion
-		return SerializeTimestampTZ(ts, 0);
-	}
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 
 	default:
 		throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT", type.ToString());
@@ -375,19 +364,13 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 		return 38;	// 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 	case LogicalTypeId::DATE:
-		return 12;	// 'YYYY-MM-DD'
-
 	case LogicalTypeId::TIME:
-		return 20;	// 'HH:MM:SS.fffffff'
-
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return 60;	// CAST('...' AS DATETIME2(7))
-
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return 75;	// CAST('...' AS DATETIMEOFFSET(7))
+		return mssql::codec::EstimateLiteralSize(type);
 
 	default:
 		return 50;	// Conservative default

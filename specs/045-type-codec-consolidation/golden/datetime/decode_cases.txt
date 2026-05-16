@@ -1,0 +1,34 @@
+# DateTime decode cases — codec::datetime::DecodeFromTds
+# Format: type | scale | wire-hex (LE) | expected human form
+#
+# All wire bytes are little-endian, omitting the BCP/PLP length prefix
+# (DecodeFromTds receives the already-extracted payload).
+
+# DATE — always 3 bytes, days since 0001-01-01.
+DATE | 0 | 1A 5C 0B | 2024-01-15  (days=739265 = 719162+20103)
+
+# TIME — scale-dispatched byte count (3/4/5).
+TIME | 0 | A8 CB 00       | 14:30:00.0000000  (52200 second-ticks)
+TIME | 3 | 80 6A 1A 03    | 14:30:00.0000000  (52200000 ms-ticks)
+TIME | 6 | 80 24 7C 25 0C | 14:30:00.0000000  (52200000000 µs-ticks)
+TIME | 7 | 00 76 D9 73 79 | 14:30:00.0000000  (522000000000 100ns-ticks)
+
+# DATETIME — 8 bytes: 4 LE days-from-1900 + 4 LE ticks (1/300 s).
+DATETIME | 0 | DF 6A 00 00 60 F0 EE 00 | 2024-01-15 14:30:00.0000000  (days=27359, ticks=15660000)
+
+# SMALLDATETIME — 4 bytes: 2 LE days-from-1900 + 2 LE minutes.
+SMALLDATETIME | 0 | DF 6A 6E 03 | 2024-01-15 14:30:00.0000000  (days=27359, minutes=870)
+
+# DATETIME2 — time(scale) + 3 date bytes.
+DATETIME2 | 0 | A8 CB 00 1A 5C 0B          | 2024-01-15 14:30:00.0000000
+DATETIME2 | 3 | 80 6A 1A 03 1A 5C 0B       | 2024-01-15 14:30:00.0000000
+DATETIME2 | 6 | 80 24 7C 25 0C 1A 5C 0B    | 2024-01-15 14:30:00.0000000
+DATETIME2 | 7 | 00 76 D9 73 79 1A 5C 0B    | 2024-01-15 14:30:00.0000000
+
+# DATETIMEN — length-dispatched on the wire (legacy datetime/smalldatetime wrapper).
+DATETIMEN | 0 (len 4) | DF 6A 6E 03                  | 2024-01-15 14:30:00.0000000  (SMALLDATETIME path)
+DATETIMEN | 0 (len 8) | DF 6A 00 00 60 F0 EE 00      | 2024-01-15 14:30:00.0000000  (DATETIME path)
+
+# DATETIMEOFFSET — time(scale) + 3 date bytes + 2 offset-minutes (signed).
+# Time stored in UTC; offset is for display only.
+DATETIMEOFFSET | 7 | 00 76 D9 73 79 1A 5C 0B 00 00 | 2024-01-15 14:30:00 UTC

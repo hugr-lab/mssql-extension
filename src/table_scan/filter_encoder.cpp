@@ -147,23 +147,14 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 	case LogicalTypeId::INTERVAL:
 		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
-	case LogicalTypeId::DATE: {
-		auto date_val = value.GetValue<date_t>();
-		return "'" + Date::ToString(date_val) + "'";
-	}
-
+	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIME:
-		// TIME is stored as microseconds since midnight
-		return "'" + value.ToString() + "'";
-
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		auto ts_val = value.GetValue<timestamp_t>();
-		return "'" + Timestamp::ToString(ts_val) + "'";
-	}
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
 
 	case LogicalTypeId::UUID: {
 		return "'" + value.ToString() + "'";

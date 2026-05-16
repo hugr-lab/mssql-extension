@@ -2,6 +2,7 @@
 
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
@@ -123,26 +124,15 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			EncodeGUID(buffer, GetVectorValue<hugeint_t>(vec, row_idx));
 			break;
 		}
-		case LogicalTypeId::DATE: {
-			EncodeDate(buffer, GetVectorValue<date_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::TIME: {
-			EncodeTime(buffer, GetVectorValue<dtime_t>(vec, row_idx), col.scale);
-			break;
-		}
+		case LogicalTypeId::DATE:
+		case LogicalTypeId::TIME:
 		case LogicalTypeId::TIMESTAMP:
 		case LogicalTypeId::TIMESTAMP_MS:
 		case LogicalTypeId::TIMESTAMP_NS:
-		case LogicalTypeId::TIMESTAMP_SEC: {
-			EncodeDatetime2(buffer, GetVectorValue<timestamp_t>(vec, row_idx), col.scale);
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_TZ:
+			mssql::codec::datetime::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
-		case LogicalTypeId::TIMESTAMP_TZ: {
-			// DuckDB stores TIMESTAMP_TZ as UTC, send with offset 0
-			EncodeDatetimeOffset(buffer, GetVectorValue<timestamp_t>(vec, row_idx), 0, col.scale);
-			break;
-		}
 		default:
 			throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
 		}
@@ -194,19 +184,13 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		EncodeGUID(buffer, value.GetValue<hugeint_t>());
 		break;
 	case LogicalTypeId::DATE:
-		EncodeDate(buffer, value.GetValue<date_t>());
-		break;
 	case LogicalTypeId::TIME:
-		EncodeTime(buffer, value.GetValue<dtime_t>(), col.scale);
-		break;
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_SEC:
-		EncodeDatetime2(buffer, value.GetValue<timestamp_t>(), col.scale);
-		break;
 	case LogicalTypeId::TIMESTAMP_TZ:
-		EncodeDatetimeOffset(buffer, value.GetValue<timestamp_t>(), 0, col.scale);
+		mssql::codec::datetime::EncodeToBcp(value, col, buffer);
 		break;
 	default:
 		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
