@@ -10,18 +10,31 @@
 // Build + run:
 //   make test-instance-resolver
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include "connection/instance_resolver.hpp"
 
 using duckdb::mssql::BrowserInstance;
+using duckdb::mssql::InstanceResolver;
 using duckdb::mssql::ParseBrowserResponse;
+using duckdb::mssql::ResolveError;
+using duckdb::mssql::ResolveResult;
 
 namespace {
 
@@ -204,6 +217,184 @@ void TestBodyWithoutNul() {
 	EXPECT_EQ(rs[0].tcp_port, static_cast<uint16_t>(1500), "port parsed without NUL terminator");
 }
 
+//===--------------------------------------------------------------------===//
+// T009 - loopback UDP echo: spin a tiny UDP listener on 127.0.0.1:<ephemeral>
+// and verify Resolve drives it correctly. POSIX-only — the standalone test
+// binary doesn't initialise Winsock, and Phase 2's docker stack provides the
+// cross-platform integration coverage.
+//===--------------------------------------------------------------------===//
+
+#ifndef _WIN32
+
+// MockBrowser - opens a UDP socket on 127.0.0.1:0, returns the ephemeral
+// port, and serves a fixed number of requests in a background thread before
+// shutting down. Modes mirror the docker-stack mock for parity.
+class MockBrowser {
+public:
+	enum class Mode { Respond, Silent, Garbage };
+
+	MockBrowser(Mode m, std::vector<uint8_t> response) : mode_(m), response_(std::move(response)) {
+		sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+		if (sock_ < 0) throw std::runtime_error("mock: socket() failed");
+
+		struct sockaddr_in addr;
+		std::memset(&addr, 0, sizeof(addr));
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = 0;
+		if (::bind(sock_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
+			::close(sock_);
+			throw std::runtime_error("mock: bind() failed");
+		}
+		socklen_t len = sizeof(addr);
+		if (::getsockname(sock_, reinterpret_cast<struct sockaddr *>(&addr), &len) < 0) {
+			::close(sock_);
+			throw std::runtime_error("mock: getsockname() failed");
+		}
+		port_ = ntohs(addr.sin_port);
+
+		thread_ = std::thread([this] { Serve(); });
+	}
+
+	~MockBrowser() {
+		stop_.store(true);
+		// Send a self-poke so the blocking recvfrom unblocks even in
+		// Silent mode (otherwise the thread would hang for ever).
+		struct sockaddr_in addr;
+		std::memset(&addr, 0, sizeof(addr));
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = htons(port_);
+		int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+		if (s >= 0) {
+			::sendto(s, "x", 1, 0, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
+			::close(s);
+		}
+		if (thread_.joinable()) thread_.join();
+		::close(sock_);
+	}
+
+	uint16_t Port() const {
+		return port_;
+	}
+
+private:
+	void Serve() {
+		while (!stop_.load()) {
+			uint8_t buf[1500];
+			struct sockaddr_in peer;
+			socklen_t plen = sizeof(peer);
+			ssize_t n = ::recvfrom(sock_, buf, sizeof(buf), 0, reinterpret_cast<struct sockaddr *>(&peer), &plen);
+			if (n < 0 || stop_.load()) break;
+			if (mode_ == Mode::Silent) continue;
+			if (mode_ == Mode::Garbage) {
+				uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+				::sendto(sock_, garbage, sizeof(garbage), 0, reinterpret_cast<struct sockaddr *>(&peer), plen);
+				continue;
+			}
+			::sendto(sock_, response_.data(), response_.size(), 0, reinterpret_cast<struct sockaddr *>(&peer), plen);
+		}
+	}
+
+	int sock_ = -1;
+	uint16_t port_ = 0;
+	Mode mode_;
+	std::vector<uint8_t> response_;
+	std::atomic<bool> stop_{false};
+	std::thread thread_;
+};
+
+void TestResolveHappyPath() {
+	std::cout << "TestResolveHappyPath" << std::endl;
+	auto resp = BuildResp("ServerName;HOST;InstanceName;TESTINST;IsClustered;No;Version;15.0;tcp;11433;;");
+	MockBrowser mock(MockBrowser::Mode::Respond, std::move(resp));
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "TESTINST", 2);
+	EXPECT(r.ok, "Resolve returned ok");
+	if (r.ok) {
+		EXPECT_EQ(r.port, static_cast<uint16_t>(11433), "resolved port");
+	} else {
+		std::cerr << "    error: " << r.error.message << std::endl;
+	}
+}
+
+void TestResolveCaseInsensitive() {
+	std::cout << "TestResolveCaseInsensitive" << std::endl;
+	auto resp = BuildResp("ServerName;H;InstanceName;TESTINST;IsClustered;No;Version;15.0;tcp;14000;;");
+	MockBrowser mock(MockBrowser::Mode::Respond, std::move(resp));
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "testinst", 2);
+	EXPECT(r.ok, "Resolve matched case-insensitively");
+}
+
+void TestResolveInstanceNotFound() {
+	std::cout << "TestResolveInstanceNotFound" << std::endl;
+	auto resp = BuildResp("ServerName;H;InstanceName;OTHER;IsClustered;No;Version;15.0;tcp;14000;;");
+	MockBrowser mock(MockBrowser::Mode::Respond, std::move(resp));
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "MISSING", 2);
+	EXPECT(!r.ok, "Resolve returned failure");
+	EXPECT(r.error.kind == ResolveError::Kind::InstanceNotFound, "InstanceNotFound kind");
+}
+
+void TestResolveTcpDisabled() {
+	std::cout << "TestResolveTcpDisabled" << std::endl;
+	auto resp = BuildResp("ServerName;H;InstanceName;PIPESONLY;IsClustered;No;Version;15.0;np;\\\\H\\pipe\\sql\\query;;");
+	MockBrowser mock(MockBrowser::Mode::Respond, std::move(resp));
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "PIPESONLY", 2);
+	EXPECT(!r.ok, "Resolve returned failure");
+	EXPECT(r.error.kind == ResolveError::Kind::TcpDisabled, "TcpDisabled kind");
+}
+
+void TestResolveMalformedResponse() {
+	std::cout << "TestResolveMalformedResponse" << std::endl;
+	MockBrowser mock(MockBrowser::Mode::Garbage, {});
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "ANYTHING", 2);
+	EXPECT(!r.ok, "Resolve returned failure");
+	EXPECT(r.error.kind == ResolveError::Kind::Malformed, "Malformed kind");
+}
+
+void TestResolveSilentBrowser() {
+	std::cout << "TestResolveSilentBrowser (~2s wall)" << std::endl;
+	MockBrowser mock(MockBrowser::Mode::Silent, {});
+	auto start = std::chrono::steady_clock::now();
+	auto r = InstanceResolver::ResolveForTest("127.0.0.1", mock.Port(), "WHATEVER", 1);
+	auto elapsed = std::chrono::steady_clock::now() - start;
+	auto elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 1000.0;
+	EXPECT(!r.ok, "Resolve returned failure");
+	EXPECT(r.error.kind == ResolveError::Kind::Unreachable, "Unreachable kind");
+	// 1s timeout + 1 retry = ~2s wall. Allow some slack.
+	EXPECT(elapsed_s >= 1.5 && elapsed_s < 4.0, "elapsed time within retry window");
+	if (!(elapsed_s >= 1.5 && elapsed_s < 4.0)) {
+		std::cerr << "    elapsed: " << elapsed_s << "s" << std::endl;
+	}
+}
+
+void TestNormaliseLocalAliases() {
+	std::cout << "TestNormaliseLocalAliases" << std::endl;
+	// (local) and "." must map to localhost. We can't run the full Resolve
+	// since the host won't bind 1434, but a Resolve against (local) with a
+	// short timeout proves NormaliseHost runs (no "DNS lookup failed for
+	// '(local)'" error — we'd get an unreachable-port error instead).
+	auto r = InstanceResolver::ResolveForTest("(local)", 1, "x", 1);
+	EXPECT(!r.ok, "Resolve failed as expected (no listener)");
+	// The exact error depends on the platform — could be unreachable or
+	// connection refused. The important thing is the host name didn't fail
+	// DNS, which would be a different error category.
+	EXPECT(r.error.message.find("(local)") == std::string::npos ||
+	           r.error.message.find("DNS lookup failed") == std::string::npos,
+	       "(local) was normalised before DNS");
+}
+
+#else  // _WIN32
+
+void TestResolveHappyPath() { std::cout << "TestResolveHappyPath (skipped on Windows)" << std::endl; }
+void TestResolveCaseInsensitive() { std::cout << "TestResolveCaseInsensitive (skipped on Windows)" << std::endl; }
+void TestResolveInstanceNotFound() { std::cout << "TestResolveInstanceNotFound (skipped on Windows)" << std::endl; }
+void TestResolveTcpDisabled() { std::cout << "TestResolveTcpDisabled (skipped on Windows)" << std::endl; }
+void TestResolveMalformedResponse() { std::cout << "TestResolveMalformedResponse (skipped on Windows)" << std::endl; }
+void TestResolveSilentBrowser() { std::cout << "TestResolveSilentBrowser (skipped on Windows)" << std::endl; }
+void TestNormaliseLocalAliases() { std::cout << "TestNormaliseLocalAliases (skipped on Windows)" << std::endl; }
+
+#endif  // _WIN32
+
 }  // namespace
 
 int main() {
@@ -226,6 +417,14 @@ int main() {
 		TestAdvertisedSizeExceedsBuffer();
 		TestRandomGarbage();
 		TestBodyWithoutNul();
+		// Phase 1: end-to-end with a loopback mock browser
+		TestResolveHappyPath();
+		TestResolveCaseInsensitive();
+		TestResolveInstanceNotFound();
+		TestResolveTcpDisabled();
+		TestResolveMalformedResponse();
+		TestResolveSilentBrowser();
+		TestNormaliseLocalAliases();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

@@ -6,16 +6,52 @@
 // Implementation of the MC-SQLR client. See instance_resolver.hpp for the
 // public interface and specs/045-named-instance-resolution/ for the design.
 //
-// Phase 0 (this commit): ParseBrowserResponse only. The UDP transport and
-// the InstanceResolver::Resolve entry points land in Phase 1.
+//   Phase 0: ParseBrowserResponse — pure parser over canned byte buffers.
+//   Phase 1: InstanceResolver::Resolve — UDP transport + retry + match.
 //===----------------------------------------------------------------------===//
 
 #include "connection/instance_resolver.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
+
+// Cross-platform socket headers. Mirror src/tds/tds_socket.cpp so the Windows
+// build picks up WSAStartup via the same path as the TDS layer (spec 019).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef int socklen_t_compat;
+#define CLOSE_SOCKET closesocket
+#define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
+#define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
+#define SOCK_OPT_CAST(x) reinterpret_cast<const char *>(x)
+#define LAST_SOCK_ERROR() WSAGetLastError()
+#define SOCK_INVALID INVALID_SOCKET
+typedef SOCKET sock_t;
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+typedef int sock_t;
+#define CLOSE_SOCKET ::close
+#define SOCK_BUF_CAST(x) reinterpret_cast<void *>(x)
+#define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const void *>(x)
+#define SOCK_OPT_CAST(x) reinterpret_cast<const void *>(x)
+#define LAST_SOCK_ERROR() (errno)
+#define SOCK_INVALID (-1)
+#endif
 
 namespace duckdb {
 namespace mssql {
@@ -222,8 +258,273 @@ std::vector<BrowserInstance> ParseBrowserResponse(const uint8_t *data, std::size
 		}
 		records.push_back(std::move(inst));
 	}
-
 	return records;
+}
+
+//===----------------------------------------------------------------------===//
+// Phase 1: UDP transport
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Convert legacy aliases that real-world users (and sqlcmd) accept.
+// (local) and "." are documented forms for "this machine". The TDS layer
+// itself only knows TCP, so we map them to "localhost" before resolution.
+std::string NormaliseHost(const std::string &host) {
+	if (host == "(local)" || host == ".") {
+		return "localhost";
+	}
+	return host;
+}
+
+bool IEquals(const std::string &a, const std::string &b) {
+	if (a.size() != b.size()) {
+		return false;
+	}
+	for (std::size_t i = 0; i < a.size(); ++i) {
+		if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Build the CLNT_UCAST_INST datagram: 0x04 + ASCII instance + 0x00.
+std::vector<uint8_t> BuildUcastInstRequest(const std::string &instance) {
+	std::vector<uint8_t> pkt;
+	pkt.reserve(2 + instance.size());
+	pkt.push_back(0x04);
+	pkt.insert(pkt.end(), instance.begin(), instance.end());
+	pkt.push_back(0x00);
+	return pkt;
+}
+
+// Set the socket receive timeout. On POSIX, takes a timeval (seconds +
+// microseconds). On Winsock, takes a DWORD of milliseconds — different
+// type AND different field. Centralised here so the call sites stay
+// readable.
+bool SetRecvTimeout(sock_t s, int seconds) {
+#ifdef _WIN32
+	DWORD ms = static_cast<DWORD>(seconds) * 1000U;
+	return ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&ms), sizeof(ms)) == 0;
+#else
+	struct timeval tv;
+	tv.tv_sec = seconds;
+	tv.tv_usec = 0;
+	return ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+// Resolve `host` to a UDP socket address. Returns 0-length vector on
+// failure. Each entry is a fully-populated sockaddr that can be passed to
+// sendto/connect. We try them in order; the first that successfully
+// receives a reply wins. (Practically there's always one address; the
+// loop exists for IPv6/IPv4 dual-stack hosts.)
+struct ResolvedAddr {
+	int family;
+	int socktype;
+	int protocol;
+	std::vector<uint8_t> addr;	// raw sockaddr bytes
+};
+
+std::vector<ResolvedAddr> ResolveAddresses(const std::string &host, uint16_t port, std::string &error_out) {
+	std::vector<ResolvedAddr> out;
+	struct addrinfo hints;
+	std::memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+
+	char port_str[16];
+	std::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));
+
+	struct addrinfo *result = nullptr;
+	int rc = ::getaddrinfo(host.c_str(), port_str, &hints, &result);
+	if (rc != 0) {
+#ifdef _WIN32
+		error_out = "DNS lookup failed for '" + host + "'";
+#else
+		error_out = std::string("DNS lookup failed for '") + host + "': " + gai_strerror(rc);
+#endif
+		return out;
+	}
+	for (struct addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+		ResolvedAddr a;
+		a.family = rp->ai_family;
+		a.socktype = rp->ai_socktype;
+		a.protocol = rp->ai_protocol;
+		a.addr.assign(reinterpret_cast<uint8_t *>(rp->ai_addr),
+		              reinterpret_cast<uint8_t *>(rp->ai_addr) + rp->ai_addrlen);
+		out.push_back(std::move(a));
+	}
+	::freeaddrinfo(result);
+	return out;
+}
+
+// One send + one recv attempt. Returns true on success (resp_out populated).
+// Sets timed_out = true if the timeout fired, leaves it false on other
+// failures (logged into err_out).
+bool SendAndRecvOnce(const ResolvedAddr &addr, const std::vector<uint8_t> &req, int timeout_seconds,
+                     std::vector<uint8_t> &resp_out, bool &timed_out, std::string &err_out) {
+	timed_out = false;
+	sock_t s = ::socket(addr.family, addr.socktype, addr.protocol);
+	if (s == SOCK_INVALID) {
+		err_out = "UDP socket() failed";
+		return false;
+	}
+
+	if (!SetRecvTimeout(s, timeout_seconds)) {
+		err_out = "setsockopt(SO_RCVTIMEO) failed";
+		CLOSE_SOCKET(s);
+		return false;
+	}
+
+	// connect() on a UDP socket sets the default peer for send/recv. Using
+	// it lets us call send()/recv() instead of sendto()/recvfrom(), and
+	// (more usefully) makes the kernel return ECONNREFUSED on the next
+	// recv if the host sent an ICMP "port unreachable" — without it, the
+	// recv would just block until timeout. ECONNREFUSED is a much faster
+	// "Browser not running" signal than waiting 3 seconds.
+	if (::connect(s, reinterpret_cast<const struct sockaddr *>(addr.addr.data()),
+	              static_cast<socklen_t>(addr.addr.size())) != 0) {
+		err_out = "UDP connect() failed";
+		CLOSE_SOCKET(s);
+		return false;
+	}
+
+#ifdef _WIN32
+	int sent = ::send(s, SOCK_BUF_CONST_CAST(req.data()), static_cast<int>(req.size()), 0);
+#else
+	ssize_t sent = ::send(s, req.data(), req.size(), 0);
+#endif
+	if (sent < 0 || static_cast<std::size_t>(sent) != req.size()) {
+		err_out = "UDP send() failed";
+		CLOSE_SOCKET(s);
+		return false;
+	}
+
+	// One MTU is the practical cap for a single UDP datagram on common
+	// networks (1500 - 20 IP - 8 UDP = 1472 payload). SQL Browser responses
+	// for a single instance are well under 200 bytes; multi-instance
+	// responses are still under a kilobyte in practice.
+	std::vector<uint8_t> buf(1472);
+#ifdef _WIN32
+	int n = ::recv(s, SOCK_BUF_CAST(buf.data()), static_cast<int>(buf.size()), 0);
+#else
+	ssize_t n = ::recv(s, buf.data(), buf.size(), 0);
+#endif
+	if (n < 0) {
+#ifdef _WIN32
+		int e = WSAGetLastError();
+		if (e == WSAETIMEDOUT) {
+			timed_out = true;
+		} else {
+			err_out = "UDP recv() failed (winsock error " + std::to_string(e) + ")";
+		}
+#else
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			timed_out = true;
+		} else if (errno == ECONNREFUSED) {
+			// ICMP port unreachable arrived synchronously — Browser is
+			// definitely not listening. Surface this distinctly from a
+			// generic timeout so the caller's retry isn't wasted.
+			err_out = "UDP port unreachable (ICMP)";
+		} else {
+			err_out = std::string("UDP recv() failed: ") + std::strerror(errno);
+		}
+#endif
+		CLOSE_SOCKET(s);
+		return false;
+	}
+
+	buf.resize(static_cast<std::size_t>(n));
+	resp_out = std::move(buf);
+	CLOSE_SOCKET(s);
+	return true;
+}
+
+ResolveResult ResolveCore(const std::string &raw_host, uint16_t browser_port, const std::string &instance,
+                          int timeout_seconds) {
+	const std::string host = NormaliseHost(raw_host);
+
+	std::string err;
+	auto addrs = ResolveAddresses(host, browser_port, err);
+	if (addrs.empty()) {
+		return ResolveResult::Failure(ResolveError::Kind::Unreachable, err);
+	}
+
+	const auto req = BuildUcastInstRequest(instance);
+
+	// We try the first address. UDP is best-effort and the second address
+	// (e.g. an IPv6 literal advertised in DNS but not routed) would have
+	// the same retry budget anyway. Most hosts return one address.
+	const ResolvedAddr &addr = addrs.front();
+
+	std::vector<uint8_t> resp;
+	bool timed_out = false;
+	std::string send_err;
+	bool ok = SendAndRecvOnce(addr, req, timeout_seconds, resp, timed_out, send_err);
+
+	// FR-006: one retry on timeout. UDP is lossy; the cost of a single
+	// retry is small relative to the cost of a spurious ATTACH failure.
+	if (!ok && timed_out) {
+		ok = SendAndRecvOnce(addr, req, timeout_seconds, resp, timed_out, send_err);
+	}
+
+	if (!ok) {
+		std::ostringstream oss;
+		oss << "SQL Browser unreachable at " << host << ":" << browser_port << "/udp";
+		if (timed_out) {
+			oss << " after " << (timeout_seconds * 2) << "s (1 send + 1 retry)";
+		} else if (!send_err.empty()) {
+			oss << ": " << send_err;
+		}
+		return ResolveResult::Failure(ResolveError::Kind::Unreachable, oss.str());
+	}
+
+	std::vector<BrowserInstance> records;
+	try {
+		records = ParseBrowserResponse(resp.data(), resp.size());
+	} catch (const std::runtime_error &e) {
+		std::ostringstream oss;
+		oss << "SQL Browser at " << host << ":" << browser_port << "/udp returned " << e.what();
+		return ResolveResult::Failure(ResolveError::Kind::Malformed, oss.str());
+	}
+
+	for (const auto &r : records) {
+		if (IEquals(r.instance_name, instance)) {
+			if (!r.tcp_enabled) {
+				std::ostringstream oss;
+				oss << "instance '" << instance << "' exists on " << host << " but TCP transport is disabled";
+				return ResolveResult::Failure(ResolveError::Kind::TcpDisabled, oss.str());
+			}
+			return ResolveResult::Success(r.tcp_port);
+		}
+	}
+
+	std::ostringstream oss;
+	oss << "instance '" << instance << "' not found on host '" << host << "'";
+	if (!records.empty()) {
+		oss << "; available: ";
+		for (std::size_t i = 0; i < records.size(); ++i) {
+			if (i > 0) oss << ", ";
+			oss << records[i].instance_name;
+		}
+	} else {
+		oss << " (browser returned no instances)";
+	}
+	return ResolveResult::Failure(ResolveError::Kind::InstanceNotFound, oss.str());
+}
+
+}  // namespace
+
+ResolveResult InstanceResolver::Resolve(const std::string &host, const std::string &instance, int timeout_seconds) {
+	return ResolveCore(host, BROWSER_PORT, instance, timeout_seconds);
+}
+
+ResolveResult InstanceResolver::ResolveForTest(const std::string &host, uint16_t browser_port,
+                                               const std::string &instance, int timeout_seconds) {
+	return ResolveCore(host, browser_port, instance, timeout_seconds);
 }
 
 }  // namespace mssql
