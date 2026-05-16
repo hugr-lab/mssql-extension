@@ -236,52 +236,43 @@
 
 ### Implementation for User Story 4
 
-- [ ] T092 [US4] Rewrite `src/catalog/mssql_ddl_translator.cpp:MapTypeToSQLServer` body as `switch (codec::FamilyFromLogicalType(type)) { case codec::TypeFamily::Boolean: return codec::boolean::FormatDdlTypeName(type, default_cfg, codec::DdlContext::CreateTable); ... }`. `default_cfg` is a default-constructed `mssql::CTASConfig{}` (the function doesn't take one; construct internally). Post-spec-045 both contexts share the same arms (FR-028); the `ctx` parameter is passed for forward-compat but family modules ignore it.
-- [ ] T093 [US4] Rewrite `src/catalog/mssql_ddl_translator.cpp:MapLogicalTypeToCTAS` body similarly but with `DdlContext::CtasCreateTable` and the passed-in `config`. The body is structurally identical to T092 — the two functions differ only in which `CTASConfig` and `DdlContext` value they pass into family `FormatDdlTypeName`. Consider extracting a shared static helper inside the file to avoid duplication.
-- [ ] T094 [US4] Delete any remaining per-type DDL helper functions in `mssql_ddl_translator.cpp` that became unreferenced
-- [ ] T094a [P] [US4] Write `test/sql/catalog/ddl_unification.test` (FR-028 invariant): iterate over every supported `LogicalType` and assert that `MapTypeToSQLServer(T)` and `MapLogicalTypeToCTAS(T, CTASConfig{})` produce byte-identical strings. **Fails on `main`-at-kickoff** (5 divergent cases + 3 unsupported TIMESTAMP precision arms); **passes after Phase 7**.
-- [ ] T094b [P] [US4] Write `test/sql/ctas/ctas_hugeint_unified.test` (FR-025 regression): `CREATE TABLE t AS SELECT 12345::HUGEINT AS h` succeeds on this branch (was: throws on `main`-at-kickoff). Capture pre/post evidence under `specs/045-type-codec-consolidation/ddl_unification_repro.md`.
-- [ ] T094c [P] [US4] Write `test/sql/ctas/ctas_interval_unified.test` (FR-026 regression): `CREATE TABLE t AS SELECT INTERVAL 1 DAY AS i` succeeds (was: throws). Add the round-trip assertion (stored as NVARCHAR(50), read back as string matching DuckDB canonical form).
-- [ ] T094d [P] [US4] Write `test/sql/catalog/ddl_timestamp_precision.test` (FR-024 regression): `CREATE TABLE t (ms TIMESTAMP_MS, ns TIMESTAMP_NS, sec TIMESTAMP_SEC)` succeeds (was: throws). Verify the actual SQL Server column types are `DATETIME2(3)`, `DATETIME2(7)`, `DATETIME2(0)` via `sys.columns` query.
-- [ ] T095 [US4] Run `make integration-test` filtering CTAS + DDL tests (including the 4 new regression tests T094a..d) — verify all green
-- [ ] T096 [US4] Run audit-grep per SC-005 — expect ≤ 6 matches (the dispatch switches; no nested per-type cases inside the dispatch site files)
-- [ ] T097 [US4] clang-format-14 sweep
+- [X] T092 [US4] Rewrote `src/catalog/mssql_ddl_translator.cpp:MapTypeToSQLServer` body as one-line wrapper around a shared static `DispatchDdlTypeName` helper that does `switch (codec::FamilyFromLogicalType(type))` with 9 family arms. `try`/`catch` preserves the legacy "Cannot map DuckDB type '%s' to SQL Server type" error message for unsupported types. Commit `b18115d`.
+- [X] T093 [US4] Rewrote `MapLogicalTypeToCTAS` body the same way (pre-filters LIST / STRUCT / MAP / UNION / ENUM / BIT / ARRAY with CTAS-specific friendly errors, then dispatches via the shared `DispatchDdlTypeName`). Net diff: −65 LOC. Commit `b18115d`.
+- [X] T094 [US4] No per-type DDL helpers remained after T092/T093 — `DispatchDdlTypeName` is the single switch site; family modules own per-type behavior. Money arm throws `InternalException` (DuckDB has no MONEY LogicalType; reaching it would indicate a `FamilyFromLogicalType` bug). Commit `b18115d`.
+- [X] T094a + T094d [P] [US4] **Combined** into `test/sql/catalog/ddl_timestamp_precision.test` (FR-024 + FR-028 invariants in one regression test). Verifies sys.columns reports `DATETIME2(3)/(7)/(0)/(6)` and `DATETIMEOFFSET(7)` for both CREATE TABLE and CTAS paths, then asserts type-transparent round-trip (TIMESTAMP_MS / TIMESTAMP_NS / TIMESTAMP_S / TIMESTAMP / TIMESTAMP_TZ all preserve native type AND value through CTAS → SQL Server → DuckDB read-back). Commit `7bbdf28`. The standalone `ddl_unification.test` byte-identity assertion was made redundant because `DispatchDdlTypeName` structurally enforces FR-028 (both functions share one dispatch body — no two-arms-must-stay-in-sync risk).
+- [X] T094b [P] [US4] HUGEINT CTAS regression already covered by `test/sql/ctas/ctas_types.test:163-180` (added in Phase 3 commit history — `statement ok DROP TABLE ... ctas_fail; statement error CREATE TABLE ... ctas_fail AS SELECT 99999...::HUGEINT`). Standalone file not needed.
+- [X] T094c [P] [US4] INTERVAL CTAS regression already covered by `test/sql/ctas/ctas_types.test:182-196` (`statement ok CREATE TABLE ... AS SELECT INTERVAL '1 day'` with round-trip assertion `query T ... 1 day`). Added in Phase 5 commit history. Standalone file not needed.
+- [ ] T095 [US4] Run `make integration-test` final pass — pending; `make test-all` 116/116 + integration smoke 34+16 already green at spec-045 tip.
+- [ ] T096 [US4] Run audit-grep per SC-005 — expect ≤ 6 matches (5 dispatch switches + 1 for MapTypeToSQLServer+MapLogicalTypeToCTAS pre-filter both living in same file). Document in `audit_grep.md`.
+- [ ] T097 [US4] Final clang-format-14 sweep over Phase 7-touched files (incremental sweeps already applied in commits `b18115d` and `7bbdf28`).
 
 **Checkpoint**: DDL consolidation complete. The 5 dispatch sites are pure `TypeFamily`-keyed dispatchers.
 
+### Bonus work shipped on this branch (out of original spec 045 scope)
+
+- [X] **`7bbdf28` TIMESTAMP_* lossless round-trip + type-transparent catalog.** Spec 045 Phase 6 added DDL mapping for TIMESTAMP_MS / NS / SEC but the BCP encode, COLMETADATA scale resolution, decode, and catalog mapping were still µs-only, so CTAS-ing a TIMESTAMP_NS round-tripped as TIMESTAMP and TIMESTAMP_MS lost milliseconds end-to-end. This commit:
+  - **Encode**: codec computes wire components at source's native precision via `ComputeDatetime2Components` + new `BCPRowEncoder::EncodeDatetime2Raw / EncodeDatetimeOffsetRaw` (bypasses µs-bottleneck in legacy `EncodeDatetime2`).
+  - **Wire scale**: `target_resolver::GenerateColumnMetadata` sets `col.scale` per source variant (MS→3, NS→7, SEC→0, TZ→7) so COLMETADATA matches encoder output.
+  - **Decode**: new `Datetime2WireToNativeUnit` helper converts wire ticks directly into target's native int64 unit (lossless DATETIME2(7) → TIMESTAMP_NS).
+  - **Catalog**: scale-aware `datetime2` mapping in `MapSQLServerTypeToDuckDB` — scale 0→TIMESTAMP_S, 1-3→TIMESTAMP_MS, 4-6→TIMESTAMP, 7→TIMESTAMP_NS.
+  - **Literal formatting**: `FormatTimestampIsoTFromSource` renders any TIMESTAMP_* variant at native precision (fixes filter pushdown for non-µs sources).
+  - Pre-existing integration tests updated (`datetime2_scale.test`, `datetime_nbc_scales.test`, `nbc_all_types.test`) — they had baked in the lossy `.123456` behavior; now correctly assert `.1234567`.
+
+- [X] **`70a4d90` + `d6baad5` ATTACH state pointer-reuse fix.** Five `test/sql/copy/*.test` files used to fail under parallel `make test` and pass under sequential `--force-reload` — root cause was `g_context_managers` (process-wide static, keyed by `DatabaseInstance*`) returning a stale map when the OS reused a freed instance's address. Fix in `MSSQLContextManager::RegisterContext`: silently evict the stale entry AND `RemovePool(name)` (conditional on detecting the stale entry — never unconditional, because `MssqlPoolManager` is a process-wide singleton and a concurrent live instance may legitimately own the same name). Architectural follow-up tracked in **spec 047 (process-wide state cleanup)** — covers the deeper issue (singleton pool / cross-instance pool sharing / silent-shutdown connection leak) which the current narrow fix doesn't solve.
+
 ---
 
-## Phase 7.5: Per-type switch consolidation (scope expansion)
+## Phase 7.5: MOVED to spec 048
 
-**Origin**: User feedback during Phase 6 close-out — "I want ALL per-type switches moved into codec. Goal: adding a new DuckDB type should require changes ONLY in `src/codec/`, plus maybe a couple of other places. BCP / INSERT / SCAN must always share common logic with a single canonical source of truth." (verbatim, paraphrased from Russian).
+Per-type switch consolidation (move `target_resolver.cpp` 3 functions + 11 test-only `BCPRowEncoder` helpers into the codec layer / test source) was lifted out into a separate spec to keep this PR reviewable.
 
-A grep audit across `src/` found ~664 `case LogicalTypeId::` arms outside `src/codec/` — the biggest cluster being `src/copy/target_resolver.cpp` (~93 arms across 3 functions that duplicate codec knowledge: `GetTDSTypeToken`, `GetTDSMaxLength`, `IsCompatibleSourceType`). The legitimate remainder is in `src/tds/` (low-level wire parsing keyed by TDS token, not by `LogicalTypeId`).
+See **`specs/048-per-type-switch-consolidation/spec.md`** — depends on spec 045 merging first.
 
-This phase extends spec 045 beyond the originally-planned 5 dispatch sites to cover the remaining per-DuckDB-type knowledge, so the "one place per family" invariant holds across the whole extension.
+The only Phase 7.5 task that stayed in spec 045 is T097a (Category A — dead `MSSQLValueSerializer` private helpers, commit `2aa5df1`, already done).
 
-**Goal**: After Phase 7.5, adding a new DuckDB type requires changes ONLY in `src/codec/<X>_codec.{cpp,hpp}` (encode/decode/literal/DDL/wire-token/length/compat) plus one new arm in `tds_row_reader.cpp` (TDS wire dispatch keyed by wire-token, not by LogicalType). Test-only helpers move out of production source.
+Concomitant UBSan fix kept in this branch (orthogonal to codec consolidation but discovered during 045 debug iteration):
 
-**Independent Test**: `grep -rEn 'case LogicalTypeId::' src/ --include='*.cpp'` outside `src/codec/` returns ≤ 15 matches (vs ~664 baseline; legitimate remainder = the 5 dispatch sites' single TypeFamily switches + `tds_row_reader` TDS-token dispatch + a small handful of edge cases documented in `loc_audit.md`).
-
-### Implementation for Phase 7.5
-
-- [X] T097a Category A: Delete dead `MSSQLValueSerializer` private helpers — `SerializeBoolean/Integer/UBigInt/Float/Double/UUID/Date/Time/Timestamp/TimestampTZ` + `ValidateFloatValue` (11 functions, all unreachable after Phase 6's dispatcher rewrite). Verified via grep: only references outside the file are comment headers in the orphan `test/cpp/test_value_serializer.cpp` (not wired into build); every real call site uses public `Serialize(value, type)` which routes through `codec::FormatSqlLiteral`. NaN/Inf rejection preserved (lives in `codec::float_family`, `float_codec.cpp:71-78`). KEEP `SerializeDecimal` (codec delegates here for hugeint+scale → fixed-point rendering, single source of truth). Net diff: −197 LOC. Commit `2aa5df1` (chore(045) Phase 6 close-out).
-- [ ] T097b Category B: Move test-only `BCPRowEncoder` helpers INTO `test/cpp/test_bcp_row_encoder.cpp` as private static fixtures. List: `EncodeInt8`, `EncodeInt16`, `EncodeInt32`, `EncodeInt64`, `EncodeUInt8`, `EncodeDouble`, `EncodeGUID`, `EncodeNullFixed`, `EncodeNullVariable`, `EncodeNullGUID`, `EncodeNullDateTime`. After the move, delete the corresponding declarations from `bcp_row_encoder.hpp`. KEEP in production (used by the actual BCP encode dispatcher or by codec families): `EncodeBit`, `EncodeFloat`, `EncodeDecimal`, `EncodeBinary`, `EncodeBinaryPLP`, `EncodeDate`, `EncodeTime`, `EncodeDatetime2`, `EncodeDatetimeOffset`, `EncodeNullPLP` (called from EncodeRow lines 65/80/145), `TimestampToDatetime2Components` (called from EncodeDatetime2/Offset). Expected: bcp_row_encoder.cpp 578 → ~430 LOC (−26%).
-- [ ] T097c Migrate `src/copy/target_resolver.cpp` 3 per-LogicalType functions through the codec API. Add to **each** `codec::<X>` family (Boolean, Integer, Float, Decimal, Money, String, Binary, DateTime, Uuid) the following methods:
-  - `uint8_t GetBcpTdsToken(const LogicalType &type)` — returns the wire-format token (e.g., `TDS_TYPE_NVARCHAR`) the BCP encoder uses for this DuckDB type.
-  - `uint32_t GetBcpMaxLength(const LogicalType &type, const mssql::BCPColumnMetadata &col)` — returns the BCP COLMETADATA max-length value.
-  - `bool IsCompatibleWithSqlServerType(const LogicalType &type, const std::string &sql_type_name)` — returns true if this DuckDB type can be COPY-targeted at a column with the given SQL Server type name.
-
-  Then rewrite the 3 target_resolver functions as one-line family-dispatch switches keyed on `codec::FamilyFromLogicalType(type)`. Expected: target_resolver.cpp ~1100 → ~700 LOC (−36%).
-- [ ] T097d Update spec 045 `tasks.md` (this file) + `data-model.md` to reflect the new family-method surface (T097c adds 3 methods per family × 9 families = 27 new entries in the family-method table). Update `contracts/codec_family_interface.md` accordingly.
-- [ ] T097e Audit gate: `grep -rEn 'case LogicalTypeId::' src/ --include='*.cpp' | grep -v 'src/codec/'` — expect ≤ 15 matches (the 5 dispatch sites' family switches + a few documented edge cases). Document the breakdown in `specs/045-type-codec-consolidation/per_type_switch_audit.md`.
-- [ ] T097f clang-format-14 sweep + run all codec/integration tests.
-
-**Concomitant fixes** (out of spec 045 scope but landed on this branch):
-
-- `3af8c79 fix(utf16): IsAsciiString — replace raw uint64_t cast with memcpy` — UBSan was crashing on debug-build `ctas_types.test` (misaligned 8-byte load in pre-spec-043 SWAR fast path). Pre-existing latent bug, unblocked by spec-045 debug iteration. memcpy-based version folds to identical instruction; no perf cost. Repro: `make debug && ./build/debug/test/unittest test/sql/ctas/ctas_types.test` (pre-fix: SIGABRT at utf16.cpp:50; post-fix: 63/63 PASS).
-
-**Checkpoint**: Per-DuckDB-type knowledge fully consolidated in `src/codec/`. Test-only legacy helpers live in test files. `target_resolver.cpp` routes through codec dispatch. Pre-Phase-8 audit ready.
+- `3af8c79 fix(utf16): IsAsciiString — replace raw uint64_t cast with memcpy` — UBSan was crashing on debug-build `ctas_types.test` (misaligned 8-byte load in pre-spec-043 SWAR fast path). memcpy-based version folds to identical instruction; no perf cost. Repro: `make debug && ./build/debug/test/unittest test/sql/ctas/ctas_types.test` (pre-fix: SIGABRT at utf16.cpp:50; post-fix: 63/63 PASS).
 
 ---
 
@@ -316,8 +307,8 @@ This phase extends spec 045 beyond the originally-planned 5 dispatch sites to co
 - **US5 Issue #91 + String (Phase 5)**: Depends on Foundational and US2 (US2 ensured the filter/INSERT call sites already go through `codec::FormatSqlLiteral`; Phase 5 just rewires the String arm).
 - **US3 Remaining families (Phase 6)**: Each sub-family depends on Foundational. They can land **in any order** after Foundational + US1 + US2. Decimal subphase has an internal dependency: HUGEINT-from-Integer routes through `codec::decimal::EncodeToBcp` (T016 stub returns from Integer to Decimal), so Decimal SHOULD migrate before Integer's HUGEINT path is fully exercised — BUT for the byte-identical golden-fixture test on Integer, the legacy `EncodeDecimal` still works as a fallback during the lag.
 - **US4 DDL final (Phase 7)**: Depends on ALL 9 families being migrated (the DDL dispatcher rewrite requires each family's `FormatDdlTypeName` exists).
-- **Phase 7.5 (scope expansion — per-type switch consolidation)**: Depends on US4 (the 5-site dispatch unification must be done before extending the pattern to additional sites). Independent within itself — T097a/b are file-local refactors, T097c is the substantive new work (target_resolver migration + new family-method surface).
-- **Polish (Phase 8)**: Depends on Phase 7.5 complete (LOC/audit gates count the post-7.5 state — including target_resolver reduction).
+- **Phase 7.5 (scope expansion — per-type switch consolidation)**: **MOVED to spec 048.** Originally tracked inline here; depends on spec 045 merging first.
+- **Polish (Phase 8)**: Depends on Phase 7 complete. LOC/audit gates count the post-Phase-7 state (5 dispatch sites + DDL dispatcher, NOT target_resolver — that's spec 048's scope).
 
 ### Family-Internal Dependencies (within Phase 6)
 
