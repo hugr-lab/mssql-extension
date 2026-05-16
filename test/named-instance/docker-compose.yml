@@ -1,0 +1,104 @@
+# Spec 045 — Named-Instance Resolution test stack.
+#
+# Three-service compose for SQL Server Browser resolution testing. No real
+# Windows, no real SQL Browser service, no fixed local port allocation.
+#
+#   mock-browser   Python UDP responder on 1434 — mimics MC-SQLR
+#   sql            SQL Server 2022 listening on 11433 (non-default)
+#   test-client    Ubuntu + the standalone resolver binary
+#
+# Usage:
+#   docker compose up -d --build --wait
+#   docker compose exec test-client /run-tests.sh
+#   docker compose down -v
+#
+# Two-hostname layout (research.md §R3): the mock browser advertises
+# sql.example.com:11433 as the TCP endpoint. Clients first send the UDP
+# Browser query to browser.example.com, then connect TCP to whatever
+# hostname the Browser response named. This matches real-world Browser
+# semantics (Browser can advertise a different host than itself — common
+# in failover-cluster scenarios) and avoids any Docker DNS round-robin
+# trickery.
+#
+# Spec: specs/045-named-instance-resolution/
+# Test/kerberos precedent: test/kerberos/docker-compose.yml (spec 042)
+
+services:
+  mock-browser:
+    build: ./mock-browser
+    container_name: mssql-spec045-browser
+    hostname: browser.example.com
+    networks:
+      spec045_net:
+        aliases:
+          - browser.example.com
+    environment:
+      MOCK_BROWSER_MODE: "${MOCK_BROWSER_MODE:-respond}"
+      MOCK_BROWSER_INSTANCES: "${MOCK_BROWSER_INSTANCES:-TESTINST:sql.example.com:11433:15.0.4123.1;SECONDARY:sql.example.com:11434:15.0.4123.1}"
+    expose:
+      - "1434/udp"
+    # Healthcheck sends a real CLNT_UCAST_INST and asserts the reply
+    # starts with the SVR_RESP opcode (0x05). Proves the responder is
+    # wire-compatible, not just that the python process is up.
+    # `pgrep` is not available in python:3.12-slim, so we use python
+    # itself (which is the one thing guaranteed to be present).
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'\\x04probe\\x00',('127.0.0.1',1434)); d,_=s.recvfrom(1024); raise SystemExit(0 if d[:1]==b'\\x05' else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  sql:
+    build:
+      context: ./sql
+    container_name: mssql-spec045-sql
+    hostname: sql.example.com
+    networks:
+      spec045_net:
+        aliases:
+          - sql.example.com
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "TestPassword1"
+      MSSQL_PID: Developer
+      SQL_TCP_PORT: "11433"
+    expose:
+      - "11433/tcp"
+    # Healthcheck verifies init.sql has run (NamedInstTest DB exists),
+    # not just that sqlservr started. Otherwise the test-client could
+    # query before the probe row is in.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "/opt/mssql-tools18/bin/sqlcmd -S localhost,11433 -U sa -P TestPassword1 -C -Q \"IF DB_ID('NamedInstTest') IS NULL RAISERROR('init pending', 16, 1); SELECT 1;\" >/dev/null 2>&1"
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  test-client:
+    build:
+      context: ../..
+      dockerfile: test/named-instance/test-client/Dockerfile
+    container_name: mssql-spec045-client
+    hostname: client.example.com
+    networks:
+      - spec045_net
+    volumes:
+      - ./test-client/run-tests.sh:/run-tests.sh:ro
+    depends_on:
+      mock-browser:
+        condition: service_healthy
+      sql:
+        condition: service_healthy
+    # Keep alive so `docker compose exec test-client /run-tests.sh` works.
+    command: ["sleep", "infinity"]
+
+networks:
+  spec045_net:
+    driver: bridge

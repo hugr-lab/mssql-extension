@@ -397,7 +397,61 @@ void TestNormaliseLocalAliases() { std::cout << "TestNormaliseLocalAliases (skip
 
 }  // namespace
 
-int main() {
+//===--------------------------------------------------------------------===//
+// CLI mode for the docker-stack smoke test (Phase 2).
+//
+// When invoked as:
+//   test_instance_resolver --resolve <host> <browser_port> <instance> [timeout]
+//
+// runs a single resolution against the given browser and prints the result.
+// Used by test/named-instance/test-client/run-tests.sh to exercise the
+// real C++ resolver against the containerised mock browser.
+//
+// Exit codes:
+//   0 - resolution succeeded; prints "OK port=<port>" on stdout
+//   1 - resolution failed; prints "FAIL <kind>: <message>" on stdout
+//   2 - usage error
+//===--------------------------------------------------------------------===//
+int RunCliResolve(int argc, char **argv) {
+	if (argc < 5 || argc > 6) {
+		std::cerr << "usage: " << argv[0] << " --resolve <host> <browser_port> <instance> [timeout_seconds]" << std::endl;
+		return 2;
+	}
+	std::string host = argv[2];
+	int browser_port_int = std::atoi(argv[3]);
+	if (browser_port_int <= 0 || browser_port_int > 65535) {
+		std::cerr << "invalid browser_port: " << argv[3] << std::endl;
+		return 2;
+	}
+	std::string instance = argv[4];
+	int timeout = (argc == 6) ? std::atoi(argv[5]) : 3;
+	if (timeout <= 0) timeout = 3;
+
+	auto r = InstanceResolver::ResolveForTest(host, static_cast<uint16_t>(browser_port_int), instance, timeout);
+	if (r.ok) {
+		std::cout << "OK port=" << r.port << std::endl;
+		return 0;
+	}
+	const char *kind = "Unknown";
+	switch (r.error.kind) {
+	case ResolveError::Kind::Unreachable:
+		kind = "Unreachable";
+		break;
+	case ResolveError::Kind::InstanceNotFound:
+		kind = "InstanceNotFound";
+		break;
+	case ResolveError::Kind::TcpDisabled:
+		kind = "TcpDisabled";
+		break;
+	case ResolveError::Kind::Malformed:
+		kind = "Malformed";
+		break;
+	}
+	std::cout << "FAIL " << kind << ": " << r.error.message << std::endl;
+	return 1;
+}
+
+int RunUnitTests() {
 	std::cout << "============================================================" << std::endl;
 	std::cout << "InstanceResolver parser unit tests (spec 045, Phase 0)" << std::endl;
 	std::cout << "============================================================" << std::endl;
@@ -437,4 +491,13 @@ int main() {
 	}
 	std::cerr << g_failures << " TEST(S) FAILED" << std::endl;
 	return 1;
+}
+
+int main(int argc, char **argv) {
+	if (argc >= 2 && std::string(argv[1]) == "--resolve") {
+		return RunCliResolve(argc, argv);
+	}
+	(void)argc;
+	(void)argv;
+	return RunUnitTests();
 }
