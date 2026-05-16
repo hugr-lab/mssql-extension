@@ -810,15 +810,25 @@ MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
 
 void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
 	lock_guard<mutex> guard(lock);
-	// We do NOT throw if `name` is already in the map: DuckDB's catalog deduplicates
-	// `ATTACH AS <name>` within a single DatabaseInstance before MSSQLAttach is ever
-	// called. Reaching here with a populated `name` slot means the previous owning
-	// DatabaseInstance was destroyed without going through MSSQLCatalog::OnDetach
-	// (typical for sqllogictest's `--force-reload`, or any process shutdown without
-	// an explicit DETACH) AND the OS reused that DatabaseInstance's address for the
-	// new one — `g_context_managers` is keyed by `DatabaseInstance*`, so the stale
-	// manager came back via Get(). Silently evict the dead entry so the new attach
-	// can proceed. Symmetric pool cleanup is handled in MSSQLAttach prologue.
+	// DuckDB's catalog deduplicates `ATTACH AS <name>` within a single live
+	// DatabaseInstance before MSSQLAttach is ever called, so a populated slot
+	// here can only mean the previous owning DatabaseInstance died without
+	// going through MSSQLCatalog::OnDetach (sqllogictest's `--force-reload`,
+	// process shutdown without DETACH) AND the OS reused its memory address
+	// for the new instance — `g_context_managers` is keyed by
+	// `DatabaseInstance*`, so the stale manager came back via `Get()`.
+	//
+	// When that happens, also sweep the shared `MssqlPoolManager` entry for
+	// this name: the old pool's TDS connections may be half-broken (e.g. BCP
+	// stream aborted without ATTENTION). Note: pool sweep is CONDITIONAL on
+	// detecting a stale manager entry — never do it unconditionally in
+	// MSSQLAttach, because `MssqlPoolManager` is process-wide and a different
+	// concurrently-live DatabaseInstance may legitimately own a pool under
+	// the same name (see the pool-isolation caveat below).
+	auto it = contexts.find(name);
+	if (it != contexts.end()) {
+		MssqlPoolManager::Instance().RemovePool(name);
+	}
 	contexts[name] = std::move(ctx);
 }
 
@@ -1196,12 +1206,6 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
-	// Sweep any stale pool registered under this name from a previous DatabaseInstance
-	// at the same memory address (see RegisterContext comment for the full picture).
-	// A leftover pool may hold half-broken TDS connections (e.g. BCP mid-stream
-	// abort never sent ATTENTION); rebuilding it gives the new attach a clean slate.
-	MssqlPoolManager::Instance().RemovePool(name);
-
 	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
