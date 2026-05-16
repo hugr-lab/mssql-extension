@@ -26,6 +26,11 @@ rebuilding the image):
       exercised by the docker stack even though the stack only runs one
       real SQL Server container.
 
+      Note: the `:` field separator means IPv6 literals (which contain
+      `:`) cannot appear as `server_name`. Use a hostname instead.
+      Acceptable limitation for a test fixture; real SQL Browser
+      responses also identify the server by hostname, not literal IP.
+
 Logs every request to stdout for `docker compose logs mock-browser`.
 
 Spec: specs/045-named-instance-resolution/research.md §R2
@@ -136,28 +141,39 @@ def main() -> int:
             print(f"[mock-browser] {addr} sent non-UCAST_INST request; dropping ({data[:16]!r})", flush=True)
             continue
 
-        if mode == "silent":
+        # Docker healthcheck sends a query every 2s. We answer it (so the
+        # healthcheck observes a valid SVR_RESP) but don't log it, otherwise
+        # the log fills with healthcheck noise and real test queries get
+        # lost in the scroll. The sentinel name __healthcheck is matched
+        # case-insensitively below; we also short-circuit logging here.
+        is_healthcheck = requested.lower().startswith("__healthcheck")
+
+        if mode == "silent" and not is_healthcheck:
+            # Healthcheck still gets a reply even in silent mode, otherwise
+            # the container would never become healthy and dependent
+            # services would never start.
             print(f"[mock-browser] {addr} asked for {requested!r}; silent mode, dropping", flush=True)
             continue
-        if mode == "slow":
+        if mode == "slow" and not is_healthcheck:
             print(f"[mock-browser] {addr} asked for {requested!r}; sleeping 5s before reply", flush=True)
             time.sleep(5)
 
         matches = [r for r in instances if r[0].lower() == requested.lower()]
 
-        if mode == "garbage":
+        if mode == "garbage" and not is_healthcheck:
             reply = bytes([random.randint(0, 255) for _ in range(8)])
             print(f"[mock-browser] {addr} -> garbage ({len(reply)} bytes)", flush=True)
-        elif mode == "truncate":
+        elif mode == "truncate" and not is_healthcheck:
             full = build_svr_resp(matches)
-            # Drop the trailing NUL + half the body to simulate a clipped
-            # response. The resolver should produce a Malformed error.
-            cut = max(3, len(full) - max(1, (len(full) - 3) // 2 + 1))
+            # Drop ~half the body to simulate a clipped response. The
+            # resolver should produce a Malformed error.
+            cut = len(full) - max(1, (len(full) - 3) // 2)
             reply = full[:cut]
             print(f"[mock-browser] {addr} -> truncated SVR_RESP ({len(reply)}/{len(full)} bytes)", flush=True)
-        else:  # respond
+        else:  # respond (or any mode for healthcheck)
             reply = build_svr_resp(matches)
-            print(f"[mock-browser] {addr} asked for {requested!r}; matched {[r[0] for r in matches]} ({len(reply)} bytes)", flush=True)
+            if not is_healthcheck:
+                print(f"[mock-browser] {addr} asked for {requested!r}; matched {[r[0] for r in matches]} ({len(reply)} bytes)", flush=True)
 
         try:
             sock.sendto(reply, addr)

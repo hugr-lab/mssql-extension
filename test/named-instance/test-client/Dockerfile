@@ -21,7 +21,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY src/include/connection/instance_resolver.hpp /src/src/include/connection/
+
+# COPY whole directories rather than individual files. The resolver may
+# grow a #include from another header in the same trees (especially as
+# Phase 3 lands), and a stale per-file COPY list would silently break
+# the Linux build with an opaque "header not found" error. Directory-
+# level COPYs invalidate cache when ANY file under them changes, which
+# costs a slightly larger context but never silently drops a needed file.
+COPY src/include/connection/ /src/src/include/connection/
 COPY src/connection/instance_resolver.cpp /src/src/connection/
 COPY test/cpp/test_instance_resolver.cpp /src/test/cpp/
 

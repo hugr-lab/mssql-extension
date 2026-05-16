@@ -376,27 +376,31 @@ void TestResolveSilentBrowser() {
 	auto elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 1000.0;
 	EXPECT(!r.ok, "Resolve returned failure");
 	EXPECT(r.error.kind == ResolveError::Kind::Unreachable, "Unreachable kind");
-	// 1s timeout + 1 retry = ~2s wall. Allow some slack.
-	EXPECT(elapsed_s >= 1.5 && elapsed_s < 4.0, "elapsed time within retry window");
-	if (!(elapsed_s >= 1.5 && elapsed_s < 4.0)) {
+	// 1s timeout + 1 retry = ~2s wall. CI runners can be loaded; allow
+	// wide slack on the upper bound. The lower bound (>=1.5s) is the
+	// load-bearing assertion - it proves the retry ran at all.
+	EXPECT(elapsed_s >= 1.5 && elapsed_s < 6.0, "elapsed time within retry window");
+	if (!(elapsed_s >= 1.5 && elapsed_s < 6.0)) {
 		std::cerr << "    elapsed: " << elapsed_s << "s" << std::endl;
 	}
 }
 
 void TestNormaliseLocalAliases() {
 	std::cout << "TestNormaliseLocalAliases" << std::endl;
-	// (local) and "." must map to localhost. We can't run the full Resolve
-	// since the host won't bind 1434, but a Resolve against (local) with a
-	// short timeout proves NormaliseHost runs (no "DNS lookup failed for
-	// '(local)'" error — we'd get an unreachable-port error instead).
+	// (local) and "." must map to localhost before getaddrinfo. If
+	// normalisation didn't run, getaddrinfo would fail on the literal
+	// string "(local)" (not a valid hostname) and the error would mention
+	// "(local)". After normalisation, errors mention "localhost" instead.
+	//
+	// We probe port 1 (no listener) with a 1s timeout. The resolver will
+	// fail with either Unreachable or ConnectionRefused, but the error
+	// message must say "localhost" if normalisation ran.
 	auto r = InstanceResolver::ResolveForTest("(local)", 1, "x", 1);
-	EXPECT(!r.ok, "Resolve failed as expected (no listener)");
-	// The exact error depends on the platform — could be unreachable or
-	// connection refused. The important thing is the host name didn't fail
-	// DNS, which would be a different error category.
-	EXPECT(r.error.message.find("(local)") == std::string::npos ||
-			   r.error.message.find("DNS lookup failed") == std::string::npos,
-		   "(local) was normalised before DNS");
+	EXPECT(!r.ok, "Resolve failed as expected (no listener on localhost:1)");
+	EXPECT(r.error.message.find("(local)") == std::string::npos,
+		   "(local) was normalised - error must not contain literal '(local)'");
+	EXPECT(r.error.message.find("localhost") != std::string::npos,
+		   "(local) was normalised to 'localhost' - error must contain it");
 }
 
 #else  // _WIN32

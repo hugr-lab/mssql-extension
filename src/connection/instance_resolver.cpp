@@ -342,8 +342,13 @@ std::vector<ResolvedAddr> ResolveAddresses(const std::string &host, uint16_t por
 	struct addrinfo *result = nullptr;
 	int rc = ::getaddrinfo(host.c_str(), port_str, &hints, &result);
 	if (rc != 0) {
+		// gai_strerrorA is the ANSI variant; both POSIX and Win32
+		// expose it as thread-safe for the strings getaddrinfo returns.
+		// On Windows getaddrinfo also surfaces the WSA error code via
+		// WSAGetLastError - we'd lose that, but the gai message is
+		// already a translated human-readable string, so it suffices.
 #ifdef _WIN32
-		error_out = "DNS lookup failed for '" + host + "'";
+		error_out = std::string("DNS lookup failed for '") + host + "': " + gai_strerrorA(rc);
 #else
 		error_out = std::string("DNS lookup failed for '") + host + "': " + gai_strerror(rc);
 #endif
@@ -429,7 +434,11 @@ bool SendAndRecvOnce(const ResolvedAddr &addr, const std::vector<uint8_t> &req, 
 			// ICMP port unreachable arrived synchronously — Browser is
 			// definitely not listening. Surface this distinctly from a
 			// generic timeout so the caller's retry isn't wasted.
-			err_out = "UDP port unreachable (ICMP)";
+			err_out = "UDP port unreachable (ICMP ECONNREFUSED)";
+		} else if (errno == ENETUNREACH) {
+			err_out = "network unreachable (ENETUNREACH)";
+		} else if (errno == EHOSTUNREACH) {
+			err_out = "host unreachable (EHOSTUNREACH)";
 		} else {
 			err_out = std::string("UDP recv() failed: ") + std::strerror(errno);
 		}

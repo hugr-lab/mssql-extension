@@ -35,18 +35,13 @@ SQL_HOST="${SQL_HOST:-sql.example.com}"
 EXPECTED_PORT="${EXPECTED_PORT:-11433}"
 INSTANCE="${INSTANCE:-TESTINST}"
 
-echo "[run-tests] step 0: resolver binary sanity"
+echo "[run-tests] step 1: resolver binary sanity"
 if [[ ! -x "${RESOLVER}" ]]; then
     echo "[run-tests] ERROR: ${RESOLVER} not found or not executable" >&2
     exit 2
 fi
 file "${RESOLVER}" 2>/dev/null || true
 
-echo "[run-tests] step 1: mock browser TCP-level reachability"
-# UDP can't be probed without sending a real packet, but we can confirm
-# the host resolves and the port is unblocked at the network layer by
-# attempting a UDP nc with a tiny payload — `nc -uz` doesn't really work
-# with UDP (no handshake), so we drive the resolver instead.
 echo "[run-tests] step 2: resolve ${BROWSER_HOST}\\${INSTANCE} via mock browser"
 result=$("${RESOLVER}" --resolve "${BROWSER_HOST}" "${BROWSER_PORT}" "${INSTANCE}" 5)
 echo "  resolver output: ${result}"

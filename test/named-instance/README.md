@@ -34,6 +34,14 @@ docker compose exec test-client /run-tests.sh
 docker compose down -v
 ```
 
+> **Apple Silicon note**: `mcr.microsoft.com/mssql/server:2022-latest`
+> ships an `amd64`-only manifest. On macOS arm64 hosts Docker Desktop
+> runs it under Rosetta emulation. The stack works correctly but SQL
+> Server boot is ~3× slower (~30 s vs ~10 s on native amd64). The
+> `mock-browser` and `test-client` images are multi-arch and run
+> natively. If you see a Docker warning about platform mismatch on the
+> `sql` service, that's expected.
+
 Expected output ends with:
 
 ```
