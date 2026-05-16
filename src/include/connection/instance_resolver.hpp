@@ -93,7 +93,8 @@ struct ResolveResult {
 //===----------------------------------------------------------------------===//
 // Parser - pure function over a byte buffer.
 //
-// Walks an MC-SQLR SVR_RESP packet (opcode 0x05 + LE u16 size + ASCII body)
+// Walks an MC-SQLR SVR_RESP packet (opcode 0x05 + LE u16 size + MBCS body
+// per [MC-SQLR] §2.2; ASCII in practice for all documented fields)
 // and returns one BrowserInstance per record. Throws std::runtime_error
 // with a hex-dump diagnostic message on malformed input.
 //

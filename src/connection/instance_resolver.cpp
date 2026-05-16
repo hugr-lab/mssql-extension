@@ -84,7 +84,11 @@ std::string HexDump(const uint8_t *data, std::size_t len, std::size_t max_bytes 
 }
 
 //===--------------------------------------------------------------------===//
-// Token scanner over the ASCII body of a SVR_RESP.
+// Token scanner over the MBCS body of a SVR_RESP. Spec is MBCS per
+// [MC-SQLR] §2.2; in practice every documented field is ASCII (keys,
+// digits, version dotted-quad, instance-name grammar [A-Za-z0-9_$#]).
+// The state machine only compares against `;` (0x3B), which is
+// invariant across every MBCS codepage, so byte-level scanning is safe.
 //
 // Body format (NUL-terminated):
 //   key;value;key;value;...;tcp;<port>;np;<pipe>;;next_record_first_key;...
@@ -290,7 +294,9 @@ bool IEquals(const std::string &a, const std::string &b) {
 	return true;
 }
 
-// Build the CLNT_UCAST_INST datagram: 0x04 + ASCII instance + 0x00.
+// Build the CLNT_UCAST_INST datagram: 0x04 + MBCS instance name +
+// 0x00. Per [MC-SQLR] §2.2.3 the instance name is MBCS; in practice
+// SQL Server's own instance-name grammar restricts it to ASCII.
 std::vector<uint8_t> BuildUcastInstRequest(const std::string &instance) {
 	std::vector<uint8_t> pkt;
 	pkt.reserve(2 + instance.size());
