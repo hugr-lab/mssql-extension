@@ -1,4 +1,4 @@
--- Spec 045 test data.
+-- Spec 046 test data.
 --
 -- Runs once after SQL Server is reachable on the configured TCP port
 -- (11433 in this stack, not the default 1433 — the non-default port is
@@ -27,5 +27,5 @@ CREATE TABLE dbo.Probe (
 );
 GO
 
-INSERT INTO dbo.Probe (id, payload) VALUES (1, N'spec045 lives');
+INSERT INTO dbo.Probe (id, payload) VALUES (1, N'spec046 lives');
 GO
