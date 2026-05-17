@@ -364,10 +364,11 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 
 
 <!-- SPECKIT START -->
-Active spec: 045-type-codec-consolidation. Spec, plan, research,
-data model, contracts, quickstart, and tasks are generated. See
-`specs/045-type-codec-consolidation/plan.md` for the implementation
-plan, with `research.md`, `data-model.md`, `contracts/`,
-`quickstart.md`, and `tasks.md` (108 tasks across 8 phases) alongside.
-Implementation proceeds via `/speckit-implement` in phased commits.
+Active spec: 047-process-state-cleanup. Spec, plan, research,
+data model, contracts, and quickstart are generated. See
+`specs/047-process-state-cleanup/plan.md` for the implementation
+plan, with `research.md`, `data-model.md`, `contracts/`, and
+`quickstart.md` alongside. Closes [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96)
+(production manifestation of cross-instance singleton-pool bug class).
+Implementation proceeds via `/speckit-tasks` then `/speckit-implement`.
 <!-- SPECKIT END -->
