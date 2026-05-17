@@ -1,6 +1,6 @@
-# Security Review — Spec 045 PR #116 (Phases 0–2)
+# Security Review — Spec 046 PR #116 (Phases 0–2)
 
-**Branch**: `task/spec045-phase0-2-resolver`
+**Branch**: `task/spec046-phase0-2-resolver`
 **PR**: [#116](https://github.com/hugr-lab/mssql-extension/pull/116)
 **Reviewer**: self-review (Claude Code, security-review skill)
 **Date**: 2026-05-16

@@ -20,7 +20,7 @@ public:
 	// Get or create a pool for a context (SQL authentication)
 	// Parameters:
 	//   use_encrypt   - if true, enables TLS encryption for all connections in the pool
-	//   instance_name - Spec 045: when non-empty, each connection's LOGIN7 ServerName
+	//   instance_name - Spec 046: when non-empty, each connection's LOGIN7 ServerName
 	//                   field is set to "host\instance_name" (matching every other
 	//                   SQL Server client). Empty means default instance (pre-spec-045
 	//                   behaviour, ServerName == host).
@@ -33,7 +33,7 @@ public:
 	// Parameters:
 	//   fedauth_token_utf16le - pre-encoded UTF-16LE access token
 	//   use_encrypt - TLS encryption (required for Azure)
-	//   instance_name - Spec 045: see GetOrCreatePool. Azure SQL doesn't use named
+	//   instance_name - Spec 046: see GetOrCreatePool. Azure SQL doesn't use named
 	//                   instances in practice but the parameter is accepted for
 	//                   symmetry with the SQL-auth factory.
 	// Note: For Azure auth, token refresh is handled separately

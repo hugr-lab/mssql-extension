@@ -50,7 +50,7 @@ struct MSSQLConnectionInfo {
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
 	//===----------------------------------------------------------------------===//
-	// Named-Instance Resolution (Spec 045)
+	// Named-Instance Resolution (Spec 046)
 	//
 	// When the user writes `Server=host\instance` the parser extracts the instance
 	// name here. The TDS layer composes LOGIN7's ServerName as `host\instance`

@@ -1,5 +1,5 @@
 // test/cpp/test_instance_resolver.cpp
-// Unit tests for the SQL Server Browser parser (spec 045, Phase 0).
+// Unit tests for the SQL Server Browser parser (spec 046, Phase 0).
 //
 // These tests do NOT require a running SQL Server or any network access.
 // The parser is exercised against canned SVR_RESP byte buffers.
@@ -490,7 +490,7 @@ int RunCliResolve(int argc, char **argv) {
 
 int RunUnitTests() {
 	std::cout << "============================================================" << std::endl;
-	std::cout << "InstanceResolver parser unit tests (spec 045, Phase 0)" << std::endl;
+	std::cout << "InstanceResolver parser unit tests (spec 046, Phase 0)" << std::endl;
 	std::cout << "============================================================" << std::endl;
 
 	try {

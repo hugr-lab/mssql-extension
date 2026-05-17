@@ -4,7 +4,7 @@
 // instance_resolver.cpp
 //
 // Implementation of the MC-SQLR client. See instance_resolver.hpp for the
-// public interface and specs/045-named-instance-resolution/ for the design.
+// public interface and specs/046-named-instance-resolution/ for the design.
 //
 //   Phase 0: ParseBrowserResponse — pure parser over canned byte buffers.
 //   Phase 1: InstanceResolver::Resolve — UDP transport + retry + match.

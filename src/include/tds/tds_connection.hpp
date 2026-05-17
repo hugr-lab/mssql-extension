@@ -99,7 +99,7 @@ public:
 	// Attempt state transition (thread-safe)
 	bool TransitionState(ConnectionState from, ConnectionState to);
 
-	// Spec 045: set the TDS ServerName field that will be sent in LOGIN7. The
+	// Spec 046: set the TDS ServerName field that will be sent in LOGIN7. The
 	// pool factory calls this between Connect() and Authenticate*() when the
 	// user connected via a named instance, so LOGIN7 ServerName carries
 	// "host\instance" (matching every other SQL Server client) instead of the

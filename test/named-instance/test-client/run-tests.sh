@@ -1,10 +1,10 @@
 #!/bin/bash
-# Spec 045 smoke test driver — Phase 2 (resolver-only; no DuckDB yet).
+# Spec 046 smoke test driver — Phase 2 (resolver-only; no DuckDB yet).
 #
 # Run inside the test-client container after `docker compose up -d --wait`:
 #   docker compose exec test-client /run-tests.sh
 #
-# What this covers (the high-value regression surface for spec 045 Phase 2):
+# What this covers (the high-value regression surface for spec 046 Phase 2):
 #
 #   1. The mock SQL Server Browser is reachable on UDP 1434 and answers
 #      CLNT_UCAST_INST queries (proves the docker stack networking works).
@@ -104,7 +104,7 @@ echo "[run-tests] step 5: resolver self-tests (unit tests baked into binary)"
 
 # ----------------------------------------------------------------------------
 # Phase 3 end-to-end tests via the DuckDB CLI + mssql extension.
-# These exercise the ATTACH path so the spec 045 plumbing (parse host\instance,
+# These exercise the ATTACH path so the spec 046 plumbing (parse host\instance,
 # invoke resolver, populate LOGIN7 ServerName) is covered end-to-end.
 # ----------------------------------------------------------------------------
 EXT=/home/tester/mssql.duckdb_extension
@@ -124,7 +124,7 @@ SELECT id, payload FROM db.dbo.Probe;
 EOF
 )
 echo "  output: ${out}"
-echo "${out}" | grep -q "spec045 lives" || {
+echo "${out}" | grep -q "spec046 lives" || {
     echo "  FAIL: probe row not returned via named-instance ATTACH" >&2
     exit 6
 }
@@ -138,7 +138,7 @@ SELECT payload FROM db.dbo.Probe;
 EOF
 )
 echo "  output: ${out}"
-echo "${out}" | grep -q "spec045 lives" || {
+echo "${out}" | grep -q "spec046 lives" || {
     echo "  FAIL: probe row not returned via explicit-port ATTACH" >&2
     exit 7
 }
@@ -200,13 +200,13 @@ echo "  PASS"
 echo "[run-tests] step 12: secret-form host\\instance is resolved (review finding I1)"
 out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF
 LOAD '${EXT}';
-CREATE SECRET spec045 (TYPE mssql, host '${BROWSER_HOST}\\${INSTANCE}', database 'NamedInstTest', user 'sa', password 'TestPassword1', use_encrypt false);
-ATTACH '' AS db (TYPE mssql, SECRET spec045);
+CREATE SECRET spec046 (TYPE mssql, host '${BROWSER_HOST}\\${INSTANCE}', database 'NamedInstTest', user 'sa', password 'TestPassword1', use_encrypt false);
+ATTACH '' AS db (TYPE mssql, SECRET spec046);
 SELECT payload FROM db.dbo.Probe;
 EOF
 )
 echo "  output: ${out}"
-echo "${out}" | grep -q "spec045 lives" || {
+echo "${out}" | grep -q "spec046 lives" || {
     echo "  FAIL: secret-form host\\instance ATTACH did not return probe row" >&2
     exit 12
 }

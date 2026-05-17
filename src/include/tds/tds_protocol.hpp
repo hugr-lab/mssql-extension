@@ -81,7 +81,7 @@ public:
 								 const std::string &database, const std::string &app_name = "DuckDB MSSQL Extension",
 								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
 
-	// Spec 045 overload: separate client workstation name from server name so
+	// Spec 046 overload: separate client workstation name from server name so
 	// LOGIN7 ServerName can carry host\instance while HostName stays as the
 	// actual local hostname. Required for named-instance support.
 	//   client_hostname - client workstation name (HostName field)

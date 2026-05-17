@@ -167,7 +167,7 @@ Windows SQL Server installs often run multiple instances side-by-side (e.g.
 `SS2019`, `SS2022`, `SQLEXPRESS`), each on a dynamic TCP port chosen at
 service startup. Use the standard `host\instance` syntax — the extension
 queries SQL Server Browser on UDP 1434 to resolve the current port before
-connecting (spec 045):
+connecting (spec 046):
 
 ```sql
 -- ADO.NET form (most common)
@@ -206,7 +206,7 @@ Two settings control the resolver:
 | `mssql_named_instance_resolution` | `true`  | Set `false` to reject `host\instance` at parse time (forces explicit-port form). |
 
 Works on Linux, macOS, and Windows. See
-[specs/045-named-instance-resolution/quickstart.md](specs/045-named-instance-resolution/quickstart.md)
+[specs/046-named-instance-resolution/quickstart.md](specs/046-named-instance-resolution/quickstart.md)
 for the full reference (error categories, manual repro for issue #77,
 docker test stack).
 

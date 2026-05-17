@@ -1,4 +1,4 @@
-# Research: SQL Server Named-Instance Resolution (spec 045)
+# Research: SQL Server Named-Instance Resolution (spec 046)
 
 Resolved questions and design decisions. All items are decision-locked unless flagged `OPEN`.
 
@@ -257,7 +257,7 @@ If someone shows a benchmark where the 2ms matters, we'll revisit. Until then: n
 
 ## R6. SPN derivation under integrated auth
 
-The current SPN derivation in `src/tds/auth/krb5_authenticator.cpp` builds `MSSQLSvc/<host>:<port>` from `info.host` and `info.port`. After spec 045:
+The current SPN derivation in `src/tds/auth/krb5_authenticator.cpp` builds `MSSQLSvc/<host>:<port>` from `info.host` and `info.port`. After spec 046:
 
 - `info.host` is unchanged (the original hostname token, instance stripped).
 - `info.port` is the **discovered** port from the Browser response.

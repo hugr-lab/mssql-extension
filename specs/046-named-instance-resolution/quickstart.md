@@ -1,11 +1,11 @@
-# Quickstart — Named-Instance Resolution (Spec 045)
+# Quickstart — Named-Instance Resolution (Spec 046)
 
 End-to-end recipes for using the named-instance support shipped in
-spec 045. Closes [#77](https://github.com/hugr-lab/mssql-extension/issues/77).
+spec 046. Closes [#77](https://github.com/hugr-lab/mssql-extension/issues/77).
 
 ## TL;DR — connect to a named instance
 
-After spec 045, `Server=host\instance` works the same way it does in
+After spec 046, `Server=host\instance` works the same way it does in
 every other SQL Server client (pyodbc, sqlcmd, JDBC, go-mssqldb):
 
 ```sql
@@ -96,7 +96,7 @@ SS2022 (SQL Server 2022, dynamic port)
 SQLEXPRESS (Express, dynamic port)
 ```
 
-Before spec 045:
+Before spec 046:
 
 ```sql
 -- Fails with "Cannot resolve hostname 'localhost\SS2022'"
@@ -104,7 +104,7 @@ ATTACH 'Server=localhost\SS2022;Database=master;User Id=sa;Password=...;TrustSer
   AS s2022 (TYPE mssql);
 ```
 
-After spec 045:
+After spec 046:
 
 ```sql
 -- All three work without specifying ports
@@ -172,7 +172,7 @@ Expected: query returns rows. Negative test: stop the SQL Server
 Browser service, retry — should fail within ~6s (3s × 1 retry) with
 *"SQL Browser unreachable at sqlserver.example.com:1434/udp after 6s"*.
 
-The integrated-auth code path is unchanged from spec 042; spec 045
+The integrated-auth code path is unchanged from spec 042; spec 046
 only changes the *target port* the auth flow uses (now the
 Browser-discovered port instead of the explicit one). SPN derivation
 under Kerberos uses `MSSQLSvc/<host.fqdn>:<discovered-port>`, which
@@ -181,7 +181,7 @@ matches AD's default SPN registration for named instances.
 ## Cross-references
 
 - Issue: [#77](https://github.com/hugr-lab/mssql-extension/issues/77)
-- Spec: `specs/045-named-instance-resolution/`
+- Spec: `specs/046-named-instance-resolution/`
 - Microsoft docs:
   [Database engine instances](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/database-engine-instances-sql-server),
   [MC-SQLR](https://learn.microsoft.com/en-us/openspecs/windows_protocols/mc-sqlr/)

@@ -245,7 +245,7 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 						 database.c_str(), fedauth_token.size());
 
 	// Initialize TDS server name to host if the caller hasn't already set it
-	// (Spec 045: pool factory calls SetTdsServerName for named-instance
+	// (Spec 046: pool factory calls SetTdsServerName for named-instance
 	// connects). The routing-redirect code below may further update this
 	// when the gateway issues an ENVCHANGE 20 (Routing).
 	if (tds_server_name_.empty()) {
@@ -793,7 +793,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
 						 database.c_str());
-	// Spec 045: LOGIN7 ServerName must carry "host\instance" when the user
+	// Spec 046: LOGIN7 ServerName must carry "host\instance" when the user
 	// connected via a named instance; HostName stays as the real client
 	// workstation name. Falls back to host_ when no instance is set, which
 	// preserves the pre-spec-045 behaviour for default-instance connects.

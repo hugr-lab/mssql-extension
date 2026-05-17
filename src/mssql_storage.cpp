@@ -13,7 +13,7 @@ namespace duckdb {
 namespace {
 
 //===----------------------------------------------------------------------===//
-// SplitAndResolveInstance - shared helper for spec 045 named-instance
+// SplitAndResolveInstance - shared helper for spec 046 named-instance
 // resolution. Used by both FromConnectionString and FromSecret so the secret
 // path doesn't silently lose the host\instance handling.
 //
@@ -162,7 +162,7 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	auto &kv_secret = static_cast<const KeyValueSecret &>(*secret);
 
 	auto result = make_shared_ptr<MSSQLConnectionInfo>();
-	// Spec 045: secret-form host may be "host\instance". Same parse + resolver
+	// Spec 046: secret-form host may be "host\instance". Same parse + resolver
 	// invocation as the connection-string path (review finding I1).
 	string raw_host = kv_secret.TryGetValue("host").ToString();
 	auto port_val = kv_secret.TryGetValue("port");
@@ -775,7 +775,7 @@ string MSSQLConnectionInfo::ValidateConnectionString(const string &connection_st
 		}
 	}
 
-	// Spec 045: split host\instance and validate the instance-name grammar at parse time.
+	// Spec 046: split host\instance and validate the instance-name grammar at parse time.
 	// SQL Server's own constraint is [A-Za-z0-9_$#]{1,16} (verified against the SSMS
 	// installer regex). Rejecting empty + out-of-grammar names here gives a clear error
 	// message before we try to resolve over UDP and time out 3 seconds later.
@@ -824,7 +824,7 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 
 	// Parse server (host[\instance][,port]). The host\instance split, grammar
 	// re-check, and resolver invocation all live in SplitAndResolveInstance so
-	// FromSecret can share them (spec 045 review finding I1).
+	// FromSecret can share them (spec 046 review finding I1).
 	auto server = params["server"];
 	bool explicit_port_given = false;
 	string host_part = server;
@@ -1217,7 +1217,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	}
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection succeeded");
 
-	// Spec 045: LOGIN7 ServerName mirrors the user-typed "host\instance" form
+	// Spec 046: LOGIN7 ServerName mirrors the user-typed "host\instance" form
 	// for named-instance connects.
 	if (!info.instance_name.empty()) {
 		conn.SetTdsServerName(info.host + "\\" + info.instance_name);

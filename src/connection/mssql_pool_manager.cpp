@@ -35,7 +35,7 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &contex
 	pool_config.acquire_timeout = config.acquire_timeout;
 
 	// Create connection factory that captures use_encrypt for TLS support.
-	// Spec 045: when instance_name is non-empty, LOGIN7 ServerName is set
+	// Spec 046: when instance_name is non-empty, LOGIN7 ServerName is set
 	// to "host\instance" so SQL Server logs and DMVs see the same form the
 	// user typed in their connection string.
 	auto factory = [host, port, username, password, database, use_encrypt,
@@ -150,7 +150,7 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithIntegratedAuth(const s
 					static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
 			return nullptr;
 		}
-		// Spec 045: LOGIN7 ServerName carries host\instance for named instances.
+		// Spec 046: LOGIN7 ServerName carries host\instance for named instances.
 		if (!info_copy.instance_name.empty()) {
 			conn->SetTdsServerName(info_copy.host + "\\" + info_copy.instance_name);
 		}
