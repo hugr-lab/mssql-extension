@@ -7,6 +7,7 @@
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/type_family.hpp"
 #include "codec/uuid_codec.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
@@ -86,55 +87,47 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			continue;
 		}
 
-		// Get the value and encode based on type
-		// Using GetVectorValue to handle both flat and constant vectors
-		switch (col.duckdb_type.id()) {
-		case LogicalTypeId::BOOLEAN: {
+		// Family-level dispatch — the per-type LogicalTypeId fan-out lives
+		// inside FamilyFromLogicalType (spec 045). FamilyFromLogicalType throws
+		// NotImplementedException for unsupported types; rethrow with BCP-specific message.
+		mssql::codec::TypeFamily family;
+		try {
+			family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
+		} catch (const NotImplementedException &) {
+			throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+		}
+		switch (family) {
+		case mssql::codec::TypeFamily::Boolean:
 			mssql::codec::boolean::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
-		case LogicalTypeId::TINYINT:
-		case LogicalTypeId::UTINYINT:
-		case LogicalTypeId::SMALLINT:
-		case LogicalTypeId::USMALLINT:
-		case LogicalTypeId::INTEGER:
-		case LogicalTypeId::UINTEGER:
-		case LogicalTypeId::BIGINT:
-		case LogicalTypeId::UBIGINT: {
+		case mssql::codec::TypeFamily::Integer:
 			mssql::codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
-		case LogicalTypeId::FLOAT:
-		case LogicalTypeId::DOUBLE: {
+		case mssql::codec::TypeFamily::Float:
 			mssql::codec::float_family::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
-		case LogicalTypeId::DECIMAL: {
+		case mssql::codec::TypeFamily::Decimal:
 			mssql::codec::decimal::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		}
-		case LogicalTypeId::VARCHAR:
-		case LogicalTypeId::INTERVAL:
+		case mssql::codec::TypeFamily::String:
 			mssql::codec::string::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		case LogicalTypeId::BLOB:
-		case LogicalTypeId::GEOMETRY:
+		case mssql::codec::TypeFamily::Binary:
 			mssql::codec::binary::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		case LogicalTypeId::UUID:
+		case mssql::codec::TypeFamily::Uuid:
 			mssql::codec::uuid::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		case LogicalTypeId::DATE:
-		case LogicalTypeId::TIME:
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_MS:
-		case LogicalTypeId::TIMESTAMP_NS:
-		case LogicalTypeId::TIMESTAMP_SEC:
-		case LogicalTypeId::TIMESTAMP_TZ:
+		case mssql::codec::TypeFamily::DateTime:
 			mssql::codec::datetime::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
-		default:
-			throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+		case mssql::codec::TypeFamily::Money:
+			// DuckDB has no MONEY LogicalType; FamilyFromLogicalType never returns
+			// Money. If we reach this arm the family mapping has a bug.
+			throw InternalException(
+				"BCP encoder reached Money family arm for DuckDB type '%s' — "
+				"Money is decode-only and has no LogicalType mapping",
+				col.duckdb_type.ToString());
 		}
 	}
 }
@@ -151,49 +144,44 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		return;
 	}
 
-	switch (col.duckdb_type.id()) {
-	case LogicalTypeId::BOOLEAN:
+	// Family-level dispatch — see EncodeRow above for the same pattern.
+	mssql::codec::TypeFamily family;
+	try {
+		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
+	} catch (const NotImplementedException &) {
+		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+	}
+	switch (family) {
+	case mssql::codec::TypeFamily::Boolean:
 		mssql::codec::boolean::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
+	case mssql::codec::TypeFamily::Integer:
 		mssql::codec::integer::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
+	case mssql::codec::TypeFamily::Float:
 		mssql::codec::float_family::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::DECIMAL:
+	case mssql::codec::TypeFamily::Decimal:
 		mssql::codec::decimal::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::VARCHAR:
-	case LogicalTypeId::INTERVAL:
+	case mssql::codec::TypeFamily::String:
 		mssql::codec::string::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::GEOMETRY:
+	case mssql::codec::TypeFamily::Binary:
 		mssql::codec::binary::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::UUID:
+	case mssql::codec::TypeFamily::Uuid:
 		mssql::codec::uuid::EncodeToBcp(value, col, buffer);
 		break;
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ:
+	case mssql::codec::TypeFamily::DateTime:
 		mssql::codec::datetime::EncodeToBcp(value, col, buffer);
 		break;
-	default:
-		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+	case mssql::codec::TypeFamily::Money:
+		// DuckDB has no MONEY LogicalType; see EncodeRow Money arm.
+		throw InternalException(
+			"BCP encoder reached Money family arm for DuckDB type '%s' — "
+			"Money is decode-only and has no LogicalType mapping",
+			col.duckdb_type.ToString());
 	}
 }
 

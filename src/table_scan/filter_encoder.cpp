@@ -117,55 +117,17 @@ bool FilterEncoder::GetArithmeticOperator(ExpressionType type, std::string &out_
 }
 
 std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalType &type) {
-	if (value.IsNull()) {
-		return "NULL";
-	}
-
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
+	// All supported families route through the canonical codec dispatcher
+	// (handles NULL + 9-arm family switch internally). Unsupported types
+	// throw NotImplementedException; fall back to a string-escaped form so
+	// filter pushdown still produces *something* valid for the SQL Server side
+	// (filter is then compared as text rather than rejected outright).
+	try {
 		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::HUGEINT:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::DECIMAL:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::VARCHAR:
-	case LogicalTypeId::INTERVAL:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::UUID:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::GEOMETRY:
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-
-	default:
-		// For other types, try ToString and quote as string. Routes through the
-		// String-family helper so the escape rule lives in one place.
+	} catch (const NotImplementedException &) {
+		if (value.IsNull()) {
+			return "NULL";
+		}
 		return "N'" + codec::string::EscapeSqlSingleQuotes(value.ToString()) + "'";
 	}
 }
