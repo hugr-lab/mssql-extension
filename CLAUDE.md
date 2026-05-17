@@ -15,6 +15,11 @@ DuckDB extension for SQL Server via a custom TDS protocol implementation (no Fre
 src/
   azure/                # Azure AD authentication infrastructure
   catalog/              # DuckDB catalog integration + transaction manager
+  codec/                # Per-type-family codec layer (spec 045): boolean/integer/
+                        # float/decimal/money/string/binary/datetime/uuid. Each
+                        # <family>_codec.cpp owns EncodeToBcp / DecodeFromTds /
+                        # FormatSqlLiteral / FormatDdlTypeName for its types.
+                        # literal_format.cpp + type_family.cpp are the dispatchers.
   connection/           # Connection pooling, provider, settings
   dml/                  # DML operations
     insert/             # INSERT (batched VALUES, OUTPUT INSERTED for RETURNING)
@@ -349,7 +354,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 
 ## Recent Changes
 - 042-integrated-authentication Phase 4: Added Windows SSPI authentication via `secur32.dll`'s Negotiate package. `WinSspiAuthenticator` peer of `Krb5Authenticator`. Same `IAuthenticator` interface; shared SPNEGO continuation loop in `TdsConnection::AuthenticateIntegrated`.
-- 045-type-codec-consolidation: Refactor — consolidates per-type encoding/decoding/literal/DDL logic across the 5 dispatch sites (type_converter, bcp_row_encoder, filter_encoder, mssql_value_serializer, mssql_ddl_translator) into per-type-family modules under `src/codec/`. Eliminates ~170 LOC of filter-vs-INSERT literal duplication. Phased migration; ~3-6 weeks scope. No new vcpkg deps. Includes fix for issue #91 (BCP nvarchar character-vs-byte length).
+- 045-type-codec-consolidation: Per-type encoding/decoding/literal/DDL logic consolidated into 9 family modules under `src/codec/` (boolean/integer/float/decimal/money/string/binary/datetime/uuid). 5 LogicalType-side dispatch sites collapsed to family-dispatch (`FamilyFromLogicalType` switch or `codec::FormatSqlLiteral` one-liner). 762 LOC removed across dispatch sites (3243→2481, −23.5%). Bonus: TIMESTAMP_MS/NS/S/TZ now round-trip losslessly through SQL Server DATETIME2(3/7/0/7) with full type-transparency (catalog reports the variant, encode/decode preserves native precision). Bonus: stale-ATTACH ContextManager fix (sqllogictest `--force-reload` pointer-reuse). Closes issue #91 (BCP nvarchar character-vs-byte length); closes issue #89 (VIEW catalog-vs-runtime type divergence). No new vcpkg deps. Per-row bench (1M rows): 0.988–1.015× ratio vs spec-044 baseline (well within 5% gate).
 - 044-codec-consolidation: Finishes the simdutf migration started in 043 — every legacy `Utf16LE*` call site moves to the simdutf-backed wrapper, the wrapper is renamed back to `Utf16LE*` (legacy file path resurrected with new implementation), and the legacy hand-rolled converter survives only as a private invalid-input fallback. Includes codec microbenchmark (`make bench-utf16`) and an end-to-end before/after benchmark (`test/bench/bench_codec_e2e.sh`, 100M rows) recorded into `bench_results.md`. No new vcpkg deps.
 - 043-refactoring-foundation: Added C++ (C++11-compatible ABI) + DuckDB (main branch), simdutf (vcpkg, statically linked, MIT) for LOGIN7 non-ASCII fix; OpenSSL unchanged
 - 042-integrated-authentication: Added Kerberos (POSIX) integrated authentication via system GSSAPI. SPNEGO + LOGIN7 `fIntSecurity` bit + 0xED SSPI continuation tokens. Self-contained test stack at `test/kerberos/`.
