@@ -231,6 +231,106 @@ bench-utf16: release
 	@echo "Running UTF-16 codec microbenchmark..."
 	build/test/bench_utf16
 
+# Spec 045: per-type-family codec unit tests
+# Pattern target: `make test-codec-<family>` builds and runs
+# test/cpp/codec/test_<family>_codec.cpp linked against src/codec/*.cpp.
+# Supported family names: boolean integer float decimal money string binary
+# datetime uuid. Plus `make test-literal-format` for the shared dispatcher.
+#
+# All codec tests need DuckDB headers (LogicalType / Value / Vector) so they
+# follow the spec-043 LOGIN7 test pattern (CXX direct compile + vcpkg lib
+# linkage). Each test links in ALL codec sources (so cross-family forwards
+# like HUGEINT→Decimal in the Integer module resolve) plus the encoding
+# helpers (utf16, datetime_encoding, decimal_encoding, guid_encoding).
+#
+# Files are populated as families migrate (Phase 2+). The targets exist
+# from Phase 1 but will print an explanatory error if the test or family
+# sources are missing.
+CODEC_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
+CODEC_TEST_VCPKG_TRIPLET := $(shell ls $(CODEC_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
+CODEC_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+CODEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+    -I $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/include
+# Link against built libduckdb.dylib (built by `make debug`) for Value/Vector/hugeint
+# symbols. Tests run with DYLD_LIBRARY_PATH set so the loader can find it.
+CODEC_TEST_LIBS := -L $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf \
+    -L build/debug/src -lduckdb
+CODEC_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+CODEC_TEST_ENCODING_SOURCES := \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/datetime_encoding.cpp \
+    src/tds/encoding/decimal_encoding.cpp \
+    src/tds/encoding/guid_encoding.cpp
+# CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
+# migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
+CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)
+
+test-codec-%: debug
+	@echo "Building codec unit test for family: $*"
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f test/cpp/codec/test_$*_codec.cpp ]; then \
+		echo "ERROR: test/cpp/codec/test_$*_codec.cpp does not exist yet (Phase 1 scaffolding;" >&2; \
+		echo "       the test file is written when the $* family migrates in Phase 3 or later)." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/codec/test_$*_codec.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_$*_codec
+	@echo ""
+	@echo "Running codec unit test for $*..."
+	$(CODEC_TEST_RPATH) build/test/test_$*_codec
+
+# TypeConverter VARCHAR-fallback test (issue #89 regression — spec 045 Phase 6 sub-phase 3).
+# Exercises the "catalog says VARCHAR but TDS returns non-string" path that views with
+# CAST/CONVERT can trigger.
+test-type-converter-fallback: debug
+	@echo "Building TypeConverter VARCHAR-fallback test..."
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/codec/test_type_converter_fallback.cpp \
+	    src/tds/encoding/type_converter.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_type_converter_fallback
+	@echo ""
+	@echo "Running TypeConverter VARCHAR-fallback test..."
+	$(CODEC_TEST_RPATH) build/test/test_type_converter_fallback
+
+# Shared literal_format dispatcher test (covers LiteralContext divergence cases)
+test-literal-format: debug
+	@echo "Building shared literal_format test..."
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f test/cpp/test_literal_format.cpp ]; then \
+		echo "ERROR: test/cpp/test_literal_format.cpp does not exist yet (Phase 1 scaffolding;" >&2; \
+		echo "       written when US2 lands in Phase 4)." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/test_literal_format.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_literal_format
+	@echo ""
+	@echo "Running shared literal_format test..."
+	$(CODEC_TEST_RPATH) build/test/test_literal_format
+
 # Show help
 help:
 	@echo "DuckDB MSSQL Extension Build System"

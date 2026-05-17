@@ -1,0 +1,21 @@
+# DateTime literal cases — codec::datetime::FormatSqlLiteral
+# FR-022: Filter and InsertValues contexts produce byte-identical output.
+# Format: type | input (human) | expected SQL literal
+
+DATE         | 2024-01-15                | '2024-01-15'
+TIME         | 14:30:00.1234560          | '14:30:00.1234560'
+TIME         | 00:00:00                  | '00:00:00.0000000'
+TIME         | 23:59:59.9999990          | '23:59:59.9999990'
+
+TIMESTAMP    | 2024-01-15 14:30:00       | CAST('2024-01-15T14:30:00.0000000' AS DATETIME2(7))
+TIMESTAMP    | 2024-01-15 14:30:00.123   | CAST('2024-01-15T14:30:00.1230000' AS DATETIME2(7))
+TIMESTAMP    | 2024-01-15 14:30:00.123456| CAST('2024-01-15T14:30:00.1234560' AS DATETIME2(7))
+
+TIMESTAMP_MS | 2024-01-15 14:30:00.123   | CAST('2024-01-15T14:30:00.1230000' AS DATETIME2(7))
+TIMESTAMP_NS | 2024-01-15 14:30:00.123   | CAST('2024-01-15T14:30:00.1230000' AS DATETIME2(7))
+TIMESTAMP_S  | 2024-01-15 14:30:00       | CAST('2024-01-15T14:30:00.0000000' AS DATETIME2(7))
+
+TIMESTAMP_TZ | 2024-01-15 14:30:00 UTC   | CAST('2024-01-15T14:30:00.0000000+00:00' AS DATETIMEOFFSET(7))
+
+# NULL handling — dispatcher short-circuits before codec arm.
+NULL (any type) | NULL | NULL

@@ -810,8 +810,24 @@ MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
 
 void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
 	lock_guard<mutex> guard(lock);
-	if (contexts.find(name) != contexts.end()) {
-		throw CatalogException("MSSQL Error: Context '%s' already exists. Use a different name or DETACH first.", name);
+	// DuckDB's catalog deduplicates `ATTACH AS <name>` within a single live
+	// DatabaseInstance before MSSQLAttach is ever called, so a populated slot
+	// here can only mean the previous owning DatabaseInstance died without
+	// going through MSSQLCatalog::OnDetach (sqllogictest's `--force-reload`,
+	// process shutdown without DETACH) AND the OS reused its memory address
+	// for the new instance — `g_context_managers` is keyed by
+	// `DatabaseInstance*`, so the stale manager came back via `Get()`.
+	//
+	// When that happens, also sweep the shared `MssqlPoolManager` entry for
+	// this name: the old pool's TDS connections may be half-broken (e.g. BCP
+	// stream aborted without ATTENTION). Note: pool sweep is CONDITIONAL on
+	// detecting a stale manager entry — never do it unconditionally in
+	// MSSQLAttach, because `MssqlPoolManager` is process-wide and a different
+	// concurrently-live DatabaseInstance may legitimately own a pool under
+	// the same name (see the pool-isolation caveat below).
+	auto it = contexts.find(name);
+	if (it != contexts.end()) {
+		MssqlPoolManager::Instance().RemovePool(name);
 	}
 	contexts[name] = std::move(ctx);
 }

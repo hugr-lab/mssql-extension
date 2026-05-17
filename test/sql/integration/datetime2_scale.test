@@ -41,11 +41,12 @@ SELECT id, dt2_s3 FROM dt2test.dbo.TestDatetime2Scale WHERE id = 1;
 ----
 1	2020-04-04 12:12:48.123
 
-# Test datetime2(7) - 100ns precision (truncated to microseconds in DuckDB)
+# Test datetime2(7) - 100ns precision (spec 045: catalog maps DATETIME2(7) → TIMESTAMP_NS
+# and the codec decode path preserves every 100-ns wire tick losslessly).
 query II
 SELECT id, dt2_s7 FROM dt2test.dbo.TestDatetime2Scale WHERE id = 1;
 ----
-1	2020-04-04 12:12:48.123456
+1	2020-04-04 12:12:48.1234567
 
 # Cleanup
 statement ok

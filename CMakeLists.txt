@@ -118,6 +118,20 @@ set(EXTENSION_SOURCES
     src/tds/encoding/guid_encoding.cpp
     src/tds/encoding/type_converter.cpp
     src/tds/encoding/bcp_row_encoder.cpp
+    # Codec layer (spec 045) — per-type-family modules. Phase 2 lands the
+    # foundational dispatch helpers + per-family stubs; family bodies are
+    # populated in Phase 3 (US1 Integer MVP) onwards.
+    src/codec/type_family.cpp
+    src/codec/literal_format.cpp
+    src/codec/boolean_codec.cpp
+    src/codec/integer_codec.cpp
+    src/codec/float_codec.cpp
+    src/codec/decimal_codec.cpp
+    src/codec/money_codec.cpp
+    src/codec/string_codec.cpp
+    src/codec/binary_codec.cpp
+    src/codec/datetime_codec.cpp
+    src/codec/uuid_codec.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp

@@ -1,0 +1,125 @@
+# name: test/sql/copy/copy_nvarchar_length_validation.test
+# description: Issue #91 (FR-023) — BCP NVARCHAR(N) length is checked in
+# UCS-2 code units, not UTF-8 bytes. Pre-spec-045 the BCP encoder validated
+# nothing client-side and the server rejected over-length payloads with
+# the opaque "Received an invalid column length from the bcp client" error.
+# Post-spec-045 the client-side String-family encoder pre-validates the
+# UTF-16LE byte length against col.max_length and throws a clear error
+# naming the column plus observed-vs-allowed code units.
+#
+# Acceptance scenarios from spec/user-story-5:
+#   (a) 500 chars (250 ASCII + 250 Cyrillic) into nvarchar(500) — 500 UCS-2
+#       code units (1000 UTF-16LE bytes), fits exactly in 1000-byte capacity;
+#       must succeed + round-trip byte-identical.
+#   (b) 8 ASCII + 4 emoji into nvarchar(20) — 16 UCS-2 code units (32 bytes),
+#       fits in 40-byte capacity; must succeed + round-trip.
+#   (c) 8 ASCII + 8 emoji into nvarchar(20) — 24 UCS-2 code units (48 bytes),
+#       exceeds 40-byte capacity; must fail with a String-family-emitted
+#       error naming the column.
+#
+# Pre-spec-045 baseline (on `main`-at-kickoff): (a) and (b) succeed; (c)
+# fails with the opaque server-side "Received an invalid column length"
+# message that does NOT name the column or the code-unit counts.
+
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# Pre-test cleanup: drop any leftover tables from a previous failed run.
+statement ok
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.copy_nv_91_a'', ''U'') IS NOT NULL DROP TABLE dbo.copy_nv_91_a');
+
+statement ok
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.copy_nv_91_b'', ''U'') IS NOT NULL DROP TABLE dbo.copy_nv_91_b');
+
+statement ok
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.copy_nv_91_c'', ''U'') IS NOT NULL DROP TABLE dbo.copy_nv_91_c');
+
+# ---------------------------------------------------------------------------
+# Scenario (a): 500 chars (250 ASCII + 250 Cyrillic) into nvarchar(500)
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_nv_91_a (id INT NOT NULL, payload NVARCHAR(500) NOT NULL)');
+
+statement ok
+SELECT mssql_refresh_cache('db');
+
+statement ok
+CREATE TABLE local_a AS SELECT 1 AS id, (repeat('A', 250) || repeat('Б', 250))::VARCHAR AS payload;
+
+statement ok
+COPY local_a TO 'mssql://db/dbo/copy_nv_91_a' (FORMAT 'bcp', CREATE_TABLE false);
+
+query II
+SELECT id, payload = (repeat('A', 250) || repeat('Б', 250))
+FROM mssql_scan('db', 'SELECT id, payload FROM dbo.copy_nv_91_a');
+----
+1	true
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE dbo.copy_nv_91_a');
+
+# ---------------------------------------------------------------------------
+# Scenario (b): 8 ASCII + 4 surrogate-pair emoji into nvarchar(20)
+#   Each non-BMP emoji is 2 UCS-2 code units (4 UTF-16 bytes).
+#   Total: 8 + 4*2 = 16 UCS-2 code units = 32 bytes ≤ 40-byte capacity.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_nv_91_b (id INT NOT NULL, payload NVARCHAR(20) NOT NULL)');
+
+statement ok
+SELECT mssql_refresh_cache('db');
+
+statement ok
+CREATE TABLE local_b AS SELECT 1 AS id, ('ABCDEFGH' || '😀😁😂😃')::VARCHAR AS payload;
+
+statement ok
+COPY local_b TO 'mssql://db/dbo/copy_nv_91_b' (FORMAT 'bcp', CREATE_TABLE false);
+
+query II
+SELECT id, payload = ('ABCDEFGH' || '😀😁😂😃')
+FROM mssql_scan('db', 'SELECT id, payload FROM dbo.copy_nv_91_b');
+----
+1	true
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE dbo.copy_nv_91_b');
+
+# ---------------------------------------------------------------------------
+# Scenario (c): 8 ASCII + 8 surrogate-pair emoji into nvarchar(20)
+#   24 UCS-2 code units / 48 bytes > 40-byte capacity → must throw a
+#   String-family error naming the 'payload' column.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_nv_91_c (id INT NOT NULL, payload NVARCHAR(20) NOT NULL)');
+
+statement ok
+SELECT mssql_refresh_cache('db');
+
+statement ok
+CREATE TABLE local_c AS SELECT 1 AS id, ('ABCDEFGH' || '😀😁😂😃😄😅😆😇')::VARCHAR AS payload;
+
+statement error
+COPY local_c TO 'mssql://db/dbo/copy_nv_91_c' (FORMAT 'bcp', CREATE_TABLE false);
+----
+payload
+
+# NOTE: No post-test cleanup for scenario (c). The codec validation throws
+# mid-BCP-stream, which leaves the per-test ATTACH-scoped pool with a
+# corrupted connection (the server still expects more BCP data; subsequent
+# commands on that connection fail with "Failed to receive TDS packet").
+# Cleaning up the dangling SQL Server table is handled by the pre-test
+# `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` block at the file head, which
+# runs in a fresh DuckDB ATTACH for the next test invocation. Robust
+# in-flight BCP cancellation (ATTENTION token round-trip + state reset) is
+# tracked separately from spec 045 — it is a pre-existing limitation of
+# the COPY error path that becomes visible because Phase 5 introduces
+# client-side BCP validation for the first time.

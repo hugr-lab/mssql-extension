@@ -1,0 +1,18 @@
+# Uuid SQL literal cases — codec::uuid::FormatSqlLiteral
+# Format: canonical UUID string | expected literal (both Filter and InsertValues — must be byte-identical, FR-022)
+#
+# UUIDs are quoted as single-quoted strings — no escaping ever required
+# (the canonical form contains only [0-9a-f-]).
+# Both contexts emit IDENTICAL output. The InsertValues path historically went
+# through MSSQLValueSerializer::SerializeUUID which produced "'" + UUID::ToString() + "'";
+# the Filter path used the same form via `"'" + value.ToString() + "'"`.
+
+00000000-0000-0000-0000-000000000000 | '00000000-0000-0000-0000-000000000000'
+ffffffff-ffff-ffff-ffff-ffffffffffff | 'ffffffff-ffff-ffff-ffff-ffffffffffff'
+6ba7b810-9dad-11d1-80b4-00c04fd430c8 | '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
+01234567-89ab-cdef-0123-456789abcdef | '01234567-89ab-cdef-0123-456789abcdef'
+c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d | 'c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d'
+
+# NULL → literal "NULL" (no quotes) — handled by dispatcher in literal_format.cpp,
+# not by codec::uuid::FormatSqlLiteral itself. Listed here for completeness.
+NULL | NULL

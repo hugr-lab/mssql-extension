@@ -1,0 +1,63 @@
+# DateTime edge cases — wire ambiguity, scale boundaries, NULL paths, fallback.
+
+## DATETIMEN length dispatch (legacy NULLable wrapper)
+# The DATETIMEN type token (0x6F) at column declaration time hides the actual
+# underlying type — both `datetime` (8 bytes) and `smalldatetime` (4 bytes)
+# can ride on a DATETIMEN column. The TDS COLMETADATA `max_length` field
+# tells the *maximum* size, but per-row the payload length determines which
+# decoder to use:
+#
+#   bytes.size() == 8 → ConvertDatetime  (datetime path)
+#   bytes.size() == 4 → ConvertSmallDatetime (smalldatetime path)
+#   anything else      → InvalidInputException("Invalid DATETIMEN length")
+#
+# The codec dispatches by `bytes.size()` exactly as the legacy
+# TypeConverter::ConvertDateTime did.
+
+## TIME wire-size buckets
+# scale 0,1,2 → 3 bytes (max ticks ~86400 — fits in 17 bits)
+# scale 3,4   → 4 bytes
+# scale 5,6,7 → 5 bytes
+# Encode pads from microseconds to the target unit; scale 7 multiplies by 10
+# (µs → 100 ns) while scales 0-6 divide. Per FR-022 the literal form always
+# renders 7 digits (HH:MM:SS.fffffff) regardless of source scale.
+
+## DATETIMEOFFSET — UTC-only round-trip
+# Wire-side: time bytes are already UTC (offset is for display only).
+# Decode reads UTC directly and stores in TIMESTAMP_TZ as-is.
+# Encode emits offset_minutes = 0 unconditionally — DuckDB stores
+# TIMESTAMP_TZ as UTC internally and the BCP path does not know the source
+# timezone. Downstream consumers should read it back as UTC.
+
+## TIMESTAMP_NS precision loss
+# DuckDB nanoseconds → SQL Server DATETIME2(7) (100 ns precision).
+# The two trailing digits are truncated by SQL Server's implicit round
+# during CAST. Documented as lossy; literal form still emits 7 digits.
+
+## NULL paths
+# - Wire NULL: TypeConverter::ConvertValue short-circuits on `is_null` before
+#   calling DateTime codec. Codec never receives an empty `bytes` vector.
+# - Value NULL: codec::FormatSqlLiteral and codec::datetime::FormatSqlLiteral
+#   both short-circuit Value::IsNull() → "NULL" before delegating.
+# - Spec 040 NBC: DATETIMEOFFSET via NBC token paths are exercised in
+#   test/sql/catalog/datetimeoffset_*.test; this sub-phase preserves
+#   behaviour (length-dispatch unchanged, NULL short-circuit unchanged).
+
+## Issue #89 fallback (RenderAsString)
+# When a SQL Server view CAST(...) declares a column as VARCHAR but TDS
+# COLMETADATA reports a temporal type, the dispatcher routes through
+# TypeConverter::WriteAsStringFallback → codec::datetime::RenderAsString.
+# Rendered forms (bare text, no SQL quoting):
+#   DATE          → "YYYY-MM-DD"
+#   TIME          → "HH:MM:SS.fffffff"
+#   DATETIME / SMALLDATETIME / DATETIME2 / DATETIMEN → "YYYY-MM-DD HH:MM:SS.fffffff"
+#     (space separator, not 'T', for natural string sort order)
+#   DATETIMEOFFSET → "YYYY-MM-DD HH:MM:SS.fffffff+HH:MM" (UTC; offset always +00:00)
+
+## TIMESTAMP_MS / TIMESTAMP_SEC at the encode path
+# `Value::TIMESTAMPMS(...)` / `Value::TIMESTAMPSEC(...)` are intentionally
+# extracted via `TimestampValue::Get(value)` rather than
+# `Value::GetValue<timestamp_t>()` — the latter invokes cast operators that
+# fail for non-TIMESTAMP logical types in some DuckDB builds. The *Value::Get
+# extractors return the raw int64 storage directly, which is what we want:
+# all TIMESTAMP_* logical types share an int64 physical layout.

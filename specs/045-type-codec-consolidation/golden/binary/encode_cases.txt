@@ -1,0 +1,37 @@
+# Binary BCP encode — DuckDB BLOB → BCP wire bytes
+#
+# Format:
+#   <mode> | <input-hex> | <expected-wire-hex>
+#
+# Modes:
+#   non-plp: BIGBINARYTYPE (0xAD) — USHORT length prefix + raw bytes
+#            wire = LE-uint16(N) + N bytes
+#   plp:     BIGVARBINARYTYPE (0xA5) MAX form — PLP framing
+#            wire = ULONGLONG_LE(UNKNOWN_PLP_LEN=0xFFFFFFFFFFFFFFFE)
+#                 + per-chunk { ULONG_LE(chunk_len) + chunk_bytes }
+#                 + ULONG_LE(0)  // terminator (4 bytes of 0)
+#            Empty PLP = UNKNOWN_PLP_LEN + 4 bytes of 0 (no chunks).
+#
+# Pre-spec-045 BCP encode is in src/tds/encoding/bcp_row_encoder.cpp
+# (EncodeBinary for non-PLP, EncodeBinaryPLP for PLP). Post-spec-045 they
+# delegate from codec::binary::EncodeToBcp; the wire layout is identical
+# (byte-for-byte parity per FR-014).
+
+# === non-PLP BIGBINARY (length-prefixed) ===
+# Empty: 0x0000 + zero payload bytes
+non-plp||00 00
+# 1 byte 0xff: 0x0001 length, then 0xff
+non-plp|ff|01 00 ff
+# 4-byte payload
+non-plp|de ad be ef|04 00 de ad be ef
+# 16-byte payload
+non-plp|00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f|10 00 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+
+# === PLP VARBINARY(MAX) (chunked) ===
+# Empty PLP: UNKNOWN_PLP_LEN + terminator (no chunks, all-zero length terminator)
+plp||fe ff ff ff ff ff ff ff 00 00 00 00
+# Small PLP payload "Hello" (5 bytes):
+#   header  fe ff ff ff ff ff ff ff
+#   chunk1: 05 00 00 00  48 65 6c 6c 6f
+#   term:   00 00 00 00
+plp|48 65 6c 6c 6f|fe ff ff ff ff ff ff ff 05 00 00 00 48 65 6c 6c 6f 00 00 00 00

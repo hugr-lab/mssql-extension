@@ -1,0 +1,72 @@
+# name: test/sql/catalog/view_cast_type_mismatch.test
+# description: Regression test for issue #89 — SQL Server VIEW with CAST/CONVERT triggers
+#   catalog-vs-runtime type divergence. Pre-spec-045 (issue #89 baseline) this crashed
+#   with "Expected vector of type INT128, but found vector of type VARCHAR" inside
+#   FlatVector::GetData<hugeint_t>(varchar_vector). Post-spec-045 the dispatcher renders
+#   the value as a string via the per-family RenderAsString fallback.
+# group: [sql]
+#
+# Setup pattern: a base table with NVARCHAR(255) column storing numeric data, then a
+# view that CASTs that column to DECIMAL(19,4). sys.columns for the view *can* report
+# either the base or the CAST'd type depending on SQL Server version / view definition;
+# we exercise both directions to demonstrate the fallback.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS view_cast (TYPE mssql);
+
+# Build a base table whose columns reproduce the issue #89 schema shape:
+#   - A numeric-looking column declared as NVARCHAR (issue #89's "Convenience Fee")
+#   - A column where the view will project a CAST'ed numeric form
+statement ok
+SELECT mssql_exec('view_cast', 'IF OBJECT_ID(N''dbo.cast_view_target'', N''V'') IS NOT NULL DROP VIEW dbo.cast_view_target;');
+
+statement ok
+SELECT mssql_exec('view_cast', 'IF OBJECT_ID(N''dbo.cast_base_table'', N''U'') IS NOT NULL DROP TABLE dbo.cast_base_table;');
+
+statement ok
+SELECT mssql_exec('view_cast', 'CREATE TABLE dbo.cast_base_table (id INT NOT NULL, raw_amount NVARCHAR(255) NULL, raw_qty NVARCHAR(50) NULL);');
+
+statement ok
+SELECT mssql_exec('view_cast', 'INSERT INTO dbo.cast_base_table (id, raw_amount, raw_qty) VALUES (1, ''123.4500'', ''42''), (2, ''-5.0000'', ''-1''), (3, NULL, NULL);');
+
+statement ok
+SELECT mssql_exec('view_cast', 'CREATE VIEW dbo.cast_view_target AS SELECT id, raw_amount AS [Convenience Fee], CAST(raw_amount AS DECIMAL(19, 4)) AS amount_dec, CAST(raw_qty AS INT) AS qty_int FROM dbo.cast_base_table;');
+
+statement ok
+SELECT mssql_refresh_cache('view_cast');
+
+# Sanity: catalog should expose all four columns.
+query I
+SELECT count(*) FROM information_schema.columns
+WHERE table_catalog = 'view_cast' AND table_name = 'cast_view_target';
+----
+4
+
+# === Core regression: SELECT * on the view must NOT crash ===
+# Pre-spec-045 this query failed with "Expected vector of type INT128, but found vector
+# of type VARCHAR" because the view's CAST(... AS DECIMAL(19,4)) on the amount_dec column
+# returns DECIMAL bytes on the wire but the catalog allocates per-column vectors based on
+# sys.columns metadata for the view. Post-spec-045 the dispatcher's VARCHAR fallback
+# renders mismatched non-string TDS values as strings.
+statement ok
+SELECT * FROM view_cast.dbo.cast_view_target ORDER BY id;
+
+# Filter pushdown over the view also must not crash.
+query I
+SELECT count(*) FROM view_cast.dbo.cast_view_target WHERE id <= 2;
+----
+2
+
+# Cleanup.
+statement ok
+SELECT mssql_exec('view_cast', 'IF OBJECT_ID(N''dbo.cast_view_target'', N''V'') IS NOT NULL DROP VIEW dbo.cast_view_target;');
+
+statement ok
+SELECT mssql_exec('view_cast', 'IF OBJECT_ID(N''dbo.cast_base_table'', N''U'') IS NOT NULL DROP TABLE dbo.cast_base_table;');
+
+statement ok
+DETACH view_cast;

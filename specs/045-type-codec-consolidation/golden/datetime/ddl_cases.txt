@@ -1,0 +1,24 @@
+# DateTime DDL cases — codec::datetime::FormatDdlTypeName
+# FR-024/FR-027/FR-028: CreateTable and CtasCreateTable produce byte-identical output.
+#
+# Pre-spec-045 status:
+#   CREATE TABLE (MapTypeToSQLServer) — TIMESTAMP=DATETIME2(6), MS/NS/SEC threw NotImplementedException.
+#   CTAS (MapLogicalTypeToCTAS)       — TIMESTAMP=DATETIME2(7), MS/NS/SEC threw NotImplementedException.
+# Post-spec-045 unified mapping (both contexts):
+
+DATE          | DATE
+TIME          | TIME(7)
+TIMESTAMP     | DATETIME2(6)   # μs — exact match to DuckDB native
+TIMESTAMP_MS  | DATETIME2(3)   # ms — exact (NEW in spec 045)
+TIMESTAMP_NS  | DATETIME2(7)   # ns — closest fit, lossy 2 digits (NEW in spec 045)
+TIMESTAMP_S   | DATETIME2(0)   # s  — exact (NEW in spec 045)
+TIMESTAMP_TZ  | DATETIMEOFFSET(7)
+
+# Notes:
+# - TIMESTAMP unified at (6) not (7) — DuckDB TIMESTAMP is μs-precision; the
+#   pre-spec-045 CTAS-side (7) was reserving 2 digits the peer cannot fill.
+# - TIMESTAMP_NS at (7) is the closest SQL Server precision; the lower 2
+#   nanosecond digits round at the SQL Server side.
+# - DATETIME (1/300 s) and SMALLDATETIME (minute resolution) are decode-only;
+#   CTAS / CreateTable target DATETIME2(6) for any TIMESTAMP value (write-back
+#   loses the SQL Server-specific quirks). This is intentional.

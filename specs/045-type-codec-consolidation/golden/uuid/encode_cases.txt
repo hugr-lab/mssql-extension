@@ -1,0 +1,21 @@
+# Uuid encode cases — codec::uuid::EncodeToBcp (Vector + Value overloads)
+# Format: canonical UUID string | expected BCP-wire-hex (length-prefix + 16 bytes)
+#
+# BCP wire format: 1-byte length (always 16 = 0x10) followed by the
+# 16 mixed-endian bytes (Data1 LE | Data2 LE | Data3 LE | Data4 BE).
+# All cases are the symmetric inverse of decode_cases.txt.
+
+# nil
+00000000-0000-0000-0000-000000000000 | 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# max
+ffffffff-ffff-ffff-ffff-ffffffffffff | 10 FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+
+# RFC 4122 §3 example
+6ba7b810-9dad-11d1-80b4-00c04fd430c8 | 10 10 B8 A7 6B AD 9D D1 11 80 B4 00 C0 4F D4 30 C8
+
+# Mixed-byte pattern
+01234567-89ab-cdef-0123-456789abcdef | 10 67 45 23 01 AB 89 EF CD 01 23 45 67 89 AB CD EF
+
+# Sequential GUID (high bit of Data4[0] set)
+c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d | 10 7E F4 C7 C2 DD 8E 1F 4E 8A 3F AE F2 A1 8B 1C 2D

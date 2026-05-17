@@ -87,7 +87,7 @@ CHAR_VAL  	varchar val	NCHAR	nvarchar val
 query IIIII
 SELECT col_date, col_time, col_datetime2, col_smalldatetime, col_datetimeoffset FROM nbc_all.dbo.TestNbcAllTypes WHERE id = 1;
 ----
-2024-06-15	13:45:30.123456	2024-06-15 13:45:30.123456	2024-06-15 13:45:00	2024-06-15 08:15:30.123456+00
+2024-06-15	13:45:30.123456	2024-06-15 13:45:30.1234567	2024-06-15 13:45:00	2024-06-15 08:15:30.123456+00
 
 # =============================================================================
 # Test 2: All-NULL row via NBCROW

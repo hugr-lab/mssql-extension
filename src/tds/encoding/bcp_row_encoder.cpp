@@ -1,5 +1,14 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/binary_codec.hpp"
+#include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
+#include "codec/decimal_codec.hpp"
+#include "codec/float_codec.hpp"
+#include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
+#include "codec/type_family.hpp"
+#include "codec/uuid_codec.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -28,6 +37,18 @@ static T GetVectorValue(Vector &vec, idx_t row_idx) {
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];
+}
+
+// Money family is decode-only (DuckDB has no MONEY LogicalType — SQL Server
+// MONEY/SMALLMONEY/MONEYN tokens surface as DECIMAL on decode). The Money arm
+// in BCP encode is a compile-required exhaustiveness placeholder + runtime
+// assertion: FamilyFromLogicalType never returns Money, so reaching this
+// throw indicates the LogicalType→family mapping has drifted.
+[[noreturn]] static void ThrowMoneyUnreachable(const LogicalType &type) {
+	throw InternalException(
+		"BCP encoder reached Money family arm for DuckDB type '%s' — "
+		"Money is decode-only and has no LogicalType mapping",
+		type.ToString());
 }
 
 static bool IsVectorNull(Vector &vec, idx_t row_idx) {
@@ -78,127 +99,42 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			continue;
 		}
 
-		// Get the value and encode based on type
-		// Using GetVectorValue to handle both flat and constant vectors
-		switch (col.duckdb_type.id()) {
-		case LogicalTypeId::BOOLEAN: {
-			EncodeBit(buffer, GetVectorValue<bool>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::TINYINT: {
-			EncodeInt8(buffer, GetVectorValue<int8_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			EncodeUInt8(buffer, GetVectorValue<uint8_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::SMALLINT: {
-			EncodeInt16(buffer, GetVectorValue<int16_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			// USMALLINT (0-65535) needs 4 bytes (int) to fit without overflow
-			EncodeInt32(buffer, static_cast<int32_t>(GetVectorValue<uint16_t>(vec, row_idx)));
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			EncodeInt32(buffer, GetVectorValue<int32_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::UINTEGER: {
-			// UINTEGER (0-4B) needs 8 bytes (bigint) to fit without overflow
-			EncodeInt64(buffer, static_cast<int64_t>(GetVectorValue<uint32_t>(vec, row_idx)));
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			EncodeInt64(buffer, GetVectorValue<int64_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::UBIGINT: {
-			// UBIGINT (0-18e18) uses DECIMAL(20,0) to handle full range
-			// Use two-argument constructor hugeint_t(upper=0, lower=val) to avoid
-			// sign issues when val > INT64_MAX (the single-arg constructor takes int64_t)
-			uint64_t val = GetVectorValue<uint64_t>(vec, row_idx);
-			EncodeDecimal(buffer, hugeint_t(0, val), col.precision, col.scale);
-			break;
-		}
-		case LogicalTypeId::FLOAT: {
-			EncodeFloat(buffer, GetVectorValue<float>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::DOUBLE: {
-			EncodeDouble(buffer, GetVectorValue<double>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::DECIMAL: {
-			// DuckDB stores DECIMAL in different internal types based on precision:
-			// precision <= 4: int16_t, <= 9: int32_t, <= 18: int64_t, > 18: hugeint_t
-			auto internal_type = vec.GetType().InternalType();
-			hugeint_t decimal_value;
-			switch (internal_type) {
-			case PhysicalType::INT16:
-				decimal_value = hugeint_t(GetVectorValue<int16_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT32:
-				decimal_value = hugeint_t(GetVectorValue<int32_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT64:
-				decimal_value = hugeint_t(GetVectorValue<int64_t>(vec, row_idx));
-				break;
-			case PhysicalType::INT128:
-				decimal_value = GetVectorValue<hugeint_t>(vec, row_idx);
-				break;
-			default:
-				throw InternalException("Unexpected physical type for DECIMAL: %s", TypeIdToString(internal_type));
-			}
-			EncodeDecimal(buffer, decimal_value, col.precision, col.scale);
-			break;
-		}
-		case LogicalTypeId::VARCHAR: {
-			auto str_val = GetVectorValue<string_t>(vec, row_idx);
-			if (col.IsPLPType()) {
-				EncodeNVarcharPLP(buffer, str_val);
-			} else {
-				EncodeNVarchar(buffer, str_val);
-			}
-			break;
-		}
-		case LogicalTypeId::BLOB: {
-			auto blob_val = GetVectorValue<string_t>(vec, row_idx);
-			if (col.IsPLPType()) {
-				EncodeBinaryPLP(buffer, blob_val);
-			} else {
-				EncodeBinary(buffer, blob_val);
-			}
-			break;
-		}
-		case LogicalTypeId::UUID: {
-			EncodeGUID(buffer, GetVectorValue<hugeint_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::DATE: {
-			EncodeDate(buffer, GetVectorValue<date_t>(vec, row_idx));
-			break;
-		}
-		case LogicalTypeId::TIME: {
-			EncodeTime(buffer, GetVectorValue<dtime_t>(vec, row_idx), col.scale);
-			break;
-		}
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_MS:
-		case LogicalTypeId::TIMESTAMP_NS:
-		case LogicalTypeId::TIMESTAMP_SEC: {
-			EncodeDatetime2(buffer, GetVectorValue<timestamp_t>(vec, row_idx), col.scale);
-			break;
-		}
-		case LogicalTypeId::TIMESTAMP_TZ: {
-			// DuckDB stores TIMESTAMP_TZ as UTC, send with offset 0
-			EncodeDatetimeOffset(buffer, GetVectorValue<timestamp_t>(vec, row_idx), 0, col.scale);
-			break;
-		}
-		default:
+		// Family-level dispatch — the per-type LogicalTypeId fan-out lives
+		// inside FamilyFromLogicalType (spec 045). FamilyFromLogicalType throws
+		// NotImplementedException for unsupported types; rethrow with BCP-specific message.
+		mssql::codec::TypeFamily family;
+		try {
+			family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
+		} catch (const NotImplementedException &) {
 			throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+		}
+		switch (family) {
+		case mssql::codec::TypeFamily::Boolean:
+			mssql::codec::boolean::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Integer:
+			mssql::codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Float:
+			mssql::codec::float_family::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Decimal:
+			mssql::codec::decimal::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::String:
+			mssql::codec::string::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Binary:
+			mssql::codec::binary::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Uuid:
+			mssql::codec::uuid::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::DateTime:
+			mssql::codec::datetime::EncodeToBcp(vec, row_idx, col, buffer);
+			break;
+		case mssql::codec::TypeFamily::Money:
+			ThrowMoneyUnreachable(col.duckdb_type);
 		}
 	}
 }
@@ -215,81 +151,40 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		return;
 	}
 
-	switch (col.duckdb_type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		EncodeBit(buffer, value.GetValue<bool>());
-		break;
-	case LogicalTypeId::TINYINT:
-		EncodeInt8(buffer, value.GetValue<int8_t>());
-		break;
-	case LogicalTypeId::UTINYINT:
-		EncodeUInt8(buffer, value.GetValue<uint8_t>());
-		break;
-	case LogicalTypeId::SMALLINT:
-		EncodeInt16(buffer, value.GetValue<int16_t>());
-		break;
-	case LogicalTypeId::USMALLINT:
-		EncodeInt32(buffer, static_cast<int32_t>(value.GetValue<uint16_t>()));
-		break;
-	case LogicalTypeId::INTEGER:
-		EncodeInt32(buffer, value.GetValue<int32_t>());
-		break;
-	case LogicalTypeId::UINTEGER:
-		EncodeInt64(buffer, static_cast<int64_t>(value.GetValue<uint32_t>()));
-		break;
-	case LogicalTypeId::BIGINT:
-		EncodeInt64(buffer, value.GetValue<int64_t>());
-		break;
-	case LogicalTypeId::UBIGINT: {
-		// Use two-argument constructor hugeint_t(upper=0, lower=val) to avoid
-		// sign issues when val > INT64_MAX
-		uint64_t val = value.GetValue<uint64_t>();
-		EncodeDecimal(buffer, hugeint_t(0, val), col.precision, col.scale);
-		break;
-	}
-	case LogicalTypeId::FLOAT:
-		EncodeFloat(buffer, value.GetValue<float>());
-		break;
-	case LogicalTypeId::DOUBLE:
-		EncodeDouble(buffer, value.GetValue<double>());
-		break;
-	case LogicalTypeId::DECIMAL:
-		EncodeDecimal(buffer, value.GetValue<hugeint_t>(), col.precision, col.scale);
-		break;
-	case LogicalTypeId::VARCHAR:
-		if (col.IsPLPType()) {
-			EncodeNVarcharPLP(buffer, string_t(value.ToString()));
-		} else {
-			EncodeNVarchar(buffer, string_t(value.ToString()));
-		}
-		break;
-	case LogicalTypeId::BLOB:
-		if (col.IsPLPType()) {
-			EncodeBinaryPLP(buffer, string_t(value.GetValueUnsafe<string>()));
-		} else {
-			EncodeBinary(buffer, string_t(value.GetValueUnsafe<string>()));
-		}
-		break;
-	case LogicalTypeId::UUID:
-		EncodeGUID(buffer, value.GetValue<hugeint_t>());
-		break;
-	case LogicalTypeId::DATE:
-		EncodeDate(buffer, value.GetValue<date_t>());
-		break;
-	case LogicalTypeId::TIME:
-		EncodeTime(buffer, value.GetValue<dtime_t>(), col.scale);
-		break;
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-		EncodeDatetime2(buffer, value.GetValue<timestamp_t>(), col.scale);
-		break;
-	case LogicalTypeId::TIMESTAMP_TZ:
-		EncodeDatetimeOffset(buffer, value.GetValue<timestamp_t>(), 0, col.scale);
-		break;
-	default:
+	// Family-level dispatch — see EncodeRow above for the same pattern.
+	mssql::codec::TypeFamily family;
+	try {
+		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
+	} catch (const NotImplementedException &) {
 		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+	}
+	switch (family) {
+	case mssql::codec::TypeFamily::Boolean:
+		mssql::codec::boolean::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Integer:
+		mssql::codec::integer::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Float:
+		mssql::codec::float_family::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Decimal:
+		mssql::codec::decimal::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::String:
+		mssql::codec::string::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Binary:
+		mssql::codec::binary::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Uuid:
+		mssql::codec::uuid::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::DateTime:
+		mssql::codec::datetime::EncodeToBcp(value, col, buffer);
+		break;
+	case mssql::codec::TypeFamily::Money:
+		ThrowMoneyUnreachable(col.duckdb_type);
 	}
 }
 
@@ -391,30 +286,6 @@ void BCPRowEncoder::EncodeDecimal(vector<uint8_t> &buffer, const hugeint_t &valu
 }
 
 //===----------------------------------------------------------------------===//
-// Unicode String (NVARCHARTYPE 0xE7)
-//===----------------------------------------------------------------------===//
-
-void BCPRowEncoder::EncodeNVarchar(vector<uint8_t> &buffer, const string_t &value) {
-	// Optimized: encode directly to buffer without intermediate allocation
-	size_t input_len = value.GetSize();
-	const char *input = value.GetData();
-
-	// Reserve space: 2 bytes for length + max UTF-16 size (input_len * 2 for ASCII, may be less for non-ASCII)
-	size_t start_pos = buffer.size();
-	buffer.resize(start_pos + 2 + input_len * 2);
-
-	// Encode directly to buffer (skip 2 bytes for length prefix)
-	size_t utf16_len = Utf16LEEncodeDirect(input, input_len, buffer.data() + start_pos + 2);
-
-	// Write actual length
-	buffer[start_pos] = static_cast<uint8_t>(utf16_len & 0xFF);
-	buffer[start_pos + 1] = static_cast<uint8_t>((utf16_len >> 8) & 0xFF);
-
-	// Shrink buffer to actual size (in case non-ASCII used less space)
-	buffer.resize(start_pos + 2 + utf16_len);
-}
-
-//===----------------------------------------------------------------------===//
 // Binary Data (BIGVARBINARYTYPE 0xA5)
 //===----------------------------------------------------------------------===//
 
@@ -433,66 +304,6 @@ void BCPRowEncoder::EncodeBinary(vector<uint8_t> &buffer, const string_t &value)
 //===----------------------------------------------------------------------===//
 // PLP (Partially Length-prefixed) Encoding for MAX types
 //===----------------------------------------------------------------------===//
-
-void BCPRowEncoder::EncodeNVarcharPLP(vector<uint8_t> &buffer, const string_t &value) {
-	// Optimized: encode directly to buffer without intermediate allocation
-	size_t input_len = value.GetSize();
-	const char *input = value.GetData();
-
-	// Handle empty string: PLP with no chunks, just terminator
-	// PLP chunks must have length > 0, so empty string = no chunks
-	if (input_len == 0) {
-		// Write UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE)
-		constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
-		for (int i = 0; i < 8; i++) {
-			buffer.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
-		}
-		// Write terminator (4 bytes of 0x00) - no chunks for empty string
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		buffer.push_back(0x00);
-		return;
-	}
-
-	// PLP format: 8 bytes (UNKNOWN_LEN) + 4 bytes (chunk len) + data + 4 bytes (terminator)
-	size_t start_pos = buffer.size();
-	size_t max_utf16_len = input_len * 2;
-	buffer.resize(start_pos + 8 + 4 + max_utf16_len + 4);
-
-	uint8_t *out = buffer.data() + start_pos;
-
-	// Write UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE)
-	constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
-	for (int i = 0; i < 8; i++) {
-		out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
-	}
-	out += 8;
-
-	// Reserve 4 bytes for chunk length (will fill in after encoding)
-	uint8_t *chunk_len_ptr = out;
-	out += 4;
-
-	// Encode UTF-16 directly
-	size_t utf16_len = Utf16LEEncodeDirect(input, input_len, out);
-	out += utf16_len;
-
-	// Write actual chunk length
-	uint32_t chunk_len = static_cast<uint32_t>(utf16_len);
-	chunk_len_ptr[0] = static_cast<uint8_t>(chunk_len & 0xFF);
-	chunk_len_ptr[1] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
-	chunk_len_ptr[2] = static_cast<uint8_t>((chunk_len >> 16) & 0xFF);
-	chunk_len_ptr[3] = static_cast<uint8_t>((chunk_len >> 24) & 0xFF);
-
-	// Write terminator (4 bytes of 0x00)
-	out[0] = 0x00;
-	out[1] = 0x00;
-	out[2] = 0x00;
-	out[3] = 0x00;
-
-	// Shrink buffer to actual size
-	buffer.resize(start_pos + 8 + 4 + utf16_len + 4);
-}
 
 void BCPRowEncoder::EncodeBinaryPLP(vector<uint8_t> &buffer, const string_t &value) {
 	// Use UNKNOWN_PLP_LEN (0xFFFFFFFFFFFFFFFE) instead of actual length
@@ -610,12 +421,8 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 	}
 }
 
-void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uint8_t scale) {
-	// DATETIME2: time (3-5 bytes) + date (3 bytes)
-	uint64_t time_value;
-	uint32_t date_value;
-	TimestampToDatetime2Components(ts, scale, time_value, date_value);
-
+void BCPRowEncoder::EncodeDatetime2Raw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value,
+									   uint8_t scale) {
 	uint8_t time_size = GetTimeByteSize(scale);
 	uint8_t total_size = time_size + 3;
 
@@ -632,31 +439,36 @@ void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uin
 	buffer.push_back(static_cast<uint8_t>((date_value >> 16) & 0xFF));
 }
 
-void BCPRowEncoder::EncodeDatetimeOffset(vector<uint8_t> &buffer, timestamp_t ts, int16_t offset_minutes,
-										 uint8_t scale) {
-	// DATETIMEOFFSET: time (3-5 bytes) + date (3 bytes) + offset (2 bytes signed)
+void BCPRowEncoder::EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uint8_t scale) {
 	uint64_t time_value;
 	uint32_t date_value;
 	TimestampToDatetime2Components(ts, scale, time_value, date_value);
+	EncodeDatetime2Raw(buffer, time_value, date_value, scale);
+}
 
+void BCPRowEncoder::EncodeDatetimeOffsetRaw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value,
+											int16_t offset_minutes, uint8_t scale) {
 	uint8_t time_size = GetTimeByteSize(scale);
 	uint8_t total_size = time_size + 3 + 2;
 
 	buffer.push_back(total_size);
 
-	// Write time portion (little-endian)
 	for (uint8_t i = 0; i < time_size; i++) {
 		buffer.push_back(static_cast<uint8_t>((time_value >> (i * 8)) & 0xFF));
 	}
-
-	// Write date portion (3 bytes little-endian)
 	buffer.push_back(static_cast<uint8_t>(date_value & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((date_value >> 8) & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((date_value >> 16) & 0xFF));
-
-	// Write offset (2 bytes signed little-endian)
 	buffer.push_back(static_cast<uint8_t>(offset_minutes & 0xFF));
 	buffer.push_back(static_cast<uint8_t>((offset_minutes >> 8) & 0xFF));
+}
+
+void BCPRowEncoder::EncodeDatetimeOffset(vector<uint8_t> &buffer, timestamp_t ts, int16_t offset_minutes,
+										 uint8_t scale) {
+	uint64_t time_value;
+	uint32_t date_value;
+	TimestampToDatetime2Components(ts, scale, time_value, date_value);
+	EncodeDatetimeOffsetRaw(buffer, time_value, date_value, offset_minutes, scale);
 }
 
 //===----------------------------------------------------------------------===//

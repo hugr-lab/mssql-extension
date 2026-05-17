@@ -36,38 +36,16 @@ public:
 	static std::string GetTypeName(uint8_t type_id);
 
 private:
-	// Type-specific converters
-	static void ConvertInteger(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							   idx_t row_idx);
+	// Type-specific converters (all 9 type families migrated to codec — spec 045 Phase 6 complete)
 
-	static void ConvertBoolean(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
-
-	static void ConvertFloat(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							 idx_t row_idx);
-
-	static void ConvertDecimal(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							   idx_t row_idx);
-
-	static void ConvertMoney(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							 idx_t row_idx);
-
-	static void ConvertString(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							  idx_t row_idx);
-
-	static void ConvertBinary(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
-
-	static void ConvertDate(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
-
-	static void ConvertTime(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-							idx_t row_idx);
-
-	static void ConvertDateTime(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column, Vector &vector,
-								idx_t row_idx);
-
-	static void ConvertDatetimeOffset(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column,
+	// Issue #89 fallback: render a non-string TDS value as a string and write into a VARCHAR
+	// destination vector. Used when catalog-declared type (VARCHAR) disagrees with the runtime
+	// TDS column type (e.g. for views that CAST(... AS DECIMAL) internally).
+	static void WriteAsStringFallback(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column,
 									  Vector &vector, idx_t row_idx);
 
-	static void ConvertGuid(const std::vector<uint8_t> &value, Vector &vector, idx_t row_idx);
+	// True if the TDS type tag is a character type (no fallback rendering needed).
+	static bool IsStringTdsType(uint8_t type_id);
 };
 
 }  // namespace encoding

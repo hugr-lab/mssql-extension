@@ -157,38 +157,75 @@ SELECT * FROM mssql_ctas_types.dbo.ctas_decimal_precision;
 12345678901234567890.12345
 
 # =============================================================================
-# Unsupported Types - Should Error
+# Unsupported / Restricted Types
 # =============================================================================
+#
+# Per spec 045 Phase 3 (FR-025 / FR-028 DDL unification): HUGEINT and UHUGEINT
+# now map to DECIMAL(38,0) in BOTH the CREATE-TABLE and CTAS DDL contexts. The
+# DDL phase therefore succeeds; the BCP data-insert phase still throws until
+# the Decimal family migration lands (spec 045 Phase 6 / T069). The expected
+# error text matches the BCP NotImplementedException, which contains "HUGEINT".
 
-# HUGEINT is unsupported
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
+# HUGEINT — DDL maps to DECIMAL(38,0); BCP encoding pending (spec 045 Phase 6)
 statement error
-CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 170141183460469231731687303715884105727::HUGEINT AS val;
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 99999999999999999999999999999999999999::HUGEINT AS val;
 ----
 HUGEINT
 
-# INTERVAL is unsupported
-statement error
-CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT INTERVAL '1 day' AS val;
-----
-INTERVAL
+# CTAS partially created the table at DDL phase; drop it before the next case.
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
-# LIST is unsupported
+# INTERVAL — post-spec-045 maps to NVARCHAR(50); CTAS succeeds (FR-026).
+# Pre-spec-045 this raised a NotImplementedException with substring "INTERVAL".
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_interval;
+
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_interval AS SELECT INTERVAL '1 day' AS val;
+
+query T
+SELECT val FROM mssql_ctas_types.dbo.ctas_interval;
+----
+1 day
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_interval;
+
+# LIST / STRUCT / MAP — SQL Server has no array / struct / map types, so the
+# extension rejects them. The exact error text varies between DuckDB's CTAS
+# dispatch paths (the custom CTAS planner emits "CTAS does not support DuckDB
+# type LIST..."; the generic CreateTable path emits "Cannot map DuckDB type
+# 'INTEGER[]' to SQL Server type"). Either form is a correct rejection —
+# what matters is the operation fails. Match a substring that appears in
+# both: the type's DuckDB ToString form quoted with single quotes.
+
 statement error
 CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT [1, 2, 3] AS val;
 ----
-LIST
+INTEGER[]
 
-# STRUCT is unsupported
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
 statement error
 CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT {'a': 1, 'b': 2} AS val;
 ----
 STRUCT
 
-# MAP is unsupported
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
+
 statement error
 CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT MAP {'key': 'value'} AS val;
 ----
 MAP
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
 # =============================================================================
 # Cleanup

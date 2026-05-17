@@ -1,0 +1,12 @@
+# Binary DDL — DuckDB BLOB → SQL Server type name
+#
+# Format:
+#   <ctx> | <expected-text>
+#
+# ctx is CreateTable or CtasCreateTable. Per FR-027/FR-028 both contexts
+# return byte-identical "VARBINARY(MAX)". Pre-spec-045 both dispatch sites
+# already produced this exact literal — the consolidation is purely about
+# removing duplication.
+
+CreateTable|VARBINARY(MAX)
+CtasCreateTable|VARBINARY(MAX)

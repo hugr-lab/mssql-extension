@@ -1,0 +1,89 @@
+# Decimal — edge cases that informed the migration design
+#
+# These cases are documentation only — implemented as unit-test
+# assertions in test/cpp/codec/test_decimal_codec.cpp.
+
+## 1. HUGEINT-from-Integer routing (FR-025)
+DuckDB HUGEINT (signed 128-bit) has no direct SQL Server counterpart.
+The Integer codec already forwards HUGEINT *literals* to
+`MSSQLValueSerializer::SerializeDecimal(value, 38, 0)`. Post-Decimal-
+migration this routes through `codec::decimal::FormatSqlLiteral` /
+`RenderAsString` so there is one canonical implementation.
+
+DDL: Integer codec's `FormatDdlTypeName(HUGEINT, _, _)` already
+returns `DECIMAL(38,0)` (FR-025). Decimal codec's
+`FormatDdlTypeName(DECIMAL(38,0), _, _)` returns the same string —
+both code paths converge byte-identically.
+
+BCP: HUGEINT BCP encoding was a Phase-2-stub `NotImplementedException`
+in the Integer codec. Post-Decimal-migration the Integer codec
+delegates to `codec::decimal::EncodeToBcp` with synthesized
+`BCPColumnMetadata{precision=38, scale=0}` instead of throwing.
+
+## 2. FR-022 — Filter vs InsertValues divergence
+Pre-spec-045 the Filter path called `Value::ToString()` on DECIMAL
+values, which DuckDB renders using its own canonical form:
+- DECIMAL(38,18) with stored value 1 (= 0.000000000000000001):
+  - InsertValues: "0.000000000000000001" (manual fixed-point)
+  - Filter (legacy ToString): "0.000000000000000001" — happens to
+    match in this case
+- DECIMAL(38,0) with stored hugeint value 9999999999999999999:
+  - InsertValues: "9999999999999999999"
+  - Filter (legacy ToString): "9999999999999999999" — also matches
+- The divergence shows up for DECIMAL types where DuckDB's ToString
+  uses comma-as-thousands-separator in some locales, or where
+  rounding kicks in for values near the precision limit.
+
+Post-spec-045 both contexts route through the same
+`codec::decimal::FormatSqlLiteral` which calls
+`MSSQLValueSerializer::SerializeDecimal` internally — byte-identical
+by construction.
+
+## 3. PhysicalType dispatch
+Decoder branches on `column.precision`; encoder branches on
+`vector.GetType().InternalType()`. These must align:
+- precision <= 4   ↔ PhysicalType::INT16
+- precision <= 9   ↔ PhysicalType::INT32
+- precision <= 18  ↔ PhysicalType::INT64
+- precision >  18  ↔ PhysicalType::INT128
+
+Decoder must use the *catalog's precision* (not the vector's
+InternalType) because TDS only sends precision/scale, not
+PhysicalType. The dispatcher trusts that DuckDB allocated a vector
+whose InternalType matches the catalog's precision bucket.
+
+## 4. MONEY routing (FR-024 deferred)
+The Money family stubs (`codec::money::*`) are decode-only this
+sub-phase. Their EncodeToBcp / FormatSqlLiteral / FormatDdlTypeName
+remain undefined (linker-fenced — calling them is a link error).
+All write/literal/DDL paths for MONEY/SMALLMONEY values route via
+the Decimal family (MONEY → DECIMAL(19,4), SMALLMONEY → DECIMAL(10,4)).
+
+## 5. Issue #89 — VARCHAR fallback (DISPATCHER-LEVEL fix)
+SQL Server VIEWs can project a column at a different type than
+`sys.columns` reports — typically because the view does
+`CAST(col AS DECIMAL(19,4))` or `CONVERT(VARCHAR(50), col)`. In
+those cases:
+- DuckDB allocates the result vector from the catalog type
+  (e.g. VARCHAR — what `sys.columns` reported).
+- TDS sends column data in the actual projected type
+  (e.g. DECIMAL — what the SELECT executes).
+- The codec dispatcher tries
+  `FlatVector::GetData<hugeint_t>(varchar_vector)` → assertion
+  failure inside DuckDB.
+
+Post-spec-045 fix: `TypeConverter::ConvertValue` checks the
+destination vector's type before dispatching. If the vector is
+VARCHAR but the TDS column type is non-string, it renders the
+incoming bytes as a string via per-family `RenderAsString` helpers
+and writes into the StringVector. The Decimal family's
+`RenderAsString(bytes, precision, scale)` reuses the same
+`SerializeDecimal` rendering as the InsertValues literal context —
+deterministic, no scientific notation, round-trips losslessly.
+
+The fallback is *defensive* — it does not change the catalog or
+result schema. Users see strings in VARCHAR columns even if the
+view actually returns a decimal; this matches what the catalog
+promised. The fallback prevents the crash; the proper fix (using
+`sp_describe_first_result_set` for view metadata) is out of scope
+for this spec.

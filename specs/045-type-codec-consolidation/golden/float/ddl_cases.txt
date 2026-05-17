@@ -1,0 +1,15 @@
+# Float/Double → SQL Server DDL type name cases (FR-027/FR-028: byte-
+# identical CreateTable == CtasCreateTable)
+# format: type | cfg.text_type | ctx | expected_text
+# Notes:
+#   - DuckDB FLOAT (32-bit) → SQL Server REAL (32-bit)
+#   - DuckDB DOUBLE (64-bit) → SQL Server FLOAT (64-bit by default)
+#   - cfg.text_type is irrelevant for Float DDL (recorded for completeness)
+FLOAT  | NVARCHAR | CreateTable     | REAL
+FLOAT  | NVARCHAR | CtasCreateTable | REAL
+FLOAT  | VARCHAR  | CreateTable     | REAL
+FLOAT  | VARCHAR  | CtasCreateTable | REAL
+DOUBLE | NVARCHAR | CreateTable     | FLOAT
+DOUBLE | NVARCHAR | CtasCreateTable | FLOAT
+DOUBLE | VARCHAR  | CreateTable     | FLOAT
+DOUBLE | VARCHAR  | CtasCreateTable | FLOAT

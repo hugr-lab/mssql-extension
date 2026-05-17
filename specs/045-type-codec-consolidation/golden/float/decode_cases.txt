@@ -1,0 +1,22 @@
+# Float/Double decode cases — TDS wire bytes (LE) → DuckDB float/double
+# format: bytes_len | LE_hex_bytes | expected_type | expected_value
+# Notes:
+#   - The legacy ConvertFloat rule is: 4 bytes → memcpy into float;
+#     8 bytes → memcpy into double. The TDS protocol uses native LE
+#     IEEE 754 encoding (no byte swapping needed on x86/arm64).
+#   - 4-byte REAL → DuckDB FLOAT
+#   - 8-byte FLOAT → DuckDB DOUBLE
+4 | 00 00 00 00 | FLOAT  | 0.0
+4 | 00 00 80 3F | FLOAT  | 1.0
+4 | 00 00 80 BF | FLOAT  | -1.0
+4 | 00 00 80 7F | FLOAT  | +inf
+4 | 00 00 80 FF | FLOAT  | -inf
+4 | 00 00 C0 7F | FLOAT  | NaN
+4 | C3 F5 48 40 | FLOAT  | 3.14 (approx)
+8 | 00 00 00 00 00 00 00 00 | DOUBLE | 0.0
+8 | 00 00 00 00 00 00 F0 3F | DOUBLE | 1.0
+8 | 00 00 00 00 00 00 F0 BF | DOUBLE | -1.0
+8 | 00 00 00 00 00 00 F0 7F | DOUBLE | +inf
+8 | 00 00 00 00 00 00 F0 FF | DOUBLE | -inf
+8 | 00 00 00 00 00 00 F8 7F | DOUBLE | NaN
+8 | 1F 85 EB 51 B8 1E 09 40 | DOUBLE | 3.14
