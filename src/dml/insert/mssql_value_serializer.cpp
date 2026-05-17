@@ -116,7 +116,12 @@ idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const Log
 	try {
 		return mssql::codec::EstimateLiteralSize(type);
 	} catch (const NotImplementedException &) {
-		return 50;	// Conservative fallback for unsupported families.
+		// Unreachable in practice — the only path here is Serialize() failing on
+		// an unsupported family, which throws InvalidInputException before this
+		// estimator is needed. 50 bytes is a conservative upper bound that won't
+		// trigger an INSERT-batch StringBuffer realloc for any plausibly-sized
+		// literal an unsupported family could produce.
+		return 50;
 	}
 }
 

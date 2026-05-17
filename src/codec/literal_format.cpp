@@ -32,9 +32,16 @@ namespace codec {
 
 namespace {
 
-[[noreturn]] void ThrowFamilyNotMigrated(const char *family_name, const LogicalType &type) {
-	throw NotImplementedException("codec::FormatSqlLiteral: %s family not yet migrated to codec layer (type '%s')",
-								  family_name, type.ToString());
+// Money is decode-only by design (DuckDB has no MONEY LogicalType — SQL Server
+// MONEY/SMALLMONEY/MONEYN tokens surface as DECIMAL at decode time). The Money
+// arm in either dispatcher is structurally unreachable: FamilyFromLogicalType
+// never returns Money. The throw is a compile-required exhaustiveness arm + a
+// runtime assertion that the LogicalType→family mapping hasn't drifted.
+[[noreturn]] void ThrowMoneyUnreachable(const char *fn_name, const LogicalType &type) {
+	throw InternalException(
+		"codec::%s: Money family has no LogicalType-side path — "
+		"SQL Server MONEY values surface as DECIMAL on decode; reached for type '%s'",
+		fn_name, type.ToString());
 }
 
 }  // namespace
@@ -53,7 +60,7 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	case TypeFamily::Decimal:
 		return decimal::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Money:
-		ThrowFamilyNotMigrated("Money", type);
+		ThrowMoneyUnreachable("FormatSqlLiteral", type);
 	case TypeFamily::String:
 		return string::FormatSqlLiteral(v, type, ctx);
 	case TypeFamily::Binary:
@@ -77,7 +84,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 	case TypeFamily::Decimal:
 		return decimal::EstimateLiteralSize(type);
 	case TypeFamily::Money:
-		ThrowFamilyNotMigrated("Money", type);
+		ThrowMoneyUnreachable("EstimateLiteralSize", type);
 	case TypeFamily::String:
 		return string::EstimateLiteralSize(type);
 	case TypeFamily::Binary:

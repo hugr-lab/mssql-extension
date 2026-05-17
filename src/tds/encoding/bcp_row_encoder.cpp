@@ -39,6 +39,18 @@ static T GetVectorValue(Vector &vec, idx_t row_idx) {
 	return data[idx];
 }
 
+// Money family is decode-only (DuckDB has no MONEY LogicalType — SQL Server
+// MONEY/SMALLMONEY/MONEYN tokens surface as DECIMAL on decode). The Money arm
+// in BCP encode is a compile-required exhaustiveness placeholder + runtime
+// assertion: FamilyFromLogicalType never returns Money, so reaching this
+// throw indicates the LogicalType→family mapping has drifted.
+[[noreturn]] static void ThrowMoneyUnreachable(const LogicalType &type) {
+	throw InternalException(
+		"BCP encoder reached Money family arm for DuckDB type '%s' — "
+		"Money is decode-only and has no LogicalType mapping",
+		type.ToString());
+}
+
 static bool IsVectorNull(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
 	vec.ToUnifiedFormat(1, format);
@@ -122,12 +134,7 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 			mssql::codec::datetime::EncodeToBcp(vec, row_idx, col, buffer);
 			break;
 		case mssql::codec::TypeFamily::Money:
-			// DuckDB has no MONEY LogicalType; FamilyFromLogicalType never returns
-			// Money. If we reach this arm the family mapping has a bug.
-			throw InternalException(
-				"BCP encoder reached Money family arm for DuckDB type '%s' — "
-				"Money is decode-only and has no LogicalType mapping",
-				col.duckdb_type.ToString());
+			ThrowMoneyUnreachable(col.duckdb_type);
 		}
 	}
 }
@@ -177,11 +184,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 		mssql::codec::datetime::EncodeToBcp(value, col, buffer);
 		break;
 	case mssql::codec::TypeFamily::Money:
-		// DuckDB has no MONEY LogicalType; see EncodeRow Money arm.
-		throw InternalException(
-			"BCP encoder reached Money family arm for DuckDB type '%s' — "
-			"Money is decode-only and has no LogicalType mapping",
-			col.duckdb_type.ToString());
+		ThrowMoneyUnreachable(col.duckdb_type);
 	}
 }
 
