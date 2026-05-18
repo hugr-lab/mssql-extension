@@ -720,6 +720,56 @@ file modified by the singleton-cleanup phases.
    table to add a row for `application_name`; mention `Application Name=`
    syntax in user-facing docs.
 
+### Phase 7 — Security hardening (post PR #118 review)
+
+Note: numbering aligns with `tasks.md` Phase 7 (US-SEC). Closes the 5
+in-scope security-design items surfaced during PR #118 review (see
+`## Clarifications` Session 2026-05-18). Two out-of-scope items
+(credential zeroization → issue #119 / spec 049; cooperative TDS
+cancellation → future spec) are documented as non-goals.
+
+1. **FR-012 TokenCache key namespacing**: change
+   `mssql::azure::TokenCache` key from bare `secret_name` to
+   `(reinterpret_cast<uintptr_t>(&database_instance), secret_name)`.
+   Plumb `DatabaseInstance &` (or `ClientContext &`) through
+   `TokenCache::Get/Put/Invalidate` call sites
+   (`src/azure/azure_secret_reader.cpp`, `azure_token.cpp`,
+   `src/connection/mssql_connection_provider.cpp` FEDAUTH path).
+2. **OnDetach per-instance invalidation**: update Azure-cache
+   invalidation in `MSSQLCatalog::OnDetach`
+   (`src/catalog/mssql_catalog.cpp:622`) to scope by
+   `(this->db_instance_id, secret_name)`, preventing inadvertent
+   cross-instance cache invalidation.
+3. **FR-013 `mssql_close_all()`**: register new diagnostic scalar
+   function that walks `MSSQLConnectionHandleManager`'s handle map
+   under its existing mutex, closes each `TdsConnection`, returns the
+   count. Idempotent. Description starts with `[DEPRECATED]` per
+   FR-010.
+4. **SC-005 credential-redaction gate**: write
+   `test/sql/diagnostic/pool_stats_no_credentials.test` — for each
+   enabled auth method (SQL minimum; FEDAUTH and Kerberos gated on
+   their env vars), ATTACH with a known sentinel substring in the
+   credential, `SELECT * FROM mssql_pool_stats()`, assert no column
+   contains the sentinel. Defends against accidental future column
+   additions that echo connection strings.
+5. **noexcept teardown chain audit**: explicitly mark `~MSSQLCatalog`,
+   `~ConnectionPool`, `~TdsConnection`, `~TdsSocket`,
+   `~TlsContext` `noexcept` (or verify implicit). Wrap any
+   potentially-throwing destructor body in
+   `try { ... } catch (...) { /* log + swallow */ }`. A throw during
+   `~AttachedDatabase` unwind invokes `std::terminate`.
+6. **`~ConnectionPool` RAII contract**: add debug-only
+   `D_ASSERT(checked_out_count_.load() == 0)` (violation of DuckDB
+   quiescence contract). Release builds: close sockets immediately,
+   do NOT join threads holding checked-out connections (they observe
+   EBADF on next read). Document at the top of
+   `class ConnectionPool`: sockets close immediately on pool
+   destruction; in-flight TDS requests on other threads observe
+   connection-reset on next read; server-side rollback of open
+   transactions happens via TCP FIN within seconds; no graceful TDS
+   ATTENTION cancel (cross-thread socket write would be unsafe);
+   cooperative cancellation tracked as a future spec.
+
 ### Phase 6 — Polish
 
 1. (Band-aid retirement is part of Phase 3 — the entire `MSSQLContextManager`

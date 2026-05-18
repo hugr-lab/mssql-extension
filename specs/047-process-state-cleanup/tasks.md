@@ -8,7 +8,7 @@ description: "Task list for spec 047 — Process-Wide State Cleanup"
 
 **Prerequisites**: `plan.md` (required), `spec.md` (required), `research.md`, `data-model.md`, `contracts/README.md`, `quickstart.md` — all generated.
 
-**Tests**: Test tasks are explicitly part of every user story (per FR-008, FR-009, and SC-001..SC-010). C++ + SQL regression tests are required for merge gate.
+**Tests**: Test tasks are explicitly part of every user story (per FR-008, FR-009, FR-014, and SC-001..SC-012). C++ + SQL regression tests are required for merge gate.
 
 **Organization**: Tasks are grouped by user story so each story can be implemented, tested, and merged independently. US1 alone delivers the production-bug fix (issue #96 + Scenarios 1/2/3); the rest are stacked improvements.
 
@@ -219,12 +219,12 @@ Single-project C++ extension layout:
 - [ ] T061 [US-AN] In `MSSQLConnectionInfo::FromConnectionString` (ADO.NET branch, `src/mssql_storage.cpp`): recognize `Application Name`, `ApplicationName`, `App Name` (all case-insensitive). Use `StringUtil::CIEquals` (already in use elsewhere in the parser). Lookup populates `info.application_name`.
 - [ ] T062 [US-AN] In the URI branch of the same function: recognize `applicationname` query parameter (no spaces in URI keys per URL convention). Populate `info.application_name`.
 - [ ] T063 [US-AN] In `MSSQLConnectionInfo::FromSecret` (`src/mssql_storage.cpp`): read both `application_name` (underscore form, matches existing convention) and `applicationname` secret fields; the first non-empty wins.
-- [ ] T064 [US-AN] Update all four authentication strategies to consult `info.application_name` first, falling back to the unified default `"DuckDB MSSQL Extension"` (replacing today's mix of `"DuckDB"` and `"DuckDB MSSQL Extension"`):
-  - `src/tds/auth/sql_auth_strategy.cpp` (~line 32, replace `options.app_name = "DuckDB"`)
-  - `src/tds/auth/manual_token_strategy.cpp` (~line 50, same)
-  - `src/tds/auth/fedauth_strategy.cpp` (~line 36, same)
-  - `src/include/tds/auth/integrated_auth_strategy.hpp` (~line 52, already `"DuckDB MSSQL Extension"` — change to consult `info`).
-  Each strategy receives the `MSSQLConnectionInfo` (or equivalent) — verify the field is reachable; if not, plumb it through (typically one extra `info` parameter or via existing options struct).
+- [ ] T064 [US-AN] Plumb `application_name` into all four authentication strategies via an extended constructor parameter (verified plumbing: today none of the strategies see `MSSQLConnectionInfo` — they receive individual fields from `AuthStrategyFactory::Create`). For each strategy: add `const std::string &app_name` constructor parameter (default `""`); store as private member `app_name_`; in `GetLogin7Options()` set `options.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;` (replaces today's hardcoded `"DuckDB"` or `"DuckDB MSSQL Extension"`).
+  - `src/include/tds/auth/sql_auth_strategy.hpp:23` constructor + `src/tds/auth/sql_auth_strategy.cpp:15` impl + `:32` `options.app_name = "DuckDB"` site.
+  - `src/include/tds/auth/manual_token_strategy.hpp` constructor + `src/tds/auth/manual_token_strategy.cpp:17` impl + `:50` `options.app_name = "DuckDB"` site.
+  - `src/include/tds/auth/fedauth_strategy.hpp` constructor + `src/tds/auth/fedauth_strategy.cpp:19` impl + `:36` `options.app_name = "DuckDB"` site.
+  - `src/include/tds/auth/integrated_auth_strategy.hpp:27` constructor (header-only class) + `:52` `opts.app_name = "DuckDB MSSQL Extension"` site (already correct default, but parameterize).
+  Then `src/tds/auth/auth_strategy_factory.cpp` — 4 construction sites at lines 94, 107, 135 (`CreateSqlAuth`), 141 (`CreateFedAuth`), 152 (`CreateManualToken`): each gets `conn_info.application_name` appended as the new last argument. `CreateSqlAuth`/`CreateFedAuth`/`CreateManualToken` helper signatures also gain the new param.
 - [ ] T065 [US-AN] Add 128-char clamp + DEBUG log line in one place (recommended: a tiny helper `ResolveAppName(const MSSQLConnectionInfo &info)` inline in `src/include/mssql_storage.hpp` or near the auth-strategy fan-out). SQL Server clamps `program_name` to 128; truncating client-side keeps the value the user sees in `APP_NAME()` consistent with what we sent.
 
 ### Tests for User Story US-AN
@@ -248,7 +248,6 @@ Single-project C++ extension layout:
 
 - [ ] T047 [P] SC-004 grep audit: `grep -rn 'MssqlPoolManager\|MSSQLContextManager\|MSSQLResultStreamRegistry' src/ src/include/`. Expect zero matches (excluding comment-only mentions tagged with "removed in spec 047"). Note: `MSSQLConnectionHandleManager` is NOT in this grep — it stays.
 - [ ] T048 [P] Write `specs/047-process-state-cleanup/state_inventory.md` (FR-007 deliverable). Final classification table of every process-wide static after implementation: 0 "migrate" entries; legitimate set = Winsock + OpenSSL + thread-local scratch (×2) + Azure TokenCache + MSSQLConnectionHandleManager (with deprecation note linking to FR-010).
-- [ ] T049 [P] (Superseded by T046c — TokenCache inline comment now covers both the intentional-singleton rationale and the FR-012 key-namespacing decision. Marked complete when T046c lands.)
 - [ ] T050 [P] Update `CLAUDE.md` "Key Architecture Concepts" → "Connection pool" bullet to reflect per-catalog ownership. Current text mentions "per attached database" — make explicit that pool lifetime is bounded by catalog lifetime (RAII via `unique_ptr`); deleted singletons; no shared cross-instance pool state.
 - [ ] T051 [P] Update `CLAUDE.md` "Recent Changes" with spec 047 entry summarizing: 3 singletons removed (pool manager, context managers, result stream registry); handle manager stays + deprecated functions; ATTACH credential validation; closes issue #96; bench-neutral; no public API regression.
 - [ ] T052 Run bench parity gate: `MSSQL_BENCH_ROW_COUNT=1000000 MSSQL_BENCH_DUCKDB_BIN=$(pwd)/build/release/duckdb MSSQL_BENCH_OUTPUT=/tmp/bench_codec_e2e_spec047_run1.txt bash test/bench/bench_codec_e2e.sh` × 3 runs, min-of-3 per step. Compare to baseline captured in T002. Save to `specs/047-process-state-cleanup/bench_results.md`. Every step within ±5% (SC-007 gate).
@@ -279,7 +278,7 @@ Single-project C++ extension layout:
 
 **Across stories**: After US1 lands (T007-T022), US2 (Phase 4), US3 (Phase 5), US4 (Phase 6), and most of US-SEC (Phase 7) can proceed in parallel — each touches different files / responsibilities. T030 (US2 test) is independent of T040 (US3 test) and T046 (US4 test). FR-012 / TokenCache work (T046a-c, T046g) is orthogonal to all of US1/2/3/4 (different subsystem); can start any time after T022. T046k-m (noexcept audit + RAII contract) wait for US1 ownership-chain stabilization (post-T022). **US-AN (T060-T067)** is fully orthogonal — different files entirely (`MSSQLConnectionInfo` + 4 auth strategies, no overlap with singleton-cleanup files) — can start any time after Phase 1; recommended start: in parallel with US2/US3/US4 or even before, by a separate implementer.
 
-**Within Polish**: T047, T048, T050, T051 are all `[P]` — different files, different concerns. (T049 superseded by T046c.)
+**Within Polish**: T047, T048, T050, T051 are all `[P]` — different files, different concerns.
 
 ### Critical Path (longest single-thread chain)
 
