@@ -5,7 +5,6 @@
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/ctas/mssql_ctas_planner.hpp"
 #include "dml/delete/mssql_delete_target.hpp"
@@ -28,6 +27,9 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
+
+#include <cstdio>
 
 namespace duckdb {
 
@@ -43,11 +45,13 @@ static const char *DATABASE_COLLATION_SQL =
 //===----------------------------------------------------------------------===//
 
 MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
-						   shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode,
-						   bool catalog_enabled)
+						   shared_ptr<MSSQLConnectionInfo> connection_info, tds::PoolConfiguration pool_config,
+						   std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode, bool catalog_enabled)
 	: Catalog(db),
 	  context_name_(context_name),
 	  connection_info_(std::move(connection_info)),
+	  pool_config_(std::move(pool_config)),
+	  fedauth_token_utf16le_(std::move(fedauth_token_utf16le)),
 	  access_mode_(access_mode),
 	  catalog_enabled_(catalog_enabled),
 	  default_schema_("dbo") {
@@ -77,17 +81,95 @@ MSSQLCatalog::~MSSQLCatalog() = default;
 //===----------------------------------------------------------------------===//
 
 void MSSQLCatalog::Initialize(bool load_builtin) {
-	// Get or create connection pool for this catalog
-	// The pool is managed by MssqlPoolManager and shared with other operations
-	auto &pool_manager = MssqlPoolManager::Instance();
-
-	// Check if pool already exists (created during attach)
-	auto existing_pool = pool_manager.GetPool(context_name_);
-	if (existing_pool) {
-		// Wrap raw pointer in shared_ptr with no-op deleter (pool manager owns the pool)
-		connection_pool_ = shared_ptr<tds::ConnectionPool>(existing_pool, [](tds::ConnectionPool *) {});
+	// Spec 047: build the connection pool inline (per-catalog ownership).
+	// Replaces the MssqlPoolManager singleton lookup that lived here before.
+	// The pool is owned by this catalog and torn down via unique_ptr in the
+	// catalog destructor — no singleton, no cross-instance sharing.
+	tds::ConnectionFactory factory;
+	switch (connection_info_->auth_method) {
+	case AuthMethod::AZURE_AD:
+	case AuthMethod::MANUAL_TOKEN: {
+		// FEDAUTH path: token was pre-built by MSSQLAttach (acquire happens
+		// there so credential errors surface before catalog construction).
+		// Captured by value in the factory closure; same lifetime as the pool.
+		auto host = connection_info_->host;
+		auto port = connection_info_->port;
+		auto database = connection_info_->database;
+		auto encrypt = connection_info_->use_encrypt;
+		auto token = fedauth_token_utf16le_;
+		factory = [host, port, database, encrypt, token]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(host, port)) {
+				return nullptr;
+			}
+			if (!conn->AuthenticateWithFedAuth(database, token, encrypt)) {
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
 	}
-	// Note: Pool should be created during ATTACH; if missing, queries will fail later
+	case AuthMethod::KRB5:
+	case AuthMethod::WINSSPI: {
+		// Integrated-auth path: build a fresh authenticator per connection so
+		// gss_init_sec_context state is independent across pool refills and a
+		// kinit-refreshed ticket is picked up on the next fill. (Spec 042.)
+		MSSQLConnectionInfo info_copy = *connection_info_;
+		factory = [info_copy]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(info_copy.host, info_copy.port)) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
+						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
+				return nullptr;
+			}
+			std::shared_ptr<tds::AuthenticationStrategy> strategy;
+			try {
+				strategy = tds::AuthStrategyFactory::Create(info_copy);
+			} catch (const std::exception &e) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
+				return nullptr;
+			}
+			if (!strategy) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
+				return nullptr;
+			}
+			auto authenticator = strategy->GetAuthenticator();
+			if (!authenticator) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
+				return nullptr;
+			}
+			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt)) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
+	}
+	case AuthMethod::SQL:
+	default: {
+		// SQL Server username/password.
+		auto host = connection_info_->host;
+		auto port = connection_info_->port;
+		auto username = connection_info_->user;
+		auto password = connection_info_->password;
+		auto database = connection_info_->database;
+		auto encrypt = connection_info_->use_encrypt;
+		factory = [host, port, username, password, database, encrypt]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(host, port)) {
+				return nullptr;
+			}
+			if (!conn->Authenticate(username, password, database, encrypt)) {
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
+	}
+	}
+
+	connection_pool_ = make_uniq<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
 
 	// Skip metadata initialization when catalog integration is disabled
 	// (mssql_scan/mssql_exec will still work via raw queries)
@@ -96,9 +178,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	}
 
 	// Query database collation (needed for column metadata)
-	if (connection_pool_) {
-		QueryDatabaseCollation();
-	}
+	QueryDatabaseCollation();
 }
 
 tds::ConnectionFactory MSSQLCatalog::CreateConnectionFactory() {
@@ -626,10 +706,13 @@ void MSSQLCatalog::OnDetach(ClientContext &context) {
 		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
 	}
 
-	// Remove connection pool for this context (shuts down and cleans up connections)
-	MssqlPoolManager::Instance().RemovePool(context_name_);
+	// Spec 047 T012: pool teardown is implicit via ~MSSQLCatalog → unique_ptr
+	// destruction. The MssqlPoolManager::RemovePool() call that used to live
+	// here is gone with the singleton.
 
-	// Unregister context from the manager
+	// Unregister context from the manager (MSSQLContextManager slated for
+	// removal in T020 — kept here so mssql_scan/mssql_exec consumers that
+	// still query it via HasContext / GetContext find the right state).
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.UnregisterContext(context_name_);
 }

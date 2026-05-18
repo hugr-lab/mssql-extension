@@ -1,7 +1,11 @@
 #include "connection/mssql_diagnostic.hpp"
-#include "connection/mssql_pool_manager.hpp"
+#include "catalog/mssql_catalog.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
@@ -218,7 +222,7 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	names.emplace_back("acquire_timeout_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
-	names.emplace_back("pinned_connections");
+	names.emplace_back("pinned_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
 	return std::move(bind_data);
@@ -226,18 +230,35 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 
 unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientContext &context,
 																		TableFunctionInitInput &input) {
+	// Spec 047 T019: enumerate via DuckDB catalog list instead of the
+	// (deleted) MssqlPoolManager singleton. Per-catalog pool ownership means
+	// the authoritative list of MSSQL pools IS the list of attached MSSQL
+	// catalogs in this DuckDB instance.
 	auto gstate = make_uniq<MssqlPoolStatsGlobalState>();
 	auto &bind_data = input.bind_data->Cast<MSSQLPoolStatsBindData>();
 
 	if (bind_data.all_pools) {
-		// Get all pool names
-		gstate->pool_names = MssqlPoolManager::Instance().GetAllPoolNames();
-	} else {
-		// Single pool
-		if (MssqlPoolManager::Instance().HasPool(bind_data.context_name)) {
-			gstate->pool_names.push_back(bind_data.context_name);
+		auto &db_manager = DatabaseManager::Get(context);
+		auto attached_dbs = db_manager.GetDatabases(context);
+		for (auto &db : attached_dbs) {
+			if (!db) {
+				continue;
+			}
+			auto &catalog = db->GetCatalog();
+			if (catalog.GetCatalogType() == "mssql") {
+				gstate->pool_names.push_back(db->GetName());
+			}
 		}
-		// If pool doesn't exist, pool_names remains empty (no rows returned)
+	} else {
+		// Single catalog lookup
+		try {
+			auto &catalog = Catalog::GetCatalog(context, bind_data.context_name);
+			if (catalog.GetCatalogType() == "mssql") {
+				gstate->pool_names.push_back(bind_data.context_name);
+			}
+		} catch (...) {
+			// Not attached / not an MSSQL catalog — empty result
+		}
 	}
 
 	return std::move(gstate);
@@ -251,26 +272,31 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 		return;
 	}
 
-	// Calculate how many rows we can output in this batch
 	idx_t count = 0;
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
 	while (gstate.current_index < gstate.pool_names.size() && count < max_count) {
 		const auto &pool_name = gstate.pool_names[gstate.current_index];
-		auto stats = MssqlPoolManager::Instance().GetPoolStats(pool_name);
-		auto pinned_count = MssqlPoolManager::Instance().GetPinnedCount(pool_name);
+		try {
+			auto &catalog = Catalog::GetCatalog(context, pool_name);
+			auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+			auto &pool = mssql_catalog.GetConnectionPool();
+			auto stats = pool.GetStats();
 
-		output.data[0].SetValue(count, Value(pool_name));  // db
-		output.data[1].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.total_connections)));
-		output.data[2].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.idle_connections)));
-		output.data[3].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.active_connections)));
-		output.data[4].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_created)));
-		output.data[5].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_closed)));
-		output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
-		output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
-		output.data[8].SetValue(count, Value::BIGINT(static_cast<int64_t>(pinned_count)));
+			output.data[0].SetValue(count, Value(pool_name));  // db
+			output.data[1].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.total_connections)));
+			output.data[2].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.idle_connections)));
+			output.data[3].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.active_connections)));
+			output.data[4].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_created)));
+			output.data[5].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_closed)));
+			output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
+			output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
+			output.data[8].SetValue(count, Value::BIGINT(stats.pinned_count));
 
-		count++;
+			count++;
+		} catch (...) {
+			// Catalog detached between InitGlobal and Execute — skip silently.
+		}
 		gstate.current_index++;
 	}
 

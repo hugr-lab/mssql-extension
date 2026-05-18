@@ -1,7 +1,6 @@
 #include "catalog/mssql_transaction.hpp"
 #include <cstring>
 #include "catalog/mssql_catalog.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/tds_connection.hpp"
@@ -135,12 +134,12 @@ void MSSQLTransaction::SetPinnedConnection(std::shared_ptr<tds::TdsConnection> c
 	bool will_be_pinned = (conn != nullptr);
 
 	if (!was_pinned && will_be_pinned) {
-		// Pinning a connection - increment count
-		MssqlPoolManager::Instance().IncrementPinnedCount(catalog_.GetContextName());
+		// Pinning a connection - increment count on the per-catalog pool (spec 047 T014).
+		catalog_.GetConnectionPool().IncrementPinned();
 		MSSQL_TXN_LOG("Pinned connection set for transaction (pinned_count incremented)");
 	} else if (was_pinned && !will_be_pinned) {
-		// Unpinning a connection - decrement count
-		MssqlPoolManager::Instance().DecrementPinnedCount(catalog_.GetContextName());
+		// Unpinning a connection - decrement count.
+		catalog_.GetConnectionPool().DecrementPinned();
 		MSSQL_TXN_LOG("Pinned connection cleared for transaction (pinned_count decremented)");
 	} else {
 		MSSQL_TXN_LOG("Pinned connection set for transaction (no count change)");

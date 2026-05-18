@@ -810,25 +810,12 @@ MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
 
 void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
 	lock_guard<mutex> guard(lock);
-	// DuckDB's catalog deduplicates `ATTACH AS <name>` within a single live
-	// DatabaseInstance before MSSQLAttach is ever called, so a populated slot
-	// here can only mean the previous owning DatabaseInstance died without
-	// going through MSSQLCatalog::OnDetach (sqllogictest's `--force-reload`,
-	// process shutdown without DETACH) AND the OS reused its memory address
-	// for the new instance — `g_context_managers` is keyed by
-	// `DatabaseInstance*`, so the stale manager came back via `Get()`.
-	//
-	// When that happens, also sweep the shared `MssqlPoolManager` entry for
-	// this name: the old pool's TDS connections may be half-broken (e.g. BCP
-	// stream aborted without ATTENTION). Note: pool sweep is CONDITIONAL on
-	// detecting a stale manager entry — never do it unconditionally in
-	// MSSQLAttach, because `MssqlPoolManager` is process-wide and a different
-	// concurrently-live DatabaseInstance may legitimately own a pool under
-	// the same name (see the pool-isolation caveat below).
-	auto it = contexts.find(name);
-	if (it != contexts.end()) {
-		MssqlPoolManager::Instance().RemovePool(name);
-	}
+	// Spec 047 retires the spec 045 band-aid (commit 70a4d90): pools no longer
+	// live in MssqlPoolManager — they're owned by MSSQLCatalog via unique_ptr
+	// and torn down with the catalog. The pointer-reuse hazard that motivated
+	// the conditional pool sweep is gone. (MSSQLContextManager itself is
+	// slated for removal in T020 once all consumers migrate to catalog list
+	// lookups.)
 	contexts[name] = std::move(ctx);
 }
 
@@ -1366,29 +1353,24 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	auto &manager = MSSQLContextManager::Get(*context.db);
 	manager.RegisterContext(name, ctx);
 
-	// Create connection pool for this context
-	if (!ctx->connection_info->access_token.empty() || ctx->connection_info->use_azure_auth) {
-		// Use Azure AD authentication pool (manual token or azure_secret)
-		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
-			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
-			fedauth_token_utf16le, ctx->connection_info->use_encrypt);
-	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
-			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
-		// Spec 042: Integrated Authentication pool. Each new pool connection
-		// builds a fresh authenticator so kinit-refreshed tickets are picked up.
-		MssqlPoolManager::Instance().GetOrCreatePoolWithIntegratedAuth(name, pool_config, *ctx->connection_info);
-	} else {
-		// Use SQL authentication pool
-		MssqlPoolManager::Instance().GetOrCreatePool(
-			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
-			ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
-	}
+	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the
+	// tds::PoolConfiguration the pool itself consumes. The MSSQLCatalog now
+	// owns its pool — no MssqlPoolManager singleton, no cross-instance map.
+	tds::PoolConfiguration tds_pool_config;
+	tds_pool_config.connection_limit = pool_config.connection_limit;
+	tds_pool_config.connection_cache = pool_config.connection_cache;
+	tds_pool_config.connection_timeout = pool_config.connection_timeout;
+	tds_pool_config.idle_timeout = pool_config.idle_timeout;
+	tds_pool_config.min_connections = pool_config.min_connections;
+	tds_pool_config.acquire_timeout = pool_config.acquire_timeout;
 
-	// Create MSSQLCatalog with connection info and access mode from options
-	// The catalog will use the connection pool to query SQL Server
-	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH
-	// catalog_enabled flag determines whether schema discovery is available
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, options.access_mode,
+	// Create MSSQLCatalog with connection info, pool config, FEDAUTH token,
+	// and access mode. The constructor stores them; Initialize() builds the
+	// pool inline based on connection_info_->auth_method.
+	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
+	// catalog_enabled flag determines whether schema discovery is available.
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, std::move(tds_pool_config),
+										   std::move(fedauth_token_utf16le), options.access_mode,
 										   ctx->connection_info->catalog_enabled);
 	catalog->Initialize(false);
 

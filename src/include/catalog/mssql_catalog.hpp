@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
@@ -37,11 +39,15 @@ class LogicalUpdate;
 
 class MSSQLCatalog : public Catalog {
 public:
-	// Constructor
+	// Constructor (spec 047: catalog now owns its connection pool via unique_ptr).
+	// @param pool_config Pool sizing/timeout configuration translated from DuckDB settings.
+	// @param fedauth_token_utf16le Pre-acquired FEDAUTH token (UTF-16LE) for Azure/manual-token
+	//        auth paths; empty for SQL auth and integrated auth. Captured by the pool factory.
 	// @param catalog_enabled When false, catalog integration is disabled (raw query mode only via
 	// mssql_scan/mssql_exec)
 	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
-				 AccessMode access_mode, bool catalog_enabled = true);
+				 tds::PoolConfiguration pool_config, std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode,
+				 bool catalog_enabled = true);
 
 	~MSSQLCatalog() override;
 
@@ -189,10 +195,12 @@ private:
 
 	string context_name_;												  // Attached context name
 	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
+	tds::PoolConfiguration pool_config_;								  // Pool config (spec 047)
+	std::vector<uint8_t> fedauth_token_utf16le_;						  // FEDAUTH token (spec 047)
 	AccessMode access_mode_;											  // READ_ONLY enforced
 	bool catalog_enabled_;												  // Catalog integration enabled
 	MSSQLCatalogFilter catalog_filter_;									  // Regex visibility filter
-	shared_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool
+	unique_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool (per-catalog owned, spec 047)
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider
 	string database_collation_;											  // Database default collation
