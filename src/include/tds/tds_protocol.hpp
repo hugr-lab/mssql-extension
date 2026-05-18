@@ -67,7 +67,11 @@ public:
 
 	// Build LOGIN7 packet for SQL Server authentication
 	// Parameters:
-	//   host - client hostname (for logging on server side)
+	//   host - client hostname (for logging on server side). Used for BOTH
+	//          HostName and ServerName fields when only this single-arg form
+	//          is called - this is the pre-spec-045 behaviour, kept for
+	//          backwards compatibility with existing tests and the diagnostic
+	//          path. New code SHOULD use the two-arg overload below.
 	//   username - SQL Server login name
 	//   password - SQL Server password (will be encoded)
 	//   database - initial database to connect to
@@ -75,6 +79,16 @@ public:
 	//   packet_size - requested packet size (default 4096)
 	static TdsPacket BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								 const std::string &database, const std::string &app_name = "DuckDB MSSQL Extension",
+								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+
+	// Spec 046 overload: separate client workstation name from server name so
+	// LOGIN7 ServerName can carry host\instance while HostName stays as the
+	// actual local hostname. Required for named-instance support.
+	//   client_hostname - client workstation name (HostName field)
+	//   server_name     - TDS server name (ServerName field), e.g. "sql\SS2022"
+	static TdsPacket BuildLogin7(const std::string &client_hostname, const std::string &server_name,
+								 const std::string &username, const std::string &password, const std::string &database,
+								 const std::string &app_name = "DuckDB MSSQL Extension",
 								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
 
 	// Parse LOGIN7 response (LOGINACK token and potential errors)

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Spec 045 sql container entrypoint.
+# Spec 046 sql container entrypoint.
 #
 # Backgrounds sqlservr (listening on 11433 via mssql.conf), polls until it
 # accepts SA connections, then runs /init/init.sql exactly once. The init
 # script is idempotent (IF NOT EXISTS guards) so re-running on a restart
 # is safe.
 #
-# Why port 11433 and not 1433: the entire point of the spec 045 test stack
+# Why port 11433 and not 1433: the entire point of the spec 046 test stack
 # is to verify the resolver translates an instance name to the correct
 # port. Pinning SQL Server to a non-default port means a test that passes
 # could only have passed via Browser resolution, not by lucky default.
@@ -20,7 +20,7 @@ INIT_SQL=/init/init.sql
 SQLCMD=/opt/mssql-tools18/bin/sqlcmd
 SA_PASSWORD="${MSSQL_SA_PASSWORD:-TestPassword1}"
 SQL_PORT="${SQL_TCP_PORT:-11433}"
-INIT_DONE=/var/opt/mssql/.spec045-init-done
+INIT_DONE=/var/opt/mssql/.spec046-init-done
 
 run_init() {
     if [[ -f "${INIT_DONE}" ]]; then

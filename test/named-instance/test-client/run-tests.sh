@@ -1,10 +1,10 @@
 #!/bin/bash
-# Spec 045 smoke test driver — Phase 2 (resolver-only; no DuckDB yet).
+# Spec 046 smoke test driver — Phase 2 (resolver-only; no DuckDB yet).
 #
 # Run inside the test-client container after `docker compose up -d --wait`:
 #   docker compose exec test-client /run-tests.sh
 #
-# What this covers (the high-value regression surface for spec 045 Phase 2):
+# What this covers (the high-value regression surface for spec 046 Phase 2):
 #
 #   1. The mock SQL Server Browser is reachable on UDP 1434 and answers
 #      CLNT_UCAST_INST queries (proves the docker stack networking works).
@@ -101,6 +101,136 @@ fi
 
 echo "[run-tests] step 5: resolver self-tests (unit tests baked into binary)"
 "${RESOLVER}"
+
+# ----------------------------------------------------------------------------
+# Phase 3 end-to-end tests via the DuckDB CLI + mssql extension.
+# These exercise the ATTACH path so the spec 046 plumbing (parse host\instance,
+# invoke resolver, populate LOGIN7 ServerName) is covered end-to-end.
+# ----------------------------------------------------------------------------
+EXT=/home/tester/mssql.duckdb_extension
+DUCKDB=$(command -v duckdb || true)
+
+if [[ -z "${DUCKDB}" || ! -f "${EXT}" ]]; then
+    echo "[run-tests] DuckDB CLI or extension missing -- skipping Phase 3 end-to-end tests"
+    echo "[run-tests] ALL SMOKE TESTS PASSED"
+    exit 0
+fi
+
+echo "[run-tests] step 6: ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE}; ...' end-to-end"
+out=$("${DUCKDB}" --unsigned -noheader -list <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS db (TYPE mssql);
+SELECT id, payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec046 lives" || {
+    echo "  FAIL: probe row not returned via named-instance ATTACH" >&2
+    exit 6
+}
+echo "  PASS"
+
+echo "[run-tests] step 7: ATTACH explicit ,port bypasses Browser"
+out=$("${DUCKDB}" --unsigned -noheader -list <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=${SQL_HOST}\\${INSTANCE},${EXPECTED_PORT};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS db (TYPE mssql);
+SELECT payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec046 lives" || {
+    echo "  FAIL: probe row not returned via explicit-port ATTACH" >&2
+    exit 7
+}
+echo "  PASS"
+
+echo "[run-tests] step 8: unknown instance fails with InstanceNotFound at ATTACH time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\NONESUCH;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "not found on host" || {
+    echo "  FAIL: expected 'not found on host' error, got: ${out}" >&2
+    exit 8
+}
+echo "  PASS"
+
+echo "[run-tests] step 9: mssql_named_instance_resolution=false rejects host\\instance at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+SET mssql_named_instance_resolution=false;
+ATTACH 'Server=${BROWSER_HOST}\\${INSTANCE};Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "named-instance resolution is disabled" || {
+    echo "  FAIL: expected 'named-instance resolution is disabled' error, got: ${out}" >&2
+    exit 9
+}
+echo "  PASS"
+
+echo "[run-tests] step 10: bad instance grammar rejected at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\bad-instance;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "invalid character" || {
+    echo "  FAIL: expected 'invalid character' error, got: ${out}" >&2
+    exit 10
+}
+echo "  PASS"
+
+echo "[run-tests] step 11: empty instance name rejected at parse time"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+ATTACH 'Server=${BROWSER_HOST}\\;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "empty instance name" || {
+    echo "  FAIL: expected 'empty instance name' error, got: ${out}" >&2
+    exit 11
+}
+echo "  PASS"
+
+echo "[run-tests] step 11.5: Browser-unreachable error includes the explicit-port hint"
+# Use a hostname that won't resolve so we hit Kind::Unreachable. Short
+# timeout to keep the test fast.
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+SET mssql_browser_timeout_seconds=1;
+ATTACH 'Server=this-host-does-not-exist.invalid\\TESTINST;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "bypass it by specifying the port directly" || {
+    echo "  FAIL: expected explicit-port hint in Unreachable error, got: ${out}" >&2
+    exit 11
+}
+echo "${out}" | grep -qF 'this-host-does-not-exist.invalid\TESTINST,<port>' || {
+    echo "  FAIL: hint should include the user's host\\instance verbatim, got: ${out}" >&2
+    exit 11
+}
+echo "  PASS"
+
+echo "[run-tests] step 12: secret-form host\\instance is resolved (review finding I1)"
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF
+LOAD '${EXT}';
+CREATE SECRET spec046 (TYPE mssql, host '${BROWSER_HOST}\\${INSTANCE}', database 'NamedInstTest', user 'sa', password 'TestPassword1', use_encrypt false);
+ATTACH '' AS db (TYPE mssql, SECRET spec046);
+SELECT payload FROM db.dbo.Probe;
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -q "spec046 lives" || {
+    echo "  FAIL: secret-form host\\instance ATTACH did not return probe row" >&2
+    exit 12
+}
+echo "  PASS"
 
 echo ""
 echo "[run-tests] ALL SMOKE TESTS PASSED"

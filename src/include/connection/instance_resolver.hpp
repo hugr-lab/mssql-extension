@@ -7,7 +7,7 @@
 // (host\instance) to a TCP port by sending a CLNT_UCAST_INST query to
 // host:1434/udp and parsing the SVR_RESP response.
 //
-// Spec: specs/045-named-instance-resolution/
+// Spec: specs/046-named-instance-resolution/
 //
 // IMPORTANT: This header MUST NOT include any DuckDB headers. The resolver
 // is logically reusable outside DuckDB (mirrors iauthenticator.hpp). Errors

@@ -15,7 +15,8 @@ MssqlPoolManager &MssqlPoolManager::Instance() {
 tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &context_name, const MSSQLPoolConfig &config,
 													   const std::string &host, uint16_t port,
 													   const std::string &username, const std::string &password,
-													   const std::string &database, bool use_encrypt) {
+													   const std::string &database, bool use_encrypt,
+													   const std::string &instance_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 
 	// Check if pool already exists
@@ -33,11 +34,18 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &contex
 	pool_config.min_connections = config.min_connections;
 	pool_config.acquire_timeout = config.acquire_timeout;
 
-	// Create connection factory that captures use_encrypt for TLS support
-	auto factory = [host, port, username, password, database, use_encrypt]() -> std::shared_ptr<tds::TdsConnection> {
+	// Create connection factory that captures use_encrypt for TLS support.
+	// Spec 046: when instance_name is non-empty, LOGIN7 ServerName is set
+	// to "host\instance" so SQL Server logs and DMVs see the same form the
+	// user typed in their connection string.
+	auto factory = [host, port, username, password, database, use_encrypt,
+					instance_name]() -> std::shared_ptr<tds::TdsConnection> {
 		auto conn = std::make_shared<tds::TdsConnection>();
 		if (!conn->Connect(host, port)) {
 			return nullptr;
+		}
+		if (!instance_name.empty()) {
+			conn->SetTdsServerName(host + "\\" + instance_name);
 		}
 		if (!conn->Authenticate(username, password, database, use_encrypt)) {
 			return nullptr;
@@ -55,7 +63,8 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePool(const std::string &contex
 
 tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(
 	const std::string &context_name, const MSSQLPoolConfig &config, const std::string &host, uint16_t port,
-	const std::string &database, const std::vector<uint8_t> &fedauth_token_utf16le, bool use_encrypt) {
+	const std::string &database, const std::vector<uint8_t> &fedauth_token_utf16le, bool use_encrypt,
+	const std::string &instance_name) {
 	std::lock_guard<std::mutex> lock(manager_mutex_);
 
 	// Check if pool already exists
@@ -75,10 +84,14 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithAzureAuth(
 
 	// Create connection factory for Azure AD authentication
 	// Note: This captures the token by value. For token refresh, a separate mechanism is needed.
-	auto factory = [host, port, database, fedauth_token_utf16le, use_encrypt]() -> std::shared_ptr<tds::TdsConnection> {
+	auto factory = [host, port, database, fedauth_token_utf16le, use_encrypt,
+					instance_name]() -> std::shared_ptr<tds::TdsConnection> {
 		auto conn = std::make_shared<tds::TdsConnection>();
 		if (!conn->Connect(host, port)) {
 			return nullptr;
+		}
+		if (!instance_name.empty()) {
+			conn->SetTdsServerName(host + "\\" + instance_name);
 		}
 		// Use FEDAUTH authentication with pre-acquired token
 		if (!conn->AuthenticateWithFedAuth(database, fedauth_token_utf16le, use_encrypt)) {
@@ -136,6 +149,10 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithIntegratedAuth(const s
 			fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n", info_copy.host.c_str(),
 					static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
 			return nullptr;
+		}
+		// Spec 046: LOGIN7 ServerName carries host\instance for named instances.
+		if (!info_copy.instance_name.empty()) {
+			conn->SetTdsServerName(info_copy.host + "\\" + info_copy.instance_name);
 		}
 		// Build a fresh strategy / authenticator for this connection so
 		// gss_init_sec_context state is independent across pool connections.

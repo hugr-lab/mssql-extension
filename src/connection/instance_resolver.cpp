@@ -4,7 +4,7 @@
 // instance_resolver.cpp
 //
 // Implementation of the MC-SQLR client. See instance_resolver.hpp for the
-// public interface and specs/045-named-instance-resolution/ for the design.
+// public interface and specs/046-named-instance-resolution/ for the design.
 //
 //   Phase 0: ParseBrowserResponse — pure parser over canned byte buffers.
 //   Phase 1: InstanceResolver::Resolve — UDP transport + retry + match.
@@ -28,12 +28,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
-typedef int socklen_t_compat;
 #define CLOSE_SOCKET closesocket
 #define SOCK_BUF_CAST(x) reinterpret_cast<char *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const char *>(x)
-#define SOCK_OPT_CAST(x) reinterpret_cast<const char *>(x)
-#define LAST_SOCK_ERROR() WSAGetLastError()
 #define SOCK_INVALID INVALID_SOCKET
 typedef SOCKET sock_t;
 #else
@@ -48,8 +45,6 @@ typedef int sock_t;
 #define CLOSE_SOCKET ::close
 #define SOCK_BUF_CAST(x) reinterpret_cast<void *>(x)
 #define SOCK_BUF_CONST_CAST(x) reinterpret_cast<const void *>(x)
-#define SOCK_OPT_CAST(x) reinterpret_cast<const void *>(x)
-#define LAST_SOCK_ERROR() (errno)
 #define SOCK_INVALID (-1)
 #endif
 

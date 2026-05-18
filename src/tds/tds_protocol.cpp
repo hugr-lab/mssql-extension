@@ -205,7 +205,16 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string &password) {
 	return encoded;
 }
 
+// Pre-spec-045 single-arg form: HostName and ServerName both get the same string.
+// Preserved for the test fixtures and any caller that doesn't care about the
+// distinction; new code paths use the two-arg overload below.
 TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
+								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
+	return BuildLogin7(host, host, username, password, database, app_name, packet_size);
+}
+
+TdsPacket TdsProtocol::BuildLogin7(const std::string &client_hostname, const std::string &server_name,
+								   const std::string &username, const std::string &password,
 								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
 	TdsPacket packet(PacketType::LOGIN7);
 
@@ -217,11 +226,11 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// numbers via the EncodeLogin7VarField helper.
 
 	uint16_t var_offset = 94;
-	Login7VarField field_hostname = EncodeLogin7VarField("HostName", host, var_offset);
+	Login7VarField field_hostname = EncodeLogin7VarField("HostName", client_hostname, var_offset);
 	Login7VarField field_username = EncodeLogin7VarField("UserName", username, var_offset);
 	Login7VarField field_password = EncodeLogin7VarField("Password", password, var_offset, /*obfuscate_password=*/true);
 	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
-	Login7VarField field_servername = EncodeLogin7VarField("ServerName", host, var_offset);	 // ServerName mirrors host
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", server_name, var_offset);
 
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields

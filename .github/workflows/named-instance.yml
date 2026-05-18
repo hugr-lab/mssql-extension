@@ -1,6 +1,6 @@
 name: Named-Instance Resolution
 
-# Spec 045: validates the SQL Server Browser (MC-SQLR) resolver.
+# Spec 046: validates the SQL Server Browser (MC-SQLR) resolver.
 #
 # Two jobs:
 #   1. unit-tests   - fast standalone unit + loopback tests (POSIX, no Docker).

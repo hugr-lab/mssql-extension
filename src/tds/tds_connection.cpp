@@ -244,8 +244,13 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: starting Azure AD authentication for db='%s', token_size=%zu",
 						 database.c_str(), fedauth_token.size());
 
-	// Initialize TDS server name to host - may be updated if routing includes instance name
-	tds_server_name_ = host_;
+	// Initialize TDS server name to host if the caller hasn't already set it
+	// (Spec 046: pool factory calls SetTdsServerName for named-instance
+	// connects). The routing-redirect code below may further update this
+	// when the gateway issues an ENVCHANGE 20 (Routing).
+	if (tds_server_name_.empty()) {
+		tds_server_name_ = host_;
+	}
 
 	// Azure SQL/Fabric may require multiple routing hops through gateway infrastructure
 	// Each hop requires full PRELOGIN + LOGIN7 handshake
@@ -788,10 +793,16 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
 						 database.c_str());
+	// Spec 046: LOGIN7 ServerName must carry "host\instance" when the user
+	// connected via a named instance; HostName stays as the real client
+	// workstation name. Falls back to host_ when no instance is set, which
+	// preserves the pre-spec-045 behaviour for default-instance connects.
+	const std::string client_workstation = GetClientHostname();
+	const std::string &server_name = tds_server_name_.empty() ? host_ : tds_server_name_;
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, "DuckDB MSSQL Extension",
-											   TDS_DEFAULT_PACKET_SIZE);
+	TdsPacket login = TdsProtocol::BuildLogin7(client_workstation, server_name, username, password, database,
+											   "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

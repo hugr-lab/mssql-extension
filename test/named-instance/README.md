@@ -1,4 +1,4 @@
-# Spec 045 — Named-Instance Resolution test stack
+# Spec 046 — Named-Instance Resolution test stack
 
 Self-contained docker-compose stack for exercising the SQL Server Browser
 resolver (`InstanceResolver`) against a faithful mock Browser. No real

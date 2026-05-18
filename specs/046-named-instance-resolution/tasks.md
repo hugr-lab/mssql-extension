@@ -1,10 +1,10 @@
 ---
-description: "Task list for spec 045 — SQL Server Named-Instance Resolution"
+description: "Task list for spec 046 — SQL Server Named-Instance Resolution"
 ---
 
 # Tasks: Named-Instance Resolution
 
-**Input**: Design documents from `/specs/045-named-instance-resolution/`
+**Input**: Design documents from `/specs/046-named-instance-resolution/`
 **Prerequisites**: spec.md, plan.md, research.md (all present). `quickstart.md` is a Phase 4 deliverable.
 
 **Legend**:
@@ -127,7 +127,7 @@ Same file as T003.
 ### T013 [T][P2] SQL Server init
 `test/named-instance/sql/init.sql` (NEW)
 - `CREATE DATABASE NamedInstTest;`
-- `USE NamedInstTest; CREATE TABLE Probe (id INT, payload NVARCHAR(100)); INSERT INTO Probe VALUES (1, N'spec045 lives');`
+- `USE NamedInstTest; CREATE TABLE Probe (id INT, payload NVARCHAR(100)); INSERT INTO Probe VALUES (1, N'spec046 lives');`
 
 ### T014 [T][P2] SQL Server Dockerfile
 `test/named-instance/sql/Dockerfile` (NEW)
@@ -206,7 +206,7 @@ Same file as T003.
 
 ### T024 [X] CLAUDE.md + Kerberos.md updates
 - New settings in the settings table.
-- One-line entry under "Recent Changes": `045-named-instance-resolution: …`.
+- One-line entry under "Recent Changes": `046-named-instance-resolution: …`.
 - Kerberos.md SPN section: brief note that SPN derivation uses the discovered port for named instances.
 
 **Phase 3 exit gate**: All four `test/sql/named_instance/*.test` pass against the live mock-browser stack; spec-042 Kerberos test suite (`docker compose exec test-client /run-tests.sh` in `test/kerberos/`) passes unchanged.
@@ -216,7 +216,7 @@ Same file as T003.
 ## Phase 4 — Docs + manual test recipe
 
 ### T025 [P4] quickstart.md
-`specs/045-named-instance-resolution/quickstart.md` (NEW)
+`specs/046-named-instance-resolution/quickstart.md` (NEW)
 - Bring-up commands for the mock-browser stack.
 - Manual repro for issue #77: install SQL Server Developer with two named instances on a Windows host, attach from DuckDB CLI.
 - Windows + SSPI + named-instance manual-test recipe (research.md §R10 option b).

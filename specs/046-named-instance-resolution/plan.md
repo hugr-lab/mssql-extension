@@ -1,8 +1,8 @@
 # Implementation Plan: SQL Server Named-Instance Resolution
 
-**Branch**: `045-named-instance-resolution` | **Date**: 2026-05-16 | **Spec**: [spec.md](./spec.md)
+**Branch**: `046-named-instance-resolution` | **Date**: 2026-05-16 | **Spec**: [spec.md](./spec.md)
 
-**Input**: Feature specification from `/specs/045-named-instance-resolution/spec.md`
+**Input**: Feature specification from `/specs/046-named-instance-resolution/spec.md`
 **Research**: [research.md](./research.md) — wire format, mock-browser design, code placement, error taxonomy
 
 ## Summary
@@ -48,7 +48,7 @@ for the mock browser, ~150 lines of test harness.
 ### Documentation (this feature)
 
 ```text
-specs/045-named-instance-resolution/
+specs/046-named-instance-resolution/
 ├── spec.md         # what + why
 ├── research.md     # MC-SQLR wire format, mock design, code placement, settings
 ├── plan.md         # this file
@@ -157,7 +157,7 @@ test/
 ## Phase 4: Polish — quickstart + CLAUDE.md + release notes
 
 **Deliverable**:
-- `specs/045-named-instance-resolution/quickstart.md` — bring-up commands, manual repro steps for issue #77, Windows SSPI manual-test recipe (research.md §R10 path b).
+- `specs/046-named-instance-resolution/quickstart.md` — bring-up commands, manual repro steps for issue #77, Windows SSPI manual-test recipe (research.md §R10 path b).
 - `CLAUDE.md` updated with new settings and a one-line entry under "Recent Changes".
 - `Kerberos.md` cross-references named-instance support in the SPN section.
 - A small section in the user-facing README (if one exists) — defer this if the README is unmaintained, document in `CLAUDE.md` only.

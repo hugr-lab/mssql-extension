@@ -1,4 +1,4 @@
-# Spec 045 — Named-Instance Resolution test stack.
+# Spec 046 — Named-Instance Resolution test stack.
 #
 # Three-service compose for SQL Server Browser resolution testing. No real
 # Windows, no real SQL Browser service, no fixed local port allocation.
@@ -20,16 +20,16 @@
 # in failover-cluster scenarios) and avoids any Docker DNS round-robin
 # trickery.
 #
-# Spec: specs/045-named-instance-resolution/
+# Spec: specs/046-named-instance-resolution/
 # Test/kerberos precedent: test/kerberos/docker-compose.yml (spec 042)
 
 services:
   mock-browser:
     build: ./mock-browser
-    container_name: mssql-spec045-browser
+    container_name: mssql-spec046-browser
     hostname: browser.example.com
     networks:
-      spec045_net:
+      spec046_net:
         aliases:
           - browser.example.com
     environment:
@@ -58,10 +58,10 @@ services:
   sql:
     build:
       context: ./sql
-    container_name: mssql-spec045-sql
+    container_name: mssql-spec046-sql
     hostname: sql.example.com
     networks:
-      spec045_net:
+      spec046_net:
         aliases:
           - sql.example.com
     environment:
@@ -87,10 +87,10 @@ services:
     build:
       context: ../..
       dockerfile: test/named-instance/test-client/Dockerfile
-    container_name: mssql-spec045-client
+    container_name: mssql-spec046-client
     hostname: client.example.com
     networks:
-      - spec045_net
+      - spec046_net
     volumes:
       - ./test-client/run-tests.sh:/run-tests.sh:ro
     depends_on:
@@ -102,5 +102,5 @@ services:
     command: ["sleep", "infinity"]
 
 networks:
-  spec045_net:
+  spec046_net:
     driver: bridge

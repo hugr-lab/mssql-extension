@@ -1,6 +1,6 @@
 # Feature Specification: SQL Server Named-Instance Resolution (SQL Browser)
 
-**Feature Branch**: `045-named-instance-resolution`
+**Feature Branch**: `046-named-instance-resolution`
 **Created**: 2026-05-16
 **Status**: Draft
 **Resolves**: [#77 — Unable to connect to the named instance](https://github.com/hugr-lab/mssql-extension/issues/77)

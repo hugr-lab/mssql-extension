@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mock SQL Server Browser for the spec 045 test stack.
+"""Mock SQL Server Browser for the spec 046 test stack.
 
 Implements just enough of MC-SQLR to drive the InstanceResolver C++ code
 under test. Listens on UDP 1434, answers CLNT_UCAST_INST (opcode 0x04)
@@ -33,7 +33,7 @@ rebuilding the image):
 
 Logs every request to stdout for `docker compose logs mock-browser`.
 
-Spec: specs/045-named-instance-resolution/research.md §R2
+Spec: specs/046-named-instance-resolution/research.md §R2
 """
 
 from __future__ import annotations

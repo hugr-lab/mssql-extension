@@ -183,6 +183,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_copy_tablock` | auto | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access). Auto-enabled for new tables when not explicitly set. |
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |
 | `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
+| `mssql_browser_timeout_seconds` | 3 | SQL Server Browser UDP query timeout in seconds for named-instance resolution (spec 046) |
+| `mssql_named_instance_resolution` | true | Enable SQL Server Browser (UDP 1434) resolution of `host\instance` connection strings (spec 046) |
 
 ## ATTACH Options & Secret Parameters (Catalog Filters)
 
@@ -348,6 +350,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 046-named-instance-resolution: Added SQL Server Browser (MC-SQLR / UDP 1434) client. `Server=host\instance` connection strings now resolve the dynamic TCP port via Browser query before the TDS connect, fixing #77. Cross-platform (POSIX + Winsock), no new vcpkg deps. Self-contained mock-browser docker stack at `test/named-instance/` mirrors `test/kerberos/`. Two new settings: `mssql_browser_timeout_seconds` (default 3), `mssql_named_instance_resolution` (default true). LOGIN7 `ServerName` now carries `host\instance` via new 2-arg `BuildLogin7` overload that separates HostName (client workstation) from ServerName.
 - 042-integrated-authentication Phase 4: Added Windows SSPI authentication via `secur32.dll`'s Negotiate package. `WinSspiAuthenticator` peer of `Krb5Authenticator`. Same `IAuthenticator` interface; shared SPNEGO continuation loop in `TdsConnection::AuthenticateIntegrated`.
 - 044-codec-consolidation: Finishes the simdutf migration started in 043 — every legacy `Utf16LE*` call site moves to the simdutf-backed wrapper, the wrapper is renamed back to `Utf16LE*` (legacy file path resurrected with new implementation), and the legacy hand-rolled converter survives only as a private invalid-input fallback. Includes codec microbenchmark (`make bench-utf16`) and an end-to-end before/after benchmark (`test/bench/bench_codec_e2e.sh`, 100M rows) recorded into `bench_results.md`. No new vcpkg deps.
 - 043-refactoring-foundation: Added C++ (C++11-compatible ABI) + DuckDB (main branch), simdutf (vcpkg, statically linked, MIT) for LOGIN7 non-ASCII fix; OpenSSL unchanged
