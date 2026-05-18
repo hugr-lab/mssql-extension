@@ -15,8 +15,9 @@
 
 namespace duckdb {
 
-// Forward declaration for DuckDB context
+// Forward declarations for DuckDB context
 class ClientContext;
+class DatabaseInstance;
 
 namespace tds {
 
@@ -33,9 +34,13 @@ using TokenAcquirer = std::function<std::string(const std::string &secret_name, 
 
 class FedAuthStrategy : public AuthenticationStrategy {
 public:
-	// Constructor with secret name and optional tenant override
-	FedAuthStrategy(const std::string &secret_name, const std::string &database, const std::string &host,
-					const std::string &tenant_override = "");
+	// Constructor with secret name and optional tenant override.
+	// `db` is the DuckDB instance whose namespace the TokenCache will use for
+	// this strategy's cached token (spec 047 FR-012). The reference must
+	// outlive the strategy — the strategy is owned by the connection pool,
+	// which is owned by the catalog, which is owned by the DatabaseInstance.
+	FedAuthStrategy(DatabaseInstance &db, const std::string &secret_name, const std::string &database,
+					const std::string &host, const std::string &tenant_override = "");
 
 	~FedAuthStrategy() override = default;
 
@@ -74,6 +79,7 @@ public:
 	}
 
 private:
+	DatabaseInstance &db_;	// TokenCache namespace (FR-012); raw ref — lifetime invariant above.
 	std::string secret_name_;
 	std::string database_;
 	std::string host_;

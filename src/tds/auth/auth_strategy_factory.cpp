@@ -138,7 +138,9 @@ AuthStrategyPtr AuthStrategyFactory::CreateSqlAuth(const std::string &username, 
 AuthStrategyPtr AuthStrategyFactory::CreateFedAuth(ClientContext &context, const std::string &secret_name,
 												   const std::string &database, const std::string &host,
 												   const std::string &tenant_override) {
-	auto strategy = std::make_shared<FedAuthStrategy>(secret_name, database, host, tenant_override);
+	// Spec 047 FR-012: strategy holds the DatabaseInstance reference so its
+	// InvalidateToken/IsTokenExpired calls hit the correct TokenCache namespace.
+	auto strategy = std::make_shared<FedAuthStrategy>(*context.db, secret_name, database, host, tenant_override);
 
 	// Set up token acquirer that uses the DuckDB context
 	strategy->SetTokenAcquirer(BuildTokenAcquirer(context));
@@ -156,8 +158,15 @@ TokenAcquirer AuthStrategyFactory::BuildTokenAcquirer(ClientContext &context) {
 	// Capture context by reference - caller must ensure context lifetime
 	// In practice, context outlives the connection pool that uses this acquirer
 	return [&context](const std::string &secret_name, const std::string &tenant_override) -> std::string {
-		// Try to get cached token first
-		std::string cached = mssql::azure::TokenCache::Instance().GetToken(secret_name);
+		// Spec 047 FR-012: cache reads are namespaced by DatabaseInstance.
+		// Build the same cache key shape AcquireToken uses (secret_name[:tenant]).
+		auto &db_instance = *context.db;
+		std::string cache_key = secret_name;
+		if (!tenant_override.empty()) {
+			cache_key += ":" + tenant_override;
+		}
+
+		std::string cached = mssql::azure::TokenCache::Instance().GetToken(db_instance, cache_key);
 		if (!cached.empty()) {
 			return cached;
 		}

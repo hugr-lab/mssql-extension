@@ -724,9 +724,11 @@ string MSSQLCatalog::GetDBPath() {
 
 void MSSQLCatalog::OnDetach(ClientContext &context) {
 	// T023 (FR-005): Invalidate cached Azure token on detach
-	// This ensures re-attach will acquire a fresh token, not use a stale cached one
+	// This ensures re-attach will acquire a fresh token, not use a stale cached one.
+	// Spec 047 T046b (FR-012): invalidate only this DatabaseInstance's namespace
+	// so a sibling instance sharing the same secret name keeps its token.
 	if (connection_info_ && connection_info_->use_azure_auth && !connection_info_->azure_secret_name.empty()) {
-		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
+		mssql::azure::TokenCache::Instance().Invalidate(*context.db, connection_info_->azure_secret_name);
 	}
 
 	// Spec 047 T012+T020: pool teardown is implicit via ~MSSQLCatalog → unique_ptr
