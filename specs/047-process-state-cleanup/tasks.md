@@ -51,7 +51,7 @@ Single-project C++ extension layout:
 
 **Goal**: `MSSQLCatalog` becomes the sole owner of its `tds::ConnectionPool` via `unique_ptr` member. Delete the `MssqlPoolManager` singleton and the `MSSQLContextManager` + `g_context_managers` global container. Pool construction moves inline into `MSSQLCatalog::Initialize`. All consumers route via `catalog.GetConnectionPool()`. Closes issue #96.
 
-**Independent Test**: `test/cpp/test_multi_instance_pool_isolation.cpp` (Scenarios 1/2/3) and `test/cpp/test_issue_96_attach_loop.cpp` (Scenario 4) all pass. `make test && make integration-test` stay green. Verifies SC-001, SC-002, SC-003, SC-005, SC-009.
+**Independent Test**: `test/cpp/test_multi_instance_pool_isolation.cpp` (Scenarios 1/2/3) and `test/cpp/test_issue_96_attach_loop.cpp` (Scenario 4) all pass. `make test && make integration-test` stay green. Verifies SC-001, SC-002, SC-003, SC-005 (parity portion — credential-redaction portion gated separately in Phase 7), SC-009.
 
 ### Implementation for User Story 1
 
@@ -98,12 +98,13 @@ Single-project C++ extension layout:
 - [ ] T026 [US2] Add new pool setting `mssql_attach_validation_timeout` (INTEGER seconds, default = value of `mssql_connection_timeout`) to the extension settings registration in `src/mssql_storage.cpp` (search for existing `mssql_connection_timeout` registration as template).
 - [ ] T027 [US2] Parse `lazy_validation` ATTACH option in `MSSQLAttach` (`src/mssql_storage.cpp`): accept BOOL value, default `false`; also accept ADO.NET alias `LazyValidation` from connection-string parse path. Plumb the parsed flag into `MSSQLCatalog` (add `bool lazy_validation_` member or pass through `connection_info_`).
 - [ ] T028 [US2] Add eager validation step at the end of `MSSQLCatalog::Initialize` in `src/catalog/mssql_catalog.cpp`. After successful pool construction (post-T011), if `lazy_validation_ == false`: call `pool.Acquire()` with `mssql_attach_validation_timeout`; on any exception (TCP refused, LOGIN7 rejected, FEDAUTH token failure, Kerberos failure), propagate out of `Initialize` so `MSSQLAttach` surfaces it to the user with verbatim TDS error attached. On success, immediately release the connection back to the pool (RAII via `tds::ConnectionPool::ConnectionHandle` or equivalent — keep it warm for the first real query, don't leak).
+- [ ] T028a [US2] **Security: no credential leak in error message** (FR-011 security requirement). Audit the error wrapping path in `MSSQLAttach` and any `MSSQLCatalog::Initialize` exception sites: when the validation exception is caught and rethrown with context, the rethrown message MUST contain the verbatim TDS error + catalog alias + host:port, but MUST NOT concatenate the connection string (which holds `Password=…`, FEDAUTH tokens, Kerberos keytab paths). Specifically: no `connection_info_.password` substring, no raw `attach_options` string, no `secret.GetSecretValue("password")` value. Test coverage in T030 case 1 with sentinel password.
 - [ ] T029 [US2] Build + existing test sweep: `GEN=ninja make debug && GEN=ninja make test && GEN=ninja make integration-test`. ATTACH-using tests must stay green (their credentials are good, so validation passes invisibly).
 
 ### Tests for User Story 2
 
 - [ ] T030 [US2] Write `test/sql/attach/attach_validates_credentials.test`. Three SQL test cases (per `spec.md` SC-010):
-  - `statement error ATTACH 'Server=...;User Id=sa;Password=WRONG_PASSWORD' AS bad (TYPE mssql)` — expects login error containing "Login failed for user 'sa'".
+  - `statement error ATTACH 'Server=...;User Id=sa;Password=WRONG_PASSWORD_SENTINEL_xyz123' AS bad (TYPE mssql)` — expects login error containing "Login failed for user 'sa'". Add a second assertion immediately after via `query I` + `string_contains` test that the error message captured does NOT contain the substring `WRONG_PASSWORD_SENTINEL_xyz123` (the unique sentinel ensures no false negatives from generic text). Asserts T028a security gate.
   - `statement error ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS unreachable (TYPE mssql)` — expects connection error (DNS / TCP) within configured timeout.
   - `statement ok ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS lazy (TYPE mssql, lazy_validation=true)` — expects ATTACH succeeds (opt-out); subsequent query against `lazy.dbo.x` then fails (asserted by `statement error`).
 - [ ] T031 [US2] Run the new SQL test: `./build/debug/test/unittest "test/sql/attach/attach_validates_credentials.test"`. All cases pass; existing ATTACH tests stay green.
@@ -167,19 +168,56 @@ Single-project C++ extension layout:
 
 ---
 
-## Phase 7: Polish & Cross-Cutting Concerns
+## Phase 7: Security Hardening (post PR #118 review)
+
+**Purpose**: Address security-design items surfaced during PR #118 external review (see `spec.md` Clarifications Session 2026-05-18). Adds FR-012 (TokenCache key namespacing), FR-013 (`mssql_close_all()`), credential-redaction grep gate for diagnostic output (SC-005 extension), and noexcept audit + RAII contract for the teardown chain.
+
+**Independent Tests**: `test/cpp/test_token_cache_isolation.cpp` (SC-011), `test/sql/diagnostic/pool_stats_no_credentials.test` (SC-005 redaction), `test/sql/diagnostic/close_all.test` (FR-013 smoke).
+
+**Depends on**: US1 (catalog ownership), US4 (deprecation labelling baseline). Can ship in same PR.
+
+### Implementation: FR-012 TokenCache key namespacing
+
+- [ ] T046a [US-SEC] Change cache key in `src/azure/azure_token.{hpp,cpp}`: replace `std::unordered_map<std::string, CachedToken>` (keyed by `secret_name`) with `std::unordered_map<std::pair<uintptr_t, std::string>, CachedToken, PairHash>` keyed by `(reinterpret_cast<uintptr_t>(&database_instance), secret_name)`. Add `PairHash` specialization or use `boost::hash_combine` equivalent (DuckDB has a similar pattern in `common/types.hpp` — check). All `TokenCache::Get` / `TokenCache::Put` / `TokenCache::Invalidate` call sites take an additional `DatabaseInstance &` (or `ClientContext &` from which we extract `context.db.get()`). Plumb through callers in `src/azure/azure_secret_reader.cpp`, `src/azure/azure_token.cpp`, `src/connection/mssql_connection_provider.cpp` (FEDAUTH path), and any other token-acquisition site.
+- [ ] T046b [US-SEC] Update `OnDetach` Azure-cache-invalidation path in `src/catalog/mssql_catalog.cpp` (~line 622) to invalidate only entries matching `(this->db_instance_id, secret_name)`, not all entries with `secret_name`. Prevents inadvertent cross-instance cache invalidation.
+- [ ] T046c [US-SEC] Inline comment in `src/azure/azure_token.hpp` documenting the namespaced key, the `~DatabaseInstance` non-reaping decision (entries become unreachable on instance death, evicted by TTL), and the FR-012 / clarification reference.
+
+### Implementation: FR-013 mssql_close_all() bulk reset
+
+- [ ] T046d [US-SEC] Add `int64_t MSSQLConnectionHandleManager::CloseAll()` method in `src/include/connection/mssql_diagnostic.hpp` + `src/connection/mssql_diagnostic.cpp`: atomic under existing manager mutex, walks the handle map, closes each `TdsConnection`, returns the count of closed handles. Idempotent.
+- [ ] T046e [US-SEC] Register `mssql_close_all()` scalar function in `RegisterMSSQLDiagnosticFunctions` (`src/connection/mssql_diagnostic.cpp`). Returns `INTEGER`. Description starts with `[DEPRECATED]` (per FR-010 group) and points at FR-013 rationale.
+- [ ] T046f [US-SEC] Add row for `mssql_close_all` in `CLAUDE.md` "Extension Functions" table with `[DEPRECATED]` marker; update CHANGELOG note in T044 to mention `mssql_close_all` as the recommended shutdown hook.
+
+### Tests for security hardening
+
+- [ ] T046g [US-SEC] Write `test/cpp/test_token_cache_isolation.cpp` (SC-011). Single Catch2 case: construct two `DuckDB` instances, in each register a secret named `mssql_secret` with different `client_secret` values via a test-only fake auth-server endpoint (httplib stub). Trigger token acquisition in A first, then B; assert B receives B's secret value, not A's cached token. Fails on `main`-at-kickoff (cache aliasing); passes after T046a. Add to `CMakeLists.txt`.
+- [ ] T046h [US-SEC] Write `test/sql/diagnostic/pool_stats_no_credentials.test` (SC-005 credential-redaction gate). For each auth method available in CI (minimum SQL auth; FEDAUTH and Kerberos only if their env vars are set), `ATTACH` with a known sentinel substring in the credential (e.g., `Password=PWSENTINEL_xyz` for SQL auth; sentinel token / keytab-path for the others); then `SELECT * FROM mssql_pool_stats();` and assert via `query II` + `string_contains` that no column value contains the sentinel substring.
+- [ ] T046i [US-SEC] Write `test/sql/diagnostic/close_all.test` (FR-013 smoke). Open N handles via `mssql_open`; call `mssql_close_all()` and assert returned count equals N; second call returns 0; subsequent `mssql_ping(any_handle)` errors (handle gone).
+- [ ] T046j [US-SEC] Run the security suite: `./build/debug/test/unittest "test_token_cache_isolation*"` + `./build/debug/test/unittest "test/sql/diagnostic/pool_stats_no_credentials.test"` + `./build/debug/test/unittest "test/sql/diagnostic/close_all.test"`. All pass.
+
+### Teardown-contract hardening (post-PR-118 review item #4)
+
+- [ ] T046k [US-SEC] noexcept audit of the teardown chain. Mark explicitly `noexcept` (or verify implicit noexcept via C++17 rules): `~MSSQLCatalog`, `~ConnectionPool`, `~TdsConnection`, `~TdsSocket`, and (if it owns OpenSSL state) `~TlsContext`. Touched files: `src/include/catalog/mssql_catalog.hpp`, `src/include/tds/tds_connection_pool.hpp`, `src/include/tds/tds_connection.hpp`, `src/include/tds/tds_socket.hpp`, `src/include/tds/tls/tds_tls.hpp`. Any user-defined destructor without explicit `noexcept`: add it. Any destructor body that calls a potentially-throwing function: wrap in `try { ... } catch (...) { /* log and swallow */ }`. A throw from these destructors invokes `std::terminate` during `~AttachedDatabase` unwind.
+- [ ] T046l [US-SEC] Add debug-only assert in `~ConnectionPool` (`src/tds/tds_connection_pool.cpp`): `D_ASSERT(checked_out_count_.load() == 0)` (using DuckDB's `D_ASSERT`). Pool destruction with checked-out connections violates the DuckDB quiescence contract — surface it as an invariant failure in debug builds instead of UB. Release build: forcibly close underlying sockets without blocking; do NOT join threads holding checked-out connections (they'll see EBADF on next read).
+- [ ] T046m [US-SEC] Add doc-comment at the top of `src/include/tds/tds_connection_pool.hpp` `class ConnectionPool`: explicit contract for destruction — "Sockets close immediately on pool destruction. In-flight TDS requests on other threads observe connection-reset on next read. Server-side rollback of open transactions happens via TCP FIN within seconds. No graceful TDS ATTENTION cancel is sent (would require cross-thread write to the connection's socket — unsafe). See spec 047 Constraints / non-goals; cooperative cancellation is tracked as a follow-up spec."
+
+**Checkpoint**: Phase 7 lands. Spec 047 closes all 5 in-scope items from the PR #118 security review. The 2 out-of-scope items (credential zeroization → issue #119; cooperative cancellation → future spec) are documented in Constraints / non-goals.
+
+---
+
+## Phase 8: Polish & Cross-Cutting Concerns
 
 **Purpose**: Audit gates, docs, bench, final test pass, PR prep.
 
 - [ ] T047 [P] SC-004 grep audit: `grep -rn 'MssqlPoolManager\|MSSQLContextManager\|MSSQLResultStreamRegistry' src/ src/include/`. Expect zero matches (excluding comment-only mentions tagged with "removed in spec 047"). Note: `MSSQLConnectionHandleManager` is NOT in this grep — it stays.
 - [ ] T048 [P] Write `specs/047-process-state-cleanup/state_inventory.md` (FR-007 deliverable). Final classification table of every process-wide static after implementation: 0 "migrate" entries; legitimate set = Winsock + OpenSSL + thread-local scratch (×2) + Azure TokenCache + MSSQLConnectionHandleManager (with deprecation note linking to FR-010).
-- [ ] T049 [P] Add inline comment in `src/azure/azure_token.{hpp,cpp}` explaining that the singleton TokenCache is process-wide intentionally (deduplicates token acquisition for same `secret_name` across DuckDB instances). Point at clarification Q3.
+- [ ] T049 [P] (Superseded by T046c — TokenCache inline comment now covers both the intentional-singleton rationale and the FR-012 key-namespacing decision. Marked complete when T046c lands.)
 - [ ] T050 [P] Update `CLAUDE.md` "Key Architecture Concepts" → "Connection pool" bullet to reflect per-catalog ownership. Current text mentions "per attached database" — make explicit that pool lifetime is bounded by catalog lifetime (RAII via `unique_ptr`); deleted singletons; no shared cross-instance pool state.
 - [ ] T051 [P] Update `CLAUDE.md` "Recent Changes" with spec 047 entry summarizing: 3 singletons removed (pool manager, context managers, result stream registry); handle manager stays + deprecated functions; ATTACH credential validation; closes issue #96; bench-neutral; no public API regression.
 - [ ] T052 Run bench parity gate: `MSSQL_BENCH_ROW_COUNT=1000000 MSSQL_BENCH_DUCKDB_BIN=$(pwd)/build/release/duckdb MSSQL_BENCH_OUTPUT=/tmp/bench_codec_e2e_spec047_run1.txt bash test/bench/bench_codec_e2e.sh` × 3 runs, min-of-3 per step. Compare to baseline captured in T002. Save to `specs/047-process-state-cleanup/bench_results.md`. Every step within ±5% (SC-007 gate).
-- [ ] T053 clang-format-14 sweep over all touched files: `/opt/homebrew/opt/llvm@14/bin/clang-format -i src/catalog/mssql_catalog.{cpp,hpp} src/catalog/mssql_transaction.cpp src/include/tds/tds_connection_pool.hpp src/tds/tds_connection_pool.cpp src/mssql_storage.cpp src/mssql_functions.{cpp} src/include/mssql_functions.hpp src/connection/mssql_diagnostic.cpp src/dml/insert/mssql_insert_executor.cpp src/dml/update/mssql_update_executor.cpp src/query/mssql_result_stream.cpp src/query/mssql_query_executor.cpp` plus headers under `src/include/`.
-- [ ] T054 Final full-suite test gate: `GEN=ninja make test && GEN=ninja make integration-test`. All previously-green tests still green; all new tests (T023, T024, T030, T040) green; SC-006-related stream isolation green; SC-010 ATTACH validation green.
-- [ ] T055 Write `specs/047-process-state-cleanup/pr_description.md`: Summary; the 3 production bug classes fixed (Scenarios 1/2/3); issue #96 closure (Scenario 4 + SC-009); ATTACH validation (FR-011 + SC-010); 3 singletons deleted vs 1 kept-deprecated; bench parity; test plan; follow-ups (potential removal of `mssql_open/close/ping` in a future major release closes the handle manager singleton too).
+- [ ] T053 clang-format-14 sweep over all touched files: `/opt/homebrew/opt/llvm@14/bin/clang-format -i src/catalog/mssql_catalog.{cpp,hpp} src/catalog/mssql_transaction.cpp src/include/tds/tds_connection_pool.hpp src/tds/tds_connection_pool.cpp src/include/tds/tds_connection.hpp src/include/tds/tds_socket.hpp src/mssql_storage.cpp src/mssql_functions.{cpp} src/include/mssql_functions.hpp src/connection/mssql_diagnostic.cpp src/include/connection/mssql_diagnostic.hpp src/azure/azure_token.{cpp,hpp} src/azure/azure_secret_reader.cpp src/dml/insert/mssql_insert_executor.cpp src/dml/update/mssql_update_executor.cpp src/query/mssql_result_stream.cpp src/query/mssql_query_executor.cpp` plus headers under `src/include/`.
+- [ ] T054 Final full-suite test gate: `GEN=ninja make test && GEN=ninja make integration-test`. All previously-green tests still green; all new tests (T023, T024, T030, T040, T046g, T046h, T046i) green; SC-006-related stream isolation green; SC-010 ATTACH validation green; SC-011 TokenCache isolation green; SC-005 credential-redaction green.
+- [ ] T055 Write `specs/047-process-state-cleanup/pr_description.md`: Summary; the 3 production bug classes fixed (Scenarios 1/2/3); issue #96 closure (Scenario 4 + SC-009); ATTACH validation (FR-011 + SC-010); 3 singletons deleted vs 1 kept-deprecated; **security hardening**: FR-012 TokenCache namespacing + SC-011 isolation test, FR-013 `mssql_close_all()`, SC-005 credential redaction in `mssql_pool_stats`, noexcept teardown chain audit; bench parity; test plan; follow-ups (issue #119 / spec 049 lazy credential materialization; future spec for cooperative TDS cancellation; eventual removal of `mssql_open/close/ping/close_all` closes the handle manager singleton too).
 - [ ] T056 Push branch + open PR: `git push -u origin 047-process-state-cleanup`; `gh pr create --title "feat(047): process-wide state cleanup — per-catalog pool ownership; closes #96" --body "$(cat specs/047-process-state-cleanup/pr_description.md)"`. Mark ready for review when CI is green.
 
 ---
@@ -194,21 +232,22 @@ Single-project C++ extension layout:
 - **Phase 4 (US2 — ATTACH validation)** — depends on US1 (validation acquire lives inside Initialize, which is meaningful only after pool is catalog-owned). Independent of US3 / US4.
 - **Phase 5 (US3 — result stream registry)** — depends on US1 (catalog needs to be the natural owner before adding stream methods there). Independent of US2 / US4.
 - **Phase 6 (US4 — deprecate diagnostic)** — no real dependencies on other stories; can be implemented in parallel with US1-3 if helpful. Order in the doc reflects priority not blocking.
-- **Phase 7 (Polish)** — depends on US1 (must be done) + US3 (singleton-deletion gate); US2 and US4 must be done if they're shipping in this PR. Bench (T052) must run on release build with full implementation applied.
+- **Phase 7 (Security hardening)** — depends on US1 (the noexcept audit + ~ConnectionPool contract target the new ownership chain) + US4 (FR-013 deprecation label coordinates with FR-010 group). FR-012 TokenCache work is orthogonal — can land independently. SC-005 redaction grep depends on US1's `mssql_pool_stats` rewrite.
+- **Phase 8 (Polish)** — depends on US1 + US3 (singleton-deletion gate) + Phase 7 (security hardening must be in for SC-004 grep + SC-008 inventory). US2 and US4 must be done if they're shipping in this PR. Bench (T052) must run on release build with full implementation applied.
 
 ### Story-Level Parallel Execution
 
 **Within US1**: T015, T016, T017, T018 are `[P]` — different files, no interdependency. After T007-T014 land, run them concurrently.
 
-**Across stories**: After US1 lands (T007-T022), US2 (Phase 4), US3 (Phase 5), and US4 (Phase 6) can proceed in parallel — each touches different files / responsibilities. T030 (US2 test) is independent of T040 (US3 test) and T046 (US4 test).
+**Across stories**: After US1 lands (T007-T022), US2 (Phase 4), US3 (Phase 5), US4 (Phase 6), and most of US-SEC (Phase 7) can proceed in parallel — each touches different files / responsibilities. T030 (US2 test) is independent of T040 (US3 test) and T046 (US4 test). FR-012 / TokenCache work (T046a-c, T046g) is orthogonal to all of US1/2/3/4 (different subsystem); can start any time after T022. T046k-m (noexcept audit + RAII contract) wait for US1 ownership-chain stabilization (post-T022).
 
-**Within Polish**: T047, T048, T049, T050, T051 are all `[P]` — different files, different concerns.
+**Within Polish**: T047, T048, T050, T051 are all `[P]` — different files, different concerns. (T049 superseded by T046c.)
 
 ### Critical Path (longest single-thread chain)
 
-T001 → T002 → T003 → T004 → T005 → T006 → T007 → T008 → T009 → T010 → T011 → T012 → T013 → T014 → T020 → T021 → T022 → T023 → T024 → T025 → T026 → T027 → T028 → T029 → T032 → ... → T054 → T055 → T056.
+T001 → T002 → T003 → T004 → T005 → T006 → T007 → T008 → T009 → T010 → T011 → T012 → T013 → T014 → T020 → T021 → T022 → T023 → T024 → T025 → T026 → T027 → T028 → T028a → T029 → T032 → ... → T046k → T046l → T052 → T054 → T055 → T056.
 
-Tasks T015-T018 (parallel within US1), T030-T046 (cross-story parallelism after US1), and T047-T051 (polish parallelism) cut wall-clock substantially below the critical-path length.
+Tasks T015-T018 (parallel within US1), T030-T046 (cross-story parallelism after US1), T046a-c + T046g (FR-012 TokenCache work in parallel with US2/3/4), and T047-T051 (polish parallelism) cut wall-clock substantially below the critical-path length.
 
 ---
 
@@ -219,22 +258,23 @@ Tasks T015-T018 (parallel within US1), T030-T046 (cross-story parallelism after 
 If pressure exists to ship the issue #96 fix ASAP:
 
 1. Run Phase 1 + Phase 2 + Phase 3 (T001-T025) only.
-2. Phase 7 polish (T047, T050, T051, T053, T054, T055, T056) — minimal subset.
-3. Skip Phase 4 (US2), Phase 5 (US3), Phase 6 (US4) — defer to follow-up PRs.
+2. Phase 8 polish (T047, T050, T051, T053, T054, T055, T056) — minimal subset.
+3. Skip Phase 4 (US2), Phase 5 (US3), Phase 6 (US4), Phase 7 (US-SEC) — defer to follow-up PRs.
 
-Result: issue #96 closed; production bug fixed; ATTACH still lazy-validates (today's behavior preserved); stream registry still singleton; diagnostic functions not yet labeled deprecated.
+Result: issue #96 closed; production bug fixed; ATTACH still lazy-validates (today's behavior preserved); stream registry still singleton; diagnostic functions not yet labeled deprecated; security-review items not yet addressed (TokenCache aliasing remains; no `mssql_close_all`; no noexcept audit). MVP path leaves a debt — only viable if the security items are tracked separately and don't block the production fix.
 
 ### Incremental Delivery (recommended)
 
-Ship the full spec in one PR following the natural order: Phase 1 → 2 → 3 → 4 → 5 → 6 → 7. ATTACH validation (US2) and stream registry move (US3) are small enough to land alongside US1 without bloating the PR. US4 is essentially documentation — trivial to include.
+Ship the full spec in one PR following the natural order: Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. ATTACH validation (US2), stream registry move (US3), and the security-hardening pack (Phase 7) are small enough to land alongside US1 without bloating the PR. US4 is essentially documentation — trivial to include.
 
 ### Parallel-Team Execution
 
 If multiple implementers available:
 - **Implementer A** (lead): Phase 1 + 2, then US1 critical path (T007-T014, T019-T022).
 - **Implementer B**: After US1 T022 lands, US2 (T026-T031) in parallel with US3.
-- **Implementer C**: US3 (T032-T041) in parallel with US2; US4 (T042-T046) can start any time (no blocking).
-- **Implementer A or any**: Phase 7 polish after US1+2+3 land.
+- **Implementer C**: US3 (T032-T041) in parallel with US2; US4 (T042-T046) can start any time (no blocking); Phase 7 FR-012 work (T046a-c, T046g) is fully orthogonal — can start immediately after T022.
+- **Any implementer**: Phase 7 noexcept + RAII contract (T046k-m) after US1 ownership-chain stabilizes (post-T022); SC-005 redaction grep (T046h) after US1 pool_stats rewrite (post-T019).
+- **Implementer A or any**: Phase 8 polish after US1+2+3+Phase 7 land.
 
 ### Risk Mitigation
 

@@ -6,7 +6,9 @@
 
 ## Summary
 
-Replace the singleton-based pool / context-managers / result-stream-registry ownership with per-`MSSQLCatalog` ownership via RAII (`unique_ptr` member + inline members). Closes 3 reproducible bug classes (cross-instance contamination, cross-instance cascade failure on DETACH, silent-shutdown leak) including production-reported [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96). Retires spec 045's `g_context_managers` band-aid (`70a4d90`). Adds eager ATTACH credential validation (fixes "ATTACH passes with wrong password" UX bug surfaced during plan review). Marks `mssql_open`/`mssql_close`/`mssql_ping` as `[DEPRECATED]` and keeps their handle-manager singleton as legitimate (no catalog binding by API). Surface API stable; 3 internal singletons deleted; bench-neutral (hot paths already go through the catalog).
+Replace the singleton-based pool / context-managers / result-stream-registry ownership with per-`MSSQLCatalog` ownership via RAII (`unique_ptr` member + inline members). Closes 3 reproducible bug classes (cross-instance contamination, cross-instance cascade failure on DETACH, silent-shutdown leak) including production-reported [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96). Retires spec 045's `g_context_managers` band-aid (`70a4d90`). Adds eager ATTACH credential validation (fixes "ATTACH passes with wrong password" UX bug surfaced during plan review). Marks `mssql_open`/`mssql_close`/`mssql_ping` as `[DEPRECATED]` and keeps their handle-manager singleton as legitimate (no catalog binding by API). Adds `mssql_close_all()` bulk-reset helper for long-running embedding processes. Namespaces the Azure `TokenCache` key by `DatabaseInstance` to eliminate cross-instance token aliasing. Hardens FR-011 / FR-003 against credential leakage in error messages and diagnostic output. Surface API stable (one additive function); 3 internal singletons deleted; bench-neutral (hot paths already go through the catalog).
+
+Two related concerns are explicitly **out of scope** and tracked elsewhere: in-memory credential zeroization ([issue #119](https://github.com/hugr-lab/mssql-extension/issues/119), future spec 049); graceful in-flight TDS cancellation on teardown (future spec covering DuckDB `InterruptCheck` integration).
 
 ## Technical Context
 
@@ -33,17 +35,20 @@ Replace the singleton-based pool / context-managers / result-stream-registry own
 - **Bench parity gate**: `test/bench/bench_codec_e2e.sh` at 1M rows stays within ±2% of pre-spec-047 baseline (same gate spec 045 used).
 
 **Constraints**:
-- No public extension API change (Constraint #1 + SC-007). All 12+ extension functions keep signatures and observable semantics.
+- No breaking public extension API change (SC-007). All existing extension functions keep signatures and observable semantics. One additive function: `mssql_close_all()` (FR-013).
 - TDS pool semantics preserved exactly (acquire / release / pin / idle timeout / connection limit / metrics).
 - No backward-compatibility shims for the removed singletons (Constraint #4 — clean break).
-- TokenCache stays singleton (clarification Q3 — reclassified as legitimate).
+- TokenCache stays singleton (clarification Q3 — reclassified as legitimate) **with namespaced key per FR-012** (post-PR-118 security review).
+- **`noexcept` on the entire teardown chain.** All destructors in the new ownership chain (`~MSSQLCatalog`, `~ConnectionPool`, `~TdsConnection`, `~TdsSocket`, `~TlsContext` if it owns OpenSSL state) MUST be marked `noexcept` (explicitly or by being implicitly noexcept under C++17 rules). A throw during stack unwind from `~AttachedDatabase` → `~MSSQLCatalog` invokes `std::terminate`. Audited in Phase 7 polish.
+- **`~ConnectionPool` does not block on checked-out connections.** The DuckDB contract is that quiescence precedes `~AttachedDatabase` (DETACH is exclusive; `~DatabaseInstance` only runs when no in-flight executors hold the catalog). Debug build asserts this invariant; release build closes underlying sockets without waiting (any thread still using the connection will see EBADF / connection-reset on the next read — same behavior as today's silent-shutdown leak fix). No graceful TDS ATTENTION is sent (see Constraints / non-goals in spec.md).
 
 **Scale/Scope**:
 - **3 singleton classes deleted**: `MssqlPoolManager`, `MSSQLContextManager`, `MSSQLResultStreamRegistry`. Plus the `g_context_managers` map + lock.
-- **`MSSQLConnectionHandleManager` retained** as legitimate (no catalog binding by API); surrounding `mssql_open`/`mssql_close`/`mssql_ping` functions marked `[DEPRECATED]` (FR-010).
+- **`MSSQLConnectionHandleManager` retained** as legitimate (no catalog binding by API); surrounding `mssql_open`/`mssql_close`/`mssql_ping` functions marked `[DEPRECATED]` (FR-010); companion `mssql_close_all()` added (FR-013).
+- **`mssql::azure::TokenCache` retained** as legitimate, cache key namespaced per `DatabaseInstance` (FR-012).
 - **~15-25 call sites updated** (per spec Inventory + Phase 1-4 walkthroughs).
-- **6 implementation phases** (per spec Plan section).
-- **10 success criteria** (SC-001..SC-010), including issue #96 closure (SC-009) and ATTACH credential validation (SC-010).
+- **6 implementation phases + 1 security-hardening sub-phase + polish** (per spec Plan section + post-PR-118 review additions).
+- **13 functional requirements** (FR-001..FR-013) and **11 success criteria** (SC-001..SC-011), including issue #96 closure (SC-009), ATTACH credential validation (SC-010), and TokenCache cross-instance isolation (SC-011).
 
 ## Constitution Check
 
@@ -94,7 +99,9 @@ src/
 │   ├── mssql_pool_manager.{cpp,hpp} # DELETE — singleton, 3 GetOrCreatePool* bodies move into MSSQLCatalog::Initialize
 │   ├── mssql_connection_provider.cpp # NO CHANGE — already routes via catalog
 │   ├── connection_pool.{cpp,hpp}    # MINOR — add pinned_count_ atomic + Increment/Decrement/GetPinnedCount methods
-│   └── mssql_diagnostic.cpp         # MINOR — pool_stats walks catalog list; mssql_open/close/ping descriptions gain [DEPRECATED] prefix
+│   └── mssql_diagnostic.cpp         # MINOR — pool_stats walks catalog list + credential redaction asserted (SC-005); mssql_open/close/ping descriptions gain [DEPRECATED] prefix; mssql_close_all() registered (FR-013)
+├── azure/
+│   └── azure_token.{cpp,hpp}        # MINOR — TokenCache key namespaced by DatabaseInstance (FR-012); singleton retained
 ├── dml/
 │   ├── insert/mssql_insert_executor.cpp # MINOR — line 74: replace singleton call with catalog.GetConnectionPool()
 │   └── update/mssql_update_executor.cpp # MINOR — line 73: same
@@ -108,10 +115,15 @@ src/
 test/
 ├── cpp/
 │   ├── test_multi_instance_pool_isolation.cpp  # NEW — SC-001/002/003
-│   └── test_issue_96_attach_loop.cpp           # NEW — SC-009
+│   ├── test_issue_96_attach_loop.cpp           # NEW — SC-009
+│   ├── test_result_stream_registry_isolation.cpp  # NEW — SC-006
+│   └── test_token_cache_isolation.cpp          # NEW — SC-011
 ├── sql/
-│   └── attach/
-│       └── attach_validates_credentials.test   # NEW — SC-010 (3 cases: bad password, unreachable host, lazy_validation opt-out)
+│   ├── attach/
+│   │   └── attach_validates_credentials.test   # NEW — SC-010 (3 cases: bad password [+ no-leak-in-error assert], unreachable host, lazy_validation opt-out)
+│   └── diagnostic/
+│       ├── pool_stats_no_credentials.test      # NEW — SC-005 credential redaction (per-auth-method sentinel grep)
+│       └── close_all.test                      # NEW — FR-013 smoke (open N handles, close_all returns N, second call returns 0)
 └── ...
 
 specs/047-process-state-cleanup/

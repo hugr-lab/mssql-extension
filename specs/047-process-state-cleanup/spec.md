@@ -28,6 +28,16 @@ instances, do its TDS connections leak?" The answer to the second question is
 - Q: Silent-shutdown leak reliability SC — iteration count for the no-leaked-socket test (Scenario 3 gate)? → A: 100 iterations. Fast (~3 sec CI cost), catches per-iteration linear leaks (would produce ~100 ghost sockets — trivially detectable via DMV / netstat). If implementation surfaces slow-leak suspicion during plan/implementation, threshold can be raised in a follow-up before merge.
 - Addendum: Related production bug **[issue #96](https://github.com/hugr-lab/mssql-extension/issues/96)** (`Catalog Error: MSSQL Error: Context 'TO_MSSQL' already exists. Use a different name or DETACH first`) is the production manifestation of this spec's bug class. Reproduced in Python / DuckDB.Net 1.5+ via a `duckdb.connect(":memory:")` loop where each iteration ATTACHes the same alias without an explicit DETACH. Added as Scenario 4 + SC-009; spec 047 closes it.
 
+### Session 2026-05-18 (post PR #118 security review)
+
+External security review of PR #118 surfaced a handful of design-level items that needed explicit handling in 047 rather than being deferred. Of the 6 review points, 5 are folded into this spec; 2 are explicitly out-of-scope and tracked elsewhere (see Constraints / non-goals).
+
+- Q: `mssql::azure::TokenCache` key is today `secret_name` (a bare string) — across two DuckDB instances in the same process, two `CREATE SECRET mssql_secret WITH (...)` statements with the same name but different `client_secret` / `tenant` would alias each other's cached OAuth2 tokens. Keep singleton, change key, or document? → A: **Keep singleton; change cache key** to namespace by the owning `DatabaseInstance` (key becomes `(database_instance_id, secret_name)`). Trivial change, eliminates the theoretical-but-real cross-instance token leak. Added as FR-012 + SC-011.
+- Q: After 047, `MSSQLConnectionHandleManager` is the only surviving cross-instance credentialed-state holder. Long-running embedding processes that open `mssql_open()` handles and never `mssql_close()` them retain sockets + creds for process lifetime. Add automatic cleanup or just a user-callable bulk-close? → A: **Add `mssql_close_all()` scalar function** (also `[DEPRECATED]` per FR-010 group). Automatic cleanup on `~DatabaseInstance` is fragile (handle map doesn't know which instance opened which handle, and DuckDB has no `~DatabaseInstance` hook for us). `mssql_close_all()` is a tool users can wire into orchestrator shutdown / `atexit` / equivalent. Added as FR-013.
+- Q: FR-011 eager validation moves the LOGIN7 error site from deep inside `pool.Acquire()` (where the connection string isn't directly in scope) to `MSSQLAttach` (where it absolutely is). A naive `<<connection_string` in the error wrap → password leaks into `what()` → into user-facing exceptions → into logs. → A: SC-010 gets an explicit assertion: the bad-credentials error message **must not contain** the password substring. Audit `MSSQLAttach` error wrapping accordingly.
+- Q: FR-003 rewrites `mssql_pool_stats()` to project directly from per-catalog `connection_info_`, which holds passwords / FEDAUTH tokens / Kerberos keytab paths. Today's singleton output already redacts at the projection layer; the rewrite must preserve that. → A: SC-005 extended with a grep-style assertion: no column in `mssql_pool_stats()` output contains password / token / keytab values for any auth method (SQL / FEDAUTH / Kerberos).
+- Q: `~MSSQLCatalog` RAII chain — destructors must be `noexcept` (throw during stack unwind = `std::terminate`). Also: `~ConnectionPool` semantics if connections are still checked out. → A: Polish task (T047a) audits all destructors in the touched ownership chain for `noexcept`. `~ConnectionPool` adds a debug-only assert (no checked-out connections at destruct time — DuckDB contract is that quiescence precedes `~AttachedDatabase`); in release, it forcibly closes underlying sockets without blocking. Doc-comment in `tds_connection_pool.hpp` makes the contract explicit. Graceful in-flight TDS cancellation is **out of scope** (see Constraints / non-goals).
+
 ## Overview
 
 The extension currently owns several pieces of **process-wide global state**.
@@ -199,6 +209,16 @@ share one via name collision in the singleton). Cost: 2× connection limit +
 no cross-catalog lifetime/transaction coupling; cleaner ownership semantics;
 `mssql_pool_stats` reports a row per catalog. Documented in release notes.
 
+**Note on credential footprint:** as a side-effect, duplicate-DSN attaches
+also double the in-memory copy count of `Password` / FEDAUTH token / Kerberos
+ccache path (one `MSSQLConnectionInfo` per pool instead of one shared entry).
+This is an accepted tradeoff in spec 047 — eliminating it requires a separate
+`CredentialProvider` redesign that splits secret-backed auth (where the
+password can be materialized transiently at LOGIN7 time) from connection-string
+auth (where DuckDB itself holds the credential in catalog metadata). Tracked
+in [issue #119](https://github.com/hugr-lab/mssql-extension/issues/119) and
+scheduled as a future spec; see Constraints / non-goals.
+
 ### FR-002: Remove `MssqlPoolManager` singleton
 
 After FR-001, no production code path needs `MssqlPoolManager::Instance()`.
@@ -310,6 +330,55 @@ expected to come up later, or in containerized startup orchestration where
 the SQL Server might not be reachable at attach time but will be at query
 time). Default: `lazy_validation=false` (eager).
 
+**Security requirement — no credential leak in error message.** The eager
+validation moves the error site from deep inside `pool.Acquire()` (where the
+connection string isn't directly in scope) to `MSSQLAttach` (where the full
+parsed connection string is in scope, including `Password=…`). The wrapping
+code that catches the validation exception and rethrows with context **must
+not** concatenate the connection string into the error message. Acceptable:
+the verbatim TDS error from SQL Server (`Login failed for user 'sa'`), plus
+the catalog alias, plus the host:port. **Not acceptable**: any substring of
+the password / FEDAUTH token / Kerberos keytab path. Asserted in SC-010.
+
+### FR-012: TokenCache key namespacing per DatabaseInstance
+
+`mssql::azure::TokenCache` (Meyers singleton) is kept (per clarification Q3 —
+legitimate cross-instance optimization), but its cache key changes from
+`secret_name` to `(database_instance_id, secret_name)`.
+
+Today's bug: if two DuckDB instances in the same process each define a
+secret with the same name (e.g., `mssql_secret`) but different content
+(different `tenant_id`, `client_secret`, or `scope`), the second instance's
+lookup gets the first instance's cached token. The DuckDB Secret namespace
+is per-`DatabaseInstance`, so the names colliding is realistic — many
+applications use a fixed secret name like `mssql_secret` in templates.
+
+The `database_instance_id` is the `uintptr_t` cast of the `DatabaseInstance*`
+(same identity already used elsewhere in this spec for catalog dispatch).
+The same secret-name from two different instances now misses cache and
+fetches independently. The optimization clarification Q3 promised
+(deduplication across two ATTACHes within one instance using the same
+secret) is preserved.
+
+When an instance dies (`~DatabaseInstance`), its entries become unreachable
+but stay in the cache map. Spec 047 does not add a per-instance reaper —
+entries are evicted lazily on the existing TTL path (cache entries already
+have an expiry inherited from the token's `expires_in`). Long-running
+processes that create + destroy many `DatabaseInstance`s with rotating
+secret names will see modest cache growth bounded by token TTL; documented.
+
+### FR-013: `mssql_close_all()` bulk handle reset
+
+New scalar function `mssql_close_all()` returns `INTEGER` (the count of
+handles closed). Internally walks `MSSQLConnectionHandleManager`'s map,
+closes every live `TdsConnection`, drops every entry. Atomic under the
+manager's mutex; idempotent (returns 0 if no handles).
+
+Marked `[DEPRECATED]` from registration alongside `mssql_open` / `_close` /
+`_ping` (it's part of the same diagnostic-helper family). Documented in
+`CHANGELOG.md` as the recommended shutdown hook for long-running embedding
+processes that use the diagnostic API. Catalog-based usage doesn't need it.
+
 ### FR-010: Deprecate `mssql_open` / `mssql_close` / `mssql_ping`
 
 These diagnostic functions stay functional (handle manager singleton kept as
@@ -330,6 +399,11 @@ this spec:
 No deletion in this spec — only marking. If/when a future spec removes the
 functions, the singleton goes with them, ending all process-wide state in
 this category.
+
+A companion bulk-close helper `mssql_close_all()` (see FR-013) is added so
+that long-running embedding processes have a single call to drop accumulated
+diagnostic handles at shutdown — without forcing them to track individual
+handle ids.
 
 ## Success Criteria
 
@@ -364,13 +438,22 @@ FR-005 lands.
 returns **zero matches** (excluding test/ and comment-only mentions). Verifies
 FR-002 + FR-006 + FR-009 + Phase 4 cleanup all landed.
 
-### SC-005: Diagnostic enumeration parity
+### SC-005: Diagnostic enumeration parity + credential redaction
 
 `SELECT * FROM mssql_pool_stats()` on a single-attach instance returns the same
 row count and the same column values (modulo per-run numeric stats) before
 and after spec 047. Verifies FR-003 doesn't regress observability. With two
 attaches to the same DSN under different aliases, returns 2 rows (per
 clarification Q4).
+
+**Credential redaction gate (added per PR #118 security review).** For each
+of the three auth methods (SQL auth, Azure FEDAUTH, Integrated/Kerberos), the
+test attaches a catalog with credentials that include a known-unique sentinel
+string in the password / token / keytab path, then queries `mssql_pool_stats()`
+and asserts via `string_contains` that no column in any row contains that
+sentinel substring. This ensures the FR-003 rewrite (per-catalog projection
+from `connection_info_`) doesn't accidentally leak credentials that today's
+singleton-keyed output was redacting at the projection layer.
 
 ### SC-006: Result stream registry isolation
 
@@ -399,10 +482,25 @@ documented in the "legitimate" table. No new "migrate" entries introduced.
 
 Test `test/sql/attach/attach_validates_credentials.test`:
 
-1. `ATTACH 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=WRONG_PASSWORD' AS bad (TYPE mssql);` — **MUST** fail with a login error containing the verbatim "Login failed for user 'sa'" string from SQL Server. **Today**: passes silently; first subsequent query fails.
+1. `ATTACH 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=WRONG_PASSWORD_SENTINEL' AS bad (TYPE mssql);` — **MUST** fail with a login error containing the verbatim "Login failed for user 'sa'" string from SQL Server. The error message **MUST NOT** contain the substring `WRONG_PASSWORD_SENTINEL` (asserted via `string_contains` in the test) — preserves the FR-011 security requirement that credentials never leak into user-facing exceptions. **Today**: passes silently; first subsequent query fails.
 2. `ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS unreachable (TYPE mssql);` — **MUST** fail with a connection error (DNS resolution failure / TCP timeout) within the configured `mssql_attach_validation_timeout`. **Today**: passes silently.
 3. `ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS lazy (TYPE mssql, lazy_validation=true);` — **MUST** succeed (opt-out preserves today's behavior); subsequent query fails with the connection error.
 4. Existing valid-credential `ATTACH` tests continue to pass with no observable change (the warm connection produced by validation is invisible).
+
+### SC-011: TokenCache cross-instance isolation
+
+C++ test `test/cpp/test_token_cache_isolation.cpp`: construct two `DuckDB`
+instances `db_a` and `db_b`. In each instance, `CREATE SECRET mssql_secret`
+with the same name but **different** `client_secret` values (or stub
+test-only fake secrets that the test harness can distinguish). Trigger token
+acquisition in instance A first (via `mssql_azure_auth_test('mssql_secret')`
+or equivalent path), then trigger the same in instance B. Assert that
+B's acquisition resolves with B's secret value, not A's cached token.
+
+Verifies FR-012 (key is `(database_instance_id, secret_name)`, not bare
+`secret_name`). **Today**: fails (B reuses A's cached token because cache
+key is bare `secret_name`). **After FR-012**: passes — each instance has
+its own cache entry.
 
 ### SC-009: Issue #96 regression test
 
@@ -434,7 +532,7 @@ via `sys.dm_exec_connections`). Fails on `main`-at-kickoff (reproduces issue
 | OpenSSL global init (implicit, via `OPENSSL_init_ssl` first call) | `src/tds/tls/tds_tls_impl.cpp` | OpenSSL ≥ 1.1 self-initializes on first use; cleanup via library atexit hooks. Per-instance overhead unjustified. |
 | `static thread_local CreateSchemaInfo info` | `src/catalog/mssql_schema_entry.cpp:36` | Thread-local scratch buffer for DuckDB Bind callbacks. Scope is one bind operation; thread-local lifetime is bounded by thread, not process. |
 | `static thread_local CreateTableInfo info` | `src/catalog/mssql_table_entry.cpp:60` | Same as above. |
-| `mssql::azure::TokenCache` (Meyers singleton) | `src/azure/azure_token.{hpp,cpp}` | Process-wide OAuth2 token cache keyed by `secret_name`. Cross-instance sharing is a **deliberate optimization** — same secret name → same OAuth2 token reused, avoiding redundant device-code / client-secret round-trips. The "two instances mean different things by the same secret name" risk is theoretical (secret namespace is per-instance via DuckDB `CREATE SECRET`). Document semantics; keep singleton. |
+| `mssql::azure::TokenCache` (Meyers singleton) | `src/azure/azure_token.{hpp,cpp}` | Process-wide OAuth2 token cache. Cross-instance sharing is a **deliberate optimization** — same secret name within one instance → same OAuth2 token reused, avoiding redundant device-code / client-secret round-trips. Per PR #118 security review (FR-012), cache key changes from bare `secret_name` to `(database_instance_id, secret_name)` to eliminate the cross-instance leak that the prior "theoretical risk" framing left open. Keep singleton; namespaced key; documented sharing semantics. |
 | `MSSQLConnectionHandleManager` (Meyers singleton) | `src/include/connection/mssql_diagnostic.hpp:15-37`, impl in `mssql_diagnostic.cpp:15` | Process-wide handle counter + `unordered_map<int64_t, shared_ptr<TdsConnection>>` for `mssql_open` / `mssql_close` / `mssql_ping`. These functions are diagnostic helpers; `mssql_open(secret_or_dsn)` returns an opaque `BIGINT` handle that survives across SQL statements; subsequent `mssql_ping(handle)` / `mssql_close(handle)` calls have no catalog discriminator by API design (no `context_name` argument). The map IS process-wide state, but it is **not** load-bearing for any cross-instance correctness invariant — there is no pool sharing, no transaction state, no shutdown leak that matters. Static field is the right answer. **Note**: per FR-010 the surrounding functions are marked `[DEPRECATED]` in this spec; the singleton is retained for as long as the functions exist and is slated for removal when a future spec removes the functions. |
 
 ## Plan (high level)
@@ -556,6 +654,28 @@ via `sys.dm_exec_connections`). Fails on `main`-at-kickoff (reproduces issue
   for the same `secret_name`). Documented but not migrated.
 - **No backward compatibility shims.** The pool manager removal is a clean
   break; once it's gone, it's gone.
+- **Credential zeroization / lazy materialization is out of scope.** Spec
+  047 doubles in-memory credential copies for the same-DSN-multi-alias case
+  (one `MSSQLConnectionInfo` per pool instead of one shared entry). Reducing
+  the in-memory credential footprint requires a separate `CredentialProvider`
+  redesign that splits secret-backed auth (where the password can be
+  materialized transiently at LOGIN7 time from DuckDB's Secret store) from
+  connection-string auth (where DuckDB itself permanently holds the
+  credential in catalog metadata). Tracked in
+  [issue #119](https://github.com/hugr-lab/mssql-extension/issues/119);
+  scheduled as a follow-up spec (provisionally 049).
+- **Graceful in-flight TDS cancellation on DETACH / pool teardown is out of
+  scope.** Today's `~MSSQLCatalog` chain (post-047) closes sockets via RAII;
+  any in-flight TDS request on another thread observes connection-reset on
+  its next read. Sending a TDS ATTENTION packet from the destructor on
+  another thread's connection is unsafe (write-while-read race on the TDS
+  state machine), and unsolicited ROLLBACK is incorrect (would abort
+  user-intended transactions). A proper redesign — cooperative cancellation
+  via an atomic flag on `TdsConnection` that the owner thread polls between
+  packets — belongs in a future spec covering DuckDB-side `InterruptCheck`
+  integration. Spec 047 only documents the contract: destructor closes
+  sockets immediately; server-side rollback happens via TCP FIN within
+  seconds; no graceful ATTENTION is sent.
 
 ## References
 

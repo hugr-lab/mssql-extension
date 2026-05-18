@@ -137,7 +137,47 @@ grep -rn "MSSQLResultStreamRegistry" src/ src/include/
 ./build/debug/test/unittest "test/sql/attach/attach_validates_credentials.test"  # SC-010
 ```
 
-### Phase 6 (polish + bench)
+### Phase 7 (security hardening — post PR #118 review)
+
+```bash
+# SC-005 credential redaction (FR-003 must not leak creds in pool_stats)
+./build/debug/test/unittest "test/sql/diagnostic/pool_stats_no_credentials.test"
+# Expected: each auth method (SQL / FEDAUTH / Kerberos) ATTACHes with a sentinel
+# string in the credential; no column of mssql_pool_stats() contains the sentinel.
+
+# SC-010 ATTACH credential leak in error (FR-011 hardening)
+./build/debug/duckdb -unsigned 2>&1 -c "
+    INSTALL mssql FROM local_build_debug; LOAD mssql;
+    ATTACH 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=PWSENTINEL_xyz123' AS bad (TYPE mssql);
+" | tee /tmp/spec047_attach_err.txt
+# Expected: error contains "Login failed for user 'sa'".
+grep -c 'PWSENTINEL_xyz123' /tmp/spec047_attach_err.txt
+# Expected: 0 (password substring MUST NOT appear in error output).
+
+# SC-011 TokenCache isolation (FR-012 key namespacing)
+./build/debug/test/unittest "test_token_cache_isolation*"
+# Expected: 2 DuckDB instances + same-named different-content secrets → each
+# instance resolves to its own secret value (no cross-instance cache aliasing).
+
+# FR-013 mssql_close_all smoke
+./build/debug/test/unittest "test/sql/diagnostic/close_all.test"
+# Expected: open N handles → close_all returns N → second call returns 0 → ping(handle) errors.
+
+# Teardown-contract noexcept audit (T046k)
+grep -rn 'noexcept' src/include/catalog/mssql_catalog.hpp src/include/tds/tds_connection_pool.hpp \
+    src/include/tds/tds_connection.hpp src/include/tds/tds_socket.hpp 2>/dev/null | grep '~'
+# Expected: every user-defined destructor in the teardown chain is marked noexcept.
+
+# ~ConnectionPool debug-assert smoke (T046l)
+./build/debug/duckdb -unsigned -c "
+    INSTALL mssql FROM local_build_debug; LOAD mssql;
+    ATTACH 'Server=localhost,1433;Database=TestDB;User Id=sa;Password=TPassw0rd!' AS db (TYPE mssql);
+    SELECT * FROM db.dbo.TestSimplePK LIMIT 1;
+"
+# Expected: normal exit (debug assert does not trip — DuckDB quiescence holds).
+```
+
+### Phase 8 (polish + bench)
 
 ```bash
 # SC-004 grep gate
@@ -172,12 +212,13 @@ cat specs/047-process-state-cleanup/state_inventory.md
 | SC-002 | `./build/debug/test/unittest "test_multi_instance_pool_isolation/scenario_2*"` |
 | SC-003 | `./build/debug/test/unittest "test_multi_instance_pool_isolation/scenario_3*"` + manual leaked-sockets check above |
 | SC-004 | `grep -rn 'MssqlPoolManager\|MSSQLContextManager\|MSSQLResultStreamRegistry' src/ src/include/` → 0 |
-| SC-005 | Phase 2 manual check above (2 attaches → 2 rows in `mssql_pool_stats()`) |
-| SC-006 | (Dropped — handle-isolation requirement is moot now that the handle manager stays singleton) |
+| SC-005 | Phase 2 manual check above (2 attaches → 2 rows in `mssql_pool_stats()`) **+** `./build/debug/test/unittest "test/sql/diagnostic/pool_stats_no_credentials.test"` (credential redaction grep) |
+| SC-006 | `./build/debug/test/unittest "test_result_stream_registry_isolation*"` |
 | SC-007 | `GEN=ninja make test && GEN=ninja make integration-test` — full green |
 | SC-008 | `cat specs/047-process-state-cleanup/state_inventory.md` — zero "migrate" entries |
 | SC-009 | `./build/debug/test/unittest "test_issue_96_attach_loop*"` |
-| SC-010 | `./build/debug/test/unittest "test/sql/attach/attach_validates_credentials.test"` |
+| SC-010 | `./build/debug/test/unittest "test/sql/attach/attach_validates_credentials.test"` (3 cases incl. password-not-in-error sentinel assertion) |
+| SC-011 | `./build/debug/test/unittest "test_token_cache_isolation*"` |
 
 ## Common pitfalls
 
@@ -186,3 +227,7 @@ cat specs/047-process-state-cleanup/state_inventory.md
 - **`lazy_validation` option must be respected by all 3 auth paths**: SQL auth, FEDAUTH, Integrated. Don't hard-code eager validation.
 - **Result stream registry move**: `mssql_scan` Bind already does a `manager.HasContext(bind_data->context_name)` check at line 121 today; after Phase 4 that becomes a catalog lookup. Make sure the catalog reference acquired in Bind survives into the `RegisterStream(...)` call.
 - **TokenCache + HandleManager NOT in SC-004 grep** — they're legitimate. Don't accidentally include them in the "delete all singletons" sweep.
+- **TokenCache key plumbing requires a `DatabaseInstance &` (or `ClientContext &`) at every call site** — `azure_secret_reader.cpp`, `azure_token.cpp`, `mssql_connection_provider.cpp` (FEDAUTH path), and any test stubs. Don't keep the old bare-`secret_name` overload around as a "convenience" — it silently brings back the cross-instance aliasing the spec just fixed.
+- **Don't concatenate the connection string into ATTACH error messages** (FR-011 / T028a). Even `"failed to attach: " + attach_options_string` leaks the password. Acceptable wrap: catalog alias + host:port + verbatim TDS error.
+- **`noexcept` destructors are non-negotiable** (T046k). The compiler does NOT default user-defined destructors to `noexcept` if any body statement is potentially-throwing — mark explicitly and wrap any non-trivial body in `try { ... } catch (...) {}`. A throw during `~AttachedDatabase` unwind invokes `std::terminate`.
+- **`mssql_close_all()` is registered with [DEPRECATED] description** — it's a tool for the deprecated diagnostic-handle family, not a recommended pattern. New code should not need it (catalog-based usage = RAII cleanup on DETACH / `~MSSQLCatalog`).
