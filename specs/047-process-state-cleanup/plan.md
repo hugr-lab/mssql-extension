@@ -6,7 +6,7 @@
 
 ## Summary
 
-Replace the singleton-based pool / context-managers / result-stream-registry ownership with per-`MSSQLCatalog` ownership via RAII (`unique_ptr` member + inline members). Closes 3 reproducible bug classes (cross-instance contamination, cross-instance cascade failure on DETACH, silent-shutdown leak) including production-reported [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96). Retires spec 045's `g_context_managers` band-aid (`70a4d90`). Adds eager ATTACH credential validation (fixes "ATTACH passes with wrong password" UX bug surfaced during plan review). Marks `mssql_open`/`mssql_close`/`mssql_ping` as `[DEPRECATED]` and keeps their handle-manager singleton as legitimate (no catalog binding by API). Adds `mssql_close_all()` bulk-reset helper for long-running embedding processes. Namespaces the Azure `TokenCache` key by `DatabaseInstance` to eliminate cross-instance token aliasing. Hardens FR-011 / FR-003 against credential leakage in error messages and diagnostic output. Surface API stable (one additive function); 3 internal singletons deleted; bench-neutral (hot paths already go through the catalog).
+Replace the singleton-based pool / context-managers / result-stream-registry ownership with per-`MSSQLCatalog` ownership via RAII (`unique_ptr` member + inline members). Closes 3 reproducible bug classes (cross-instance contamination, cross-instance cascade failure on DETACH, silent-shutdown leak) including production-reported [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96). Retires spec 045's `g_context_managers` band-aid (`70a4d90`). Adds eager ATTACH credential validation (fixes "ATTACH passes with wrong password" UX bug surfaced during plan review). Marks `mssql_open`/`mssql_close`/`mssql_ping` as `[DEPRECATED]` and keeps their handle-manager singleton as legitimate (no catalog binding by API). Adds `mssql_close_all()` bulk-reset helper for long-running embedding processes. Namespaces the Azure `TokenCache` key by `DatabaseInstance` to eliminate cross-instance token aliasing. Hardens FR-011 / FR-003 against credential leakage in error messages and diagnostic output. **Bundled enhancement** (orthogonal but small): custom `Application Name=` in connection string propagated to LOGIN7 (FR-014 / SC-012 / US-AN) — closes [issue #82](https://github.com/hugr-lab/mssql-extension/issues/82). Surface API stable (one additive function); 3 internal singletons deleted; bench-neutral (hot paths already go through the catalog).
 
 Two related concerns are explicitly **out of scope** and tracked elsewhere: in-memory credential zeroization ([issue #119](https://github.com/hugr-lab/mssql-extension/issues/119), future spec 049); graceful in-flight TDS cancellation on teardown (future spec covering DuckDB `InterruptCheck` integration).
 
@@ -46,9 +46,9 @@ Two related concerns are explicitly **out of scope** and tracked elsewhere: in-m
 - **3 singleton classes deleted**: `MssqlPoolManager`, `MSSQLContextManager`, `MSSQLResultStreamRegistry`. Plus the `g_context_managers` map + lock.
 - **`MSSQLConnectionHandleManager` retained** as legitimate (no catalog binding by API); surrounding `mssql_open`/`mssql_close`/`mssql_ping` functions marked `[DEPRECATED]` (FR-010); companion `mssql_close_all()` added (FR-013).
 - **`mssql::azure::TokenCache` retained** as legitimate, cache key namespaced per `DatabaseInstance` (FR-012).
-- **~15-25 call sites updated** (per spec Inventory + Phase 1-4 walkthroughs).
-- **6 implementation phases + 1 security-hardening sub-phase + polish** (per spec Plan section + post-PR-118 review additions).
-- **13 functional requirements** (FR-001..FR-013) and **11 success criteria** (SC-001..SC-011), including issue #96 closure (SC-009), ATTACH credential validation (SC-010), and TokenCache cross-instance isolation (SC-011).
+- **~15-25 call sites updated** (per spec Inventory + Phase 1-4 walkthroughs); +5-8 additional sites for US-AN (parsers + 4 auth strategies).
+- **6 implementation phases + 1 security-hardening + 1 bundled-feature (US-AN) + polish = 9 phases total** (per spec Plan section + post-PR-118 review additions + issue #82 bundle).
+- **14 functional requirements** (FR-001..FR-014) and **12 success criteria** (SC-001..SC-012), including issue #96 closure (SC-009), ATTACH credential validation (SC-010), TokenCache cross-instance isolation (SC-011), and issue #82 closure (SC-012 — custom Application Name).
 
 ## Constitution Check
 
@@ -108,9 +108,13 @@ src/
 ├── query/
 │   ├── mssql_result_stream.cpp      # MINOR — lines 82,89: replace singleton call with catalog.GetConnectionPool()
 │   └── mssql_query_executor.cpp     # MINOR — line 40: same
-├── mssql_storage.cpp                # MAJOR — delete MSSQLContextManager + g_context_managers; MSSQLAttach simplifies + parses lazy_validation option
+├── mssql_storage.cpp                # MAJOR — delete MSSQLContextManager + g_context_managers; MSSQLAttach simplifies + parses lazy_validation option; ALSO US-AN: parse Application Name / App Name / ApplicationName variants in FromConnectionString (ADO.NET + URI) and FromSecret
 ├── mssql_functions.cpp              # MAJOR — delete MSSQLResultStreamRegistry; mssql_scan uses catalog.RegisterStream/RetrieveStream
-└── include/                         # mirrors src/
+├── tds/auth/
+│   ├── sql_auth_strategy.cpp       # MINOR (US-AN) — replace hardcoded "DuckDB" with info.application_name fallback "DuckDB MSSQL Extension"
+│   ├── manual_token_strategy.cpp   # MINOR (US-AN) — same
+│   └── fedauth_strategy.cpp        # MINOR (US-AN) — same
+└── include/                         # mirrors src/; integrated_auth_strategy.hpp (US-AN: same change as the .cpp strategies)
 
 test/
 ├── cpp/
@@ -120,7 +124,8 @@ test/
 │   └── test_token_cache_isolation.cpp          # NEW — SC-011
 ├── sql/
 │   ├── attach/
-│   │   └── attach_validates_credentials.test   # NEW — SC-010 (3 cases: bad password [+ no-leak-in-error assert], unreachable host, lazy_validation opt-out)
+│   │   ├── attach_validates_credentials.test   # NEW — SC-010 (3 cases: bad password [+ no-leak-in-error assert], unreachable host, lazy_validation opt-out)
+│   │   └── application_name.test               # NEW (US-AN) — SC-012 5 steps: variant keys, default fallback, secret form, 128-char clamp
 │   └── diagnostic/
 │       ├── pool_stats_no_credentials.test      # NEW — SC-005 credential redaction (per-auth-method sentinel grep)
 │       └── close_all.test                      # NEW — FR-013 smoke (open N handles, close_all returns N, second call returns 0)

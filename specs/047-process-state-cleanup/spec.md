@@ -67,6 +67,22 @@ away (or shrinks to a thin façade for diagnostics), and a process-wide audit
 classifies every remaining piece of global state as **legitimate** or
 **migrate**.
 
+### Bundled enhancement: Custom `Application Name` (issue #82)
+
+While we are touching connection-string parsing and the LOGIN7 build path,
+spec 047 also resolves [issue #82](https://github.com/hugr-lab/mssql-extension/issues/82):
+the extension currently hard-codes `AppName="DuckDB MSSQL Extension"` in
+LOGIN7 (and `"DuckDB"` in the three SQL-auth strategies), ignoring any
+`Application Name=foo` key the user supplies in the connection string.
+SQL Server Profiler / `sys.dm_exec_sessions.program_name` therefore always
+shows the hard-coded string, making it impossible for ops to attribute
+sessions to a specific application.
+
+The fix is small and fully orthogonal to the ownership refactor (FR-014 /
+SC-012 / US-AN below); it shares no files with US1-4. Bundled here because
+it touches the same surface (`MSSQLConnectionInfo` parsing + LOGIN7) and
+because shipping it as a separate spec would be ceremony for ~50 LOC.
+
 ## Current state (band-aid)
 
 Commit `70a4d90` (`fix: stale ATTACH state survives DatabaseInstance reuse`)
@@ -405,6 +421,43 @@ that long-running embedding processes have a single call to drop accumulated
 diagnostic handles at shutdown — without forcing them to track individual
 handle ids.
 
+### FR-014: Custom `Application Name` in connection string (issue #82) — US-AN
+
+Add `application_name` to `MSSQLConnectionInfo` (default empty). Parse the
+following connection-string keys (case-insensitive) into that field, in both
+ADO.NET and URI parsers, and in the secret reader:
+
+- `Application Name` (with space — ADO.NET / pyodbc canonical form)
+- `ApplicationName` (no space — variant accepted by `microsoft/go-mssqldb`)
+- `App Name` (short alias)
+- `applicationname` (URI / secret underscore-free form)
+- `application_name` (secret underscore form, matching existing convention
+  for other underscored keys like `krb5_keytabfile`)
+
+If `application_name` is non-empty, propagate it to `AuthOptions.app_name`
+in **all** authentication strategies — SQL auth (`sql_auth_strategy.cpp`),
+Manual token (`manual_token_strategy.cpp`), FedAuth
+(`fedauth_strategy.cpp`), and Integrated/Kerberos/SSPI
+(`integrated_auth_strategy.hpp`). Today three of those four strategies
+hard-code `"DuckDB"` and the integrated one hard-codes
+`"DuckDB MSSQL Extension"` — all four must consult `info.application_name`
+first.
+
+If `application_name` is empty (default — current behavior), the four
+strategies fall back to a **unified** default string `"DuckDB MSSQL Extension"`
+(today three say `"DuckDB"` and one says `"DuckDB MSSQL Extension"` — a
+separate bug fixed in passing by this FR; users who saw `"DuckDB"` in their
+profiler before will see `"DuckDB MSSQL Extension"` after, matching the
+extension's existing public name and the integrated-auth precedent).
+
+LOGIN7 `AppName` field has no length cap from the protocol side, but
+SQL Server clamps `program_name` to 128 chars. Truncate at 128 with a
+DEBUG-level log line; do not error.
+
+**Out of scope for FR-014**: `WorkstationID` / `Host Name` / `WSID`
+connection-string keys (a related issue #82 mentions but not the primary
+ask). Tracked as a separate enhancement if requested.
+
 ## Success Criteria
 
 Measurable outcomes derived from Requirements + User Scenarios. All criteria
@@ -513,6 +566,29 @@ errors; no leaked SQL Server connections after the loop completes (verified
 via `sys.dm_exec_connections`). Fails on `main`-at-kickoff (reproduces issue
 #96); passes after FR-001 + FR-005 + FR-006 land. Closes issue #96.
 
+### SC-012: Custom `Application Name` round-trips to SQL Server (issue #82)
+
+SQL test `test/sql/attach/application_name.test` (requires SQL Server):
+
+1. `ATTACH 'Server=...;Database=...;Application Name=MyHugrApp' AS s (TYPE mssql)`
+   → `SELECT APP_NAME() FROM mssql_scan('s', 'SELECT 1')` returns `MyHugrApp`.
+2. Same with the variant key spellings (`App Name=`, `ApplicationName=`)
+   — each returns the supplied value.
+3. ATTACH without `Application Name=` → `APP_NAME()` returns
+   `DuckDB MSSQL Extension` (the unified default per FR-014).
+4. ATTACH via `CREATE SECRET` carrying `application_name = 'SecretApp'`
+   → `APP_NAME()` returns `SecretApp`.
+5. 200-character value → `APP_NAME()` returns the first 128 characters
+   (SQL Server clamp, verified by `LEN(APP_NAME()) = 128`).
+
+Verifies FR-014 across both connection-string parsers (ADO.NET) and the
+secret reader, and across all four auth strategies (the test repeats step 1
+for each: SQL auth, manual token, Azure FEDAUTH where Azure secret is
+configured, Integrated auth on the Kerberos test rig). **Today**: fails
+(steps 1-2 return `DuckDB`; step 3 returns `DuckDB` or `DuckDB MSSQL Extension`
+depending on which strategy was used; step 4 same; step 5 N/A — feature
+absent). **After FR-014**: all five steps pass. Closes issue #82.
+
 ---
 
 ## Inventory of process-wide state (current audit)
@@ -617,6 +693,33 @@ via `sys.dm_exec_connections`). Fails on `main`-at-kickoff (reproduces issue
 3. Write `test/cpp/test_issue_96_attach_loop.cpp` for SC-009 (Scenario 4 from spec).
 4. Verify both tests fail on `main`-at-kickoff and pass post-spec-047.
 
+### Phase 6.5 — Bundled: Custom Application Name (issue #82, US-AN)
+
+Fully independent of Phases 1-5 and 7; can land in any order. Touches no
+file modified by the singleton-cleanup phases.
+
+1. Add `string application_name;` to `MSSQLConnectionInfo`
+   (`src/include/mssql_storage.hpp`); default empty.
+2. Extend the ADO.NET parser in `MSSQLConnectionInfo::FromConnectionString`
+   (`src/mssql_storage.cpp`) to recognize the five variant keys per FR-014.
+3. Extend the URI parser (same file, `FromConnectionString` URI branch) to
+   recognize `applicationname=` query parameter.
+4. Extend `MSSQLConnectionInfo::FromSecret` (same file) to read the
+   `application_name` and `applicationname` secret fields.
+5. Update the four auth strategies to consult `info.application_name`
+   first, falling back to the unified default `"DuckDB MSSQL Extension"`:
+   - `src/tds/auth/sql_auth_strategy.cpp`
+   - `src/tds/auth/manual_token_strategy.cpp`
+   - `src/tds/auth/fedauth_strategy.cpp`
+   - `src/include/tds/auth/integrated_auth_strategy.hpp`
+6. Implement 128-char clamp with DEBUG log in the same code path (one place,
+   either in the strategies' helper or in `MSSQLConnectionInfo` post-parse
+   validation).
+7. Write `test/sql/attach/application_name.test` covering SC-012 steps 1-5.
+8. Update `CLAUDE.md` "ATTACH Options & Secret Parameters (Catalog Filters)"
+   table to add a row for `application_name`; mention `Application Name=`
+   syntax in user-facing docs.
+
 ### Phase 6 — Polish
 
 1. (Band-aid retirement is part of Phase 3 — the entire `MSSQLContextManager`
@@ -683,6 +786,10 @@ via `sys.dm_exec_connections`). Fails on `main`-at-kickoff (reproduces issue
   "Catalog Error: MSSQL Error: Context 'dbalias' already exists" production
   manifestation of the singleton-pool / context-managers bug class. Spec 047
   closes this issue (see Scenario 4 + SC-009).
+- **Issue [#82](https://github.com/hugr-lab/mssql-extension/issues/82)** —
+  "Application Name in connection string" enhancement request. Bundled into
+  spec 047 because it touches the same `MSSQLConnectionInfo` parser surface;
+  closed by FR-014 + SC-012 (US-AN).
 - Spec 045 commit `70a4d90` — band-aid for `g_context_managers` pointer-reuse
   (partial fix only; full fix in this spec)
 - Spec 045 commit `7bbdf28` — TIMESTAMP_* round-trip (concomitant with pool

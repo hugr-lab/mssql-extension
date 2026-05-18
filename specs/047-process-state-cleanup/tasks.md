@@ -15,7 +15,7 @@ description: "Task list for spec 047 — Process-Wide State Cleanup"
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: Can run in parallel (different files, no dependencies on incomplete tasks)
-- **[Story]**: User story label (US1..US4); setup/foundational/polish phases have no story label
+- **[Story]**: User story label (US1..US4, US-SEC for security hardening, US-AN for Application Name bundle); setup/foundational/polish phases have no story label
 - File paths are exact and clickable
 
 ## Path Conventions
@@ -205,7 +205,44 @@ Single-project C++ extension layout:
 
 ---
 
-## Phase 8: Polish & Cross-Cutting Concerns
+## Phase 8: User Story US-AN — Custom Application Name (Priority: P3, issue #82)
+
+**Story goal**: User-supplied `Application Name=foo` in connection string (and in MSSQL secrets) reaches SQL Server's `program_name` so ops can attribute sessions in `sys.dm_exec_sessions` and Profiler.
+
+**Independent test**: ATTACH with `Application Name=MyApp` → `SELECT APP_NAME() FROM mssql_scan('s', 'SELECT 1')` returns `MyApp`. SC-012 covers 5 sub-cases.
+
+**Dependencies**: None on US1-4 / US-SEC. Touches only `MSSQLConnectionInfo` parsing and the four auth strategies. Can land any time after Phase 1 — no foundational blocker.
+
+### Implementation for User Story US-AN
+
+- [ ] T060 [US-AN] Add `string application_name;` (default empty) to `MSSQLConnectionInfo` in `src/include/mssql_storage.hpp`. Place alongside `database` / `user` / `password` near line 47.
+- [ ] T061 [US-AN] In `MSSQLConnectionInfo::FromConnectionString` (ADO.NET branch, `src/mssql_storage.cpp`): recognize `Application Name`, `ApplicationName`, `App Name` (all case-insensitive). Use `StringUtil::CIEquals` (already in use elsewhere in the parser). Lookup populates `info.application_name`.
+- [ ] T062 [US-AN] In the URI branch of the same function: recognize `applicationname` query parameter (no spaces in URI keys per URL convention). Populate `info.application_name`.
+- [ ] T063 [US-AN] In `MSSQLConnectionInfo::FromSecret` (`src/mssql_storage.cpp`): read both `application_name` (underscore form, matches existing convention) and `applicationname` secret fields; the first non-empty wins.
+- [ ] T064 [US-AN] Update all four authentication strategies to consult `info.application_name` first, falling back to the unified default `"DuckDB MSSQL Extension"` (replacing today's mix of `"DuckDB"` and `"DuckDB MSSQL Extension"`):
+  - `src/tds/auth/sql_auth_strategy.cpp` (~line 32, replace `options.app_name = "DuckDB"`)
+  - `src/tds/auth/manual_token_strategy.cpp` (~line 50, same)
+  - `src/tds/auth/fedauth_strategy.cpp` (~line 36, same)
+  - `src/include/tds/auth/integrated_auth_strategy.hpp` (~line 52, already `"DuckDB MSSQL Extension"` — change to consult `info`).
+  Each strategy receives the `MSSQLConnectionInfo` (or equivalent) — verify the field is reachable; if not, plumb it through (typically one extra `info` parameter or via existing options struct).
+- [ ] T065 [US-AN] Add 128-char clamp + DEBUG log line in one place (recommended: a tiny helper `ResolveAppName(const MSSQLConnectionInfo &info)` inline in `src/include/mssql_storage.hpp` or near the auth-strategy fan-out). SQL Server clamps `program_name` to 128; truncating client-side keeps the value the user sees in `APP_NAME()` consistent with what we sent.
+
+### Tests for User Story US-AN
+
+- [ ] T066 [US-AN] Write `test/sql/attach/application_name.test` (SC-012). Five test groups:
+  1. ATTACH with `Application Name=MyHugrApp` → `APP_NAME()` returns `MyHugrApp`.
+  2. Same with `App Name=` and `ApplicationName=` variants.
+  3. ATTACH without the key → `APP_NAME()` returns `DuckDB MSSQL Extension` (unified default).
+  4. `CREATE SECRET` carrying `application_name = 'SecretApp'` + ATTACH via secret → `APP_NAME()` returns `SecretApp`.
+  5. 200-char value → `APP_NAME()` returns the first 128 chars (`LEN(APP_NAME()) = 128`).
+  Gate on `MSSQL_TEST_DSN`; skip cleanly when unset.
+- [ ] T067 [US-AN] Update `CLAUDE.md` "ATTACH Options & Secret Parameters (Catalog Filters)" table: add a row for `application_name` describing the supported key variants and the LOGIN7 propagation; cross-link to issue #82.
+
+**Checkpoint**: Phase 8 lands. Issue #82 closed. No interaction with the ownership refactor.
+
+---
+
+## Phase 9: Polish & Cross-Cutting Concerns
 
 **Purpose**: Audit gates, docs, bench, final test pass, PR prep.
 
@@ -215,8 +252,8 @@ Single-project C++ extension layout:
 - [ ] T050 [P] Update `CLAUDE.md` "Key Architecture Concepts" → "Connection pool" bullet to reflect per-catalog ownership. Current text mentions "per attached database" — make explicit that pool lifetime is bounded by catalog lifetime (RAII via `unique_ptr`); deleted singletons; no shared cross-instance pool state.
 - [ ] T051 [P] Update `CLAUDE.md` "Recent Changes" with spec 047 entry summarizing: 3 singletons removed (pool manager, context managers, result stream registry); handle manager stays + deprecated functions; ATTACH credential validation; closes issue #96; bench-neutral; no public API regression.
 - [ ] T052 Run bench parity gate: `MSSQL_BENCH_ROW_COUNT=1000000 MSSQL_BENCH_DUCKDB_BIN=$(pwd)/build/release/duckdb MSSQL_BENCH_OUTPUT=/tmp/bench_codec_e2e_spec047_run1.txt bash test/bench/bench_codec_e2e.sh` × 3 runs, min-of-3 per step. Compare to baseline captured in T002. Save to `specs/047-process-state-cleanup/bench_results.md`. Every step within ±5% (SC-007 gate).
-- [ ] T053 clang-format-14 sweep over all touched files: `/opt/homebrew/opt/llvm@14/bin/clang-format -i src/catalog/mssql_catalog.{cpp,hpp} src/catalog/mssql_transaction.cpp src/include/tds/tds_connection_pool.hpp src/tds/tds_connection_pool.cpp src/include/tds/tds_connection.hpp src/include/tds/tds_socket.hpp src/mssql_storage.cpp src/mssql_functions.{cpp} src/include/mssql_functions.hpp src/connection/mssql_diagnostic.cpp src/include/connection/mssql_diagnostic.hpp src/azure/azure_token.{cpp,hpp} src/azure/azure_secret_reader.cpp src/dml/insert/mssql_insert_executor.cpp src/dml/update/mssql_update_executor.cpp src/query/mssql_result_stream.cpp src/query/mssql_query_executor.cpp` plus headers under `src/include/`.
-- [ ] T054 Final full-suite test gate: `GEN=ninja make test && GEN=ninja make integration-test`. All previously-green tests still green; all new tests (T023, T024, T030, T040, T046g, T046h, T046i) green; SC-006-related stream isolation green; SC-010 ATTACH validation green; SC-011 TokenCache isolation green; SC-005 credential-redaction green.
+- [ ] T053 clang-format-14 sweep over all touched files: `/opt/homebrew/opt/llvm@14/bin/clang-format -i src/catalog/mssql_catalog.{cpp,hpp} src/catalog/mssql_transaction.cpp src/include/tds/tds_connection_pool.hpp src/tds/tds_connection_pool.cpp src/include/tds/tds_connection.hpp src/include/tds/tds_socket.hpp src/mssql_storage.cpp src/include/mssql_storage.hpp src/mssql_functions.{cpp} src/include/mssql_functions.hpp src/connection/mssql_diagnostic.cpp src/include/connection/mssql_diagnostic.hpp src/azure/azure_token.{cpp,hpp} src/azure/azure_secret_reader.cpp src/dml/insert/mssql_insert_executor.cpp src/dml/update/mssql_update_executor.cpp src/query/mssql_result_stream.cpp src/query/mssql_query_executor.cpp src/tds/auth/sql_auth_strategy.cpp src/tds/auth/manual_token_strategy.cpp src/tds/auth/fedauth_strategy.cpp src/include/tds/auth/integrated_auth_strategy.hpp` plus headers under `src/include/`.
+- [ ] T054 Final full-suite test gate: `GEN=ninja make test && GEN=ninja make integration-test`. All previously-green tests still green; all new tests (T023, T024, T030, T040, T046g, T046h, T046i, T066) green; SC-006-related stream isolation green; SC-010 ATTACH validation green; SC-011 TokenCache isolation green; SC-005 credential-redaction green; SC-012 Application Name green.
 - [ ] T055 Write `specs/047-process-state-cleanup/pr_description.md`: Summary; the 3 production bug classes fixed (Scenarios 1/2/3); issue #96 closure (Scenario 4 + SC-009); ATTACH validation (FR-011 + SC-010); 3 singletons deleted vs 1 kept-deprecated; **security hardening**: FR-012 TokenCache namespacing + SC-011 isolation test, FR-013 `mssql_close_all()`, SC-005 credential redaction in `mssql_pool_stats`, noexcept teardown chain audit; bench parity; test plan; follow-ups (issue #119 / spec 049 lazy credential materialization; future spec for cooperative TDS cancellation; eventual removal of `mssql_open/close/ping/close_all` closes the handle manager singleton too).
 - [ ] T056 Push branch + open PR: `git push -u origin 047-process-state-cleanup`; `gh pr create --title "feat(047): process-wide state cleanup — per-catalog pool ownership; closes #96" --body "$(cat specs/047-process-state-cleanup/pr_description.md)"`. Mark ready for review when CI is green.
 
@@ -233,13 +270,14 @@ Single-project C++ extension layout:
 - **Phase 5 (US3 — result stream registry)** — depends on US1 (catalog needs to be the natural owner before adding stream methods there). Independent of US2 / US4.
 - **Phase 6 (US4 — deprecate diagnostic)** — no real dependencies on other stories; can be implemented in parallel with US1-3 if helpful. Order in the doc reflects priority not blocking.
 - **Phase 7 (Security hardening)** — depends on US1 (the noexcept audit + ~ConnectionPool contract target the new ownership chain) + US4 (FR-013 deprecation label coordinates with FR-010 group). FR-012 TokenCache work is orthogonal — can land independently. SC-005 redaction grep depends on US1's `mssql_pool_stats` rewrite.
-- **Phase 8 (Polish)** — depends on US1 + US3 (singleton-deletion gate) + Phase 7 (security hardening must be in for SC-004 grep + SC-008 inventory). US2 and US4 must be done if they're shipping in this PR. Bench (T052) must run on release build with full implementation applied.
+- **Phase 8 (US-AN — Application Name)** — fully independent of US1-4 / US-SEC. Touches only `MSSQLConnectionInfo` parsing and the four auth strategies (no overlap with the singleton-cleanup files). Can land any time after Phase 1.
+- **Phase 9 (Polish)** — depends on US1 + US3 (singleton-deletion gate) + Phase 7 (security hardening must be in for SC-004 grep + SC-008 inventory) + Phase 8 (US-AN must be done for SC-012 in the final test gate, if shipping in this PR). US2 and US4 must be done if they're shipping in this PR. Bench (T052) must run on release build with full implementation applied.
 
 ### Story-Level Parallel Execution
 
 **Within US1**: T015, T016, T017, T018 are `[P]` — different files, no interdependency. After T007-T014 land, run them concurrently.
 
-**Across stories**: After US1 lands (T007-T022), US2 (Phase 4), US3 (Phase 5), US4 (Phase 6), and most of US-SEC (Phase 7) can proceed in parallel — each touches different files / responsibilities. T030 (US2 test) is independent of T040 (US3 test) and T046 (US4 test). FR-012 / TokenCache work (T046a-c, T046g) is orthogonal to all of US1/2/3/4 (different subsystem); can start any time after T022. T046k-m (noexcept audit + RAII contract) wait for US1 ownership-chain stabilization (post-T022).
+**Across stories**: After US1 lands (T007-T022), US2 (Phase 4), US3 (Phase 5), US4 (Phase 6), and most of US-SEC (Phase 7) can proceed in parallel — each touches different files / responsibilities. T030 (US2 test) is independent of T040 (US3 test) and T046 (US4 test). FR-012 / TokenCache work (T046a-c, T046g) is orthogonal to all of US1/2/3/4 (different subsystem); can start any time after T022. T046k-m (noexcept audit + RAII contract) wait for US1 ownership-chain stabilization (post-T022). **US-AN (T060-T067)** is fully orthogonal — different files entirely (`MSSQLConnectionInfo` + 4 auth strategies, no overlap with singleton-cleanup files) — can start any time after Phase 1; recommended start: in parallel with US2/US3/US4 or even before, by a separate implementer.
 
 **Within Polish**: T047, T048, T050, T051 are all `[P]` — different files, different concerns. (T049 superseded by T046c.)
 
@@ -265,7 +303,7 @@ Result: issue #96 closed; production bug fixed; ATTACH still lazy-validates (tod
 
 ### Incremental Delivery (recommended)
 
-Ship the full spec in one PR following the natural order: Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. ATTACH validation (US2), stream registry move (US3), and the security-hardening pack (Phase 7) are small enough to land alongside US1 without bloating the PR. US4 is essentially documentation — trivial to include.
+Ship the full spec in one PR following the natural order: Phase 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9. ATTACH validation (US2), stream registry move (US3), the security-hardening pack (Phase 7), and US-AN (Phase 8 — issue #82 Application Name) are small enough to land alongside US1 without bloating the PR. US4 is essentially documentation — trivial to include. US-AN is fully orthogonal — different files entirely; can land first, last, or in parallel with anything.
 
 ### Parallel-Team Execution
 
@@ -274,7 +312,8 @@ If multiple implementers available:
 - **Implementer B**: After US1 T022 lands, US2 (T026-T031) in parallel with US3.
 - **Implementer C**: US3 (T032-T041) in parallel with US2; US4 (T042-T046) can start any time (no blocking); Phase 7 FR-012 work (T046a-c, T046g) is fully orthogonal — can start immediately after T022.
 - **Any implementer**: Phase 7 noexcept + RAII contract (T046k-m) after US1 ownership-chain stabilizes (post-T022); SC-005 redaction grep (T046h) after US1 pool_stats rewrite (post-T019).
-- **Implementer A or any**: Phase 8 polish after US1+2+3+Phase 7 land.
+- **Implementer D (or any)**: US-AN (T060-T067) any time after Phase 1 — touches no file owned by Phases 3-7.
+- **Implementer A or any**: Phase 9 polish after US1+2+3+Phase 7+Phase 8 land.
 
 ### Risk Mitigation
 
