@@ -207,9 +207,10 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_pool_stats([context])` | Table | View connection pool statistics |
 | `mssql_refresh_cache(context)` | Scalar | Refresh metadata cache |
 | `mssql_preload_catalog(context [, schema])` | Scalar | Bulk-load all metadata in one round trip |
-| `mssql_open(conn_string)` | Scalar | Open standalone diagnostic connection |
-| `mssql_close(handle)` | Scalar | Close diagnostic connection |
-| `mssql_ping(handle)` | Scalar | Test connection liveness |
+| `mssql_open(conn_string)` | Scalar | [DEPRECATED] Open standalone diagnostic connection (spec 047 FR-010 — prefer ATTACH + catalog-bound functions) |
+| `mssql_close(handle)` | Scalar | [DEPRECATED] Close diagnostic connection (spec 047 FR-010) |
+| `mssql_ping(handle)` | Scalar | [DEPRECATED] Test connection liveness (spec 047 FR-010) |
+| `mssql_close_all()` | Scalar | [DEPRECATED] Close every open `mssql_open` handle in one shot; returns the count of handles closed. Recommended shutdown hook for hosts using the diagnostic API. (spec 047 FR-013) |
 | `mssql_azure_auth_test(secret, tenant?)` | Scalar | Test Azure AD token acquisition |
 | `mssql_kerberos_auth_test(host [, port])` | Scalar | Test POSIX Kerberos auth path (spec 042); returns OK + SPN / principal / token size, or verbatim GSSAPI error |
 | `mssql_kerberos_auth_test_secret(secret_name)` | Scalar | Same but reads keytab / SPN-override / etc. from an MSSQL secret |

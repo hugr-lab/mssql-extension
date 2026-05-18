@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mssql_close_all()`** scalar function (spec 047 FR-013). Closes every
+  diagnostic-API connection opened via `mssql_open()` in one call; returns
+  the count of handles closed. Idempotent — a second call after a full
+  close returns 0. Recommended shutdown hook for hosts that use the
+  diagnostic API but do not track individual handles. Marked `[DEPRECATED]`
+  from registration: lives in the same group as `mssql_open` / `mssql_close`
+  / `mssql_ping` and will be removed alongside them in a future major
+  release once the catalog-bound API covers all diagnostic needs (FR-010).
+
+### Changed
+
+- **`mssql_open` / `mssql_close` / `mssql_ping` are now documented as
+  `[DEPRECATED]`** (spec 047 FR-010). They remain functional and are kept
+  for backward compatibility. Prefer ATTACH + the catalog-bound functions
+  (`mssql_scan`, `mssql_exec`, `mssql_pool_stats`) which integrate with
+  DuckDB's catalog lifecycle and the per-catalog pool ownership introduced
+  in spec 047. The handle manager singleton these three functions share is
+  the last extension-internal process-wide state and will be removed
+  together with the functions themselves.
+
+### Security
+
+- **Azure TokenCache cross-instance aliasing** fixed (spec 047 FR-012).
+  Pre-047, two DuckDB instances in the same process that each defined a
+  secret with the same name (e.g. `mssql_secret`) shared a single
+  TokenCache row keyed by `secret_name` alone — instance B could silently
+  authenticate with instance A's already-acquired token even when the two
+  secrets resolved to different Azure principals. The cache key is now
+  namespaced by `(DatabaseInstance address, cache_key)`; tokens from
+  different instances are independent. The `OnDetach` invalidation path
+  is scoped to the calling instance's namespace so a sibling instance
+  sharing the secret name keeps its token.
+
+- **ATTACH credentials are now validated eagerly** by default (spec 047
+  FR-011). Wrong passwords / unreachable hosts surface as ATTACH errors
+  instead of being deferred to the first query. Error messages never
+  contain the password (audited via sentinel substring assertion in
+  `test/sql/attach/attach_validates_credentials.test`). Opt out with
+  `lazy_validation true` for container/orchestration scenarios; ceiling
+  controlled by the new `mssql_attach_validation_timeout` setting.
+
+### Internal
+
+- **Process-wide singletons removed** (spec 047, closes [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96)):
+  `MssqlPoolManager`, `MSSQLContextManager`, and `MSSQLResultStreamRegistry`
+  are gone. Connection pools are now owned per-`MSSQLCatalog` via
+  `unique_ptr`; result streams live on the catalog as
+  `RegisterStream` / `RetrieveStream` methods. Two attached MSSQL
+  databases under different ATTACH aliases no longer alias to the same
+  pool, and ATTACH/DETACH cycles in a Python-style loop (the issue #96
+  repro) succeed indefinitely.
+
 - **Windows SSPI** integrated authentication (spec 042 Phase 4). `WinSspiAuthenticator`
   via `secur32.dll`'s Negotiate package. Uses the current Windows logon session — no
   `kinit` needed. Same connection-string surface as POSIX (`Trusted_Connection=yes` /

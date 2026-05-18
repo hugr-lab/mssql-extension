@@ -28,6 +28,13 @@ public:
 	// Check if handle exists
 	bool HasConnection(int64_t handle);
 
+	// Spec 047 FR-013: close every open handle in one shot. Returns the count
+	// of connections closed. Idempotent — a second call after closing returns 0.
+	// Used by hosts that want a clean shutdown path before tearing down the
+	// process: `SELECT mssql_close_all()` releases every diagnostic-API socket
+	// without forcing the user to track handles manually.
+	int64_t CloseAll();
+
 private:
 	MSSQLConnectionHandleManager() : next_handle_(1) {}
 
@@ -55,6 +62,14 @@ void MSSQLCloseFunction(DataChunk &args, ExpressionState &state, Vector &result)
 // Tests if a connection is alive by sending a minimal TDS packet
 // Returns true if connection responds, false otherwise
 void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result);
+
+// mssql_close_all() -> INTEGER
+// [DEPRECATED] Closes every diagnostic connection opened via mssql_open and
+// returns the count of closed handles. Idempotent. Companion to mssql_open /
+// mssql_close / mssql_ping, all of which share the singleton
+// MSSQLConnectionHandleManager and will be removed together in a future major
+// release (see FR-010/FR-013, spec 047).
+void MSSQLCloseAllFunction(DataChunk &args, ExpressionState &state, Vector &result);
 
 // mssql_pool_stats table function
 // Returns statistics for connection pools associated with attached databases

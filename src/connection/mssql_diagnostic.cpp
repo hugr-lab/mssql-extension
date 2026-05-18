@@ -53,6 +53,24 @@ bool MSSQLConnectionHandleManager::HasConnection(int64_t handle) {
 	return connections_.find(handle) != connections_.end();
 }
 
+int64_t MSSQLConnectionHandleManager::CloseAll() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	int64_t closed = 0;
+	for (auto &entry : connections_) {
+		if (!entry.second) {
+			continue;
+		}
+		try {
+			entry.second->Close();
+		} catch (...) {
+			// Swallow — best-effort shutdown; counting only sockets we actually owned.
+		}
+		++closed;
+	}
+	connections_.clear();
+	return closed;
+}
+
 //===----------------------------------------------------------------------===//
 // mssql_open
 //===----------------------------------------------------------------------===//
@@ -164,6 +182,23 @@ void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 
 		return conn->Ping();
 	});
+}
+
+//===----------------------------------------------------------------------===//
+// mssql_close_all (spec 047 FR-013)
+//===----------------------------------------------------------------------===//
+
+// Closes every diagnostic handle in one shot. Computed once per call;
+// broadcast as a constant across the result vector — `SELECT mssql_close_all()`
+// returns one row, but a `SELECT mssql_close_all() FROM range(N)` still only
+// triggers a single CloseAll().
+void MSSQLCloseAllFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	int64_t closed = MSSQLConnectionHandleManager::Instance().CloseAll();
+	auto closed_i32 = static_cast<int32_t>(closed);
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto data = ConstantVector::GetData<int32_t>(result);
+	data[0] = closed_i32;
 }
 
 //===----------------------------------------------------------------------===//
@@ -326,6 +361,18 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet ping_func("mssql_ping");
 	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);
+
+	// [DEPRECATED] mssql_close_all() -> INTEGER  (spec 047 FR-013)
+	// Companion shutdown helper for the diagnostic handle API. Lives in the
+	// same `[DEPRECATED]` group as mssql_open / mssql_close / mssql_ping
+	// (FR-010) — the deprecation marker is in CLAUDE.md's Extension Functions
+	// table; DuckDB's ScalarFunctionSet registration path does not surface a
+	// per-function description string, so the marker stays in docs + this
+	// comment until the diagnostic API is retired and the singleton
+	// MSSQLConnectionHandleManager goes with it.
+	ScalarFunctionSet close_all_func("mssql_close_all");
+	close_all_func.AddFunction(ScalarFunction({}, LogicalType::INTEGER, MSSQLCloseAllFunction));
+	loader.RegisterFunction(close_all_func);
 
 	// mssql_pool_stats([context_name] VARCHAR) -> TABLE
 	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunctionSet());
