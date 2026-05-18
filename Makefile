@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -407,6 +407,27 @@ test-result-stream-registry-isolation: debug
 test-spec047-us3: test-result-stream-registry-isolation
 	@echo ""
 	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
+
+# Spec 047 US-SEC: TokenCache per-DatabaseInstance namespace isolation (T046g, SC-011).
+# Compiles src/azure/azure_token.cpp together with the test driver. The driver
+# stubs HttpPost / ReadAzureSecret / AcquireInteractiveToken so AcquireToken's
+# call graph links cleanly without dragging in httplib, OpenSSL, or the DuckDB
+# Secret API. Test only exercises TokenCache::Set/Get/Has/Invalidate.
+test-token-cache-isolation: debug
+	@echo "Building spec 047 TokenCache isolation test (T046g)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) -I src/include \
+	    test/cpp/test_token_cache_isolation.cpp \
+	    src/azure/azure_token.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_token_cache_isolation
+	@echo ""
+	@echo "Running spec 047 TokenCache isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_token_cache_isolation
+
+test-spec047-us-sec: test-token-cache-isolation
+	@echo ""
+	@echo "Spec 047 US-SEC TokenCache isolation test PASSED (SC-011)"
 
 # Show help
 help:
