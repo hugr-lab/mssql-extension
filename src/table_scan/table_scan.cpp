@@ -4,7 +4,6 @@
 
 #include "table_scan/table_scan.hpp"
 #include <cstdlib>
-#include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
