@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -350,6 +350,48 @@ test-literal-format: debug
 	@echo ""
 	@echo "Running shared literal_format test..."
 	$(CODEC_TEST_RPATH) build/test/test_literal_format
+
+# Spec 047 — US1 acceptance tests. Two C++ standalone binaries that link
+# the debug DuckDB shared library and exercise the extension's catalog +
+# pool ownership via real ATTACH / mssql_scan calls.
+#
+# Each binary auto-skips when MSSQL_TEST_PASS is unset (env-var gate per
+# the same pattern as test_multi_connection_transactions.cpp).
+#
+# Targets:
+#   test-multi-instance-pool-isolation  — Scenarios 1/2/3 (SC-001/002/003)
+#   test-issue-96-attach-loop           — Scenario 4   (SC-009, closes #96)
+#   test-spec047-us1                    — meta target: builds + runs both
+SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+SPEC047_TEST_INCLUDES := -I duckdb/src/include
+SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
+SPEC047_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+test-multi-instance-pool-isolation: debug
+	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_multi_instance_pool_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_multi_instance_pool_isolation
+	@echo ""
+	@echo "Running spec 047 multi-instance pool isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_multi_instance_pool_isolation
+
+test-issue-96-attach-loop: debug
+	@echo "Building spec 047 issue #96 ATTACH-loop regression test (T024)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_issue_96_attach_loop.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_issue_96_attach_loop
+	@echo ""
+	@echo "Running spec 047 issue #96 ATTACH-loop regression test..."
+	$(SPEC047_TEST_RPATH) build/test/test_issue_96_attach_loop
+
+test-spec047-us1: test-multi-instance-pool-isolation test-issue-96-attach-loop
+	@echo ""
+	@echo "All spec 047 US1 acceptance tests PASSED (SC-001, SC-002, SC-003, SC-009)"
 
 # Show help
 help:
