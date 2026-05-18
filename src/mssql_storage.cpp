@@ -779,80 +779,6 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 }
 
 //===----------------------------------------------------------------------===//
-// MSSQLContext implementation
-//===----------------------------------------------------------------------===//
-
-MSSQLContext::MSSQLContext(const string &name, const string &secret_name) : name(name), secret_name(secret_name) {}
-
-//===----------------------------------------------------------------------===//
-// MSSQLContextManager implementation
-//===----------------------------------------------------------------------===//
-
-// Static storage for context managers - keyed by DatabaseInstance pointer
-static case_insensitive_map_t<unique_ptr<MSSQLContextManager>> g_context_managers;
-static mutex g_context_managers_lock;
-
-MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
-	lock_guard<mutex> guard(g_context_managers_lock);
-
-	// Use pointer address as unique key - cast to size_t for formatting
-	string db_key = StringUtil::Format("%llu", (unsigned long long)(uintptr_t)&db);
-
-	auto it = g_context_managers.find(db_key);
-	if (it == g_context_managers.end()) {
-		auto manager = make_uniq<MSSQLContextManager>();
-		auto &manager_ref = *manager;
-		g_context_managers[db_key] = std::move(manager);
-		return manager_ref;
-	}
-	return *it->second;
-}
-
-void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
-	lock_guard<mutex> guard(lock);
-	// Spec 047 retires the spec 045 band-aid (commit 70a4d90): pools no longer
-	// live in MssqlPoolManager — they're owned by MSSQLCatalog via unique_ptr
-	// and torn down with the catalog. The pointer-reuse hazard that motivated
-	// the conditional pool sweep is gone. (MSSQLContextManager itself is
-	// slated for removal in T020 once all consumers migrate to catalog list
-	// lookups.)
-	contexts[name] = std::move(ctx);
-}
-
-void MSSQLContextManager::UnregisterContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	auto it = contexts.find(name);
-	if (it != contexts.end()) {
-		// Clean up: abort any in-progress queries, close connection
-		// For stub implementation, just remove from map
-		contexts.erase(it);
-	}
-}
-
-shared_ptr<MSSQLContext> MSSQLContextManager::GetContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	auto it = contexts.find(name);
-	if (it == contexts.end()) {
-		return nullptr;
-	}
-	return it->second;
-}
-
-bool MSSQLContextManager::HasContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	return contexts.find(name) != contexts.end();
-}
-
-vector<string> MSSQLContextManager::ListContexts() {
-	lock_guard<mutex> guard(lock);
-	vector<string> result;
-	for (auto &entry : contexts) {
-		result.push_back(entry.first);
-	}
-	return result;
-}
-
-//===----------------------------------------------------------------------===//
 // Connection Validation
 //===----------------------------------------------------------------------===//
 
@@ -1240,29 +1166,30 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Get connection string from info.path (the first argument to ATTACH)
 	string connection_string = info.path;
 
-	// Create context based on whether SECRET or connection string is provided
-	auto ctx = make_shared_ptr<MSSQLContext>(name, secret_name);
-	ctx->attached_db = &db;
+	// Build connection info based on whether SECRET or connection string is provided.
+	// Spec 047 T020: MSSQLContext / MSSQLContextManager singletons removed; the
+	// catalog itself is the per-instance owner of connection_info + pool.
+	shared_ptr<MSSQLConnectionInfo> connection_info;
 
 	if (!secret_name.empty()) {
 		// SECRET provided - use secret-based connection
-		ctx->connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
+		connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
 	} else if (!connection_string.empty()) {
 		// Connection string provided - parse it
 		// If access_token or azure_secret is provided as option, allow missing user/password
 		bool azure_auth_option = !access_token.empty() || !azure_secret_name.empty();
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
+		connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
 
 		// Set access_token from ATTACH option if provided (Spec 032: takes precedence)
 		if (!access_token.empty()) {
-			ctx->connection_info->access_token = access_token;
-			ctx->connection_info->use_azure_auth = true;
-			ctx->connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
+			connection_info->access_token = access_token;
+			connection_info->use_azure_auth = true;
+			connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
 		} else if (!azure_secret_name.empty()) {
 			// Set azure_secret from ATTACH option if provided
-			ctx->connection_info->azure_secret_name = azure_secret_name;
-			ctx->connection_info->use_azure_auth = true;
-			ctx->connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
+			connection_info->azure_secret_name = azure_secret_name;
+			connection_info->use_azure_auth = true;
+			connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
 		}
 	} else {
 		// Neither SECRET nor connection string provided
@@ -1275,13 +1202,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 	// Apply ORDER BY pushdown option from ATTACH if specified (Spec 039)
 	if (order_pushdown_option >= 0) {
-		ctx->connection_info->order_pushdown = order_pushdown_option;
+		connection_info->order_pushdown = order_pushdown_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "ORDER_PUSHDOWN option from ATTACH: %s", order_pushdown_option ? "true" : "false");
 	}
 
 	// Apply CATALOG option from ATTACH if specified (overrides connection string/secret value)
 	if (catalog_option_specified) {
-		ctx->connection_info->catalog_enabled = catalog_enabled_option;
+		connection_info->catalog_enabled = catalog_enabled_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
 	}
 
@@ -1292,66 +1219,62 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		if (!error.empty()) {
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
-		ctx->connection_info->schema_filter = schema_filter_option;
+		connection_info->schema_filter = schema_filter_option;
 	}
 	if (table_filter_specified) {
 		auto error = MSSQLCatalogFilter::ValidatePattern(table_filter_option);
 		if (!error.empty()) {
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
-		ctx->connection_info->table_filter = table_filter_option;
+		connection_info->table_filter = table_filter_option;
 	}
 
 	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance
 	// Fabric endpoints don't support BCP/INSERT BULK, need fallback to INSERT
-	ctx->connection_info->is_fabric_endpoint = ctx->connection_info->IsFabricEndpoint();
-	if (ctx->connection_info->is_fabric_endpoint) {
+	connection_info->is_fabric_endpoint = connection_info->IsFabricEndpoint();
+	if (connection_info->is_fabric_endpoint) {
 		MSSQL_STORAGE_DEBUG_LOG(1, "Fabric endpoint detected: %s (BCP disabled, using INSERT fallback)",
-								ctx->connection_info->host.c_str());
+								connection_info->host.c_str());
 	}
 
-	// Validate connection before registering context or creating catalog
-	// This ensures we fail fast on invalid credentials
+	// Validate connection before creating the catalog so invalid credentials
+	// surface immediately rather than at first query.
 	auto pool_config = LoadPoolConfig(context);
 
 	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
-	if (!ctx->connection_info->access_token.empty()) {
+	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
 		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
 
 		// Create auth strategy - this validates JWT format, audience, and expiration
-		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(ctx->connection_info->access_token,
-																		 ctx->connection_info->database);
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(connection_info->access_token,
+																		 connection_info->database);
 
 		// Get the pre-encoded UTF-16LE token for pool creation
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
 		// Validate actual connection to server using the pre-provided token
-		ValidateManualTokenConnection(*ctx->connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
-	} else if (ctx->connection_info->use_azure_auth) {
+		ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
+	} else if (connection_info->use_azure_auth) {
 		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
 		// This ensures invalid credentials are detected immediately, not on first query
 		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
-		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
+		ValidateAzureConnection(context, *connection_info, pool_config.connection_timeout);
 
 		// Build FEDAUTH token for pool factory (uses validated credentials)
-		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
+		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
-	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
-			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
+	} else if (connection_info->auth_method == AuthMethod::KRB5 ||
+			   connection_info->auth_method == AuthMethod::WINSSPI) {
 		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
 		// time so credential / SPN / clock-skew errors surface immediately.
 		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
-		ValidateIntegratedAuthConnection(*ctx->connection_info, pool_config.connection_timeout);
+		ValidateIntegratedAuthConnection(*connection_info, pool_config.connection_timeout);
 	} else {
-		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
+		ValidateConnection(*connection_info, pool_config.connection_timeout);
 	}
-
-	// Register context (only reached if validation succeeds)
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	manager.RegisterContext(name, ctx);
 
 	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the
 	// tds::PoolConfiguration the pool itself consumes. The MSSQLCatalog now
@@ -1369,9 +1292,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// pool inline based on connection_info_->auth_method.
 	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
 	// catalog_enabled flag determines whether schema discovery is available.
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, std::move(tds_pool_config),
-										   std::move(fedauth_token_utf16le), options.access_mode,
-										   ctx->connection_info->catalog_enabled);
+	auto catalog_enabled = connection_info->catalog_enabled;
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
+										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
 	catalog->Initialize(false);
 
 	return std::move(catalog);

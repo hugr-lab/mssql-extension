@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -116,9 +115,15 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	bind_data->context_name = input.inputs[0].GetValue<string>();
 	bind_data->query = input.inputs[1].GetValue<string>();
 
-	// Validate context exists
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	if (!manager.HasContext(bind_data->context_name)) {
+	// Validate context exists (Spec 047: per-catalog ownership via DuckDB catalog lookup)
+	try {
+		auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
+		if (catalog.GetCatalogType() != "mssql") {
+			throw InvalidInputException(
+				"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+				bind_data->context_name, bind_data->context_name);
+		}
+	} catch (const std::exception &) {
 		throw InvalidInputException(
 			"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
 			bind_data->context_name, bind_data->context_name);
@@ -316,9 +321,16 @@ static unique_ptr<FunctionData> MSSQLExecBind(ClientContext &context, ScalarFunc
 		auto context_val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 		context_name = context_val.ToString();
 
-		// Validate the context exists (attached database)
-		auto &manager = MSSQLContextManager::Get(*context.db);
-		if (!manager.HasContext(context_name)) {
+		// Validate the context exists (Spec 047: per-catalog ownership)
+		try {
+			auto &catalog = Catalog::GetCatalog(context, context_name);
+			if (catalog.GetCatalogType() != "mssql") {
+				throw BinderException(
+					"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, "
+					"SECRET ...)",
+					context_name, context_name);
+			}
+		} catch (const std::exception &) {
 			throw BinderException(
 				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
 				"...)",
@@ -352,22 +364,25 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		// Get context from the state
 		auto &client_context = state.GetContext();
 
-		// Get the MSSQL context and catalog
-		auto &manager = MSSQLContextManager::Get(*client_context.db);
-		auto ctx = manager.GetContext(context_name);
-		if (!ctx) {
+		// Get the MSSQL catalog (Spec 047: per-catalog ownership)
+		MSSQLCatalog *catalog_ptr = nullptr;
+		try {
+			auto &raw_catalog = Catalog::GetCatalog(client_context, context_name);
+			if (raw_catalog.GetCatalogType() != "mssql") {
+				throw InvalidInputException(
+					"mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)", context_name,
+					raw_catalog.GetCatalogType());
+			}
+			catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
+		} catch (const InvalidInputException &) {
+			throw;
+		} catch (const std::exception &) {
 			throw InvalidInputException(
 				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
 				"...)",
 				context_name, context_name);
 		}
-
-		// Get the catalog and check if it's read-only
-		if (!ctx->attached_db) {
-			throw InvalidInputException("mssql_exec: Context '%s' has no attached database", context_name);
-		}
-
-		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
+		auto &catalog = *catalog_ptr;
 		if (catalog.IsReadOnly()) {
 			throw InvalidInputException("Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
 										context_name);

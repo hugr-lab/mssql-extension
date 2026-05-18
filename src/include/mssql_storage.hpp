@@ -135,38 +135,6 @@ struct MSSQLConnectionInfo {
 };
 
 //===----------------------------------------------------------------------===//
-// MSSQLContext - Attached context state
-//===----------------------------------------------------------------------===//
-struct MSSQLContext {
-	string name;
-	string secret_name;
-	shared_ptr<MSSQLConnectionInfo> connection_info;
-	optional_ptr<AttachedDatabase> attached_db;
-
-	MSSQLContext(const string &name, const string &secret_name);
-};
-
-//===----------------------------------------------------------------------===//
-// MSSQLContextManager - Global context manager (singleton per DatabaseInstance)
-//===----------------------------------------------------------------------===//
-class MSSQLContextManager {
-public:
-	// Get singleton instance for a DatabaseInstance
-	static MSSQLContextManager &Get(DatabaseInstance &db);
-
-	// Context operations
-	void RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx);
-	void UnregisterContext(const string &name);
-	shared_ptr<MSSQLContext> GetContext(const string &name);
-	bool HasContext(const string &name);
-	vector<string> ListContexts();
-
-private:
-	mutex lock;
-	case_insensitive_map_t<shared_ptr<MSSQLContext>> contexts;
-};
-
-//===----------------------------------------------------------------------===//
 // MSSQLStorageExtensionInfo - Shared state for storage extension
 //===----------------------------------------------------------------------===//
 struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {

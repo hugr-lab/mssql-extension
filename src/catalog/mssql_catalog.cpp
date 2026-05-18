@@ -706,15 +706,10 @@ void MSSQLCatalog::OnDetach(ClientContext &context) {
 		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
 	}
 
-	// Spec 047 T012: pool teardown is implicit via ~MSSQLCatalog → unique_ptr
-	// destruction. The MssqlPoolManager::RemovePool() call that used to live
-	// here is gone with the singleton.
-
-	// Unregister context from the manager (MSSQLContextManager slated for
-	// removal in T020 — kept here so mssql_scan/mssql_exec consumers that
-	// still query it via HasContext / GetContext find the right state).
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	manager.UnregisterContext(context_name_);
+	// Spec 047 T012+T020: pool teardown is implicit via ~MSSQLCatalog → unique_ptr
+	// destruction; the MssqlPoolManager / MSSQLContextManager singletons that
+	// used to require explicit RemovePool() / UnregisterContext() are gone.
+	(void)context;
 }
 
 //===----------------------------------------------------------------------===//
