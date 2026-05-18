@@ -4,39 +4,140 @@ Resolved questions and design decisions. All items are decision-locked unless fl
 
 ## R1. Wire format — `CLNT_UCAST_INST` and `SVR_RESP`
 
-Source: [MS-SQLR] §2.2.1–2.2.4, cross-referenced against `microsoft/go-mssqldb/msdsn/browser.go` and the wire captures from `Microsoft.Data.SqlClient` (open-source `SqlConnectionFactory`).
+Source: [MC-SQLR] (Microsoft Open Specifications, latest revision 20.0
+dated 2025-10-31; downloadable PDF at
+`https://winprotocoldoc.z19.web.core.windows.net/MC-SQLR/[MC-SQLR].pdf`),
+cross-referenced against `microsoft/go-mssqldb/msdsn/browser.go` and the
+wire captures from `Microsoft.Data.SqlClient`.
+
+### Wire-level string encoding
+
+**The protocol-level encoding is MBCS, not ASCII.** [MC-SQLR] §2.2
+(Message Syntax) states verbatim:
+
+> All integer fields are represented in little-endian format. All text
+> strings are represented as a multibyte character set (MBCS) string
+> [MS-UCODEREF] on the current system code page of the server and the
+> client. (The system code page on the client and the system code page
+> on the server are assumed to be common.) They are not case-sensitive.
+
+Confirmed by the per-field text in §2.2.3 (request) and §2.2.5
+(response):
+
+> §2.2.3 INSTANCENAME (variable): A variable-length null-terminated
+> multibyte character set (MBCS) string ... MUST be no greater than 32
+> bytes in length, not including the null terminator.
+
+> §2.2.5 RESP_DATA (variable): A variable-length MBCS string that does
+> not need to be byte-aligned. The maximum size of RESP_DATA MUST be
+> 1,024 bytes if the server is responding to a CLNT_UCAST_INST request.
+
+### Why "ASCII in practice" is still right for our implementation
+
+In every realistic deployment the bytes that travel over the wire are
+ASCII, because:
+
+- **Keys** (`ServerName`, `InstanceName`, `IsClustered`, `Version`,
+  `tcp`, `np`) are ASCII literals fixed by the spec.
+- **Instance names**: §2.2.5 itself caps them: *"INSTANCENAME MUST be no
+  greater than 255 bytes but SHOULD be no greater than 16 MBCS
+  characters."* SQL Server itself further restricts instance names at
+  install time to `[A-Za-z0-9_$#]{1,16}` (verified against the SSMS
+  installer regex), so all production instance names ARE ASCII.
+- **`tcp` value**: decimal port digits — ASCII.
+- **`IsClustered`**: `"Yes"`/`"No"` — ASCII.
+- **`Version`**: dotted-quad like `15.0.4123.1` — ASCII.
+- **`np` value**: a `\\HOST\pipe\...` UNC pipe path. The hostname could
+  in principle be a non-ASCII NetBIOS name under the server's active
+  codepage, but we don't consume `np` at all.
+- **`ServerName`**: typically the engine's NetBIOS or DNS hostname; both
+  are practically ASCII (RFC 952/1123 DNS, and Microsoft's NetBIOS rules
+  predate IDN). A server with a non-ASCII NetBIOS name under e.g. CP932
+  is theoretically possible but extremely rare.
+
+### Implications for the parser
+
+The parser stores the body as a `std::string` byte buffer and treats
+fields as opaque byte sequences. This is correct under MBCS:
+
+1. **Tokenisation** keys off the `;` byte (0x3B) which is the same in
+   every MBCS codepage (0x00–0x7F is invariant ASCII). No risk of a
+   trail byte of a CP932 DBCS character colliding with `;`.
+2. **Instance-name case-fold match** uses `std::tolower((unsigned char)
+   c)` over both strings. This is correct for ASCII alphabetic
+   characters (the only ones that can appear in a valid SQL Server
+   instance name) and a no-op for digits and underscore. It does NOT
+   do correct case-folding for non-ASCII MBCS bytes — but those can't
+   appear in a valid instance name per Microsoft's own constraints.
+3. **`tcp` value parse** uses `std::stoi` which only consumes ASCII
+   digits — same in every MBCS codepage.
+4. **Pass-through of `ServerName`** as raw bytes: any non-ASCII MBCS
+   bytes survive the parser intact and reach the caller verbatim. The
+   downstream consumer (`tds_connection.cpp` for the TCP connect, the
+   integrated-auth strategy for the SPN) gets the original bytes; in
+   the pathological case of a non-ASCII NetBIOS hostname under a
+   foreign codepage, what the caller does with those bytes is the
+   caller's problem — we do not corrupt them.
+
+So the spec says MBCS, the parser respects MBCS in the byte-stream
+sense, and the practical wire content is invariably ASCII. The earlier
+internal documentation calling the wire format "ASCII" was imprecise
+shorthand and has been corrected to "MBCS (ASCII in practice for the
+documented fields)".
 
 ### Request — `CLNT_UCAST_INST`
 
 ```
-+---------+-------------------+------+
-| 0x04    | InstanceName ASCII| 0x00 |
-+---------+-------------------+------+
-   1 byte    1..32 bytes        1
++---------+----------------------+------+
+| 0x04    | InstanceName (MBCS)  | 0x00 |
++---------+----------------------+------+
+   1 byte    1..32 bytes           1
 ```
 
-- Opcode `0x04` selects the unicast-by-name query (vs `0x02` `CLNT_UCAST_DAC` for dedicated admin connection, `0x03` `CLNT_UCAST_EX` for all instances on the host, `0x01` `CLNT_BCAST_EX` for subnet broadcast).
-- Instance name is ASCII, NUL-terminated, max 32 bytes including the NUL per the spec — *but* SQL Server only ever registers names of `[A-Za-z0-9_$#]{1,16}` (the engine itself rejects longer at install time), and we enforce the tighter range at parse time (FR-010). The 32-byte cap is the wire limit, not a permission to send longer.
+- Opcode `0x04` selects the unicast-by-name query (vs `0x02`
+  `CLNT_UCAST_DAC` for dedicated admin connection, `0x03`
+  `CLNT_UCAST_EX` for all instances on the host, `0x01` `CLNT_BCAST_EX`
+  for subnet broadcast).
+- Instance name is MBCS, NUL-terminated, max 32 bytes including the NUL
+  per the spec — *but* SQL Server only ever registers names of
+  `[A-Za-z0-9_$#]{1,16}` (the engine itself rejects longer at install
+  time), and we enforce the tighter range at parse time (FR-010). The
+  32-byte cap is the wire limit, not a permission to send longer.
 - Sent as a single UDP datagram to `host:1434`.
 
 ### Response — `SVR_RESP`
 
 ```
-+---------+----------+----------------------+
-| 0x05    | RespSize | RespData (ASCII)     |
-+---------+----------+----------------------+
++---------+----------+---------------------+
+| 0x05    | RespSize | RespData (MBCS)     |
++---------+----------+---------------------+
    1 byte    2 bytes    RespSize bytes
                         NUL-terminated
 ```
 
 - `RespSize` is little-endian.
-- `RespData` is a NUL-terminated ASCII string of `key;value;` pairs, one **logical record** per instance, concatenated. The record separator is implicit — `;;` marks end of record, but in practice SQL Server emits `IsClustered;No;` then immediately the next `ServerName;…` for the next instance, so the parser must key off the appearance of a second `ServerName;` to delimit records.
-- Standard keys for `CLNT_UCAST_INST` (always emitted, in this order): `ServerName`, `InstanceName`, `IsClustered`, `Version`, `tcp`, `np` (named pipes — present even when disabled, value `\\.\pipe\...`).
-- A record without a `tcp;` entry means TCP is disabled on that instance — we surface that as an explicit error ("instance found but TCP transport not enabled"), not as "instance not found".
+- `RespData` is a NUL-terminated MBCS string of `key;value;` pairs, one
+  **logical record** per instance, concatenated. The record separator
+  is implicit — `;;` marks end of record, but in practice SQL Server
+  emits `IsClustered;No;` then immediately the next `ServerName;…` for
+  the next instance, so the parser must key off the appearance of a
+  second `ServerName;` to delimit records.
+- Standard keys for `CLNT_UCAST_INST` (always emitted, in this order):
+  `ServerName`, `InstanceName`, `IsClustered`, `Version`, `tcp`, `np`
+  (named pipes — present even when disabled, value `\\.\pipe\...`).
+- A record without a `tcp;` entry means TCP is disabled on that
+  instance — we surface that as an explicit error ("instance found but
+  TCP transport not enabled"), not as "instance not found".
 
 ### Decision
 
-Implement the parser as a single state machine over the ASCII buffer: scan key, scan value, until end of buffer or `;;`. Build `vector<map<string, string>>`. Then `for each record: if record["InstanceName"].lower() == requested.lower(): return stoi(record["tcp"])`. ~80 lines of C++.
+Implement the parser as a single state machine over the MBCS byte
+buffer (treated as opaque bytes; the only bytes the state machine ever
+compares against are ASCII-invariant `;` and key literals): scan key,
+scan value, until end of buffer or `;;`. Build
+`vector<map<string, string>>`. Then `for each record: if
+record["InstanceName"].lower() == requested.lower(): return
+stoi(record["tcp"])`. ~80 lines of C++.
 
 ## R2. Mock Browser — language and shape
 

@@ -201,6 +201,26 @@ test-login7-encoding: debug
 	@echo "Running LOGIN7 + simdutf unit test..."
 	build/test/test_login7_encoding
 
+# Spec 045: SQL Server Browser parser unit tests (Phase 0).
+# Pure unit test — no SQL Server, no vcpkg, no DuckDB linkage required.
+# Compiles the resolver TU together with the test driver as a standalone
+# binary. Phase 1 will extend the same target with a loopback UDP listener
+# test (still no external network).
+INSTANCE_RESOLVER_TEST_SOURCES := src/connection/instance_resolver.cpp
+INSTANCE_RESOLVER_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+INSTANCE_RESOLVER_TEST_INCLUDES := -I src/include
+
+test-instance-resolver:
+	@echo "Building SQL Browser parser unit test (spec 045, Phase 0)..."
+	@mkdir -p build/test
+	$(CXX) $(INSTANCE_RESOLVER_TEST_FLAGS) $(INSTANCE_RESOLVER_TEST_INCLUDES) \
+	    test/cpp/test_instance_resolver.cpp \
+	    $(INSTANCE_RESOLVER_TEST_SOURCES) \
+	    -o build/test/test_instance_resolver
+	@echo ""
+	@echo "Running SQL Browser parser unit test..."
+	build/test/test_instance_resolver
+
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.
 # Requires `make debug` first to populate build/debug/vcpkg_installed.

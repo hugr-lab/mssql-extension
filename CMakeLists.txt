@@ -161,6 +161,7 @@ set(EXTENSION_SOURCES
     src/connection/mssql_diagnostic.cpp
     src/connection/mssql_pool_manager.cpp
     src/connection/mssql_connection_provider.cpp
+    src/connection/instance_resolver.cpp
     # Catalog integration layer (DuckDB catalog API)
     src/catalog/mssql_catalog_filter.cpp
     src/catalog/mssql_column_info.cpp

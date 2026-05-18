@@ -48,6 +48,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
 							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
+	// Used when resolving named instances (host\instance) via MC-SQLR.
+	// Short by design — Browser is on the critical path of every named-instance attach.
+	config.AddExtensionOption(
+		"mssql_browser_timeout_seconds",
+		"SQL Server Browser UDP query timeout in seconds for named-instance resolution (default: 3)",
+		LogicalType::BIGINT, Value::BIGINT(3), ValidatePositive, SetScope::GLOBAL);
+
+	// mssql_named_instance_resolution - Enable host\instance resolution via SQL Browser (spec 045)
+	// Escape hatch for environments that strip outbound UDP 1434.
+	config.AddExtensionOption("mssql_named_instance_resolution",
+							  "Enable SQL Server Browser (UDP 1434) resolution of host\\instance connection strings",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_idle_timeout - Idle connection timeout in seconds
 	config.AddExtensionOption("mssql_idle_timeout", "Idle connection timeout in seconds (0 = no timeout)",
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_IDLE_TIMEOUT), ValidateNonNegative,
