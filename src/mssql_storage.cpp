@@ -90,7 +90,21 @@ void SplitAndResolveInstance(const string &raw_host, bool explicit_port_given, C
 	}
 	auto rr = mssql::InstanceResolver::Resolve(result.host, instance, browser_timeout);
 	if (!rr.ok) {
-		throw IOException("MSSQL Error: %s", rr.error.message);
+		std::string msg = rr.error.message;
+		// FR-007 + real-world deployment finding: corporate firewalls almost
+		// always block outbound UDP 1434, and the "SQL Browser unreachable"
+		// error otherwise leaves the user without an obvious next step.
+		// Append the explicit-port escape hatch inline (FR-002) so they don't
+		// have to consult docs. Only attached for Unreachable - for
+		// InstanceNotFound / TcpDisabled / Malformed the port wouldn't help.
+		if (rr.error.kind == mssql::ResolveError::Kind::Unreachable) {
+			msg +=
+				". If UDP 1434 is blocked or SQL Server Browser is not "
+				"running, bypass it by specifying the port directly: "
+				"Server=" +
+				result.host + "\\" + instance + ",<port>";
+		}
+		throw IOException("MSSQL Error: %s", msg);
 	}
 	// Honour the host the Browser advertised. In most deployments this equals
 	// the host we queried (Browser runs on the same machine as the engine),

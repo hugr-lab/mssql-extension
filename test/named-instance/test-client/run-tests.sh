@@ -197,6 +197,26 @@ echo "${out}" | grep -qi "empty instance name" || {
 }
 echo "  PASS"
 
+echo "[run-tests] step 11.5: Browser-unreachable error includes the explicit-port hint"
+# Use a hostname that won't resolve so we hit Kind::Unreachable. Short
+# timeout to keep the test fast.
+out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF || true
+LOAD '${EXT}';
+SET mssql_browser_timeout_seconds=1;
+ATTACH 'Server=this-host-does-not-exist.invalid\\TESTINST;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS bad (TYPE mssql);
+EOF
+)
+echo "  output: ${out}"
+echo "${out}" | grep -qi "bypass it by specifying the port directly" || {
+    echo "  FAIL: expected explicit-port hint in Unreachable error, got: ${out}" >&2
+    exit 11
+}
+echo "${out}" | grep -qF 'this-host-does-not-exist.invalid\TESTINST,<port>' || {
+    echo "  FAIL: hint should include the user's host\\instance verbatim, got: ${out}" >&2
+    exit 11
+}
+echo "  PASS"
+
 echo "[run-tests] step 12: secret-form host\\instance is resolved (review finding I1)"
 out=$("${DUCKDB}" --unsigned -noheader -list 2>&1 <<EOF
 LOAD '${EXT}';
