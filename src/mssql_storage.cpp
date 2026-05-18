@@ -1130,6 +1130,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
+	bool lazy_validation = false;		 // Spec 047 (US2): opt out of eager creds check
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1156,6 +1157,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "order_pushdown") {
 			order_pushdown_option = it->second.GetValue<bool>() ? 1 : 0;
+			it = options.options.erase(it);
+		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
+			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
+			// Match the ADO.NET-style alias `LazyValidation` (lowercase via
+			// StringUtil::Lower) alongside the canonical `lazy_validation`.
+			lazy_validation = it->second.GetValue<bool>();
 			it = options.options.erase(it);
 		} else {
 			++it;
@@ -1238,15 +1245,34 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 	// Validate connection before creating the catalog so invalid credentials
 	// surface immediately rather than at first query.
+	//
+	// Spec 047 (US2): the eager-validation block below is governed by the
+	// `lazy_validation` ATTACH option. When the user opts out (typically
+	// container/orchestration startup where ATTACH must succeed even if the
+	// SQL Server isn't ready yet), the FEDAUTH and ManualToken paths still
+	// pre-build their tokens — those are local-only operations that don't
+	// hit the server — and only the actual TCP+LOGIN7 round trip is skipped.
+	// Errors will then surface on the first real query (today's pre-US2
+	// behaviour).
+	//
+	// The validation timeout itself is `mssql_attach_validation_timeout`
+	// (spec 047 T026), which defaults to `mssql_connection_timeout` so
+	// existing deployments see no observable change in the steady state.
 	auto pool_config = LoadPoolConfig(context);
+	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
+	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
+							lazy_validation ? "true" : "false", attach_validation_timeout);
 
-	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
 	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
-		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
+		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: %s at ATTACH time",
+								lazy_validation ? "skipping network validation (lazy_validation=true)"
+												: "validating connection");
 
-		// Create auth strategy - this validates JWT format, audience, and expiration
+		// Create auth strategy - this validates JWT format, audience, and expiration.
+		// JWT-shape validation runs even under lazy_validation: it's local and
+		// catches obviously-malformed tokens up front (cheap; no network).
 		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(connection_info->access_token,
 																		 connection_info->database);
 
@@ -1254,25 +1280,35 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
-		// Validate actual connection to server using the pre-provided token
-		ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
+		if (!lazy_validation) {
+			ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, attach_validation_timeout);
+		}
 	} else if (connection_info->use_azure_auth) {
-		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
-		// This ensures invalid credentials are detected immediately, not on first query
-		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
-		ValidateAzureConnection(context, *connection_info, pool_config.connection_timeout);
-
-		// Build FEDAUTH token for pool factory (uses validated credentials)
+		// Validate FEDAUTH connections at ATTACH time (fail-fast).
+		// Always acquire the token (it's needed by the pool factory anyway);
+		// only the TCP+LOGIN7 verification step is governed by lazy_validation.
+		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: %s at ATTACH time",
+								lazy_validation ? "skipping network validation (lazy_validation=true)"
+												: "validating connection");
+		if (!lazy_validation) {
+			ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
+		}
+		// Build FEDAUTH token for pool factory (uses validated credentials when
+		// not lazy; on lazy path the token still has to exist for pool fills).
 		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
 	} else if (connection_info->auth_method == AuthMethod::KRB5 ||
 			   connection_info->auth_method == AuthMethod::WINSSPI) {
 		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
 		// time so credential / SPN / clock-skew errors surface immediately.
-		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
-		ValidateIntegratedAuthConnection(*connection_info, pool_config.connection_timeout);
-	} else {
-		ValidateConnection(*connection_info, pool_config.connection_timeout);
+		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: %s at ATTACH time",
+								lazy_validation ? "skipping network validation (lazy_validation=true)"
+												: "validating connection");
+		if (!lazy_validation) {
+			ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
+		}
+	} else if (!lazy_validation) {
+		ValidateConnection(*connection_info, attach_validation_timeout);
 	}
 
 	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the

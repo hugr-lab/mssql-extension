@@ -77,6 +77,18 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_ACQUIRE_TIMEOUT), ValidateNonNegative,
 							  SetScope::GLOBAL);
 
+	// mssql_attach_validation_timeout - Spec 047 (US2): timeout for the
+	// eager TCP + LOGIN7 round-trip that ATTACH runs to surface bad
+	// credentials / unreachable host / wrong DB up front. 0 means use
+	// mssql_connection_timeout. Distinct from connection_timeout so
+	// operators can give ATTACH a shorter ceiling than steady-state
+	// queries (ATTACH is on the user's interactive path; query pool
+	// fills can tolerate a longer wait).
+	config.AddExtensionOption("mssql_attach_validation_timeout",
+							  "Timeout in seconds for the ATTACH-time credential round trip "
+							  "(0 = inherit mssql_connection_timeout). Spec 047 / US2.",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_query_timeout - Query execution timeout in seconds (0 = no timeout)
 	config.AddExtensionOption("mssql_query_timeout", "Query execution timeout in seconds (0 = no timeout, default: 30)",
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_QUERY_TIMEOUT), ValidateNonNegative,
@@ -295,6 +307,22 @@ int LoadMetadataTimeout(ClientContext &context) {
 		return static_cast<int>(val.GetValue<int64_t>());
 	}
 	return tds::DEFAULT_METADATA_TIMEOUT;  // Default: 300 seconds
+}
+
+// Spec 047 (US2): timeout for the eager ATTACH-time credential round trip.
+// 0 ⇒ fall back to mssql_connection_timeout (the steady-state ceiling).
+int LoadAttachValidationTimeout(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_attach_validation_timeout", val)) {
+		auto seconds = static_cast<int>(val.GetValue<int64_t>());
+		if (seconds > 0) {
+			return seconds;
+		}
+	}
+	if (context.TryGetCurrentSetting("mssql_connection_timeout", val)) {
+		return static_cast<int>(val.GetValue<int64_t>());
+	}
+	return tds::DEFAULT_CONNECTION_TIMEOUT;
 }
 
 //===----------------------------------------------------------------------===//
