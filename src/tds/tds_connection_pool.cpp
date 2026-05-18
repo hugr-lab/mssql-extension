@@ -198,7 +198,21 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 
 PoolStatistics ConnectionPool::GetStats() const {
 	std::lock_guard<std::mutex> lock(pool_mutex_);
-	return stats_;
+	PoolStatistics result = stats_;
+	result.pinned_count = pinned_count_.load(std::memory_order_relaxed);
+	return result;
+}
+
+void ConnectionPool::IncrementPinned() {
+	pinned_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ConnectionPool::DecrementPinned() {
+	pinned_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+int64_t ConnectionPool::GetPinnedCount() const noexcept {
+	return pinned_count_.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdle() {

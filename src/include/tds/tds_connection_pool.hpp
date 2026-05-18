@@ -42,7 +42,7 @@ struct PoolStatistics {
 	size_t acquire_count = 0;
 	size_t acquire_timeout_count = 0;
 	uint64_t acquire_wait_total_ms = 0;
-	size_t pinned_connections = 0;	// Connections pinned to active transactions
+	int64_t pinned_count = 0;  // Connections pinned to active transactions (spec 047 FR-005)
 };
 
 // Connection factory function type
@@ -70,6 +70,14 @@ public:
 
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
+
+	// Pin counter — tracks connections currently pinned to active DuckDB
+	// transactions (spec 047 FR-005). Migrated from the deleted
+	// MssqlPoolManager::pinned_counts_ map. Lock-free; safe to call from any
+	// thread.
+	void IncrementPinned();
+	void DecrementPinned();
+	int64_t GetPinnedCount() const noexcept;
 
 	// Shutdown the pool (closes all connections)
 	void Shutdown();
@@ -99,6 +107,11 @@ private:
 	// Background cleanup
 	std::thread cleanup_thread_;
 	std::atomic<bool> shutdown_flag_;
+
+	// Pin counter (spec 047 FR-005). Separate from pool_mutex_ — pin counting
+	// is high-frequency on transaction begin/commit and should not contend
+	// with Acquire/Release.
+	std::atomic<int64_t> pinned_count_{0};
 
 	// Internal methods
 	void CleanupThreadFunc();

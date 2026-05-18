@@ -41,9 +41,9 @@ Single-project C++ extension layout:
 
 **Purpose**: Cross-story infrastructure changes that must land before any user story can complete.
 
-- [ ] T004 Add pin-counter to pool: in `src/include/tds/tds_connection_pool.hpp` add private `std::atomic<int64_t> pinned_count_{0}` member and public methods `IncrementPinned()`, `DecrementPinned()`, `GetPinnedCount() const noexcept`. In `src/tds/tds_connection_pool.cpp` implement via `fetch_add` / `fetch_sub` / `load` with `std::memory_order_relaxed`.
-- [ ] T005 Extend `PoolStatistics` struct in `src/include/tds/tds_connection_pool.hpp` with `int64_t pinned_count` field. Update `tds::ConnectionPool::GetStats()` in `src/tds/tds_connection_pool.cpp` to populate it from `GetPinnedCount()`.
-- [ ] T006 Verify build + existing tests stay green: `GEN=ninja make debug && GEN=ninja make test && GEN=ninja make integration-test`. New members have no callers yet — must not break anything.
+- [X] T004 Add pin-counter to pool: in `src/include/tds/tds_connection_pool.hpp` add private `std::atomic<int64_t> pinned_count_{0}` member and public methods `IncrementPinned()`, `DecrementPinned()`, `GetPinnedCount() const noexcept`. In `src/tds/tds_connection_pool.cpp` implement via `fetch_add` / `fetch_sub` / `load` with `std::memory_order_relaxed`.
+- [X] T005 Extend `PoolStatistics` struct in `src/include/tds/tds_connection_pool.hpp` with `int64_t pinned_count` field (renames stale `size_t pinned_connections` placeholder that was never wired up). Update `tds::ConnectionPool::GetStats()` in `src/tds/tds_connection_pool.cpp` to populate it from `GetPinnedCount()`. Note: `mssql_diagnostic.cpp:221` column-header string `"pinned_connections"` is left as-is until T019 rewrites the diagnostic enumerator (will rename column to `pinned_count` to match quickstart.md schema).
+- [X] T006 Verify build + existing tests stay green: `GEN=ninja make debug && GEN=ninja make test && GEN=ninja make integration-test`. New members have no callers yet — must not break anything.
 
 ---
 
