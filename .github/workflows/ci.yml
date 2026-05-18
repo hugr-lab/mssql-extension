@@ -112,7 +112,12 @@ jobs:
             brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build ccache
+            # libkrb5-dev + pkg-config let CMake's ENABLE_KRB5=ON auto-discover
+            # GSSAPI on Linux (spec 042). Without these the Linux build still
+            # succeeds but ships without Kerberos support, and the
+            # mssql_kerberos_auth_test scalar function returns
+            # "compiled without Kerberos support" at runtime.
+            sudo apt-get install -y ninja-build ccache libkrb5-dev pkg-config
           fi
 
       # Cache ccache to speed up compilation
