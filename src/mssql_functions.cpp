@@ -34,36 +34,6 @@ static int GetFunctionDebugLevel() {
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
-// MSSQLResultStreamRegistry Implementation
-//===----------------------------------------------------------------------===//
-
-MSSQLResultStreamRegistry &MSSQLResultStreamRegistry::Instance() {
-	static MSSQLResultStreamRegistry instance;
-	return instance;
-}
-
-uint64_t MSSQLResultStreamRegistry::Register(std::unique_ptr<MSSQLResultStream> stream) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	uint64_t id = next_id_++;
-	streams_[id] = std::move(stream);
-	MSSQL_FN_DEBUG_LOG(1, "Registry: registered stream id=%llu", (unsigned long long)id);
-	return id;
-}
-
-std::unique_ptr<MSSQLResultStream> MSSQLResultStreamRegistry::Retrieve(uint64_t id) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = streams_.find(id);
-	if (it == streams_.end()) {
-		MSSQL_FN_DEBUG_LOG(1, "Registry: stream id=%llu not found", (unsigned long long)id);
-		return nullptr;
-	}
-	auto stream = std::move(it->second);
-	streams_.erase(it);
-	MSSQL_FN_DEBUG_LOG(1, "Registry: retrieved stream id=%llu", (unsigned long long)id);
-	return stream;
-}
-
-//===----------------------------------------------------------------------===//
 // mssql_scan implementation
 //===----------------------------------------------------------------------===//
 
@@ -155,9 +125,12 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 
 	// Register the result stream for later retrieval in InitGlobal
 	// This avoids executing the query twice (which causes 30s timeout on large datasets)
-	bind_data->result_stream_id = MSSQLResultStreamRegistry::Instance().Register(std::move(result_stream));
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%llu",
-					   (unsigned long long)bind_data->result_stream_id);
+	// Spec 047 / US3: registry lives on MSSQLCatalog (previously process-wide singleton).
+	auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+	bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s",
+					   bind_data->result_stream_id.c_str());
 
 	auto bind_end = std::chrono::steady_clock::now();
 	auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bind_end - bind_start).count();
@@ -176,10 +149,13 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 
 	// Try to retrieve pre-initialized result stream from registry
 	// This was created in Bind and avoids executing the query twice
-	if (bind_data.result_stream_id != 0) {
-		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieving result_stream_id=%llu",
-						   (unsigned long long)bind_data.result_stream_id);
-		result->result_stream = MSSQLResultStreamRegistry::Instance().Retrieve(bind_data.result_stream_id);
+	// Spec 047 / US3: registry lives on MSSQLCatalog (previously process-wide singleton).
+	if (!bind_data.result_stream_id.empty()) {
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieving result_stream_id=%s",
+						   bind_data.result_stream_id.c_str());
+		auto &catalog = Catalog::GetCatalog(context, bind_data.context_name);
+		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		result->result_stream = mssql_catalog.RetrieveStream(bind_data.result_stream_id);
 		if (result->result_stream) {
 			auto init_end = std::chrono::steady_clock::now();
 			auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();

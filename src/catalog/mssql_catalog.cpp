@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
@@ -75,6 +76,28 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 }
 
 MSSQLCatalog::~MSSQLCatalog() = default;
+
+//===----------------------------------------------------------------------===//
+// Result Stream Registry (spec 047 / US3)
+//===----------------------------------------------------------------------===//
+
+std::string MSSQLCatalog::RegisterStream(std::unique_ptr<MSSQLResultStream> stream) {
+	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
+	std::lock_guard<std::mutex> lock(streams_mutex_);
+	active_streams_.emplace(uuid, std::move(stream));
+	return uuid;
+}
+
+std::unique_ptr<MSSQLResultStream> MSSQLCatalog::RetrieveStream(const std::string &uuid) {
+	std::lock_guard<std::mutex> lock(streams_mutex_);
+	auto it = active_streams_.find(uuid);
+	if (it == active_streams_.end()) {
+		return nullptr;
+	}
+	auto stream = std::move(it->second);
+	active_streams_.erase(it);
+	return stream;
+}
 
 //===----------------------------------------------------------------------===//
 // Initialization

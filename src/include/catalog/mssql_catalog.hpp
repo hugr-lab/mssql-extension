@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "catalog/mssql_catalog_filter.hpp"
@@ -11,6 +13,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "mssql_storage.hpp"
+#include "query/mssql_result_stream.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -130,6 +133,24 @@ public:
 	const string &GetContextName() const;
 
 	//===----------------------------------------------------------------------===//
+	// Result Stream Registry (spec 047 / US3 — replaces process-wide
+	// MSSQLResultStreamRegistry singleton; stream lifetime is now bounded by
+	// the catalog's lifetime, so DETACH or per-instance teardown drops orphans
+	// automatically.)
+	//===----------------------------------------------------------------------===//
+
+	// Register a result stream produced at Bind time and return a UUID handle
+	// that survives Bind→InitGlobal copies of MSSQLScanBindData (DuckDB
+	// BindData must be serializable; we store the UUID string, not the raw
+	// pointer).
+	std::string RegisterStream(std::unique_ptr<MSSQLResultStream> stream);
+
+	// Retrieve and remove the stream registered under `uuid`. Returns nullptr
+	// when the handle is absent (already retrieved, or never registered).
+	// find+erase is atomic under one lock.
+	std::unique_ptr<MSSQLResultStream> RetrieveStream(const std::string &uuid);
+
+	//===----------------------------------------------------------------------===//
 	// Access Mode (READ_ONLY Support)
 	//===----------------------------------------------------------------------===//
 
@@ -207,6 +228,13 @@ private:
 	string default_schema_;												  // Default schema ("dbo")
 	unordered_map<string, unique_ptr<MSSQLSchemaEntry>> schema_entries_;  // Schema entry cache
 	mutable std::mutex schema_mutex_;									  // Thread-safety for schema access
+
+	// Spec 047 / US3: per-catalog result stream registry (replaces process-wide
+	// MSSQLResultStreamRegistry singleton). Streams are produced at mssql_scan
+	// Bind time and consumed at InitGlobal time; the UUID handle bridges the
+	// two via the serializable BindData.
+	mutable std::mutex streams_mutex_;
+	std::unordered_map<std::string, std::unique_ptr<MSSQLResultStream>> active_streams_;
 };
 
 }  // namespace duckdb

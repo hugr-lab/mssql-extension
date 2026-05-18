@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -392,6 +392,21 @@ test-issue-96-attach-loop: debug
 test-spec047-us1: test-multi-instance-pool-isolation test-issue-96-attach-loop
 	@echo ""
 	@echo "All spec 047 US1 acceptance tests PASSED (SC-001, SC-002, SC-003, SC-009)"
+
+test-result-stream-registry-isolation: debug
+	@echo "Building spec 047 result-stream registry isolation test (T040)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_result_stream_registry_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_result_stream_registry_isolation
+	@echo ""
+	@echo "Running spec 047 result-stream registry isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_result_stream_registry_isolation
+
+test-spec047-us3: test-result-stream-registry-isolation
+	@echo ""
+	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
 
 # Show help
 help:
