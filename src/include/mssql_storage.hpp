@@ -49,6 +49,16 @@ struct MSSQLConnectionInfo {
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
+	// Spec 047 US-AN (FR-014, closes issue #82): custom LOGIN7 program_name.
+	// Empty = use the extension's default ("DuckDB MSSQL Extension"). Parsed
+	// from `Application Name` / `ApplicationName` / `App Name` in ADO.NET
+	// connection strings, from `applicationname` query parameter in URI
+	// strings, and from `application_name` / `applicationname` in secrets.
+	// SQL Server clamps program_name to 128 chars — `ResolveAppName()`
+	// clamps client-side so the value the user sees in `APP_NAME()` matches
+	// exactly what we sent.
+	string application_name;
+
 	//===----------------------------------------------------------------------===//
 	// Authentication method (Spec 042)
 	//
@@ -135,36 +145,26 @@ struct MSSQLConnectionInfo {
 };
 
 //===----------------------------------------------------------------------===//
-// MSSQLContext - Attached context state
+// ResolveAppName (Spec 047 US-AN / FR-014 / T065)
+//
+// Single resolution point for the LOGIN7 program_name. Returns the
+// caller-supplied `application_name` clamped to 128 UTF-16 code units
+// (SQL Server's own program_name limit — clamp client-side so the value
+// shown by `APP_NAME()` matches exactly what we sent on the wire), or
+// the extension default when the user did not configure one.
+//
+// The clamp counts UTF-16 code units (NOT UTF-8 bytes) to mirror the
+// wire encoding in `tds_protocol.cpp::BuildLogin7`. A naive UTF-8 byte
+// clamp would chop multi-byte sequences mid-character, producing
+// invalid UTF-8 that the LOGIN7 encoder would either substitute with
+// the replacement character or reject.
+//
+// Called from the AuthStrategyFactory fan-out + every TdsConnection
+// Authenticate* call site so every auth path (SQL / Azure FEDAUTH /
+// manual token / integrated) goes through the same logic. A future
+// change to the default string only touches the impl.
 //===----------------------------------------------------------------------===//
-struct MSSQLContext {
-	string name;
-	string secret_name;
-	shared_ptr<MSSQLConnectionInfo> connection_info;
-	optional_ptr<AttachedDatabase> attached_db;
-
-	MSSQLContext(const string &name, const string &secret_name);
-};
-
-//===----------------------------------------------------------------------===//
-// MSSQLContextManager - Global context manager (singleton per DatabaseInstance)
-//===----------------------------------------------------------------------===//
-class MSSQLContextManager {
-public:
-	// Get singleton instance for a DatabaseInstance
-	static MSSQLContextManager &Get(DatabaseInstance &db);
-
-	// Context operations
-	void RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx);
-	void UnregisterContext(const string &name);
-	shared_ptr<MSSQLContext> GetContext(const string &name);
-	bool HasContext(const string &name);
-	vector<string> ListContexts();
-
-private:
-	mutex lock;
-	case_insensitive_map_t<shared_ptr<MSSQLContext>> contexts;
-};
+string ResolveAppName(const MSSQLConnectionInfo &info);
 
 //===----------------------------------------------------------------------===//
 // MSSQLStorageExtensionInfo - Shared state for storage extension

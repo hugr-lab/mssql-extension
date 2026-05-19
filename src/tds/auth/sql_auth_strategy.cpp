@@ -13,8 +13,8 @@ namespace duckdb {
 namespace tds {
 
 SqlServerAuthStrategy::SqlServerAuthStrategy(const std::string &username, const std::string &password,
-											 const std::string &database, bool use_encrypt)
-	: username_(username), password_(password), database_(database), use_encrypt_(use_encrypt) {}
+											 const std::string &database, bool use_encrypt, const std::string &app_name)
+	: username_(username), password_(password), database_(database), use_encrypt_(use_encrypt), app_name_(app_name) {}
 
 PreloginOptions SqlServerAuthStrategy::GetPreloginOptions() const {
 	PreloginOptions options;
@@ -29,7 +29,10 @@ Login7Options SqlServerAuthStrategy::GetLogin7Options() const {
 	options.database = database_;
 	options.username = username_;
 	options.password = password_;
-	options.app_name = "DuckDB";
+	// Spec 047 FR-014: caller-supplied program_name (already clamped to 128
+	// by ResolveAppName at the factory layer). Empty falls back to the
+	// extension default.
+	options.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;
 	options.include_fedauth_ext = false;  // SQL auth doesn't use FEDAUTH
 	return options;
 }

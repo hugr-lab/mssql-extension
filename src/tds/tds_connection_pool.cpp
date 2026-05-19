@@ -1,5 +1,7 @@
 #include "tds/tds_connection_pool.hpp"
 
+#include "duckdb/common/assert.hpp"
+
 #include <cstdlib>
 
 namespace duckdb {
@@ -31,11 +33,38 @@ ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguratio
 	cleanup_thread_ = std::thread(&ConnectionPool::CleanupThreadFunc, this);
 }
 
-ConnectionPool::~ConnectionPool() {
-	Shutdown();
+ConnectionPool::~ConnectionPool() noexcept {
+	// Spec 047 T046k: explicit noexcept + try/catch — a throw from teardown
+	// during `~AttachedDatabase` unwind would invoke std::terminate. Failures
+	// here are best-effort (socket close errors, log emission failures) and
+	// we have no caller to report them to anyway.
+	try {
+		Shutdown();
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr so silent destructor swallow
+		// doesn't hide pool-teardown errors in production diagnosis paths.
+		MSSQL_POOL_DEBUG_LOG(1, "~ConnectionPool: swallowed exception during Shutdown: %s", e.what());
+	} catch (...) {
+		MSSQL_POOL_DEBUG_LOG(1, "~ConnectionPool: swallowed unknown exception during Shutdown");
+	}
 }
 
 void ConnectionPool::Shutdown() {
+	// Spec 047 T046l: surface DuckDB quiescence-contract violations in debug
+	// builds via D_ASSERT. PR #118 review M2: also emit a release-mode warning
+	// — silent UB on a real quiescence violation is worse for operators than
+	// one stderr line. The warning runs BEFORE the assert so debug builds
+	// emit both the warning and the assert hit before std::terminate.
+	if (!active_connections_.empty()) {
+		fprintf(stderr,
+				"[MSSQL POOL] WARNING: ~ConnectionPool '%s' called with %zu connection(s) still "
+				"checked out — DuckDB quiescence contract violated. Sockets are about to close under "
+				"the calling thread(s); next read on the held connection will see EBADF / connection "
+				"reset. On Windows the closesocket-vs-recv race is undefined.\n",
+				context_name_.c_str(), active_connections_.size());
+	}
+	D_ASSERT(active_connections_.empty());
+
 	// Signal shutdown
 	shutdown_flag_.store(true);
 
@@ -198,7 +227,21 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 
 PoolStatistics ConnectionPool::GetStats() const {
 	std::lock_guard<std::mutex> lock(pool_mutex_);
-	return stats_;
+	PoolStatistics result = stats_;
+	result.pinned_count = pinned_count_.load(std::memory_order_relaxed);
+	return result;
+}
+
+void ConnectionPool::IncrementPinned() {
+	pinned_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ConnectionPool::DecrementPinned() {
+	pinned_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+int64_t ConnectionPool::GetPinnedCount() const noexcept {
+	return pinned_count_.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdle() {

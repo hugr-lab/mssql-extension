@@ -31,9 +31,10 @@ struct MSSQLScanBindData : public FunctionData {
 	vector<LogicalType> return_types;
 	vector<string> column_names;
 
-	// ID to retrieve pre-initialized result stream from registry
-	// This avoids executing the query twice (once for schema, once for data)
-	uint64_t result_stream_id = 0;
+	// UUID handle to retrieve pre-initialized result stream registered on the
+	// owning MSSQLCatalog at Bind time (spec 047 / US3). Empty when there is
+	// no pre-built stream (InitGlobal then re-executes the query).
+	string result_stream_id;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
@@ -106,27 +107,6 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
-};
-
-//===----------------------------------------------------------------------===//
-// Result Stream Registry - stores result streams between Bind and InitGlobal
-//===----------------------------------------------------------------------===//
-
-class MSSQLResultStreamRegistry {
-public:
-	static MSSQLResultStreamRegistry &Instance();
-
-	// Register a result stream and get an ID
-	uint64_t Register(std::unique_ptr<MSSQLResultStream> stream);
-
-	// Retrieve and remove a result stream by ID
-	std::unique_ptr<MSSQLResultStream> Retrieve(uint64_t id);
-
-private:
-	MSSQLResultStreamRegistry() = default;
-	std::mutex mutex_;
-	std::unordered_map<uint64_t, std::unique_ptr<MSSQLResultStream>> streams_;
-	std::atomic<uint64_t> next_id_{1};
 };
 
 struct MSSQLScanGlobalState : public GlobalTableFunctionState {

@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -350,6 +350,84 @@ test-literal-format: debug
 	@echo ""
 	@echo "Running shared literal_format test..."
 	$(CODEC_TEST_RPATH) build/test/test_literal_format
+
+# Spec 047 — US1 acceptance tests. Two C++ standalone binaries that link
+# the debug DuckDB shared library and exercise the extension's catalog +
+# pool ownership via real ATTACH / mssql_scan calls.
+#
+# Each binary auto-skips when MSSQL_TEST_PASS is unset (env-var gate per
+# the same pattern as test_multi_connection_transactions.cpp).
+#
+# Targets:
+#   test-multi-instance-pool-isolation  — Scenarios 1/2/3 (SC-001/002/003)
+#   test-issue-96-attach-loop           — Scenario 4   (SC-009, closes #96)
+#   test-spec047-us1                    — meta target: builds + runs both
+SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+SPEC047_TEST_INCLUDES := -I duckdb/src/include
+SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
+SPEC047_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+test-multi-instance-pool-isolation: debug
+	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_multi_instance_pool_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_multi_instance_pool_isolation
+	@echo ""
+	@echo "Running spec 047 multi-instance pool isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_multi_instance_pool_isolation
+
+test-issue-96-attach-loop: debug
+	@echo "Building spec 047 issue #96 ATTACH-loop regression test (T024)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_issue_96_attach_loop.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_issue_96_attach_loop
+	@echo ""
+	@echo "Running spec 047 issue #96 ATTACH-loop regression test..."
+	$(SPEC047_TEST_RPATH) build/test/test_issue_96_attach_loop
+
+test-spec047-us1: test-multi-instance-pool-isolation test-issue-96-attach-loop
+	@echo ""
+	@echo "All spec 047 US1 acceptance tests PASSED (SC-001, SC-002, SC-003, SC-009)"
+
+test-result-stream-registry-isolation: debug
+	@echo "Building spec 047 result-stream registry isolation test (T040)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_result_stream_registry_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_result_stream_registry_isolation
+	@echo ""
+	@echo "Running spec 047 result-stream registry isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_result_stream_registry_isolation
+
+test-spec047-us3: test-result-stream-registry-isolation
+	@echo ""
+	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
+
+# Spec 047 US-SEC: TokenCache per-DatabaseInstance namespace isolation (T046g, SC-011).
+# Compiles src/azure/azure_token.cpp together with the test driver. The driver
+# stubs HttpPost / ReadAzureSecret / AcquireInteractiveToken so AcquireToken's
+# call graph links cleanly without dragging in httplib, OpenSSL, or the DuckDB
+# Secret API. Test only exercises TokenCache::Set/Get/Has/Invalidate.
+test-token-cache-isolation: debug
+	@echo "Building spec 047 TokenCache isolation test (T046g)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) -I src/include \
+	    test/cpp/test_token_cache_isolation.cpp \
+	    src/azure/azure_token.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_token_cache_isolation
+	@echo ""
+	@echo "Running spec 047 TokenCache isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_token_cache_isolation
+
+test-spec047-us-sec: test-token-cache-isolation
+	@echo ""
+	@echo "Spec 047 US-SEC TokenCache isolation test PASSED (SC-011)"
 
 # Show help
 help:

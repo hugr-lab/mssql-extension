@@ -141,7 +141,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 ## Key Architecture Concepts
 
 - **Custom TDS implementation**: No external TDS/ODBC library. TDS v7.4 protocol with PRELOGIN, LOGIN7, SQL_BATCH, ATTENTION packet types.
-- **Connection pool**: Thread-safe pool per attached database with idle timeout, background cleanup, configurable limits.
+- **Connection pool**: Thread-safe pool, **owned per `MSSQLCatalog` via `unique_ptr<ConnectionPool>` (spec 047)** — pool lifetime is bounded by catalog lifetime; no singleton, no cross-instance sharing. Two ATTACHes against the same DSN under different aliases get independent pools; DETACH tears down the pool deterministically via RAII. Idle timeout, background cleanup, configurable limits as before.
 - **Transaction support**: Connection pinning maps DuckDB transactions to SQL Server transactions via 8-byte ENVCHANGE descriptors. See `docs/transactions.md`.
 - **Catalog integration**: DuckDB Catalog/Schema/Table APIs with incremental metadata cache (lazy loading, TTL-based expiration, point invalidation), primary key discovery for rowid support.
 - **DML**: INSERT uses batched VALUES; UPDATE/DELETE use rowid-based VALUES JOIN pattern with deferred execution in transactions.
@@ -174,6 +174,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_acquire_timeout` | 30 | Connection acquire timeout (seconds) |
 | `mssql_connection_cache` | true | Enable connection pooling |
 | `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
+| `mssql_attach_validation_timeout` | 0 | ATTACH-time eager credential validation timeout in seconds (0 = inherit `mssql_connection_timeout`). Spec 047 FR-011. |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
@@ -195,6 +196,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 |-----------|------|-------------|
 | `schema_filter` | VARCHAR | Regex pattern to filter visible schemas (case-insensitive, partial match via `regex_search`) |
 | `table_filter` | VARCHAR | Regex pattern to filter visible tables/views (case-insensitive, partial match via `regex_search`) |
+| `lazy_validation` (or `LazyValidation`) | BOOLEAN | Skip the eager ATTACH-time TCP+LOGIN7 credential check. Default `false` (eager — wrong creds / unreachable host surface as ATTACH errors). Set `true` for container/orchestrator startup where the SQL Server may not yet be reachable; first query then pays the connection-establishment cost as in the pre-spec-047 behaviour. Bounded by `mssql_attach_validation_timeout`. Spec 047 FR-011. |
+| `Application Name` / `ApplicationName` / `App Name` / `application_name` | VARCHAR | LOGIN7 `program_name` propagated to SQL Server (visible via `APP_NAME()` / `sys.dm_exec_sessions.program_name`). URI form uses spaceless `applicationname` query parameter; secret form uses `application_name` (canonical) or `applicationname`. Empty falls back to `"DuckDB MSSQL Extension"`; values longer than 128 chars are clamped client-side. Closes [issue #82](https://github.com/hugr-lab/mssql-extension/issues/82) (spec 047 FR-014). |
 
 Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableFilter`), URI query parameters, and MSSQL secrets. ATTACH options override secret/connection string values.
 
@@ -207,9 +210,10 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_pool_stats([context])` | Table | View connection pool statistics |
 | `mssql_refresh_cache(context)` | Scalar | Refresh metadata cache |
 | `mssql_preload_catalog(context [, schema])` | Scalar | Bulk-load all metadata in one round trip |
-| `mssql_open(conn_string)` | Scalar | Open standalone diagnostic connection |
-| `mssql_close(handle)` | Scalar | Close diagnostic connection |
-| `mssql_ping(handle)` | Scalar | Test connection liveness |
+| `mssql_open(conn_string)` | Scalar | [DEPRECATED] Open standalone diagnostic connection (spec 047 FR-010 — prefer ATTACH + catalog-bound functions) |
+| `mssql_close(handle)` | Scalar | [DEPRECATED] Close diagnostic connection (spec 047 FR-010) |
+| `mssql_ping(handle)` | Scalar | [DEPRECATED] Test connection liveness (spec 047 FR-010) |
+| `mssql_close_all()` | Scalar | [DEPRECATED] Close every open `mssql_open` handle in one shot; returns the count of handles closed. Recommended shutdown hook for hosts using the diagnostic API. (spec 047 FR-013) |
 | `mssql_azure_auth_test(secret, tenant?)` | Scalar | Test Azure AD token acquisition |
 | `mssql_kerberos_auth_test(host [, port])` | Scalar | Test POSIX Kerberos auth path (spec 042); returns OK + SPN / principal / token size, or verbatim GSSAPI error |
 | `mssql_kerberos_auth_test_secret(secret_name)` | Scalar | Same but reads keytab / SPN-override / etc. from an MSSQL secret |
@@ -353,6 +357,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 **Note:** This issue only manifests on GCC/Linux, not on Clang/macOS, because Clang is more lenient with ODR for constexpr static members.
 
 ## Recent Changes
+- 047-process-state-cleanup: Process-wide singleton cleanup + ATTACH credential validation + Azure TokenCache namespacing + custom Application Name (closes [#96](https://github.com/hugr-lab/mssql-extension/issues/96), [#82](https://github.com/hugr-lab/mssql-extension/issues/82); spawns [#119](https://github.com/hugr-lab/mssql-extension/issues/119) for future spec 049). **Three singletons removed**: `MssqlPoolManager` → per-`MSSQLCatalog` `unique_ptr<ConnectionPool>`; `MSSQLContextManager` (spec 045 band-aid) → direct `Catalog::GetCatalog()` lookup; `MSSQLResultStreamRegistry` → per-catalog `RegisterStream` / `RetrieveStream` methods on `MSSQLCatalog`. **One singleton kept + deprecated**: `MSSQLConnectionHandleManager` backs `mssql_open` / `mssql_close` / `mssql_ping` (no catalog discriminator on those APIs); marked `[DEPRECATED]` group with companion `mssql_close_all()` shutdown helper, scheduled for removal with the functions in a future major release. **Security hardening**: Azure `TokenCache` keyed by `(uintptr_t(DatabaseInstance*), cache_key)` so two instances sharing a secret name no longer alias (FR-012); ATTACH eagerly validates credentials by default with `lazy_validation true` opt-out (FR-011); ATTACH error path audited to never echo password (T028a); `mssql_pool_stats` redaction grep gate (SC-005); explicit `noexcept` on the teardown chain (`~MSSQLCatalog` / `~ConnectionPool` / `~TdsConnection` / `~TdsSocket` / `~TlsTdsContext` / `~TlsImpl`) + debug-only `D_ASSERT(active_connections_.empty())` invariant. **Custom Application Name**: `Application Name=...` / `applicationname=...` / secret `application_name` propagated to LOGIN7 program_name; visible as `APP_NAME()` / `sys.dm_exec_sessions.program_name`; 128-char client-side clamp matches SQL Server's own limit. See `specs/047-process-state-cleanup/state_inventory.md` for the post-spec process-wide-static classification.
 - 042-integrated-authentication Phase 4: Added Windows SSPI authentication via `secur32.dll`'s Negotiate package. `WinSspiAuthenticator` peer of `Krb5Authenticator`. Same `IAuthenticator` interface; shared SPNEGO continuation loop in `TdsConnection::AuthenticateIntegrated`.
 - 045-type-codec-consolidation: Per-type encoding/decoding/literal/DDL logic consolidated into 9 family modules under `src/codec/` (boolean/integer/float/decimal/money/string/binary/datetime/uuid). 5 LogicalType-side dispatch sites collapsed to family-dispatch (`FamilyFromLogicalType` switch or `codec::FormatSqlLiteral` one-liner). 762 LOC removed across dispatch sites (3243→2481, −23.5%). Bonus: TIMESTAMP_MS/NS/S/TZ now round-trip losslessly through SQL Server DATETIME2(3/7/0/7) with full type-transparency (catalog reports the variant, encode/decode preserves native precision). Bonus: stale-ATTACH ContextManager fix (sqllogictest `--force-reload` pointer-reuse). Closes issue #91 (BCP nvarchar character-vs-byte length); closes issue #89 (VIEW catalog-vs-runtime type divergence). No new vcpkg deps. Per-row bench (1M rows): 0.988–1.015× ratio vs spec-044 baseline (well within 5% gate).
 - 044-codec-consolidation: Finishes the simdutf migration started in 043 — every legacy `Utf16LE*` call site moves to the simdutf-backed wrapper, the wrapper is renamed back to `Utf16LE*` (legacy file path resurrected with new implementation), and the legacy hand-rolled converter survives only as a private invalid-input fallback. Includes codec microbenchmark (`make bench-utf16`) and an end-to-end before/after benchmark (`test/bench/bench_codec_e2e.sh`, 100M rows) recorded into `bench_results.md`. No new vcpkg deps.
@@ -364,10 +369,11 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 
 
 <!-- SPECKIT START -->
-Active spec: 045-type-codec-consolidation. Spec, plan, research,
-data model, contracts, quickstart, and tasks are generated. See
-`specs/045-type-codec-consolidation/plan.md` for the implementation
-plan, with `research.md`, `data-model.md`, `contracts/`,
-`quickstart.md`, and `tasks.md` (108 tasks across 8 phases) alongside.
-Implementation proceeds via `/speckit-implement` in phased commits.
+Active spec: 047-process-state-cleanup. Spec, plan, research,
+data model, contracts, and quickstart are generated. See
+`specs/047-process-state-cleanup/plan.md` for the implementation
+plan, with `research.md`, `data-model.md`, `contracts/`, and
+`quickstart.md` alongside. Closes [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96)
+(production manifestation of cross-instance singleton-pool bug class).
+Implementation proceeds via `/speckit-tasks` then `/speckit-implement`.
 <!-- SPECKIT END -->

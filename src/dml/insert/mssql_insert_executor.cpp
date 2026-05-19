@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -70,13 +69,11 @@ tds::ConnectionPool &MSSQLInsertExecutor::GetConnectionPool() {
 		return *connection_pool_;
 	}
 
-	// Get the connection pool from the pool manager using the catalog name
-	auto *pool = MssqlPoolManager::Instance().GetPool(target_.catalog_name);
-	if (!pool) {
-		throw IOException("MSSQL connection pool for catalog '%s' not found", target_.catalog_name);
-	}
-
-	connection_pool_ = pool;
+	// Spec 047: route through DuckDB catalog (per-catalog pool ownership).
+	// The MssqlPoolManager singleton is gone; pool is owned by MSSQLCatalog.
+	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+	connection_pool_ = &mssql_catalog.GetConnectionPool();
 	return *connection_pool_;
 }
 

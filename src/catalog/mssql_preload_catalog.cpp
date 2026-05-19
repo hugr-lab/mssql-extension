@@ -39,24 +39,20 @@ static unique_ptr<FunctionData> MSSQLPreloadCatalogBind(ClientContext &context, 
 			throw InvalidInputException("mssql_preload_catalog: catalog name is required (got empty string)");
 		}
 
-		// Validate the catalog exists
-		auto &manager = MSSQLContextManager::Get(*context.db);
-		if (!manager.HasContext(catalog_name)) {
+		// Validate the catalog exists (Spec 047: per-catalog ownership)
+		try {
+			auto &catalog = Catalog::GetCatalog(context, catalog_name);
+			if (catalog.GetCatalogType() != "mssql") {
+				throw BinderException("mssql_preload_catalog: catalog '%s' is not an MSSQL catalog (type: %s)",
+									  catalog_name, catalog.GetCatalogType());
+			}
+		} catch (const BinderException &) {
+			throw;
+		} catch (const std::exception &) {
 			throw BinderException(
 				"mssql_preload_catalog: catalog '%s' not found. "
 				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
 				catalog_name, catalog_name);
-		}
-
-		auto ctx = manager.GetContext(catalog_name);
-		if (!ctx || !ctx->attached_db) {
-			throw BinderException("mssql_preload_catalog: catalog '%s' has no attached database", catalog_name);
-		}
-
-		auto &catalog = ctx->attached_db->GetCatalog();
-		if (catalog.GetCatalogType() != "mssql") {
-			throw BinderException("mssql_preload_catalog: catalog '%s' is not an MSSQL catalog (type: %s)",
-								  catalog_name, catalog.GetCatalogType());
 		}
 	}
 
@@ -89,23 +85,25 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 
 			auto &client_context = state.GetContext();
 
-			// Get the MSSQL context
-			auto &manager = MSSQLContextManager::Get(*client_context.db);
-			auto ctx = manager.GetContext(catalog_name);
-			if (!ctx) {
+			// Get the MSSQL catalog (Spec 047: per-catalog ownership)
+			MSSQLCatalog *catalog_ptr = nullptr;
+			try {
+				auto &raw_catalog = Catalog::GetCatalog(client_context, catalog_name);
+				if (raw_catalog.GetCatalogType() != "mssql") {
+					throw InvalidInputException(
+						"mssql_preload_catalog: catalog '%s' is not an MSSQL catalog (type: %s)", catalog_name,
+						raw_catalog.GetCatalogType());
+				}
+				catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
+			} catch (const InvalidInputException &) {
+				throw;
+			} catch (const std::exception &) {
 				throw InvalidInputException(
 					"mssql_preload_catalog: catalog '%s' not found. "
 					"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
 					catalog_name, catalog_name);
 			}
-
-			if (!ctx->attached_db) {
-				throw InvalidInputException("mssql_preload_catalog: catalog '%s' has no attached database",
-											catalog_name);
-			}
-
-			// Get the MSSQL catalog
-			auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
+			auto &catalog = *catalog_ptr;
 			auto &cache = catalog.GetMetadataCache();
 			auto &pool = catalog.GetConnectionPool();
 

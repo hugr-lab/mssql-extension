@@ -12,7 +12,19 @@ require-env AZURE_SQL_TEST_DSN
 
 # =============================================================================
 # Setup: Attach Azure SQL Database
+#
+# Azure SQL Serverless can be in a paused state when the test starts;
+# waking the database can take up to ~60s, exceeding the default 30s
+# `mssql_connection_timeout`. Spec 047 FR-011 made ATTACH eager by
+# default, so this round-trip happens at ATTACH time. Lift the
+# attach-validation ceiling for this test so the wake-up has room.
 # =============================================================================
+
+statement ok
+SET mssql_connection_timeout = 120;
+
+statement ok
+SET mssql_attach_validation_timeout = 120;
 
 statement ok
 ATTACH '${AZURE_SQL_TEST_DSN}' AS azure_test (TYPE mssql);

@@ -1,0 +1,189 @@
+# name: test/sql/attach/application_name.test
+# description: Spec 047 (US-AN / FR-014 / SC-012 / T066) — custom LOGIN7
+#              program_name. Closes [issue #82](https://github.com/hugr-lab/mssql-extension/issues/82).
+#              Five test groups: ADO.NET canonical variants, URI canonical
+#              variant, default fallback, 128-char clamp, and isolation
+#              between two simultaneous ATTACHes.
+# group: [attach]
+
+require mssql
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+#
+# Group 1 — ADO.NET `Application Name=...` (canonical spaced form).
+# Verifies the value reaches SQL Server's APP_NAME() / program_name.
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppV1' AS appn_adonet1 (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_adonet1', 'SELECT APP_NAME() AS app');
+----
+AppV1
+
+statement ok
+DETACH appn_adonet1;
+
+# Spaceless ADO.NET alias `ApplicationName=...`.
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};ApplicationName=AppV2' AS appn_adonet2 (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_adonet2', 'SELECT APP_NAME() AS app');
+----
+AppV2
+
+statement ok
+DETACH appn_adonet2;
+
+# Underscore form `application_name=...` (matches the secret convention).
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};application_name=AppV3' AS appn_adonet3 (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_adonet3', 'SELECT APP_NAME() AS app');
+----
+AppV3
+
+statement ok
+DETACH appn_adonet3;
+
+#
+# Group 2 — URI `?applicationname=...` (spaceless form per URI convention).
+#
+statement ok
+ATTACH 'mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/master?applicationname=UriAppName' AS appn_uri (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_uri', 'SELECT APP_NAME() AS app');
+----
+UriAppName
+
+statement ok
+DETACH appn_uri;
+
+#
+# Group 3 — Default fallback (no Application Name specified). The
+# extension default string is what SQL Server should see.
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}' AS appn_default (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_default', 'SELECT APP_NAME() AS app');
+----
+DuckDB MSSQL Extension
+
+statement ok
+DETACH appn_default;
+
+#
+# Group 4 — 128-character client-side clamp (matches SQL Server's own
+# program_name limit). Using a 200-char input ensures we trim before the
+# wire, so what the client supplied and what `APP_NAME()` returns agree
+# on the client. Without the clamp, SQL Server would silently truncate
+# and an APP_NAME()-based audit assertion would surprise the user.
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' AS appn_clamp (TYPE mssql);
+
+query I
+SELECT app_len FROM mssql_scan('appn_clamp', 'SELECT LEN(APP_NAME()) AS app_len');
+----
+128
+
+statement ok
+DETACH appn_clamp;
+
+#
+# Group 5 — Two simultaneous ATTACHes carry independent app_names.
+# Confirms the per-catalog plumbing: each catalog stores its own
+# `MSSQLConnectionInfo::application_name` and each pool factory closure
+# captures its own resolved value (spec 047 per-catalog pool ownership).
+#
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppA' AS appn_a (TYPE mssql);
+
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppB' AS appn_b (TYPE mssql);
+
+query I
+SELECT app FROM mssql_scan('appn_a', 'SELECT APP_NAME() AS app');
+----
+AppA
+
+query I
+SELECT app FROM mssql_scan('appn_b', 'SELECT APP_NAME() AS app');
+----
+AppB
+
+statement ok
+DETACH appn_a;
+
+statement ok
+DETACH appn_b;
+
+#
+# Group 6 — CREATE SECRET path. Verifies `FromSecret` reads the
+# `application_name` field (canonical, underscore form) AND the
+# `applicationname` fallback. Closes the secret-side surface of FR-014.
+#
+statement ok
+CREATE SECRET appn_secret_canonical (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'master',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    application_name 'SecretApp'
+);
+
+statement ok
+ATTACH '' AS appn_secret_a (TYPE mssql, SECRET appn_secret_canonical);
+
+query I
+SELECT app FROM mssql_scan('appn_secret_a', 'SELECT APP_NAME() AS app');
+----
+SecretApp
+
+statement ok
+DETACH appn_secret_a;
+
+statement ok
+DROP SECRET appn_secret_canonical;
+
+# Fallback form `applicationname` (spaceless variant). When the
+# canonical underscore key is absent, FromSecret reads the spaceless
+# fallback.
+statement ok
+CREATE SECRET appn_secret_fallback (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'master',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    applicationname 'SecretAppFallback'
+);
+
+statement ok
+ATTACH '' AS appn_secret_b (TYPE mssql, SECRET appn_secret_fallback);
+
+query I
+SELECT app FROM mssql_scan('appn_secret_b', 'SELECT APP_NAME() AS app');
+----
+SecretAppFallback
+
+statement ok
+DETACH appn_secret_b;
+
+statement ok
+DROP SECRET appn_secret_fallback;

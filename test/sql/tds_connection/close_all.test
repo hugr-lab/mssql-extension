@@ -1,0 +1,57 @@
+# name: test/sql/tds_connection/close_all.test
+# description: Spec 047 (US-SEC / FR-013 / T046i) — mssql_close_all() bulk
+#              shutdown helper. Opens N diagnostic handles, asserts the
+#              first close returns N and the second returns 0 (idempotent),
+#              and confirms a stale handle now errors on mssql_ping().
+# group: [tds_connection]
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+# Start from a known-clean handle map so the assertion below isn't fragile
+# to handles left over from earlier tests in the same process.
+query I
+SELECT mssql_close_all() >= 0;
+----
+true
+
+# Open three diagnostic handles. Store them in a TEMP table — handle IDs
+# are non-deterministic across runs / concurrent tests, so we rely on the
+# stored values for the ping assertion later.
+statement ok
+CREATE TEMP TABLE close_all_handles AS
+  SELECT mssql_open('${MSSQL_TEST_DSN}') AS h
+  UNION ALL SELECT mssql_open('${MSSQL_TEST_DSN}')
+  UNION ALL SELECT mssql_open('${MSSQL_TEST_DSN}');
+
+query I
+SELECT COUNT(*) FROM close_all_handles;
+----
+3
+
+# First close: every handle in the manager closes; returns the count we
+# opened (3). The check is `>= 3` instead of `= 3` so a future test that
+# leaves handles open in a different test file doesn't flake this one
+# (we close everything, not just our three).
+query I
+SELECT mssql_close_all() >= 3;
+----
+true
+
+# Second close: idempotent — handle map is now empty.
+query I
+SELECT mssql_close_all();
+----
+0
+
+# Each previously-handed-out handle is gone. mssql_ping errors with
+# "Invalid connection handle" (per MSSQLPingFunction) because the handle
+# manager no longer knows about it.
+statement error
+SELECT mssql_ping((SELECT h FROM close_all_handles LIMIT 1));
+----
+Invalid connection handle
+
+statement ok
+DROP TABLE close_all_handles;

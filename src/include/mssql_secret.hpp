@@ -35,6 +35,14 @@ constexpr const char *MSSQL_SECRET_KRB5_CREDCACHEFILE = "krb5_credcachefile";  /
 constexpr const char *MSSQL_SECRET_KRB5_REALM = "krb5_realm";				   // AD realm (uppercased)
 constexpr const char *MSSQL_SECRET_SPN = "service_principal_name";			   // Override default SPN derivation
 
+// Spec 047 FR-014: LOGIN7 program_name (closes issue #82). Canonical
+// underscore form matches the existing MSSQL-secret field convention.
+constexpr const char *MSSQL_SECRET_APPLICATION_NAME = "application_name";
+// Spec 047 FR-014 fallback: spaceless ADO.NET-style key, accepted for
+// convenience when the user copies a connection-string-style spelling
+// into a secret.
+constexpr const char *MSSQL_SECRET_APPLICATION_NAME_FALLBACK = "applicationname";
+
 // Register MSSQL secret type and creation function
 void RegisterMSSQLSecretType(ExtensionLoader &loader);
 
