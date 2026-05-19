@@ -33,7 +33,7 @@ struct ColumnMetadata;
 }  // namespace tds
 
 namespace mssql {
-class BCPColumnMetadata;
+struct BCPColumnMetadata;
 struct CTASConfig;
 }  // namespace mssql
 
