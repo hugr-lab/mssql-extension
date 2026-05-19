@@ -52,7 +52,12 @@ public:
 				 tds::PoolConfiguration pool_config, std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode,
 				 bool catalog_enabled = true);
 
-	~MSSQLCatalog() override;
+	// noexcept (spec 047 T046k): defaulted body destructs the per-catalog
+	// `unique_ptr<ConnectionPool>` (and other unique_ptr members), each of
+	// whose destructors is also `noexcept`. Marked explicit for grep-ability
+	// and to keep the teardown contract loud: a throw here during
+	// `~AttachedDatabase` unwind would invoke std::terminate.
+	~MSSQLCatalog() noexcept override;
 
 	//===----------------------------------------------------------------------===//
 	// Required Catalog Overrides

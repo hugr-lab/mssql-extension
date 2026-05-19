@@ -70,9 +70,14 @@ struct TlsTdsContextImpl {
 
 TlsTdsContext::TlsTdsContext() : impl_(new TlsTdsContextImpl()) {}
 
-TlsTdsContext::~TlsTdsContext() {
-	if (impl_ && impl_->tls) {
-		impl_->tls->Close();
+TlsTdsContext::~TlsTdsContext() noexcept {
+	try {
+		if (impl_ && impl_->tls) {
+			impl_->tls->Close();
+		}
+	} catch (...) {
+		// Swallowed (spec 047 T046k) — OpenSSL cleanup paths can throw in
+		// degenerate cases; we have no caller to surface them to.
 	}
 }
 

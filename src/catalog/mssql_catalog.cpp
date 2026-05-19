@@ -75,7 +75,7 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
 }
 
-MSSQLCatalog::~MSSQLCatalog() = default;
+MSSQLCatalog::~MSSQLCatalog() noexcept = default;
 
 //===----------------------------------------------------------------------===//
 // Result Stream Registry (spec 047 / US3)

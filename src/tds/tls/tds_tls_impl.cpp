@@ -272,8 +272,14 @@ static void ClearOpenSSLErrors() {
 
 TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {}
 
-TlsImpl::~TlsImpl() {
-	Close();
+TlsImpl::~TlsImpl() noexcept {
+	try {
+		Close();
+	} catch (...) {
+		// Swallowed (spec 047 T046k) — Close() walks the OpenSSL teardown
+		// path; SSL_free / SSL_CTX_free are documented as not-throwing in
+		// practice, but the catch ensures std::terminate isn't risked.
+	}
 }
 
 bool TlsImpl::Initialize() {

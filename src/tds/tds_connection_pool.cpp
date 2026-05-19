@@ -1,5 +1,7 @@
 #include "tds/tds_connection_pool.hpp"
 
+#include "duckdb/common/assert.hpp"
+
 #include <cstdlib>
 
 namespace duckdb {
@@ -31,11 +33,27 @@ ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguratio
 	cleanup_thread_ = std::thread(&ConnectionPool::CleanupThreadFunc, this);
 }
 
-ConnectionPool::~ConnectionPool() {
-	Shutdown();
+ConnectionPool::~ConnectionPool() noexcept {
+	// Spec 047 T046k: explicit noexcept + try/catch — a throw from teardown
+	// during `~AttachedDatabase` unwind would invoke std::terminate. Failures
+	// here are best-effort (socket close errors, log emission failures) and
+	// we have no caller to report them to anyway.
+	try {
+		Shutdown();
+	} catch (...) {
+		// Swallowed — see header `class ConnectionPool` destruction contract.
+	}
 }
 
 void ConnectionPool::Shutdown() {
+	// Spec 047 T046l: surface DuckDB quiescence-contract violations in debug
+	// builds. Production paths should never reach destruction with active
+	// connections still checked out (the DuckDB harness drives `~AttachedDatabase`
+	// only after query quiescence). If this assert fires, a host is destroying
+	// the catalog while a worker thread still holds a connection — sockets are
+	// about to close under that thread's feet (EBADF on next read).
+	D_ASSERT(active_connections_.empty());
+
 	// Signal shutdown
 	shutdown_flag_.store(true);
 

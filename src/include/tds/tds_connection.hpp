@@ -18,7 +18,9 @@ namespace tds {
 class TdsConnection {
 public:
 	TdsConnection();
-	~TdsConnection();
+	// noexcept (spec 047 T046k): body wraps Close() in try/catch — destructor
+	// throws during `~AttachedDatabase` unwind would invoke std::terminate.
+	~TdsConnection() noexcept;
 
 	// Non-copyable
 	TdsConnection(const TdsConnection &) = delete;

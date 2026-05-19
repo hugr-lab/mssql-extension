@@ -70,8 +70,13 @@ TdsConnection::TdsConnection()
 	  next_packet_id_(1),
 	  negotiated_packet_size_(TDS_DEFAULT_PACKET_SIZE) {}
 
-TdsConnection::~TdsConnection() {
-	Close();
+TdsConnection::~TdsConnection() noexcept {
+	try {
+		Close();
+	} catch (...) {
+		// Swallowed — see header note. Socket close failures are observable to
+		// the server via TCP FIN; no caller exists to surface them anyway.
+	}
 }
 
 TdsConnection::TdsConnection(TdsConnection &&other) noexcept

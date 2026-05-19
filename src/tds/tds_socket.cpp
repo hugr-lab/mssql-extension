@@ -86,8 +86,14 @@ namespace tds {
 
 TdsSocket::TdsSocket() : fd_(-1), port_(0), connected_(false) {}
 
-TdsSocket::~TdsSocket() {
-	Close();
+TdsSocket::~TdsSocket() noexcept {
+	try {
+		Close();
+	} catch (...) {
+		// Swallowed (spec 047 T046k) — close(fd_) failures are silent on POSIX
+		// anyway; this guard protects against TLS shutdown paths that could
+		// raise via OpenSSL exceptions in rare configs.
+	}
 }
 
 TdsSocket::TdsSocket(TdsSocket &&other) noexcept

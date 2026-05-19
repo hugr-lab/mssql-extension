@@ -48,11 +48,31 @@ struct PoolStatistics {
 // Connection factory function type
 using ConnectionFactory = std::function<std::shared_ptr<TdsConnection>()>;
 
-// Thread-safe connection pool for a single database context
+// Thread-safe connection pool for a single database context.
+//
+// Spec 047 T046m — destruction contract:
+//   Sockets close immediately on pool destruction. In-flight TDS requests
+//   on other threads observe connection-reset on next read (EBADF / SSL
+//   read error). Server-side rollback of any open transactions happens
+//   via TCP FIN within seconds.
+//
+//   No graceful TDS ATTENTION cancel is sent during destruction — that
+//   would require a cross-thread write to a connection's socket, racing
+//   with the owning thread's read. The DuckDB extension contract
+//   requires query quiescence before `~AttachedDatabase` runs (and
+//   therefore before `~MSSQLCatalog` / `~ConnectionPool`); the debug
+//   `D_ASSERT(active_connections_.empty())` in Shutdown() surfaces
+//   any host that violates that contract.
+//
+//   Cooperative cancellation (atomic flag polled by the owner thread,
+//   per spec 047 Constraints / non-goals) is tracked as a follow-up
+//   spec — out of scope here.
 class ConnectionPool {
 public:
 	ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory);
-	~ConnectionPool();
+	// noexcept: destructor body wraps Shutdown() in try/catch — a throw from
+	// teardown during `~AttachedDatabase` unwind would invoke std::terminate.
+	~ConnectionPool() noexcept;
 
 	// Non-copyable, non-movable
 	ConnectionPool(const ConnectionPool &) = delete;
