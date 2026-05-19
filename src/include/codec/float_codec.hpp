@@ -45,7 +45,7 @@
 namespace duckdb {
 
 namespace tds {
-class ColumnMetadata;
+struct ColumnMetadata;
 }  // namespace tds
 
 namespace mssql {
