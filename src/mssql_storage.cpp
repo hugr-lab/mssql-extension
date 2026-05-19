@@ -1167,7 +1167,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
-	bool lazy_validation = false;		 // Spec 047 (US2): opt out of eager creds check
+	bool lazy_validation = false;		// Spec 047 (US2): opt out of eager creds check
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1303,9 +1303,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	std::vector<uint8_t> fedauth_token_utf16le;
 	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
-		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: %s at ATTACH time",
-								lazy_validation ? "skipping network validation (lazy_validation=true)"
-												: "validating connection");
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Manual token auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 
 		// Create auth strategy - this validates JWT format, audience, and expiration.
 		// JWT-shape validation runs even under lazy_validation: it's local and
@@ -1328,9 +1328,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Validate FEDAUTH connections at ATTACH time (fail-fast).
 		// Always acquire the token (it's needed by the pool factory anyway);
 		// only the TCP+LOGIN7 verification step is governed by lazy_validation.
-		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: %s at ATTACH time",
-								lazy_validation ? "skipping network validation (lazy_validation=true)"
-												: "validating connection");
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Azure auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 		if (!lazy_validation) {
 			ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
 		}
@@ -1342,9 +1342,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			   connection_info->auth_method == AuthMethod::WINSSPI) {
 		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
 		// time so credential / SPN / clock-skew errors surface immediately.
-		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: %s at ATTACH time",
-								lazy_validation ? "skipping network validation (lazy_validation=true)"
-												: "validating connection");
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Integrated Auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 		if (!lazy_validation) {
 			ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
 		}

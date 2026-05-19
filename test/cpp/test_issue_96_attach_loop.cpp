@@ -70,7 +70,7 @@ struct TestConfig {
 	std::string Dsn() const {
 		std::ostringstream oss;
 		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user
-		    << ";Password=" << pass;
+			<< ";Password=" << pass;
 		return oss.str();
 	}
 };
@@ -85,7 +85,7 @@ void load_extension(Connection &conn) {
 	}
 }
 
-} // namespace
+}  // namespace
 
 int main() {
 	std::cout << "==========================================" << std::endl;
@@ -99,8 +99,8 @@ int main() {
 		return 0;
 	}
 
-	std::cout << "\nDSN: Server=" << cfg.host << "," << cfg.port << ";Database=" << cfg.database << ";User Id="
-	          << cfg.user << ";Password=***" << std::endl;
+	std::cout << "\nDSN: Server=" << cfg.host << "," << cfg.port << ";Database=" << cfg.database
+			  << ";User Id=" << cfg.user << ";Password=***" << std::endl;
 	std::cout << "Repro: 100 iterations of `{ DuckDB db; ATTACH AS TO_MSSQL; SELECT 1; }`" << std::endl;
 
 	std::ostringstream attach_sql;

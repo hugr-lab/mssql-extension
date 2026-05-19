@@ -807,8 +807,8 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
-											   TDS_DEFAULT_PACKET_SIZE);
+	TdsPacket login =
+		TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name, TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

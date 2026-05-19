@@ -13,8 +13,7 @@ namespace duckdb {
 namespace tds {
 
 SqlServerAuthStrategy::SqlServerAuthStrategy(const std::string &username, const std::string &password,
-											 const std::string &database, bool use_encrypt,
-											 const std::string &app_name)
+											 const std::string &database, bool use_encrypt, const std::string &app_name)
 	: username_(username), password_(password), database_(database), use_encrypt_(use_encrypt), app_name_(app_name) {}
 
 PreloginOptions SqlServerAuthStrategy::GetPreloginOptions() const {

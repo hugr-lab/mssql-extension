@@ -65,7 +65,7 @@ struct TestConfig {
 	std::string DsnFor(const std::string &database) const {
 		std::ostringstream oss;
 		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user
-		    << ";Password=" << pass;
+			<< ";Password=" << pass;
 		return oss.str();
 	}
 };
@@ -203,7 +203,7 @@ void scenario_2_detach_isolation(const TestConfig &cfg) {
 
 	if (db_b_name != "TestDB") {
 		throw std::runtime_error("Scenario 2 FAILED: Instance B routed to '" + db_b_name +
-		                         "' after A's DETACH, expected 'TestDB'");
+								 "' after A's DETACH, expected 'TestDB'");
 	}
 
 	std::cout << "  PASSED (SC-002)" << std::endl;
@@ -244,12 +244,12 @@ void scenario_3_silent_shutdown(const TestConfig &cfg) {
 	// quote-doubling escape inside the outer SQL literal.
 	std::ostringstream baseline_query;
 	baseline_query << "SELECT * FROM mssql_scan('verifier', "
-	               << "'SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE login_name = ''" << cfg.user
-	               << "'' AND program_name LIKE ''%DuckDB%''')";
+				   << "'SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE login_name = ''" << cfg.user
+				   << "'' AND program_name LIKE ''%DuckDB%''')";
 
 	auto baseline = query_single_int(verifier_conn, baseline_query.str());
 	std::cout << "  Baseline residual sessions (DuckDB-program_name, user " << cfg.user << "): " << baseline
-	          << std::endl;
+			  << std::endl;
 
 	const int iterations = 100;
 	for (int i = 0; i < iterations; ++i) {
@@ -277,13 +277,13 @@ void scenario_3_silent_shutdown(const TestConfig &cfg) {
 
 	if (residual > baseline) {
 		throw std::runtime_error("Scenario 3 FAILED: " + std::to_string(residual - baseline) +
-		                         " residual SQL Server sessions after 100 silent-shutdown iterations");
+								 " residual SQL Server sessions after 100 silent-shutdown iterations");
 	}
 
 	std::cout << "  PASSED (SC-003)" << std::endl;
 }
 
-} // namespace
+}  // namespace
 
 int main() {
 	std::cout << "==========================================" << std::endl;

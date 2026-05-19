@@ -63,7 +63,7 @@ bool TokenCache::HasValidToken(DatabaseInstance &db, const std::string &cache_ke
 void TokenCache::SetToken(DatabaseInstance &db, const std::string &cache_key, const std::string &token,
 						  std::chrono::system_clock::time_point expires_at) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	cache_[MakeKey(db, cache_key)] = CachedToken {token, expires_at};
+	cache_[MakeKey(db, cache_key)] = CachedToken{token, expires_at};
 }
 
 void TokenCache::Invalidate(DatabaseInstance &db, const std::string &cache_key) {

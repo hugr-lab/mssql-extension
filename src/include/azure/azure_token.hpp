@@ -111,8 +111,8 @@ struct CachedToken {
 // is not in libstdc++ for unordered containers, so we provide our own.
 struct PairHash {
 	std::size_t operator()(const std::pair<std::uintptr_t, std::string> &p) const noexcept {
-		std::size_t h1 = std::hash<std::uintptr_t> {}(p.first);
-		std::size_t h2 = std::hash<std::string> {}(p.second);
+		std::size_t h1 = std::hash<std::uintptr_t>{}(p.first);
+		std::size_t h2 = std::hash<std::string>{}(p.second);
 		return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
 	}
 };

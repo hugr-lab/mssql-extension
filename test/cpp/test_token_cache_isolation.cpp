@@ -80,7 +80,7 @@ HttpResponse HttpPost(const std::string & /*host*/, const std::string & /*path*/
 }
 
 std::string UrlEncode(const std::string &value) {
-	return value;	// stub: not called from this test's code paths
+	return value;  // stub: not called from this test's code paths
 }
 
 AzureSecretInfo ReadAzureSecret(ClientContext & /*context*/, const std::string & /*secret_name*/) {

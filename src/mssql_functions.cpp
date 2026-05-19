@@ -90,7 +90,8 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 		auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
 		if (catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException(
-				"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+				"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
+				"...)",
 				bind_data->context_name, bind_data->context_name);
 		}
 	} catch (const std::exception &) {
@@ -129,8 +130,7 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s",
-					   bind_data->result_stream_id.c_str());
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data->result_stream_id.c_str());
 
 	auto bind_end = std::chrono::steady_clock::now();
 	auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bind_end - bind_start).count();
@@ -345,9 +345,8 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		try {
 			auto &raw_catalog = Catalog::GetCatalog(client_context, context_name);
 			if (raw_catalog.GetCatalogType() != "mssql") {
-				throw InvalidInputException(
-					"mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)", context_name,
-					raw_catalog.GetCatalogType());
+				throw InvalidInputException("mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)",
+											context_name, raw_catalog.GetCatalogType());
 			}
 			catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
 		} catch (const InvalidInputException &) {

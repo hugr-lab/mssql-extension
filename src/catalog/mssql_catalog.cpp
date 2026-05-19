@@ -17,6 +17,7 @@
 #include "dml/update/mssql_update_target.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
@@ -26,7 +27,6 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
-#include "duckdb/common/types/uuid.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 

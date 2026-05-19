@@ -43,8 +43,7 @@ public:
 	// Requires ClientContext for token acquisition
 	static AuthStrategyPtr CreateFedAuth(ClientContext &context, const std::string &secret_name,
 										 const std::string &database, const std::string &host,
-										 const std::string &tenant_override = "",
-										 const std::string &app_name = "");
+										 const std::string &tenant_override = "", const std::string &app_name = "");
 
 	// Create manual token strategy from pre-provided JWT (Spec 032)
 	// Token is validated for format and audience at creation time

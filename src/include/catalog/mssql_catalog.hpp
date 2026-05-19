@@ -219,18 +219,18 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	string context_name_;												  // Attached context name
-	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
-	tds::PoolConfiguration pool_config_;								  // Pool config (spec 047)
-	std::vector<uint8_t> fedauth_token_utf16le_;						  // FEDAUTH token (spec 047)
-	AccessMode access_mode_;											  // READ_ONLY enforced
-	bool catalog_enabled_;												  // Catalog integration enabled
-	MSSQLCatalogFilter catalog_filter_;									  // Regex visibility filter
-	unique_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool (per-catalog owned, spec 047)
-	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
-	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider
-	string database_collation_;											  // Database default collation
-	string default_schema_;												  // Default schema ("dbo")
+	string context_name_;									   // Attached context name
+	shared_ptr<MSSQLConnectionInfo> connection_info_;		   // Connection parameters
+	tds::PoolConfiguration pool_config_;					   // Pool config (spec 047)
+	std::vector<uint8_t> fedauth_token_utf16le_;			   // FEDAUTH token (spec 047)
+	AccessMode access_mode_;								   // READ_ONLY enforced
+	bool catalog_enabled_;									   // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;						   // Regex visibility filter
+	unique_ptr<tds::ConnectionPool> connection_pool_;		   // Connection pool (per-catalog owned, spec 047)
+	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
+	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
+	string database_collation_;								   // Database default collation
+	string default_schema_;									   // Default schema ("dbo")
 	unordered_map<string, unique_ptr<MSSQLSchemaEntry>> schema_entries_;  // Schema entry cache
 	mutable std::mutex schema_mutex_;									  // Thread-safety for schema access
 

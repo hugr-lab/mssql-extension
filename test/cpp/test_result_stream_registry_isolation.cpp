@@ -72,7 +72,7 @@ struct TestConfig {
 	std::string DsnFor(const std::string &database) const {
 		std::ostringstream oss;
 		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user
-		    << ";Password=" << pass;
+			<< ";Password=" << pass;
 		return oss.str();
 	}
 };
@@ -140,19 +140,19 @@ void scenario_per_catalog_stream_isolation(const TestConfig &cfg) {
 	// either database.
 	const int iterations = 50;
 	const int top_n = 5;
-	const std::string scan_sql = "SELECT COUNT(*) FROM mssql_scan('mssql', 'SELECT TOP " + std::to_string(top_n) +
-	                             " name FROM sys.tables')";
+	const std::string scan_sql =
+		"SELECT COUNT(*) FROM mssql_scan('mssql', 'SELECT TOP " + std::to_string(top_n) + " name FROM sys.tables')";
 
 	for (int i = 0; i < iterations; ++i) {
 		auto count_a = query_single_int(conn_a, scan_sql);
 		auto count_b = query_single_int(conn_b, scan_sql);
 		if (count_a != top_n) {
 			throw std::runtime_error("Iteration " + std::to_string(i) + ": Instance A returned " +
-			                         std::to_string(count_a) + " rows, expected " + std::to_string(top_n));
+									 std::to_string(count_a) + " rows, expected " + std::to_string(top_n));
 		}
 		if (count_b != top_n) {
 			throw std::runtime_error("Iteration " + std::to_string(i) + ": Instance B returned " +
-			                         std::to_string(count_b) + " rows, expected " + std::to_string(top_n));
+									 std::to_string(count_b) + " rows, expected " + std::to_string(top_n));
 		}
 	}
 	std::cout << "  Completed " << iterations << " interleaved scan pairs across both instances" << std::endl;
@@ -160,7 +160,7 @@ void scenario_per_catalog_stream_isolation(const TestConfig &cfg) {
 	std::cout << "  PASSED (SC-006)" << std::endl;
 }
 
-} // namespace
+}  // namespace
 
 int main() {
 	std::cout << "==========================================" << std::endl;

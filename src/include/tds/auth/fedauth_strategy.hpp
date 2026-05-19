@@ -40,8 +40,7 @@ public:
 	// outlive the strategy — the strategy is owned by the connection pool,
 	// which is owned by the catalog, which is owned by the DatabaseInstance.
 	FedAuthStrategy(DatabaseInstance &db, const std::string &secret_name, const std::string &database,
-					const std::string &host, const std::string &tenant_override = "",
-					const std::string &app_name = "");
+					const std::string &host, const std::string &tenant_override = "", const std::string &app_name = "");
 
 	~FedAuthStrategy() override = default;
 
