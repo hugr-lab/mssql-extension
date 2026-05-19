@@ -129,3 +129,61 @@ DETACH appn_a;
 
 statement ok
 DETACH appn_b;
+
+#
+# Group 6 — CREATE SECRET path. Verifies `FromSecret` reads the
+# `application_name` field (canonical, underscore form) AND the
+# `applicationname` fallback. Closes the secret-side surface of FR-014.
+#
+statement ok
+CREATE SECRET appn_secret_canonical (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'master',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    application_name 'SecretApp'
+);
+
+statement ok
+ATTACH '' AS appn_secret_a (TYPE mssql, SECRET appn_secret_canonical);
+
+query I
+SELECT app FROM mssql_scan('appn_secret_a', 'SELECT APP_NAME() AS app');
+----
+SecretApp
+
+statement ok
+DETACH appn_secret_a;
+
+statement ok
+DROP SECRET appn_secret_canonical;
+
+# Fallback form `applicationname` (spaceless variant). When the
+# canonical underscore key is absent, FromSecret reads the spaceless
+# fallback.
+statement ok
+CREATE SECRET appn_secret_fallback (
+    TYPE mssql,
+    host '${MSSQL_TEST_HOST}',
+    port ${MSSQL_TEST_PORT},
+    database 'master',
+    user '${MSSQL_TEST_USER}',
+    password '${MSSQL_TEST_PASS}',
+    applicationname 'SecretAppFallback'
+);
+
+statement ok
+ATTACH '' AS appn_secret_b (TYPE mssql, SECRET appn_secret_fallback);
+
+query I
+SELECT app FROM mssql_scan('appn_secret_b', 'SELECT APP_NAME() AS app');
+----
+SecretAppFallback
+
+statement ok
+DETACH appn_secret_b;
+
+statement ok
+DROP SECRET appn_secret_fallback;

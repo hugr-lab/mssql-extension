@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Custom Application Name in connection string** (spec 047 FR-014,
+  closes [#82](https://github.com/hugr-lab/mssql-extension/issues/82)).
+  ADO.NET keys `Application Name` / `ApplicationName` / `App Name` /
+  `application_name` (case-insensitive), URI query parameter
+  `applicationname`, and MSSQL secret fields `application_name`
+  (canonical) / `applicationname` (fallback) propagate to LOGIN7
+  `program_name` — visible as `APP_NAME()` /
+  `sys.dm_exec_sessions.program_name`. Empty falls back to the
+  extension default (`"DuckDB MSSQL Extension"`); values exceeding
+  128 UTF-16 code units are clamped client-side so what the user sees
+  in `APP_NAME()` equals what we sent.
+- **`lazy_validation` ATTACH option** + **`mssql_attach_validation_timeout`
+  setting** (spec 047 FR-011). Eager ATTACH validation is on by default
+  (wrong password / unreachable host fail ATTACH instead of being
+  deferred to the first query); opt out per ATTACH with
+  `lazy_validation true` to preserve the pre-047 lazy behaviour
+  (useful for container / orchestrator startup where the SQL Server
+  may not yet be reachable). The setting bounds the eager round-trip;
+  `0` (default) inherits `mssql_connection_timeout`.
 - **`mssql_close_all()`** scalar function (spec 047 FR-013). Closes every
   diagnostic-API connection opened via `mssql_open()` in one call; returns
   the count of handles closed. Idempotent — a second call after a full
@@ -20,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **LOGIN7 default `program_name` unified to `"DuckDB MSSQL Extension"`**
+  (spec 047 FR-014 side-effect). Pre-047 SQL auth sent `"DuckDB"` and
+  integrated auth sent `"DuckDB MSSQL Extension"`. The single resolution
+  point (`ResolveAppName` helper, called by every auth path) now sends
+  `"DuckDB MSSQL Extension"` uniformly when no `application_name` is
+  supplied. Observable change for SQL-auth users who previously saw
+  `APP_NAME() = 'DuckDB'`; they will now see `'DuckDB MSSQL Extension'`
+  unless they explicitly set `Application Name=DuckDB`.
 - **`mssql_open` / `mssql_close` / `mssql_ping` are now documented as
   `[DEPRECATED]`** (spec 047 FR-010). They remain functional and are kept
   for backward compatibility. Prefer ATTACH + the catalog-bound functions

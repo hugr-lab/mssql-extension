@@ -37,6 +37,60 @@ static int GetMssqlStorageDebugLevel() {
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
+// ResolveAppName (Spec 047 US-AN / FR-014 / T065) — see header doc-comment
+//
+// UTF-16 code unit clamp at 128, mirroring SQL Server's program_name limit
+// and the wire encoding in `tds_protocol.cpp::BuildLogin7`. Walks the
+// UTF-8 input forward by codepoint; counts UTF-16 code units (1 for BMP
+// codepoints in 1/2/3-byte UTF-8 sequences, 2 for supplementary plane
+// codepoints in 4-byte UTF-8 sequences = surrogate pair). Invalid UTF-8
+// bytes advance defensively by 1 byte / 1 code unit so a malformed input
+// still terminates rather than looping.
+//===----------------------------------------------------------------------===//
+string ResolveAppName(const MSSQLConnectionInfo &info) {
+	static constexpr size_t MAX_UTF16_CODE_UNITS = 128;
+	if (info.application_name.empty()) {
+		return "DuckDB MSSQL Extension";
+	}
+	const string &s = info.application_name;
+	size_t byte_pos = 0;
+	size_t utf16_units = 0;
+	while (byte_pos < s.size() && utf16_units < MAX_UTF16_CODE_UNITS) {
+		auto c = static_cast<unsigned char>(s[byte_pos]);
+		size_t advance;
+		size_t units;
+		if (c < 0x80) {
+			advance = 1;
+			units = 1;	// ASCII
+		} else if ((c & 0xE0) == 0xC0) {
+			advance = 2;
+			units = 1;	// 2-byte UTF-8 → 1 UCS-2 code unit
+		} else if ((c & 0xF0) == 0xE0) {
+			advance = 3;
+			units = 1;	// 3-byte UTF-8 → 1 UCS-2 code unit
+		} else if ((c & 0xF8) == 0xF0) {
+			advance = 4;
+			units = 2;	// 4-byte UTF-8 → surrogate pair (2 code units)
+		} else {
+			advance = 1;
+			units = 1;	// invalid lead byte — defensive single-byte step
+		}
+		if (utf16_units + units > MAX_UTF16_CODE_UNITS) {
+			break;
+		}
+		if (byte_pos + advance > s.size()) {
+			break;  // truncated UTF-8 at end of input
+		}
+		byte_pos += advance;
+		utf16_units += units;
+	}
+	if (byte_pos == s.size()) {
+		return s;
+	}
+	return s.substr(0, byte_pos);
+}
+
+//===----------------------------------------------------------------------===//
 // MSSQLConnectionInfo implementation
 //===----------------------------------------------------------------------===//
 

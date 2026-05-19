@@ -148,24 +148,23 @@ struct MSSQLConnectionInfo {
 // ResolveAppName (Spec 047 US-AN / FR-014 / T065)
 //
 // Single resolution point for the LOGIN7 program_name. Returns the
-// caller-supplied `application_name` clamped to 128 characters (SQL
-// Server's own program_name limit — clamp client-side so the value
-// shown by `APP_NAME()` matches exactly what we sent on the wire),
-// or the extension default when the user did not configure one.
+// caller-supplied `application_name` clamped to 128 UTF-16 code units
+// (SQL Server's own program_name limit — clamp client-side so the value
+// shown by `APP_NAME()` matches exactly what we sent on the wire), or
+// the extension default when the user did not configure one.
 //
-// Called from the AuthStrategyFactory fan-out so every auth path
-// (SQL / Azure FEDAUTH / manual token / integrated) goes through the
-// same logic. A future change to the default string only touches here.
+// The clamp counts UTF-16 code units (NOT UTF-8 bytes) to mirror the
+// wire encoding in `tds_protocol.cpp::BuildLogin7`. A naive UTF-8 byte
+// clamp would chop multi-byte sequences mid-character, producing
+// invalid UTF-8 that the LOGIN7 encoder would either substitute with
+// the replacement character or reject.
+//
+// Called from the AuthStrategyFactory fan-out + every TdsConnection
+// Authenticate* call site so every auth path (SQL / Azure FEDAUTH /
+// manual token / integrated) goes through the same logic. A future
+// change to the default string only touches the impl.
 //===----------------------------------------------------------------------===//
-inline string ResolveAppName(const MSSQLConnectionInfo &info) {
-	if (info.application_name.empty()) {
-		return "DuckDB MSSQL Extension";
-	}
-	if (info.application_name.size() > 128) {
-		return info.application_name.substr(0, 128);
-	}
-	return info.application_name;
-}
+string ResolveAppName(const MSSQLConnectionInfo &info);
 
 //===----------------------------------------------------------------------===//
 // MSSQLStorageExtensionInfo - Shared state for storage extension

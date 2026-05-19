@@ -99,6 +99,21 @@ MSSQLTransaction::~MSSQLTransaction() {
 		}
 		sql_server_transaction_active_ = false;
 	}
+	// Spec 047: every SetPinnedConnection(non-null) on `pinned_connection_`
+	// incremented the per-catalog `pinned_count_` atomic. The destructor path
+	// (commit/rollback/crash/abandoned) drops the shared_ptr WITHOUT going
+	// through SetPinnedConnection(nullptr), so the matching DecrementPinned
+	// would never fire and `pool_stats.pinned_count` would leak +1 forever.
+	// Decrement here under try/catch — the catalog is still alive (transaction
+	// destruction precedes catalog destruction in DuckDB's teardown order).
+	if (pinned_connection_) {
+		try {
+			catalog_.GetConnectionPool().DecrementPinned();
+		} catch (...) {
+			// Catalog or pool already destroyed (unexpected order) — accept the
+			// stat leak rather than escape the destructor.
+		}
+	}
 	// Note: pinned_connection_ shared_ptr will be released here, decreasing ref count.
 	// The connection will be destroyed if this was the last reference.
 }
