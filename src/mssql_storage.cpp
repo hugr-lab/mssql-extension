@@ -79,7 +79,7 @@ string ResolveAppName(const MSSQLConnectionInfo &info) {
 			break;
 		}
 		if (byte_pos + advance > s.size()) {
-			break;  // truncated UTF-8 at end of input
+			break;	// truncated UTF-8 at end of input
 		}
 		byte_pos += advance;
 		utf16_units += units;
