@@ -148,6 +148,20 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->krb5_realm = get_str("krb5_realm");
 	result->service_principal_name = get_str("service_principal_name");
 
+	// Spec 047 FR-014 (issue #82): LOGIN7 program_name from secret. Accept
+	// both `application_name` (underscore form, the existing convention for
+	// MSSQL secret fields) and `applicationname` (spaceless ADO.NET form).
+	// First non-empty wins; underscore form is the documented canonical key.
+	{
+		auto app_name_val = kv_secret.TryGetValue("application_name");
+		if (app_name_val.IsNull() || app_name_val.ToString().empty()) {
+			app_name_val = kv_secret.TryGetValue("applicationname");
+		}
+		if (!app_name_val.IsNull()) {
+			result->application_name = app_name_val.ToString();
+		}
+	}
+
 	result->connected = false;
 	return result;
 }
@@ -314,6 +328,12 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 				} else if (lower_key == "integrated_security" || lower_key == "integratedsecurity" ||
 						   lower_key == "integrated-security") {
 					result["integrated_security"] = value;
+				} else if (lower_key == "applicationname" || lower_key == "application_name") {
+					// Spec 047 FR-014 (issue #82): URI keys cannot contain spaces, so
+					// `application name` is not a valid form here — accept the spaceless
+					// canonical variants only. Routes to the same `application_name`
+					// canonical key as the ADO.NET branch.
+					result["application_name"] = value;
 				} else {
 					result[key] = value;
 				}
@@ -470,6 +490,13 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 				   lower_key == "integrated security" || lower_key == "integrated-security") {
 			// ADO.NET canonical alias
 			result["integrated_security"] = value;
+		} else if (lower_key == "application name" || lower_key == "applicationname" || lower_key == "app name" ||
+				   lower_key == "application_name") {
+			// Spec 047 FR-014 (issue #82): LOGIN7 program_name. Recognise the
+			// ADO.NET canonical variants + the underscore form so the same
+			// `application_name=...` shape works in connection strings, URIs,
+			// and secrets.
+			result["application_name"] = value;
 		} else {
 			result[key] = value;
 		}
@@ -773,6 +800,15 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 		result->service_principal_name = get("service_principal_name");
 	}
 
+	// Spec 047 FR-014 (issue #82): custom LOGIN7 program_name. Routed through
+	// the canonical `application_name` key by both ADO.NET and URI parsers.
+	{
+		auto it = params.find("application_name");
+		if (it != params.end()) {
+			result->application_name = it->second;
+		}
+	}
+
 	result->connected = false;
 	return result;
 }
@@ -885,7 +921,8 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 
 	// Attempt Azure AD authentication (FEDAUTH)
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
-	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt)) {
+	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt,
+									  ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
 		conn.Close();
@@ -949,7 +986,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 
 	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
-	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt)) {
+	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
 		conn.Close();
@@ -1010,7 +1047,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 	// Attempt authentication
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
-	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
+	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
@@ -1102,7 +1139,7 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
 	}
 
-	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt)) {
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
@@ -1273,8 +1310,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Create auth strategy - this validates JWT format, audience, and expiration.
 		// JWT-shape validation runs even under lazy_validation: it's local and
 		// catches obviously-malformed tokens up front (cheap; no network).
-		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(connection_info->access_token,
-																		 connection_info->database);
+		// app_name (spec 047 FR-014) threaded through so the validation-time and
+		// pool-time strategies agree on program_name (this strategy is throw-away
+		// for the validator's token-encode, but the pool factory in catalog
+		// Initialize builds its own with the same resolved name).
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(
+			connection_info->access_token, connection_info->database, ResolveAppName(*connection_info));
 
 		// Get the pre-encoded UTF-16LE token for pool creation
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy

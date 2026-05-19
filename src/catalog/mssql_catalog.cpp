@@ -108,6 +108,11 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	// Replaces the MssqlPoolManager singleton lookup that lived here before.
 	// The pool is owned by this catalog and torn down via unique_ptr in the
 	// catalog destructor — no singleton, no cross-instance sharing.
+	// Spec 047 FR-014: resolve the LOGIN7 program_name once at factory build
+	// time; the same value is captured by each closure variant below so every
+	// connection refilled into the pool advertises the same APP_NAME().
+	const std::string app_name = ResolveAppName(*connection_info_);
+
 	tds::ConnectionFactory factory;
 	switch (connection_info_->auth_method) {
 	case AuthMethod::AZURE_AD:
@@ -120,12 +125,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
 		auto token = fedauth_token_utf16le_;
-		factory = [host, port, database, encrypt, token]() -> std::shared_ptr<tds::TdsConnection> {
+		factory = [host, port, database, encrypt, token, app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
-			if (!conn->AuthenticateWithFedAuth(database, token, encrypt)) {
+			if (!conn->AuthenticateWithFedAuth(database, token, encrypt, app_name)) {
 				return nullptr;
 			}
 			return conn;
@@ -138,7 +143,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		// gss_init_sec_context state is independent across pool refills and a
 		// kinit-refreshed ticket is picked up on the next fill. (Spec 042.)
 		MSSQLConnectionInfo info_copy = *connection_info_;
-		factory = [info_copy]() -> std::shared_ptr<tds::TdsConnection> {
+		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			if (!conn->Connect(info_copy.host, info_copy.port)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
@@ -161,7 +166,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
 				return nullptr;
 			}
-			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt)) {
+			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt, app_name)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
 				return nullptr;
 			}
@@ -178,12 +183,13 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto password = connection_info_->password;
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
-		factory = [host, port, username, password, database, encrypt]() -> std::shared_ptr<tds::TdsConnection> {
+		factory = [host, port, username, password, database, encrypt,
+				   app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
-			if (!conn->Authenticate(username, password, database, encrypt)) {
+			if (!conn->Authenticate(username, password, database, encrypt, app_name)) {
 				return nullptr;
 			}
 			return conn;

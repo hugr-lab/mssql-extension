@@ -18,8 +18,14 @@ namespace duckdb {
 namespace tds {
 
 FedAuthStrategy::FedAuthStrategy(DatabaseInstance &db, const std::string &secret_name, const std::string &database,
-								 const std::string &host, const std::string &tenant_override)
-	: db_(db), secret_name_(secret_name), database_(database), host_(host), tenant_override_(tenant_override) {}
+								 const std::string &host, const std::string &tenant_override,
+								 const std::string &app_name)
+	: db_(db),
+	  secret_name_(secret_name),
+	  database_(database),
+	  host_(host),
+	  tenant_override_(tenant_override),
+	  app_name_(app_name) {}
 
 PreloginOptions FedAuthStrategy::GetPreloginOptions() const {
 	PreloginOptions options;
@@ -34,7 +40,8 @@ Login7Options FedAuthStrategy::GetLogin7Options() const {
 	options.database = database_;
 	options.username.clear();  // No username for FEDAUTH
 	options.password.clear();  // No password for FEDAUTH
-	options.app_name = "DuckDB";
+	// Spec 047 FR-014 — caller-supplied program_name (clamped at factory).
+	options.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;
 	options.include_fedauth_ext = true;	 // Include FEDAUTH extension
 	return options;
 }

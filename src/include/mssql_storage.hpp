@@ -49,6 +49,16 @@ struct MSSQLConnectionInfo {
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
+	// Spec 047 US-AN (FR-014, closes issue #82): custom LOGIN7 program_name.
+	// Empty = use the extension's default ("DuckDB MSSQL Extension"). Parsed
+	// from `Application Name` / `ApplicationName` / `App Name` in ADO.NET
+	// connection strings, from `applicationname` query parameter in URI
+	// strings, and from `application_name` / `applicationname` in secrets.
+	// SQL Server clamps program_name to 128 chars — `ResolveAppName()`
+	// clamps client-side so the value the user sees in `APP_NAME()` matches
+	// exactly what we sent.
+	string application_name;
+
 	//===----------------------------------------------------------------------===//
 	// Authentication method (Spec 042)
 	//
@@ -133,6 +143,29 @@ struct MSSQLConnectionInfo {
 	// Check if string is a connection string (contains key=value pairs)
 	static bool IsConnectionString(const string &str);
 };
+
+//===----------------------------------------------------------------------===//
+// ResolveAppName (Spec 047 US-AN / FR-014 / T065)
+//
+// Single resolution point for the LOGIN7 program_name. Returns the
+// caller-supplied `application_name` clamped to 128 characters (SQL
+// Server's own program_name limit — clamp client-side so the value
+// shown by `APP_NAME()` matches exactly what we sent on the wire),
+// or the extension default when the user did not configure one.
+//
+// Called from the AuthStrategyFactory fan-out so every auth path
+// (SQL / Azure FEDAUTH / manual token / integrated) goes through the
+// same logic. A future change to the default string only touches here.
+//===----------------------------------------------------------------------===//
+inline string ResolveAppName(const MSSQLConnectionInfo &info) {
+	if (info.application_name.empty()) {
+		return "DuckDB MSSQL Extension";
+	}
+	if (info.application_name.size() > 128) {
+		return info.application_name.substr(0, 128);
+	}
+	return info.application_name;
+}
 
 //===----------------------------------------------------------------------===//
 // MSSQLStorageExtensionInfo - Shared state for storage extension

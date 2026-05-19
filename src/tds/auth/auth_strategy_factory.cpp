@@ -71,6 +71,12 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 }  // namespace
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {
+	// Spec 047 FR-014 / T065: single resolution point for LOGIN7 program_name.
+	// 128-char clamp + default fallback inside ResolveAppName; the resolved
+	// value is forwarded to every concrete strategy below so the wire format
+	// is consistent across SQL / FEDAUTH / manual-token / integrated auth.
+	std::string app_name = ResolveAppName(conn_info);
+
 	// Spec 042: Integrated Authentication (Kerberos / SSPI) takes precedence
 	// over the other paths only when explicitly requested.
 	if (conn_info.auth_method == AuthMethod::KRB5) {
@@ -92,7 +98,7 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 		kc.raw_password = conn_info.password;
 		auto authn = std::make_shared<Krb5Authenticator>(std::move(kc));
 		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database, "IntegratedAuth(krb5)",
-														conn_info.use_encrypt);
+														conn_info.use_encrypt, app_name);
 #else
 		throw std::runtime_error(
 			"MSSQL Error: This build of the mssql extension was compiled without Kerberos support. "
@@ -105,7 +111,7 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 		wc.spn = DeriveSpn(conn_info);
 		auto authn = std::make_shared<WinSspiAuthenticator>(std::move(wc));
 		return std::make_shared<IntegratedAuthStrategy>(std::move(authn), conn_info.database, "IntegratedAuth(winsspi)",
-														conn_info.use_encrypt);
+														conn_info.use_encrypt, app_name);
 #else
 		throw std::runtime_error(
 			"MSSQL Error: Windows SSPI authentication requires a Windows build of the extension. "
@@ -117,30 +123,33 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 	// Priority for non-integrated paths: access_token > azure_secret > SQL auth (Spec 032)
 	if (!conn_info.access_token.empty()) {
 		// Manual token authentication (Spec 032)
-		return CreateManualToken(conn_info.access_token, conn_info.database);
+		return CreateManualToken(conn_info.access_token, conn_info.database, app_name);
 	} else if (conn_info.use_azure_auth) {
 		// Azure secret-based authentication
 		if (!context) {
 			throw std::runtime_error("AuthStrategyFactory: ClientContext required for Azure authentication");
 		}
-		return CreateFedAuth(*context, conn_info.azure_secret_name, conn_info.database, conn_info.host);
+		return CreateFedAuth(*context, conn_info.azure_secret_name, conn_info.database, conn_info.host,
+							 /*tenant_override=*/"", app_name);
 	} else {
 		// SQL Server authentication
-		return CreateSqlAuth(conn_info.user, conn_info.password, conn_info.database, conn_info.use_encrypt);
+		return CreateSqlAuth(conn_info.user, conn_info.password, conn_info.database, conn_info.use_encrypt, app_name);
 	}
 }
 
 AuthStrategyPtr AuthStrategyFactory::CreateSqlAuth(const std::string &username, const std::string &password,
-												   const std::string &database, bool use_encrypt) {
-	return std::make_shared<SqlServerAuthStrategy>(username, password, database, use_encrypt);
+												   const std::string &database, bool use_encrypt,
+												   const std::string &app_name) {
+	return std::make_shared<SqlServerAuthStrategy>(username, password, database, use_encrypt, app_name);
 }
 
 AuthStrategyPtr AuthStrategyFactory::CreateFedAuth(ClientContext &context, const std::string &secret_name,
 												   const std::string &database, const std::string &host,
-												   const std::string &tenant_override) {
+												   const std::string &tenant_override, const std::string &app_name) {
 	// Spec 047 FR-012: strategy holds the DatabaseInstance reference so its
 	// InvalidateToken/IsTokenExpired calls hit the correct TokenCache namespace.
-	auto strategy = std::make_shared<FedAuthStrategy>(*context.db, secret_name, database, host, tenant_override);
+	auto strategy =
+		std::make_shared<FedAuthStrategy>(*context.db, secret_name, database, host, tenant_override, app_name);
 
 	// Set up token acquirer that uses the DuckDB context
 	strategy->SetTokenAcquirer(BuildTokenAcquirer(context));
@@ -148,10 +157,11 @@ AuthStrategyPtr AuthStrategyFactory::CreateFedAuth(ClientContext &context, const
 	return strategy;
 }
 
-AuthStrategyPtr AuthStrategyFactory::CreateManualToken(const std::string &access_token, const std::string &database) {
+AuthStrategyPtr AuthStrategyFactory::CreateManualToken(const std::string &access_token, const std::string &database,
+													   const std::string &app_name) {
 	// Spec 032: Create ManualTokenAuthStrategy with pre-provided token
 	// Token validation (JWT format, audience, expiration) is done in the constructor
-	return std::make_shared<ManualTokenAuthStrategy>(access_token, database);
+	return std::make_shared<ManualTokenAuthStrategy>(access_token, database, app_name);
 }
 
 TokenAcquirer AuthStrategyFactory::BuildTokenAcquirer(ClientContext &context) {

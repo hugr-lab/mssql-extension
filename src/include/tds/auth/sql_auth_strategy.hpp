@@ -20,8 +20,11 @@ namespace tds {
 
 class SqlServerAuthStrategy : public AuthenticationStrategy {
 public:
+	// `app_name` is the LOGIN7 program_name (spec 047 FR-014). Empty = use
+	// the extension default. Pre-resolved via `ResolveAppName()` at the
+	// factory layer so each strategy stores the literal string to send.
 	SqlServerAuthStrategy(const std::string &username, const std::string &password, const std::string &database,
-						  bool use_encrypt = true);
+						  bool use_encrypt = true, const std::string &app_name = "");
 
 	~SqlServerAuthStrategy() override = default;
 
@@ -49,6 +52,7 @@ private:
 	std::string password_;
 	std::string database_;
 	bool use_encrypt_;
+	std::string app_name_;
 };
 
 }  // namespace tds

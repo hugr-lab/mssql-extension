@@ -40,7 +40,8 @@ public:
 	// outlive the strategy — the strategy is owned by the connection pool,
 	// which is owned by the catalog, which is owned by the DatabaseInstance.
 	FedAuthStrategy(DatabaseInstance &db, const std::string &secret_name, const std::string &database,
-					const std::string &host, const std::string &tenant_override = "");
+					const std::string &host, const std::string &tenant_override = "",
+					const std::string &app_name = "");
 
 	~FedAuthStrategy() override = default;
 
@@ -84,6 +85,7 @@ private:
 	std::string database_;
 	std::string host_;
 	std::string tenant_override_;
+	std::string app_name_;	// Spec 047 FR-014 — see SqlServerAuthStrategy for the contract.
 	TokenAcquirer token_acquirer_;
 };
 

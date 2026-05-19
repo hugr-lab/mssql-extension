@@ -145,7 +145,7 @@ bool TdsConnection::Connect(const std::string &host, uint16_t port, int timeout_
 }
 
 bool TdsConnection::Authenticate(const std::string &username, const std::string &password, const std::string &database,
-								 bool use_encrypt) {
+								 bool use_encrypt, const std::string &app_name) {
 	// Must be in Authenticating state
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
@@ -161,7 +161,7 @@ bool TdsConnection::Authenticate(const std::string &username, const std::string 
 
 	// Step 2: LOGIN7 authentication
 	// Note: If TLS was enabled during PRELOGIN, all subsequent traffic is encrypted
-	if (!DoLogin7(username, password, database)) {
+	if (!DoLogin7(username, password, database, app_name)) {
 		state_.store(ConnectionState::Disconnected);
 		socket_->Close();
 		return false;
@@ -239,7 +239,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 //===----------------------------------------------------------------------===//
 
 bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
-											bool use_encrypt) {
+											bool use_encrypt, const std::string &app_name) {
 	// Must be in Authenticating state
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
@@ -271,7 +271,7 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 		}
 
 		// Step 2: LOGIN7 with FEDAUTH feature extension
-		if (!DoLogin7WithFedAuth(database, fedauth_token)) {
+		if (!DoLogin7WithFedAuth(database, fedauth_token, app_name)) {
 			state_.store(ConnectionState::Disconnected);
 			socket_->Close();
 			return false;
@@ -463,9 +463,13 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 	return true;
 }
 
-bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token) {
+bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
+										const std::string &app_name) {
 	// Get local hostname for LOGIN7 HostName field (per go-mssqldb: HostName = client workstation)
 	std::string client_hostname = GetClientHostname();
+	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
+	// preserves the prior extension default.
+	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 
 	// ADAL workflow (per go-mssqldb):
 	// 1. Send LOGIN7 with small ADAL FEDAUTH extension (no token)
@@ -479,7 +483,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 	// Step 1: Send LOGIN7 with ADAL FEDAUTH extension (no token embedded)
 	TdsPacket login = TdsProtocol::BuildLogin7WithADAL(client_hostname, tds_server_name_, database, fedauth_echo_,
-													   "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
+													   login7_app_name, TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
 	// Debug: dump LOGIN7 payload (last 20 bytes should contain FEDAUTH extension)
@@ -651,7 +655,8 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 // implementations. Without one, this returns a clear error per FR-012.
 //===----------------------------------------------------------------------===//
 bool TdsConnection::AuthenticateIntegrated(const std::string &database,
-										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt) {
+										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt,
+										   const std::string &app_name) {
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
 		return false;
@@ -701,9 +706,12 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	MSSQL_CONN_DEBUG_LOG(1,
 						 "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
 						 initial_blob.size(), client_hostname.c_str(), database.c_str());
+	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
+	// preserves the prior extension default.
+	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 	TdsPacket login =
 		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
-										 initial_blob, "DuckDB MSSQL Extension", TDS_DEFAULT_PACKET_SIZE);
+										 initial_blob, login7_app_name, TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 	if (!socket_->SendPacket(login)) {
 		last_error_ = "Failed to send LOGIN7 (integrated): " + socket_->GetLastError();
@@ -790,12 +798,16 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	return false;
 }
 
-bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database) {
+bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database,
+							 const std::string &app_name) {
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
 						 database.c_str());
+	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
+	// preserves the prior extension default.
+	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 	// Request default packet size - server will negotiate up if it supports larger
 	// This allows the server to tell us its optimal packet size via ENVCHANGE
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, "DuckDB MSSQL Extension",
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
 											   TDS_DEFAULT_PACKET_SIZE);
 	login.SetPacketId(next_packet_id_++);
 
