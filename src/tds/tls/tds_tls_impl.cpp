@@ -275,10 +275,11 @@ TlsImpl::TlsImpl() : ctx_(new TlsImplContext()) {}
 TlsImpl::~TlsImpl() noexcept {
 	try {
 		Close();
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr surfaces the swallow.
+		MSSQL_TLS_DEBUG_LOG(1, "~TlsImpl: swallowed exception during Close: %s", e.what());
 	} catch (...) {
-		// Swallowed (spec 047 T046k) — Close() walks the OpenSSL teardown
-		// path; SSL_free / SSL_CTX_free are documented as not-throwing in
-		// practice, but the catch ensures std::terminate isn't risked.
+		MSSQL_TLS_DEBUG_LOG(1, "~TlsImpl: swallowed unknown exception during Close");
 	}
 }
 

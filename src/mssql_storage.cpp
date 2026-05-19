@@ -39,20 +39,40 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // ResolveAppName (Spec 047 US-AN / FR-014 / T065) — see header doc-comment
 //
-// UTF-16 code unit clamp at 128, mirroring SQL Server's program_name limit
-// and the wire encoding in `tds_protocol.cpp::BuildLogin7`. Walks the
-// UTF-8 input forward by codepoint; counts UTF-16 code units (1 for BMP
-// codepoints in 1/2/3-byte UTF-8 sequences, 2 for supplementary plane
-// codepoints in 4-byte UTF-8 sequences = surrogate pair). Invalid UTF-8
-// bytes advance defensively by 1 byte / 1 code unit so a malformed input
-// still terminates rather than looping.
+// Two-step normalization:
+//   1. Strip C0 controls (bytes 0x00–0x1F) and DEL (0x7F). LOGIN7
+//      program_name lands in `sys.dm_exec_sessions.program_name`,
+//      `sys.dm_exec_requests`, and the SQL Server error log; un-stripped
+//      `\r\n` would let an attacker who controls any ATTACH path inject
+//      fake log lines (CR/LF injection — flagged by PR #118 review H2).
+//   2. UTF-16 code unit clamp at 128, mirroring SQL Server's program_name
+//      limit and the wire encoding in `tds_protocol.cpp::BuildLogin7`.
+//      Walks the UTF-8 input forward by codepoint; counts UTF-16 code
+//      units (1 for BMP codepoints in 1/2/3-byte UTF-8 sequences, 2 for
+//      supplementary plane codepoints in 4-byte UTF-8 sequences =
+//      surrogate pair). Invalid UTF-8 bytes advance defensively by 1
+//      byte / 1 code unit so a malformed input still terminates rather
+//      than looping.
 //===----------------------------------------------------------------------===//
 string ResolveAppName(const MSSQLConnectionInfo &info) {
 	static constexpr size_t MAX_UTF16_CODE_UNITS = 128;
 	if (info.application_name.empty()) {
 		return "DuckDB MSSQL Extension";
 	}
-	const string &s = info.application_name;
+	// Step 1: strip C0 controls + DEL (log-injection defense).
+	string sanitized;
+	sanitized.reserve(info.application_name.size());
+	for (char ch : info.application_name) {
+		auto c = static_cast<unsigned char>(ch);
+		if (c >= 0x20 && c != 0x7F) {
+			sanitized.push_back(ch);
+		}
+	}
+	if (sanitized.empty()) {
+		return "DuckDB MSSQL Extension";
+	}
+	// Step 2: 128 UTF-16 code unit clamp.
+	const string &s = sanitized;
 	size_t byte_pos = 0;
 	size_t utf16_units = 0;
 	while (byte_pos < s.size() && utf16_units < MAX_UTF16_CODE_UNITS) {
@@ -1222,6 +1242,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
 	bool lazy_validation = false;		// Spec 047 (US2): opt out of eager creds check
+	string application_name_option;		// Spec 047 (US-AN): ATTACH-level program_name override
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1254,6 +1275,15 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// Match the ADO.NET-style alias `LazyValidation` (lowercase via
 			// StringUtil::Lower) alongside the canonical `lazy_validation`.
 			lazy_validation = it->second.GetValue<bool>();
+			it = options.options.erase(it);
+		} else if (lower_name == "application_name" || lower_name == "applicationname" ||
+				   lower_name == "application name" || lower_name == "app name") {
+			// Spec 047 (US-AN / FR-014): ATTACH-level override for LOGIN7
+			// program_name. Accept the canonical underscore form, the spaceless
+			// ADO.NET-style alias, and the two ADO.NET spaced variants. Wins
+			// over connection-string / secret value via the precedence pattern
+			// established by schema_filter / table_filter (ATTACH > secret).
+			application_name_option = it->second.ToString();
 			it = options.options.erase(it);
 		} else {
 			++it;
@@ -1324,6 +1354,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
 		connection_info->table_filter = table_filter_option;
+	}
+	if (!application_name_option.empty()) {
+		// Spec 047 FR-014: ATTACH-level value wins over connection-string /
+		// secret embedded value. ResolveAppName at the auth fan-out applies
+		// the 128-UTF-16-code-unit clamp + control-char strip.
+		connection_info->application_name = application_name_option;
 	}
 
 	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance

@@ -212,9 +212,6 @@ private:
 	// Query database default collation
 	void QueryDatabaseCollation();
 
-	// Create connection factory for the pool
-	tds::ConnectionFactory CreateConnectionFactory();
-
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//

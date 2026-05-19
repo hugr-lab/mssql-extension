@@ -40,18 +40,29 @@ ConnectionPool::~ConnectionPool() noexcept {
 	// we have no caller to report them to anyway.
 	try {
 		Shutdown();
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr so silent destructor swallow
+		// doesn't hide pool-teardown errors in production diagnosis paths.
+		MSSQL_POOL_DEBUG_LOG(1, "~ConnectionPool: swallowed exception during Shutdown: %s", e.what());
 	} catch (...) {
-		// Swallowed — see header `class ConnectionPool` destruction contract.
+		MSSQL_POOL_DEBUG_LOG(1, "~ConnectionPool: swallowed unknown exception during Shutdown");
 	}
 }
 
 void ConnectionPool::Shutdown() {
 	// Spec 047 T046l: surface DuckDB quiescence-contract violations in debug
-	// builds. Production paths should never reach destruction with active
-	// connections still checked out (the DuckDB harness drives `~AttachedDatabase`
-	// only after query quiescence). If this assert fires, a host is destroying
-	// the catalog while a worker thread still holds a connection — sockets are
-	// about to close under that thread's feet (EBADF on next read).
+	// builds via D_ASSERT. PR #118 review M2: also emit a release-mode warning
+	// — silent UB on a real quiescence violation is worse for operators than
+	// one stderr line. The warning runs BEFORE the assert so debug builds
+	// emit both the warning and the assert hit before std::terminate.
+	if (!active_connections_.empty()) {
+		fprintf(stderr,
+				"[MSSQL POOL] WARNING: ~ConnectionPool '%s' called with %zu connection(s) still "
+				"checked out — DuckDB quiescence contract violated. Sockets are about to close under "
+				"the calling thread(s); next read on the held connection will see EBADF / connection "
+				"reset. On Windows the closesocket-vs-recv race is undefined.\n",
+				context_name_.c_str(), active_connections_.size());
+	}
 	D_ASSERT(active_connections_.empty());
 
 	// Signal shutdown

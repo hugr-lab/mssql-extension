@@ -101,9 +101,19 @@ struct CachedToken {
 //
 // Lifetime note: entries are NOT proactively swept when a DatabaseInstance
 // is destroyed. The namespace is the raw `uintptr_t` address of the
-// instance, so entries belonging to a dead instance become unreachable and
-// are evicted naturally by TTL (~1 h max). Reaping would require a
+// instance, so entries belonging to a dead instance become unreachable
+// from new instances UNLESS the allocator reuses the same address — at
+// which point a stale row will be returned to the new instance for the
+// remainder of the row's TTL window (~1 h). Reaping would require a
 // `~DatabaseInstance` hook which DuckDB does not expose to extensions.
+//
+// **Eviction model**: the underlying map only shrinks via `Invalidate`,
+// `InvalidateByPrefix`, `Clear`, or overwrite in `SetToken`. TTL only
+// suppresses READS (`GetToken` returns empty when `CachedToken::IsValid()`
+// is false) — it does NOT erase the entry. The OnDetach path in
+// `MSSQLCatalog` calls `InvalidateByPrefix` to clear bare + tenant-suffixed
+// rows for the detached catalog, so the long-running-process accumulation
+// risk is bounded by the catalog churn rather than by TTL.
 //===----------------------------------------------------------------------===//
 
 // Hash for the (DatabaseInstance*-as-uintptr, cache_key) pair used as the
@@ -131,6 +141,13 @@ public:
 
 	// Invalidate a specific token within a DatabaseInstance's namespace
 	void Invalidate(DatabaseInstance &db, const std::string &cache_key);
+
+	// Invalidate every key in a DatabaseInstance's namespace whose cache_key
+	// starts with `prefix`. Use case: OnDetach must evict both the bare secret
+	// name AND its tenant-suffixed variants (`secret:tenant1`,
+	// `secret:tenant2`, ...) that interactive-auth paths build via
+	// `secret_name + ":" + tenant_id_override` in `AcquireToken`.
+	void InvalidateByPrefix(DatabaseInstance &db, const std::string &prefix);
 
 	// Clear all cached tokens (test/diagnostic only — does not respect namespacing)
 	void Clear();

@@ -82,6 +82,12 @@ MSSQLCatalog::~MSSQLCatalog() noexcept = default;
 //===----------------------------------------------------------------------===//
 
 std::string MSSQLCatalog::RegisterStream(std::unique_ptr<MSSQLResultStream> stream) {
+	// PR #118 review L3: UUID::GenerateRandomUUID is backed by std::mt19937
+	// in DuckDB (NOT a CSPRNG). Acceptable here because the registry is
+	// per-catalog and in-process; an attacker who could brute-force a stream
+	// ID is already executing in the same process and has access to the
+	// catalog directly. Replace with a CSPRNG only if the registry ever
+	// becomes externally addressable.
 	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	std::lock_guard<std::mutex> lock(streams_mutex_);
 	active_streams_.emplace(uuid, std::move(stream));
@@ -208,23 +214,6 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 
 	// Query database collation (needed for column metadata)
 	QueryDatabaseCollation();
-}
-
-tds::ConnectionFactory MSSQLCatalog::CreateConnectionFactory() {
-	auto conn_info = connection_info_;	// Capture shared_ptr
-	return [conn_info]() -> std::shared_ptr<tds::TdsConnection> {
-		auto connection = std::make_shared<tds::TdsConnection>();
-		// First establish TCP connection
-		if (!connection->Connect(conn_info->host, conn_info->port)) {
-			throw IOException("Failed to connect to MSSQL server %s:%d", conn_info->host, conn_info->port);
-		}
-		// Then authenticate (optionally with TLS)
-		if (!connection->Authenticate(conn_info->user, conn_info->password, conn_info->database,
-									  conn_info->use_encrypt)) {
-			throw IOException("Failed to authenticate to MSSQL server");
-		}
-		return connection;
-	};
 }
 
 void MSSQLCatalog::QueryDatabaseCollation() {
@@ -733,8 +722,12 @@ void MSSQLCatalog::OnDetach(ClientContext &context) {
 	// This ensures re-attach will acquire a fresh token, not use a stale cached one.
 	// Spec 047 T046b (FR-012): invalidate only this DatabaseInstance's namespace
 	// so a sibling instance sharing the same secret name keeps its token.
+	// PR #118 review M3: also evict tenant-suffixed variants
+	// (`secret_name:tenant_a`, `secret_name:tenant_b`, ...) that the
+	// interactive-auth path in AcquireToken builds — bare-name Invalidate
+	// would otherwise leave those rows behind.
 	if (connection_info_ && connection_info_->use_azure_auth && !connection_info_->azure_secret_name.empty()) {
-		mssql::azure::TokenCache::Instance().Invalidate(*context.db, connection_info_->azure_secret_name);
+		mssql::azure::TokenCache::Instance().InvalidateByPrefix(*context.db, connection_info_->azure_secret_name);
 	}
 
 	// Spec 047 T012+T020: pool teardown is implicit via ~MSSQLCatalog → unique_ptr

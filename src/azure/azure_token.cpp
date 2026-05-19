@@ -48,9 +48,16 @@ static std::pair<std::uintptr_t, std::string> MakeKey(DatabaseInstance &db, cons
 std::string TokenCache::GetToken(DatabaseInstance &db, const std::string &cache_key) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = cache_.find(MakeKey(db, cache_key));
-	if (it != cache_.end() && it->second.IsValid()) {
+	if (it == cache_.end()) {
+		return "";
+	}
+	if (it->second.IsValid()) {
 		return it->second.access_token;
 	}
+	// PR #118 review M4: opportunistic shrink on stale read. The map would
+	// otherwise accumulate dead rows for the process lifetime in long-running
+	// hosts that ATTACH/DETACH against many distinct `(db, secret)` tuples.
+	cache_.erase(it);
 	return "";
 }
 
@@ -69,6 +76,23 @@ void TokenCache::SetToken(DatabaseInstance &db, const std::string &cache_key, co
 void TokenCache::Invalidate(DatabaseInstance &db, const std::string &cache_key) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	cache_.erase(MakeKey(db, cache_key));
+}
+
+void TokenCache::InvalidateByPrefix(DatabaseInstance &db, const std::string &prefix) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto db_id = reinterpret_cast<std::uintptr_t>(&db);
+	for (auto it = cache_.begin(); it != cache_.end();) {
+		const auto &key_db = it->first.first;
+		const auto &key_str = it->first.second;
+		bool matches =
+			key_db == db_id && (key_str == prefix || (key_str.size() > prefix.size() && key_str[prefix.size()] == ':' &&
+													  key_str.compare(0, prefix.size(), prefix) == 0));
+		if (matches) {
+			it = cache_.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void TokenCache::Clear() {

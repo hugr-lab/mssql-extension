@@ -73,9 +73,12 @@ TdsConnection::TdsConnection()
 TdsConnection::~TdsConnection() noexcept {
 	try {
 		Close();
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr so silent destructor swallow
+		// doesn't hide TLS/socket teardown errors in production diagnosis paths.
+		MSSQL_CONN_DEBUG_LOG(1, "~TdsConnection: swallowed exception during Close: %s", e.what());
 	} catch (...) {
-		// Swallowed — see header note. Socket close failures are observable to
-		// the server via TCP FIN; no caller exists to surface them anyway.
+		MSSQL_CONN_DEBUG_LOG(1, "~TdsConnection: swallowed unknown exception during Close");
 	}
 }
 
