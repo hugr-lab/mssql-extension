@@ -343,7 +343,12 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
-	// mssql_open(connection_string VARCHAR) -> BIGINT
+	// [DEPRECATED] mssql_open(connection_string VARCHAR) -> BIGINT  (spec 047 FR-010)
+	// Prefer ATTACH + the catalog-bound functions (mssql_scan / mssql_exec /
+	// mssql_pool_stats); see CLAUDE.md Extension Functions table. The
+	// singleton MSSQLConnectionHandleManager that backs mssql_open / close /
+	// ping is the last extension-internal process-wide state and will be
+	// removed together with these functions in a future major release.
 	// Accepts:
 	//   - Connection string: "Server=host,port;Database=db;User Id=user;Password=pass"
 	//   - URI format: "mssql://user:password@host:port/database"
@@ -352,12 +357,12 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction));
 	loader.RegisterFunction(open_func);
 
-	// mssql_close(handle BIGINT) -> BOOLEAN
+	// [DEPRECATED] mssql_close(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet close_func("mssql_close");
 	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction));
 	loader.RegisterFunction(close_func);
 
-	// mssql_ping(handle BIGINT) -> BOOLEAN
+	// [DEPRECATED] mssql_ping(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet ping_func("mssql_ping");
 	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);

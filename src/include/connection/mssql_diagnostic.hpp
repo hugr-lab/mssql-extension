@@ -10,8 +10,31 @@
 
 namespace duckdb {
 
-// Global connection handle manager
-// Manages connections opened via mssql_open for diagnostic purposes
+// Global connection handle manager.
+//
+// Spec 047 design note (FR-010, T045):
+//   This singleton is RETAINED on purpose. The diagnostic API trio —
+//   mssql_open / mssql_close / mssql_ping — plus the mssql_close_all
+//   shutdown helper (FR-013) take a connection string (not a catalog
+//   name) by design, so there is no natural per-catalog owner to hold
+//   the handle map. Unlike the three removed singletons (MssqlPoolManager,
+//   MSSQLContextManager, MSSQLResultStreamRegistry) which had a clear
+//   catalog discriminator and were folded into MSSQLCatalog, the
+//   diagnostic handles are inherently process-scoped.
+//
+//   The four functions above are all marked [DEPRECATED] (FR-010 group);
+//   when they are removed in a future major release, this singleton goes
+//   with them — that is the planned cleanup for the last extension-
+//   internal process-wide state. The mssql_close_all() function (FR-013,
+//   added in spec 047) gives hosts a shutdown path so they can release
+//   sockets cleanly before that removal.
+//
+//   See `state_inventory.md` in specs/047-process-state-cleanup/ for the
+//   final classification of every process-wide static after spec 047:
+//   zero "migrate" entries, this manager + OS/library scratch are the
+//   legitimate remainder.
+//
+// Manages connections opened via mssql_open for diagnostic purposes.
 class MSSQLConnectionHandleManager {
 public:
 	static MSSQLConnectionHandleManager &Instance();
