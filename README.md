@@ -1568,11 +1568,24 @@ The following features are planned for future releases:
 | **Transactions** | BEGIN/COMMIT/ROLLBACK with connection pinning | ✅ Implemented |
 | **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | ✅ Implemented |
-| **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
 | **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | ✅ Implemented |
 | **Integrated Auth** | Kerberos on POSIX (kinit / keytab / raw); SSPI on Windows | ✅ Implemented |
 | **Custom Application Name** | LOGIN7 `program_name` from connection string / URI / secret / ATTACH option | ✅ Implemented |
 | **ATTACH credential validation** | Fail-fast on wrong password / unreachable host (`lazy_validation true` to opt out) | ✅ Implemented |
+| **BCP throughput** | LOGIN7 32 KB packet size, single-connection encoder/sender pipelining, column-batch encoding, parallel multi-connection BCP for heap targets | Planned |
+| **CTAS quality** | Bounded `NVARCHAR(N)` text defaults, `PAGE` compression, primary-key propagation, per-query overrides via COPY options | Planned |
+| **TRUNCATE optimization** | Auto-detect `DELETE FROM t` without `WHERE` and emit `TRUNCATE TABLE` when safe (no triggers/FK/CCI) | Planned |
+| **COPY TO TRUNCATE mode** | Atomic replace via TRUNCATE + BCP (distinct from current `OVERWRITE` = DROP+CREATE) | Planned |
+
+### Under consideration
+
+Items being designed; surface and implementation strategy not committed yet.
+
+| Topic | What we're thinking about |
+|-------|----------------------------|
+| **Direct DML pushdown** | Skip the `rowid` round trip on UPDATE/DELETE when the entire `WHERE` filter is pushable — emit a single `UPDATE target SET ... WHERE <pushdown>` / `DELETE FROM target WHERE <pushdown>` statement instead. |
+| **MERGE INTO** | Native SQL Server `MERGE` push-down. Pipelined BCP upload of the USING source to a session `#tmp`, then emit `MERGE INTO target USING #tmp WITH (HOLDLOCK)`. RETURNING via `OUTPUT $action`. |
+| **VARIANT fallback for unsupported types** | UDT / `SQL_VARIANT` / legacy `IMAGE` / `TEXT` / `NTEXT` columns mapped to DuckDB `VARIANT` instead of raising. Opt-in via a setting. |
 
 ### Feature Details
 
@@ -1585,8 +1598,6 @@ The following features are planned for future releases:
 **Multi-Statement Batches**: `mssql_scan()` supports batches where intermediate statements (DML/DDL) don't return result sets. Only one result-producing statement per batch is allowed. Session state (temp tables, variables) is reset via TDS RESET_CONNECTION flag when connections return to the pool.
 
 **CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` with two-phase execution: CREATE TABLE DDL followed by batched INSERT. Supports CREATE OR REPLACE, configurable text type (NVARCHAR/VARCHAR), and streaming for large result sets. Type mapping from DuckDB to SQL Server with clear errors for unsupported types.
-
-**MERGE/UPSERT**: Batched upsert using SQL Server `MERGE` statement. Supports primary key or user-specified key columns.
 
 **BCP/COPY**: Binary bulk copy protocol for maximum throughput. Streaming execution with bounded memory. No RETURNING support (use regular INSERT for that).
 
