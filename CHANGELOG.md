@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-20
+
+Major release: integrated authentication (Kerberos + Windows SSPI),
+process-wide singleton cleanup, security hardening, and a deep codec
+refactor. Closes [#82](https://github.com/hugr-lab/mssql-extension/issues/82)
+(custom Application Name) and [#96](https://github.com/hugr-lab/mssql-extension/issues/96)
+(ATTACH/DETACH-in-Python-loop crash class).
+
 ### Added
 
 - **Custom Application Name in connection string** (spec 047 FR-014,
@@ -184,6 +192,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CMakeLists.txt` adds `ENABLE_KRB5` option (default ON on POSIX),
   pkg-config GSSAPI discovery on Linux, `find_library(GSS_FRAMEWORK GSS)` on
   macOS, `secur32` linkage hook for Windows (Phase 4).
+
+- **Type codec consolidation** (spec 045). Per-type encoding/decoding/literal/DDL
+  logic consolidated into 9 family modules under `src/codec/`:
+  boolean/integer/float/decimal/money/string/binary/datetime/uuid. Each
+  `<family>_codec.cpp` owns `EncodeToBcp` / `DecodeFromTds` /
+  `FormatSqlLiteral` / `FormatDdlTypeName` for its types. Dispatch via
+  `FamilyFromLogicalType` switch in `literal_format.cpp` + `type_family.cpp`.
+  5 LogicalType-side dispatch sites collapsed; net −762 LOC across dispatch
+  sites (3243→2481, −23.5%). Bonus: TIMESTAMP_MS/NS/S/TZ now round-trip
+  losslessly through SQL Server DATETIME2(3/7/0/7) with full
+  type-transparency. Closes [issue #91](https://github.com/hugr-lab/mssql-extension/issues/91)
+  (BCP nvarchar character-vs-byte length) and [#89](https://github.com/hugr-lab/mssql-extension/issues/89)
+  (VIEW catalog-vs-runtime type divergence). No new vcpkg deps. Per-row bench
+  (1M rows): within 5% gate vs spec-044 baseline.
+
+- **Named instance resolver** (spec 045 phases 0-2). SQL Server Browser
+  (UDP 1434) discovery for named instances. Mock-browser test stack under
+  `test/named-instance/`.
+
+- **UTF-16 codec consolidation** (spec 044). Finishes the simdutf migration
+  started in spec 043 — every legacy `Utf16LE*` call site moves to the
+  simdutf-backed wrapper. simdutf becomes the production UTF-16 codec; the
+  legacy hand-rolled converter survives only as a private invalid-input
+  fallback. Includes microbenchmark (`make bench-utf16`) and an end-to-end
+  before/after benchmark (`test/bench/bench_codec_e2e.sh`).
+
+- **LOGIN7 non-ASCII fix + simdutf foundation** (spec 043). Non-ASCII bytes
+  in LOGIN7 username/password/database fields no longer get corrupted by the
+  hand-rolled UTF-16 converter. Adds simdutf as a vcpkg dependency
+  (statically linked, MIT). Foundation for spec 044's full migration.
+
+### CI / Build
+
+- **Tier-1 lint and security checks** added: CodeQL (C++), gitleaks,
+  shellcheck, hadolint, yamllint, codespell. Dependabot updates enabled.
+  PR prompt-injection scanner for review descriptions.
+- **CodeQL speedup** (3-part): target restriction + vcpkg cache + submodule
+  trim. Cuts CodeQL job runtime substantially on PR triggers.
+- **Kerberos integration job** in CI: spins up the
+  `test/kerberos/docker-compose.yml` KDC + SQL Server + test-client stack
+  for every PR touching the integrated-auth path.
+- **Drive-by fix**: 9 codec headers (spec 045) had `class ColumnMetadata` /
+  `class BCPColumnMetadata` forward declarations while the real
+  definitions are `struct`. MSVC mangles `class` and `struct`
+  differently (clang/gcc don't), producing 16 unresolved-external LNK2019
+  errors at link time. Latent regression — last successful MSVC build on
+  main was 2026-05-15, BEFORE spec 045 merged. Fixed all 9 forward
+  declarations.
 
 ## [0.1.18] - 2026-02-24
 
