@@ -30,21 +30,21 @@
 
 #ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
 
-#define MSSQL_BIND_SCALAR_SIG(name)                                                                                    \
+#define MSSQL_BIND_SCALAR_SIG(name) \
 	static duckdb::unique_ptr<duckdb::FunctionData> name(duckdb::BindScalarFunctionInput &input)
 
-#define MSSQL_BIND_SCALAR_PROLOGUE                                                                                     \
-	auto &context = input.GetClientContext();                                                                          \
-	auto &arguments = input.GetArguments();                                                                            \
-	(void)context;                                                                                                     \
+#define MSSQL_BIND_SCALAR_PROLOGUE            \
+	auto &context = input.GetClientContext(); \
+	auto &arguments = input.GetArguments();   \
+	(void)context;                            \
 	(void)arguments;
 
 #else
 
-#define MSSQL_BIND_SCALAR_SIG(name)                                                                                    \
-	static duckdb::unique_ptr<duckdb::FunctionData> name(                                                              \
-	    duckdb::ClientContext &context, duckdb::ScalarFunction & /*bound_function*/,                                   \
-	    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &arguments)
+#define MSSQL_BIND_SCALAR_SIG(name)                                                  \
+	static duckdb::unique_ptr<duckdb::FunctionData> name(                            \
+		duckdb::ClientContext &context, duckdb::ScalarFunction & /*bound_function*/, \
+		duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &arguments)
 
 #define MSSQL_BIND_SCALAR_PROLOGUE /* no-op on legacy SHA */
 
