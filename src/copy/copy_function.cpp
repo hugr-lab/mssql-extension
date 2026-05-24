@@ -459,7 +459,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	}
 
 	// Check for interrupt (Ctrl+C) - allows user to cancel long-running COPY
-	if (context.client.interrupted) {
+	if (context.client.IsInterrupted()) {
 		CopyDebugLog(1, "BCPCopySink: INTERRUPT detected at start");
 		throw InterruptException();
 	}
@@ -483,7 +483,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 					 (unsigned long long)rows_written, write_ms);
 
 		// Check for interrupt after encoding
-		if (context.client.interrupted) {
+		if (context.client.IsInterrupted()) {
 			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after encoding");
 			throw InterruptException();
 		}
@@ -505,7 +505,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		}
 
 		// Check for interrupt after flush
-		if (context.client.interrupted) {
+		if (context.client.IsInterrupted()) {
 			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after flush");
 			throw InterruptException();
 		}
@@ -614,7 +614,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	auto &gdata = gstate.Cast<MSSQLCopyGlobalState>();
 
 	// Check for interrupt before starting heavy finalize
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 
