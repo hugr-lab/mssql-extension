@@ -399,7 +399,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLExecExecute,
 						MSSQLExecBind);
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return func;
 }
 

@@ -115,7 +115,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
 						MSSQLRefreshCacheBind);
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(func);
 }
 

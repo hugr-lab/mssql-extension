@@ -159,7 +159,7 @@ void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 	ScalarFunction func("mssql_preload_catalog", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind);
 	func.varargs = LogicalType::VARCHAR;  // Optional schema_name
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(func);
 }
 
