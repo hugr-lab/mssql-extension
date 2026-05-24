@@ -58,7 +58,7 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 #include "tds/tds_column_metadata.hpp"

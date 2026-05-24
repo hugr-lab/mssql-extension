@@ -14,7 +14,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/interval.hpp"
-#include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
