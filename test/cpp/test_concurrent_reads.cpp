@@ -644,6 +644,271 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 7 (Spec 052): concurrent writes into a SHARED table.
+// N writer threads + 1 reader thread, all hitting dbo.write_race_shared.
+// Writers cycle catalog-bound INSERT → UPDATE → SELECT → DELETE on disjoint
+// PK ranges (thread t uses ids [t*1000, t*1000+999]) so SQL Server's
+// row-level locks don't deadlock between writers. Reader does
+// SELECT COUNT(*) over the full table.
+//
+// What's stressed beyond scenario 5/6: the SAME MSSQLTableEntry pointer is
+// reached concurrently from N+1 binders simultaneously, each going through
+// LookupSchema → LookupEntry → GetScanFunction (read) or DML binder path
+// (writes). Concurrent shared_from_this() on the same entry, concurrent
+// EnsurePKLoaded (pk_load_mutex_ from US2), and any race in the catalog
+// integration layer between writes and reads would surface here.
+// ---------------------------------------------------------------------------
+bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, int duration_seconds) {
+	std::cout << "\n=== Concurrent writes to ONE table: " << num_writers
+	          << " writers + 1 reader for " << duration_seconds << "s ===" << std::endl;
+
+	DuckDB db(nullptr);
+	{
+		Connection setup(db);
+		load_extension(setup);
+		std::ostringstream attach;
+		attach << "ATTACH '" << cfg.Dsn("TestDB") << "' AS mssql (TYPE mssql)";
+		auto r = setup.Query(attach.str());
+		if (r->HasError()) {
+			std::cerr << "  ATTACH failed: " << r->GetError() << std::endl;
+			return false;
+		}
+		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_race_shared')");
+		auto cr = setup.Query(
+		    "SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_race_shared (id INT PRIMARY KEY, v INT, name NVARCHAR(64))')");
+		if (cr->HasError()) {
+			std::cerr << "  CREATE shared table failed: " << cr->GetError() << std::endl;
+			return false;
+		}
+		// Pre-populate so the reader always sees rows even if writers are mid-cycle.
+		for (int i = 0; i < 100; ++i) {
+			setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.write_race_shared VALUES (" +
+			            std::to_string(i) + ", " + std::to_string(i * 3) + ", N''seed " + std::to_string(i) +
+			            "'')')");
+		}
+		setup.Query("SELECT mssql_refresh_cache('mssql')");
+	}
+
+	std::atomic<bool> stop_flag(false);
+	std::atomic<bool> abort_flag(false);
+	std::vector<std::thread> threads;
+	std::vector<WorkerResult> results(num_writers);
+	std::atomic<int> reader_iters(0);
+	std::atomic<int> total_inserts(0);
+	std::atomic<int> total_updates(0);
+	std::atomic<int> total_deletes(0);
+	std::string reader_error;
+
+	auto start = std::chrono::steady_clock::now();
+
+	for (int t = 0; t < num_writers; ++t) {
+		threads.emplace_back([&, t]() {
+			Connection conn(db);
+			results[t].thread_id = t;
+			// Each writer owns PK range [base, base + 999].
+			int base = 1000 + t * 1000;
+			int i = 0;
+			while (!stop_flag.load() && !abort_flag.load()) {
+				int row_id = base + (i % 100);  // recycle 100 IDs per writer
+				auto step = [&](const std::string &label, const std::string &sql) -> bool {
+					auto r = conn.Query(sql);
+					if (r->HasError()) {
+						results[t].first_error = label + " iter " + std::to_string(i) + ": " + r->GetError();
+						abort_flag.store(true);
+						return false;
+					}
+					return true;
+				};
+				// INSERT — the DELETE at end of previous cycle removed any prior row
+				// at this id. If the very first cycle's id collides with a seeded row
+				// it'd PK-fail, but base ids are 1000+ so no collision with seeds (0-99).
+				if (!step("INSERT",
+				          "INSERT INTO mssql.dbo.write_race_shared (id, v, name) VALUES (" +
+				              std::to_string(row_id) + ", " + std::to_string(i) + ", 'writer_" +
+				              std::to_string(t) + "_" + std::to_string(i) + "')")) {
+					return;
+				}
+				++total_inserts;
+				// UPDATE
+				if (!step("UPDATE", "UPDATE mssql.dbo.write_race_shared SET v = v + 1 WHERE id = " +
+				                        std::to_string(row_id))) {
+					return;
+				}
+				++total_updates;
+				// SELECT (catalog-bound read of our own row)
+				if (!step("SELECT", "SELECT id, v FROM mssql.dbo.write_race_shared WHERE id = " +
+				                        std::to_string(row_id))) {
+					return;
+				}
+				// DELETE
+				if (!step("DELETE", "DELETE FROM mssql.dbo.write_race_shared WHERE id = " + std::to_string(row_id))) {
+					return;
+				}
+				++total_deletes;
+				++i;
+				results[t].iterations_done = i;
+			}
+		});
+	}
+
+	// Reader thread.
+	threads.emplace_back([&]() {
+		Connection conn(db);
+		int i = 0;
+		while (!stop_flag.load() && !abort_flag.load()) {
+			auto r = conn.Query("SELECT COUNT(*), MAX(v) FROM mssql.dbo.write_race_shared");
+			if (r->HasError()) {
+				reader_error = "iter " + std::to_string(i) + ": " + r->GetError();
+				abort_flag.store(true);
+				return;
+			}
+			++i;
+			reader_iters = i;
+		}
+	});
+
+	std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+	stop_flag.store(true);
+	for (auto &th : threads) {
+		th.join();
+	}
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+	bool any_error = false;
+	int total_writer_iters = 0;
+	for (auto &r : results) {
+		total_writer_iters += r.iterations_done;
+		if (!r.first_error.empty()) {
+			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done << " cycles: "
+			          << r.first_error << std::endl;
+			any_error = true;
+		}
+	}
+	if (!reader_error.empty()) {
+		std::cerr << "  Reader ERROR: " << reader_error << std::endl;
+		any_error = true;
+	}
+
+	// Cleanup
+	{
+		Connection cleanup(db);
+		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_race_shared')");
+	}
+
+	std::cout << "  Writers: " << total_writer_iters << " complete cycles ("
+	          << total_inserts.load() << " INSERT, " << total_updates.load() << " UPDATE, "
+	          << total_deletes.load() << " DELETE); reader: " << reader_iters.load() << " iters; "
+	          << elapsed << " ms total" << std::endl;
+	if (any_error) {
+		std::cerr << "  FAILED" << std::endl;
+		return false;
+	}
+	std::cout << "  PASSED" << std::endl;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 8 (Spec 052): pure-write contention on a SHARED table.
+// N writer threads, no reader. All threads INSERT into dbo.write_only_shared
+// concurrently using disjoint PK ranges (no SQL Server row-lock conflict).
+// Pure DML pipeline stress: catalog-bound INSERT bind path runs concurrently
+// on the same MSSQLTableEntry across all threads; shared_from_this() racing
+// on the same entry; EnsurePKLoaded races (each binder triggers PK discovery
+// the first time, pk_load_mutex_ must serialise them).
+// ---------------------------------------------------------------------------
+bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int duration_seconds) {
+	std::cout << "\n=== Pure concurrent writes to ONE table: " << num_writers
+	          << " writers for " << duration_seconds << "s ===" << std::endl;
+
+	DuckDB db(nullptr);
+	{
+		Connection setup(db);
+		load_extension(setup);
+		std::ostringstream attach;
+		attach << "ATTACH '" << cfg.Dsn("TestDB") << "' AS mssql (TYPE mssql)";
+		auto r = setup.Query(attach.str());
+		if (r->HasError()) {
+			std::cerr << "  ATTACH failed: " << r->GetError() << std::endl;
+			return false;
+		}
+		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_only_shared')");
+		auto cr = setup.Query(
+		    "SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_only_shared (id BIGINT PRIMARY KEY, v INT, "
+		    "name NVARCHAR(64))')");
+		if (cr->HasError()) {
+			std::cerr << "  CREATE failed: " << cr->GetError() << std::endl;
+			return false;
+		}
+		setup.Query("SELECT mssql_refresh_cache('mssql')");
+	}
+
+	std::atomic<bool> stop_flag(false);
+	std::atomic<bool> abort_flag(false);
+	std::vector<std::thread> threads;
+	std::vector<WorkerResult> results(num_writers);
+	std::atomic<int64_t> total_inserts(0);
+
+	auto start = std::chrono::steady_clock::now();
+
+	for (int t = 0; t < num_writers; ++t) {
+		threads.emplace_back([&, t]() {
+			Connection conn(db);
+			results[t].thread_id = t;
+			// Disjoint id ranges per writer: [t*1_000_000, ...) so no PK conflict.
+			int64_t base = static_cast<int64_t>(t) * 1000000LL;
+			int64_t offset = 0;
+			while (!stop_flag.load() && !abort_flag.load()) {
+				int64_t row_id = base + offset;
+				std::string sql = "INSERT INTO mssql.dbo.write_only_shared (id, v, name) VALUES (" +
+				                  std::to_string(row_id) + ", " + std::to_string(offset) + ", 'w" +
+				                  std::to_string(t) + "_" + std::to_string(offset) + "')";
+				auto r = conn.Query(sql);
+				if (r->HasError()) {
+					results[t].first_error = "iter " + std::to_string(offset) + ": " + r->GetError();
+					abort_flag.store(true);
+					return;
+				}
+				++offset;
+				++total_inserts;
+				results[t].iterations_done = static_cast<int>(offset);
+			}
+		});
+	}
+
+	std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+	stop_flag.store(true);
+	for (auto &th : threads) {
+		th.join();
+	}
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+	bool any_error = false;
+	for (auto &r : results) {
+		if (!r.first_error.empty()) {
+			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done << ": "
+			          << r.first_error << std::endl;
+			any_error = true;
+		}
+	}
+
+	// Cleanup
+	{
+		Connection cleanup(db);
+		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_only_shared')");
+	}
+
+	std::cout << "  Total INSERTs: " << total_inserts.load() << " across " << num_writers
+	          << " threads; " << elapsed << " ms total ("
+	          << (total_inserts.load() * 1000 / std::max<int64_t>(elapsed, 1)) << " inserts/sec)" << std::endl;
+	if (any_error) {
+		std::cerr << "  FAILED" << std::endl;
+		return false;
+	}
+	std::cout << "  PASSED" << std::endl;
+	return true;
+}
+
 }  // namespace
 
 int main() {
@@ -674,6 +939,11 @@ int main() {
 		ok &= scenario_invalidation_race(cfg, 4, sec, 50);
 		// Scenario 6 (spec 052 US3): scenario 5 + schema walker thread.
 		ok &= scenario_sibling_cache_stress(cfg, 4, sec, 50);
+		// Scenario 7 (spec 052): concurrent INSERT/UPDATE/SELECT/DELETE on a
+		// shared table with disjoint PK ranges + a reader thread on same table.
+		ok &= scenario_concurrent_writes_shared(cfg, 4, sec);
+		// Scenario 8 (spec 052): pure concurrent INSERTs into one table.
+		ok &= scenario_pure_concurrent_writes(cfg, 4, sec);
 	} catch (const std::exception &e) {
 		std::cerr << "\nTEST CRASHED: " << e.what() << std::endl;
 		return 2;
