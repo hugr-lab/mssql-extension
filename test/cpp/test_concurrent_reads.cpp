@@ -494,6 +494,156 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 6 (Spec 052 US3 SC-004): sibling-cache stress.
+// Scenario 5 (readers + invalidator) PLUS a sixth thread that loops over
+// duckdb_schemas() / duckdb_tables() — these exercise MSSQLCatalog::
+// schema_entries_, MSSQLMetadataCache::GetTableMetadata, and the schema-
+// level invalidation paths. If any sibling cache still hands out raw
+// pointers under concurrent invalidation, this scenario UAFs.
+// ---------------------------------------------------------------------------
+bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int duration_seconds, int invalidator_ms) {
+	std::cout << "\n=== Sibling-cache stress: " << num_readers << " readers + invalidator + schema-walker for "
+	          << duration_seconds << "s ===" << std::endl;
+
+	DuckDB db(nullptr);
+	{
+		Connection setup(db);
+		load_extension(setup);
+		std::ostringstream attach;
+		attach << "ATTACH '" << cfg.Dsn("TestDB") << "' AS mssql (TYPE mssql)";
+		auto r = setup.Query(attach.str());
+		if (r->HasError()) {
+			std::cerr << "  ATTACH failed: " << r->GetError() << std::endl;
+			return false;
+		}
+		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.sibling_cache_test')");
+		auto cr = setup.Query("SELECT mssql_exec('mssql', 'CREATE TABLE dbo.sibling_cache_test (id INT PRIMARY KEY, "
+		                       "name NVARCHAR(100), v INT)')");
+		if (cr->HasError()) {
+			std::cerr << "  CREATE TABLE failed: " << cr->GetError() << std::endl;
+			return false;
+		}
+		for (int i = 0; i < 50; ++i) {
+			auto ins = setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.sibling_cache_test VALUES (" +
+			                       std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
+			                       std::to_string(i * 7) + ")')");
+			if (ins->HasError()) {
+				std::cerr << "  INSERT failed: " << ins->GetError() << std::endl;
+				return false;
+			}
+		}
+		setup.Query("SELECT mssql_refresh_cache('mssql')");
+	}
+
+	std::atomic<bool> stop_flag(false);
+	std::atomic<bool> abort_flag(false);
+	std::vector<std::thread> threads;
+	std::vector<WorkerResult> results(num_readers);
+	std::atomic<int> invalidations(0);
+	std::atomic<int> schema_walks(0);
+	std::string invalidator_error;
+	std::string walker_error;
+
+	auto start = std::chrono::steady_clock::now();
+
+	// Reader threads.
+	for (int t = 0; t < num_readers; ++t) {
+		threads.emplace_back([&, t]() {
+			Connection conn(db);
+			results[t].thread_id = t;
+			int i = 0;
+			while (!stop_flag.load() && !abort_flag.load()) {
+				std::string sql = "SELECT id, name, v FROM mssql.dbo.sibling_cache_test WHERE id < " +
+				                  std::to_string(20 + (i % 10)) + " ORDER BY id";
+				auto r = conn.Query(sql);
+				if (r->HasError()) {
+					results[t].first_error = "iter " + std::to_string(i) + ": " + r->GetError();
+					abort_flag.store(true);
+					return;
+				}
+				++i;
+				results[t].iterations_done = i;
+			}
+		});
+	}
+
+	// Invalidator thread.
+	threads.emplace_back([&]() {
+		Connection conn(db);
+		while (!stop_flag.load() && !abort_flag.load()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(invalidator_ms));
+			auto r = conn.Query("SELECT mssql_refresh_cache('mssql')");
+			if (r->HasError()) {
+				invalidator_error = r->GetError();
+				abort_flag.store(true);
+				return;
+			}
+			++invalidations;
+		}
+	});
+
+	// Schema-walker thread — exercises MSSQLCatalog::schema_entries_,
+	// MSSQLMetadataCache::GetTableNames, and the schema-level cache paths.
+	threads.emplace_back([&]() {
+		Connection conn(db);
+		int i = 0;
+		while (!stop_flag.load() && !abort_flag.load()) {
+			auto kind = i % 2;
+			auto r = (kind == 0) ? conn.Query("SELECT database_name, schema_name FROM duckdb_schemas() WHERE database_name = 'mssql'")
+			                     : conn.Query("SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE database_name = 'mssql' LIMIT 100");
+			if (r->HasError()) {
+				walker_error = "iter " + std::to_string(i) + ": " + r->GetError();
+				abort_flag.store(true);
+				return;
+			}
+			++i;
+			++schema_walks;
+		}
+	});
+
+	std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+	stop_flag.store(true);
+	for (auto &th : threads) {
+		th.join();
+	}
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+	int total_done = 0;
+	bool any_error = false;
+	for (auto &r : results) {
+		total_done += r.iterations_done;
+		if (!r.first_error.empty()) {
+			std::cerr << "  Reader " << r.thread_id << " ERROR after " << r.iterations_done << " iters: "
+			          << r.first_error << std::endl;
+			any_error = true;
+		}
+	}
+	if (!invalidator_error.empty()) {
+		std::cerr << "  Invalidator ERROR: " << invalidator_error << std::endl;
+		any_error = true;
+	}
+	if (!walker_error.empty()) {
+		std::cerr << "  Walker ERROR: " << walker_error << std::endl;
+		any_error = true;
+	}
+
+	// Cleanup
+	{
+		Connection cleanup(db);
+		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.sibling_cache_test')");
+	}
+
+	std::cout << "  Readers completed " << total_done << " queries; " << invalidations.load()
+	          << " invalidations; " << schema_walks.load() << " schema walks; " << elapsed << " ms total" << std::endl;
+	if (any_error) {
+		std::cerr << "  FAILED" << std::endl;
+		return false;
+	}
+	std::cout << "  PASSED" << std::endl;
+	return true;
+}
+
 }  // namespace
 
 int main() {
@@ -522,6 +672,8 @@ int main() {
 		// for 30 seconds. Reduce duration on CI via INVALIDATION_RACE_SECS env.
 		int sec = std::getenv("INVALIDATION_RACE_SECS") ? std::atoi(std::getenv("INVALIDATION_RACE_SECS")) : 30;
 		ok &= scenario_invalidation_race(cfg, 4, sec, 50);
+		// Scenario 6 (spec 052 US3): scenario 5 + schema walker thread.
+		ok &= scenario_sibling_cache_stress(cfg, 4, sec, 50);
 	} catch (const std::exception &e) {
 		std::cerr << "\nTEST CRASHED: " << e.what() << std::endl;
 		return 2;
