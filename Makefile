@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
 
 # Bootstrap vcpkg if not present
 vcpkg-setup:
@@ -407,6 +407,20 @@ test-result-stream-registry-isolation: debug
 test-spec047-us3: test-result-stream-registry-isolation
 	@echo ""
 	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
+
+# Concurrent reads stress test (dbt threads>=2 scenario reproduction).
+# Mixed mssql_scan + catalog-bound SELECT across N threads sharing a single
+# ATTACH; also scenario with N concurrent ATTACHes (different aliases).
+test-concurrent-reads: debug
+	@echo "Building concurrent-reads stress test..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_concurrent_reads.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_concurrent_reads
+	@echo ""
+	@echo "Running concurrent-reads stress test..."
+	$(SPEC047_TEST_RPATH) build/test/test_concurrent_reads
 
 # Spec 047 US-SEC: TokenCache per-DatabaseInstance namespace isolation (T046g, SC-011).
 # Compiles src/azure/azure_token.cpp together with the test driver. The driver

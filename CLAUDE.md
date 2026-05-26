@@ -369,11 +369,15 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 
 
 <!-- SPECKIT START -->
-Active spec: 047-process-state-cleanup. Spec, plan, research,
+Active spec: 052-thread-safe-catalog-entries. Spec, plan, research,
 data model, contracts, and quickstart are generated. See
-`specs/047-process-state-cleanup/plan.md` for the implementation
-plan, with `research.md`, `data-model.md`, `contracts/`, and
-`quickstart.md` alongside. Closes [issue #96](https://github.com/hugr-lab/mssql-extension/issues/96)
-(production manifestation of cross-instance singleton-pool bug class).
+`specs/052-thread-safe-catalog-entries/plan.md` for the implementation
+plan, with `research.md`, `data-model.md`, `contracts/ownership.md`,
+and `quickstart.md` alongside. Closes
+[issue #126](https://github.com/hugr-lab/mssql-extension/issues/126)
+(dbt segfault with `threads >= 2`; catalog entry UAF in MSSQLTableSet).
+Approach: `unique_ptr` → `shared_ptr` ownership for `MSSQLTableEntry`
+and `MSSQLSchemaEntry`; emplace-only on first-load (US1); per-catalog
+graveyard on `Invalidate()` (US2); sibling-cache audit (US3).
 Implementation proceeds via `/speckit-tasks` then `/speckit-implement`.
 <!-- SPECKIT END -->
