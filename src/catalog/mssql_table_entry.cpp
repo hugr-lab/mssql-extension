@@ -87,6 +87,15 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	// This allows DuckDB to discover virtual columns like rowid
 	catalog_bind_data->table_entry = this;
 
+	// Spec 052 T015: anchor the underlying shared_ptr<MSSQLTableEntry> into
+	// the bind data. If a sibling thread invalidates the table set mid-query
+	// (mssql_refresh_cache, DROP TABLE via DuckDB, TTL boundary) the table
+	// entry is moved into MSSQLCatalog::table_graveyard_ rather than freed.
+	// This anchor (a shared_ptr copy via shared_from_this()) keeps the
+	// underlying object alive for the entire execute phase — destruction
+	// happens only when DuckDB tears down the bind data (= query plan dies).
+	catalog_bind_data->table_entry_anchor = shared_ptr<void>(shared_from_this());
+
 	// Store ALL column information - the query will use only projected columns
 	for (const auto &col : mssql_columns_) {
 		catalog_bind_data->all_column_names.push_back(col.name);
@@ -246,7 +255,22 @@ MSSQLSchemaEntry &MSSQLTableEntry::GetMSSQLSchema() {
 //===----------------------------------------------------------------------===//
 
 void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
+	// Fast path: already loaded. NOT thread-safe for the boolean read, but
+	// safe in practice — `loaded` only ever transitions false→true (latched).
+	// A torn read here at worst forces a redundant mutex acquire below, which
+	// the double-check then short-circuits.
 	if (pk_info_.loaded) {
+		return;
+	}
+
+	// Spec 052 EnsurePKLoaded race fix: serialise concurrent first-loads so
+	// only one thread does the PrimaryKeyInfo::Discover round trip and the
+	// `pk_info_ = std::move(...)` write. Without this serialisation, two
+	// threads both loaded and both move-assigned, double-freeing the loser's
+	// previous-value vector<PKColumnInfo>. Caught by ASan in scenario 5.
+	std::lock_guard<std::mutex> lock(pk_load_mutex_);
+	if (pk_info_.loaded) {
+		// Another thread won the race while we were waiting on the mutex.
 		return;
 	}
 

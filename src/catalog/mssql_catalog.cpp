@@ -441,11 +441,23 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Point invalidation: invalidate schema list
 	metadata_cache_->InvalidateAll();
 
-	// Remove the schema entry from our local cache
+	// Spec 052 T012: route the dropped schema entry into the catalog's
+	// schema_graveyard_ rather than destroying it outright. A binder may
+	// have looked up this schema before DROP SCHEMA fired and still be
+	// inside its bind/execute scope (CREATE TABLE inside the schema
+	// is the realistic window — bind phase issues a SQL Server round
+	// trip). The graveyard's shared_ptr keeps the underlying
+	// MSSQLSchemaEntry alive until ~MSSQLCatalog drains it.
+	shared_ptr<MSSQLSchemaEntry> retired;
 	{
 		std::lock_guard<std::mutex> lock(schema_mutex_);
-		schema_entries_.erase(info.name);
+		auto it = schema_entries_.find(info.name);
+		if (it != schema_entries_.end()) {
+			retired = std::move(it->second);
+			schema_entries_.erase(it);
+		}
 	}
+	AppendToSchemaGraveyard(std::move(retired));
 }
 
 //===----------------------------------------------------------------------===//
@@ -868,7 +880,10 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 		metadata_cache_->Invalidate();
 	}
 
-	// Also clear the local schema entry cache
+	// Also clear the local schema entry cache.
+	// Spec 052 T013: GetTableSet().Invalidate() routes retired table entries
+	// into table_graveyard_ via AppendToTableGraveyard; in-flight binders
+	// holding raw pointers retain validity through bind/execute.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();
@@ -881,7 +896,8 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 		metadata_cache_->InvalidateSchema(schema_name);
 	}
 
-	// Also invalidate the local schema entry's table set if it exists
+	// Also invalidate the local schema entry's table set if it exists.
+	// Spec 052 T013: same graveyard guarantee as InvalidateMetadataCache.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
@@ -945,7 +961,10 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// Release connection
 	connection_pool_->Release(std::move(connection));
 
-	// Invalidate all schema table sets to pick up any changes
+	// Invalidate all schema table sets to pick up any changes.
+	// Spec 052 T013: GetTableSet().Invalidate() routes retired table entries
+	// into table_graveyard_; in-flight binders holding raw pointers remain
+	// valid through the rest of their bind/execute scope.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();

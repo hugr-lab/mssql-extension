@@ -254,6 +254,14 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->pk_result_indices = pk_result_indices;
 	result->pk_is_composite = pk_is_composite;
 	result->rowid_type = rowid_type;
+	// Spec 052 T014: copy the bare table_entry pointer AND the shared_ptr
+	// anchor. shared_ptr copy = one atomic refcount inc (the spec-mandated
+	// per-bind-data-construction cost). Without copying the anchor, the
+	// copied bind data would dangle its table_entry pointer at the next
+	// catalog Invalidate(). Equals() does NOT compare anchors — they are a
+	// pure lifetime device, not part of identity.
+	result->table_entry = table_entry;
+	result->table_entry_anchor = table_entry_anchor;
 	return std::move(result);
 }
 

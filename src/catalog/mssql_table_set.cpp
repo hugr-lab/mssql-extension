@@ -239,11 +239,25 @@ void MSSQLTableSet::Invalidate() {
 	std::lock_guard<std::mutex> lock(load_mutex_);
 	is_fully_loaded_.store(false);
 	names_loaded_.store(false);
+	// Spec 052 T011: move retired entries into the catalog's graveyard
+	// instead of dropping them outright. In-flight binders still hold raw
+	// pointers obtained before this Invalidate() — the graveyard's shared_ptr
+	// keeps the underlying MSSQLTableEntry objects alive until either the
+	// bind data releases its anchor (US2 T015) or ~MSSQLCatalog drains the
+	// graveyard. Subsequent LoadSingleEntry calls see an empty entries_ map
+	// and reload from SQL Server (FR-006 — pre-Invalidate binders observe
+	// stale metadata; new binds resolve fresh metadata).
+	vector<shared_ptr<MSSQLTableEntry>> retired;
 	{
 		std::lock_guard<std::mutex> elock(entry_mutex_);
+		retired.reserve(entries_.size());
+		for (auto &kv : entries_) {
+			retired.push_back(std::move(kv.second));
+		}
 		entries_.clear();
 		attempted_tables_.clear();
 	}
+	schema_.GetMSSQLCatalog().AppendToTableGraveyard(std::move(retired));
 	{
 		std::lock_guard<std::mutex> nlock(names_mutex_);
 		known_table_names_.clear();

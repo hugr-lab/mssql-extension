@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <vector>
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
@@ -95,7 +96,13 @@ private:
 	MSSQLObjectType object_type_;			 // TABLE or VIEW
 	idx_t approx_row_count_;				 // Cardinality estimate
 
-	// Lazy-loaded PK cache
+	// Lazy-loaded PK cache.
+	// Spec 052 EnsurePKLoaded race fix: pk_load_mutex_ serialises concurrent
+	// callers. Without it, two threads both saw `pk_info_.loaded == false`
+	// and both did `pk_info_ = std::move(...)`, double-freeing the
+	// underlying vector<PKColumnInfo> the loser's previous-value held.
+	// Caught by ASan during spec 052 scenario-5 stress.
+	mutable std::mutex pk_load_mutex_;
 	mutable mssql::PrimaryKeyInfo pk_info_;
 
 	// Ensure PK info is loaded
