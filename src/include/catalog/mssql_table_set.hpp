@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -69,7 +70,9 @@ private:
 	//===----------------------------------------------------------------------===//
 
 	// Create table entry from metadata
-	unique_ptr<MSSQLTableEntry> CreateTableEntry(const MSSQLTableMetadata &metadata);
+	// Spec 052: returns shared_ptr — entries co-owned by entries_ map and any
+	// in-flight bind data anchor (MSSQLCatalogScanBindData::table_entry_anchor_).
+	shared_ptr<MSSQLTableEntry> CreateTableEntry(const MSSQLTableMetadata &metadata);
 
 	// Ensure table names are loaded (no column queries, fast)
 	void EnsureNamesLoaded(ClientContext &context);
@@ -89,8 +92,20 @@ private:
 	std::atomic<bool> is_fully_loaded_;							  // True when ALL tables are loaded
 	std::mutex load_mutex_;										  // Loading synchronization
 	std::mutex entry_mutex_;									  // Entry access synchronization
-	unordered_map<string, unique_ptr<MSSQLTableEntry>> entries_;  // Cached entries
-	std::unordered_set<string> attempted_tables_;				  // Tables we've tried to load (including non-existent)
+	// Spec 052: shared_ptr (was unique_ptr) so retired entries can flow into
+	// MSSQLCatalog::table_graveyard_ on Invalidate() while in-flight binders
+	// retain validity. Insertion is emplace-only (winner wins on race).
+	unordered_map<string, shared_ptr<MSSQLTableEntry>> entries_;
+	std::unordered_set<string> attempted_tables_;  // Tables we've tried to load (including non-existent)
+
+	// Spec 052 singleflight: per-table load coordination so concurrent
+	// first-loads of the same table issue only ONE SQL Server round trip.
+	// Owner thread inserts `name` into loads_in_progress_, releases entry_mutex_
+	// for the fetch, then re-acquires and erases on completion. Waiters block
+	// on load_cv_ (over entry_mutex_) and re-check the cache after wake-up.
+	// Different tables can still load in parallel.
+	std::condition_variable load_cv_;
+	std::unordered_set<string> loads_in_progress_;
 };
 
 }  // namespace duckdb

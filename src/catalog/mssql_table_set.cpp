@@ -137,9 +137,12 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 		auto entry = CreateTableEntry(table_meta);
 		if (entry) {
-			auto &ref = *entry;
-			entries_[entry->name] = std::move(entry);
-			callback(ref);
+			// Spec 052 T007: emplace-only (winner wins on race vs LoadSingleEntry).
+			// On collision the new entry is discarded; the in-place entry already
+			// served any concurrent first-load caller. C++11-compatible pair
+			// destructuring (CLAUDE.md ODR rule: no structured bindings).
+			auto insert_result = entries_.emplace(entry->name, std::move(entry));
+			callback(*insert_result.first->second);
 		}
 	});
 
@@ -159,40 +162,73 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 	// Ensure cache settings are loaded (sets TTL)
 	catalog.EnsureCacheLoaded(context);
 
-	// Acquire connection for lazy loading
-	auto connection = pool.Acquire();
-	if (!connection) {
-		throw IOException("Failed to acquire connection for table loading");
+	// Spec 052 singleflight (FR-007): coordinate concurrent first-loads of the
+	// same table so only ONE thread issues the SQL Server round trip. Waiters
+	// re-check the cache after the owner finishes; on cache hit they return
+	// the owner's entry without a redundant fetch.
+	{
+		std::unique_lock<std::mutex> lock(entry_mutex_);
+		load_cv_.wait(lock, [this, &name]() { return loads_in_progress_.find(name) == loads_in_progress_.end(); });
+		// Owner-before-us may have already loaded or confirmed not-exists.
+		if (entries_.find(name) != entries_.end()) {
+			return true;
+		}
+		if (attempted_tables_.find(name) != attempted_tables_.end()) {
+			return false;
+		}
+		// Take the load slot. From here we are the sole fetcher for `name`.
+		loads_in_progress_.insert(name);
 	}
 
-	// Get metadata for this specific table only (does NOT load all tables in schema)
-	const MSSQLTableMetadata *table_meta;
+	// Owner of the load slot. The SQL Server round trip happens with no mutex
+	// held so different tables can load in parallel. The slot is released at
+	// the end (success, table-not-exists, or exception) under entry_mutex_,
+	// followed by notify_all() on load_cv_ to wake any waiters.
+	std::exception_ptr propagated;
+	shared_ptr<MSSQLTableEntry> fetched_entry;
+	bool table_exists = false;
+
 	try {
-		table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
-	} catch (...) {
+		auto connection = pool.Acquire();
+		if (!connection) {
+			throw IOException("Failed to acquire connection for table loading");
+		}
+		const MSSQLTableMetadata *table_meta = nullptr;
+		try {
+			table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+		} catch (...) {
+			pool.Release(std::move(connection));
+			throw;
+		}
 		pool.Release(std::move(connection));
-		throw;
+
+		if (table_meta) {
+			table_exists = true;
+			fetched_entry = CreateTableEntry(*table_meta);
+		}
+	} catch (...) {
+		propagated = std::current_exception();
 	}
 
-	pool.Release(std::move(connection));
-
-	if (!table_meta) {
-		// Table doesn't exist - mark as attempted so we don't retry
-		std::lock_guard<std::mutex> lock(entry_mutex_);
-		attempted_tables_.insert(name);
-		return false;
+	// Publish results + release the load slot. attempted_tables_ is set on
+	// success and on confirmed-not-exists; on exception it is NOT set so the
+	// next caller retries the fetch.
+	{
+		std::unique_lock<std::mutex> lock(entry_mutex_);
+		if (table_exists && fetched_entry) {
+			entries_.emplace(fetched_entry->name, std::move(fetched_entry));
+			attempted_tables_.insert(name);
+		} else if (!propagated && !table_exists) {
+			attempted_tables_.insert(name);
+		}
+		loads_in_progress_.erase(name);
 	}
+	load_cv_.notify_all();
 
-	// Create table entry and add to cache
-	auto entry = CreateTableEntry(*table_meta);
-	if (entry) {
-		std::lock_guard<std::mutex> lock(entry_mutex_);
-		entries_[entry->name] = std::move(entry);
-		attempted_tables_.insert(name);
-		return true;
+	if (propagated) {
+		std::rethrow_exception(propagated);
 	}
-
-	return false;
+	return table_exists;
 }
 
 bool MSSQLTableSet::IsLoaded() const {
@@ -218,8 +254,12 @@ void MSSQLTableSet::Invalidate() {
 // Internal Methods
 //===----------------------------------------------------------------------===//
 
-unique_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
-	return make_uniq<MSSQLTableEntry>(schema_.catalog, schema_, metadata);
+shared_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
+	// Spec 052: make_shared_ptr (DuckDB's shared_ptr wrapper) so the entry is
+	// owned via shared_ptr from the moment of construction. Required for
+	// enable_shared_from_this to work in MSSQLTableEntry::GetScanFunction's
+	// bind-data anchor (shared_from_this()).
+	return make_shared_ptr<MSSQLTableEntry>(schema_.catalog, schema_, metadata);
 }
 
 void MSSQLTableSet::EnsureNamesLoaded(ClientContext &context) {

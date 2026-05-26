@@ -382,11 +382,13 @@ MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name
 		return *it->second;
 	}
 
-	// Create new schema entry
-	auto entry = make_uniq<MSSQLSchemaEntry>(*this, schema_name);
-	auto &entry_ref = *entry;
-	schema_entries_[schema_name] = std::move(entry);
-	return entry_ref;
+	// Spec 052 T009: emplace-only with make_shared_ptr. enable_shared_from_this
+	// on MSSQLSchemaEntry requires construction via shared_ptr from day one.
+	// On race the late-arriving shared_ptr is discarded; emplace returns the
+	// winner's iterator either way.
+	auto entry = make_shared_ptr<MSSQLSchemaEntry>(*this, schema_name);
+	auto insert_result = schema_entries_.emplace(schema_name, std::move(entry));
+	return *insert_result.first->second;
 }
 
 optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
@@ -826,6 +828,39 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 	}
 
 	connection_pool_->Release(std::move(connection));
+}
+
+//===----------------------------------------------------------------------===//
+// Spec 052: Catalog-entry graveyard (lifetime extension across Invalidate)
+//===----------------------------------------------------------------------===//
+
+void MSSQLCatalog::AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired) noexcept {
+	if (retired.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(graveyard_mutex_);
+	table_graveyard_.reserve(table_graveyard_.size() + retired.size());
+	for (auto &entry : retired) {
+		table_graveyard_.push_back(std::move(entry));
+	}
+}
+
+void MSSQLCatalog::AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired) noexcept {
+	if (!retired) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(graveyard_mutex_);
+	schema_graveyard_.push_back(std::move(retired));
+}
+
+size_t MSSQLCatalog::GetTableGraveyardSize() const noexcept {
+	std::lock_guard<std::mutex> lock(graveyard_mutex_);
+	return table_graveyard_.size();
+}
+
+size_t MSSQLCatalog::GetSchemaGraveyardSize() const noexcept {
+	std::lock_guard<std::mutex> lock(graveyard_mutex_);
+	return schema_graveyard_.size();
 }
 
 void MSSQLCatalog::InvalidateMetadataCache() {

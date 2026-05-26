@@ -1,8 +1,8 @@
 #pragma once
 
-#include <memory>
 #include "catalog/mssql_table_set.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/shared_ptr.hpp"	 // duckdb::enable_shared_from_this (spec 052)
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 
 namespace duckdb {
@@ -15,9 +15,13 @@ class MSSQLCatalog;
 
 //===----------------------------------------------------------------------===//
 // MSSQLSchemaEntry - DuckDB schema entry for SQL Server schema
+//
+// Inherits enable_shared_from_this (spec 052) so the parent MSSQLCatalog can
+// route detached/invalidated schema entries into a graveyard that keeps them
+// alive while binders still hold raw pointers from a previous LookupSchema.
 //===----------------------------------------------------------------------===//
 
-class MSSQLSchemaEntry : public SchemaCatalogEntry {
+class MSSQLSchemaEntry : public SchemaCatalogEntry, public enable_shared_from_this<MSSQLSchemaEntry> {
 public:
 	// Constructor
 	MSSQLSchemaEntry(Catalog &catalog, const string &name);

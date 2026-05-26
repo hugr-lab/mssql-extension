@@ -5,6 +5,7 @@
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_primary_key.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/shared_ptr.hpp"		// duckdb::enable_shared_from_this (spec 052)
 #include "duckdb/common/table_column.hpp"  // For virtual_column_map_t
 
 namespace duckdb {
@@ -18,9 +19,14 @@ class MSSQLCatalog;
 
 //===----------------------------------------------------------------------===//
 // MSSQLTableEntry - DuckDB table entry for SQL Server table/view
+//
+// Inherits enable_shared_from_this (spec 052) so GetScanFunction can anchor
+// this entry into the bind data via shared_from_this() — the bind data's
+// shared_ptr keeps the entry alive through query execute even if
+// MSSQLTableSet::Invalidate() races concurrently.
 //===----------------------------------------------------------------------===//
 
-class MSSQLTableEntry : public TableCatalogEntry {
+class MSSQLTableEntry : public TableCatalogEntry, public enable_shared_from_this<MSSQLTableEntry> {
 public:
 	// Constructor from table metadata
 	MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const MSSQLTableMetadata &metadata);
