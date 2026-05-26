@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **dbt segfault with `threads >= 2`** (spec 052, closes
+  [#126](https://github.com/hugr-lab/mssql-extension/issues/126)).
+  Catalog entries (`MSSQLTableEntry`, `MSSQLSchemaEntry`) switched from
+  `unique_ptr` to `shared_ptr` ownership; concurrent first-load of the
+  same table is coordinated via per-table singleflight so only one
+  thread issues the SQL Server round trip (waiters re-check the cache);
+  `MSSQLTableSet::Invalidate` and `MSSQLCatalog::OnDetach` route
+  retired entries into per-catalog `table_graveyard_` /
+  `schema_graveyard_` rather than freeing them outright — in-flight
+  binders holding raw `optional_ptr<CatalogEntry>` references obtained
+  before the invalidation now retain validity through the rest of
+  their bind/execute scope. Bind data anchors the underlying
+  `MSSQLTableEntry` via `shared_from_this()` so query execute keeps
+  the entry alive even across catalog-cache cycles. Graveyards drain
+  at `~MSSQLCatalog` (no runtime GC — bounded by realistic invalidation
+  cadence per spec 052 research § Decision 3). Audit of
+  `MSSQLMetadataCache::GetTableMetadata` confirms its only caller
+  (`MSSQLTableSet::LoadSingleEntry`) copies fields immediately;
+  contract pinned in the header. `MSSQLStatisticsProvider` returns
+  by value, no pointer-handout surface.
+- **`MSSQLTableEntry::EnsurePKLoaded` double-free under thread stress**
+  (spec 052). Two threads both saw `pk_info_.loaded == false`, both
+  fetched, both move-assigned to `pk_info_` — the second move freed
+  the loser's previous `vector<PKColumnInfo>` while the first thread
+  still held it. Caught by AddressSanitizer during scenario 5 stress.
+  Fixed with a `pk_load_mutex_` + double-checked-load (fast path
+  stays lock-free when `loaded == true`).
+
+### Added
+
+- `test/cpp/test_concurrent_reads.cpp` scenarios 5 and 6 (spec 052
+  US2/US3 acceptance): 30 s soak with 4 readers + invalidator at 50 ms
+  cadence (scenario 5), plus a schema-walker thread exercising sibling
+  caches (scenario 6). Sample 30 s run: scenario 5 — 9780 reads ×
+  278 invalidations, scenario 6 — 7069 reads × 276 invalidations ×
+  1099 schema walks, both AddressSanitizer-clean.
+- `test/cpp/test_catalog_graveyard.cpp` + `make test-catalog-graveyard`
+  target (spec 052 T021) — focused unit test asserting graveyard
+  accumulates on `Invalidate()` and drains on `DETACH`.
+
 ## [0.2.0] - 2026-05-20
 
 Major release: integrated authentication (Kerberos + Windows SSPI),
