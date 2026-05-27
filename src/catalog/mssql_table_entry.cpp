@@ -297,8 +297,8 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 			// `active_connections_` — ~ConnectionPool then fires its quiescence
 			// warning on teardown and the D_ASSERT aborts the debug build.
 			try {
-				pk_info_ = mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name,
-														   cache.GetDatabaseCollation());
+				pk_info_ =
+					mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name, cache.GetDatabaseCollation());
 			} catch (...) {
 				pool.Release(std::move(connection));
 				throw;
