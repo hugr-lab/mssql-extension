@@ -87,8 +87,12 @@ jobs:
         run: |
           echo "Before:"
           free -h
-          sudo swapoff /swapfile || true
-          sudo rm -f /swapfile
+          # The ubuntu-latest image already changed twice since spec 052 landed:
+          # first it had /swapfile (4G), then /mnt/swapfile (4G). Whichever is
+          # mounted, swapoff + remove first, then recreate at 12G on /mnt.
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo swapoff /mnt/swapfile 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile
           sudo fallocate -l 12G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile

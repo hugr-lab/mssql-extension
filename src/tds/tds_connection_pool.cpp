@@ -100,10 +100,9 @@ void ConnectionPool::Shutdown() {
 	// only says "1 connection" with no clue which call path stranded it.
 	for (auto &pair : active_connections_) {
 		if (pair.second) {
-			fprintf(stderr,
-					"[MSSQL POOL] LEAKED active conn id=%llu spid=%u state=%d use_count=%ld pool='%s'\n",
-					(unsigned long long)pair.first, (unsigned)pair.second->GetSpid(),
-					(int)pair.second->GetState(), (long)pair.second.use_count(), context_name_.c_str());
+			fprintf(stderr, "[MSSQL POOL] LEAKED active conn id=%llu spid=%u state=%d use_count=%ld pool='%s'\n",
+					(unsigned long long)pair.first, (unsigned)pair.second->GetSpid(), (int)pair.second->GetState(),
+					(long)pair.second.use_count(), context_name_.c_str());
 			pair.second->Close();
 		}
 		stats_.connections_closed++;
