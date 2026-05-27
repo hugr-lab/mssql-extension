@@ -365,7 +365,25 @@ test-literal-format: debug
 SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 SPEC047_TEST_INCLUDES := -I duckdb/src/include
 SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
-SPEC047_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+# On Linux, libduckdb.so is ASan/UBSan-instrumented (DuckDB CMake default for
+# Debug) but our test binaries are NOT compiled with -fsanitize=* (these
+# Makefile rules keep the test build platform-agnostic). glibc loader
+# requires libasan come FIRST in the initial library list — otherwise:
+#   ==NNN==ASan runtime does not come first in initial library list;
+#   you should either link runtime to your application or manually
+#   preload it with LD_PRELOAD
+# Set LD_PRELOAD only on the run prefix (NOT a make-wide env var — that
+# would propagate into any cmake/vcpkg sub-invocation triggered by a
+# `make test-…: debug` dependency, and break vcpkg's compiler-detection
+# probe). macOS dyld handles ASan-via-linked-lib transparently, so no
+# preload needed there.
+ifeq ($(shell uname),Linux)
+SANITIZER_PRELOAD := LD_PRELOAD=$(shell gcc -print-file-name=libasan.so):$(shell gcc -print-file-name=libubsan.so)
+else
+SANITIZER_PRELOAD :=
+endif
+SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
 
 test-multi-instance-pool-isolation: debug
 	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
