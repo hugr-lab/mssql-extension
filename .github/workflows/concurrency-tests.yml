@@ -134,6 +134,23 @@ jobs:
         if: always()
         run: ccache -s
 
+      - name: Initialize TestDB (scenarios 4-8 require it)
+        run: |
+          # Wait briefly so sqlcmd can connect; the service container has its
+          # own healthcheck but we add a small grace period.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/1433) 2>/dev/null; then break; fi
+            sleep 2
+          done
+          # scenarios 1-3 only ATTACH against `master` (always present);
+          # scenarios 4-8 ATTACH against `TestDB` and CREATE their own
+          # tables inside. We just need the database to exist; the test
+          # creates / drops the per-scenario tables on its own.
+          docker run --rm --network host mcr.microsoft.com/mssql-tools:latest \
+            /opt/mssql-tools/bin/sqlcmd \
+              -S localhost -U sa -P TestPassword1 \
+              -Q "IF DB_ID('TestDB') IS NULL CREATE DATABASE TestDB"
+
       - name: Wait for SQL Server
         run: |
           echo "Waiting for SQL Server on localhost:1433..."
