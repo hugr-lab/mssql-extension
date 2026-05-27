@@ -1,12 +1,12 @@
 name: Concurrency Tests
 
-# Spec 052: validates the catalog-entry lifetime / singleflight fix under
-# multi-threaded stress. The Makefile targets `test-concurrent-reads` and
-# `test-catalog-graveyard` are added in PR #127 but no CI workflow invoked
-# them — the PR author ran them locally and pasted soak results into the
-# PR. This job reproduces the full scenarios 1-8 sweep + the graveyard
-# unit test on every PR that touches the catalog or singleflight surfaces,
-# so the suite cannot bit-rot.
+# Spec 052: validates the catalog-entry lifetime / singleflight /
+# ClientContextState anchor fix under multi-threaded stress. The Makefile
+# target `test-concurrent-reads` is added in PR #127 but no CI workflow
+# invoked it — the PR author ran it locally and pasted soak results into
+# the PR. This job reproduces the full scenarios 1-8 sweep on every PR
+# that touches the catalog or singleflight surfaces, so the suite cannot
+# bit-rot.
 #
 # Debug build → ASan + UBSan instrumented via DuckDB's CMake defaults; any
 # UAF or atomic-publication race in the catalog will surface in the soak
@@ -24,7 +24,6 @@ on:
       - 'CMakeLists.txt'
       - 'Makefile'
       - 'test/cpp/test_concurrent_reads.cpp'
-      - 'test/cpp/test_catalog_graveyard.cpp'
       - '.github/workflows/concurrency-tests.yml'
   workflow_dispatch:
 
@@ -34,7 +33,7 @@ concurrency:
 
 jobs:
   concurrency-tests:
-    name: Concurrency stress (scenarios 1-8 + graveyard)
+    name: Concurrency stress (scenarios 1-8)
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -128,9 +127,6 @@ jobs:
           done
           echo "SQL Server unreachable after 150s" >&2
           exit 1
-
-      - name: Run catalog graveyard unit test (spec 052 T021)
-        run: make test-catalog-graveyard
 
       - name: Run concurrent-reads stress (spec 052 scenarios 1-8)
         run: make test-concurrent-reads
