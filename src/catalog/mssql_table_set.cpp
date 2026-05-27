@@ -168,9 +168,23 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 		});
 	}
 
+	// Spec 052 (Option D): anchor each entry in the per-ClientContext
+	// MSSQLBindAnchors BEFORE calling the user callback. The local snapshot
+	// only keeps entries alive for the duration of this Scan call, but
+	// DuckDB's catalog walkers (duckdb_tables, duckdb_schemas, etc.) collect
+	// raw pointers via callback in PHASE 1, then read columns / properties
+	// from those pointers in PHASE 2 after Scan returns. Without anchoring
+	// into BindAnchors, a concurrent Invalidate between phase 1 and phase 2
+	// turns those pointers into UAFs (ASan-caught in CI scenario 6 against
+	// duckdb_tables.cpp:111).
+	auto &bind_anchors = MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog());
+
 	// Phase 2: callback runs outside entry_mutex_. Snapshot holds shared_ptr
-	// so entries cannot disappear even if Invalidate() retires them mid-loop.
+	// so entries cannot disappear even if Invalidate() retires them mid-loop;
+	// BindAnchors then keeps them alive for the rest of the query (= until
+	// QueryEnd).
 	for (auto &entry_ptr : snapshot) {
+		bind_anchors.AnchorTable(entry_ptr);
 		callback(*entry_ptr);
 	}
 

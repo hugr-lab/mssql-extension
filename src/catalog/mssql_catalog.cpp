@@ -348,10 +348,14 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	// Fast path: If schemas are already loaded, get names without acquiring connection
 	vector<string> schema_names;
 	if (metadata_cache_->TryGetCachedSchemaNames(schema_names)) {
-		// Cache hit - iterate without connection
+		// Cache hit - iterate without connection.
+		// Spec 052 (Option D): anchor each schema entry so it survives a
+		// concurrent Invalidate between DuckDB walker phase 1 (collect) and
+		// phase 2 (read). Same reasoning as MSSQLTableSet::Scan.
 		for (const auto &name : schema_names) {
-			auto &schema_entry = GetOrCreateSchemaEntry(name);
-			callback(schema_entry);
+			auto schema_sp = GetOrCreateSchemaEntryShared(name);
+			MSSQLBindAnchors::For(context, *this).AnchorSchema(schema_sp);
+			callback(*schema_sp);
 		}
 		return;
 	}
