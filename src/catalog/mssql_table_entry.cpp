@@ -176,11 +176,22 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 		auto connection = pool.Acquire();
 
 		if (connection) {
-			idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
-			info.cardinality = row_count;
+			// Spec 052 PR #127: nested try so the connection is returned to the
+			// pool BEFORE the outer catch swallows the exception. Without this
+			// inner release, a DMV-query throw under stress leaks the
+			// connection into `active_connections_` — ~ConnectionPool then
+			// fires its quiescence warning on teardown and the D_ASSERT aborts
+			// the debug build.
+			try {
+				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
+				info.cardinality = row_count;
+				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
+							   name.c_str(), (unsigned long long)row_count);
+			} catch (...) {
+				pool.Release(std::move(connection));
+				throw;
+			}
 			pool.Release(std::move(connection));
-			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
-						   name.c_str(), (unsigned long long)row_count);
 		} else {
 			info.cardinality = approx_row_count_;
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
@@ -279,8 +290,19 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 
 		if (connection) {
 			auto &cache = mssql_catalog.GetMetadataCache();
-			pk_info_ =
-				mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name, cache.GetDatabaseCollation());
+			// Spec 052 PR #127: nested try so the connection is returned to the
+			// pool BEFORE the outer catch swallows the exception. Without this
+			// inner release, a Discover() throw under stress (concurrent TDS
+			// hiccup in scenario 5/8) leaks the connection into
+			// `active_connections_` — ~ConnectionPool then fires its quiescence
+			// warning on teardown and the D_ASSERT aborts the debug build.
+			try {
+				pk_info_ = mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name,
+														   cache.GetDatabaseCollation());
+			} catch (...) {
+				pool.Release(std::move(connection));
+				throw;
+			}
 			pool.Release(std::move(connection));
 		} else {
 			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available, assuming no PK");
