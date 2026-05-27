@@ -147,8 +147,21 @@ jobs:
           echo "SQL Server unreachable after 150s" >&2
           exit 1
 
+      # ASan-instrumented libduckdb.so is linked into the test binary via
+      # -lduckdb, but the test binary itself is NOT compiled with
+      # -fsanitize=address (Makefile keeps test build platform-agnostic;
+      # macOS dyld handles this transparently). On Linux glibc loader,
+      # libasan must come FIRST in the initial library list — otherwise:
+      #   ==NNNN==ASan runtime does not come first ... use LD_PRELOAD
+      # Preload libasan + libubsan via gcc's runtime lookup so we don't
+      # hardcode glibc version-specific .so names.
       - name: Run concurrent-reads stress (spec 052 scenarios 1-8)
-        run: make test-concurrent-reads
+        run: |
+          ASAN_LIB=$(gcc -print-file-name=libasan.so)
+          UBSAN_LIB=$(gcc -print-file-name=libubsan.so)
+          echo "ASan runtime: $ASAN_LIB"
+          echo "UBSan runtime: $UBSAN_LIB"
+          LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" make test-concurrent-reads
 
       - name: Dump SQL Server logs on failure
         if: failure()
