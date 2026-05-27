@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   propagated past `connection_pool_->Release`, leaving one connection
   checked out and tripping `~ConnectionPool`'s quiescence-contract
   assert at catalog teardown. Wrapped the `Refresh` call in try/release.
+- **`MSSQLTableEntry::EnsurePKLoaded` / `GetStorageInfo` connection
+  leak on TDS hiccup** (spec 052). Both functions intentionally swallow
+  exceptions to fall back to `pk_info_.exists = false` / cached
+  `approx_row_count_`, but the outer `catch (...)` never released the
+  pool-owned connection acquired inside the try. Every SELECT bind
+  calls `EnsurePKLoaded`, so under scenario 5/8 stress a single TDS
+  hiccup inside `PrimaryKeyInfo::Discover` stranded one connection in
+  `active_connections_` for the lifetime of the pool. Nested an inner
+  try/release/throw around the SQL Server I/O so the connection is
+  returned BEFORE the outer fallback catch runs.
 - **`ConnectionPool::Shutdown` cleanup-thread strand on quiescence
   violation** (spec 052). `D_ASSERT` in DuckDB-debug builds throws
   `InternalException` rather than calling `abort()`. The throw fired
