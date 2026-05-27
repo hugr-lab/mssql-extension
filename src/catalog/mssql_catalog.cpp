@@ -1,5 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include "azure/azure_token.hpp"
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
@@ -279,7 +280,11 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
 	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
-		return &GetOrCreateSchemaEntry(name);
+		auto schema_sp = GetOrCreateSchemaEntryShared(name);
+		if (transaction.context) {
+			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
+		}
+		return schema_sp.get();
 	}
 
 	// T013-T014 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
@@ -328,7 +333,11 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Get or create schema entry
-	return &GetOrCreateSchemaEntry(name);
+	auto schema_sp = GetOrCreateSchemaEntryShared(name);
+	if (transaction.context) {
+		MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
+	}
+	return schema_sp.get();
 }
 
 void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -369,27 +378,34 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 
 	for (const auto &name : schema_names) {
-		auto &schema_entry = GetOrCreateSchemaEntry(name);
-		callback(schema_entry);
+		auto schema_sp = GetOrCreateSchemaEntryShared(name);
+		MSSQLBindAnchors::For(context, *this).AnchorSchema(schema_sp);
+		callback(*schema_sp);
 	}
 }
 
-MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name) {
+shared_ptr<MSSQLSchemaEntry> MSSQLCatalog::GetOrCreateSchemaEntryShared(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
-		return *it->second;
+		return it->second;  // shared_ptr copy — refcount inc
 	}
 
-	// Spec 052 T009: construct via make_shared_ptr —
-	// enable_shared_from_this on MSSQLSchemaEntry requires shared_ptr
-	// ownership from the first store. schema_mutex_ is held across find +
-	// emplace above, so no race is possible here; the emplace simply
-	// publishes the freshly constructed entry.
+	// Spec 052: construct via make_shared_ptr — enable_shared_from_this on
+	// MSSQLSchemaEntry requires shared_ptr ownership from the first store.
+	// schema_mutex_ is held across find + emplace above, so no race is
+	// possible here; the emplace simply publishes the freshly constructed
+	// entry.
 	auto entry = make_shared_ptr<MSSQLSchemaEntry>(*this, schema_name);
 	auto insert_result = schema_entries_.emplace(schema_name, std::move(entry));
-	return *insert_result.first->second;
+	return insert_result.first->second;
+}
+
+MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name) {
+	// Reference-returning wrapper for internal call-sites that don't need to
+	// anchor (DDL paths that use the entry briefly and discard).
+	return *GetOrCreateSchemaEntryShared(schema_name);
 }
 
 optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
@@ -442,23 +458,14 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Point invalidation: invalidate schema list
 	metadata_cache_->InvalidateAll();
 
-	// Spec 052 T012: route the dropped schema entry into the catalog's
-	// schema_graveyard_ rather than destroying it outright. A binder may
-	// have looked up this schema before DROP SCHEMA fired and still be
-	// inside its bind/execute scope (CREATE TABLE inside the schema
-	// is the realistic window — bind phase issues a SQL Server round
-	// trip). The graveyard's shared_ptr keeps the underlying
-	// MSSQLSchemaEntry alive until ~MSSQLCatalog drains it.
-	shared_ptr<MSSQLSchemaEntry> retired;
-	{
-		std::lock_guard<std::mutex> lock(schema_mutex_);
-		auto it = schema_entries_.find(info.name);
-		if (it != schema_entries_.end()) {
-			retired = std::move(it->second);
-			schema_entries_.erase(it);
-		}
-	}
-	AppendToSchemaGraveyard(std::move(retired));
+	// Spec 052 (Option D): just erase. Any binder that looked up this schema
+	// before DROP SCHEMA fired is already anchored in its ClientContext's
+	// MSSQLBindAnchors via the LookupSchema path; the schema entry stays
+	// alive until that ClientContext's QueryEnd. DuckDB serializes DETACH
+	// against active queries, so we don't need to worry about the catalog
+	// dying mid-query.
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	schema_entries_.erase(info.name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -843,48 +850,15 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 	connection_pool_->Release(std::move(connection));
 }
 
-//===----------------------------------------------------------------------===//
-// Spec 052: Catalog-entry graveyard (lifetime extension across Invalidate)
-//===----------------------------------------------------------------------===//
-
-void MSSQLCatalog::AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired) {
-	if (retired.empty()) {
-		return;
-	}
-	std::lock_guard<std::mutex> lock(graveyard_mutex_);
-	table_graveyard_.reserve(table_graveyard_.size() + retired.size());
-	for (auto &entry : retired) {
-		table_graveyard_.push_back(std::move(entry));
-	}
-}
-
-void MSSQLCatalog::AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired) {
-	if (!retired) {
-		return;
-	}
-	std::lock_guard<std::mutex> lock(graveyard_mutex_);
-	schema_graveyard_.push_back(std::move(retired));
-}
-
-size_t MSSQLCatalog::GetTableGraveyardSize() const noexcept {
-	std::lock_guard<std::mutex> lock(graveyard_mutex_);
-	return table_graveyard_.size();
-}
-
-size_t MSSQLCatalog::GetSchemaGraveyardSize() const noexcept {
-	std::lock_guard<std::mutex> lock(graveyard_mutex_);
-	return schema_graveyard_.size();
-}
-
 void MSSQLCatalog::InvalidateMetadataCache() {
 	if (metadata_cache_) {
 		metadata_cache_->Invalidate();
 	}
 
 	// Also clear the local schema entry cache.
-	// Spec 052 T013: GetTableSet().Invalidate() routes retired table entries
-	// into table_graveyard_ via AppendToTableGraveyard; in-flight binders
-	// holding raw pointers retain validity through bind/execute.
+	// Spec 052 (Option D): in-flight binders are anchored in their
+	// ClientContext's MSSQLBindAnchors; dropping entries_ here just
+	// decrements refcount.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();
@@ -898,7 +872,7 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 	}
 
 	// Also invalidate the local schema entry's table set if it exists.
-	// Spec 052 T013: same graveyard guarantee as InvalidateMetadataCache.
+	// Spec 052 (Option D): MSSQLBindAnchors holds in-flight binder refs.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
@@ -963,9 +937,8 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	connection_pool_->Release(std::move(connection));
 
 	// Invalidate all schema table sets to pick up any changes.
-	// Spec 052 T013: GetTableSet().Invalidate() routes retired table entries
-	// into table_graveyard_; in-flight binders holding raw pointers remain
-	// valid through the rest of their bind/execute scope.
+	// Spec 052 (Option D): in-flight binders are anchored in
+	// MSSQLBindAnchors per ClientContext (released at QueryEnd).
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();

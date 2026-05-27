@@ -83,18 +83,11 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	catalog_bind_data->schema_name = mssql_schema.name;
 	catalog_bind_data->table_name = name;
 
-	// Store pointer to this table entry for get_bind_info callback
-	// This allows DuckDB to discover virtual columns like rowid
+	// Store pointer to this table entry for get_bind_info callback.
+	// Spec 052 (Option D): lifetime guaranteed by MSSQLBindAnchors set in
+	// MSSQLTableSet::GetEntry (per-ClientContext, released at QueryEnd) —
+	// no per-bind-data anchor needed here.
 	catalog_bind_data->table_entry = this;
-
-	// Spec 052 T015: anchor the underlying shared_ptr<MSSQLTableEntry> into
-	// the bind data. If a sibling thread invalidates the table set mid-query
-	// (mssql_refresh_cache, DROP TABLE via DuckDB, TTL boundary) the table
-	// entry is moved into MSSQLCatalog::table_graveyard_ rather than freed.
-	// This anchor (a shared_ptr copy via shared_from_this()) keeps the
-	// underlying object alive for the entire execute phase — destruction
-	// happens only when DuckDB tears down the bind data (= query plan dies).
-	catalog_bind_data->table_entry_anchor = shared_ptr<void>(shared_from_this());
 
 	// Store ALL column information - the query will use only projected columns
 	for (const auto &col : mssql_columns_) {

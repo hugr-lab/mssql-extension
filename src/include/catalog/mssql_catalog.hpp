@@ -23,7 +23,6 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 class MSSQLSchemaEntry;
-class MSSQLTableEntry;	// Forward decl — spec 052 table_graveyard_ holds shared_ptr to it
 class MSSQLStatisticsProvider;
 class PhysicalPlanGenerator;
 class LogicalCreateTable;
@@ -195,27 +194,6 @@ public:
 	// Unlike EnsureCacheLoaded() which only sets TTL, this does eager full refresh
 	void RefreshCache(ClientContext &context);
 
-	//===----------------------------------------------------------------------===//
-	// Spec 052: Catalog-entry graveyard (lifetime extension across Invalidate)
-	//
-	// MSSQLTableSet::Invalidate() and MSSQLCatalog::OnDetach() route retired
-	// shared_ptr<…Entry> instances into these graveyards instead of dropping
-	// them. The DuckDB binder may still hold a raw pointer obtained before the
-	// invalidation; the graveyard's shared_ptr keeps the underlying object
-	// alive until ~MSSQLCatalog() drains both vectors.
-	//
-	// No runtime GC — bounded by (unique entries × invalidation events). See
-	// specs/052-thread-safe-catalog-entries/research.md § Decision 3.
-	//===----------------------------------------------------------------------===//
-
-	// Reserve / push_back can throw std::bad_alloc; bubble that up rather
-	// than terminate. (Size accessors are pure mutex+size — keep noexcept.)
-	void AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired);
-	void AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired);
-
-	size_t GetTableGraveyardSize() const noexcept;
-	size_t GetSchemaGraveyardSize() const noexcept;
-
 protected:
 	//===----------------------------------------------------------------------===//
 	// Protected Override (required by Catalog)
@@ -228,7 +206,11 @@ private:
 	// Internal Methods
 	//===----------------------------------------------------------------------===//
 
-	// Get or create schema entry
+	// Get or create schema entry.
+	// Spec 052 (Option D): shared variant returns the shared_ptr (used by
+	// LookupSchema/ScanSchemas to anchor in MSSQLBindAnchors); reference
+	// variant wraps for callers that don't need to anchor.
+	shared_ptr<MSSQLSchemaEntry> GetOrCreateSchemaEntryShared(const string &schema_name);
 	MSSQLSchemaEntry &GetOrCreateSchemaEntry(const string &schema_name);
 
 	// Query database default collation
@@ -250,16 +232,12 @@ private:
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	string database_collation_;								   // Database default collation
 	string default_schema_;									   // Default schema ("dbo")
-	// Spec 052: shared_ptr (was unique_ptr) so retired schema entries can flow
-	// into schema_graveyard_ on OnDetach while in-flight binders retain
-	// validity. Insertion is emplace-only (winner wins on race).
+	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
+	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
+	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-
+	// only insertion guards against concurrent first-load.
 	unordered_map<string, shared_ptr<MSSQLSchemaEntry>> schema_entries_;
 	mutable std::mutex schema_mutex_;  // Thread-safety for schema access
-
-	// Spec 052: per-catalog graveyards (see AppendTo*Graveyard above)
-	mutable std::mutex graveyard_mutex_;
-	vector<shared_ptr<MSSQLTableEntry>> table_graveyard_;
-	vector<shared_ptr<MSSQLSchemaEntry>> schema_graveyard_;
 
 	// Spec 047 / US3: per-catalog result stream registry (replaces process-wide
 	// MSSQLResultStreamRegistry singleton). Streams are produced at mssql_scan

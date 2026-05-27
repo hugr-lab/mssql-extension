@@ -83,21 +83,11 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	//===----------------------------------------------------------------------===//
 
 	// Pointer to the table entry (for GetTable() / get_bind_info)
-	// This allows DuckDB to discover virtual columns like rowid
+	// This allows DuckDB to discover virtual columns like rowid.
+	// Spec 052 (Option D): lifetime of the underlying entry is guaranteed by
+	// MSSQLBindAnchors (per ClientContext, released at QueryEnd) which is
+	// populated on every LookupEntry call. No per-bind-data anchor needed.
 	optional_ptr<TableCatalogEntry> table_entry;
-
-	// Spec 052 T014: shared_ptr anchor that co-owns the MSSQLTableEntry the
-	// `table_entry` raw pointer points at. Set in MSSQLTableEntry::GetScanFunction
-	// via shared_from_this(); held for the entire execute phase. If a sibling
-	// thread calls mssql_refresh_cache() / DROP TABLE / TTL invalidation
-	// mid-execute, the MSSQLTableSet routes the retired entry into
-	// MSSQLCatalog::table_graveyard_; our anchor keeps the underlying object
-	// alive until this bind data is destroyed (= query plan teardown).
-	// Type is shared_ptr<MSSQLTableEntry> but declared as shared_ptr<void>
-	// here because mssql_functions.hpp avoids the MSSQLTableEntry include
-	// (forward-decl only); the construction site (mssql_table_entry.cpp)
-	// has the full type and can shared_ptr_cast.
-	shared_ptr<void> table_entry_anchor;
 
 	// Whether rowid was requested in the projection
 	bool rowid_requested = false;

@@ -1,6 +1,7 @@
 #include "catalog/mssql_table_set.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_schema_entry.hpp"
@@ -35,20 +36,30 @@ MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
 
 optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const string &name) {
 	CATALOG_DEBUG(2, "GetEntry('%s.%s')", schema_.name.c_str(), name.c_str());
+
+	// Spec 052 Option D: stash a copy of the shared_ptr in the per-context
+	// MSSQLBindAnchors; it's released at QueryEnd. This keeps the entry alive
+	// from LookupEntry's return through any binder dereferences AND through
+	// GetScanFunction (no separate bind_data anchor needed). If a concurrent
+	// Invalidate moves entries_ to nothing, our anchor still holds the entry
+	// for the rest of this query.
+	shared_ptr<MSSQLTableEntry> anchored;
+
 	// 1. Check cached entries (fast path)
 	{
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
 		if (it != entries_.end()) {
 			CATALOG_DEBUG(2, "  -> cache hit for '%s'", name.c_str());
-			return it->second.get();
-		}
-
-		// If we've already tried to load this table and it wasn't found, return nullptr
-		if (attempted_tables_.find(name) != attempted_tables_.end()) {
+			anchored = it->second;	// shared_ptr copy under lock — refcount inc
+		} else if (attempted_tables_.find(name) != attempted_tables_.end()) {
 			CATALOG_DEBUG(2, "  -> already attempted, not found");
 			return nullptr;
 		}
+	}
+	if (anchored) {
+		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		return anchored.get();
 	}
 
 	// 2. If fully loaded and not found, table doesn't exist
@@ -87,8 +98,12 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
 		if (it != entries_.end()) {
-			return it->second.get();
+			anchored = it->second;	// shared_ptr copy under lock
 		}
+	}
+	if (anchored) {
+		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		return anchored.get();
 	}
 	return nullptr;
 }
@@ -252,25 +267,17 @@ void MSSQLTableSet::Invalidate() {
 	std::lock_guard<std::mutex> lock(load_mutex_);
 	is_fully_loaded_.store(false);
 	names_loaded_.store(false);
-	// Spec 052 T011: move retired entries into the catalog's graveyard
-	// instead of dropping them outright. In-flight binders still hold raw
-	// pointers obtained before this Invalidate() — the graveyard's shared_ptr
-	// keeps the underlying MSSQLTableEntry objects alive until either the
-	// bind data releases its anchor (US2 T015) or ~MSSQLCatalog drains the
-	// graveyard. Subsequent LoadSingleEntry calls see an empty entries_ map
-	// and reload from SQL Server (FR-006 — pre-Invalidate binders observe
-	// stale metadata; new binds resolve fresh metadata).
-	vector<shared_ptr<MSSQLTableEntry>> retired;
+	// Spec 052 (Option D): just clear entries_. In-flight binders that
+	// looked up an entry BEFORE this Invalidate are already anchored in
+	// their ClientContext's MSSQLBindAnchors (per the LookupEntry / GetEntry
+	// path that auto-anchors). Dropping our shared_ptr here decrements
+	// refcount, but the anchor's shared_ptr keeps the underlying entry alive
+	// until QueryEnd. New binds resolve fresh metadata (FR-006).
 	{
 		std::lock_guard<std::mutex> elock(entry_mutex_);
-		retired.reserve(entries_.size());
-		for (auto &kv : entries_) {
-			retired.push_back(std::move(kv.second));
-		}
 		entries_.clear();
 		attempted_tables_.clear();
 	}
-	schema_.GetMSSQLCatalog().AppendToTableGraveyard(std::move(retired));
 	{
 		std::lock_guard<std::mutex> nlock(names_mutex_);
 		known_table_names_.clear();
