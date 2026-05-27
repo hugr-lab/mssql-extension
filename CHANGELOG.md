@@ -14,40 +14,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Catalog entries (`MSSQLTableEntry`, `MSSQLSchemaEntry`) switched from
   `unique_ptr` to `shared_ptr` ownership; concurrent first-load of the
   same table is coordinated via per-table singleflight so only one
-  thread issues the SQL Server round trip (waiters re-check the cache);
-  `MSSQLTableSet::Invalidate` and `MSSQLCatalog::OnDetach` route
-  retired entries into per-catalog `table_graveyard_` /
-  `schema_graveyard_` rather than freeing them outright — in-flight
-  binders holding raw `optional_ptr<CatalogEntry>` references obtained
-  before the invalidation now retain validity through the rest of
-  their bind/execute scope. Bind data anchors the underlying
-  `MSSQLTableEntry` via `shared_from_this()` so query execute keeps
-  the entry alive even across catalog-cache cycles. Graveyards drain
-  at `~MSSQLCatalog` (no runtime GC — bounded by realistic invalidation
-  cadence per spec 052 research § Decision 3). Audit of
-  `MSSQLMetadataCache::GetTableMetadata` confirms its only caller
-  (`MSSQLTableSet::LoadSingleEntry`) copies fields immediately;
-  contract pinned in the header. `MSSQLStatisticsProvider` returns
-  by value, no pointer-handout surface.
+  thread issues the SQL Server round trip (waiters re-check the cache).
+  Lifetime extension across `Invalidate()` / `OnDetach` is done via
+  per-`ClientContext` bind-time anchors registered as
+  `ClientContextState`: every `MSSQLSchemaEntry::LookupEntry` /
+  `MSSQLCatalog::LookupSchema` / catalog `Scan` callback path stashes
+  the `shared_ptr` into the per-context `MSSQLBindAnchors` holder, which
+  DuckDB releases via the `QueryEnd` hook. In-flight binders therefore
+  hold every entry they touched alive for the full bind+execute span;
+  release happens naturally at end of query, with no catalog-lifetime
+  accumulation. Audit of `MSSQLMetadataCache::GetTableMetadata` confirms
+  its only caller (`MSSQLTableSet::LoadSingleEntry`) copies fields
+  immediately; contract pinned in the header.
+  `MSSQLStatisticsProvider` returns by value, no pointer-handout surface.
 - **`MSSQLTableEntry::EnsurePKLoaded` double-free under thread stress**
-  (spec 052). Two threads both saw `pk_info_.loaded == false`, both
-  fetched, both move-assigned to `pk_info_` — the second move freed
-  the loser's previous `vector<PKColumnInfo>` while the first thread
-  still held it. Caught by AddressSanitizer during scenario 5 stress.
-  Fixed with a `pk_load_mutex_` + double-checked-load (fast path
-  stays lock-free when `loaded == true`).
+  (spec 052). Two threads both saw the load flag false, both fetched, and
+  both move-assigned to `pk_info_` — the second move freed the loser's
+  previous `vector<PKColumnInfo>` while the first thread still held it.
+  Caught by AddressSanitizer during the spec 052 invalidation-race soak.
+  Fixed with a `pk_load_mutex_` + `std::atomic<bool> pk_loaded_`
+  acquire/release publication so the lock-free fast path stays correct
+  under the C++ memory model.
+- **`MSSQLCatalog::RefreshCache` connection leak on TDS hiccup** (spec
+  052). Under thread stress (~318 invalidations / 30 s), SQL Server
+  occasionally returns a transient TDS error mid-Refresh. The exception
+  propagated past `connection_pool_->Release`, leaving one connection
+  checked out and tripping `~ConnectionPool`'s quiescence-contract
+  assert at catalog teardown. Wrapped the `Refresh` call in try/release.
+- **`ConnectionPool::Shutdown` cleanup-thread strand on quiescence
+  violation** (spec 052). `D_ASSERT` in DuckDB-debug builds throws
+  `InternalException` rather than calling `abort()`. The throw fired
+  while `cleanup_thread_` was still joinable; `~ConnectionPool noexcept`
+  caught the exception, but `~std::thread` on the joinable thread then
+  called `std::terminate()`. Reordered: signal + join the cleanup thread
+  and close pooled connections FIRST, then emit the warning and assert
+  at the end. The warning is the operator-visibility signal; the
+  trailing assert preserves the debug invariant without stranding
+  resources on its unwind path.
 
 ### Added
 
-- `test/cpp/test_concurrent_reads.cpp` scenarios 5 and 6 (spec 052
-  US2/US3 acceptance): 30 s soak with 4 readers + invalidator at 50 ms
-  cadence (scenario 5), plus a schema-walker thread exercising sibling
-  caches (scenario 6). Sample 30 s run: scenario 5 — 9780 reads ×
-  278 invalidations, scenario 6 — 7069 reads × 276 invalidations ×
-  1099 schema walks, both AddressSanitizer-clean.
-- `test/cpp/test_catalog_graveyard.cpp` + `make test-catalog-graveyard`
-  target (spec 052 T021) — focused unit test asserting graveyard
-  accumulates on `Invalidate()` and drains on `DETACH`.
+- `test/cpp/test_concurrent_reads.cpp` scenarios 5-8 (spec 052
+  US2/US3 + concurrent-write acceptance): 30 s soak runs that exercise
+  every spec 052 lifetime guarantee under AddressSanitizer/UBSan.
+  Scenario 5 — 4 readers + invalidator at 50 ms cadence
+  (~2500 reads × ~300 invalidations). Scenario 6 — scenario 5 plus a
+  `duckdb_schemas()` / `duckdb_tables()` walker exercising the bulk-scan
+  anchor path (~1200 reads × ~260 invalidations × ~200 schema walks).
+  Scenario 7 — 4 writers + 1 reader on one shared table with disjoint PK
+  ranges (~550 INSERT/UPDATE/DELETE cycles + ~500 reads). Scenario 8 —
+  4 pure-write threads (~2700 INSERTs / 30 s).
+- `.github/workflows/concurrency-tests.yml` job that rebuilds the
+  extension with ASan/UBSan and runs `test-concurrent-reads` on every
+  PR that touches the catalog or singleflight surfaces. Includes an
+  8 GB swap on `/mnt` to absorb the link-time RAM peak, a
+  `TestDB`-creation step for scenarios 4-8, and `LD_PRELOAD`-ed
+  `libasan`/`libubsan` on the test binary run only (so the preload
+  doesn't leak into vcpkg's compiler probe).
 ### Security
 
 - **Wipe bearer credentials on destruction.** `MSSQLConnectionInfo` gains a

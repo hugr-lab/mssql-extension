@@ -53,17 +53,19 @@ void ConnectionPool::Shutdown() {
 	// Spec 047 T046l: surface DuckDB quiescence-contract violations in debug
 	// builds via D_ASSERT. PR #118 review M2: also emit a release-mode warning
 	// — silent UB on a real quiescence violation is worse for operators than
-	// one stderr line. The warning runs BEFORE the assert so debug builds
-	// emit both the warning and the assert hit before std::terminate.
-	if (!active_connections_.empty()) {
-		fprintf(stderr,
-				"[MSSQL POOL] WARNING: ~ConnectionPool '%s' called with %zu connection(s) still "
-				"checked out — DuckDB quiescence contract violated. Sockets are about to close under "
-				"the calling thread(s); next read on the held connection will see EBADF / connection "
-				"reset. On Windows the closesocket-vs-recv race is undefined.\n",
-				context_name_.c_str(), active_connections_.size());
-	}
-	D_ASSERT(active_connections_.empty());
+	// one stderr line.
+	//
+	// Spec 052 fix (PR #127): D_ASSERT in DuckDB-debug **throws**
+	// InternalException (it doesn't call abort() like libc assert). If the
+	// throw fires while cleanup_thread_ is still joinable, the unwind
+	// skipped the join, ~ConnectionPool catches the exception but then
+	// ~std::thread on the joinable cleanup_thread_ called std::terminate().
+	// Reorder: signal+join cleanup thread first, close connections, THEN
+	// emit the warning and run the assert at the very end — by which point
+	// the unwind path can't strand any owned resource. The warning is the
+	// operator-visibility signal; if it printed, the violation IS reported,
+	// even if the trailing assert later throws.
+	const size_t leaked = active_connections_.size();
 
 	// Signal shutdown
 	shutdown_flag_.store(true);
@@ -71,7 +73,9 @@ void ConnectionPool::Shutdown() {
 	// Wake up cleanup thread
 	available_cv_.notify_all();
 
-	// Wait for cleanup thread to finish
+	// Wait for cleanup thread to finish (do this BEFORE the assert that may
+	// throw, otherwise the noexcept catch upstairs followed by ~std::thread
+	// on a still-joinable thread = std::terminate).
 	if (cleanup_thread_.joinable()) {
 		cleanup_thread_.join();
 	}
@@ -101,6 +105,21 @@ void ConnectionPool::Shutdown() {
 	stats_.total_connections = 0;
 	stats_.idle_connections = 0;
 	stats_.active_connections = 0;
+
+	// Spec 052 fix (PR #127): emit the warning + assert AFTER cleanup so that
+	// if D_ASSERT throws (DuckDB-debug behaviour), no owned resource (cleanup
+	// thread, sockets) is stranded by the unwind. `leaked` was captured at
+	// entry — by this point active_connections_ is empty regardless, but the
+	// quiescence-contract violation is what the operator needs to see.
+	if (leaked > 0) {
+		fprintf(stderr,
+				"[MSSQL POOL] WARNING: ~ConnectionPool '%s' shut down with %zu connection(s) still "
+				"checked out — DuckDB quiescence contract violated. Held connections were force-"
+				"closed; any thread that still held a reference will see EBADF / connection reset "
+				"on its next socket read. On Windows the closesocket-vs-recv race is undefined.\n",
+				context_name_.c_str(), leaked);
+	}
+	D_ASSERT(leaked == 0);
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
