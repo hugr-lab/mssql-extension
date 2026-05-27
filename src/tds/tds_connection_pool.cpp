@@ -93,9 +93,17 @@ void ConnectionPool::Shutdown() {
 		stats_.connections_closed++;
 	}
 
-	// Close active connections
+	// Close active connections.
+	// Spec 052 PR #127: dump per-connection diagnostics for every leaked
+	// active conn (id, SPID, state, in-flight ref count). This is what
+	// tells us WHERE the leak originated — without it the leak warning
+	// only says "1 connection" with no clue which call path stranded it.
 	for (auto &pair : active_connections_) {
 		if (pair.second) {
+			fprintf(stderr,
+					"[MSSQL POOL] LEAKED active conn id=%llu spid=%u state=%d use_count=%ld pool='%s'\n",
+					(unsigned long long)pair.first, (unsigned)pair.second->GetSpid(),
+					(int)pair.second->GetState(), (long)pair.second.use_count(), context_name_.c_str());
 			pair.second->Close();
 		}
 		stats_.connections_closed++;
