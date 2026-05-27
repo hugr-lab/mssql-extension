@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Wipe bearer credentials on destruction.** `MSSQLConnectionInfo` gains a
+  user-declared destructor that `OPENSSL_cleanse`s `password` and
+  `access_token`; `~MSSQLCatalog` wipes the cached `fedauth_token_utf16le_`
+  byte vector. `OPENSSL_cleanse` defeats dead-store elimination, so secrets
+  do not linger in heap-recycled memory after the owning
+  `shared_ptr<MSSQLConnectionInfo>` or `MSSQLCatalog` is destroyed.
+  Rule-of-five compliance: copy/move ctors and assigns on
+  `MSSQLConnectionInfo` are explicitly `= default`-ed so that user-declaring
+  the destructor doesn't silently disable move generation.
+
 ## [0.2.0] - 2026-05-20
 
 Major release: integrated authentication (Kerberos + Windows SSPI),
