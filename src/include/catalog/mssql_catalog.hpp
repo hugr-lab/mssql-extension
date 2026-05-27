@@ -208,8 +208,10 @@ public:
 	// specs/052-thread-safe-catalog-entries/research.md § Decision 3.
 	//===----------------------------------------------------------------------===//
 
-	void AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired) noexcept;
-	void AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired) noexcept;
+	// Reserve / push_back can throw std::bad_alloc; bubble that up rather
+	// than terminate. (Size accessors are pure mutex+size — keep noexcept.)
+	void AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired);
+	void AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired);
 
 	size_t GetTableGraveyardSize() const noexcept;
 	size_t GetSchemaGraveyardSize() const noexcept;

@@ -33,10 +33,8 @@ struct PKColumnInfo {
 //===----------------------------------------------------------------------===//
 
 struct PrimaryKeyInfo {
-	// Loading state
-	bool loaded = false;  // Has PK discovery been attempted?
-
-	// PK existence
+	// PK existence (only meaningful once the owning MSSQLTableEntry has
+	// published this struct via its pk_loaded_ atomic — see header).
 	bool exists = false;  // Does table have a PK?
 
 	// PK structure (only valid if exists == true)
@@ -46,7 +44,7 @@ struct PrimaryKeyInfo {
 	LogicalType rowid_type;	 // Scalar (single col) or STRUCT (composite)
 
 	// Default constructor
-	PrimaryKeyInfo() : loaded(false), exists(false), rowid_type(LogicalType::SQLNULL) {}
+	PrimaryKeyInfo() : exists(false), rowid_type(LogicalType::SQLNULL) {}
 
 	// Predicates
 	bool IsScalar() const {

@@ -382,10 +382,11 @@ MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name
 		return *it->second;
 	}
 
-	// Spec 052 T009: emplace-only with make_shared_ptr. enable_shared_from_this
-	// on MSSQLSchemaEntry requires construction via shared_ptr from day one.
-	// On race the late-arriving shared_ptr is discarded; emplace returns the
-	// winner's iterator either way.
+	// Spec 052 T009: construct via make_shared_ptr —
+	// enable_shared_from_this on MSSQLSchemaEntry requires shared_ptr
+	// ownership from the first store. schema_mutex_ is held across find +
+	// emplace above, so no race is possible here; the emplace simply
+	// publishes the freshly constructed entry.
 	auto entry = make_shared_ptr<MSSQLSchemaEntry>(*this, schema_name);
 	auto insert_result = schema_entries_.emplace(schema_name, std::move(entry));
 	return *insert_result.first->second;
@@ -846,7 +847,7 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 // Spec 052: Catalog-entry graveyard (lifetime extension across Invalidate)
 //===----------------------------------------------------------------------===//
 
-void MSSQLCatalog::AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired) noexcept {
+void MSSQLCatalog::AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> retired) {
 	if (retired.empty()) {
 		return;
 	}
@@ -857,7 +858,7 @@ void MSSQLCatalog::AppendToTableGraveyard(vector<shared_ptr<MSSQLTableEntry>> re
 	}
 }
 
-void MSSQLCatalog::AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired) noexcept {
+void MSSQLCatalog::AppendToSchemaGraveyard(shared_ptr<MSSQLSchemaEntry> retired) {
 	if (!retired) {
 		return;
 	}

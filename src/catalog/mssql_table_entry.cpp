@@ -255,22 +255,23 @@ MSSQLSchemaEntry &MSSQLTableEntry::GetMSSQLSchema() {
 //===----------------------------------------------------------------------===//
 
 void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
-	// Fast path: already loaded. NOT thread-safe for the boolean read, but
-	// safe in practice — `loaded` only ever transitions false→true (latched).
-	// A torn read here at worst forces a redundant mutex acquire below, which
-	// the double-check then short-circuits.
-	if (pk_info_.loaded) {
+	// Fast path: already loaded. Acquire-load synchronises with the
+	// release-store at the end of the slow path so any thread observing
+	// pk_loaded_ == true is guaranteed to also see the fully-published
+	// pk_info_ fields.
+	if (pk_loaded_.load(std::memory_order_acquire)) {
 		return;
 	}
 
 	// Spec 052 EnsurePKLoaded race fix: serialise concurrent first-loads so
 	// only one thread does the PrimaryKeyInfo::Discover round trip and the
-	// `pk_info_ = std::move(...)` write. Without this serialisation, two
+	// `pk_info_ = Discover(...)` write. Without this serialisation, two
 	// threads both loaded and both move-assigned, double-freeing the loser's
 	// previous-value vector<PKColumnInfo>. Caught by ASan in scenario 5.
 	std::lock_guard<std::mutex> lock(pk_load_mutex_);
-	if (pk_info_.loaded) {
-		// Another thread won the race while we were waiting on the mutex.
+	// Double-check under the mutex. The mutex provides the happens-before
+	// edge here, so a relaxed load is sufficient.
+	if (pk_loaded_.load(std::memory_order_relaxed)) {
 		return;
 	}
 
@@ -289,16 +290,17 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 				mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name, cache.GetDatabaseCollation());
 			pool.Release(std::move(connection));
 		} else {
-			// No connection available - mark as loaded but no PK
 			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available, assuming no PK");
-			pk_info_.loaded = true;
 			pk_info_.exists = false;
 		}
 	} catch (const std::exception &e) {
 		MSSQL_TE_DEBUG("EnsurePKLoaded: error discovering PK: %s", e.what());
-		pk_info_.loaded = true;
 		pk_info_.exists = false;
 	}
+
+	// Release-store publishes pk_info_ to any reader doing acquire-load.
+	// MUST be the last write to MSSQLTableEntry state in this function.
+	pk_loaded_.store(true, std::memory_order_release);
 }
 
 LogicalType MSSQLTableEntry::GetRowIdType(ClientContext &context) {
@@ -338,8 +340,14 @@ const mssql::PrimaryKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &c
 virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
 
+	// Spec 052: acquire-load pairs with EnsurePKLoaded's release-store so
+	// reading pk_info_.exists / pk_info_.rowid_type below is safe whenever
+	// this load returns true.
+	const bool pk_loaded = pk_loaded_.load(std::memory_order_acquire);
+
 	MSSQL_TE_DEBUG("GetVirtualColumns: table=%s, pk_loaded=%s, pk_exists=%s", name.c_str(),
-				   pk_info_.loaded ? "true" : "false", pk_info_.exists ? "true" : "false");
+				   pk_loaded ? "true" : "false",
+				   (pk_loaded && pk_info_.exists) ? "true" : "false");
 
 	// Views don't support rowid
 	if (object_type_ == MSSQLObjectType::VIEW) {
@@ -350,7 +358,7 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	// Check if PK info is loaded and has a primary key
 	// Note: PK info is lazy-loaded in GetScanFunction(), which is called before this
 	// method during binding. If not loaded yet, we can't expose rowid.
-	if (!pk_info_.loaded) {
+	if (!pk_loaded) {
 		MSSQL_TE_DEBUG("GetVirtualColumns: PK info not loaded for %s, not exposing rowid", name.c_str());
 		return result;
 	}

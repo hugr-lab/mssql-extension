@@ -120,31 +120,46 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	// Pre-populating statistics avoids 200K+ individual DMV queries when
 	// duckdb_tables() calls GetStorageInfo() on each table entry.
 	auto &stats_provider = catalog.GetStatisticsProvider();
-	std::lock_guard<std::mutex> lock(entry_mutex_);
 
-	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
-		// Pre-populate statistics cache with approx_row_count from bulk metadata
-		stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+	// Phase 1: populate entries_ under entry_mutex_ and capture shared_ptr
+	// references for the callback phase. We collect refs rather than invoking
+	// callback() here so the lock can be released before user code runs —
+	// callbacks frequently call back into DuckDB binder paths that resolve
+	// virtual columns or sibling tables, which would re-enter LoadSingleEntry
+	// and block on entry_mutex_ (spec 052 singleflight grabs it first).
+	// shared_ptr copies in the snapshot keep entries alive even if a sibling
+	// thread fires Invalidate() between phase 1 and phase 2.
+	vector<shared_ptr<MSSQLTableEntry>> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(entry_mutex_);
+		cache.ForEachTableInSchema(schema_.name,
+								   [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+									   stats_provider.PreloadRowCount(schema_.name, table_name,
+																	  table_meta.approx_row_count);
+									   known_table_names_.insert(table_name);
 
-		// Update known_table_names_
-		known_table_names_.insert(table_name);
+									   auto it = entries_.find(table_name);
+									   if (it != entries_.end()) {
+										   snapshot.push_back(it->second);
+										   return;
+									   }
 
-		// Skip if already loaded as entry
-		if (entries_.find(table_name) != entries_.end()) {
-			callback(*entries_[table_name]);
-			return;
-		}
+									   auto entry = CreateTableEntry(table_meta);
+									   if (entry) {
+										   // Spec 052 T007: emplace-only (winner wins on race
+										   // vs LoadSingleEntry). C++11-compatible pair access
+										   // (CLAUDE.md ODR rule: no structured bindings).
+										   auto insert_result = entries_.emplace(entry->name, std::move(entry));
+										   snapshot.push_back(insert_result.first->second);
+									   }
+								   });
+	}
 
-		auto entry = CreateTableEntry(table_meta);
-		if (entry) {
-			// Spec 052 T007: emplace-only (winner wins on race vs LoadSingleEntry).
-			// On collision the new entry is discarded; the in-place entry already
-			// served any concurrent first-load caller. C++11-compatible pair
-			// destructuring (CLAUDE.md ODR rule: no structured bindings).
-			auto insert_result = entries_.emplace(entry->name, std::move(entry));
-			callback(*insert_result.first->second);
-		}
-	});
+	// Phase 2: callback runs outside entry_mutex_. Snapshot holds shared_ptr
+	// so entries cannot disappear even if Invalidate() retires them mid-loop.
+	for (auto &entry_ptr : snapshot) {
+		callback(*entry_ptr);
+	}
 
 	names_loaded_.store(true);
 	is_fully_loaded_.store(true);

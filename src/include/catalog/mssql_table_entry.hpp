@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "catalog/mssql_column_info.hpp"
@@ -98,10 +99,17 @@ private:
 
 	// Lazy-loaded PK cache.
 	// Spec 052 EnsurePKLoaded race fix: pk_load_mutex_ serialises concurrent
-	// callers. Without it, two threads both saw `pk_info_.loaded == false`
-	// and both did `pk_info_ = std::move(...)`, double-freeing the
-	// underlying vector<PKColumnInfo> the loser's previous-value held.
-	// Caught by ASan during spec 052 scenario-5 stress.
+	// callers. Without it, two threads both saw the load flag false and both
+	// did `pk_info_ = Discover(...)`, double-freeing the loser's previous
+	// `vector<PKColumnInfo>`. Caught by ASan during spec 052 scenario-5
+	// stress.
+	//
+	// pk_loaded_ is a separate atomic (hoisted out of PrimaryKeyInfo so the
+	// struct remains move-assignable). The fast path in EnsurePKLoaded and
+	// the publication check in GetVirtualColumns use load(acquire) /
+	// store(release) so a reader observing pk_loaded_ == true is guaranteed
+	// to see the fully-published pk_info_ assigned under the mutex.
+	mutable std::atomic<bool> pk_loaded_{false};
 	mutable std::mutex pk_load_mutex_;
 	mutable mssql::PrimaryKeyInfo pk_info_;
 
