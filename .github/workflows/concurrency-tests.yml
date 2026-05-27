@@ -77,6 +77,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config ccache
 
+      # ASan+UBSan-instrumented DuckDB+jemalloc+mssql linking spikes RAM to
+      # >7GB on ubuntu-latest (7GB total, no swap). Without this the build
+      # OOM-kills around [709/721] (linking final unittest binary). 8GB
+      # swap is enough to hold the linker peak; ccache + ninja parallelism
+      # keep the actual working set well under it.
+      - name: Add swap space (avoid OOM during ASan/UBSan link)
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Cache ccache
         uses: actions/cache@v5
         with:
