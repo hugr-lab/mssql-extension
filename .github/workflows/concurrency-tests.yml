@@ -1,0 +1,145 @@
+name: Concurrency Tests
+
+# Spec 052: validates the catalog-entry lifetime / singleflight fix under
+# multi-threaded stress. The Makefile targets `test-concurrent-reads` and
+# `test-catalog-graveyard` are added in PR #127 but no CI workflow invoked
+# them — the PR author ran them locally and pasted soak results into the
+# PR. This job reproduces the full scenarios 1-8 sweep + the graveyard
+# unit test on every PR that touches the catalog or singleflight surfaces,
+# so the suite cannot bit-rot.
+#
+# Debug build → ASan + UBSan instrumented via DuckDB's CMake defaults; any
+# UAF or atomic-publication race in the catalog will surface in the soak
+# scenarios (each 30s, ~10k-17k ops apiece).
+
+on:
+  pull_request:
+    paths:
+      - 'src/catalog/**'
+      - 'src/include/catalog/**'
+      - 'src/mssql_functions.cpp'
+      - 'src/include/mssql_functions.hpp'
+      - 'src/mssql_storage.cpp'
+      - 'src/include/mssql_storage.hpp'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'test/cpp/test_concurrent_reads.cpp'
+      - 'test/cpp/test_catalog_graveyard.cpp'
+      - '.github/workflows/concurrency-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: concurrency-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  concurrency-tests:
+    name: Concurrency stress (scenarios 1-8 + graveyard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # SQL Server 2022 sidecar — same image and credentials as the existing
+    # integration-test job in ci.yml. Concurrency tests only need `master`
+    # (always present), so no init script is required.
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+    env:
+      MSSQL_TEST_HOST: localhost
+      MSSQL_TEST_PORT: '1433'
+      MSSQL_TEST_USER: sa
+      MSSQL_TEST_PASS: TestPassword1
+      MSSQL_TEST_DB: master
+      # Surface sanitizer stacks on the first hit rather than continuing.
+      ASAN_OPTIONS: detect_stack_use_after_return=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      GEN: ninja
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (ninja + pkg-config + ccache)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-concurrency-${{ github.sha }}
+          restore-keys: |
+            ccache-concurrency-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+            vcpkg/buildtrees
+          key: vcpkg-concurrency-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-concurrency-
+
+      - name: Bootstrap vcpkg
+        run: make vcpkg-setup
+
+      - name: Build extension (Debug — enables ASan/UBSan via DuckDB CMake)
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: make debug
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Wait for SQL Server
+        run: |
+          echo "Waiting for SQL Server on localhost:1433..."
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/1433) 2>/dev/null; then
+              echo "SQL Server reachable after ${i} attempts"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SQL Server unreachable after 150s" >&2
+          exit 1
+
+      - name: Run catalog graveyard unit test (spec 052 T021)
+        run: make test-catalog-graveyard
+
+      - name: Run concurrent-reads stress (spec 052 scenarios 1-8)
+        run: make test-concurrent-reads
+
+      - name: Dump SQL Server logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          sql_container="$(docker ps -a --filter ancestor=mcr.microsoft.com/mssql/server:2022-latest --format '{{.ID}}' | head -1)"
+          if [ -n "$sql_container" ]; then
+            docker logs "$sql_container" 2>&1 | tail -200
+          fi
