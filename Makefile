@@ -23,13 +23,21 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
 
-# Bootstrap vcpkg if not present
+# Bootstrap vcpkg if not present.
+# Spec 052 PR #127 CI fix: check for the toolchain file specifically, not
+# just the directory. GitHub Actions cache restore creates an empty `vcpkg/`
+# parent when restoring `vcpkg/installed/` — the bare directory existed
+# without the bootstrap-shipped scripts, so `make debug` then ran without
+# -DCMAKE_TOOLCHAIN_FILE and find_package(simdutf) failed.
 vcpkg-setup:
-	@if [ ! -d "$(VCPKG_DIR)" ]; then \
+	@if [ ! -f "$(VCPKG_TOOLCHAIN)" ]; then \
 		echo "Bootstrapping vcpkg..."; \
-		git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
+		if [ ! -d "$(VCPKG_DIR)/.git" ]; then \
+			rm -rf $(VCPKG_DIR); \
+			git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
+		fi; \
 		$(VCPKG_DIR)/bootstrap-vcpkg.sh; \
 	fi
 
@@ -365,7 +373,25 @@ test-literal-format: debug
 SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 SPEC047_TEST_INCLUDES := -I duckdb/src/include
 SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
-SPEC047_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+# On Linux, libduckdb.so is ASan/UBSan-instrumented (DuckDB CMake default for
+# Debug) but our test binaries are NOT compiled with -fsanitize=* (these
+# Makefile rules keep the test build platform-agnostic). glibc loader
+# requires libasan come FIRST in the initial library list — otherwise:
+#   ==NNN==ASan runtime does not come first in initial library list;
+#   you should either link runtime to your application or manually
+#   preload it with LD_PRELOAD
+# Set LD_PRELOAD only on the run prefix (NOT a make-wide env var — that
+# would propagate into any cmake/vcpkg sub-invocation triggered by a
+# `make test-…: debug` dependency, and break vcpkg's compiler-detection
+# probe). macOS dyld handles ASan-via-linked-lib transparently, so no
+# preload needed there.
+ifeq ($(shell uname),Linux)
+SANITIZER_PRELOAD := LD_PRELOAD=$(shell gcc -print-file-name=libasan.so):$(shell gcc -print-file-name=libubsan.so)
+else
+SANITIZER_PRELOAD :=
+endif
+SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
 
 test-multi-instance-pool-isolation: debug
 	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
@@ -407,6 +433,20 @@ test-result-stream-registry-isolation: debug
 test-spec047-us3: test-result-stream-registry-isolation
 	@echo ""
 	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
+
+# Concurrent reads stress test (dbt threads>=2 scenario reproduction).
+# Mixed mssql_scan + catalog-bound SELECT across N threads sharing a single
+# ATTACH; also scenario with N concurrent ATTACHes (different aliases).
+test-concurrent-reads: debug
+	@echo "Building concurrent-reads stress test..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_concurrent_reads.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_concurrent_reads
+	@echo ""
+	@echo "Running concurrent-reads stress test..."
+	$(SPEC047_TEST_RPATH) build/test/test_concurrent_reads
 
 # Spec 047 US-SEC: TokenCache per-DatabaseInstance namespace isolation (T046g, SC-011).
 # Compiles src/azure/azure_token.cpp together with the test driver. The driver

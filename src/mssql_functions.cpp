@@ -254,6 +254,11 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->pk_result_indices = pk_result_indices;
 	result->pk_is_composite = pk_is_composite;
 	result->rowid_type = rowid_type;
+	// Spec 052 (Option D): copy the table_entry pointer. Lifetime of the
+	// underlying entry is guaranteed by MSSQLBindAnchors (per ClientContext,
+	// released at QueryEnd); the bind-data copy inherits the same anchor
+	// from the originating LookupEntry call.
+	result->table_entry = table_entry;
 	return std::move(result);
 }
 

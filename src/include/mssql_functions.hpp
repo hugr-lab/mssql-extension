@@ -83,7 +83,10 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	//===----------------------------------------------------------------------===//
 
 	// Pointer to the table entry (for GetTable() / get_bind_info)
-	// This allows DuckDB to discover virtual columns like rowid
+	// This allows DuckDB to discover virtual columns like rowid.
+	// Spec 052 (Option D): lifetime of the underlying entry is guaranteed by
+	// MSSQLBindAnchors (per ClientContext, released at QueryEnd) which is
+	// populated on every LookupEntry call. No per-bind-data anchor needed.
 	optional_ptr<TableCatalogEntry> table_entry;
 
 	// Whether rowid was requested in the projection

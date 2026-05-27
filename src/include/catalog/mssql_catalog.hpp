@@ -206,7 +206,11 @@ private:
 	// Internal Methods
 	//===----------------------------------------------------------------------===//
 
-	// Get or create schema entry
+	// Get or create schema entry.
+	// Spec 052 (Option D): shared variant returns the shared_ptr (used by
+	// LookupSchema/ScanSchemas to anchor in MSSQLBindAnchors); reference
+	// variant wraps for callers that don't need to anchor.
+	shared_ptr<MSSQLSchemaEntry> GetOrCreateSchemaEntryShared(const string &schema_name);
 	MSSQLSchemaEntry &GetOrCreateSchemaEntry(const string &schema_name);
 
 	// Query database default collation
@@ -228,8 +232,12 @@ private:
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	string database_collation_;								   // Database default collation
 	string default_schema_;									   // Default schema ("dbo")
-	unordered_map<string, unique_ptr<MSSQLSchemaEntry>> schema_entries_;  // Schema entry cache
-	mutable std::mutex schema_mutex_;									  // Thread-safety for schema access
+	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
+	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
+	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-
+	// only insertion guards against concurrent first-load.
+	unordered_map<string, shared_ptr<MSSQLSchemaEntry>> schema_entries_;
+	mutable std::mutex schema_mutex_;  // Thread-safety for schema access
 
 	// Spec 047 / US3: per-catalog result stream registry (replaces process-wide
 	// MSSQLResultStreamRegistry singleton). Streams are produced at mssql_scan

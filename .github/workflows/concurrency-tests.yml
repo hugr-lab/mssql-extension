@@ -1,0 +1,186 @@
+name: Concurrency Tests
+
+# Spec 052: validates the catalog-entry lifetime / singleflight /
+# ClientContextState anchor fix under multi-threaded stress. The Makefile
+# target `test-concurrent-reads` is added in PR #127 but no CI workflow
+# invoked it — the PR author ran it locally and pasted soak results into
+# the PR. This job reproduces the full scenarios 1-8 sweep on every PR
+# that touches the catalog or singleflight surfaces, so the suite cannot
+# bit-rot.
+#
+# Debug build → ASan + UBSan instrumented via DuckDB's CMake defaults; any
+# UAF or atomic-publication race in the catalog will surface in the soak
+# scenarios (each 30s, ~10k-17k ops apiece).
+
+on:
+  pull_request:
+    paths:
+      - 'src/catalog/**'
+      - 'src/include/catalog/**'
+      - 'src/mssql_functions.cpp'
+      - 'src/include/mssql_functions.hpp'
+      - 'src/mssql_storage.cpp'
+      - 'src/include/mssql_storage.hpp'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'test/cpp/test_concurrent_reads.cpp'
+      - '.github/workflows/concurrency-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: concurrency-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  concurrency-tests:
+    name: Concurrency stress (scenarios 1-8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # SQL Server 2022 sidecar — same image and credentials as the existing
+    # integration-test job in ci.yml. Concurrency tests only need `master`
+    # (always present), so no init script is required.
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+    env:
+      MSSQL_TEST_HOST: localhost
+      MSSQL_TEST_PORT: '1433'
+      MSSQL_TEST_USER: sa
+      MSSQL_TEST_PASS: TestPassword1
+      MSSQL_TEST_DB: master
+      # Surface sanitizer stacks on the first hit rather than continuing.
+      ASAN_OPTIONS: detect_stack_use_after_return=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      GEN: ninja
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (ninja + pkg-config + ccache)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config ccache
+
+      # ASan+UBSan-instrumented DuckDB+jemalloc+mssql linking spikes RAM to
+      # >7GB on ubuntu-latest (7GB total, no swap). Without this the build
+      # OOM-kills around [709/721] (linking final unittest binary). Add a
+      # second swapfile (ubuntu-latest already has /swapfile mounted but
+      # only ~4GB which isn't enough). ccache + ninja parallelism keep the
+      # actual working set well under the peak.
+      - name: Add swap space (avoid OOM during ASan/UBSan link)
+        run: |
+          echo "Before:"
+          free -h
+          # The ubuntu-latest image already changed twice since spec 052 landed:
+          # first it had /swapfile (4G), then /mnt/swapfile (4G). Whichever is
+          # mounted, swapoff + remove first, then recreate at 12G on /mnt.
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo swapoff /mnt/swapfile 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "After:"
+          free -h
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-concurrency-${{ github.sha }}
+          restore-keys: |
+            ccache-concurrency-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            vcpkg/installed
+            vcpkg/packages
+            vcpkg/buildtrees
+          key: vcpkg-concurrency-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-concurrency-
+
+      - name: Bootstrap vcpkg
+        run: make vcpkg-setup
+
+      - name: Build extension (Debug — enables ASan/UBSan via DuckDB CMake)
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: make debug
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Initialize TestDB (scenarios 4-8 require it)
+        run: |
+          # Wait briefly so sqlcmd can connect; the service container has its
+          # own healthcheck but we add a small grace period.
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/1433) 2>/dev/null; then break; fi
+            sleep 2
+          done
+          # scenarios 1-3 only ATTACH against `master` (always present);
+          # scenarios 4-8 ATTACH against `TestDB` and CREATE their own
+          # tables inside. We just need the database to exist; the test
+          # creates / drops the per-scenario tables on its own.
+          docker run --rm --network host mcr.microsoft.com/mssql-tools:latest \
+            /opt/mssql-tools/bin/sqlcmd \
+              -S localhost -U sa -P TestPassword1 \
+              -Q "IF DB_ID('TestDB') IS NULL CREATE DATABASE TestDB"
+
+      - name: Wait for SQL Server
+        run: |
+          echo "Waiting for SQL Server on localhost:1433..."
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/1433) 2>/dev/null; then
+              echo "SQL Server reachable after ${i} attempts"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SQL Server unreachable after 150s" >&2
+          exit 1
+
+      # ASan/UBSan LD_PRELOAD lives in Makefile's SPEC047_TEST_RPATH (Linux
+      # only). Setting LD_PRELOAD around `make` itself was tried first but
+      # propagated into vcpkg's compiler-detection probe (sub-cmake) and
+      # broke it; scoping LD_PRELOAD to just the test binary's run-prefix
+      # avoids that.
+      - name: Run concurrent-reads stress (spec 052 scenarios 1-8)
+        run: make test-concurrent-reads
+
+      - name: Dump SQL Server logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          sql_container="$(docker ps -a --filter ancestor=mcr.microsoft.com/mssql/server:2022-latest --format '{{.ID}}' | head -1)"
+          if [ -n "$sql_container" ]; then
+            docker logs "$sql_container" 2>&1 | tail -200
+          fi

@@ -32,6 +32,16 @@ struct MSSQLTableStatistics {
 // This class fetches and caches table statistics (primarily row counts) from
 // SQL Server for use by DuckDB's query optimizer. Statistics are cached with
 // a configurable TTL to avoid excessive queries to SQL Server.
+//
+// LIFETIME CONTRACT (spec 052 US3 T019):
+// All public methods return by value (idx_t for row counts,
+// unique_ptr<BaseStatistics> owned by caller) or via out-parameter. NO
+// raw-pointer-handout pattern present in this surface, so the spec 052
+// catalog-entry UAF class (binder holds raw pointer into a cache that
+// another thread invalidates) cannot occur here. If a future method
+// returns a `MSSQLTableStatistics *` or similar, audit it against this
+// rule and either keep the by-value pattern or apply shared_ptr +
+// graveyard like MSSQLTableSet did.
 //===----------------------------------------------------------------------===//
 
 class MSSQLStatisticsProvider {

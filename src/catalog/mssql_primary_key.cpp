@@ -150,7 +150,6 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name,
 										const string &table_name, const string &database_collation) {
 	PrimaryKeyInfo info;
-	info.loaded = true;
 
 	// Build fully qualified object name
 	string full_name = "[" + schema_name + "].[" + table_name + "]";
