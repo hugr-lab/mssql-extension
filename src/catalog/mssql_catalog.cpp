@@ -1,4 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
+#include <openssl/crypto.h>
+
 #include "azure/azure_token.hpp"
 #include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
@@ -76,7 +78,15 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
 }
 
-MSSQLCatalog::~MSSQLCatalog() noexcept = default;
+MSSQLCatalog::~MSSQLCatalog() noexcept {
+	// Wipe the cached FEDAUTH token (UTF-16LE bytes) on catalog teardown so
+	// the bearer credential does not linger in heap-recycled memory. Same
+	// rationale as MSSQLConnectionInfo::~MSSQLConnectionInfo — use
+	// OPENSSL_cleanse to defeat dead-store elimination.
+	if (!fedauth_token_utf16le_.empty()) {
+		OPENSSL_cleanse(fedauth_token_utf16le_.data(), fedauth_token_utf16le_.size());
+	}
+}
 
 //===----------------------------------------------------------------------===//
 // Result Stream Registry (spec 047 / US3)
