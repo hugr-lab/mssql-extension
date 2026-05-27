@@ -142,6 +142,28 @@ struct MSSQLConnectionInfo {
 
 	// Check if string is a connection string (contains key=value pairs)
 	static bool IsConnectionString(const string &str);
+
+	//===----------------------------------------------------------------------===//
+	// Credential lifetime
+	//
+	// User-declared destructor OPENSSL_cleanse's `password` and `access_token`
+	// (and any other bearer-token storage added later) so secrets are not
+	// left behind in heap-recycled memory after this struct is freed. The
+	// implementation lives in mssql_storage.cpp to keep OpenSSL out of this
+	// header. shared_ptr<MSSQLConnectionInfo> is the canonical owner shape,
+	// so the wipe runs exactly when the last reference drops.
+	//
+	// The other four special members are explicitly defaulted because
+	// user-declaring the destructor would otherwise disable implicit move
+	// generation (and silently fall back to copy).
+	//===----------------------------------------------------------------------===//
+	MSSQLConnectionInfo() = default;
+	~MSSQLConnectionInfo();
+
+	MSSQLConnectionInfo(const MSSQLConnectionInfo &) = default;
+	MSSQLConnectionInfo &operator=(const MSSQLConnectionInfo &) = default;
+	MSSQLConnectionInfo(MSSQLConnectionInfo &&) = default;
+	MSSQLConnectionInfo &operator=(MSSQLConnectionInfo &&) = default;
 };
 
 //===----------------------------------------------------------------------===//

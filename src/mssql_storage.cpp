@@ -16,6 +16,8 @@
 #include "tds/auth/auth_strategy_factory.hpp"
 #include "tds/tds_connection.hpp"
 
+#include <openssl/crypto.h>
+
 #include <cstdlib>
 
 // Debug logging (same pattern as tds_socket.cpp)
@@ -35,6 +37,29 @@ static int GetMssqlStorageDebugLevel() {
 	} while (0)
 
 namespace duckdb {
+
+//===----------------------------------------------------------------------===//
+// MSSQLConnectionInfo destructor — wipe bearer credentials
+//
+// SQL `password` and Azure AD `access_token` are bearer credentials that
+// should not linger in heap-recycled memory after the struct dies. Use
+// OPENSSL_cleanse rather than std::fill / memset so dead-store elimination
+// can't optimise the wipe away. Cheap (microseconds) and OpenSSL is
+// already linked extension-wide via vcpkg.
+//
+// `password.data()` returns a pointer to the storage in use (whether SSO
+// inline buffer or heap allocation). Wiping `size()` bytes covers the
+// live characters; subsequent `string` destruction releases the heap
+// allocation (if any) — by then it holds zeros.
+//===----------------------------------------------------------------------===//
+MSSQLConnectionInfo::~MSSQLConnectionInfo() {
+	if (!password.empty()) {
+		OPENSSL_cleanse(&password[0], password.size());
+	}
+	if (!access_token.empty()) {
+		OPENSSL_cleanse(&access_token[0], access_token.size());
+	}
+}
 
 //===----------------------------------------------------------------------===//
 // ResolveAppName (Spec 047 US-AN / FR-014 / T065) — see header doc-comment
