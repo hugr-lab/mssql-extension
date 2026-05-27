@@ -930,8 +930,18 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 		throw IOException("Failed to acquire connection for cache refresh");
 	}
 
-	// Perform full eager cache refresh
-	metadata_cache_->Refresh(*connection, database_collation_);
+	// Perform full eager cache refresh.
+	// Exception-safe: if Refresh throws (TDS hiccup under stress — 1-in-300
+	// odds during scenario 5's 318 invalidations × 30s soak), the connection
+	// must be returned to the pool BEFORE the exception propagates, or
+	// ~ConnectionPool fires its debug-only D_ASSERT about checked-out
+	// connections during catalog teardown and the process aborts on Linux.
+	try {
+		metadata_cache_->Refresh(*connection, database_collation_);
+	} catch (...) {
+		connection_pool_->Release(std::move(connection));
+		throw;
+	}
 
 	// Release connection
 	connection_pool_->Release(std::move(connection));
