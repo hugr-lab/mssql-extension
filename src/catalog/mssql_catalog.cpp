@@ -389,7 +389,7 @@ shared_ptr<MSSQLSchemaEntry> MSSQLCatalog::GetOrCreateSchemaEntryShared(const st
 
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
-		return it->second;  // shared_ptr copy — refcount inc
+		return it->second;	// shared_ptr copy — refcount inc
 	}
 
 	// Spec 052: construct via make_shared_ptr — enable_shared_from_this on
