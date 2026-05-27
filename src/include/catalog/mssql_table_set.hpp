@@ -89,9 +89,9 @@ private:
 	std::mutex names_mutex_;						// Names loading synchronization
 
 	// Level 2: Full entries with columns (created on demand)
-	std::atomic<bool> is_fully_loaded_;							  // True when ALL tables are loaded
-	std::mutex load_mutex_;										  // Loading synchronization
-	std::mutex entry_mutex_;									  // Entry access synchronization
+	std::atomic<bool> is_fully_loaded_;	 // True when ALL tables are loaded
+	std::mutex load_mutex_;				 // Loading synchronization
+	std::mutex entry_mutex_;			 // Entry access synchronization
 	// Spec 052: shared_ptr (was unique_ptr) so retired entries can flow into
 	// MSSQLCatalog::table_graveyard_ on Invalidate() while in-flight binders
 	// retain validity. Insertion is emplace-only (winner wins on race).

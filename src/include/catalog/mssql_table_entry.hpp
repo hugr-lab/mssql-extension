@@ -7,7 +7,7 @@
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_primary_key.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/shared_ptr.hpp"		// duckdb::enable_shared_from_this (spec 052)
+#include "duckdb/common/shared_ptr.hpp"	   // duckdb::enable_shared_from_this (spec 052)
 #include "duckdb/common/table_column.hpp"  // For virtual_column_map_t
 
 namespace duckdb {

@@ -346,8 +346,7 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	const bool pk_loaded = pk_loaded_.load(std::memory_order_acquire);
 
 	MSSQL_TE_DEBUG("GetVirtualColumns: table=%s, pk_loaded=%s, pk_exists=%s", name.c_str(),
-				   pk_loaded ? "true" : "false",
-				   (pk_loaded && pk_info_.exists) ? "true" : "false");
+				   pk_loaded ? "true" : "false", (pk_loaded && pk_info_.exists) ? "true" : "false");
 
 	// Views don't support rowid
 	if (object_type_ == MSSQLObjectType::VIEW) {

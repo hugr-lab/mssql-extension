@@ -132,27 +132,25 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	vector<shared_ptr<MSSQLTableEntry>> snapshot;
 	{
 		std::lock_guard<std::mutex> lock(entry_mutex_);
-		cache.ForEachTableInSchema(schema_.name,
-								   [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
-									   stats_provider.PreloadRowCount(schema_.name, table_name,
-																	  table_meta.approx_row_count);
-									   known_table_names_.insert(table_name);
+		cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+			stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+			known_table_names_.insert(table_name);
 
-									   auto it = entries_.find(table_name);
-									   if (it != entries_.end()) {
-										   snapshot.push_back(it->second);
-										   return;
-									   }
+			auto it = entries_.find(table_name);
+			if (it != entries_.end()) {
+				snapshot.push_back(it->second);
+				return;
+			}
 
-									   auto entry = CreateTableEntry(table_meta);
-									   if (entry) {
-										   // Spec 052 T007: emplace-only (winner wins on race
-										   // vs LoadSingleEntry). C++11-compatible pair access
-										   // (CLAUDE.md ODR rule: no structured bindings).
-										   auto insert_result = entries_.emplace(entry->name, std::move(entry));
-										   snapshot.push_back(insert_result.first->second);
-									   }
-								   });
+			auto entry = CreateTableEntry(table_meta);
+			if (entry) {
+				// Spec 052 T007: emplace-only (winner wins on race
+				// vs LoadSingleEntry). C++11-compatible pair access
+				// (CLAUDE.md ODR rule: no structured bindings).
+				auto insert_result = entries_.emplace(entry->name, std::move(entry));
+				snapshot.push_back(insert_result.first->second);
+			}
+		});
 	}
 
 	// Phase 2: callback runs outside entry_mutex_. Snapshot holds shared_ptr
