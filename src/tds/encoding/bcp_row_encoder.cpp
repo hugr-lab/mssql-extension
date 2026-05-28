@@ -12,6 +12,7 @@
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 #include "tds/encoding/utf16.hpp"
 
 #include <cstring>
@@ -33,7 +34,7 @@ constexpr int64_t MICROS_PER_DAY = 86400000000LL;
 template <typename T>
 static T GetVectorValue(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);	 // We only need format info, not count
+	mssql_compat::ToUnifiedFormat(vec, 1, format);	// We only need format info, not count
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];
@@ -53,7 +54,7 @@ static T GetVectorValue(Vector &vec, idx_t row_idx) {
 
 static bool IsVectorNull(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
+	mssql_compat::ToUnifiedFormat(vec, 1, format);
 	auto idx = format.sel->get_index(row_idx);
 	return !format.validity.RowIsValid(idx);
 }

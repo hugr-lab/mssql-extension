@@ -67,7 +67,7 @@ std::string HexRender(const uint8_t *data, size_t length) {
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata & /*col*/, Vector &out, idx_t row) {
 	// AddStringOrBlob copies the raw bytes into the vector's string heap.
 	// Works for BLOB, GEOMETRY, and the VARCHAR fallback case (issue #89).
-	FlatVector::GetData<string_t>(out)[row] =
+	mssql_compat::GetDataMutable<string_t>(out)[row] =
 		StringVector::AddStringOrBlob(out, reinterpret_cast<const char *>(bytes.data()), bytes.size());
 }
 

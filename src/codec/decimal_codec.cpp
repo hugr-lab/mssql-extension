@@ -56,7 +56,7 @@ namespace {
 template <typename T>
 T GetVectorValue(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
+	mssql_compat::ToUnifiedFormat(vec, 1, format);
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];
@@ -87,13 +87,13 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// DuckDB DECIMAL uses different storage based on precision.
 	// Mirrors the dispatch in TypeConverter::ConvertDecimal.
 	if (col.precision <= 4) {
-		FlatVector::GetData<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
+		mssql_compat::GetDataMutable<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
 	} else if (col.precision <= 9) {
-		FlatVector::GetData<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
+		mssql_compat::GetDataMutable<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
 	} else if (col.precision <= 18) {
-		FlatVector::GetData<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
+		mssql_compat::GetDataMutable<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
 	} else {
-		FlatVector::GetData<hugeint_t>(out)[row] = int_value;
+		mssql_compat::GetDataMutable<hugeint_t>(out)[row] = int_value;
 	}
 }
 

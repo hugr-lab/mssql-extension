@@ -86,7 +86,7 @@ using duckdb::tds::TDS_TYPE_TIME;
 template <typename T>
 T GetVectorValue(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
+	mssql_compat::ToUnifiedFormat(vec, 1, format);
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];
@@ -261,23 +261,23 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
-		FlatVector::GetData<date_t>(out)[row] = d;
+		mssql_compat::GetDataMutable<date_t>(out)[row] = d;
 		return;
 	}
 	case TDS_TYPE_TIME: {
 		dtime_t t = tds::encoding::DateTimeEncoding::ConvertTime(bytes.data(), col.scale);
-		FlatVector::GetData<dtime_t>(out)[row] = t;
+		mssql_compat::GetDataMutable<dtime_t>(out)[row] = t;
 		return;
 	}
 	case TDS_TYPE_DATETIME: {
 		// DATETIME wire (~3 ms precision) always decodes to TIMESTAMP (µs).
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		mssql_compat::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_SMALLDATETIME: {
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes.data());
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		mssql_compat::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIME2: {
@@ -286,7 +286,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		// drop precision on DATETIME2(7) → TIMESTAMP_NS round-trips.
 		size_t time_len = Datetime2TimeByteLen(col.scale);
 		int64_t native = Datetime2WireToNativeUnit(bytes.data(), time_len, col.scale, out.GetType().id());
-		FlatVector::GetData<timestamp_t>(out)[row] = timestamp_t(native);
+		mssql_compat::GetDataMutable<timestamp_t>(out)[row] = timestamp_t(native);
 		return;
 	}
 	case TDS_TYPE_DATETIMEN: {
@@ -300,14 +300,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		} else {
 			throw InvalidInputException("Invalid DATETIMEN length: %d", bytes.size());
 		}
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		mssql_compat::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
 		// DuckDB has no nanosecond TZ type; catalog always maps DATETIMEOFFSET
 		// to TIMESTAMP_TZ (µs). Existing decoder returns UTC µs which fits.
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes.data(), col.scale);
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		mssql_compat::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	default:

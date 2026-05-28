@@ -33,7 +33,7 @@ namespace {
 template <typename T>
 T GetVectorValue(Vector &vec, idx_t row_idx) {
 	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
+	mssql_compat::ToUnifiedFormat(vec, 1, format);
 	auto data = UnifiedVectorFormat::GetData<T>(format);
 	auto idx = format.sel->get_index(row_idx);
 	return data[idx];
@@ -175,7 +175,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		}
 	}
 
-	FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
+	mssql_compat::GetDataMutable<string_t>(out)[row] = StringVector::AddString(out, str);
 }
 
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

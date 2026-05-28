@@ -40,12 +40,12 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	if (bytes.size() == 8) {
 		// MONEY → DECIMAL(19,4), hugeint storage (precision > 18).
 		hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes.data());
-		FlatVector::GetData<hugeint_t>(out)[row] = int_value;
+		mssql_compat::GetDataMutable<hugeint_t>(out)[row] = int_value;
 	} else if (bytes.size() == 4) {
 		// SMALLMONEY → DECIMAL(10,4), int64 storage. ConvertSmallMoney returns a
 		// hugeint_t whose .lower carries the sign-extended int32 in its low 64 bits.
 		hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes.data());
-		FlatVector::GetData<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
+		mssql_compat::GetDataMutable<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
 	} else {
 		throw InvalidInputException("Invalid MONEY length: %d", bytes.size());
 	}

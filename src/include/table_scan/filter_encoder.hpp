@@ -10,8 +10,10 @@
 #include <string>
 #include <vector>
 #include "duckdb.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
+#include "mssql_compat.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -173,7 +175,8 @@ private:
 	/**
 	 * Encode CONSTANT_COMPARISON filter (col OP value).
 	 */
-	static ExpressionEncodeResult EncodeConstantComparison(const ConstantFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeConstantComparison(const mssql_compat::ConstantFilter &filter,
+														   const std::string &column_name,
 														   const LogicalType &column_type);
 
 	/**
@@ -189,14 +192,14 @@ private:
 	/**
 	 * Encode IN_FILTER (col IN (values)).
 	 */
-	static ExpressionEncodeResult EncodeInFilter(const InFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeInFilter(const mssql_compat::InFilter &filter, const std::string &column_name,
 												 const LogicalType &column_type);
 
 	/**
 	 * Encode CONJUNCTION_AND filter.
 	 * Partial pushdown allowed: unsupported children are skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionAnd(const ConjunctionAndFilter &filter,
+	static ExpressionEncodeResult EncodeConjunctionAnd(const mssql_compat::ConjunctionAndFilter &filter,
 													   const std::string &column_name, const LogicalType &column_type,
 													   const ExpressionEncodeContext &ctx);
 
@@ -204,8 +207,8 @@ private:
 	 * Encode CONJUNCTION_OR filter.
 	 * All-or-nothing: if any child unsupported, entire OR is skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionOr(const ConjunctionOrFilter &filter, const std::string &column_name,
-													  const LogicalType &column_type,
+	static ExpressionEncodeResult EncodeConjunctionOr(const mssql_compat::ConjunctionOrFilter &filter,
+													  const std::string &column_name, const LogicalType &column_type,
 													  const ExpressionEncodeContext &ctx);
 
 	/**
@@ -226,9 +229,17 @@ private:
 
 	/**
 	 * Encode a comparison expression (left OP right).
+	 * On the new DuckDB SHA, comparison is a BoundFunctionExpression and
+	 * BoundComparisonExpression is a static-helper struct; on the legacy SHA
+	 * it is a class. The signature differs accordingly.
 	 */
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+	static ExpressionEncodeResult EncodeComparisonExpression(const BoundFunctionExpression &expr,
+															 const ExpressionEncodeContext &ctx);
+#else
 	static ExpressionEncodeResult EncodeComparisonExpression(const BoundComparisonExpression &expr,
 															 const ExpressionEncodeContext &ctx);
+#endif
 
 	/**
 	 * Encode an operator expression (+, -, *, /, etc.).
@@ -244,9 +255,17 @@ private:
 
 	/**
 	 * Encode a BETWEEN expression (input BETWEEN lower AND upper).
+	 * On the new DuckDB SHA, BETWEEN is a BoundFunctionExpression (function
+	 * name "__between") and BoundBetweenExpression is a static-helper struct;
+	 * on the legacy SHA it is a class. The signature differs accordingly.
 	 */
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+	static ExpressionEncodeResult EncodeBetweenExpression(const BoundFunctionExpression &expr,
+														  const ExpressionEncodeContext &ctx);
+#else
 	static ExpressionEncodeResult EncodeBetweenExpression(const BoundBetweenExpression &expr,
 														  const ExpressionEncodeContext &ctx);
+#endif
 
 	/**
 	 * Encode a column reference.
