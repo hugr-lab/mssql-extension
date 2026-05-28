@@ -13,9 +13,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
-#include "mssql_compat.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 
 #include <string>

@@ -127,7 +127,6 @@ struct TFT {
 #endif
 };
 
-
 // M5 — write-site adapter for FlatVector data pointers. On the new SHA this
 // routes to GetDataMutable<T>; on the legacy SHA the single-overload
 // GetData<T>(Vector&) already returns T*, so we forward to it.

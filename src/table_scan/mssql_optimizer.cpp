@@ -13,7 +13,6 @@
 #include <cstdlib>
 #include <unordered_set>
 #include "catalog/mssql_catalog.hpp"
-#include "mssql_compat.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -24,6 +23,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -140,8 +140,7 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get, id
 							(unsigned long long)get.table_index.index);
 #else
 			MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF table_index %llu != get.table_index %llu",
-							(unsigned long long)col_ref.binding.table_index,
-							(unsigned long long)get.table_index);
+							(unsigned long long)col_ref.binding.table_index, (unsigned long long)get.table_index);
 #endif
 			return false;
 		}
@@ -245,14 +244,15 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		}
 
 		if (mapping->expected_args != 1 || func_expr.children.size() != 1) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu", mssql_compat::GetFunctionName(func_expr).c_str(),
-							func_expr.children.size());
+			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu",
+							mssql_compat::GetFunctionName(func_expr).c_str(), func_expr.children.size());
 			return false;
 		}
 
 		idx_t inner_col_ids_index;
 		if (!ResolveColumnIndex(*func_expr.children[0], get, inner_col_ids_index)) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref", mssql_compat::GetFunctionName(func_expr).c_str());
+			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref",
+							mssql_compat::GetFunctionName(func_expr).c_str());
 			return false;
 		}
 

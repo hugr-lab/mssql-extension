@@ -163,7 +163,7 @@ void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 	// M9 (spec 051 follow-up): varargs moved from a public ScalarFunction
 	// field to a private FunctionSignature member with a SetVarArgs setter.
 #ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
-	func.SetVarArgs(LogicalType::VARCHAR);  // Optional schema_name
+	func.SetVarArgs(LogicalType::VARCHAR);	// Optional schema_name
 #else
 	func.varargs = LogicalType::VARCHAR;  // Optional schema_name
 #endif

@@ -298,8 +298,8 @@ ExpressionEncodeResult FilterEncoder::EncodeIsNotNull(const std::string &column_
 	return {column_name + " IS NOT NULL", true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeInFilter(const mssql_compat::InFilter &filter, const std::string &column_name,
-													 const LogicalType &column_type) {
+ExpressionEncodeResult FilterEncoder::EncodeInFilter(const mssql_compat::InFilter &filter,
+													 const std::string &column_name, const LogicalType &column_type) {
 	std::string sql = column_name + " IN (";
 	for (idx_t i = 0; i < filter.values.size(); i++) {
 		if (i > 0) {
@@ -389,7 +389,8 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const mssql_compat::Co
 ExpressionEncodeResult FilterEncoder::EncodeExpressionFilter(const ExpressionFilter &filter,
 															 const ExpressionEncodeContext &ctx) {
 	// Expression filters contain arbitrary expressions
-	MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpressionFilter: encoding expression type %d", (int)filter.expr->GetExpressionType());
+	MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpressionFilter: encoding expression type %d",
+						   (int)filter.expr->GetExpressionType());
 	return EncodeExpression(*filter.expr, ctx);
 }
 
@@ -404,7 +405,8 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 		return {"", false};
 	}
 
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeExpression: type=%d class=%d", (int)expr.GetExpressionType(), (int)expr.GetExpressionClass());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeExpression: type=%d class=%d", (int)expr.GetExpressionType(),
+						   (int)expr.GetExpressionClass());
 
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
@@ -584,7 +586,8 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundComp
 	// Get the comparison operator
 	std::string op;
 	if (!GetComparisonOperator(expr.GetExpressionType(), op)) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: unsupported comparison type %d", (int)expr.GetExpressionType());
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: unsupported comparison type %d",
+							   (int)expr.GetExpressionType());
 		return {"", false};
 	}
 
@@ -610,7 +613,8 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundComp
 
 ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperatorExpression &expr,
 															   const ExpressionEncodeContext &ctx) {
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: type=%d, children=%zu", (int)expr.GetExpressionType(), expr.children.size());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: type=%d, children=%zu", (int)expr.GetExpressionType(),
+						   expr.children.size());
 
 	// Handle NOT operator
 	if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
