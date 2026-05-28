@@ -147,7 +147,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - **DML**: INSERT uses batched VALUES; UPDATE/DELETE use rowid-based VALUES JOIN pattern with deferred execution in transactions.
 - **DDL**: `CREATE TABLE IF NOT EXISTS` silently succeeds when table exists; `CREATE OR REPLACE TABLE` drops and recreates. Auto-TABLOCK enabled for new table creation (CTAS/COPY TO).
 - **Filter pushdown**: DuckDB filter expressions translated to T-SQL WHERE clauses. Function mapping for common string/date/arithmetic operations.
-- **DuckDB API compat**: Auto-detected at CMake time. `MSSQL_GETDATA_METHOD` macro handles GetData vs GetDataInternal.
+- **DuckDB API compat**: `src/include/mssql_compat.hpp` adapts API-shape differences between DuckDB SHAs so a single source tree compiles against both the pinned submodule SHA and rolling main. Detection uses `__has_include` on a target-SHA-only header (no CMake autodetect). Currently shims (spec 051): FlatVector header relocation to `<duckdb/common/vector/flat_vector.hpp>`, and the single-arg `bind_scalar_function_t` signature via `MSSQL_BIND_SCALAR_SIG` / `MSSQL_BIND_SCALAR_PROLOGUE` macros. Unconditional renames (`IsInterrupted`, `SetNullHandling`) live at call sites, not in the header.
 
 ## Windows Build Support
 

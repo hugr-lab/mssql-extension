@@ -15,6 +15,7 @@
 #include "codec/uuid_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
+#include "mssql_compat.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 #include "tds/encoding/decimal_encoding.hpp"
 #include "tds/encoding/utf16.hpp"

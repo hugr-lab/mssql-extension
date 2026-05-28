@@ -20,7 +20,7 @@
 #include "codec/boolean_codec.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 
 #include <cstdint>
 

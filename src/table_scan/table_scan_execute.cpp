@@ -47,7 +47,7 @@ void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChun
 	}
 
 	// Check for query cancellation (Ctrl+C)
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
 		output.SetCardinality(0);

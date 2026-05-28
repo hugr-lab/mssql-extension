@@ -3,6 +3,7 @@
 
 #include "catalog/mssql_refresh_function.hpp"
 #include "catalog/mssql_catalog.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -17,8 +18,8 @@ namespace duckdb {
 // Bind Function - Validates arguments at compile time
 //===----------------------------------------------------------------------===//
 
-static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, ScalarFunction &bound_function,
-													  vector<unique_ptr<Expression>> &arguments) {
+MSSQL_BIND_SCALAR_SIG(MSSQLRefreshCacheBind) {
+	MSSQL_BIND_SCALAR_PROLOGUE
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_refresh_cache: catalog_name must be a constant, not a parameter");
@@ -115,7 +116,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
 						MSSQLRefreshCacheBind);
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(func);
 }
 

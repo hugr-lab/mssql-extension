@@ -8,6 +8,7 @@
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "mssql_compat.hpp"		// For FlatVector header relocation (spec 051 M2)
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -671,7 +672,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 	}
 
 	// Check for query cancellation (Ctrl+C)
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
 		output.SetCardinality(0);

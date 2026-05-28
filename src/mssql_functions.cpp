@@ -9,6 +9,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -207,7 +208,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	}
 
 	// Check for query cancellation (Ctrl+C)
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
 		output.SetCardinality(0);
@@ -289,8 +290,8 @@ struct MSSQLExecBindData : public FunctionData {
 };
 
 // Bind function for mssql_exec
-static unique_ptr<FunctionData> MSSQLExecBind(ClientContext &context, ScalarFunction &bound_function,
-											  vector<unique_ptr<Expression>> &arguments) {
+MSSQL_BIND_SCALAR_SIG(MSSQLExecBind) {
+	MSSQL_BIND_SCALAR_PROLOGUE
 	// First argument is the context name (attached database name, must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");
@@ -404,7 +405,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLExecExecute,
 						MSSQLExecBind);
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return func;
 }
 
