@@ -61,7 +61,7 @@ jobs:
         # vcpkg's x-gha binary-source provider needs ACTIONS_CACHE_URL and
         # ACTIONS_RUNTIME_TOKEN. GitHub injects them into actions/* steps but
         # not into plain `run:` steps, so we re-export them via the toolkit.
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
