@@ -72,7 +72,7 @@ jobs:
       # subsequent PR runs that don't touch the resolver sources reuse the
       # base layers.
       - name: Build test-client image (cached)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: test/named-instance/test-client/Dockerfile

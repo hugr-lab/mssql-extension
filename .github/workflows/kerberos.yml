@@ -54,7 +54,7 @@ jobs:
       # layer below them only invalidates when a tracked file changes.
       # docker compose then picks up the local image tag without rebuilding.
       - name: Build test-client image (cached)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: test/kerberos/test-client/Dockerfile
