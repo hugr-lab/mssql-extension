@@ -14,10 +14,11 @@ FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# zip/unzip/tar are needed by vcpkg's bootstrap + package extraction.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git pkg-config \
         libssl-dev libkrb5-dev \
-        ca-certificates curl \
+        ca-certificates curl zip unzip tar \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -27,18 +28,42 @@ WORKDIR /src
 # duckdb submodule for version tracking.
 COPY . /src/
 
-# Build the extension. ENABLE_KRB5=ON is the default; we set it explicitly so
-# the test stack always exercises the Kerberos path.
+# Bootstrap vcpkg INSIDE the container. The extension gained a vcpkg simdutf
+# dependency (spec 043/044) after this test stack was first written. (Host
+# vcpkg/ is .dockerignore'd, so this clone is always fresh.) vcpkg builds
+# openssl + simdutf from the manifest during cmake configure.
 #
-# CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on
-# hosts with low Docker memory limits (DuckDB's compile is heap-heavy --
-# 4-way parallel needs ~8GB; 2-way fits in ~4GB).
+# NOTE: a full clone is required -- manifest mode resolves vcpkg.json's
+# builtin-baseline commit, which a `--depth 1` clone does not contain
+# ("failed to unpack tree object ... versions/baseline.json").
+RUN git clone https://github.com/microsoft/vcpkg.git /src/vcpkg \
+    && /src/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+# Build the extension AND the matching DuckDB CLI directly with cmake, mirroring
+# the project's CI (.github/workflows/ci.yml). We deliberately do NOT use the
+# `make` wrapper here: its auto-vcpkg path breaks compiler/Ninja detection once
+# a vcpkg toolchain is injected, and the duckdb submodule is a tagless shallow
+# checkout so the make path can't derive a version. Building the CLI from the
+# same submodule guarantees the runtime CLI and the extension share an exact
+# DuckDB version (the prior approach downloaded a fixed v1.4.3 CLI that no
+# longer matches the submodule). ENABLE_KRB5=ON exercises the Kerberos path.
+#
+# CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on hosts
+# with low Docker memory limits (DuckDB's compile is heap-heavy -- 4-way needs
+# ~8GB; 2-way fits in ~4GB).
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
-RUN GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON"
+RUN cmake -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE=/src/vcpkg/scripts/buildsystems/vcpkg.cmake \
+        -DVCPKG_MANIFEST_DIR=/src \
+        -DDUCKDB_EXTENSION_CONFIGS=/src/extension_config.cmake \
+        -DENABLE_KRB5=ON \
+        -S /src/duckdb -B /src/build/release \
+    && cmake --build /src/build/release --config Release
 
 # ----------------------------------------------------------------------------
 # Stage 2: runtime test-client. krb5-user for kinit, libgssapi for runtime,
-# DuckDB CLI from the official release tarball.
+# DuckDB CLI copied from the build stage (version-matched to the extension).
 # ----------------------------------------------------------------------------
 FROM ubuntu:24.04
 
@@ -46,24 +71,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         krb5-user libgssapi-krb5-2 libssl3 \
-        ca-certificates curl unzip \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the DuckDB CLI matching the extension's API. We pull the official
-# DuckDB binary so the test client doesn't depend on the host having duckdb
-# installed.
-ARG DUCKDB_VERSION=v1.4.3
-RUN ARCH="$(dpkg --print-architecture)" \
-    && case "${ARCH}" in \
-         amd64) URL_SUFFIX="linux-amd64" ;; \
-         arm64) URL_SUFFIX="linux-arm64" ;; \
-         *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;; \
-       esac \
-    && curl -fSL -o /tmp/duckdb.zip \
-        "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${URL_SUFFIX}.zip" \
-    && unzip /tmp/duckdb.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/duckdb \
-    && rm /tmp/duckdb.zip
+# Use the DuckDB CLI built from the SAME submodule as the extension. This
+# guarantees the CLI and extension share an exact DuckDB version, so the
+# absolute-path LOAD does not fail on a version-stamp mismatch (the duckdb
+# submodule tracks main/nightly, not a tagged release).
+COPY --from=builder /src/build/release/duckdb /usr/local/bin/duckdb
+RUN chmod +x /usr/local/bin/duckdb
 
 # Copy the extension from the Linux build stage. Sanity-check it's an ELF so
 # any future Dockerfile change that breaks the multi-stage chain fails loudly

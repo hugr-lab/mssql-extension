@@ -51,11 +51,13 @@ size_t Login7FragmentPacketSize() {
 	const char *env = std::getenv("MSSQL_LOGIN7_MAX_PACKET");
 	if (env && *env) {
 		long v = std::strtol(env, nullptr, 10);
-		if (v >= 256 && v <= static_cast<long>(TDS_MAX_PACKET_SIZE)) {
+		// Qualified: this helper lives in the file-level anonymous namespace,
+		// outside duckdb::tds where these constants are declared.
+		if (v >= 256 && v <= static_cast<long>(duckdb::tds::TDS_MAX_PACKET_SIZE)) {
 			return static_cast<size_t>(v);
 		}
 	}
-	return TDS_DEFAULT_PACKET_SIZE;
+	return duckdb::tds::TDS_DEFAULT_PACKET_SIZE;
 }
 
 }  // anonymous namespace
