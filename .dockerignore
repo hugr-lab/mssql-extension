@@ -7,6 +7,9 @@
 build/
 .cache/
 .ccache/
+# Host vcpkg checkout -- the container bootstraps its own; a host clone here
+# (e.g. from `make vcpkg-setup`) would add 100+ MB to the build context.
+vcpkg/
 
 # Worktree / IDE
 .worktrees/

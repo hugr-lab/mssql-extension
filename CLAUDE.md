@@ -157,6 +157,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 |----------|-------------|
 | `MSSQL_DEBUG=1..3` | TDS protocol debug level (1=basic, 3=trace) |
 | `MSSQL_DML_DEBUG=1` | DML operation debugging (generated SQL, batch sizes, rowid values) |
+| `MSSQL_LOGIN7_MAX_PACKET=<bytes>` | **Test-only** (issue #138). Lowers the LOGIN7 / SSPI integrated-auth fragmentation boundary (clamped 256..32767) so the multi-packet send path can be exercised against a real SQL Server without an AD-sized Kerberos PAC. Unset in production → default 4096. |
 
 ## Extension Settings (SET in DuckDB)
 

@@ -41,7 +41,33 @@ SELECT COUNT(*) AS rows FROM kdb2.dbo.test;
 DETACH kdb2;
 EOF
 
-echo "[run-tests] step 5: negative case -- destroy ccache, expect a clear error"
+echo "[run-tests] step 5: forced LOGIN7 fragmentation (issue #138)"
+# Lower the LOGIN7 fragmentation boundary so the multi-packet send path is
+# exercised end-to-end: with a 512-byte cap even the test KDC's small SPNEGO
+# token produces a multi-packet LOGIN7. A real AD PAC does this naturally; the
+# test KDC issues minimal tickets, so we force the boundary down instead.
+# Success here proves SQL Server reassembles and accepts the fragmented LOGIN7.
+frag_out=$(MSSQL_LOGIN7_MAX_PACKET=512 MSSQL_DEBUG=1 duckdb --unsigned 2>&1 <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kfrag (TYPE mssql);
+SELECT COUNT(*) AS frag_rows FROM kfrag.dbo.test;
+DETACH kfrag;
+EOF
+)
+echo "${frag_out}"
+# Assert the LOGIN7 actually split into more than one TDS packet, and the query
+# returned (i.e. the server accepted the fragmented login).
+if ! echo "${frag_out}" | grep -Eq 'LOGIN7 payload=[0-9]+ bytes -> ([2-9]|[1-9][0-9]+) TDS packet'; then
+    echo "[run-tests] ERROR: LOGIN7 was not fragmented into multiple packets (knob ineffective?)" >&2
+    exit 3
+fi
+if ! echo "${frag_out}" | grep -q 'frag_rows'; then
+    echo "[run-tests] ERROR: fragmented-LOGIN7 ATTACH/query did not succeed" >&2
+    exit 3
+fi
+echo "[run-tests] step 5: OK -- multi-packet LOGIN7 accepted by SQL Server"
+
+echo "[run-tests] step 6: negative case -- destroy ccache, expect a clear error"
 kdestroy
 duckdb --unsigned 2>&1 <<EOF || true
 LOAD '${EXT}';
