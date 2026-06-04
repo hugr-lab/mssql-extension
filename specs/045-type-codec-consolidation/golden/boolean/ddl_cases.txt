@@ -1,0 +1,10 @@
+# BOOLEAN → SQL Server DDL type name cases (FR-027/FR-028: byte-identical
+# CreateTable == CtasCreateTable)
+# format: type | cfg.text_type | ctx | expected_text
+# Notes:
+#   - cfg.text_type is recorded for completeness only — Boolean DDL is
+#     identical regardless of text-type policy.
+BOOLEAN | NVARCHAR | CreateTable      | BIT
+BOOLEAN | NVARCHAR | CtasCreateTable  | BIT
+BOOLEAN | VARCHAR  | CreateTable      | BIT
+BOOLEAN | VARCHAR  | CtasCreateTable  | BIT

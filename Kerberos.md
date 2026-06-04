@@ -11,8 +11,10 @@ End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
 - [Connection Examples](#connection-examples)
 - [Using MSSQL Secrets](#using-mssql-secrets)
 - [Diagnostic function: `mssql_kerberos_auth_test`](#diagnostic-function-mssql_kerberos_auth_test)
+- [Diagnostic function: `mssql_winsspi_auth_test` (Windows)](#diagnostic-function-mssql_winsspi_auth_test-windows)
 - [Troubleshooting](#troubleshooting)
 - [Running the test stack locally](#running-the-test-stack-locally)
+- [Running the Windows SSPI test suite](#running-the-windows-sspi-test-suite)
 - [Reference](#reference)
 
 ## Quick Start
@@ -70,8 +72,43 @@ Minimal `/etc/krb5.conf`:
 
 ### Windows
 
-**Phase 4 is not yet shipped.** Windows SSPI support is on the roadmap (`secur32.dll`
-+ the `Negotiate` package). Until it lands, use [WSL2 Ubuntu](#wsl2-ubuntu-under-windows).
+Native Windows SSPI via `secur32.dll`'s Negotiate package. Uses the current
+Windows logon session — no `kinit` needed. Same connection-string surface as
+POSIX:
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com,1433;Database=YourDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes'
+    AS db (TYPE mssql);
+```
+
+Or the explicit form:
+
+```sql
+ATTACH 'Server=sqlhost.corp.example.com,1433;Database=YourDB;authenticator=winsspi;Encrypt=yes;TrustServerCertificate=yes'
+    AS db (TYPE mssql);
+```
+
+`Trusted_Connection=yes` and `Integrated Security=SSPI` both resolve to
+`authenticator=winsspi` on Windows; on POSIX they resolve to
+`authenticator=krb5`. The behavior is the same — your machine's existing
+authentication credentials are used.
+
+**Prerequisites:**
+
+- Domain-joined Windows host (or sufficient privileges to acquire a Kerberos
+  TGT for the target realm).
+- SQL Server's SPN registered in AD with the canonical
+  `MSSQLSvc/<fqdn>:<port>` form. Verify with `setspn -L DOMAIN\sqlservice`
+  from an admin PowerShell.
+- No build-time dependencies — `secur32.lib` is part of the Windows SDK.
+
+**Limitations:**
+
+- Only credential-cache mode (current logon session). Keytab and raw-credentials
+  modes are POSIX-only.
+- Negotiate falls back to NTLM transparently when the KDC isn't reachable for
+  the target SPN. If you require Kerberos-only authentication, ensure the SPN
+  is registered correctly so the fallback is never triggered.
 
 ### WSL2 (Ubuntu under Windows)
 
@@ -398,6 +435,70 @@ Kerberos support (MSSQL_ENABLE_KRB5 was not defined). Rebuild with -DENABLE_KRB5
   bug in your config that `kinit` didn't catch (wrong SPN, wrong realm
   resolution, etc.).
 
+## Diagnostic function: `mssql_winsspi_auth_test` (Windows)
+
+The Windows SSPI peer of `mssql_kerberos_auth_test`. Same idea: exercises
+the client-side handshake (`AcquireCredentialsHandleW` +
+`InitializeSecurityContextW`, Negotiate package) **without** connecting to
+SQL Server. Useful for confirming the current logon session has a valid
+ticket, the SPN resolves, and Negotiate produces a non-empty token.
+
+Three overloads:
+
+```sql
+-- 1. Smoke test against a host, default port 1433.
+SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com');
+
+-- 2. Explicit port.
+SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com', 1433);
+
+-- 3. Explicit SPN -- override default MSSQLSvc/<host>:<port> derivation.
+SELECT mssql_winsspi_auth_test_spn('MSSQLSvc/sqlcluster.corp.example.com:1433');
+```
+
+### Success output
+
+```text
+OK: principal=alice@CORP.EXAMPLE.COM, spn=MSSQLSvc/sqlhost.corp.example.com:1433, mech=Negotiate, token_size=1652 bytes
+```
+
+`principal` here is the current logon session's UPN (via
+`GetUserNameEx(NameUserPrincipal)`); falls back to `DOMAIN\user` if the UPN
+isn't set on the account. `mech=Negotiate` is the SSPI package name —
+Negotiate transparently selects Kerberos when the SPN resolves through AD
+and falls back to NTLM otherwise, which is why we report it explicitly.
+
+### Failure output
+
+The function returns the verbatim error message from
+`winsspi_authenticator.cpp`, wrapping `FormatMessageW` plus the SSPI status
+code. Common cases:
+
+```text
+-- SPN not registered for this server
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x80090303, The specified target is unknown or unreachable.
+(Hint: SPN not found in Active Directory. Verify with 'setspn -L domain\sqlsvc'.)
+
+-- No domain credentials in the current session
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x8009030E, No credentials are available in the security package.
+(Hint: log in as a domain user, or run 'runas /netonly' against domain creds.)
+
+-- Clock skew
+MSSQL Kerberos auth failed: InitializeSecurityContext failed:
+sspi_status=0x80090324, The clocks on the client and server machines are skewed.
+(Hint: sync system clock; typical tolerance is ±5 minutes.)
+```
+
+### Function availability
+
+- On Windows builds: real implementation, exercises SSPI Negotiate.
+- On Linux / macOS builds: returns a clear "wrong platform — use
+  `mssql_kerberos_auth_test` on POSIX" message. Registered unconditionally
+  so the function exists on every platform and gives consistent diagnostics
+  rather than "function does not exist".
+
 ## Troubleshooting
 
 ### Common Errors
@@ -501,6 +602,68 @@ duckdb --unsigned
 
 See `test/kerberos/README.md` for the full layout and troubleshooting.
 
+## Running the Windows SSPI test suite
+
+The POSIX `test/kerberos/` docker-compose stack has no Windows analog —
+SSPI requires a real Windows logon session against a real KDC, which a
+container can't provide. The Windows test surface is a sqllogictest file
+that runs manually on a domain-joined Windows host:
+
+**Suite:** `test/sql/integrated_auth/winsspi_basic.test` — four cases
+covering `Trusted_Connection=yes` ATTACH, catalog SELECT, raw
+`mssql_scan`, and the explicit `authenticator=winsspi` form.
+
+**Gated on three env vars** so it's a no-op in normal CI:
+
+| Env var | Purpose |
+|---|---|
+| `MSSQL_WINSSPI_TEST=1` | Opt-in switch |
+| `MSSQL_TEST_HOST` | SQL Server hostname (FQDN) |
+| `MSSQL_TEST_DB` | Database to ATTACH (any DB you can read works) |
+
+**Run via the helper script** (recommended):
+
+```powershell
+.\scripts\ci\winsspi_test.ps1 -SqlHost sqlhost.corp.example.com -Database master
+```
+
+The script verifies `klist` shows a TGT, sets the env vars, and runs
+`unittest.exe` against the suite. The `unittest.exe` either comes from a
+local `make` build (`build\release\test\unittest.exe`) or from the
+`unittest-windows_amd64` artifact of a green CI run.
+
+**Or directly:**
+
+```powershell
+$env:MSSQL_WINSSPI_TEST = "1"
+$env:MSSQL_TEST_HOST    = "sqlhost.corp.example.com"
+$env:MSSQL_TEST_DB      = "master"
+
+.\build\release\test\unittest.exe test\sql\integrated_auth\winsspi_basic.test
+```
+
+**Pre-flight with the diagnostic function first.** Cheaper to debug a SPN
+or credential issue via `mssql_winsspi_auth_test` than via a failing
+sqllogictest:
+
+```powershell
+duckdb.exe --unsigned -c "
+  LOAD 'C:\duckdb\ext\mssql.duckdb_extension';
+  SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com');
+"
+```
+
+If that returns `OK: ...`, the SSPI handshake works and any
+sqllogictest failure is on the SQL Server side (login mapping,
+permissions). If it returns an error, fix the client-side problem first.
+
+**Why this isn't automated in CI.** GitHub-hosted Windows runners aren't
+domain-joined and can't be made to be. A self-hosted Windows runner
+joined to an Entra Domain Services managed domain would work but adds
+~$140/mo Azure cost and a maintenance surface that only pays off once
+there's a second Windows contributor. Until then: maintainer manual
+smoke test before merging Windows-touching PRs.
+
 ## Reference
 
 ### Supported credential modes
@@ -532,7 +695,7 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
 |---|---|---|---|---|
 | Linux x86_64 / ARM64 | yes | yes | yes (secret only) | Phase 3 shipped |
 | macOS ARM64 | yes | rejected | rejected | Phase 3 shipped |
-| Windows x64 | n/a | n/a | n/a | Phase 4 pending |
+| Windows x64 | yes (logon session) | n/a (use logon session) | n/a (use logon session) | Phase 4 shipped |
 | WSL2 Ubuntu | yes | yes | yes (secret only) | Same as Linux |
 
 ### Security notes

@@ -45,7 +45,7 @@ SELECT id, col_time_s0, col_time_s3, col_time_s7 FROM nbc_scales.dbo.NullableDat
 query IIII
 SELECT id, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
 ----
-1	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.123456
+1	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.1234567
 
 # Row 2: All null
 query IIII
@@ -105,7 +105,7 @@ SELECT id, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDateti
 query IIIIIIIIII
 SELECT id, col_time_s0, col_time_s3, col_time_s7, col_datetime2_s0, col_datetime2_s3, col_datetime2_s7, col_dto_s0, col_dto_s3, col_dto_s7 FROM nbc_scales.dbo.NullableDatetimeScales WHERE id = 1;
 ----
-1	13:45:30	13:45:30.123	13:45:30.123456	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.123456	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
+1	13:45:30	13:45:30.123	13:45:30.123456	2024-06-15 13:45:30	2024-06-15 13:45:30.123	2024-06-15 13:45:30.1234567	2024-06-15 08:15:30+00	2024-06-15 08:15:30.123+00	2024-06-15 08:15:30.123456+00
 
 # Cleanup
 statement ok

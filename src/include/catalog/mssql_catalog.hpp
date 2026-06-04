@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
@@ -9,6 +13,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "mssql_storage.hpp"
+#include "query/mssql_result_stream.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -37,13 +42,22 @@ class LogicalUpdate;
 
 class MSSQLCatalog : public Catalog {
 public:
-	// Constructor
+	// Constructor (spec 047: catalog now owns its connection pool via unique_ptr).
+	// @param pool_config Pool sizing/timeout configuration translated from DuckDB settings.
+	// @param fedauth_token_utf16le Pre-acquired FEDAUTH token (UTF-16LE) for Azure/manual-token
+	//        auth paths; empty for SQL auth and integrated auth. Captured by the pool factory.
 	// @param catalog_enabled When false, catalog integration is disabled (raw query mode only via
 	// mssql_scan/mssql_exec)
 	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
-				 AccessMode access_mode, bool catalog_enabled = true);
+				 tds::PoolConfiguration pool_config, std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode,
+				 bool catalog_enabled = true);
 
-	~MSSQLCatalog() override;
+	// noexcept (spec 047 T046k): defaulted body destructs the per-catalog
+	// `unique_ptr<ConnectionPool>` (and other unique_ptr members), each of
+	// whose destructors is also `noexcept`. Marked explicit for grep-ability
+	// and to keep the teardown contract loud: a throw here during
+	// `~AttachedDatabase` unwind would invoke std::terminate.
+	~MSSQLCatalog() noexcept override;
 
 	//===----------------------------------------------------------------------===//
 	// Required Catalog Overrides
@@ -124,6 +138,24 @@ public:
 	const string &GetContextName() const;
 
 	//===----------------------------------------------------------------------===//
+	// Result Stream Registry (spec 047 / US3 — replaces process-wide
+	// MSSQLResultStreamRegistry singleton; stream lifetime is now bounded by
+	// the catalog's lifetime, so DETACH or per-instance teardown drops orphans
+	// automatically.)
+	//===----------------------------------------------------------------------===//
+
+	// Register a result stream produced at Bind time and return a UUID handle
+	// that survives Bind→InitGlobal copies of MSSQLScanBindData (DuckDB
+	// BindData must be serializable; we store the UUID string, not the raw
+	// pointer).
+	std::string RegisterStream(std::unique_ptr<MSSQLResultStream> stream);
+
+	// Retrieve and remove the stream registered under `uuid`. Returns nullptr
+	// when the handle is absent (already retrieved, or never registered).
+	// find+erase is atomic under one lock.
+	std::unique_ptr<MSSQLResultStream> RetrieveStream(const std::string &uuid);
+
+	//===----------------------------------------------------------------------===//
 	// Access Mode (READ_ONLY Support)
 	//===----------------------------------------------------------------------===//
 
@@ -174,31 +206,45 @@ private:
 	// Internal Methods
 	//===----------------------------------------------------------------------===//
 
-	// Get or create schema entry
+	// Get or create schema entry.
+	// Spec 052 (Option D): shared variant returns the shared_ptr (used by
+	// LookupSchema/ScanSchemas to anchor in MSSQLBindAnchors); reference
+	// variant wraps for callers that don't need to anchor.
+	shared_ptr<MSSQLSchemaEntry> GetOrCreateSchemaEntryShared(const string &schema_name);
 	MSSQLSchemaEntry &GetOrCreateSchemaEntry(const string &schema_name);
 
 	// Query database default collation
 	void QueryDatabaseCollation();
 
-	// Create connection factory for the pool
-	tds::ConnectionFactory CreateConnectionFactory();
-
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	string context_name_;												  // Attached context name
-	shared_ptr<MSSQLConnectionInfo> connection_info_;					  // Connection parameters
-	AccessMode access_mode_;											  // READ_ONLY enforced
-	bool catalog_enabled_;												  // Catalog integration enabled
-	MSSQLCatalogFilter catalog_filter_;									  // Regex visibility filter
-	shared_ptr<tds::ConnectionPool> connection_pool_;					  // Connection pool
-	unique_ptr<MSSQLMetadataCache> metadata_cache_;						  // Metadata cache
-	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;			  // Statistics provider
-	string database_collation_;											  // Database default collation
-	string default_schema_;												  // Default schema ("dbo")
-	unordered_map<string, unique_ptr<MSSQLSchemaEntry>> schema_entries_;  // Schema entry cache
-	mutable std::mutex schema_mutex_;									  // Thread-safety for schema access
+	string context_name_;									   // Attached context name
+	shared_ptr<MSSQLConnectionInfo> connection_info_;		   // Connection parameters
+	tds::PoolConfiguration pool_config_;					   // Pool config (spec 047)
+	std::vector<uint8_t> fedauth_token_utf16le_;			   // FEDAUTH token (spec 047)
+	AccessMode access_mode_;								   // READ_ONLY enforced
+	bool catalog_enabled_;									   // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;						   // Regex visibility filter
+	unique_ptr<tds::ConnectionPool> connection_pool_;		   // Connection pool (per-catalog owned, spec 047)
+	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
+	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
+	string database_collation_;								   // Database default collation
+	string default_schema_;									   // Default schema ("dbo")
+	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
+	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
+	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-
+	// only insertion guards against concurrent first-load.
+	unordered_map<string, shared_ptr<MSSQLSchemaEntry>> schema_entries_;
+	mutable std::mutex schema_mutex_;  // Thread-safety for schema access
+
+	// Spec 047 / US3: per-catalog result stream registry (replaces process-wide
+	// MSSQLResultStreamRegistry singleton). Streams are produced at mssql_scan
+	// Bind time and consumed at InitGlobal time; the UUID handle bridges the
+	// two via the serializable BindData.
+	mutable std::mutex streams_mutex_;
+	std::unordered_map<std::string, std::unique_ptr<MSSQLResultStream>> active_streams_;
 };
 
 }  // namespace duckdb

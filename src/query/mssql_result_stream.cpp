@@ -5,7 +5,6 @@
 #include <iostream>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -71,25 +70,22 @@ MSSQLResultStream::~MSSQLResultStream() {
 			connection_->Close();
 		}
 
-		// Use ConnectionProvider if we have a client context (transaction-aware)
+		// Spec 047: pool is owned by MSSQLCatalog (per-catalog ownership).
+		// Without a ClientContext we can't look up the catalog; the shared_ptr
+		// drop closes the connection on this thread — no leak, just no reuse.
+		// Same outcome when catalog lookup throws (catalog detached mid-query).
 		if (client_context_) {
 			try {
 				auto &catalog = Catalog::GetCatalog(*client_context_, context_name_);
 				auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 				ConnectionProvider::ReleaseConnection(*client_context_, mssql_catalog, std::move(connection_));
 			} catch (...) {
-				// Fall back to direct pool release on error
-				auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
-				if (pool) {
-					pool->Release(std::move(connection_));
-				}
+				// Catalog gone or release failed — drop the connection.
+				// shared_ptr destructor closes the socket.
+				connection_.reset();
 			}
 		} else {
-			// Fall back to direct pool release (legacy code path)
-			auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
-			if (pool) {
-				pool->Release(std::move(connection_));
-			}
+			connection_.reset();
 		}
 	}
 }

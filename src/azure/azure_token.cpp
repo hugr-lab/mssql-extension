@@ -38,30 +38,61 @@ TokenCache &TokenCache::Instance() {
 	return instance;
 }
 
-std::string TokenCache::GetToken(const std::string &secret_name) {
+// Build the namespaced key. uintptr_t of the DatabaseInstance address is
+// stable for the instance's lifetime and unique across live instances;
+// see header comment on the non-reaping decision.
+static std::pair<std::uintptr_t, std::string> MakeKey(DatabaseInstance &db, const std::string &cache_key) {
+	return {reinterpret_cast<std::uintptr_t>(&db), cache_key};
+}
+
+std::string TokenCache::GetToken(DatabaseInstance &db, const std::string &cache_key) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = cache_.find(secret_name);
-	if (it != cache_.end() && it->second.IsValid()) {
+	auto it = cache_.find(MakeKey(db, cache_key));
+	if (it == cache_.end()) {
+		return "";
+	}
+	if (it->second.IsValid()) {
 		return it->second.access_token;
 	}
+	// PR #118 review M4: opportunistic shrink on stale read. The map would
+	// otherwise accumulate dead rows for the process lifetime in long-running
+	// hosts that ATTACH/DETACH against many distinct `(db, secret)` tuples.
+	cache_.erase(it);
 	return "";
 }
 
-bool TokenCache::HasValidToken(const std::string &secret_name) {
+bool TokenCache::HasValidToken(DatabaseInstance &db, const std::string &cache_key) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = cache_.find(secret_name);
+	auto it = cache_.find(MakeKey(db, cache_key));
 	return it != cache_.end() && it->second.IsValid();
 }
 
-void TokenCache::SetToken(const std::string &secret_name, const std::string &token,
+void TokenCache::SetToken(DatabaseInstance &db, const std::string &cache_key, const std::string &token,
 						  std::chrono::system_clock::time_point expires_at) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	cache_[secret_name] = CachedToken{token, expires_at};
+	cache_[MakeKey(db, cache_key)] = CachedToken{token, expires_at};
 }
 
-void TokenCache::Invalidate(const std::string &secret_name) {
+void TokenCache::Invalidate(DatabaseInstance &db, const std::string &cache_key) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	cache_.erase(secret_name);
+	cache_.erase(MakeKey(db, cache_key));
+}
+
+void TokenCache::InvalidateByPrefix(DatabaseInstance &db, const std::string &prefix) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto db_id = reinterpret_cast<std::uintptr_t>(&db);
+	for (auto it = cache_.begin(); it != cache_.end();) {
+		const auto &key_db = it->first.first;
+		const auto &key_str = it->first.second;
+		bool matches =
+			key_db == db_id && (key_str == prefix || (key_str.size() > prefix.size() && key_str[prefix.size()] == ':' &&
+													  key_str.compare(0, prefix.size(), prefix) == 0));
+		if (matches) {
+			it = cache_.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void TokenCache::Clear() {
@@ -380,13 +411,17 @@ static std::string ExtractErrorMessage(const std::exception &e) {
 
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 						 const std::string &tenant_id_override) {
+	// Spec 047 FR-012: cache lookups are namespaced by DatabaseInstance address
+	// so two DuckDB instances sharing a secret name cannot alias each other's tokens.
+	auto &db_instance = *context.db;
+
 	// Check cache first (include tenant in cache key for interactive auth)
 	std::string cache_key = secret_name;
 	if (!tenant_id_override.empty()) {
 		cache_key += ":" + tenant_id_override;
 	}
 
-	std::string cached = TokenCache::Instance().GetToken(cache_key);
+	std::string cached = TokenCache::Instance().GetToken(db_instance, cache_key);
 	if (!cached.empty()) {
 		return TokenResult::Success(cached,
 									std::chrono::system_clock::now() + std::chrono::hours(1));	// Approximate expiry
@@ -432,7 +467,7 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 
 		// Cache successful result
 		if (result.success) {
-			TokenCache::Instance().SetToken(cache_key, result.access_token, result.expires_at);
+			TokenCache::Instance().SetToken(db_instance, cache_key, result.access_token, result.expires_at);
 		}
 
 		return result;

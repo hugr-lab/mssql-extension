@@ -49,6 +49,16 @@ struct MSSQLConnectionInfo {
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 
+	// Spec 047 US-AN (FR-014, closes issue #82): custom LOGIN7 program_name.
+	// Empty = use the extension's default ("DuckDB MSSQL Extension"). Parsed
+	// from `Application Name` / `ApplicationName` / `App Name` in ADO.NET
+	// connection strings, from `applicationname` query parameter in URI
+	// strings, and from `application_name` / `applicationname` in secrets.
+	// SQL Server clamps program_name to 128 chars — `ResolveAppName()`
+	// clamps client-side so the value the user sees in `APP_NAME()` matches
+	// exactly what we sent.
+	string application_name;
+
 	//===----------------------------------------------------------------------===//
 	// Authentication method (Spec 042)
 	//
@@ -82,6 +92,12 @@ struct MSSQLConnectionInfo {
 	string krb5_credcachefile;		// Path to a ccache override (else KRB5CCNAME / default)
 	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
 	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
+
+	// Test-only (issue #138): LOGIN7 / SSPI fragmentation boundary in bytes,
+	// populated at ATTACH from the mssql_login7_max_packet setting. 0 = the
+	// 4096 default; smaller values force the multi-packet path for the e2e
+	// test without an AD-sized Kerberos PAC. Clamped in AuthenticateIntegrated.
+	size_t login7_max_packet = 0;
 
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
@@ -132,39 +148,51 @@ struct MSSQLConnectionInfo {
 
 	// Check if string is a connection string (contains key=value pairs)
 	static bool IsConnectionString(const string &str);
+
+	//===----------------------------------------------------------------------===//
+	// Credential lifetime
+	//
+	// User-declared destructor OPENSSL_cleanse's `password` and `access_token`
+	// (and any other bearer-token storage added later) so secrets are not
+	// left behind in heap-recycled memory after this struct is freed. The
+	// implementation lives in mssql_storage.cpp to keep OpenSSL out of this
+	// header. shared_ptr<MSSQLConnectionInfo> is the canonical owner shape,
+	// so the wipe runs exactly when the last reference drops.
+	//
+	// The other four special members are explicitly defaulted because
+	// user-declaring the destructor would otherwise disable implicit move
+	// generation (and silently fall back to copy).
+	//===----------------------------------------------------------------------===//
+	MSSQLConnectionInfo() = default;
+	~MSSQLConnectionInfo();
+
+	MSSQLConnectionInfo(const MSSQLConnectionInfo &) = default;
+	MSSQLConnectionInfo &operator=(const MSSQLConnectionInfo &) = default;
+	MSSQLConnectionInfo(MSSQLConnectionInfo &&) = default;
+	MSSQLConnectionInfo &operator=(MSSQLConnectionInfo &&) = default;
 };
 
 //===----------------------------------------------------------------------===//
-// MSSQLContext - Attached context state
+// ResolveAppName (Spec 047 US-AN / FR-014 / T065)
+//
+// Single resolution point for the LOGIN7 program_name. Returns the
+// caller-supplied `application_name` clamped to 128 UTF-16 code units
+// (SQL Server's own program_name limit — clamp client-side so the value
+// shown by `APP_NAME()` matches exactly what we sent on the wire), or
+// the extension default when the user did not configure one.
+//
+// The clamp counts UTF-16 code units (NOT UTF-8 bytes) to mirror the
+// wire encoding in `tds_protocol.cpp::BuildLogin7`. A naive UTF-8 byte
+// clamp would chop multi-byte sequences mid-character, producing
+// invalid UTF-8 that the LOGIN7 encoder would either substitute with
+// the replacement character or reject.
+//
+// Called from the AuthStrategyFactory fan-out + every TdsConnection
+// Authenticate* call site so every auth path (SQL / Azure FEDAUTH /
+// manual token / integrated) goes through the same logic. A future
+// change to the default string only touches the impl.
 //===----------------------------------------------------------------------===//
-struct MSSQLContext {
-	string name;
-	string secret_name;
-	shared_ptr<MSSQLConnectionInfo> connection_info;
-	optional_ptr<AttachedDatabase> attached_db;
-
-	MSSQLContext(const string &name, const string &secret_name);
-};
-
-//===----------------------------------------------------------------------===//
-// MSSQLContextManager - Global context manager (singleton per DatabaseInstance)
-//===----------------------------------------------------------------------===//
-class MSSQLContextManager {
-public:
-	// Get singleton instance for a DatabaseInstance
-	static MSSQLContextManager &Get(DatabaseInstance &db);
-
-	// Context operations
-	void RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx);
-	void UnregisterContext(const string &name);
-	shared_ptr<MSSQLContext> GetContext(const string &name);
-	bool HasContext(const string &name);
-	vector<string> ListContexts();
-
-private:
-	mutex lock;
-	case_insensitive_map_t<shared_ptr<MSSQLContext>> contexts;
-};
+string ResolveAppName(const MSSQLConnectionInfo &info);
 
 //===----------------------------------------------------------------------===//
 // MSSQLStorageExtensionInfo - Shared state for storage extension
@@ -183,9 +211,8 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 3
 
 // Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
 // so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
-// login7_max_packet: test-only LOGIN7 fragmentation boundary (issue #138); 0 = default 4096.
-void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30,
-									  size_t login7_max_packet = 0);
+// The LOGIN7 fragmentation boundary (issue #138) is read from info.login7_max_packet.
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);

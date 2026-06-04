@@ -940,11 +940,35 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 			col.max_length = 9;	 // DECIMAL(20,0) needs 9 bytes
 		}
 
-		// Handle scale for time types
-		if (source_types[i].id() == LogicalTypeId::TIME || source_types[i].id() == LogicalTypeId::TIMESTAMP ||
-			source_types[i].id() == LogicalTypeId::TIMESTAMP_TZ) {
-			col.scale = 6;		 // DuckDB uses microsecond precision
-			col.max_length = 8;	 // 5 bytes time + 3 bytes date for datetime2
+		// Handle scale for time types. Scale MUST match the source's native
+		// precision so the BCP wire COLMETADATA agrees with how the codec
+		// encodes the value (see codec::datetime::ComputeDatetime2Components +
+		// EncodeDatetime2Raw). Mismatch silently truncates on the server (e.g.
+		// declaring scale=0 for a TIMESTAMP_MS value drops every millisecond).
+		switch (source_types[i].id()) {
+		case LogicalTypeId::TIME:
+		case LogicalTypeId::TIMESTAMP:
+			col.scale = 6;		 // µs (DuckDB native)
+			col.max_length = 8;	 // 5 bytes time(6) + 3 bytes date
+			break;
+		case LogicalTypeId::TIMESTAMP_MS:
+			col.scale = 3;		 // ms
+			col.max_length = 7;	 // 4 bytes time(3) + 3 bytes date
+			break;
+		case LogicalTypeId::TIMESTAMP_NS:
+			col.scale = 7;		 // 100 ns (DATETIME2 max precision)
+			col.max_length = 8;	 // 5 bytes time(7) + 3 bytes date
+			break;
+		case LogicalTypeId::TIMESTAMP_SEC:
+			col.scale = 0;		 // s
+			col.max_length = 6;	 // 3 bytes time(0) + 3 bytes date
+			break;
+		case LogicalTypeId::TIMESTAMP_TZ:
+			col.scale = 7;		  // 100 ns — matches DATETIMEOFFSET(7) DDL emitted by codec
+			col.max_length = 10;  // 5 bytes time(7) + 3 bytes date + 2 bytes offset
+			break;
+		default:
+			break;
 		}
 
 		columns.push_back(std::move(col));
@@ -1014,16 +1038,23 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 		return "time(6)";  // DuckDB uses microsecond precision
 
 	case LogicalTypeId::TIMESTAMP:
+		return "datetime2(6)";	// µs — DuckDB native, exact match
 	case LogicalTypeId::TIMESTAMP_MS:
+		return "datetime2(3)";	// ms — exact (matches codec FormatDdlTypeName)
 	case LogicalTypeId::TIMESTAMP_NS:
+		return "datetime2(7)";	// 100 ns — DATETIME2 max precision
 	case LogicalTypeId::TIMESTAMP_SEC:
-		return "datetime2(6)";	// Use microsecond precision
+		return "datetime2(0)";	// s — exact
 
 	case LogicalTypeId::TIMESTAMP_TZ:
-		return "datetimeoffset(6)";
+		return "datetimeoffset(7)";	 // 100 ns — matches codec FormatDdlTypeName
 
 	case LogicalTypeId::HUGEINT:
 		return "decimal(38,0)";	 // HUGEINT maps to max precision decimal
+
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: INTERVAL stored as canonical Interval::ToString text in NVARCHAR(50).
+		return "nvarchar(50)";
 
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for SQL Server: %s", duckdb_type.ToString());
@@ -1082,6 +1113,10 @@ uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 
 	case LogicalTypeId::TIMESTAMP_TZ:
 		return tds::TDS_TYPE_DATETIMEOFFSET;  // 0x2B
+
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: INTERVAL travels as NVARCHAR text on the BCP wire.
+		return tds::TDS_TYPE_NVARCHAR;	// 0xE7
 
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for TDS: %s", duckdb_type.ToString());
@@ -1155,6 +1190,10 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 
 	case LogicalTypeId::HUGEINT:
 		return 17;	// Max decimal size for HUGEINT
+
+	case LogicalTypeId::INTERVAL:
+		// Spec 045 FR-026: nvarchar(50) = 100 UTF-16LE bytes of capacity.
+		return 100;
 
 	default:
 		throw NotImplementedException("MSSQL COPY: Unsupported DuckDB type for max_length: %s", duckdb_type.ToString());

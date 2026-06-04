@@ -6,7 +6,7 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 # Extension version - update this when creating a new release tag
-set(MSSQL_EXTENSION_VERSION "0.1.18")
+set(MSSQL_EXTENSION_VERSION "0.2.0")
 
 # Project configuration
 project(${TARGET_NAME})
@@ -118,6 +118,20 @@ set(EXTENSION_SOURCES
     src/tds/encoding/guid_encoding.cpp
     src/tds/encoding/type_converter.cpp
     src/tds/encoding/bcp_row_encoder.cpp
+    # Codec layer (spec 045) — per-type-family modules. Phase 2 lands the
+    # foundational dispatch helpers + per-family stubs; family bodies are
+    # populated in Phase 3 (US1 Integer MVP) onwards.
+    src/codec/type_family.cpp
+    src/codec/literal_format.cpp
+    src/codec/boolean_codec.cpp
+    src/codec/integer_codec.cpp
+    src/codec/float_codec.cpp
+    src/codec/decimal_codec.cpp
+    src/codec/money_codec.cpp
+    src/codec/string_codec.cpp
+    src/codec/binary_codec.cpp
+    src/codec/datetime_codec.cpp
+    src/codec/uuid_codec.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp
@@ -132,6 +146,7 @@ set(EXTENSION_SOURCES
     src/tds/auth/manual_token_strategy.cpp
     src/tds/auth/auth_strategy_factory.cpp
     src/tds/auth/krb5_test_function.cpp
+    src/tds/auth/winsspi_test_function.cpp
     src/tds/tds_token_parser.cpp
     src/tds/tds_row_reader.cpp
     # TLS layer (OpenSSL)
@@ -144,14 +159,15 @@ set(EXTENSION_SOURCES
     # Connection management layer (DuckDB integration)
     src/connection/mssql_settings.cpp
     src/connection/mssql_diagnostic.cpp
-    src/connection/mssql_pool_manager.cpp
     src/connection/mssql_connection_provider.cpp
+    src/connection/instance_resolver.cpp
     # Catalog integration layer (DuckDB catalog API)
     src/catalog/mssql_catalog_filter.cpp
     src/catalog/mssql_column_info.cpp
     src/catalog/mssql_metadata_cache.cpp
     src/catalog/mssql_primary_key.cpp
     src/catalog/mssql_catalog.cpp
+    src/catalog/mssql_bind_anchors.cpp
     src/catalog/mssql_schema_entry.cpp
     src/catalog/mssql_table_entry.cpp
     src/catalog/mssql_table_set.cpp
@@ -212,9 +228,12 @@ set(EXTENSION_SOURCES
 
 # Spec 042: conditional inclusion of the platform-specific integrated-auth
 # authenticator. POSIX gets krb5_authenticator.cpp when GSSAPI is discovered;
-# Windows gets winsspi_authenticator.cpp (Phase 4).
+# Windows gets winsspi_authenticator.cpp via secur32.dll (Phase 4).
 if(MSSQL_KRB5_AVAILABLE)
     list(APPEND EXTENSION_SOURCES src/tds/auth/krb5_authenticator.cpp)
+endif()
+if(MSSQL_SSPI_AVAILABLE)
+    list(APPEND EXTENSION_SOURCES src/tds/auth/winsspi_authenticator.cpp)
 endif()
 
 # Build static extension (linked into DuckDB)

@@ -1,7 +1,6 @@
 #include "catalog/mssql_transaction.hpp"
 #include <cstring>
 #include "catalog/mssql_catalog.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/tds_connection.hpp"
@@ -100,6 +99,21 @@ MSSQLTransaction::~MSSQLTransaction() {
 		}
 		sql_server_transaction_active_ = false;
 	}
+	// Spec 047: every SetPinnedConnection(non-null) on `pinned_connection_`
+	// incremented the per-catalog `pinned_count_` atomic. The destructor path
+	// (commit/rollback/crash/abandoned) drops the shared_ptr WITHOUT going
+	// through SetPinnedConnection(nullptr), so the matching DecrementPinned
+	// would never fire and `pool_stats.pinned_count` would leak +1 forever.
+	// Decrement here under try/catch — the catalog is still alive (transaction
+	// destruction precedes catalog destruction in DuckDB's teardown order).
+	if (pinned_connection_) {
+		try {
+			catalog_.GetConnectionPool().DecrementPinned();
+		} catch (...) {
+			// Catalog or pool already destroyed (unexpected order) — accept the
+			// stat leak rather than escape the destructor.
+		}
+	}
 	// Note: pinned_connection_ shared_ptr will be released here, decreasing ref count.
 	// The connection will be destroyed if this was the last reference.
 }
@@ -135,12 +149,12 @@ void MSSQLTransaction::SetPinnedConnection(std::shared_ptr<tds::TdsConnection> c
 	bool will_be_pinned = (conn != nullptr);
 
 	if (!was_pinned && will_be_pinned) {
-		// Pinning a connection - increment count
-		MssqlPoolManager::Instance().IncrementPinnedCount(catalog_.GetContextName());
+		// Pinning a connection - increment count on the per-catalog pool (spec 047 T014).
+		catalog_.GetConnectionPool().IncrementPinned();
 		MSSQL_TXN_LOG("Pinned connection set for transaction (pinned_count incremented)");
 	} else if (was_pinned && !will_be_pinned) {
-		// Unpinning a connection - decrement count
-		MssqlPoolManager::Instance().DecrementPinnedCount(catalog_.GetContextName());
+		// Unpinning a connection - decrement count.
+		catalog_.GetConnectionPool().DecrementPinned();
 		MSSQL_TXN_LOG("Pinned connection cleared for transaction (pinned_count decremented)");
 	} else {
 		MSSQL_TXN_LOG("Pinned connection set for transaction (no count change)");

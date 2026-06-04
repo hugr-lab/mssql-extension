@@ -1,0 +1,85 @@
+# Money edge cases — documented separately from decode_cases.txt
+# (no machine-parsed format; readers + future maintainers).
+
+## 1. Sign handling
+
+MONEY/SMALLMONEY values are **two's-complement** signed integers, NOT
+sign-magnitude (unlike NUMERIC/DECIMAL). The decoder relies on:
+
+- `ConvertMoney` reads two int32_t via memcpy, then assembles
+  `(int64_t)high << 32 | (uint32_t)low`. Casting `low` through `uint32_t`
+  before the OR is critical: a direct OR with signed int32 sign-extends
+  the low half and corrupts large positive values.
+- `ConvertSmallMoney` simply memcpy's a 4-byte int32_t.
+
+Edge case: scaled value -15000 (`-1.5000`) on the wire arrives as
+high=0xFFFFFFFF, low=0xFFFFC568. The high half's sign bit is set;
+sign-extension by the int64 cast preserves negativity. Test row:
+`ff ff ff ff 68 c5 ff ff` in `decode_cases.txt`.
+
+## 2. INT64_MIN / INT64_MAX boundaries (MONEY)
+
+SQL Server documents MONEY range as -922337203685477.5808 ..
+922337203685477.5807, which are exactly INT64_MIN / INT64_MAX scaled by
+10000. The decoder must therefore handle both:
+
+- INT64_MAX:  high=0x7FFFFFFF, low=0xFFFFFFFF
+- INT64_MIN:  high=0x80000000, low=0x00000000
+
+Both rows are in `decode_cases.txt`. Storage is `hugeint_t` (because
+DECIMAL(19,4) → physical INT128) but the conversion math is performed
+in int64 first, then widened.
+
+## 3. INT32_MIN / INT32_MAX boundaries (SMALLMONEY)
+
+SMALLMONEY range -214748.3648 .. 214748.3647 (INT32_MIN/MAX × 10000⁻¹).
+Decoder writes into `int64_t` slot of a DECIMAL(10,4) physical INT64
+vector; widening from int32 is implicit. Both rows in
+`decode_cases.txt`.
+
+## 4. MONEYN dispatch (variant)
+
+`TDS_TYPE_MONEYN` is the nullable wrapper. The `column.max_length`
+field (8 or 4) determines which DuckDB LogicalType is allocated
+upstream by `TypeConverter::GetDuckDBType`:
+
+| max_length | LogicalType    | physical | runtime bytes |
+|------------|----------------|----------|----------------|
+| 8          | DECIMAL(19,4)  | INT128   | 8 (MONEY layout) |
+| 4          | DECIMAL(10,4)  | INT64    | 4 (SMALLMONEY layout) |
+
+The decoder itself does NOT inspect `column.type_id`; it dispatches
+purely on `bytes.size()`. This matches the legacy `ConvertMoney`
+implementation: `bytes.size()` is authoritative because
+the dispatcher at `TypeConverter::ConvertValue` already filters NULL
+(is_null=true short-circuits to `SetNull`), so the per-family decoder
+only sees a present value with the canonical 8- or 4-byte form.
+
+## 5. Cross-family routing (FR-002)
+
+Because Money has no DuckDB-side type peer, EVERY operation other than
+TDS-decode routes through the **Decimal codec**:
+
+- BCP encode: a DuckDB `DECIMAL(19,4)` value goes through
+  `codec::decimal::EncodeToBcp` (writes as TDS DECIMAL wire, NOT MONEY)
+- SQL literal: `codec::decimal::FormatSqlLiteral` produces the
+  `19.5000`-style fixed-point text
+- DDL: `codec::decimal::FormatDdlTypeName` returns `DECIMAL(19,4)`
+
+If a SQL Server table has a MONEY column and we CTAS-insert into it,
+the receiving side will silently widen `DECIMAL(19,4)` ↔ MONEY in T-SQL
+itself; the extension does not need to round-trip the wire format.
+
+`codec::money::EncodeToBcp`, `FormatSqlLiteral`, and `FormatDdlTypeName`
+are **declaration-only** in the header. Attempting to call them
+produces a linker error — this is the deliberate "scan-decode-only"
+fence per data-model.md.
+
+## 6. Issue #89 — VIEW + MONEY catalog/runtime mismatch
+
+When a SQL Server VIEW projects a base NVARCHAR column via
+`CAST(... AS MONEY)`, `sys.columns` may report the underlying VARCHAR
+type while the wire returns MONEY bytes. The dispatcher fallback
+(spec 045 / Phase 6 sub-phase 3) renders such mismatched MONEY values
+via `codec::decimal::RenderMoneyAsString`, **not** through this Money
+codec — that path stays decode-only.

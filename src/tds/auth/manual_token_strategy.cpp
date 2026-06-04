@@ -14,8 +14,9 @@
 namespace duckdb {
 namespace tds {
 
-ManualTokenAuthStrategy::ManualTokenAuthStrategy(const std::string &access_token, const std::string &database)
-	: raw_token_(access_token), database_(database) {
+ManualTokenAuthStrategy::ManualTokenAuthStrategy(const std::string &access_token, const std::string &database,
+												 const std::string &app_name)
+	: raw_token_(access_token), database_(database), app_name_(app_name) {
 	// Parse and validate the JWT token
 	claims_ = mssql::azure::ParseJwtClaims(access_token);
 
@@ -47,7 +48,8 @@ Login7Options ManualTokenAuthStrategy::GetLogin7Options() const {
 	options.database = database_;
 	options.username.clear();  // No username for FEDAUTH
 	options.password.clear();  // No password for FEDAUTH
-	options.app_name = "DuckDB";
+	// Spec 047 FR-014 — caller-supplied program_name (clamped at factory).
+	options.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;
 	options.include_fedauth_ext = true;	 // Include FEDAUTH extension
 	return options;
 }

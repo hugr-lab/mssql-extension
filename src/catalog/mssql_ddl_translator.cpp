@@ -1,4 +1,13 @@
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/binary_codec.hpp"
+#include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
+#include "codec/decimal_codec.hpp"
+#include "codec/float_codec.hpp"
+#include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
+#include "codec/type_family.hpp"
+#include "codec/uuid_codec.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/exception.hpp"
@@ -6,6 +15,47 @@
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 
 namespace duckdb {
+
+namespace {
+
+// Single canonical DDL type-name dispatcher (spec 045 Phase 7 — FR-028).
+// Both MapTypeToSQLServer (CreateTable) and MapLogicalTypeToCTAS (CtasCreateTable)
+// share this body: family modules emit byte-identical strings for either ctx.
+// FamilyFromLogicalType throws NotImplementedException for unsupported types
+// (LIST/STRUCT/MAP/UNION/ENUM/BIT/ARRAY — caller may pre-filter for friendlier
+// CTAS-specific error messages).
+string DispatchDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, mssql::codec::DdlContext ctx) {
+	switch (mssql::codec::FamilyFromLogicalType(type)) {
+	case mssql::codec::TypeFamily::Boolean:
+		return mssql::codec::boolean::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Integer:
+		return mssql::codec::integer::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Float:
+		return mssql::codec::float_family::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Decimal:
+		return mssql::codec::decimal::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Money:
+		// DuckDB has no MONEY LogicalType; FamilyFromLogicalType never returns
+		// Money. Money is decode-only (from SQL Server MONEY/SMALLMONEY tokens,
+		// surfaced as DuckDB DECIMAL). If we ever reach this arm, the type-family
+		// mapping has a bug.
+		throw InternalException(
+			"DDL dispatcher reached Money arm for DuckDB type '%s' — "
+			"Money family is decode-only and has no LogicalType mapping",
+			type.ToString());
+	case mssql::codec::TypeFamily::String:
+		return mssql::codec::string::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Binary:
+		return mssql::codec::binary::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::DateTime:
+		return mssql::codec::datetime::FormatDdlTypeName(type, cfg, ctx);
+	case mssql::codec::TypeFamily::Uuid:
+		return mssql::codec::uuid::FormatDdlTypeName(type, cfg, ctx);
+	}
+	throw InternalException("Unreachable: unhandled TypeFamily in DDL dispatcher for '%s'", type.ToString());
+}
+
+}  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // DDLOperation to String
@@ -76,87 +126,10 @@ string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return "BIT";
-
-	case LogicalTypeId::TINYINT:
-		return "TINYINT";
-
-	case LogicalTypeId::SMALLINT:
-		return "SMALLINT";
-
-	case LogicalTypeId::INTEGER:
-		return "INT";
-
-	case LogicalTypeId::BIGINT:
-		return "BIGINT";
-
-	case LogicalTypeId::UTINYINT:
-		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
-		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
-
-	case LogicalTypeId::USMALLINT:
-		return "INT";  // Wider to fit full range
-
-	case LogicalTypeId::UINTEGER:
-		return "BIGINT";  // Wider to fit full range
-
-	case LogicalTypeId::UBIGINT:
-		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
-
-	case LogicalTypeId::FLOAT:
-		return "REAL";	// 32-bit float
-
-	case LogicalTypeId::DOUBLE:
-		return "FLOAT";	 // 64-bit float in SQL Server
-
-	case LogicalTypeId::DECIMAL: {
-		// Get precision and scale, clamp to SQL Server limits
-		uint8_t width, scale;
-		type.GetDecimalProperties(width, scale);
-		// SQL Server: precision 1-38, scale 0-precision
-		uint8_t precision = width > 38 ? 38 : width;
-		if (scale > precision) {
-			scale = precision;
-		}
-		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
-	}
-
-	case LogicalTypeId::VARCHAR: {
-		// Check for collation info to determine length
-		// Default to NVARCHAR for Unicode safety
-		// DuckDB VARCHAR maps to NVARCHAR in SQL Server
-		return "NVARCHAR(MAX)";	 // Default to MAX for unbounded strings
-	}
-
-	case LogicalTypeId::BLOB:
-		return "VARBINARY(MAX)";
-
-	case LogicalTypeId::DATE:
-		return "DATE";
-
-	case LogicalTypeId::TIME:
-		return "TIME(7)";  // Maximum precision
-
-	case LogicalTypeId::TIMESTAMP:
-		return "DATETIME2(6)";	// Microsecond precision
-
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return "DATETIMEOFFSET(7)";	 // With timezone
-
-	case LogicalTypeId::UUID:
-		return "UNIQUEIDENTIFIER";
-
-	case LogicalTypeId::HUGEINT:
-		// DuckDB HUGEINT is 128-bit, SQL Server max is DECIMAL(38,0)
-		return "DECIMAL(38,0)";
-
-	case LogicalTypeId::INTERVAL:
-		// SQL Server doesn't have interval type, store as string
-		return "NVARCHAR(100)";
-
-	default:
+	try {
+		return DispatchDdlTypeName(type, mssql::CTASConfig{}, mssql::codec::DdlContext::CreateTable);
+	} catch (const NotImplementedException &) {
+		// Preserve legacy non-CTAS error message for unsupported types.
 		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type", type.ToString());
 	}
 }
@@ -349,131 +322,45 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const mssql::CTASConfig &config) {
+	// Pre-filter known-unsupported nested types with CTAS-specific friendly errors.
+	// All supported types route through the shared dispatcher (FR-028 byte-identity
+	// with MapTypeToSQLServer for the same LogicalType).
 	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return "BIT";
-
-	case LogicalTypeId::TINYINT:
-		return "TINYINT";
-
-	case LogicalTypeId::SMALLINT:
-		return "SMALLINT";
-
-	case LogicalTypeId::INTEGER:
-		return "INT";
-
-	case LogicalTypeId::BIGINT:
-		return "BIGINT";
-
-	case LogicalTypeId::UTINYINT:
-		// Unsigned types: SQL Server doesn't have unsigned, use next larger signed type
-		return "TINYINT";  // Range 0-255 fits in SQL Server TINYINT
-
-	case LogicalTypeId::USMALLINT:
-		return "INT";  // Wider to fit full range
-
-	case LogicalTypeId::UINTEGER:
-		return "BIGINT";  // Wider to fit full range
-
-	case LogicalTypeId::UBIGINT:
-		return "DECIMAL(20,0)";	 // No native unsigned 64-bit
-
-	case LogicalTypeId::FLOAT:
-		return "REAL";	// 32-bit float
-
-	case LogicalTypeId::DOUBLE:
-		return "FLOAT";	 // 64-bit float in SQL Server
-
-	case LogicalTypeId::DECIMAL: {
-		// Get precision and scale, clamp to SQL Server limits (FR-017)
-		uint8_t width, scale;
-		type.GetDecimalProperties(width, scale);
-		// SQL Server: precision 1-38, scale 0-precision
-		uint8_t precision = width > 38 ? 38 : width;
-		if (scale > precision) {
-			scale = precision;
-		}
-		return StringUtil::Format("DECIMAL(%d,%d)", precision, scale);
-	}
-
-	case LogicalTypeId::VARCHAR: {
-		// CTAS-specific: respect text_type setting (FR-013)
-		if (config.text_type == mssql::CTASTextType::VARCHAR) {
-			return "VARCHAR(MAX)";
-		}
-		return "NVARCHAR(MAX)";	 // Default to NVARCHAR for Unicode safety
-	}
-
-	case LogicalTypeId::BLOB:
-		return "VARBINARY(MAX)";
-
-	case LogicalTypeId::DATE:
-		return "DATE";
-
-	case LogicalTypeId::TIME:
-		return "TIME(7)";  // Maximum precision
-
-	case LogicalTypeId::TIMESTAMP:
-		return "DATETIME2(7)";	// Maximum precision (100 nanoseconds)
-
-	case LogicalTypeId::TIMESTAMP_TZ:
-		return "DATETIMEOFFSET(7)";	 // With timezone
-
-	case LogicalTypeId::UUID:
-		return "UNIQUEIDENTIFIER";
-
-	// Unsupported types - CTAS must fail with clear error (FR-012)
-	case LogicalTypeId::HUGEINT:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type HUGEINT. "
-			"Consider casting to DECIMAL(38,0) in your SELECT query.");
-
-	case LogicalTypeId::UHUGEINT:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type UHUGEINT. "
-			"Consider casting to DECIMAL(38,0) in your SELECT query.");
-
-	case LogicalTypeId::INTERVAL:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type INTERVAL. "
-			"SQL Server has no equivalent. Consider casting to VARCHAR.");
-
 	case LogicalTypeId::LIST:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type LIST. "
 			"SQL Server has no array type. Consider flattening or serializing to JSON.");
-
 	case LogicalTypeId::STRUCT:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type STRUCT. "
 			"SQL Server has no struct type. Consider flattening or serializing to JSON.");
-
 	case LogicalTypeId::MAP:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type MAP. "
 			"SQL Server has no map type. Consider serializing to JSON.");
-
 	case LogicalTypeId::UNION:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type UNION. "
 			"SQL Server has no union type. Consider normalizing the data.");
-
 	case LogicalTypeId::ENUM:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type ENUM. "
 			"Consider casting to VARCHAR or INTEGER.");
-
 	case LogicalTypeId::BIT:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type BIT. "
 			"Consider using BOOLEAN or BLOB.");
-
 	case LogicalTypeId::ARRAY:
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type ARRAY. "
 			"SQL Server has no array type. Consider flattening or serializing to JSON.");
-
 	default:
+		break;
+	}
+
+	try {
+		return DispatchDdlTypeName(type, config, mssql::codec::DdlContext::CtasCreateTable);
+	} catch (const NotImplementedException &) {
 		throw NotImplementedException(
 			"CTAS does not support DuckDB type '%s'. "
 			"No SQL Server equivalent exists.",

@@ -1,0 +1,73 @@
+# Binary edge cases — documented separately from machine-parseable fixtures.
+
+## 1. Empty BLOB
+
+- decode: 0 wire bytes → DuckDB BLOB of length 0
+- encode (non-PLP): writes 0x0000 length-prefix + 0 payload bytes
+- encode (PLP): writes UNKNOWN_PLP_LEN header + immediate terminator (no chunks)
+- literal: "0x" (legal T-SQL empty varbinary literal — `CAST(0x AS VARBINARY)`)
+- DDL: VARBINARY(MAX) (unchanged)
+
+All four operations are exercised by the empty-input row in each
+fixture file.
+
+## 2. PLP vs non-PLP dispatch (FR-014)
+
+The decoder doesn't need to distinguish: by the time bytes reach
+`codec::binary::DecodeFromTds`, `tds_row_reader` has already reassembled
+PLP chunks into a contiguous buffer. The vector receives the joined
+payload exactly as if it were a fixed-length BINARY.
+
+The BCP encoder DOES need to know: `BCPColumnMetadata::IsPLPType()` is
+authoritative. PLP types (varbinary(max), nvarchar(max), text/ntext)
+use the chunked framing; everything else uses the length-prefixed
+framing. The codec dispatches purely on `col.IsPLPType()` — no DuckDB
+LogicalType inspection.
+
+## 3. Cross-family routing: GEOMETRY/GEOGRAPHY
+
+SQL Server `geometry`/`geography` are CLR UDTs (TDS type 0xF0) that
+serialize on the wire in Microsoft's proprietary format — NOT standard
+OGC WKB. This extension's catalog/scan layer auto-rewrites geometry
+columns to project `[col].STAsBinary() AS [col]`; SQL Server returns
+the resulting `varbinary(max)` containing OGC WKB bytes. On the
+DuckDB side these arrive at a vector whose LogicalType is
+`GEOMETRY()` (mapped by `MSSQLColumnInfo`).
+
+Because `GEOMETRY` and `BLOB` share the same physical storage type
+(`string_t`), `codec::binary::DecodeFromTds` writes the WKB bytes
+correctly into a GEOMETRY-typed vector with NO geometry-specific
+branch. This is the simplest possible integration: the Binary codec
+is type-storage-aware (writes any `string_t`-backed type), not
+LogicalType-aware.
+
+`type_family.cpp` routes `LogicalTypeId::GEOMETRY` to
+`TypeFamily::Binary`, so:
+- Filter pushdown of GEOMETRY constants renders as `0x<hex>` (same as
+  BLOB). Whether SQL Server's WHERE clause accepts that against a
+  geometry column is a separate concern (it does, via implicit
+  conversion `varbinary → geometry::STGeomFromWKB`).
+- INSERT/CTAS DDL of GEOMETRY renders as `VARBINARY(MAX)` (write-path
+  full support is out of scope; user explicitly noted "пока вне scope").
+
+## 4. Hex casing (FR-022 detail)
+
+Pre-spec-045 both dispatch sites used uppercase hex (`0xDEADBEEF`).
+The Binary codec preserves that. Lowercase hex is not produced;
+verifiers / equality tests should always compare against uppercase.
+
+## 5. EstimateLiteralSize cap
+
+Pre-spec-045 the upper bound for filter-literal buffer was implicit
+(snprintf grew the string by 2 chars per byte). The codec returns
+`2 + max(1, type.max_length) * 2` for sized BLOBs, and a fixed
+`2 + 8192 * 2 = 16386` for VARBINARY(MAX) where `max_length == -1`.
+This is purely an estimate for buffer pre-sizing; oversize is fine.
+
+## 6. NULL handling
+
+NULL is short-circuited at the dispatcher (`TypeConverter::ConvertValue`
+checks `is_null` before per-family decode; `FormatSqlLiteral` checks
+`v.IsNull()` before dispatching). The Binary codec is never invoked
+with a NULL input from production code; the test still exercises the
+dispatcher-level NULL path to keep behavior documented.

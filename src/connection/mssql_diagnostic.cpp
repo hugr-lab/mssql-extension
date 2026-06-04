@@ -1,7 +1,11 @@
 #include "connection/mssql_diagnostic.hpp"
-#include "connection/mssql_pool_manager.hpp"
+#include "catalog/mssql_catalog.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
@@ -47,6 +51,24 @@ std::shared_ptr<tds::TdsConnection> MSSQLConnectionHandleManager::RemoveConnecti
 bool MSSQLConnectionHandleManager::HasConnection(int64_t handle) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return connections_.find(handle) != connections_.end();
+}
+
+int64_t MSSQLConnectionHandleManager::CloseAll() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	int64_t closed = 0;
+	for (auto &entry : connections_) {
+		if (!entry.second) {
+			continue;
+		}
+		try {
+			entry.second->Close();
+		} catch (...) {
+			// Swallow — best-effort shutdown; counting only sockets we actually owned.
+		}
+		++closed;
+	}
+	connections_.clear();
+	return closed;
 }
 
 //===----------------------------------------------------------------------===//
@@ -163,6 +185,23 @@ void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 //===----------------------------------------------------------------------===//
+// mssql_close_all (spec 047 FR-013)
+//===----------------------------------------------------------------------===//
+
+// Closes every diagnostic handle in one shot. Computed once per call;
+// broadcast as a constant across the result vector — `SELECT mssql_close_all()`
+// returns one row, but a `SELECT mssql_close_all() FROM range(N)` still only
+// triggers a single CloseAll().
+void MSSQLCloseAllFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	int64_t closed = MSSQLConnectionHandleManager::Instance().CloseAll();
+	auto closed_i32 = static_cast<int32_t>(closed);
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto data = ConstantVector::GetData<int32_t>(result);
+	data[0] = closed_i32;
+}
+
+//===----------------------------------------------------------------------===//
 // mssql_pool_stats table function
 //===----------------------------------------------------------------------===//
 
@@ -218,7 +257,7 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	names.emplace_back("acquire_timeout_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
-	names.emplace_back("pinned_connections");
+	names.emplace_back("pinned_count");
 	return_types.emplace_back(LogicalType::BIGINT);
 
 	return std::move(bind_data);
@@ -226,18 +265,35 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 
 unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientContext &context,
 																		TableFunctionInitInput &input) {
+	// Spec 047 T019: enumerate via DuckDB catalog list instead of the
+	// (deleted) MssqlPoolManager singleton. Per-catalog pool ownership means
+	// the authoritative list of MSSQL pools IS the list of attached MSSQL
+	// catalogs in this DuckDB instance.
 	auto gstate = make_uniq<MssqlPoolStatsGlobalState>();
 	auto &bind_data = input.bind_data->Cast<MSSQLPoolStatsBindData>();
 
 	if (bind_data.all_pools) {
-		// Get all pool names
-		gstate->pool_names = MssqlPoolManager::Instance().GetAllPoolNames();
-	} else {
-		// Single pool
-		if (MssqlPoolManager::Instance().HasPool(bind_data.context_name)) {
-			gstate->pool_names.push_back(bind_data.context_name);
+		auto &db_manager = DatabaseManager::Get(context);
+		auto attached_dbs = db_manager.GetDatabases(context);
+		for (auto &db : attached_dbs) {
+			if (!db) {
+				continue;
+			}
+			auto &catalog = db->GetCatalog();
+			if (catalog.GetCatalogType() == "mssql") {
+				gstate->pool_names.push_back(db->GetName());
+			}
 		}
-		// If pool doesn't exist, pool_names remains empty (no rows returned)
+	} else {
+		// Single catalog lookup
+		try {
+			auto &catalog = Catalog::GetCatalog(context, bind_data.context_name);
+			if (catalog.GetCatalogType() == "mssql") {
+				gstate->pool_names.push_back(bind_data.context_name);
+			}
+		} catch (...) {
+			// Not attached / not an MSSQL catalog — empty result
+		}
 	}
 
 	return std::move(gstate);
@@ -251,26 +307,31 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 		return;
 	}
 
-	// Calculate how many rows we can output in this batch
 	idx_t count = 0;
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
 	while (gstate.current_index < gstate.pool_names.size() && count < max_count) {
 		const auto &pool_name = gstate.pool_names[gstate.current_index];
-		auto stats = MssqlPoolManager::Instance().GetPoolStats(pool_name);
-		auto pinned_count = MssqlPoolManager::Instance().GetPinnedCount(pool_name);
+		try {
+			auto &catalog = Catalog::GetCatalog(context, pool_name);
+			auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+			auto &pool = mssql_catalog.GetConnectionPool();
+			auto stats = pool.GetStats();
 
-		output.data[0].SetValue(count, Value(pool_name));  // db
-		output.data[1].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.total_connections)));
-		output.data[2].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.idle_connections)));
-		output.data[3].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.active_connections)));
-		output.data[4].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_created)));
-		output.data[5].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_closed)));
-		output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
-		output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
-		output.data[8].SetValue(count, Value::BIGINT(static_cast<int64_t>(pinned_count)));
+			output.data[0].SetValue(count, Value(pool_name));  // db
+			output.data[1].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.total_connections)));
+			output.data[2].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.idle_connections)));
+			output.data[3].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.active_connections)));
+			output.data[4].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_created)));
+			output.data[5].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.connections_closed)));
+			output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
+			output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
+			output.data[8].SetValue(count, Value::BIGINT(stats.pinned_count));
 
-		count++;
+			count++;
+		} catch (...) {
+			// Catalog detached between InitGlobal and Execute — skip silently.
+		}
 		gstate.current_index++;
 	}
 
@@ -282,7 +343,12 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
-	// mssql_open(connection_string VARCHAR) -> BIGINT
+	// [DEPRECATED] mssql_open(connection_string VARCHAR) -> BIGINT  (spec 047 FR-010)
+	// Prefer ATTACH + the catalog-bound functions (mssql_scan / mssql_exec /
+	// mssql_pool_stats); see CLAUDE.md Extension Functions table. The
+	// singleton MSSQLConnectionHandleManager that backs mssql_open / close /
+	// ping is the last extension-internal process-wide state and will be
+	// removed together with these functions in a future major release.
 	// Accepts:
 	//   - Connection string: "Server=host,port;Database=db;User Id=user;Password=pass"
 	//   - URI format: "mssql://user:password@host:port/database"
@@ -291,15 +357,27 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction));
 	loader.RegisterFunction(open_func);
 
-	// mssql_close(handle BIGINT) -> BOOLEAN
+	// [DEPRECATED] mssql_close(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet close_func("mssql_close");
 	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction));
 	loader.RegisterFunction(close_func);
 
-	// mssql_ping(handle BIGINT) -> BOOLEAN
+	// [DEPRECATED] mssql_ping(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet ping_func("mssql_ping");
 	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
 	loader.RegisterFunction(ping_func);
+
+	// [DEPRECATED] mssql_close_all() -> INTEGER  (spec 047 FR-013)
+	// Companion shutdown helper for the diagnostic handle API. Lives in the
+	// same `[DEPRECATED]` group as mssql_open / mssql_close / mssql_ping
+	// (FR-010) — the deprecation marker is in CLAUDE.md's Extension Functions
+	// table; DuckDB's ScalarFunctionSet registration path does not surface a
+	// per-function description string, so the marker stays in docs + this
+	// comment until the diagnostic API is retired and the singleton
+	// MSSQLConnectionHandleManager goes with it.
+	ScalarFunctionSet close_all_func("mssql_close_all");
+	close_all_func.AddFunction(ScalarFunction({}, LogicalType::INTEGER, MSSQLCloseAllFunction));
+	loader.RegisterFunction(close_all_func);
 
 	// mssql_pool_stats([context_name] VARCHAR) -> TABLE
 	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunctionSet());

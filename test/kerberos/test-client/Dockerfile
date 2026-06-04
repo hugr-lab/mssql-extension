@@ -6,6 +6,14 @@
 # that Linux DuckDB cannot LOAD (the magic bytes don't match ELF).
 #
 # Build context = repo root (set via docker-compose.yml `build.context: ../..`).
+#
+# Caching:
+#   * apt + simdutf layers above the `COPY . /src/` line are deterministic and
+#     get reused across CI runs via buildx + GHA cache (see kerberos.yml).
+#   * The compile step uses a BuildKit cache mount for /ccache so an
+#     incremental rebuild after a small source change reuses object files.
+#     The mount is local to the runner and not persisted across CI runs by
+#     default; locally it survives between `docker compose build` invocations.
 
 # ----------------------------------------------------------------------------
 # Stage 1: build the extension. Linux/glibc, matches the runtime stage's libc.
@@ -14,12 +22,30 @@ FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# zip/unzip/tar are needed by vcpkg's bootstrap + package extraction.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git pkg-config \
         libssl-dev libkrb5-dev \
-        ca-certificates curl zip unzip tar \
+        ca-certificates curl ccache \
     && rm -rf /var/lib/apt/lists/*
+
+# Build simdutf from source. Spec 044 made find_package(simdutf CONFIG REQUIRED)
+# unconditional in CMakeLists.txt; the main CI build gets it via vcpkg, but
+# this Dockerfile uses plain apt + cmake (faster than spinning up vcpkg). Ubuntu
+# 24.04 doesn't ship libsimdutf-dev, so we build a pinned tag from upstream and
+# install into /usr/local where the next find_package call will pick it up.
+# Static + tests/benchmarks off keeps the install tiny (just a .a + headers +
+# the CMake config) and avoids a runtime libsimdutf.so dependency.
+ARG SIMDUTF_VERSION=v8.2.0
+RUN git clone --depth 1 --branch "${SIMDUTF_VERSION}" https://github.com/simdutf/simdutf.git /tmp/simdutf \
+    && cmake -S /tmp/simdutf -B /tmp/simdutf/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSIMDUTF_TESTS=OFF \
+        -DSIMDUTF_BENCHMARKS=OFF \
+        -DSIMDUTF_TOOLS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && cmake --build /tmp/simdutf/build --target install \
+    && rm -rf /tmp/simdutf
 
 WORKDIR /src
 
@@ -28,42 +54,25 @@ WORKDIR /src
 # duckdb submodule for version tracking.
 COPY . /src/
 
-# Bootstrap vcpkg INSIDE the container. The extension gained a vcpkg simdutf
-# dependency (spec 043/044) after this test stack was first written. (Host
-# vcpkg/ is .dockerignore'd, so this clone is always fresh.) vcpkg builds
-# openssl + simdutf from the manifest during cmake configure.
+# Build the extension. ENABLE_KRB5=ON is the default; we set it explicitly so
+# the test stack always exercises the Kerberos path.
 #
-# NOTE: a full clone is required -- manifest mode resolves vcpkg.json's
-# builtin-baseline commit, which a `--depth 1` clone does not contain
-# ("failed to unpack tree object ... versions/baseline.json").
-RUN git clone https://github.com/microsoft/vcpkg.git /src/vcpkg \
-    && /src/vcpkg/bootstrap-vcpkg.sh -disableMetrics
-
-# Build the extension AND the matching DuckDB CLI directly with cmake, mirroring
-# the project's CI (.github/workflows/ci.yml). We deliberately do NOT use the
-# `make` wrapper here: its auto-vcpkg path breaks compiler/Ninja detection once
-# a vcpkg toolchain is injected, and the duckdb submodule is a tagless shallow
-# checkout so the make path can't derive a version. Building the CLI from the
-# same submodule guarantees the runtime CLI and the extension share an exact
-# DuckDB version (the prior approach downloaded a fixed v1.4.3 CLI that no
-# longer matches the submodule). ENABLE_KRB5=ON exercises the Kerberos path.
+# CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on
+# hosts with low Docker memory limits (DuckDB's compile is heap-heavy --
+# 4-way parallel needs ~8GB; 2-way fits in ~4GB).
 #
-# CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on hosts
-# with low Docker memory limits (DuckDB's compile is heap-heavy -- 4-way needs
-# ~8GB; 2-way fits in ~4GB).
-ENV CMAKE_BUILD_PARALLEL_LEVEL=2
-RUN cmake -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE=/src/vcpkg/scripts/buildsystems/vcpkg.cmake \
-        -DVCPKG_MANIFEST_DIR=/src \
-        -DDUCKDB_EXTENSION_CONFIGS=/src/extension_config.cmake \
-        -DENABLE_KRB5=ON \
-        -S /src/duckdb -B /src/build/release \
-    && cmake --build /src/build/release --config Release
+# ccache is wired through CMake's *_COMPILER_LAUNCHER hooks. The cache dir
+# lives in a BuildKit cache mount so it survives between layer rebuilds.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CCACHE_DIR=/ccache \
+    CCACHE_MAXSIZE=1G
+RUN --mount=type=cache,target=/ccache \
+    GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" \
+    && ccache --show-stats
 
 # ----------------------------------------------------------------------------
 # Stage 2: runtime test-client. krb5-user for kinit, libgssapi for runtime,
-# DuckDB CLI copied from the build stage (version-matched to the extension).
+# DuckDB CLI is the one we built in stage 1 (see version-stamp note below).
 # ----------------------------------------------------------------------------
 FROM ubuntu:24.04
 
@@ -71,13 +80,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         krb5-user libgssapi-krb5-2 libssl3 \
-        ca-certificates file \
+        ca-certificates \
+        file \
     && rm -rf /var/lib/apt/lists/*
 
-# Use the DuckDB CLI built from the SAME submodule as the extension. This
-# guarantees the CLI and extension share an exact DuckDB version, so the
-# absolute-path LOAD does not fail on a version-stamp mismatch (the duckdb
-# submodule tracks main/nightly, not a tagged release).
+# Copy the DuckDB CLI built alongside the extension in the builder stage.
+# Using the official release tarball would mismatch the extension's stamped
+# DuckDB version: `git describe --tags --long` inside the shallow-cloned
+# `duckdb/` submodule has no reachable tag and falls back to the dummy
+# `v0.0.1`, which then refuses to LOAD into a CLI that reports `v1.4.x`.
+# The DuckDB build emits `build/release/duckdb` next to the extension, so
+# the two are guaranteed to come from the same source tree.
 COPY --from=builder /src/build/release/duckdb /usr/local/bin/duckdb
 RUN chmod +x /usr/local/bin/duckdb
 

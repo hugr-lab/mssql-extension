@@ -9,6 +9,7 @@
 
 #include "tds/auth/fedauth_strategy.hpp"
 #include "azure/azure_token.hpp"
+#include "duckdb/main/database.hpp"
 #include "tds/encoding/utf16.hpp"
 
 #include <stdexcept>
@@ -16,9 +17,15 @@
 namespace duckdb {
 namespace tds {
 
-FedAuthStrategy::FedAuthStrategy(const std::string &secret_name, const std::string &database, const std::string &host,
-								 const std::string &tenant_override)
-	: secret_name_(secret_name), database_(database), host_(host), tenant_override_(tenant_override) {}
+FedAuthStrategy::FedAuthStrategy(DatabaseInstance &db, const std::string &secret_name, const std::string &database,
+								 const std::string &host, const std::string &tenant_override,
+								 const std::string &app_name)
+	: db_(db),
+	  secret_name_(secret_name),
+	  database_(database),
+	  host_(host),
+	  tenant_override_(tenant_override),
+	  app_name_(app_name) {}
 
 PreloginOptions FedAuthStrategy::GetPreloginOptions() const {
 	PreloginOptions options;
@@ -33,7 +40,8 @@ Login7Options FedAuthStrategy::GetLogin7Options() const {
 	options.database = database_;
 	options.username.clear();  // No username for FEDAUTH
 	options.password.clear();  // No password for FEDAUTH
-	options.app_name = "DuckDB";
+	// Spec 047 FR-014 — caller-supplied program_name (clamped at factory).
+	options.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;
 	options.include_fedauth_ext = true;	 // Include FEDAUTH extension
 	return options;
 }
@@ -55,13 +63,22 @@ std::vector<uint8_t> FedAuthStrategy::GetFedAuthToken(const FedAuthInfo &info) {
 }
 
 void FedAuthStrategy::InvalidateToken() {
-	// Invalidate the cached token in TokenCache
-	mssql::azure::TokenCache::Instance().Invalidate(secret_name_);
+	// Invalidate the cached token in TokenCache (spec 047 FR-012 namespace).
+	// `tenant_override_` is included in the cache key by AcquireToken when non-empty,
+	// so invalidation here matches the same key shape.
+	std::string cache_key = secret_name_;
+	if (!tenant_override_.empty()) {
+		cache_key += ":" + tenant_override_;
+	}
+	mssql::azure::TokenCache::Instance().Invalidate(db_, cache_key);
 }
 
 bool FedAuthStrategy::IsTokenExpired() const {
-	// Check if token exists and is valid in cache
-	std::string cached = mssql::azure::TokenCache::Instance().GetToken(secret_name_);
+	std::string cache_key = secret_name_;
+	if (!tenant_override_.empty()) {
+		cache_key += ":" + tenant_override_;
+	}
+	std::string cached = mssql::azure::TokenCache::Instance().GetToken(db_, cache_key);
 	return cached.empty();	// Empty means expired or not cached
 }
 

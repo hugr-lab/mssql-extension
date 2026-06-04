@@ -12,6 +12,8 @@
 #include "table_scan/mssql_optimizer.hpp"
 #include <cstdlib>
 #include <unordered_set>
+#include "catalog/mssql_catalog.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -59,15 +61,18 @@ static bool IsOrderPushdownEnabled(ClientContext &context, const MSSQLCatalogSca
 		}
 	}
 
-	// Check ATTACH option second (true = enable, false = no-op)
-	auto &db = *context.db;
-	auto &manager = MSSQLContextManager::Get(db);
-	auto ctx = manager.GetContext(bind_data.context_name);
-	if (ctx && ctx->connection_info) {
-		if (ctx->connection_info->order_pushdown > 0) {
-			MSSQL_OPT_DEBUG(1, "Order pushdown from ATTACH option: true");
-			return true;
+	// Check ATTACH option second (Spec 047: per-catalog ownership)
+	try {
+		auto &raw_catalog = Catalog::GetCatalog(context, bind_data.context_name);
+		if (raw_catalog.GetCatalogType() == "mssql") {
+			auto &mssql_catalog = raw_catalog.Cast<MSSQLCatalog>();
+			if (mssql_catalog.GetConnectionInfo().order_pushdown > 0) {
+				MSSQL_OPT_DEBUG(1, "Order pushdown from ATTACH option: true");
+				return true;
+			}
 		}
+	} catch (const std::exception &) {
+		// catalog not attached / not MSSQL → fall through to disabled
 	}
 
 	MSSQL_OPT_DEBUG(1, "Order pushdown: disabled (default)");

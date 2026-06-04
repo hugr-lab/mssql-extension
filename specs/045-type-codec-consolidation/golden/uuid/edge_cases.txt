@@ -1,0 +1,28 @@
+# Uuid edge cases — exercise the boundary conditions that have historically
+# masked bugs (high-bit XOR for sortability, mixed-endian reorder, issue #89
+# VARCHAR fallback).
+
+# 1. high-bit set in UUID upper half — verifies hugeint_t XOR mask does
+#    not corrupt the round-trip. The decoded hugeint_t.upper has bit 63
+#    flipped vs the on-wire big-endian uint64; encode re-flips it.
+#    Wire (mixed-endian): high byte of Data1 = 0xC2 → big-endian byte 0
+#    of upper64 = 0xC2 → upper64 has bit 7 set in byte 0 → bit 63 set.
+c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d
+  upper_be:  C2 C7 F4 7E 8E DD 4E 1F   (big-endian on-wire)
+  upper_xor: 42 C7 F4 7E 8E DD 4E 1F   (DuckDB stored representation — bit 63 cleared)
+  lower:     8A 3F AE F2 A1 8B 1C 2D   (Data4, unchanged)
+
+# 2. Issue #89 VARCHAR fallback — catalog says VARCHAR but TDS sends 0x24.
+#    RenderAsString(wire_bytes, col) must produce the lowercase canonical form
+#    matching UUID::ToString(GuidEncoding::ConvertGuid(wire)).
+wire: 10 B8 A7 6B AD 9D D1 11 80 B4 00 C0 4F D4 30 C8
+expected fallback: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+
+# 3. NULL handling — the dispatcher emits the bare token "NULL" for NULL
+#    Values (no quotes, no codec call). codec::uuid::FormatSqlLiteral is
+#    only invoked for non-NULL Values.
+
+# 4. EstimateLiteralSize — must accommodate the 38-char form
+#    "'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'" (36 hex chars + 4 hyphens
+#    is wrong — it's 32 hex + 4 hyphens = 36, plus 2 quotes = 38).
+expected_estimate >= 38

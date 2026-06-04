@@ -19,6 +19,9 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - Multi-statement SQL batches via `mssql_scan()` (e.g., temp table workflows)
 - DuckDB secret management for secure credential storage
 - [Azure AD authentication](AZURE.md) (service principal, CLI, interactive device code flow)
+- [Kerberos / Windows SSPI integrated authentication](Kerberos.md) — POSIX (`kinit` / keytab / raw credentials) and Windows (current logon session via `secur32.dll`)
+- Custom `Application Name` propagated to SQL Server `APP_NAME()` / `sys.dm_exec_sessions.program_name`
+- ATTACH-time credential validation (opt-out via `lazy_validation true`)
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
 ## Quick Start
@@ -118,6 +121,7 @@ CREATE SECRET secret_name (
 | `krb5_credcachefile` | VARCHAR | No | ccache path override (Linux only) |
 | `krb5_realm`         | VARCHAR | No | AD realm (UPPERCASE) — required for keytab and raw modes |
 | `service_principal_name` | VARCHAR | No | SPN override, e.g. `MSSQLSvc/sqlhost.example.com:1433` |
+| `application_name`   | VARCHAR | No | LOGIN7 `program_name` propagated to SQL Server (visible via `APP_NAME()` / `sys.dm_exec_sessions.program_name`). Empty → `"DuckDB MSSQL Extension"` default. Clamped client-side to 128 UTF-16 code units. Fallback secret key: `applicationname`. |
 
 Attach using the secret:
 
@@ -151,6 +155,7 @@ ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
 | `krb5-credcachefile`        | `krb5_credcachefile` (ccache path override, Linux only) |
 | `krb5-realm`                | `krb5_realm` (AD realm, UPPERCASE) |
 | `service_principal_name`    | `service-principal-name`, `serviceprincipalname` (SPN override) |
+| `Application Name`          | `ApplicationName`, `App Name`, `application_name` (LOGIN7 `program_name`; visible as `APP_NAME()`. URI query form: `applicationname`. Empty → `"DuckDB MSSQL Extension"`. Clamped to 128 UTF-16 code units.) |
 
 #### URI Format
 
@@ -184,9 +189,7 @@ Three credential modes are supported on POSIX:
 - **Keytab** — `krb5-keytabfile=/path` + `User Id=svc@REALM`. Linux only.
 - **Raw credentials** — username + password + realm via `CREATE SECRET` only (not connection string, to keep cleartext out of logs). Linux only.
 
-Windows SSPI is Phase 4 of spec 042 — pending. On Windows, use WSL2 Ubuntu in
-the meantime: it's a real Linux kernel with MIT Kerberos and the full POSIX
-path works inside it.
+On Windows, **SSPI** (`authenticator=winsspi` or `Trusted_Connection=yes`) authenticates with the current Windows logon session via `secur32.dll`'s Negotiate package — no `kinit` needed. The connection-string surface is identical to POSIX; `Trusted_Connection=yes` / `Integrated Security=SSPI` resolve to `winsspi` automatically on Windows hosts.
 
 See [Kerberos.md](Kerberos.md) for prerequisites, full connection-string
 reference, the bundled docker-compose test stack (no real AD required),
@@ -328,6 +331,31 @@ This fail-fast behavior ensures that:
 1. **No orphaned catalogs**: Failed ATTACH operations do not create catalog entries
 2. **Clear error messages**: Connection errors are reported immediately with specific details
 3. **Faster debugging**: Invalid configurations are caught at ATTACH time, not during first query
+4. **Password never leaks**: error messages never include the password (audited)
+
+**Opt out per-ATTACH** for container/orchestrator startup where the SQL Server may not yet be reachable:
+
+```sql
+ATTACH 'Server=...' AS db (TYPE mssql, lazy_validation true);
+```
+
+With `lazy_validation true`, ATTACH succeeds without the TCP+LOGIN7 round trip; the first query then pays the connection-establishment cost (pre-spec-047 behaviour). The eager-validation ceiling is bounded by `mssql_attach_validation_timeout` (default `0` inherits `mssql_connection_timeout`).
+
+### ATTACH Options Reference
+
+In addition to options propagated from the secret / connection string, the following ATTACH options are accepted directly:
+
+| Option              | Type    | Description                                                                  |
+| ------------------- | ------- | ---------------------------------------------------------------------------- |
+| `SECRET`            | VARCHAR | Name of an MSSQL secret holding connection parameters                        |
+| `azure_secret`      | VARCHAR | Override / supply Azure secret name for Azure AD auth                        |
+| `access_token`      | VARCHAR | Pre-acquired Azure AD JWT (see [AZURE.md](AZURE.md))                         |
+| `catalog`           | BOOLEAN | Enable catalog integration (default `true`)                                  |
+| `schema_filter`     | VARCHAR | Override secret schema_filter for this ATTACH                                |
+| `table_filter`      | VARCHAR | Override secret table_filter for this ATTACH                                 |
+| `order_pushdown`    | BOOLEAN | Per-ATTACH ORDER BY pushdown override (overrides `mssql_order_pushdown` setting) |
+| `lazy_validation`   | BOOLEAN | Skip the eager ATTACH-time credential check (default `false`)                |
+| `application_name`  | VARCHAR | Override LOGIN7 `program_name` for this ATTACH (also accepts `applicationname`) |
 
 ## Catalog Integration
 
@@ -986,13 +1014,13 @@ SELECT mssql_exec('sqlserver', 'DROP INDEX IX_users_email ON dbo.users');
 
 ### mssql_version()
 
-Returns the extension version (DuckDB commit hash).
+Returns the extension version string (e.g. `0.2.0`).
 
 **Signature:** `mssql_version() -> VARCHAR`
 
 ```sql
 SELECT mssql_version();
--- Returns: 'abc123def...'
+-- Returns: '0.2.0'
 ```
 
 ### mssql_scan()
@@ -1026,20 +1054,24 @@ SELECT mssql_exec('sqlserver', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
 -- Returns: number of affected rows
 ```
 
-### mssql_open()
+### mssql_open() — `[DEPRECATED]`
+
+> **Deprecated** (spec 047 FR-010). Prefer ATTACH + the catalog-bound functions (`mssql_scan`, `mssql_exec`, `mssql_pool_stats`) which integrate with the catalog lifecycle and the per-catalog connection pool. The handle-manager singleton backing `mssql_open` / `mssql_close` / `mssql_ping` / `mssql_close_all` is the last extension-internal process-wide state and will be removed alongside these functions in a future major release. Use `mssql_close_all()` as the bulk shutdown hook.
 
 Open a diagnostic connection to SQL Server.
 
-**Signature:** `mssql_open(secret VARCHAR) -> BIGINT`
+**Signature:** `mssql_open(connection_string VARCHAR) -> BIGINT`
 
 ```sql
-SELECT mssql_open('my_secret');
+SELECT mssql_open('Server=localhost,1433;Database=master;User Id=sa;Password=...');
 -- Returns: 12345 (connection handle)
 ```
 
-### mssql_close()
+### mssql_close() — `[DEPRECATED]`
 
-Close a diagnostic connection.
+> Same deprecation group as `mssql_open` (FR-010).
+
+Close a diagnostic connection. Idempotent — closing an already-closed handle returns true.
 
 **Signature:** `mssql_close(handle BIGINT) -> BOOLEAN`
 
@@ -1048,7 +1080,25 @@ SELECT mssql_close(12345);
 -- Returns: true
 ```
 
-### mssql_ping()
+### mssql_close_all() — `[DEPRECATED]`
+
+> Same deprecation group as `mssql_open` (FR-010 / FR-013). Lives here as a deterministic shutdown hook so hosts using the diagnostic API can release every open handle in one call without tracking IDs individually.
+
+Closes every diagnostic connection opened via `mssql_open()` in one shot. Returns the count of handles closed. Idempotent — a second call after a full close returns 0.
+
+**Signature:** `mssql_close_all() -> INTEGER`
+
+```sql
+SELECT mssql_close_all();
+-- Returns: 3 (count of handles closed on this call)
+
+SELECT mssql_close_all();
+-- Returns: 0 (idempotent)
+```
+
+### mssql_ping() — `[DEPRECATED]`
+
+> Same deprecation group as `mssql_open` (FR-010).
 
 Test if a connection is alive.
 
@@ -1081,7 +1131,7 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 | `connections_closed`    | BIGINT | Lifetime connections closed        |
 | `acquire_count`         | BIGINT | Times connections acquired         |
 | `acquire_timeout_count` | BIGINT | Times acquisition timed out        |
-| `pinned_connections`    | BIGINT | Connections pinned to transactions |
+| `pinned_count`          | BIGINT | Connections pinned to transactions (per-pool atomic; spec 047 T005) |
 
 ### mssql_refresh_cache()
 
@@ -1204,6 +1254,7 @@ Queries involving unsupported types will raise an error.
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
+| `mssql_attach_validation_timeout` | BIGINT | 0 | ≥0 | ATTACH-time eager-validation timeout (seconds). `0` inherits `mssql_connection_timeout`. Spec 047 FR-011. |
 
 ### Statistics Settings
 
@@ -1517,8 +1568,24 @@ The following features are planned for future releases:
 | **Transactions** | BEGIN/COMMIT/ROLLBACK with connection pinning | ✅ Implemented |
 | **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
 | **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | ✅ Implemented |
-| **MERGE/UPSERT** | Insert-or-update operations using SQL Server MERGE statement | Planned |
 | **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | ✅ Implemented |
+| **Integrated Auth** | Kerberos on POSIX (kinit / keytab / raw); SSPI on Windows | ✅ Implemented |
+| **Custom Application Name** | LOGIN7 `program_name` from connection string / URI / secret / ATTACH option | ✅ Implemented |
+| **ATTACH credential validation** | Fail-fast on wrong password / unreachable host (`lazy_validation true` to opt out) | ✅ Implemented |
+| **BCP throughput** | LOGIN7 32 KB packet size, single-connection encoder/sender pipelining, column-batch encoding, parallel multi-connection BCP for heap targets | Planned |
+| **CTAS quality** | Bounded `NVARCHAR(N)` text defaults, `PAGE` compression, primary-key propagation, per-query overrides via COPY options | Planned |
+| **TRUNCATE optimization** | Auto-detect `DELETE FROM t` without `WHERE` and emit `TRUNCATE TABLE` when safe (no triggers/FK/CCI) | Planned |
+| **COPY TO TRUNCATE mode** | Atomic replace via TRUNCATE + BCP (distinct from current `OVERWRITE` = DROP+CREATE) | Planned |
+
+### Under consideration
+
+Items being designed; surface and implementation strategy not committed yet.
+
+| Topic | What we're thinking about |
+|-------|----------------------------|
+| **Direct DML pushdown** | Skip the `rowid` round trip on UPDATE/DELETE when the entire `WHERE` filter is pushable — emit a single `UPDATE target SET ... WHERE <pushdown>` / `DELETE FROM target WHERE <pushdown>` statement instead. |
+| **MERGE INTO** | Native SQL Server `MERGE` push-down. Pipelined BCP upload of the USING source to a session `#tmp`, then emit `MERGE INTO target USING #tmp WITH (HOLDLOCK)`. RETURNING via `OUTPUT $action`. |
+| **VARIANT fallback for unsupported types** | UDT / `SQL_VARIANT` / legacy `IMAGE` / `TEXT` / `NTEXT` columns mapped to DuckDB `VARIANT` instead of raising. Opt-in via a setting. |
 
 ### Feature Details
 
@@ -1532,8 +1599,6 @@ The following features are planned for future releases:
 
 **CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` with two-phase execution: CREATE TABLE DDL followed by batched INSERT. Supports CREATE OR REPLACE, configurable text type (NVARCHAR/VARCHAR), and streaming for large result sets. Type mapping from DuckDB to SQL Server with clear errors for unsupported types.
 
-**MERGE/UPSERT**: Batched upsert using SQL Server `MERGE` statement. Supports primary key or user-specified key columns.
-
 **BCP/COPY**: Binary bulk copy protocol for maximum throughput. Streaming execution with bounded memory. No RETURNING support (use regular INSERT for that).
 
 ## Limitations
@@ -1543,7 +1608,7 @@ The following features are planned for future releases:
 - **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
 - **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
 - **Updating primary key columns**: UPDATE cannot modify primary key columns (used for row identification)
-- **Windows SSPI**: Phase 4 of spec 042 (pending). POSIX Kerberos via `Trusted_Connection=yes` IS supported on Linux and macOS — see [Kerberos.md](Kerberos.md). On Windows, use WSL2 Ubuntu in the meantime; the full POSIX Kerberos path works inside WSL2.
+- **Keytab / raw Kerberos credentials on macOS**: macOS's `GSS.framework` lacks MIT extensions for `gss_acquire_cred_from` keytab and raw-password paths. macOS supports credential-cache mode only (via `kinit`); keytab and raw-credentials modes are Linux-only. See [Kerberos.md](Kerberos.md) for the WSL2 / Docker testing path.
 - **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 - **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
@@ -1587,6 +1652,23 @@ FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.custo
 ```
 
 2. **VARCHAR(MAX) buffer limits**: SQL Server has TDS buffer limits (~4096 bytes) for MAX types. When converted to NVARCHAR(MAX), the effective character count is halved since NVARCHAR uses 2 bytes per character. Use `SET mssql_convert_varchar_max = false` if you need maximum buffer capacity with ASCII-only data.
+
+### Unicode Transcoding (simdutf)
+
+DuckDB strings are UTF-8 internally; the TDS wire protocol carries character data as UTF-16LE. Every NVARCHAR / NCHAR / NTEXT / XML value the extension reads from SQL Server is decoded from UTF-16LE to UTF-8 before being handed to DuckDB, and every string the extension sends back (LOGIN7 fields, INSERT/UPDATE parameters, T-SQL identifiers in BCP metadata, etc.) is encoded the other direction. On a SELECT that returns millions of rows, that's a lot of bytes — and the codec sits squarely in the hot path.
+
+The extension uses [**simdutf**](https://github.com/simdutf/simdutf) for that conversion. simdutf is a SIMD-accelerated Unicode validation and transcoding library by Daniel Lemire and contributors; on modern x86_64 (AVX-512 / AVX2 / SSE) and ARM64 (NEON / SVE) cores it typically transcodes UTF-8 ↔ UTF-16 at 2–5 GB/s, an order of magnitude faster than the hand-rolled byte-at-a-time loops it replaced. The library is dual-licensed MIT / Apache-2.0; the extension links it statically under the MIT terms.
+
+**Where simdutf is called** (`src/tds/encoding/utf16.cpp`):
+
+| Direction | simdutf entry points | Used by |
+|-----------|----------------------|---------|
+| UTF-8 → UTF-16LE (encode) | `simdutf::validate_utf8`, `simdutf::utf16_length_from_utf8`, `simdutf::convert_valid_utf8_to_utf16le` | LOGIN7 client/host/app/server/library/language/database/SSPI fields; T-SQL batches built by INSERT/UPDATE/DELETE; BCP column metadata; identifier quoting |
+| UTF-16LE → UTF-8 (decode) | `simdutf::validate_utf16le`, `simdutf::utf8_length_from_utf16le`, `simdutf::convert_valid_utf16le_to_utf8` | NVARCHAR / NCHAR / NTEXT / SQL_VARIANT-string / XML column results; ENVCHANGE token payloads; ERROR/INFO token messages |
+
+The codec validates the input first and falls back to a slower scalar implementation only when input is malformed — so well-formed UTF-8/UTF-16 (the overwhelming majority of real traffic) hits the SIMD fast path every time. There is a microbenchmark (`make bench-utf16`) and an end-to-end before/after benchmark (`test/bench/bench_codec_e2e.sh`) recorded in `bench_results.md`.
+
+**Dependency surface:** simdutf is pulled in statically via `vcpkg.json` (`"simdutf"` dependency, version resolved from the `builtin-baseline` pin). Release binaries embed it; downstream builds that don't use vcpkg need to provide `simdutfConfig.cmake` some other way (e.g., the `test/kerberos/test-client` Docker image builds it from upstream at a pinned tag).
 
 ### Known Issues
 

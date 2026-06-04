@@ -1,11 +1,13 @@
 #include "catalog/mssql_catalog.hpp"
+#include <openssl/crypto.h>
+
 #include "azure/azure_token.hpp"
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/ctas/mssql_ctas_planner.hpp"
 #include "dml/delete/mssql_delete_target.hpp"
@@ -18,6 +20,7 @@
 #include "dml/update/mssql_update_target.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
@@ -28,6 +31,9 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
+
+#include <cstdio>
 
 namespace duckdb {
 
@@ -43,11 +49,13 @@ static const char *DATABASE_COLLATION_SQL =
 //===----------------------------------------------------------------------===//
 
 MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
-						   shared_ptr<MSSQLConnectionInfo> connection_info, AccessMode access_mode,
-						   bool catalog_enabled)
+						   shared_ptr<MSSQLConnectionInfo> connection_info, tds::PoolConfiguration pool_config,
+						   std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode, bool catalog_enabled)
 	: Catalog(db),
 	  context_name_(context_name),
 	  connection_info_(std::move(connection_info)),
+	  pool_config_(std::move(pool_config)),
+	  fedauth_token_utf16le_(std::move(fedauth_token_utf16le)),
 	  access_mode_(access_mode),
 	  catalog_enabled_(catalog_enabled),
 	  default_schema_("dbo") {
@@ -70,24 +78,145 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
 }
 
-MSSQLCatalog::~MSSQLCatalog() = default;
+MSSQLCatalog::~MSSQLCatalog() noexcept {
+	// Wipe the cached FEDAUTH token (UTF-16LE bytes) on catalog teardown so
+	// the bearer credential does not linger in heap-recycled memory. Same
+	// rationale as MSSQLConnectionInfo::~MSSQLConnectionInfo — use
+	// OPENSSL_cleanse to defeat dead-store elimination.
+	if (!fedauth_token_utf16le_.empty()) {
+		OPENSSL_cleanse(fedauth_token_utf16le_.data(), fedauth_token_utf16le_.size());
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// Result Stream Registry (spec 047 / US3)
+//===----------------------------------------------------------------------===//
+
+std::string MSSQLCatalog::RegisterStream(std::unique_ptr<MSSQLResultStream> stream) {
+	// PR #118 review L3: UUID::GenerateRandomUUID is backed by std::mt19937
+	// in DuckDB (NOT a CSPRNG). Acceptable here because the registry is
+	// per-catalog and in-process; an attacker who could brute-force a stream
+	// ID is already executing in the same process and has access to the
+	// catalog directly. Replace with a CSPRNG only if the registry ever
+	// becomes externally addressable.
+	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
+	std::lock_guard<std::mutex> lock(streams_mutex_);
+	active_streams_.emplace(uuid, std::move(stream));
+	return uuid;
+}
+
+std::unique_ptr<MSSQLResultStream> MSSQLCatalog::RetrieveStream(const std::string &uuid) {
+	std::lock_guard<std::mutex> lock(streams_mutex_);
+	auto it = active_streams_.find(uuid);
+	if (it == active_streams_.end()) {
+		return nullptr;
+	}
+	auto stream = std::move(it->second);
+	active_streams_.erase(it);
+	return stream;
+}
 
 //===----------------------------------------------------------------------===//
 // Initialization
 //===----------------------------------------------------------------------===//
 
 void MSSQLCatalog::Initialize(bool load_builtin) {
-	// Get or create connection pool for this catalog
-	// The pool is managed by MssqlPoolManager and shared with other operations
-	auto &pool_manager = MssqlPoolManager::Instance();
+	// Spec 047: build the connection pool inline (per-catalog ownership).
+	// Replaces the MssqlPoolManager singleton lookup that lived here before.
+	// The pool is owned by this catalog and torn down via unique_ptr in the
+	// catalog destructor — no singleton, no cross-instance sharing.
+	// Spec 047 FR-014: resolve the LOGIN7 program_name once at factory build
+	// time; the same value is captured by each closure variant below so every
+	// connection refilled into the pool advertises the same APP_NAME().
+	const std::string app_name = ResolveAppName(*connection_info_);
 
-	// Check if pool already exists (created during attach)
-	auto existing_pool = pool_manager.GetPool(context_name_);
-	if (existing_pool) {
-		// Wrap raw pointer in shared_ptr with no-op deleter (pool manager owns the pool)
-		connection_pool_ = shared_ptr<tds::ConnectionPool>(existing_pool, [](tds::ConnectionPool *) {});
+	tds::ConnectionFactory factory;
+	switch (connection_info_->auth_method) {
+	case AuthMethod::AZURE_AD:
+	case AuthMethod::MANUAL_TOKEN: {
+		// FEDAUTH path: token was pre-built by MSSQLAttach (acquire happens
+		// there so credential errors surface before catalog construction).
+		// Captured by value in the factory closure; same lifetime as the pool.
+		auto host = connection_info_->host;
+		auto port = connection_info_->port;
+		auto database = connection_info_->database;
+		auto encrypt = connection_info_->use_encrypt;
+		auto token = fedauth_token_utf16le_;
+		factory = [host, port, database, encrypt, token, app_name]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(host, port)) {
+				return nullptr;
+			}
+			if (!conn->AuthenticateWithFedAuth(database, token, encrypt, app_name)) {
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
 	}
-	// Note: Pool should be created during ATTACH; if missing, queries will fail later
+	case AuthMethod::KRB5:
+	case AuthMethod::WINSSPI: {
+		// Integrated-auth path: build a fresh authenticator per connection so
+		// gss_init_sec_context state is independent across pool refills and a
+		// kinit-refreshed ticket is picked up on the next fill. (Spec 042.)
+		MSSQLConnectionInfo info_copy = *connection_info_;
+		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(info_copy.host, info_copy.port)) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
+						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
+				return nullptr;
+			}
+			std::shared_ptr<tds::AuthenticationStrategy> strategy;
+			try {
+				strategy = tds::AuthStrategyFactory::Create(info_copy);
+			} catch (const std::exception &e) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
+				return nullptr;
+			}
+			if (!strategy) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
+				return nullptr;
+			}
+			auto authenticator = strategy->GetAuthenticator();
+			if (!authenticator) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
+				return nullptr;
+			}
+			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt, app_name,
+											  info_copy.login7_max_packet)) {
+				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
+	}
+	case AuthMethod::SQL:
+	default: {
+		// SQL Server username/password.
+		auto host = connection_info_->host;
+		auto port = connection_info_->port;
+		auto username = connection_info_->user;
+		auto password = connection_info_->password;
+		auto database = connection_info_->database;
+		auto encrypt = connection_info_->use_encrypt;
+		factory = [host, port, username, password, database, encrypt,
+				   app_name]() -> std::shared_ptr<tds::TdsConnection> {
+			auto conn = std::make_shared<tds::TdsConnection>();
+			if (!conn->Connect(host, port)) {
+				return nullptr;
+			}
+			if (!conn->Authenticate(username, password, database, encrypt, app_name)) {
+				return nullptr;
+			}
+			return conn;
+		};
+		break;
+	}
+	}
+
+	connection_pool_ = make_uniq<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
 
 	// Skip metadata initialization when catalog integration is disabled
 	// (mssql_scan/mssql_exec will still work via raw queries)
@@ -96,26 +225,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	}
 
 	// Query database collation (needed for column metadata)
-	if (connection_pool_) {
-		QueryDatabaseCollation();
-	}
-}
-
-tds::ConnectionFactory MSSQLCatalog::CreateConnectionFactory() {
-	auto conn_info = connection_info_;	// Capture shared_ptr
-	return [conn_info]() -> std::shared_ptr<tds::TdsConnection> {
-		auto connection = std::make_shared<tds::TdsConnection>();
-		// First establish TCP connection
-		if (!connection->Connect(conn_info->host, conn_info->port)) {
-			throw IOException("Failed to connect to MSSQL server %s:%d", conn_info->host, conn_info->port);
-		}
-		// Then authenticate (optionally with TLS)
-		if (!connection->Authenticate(conn_info->user, conn_info->password, conn_info->database,
-									  conn_info->use_encrypt)) {
-			throw IOException("Failed to authenticate to MSSQL server");
-		}
-		return connection;
-	};
+	QueryDatabaseCollation();
 }
 
 void MSSQLCatalog::QueryDatabaseCollation() {
@@ -181,7 +291,11 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
 	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
-		return &GetOrCreateSchemaEntry(name);
+		auto schema_sp = GetOrCreateSchemaEntryShared(name);
+		if (transaction.context) {
+			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
+		}
+		return schema_sp.get();
 	}
 
 	// T013-T014 (FR-003): Use ConnectionProvider for transaction-aware connection acquisition
@@ -230,7 +344,11 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Get or create schema entry
-	return &GetOrCreateSchemaEntry(name);
+	auto schema_sp = GetOrCreateSchemaEntryShared(name);
+	if (transaction.context) {
+		MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
+	}
+	return schema_sp.get();
 }
 
 void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -241,10 +359,14 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	// Fast path: If schemas are already loaded, get names without acquiring connection
 	vector<string> schema_names;
 	if (metadata_cache_->TryGetCachedSchemaNames(schema_names)) {
-		// Cache hit - iterate without connection
+		// Cache hit - iterate without connection.
+		// Spec 052 (Option D): anchor each schema entry so it survives a
+		// concurrent Invalidate between DuckDB walker phase 1 (collect) and
+		// phase 2 (read). Same reasoning as MSSQLTableSet::Scan.
 		for (const auto &name : schema_names) {
-			auto &schema_entry = GetOrCreateSchemaEntry(name);
-			callback(schema_entry);
+			auto schema_sp = GetOrCreateSchemaEntryShared(name);
+			MSSQLBindAnchors::For(context, *this).AnchorSchema(schema_sp);
+			callback(*schema_sp);
 		}
 		return;
 	}
@@ -271,24 +393,34 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 
 	for (const auto &name : schema_names) {
-		auto &schema_entry = GetOrCreateSchemaEntry(name);
-		callback(schema_entry);
+		auto schema_sp = GetOrCreateSchemaEntryShared(name);
+		MSSQLBindAnchors::For(context, *this).AnchorSchema(schema_sp);
+		callback(*schema_sp);
 	}
 }
 
-MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name) {
+shared_ptr<MSSQLSchemaEntry> MSSQLCatalog::GetOrCreateSchemaEntryShared(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
-		return *it->second;
+		return it->second;	// shared_ptr copy — refcount inc
 	}
 
-	// Create new schema entry
-	auto entry = make_uniq<MSSQLSchemaEntry>(*this, schema_name);
-	auto &entry_ref = *entry;
-	schema_entries_[schema_name] = std::move(entry);
-	return entry_ref;
+	// Spec 052: construct via make_shared_ptr — enable_shared_from_this on
+	// MSSQLSchemaEntry requires shared_ptr ownership from the first store.
+	// schema_mutex_ is held across find + emplace above, so no race is
+	// possible here; the emplace simply publishes the freshly constructed
+	// entry.
+	auto entry = make_shared_ptr<MSSQLSchemaEntry>(*this, schema_name);
+	auto insert_result = schema_entries_.emplace(schema_name, std::move(entry));
+	return insert_result.first->second;
+}
+
+MSSQLSchemaEntry &MSSQLCatalog::GetOrCreateSchemaEntry(const string &schema_name) {
+	// Reference-returning wrapper for internal call-sites that don't need to
+	// anchor (DDL paths that use the entry briefly and discard).
+	return *GetOrCreateSchemaEntryShared(schema_name);
 }
 
 optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
@@ -341,11 +473,14 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Point invalidation: invalidate schema list
 	metadata_cache_->InvalidateAll();
 
-	// Remove the schema entry from our local cache
-	{
-		std::lock_guard<std::mutex> lock(schema_mutex_);
-		schema_entries_.erase(info.name);
-	}
+	// Spec 052 (Option D): just erase. Any binder that looked up this schema
+	// before DROP SCHEMA fired is already anchored in its ClientContext's
+	// MSSQLBindAnchors via the LookupSchema path; the schema entry stays
+	// alive until that ClientContext's QueryEnd. DuckDB serializes DETACH
+	// against active queries, so we don't need to worry about the catalog
+	// dying mid-query.
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	schema_entries_.erase(info.name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -621,17 +756,21 @@ string MSSQLCatalog::GetDBPath() {
 
 void MSSQLCatalog::OnDetach(ClientContext &context) {
 	// T023 (FR-005): Invalidate cached Azure token on detach
-	// This ensures re-attach will acquire a fresh token, not use a stale cached one
+	// This ensures re-attach will acquire a fresh token, not use a stale cached one.
+	// Spec 047 T046b (FR-012): invalidate only this DatabaseInstance's namespace
+	// so a sibling instance sharing the same secret name keeps its token.
+	// PR #118 review M3: also evict tenant-suffixed variants
+	// (`secret_name:tenant_a`, `secret_name:tenant_b`, ...) that the
+	// interactive-auth path in AcquireToken builds — bare-name Invalidate
+	// would otherwise leave those rows behind.
 	if (connection_info_ && connection_info_->use_azure_auth && !connection_info_->azure_secret_name.empty()) {
-		mssql::azure::TokenCache::Instance().Invalidate(connection_info_->azure_secret_name);
+		mssql::azure::TokenCache::Instance().InvalidateByPrefix(*context.db, connection_info_->azure_secret_name);
 	}
 
-	// Remove connection pool for this context (shuts down and cleans up connections)
-	MssqlPoolManager::Instance().RemovePool(context_name_);
-
-	// Unregister context from the manager
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	manager.UnregisterContext(context_name_);
+	// Spec 047 T012+T020: pool teardown is implicit via ~MSSQLCatalog → unique_ptr
+	// destruction; the MssqlPoolManager / MSSQLContextManager singletons that
+	// used to require explicit RemovePool() / UnregisterContext() are gone.
+	(void)context;
 }
 
 //===----------------------------------------------------------------------===//
@@ -731,7 +870,10 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 		metadata_cache_->Invalidate();
 	}
 
-	// Also clear the local schema entry cache
+	// Also clear the local schema entry cache.
+	// Spec 052 (Option D): in-flight binders are anchored in their
+	// ClientContext's MSSQLBindAnchors; dropping entries_ here just
+	// decrements refcount.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();
@@ -744,7 +886,8 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 		metadata_cache_->InvalidateSchema(schema_name);
 	}
 
-	// Also invalidate the local schema entry's table set if it exists
+	// Also invalidate the local schema entry's table set if it exists.
+	// Spec 052 (Option D): MSSQLBindAnchors holds in-flight binder refs.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	auto it = schema_entries_.find(schema_name);
 	if (it != schema_entries_.end()) {
@@ -802,13 +945,25 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 		throw IOException("Failed to acquire connection for cache refresh");
 	}
 
-	// Perform full eager cache refresh
-	metadata_cache_->Refresh(*connection, database_collation_);
+	// Perform full eager cache refresh.
+	// Exception-safe: if Refresh throws (TDS hiccup under stress — 1-in-300
+	// odds during scenario 5's 318 invalidations × 30s soak), the connection
+	// must be returned to the pool BEFORE the exception propagates, or
+	// ~ConnectionPool fires its debug-only D_ASSERT about checked-out
+	// connections during catalog teardown and the process aborts on Linux.
+	try {
+		metadata_cache_->Refresh(*connection, database_collation_);
+	} catch (...) {
+		connection_pool_->Release(std::move(connection));
+		throw;
+	}
 
 	// Release connection
 	connection_pool_->Release(std::move(connection));
 
-	// Invalidate all schema table sets to pick up any changes
+	// Invalidate all schema table sets to pick up any changes.
+	// Spec 052 (Option D): in-flight binders are anchored in
+	// MSSQLBindAnchors per ClientContext (released at QueryEnd).
 	std::lock_guard<std::mutex> lock(schema_mutex_);
 	for (auto &entry : schema_entries_) {
 		entry.second->GetTableSet().Invalidate();

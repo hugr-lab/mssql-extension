@@ -70,9 +70,16 @@ struct TlsTdsContextImpl {
 
 TlsTdsContext::TlsTdsContext() : impl_(new TlsTdsContextImpl()) {}
 
-TlsTdsContext::~TlsTdsContext() {
-	if (impl_ && impl_->tls) {
-		impl_->tls->Close();
+TlsTdsContext::~TlsTdsContext() noexcept {
+	try {
+		if (impl_ && impl_->tls) {
+			impl_->tls->Close();
+		}
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr surfaces the swallow.
+		MSSQL_TLS_DEBUG_LOG(1, "~TlsTdsContext: swallowed exception during Close: %s", e.what());
+	} catch (...) {
+		MSSQL_TLS_DEBUG_LOG(1, "~TlsTdsContext: swallowed unknown exception during Close");
 	}
 }
 

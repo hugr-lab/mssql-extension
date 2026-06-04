@@ -1,0 +1,12 @@
+# BOOLEAN → SQL literal cases (FR-020(b): byte-identical Filter == InsertValues)
+# format: bool_value | ctx | expected_text
+# Notes:
+#   - SQL Server's BIT column accepts 0/1 literals directly (no quoting).
+#   - true  -> "1"
+#   - false -> "0"
+#   - NULL is handled by the dispatcher (returns "NULL" before reaching the
+#     family arm), so the family literal cases never see NULL.
+true  | Filter        | 1
+true  | InsertValues  | 1
+false | Filter        | 0
+false | InsertValues  | 0

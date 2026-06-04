@@ -60,6 +60,10 @@ int LoadQueryTimeout(ClientContext &context);
 // Load metadata query timeout setting (0 = no timeout)
 int LoadMetadataTimeout(ClientContext &context);
 
+// Load ATTACH credential-validation timeout (spec 047 / US2).
+// Returns mssql_attach_validation_timeout if > 0, else mssql_connection_timeout.
+int LoadAttachValidationTimeout(ClientContext &context);
+
 // Load statistics configuration from context settings
 MSSQLStatisticsConfig LoadStatisticsConfig(ClientContext &context);
 

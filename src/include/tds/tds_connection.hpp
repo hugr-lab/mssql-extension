@@ -18,7 +18,9 @@ namespace tds {
 class TdsConnection {
 public:
 	TdsConnection();
-	~TdsConnection();
+	// noexcept (spec 047 T046k): body wraps Close() in try/catch — destructor
+	// throws during `~AttachedDatabase` unwind would invoke std::terminate.
+	~TdsConnection() noexcept;
 
 	// Non-copyable
 	TdsConnection(const TdsConnection &) = delete;
@@ -36,8 +38,12 @@ public:
 	// Performs PRELOGIN and LOGIN7 handshake with SQL Server authentication
 	// Parameters:
 	//   use_encrypt - if true, enables TLS encryption after PRELOGIN (requires server support)
+	// `app_name` (spec 047 FR-014, issue #82) becomes the LOGIN7 program_name —
+	// surfaced as `APP_NAME()` / `program_name` in SQL Server-side sys.dm_*
+	// views. Empty falls back to the extension default ("DuckDB MSSQL Extension").
+	// Caller is expected to pre-clamp to 128 chars via `ResolveAppName()`.
 	bool Authenticate(const std::string &username, const std::string &password, const std::string &database,
-					  bool use_encrypt = false);
+					  bool use_encrypt = false, const std::string &app_name = "");
 
 	// Azure AD Authentication via FEDAUTH (T018/T020)
 	// Performs PRELOGIN with FEDAUTHREQUIRED and LOGIN7 with FEDAUTH feature extension
@@ -45,8 +51,9 @@ public:
 	//   database - initial database to connect to
 	//   fedauth_token - UTF-16LE encoded access token from Azure AD
 	//   use_encrypt - if true, enables TLS encryption (required for Azure)
+	//   app_name    - spec 047 FR-014; see SQL-auth Authenticate above.
 	bool AuthenticateWithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
-								 bool use_encrypt = true);
+								 bool use_encrypt = true, const std::string &app_name = "");
 
 	// Integrated Authentication via Kerberos / SSPI -- Spec 042
 	// Performs PRELOGIN, then LOGIN7 with the SPNEGO blob in the SSPI field, then
@@ -58,6 +65,7 @@ public:
 	//                   errors out unless a real implementation is supplied; the
 	//                   real implementations land in Phase 3 / 4.
 	//   use_encrypt  - if true, enables TLS encryption (typical for production)
+	//   app_name     - spec 047 FR-014; see SQL-auth Authenticate above.
 	//   login7_max_packet - TDS packet size to fragment the LOGIN7 / SSPI sends
 	//                   to. LOGIN7 is sent before packet-size negotiation, so a
 	//                   PAC-bearing Kerberos blob can exceed the 4096 default and
@@ -67,7 +75,8 @@ public:
 	//                   path. A plain size_t keeps the TDS layer DuckDB-free; the
 	//                   value originates from the mssql_login7_max_packet setting.
 	bool AuthenticateIntegrated(const std::string &database, std::shared_ptr<tds::IAuthenticator> authenticator,
-								bool use_encrypt = true, size_t login7_max_packet = 0);
+								bool use_encrypt = true, const std::string &app_name = "",
+								size_t login7_max_packet = 0);
 
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state
@@ -227,12 +236,14 @@ private:
 
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);
-	bool DoLogin7(const std::string &username, const std::string &password, const std::string &database);
+	bool DoLogin7(const std::string &username, const std::string &password, const std::string &database,
+				  const std::string &app_name);
 
 	// Azure AD FEDAUTH helpers (T018/T020)
 	// Optional sni_hostname overrides default for TLS SNI (for Azure routing)
 	bool DoPreloginWithFedAuth(bool use_encrypt, const std::string &sni_hostname = "");
-	bool DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token);
+	bool DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
+							 const std::string &app_name);
 };
 
 }  // namespace tds

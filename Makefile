@@ -23,13 +23,21 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
 
-# Bootstrap vcpkg if not present
+# Bootstrap vcpkg if not present.
+# Spec 052 PR #127 CI fix: check for the toolchain file specifically, not
+# just the directory. GitHub Actions cache restore creates an empty `vcpkg/`
+# parent when restoring `vcpkg/installed/` — the bare directory existed
+# without the bootstrap-shipped scripts, so `make debug` then ran without
+# -DCMAKE_TOOLCHAIN_FILE and find_package(simdutf) failed.
 vcpkg-setup:
-	@if [ ! -d "$(VCPKG_DIR)" ]; then \
+	@if [ ! -f "$(VCPKG_TOOLCHAIN)" ]; then \
 		echo "Bootstrapping vcpkg..."; \
-		git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
+		if [ ! -d "$(VCPKG_DIR)/.git" ]; then \
+			rm -rf $(VCPKG_DIR); \
+			git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
+		fi; \
 		$(VCPKG_DIR)/bootstrap-vcpkg.sh; \
 	fi
 
@@ -201,6 +209,26 @@ test-login7-encoding: debug
 	@echo "Running LOGIN7 + simdutf unit test..."
 	build/test/test_login7_encoding
 
+# Spec 045: SQL Server Browser parser unit tests (Phase 0).
+# Pure unit test — no SQL Server, no vcpkg, no DuckDB linkage required.
+# Compiles the resolver TU together with the test driver as a standalone
+# binary. Phase 1 will extend the same target with a loopback UDP listener
+# test (still no external network).
+INSTANCE_RESOLVER_TEST_SOURCES := src/connection/instance_resolver.cpp
+INSTANCE_RESOLVER_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+INSTANCE_RESOLVER_TEST_INCLUDES := -I src/include
+
+test-instance-resolver:
+	@echo "Building SQL Browser parser unit test (spec 045, Phase 0)..."
+	@mkdir -p build/test
+	$(CXX) $(INSTANCE_RESOLVER_TEST_FLAGS) $(INSTANCE_RESOLVER_TEST_INCLUDES) \
+	    test/cpp/test_instance_resolver.cpp \
+	    $(INSTANCE_RESOLVER_TEST_SOURCES) \
+	    -o build/test/test_instance_resolver
+	@echo ""
+	@echo "Running SQL Browser parser unit test..."
+	build/test/test_instance_resolver
+
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.
 # Requires `make debug` first to populate build/debug/vcpkg_installed.
@@ -230,6 +258,216 @@ bench-utf16: release
 	@echo ""
 	@echo "Running UTF-16 codec microbenchmark..."
 	build/test/bench_utf16
+
+# Spec 045: per-type-family codec unit tests
+# Pattern target: `make test-codec-<family>` builds and runs
+# test/cpp/codec/test_<family>_codec.cpp linked against src/codec/*.cpp.
+# Supported family names: boolean integer float decimal money string binary
+# datetime uuid. Plus `make test-literal-format` for the shared dispatcher.
+#
+# All codec tests need DuckDB headers (LogicalType / Value / Vector) so they
+# follow the spec-043 LOGIN7 test pattern (CXX direct compile + vcpkg lib
+# linkage). Each test links in ALL codec sources (so cross-family forwards
+# like HUGEINT→Decimal in the Integer module resolve) plus the encoding
+# helpers (utf16, datetime_encoding, decimal_encoding, guid_encoding).
+#
+# Files are populated as families migrate (Phase 2+). The targets exist
+# from Phase 1 but will print an explanatory error if the test or family
+# sources are missing.
+CODEC_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
+CODEC_TEST_VCPKG_TRIPLET := $(shell ls $(CODEC_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
+CODEC_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+CODEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+    -I $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/include
+# Link against built libduckdb.dylib (built by `make debug`) for Value/Vector/hugeint
+# symbols. Tests run with DYLD_LIBRARY_PATH set so the loader can find it.
+CODEC_TEST_LIBS := -L $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf \
+    -L build/debug/src -lduckdb
+CODEC_TEST_RPATH := DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+CODEC_TEST_ENCODING_SOURCES := \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/datetime_encoding.cpp \
+    src/tds/encoding/decimal_encoding.cpp \
+    src/tds/encoding/guid_encoding.cpp
+# CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
+# migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
+CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)
+
+test-codec-%: debug
+	@echo "Building codec unit test for family: $*"
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f test/cpp/codec/test_$*_codec.cpp ]; then \
+		echo "ERROR: test/cpp/codec/test_$*_codec.cpp does not exist yet (Phase 1 scaffolding;" >&2; \
+		echo "       the test file is written when the $* family migrates in Phase 3 or later)." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/codec/test_$*_codec.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_$*_codec
+	@echo ""
+	@echo "Running codec unit test for $*..."
+	$(CODEC_TEST_RPATH) build/test/test_$*_codec
+
+# TypeConverter VARCHAR-fallback test (issue #89 regression — spec 045 Phase 6 sub-phase 3).
+# Exercises the "catalog says VARCHAR but TDS returns non-string" path that views with
+# CAST/CONVERT can trigger.
+test-type-converter-fallback: debug
+	@echo "Building TypeConverter VARCHAR-fallback test..."
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/codec/test_type_converter_fallback.cpp \
+	    src/tds/encoding/type_converter.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_type_converter_fallback
+	@echo ""
+	@echo "Running TypeConverter VARCHAR-fallback test..."
+	$(CODEC_TEST_RPATH) build/test/test_type_converter_fallback
+
+# Shared literal_format dispatcher test (covers LiteralContext divergence cases)
+test-literal-format: debug
+	@echo "Building shared literal_format test..."
+	@mkdir -p build/test
+	@if [ -z "$(CODEC_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(CODEC_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f test/cpp/test_literal_format.cpp ]; then \
+		echo "ERROR: test/cpp/test_literal_format.cpp does not exist yet (Phase 1 scaffolding;" >&2; \
+		echo "       written when US2 lands in Phase 4)." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(CODEC_TEST_FLAGS) $(CODEC_TEST_INCLUDES) \
+	    test/cpp/test_literal_format.cpp \
+	    $(CODEC_TEST_FAMILY_SOURCES) \
+	    $(CODEC_TEST_ENCODING_SOURCES) \
+	    $(CODEC_TEST_LIBS) \
+	    -o build/test/test_literal_format
+	@echo ""
+	@echo "Running shared literal_format test..."
+	$(CODEC_TEST_RPATH) build/test/test_literal_format
+
+# Spec 047 — US1 acceptance tests. Two C++ standalone binaries that link
+# the debug DuckDB shared library and exercise the extension's catalog +
+# pool ownership via real ATTACH / mssql_scan calls.
+#
+# Each binary auto-skips when MSSQL_TEST_PASS is unset (env-var gate per
+# the same pattern as test_multi_connection_transactions.cpp).
+#
+# Targets:
+#   test-multi-instance-pool-isolation  — Scenarios 1/2/3 (SC-001/002/003)
+#   test-issue-96-attach-loop           — Scenario 4   (SC-009, closes #96)
+#   test-spec047-us1                    — meta target: builds + runs both
+SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+SPEC047_TEST_INCLUDES := -I duckdb/src/include
+SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
+
+# On Linux, libduckdb.so is ASan/UBSan-instrumented (DuckDB CMake default for
+# Debug) but our test binaries are NOT compiled with -fsanitize=* (these
+# Makefile rules keep the test build platform-agnostic). glibc loader
+# requires libasan come FIRST in the initial library list — otherwise:
+#   ==NNN==ASan runtime does not come first in initial library list;
+#   you should either link runtime to your application or manually
+#   preload it with LD_PRELOAD
+# Set LD_PRELOAD only on the run prefix (NOT a make-wide env var — that
+# would propagate into any cmake/vcpkg sub-invocation triggered by a
+# `make test-…: debug` dependency, and break vcpkg's compiler-detection
+# probe). macOS dyld handles ASan-via-linked-lib transparently, so no
+# preload needed there.
+ifeq ($(shell uname),Linux)
+SANITIZER_PRELOAD := LD_PRELOAD=$(shell gcc -print-file-name=libasan.so):$(shell gcc -print-file-name=libubsan.so)
+else
+SANITIZER_PRELOAD :=
+endif
+SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+test-multi-instance-pool-isolation: debug
+	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_multi_instance_pool_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_multi_instance_pool_isolation
+	@echo ""
+	@echo "Running spec 047 multi-instance pool isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_multi_instance_pool_isolation
+
+test-issue-96-attach-loop: debug
+	@echo "Building spec 047 issue #96 ATTACH-loop regression test (T024)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_issue_96_attach_loop.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_issue_96_attach_loop
+	@echo ""
+	@echo "Running spec 047 issue #96 ATTACH-loop regression test..."
+	$(SPEC047_TEST_RPATH) build/test/test_issue_96_attach_loop
+
+test-spec047-us1: test-multi-instance-pool-isolation test-issue-96-attach-loop
+	@echo ""
+	@echo "All spec 047 US1 acceptance tests PASSED (SC-001, SC-002, SC-003, SC-009)"
+
+test-result-stream-registry-isolation: debug
+	@echo "Building spec 047 result-stream registry isolation test (T040)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_result_stream_registry_isolation.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_result_stream_registry_isolation
+	@echo ""
+	@echo "Running spec 047 result-stream registry isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_result_stream_registry_isolation
+
+test-spec047-us3: test-result-stream-registry-isolation
+	@echo ""
+	@echo "Spec 047 US3 acceptance test PASSED (SC-006)"
+
+# Concurrent reads stress test (dbt threads>=2 scenario reproduction).
+# Mixed mssql_scan + catalog-bound SELECT across N threads sharing a single
+# ATTACH; also scenario with N concurrent ATTACHes (different aliases).
+test-concurrent-reads: debug
+	@echo "Building concurrent-reads stress test..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_concurrent_reads.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_concurrent_reads
+	@echo ""
+	@echo "Running concurrent-reads stress test..."
+	$(SPEC047_TEST_RPATH) build/test/test_concurrent_reads
+
+# Spec 047 US-SEC: TokenCache per-DatabaseInstance namespace isolation (T046g, SC-011).
+# Compiles src/azure/azure_token.cpp together with the test driver. The driver
+# stubs HttpPost / ReadAzureSecret / AcquireInteractiveToken so AcquireToken's
+# call graph links cleanly without dragging in httplib, OpenSSL, or the DuckDB
+# Secret API. Test only exercises TokenCache::Set/Get/Has/Invalidate.
+test-token-cache-isolation: debug
+	@echo "Building spec 047 TokenCache isolation test (T046g)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) $(SPEC047_TEST_INCLUDES) -I src/include \
+	    test/cpp/test_token_cache_isolation.cpp \
+	    src/azure/azure_token.cpp \
+	    $(SPEC047_TEST_LIBS) \
+	    -o build/test/test_token_cache_isolation
+	@echo ""
+	@echo "Running spec 047 TokenCache isolation test..."
+	$(SPEC047_TEST_RPATH) build/test/test_token_cache_isolation
+
+test-spec047-us-sec: test-token-cache-isolation
+	@echo ""
+	@echo "Spec 047 US-SEC TokenCache isolation test PASSED (SC-011)"
 
 # Show help
 help:

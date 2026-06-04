@@ -5,7 +5,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "dml/delete/mssql_delete_statement.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/catalog/catalog.hpp"

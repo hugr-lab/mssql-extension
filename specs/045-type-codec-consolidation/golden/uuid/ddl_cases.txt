@@ -1,0 +1,12 @@
+# Uuid DDL cases — codec::uuid::FormatDdlTypeName
+# Format: DuckDB type | DdlContext | expected DDL type string
+#
+# FR-027: CreateTable byte-identity to legacy `MapTypeToSQLServer`.
+# FR-028: CtasCreateTable byte-identity to CreateTable.
+# Pre-spec-045 both functions returned the literal string "UNIQUEIDENTIFIER".
+
+UUID | CreateTable     | UNIQUEIDENTIFIER
+UUID | CtasCreateTable | UNIQUEIDENTIFIER
+
+# No CTASConfig field affects the UUID DDL emit — there is no length,
+# precision, scale, or collation parameter to vary.

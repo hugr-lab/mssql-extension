@@ -1,0 +1,8 @@
+# BOOLEAN encode cases — DuckDB bool → BCP wire bytes (length-prefixed)
+# format: bool_value | expected_hex_bytes
+# Notes:
+#   - The BIT BCP format is: 1-byte length prefix (always 0x01) +
+#     1-byte value (0x00 or 0x01).
+#   - PLP/variable-length forms do not apply to BIT.
+false | 01 00
+true  | 01 01

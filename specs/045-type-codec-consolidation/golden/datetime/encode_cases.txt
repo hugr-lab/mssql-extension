@@ -1,0 +1,27 @@
+# DateTime encode cases — codec::datetime::EncodeToBcp
+# Format: type | scale | input (human) | expected wire bytes (length prefix + LE payload)
+
+# DATE — 3-byte LE payload, length=3.
+DATE | 0 | 2024-01-15 | 03 1A 5C 0B
+
+# TIME — length is scale-dispatched (3 / 4 / 5 bytes).
+TIME | 0 | 14:30:00.000000 | 03 A8 CB 00
+TIME | 3 | 14:30:00.000000 | 04 80 6A 1A 03
+TIME | 6 | 14:30:00.000000 | 06 80 24 7C 25 0C
+TIME | 7 | 14:30:00.000000 | 05 00 76 D9 73 79
+
+# DATETIME2 — time(scale) + 3-byte date, total length = time_size + 3.
+DATETIME2 | 0 | 2024-01-15 14:30:00 | 06 A8 CB 00 1A 5C 0B
+DATETIME2 | 3 | 2024-01-15 14:30:00 | 07 80 6A 1A 03 1A 5C 0B
+DATETIME2 | 7 | 2024-01-15 14:30:00 | 08 00 76 D9 73 79 1A 5C 0B
+
+# DATETIMEOFFSET — time(scale) + 3-byte date + 2 offset-minutes (always 0).
+# DuckDB stores TIMESTAMP_TZ as UTC internally; we always emit offset 0.
+DATETIMEOFFSET | 7 | 2024-01-15 14:30:00 | 0A 00 76 D9 73 79 1A 5C 0B 00 00
+
+# TIMESTAMP_MS / TIMESTAMP_SEC route through DATETIME2 at their natural scale.
+TIMESTAMP_MS (DATETIME2)  | 3 | 2024-01-15 14:30:00.000 | 07 80 6A 1A 03 1A 5C 0B
+TIMESTAMP_SEC (DATETIME2) | 0 | 2024-01-15 14:30:00     | 06 A8 CB 00 1A 5C 0B
+
+# TIMESTAMP_NS routes through DATETIME2 at scale 7 (lossy 2 digits at the wire).
+TIMESTAMP_NS (DATETIME2) | 7 | 2024-01-15 14:30:00.0000000 | 08 00 76 D9 73 79 1A 5C 0B

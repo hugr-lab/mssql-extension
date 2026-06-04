@@ -1,0 +1,115 @@
+name: Named-Instance Resolution
+
+# Spec 045: validates the SQL Server Browser (MC-SQLR) resolver.
+#
+# Two jobs:
+#   1. unit-tests   - fast standalone unit + loopback tests (POSIX, no Docker).
+#                     Runs on ubuntu + macos so we catch BSD/Linux socket
+#                     divergence early.
+#   2. docker-stack - the self-contained mock-browser + SQL Server stack
+#                     under test/named-instance/. Mirrors the spec 042
+#                     kerberos.yml pattern.
+
+on:
+  pull_request:
+    paths:
+      - 'src/connection/instance_resolver.cpp'
+      - 'src/include/connection/instance_resolver.hpp'
+      - 'src/connection/mssql_settings.cpp'
+      - 'src/mssql_storage.cpp'
+      - 'src/include/mssql_storage.hpp'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'test/cpp/test_instance_resolver.cpp'
+      - 'test/named-instance/**'
+      - 'test/sql/named_instance/**'
+      - '.github/workflows/named-instance.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: named-instance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Resolver unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # The test-instance-resolver target depends only on stdlib + a C++17
+      # compiler — no vcpkg, no DuckDB build, no SQL Server. Runs in seconds.
+      - name: Build and run resolver unit tests
+        run: make test-instance-resolver
+
+  docker-stack:
+    name: Docker test stack (mock browser + SQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Show docker / compose versions
+        run: |
+          docker --version
+          docker compose version
+
+      # Pre-build the test-client image with the GHA cache backend so
+      # subsequent PR runs that don't touch the resolver sources reuse the
+      # base layers.
+      - name: Build test-client image (cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: test/named-instance/test-client/Dockerfile
+          tags: named-instance-test-client:latest
+          load: true
+          cache-from: type=gha,scope=named-instance-testclient
+          cache-to: type=gha,scope=named-instance-testclient,mode=max
+
+      - name: Build and start the stack
+        working-directory: test/named-instance
+        run: docker compose up -d --wait --wait-timeout 900
+
+      - name: Show service status
+        if: always()
+        working-directory: test/named-instance
+        run: docker compose ps
+
+      - name: Run smoke tests
+        working-directory: test/named-instance
+        run: docker compose exec -T test-client /run-tests.sh
+
+      - name: Dump mock-browser logs on failure
+        if: failure()
+        working-directory: test/named-instance
+        run: docker compose logs mock-browser
+
+      - name: Dump SQL Server logs on failure
+        if: failure()
+        working-directory: test/named-instance
+        run: docker compose logs sql
+
+      - name: Dump test-client logs on failure
+        if: failure()
+        working-directory: test/named-instance
+        run: docker compose logs test-client
+
+      - name: Tear down
+        if: always()
+        working-directory: test/named-instance
+        run: docker compose down -v

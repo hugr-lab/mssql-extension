@@ -16,6 +16,7 @@
 #include "mssql_storage.hpp"
 #include "table_scan/mssql_optimizer.hpp"
 #include "tds/auth/krb5_test_function.hpp"
+#include "tds/auth/winsspi_test_function.hpp"
 
 namespace duckdb {
 
@@ -76,6 +77,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//     Always registered; on builds without MSSQL_ENABLE_KRB5 it returns a
 	//     clear "compiled without Kerberos support" message instead of being absent.
 	mssql::krb5::RegisterKrb5TestFunction(loader);
+	mssql::winsspi::RegisterWinSspiTestFunction(loader);
 
 	// 13. Register optimizer extension for ORDER BY pushdown (Spec 039)
 	auto &db = loader.GetDatabaseInstance();

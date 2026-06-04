@@ -25,11 +25,12 @@ namespace tds {
 class IntegratedAuthStrategy : public AuthenticationStrategy {
 public:
 	IntegratedAuthStrategy(std::shared_ptr<IAuthenticator> authenticator, std::string database,
-						   std::string display_name, bool use_encrypt = true)
+						   std::string display_name, bool use_encrypt = true, std::string app_name = "")
 		: authenticator_(std::move(authenticator)),
 		  database_(std::move(database)),
 		  display_name_(std::move(display_name)),
-		  use_encrypt_(use_encrypt) {}
+		  use_encrypt_(use_encrypt),
+		  app_name_(std::move(app_name)) {}
 
 	bool RequiresFedAuth() const override {
 		return false;
@@ -49,7 +50,8 @@ public:
 	Login7Options GetLogin7Options() const override {
 		Login7Options opts;
 		opts.database = database_;
-		opts.app_name = "DuckDB MSSQL Extension";
+		// Spec 047 FR-014 — caller-supplied program_name (clamped at factory).
+		opts.app_name = app_name_.empty() ? "DuckDB MSSQL Extension" : app_name_;
 		opts.username = "";	 // not used in integrated auth
 		opts.password = "";	 // not used in integrated auth
 		opts.include_fedauth_ext = false;
@@ -72,6 +74,7 @@ private:
 	std::string database_;
 	std::string display_name_;
 	bool use_encrypt_;
+	std::string app_name_;	// Spec 047 FR-014 — see SqlServerAuthStrategy for the contract.
 };
 
 }  // namespace tds
