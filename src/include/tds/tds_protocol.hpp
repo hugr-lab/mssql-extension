@@ -196,6 +196,17 @@ public:
 	static std::vector<TdsPacket> BuildBulkLoadMultiPacket(const std::vector<uint8_t> &payload,
 														   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE);
 
+	// Fragment an already-built message into TDS packets no larger than
+	// max_packet_size, preserving the original packet type and setting EOM only
+	// on the last packet. SQL Server rejects (TCP-resets) a single TDS packet
+	// whose declared length exceeds the negotiated packet size; the LOGIN7
+	// packet is sent before packet-size negotiation, so callers must use the
+	// pre-negotiation default (4096). A Kerberos LOGIN7 carrying a real Active
+	// Directory PAC routinely exceeds 4096 bytes and MUST be split. issue #138.
+	// If the payload already fits, returns the original packet unchanged.
+	static std::vector<TdsPacket> SplitIntoPackets(const TdsPacket &message,
+												   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE);
+
 	// Parse DONE token to check for ATTENTION_ACK
 	static bool ParseDoneForAttentionAck(const std::vector<uint8_t> &data);
 

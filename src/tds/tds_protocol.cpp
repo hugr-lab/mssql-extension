@@ -1099,6 +1099,42 @@ std::vector<TdsPacket> TdsProtocol::BuildBulkLoadMultiPacket(const std::vector<u
 	return packets;
 }
 
+std::vector<TdsPacket> TdsProtocol::SplitIntoPackets(const TdsPacket &message, size_t max_packet_size) {
+	std::vector<TdsPacket> packets;
+
+	const PacketType type = message.GetType();
+	const std::vector<uint8_t> &payload = message.GetPayload();
+
+	// TDS packet header is 8 bytes, so payload per packet is capped at
+	// (max_packet_size - 8). Guard against a degenerate max_packet_size.
+	const size_t max_payload = (max_packet_size > TDS_HEADER_SIZE) ? (max_packet_size - TDS_HEADER_SIZE)
+																   : (TDS_DEFAULT_PACKET_SIZE - TDS_HEADER_SIZE);
+
+	// Fits in a single packet -- return the original (already EOM) untouched so
+	// the common path is byte-identical to the pre-fix behavior.
+	if (payload.size() <= max_payload) {
+		packets.push_back(message);
+		return packets;
+	}
+
+	size_t offset = 0;
+	while (offset < payload.size()) {
+		size_t chunk_size = std::min(max_payload, payload.size() - offset);
+		bool is_last = (offset + chunk_size >= payload.size());
+
+		TdsPacket packet(type);
+		// EOM flag only on the last packet; intermediate packets clear it.
+		if (!is_last) {
+			packet.SetEndOfMessage(false);
+		}
+		packet.AppendPayload(payload.data() + offset, chunk_size);
+		packets.push_back(std::move(packet));
+		offset += chunk_size;
+	}
+
+	return packets;
+}
+
 TdsPacket TdsProtocol::BuildAttention() {
 	TdsPacket packet(PacketType::ATTENTION);
 	// Single byte payload with 0xFF marker
