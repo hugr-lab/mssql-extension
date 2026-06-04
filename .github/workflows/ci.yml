@@ -170,6 +170,28 @@ jobs:
       - name: Show ccache stats
         run: ccache -s
 
+      # Standalone C++ unit tests (test/cpp/*) — pure in-memory, no SQL Server.
+      # Reuses the simdutf already built by vcpkg for the release tree.
+      - name: Run C++ unit tests
+        run: |
+          set -euo pipefail
+          PREFIX="build/release/vcpkg_installed/${{ matrix.platform.vcpkg_triplet }}"
+          if [ ! -f "$PREFIX/include/simdutf.h" ]; then
+            echo "simdutf not found under $PREFIX" >&2
+            ls -R build/release/vcpkg_installed 2>/dev/null | head -50 >&2 || true
+            exit 1
+          fi
+          mkdir -p build/test
+          echo "::group::test_login7_encoding (spec 043 + issue #138 LOGIN7 fragmentation)"
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/test_login7_encoding.cpp \
+            src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp src/tds/encoding/utf16.cpp \
+            -L "$PREFIX/lib" -lsimdutf \
+            -o build/test/test_login7_encoding
+          ./build/test/test_login7_encoding
+          echo "::endgroup::"
+
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
         with:
