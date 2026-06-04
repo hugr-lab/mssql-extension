@@ -1142,7 +1142,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 // Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
 // instead of at first query.
 //===----------------------------------------------------------------------===//
-void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds, size_t login7_max_packet) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
 							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
 							timeout_seconds);
@@ -1174,7 +1174,7 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
 	}
 
-	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt)) {
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, login7_max_packet)) {
 		string error = conn.GetLastError();
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
@@ -1341,7 +1341,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
 		// time so credential / SPN / clock-skew errors surface immediately.
 		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
-		ValidateIntegratedAuthConnection(*ctx->connection_info, pool_config.connection_timeout);
+		ValidateIntegratedAuthConnection(
+			*ctx->connection_info, pool_config.connection_timeout,
+			pool_config.login7_max_packet > 0 ? static_cast<size_t>(pool_config.login7_max_packet) : 0);
 	} else {
 		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
 	}

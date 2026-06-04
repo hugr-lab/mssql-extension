@@ -23,7 +23,48 @@ echo -n "${PASSWORD}" | kinit "${PRINCIPAL}"
 echo "[run-tests] step 2: klist"
 klist
 
-echo "[run-tests] step 3: ATTACH via Trusted_Connection=yes"
+# --------------------------------------------------------------------------
+# step 3: forced multi-packet LOGIN7 (issue #138) -- THE regression check.
+#
+# Run this BEFORE the happy-path ATTACHes: it validates the protocol-level
+# framing fix and is independent of whether SQL Server's Kerberos *trust* lets
+# the login fully succeed (that depends on keytab/realm wiring). MSSQL_DEBUG=1
+# surfaces the packet-split line; the mssql_login7_max_packet=512 setting forces
+# the multi-packet path even for the test KDC's small (PAC-less) token -- a real
+# AD PAC pushes LOGIN7 past 4096 on its own.
+#
+# Pre-fix, an oversized single-packet LOGIN7 made SQL Server reset the TCP
+# connection ("Connection reset by peer" / "TLS receive failed"). The fix is
+# proven when (a) LOGIN7 splits into >1 TDS packet and (b) the server gives a
+# graceful TDS-level response -- a successful login OR a login-level error like
+# 18452 -- rather than a transport reset. Either means the server reassembled
+# and parsed the fragmented login.
+# --------------------------------------------------------------------------
+echo "[run-tests] step 3: forced LOGIN7 fragmentation (issue #138)"
+cat > /tmp/frag.sql <<EOF
+LOAD '${EXT}';
+SET mssql_login7_max_packet=512;
+ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kfrag (TYPE mssql);
+SELECT COUNT(*) AS frag_rows FROM kfrag.dbo.test;
+DETACH kfrag;
+EOF
+# A rejected login makes duckdb exit non-zero; we assert on the captured output,
+# so shield the command substitution from `set -e`.
+set +e
+frag_out=$(MSSQL_DEBUG=1 duckdb --unsigned -f /tmp/frag.sql 2>&1)
+set -e
+echo "${frag_out}"
+if ! echo "${frag_out}" | grep -Eq 'LOGIN7 payload=[0-9]+ bytes -> ([2-9]|[1-9][0-9]+) TDS packet'; then
+    echo "[run-tests] ERROR: LOGIN7 did not fragment into multiple packets (knob ineffective?)" >&2
+    exit 3
+fi
+if echo "${frag_out}" | grep -Eq 'Connection reset by peer|TLS receive failed|Failed to receive LOGIN7 response'; then
+    echo "[run-tests] ERROR: fragmented LOGIN7 triggered a transport reset -- issue #138 NOT fixed" >&2
+    exit 3
+fi
+echo "[run-tests] step 3: OK -- multi-packet LOGIN7 reassembled & answered by SQL Server"
+
+echo "[run-tests] step 4: ATTACH via Trusted_Connection=yes (happy path; needs Kerberos trust)"
 duckdb --unsigned <<EOF
 LOAD '${EXT}';
 ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kdb (TYPE mssql);
@@ -33,39 +74,13 @@ SELECT '== mssql_version ==' AS marker, mssql_version() AS version;
 DETACH kdb;
 EOF
 
-echo "[run-tests] step 4: ATTACH via explicit authenticator=krb5"
+echo "[run-tests] step 5: ATTACH via explicit authenticator=krb5"
 duckdb --unsigned <<EOF
 LOAD '${EXT}';
 ATTACH 'Server=sql.example.com,1433;Database=TestDB;authenticator=krb5;Encrypt=yes;TrustServerCertificate=yes' AS kdb2 (TYPE mssql);
 SELECT COUNT(*) AS rows FROM kdb2.dbo.test;
 DETACH kdb2;
 EOF
-
-echo "[run-tests] step 5: forced LOGIN7 fragmentation (issue #138)"
-# Lower the LOGIN7 fragmentation boundary so the multi-packet send path is
-# exercised end-to-end: with a 512-byte cap even the test KDC's small SPNEGO
-# token produces a multi-packet LOGIN7. A real AD PAC does this naturally; the
-# test KDC issues minimal tickets, so we force the boundary down instead.
-# Success here proves SQL Server reassembles and accepts the fragmented LOGIN7.
-frag_out=$(MSSQL_LOGIN7_MAX_PACKET=512 MSSQL_DEBUG=1 duckdb --unsigned 2>&1 <<EOF
-LOAD '${EXT}';
-ATTACH 'Server=sql.example.com,1433;Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kfrag (TYPE mssql);
-SELECT COUNT(*) AS frag_rows FROM kfrag.dbo.test;
-DETACH kfrag;
-EOF
-)
-echo "${frag_out}"
-# Assert the LOGIN7 actually split into more than one TDS packet, and the query
-# returned (i.e. the server accepted the fragmented login).
-if ! echo "${frag_out}" | grep -Eq 'LOGIN7 payload=[0-9]+ bytes -> ([2-9]|[1-9][0-9]+) TDS packet'; then
-    echo "[run-tests] ERROR: LOGIN7 was not fragmented into multiple packets (knob ineffective?)" >&2
-    exit 3
-fi
-if ! echo "${frag_out}" | grep -q 'frag_rows'; then
-    echo "[run-tests] ERROR: fragmented-LOGIN7 ATTACH/query did not succeed" >&2
-    exit 3
-fi
-echo "[run-tests] step 5: OK -- multi-packet LOGIN7 accepted by SQL Server"
 
 echo "[run-tests] step 6: negative case -- destroy ccache, expect a clear error"
 kdestroy

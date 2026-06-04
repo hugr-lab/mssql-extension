@@ -130,7 +130,9 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithIntegratedAuth(const s
 	// running with MSSQL_DEBUG=1 (or any time, on stderr) see the real
 	// reason a pool refill failed.
 	MSSQLConnectionInfo info_copy = info;
-	auto factory = [info_copy]() -> std::shared_ptr<tds::TdsConnection> {
+	// Test-only LOGIN7 fragmentation boundary (issue #138); 0 -> default 4096.
+	const size_t login7_max_packet = config.login7_max_packet > 0 ? static_cast<size_t>(config.login7_max_packet) : 0;
+	auto factory = [info_copy, login7_max_packet]() -> std::shared_ptr<tds::TdsConnection> {
 		auto conn = std::make_shared<tds::TdsConnection>();
 		if (!conn->Connect(info_copy.host, info_copy.port)) {
 			fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n", info_copy.host.c_str(),
@@ -155,7 +157,8 @@ tds::ConnectionPool *MssqlPoolManager::GetOrCreatePoolWithIntegratedAuth(const s
 			fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
 			return nullptr;
 		}
-		if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt)) {
+		if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt,
+										  login7_max_packet)) {
 			fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
 			return nullptr;
 		}

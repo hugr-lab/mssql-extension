@@ -183,7 +183,9 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 3
 
 // Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
 // so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
-void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
+// login7_max_packet: test-only LOGIN7 fragmentation boundary (issue #138); 0 = default 4096.
+void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30,
+									  size_t login7_max_packet = 0);
 
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);

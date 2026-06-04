@@ -38,28 +38,6 @@ std::string GetClientHostname() {
 #endif
 }
 
-// LOGIN7 (and the SSPI continuation messages) are sent before TDS packet-size
-// negotiation completes, so they must be fragmented to the pre-negotiation
-// default of 4096 bytes (issue #138). MSSQL_LOGIN7_MAX_PACKET is a TEST-ONLY
-// override that lowers that boundary so the multi-packet path can be exercised
-// end-to-end against a real SQL Server without an AD-sized Kerberos PAC -- the
-// server reassembles the fragments regardless of how small they are. Unset (or
-// out of range) in production -> the standard 4096-byte default. The clamp
-// guarantees room for the 8-byte TDS header plus the 94-byte LOGIN7 fixed
-// region with payload to spare.
-size_t Login7FragmentPacketSize() {
-	const char *env = std::getenv("MSSQL_LOGIN7_MAX_PACKET");
-	if (env && *env) {
-		long v = std::strtol(env, nullptr, 10);
-		// Qualified: this helper lives in the file-level anonymous namespace,
-		// outside duckdb::tds where these constants are declared.
-		if (v >= 256 && v <= static_cast<long>(duckdb::tds::TDS_MAX_PACKET_SIZE)) {
-			return static_cast<size_t>(v);
-		}
-	}
-	return duckdb::tds::TDS_DEFAULT_PACKET_SIZE;
-}
-
 }  // anonymous namespace
 
 // Debug logging
@@ -668,7 +646,15 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 // implementations. Without one, this returns a clear error per FR-012.
 //===----------------------------------------------------------------------===//
 bool TdsConnection::AuthenticateIntegrated(const std::string &database,
-										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt) {
+										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt,
+										   size_t login7_max_packet) {
+	// Validate the (DuckDB-setting-sourced) fragmentation boundary. 0 or an
+	// out-of-range value falls back to the 4096 pre-negotiation default; small
+	// in-range values are the TEST hook to force the multi-packet path. The
+	// floor leaves room for the 8-byte TDS header. (issue #138)
+	const size_t login7_fragment_size = (login7_max_packet >= 256 && login7_max_packet <= TDS_MAX_PACKET_SIZE)
+											? login7_max_packet
+											: TDS_DEFAULT_PACKET_SIZE;
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
 		return false;
@@ -727,10 +713,9 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	// packet-size negotiation completes, so it MUST be fragmented to the default
 	// packet size with EOM on the last packet only -- otherwise SQL Server
 	// TCP-resets the connection while we read the response. issue #138.
-	const size_t login7_max_packet = Login7FragmentPacketSize();
-	std::vector<TdsPacket> login_packets = TdsProtocol::SplitIntoPackets(login, login7_max_packet);
+	std::vector<TdsPacket> login_packets = TdsProtocol::SplitIntoPackets(login, login7_fragment_size);
 	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: LOGIN7 payload=%zu bytes -> %zu TDS packet(s) (max_packet=%zu)",
-						 login.GetPayload().size(), login_packets.size(), login7_max_packet);
+						 login.GetPayload().size(), login_packets.size(), login7_fragment_size);
 	for (size_t i = 0; i < login_packets.size(); i++) {
 		TdsPacket &pkt = login_packets[i];
 		pkt.SetPacketId(next_packet_id_++);
@@ -807,7 +792,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		// Continuation tokens are usually small, but fragment defensively to the
 		// default packet size for the same reason as the initial LOGIN7 (#138).
 		TdsPacket sspi_msg = TdsProtocol::BuildSSPIMessage(next_blob);
-		std::vector<TdsPacket> sspi_packets = TdsProtocol::SplitIntoPackets(sspi_msg, Login7FragmentPacketSize());
+		std::vector<TdsPacket> sspi_packets = TdsProtocol::SplitIntoPackets(sspi_msg, login7_fragment_size);
 		for (size_t i = 0; i < sspi_packets.size(); i++) {
 			TdsPacket &pkt = sspi_packets[i];
 			pkt.SetPacketId(next_packet_id_++);
