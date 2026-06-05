@@ -1,6 +1,6 @@
 {
   "name": "mssql-extension",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DuckDB extension for Microsoft SQL Server using native TDS protocol",
   "dependencies": [
     "openssl",
