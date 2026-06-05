@@ -183,7 +183,8 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
 				return nullptr;
 			}
-			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt, app_name)) {
+			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt, app_name,
+											  info_copy.login7_max_packet)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
 				return nullptr;
 			}

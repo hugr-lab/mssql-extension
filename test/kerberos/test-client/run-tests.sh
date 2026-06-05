@@ -57,7 +57,45 @@ echo "${result}" | grep -q "^OK:" || {
     exit 3
 }
 
-echo "[run-tests] step 4: negative case -- destroy ccache, expect a clear error"
+# --------------------------------------------------------------------------
+# step 4: forced multi-packet LOGIN7 (issue #138).
+#
+# Unlike step 3 (which only exercises local token generation), this performs a
+# real ATTACH so a LOGIN7 is actually sent on the wire. The
+# `mssql_login7_max_packet=512` setting lowers the fragmentation boundary so
+# even the test KDC's small (PAC-less) token produces a multi-packet LOGIN7 -- a
+# real AD PAC pushes LOGIN7 past 4096 on its own (see issue #138).
+#
+# This is independent of whether the login fully succeeds: SQL Server on Linux
+# can't map the AD principal without SSSD/realmd, so the ATTACH is expected to
+# come back with login error 18452 (see the file header). The point of the test
+# is the *framing*: pre-fix an oversized single-packet LOGIN7 made the server
+# reset the TCP connection ("Connection reset by peer" / "TLS receive failed").
+# The fix is proven when (a) LOGIN7 splits into >1 TDS packet and (b) the server
+# answers at the TDS level (success OR a login error) rather than resetting --
+# either means it reassembled and parsed the fragmented login.
+echo "[run-tests] step 4: forced LOGIN7 fragmentation (issue #138)"
+cat > /tmp/frag.sql <<EOF
+LOAD '${EXT}';
+SET mssql_login7_max_packet=512;
+ATTACH 'Server=${SQL_HOST},${SQL_PORT};Database=TestDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS kfrag (TYPE mssql);
+DETACH kfrag;
+EOF
+set +e
+frag_out=$(MSSQL_DEBUG=1 duckdb --unsigned -f /tmp/frag.sql 2>&1)
+set -e
+echo "${frag_out}"
+if ! echo "${frag_out}" | grep -Eq 'LOGIN7 payload=[0-9]+ bytes -> ([2-9]|[1-9][0-9]+) TDS packet'; then
+    echo "[run-tests] ERROR: LOGIN7 did not fragment into multiple packets (knob ineffective?)" >&2
+    exit 3
+fi
+if echo "${frag_out}" | grep -Eq 'Connection reset by peer|TLS receive failed|Failed to receive LOGIN7 response'; then
+    echo "[run-tests] ERROR: fragmented LOGIN7 triggered a transport reset -- issue #138 NOT fixed" >&2
+    exit 3
+fi
+echo "[run-tests] step 4: OK -- multi-packet LOGIN7 reassembled & answered by SQL Server"
+
+echo "[run-tests] step 5: negative case -- destroy ccache, expect a clear error"
 kdestroy
 negative=$(duckdb --unsigned -noheader -list <<EOF || true
 LOAD '${EXT}';

@@ -189,6 +189,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_copy_tablock` | auto | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access). Auto-enabled for new tables when not explicitly set. |
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |
 | `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
+| `mssql_login7_max_packet` | 0 | **Test-only** (issue #138). Max LOGIN7 TDS packet size (bytes) for integrated auth; lowers the fragmentation boundary so the multi-packet send path can be exercised without an AD-sized Kerberos PAC. 0 = production default (4096); effective values clamped to [256, 32767]. |
 
 ## ATTACH Options & Secret Parameters (Catalog Filters)
 

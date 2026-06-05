@@ -1238,7 +1238,8 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
 	}
 
-	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, ResolveAppName(info))) {
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, ResolveAppName(info),
+									 info.login7_max_packet)) {
 		string error = conn.GetLastError();
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
@@ -1411,6 +1412,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// (spec 047 T026), which defaults to `mssql_connection_timeout` so
 	// existing deployments see no observable change in the steady state.
 	auto pool_config = LoadPoolConfig(context);
+	// issue #138 (test-only): carry the LOGIN7 fragmentation boundary on the
+	// connection info so both the ATTACH-time validation and the per-connection
+	// pool factory (which only sees connection_info) can pass it through to
+	// AuthenticateIntegrated. 0 = production default (4096).
+	connection_info->login7_max_packet =
+		pool_config.login7_max_packet > 0 ? static_cast<size_t>(pool_config.login7_max_packet) : 0;
 	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
 	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
 							lazy_validation ? "true" : "false", attach_validation_timeout);

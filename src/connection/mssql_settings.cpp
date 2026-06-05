@@ -48,6 +48,14 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
 							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_login7_max_packet - TEST-ONLY (issue #138). Lowers the LOGIN7 / SSPI
+	// integrated-auth fragmentation boundary so the multi-packet send path can be
+	// exercised without an AD-sized Kerberos PAC. 0 = production default (4096);
+	// effective values are clamped to [256, 32767] when the connection is built.
+	config.AddExtensionOption("mssql_login7_max_packet",
+							  "TEST-ONLY: max LOGIN7 TDS packet size in bytes for integrated auth (0 = default 4096)",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
 	// Short by design — Browser is on the critical path of every named-instance attach.
@@ -280,6 +288,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_metadata_timeout", val)) {
 		config.metadata_timeout = static_cast<int>(val.GetValue<int64_t>());
+	}
+
+	if (context.TryGetCurrentSetting("mssql_login7_max_packet", val)) {
+		config.login7_max_packet = val.GetValue<int64_t>();
 	}
 
 	return config;

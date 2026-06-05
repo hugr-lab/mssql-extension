@@ -441,6 +441,75 @@ void TestSimdutfInvalidInputFallback() {
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// Test 8: LOGIN7 SSPI fragmentation (issue #138)
+//
+// A Kerberos LOGIN7 carrying a real AD PAC exceeds the 4096-byte
+// pre-negotiation packet size. SplitIntoPackets must fragment it across TDS
+// packets (EOM on the last only) so SQL Server does not TCP-reset the
+// connection. Small blobs must still produce exactly one EOM packet.
+//===----------------------------------------------------------------------===//
+
+void TestLogin7SspiFragmentation() {
+	std::cout << "[8] LOGIN7 SSPI fragmentation (issue #138)..." << std::endl;
+
+	const std::string host = "client-host";
+	const std::string server = "sql.example.com";
+	const std::string db = "master";
+	const std::string app = "DuckDB MSSQL Extension";
+
+	auto build = [&](size_t blob_size) {
+		// Deterministic non-trivial blob bytes (i*7+1 mod 256) so concatenation
+		// equality also catches chunk-boundary corruption, not just sizes.
+		std::vector<uint8_t> blob(blob_size);
+		for (size_t i = 0; i < blob_size; i++) {
+			blob[i] = static_cast<uint8_t>((i * 7 + 1) & 0xFF);
+		}
+		return TdsProtocol::BuildLogin7WithSSPI(host, server, db, blob, app, TDS_DEFAULT_PACKET_SIZE);
+	};
+
+	// --- Small blob: fits in one packet, returned unchanged (EOM set). ---
+	{
+		TdsPacket login = build(64);
+		CHECK_TRUE(login.GetPayload().size() <= TDS_DEFAULT_PACKET_SIZE - TDS_HEADER_SIZE,
+				   "small LOGIN7 fits in one packet");
+		auto packets = TdsProtocol::SplitIntoPackets(login, TDS_DEFAULT_PACKET_SIZE);
+		CHECK_EQ(packets.size(), static_cast<size_t>(1), "small blob -> 1 packet");
+		CHECK_TRUE(packets[0].IsEndOfMessage(), "single packet has EOM");
+		CHECK_TRUE(packets[0].GetPayload() == login.GetPayload(), "single packet payload unchanged");
+	}
+
+	// --- Large blob (PAC-sized): must fragment across multiple packets. ---
+	{
+		const size_t kBlob = 10000;	 // > 2x default packet size
+		TdsPacket login = build(kBlob);
+		const std::vector<uint8_t> original = login.GetPayload();
+		CHECK_TRUE(original.size() > TDS_DEFAULT_PACKET_SIZE, "large LOGIN7 exceeds one packet");
+
+		auto packets = TdsProtocol::SplitIntoPackets(login, TDS_DEFAULT_PACKET_SIZE);
+		CHECK_TRUE(packets.size() > 1, "large blob -> multiple packets");
+
+		std::vector<uint8_t> reassembled;
+		for (size_t i = 0; i < packets.size(); i++) {
+			const TdsPacket &pkt = packets[i];
+			const bool is_last = (i + 1 == packets.size());
+
+			CHECK_EQ(static_cast<int>(pkt.GetType()), static_cast<int>(PacketType::LOGIN7),
+					 "fragment keeps LOGIN7 type");
+			// Each serialized packet (header + payload) must fit the limit.
+			CHECK_TRUE(pkt.Serialize().size() <= TDS_DEFAULT_PACKET_SIZE, "serialized fragment <= packet size");
+			CHECK_TRUE(pkt.GetLength() <= TDS_DEFAULT_PACKET_SIZE, "fragment length header <= packet size");
+			// EOM only on the last fragment.
+			CHECK_EQ(pkt.IsEndOfMessage(), is_last, "EOM set only on last fragment");
+
+			const auto &chunk = pkt.GetPayload();
+			CHECK_TRUE(!chunk.empty(), "fragment payload non-empty");
+			reassembled.insert(reassembled.end(), chunk.begin(), chunk.end());
+		}
+		CHECK_TRUE(reassembled == original, "reassembled payload byte-identical to original LOGIN7");
+	}
+}
+
 int main() {
 	std::cout << "============================================================" << std::endl;
 	std::cout << "LOGIN7 non-ASCII fix + simdutf wrapper unit tests (spec 043)" << std::endl;
@@ -454,6 +523,7 @@ int main() {
 		TestAsciiRegression();
 		TestSimdutfByteEquivalence();
 		TestSimdutfInvalidInputFallback();
+		TestLogin7SspiFragmentation();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

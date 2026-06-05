@@ -66,8 +66,17 @@ public:
 	//                   real implementations land in Phase 3 / 4.
 	//   use_encrypt  - if true, enables TLS encryption (typical for production)
 	//   app_name     - spec 047 FR-014; see SQL-auth Authenticate above.
+	//   login7_max_packet - TDS packet size to fragment the LOGIN7 / SSPI sends
+	//                   to. LOGIN7 is sent before packet-size negotiation, so a
+	//                   PAC-bearing Kerberos blob can exceed the 4096 default and
+	//                   MUST be fragmented (issue #138). 0 (or out of the
+	//                   [256, TDS_MAX_PACKET_SIZE] range) -> the 4096 default;
+	//                   smaller values are a TEST hook to force the multi-packet
+	//                   path. A plain size_t keeps the TDS layer DuckDB-free; the
+	//                   value originates from the mssql_login7_max_packet setting.
 	bool AuthenticateIntegrated(const std::string &database, std::shared_ptr<tds::IAuthenticator> authenticator,
-								bool use_encrypt = true, const std::string &app_name = "");
+								bool use_encrypt = true, const std::string &app_name = "",
+								size_t login7_max_packet = 0);
 
 	// Connection health check (FR-015)
 	// Quick state check - no I/O, just checks internal state

@@ -93,6 +93,12 @@ struct MSSQLConnectionInfo {
 	string krb5_realm;				// AD realm (uppercased convention); needed for raw / keytab
 	string service_principal_name;	// SPN override, e.g. MSSQLSvc/host.example.com:1433
 
+	// Test-only (issue #138): LOGIN7 / SSPI fragmentation boundary in bytes,
+	// populated at ATTACH from the mssql_login7_max_packet setting. 0 = the
+	// 4096 default; smaller values force the multi-packet path for the e2e
+	// test without an AD-sized Kerberos PAC. Clamped in AuthenticateIntegrated.
+	size_t login7_max_packet = 0;
+
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//
@@ -205,6 +211,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 3
 
 // Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
 // so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
+// The LOGIN7 fragmentation boundary (issue #138) is read from info.login7_max_packet.
 void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
 // Register storage extension for ATTACH TYPE mssql

@@ -659,7 +659,14 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 //===----------------------------------------------------------------------===//
 bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt,
-										   const std::string &app_name) {
+										   const std::string &app_name, size_t login7_max_packet) {
+	// Validate the (DuckDB-setting-sourced) fragmentation boundary. 0 or an
+	// out-of-range value falls back to the 4096 pre-negotiation default; small
+	// in-range values are the TEST hook to force the multi-packet path. The
+	// floor leaves room for the 8-byte TDS header. (issue #138)
+	const size_t login7_fragment_size = (login7_max_packet >= 256 && login7_max_packet <= TDS_MAX_PACKET_SIZE)
+											? login7_max_packet
+											: TDS_DEFAULT_PACKET_SIZE;
 	if (state_.load() != ConnectionState::Authenticating) {
 		last_error_ = "Cannot authenticate: not in Authenticating state";
 		return false;
@@ -715,12 +722,25 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	TdsPacket login =
 		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
 										 initial_blob, login7_app_name, TDS_DEFAULT_PACKET_SIZE);
-	login.SetPacketId(next_packet_id_++);
-	if (!socket_->SendPacket(login)) {
-		last_error_ = "Failed to send LOGIN7 (integrated): " + socket_->GetLastError();
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
+
+	// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
+	// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
+	// packet-size negotiation completes, so it MUST be fragmented to the default
+	// packet size with EOM on the last packet only -- otherwise SQL Server
+	// TCP-resets the connection while we read the response. issue #138.
+	std::vector<TdsPacket> login_packets = TdsProtocol::SplitIntoPackets(login, login7_fragment_size);
+	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: LOGIN7 payload=%zu bytes -> %zu TDS packet(s) (max_packet=%zu)",
+						 login.GetPayload().size(), login_packets.size(), login7_fragment_size);
+	for (size_t i = 0; i < login_packets.size(); i++) {
+		TdsPacket &pkt = login_packets[i];
+		pkt.SetPacketId(next_packet_id_++);
+		if (!socket_->SendPacket(pkt)) {
+			last_error_ = "Failed to send LOGIN7 (integrated) packet " + std::to_string(i + 1) + "/" +
+						  std::to_string(login_packets.size()) + ": " + socket_->GetLastError();
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
 	}
 
 	// Step 4: Continuation loop on 0xED SSPI tokens.
@@ -784,13 +804,20 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 
 		MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- sending continuation blob (%zu bytes)", round + 1,
 							 next_blob.size());
+		// Continuation tokens are usually small, but fragment defensively to the
+		// same boundary as the initial LOGIN7 for the same reason (#138).
 		TdsPacket sspi_msg = TdsProtocol::BuildSSPIMessage(next_blob);
-		sspi_msg.SetPacketId(next_packet_id_++);
-		if (!socket_->SendPacket(sspi_msg)) {
-			last_error_ = "Failed to send SSPI continuation: " + socket_->GetLastError();
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
+		std::vector<TdsPacket> sspi_packets = TdsProtocol::SplitIntoPackets(sspi_msg, login7_fragment_size);
+		for (size_t i = 0; i < sspi_packets.size(); i++) {
+			TdsPacket &pkt = sspi_packets[i];
+			pkt.SetPacketId(next_packet_id_++);
+			if (!socket_->SendPacket(pkt)) {
+				last_error_ = "Failed to send SSPI continuation packet " + std::to_string(i + 1) + "/" +
+							  std::to_string(sspi_packets.size()) + ": " + socket_->GetLastError();
+				state_.store(ConnectionState::Disconnected);
+				socket_->Close();
+				return false;
+			}
 		}
 	}
 
