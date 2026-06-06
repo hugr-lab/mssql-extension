@@ -1,0 +1,62 @@
+# name: test/sql/dml/no_pk_update_delete.test
+# description: UPDATE/DELETE on tables without a primary key must fail with a clean, consistent BinderException (regression for issues #140 and #141)
+# group: [mssql]
+#
+# Issue #140: UPDATE on a no-PK table fails with a Binder Error (working as designed).
+# Issue #141: DELETE on a no-PK table fails with an INTERNAL assertion failure
+#             ("BindRowIdColumns could not find the row id column ...") instead of the
+#             same clean Binder Error that UPDATE produces. DELETE must surface the
+#             same user-facing error as UPDATE, never an internal assertion.
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Create a table WITHOUT a primary key
+statement ok
+DROP TABLE IF EXISTS mssql.dbo.no_pk_dml_test;
+
+statement ok
+CREATE TABLE mssql.dbo.no_pk_dml_test (id INTEGER);
+
+statement ok
+INSERT INTO mssql.dbo.no_pk_dml_test VALUES (1), (2), (3);
+
+# Sanity: SELECT and INSERT work regardless of PK
+query I
+SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_test;
+----
+3
+
+# Issue #140: UPDATE on no-PK table must fail with a clean Binder Error
+statement error
+UPDATE mssql.dbo.no_pk_dml_test SET id = 3 WHERE id = 1;
+----
+requires a table with a primary key
+
+# Issue #141: DELETE on no-PK table must fail with the SAME clean Binder Error,
+# NOT an INTERNAL assertion failure (BindRowIdColumns ...).
+statement error
+DELETE FROM mssql.dbo.no_pk_dml_test WHERE id = 3;
+----
+requires a table with a primary key
+
+# The failed DML must not have mutated any rows
+query I
+SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_test;
+----
+3
+
+# Cleanup
+statement ok
+DROP TABLE mssql.dbo.no_pk_dml_test;
+
+statement ok
+DETACH mssql;
