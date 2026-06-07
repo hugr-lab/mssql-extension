@@ -390,4 +390,32 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	return result;
 }
 
+vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
+	// Called by DuckDB's Binder::BindRowIdColumns() on the UPDATE/DELETE/MERGE bind paths.
+	//
+	// rowid is only available for base tables that have a primary key. Without this guard,
+	// DELETE binding (which, unlike UPDATE, never calls BindUpdateConstraints()) reaches
+	// BindRowIdColumns(), fails to find the rowid in GetVirtualColumns(), and raises an
+	// INTERNAL assertion failure (issue #141). Surface the same clean, user-facing error
+	// that UPDATE produces via BindUpdateConstraints() (issue #140) so both DML paths behave
+	// consistently.
+	//
+	// PK info is lazy-loaded in GetScanFunction(), which runs while the table reference is
+	// bound — before any rowid binding — so pk_info_ is published (pk_loaded_) by the time
+	// we get here. Read pk_loaded_ with acquire ordering, matching GetVirtualColumns().
+	if (object_type_ == MSSQLObjectType::VIEW) {
+		throw BinderException("MSSQL: UPDATE/DELETE is not supported on views. '%s.%s' is a view.", schema.name.c_str(),
+							  name.c_str());
+	}
+
+	if (!pk_loaded_.load(std::memory_order_acquire) || !pk_info_.exists) {
+		throw BinderException(
+			"MSSQL: UPDATE/DELETE requires a table with a primary key. "
+			"Table '%s.%s' has no primary key.",
+			schema.name.c_str(), name.c_str());
+	}
+
+	return TableCatalogEntry::GetRowIdColumns();
+}
+
 }  // namespace duckdb

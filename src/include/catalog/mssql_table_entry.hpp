@@ -56,6 +56,11 @@ public:
 	// Note: PK info is lazy-loaded in GetScanFunction(), which is called before this
 	virtual_column_map_t GetVirtualColumns() const override;
 
+	// Override to gate the rowid column required by UPDATE/DELETE binding.
+	// For tables without a primary key (or views) this throws a clean BinderException
+	// instead of letting DuckDB's BindRowIdColumns() hit an internal assertion (issue #141).
+	vector<column_t> GetRowIdColumns() const override;
+
 	//===----------------------------------------------------------------------===//
 	// MSSQL-specific Accessors
 	//===----------------------------------------------------------------------===//
