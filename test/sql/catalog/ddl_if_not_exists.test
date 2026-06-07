@@ -12,7 +12,7 @@ ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
 # Clean up any existing test tables
 statement ok
-CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.DDLIfNotExists'', ''U'') IS NOT NULL DROP TABLE dbo.DDLIfNotExists');
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.DDLIfNotExists'', ''U'') IS NOT NULL DROP TABLE dbo.DDLIfNotExists');
 
 # =============================================================================
 # Test 1: CREATE TABLE IF NOT EXISTS - table does not exist
@@ -59,7 +59,7 @@ CREATE TABLE mssql.dbo.DDLIfNotExists (
     id INTEGER
 );
 ----
-already exists
+already an object named
 
 # =============================================================================
 # Test 4: CREATE OR REPLACE TABLE - replaces existing

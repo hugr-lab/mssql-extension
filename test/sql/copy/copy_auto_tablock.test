@@ -12,7 +12,7 @@ ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
 # Clean up any existing test tables
 statement ok
-CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.CopyAutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.CopyAutoTablockTest');
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.CopyAutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.CopyAutoTablockTest');
 
 # Create source data
 statement ok
@@ -60,7 +60,7 @@ SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
 # When user explicitly sets tablock=false, auto-TABLOCK should NOT override
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
 
 statement ok
 COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, TABLOCK false);
@@ -74,7 +74,7 @@ SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
 # Test 5: Explicit TABLOCK enabled via COPY option
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
 
 statement ok
 COPY source_data TO 'mssql.dbo.CopyAutoTablockTest' (FORMAT bcp, TABLOCK true);
@@ -88,7 +88,7 @@ SELECT COUNT(*) FROM mssql.dbo.CopyAutoTablockTest;
 # Test 6: Explicit TABLOCK via setting (should override auto behavior)
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
 
 statement ok
 SET mssql_copy_tablock = true;
@@ -108,7 +108,7 @@ RESET mssql_copy_tablock;
 # Cleanup
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.CopyAutoTablockTest');
 
 statement ok
 DROP TABLE source_data;
