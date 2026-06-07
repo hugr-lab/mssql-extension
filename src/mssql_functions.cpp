@@ -1,8 +1,10 @@
 #include "mssql_functions.hpp"
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -376,9 +378,20 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 			throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
 		}
 
-		// Execute the SQL
+		// Execute the SQL.
+		// Honor the mssql_query_timeout setting (in seconds) the same way mssql_scan
+		// does — previously mssql_exec used MSSQLSimpleQuery's hardcoded 30s default and
+		// dropped long-running server-side queries regardless of the setting (#90/#145).
+		// 0 (or negative / absurdly large) means no timeout.
+		int query_timeout_s = LoadQueryTimeout(client_context);
+		int timeout_ms;
+		if (query_timeout_s <= 0 || query_timeout_s > INT_MAX / 1000) {
+			timeout_ms = 0;	 // no timeout (wait indefinitely)
+		} else {
+			timeout_ms = query_timeout_s * 1000;
+		}
 		try {
-			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql);
+			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql, timeout_ms);
 
 			// Release connection via ConnectionProvider (no-op if in transaction)
 			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));

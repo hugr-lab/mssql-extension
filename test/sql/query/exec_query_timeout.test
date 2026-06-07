@@ -1,0 +1,68 @@
+# name: test/sql/query/exec_query_timeout.test
+# description: mssql_exec() must honor the mssql_query_timeout setting for long-running server-side queries (regression for issues #90 and #145)
+# group: [mssql]
+#
+# Before the fix, mssql_exec() ignored mssql_query_timeout and used a hardcoded 30s
+# ceiling inside MSSQLSimpleQuery. A server-side statement that ran longer than ~30s
+# without sending TDS packets (e.g. a big INSERT...SELECT, or WAITFOR DELAY) was dropped
+# with "Failed to receive TDS packet: Socket timeout waiting for data", regardless of
+# SET mssql_query_timeout. mssql_scan() honored the setting; mssql_exec() did not.
+#
+# NOTE: this test deliberately runs queries that sleep server-side (WAITFOR DELAY),
+# including one >30s case that directly reproduces #90/#145, so it is slow (~45s total).
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# --- mssql_query_timeout is honored (was previously ignored) -----------------
+# A 2s timeout must abort a 5s server-side WAITFOR. Before the fix, mssql_exec used a
+# hardcoded 30s timeout, so this 5s query would have (incorrectly) succeeded.
+statement ok
+SET mssql_query_timeout=2;
+
+statement error
+SELECT mssql_exec('mssql', 'WAITFOR DELAY ''00:00:05''');
+----
+Query timeout
+
+# A timeout comfortably larger than the query lets it complete (returns 0 affected rows).
+statement ok
+SET mssql_query_timeout=30;
+
+query I
+SELECT mssql_exec('mssql', 'WAITFOR DELAY ''00:00:03''');
+----
+0
+
+# --- core repro for #90 / #145 ----------------------------------------------
+# Issue #90: "the cutoff is consistently right at 30 seconds of server-side execution
+# (WAITFOR DELAY '00:00:25' passes, '00:00:35' fails)". With mssql_query_timeout=0
+# (documented as "infinite"), the >30s case must NOT be dropped with
+# "Failed to receive TDS packet: Socket timeout waiting for data".
+statement ok
+SET mssql_query_timeout=0;
+
+query I
+SELECT mssql_exec('mssql', 'WAITFOR DELAY ''00:00:35''');
+----
+0
+
+# Issue #90 documented workaround: the same long-running statement wrapped with a
+# trailing SELECT via mssql_scan() already succeeded (mssql_scan honored the timeout;
+# mssql_exec did not). Assert that asymmetry is gone — both paths now respect the
+# setting and complete past the old 30s ceiling.
+query I
+SELECT done FROM mssql_scan('mssql', 'WAITFOR DELAY ''00:00:35''; SELECT 1 AS done');
+----
+1
+
+statement ok
+DETACH mssql;
