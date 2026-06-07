@@ -12,7 +12,7 @@ ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
 # Clean up any existing test tables
 statement ok
-CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.IfNotExistsTest'', ''U'') IS NOT NULL DROP TABLE dbo.IfNotExistsTest');
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.IfNotExistsTest'', ''U'') IS NOT NULL DROP TABLE dbo.IfNotExistsTest');
 
 # =============================================================================
 # Test 1: CREATE TABLE IF NOT EXISTS - table does not exist
@@ -50,7 +50,7 @@ statement error
 CREATE TABLE mssql.dbo.IfNotExistsTest AS
 SELECT 3 AS id, 'third' AS name;
 ----
-already exists
+already an object named
 
 # =============================================================================
 # Test 4: CREATE OR REPLACE TABLE - overwrites existing
@@ -70,7 +70,7 @@ SELECT id, name FROM mssql.dbo.IfNotExistsTest ORDER BY id;
 # Test 5: IF NOT EXISTS with larger dataset
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');
 
 statement ok
 CREATE TABLE IF NOT EXISTS mssql.dbo.IfNotExistsTest AS
@@ -102,4 +102,4 @@ row_0
 # Cleanup
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.IfNotExistsTest');
