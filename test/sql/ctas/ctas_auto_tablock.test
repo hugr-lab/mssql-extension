@@ -12,7 +12,7 @@ ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
 # Clean up any existing test tables
 statement ok
-CALL mssql_exec('mssql', 'IF OBJECT_ID(''dbo.AutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.AutoTablockTest');
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.AutoTablockTest'', ''U'') IS NOT NULL DROP TABLE dbo.AutoTablockTest');
 
 # =============================================================================
 # Test 1: CTAS new table (auto-TABLOCK should be applied)
@@ -51,7 +51,7 @@ replaced_0
 # When user explicitly sets tablock=false, auto-TABLOCK should NOT override
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
 
 statement ok
 SET mssql_copy_tablock = false;
@@ -74,7 +74,7 @@ RESET mssql_copy_tablock;
 # User explicitly enables TABLOCK
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
 
 statement ok
 SET mssql_copy_tablock = true;
@@ -96,4 +96,4 @@ RESET mssql_copy_tablock;
 # Cleanup
 # =============================================================================
 statement ok
-CALL mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.AutoTablockTest');
