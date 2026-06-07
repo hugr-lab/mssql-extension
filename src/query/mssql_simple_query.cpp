@@ -1,5 +1,6 @@
 #include "query/mssql_simple_query.hpp"
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -191,12 +192,38 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
 			recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
 		} else {
-			recv_timeout = 30000;  // No timeout: use 30s chunks for SO_RCVTIMEO (allows interrupt)
+			// No timeout configured (mssql_query_timeout = 0): wait effectively forever
+			// for each packet, matching mssql_scan's result-stream behavior
+			// (read_timeout_ms_ = INT_MAX). Previously this used a 30s value and then
+			// aborted on the first recv timeout below, which dropped long-running
+			// server-side queries issued via mssql_exec (#90/#145).
+			recv_timeout = INT_MAX;
 		}
 
 		// Read TDS packet (properly framed with 8-byte header)
 		tds::TdsPacket packet;
 		if (!socket->ReceivePacket(packet, recv_timeout)) {
+			// ReceivePacket() returns false on either a read timeout (Receive() == 0,
+			// socket stays connected) or a hard error (Receive() == -1, socket marked
+			// disconnected). A finite mssql_query_timeout that elapses surfaces here
+			// rather than in the deadline check above, because recv_timeout == the
+			// remaining budget, so the socket read times out right at the deadline.
+			// When the socket is still alive, treat it as a clean query timeout: cancel
+			// the server-side statement with ATTENTION and keep the connection reusable,
+			// instead of reporting a hard "Failed to receive TDS packet" and dropping the
+			// connection (#90/#145).
+			if (has_timeout && socket->IsConnected()) {
+				result.success = false;
+				result.error_message = "Query timeout";
+				SIMPLE_QUERY_DEBUG(1, "ExecuteWithCallback: query TIMEOUT after %dms", timeout_ms);
+				connection.SendAttention();
+				connection.WaitForAttentionAck(5000);
+				// State is reset by WaitForAttentionAck on success, else mark disconnected
+				if (connection.GetState() == tds::ConnectionState::Executing) {
+					connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
+				}
+				return result;
+			}
 			result.success = false;
 			result.error_message = "Failed to receive TDS packet: " + socket->GetLastError();
 			// Mark connection as disconnected since we can't trust it after a receive error
