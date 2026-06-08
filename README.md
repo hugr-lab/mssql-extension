@@ -1008,7 +1008,7 @@ SELECT mssql_exec('sqlserver', 'CREATE UNIQUE INDEX IX_users_username ON dbo.use
 SELECT mssql_exec('sqlserver', 'DROP INDEX IX_users_email ON dbo.users');
 ```
 
-> **Note**: After DDL operations via `mssql_exec()`, use `mssql_refresh_cache('sqlserver')` to update the metadata cache. Standard DuckDB DDL operations automatically refresh the cache.
+> **Note**: Schema-changing statements run through `mssql_exec()` (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) invalidate the metadata cache automatically, the same as standard DuckDB DDL. You only need `mssql_refresh_cache('sqlserver')` to pick up changes made entirely out of band (e.g. by another client) while `mssql_catalog_cache_ttl` is `0`. See [Cache & invalidation](DATAMODEL.md#cache-invalidation) in `DATAMODEL.md` for how the two-layer cache works.
 
 ## Function Reference
 

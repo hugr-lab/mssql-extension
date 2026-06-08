@@ -281,6 +281,45 @@ classDiagram
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
 - Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3).
 
+### Cache invalidation
+
+Existence and column metadata are cached in **two layers**, both filled lazily on first access:
+
+1. **`MSSQLMetadataCache`** (this layer) — schema list, each schema's table/view list, and per-table column metadata.
+2. **Schema table sets** (Layer 3 — `MSSQLTableSet` on each `MSSQLSchemaEntry`) — the bound `MSSQLTableEntry` objects DuckDB resolves names against; built from layer 1 the first time a table is read.
+
+Both layers must be invalidated together. Invalidating only `MSSQLMetadataCache` is not enough once a table has been read: its bound `MSSQLTableEntry` survives in the schema's table set and would still satisfy a `CREATE TABLE IF NOT EXISTS`. `MSSQLCatalog::InvalidateMetadataCache()` does both (lazy — reload deferred to next access); `RefreshCache()` is the eager variant that reloads in one round-trip.
+
+```mermaid
+flowchart TD
+    A["DuckDB catalog DDL<br/>CREATE / DROP / ALTER TABLE db.dbo.t"] --> X{{"cache marked stale"}}
+    B["mssql_exec('db', 'DROP / CREATE / ALTER ...')<br/>raw T-SQL DDL (#151)"] --> X
+    C["mssql_refresh_cache('db')<br/>eager full reload"] --> X
+    D["TTL expiry<br/>when mssql_catalog_cache_ttl is set"] --> X
+    X --> MC["MSSQLMetadataCache invalidated"]
+    X --> TS["schema table sets invalidated<br/>(bound MSSQLTableEntry evicted via graveyard)"]
+    MC --> N["reload from SQL Server<br/>on next access"]
+    TS --> N
+```
+
+Statements run through `mssql_exec()` are plain T-SQL — DuckDB never sees them, so it cannot invalidate the cache on its own. Spec/issue **#151**: `mssql_exec()` detects DDL keywords (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) and calls `InvalidateMetadataCache()` after a successful run. `INSERT`/`UPDATE`/`DELETE` do not invalidate anything, so transaction-pinned DML through `mssql_exec()` is unaffected.
+
+```mermaid
+sequenceDiagram
+    participant U as DuckDB
+    participant C as Catalog cache
+    participant S as SQL Server
+    U->>C: SELECT ... FROM db.dbo.t
+    C->>S: load metadata (lazy)
+    C-->>U: rows — t now cached and bound
+    U->>S: mssql_exec('db', 'DROP TABLE dbo.t')
+    Note over C: DDL detected → InvalidateMetadataCache()<br/>metadata + table sets marked stale
+    U->>C: CREATE TABLE IF NOT EXISTS db.dbo.t AS ...
+    C->>S: existence re-checked (cache stale) — table gone, so CREATE runs
+    U->>C: SELECT ... FROM db.dbo.t
+    C-->>U: rows ✓ (returned "Invalid object name" before the #151 fix)
+```
+
 ---
 
 ## Layer 5 — Codec (spec 045)
