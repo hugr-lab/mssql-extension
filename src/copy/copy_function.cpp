@@ -343,6 +343,10 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 					mapped_columns.reserve(gstate->columns.size());
 					mapped_mapping.reserve(gstate->column_mapping.size());
 					for (idx_t i = 0; i < gstate->columns.size(); i++) {
+						// column_mapping[i] is the source-column index feeding target column i,
+						// or -1 when no source column matches it by name. Keep only the mapped
+						// (>= 0) target columns; the -1 entries are server-generated (IDENTITY,
+						// DEFAULT, computed) and must be left out of INSERT BULK entirely.
 						if (gstate->column_mapping[i] >= 0) {
 							mapped_columns.push_back(gstate->columns[i]);
 							mapped_mapping.push_back(gstate->column_mapping[i]);
