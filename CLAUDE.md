@@ -138,6 +138,12 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - SQL test context names: unique per file, prefixed by operation (e.g., `txtest`, `mssql_upd_scalar`)
 - Test tables: PascalCase (`TestSimplePK`, `TxTestOrders`) or snake_case for simple ones (`tx_test`)
 
+## Documentation
+
+- **`DATAMODEL.md`** is the layered-architecture reference (TDS → connection pool → catalog → cache → codec) with Mermaid diagrams. **On every PR, consider whether `DATAMODEL.md` needs updating** — if the change adds/removes a layer component, alters an invariant (lifetime, cache invalidation, threading, ownership), or changes an end-to-end flow, update the relevant layer section (and its diagram) in the same PR.
+- Keep architecture/internals diagrams in `DATAMODEL.md`; keep `README.md` user-facing (link into `DATAMODEL.md` rather than duplicating internals).
+- Use GitHub-rendered ```mermaid``` fenced blocks for diagrams.
+
 ## Key Architecture Concepts
 
 - **Custom TDS implementation**: No external TDS/ODBC library. TDS v7.4 protocol with PRELOGIN, LOGIN7, SQL_BATCH, ATTENTION packet types.
