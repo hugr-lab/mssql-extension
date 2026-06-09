@@ -28,9 +28,16 @@ jobs:
           python-version: "3.x"
 
       - name: Install DuckDB CLI
+        # Pinned version + checksum (not "latest"): this workflow holds
+        # contents:write to the default branch, so the CLI it executes must be
+        # exactly the reviewed bytes. Update both values together when bumping.
+        env:
+          DUCKDB_VERSION: v1.5.3
+          DUCKDB_SHA256: 35caef1fecbc8d7e2c07de4fd2cdefc5189ec9ba9e1cca228fb1a1c48cc52a8a
         run: |
           curl -fsSL -o /tmp/duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          echo "${DUCKDB_SHA256}  /tmp/duckdb.zip" | sha256sum -c -
           unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
           "$HOME/.local/bin/duckdb" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"

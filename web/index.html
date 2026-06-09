@@ -94,7 +94,8 @@
 
     <script type="module">
       import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
-      import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+      // Exact version pin (no floating minor) so the CDN can't silently serve new code.
+      import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.17/+esm";
 
       const EXTENSION = "mssql";
       const START_YEAR = 2026;
