@@ -358,6 +358,12 @@ def build_badges_block():
     )
 
 
+def pages_url():
+    """GitHub Pages URL for the repo (owner/repo -> owner.github.io/repo/)."""
+    owner, _, repo = REPO.partition("/")
+    return "https://%s.github.io/%s/" % (owner, repo)
+
+
 def build_chart_block(version, total_last_week):
     today = datetime.date.today().isoformat()
     return "\n".join(
@@ -367,6 +373,8 @@ def build_chart_block(version, total_last_week):
             "### 📈 Community Extension Downloads",
             "",
             "![Weekly downloads of the mssql DuckDB community extension](docs/assets/download-metrics.svg)",
+            "",
+            "📊 **[Interactive chart](%s)** — queried live in your browser with DuckDB-Wasm." % pages_url(),
             "",
             "> Latest published version **v%s** · **%s** downloads in the trailing 7 days "
             "(snapshot %s UTC). Counts are a Cloudflare estimate of `INSTALL mssql FROM community` "

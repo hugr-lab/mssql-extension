@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mssql · DuckDB community extension download metrics</title>
+    <meta
+      name="description"
+      content="Live download metrics for the mssql DuckDB community extension, queried in your browser with DuckDB-Wasm."
+    />
+    <style>
+      :root {
+        --accent: #f6c344;
+        --accent-dark: #d4960b;
+        --ink: #2b3a4a;
+        --muted: #8a94a6;
+        --line: #e3e8ee;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        color: var(--ink);
+        background: #f7f9fc;
+        line-height: 1.5;
+      }
+      .wrap { max-width: 900px; margin: 0 auto; padding: 32px 20px 64px; }
+      h1 { font-size: 1.5rem; margin: 0 0 4px; }
+      .sub { color: var(--muted); margin: 0 0 24px; font-size: 0.95rem; }
+      .sub a { color: var(--accent-dark); }
+      .cards { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 24px; }
+      .card {
+        flex: 1 1 160px;
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px 18px;
+      }
+      .card .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+      .card .value { font-size: 1.8rem; font-weight: 700; margin-top: 4px; }
+      .panel {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px;
+        min-height: 380px;
+      }
+      #status { color: var(--muted); font-size: 0.95rem; }
+      .err { color: #c0392b; }
+      figure { margin: 0; overflow-x: auto; }
+      footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
+      footer a { color: var(--accent-dark); }
+      code { background: #eef1f6; padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>📈 mssql — DuckDB community extension downloads</h1>
+      <p class="sub">
+        Queried live in your browser with
+        <a href="https://duckdb.org/docs/api/wasm/overview" target="_blank" rel="noopener">DuckDB-Wasm</a>
+        against the
+        <a href="https://duckdb.org/community_extensions/download_metrics" target="_blank" rel="noopener"
+          >Community Extensions metrics endpoint</a
+        >. No server — the chart below is the result of <code>read_json(...)</code> running on this page.
+      </p>
+
+      <div class="cards">
+        <div class="card">
+          <div class="label">Downloads / week</div>
+          <div class="value" id="total">…</div>
+        </div>
+        <div class="card">
+          <div class="label">Weeks tracked</div>
+          <div class="value" id="weeks">…</div>
+        </div>
+        <div class="card">
+          <div class="label">Peak week</div>
+          <div class="value" id="peak">…</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div id="status">Booting DuckDB-Wasm…</div>
+        <figure id="chart"></figure>
+      </div>
+
+      <footer>
+        Counts are a Cloudflare estimate of <code>INSTALL mssql FROM community</code> events, aggregated across
+        DuckDB versions and platforms, for the trailing 7 days, sampled weekly. ·
+        <a href="https://github.com/hugr-lab/mssql-extension" target="_blank" rel="noopener">Source repo</a>
+      </footer>
+    </div>
+
+    <script type="module">
+      import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+      import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+
+      const EXTENSION = "mssql";
+      const START_YEAR = 2026;
+      const BASE = "https://community-extensions.duckdb.org";
+      const statusEl = document.getElementById("status");
+
+      const setStatus = (msg, isErr) => {
+        statusEl.textContent = msg;
+        statusEl.className = isErr ? "err" : "";
+      };
+
+      // ISO week of a UTC date -> [isoYear, isoWeek]
+      function isoYearWeek(d) {
+        const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+        const day = (t.getUTCDay() + 6) % 7; // Mon=0
+        t.setUTCDate(t.getUTCDate() - day + 3); // nearest Thursday
+        const isoYear = t.getUTCFullYear();
+        const firstThursday = new Date(Date.UTC(isoYear, 0, 4));
+        const fday = (firstThursday.getUTCDay() + 6) % 7;
+        firstThursday.setUTCDate(firstThursday.getUTCDate() - fday + 3);
+        const week = 1 + Math.round((t - firstThursday) / (7 * 864e5));
+        return [isoYear, week];
+      }
+
+      function weeklyUrls() {
+        const [curYear, curWeek] = isoYearWeek(new Date());
+        const urls = [];
+        for (let year = START_YEAR; year <= curYear; year++) {
+          const last = year === curYear ? curWeek : 53;
+          for (let week = 1; week <= last; week++) {
+            urls.push(`${BASE}/download-stats-weekly/${year}/${week}.json`);
+          }
+        }
+        return urls;
+      }
+
+      async function initDuckDB() {
+        const bundles = duckdb.getJsDelivrBundles();
+        const bundle = await duckdb.selectBundle(bundles);
+        const workerUrl = URL.createObjectURL(
+          new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
+        );
+        const worker = new Worker(workerUrl);
+        const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+        await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+        URL.revokeObjectURL(workerUrl);
+        return db.connect();
+      }
+
+      const rowsOf = (res) => res.toArray().map((r) => r.toJSON());
+
+      async function fetchTotal(conn) {
+        const res = await conn.query(
+          `SELECT ${EXTENSION} AS total FROM read_json('${BASE}/downloads-last-week.json')`
+        );
+        const rows = rowsOf(res);
+        return rows.length ? Number(rows[0].total) : 0;
+      }
+
+      // read_json aborts if any URL 404s (the current week may be unpublished),
+      // so drop trailing weeks and retry until the read succeeds.
+      async function fetchSeries(conn) {
+        let urls = weeklyUrls();
+        while (urls.length) {
+          const list = urls.map((u) => `'${u}'`).join(", ");
+          const sql =
+            `SELECT CAST(_last_update AS DATE)::VARCHAR AS d, ${EXTENSION} AS downloads ` +
+            `FROM read_json([${list}], union_by_name = true) ` +
+            `WHERE ${EXTENSION} IS NOT NULL ORDER BY _last_update`;
+          try {
+            const res = await conn.query(sql);
+            return rowsOf(res).map((r) => ({ date: new Date(r.d), downloads: Number(r.downloads) }));
+          } catch (e) {
+            if (String(e).includes("404") && urls.length > 1) {
+              urls = urls.slice(0, -1);
+              continue;
+            }
+            throw e;
+          }
+        }
+        return [];
+      }
+
+      function render(series, total) {
+        const fmt = (n) => n.toLocaleString("en-US");
+        document.getElementById("total").textContent = fmt(total);
+        document.getElementById("weeks").textContent = series.length;
+        const peak = series.reduce((m, p) => (p.downloads > m ? p.downloads : m), 0);
+        document.getElementById("peak").textContent = fmt(peak);
+
+        const chart = Plot.plot({
+          width: 840,
+          height: 360,
+          marginLeft: 56,
+          marginBottom: 36,
+          style: { fontSize: "12px" },
+          x: { type: "utc", label: null, grid: false },
+          y: { label: "downloads / week", grid: true, nice: true, zero: true },
+          marks: [
+            Plot.areaY(series, { x: "date", y: "downloads", fill: "#f6c344", fillOpacity: 0.18, curve: "monotone-x" }),
+            Plot.lineY(series, { x: "date", y: "downloads", stroke: "#d4960b", strokeWidth: 2.5, curve: "monotone-x" }),
+            Plot.dot(series, {
+              x: "date",
+              y: "downloads",
+              fill: "#f6c344",
+              stroke: "#fff",
+              r: 3,
+              tip: true,
+              title: (d) => `${d.date.toISOString().slice(0, 10)}\n${d.downloads.toLocaleString("en-US")} downloads`,
+            }),
+            Plot.ruleY([0]),
+          ],
+        });
+        document.getElementById("chart").replaceChildren(chart);
+        setStatus("");
+        statusEl.style.display = "none";
+      }
+
+      (async () => {
+        try {
+          setStatus("Booting DuckDB-Wasm…");
+          const conn = await initDuckDB();
+          try {
+            await conn.query("INSTALL httpfs; LOAD httpfs;");
+          } catch (_) {
+            /* httpfs is built into duckdb-wasm; ignore if not separately loadable */
+          }
+          setStatus("Querying download metrics with read_json()…");
+          const [series, total] = await Promise.all([fetchSeries(conn), fetchTotal(conn)]);
+          if (!series.length) {
+            setStatus("No data returned from the metrics endpoint.", true);
+            return;
+          }
+          render(series, total);
+        } catch (e) {
+          console.error(e);
+          setStatus("Failed to load metrics: " + e + " (the endpoint may be blocking cross-origin requests).", true);
+        }
+      })();
+    </script>
+  </body>
+</html>

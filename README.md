@@ -19,6 +19,8 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 
 ![Weekly downloads of the mssql DuckDB community extension](docs/assets/download-metrics.svg)
 
+📊 **[Interactive chart](https://hugr-lab.github.io/mssql-extension/)** — queried live in your browser with DuckDB-Wasm.
+
 > Latest published version **v0.2.1** · **4,441** downloads in the trailing 7 days (snapshot 2026-06-09 UTC). Counts are a Cloudflare estimate of `INSTALL mssql FROM community` events, aggregated across DuckDB versions and platforms. Source: [DuckDB Community Extensions download metrics](https://duckdb.org/community_extensions/download_metrics).
 
 <!-- METRICS-CHART:END -->
