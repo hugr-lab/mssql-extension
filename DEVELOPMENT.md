@@ -414,3 +414,51 @@ When debugging DML operations:
 3. Merge to main
 4. CI builds and tests on all platforms
 5. Tag release creates GitHub release with artifacts
+
+## Download Metrics Automation (PR #156)
+
+The README's badges, latest published version, and download-trend chart are
+maintained by a bot — do not edit those regions by hand.
+
+### How it works
+
+`scripts/update_download_metrics.py` dogfoods DuckDB itself (`httpfs` +
+`read_json`) to query the [Community Extensions download metrics](https://duckdb.org/community_extensions/download_metrics)
+endpoints:
+
+- `downloads-last-week.json` — rolling 7-day download count per extension
+- `download-stats-weekly/{year}/{week}.json` — the same snapshot archived per
+  ISO week (the time series; an unpublished current week 404s and is skipped)
+
+It renders `docs/assets/download-metrics.svg` (self-contained, no JS) and
+rewrites two managed regions in `README.md`:
+
+| Region markers | Content |
+|---|---|
+| `<!-- METRICS-BADGES:START/END -->` | Badge row above the title (CI, DuckDB version, release, downloads/week, license, stars) |
+| `<!-- METRICS-CHART:START/END -->` | Chart heading, SVG, link to the interactive page, summary line |
+
+Anything outside the markers is never touched; the script is idempotent
+(re-runs produce no diff).
+
+### Workflows
+
+- `.github/workflows/update-metrics.yml` — weekly cron (Mon 06:17 UTC) +
+  `workflow_dispatch`; installs the DuckDB CLI, runs the script, commits
+  `README.md` + the SVG only when changed. Holds `contents: write`, so the
+  CLI download is **pinned by version and sha256** — when bumping, update
+  `DUCKDB_VERSION` and `DUCKDB_SHA256` together in the same `env:` block.
+- `.github/workflows/pages.yml` — deploys `web/` to GitHub Pages on pushes to
+  `main` touching `web/`. Serves the DuckDB-Wasm interactive chart at
+  <https://hugr-lab.github.io/mssql-extension/> (same `read_json` queries,
+  run client-side; CDN imports are pinned to exact versions).
+
+### Running locally
+
+```bash
+# Needs a DuckDB CLI: $DUCKDB_BIN, ./build/release/duckdb, or PATH
+python3 scripts/update_download_metrics.py
+
+# Preview the interactive page
+python3 -m http.server -d web 8765   # then open http://localhost:8765/
+```
