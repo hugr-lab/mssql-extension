@@ -182,6 +182,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
 | `mssql_attach_validation_timeout` | 0 | ATTACH-time eager credential validation timeout in seconds (0 = inherit `mssql_connection_timeout`). Spec 047 FR-011. |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
+| `mssql_exec_invalidate_cache` | true | Auto-invalidate the catalog cache after DDL run via `mssql_exec()` (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC). Set false to preserve a large preloaded cache and invalidate manually with `mssql_invalidate_cache()`. Issue #151. |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
 | `mssql_insert_max_sql_bytes` | 8MB (8388608) | INSERT SQL size limit |
@@ -215,7 +216,8 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_scan(context, query)` | Table | Execute raw T-SQL, stream results |
 | `mssql_exec(context, sql)` | Scalar | Execute T-SQL, return affected row count |
 | `mssql_pool_stats([context])` | Table | View connection pool statistics |
-| `mssql_refresh_cache(context)` | Scalar | Refresh metadata cache |
+| `mssql_refresh_cache(context)` | Scalar | Refresh metadata cache (eager full reload) |
+| `mssql_invalidate_cache(context [, schema [, table]])` | Scalar | Lazy point invalidation — whole catalog / one schema / one table (keeps other tables' cached columns) |
 | `mssql_preload_catalog(context [, schema])` | Scalar | Bulk-load all metadata in one round trip |
 | `mssql_open(conn_string)` | Scalar | [DEPRECATED] Open standalone diagnostic connection (spec 047 FR-010 — prefer ATTACH + catalog-bound functions) |
 | `mssql_close(handle)` | Scalar | [DEPRECATED] Close diagnostic connection (spec 047 FR-010) |

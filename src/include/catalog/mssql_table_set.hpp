@@ -64,6 +64,11 @@ public:
 	// Invalidate cached entries (force reload on next access)
 	void Invalidate();
 
+	// Invalidate a single cached entry by name: drop its bound MSSQLTableEntry and force the
+	// (cheap) table-name list to be re-checked on next access, while keeping every OTHER
+	// table's cached metadata. Used for per-table cache invalidation.
+	void InvalidateEntry(const string &name);
+
 private:
 	//===----------------------------------------------------------------------===//
 	// Internal Methods

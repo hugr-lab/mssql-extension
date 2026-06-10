@@ -298,6 +298,25 @@ void MSSQLTableSet::Invalidate() {
 	}
 }
 
+void MSSQLTableSet::InvalidateEntry(const string &name) {
+	// Mirrors Invalidate()'s lock order (load_mutex_ -> entry_mutex_ -> names_mutex_) but
+	// evicts only `name`. Force the (cheap) name list to be re-checked so a CREATE/DROP/RENAME
+	// of this table is reflected on next access; every OTHER table's entry (and its cached
+	// column metadata) is preserved, so the expensive per-table metadata is not re-fetched.
+	std::lock_guard<std::mutex> lock(load_mutex_);
+	is_fully_loaded_.store(false);
+	names_loaded_.store(false);
+	{
+		std::lock_guard<std::mutex> elock(entry_mutex_);
+		entries_.erase(name);
+		attempted_tables_.erase(name);
+	}
+	{
+		std::lock_guard<std::mutex> nlock(names_mutex_);
+		known_table_names_.erase(name);
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Internal Methods
 //===----------------------------------------------------------------------===//

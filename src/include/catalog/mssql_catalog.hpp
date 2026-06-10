@@ -190,6 +190,10 @@ public:
 	// Invalidate a specific schema's table set (point invalidation)
 	void InvalidateSchemaTableSet(const string &schema_name);
 
+	// Invalidate a single table (point invalidation): re-fetch this table's columns and
+	// re-check its existence, while keeping every other table's cached column metadata.
+	void InvalidateTableEntry(const string &schema_name, const string &table_name);
+
 	// Perform full cache refresh (for mssql_refresh_cache())
 	// Unlike EnsureCacheLoaded() which only sets TTL, this does eager full refresh
 	void RefreshCache(ClientContext &context);
