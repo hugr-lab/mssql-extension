@@ -1,6 +1,29 @@
+<!-- METRICS-BADGES:START -->
+
+[![CI](https://github.com/hugr-lab/mssql-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/hugr-lab/mssql-extension/actions/workflows/ci.yml)
+[![DuckDB](https://img.shields.io/static/v1?label=duckdb&message=v1.4.1%2B&color=blue)](https://github.com/duckdb/duckdb/releases)
+[![Latest release](https://img.shields.io/github/v/release/hugr-lab/mssql-extension?label=release&color=blue)](https://github.com/hugr-lab/mssql-extension/releases/latest)
+[![Community downloads per week](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcommunity-extensions.duckdb.org%2Fdownloads-last-week.json&query=%24.mssql&label=downloads%2Fweek&color=brightgreen)](https://duckdb.org/community_extensions/download_metrics)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/hugr-lab/mssql-extension?style=flat&color=informational)](https://github.com/hugr-lab/mssql-extension/stargazers)
+
+<!-- METRICS-BADGES:END -->
+
 # DuckDB MSSQL Extension
 
 A DuckDB extension for connecting to Microsoft SQL Server databases using native TDS protocol - no ODBC, JDBC, or external drivers required.
+
+<!-- METRICS-CHART:START -->
+
+### 📈 Community Extension Downloads
+
+![Weekly downloads of the mssql DuckDB community extension](docs/assets/download-metrics.svg)
+
+📊 **[Interactive chart](https://hugr-lab.github.io/mssql-extension/)** — queried live in your browser with DuckDB-Wasm.
+
+> Latest published version **v0.2.1** · **4,441** downloads in the trailing 7 days (snapshot 2026-06-09 UTC). Counts are a Cloudflare estimate of `INSTALL mssql FROM community` events, aggregated across DuckDB versions and platforms. Source: [DuckDB Community Extensions download metrics](https://duckdb.org/community_extensions/download_metrics).
+
+<!-- METRICS-CHART:END -->
 
 > **Experimental**: This extension is under active development. APIs and behavior may change between releases. We welcome contributions, bug reports, and testing feedback!
 

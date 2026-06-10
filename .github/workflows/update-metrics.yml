@@ -1,0 +1,61 @@
+name: Update download metrics
+
+# Keeps the README badges, latest published version and the download-metrics
+# chart in sync with the DuckDB Community Extensions metrics endpoint.
+# Scheduled weekly; also runnable on demand. Scheduled runs only fire on the
+# repository's default branch.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC (the weekly archive refreshes daily ~04:00Z)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-metrics
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install DuckDB CLI
+        # Pinned version + checksum (not "latest"): this workflow holds
+        # contents:write to the default branch, so the CLI it executes must be
+        # exactly the reviewed bytes. Update both values together when bumping.
+        env:
+          DUCKDB_VERSION: v1.5.3
+          DUCKDB_SHA256: 35caef1fecbc8d7e2c07de4fd2cdefc5189ec9ba9e1cca228fb1a1c48cc52a8a
+        run: |
+          curl -fsSL -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          echo "${DUCKDB_SHA256}  /tmp/duckdb.zip" | sha256sum -c -
+          unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
+          "$HOME/.local/bin/duckdb" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Update README metrics (data fetched/aggregated by DuckDB)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/update_download_metrics.py
+
+      - name: Commit and push if changed
+        run: |
+          if [[ -z "$(git status --porcelain README.md docs/assets/download-metrics.svg)" ]]; then
+            echo "No metrics changes."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md docs/assets/download-metrics.svg
+          git commit -m "chore(docs): refresh download metrics [skip ci]"
+          git push
