@@ -1,0 +1,108 @@
+# name: test/sql/catalog/exec_invalidate_cache_setting.test
+# description: mssql_exec_invalidate_cache setting + mssql_invalidate_cache() point invalidation (issue #151 follow-up)
+# group: [mssql]
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# =============================================================================
+# mssql_invalidate_cache() returns true at each granularity
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.InvCacheTest'',''U'') IS NOT NULL DROP TABLE dbo.InvCacheTest');
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.InvCacheTest (id INT)');
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.InvCacheTest;
+----
+0
+
+query T
+SELECT mssql_invalidate_cache('mssql');
+----
+true
+
+query T
+SELECT mssql_invalidate_cache('mssql', 'dbo');
+----
+true
+
+query T
+SELECT mssql_invalidate_cache('mssql', 'dbo', 'InvCacheTest');
+----
+true
+
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.InvCacheTest');
+
+# =============================================================================
+# Setting OFF: mssql_exec() DDL no longer auto-invalidates; manual invalidation recovers
+# =============================================================================
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.InvOffTest'',''U'') IS NOT NULL DROP TABLE dbo.InvOffTest');
+
+# Warm the cache (create + read + replace + read) so the bound table entry exists
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.InvOffTest AS SELECT 1 AS id, 'a' AS name;
+
+query II
+SELECT id, name FROM mssql.dbo.InvOffTest ORDER BY id;
+----
+1	a
+
+statement ok
+CREATE OR REPLACE TABLE mssql.dbo.InvOffTest AS SELECT 2 AS id, 'b' AS name;
+
+query II
+SELECT id, name FROM mssql.dbo.InvOffTest ORDER BY id;
+----
+2	b
+
+# Raw DROP via mssql_exec — with the setting OFF the cache is NOT invalidated
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.InvOffTest');
+
+# CREATE TABLE IF NOT EXISTS sees the stale cached entry and skips creation
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.InvOffTest AS SELECT i AS id, 'r' || i::VARCHAR AS name FROM range(10) t(i);
+
+# ... so the read fails (table was dropped server-side, never recreated)
+statement error
+SELECT COUNT(*) FROM mssql.dbo.InvOffTest;
+----
+Invalid object name
+
+# Manual point invalidation (table granularity) recovers coherence
+statement ok
+SELECT mssql_invalidate_cache('mssql', 'dbo', 'InvOffTest');
+
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.InvOffTest AS SELECT i AS id, 'r' || i::VARCHAR AS name FROM range(10) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.InvOffTest;
+----
+10
+
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.InvOffTest');
+
+statement ok
+RESET mssql_exec_invalidate_cache;
+
+statement ok
+DETACH mssql;

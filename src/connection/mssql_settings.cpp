@@ -115,6 +115,14 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  Value::BIGINT(0),	 // Default: disabled, manual refresh only
 							  ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_exec_invalidate_cache - Auto-invalidate the catalog cache after DDL run via mssql_exec()
+	// (issue #151). Disable to preserve a large manually-preloaded cache and invalidate yourself with
+	// mssql_invalidate_cache() / mssql_refresh_cache().
+	config.AddExtensionOption(
+		"mssql_exec_invalidate_cache",
+		"Invalidate the catalog cache after DDL executed via mssql_exec() (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC)",
+		LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	//===----------------------------------------------------------------------===//
 	// Statistics Settings
 	//===----------------------------------------------------------------------===//
@@ -506,6 +514,14 @@ bool LoadCTASUseBCP(ClientContext &context) {
 		return val.GetValue<bool>();
 	}
 	return DEFAULT_CTAS_USE_BCP;
+}
+
+bool LoadExecInvalidateCache(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_exec_invalidate_cache", val)) {
+		return val.GetValue<bool>();
+	}
+	return true;  // Default: auto-invalidate after mssql_exec() DDL (issue #151)
 }
 
 }  // namespace duckdb

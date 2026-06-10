@@ -304,6 +304,16 @@ flowchart TD
 
 Statements run through `mssql_exec()` are plain T-SQL — DuckDB never sees them, so it cannot invalidate the cache on its own. Spec/issue **#151**: `mssql_exec()` detects DDL keywords (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) and calls `InvalidateMetadataCache()` after a successful run. `INSERT`/`UPDATE`/`DELETE` do not invalidate anything, so transaction-pinned DML through `mssql_exec()` is unaffected.
 
+The auto-invalidation is gated by the `mssql_exec_invalidate_cache` setting (default `true`). Users with a large `mssql_preload_catalog` cache can set it `false` and invalidate at a chosen granularity with `mssql_invalidate_cache(catalog [, schema [, table]])`:
+
+| Granularity | Catalog call | Metadata cache | Table set |
+|---|---|---|---|
+| catalog | `InvalidateMetadataCache()` | all schemas + all columns | every schema's bound entries |
+| schema | `InvalidateSchemaTableSet(schema)` | schema table list + that schema's columns | schema's bound entries |
+| table | `InvalidateTableEntry(schema, table)` | that table's columns + `InvalidateSchemaTableList` (existence only) | `InvalidateEntry(table)` (one entry) |
+
+Per-table is the cheap one: `InvalidateSchemaTableList` re-checks the table list (existence) **without** dropping any other table's column metadata, and `MSSQLTableSet::InvalidateEntry` evicts only the one bound entry — so a single `ALTER`/`DROP`/`CREATE` against a huge preloaded schema re-fetches just that table's columns, not the whole schema's.
+
 ```mermaid
 sequenceDiagram
     participant U as DuckDB

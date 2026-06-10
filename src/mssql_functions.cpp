@@ -427,7 +427,9 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 			// raw DROP followed by CREATE ... IF NOT EXISTS). InvalidateMetadataCache() is
 			// the lazy path: it marks the metadata cache stale AND invalidates each schema's
 			// table set (evicting bound table entries), with reload deferred to next access.
-			if (ExecSqlMayChangeSchema(sql)) {
+			// Gated by mssql_exec_invalidate_cache (default true) so users with a large
+			// manually-preloaded cache can opt out and invalidate via mssql_invalidate_cache().
+			if (ExecSqlMayChangeSchema(sql) && LoadExecInvalidateCache(client_context)) {
 				catalog.InvalidateMetadataCache();
 			}
 
