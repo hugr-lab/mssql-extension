@@ -47,6 +47,14 @@ A DuckDB extension for connecting to Microsoft SQL Server databases using native
 - ATTACH-time credential validation (opt-out via `lazy_validation true`)
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
+## Support MSSQL Extension
+
+MSSQL Extension is an open-source DuckDB extension maintained in spare time.
+
+If it helps you or your organization, consider sponsoring its development through GitHub Sponsors.
+
+Your support helps fund maintenance, bug fixes, testing, and new features.
+
 ## Quick Start
 
 ### Prerequisites
