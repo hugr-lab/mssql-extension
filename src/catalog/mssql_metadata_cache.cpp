@@ -1073,6 +1073,16 @@ void MSSQLMetadataCache::InvalidateSchema(const string &schema_name) {
 	}
 }
 
+void MSSQLMetadataCache::InvalidateSchemaTableList(const string &schema_name) {
+	std::lock_guard<std::mutex> lock(schemas_mutex_);
+	auto it = schemas_.find(schema_name);
+	if (it != schemas_.end()) {
+		// Existence only — re-fetch the table list, but keep every table's cached
+		// column metadata (the expensive part). Used by per-table invalidation.
+		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
+	}
+}
+
 void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string &table_name) {
 	std::lock_guard<std::mutex> lock(schemas_mutex_);
 	auto schema_it = schemas_.find(schema_name);

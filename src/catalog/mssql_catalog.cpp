@@ -895,6 +895,23 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 	}
 }
 
+void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string &table_name) {
+	if (metadata_cache_) {
+		// Re-fetch this table's columns (ALTER) ...
+		metadata_cache_->InvalidateTable(schema_name, table_name);
+		// ... and re-check the schema's table list for existence (CREATE/DROP/RENAME), but
+		// WITHOUT dropping every other table's cached columns.
+		metadata_cache_->InvalidateSchemaTableList(schema_name);
+	}
+
+	// Evict the single bound entry from the schema's table set (keeps the rest).
+	std::lock_guard<std::mutex> lock(schema_mutex_);
+	auto it = schema_entries_.find(schema_name);
+	if (it != schema_entries_.end()) {
+		it->second->GetTableSet().InvalidateEntry(table_name);
+	}
+}
+
 void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 	// Check if catalog integration is disabled
 	if (!catalog_enabled_) {

@@ -6,6 +6,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/database.hpp"
@@ -325,6 +326,23 @@ MSSQL_BIND_SCALAR_SIG(MSSQLExecBind) {
 	return make_uniq<MSSQLExecBindData>(context_name);
 }
 
+// Heuristic: does this raw T-SQL statement potentially change schema/catalog
+// metadata? Used to invalidate the catalog cache after mssql_exec() runs DDL so
+// that subsequent catalog operations (CREATE TABLE IF NOT EXISTS, reads) don't
+// act on stale existence metadata (issue #151). Over-detection only costs a
+// metadata refresh; under-detection would leave the cache stale, so we err
+// toward invalidating — including EXEC, since a stored procedure may run DDL.
+static bool ExecSqlMayChangeSchema(const string &sql) {
+	auto upper = StringUtil::Upper(sql);
+	static const char *kSchemaKeywords[] = {"CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME", "EXEC"};
+	for (auto keyword : kSchemaKeywords) {
+		if (upper.find(keyword) != string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Execute function for mssql_exec
 static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<MSSQLExecBindData>();
@@ -400,6 +418,19 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 				// Surface SQL Server error with details
 				throw InvalidInputException("MSSQL execution error: SQL Server error %d: %s", query_result.error_number,
 											query_result.error_message);
+			}
+
+			// Issue #151: raw DDL run through mssql_exec() bypasses the catalog metadata
+			// cache. If the statement may have changed schema, invalidate the cache so a
+			// subsequent CREATE TABLE IF NOT EXISTS / read sees the real server-side state
+			// instead of a stale cached entry (which caused "Invalid object name" after a
+			// raw DROP followed by CREATE ... IF NOT EXISTS). InvalidateMetadataCache() is
+			// the lazy path: it marks the metadata cache stale AND invalidates each schema's
+			// table set (evicting bound table entries), with reload deferred to next access.
+			// Gated by mssql_exec_invalidate_cache (default true) so users with a large
+			// manually-preloaded cache can opt out and invalidate via mssql_invalidate_cache().
+			if (ExecSqlMayChangeSchema(sql) && LoadExecInvalidateCache(client_context)) {
+				catalog.InvalidateMetadataCache();
 			}
 
 			// Return affected row count from DONE token

@@ -1,0 +1,94 @@
+# name: test/sql/catalog/exec_ddl_cache_invalidation.test
+# description: DDL run via mssql_exec() invalidates the catalog metadata cache so subsequent catalog operations see real server-side state (regression for issue #151)
+# group: [mssql]
+#
+# Before the fix, mssql_exec('DROP TABLE ...') (raw T-SQL) left the catalog cache
+# entry in place. A following CREATE TABLE IF NOT EXISTS then saw a stale "exists"
+# and skipped creation, and the next read failed with "Invalid object name".
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.ExecCacheTest'',''U'') IS NOT NULL DROP TABLE dbo.ExecCacheTest');
+
+# Warm the catalog cache the same way the original repro did: create, read,
+# skip-create, read, a rejected duplicate create, then replace and read again.
+# The reads are what bind the table entry into the cache, so that the later raw
+# DROP leaves a stale entry behind (the bug).
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.ExecCacheTest AS SELECT 1 AS id, 'first' AS name;
+
+query II
+SELECT id, name FROM mssql.dbo.ExecCacheTest ORDER BY id;
+----
+1	first
+
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.ExecCacheTest AS SELECT 2 AS id, 'second' AS name;
+
+query II
+SELECT id, name FROM mssql.dbo.ExecCacheTest ORDER BY id;
+----
+1	first
+
+statement error
+CREATE TABLE mssql.dbo.ExecCacheTest AS SELECT 3 AS id, 'third' AS name;
+----
+already an object named
+
+statement ok
+CREATE OR REPLACE TABLE mssql.dbo.ExecCacheTest AS SELECT 4 AS id, 'fourth' AS name;
+
+query II
+SELECT id, name FROM mssql.dbo.ExecCacheTest ORDER BY id;
+----
+4	fourth
+
+# Raw DROP via mssql_exec. With the fix this invalidates the catalog cache.
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.ExecCacheTest');
+
+# CREATE TABLE IF NOT EXISTS must actually create now (cache no longer reports it
+# as existing); before the fix this was skipped and the read below failed.
+statement ok
+CREATE TABLE IF NOT EXISTS mssql.dbo.ExecCacheTest AS
+SELECT i AS id, 'row_' || i::VARCHAR AS name FROM range(100) t(i);
+
+query I
+SELECT COUNT(*) FROM mssql.dbo.ExecCacheTest;
+----
+100
+
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.ExecCacheTest');
+
+# Reverse direction: a brand-new table created entirely via raw mssql_exec becomes
+# visible to the catalog (CREATE invalidates the cache so the table list is reloaded).
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.ExecCacheCreate'',''U'') IS NOT NULL DROP TABLE dbo.ExecCacheCreate');
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.ExecCacheCreate (id INT, label NVARCHAR(50))');
+
+statement ok
+SELECT mssql_exec('mssql', 'INSERT INTO dbo.ExecCacheCreate VALUES (7, ''seven'')');
+
+query IT
+SELECT id, label FROM mssql.dbo.ExecCacheCreate ORDER BY id;
+----
+7	seven
+
+# Cleanup
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.ExecCacheCreate');
+
+statement ok
+DETACH mssql;

@@ -234,6 +234,11 @@ public:
 	// Invalidate schema's table list (for CREATE/DROP TABLE)
 	void InvalidateSchema(const string &schema_name);
 
+	// Invalidate ONLY the schema's table list (existence), keeping every table's cached
+	// column metadata. Used by per-table invalidation so a CREATE/DROP is reflected without
+	// re-fetching the columns of every other table in the schema.
+	void InvalidateSchemaTableList(const string &schema_name);
+
 	// Invalidate table's column metadata (for ALTER TABLE)
 	void InvalidateTable(const string &schema_name, const string &table_name);
 

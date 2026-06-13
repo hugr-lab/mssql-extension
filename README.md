@@ -1039,7 +1039,7 @@ SELECT mssql_exec('sqlserver', 'CREATE UNIQUE INDEX IX_users_username ON dbo.use
 SELECT mssql_exec('sqlserver', 'DROP INDEX IX_users_email ON dbo.users');
 ```
 
-> **Note**: After DDL operations via `mssql_exec()`, use `mssql_refresh_cache('sqlserver')` to update the metadata cache. Standard DuckDB DDL operations automatically refresh the cache.
+> **Note**: Schema-changing statements run through `mssql_exec()` (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) invalidate the metadata cache automatically, the same as standard DuckDB DDL. To preserve a large manually-preloaded cache, set `mssql_exec_invalidate_cache = false` and invalidate yourself with `mssql_invalidate_cache('sqlserver' [, schema [, table]])` (lazy, point-scoped) or `mssql_refresh_cache('sqlserver')` (eager full reload). You also need a manual invalidate to pick up changes made entirely out of band (e.g. by another client) while `mssql_catalog_cache_ttl` is `0`. See [Cache & invalidation](DATAMODEL.md#cache-invalidation) in `DATAMODEL.md` for how the two-layer cache works.
 
 ## Function Reference
 
@@ -1182,6 +1182,26 @@ SELECT mssql_refresh_cache('sqlserver');
 - Non-existent catalog throws an error
 - Catalog that is not an MSSQL type throws an error
 
+### mssql_invalidate_cache()
+
+Lazily invalidate the metadata cache at a chosen granularity, without an eager reload (reload happens on next access). Unlike `mssql_refresh_cache()`, this is point-scoped, so it can drop a single table or schema while keeping the rest of a large preloaded cache intact.
+
+**Signature:** `mssql_invalidate_cache(catalog_name VARCHAR [, schema VARCHAR [, table VARCHAR]]) -> BOOLEAN`
+
+```sql
+-- Whole catalog (lazy; equivalent to what mssql_exec() DDL triggers automatically)
+SELECT mssql_invalidate_cache('sqlserver');
+
+-- One schema
+SELECT mssql_invalidate_cache('sqlserver', 'dbo');
+
+-- One table — re-fetches this table's columns + re-checks its existence,
+-- keeping every other table's cached column metadata
+SELECT mssql_invalidate_cache('sqlserver', 'dbo', 'orders');
+```
+
+Use this after changing schema out of band (e.g. via `mssql_exec()` with `mssql_exec_invalidate_cache = false`, or from another client) instead of paying for a full `mssql_refresh_cache()` reload.
+
 ### mssql_preload_catalog()
 
 Bulk-load all metadata (schemas, tables, columns) for an attached MSSQL catalog in a single operation. This is useful for large databases where you want to avoid per-table metadata queries during subsequent queries.
@@ -1285,6 +1305,7 @@ Queries involving unsupported types will raise an error.
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
+| `mssql_exec_invalidate_cache` | BOOLEAN | true | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Set `false` to keep a large preloaded cache and invalidate manually with `mssql_invalidate_cache()`. |
 | `mssql_attach_validation_timeout` | BIGINT | 0 | ≥0 | ATTACH-time eager-validation timeout (seconds). `0` inherits `mssql_connection_timeout`. Spec 047 FR-011. |
 
 ### Statistics Settings
