@@ -1,0 +1,5 @@
+# Fuzz seed corpora are raw binary inputs (TDS/UTF-16 bytes). Mark them binary so
+# git/GitHub diff them as "Binary files differ" instead of trying to render the
+# raw bytes as text — some seeds contain non-UTF-8 bytes (e.g. UTF-16 surrogate
+# halves) that otherwise break text-based diff consumers.
+* binary
