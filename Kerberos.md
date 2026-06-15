@@ -49,6 +49,16 @@ negotiates SPNEGO with the SQL Server's SPN, and connects.
 | Acquire ticket | `kinit user@REALM` | `kinit user@REALM` | `kinit user@REALM` |
 | Verify | `klist` | `klist` | `klist` |
 
+> **The Kerberos runtime is loaded on demand (spec 053 / issue #161).** The
+> extension itself loads with **no** dependency on `libgssapi_krb5.so.2` /
+> `libkrb5.so.3` — a minimal image without Kerberos installed can `LOAD mssql`
+> and use SQL or Azure AD authentication fine. The runtime is `dlopen`ed only
+> the first time you select `authenticator=krb5` (or `Trusted_Connection=yes`).
+> If it is missing at that point you get a clear error naming the package to
+> install (`libgssapi-krb5-2` on Debian/Ubuntu, `krb5-libs` on RHEL/Fedora),
+> not a load failure. macOS uses the always-present GSS system framework, so
+> nothing extra is needed there.
+
 Minimal `/etc/krb5.conf`:
 
 ```ini

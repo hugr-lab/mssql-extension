@@ -30,8 +30,8 @@ large MVP phase; US2/US3 are verification + UX refinement on top of it.
 
 **Purpose**: Confirm the build environment and locate the exact edit sites.
 
-- [ ] T001 Verify the Kerberos dev headers are present for the build (Debian/Ubuntu `libkrb5-dev`, RHEL/Fedora `krb5-devel`); confirm `pkg_check_modules(MSSQL_GSSAPI krb5-gssapi)` / `MSSQL_KRB5_BASE krb5` succeed in a configure run so include dirs still resolve after the link is dropped.
-- [ ] T002 Re-confirm the full `gss_*` / `krb5_*` call-site inventory in `src/tds/auth/krb5_authenticator.cpp` and `src/tds/auth/krb5_test_function.cpp` (8 `gss_*`, 13 `krb5_*` + 4 test-only `krb5_*` per data-model.md) so no call site is missed during rewiring.
+- [X] T001 Verify the Kerberos dev headers are present for the build (Debian/Ubuntu `libkrb5-dev`, RHEL/Fedora `krb5-devel`); confirm `pkg_check_modules(MSSQL_GSSAPI krb5-gssapi)` / `MSSQL_KRB5_BASE krb5` succeed in a configure run so include dirs still resolve after the link is dropped.
+- [X] T002 Re-confirm the full `gss_*` / `krb5_*` call-site inventory in `src/tds/auth/krb5_authenticator.cpp` and `src/tds/auth/krb5_test_function.cpp` (8 `gss_*`, 13 `krb5_*` + 4 test-only `krb5_*` per data-model.md) so no call site is missed during rewiring.
 
 ---
 
@@ -42,10 +42,10 @@ cannot be dropped until this exists.
 
 **⚠️ CRITICAL**: All user-story work depends on this phase.
 
-- [ ] T003 Create `src/include/tds/auth/gssapi_runtime.hpp` (guarded by `MSSQL_ENABLE_KRB5`, **no DuckDB headers**): declare `struct GssApiFns` (8 function pointers) and `struct Krb5Fns` (13 + 4 test pointers) with signatures taken verbatim from `<gssapi/gssapi.h>`/`<krb5.h>`; declare `class Krb5RuntimeUnavailable : public std::runtime_error`; declare accessors `const GssApiFns &GetGssApi();` and `const Krb5Fns &GetKrb5();`. Namespace `duckdb::tds`. C++11-only constructs (per research R7).
-- [ ] T004 Implement `src/tds/auth/gssapi_runtime.cpp` — Linux path: `dlopen` (`RTLD_NOW | RTLD_LOCAL`) trying SONAMEs `libgssapi_krb5.so.2`→`libgssapi_krb5.so` (gss) and `libkrb5.so.3`→`libkrb5.so` (krb5); `dlsym` each symbol; `std::call_once`-guarded one-time fill of the cached tables; on any failure throw `Krb5RuntimeUnavailable` with message naming the missing object + `dlerror()` + install package (`libgssapi-krb5-2` / `krb5-libs`) per contracts/gssapi_runtime.md (FR-005, FR-009, R3/R4/R6).
-- [ ] T005 In the same `gssapi_runtime.cpp`, add the macOS (`__APPLE__`) path: populate `GssApiFns` with direct `&gss_*` addresses (framework still linked), no `dlopen`; `GetKrb5()` is unused on macOS (R5).
-- [ ] T006 CMakeLists.txt: add `src/tds/auth/gssapi_runtime.cpp` to `EXTENSION_SOURCES` inside the existing `if(MSSQL_KRB5_AVAILABLE)` block (next to `krb5_authenticator.cpp`, ~line 217).
+- [X] T003 Create `src/include/tds/auth/gssapi_runtime.hpp` (guarded by `MSSQL_ENABLE_KRB5`, **no DuckDB headers**): declare `struct GssApiFns` (8 function pointers) and `struct Krb5Fns` (13 + 4 test pointers) with signatures taken verbatim from `<gssapi/gssapi.h>`/`<krb5.h>`; declare `class Krb5RuntimeUnavailable : public std::runtime_error`; declare accessors `const GssApiFns &GetGssApi();` and `const Krb5Fns &GetKrb5();`. Namespace `duckdb::tds`. C++11-only constructs (per research R7).
+- [X] T004 Implement `src/tds/auth/gssapi_runtime.cpp` — Linux path: `dlopen` (`RTLD_NOW | RTLD_LOCAL`) trying SONAMEs `libgssapi_krb5.so.2`→`libgssapi_krb5.so` (gss) and `libkrb5.so.3`→`libkrb5.so` (krb5); `dlsym` each symbol; `std::call_once`-guarded one-time fill of the cached tables; on any failure throw `Krb5RuntimeUnavailable` with message naming the missing object + `dlerror()` + install package (`libgssapi-krb5-2` / `krb5-libs`) per contracts/gssapi_runtime.md (FR-005, FR-009, R3/R4/R6).
+- [X] T005 In the same `gssapi_runtime.cpp`, add the macOS (`__APPLE__`) path: populate `GssApiFns` with direct `&gss_*` addresses (framework still linked), no `dlopen`; `GetKrb5()` is unused on macOS (R5).
+- [X] T006 CMakeLists.txt: add `src/tds/auth/gssapi_runtime.cpp` to `EXTENSION_SOURCES` inside the existing `if(MSSQL_KRB5_AVAILABLE)` block (next to `krb5_authenticator.cpp`, ~line 217).
 
 **Checkpoint**: Shim compiles and links (still alongside the existing direct calls). No behavior change yet.
 
@@ -59,11 +59,11 @@ cannot be dropped until this exists.
 
 ### Implementation for User Story 1
 
-- [ ] T007 [US1] Rewire all `gss_*` call sites in `src/tds/auth/krb5_authenticator.cpp` through the shim: at the top of `AcquireCredentials()` and `DoSecContextStep()` grab `const auto &gss = GetGssApi();` and replace `gss_xxx(` → `gss.xxx(`; route `ThrowGssError` through `gss.display_status`. Include `tds/auth/gssapi_runtime.hpp`. Constructor still performs **no** GSSAPI calls (lazy trigger stays on first `InitialBytes()`).
-- [ ] T008 [US1] Rewire all `krb5_*` call sites (raw-mode credential path) in `src/tds/auth/krb5_authenticator.cpp` through `const auto &k = GetKrb5();` (`k.xxx(`), behind the existing `MSSQL_KRB5_HAS_MIT_EXTENSIONS` guard.
-- [ ] T009 [US1] Rewire all `gss_*` / `krb5_*` call sites in `src/tds/auth/krb5_test_function.cpp` through `GetGssApi()` / `GetKrb5()` so it carries no direct symbol references.
-- [ ] T010 [US1] Confirm `src/include/tds/auth/krb5_authenticator.hpp` still includes the GSSAPI headers (types/handles needed) but references **no** GSSAPI function symbol — header stays link-clean and DuckDB-free.
-- [ ] T011 [US1] CMakeLists.txt non-Apple branch (static ~lines 251–259 **and** loadable ~lines 293–297): **keep** `target_include_directories(... ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})`; **remove** `target_link_libraries(... ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})`; add `${CMAKE_DL_LIBS}` to the link line. Update the adjacent comment to note link-time deps are intentionally dropped on Linux (lazy `dlopen`). Apple branch unchanged.
+- [X] T007 [US1] Rewire all `gss_*` call sites in `src/tds/auth/krb5_authenticator.cpp` through the shim: at the top of `AcquireCredentials()` and `DoSecContextStep()` grab `const auto &gss = GetGssApi();` and replace `gss_xxx(` → `gss.xxx(`; route `ThrowGssError` through `gss.display_status`. Include `tds/auth/gssapi_runtime.hpp`. Constructor still performs **no** GSSAPI calls (lazy trigger stays on first `InitialBytes()`).
+- [X] T008 [US1] Rewire all `krb5_*` call sites (raw-mode credential path) in `src/tds/auth/krb5_authenticator.cpp` through `const auto &k = GetKrb5();` (`k.xxx(`), behind the existing `MSSQL_KRB5_HAS_MIT_EXTENSIONS` guard.
+- [X] T009 [US1] Rewire all `gss_*` / `krb5_*` call sites in `src/tds/auth/krb5_test_function.cpp` through `GetGssApi()` / `GetKrb5()` so it carries no direct symbol references.
+- [X] T010 [US1] Confirm `src/include/tds/auth/krb5_authenticator.hpp` still includes the GSSAPI headers (types/handles needed) but references **no** GSSAPI function symbol — header stays link-clean and DuckDB-free.
+- [X] T011 [US1] CMakeLists.txt non-Apple branch (static ~lines 251–259 **and** loadable ~lines 293–297): **keep** `target_include_directories(... ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})`; **remove** `target_link_libraries(... ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})`; add `${CMAKE_DL_LIBS}` to the link line. Update the adjacent comment to note link-time deps are intentionally dropped on Linux (lazy `dlopen`). Apple branch unchanged.
 - [ ] T012 [US1] Build on Linux (`make`) and assert no GSSAPI/krb5 in `DT_NEEDED`: `ldd build/release/extension/mssql/mssql.duckdb_extension | grep -iE 'gssapi|krb5'` returns empty (SC-002).
 - [ ] T013 [US1] Clean-image load test reproducing issue #161 (no Kerberos package): build/use a minimal image, `INSTALL mssql FROM local_build; LOAD mssql;` succeeds and a SQL-auth `ATTACH` works (SC-001, SC-005). Capture as a runnable script (e.g. under `test/` or documented in quickstart.md).
 
@@ -95,9 +95,9 @@ cannot be dropped until this exists.
 
 ### Implementation for User Story 3
 
-- [ ] T017 [US3] Finalize the `Krb5RuntimeUnavailable` message text in `gssapi_runtime.cpp` to include all three parts (missing object, `dlerror()`, package recommendation) per the error contract (FR-005).
-- [ ] T018 [US3] In `src/tds/auth/krb5_test_function.cpp`, wrap the body so a thrown `Krb5RuntimeUnavailable` is caught and returned as the function's result string (functions stay registered and crash-free when the runtime is absent) (FR-006).
-- [ ] T019 [P] [US3] Add a C++ unit test in `test/cpp/test_gssapi_runtime.cpp` asserting the `Krb5RuntimeUnavailable::what()` text contains the missing-library name and the install package (SC-004); register it in the test CMake. Verify a non-Kerberos connection path never constructs the shim (FR-010).
+- [X] T017 [US3] Finalize the `Krb5RuntimeUnavailable` message text in `gssapi_runtime.cpp` to include all three parts (missing object, `dlerror()`, package recommendation) per the error contract (FR-005).
+- [X] T018 [US3] In `src/tds/auth/krb5_test_function.cpp`, wrap the body so a thrown `Krb5RuntimeUnavailable` is caught and returned as the function's result string (functions stay registered and crash-free when the runtime is absent) (FR-006).
+- [X] T019 [P] [US3] Add a C++ unit test in `test/cpp/test_gssapi_runtime.cpp` asserting the `Krb5RuntimeUnavailable::what()` text contains the missing-library name and the install package (SC-004); register it in the test CMake. Verify a non-Kerberos connection path never constructs the shim (FR-010).
 
 **Checkpoint**: All three observable outcomes verified.
 
@@ -105,8 +105,8 @@ cannot be dropped until this exists.
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T020 [P] Update docs: `Kerberos.md` (note the runtime is now lazily loaded; name the install packages per distro) and the CLAUDE.md Integrated Authentication section / implementation-files list to add `gssapi_runtime.{hpp,cpp}`.
-- [ ] T021 [P] Run `clang-format` (v14) over the new/changed files in `src/tds/auth/` and `src/include/tds/auth/`.
+- [X] T020 [P] Update docs: `Kerberos.md` (note the runtime is now lazily loaded; name the install packages per distro) and the CLAUDE.md Integrated Authentication section / implementation-files list to add `gssapi_runtime.{hpp,cpp}`.
+- [X] T021 [P] Run `clang-format` (v14) over the new/changed files in `src/tds/auth/` and `src/include/tds/auth/`.
 - [ ] T022 Run `make test` (unit tests, no SQL Server) and the full quickstart.md verification checklist; confirm SC-001…SC-005 all pass.
 
 ---

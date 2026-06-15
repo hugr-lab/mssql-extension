@@ -273,7 +273,8 @@ POSIX Kerberos and Windows SSPI integrated authentication, shipped via spec 042.
 
 **Implementation files:**
 - `src/include/tds/auth/iauthenticator.hpp` — three-method interface (`InitialBytes` / `NextBytes` / `Free`), modeled on `microsoft/go-mssqldb`'s `integratedauth.IntegratedAuthenticator`
-- `src/tds/auth/krb5_authenticator.{hpp,cpp}` — GSSAPI implementation (POSIX, compiled when `MSSQL_ENABLE_KRB5` is defined)
+- `src/tds/auth/krb5_authenticator.{hpp,cpp}` — GSSAPI implementation (POSIX, compiled when `MSSQL_ENABLE_KRB5` is defined). All `gss_*`/`krb5_*` calls go through the runtime shim (spec 053).
+- `src/tds/auth/gssapi_runtime.{hpp,cpp}` — **spec 053 (#161)**: lazy `dlopen`/`dlsym` loader for GSSAPI/krb5. On Linux the extension carries NO link-time (`DT_NEEDED`) dependency on `libgssapi_krb5.so.2`/`libkrb5.so.3`; the library is loaded on first `authenticator=krb5` use (thread-safe via `std::call_once`). Throws `Krb5RuntimeUnavailable` (names the missing `.so` + install package) when absent. macOS fills the table with direct `&gss_*` addresses (system framework, always present). CMake keeps the GSSAPI/krb5 include dirs but drops `target_link_libraries` on Linux.
 - `src/tds/auth/winsspi_authenticator.{hpp,cpp}` — Windows SSPI implementation (Phase 4, not yet present)
 - `src/include/tds/auth/integrated_auth_strategy.hpp` — adapter wrapping `IAuthenticator` in the existing `AuthenticationStrategy` interface
 - `src/tds/auth/auth_strategy_factory.cpp` — `AuthStrategyFactory::Create` dispatches `KRB5` / `WINSSPI` based on `info.auth_method`

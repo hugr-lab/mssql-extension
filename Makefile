@@ -201,6 +201,34 @@ test-login7-encoding: debug
 	@echo "Running LOGIN7 + simdutf unit test..."
 	build/test/test_login7_encoding
 
+# Spec 053 (#161): lazy GSSAPI/krb5 runtime loader unit test.
+# Pure in-memory — does NOT need SQL Server or a KDC. On Linux it links only
+# libdl (NOT libgssapi/libkrb5), demonstrating the no-link property: the shim
+# resolves gss_*/krb5_* at runtime via dlopen. Headers come from pkg-config.
+# On macOS the GSS system framework is linked (the macOS path uses direct
+# symbol addresses).
+GSSRT_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations -DMSSQL_ENABLE_KRB5=1
+GSSRT_TEST_INCLUDES := -I src/include
+GSSRT_TEST_UNAME := $(shell uname -s)
+ifeq ($(GSSRT_TEST_UNAME),Darwin)
+GSSRT_TEST_PLATFORM_LIBS := -framework GSS
+else
+GSSRT_TEST_INCLUDES += $(shell pkg-config --cflags krb5-gssapi krb5 2>/dev/null)
+GSSRT_TEST_PLATFORM_LIBS := -ldl
+endif
+
+test-gssapi-runtime:
+	@echo "Building GSSAPI runtime loader unit test (spec 053)..."
+	@mkdir -p build/test
+	$(CXX) $(GSSRT_TEST_FLAGS) $(GSSRT_TEST_INCLUDES) \
+	    test/cpp/test_gssapi_runtime.cpp \
+	    src/tds/auth/gssapi_runtime.cpp \
+	    $(GSSRT_TEST_PLATFORM_LIBS) \
+	    -o build/test/test_gssapi_runtime
+	@echo ""
+	@echo "Running gssapi_runtime unit test..."
+	build/test/test_gssapi_runtime
+
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.
 # Requires `make debug` first to populate build/debug/vcpkg_installed.

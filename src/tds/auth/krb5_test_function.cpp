@@ -20,6 +20,7 @@
 #include <string>
 
 #if defined(MSSQL_ENABLE_KRB5)
+#include "tds/auth/gssapi_runtime.hpp"	// spec 053 (#161): lazy GSSAPI/krb5 loader
 #include "tds/auth/krb5_authenticator.hpp"
 
 // Pulled in for the principal-name lookup on success. Same headers
@@ -44,30 +45,40 @@ namespace krb5 {
 //===----------------------------------------------------------------------===//
 static std::string LookupCcachePrincipal() {
 #if !defined(__APPLE__)
+	// Best-effort. If libkrb5 cannot be loaded, fall back to "<unknown>" --
+	// the auth result itself (from RunKrb5Test) already carries the real
+	// runtime-unavailable message (spec 053 FR-006).
+	const tds::Krb5Fns *kp = nullptr;
+	try {
+		kp = &tds::GetKrb5();
+	} catch (const std::exception &) {
+		return "<unknown>";
+	}
+	const tds::Krb5Fns &k = *kp;
 	krb5_context kctx = nullptr;
-	if (krb5_init_context(&kctx) != 0) {
+	if (k.init_context(&kctx) != 0) {
 		return "<unknown>";
 	}
 	krb5_ccache cc = nullptr;
-	if (krb5_cc_default(kctx, &cc) != 0) {
-		krb5_free_context(kctx);
+	if (k.cc_default(kctx, &cc) != 0) {
+		k.free_context(kctx);
 		return "<unknown>";
 	}
 	krb5_principal client = nullptr;
-	if (krb5_cc_get_principal(kctx, cc, &client) != 0) {
-		krb5_cc_close(kctx, cc);
-		krb5_free_context(kctx);
+	if (k.cc_get_principal(kctx, cc, &client) != 0) {
+		k.cc_close(kctx, cc);
+		k.free_context(kctx);
 		return "<no ticket>";
 	}
 	char *name = nullptr;
 	std::string result = "<unknown>";
-	if (krb5_unparse_name(kctx, client, &name) == 0 && name) {
+	if (k.unparse_name(kctx, client, &name) == 0 && name) {
 		result.assign(name);
-		krb5_free_unparsed_name(kctx, name);
+		k.free_unparsed_name(kctx, name);
 	}
-	krb5_free_principal(kctx, client);
-	krb5_cc_close(kctx, cc);
-	krb5_free_context(kctx);
+	k.free_principal(kctx, client);
+	k.cc_close(kctx, cc);
+	k.free_context(kctx);
 	return result;
 #else
 	// macOS GSS framework lacks the krb5_cc_* extensions in the public SDK.
