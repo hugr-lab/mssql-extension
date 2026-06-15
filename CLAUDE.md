@@ -355,7 +355,7 @@ target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 
 
 <!-- SPECKIT START -->
-Active spec: 044-codec-consolidation. See implementation plan at
-`specs/044-codec-consolidation/plan.md` for technical context,
+Active spec: 053-lazy-gssapi-linking. See implementation plan at
+`specs/053-lazy-gssapi-linking/plan.md` for technical context,
 research findings, data model, contracts, and quickstart.
 <!-- SPECKIT END -->
