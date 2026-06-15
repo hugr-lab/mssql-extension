@@ -72,12 +72,19 @@ class Finding:
 
 
 def gh(args: list[str]) -> str:
-    """Run `gh api` and return stdout. Errors abort the scan."""
-    res = subprocess.run(["gh", *args], capture_output=True, text=True)
+    """Run `gh api` and return stdout. Errors abort the scan.
+
+    Captures bytes and decodes with errors="replace": a PR diff can legitimately
+    contain non-UTF-8 bytes (binary files, or UTF-16 surrogate halves in test
+    fixtures) and a strict decode would crash the scan instead of scanning the
+    text. Replacement characters don't hide injection text in the readable parts.
+    """
+    res = subprocess.run(["gh", *args], capture_output=True)
     if res.returncode != 0:
-        print(f"::error::gh {' '.join(args)} failed: {res.stderr}", file=sys.stderr)
+        stderr = res.stderr.decode("utf-8", errors="replace")
+        print(f"::error::gh {' '.join(args)} failed: {stderr}", file=sys.stderr)
         sys.exit(2)
-    return res.stdout
+    return res.stdout.decode("utf-8", errors="replace")
 
 
 def collect_sources(repo: str, pr_number: int) -> list[tuple[str, str, str]]:
