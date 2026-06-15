@@ -10,6 +10,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -159,7 +160,13 @@ void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 	// mssql_preload_catalog(catalog_name VARCHAR [, schema_name VARCHAR]) -> VARCHAR
 	ScalarFunction func("mssql_preload_catalog", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind);
+	// M9 (spec 051 follow-up): varargs moved from a public ScalarFunction
+	// field to a private FunctionSignature member with a SetVarArgs setter.
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+	func.SetVarArgs(LogicalType::VARCHAR);	// Optional schema_name
+#else
 	func.varargs = LogicalType::VARCHAR;  // Optional schema_name
+#endif
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(func);
 }

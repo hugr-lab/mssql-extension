@@ -21,6 +21,7 @@
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "mssql_compat.hpp"
 
 #include <string>
 

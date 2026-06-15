@@ -23,6 +23,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -133,8 +134,14 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get, id
 		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 		// Match against the Get's table_index and find column in GetColumnIds
 		if (col_ref.binding.table_index != get.table_index) {
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+			MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF table_index %llu != get.table_index %llu",
+							(unsigned long long)col_ref.binding.table_index.index,
+							(unsigned long long)get.table_index.index);
+#else
 			MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF table_index %llu != get.table_index %llu",
 							(unsigned long long)col_ref.binding.table_index, (unsigned long long)get.table_index);
+#endif
 			return false;
 		}
 		// column_index maps to position in GetColumnIds
@@ -185,16 +192,29 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 			if (col_ref.binding.table_index == projection->table_index &&
 				col_ref.binding.column_index < projection->expressions.size()) {
 				resolve_expr = projection->expressions[col_ref.binding.column_index].get();
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_COLUMN_REF[%llu.%llu] through projection -> class=%d",
+								(unsigned long long)col_ref.binding.table_index.index,
+								(unsigned long long)col_ref.binding.column_index,
+								(int)resolve_expr->GetExpressionClass());
+#else
 				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_COLUMN_REF[%llu.%llu] through projection -> class=%d",
 								(unsigned long long)col_ref.binding.table_index,
 								(unsigned long long)col_ref.binding.column_index,
 								(int)resolve_expr->GetExpressionClass());
+#endif
 			}
 			// If binding matches Get's table_index, resolve directly against Get (skip projection)
 			else if (col_ref.binding.table_index == get.table_index) {
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+				MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF[%llu.%llu] references Get directly",
+								(unsigned long long)col_ref.binding.table_index.index,
+								(unsigned long long)col_ref.binding.column_index);
+#else
 				MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF[%llu.%llu] references Get directly",
 								(unsigned long long)col_ref.binding.table_index,
 								(unsigned long long)col_ref.binding.column_index);
+#endif
 				// resolve_expr stays as &expr, handled below
 			}
 		}
@@ -217,21 +237,22 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 	// Case 2: Function expression (e.g., YEAR(col))
 	if (resolve_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &func_expr = resolve_expr->Cast<BoundFunctionExpression>();
-		auto *mapping = mssql::GetFunctionMapping(func_expr.function.name);
+		auto *mapping = mssql::GetFunctionMapping(mssql_compat::GetFunctionName(func_expr));
 		if (!mapping) {
-			MSSQL_OPT_DEBUG(2, "  Unsupported function: %s", func_expr.function.name.c_str());
+			MSSQL_OPT_DEBUG(2, "  Unsupported function: %s", mssql_compat::GetFunctionName(func_expr).c_str());
 			return false;
 		}
 
 		if (mapping->expected_args != 1 || func_expr.children.size() != 1) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu", func_expr.function.name.c_str(),
-							func_expr.children.size());
+			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu",
+							mssql_compat::GetFunctionName(func_expr).c_str(), func_expr.children.size());
 			return false;
 		}
 
 		idx_t inner_col_ids_index;
 		if (!ResolveColumnIndex(*func_expr.children[0], get, inner_col_ids_index)) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref", func_expr.function.name.c_str());
+			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref",
+							mssql_compat::GetFunctionName(func_expr).c_str());
 			return false;
 		}
 
@@ -500,8 +521,15 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 
 	// Full pushdown: remove LogicalOrder from plan, keep Projection if present
 	if (pushed == order.orders.size()) {
-		// Capture projection_map BEFORE destroying LogicalOrder
-		vector<idx_t> projection_map = order.projection_map;
+		// Capture projection_map BEFORE destroying LogicalOrder. On the new
+		// DuckDB SHA the LogicalOrder field is vector<ProjectionIndex>, which
+		// implicitly converts to vector<idx_t> elementwise but not as a vector
+		// type, so we copy through a manual loop.
+		vector<idx_t> projection_map;
+		projection_map.reserve(order.projection_map.size());
+		for (auto &p : order.projection_map) {
+			projection_map.push_back((idx_t)p);
+		}
 
 		MSSQL_OPT_DEBUG(1, "Full ORDER BY pushdown - removing LogicalOrder from plan");
 		plan = std::move(plan->children[0]);

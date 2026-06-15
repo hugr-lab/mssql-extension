@@ -338,9 +338,18 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	bool needs_duckdb_filter = false;
 
 	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+	if (input.filters && input.filters->HasFilters()) {
+#else
 	if (input.filters && !input.filters->filters.empty()) {
+#endif
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
+							 (size_t)input.filters->FilterCount());
+#else
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
 							 input.filters->filters.size());
+#endif
 
 		auto encode_result =
 			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types);
@@ -547,7 +556,11 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 				if (output_idx != UINT64_MAX) {
 					// This PK column is in the projection - copy to STRUCT child
 					auto &src_vector = output.data[output_idx];
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+					auto &dst_vector = entries[pk_idx];
+#else
 					auto &dst_vector = *entries[pk_idx];
+#endif
 					VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 					MSSQL_SCAN_DEBUG_LOG(2, "Execute: copied PK column %llu from output[%llu] to STRUCT child",
 										 (unsigned long long)pk_idx, (unsigned long long)output_idx);
@@ -555,7 +568,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 			}
 		}
 
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = mssql_compat::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %llu rows",
 							 (unsigned long long)row_count);
@@ -571,14 +584,18 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		for (idx_t pk_idx = 0; pk_idx < state.pk_result_indices.size(); pk_idx++) {
 			idx_t src_col_idx = state.pk_result_indices[pk_idx];
 			auto &src_vector = output.data[src_col_idx];
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+			auto &dst_vector = entries[pk_idx];
+#else
 			auto &dst_vector = *entries[pk_idx];
+#endif
 
 			// Copy the PK column data to the struct child
 			VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 		}
 
 		// Set validity for the struct itself (valid if any child is valid)
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = mssql_compat::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %llu rows",
@@ -634,7 +651,11 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
 					if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
 						// This PK column was added - SQL will write to STRUCT child
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+						target_vectors.push_back(&entries[pk_idx]);
+#else
 						target_vectors.push_back(entries[pk_idx].get());
+#endif
 						added_pk_count++;
 					}
 					// PK columns already in projection will be copied after FillChunk
@@ -651,7 +672,11 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				// Composite PK rowid-only: write directly to STRUCT children
 				vector<Vector *> target_vectors;
 				for (auto &entry : entries) {
+#ifdef MSSQL_DUCKDB_HAS_NEW_BIND_INPUT
+					target_vectors.push_back(&entry);
+#else
 					target_vectors.push_back(entry.get());
+#endif
 				}
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(entries.size());
@@ -739,8 +764,8 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
-		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i, (int)filter->type,
-							 (int)filter->GetExpressionClass());
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i,
+							 (int)filter->GetExpressionType(), (int)filter->GetExpressionClass());
 
 		// Try to encode this expression
 		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
