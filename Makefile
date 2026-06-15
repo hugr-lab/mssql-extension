@@ -257,6 +257,37 @@ test-instance-resolver:
 	@echo "Running SQL Browser parser unit test..."
 	build/test/test_instance_resolver
 
+# TDS token-parser security regression (ASan + UBSan). Reproduces the ERROR/INFO
+# under-declared-length heap-buffer-overflow found by fuzzing (fuzz/fuzz_tds_tokens);
+# crashes under ASan on a regression. No SQL Server; uses vcpkg simdutf like login7.
+TOKEN_SEC_TEST_SOURCES := \
+    src/tds/tds_token_parser.cpp \
+    src/tds/tds_row_reader.cpp \
+    src/tds/tds_column_metadata.cpp \
+    src/tds/tds_types.cpp \
+    src/tds/encoding/utf16.cpp
+TOKEN_SEC_TEST_FLAGS := -std=c++17 -g -O1 -pthread -Wno-deprecated-declarations \
+    -fsanitize=address,undefined -fno-sanitize-recover=all
+TOKEN_SEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+    -I $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/include
+TOKEN_SEC_TEST_LIBS := -L $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
+
+test-token-parser-security: debug
+	@echo "Building TDS token-parser security regression (ASan+UBSan)..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(TOKEN_SEC_TEST_FLAGS) $(TOKEN_SEC_TEST_INCLUDES) \
+	    test/cpp/test_token_parser_security.cpp \
+	    $(TOKEN_SEC_TEST_SOURCES) \
+	    $(TOKEN_SEC_TEST_LIBS) \
+	    -o build/test/test_token_parser_security
+	@echo ""
+	@echo "Running TDS token-parser security regression..."
+	build/test/test_token_parser_security
+
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.
 # Requires `make debug` first to populate build/debug/vcpkg_installed.

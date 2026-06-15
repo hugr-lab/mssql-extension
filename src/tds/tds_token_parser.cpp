@@ -383,6 +383,15 @@ bool TokenParser::ParseError() {
 		return false;
 	}
 
+	// The fixed prefix (number[4] + state[1] + severity[1]) must fit within the
+	// declared token length. The check above only guarantees the buffer holds
+	// `3 + token_length` bytes, so a (malicious) server under-declaring
+	// token_length < 6 would make the fixed reads below run past the buffer.
+	// Found by fuzzing: an ERROR token "AA 00 00" (token_length == 0).
+	if (token_length < 6) {
+		return false;
+	}
+
 	size_t offset = 3;	// Skip type and length
 
 	// Error number (4 bytes)
@@ -434,6 +443,13 @@ bool TokenParser::ParseInfo() {
 	uint16_t token_length = static_cast<uint16_t>(data[1]) | (static_cast<uint16_t>(data[2]) << 8);
 
 	if (Available() < 3 + token_length) {
+		return false;
+	}
+
+	// Same under-declared-length guard as ParseError: the fixed prefix
+	// (number[4] + state[1] + severity[1]) must fit within token_length, else
+	// the fixed reads below run past the buffer (e.g. INFO token "AB 00 00").
+	if (token_length < 6) {
 		return false;
 	}
 
