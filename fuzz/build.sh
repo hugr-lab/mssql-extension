@@ -103,7 +103,7 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 
 # TARGETS selects which harnesses to build (default: all). Lets CI / run.sh /
 # verification build a subset; e.g. TARGETS=browser_response builds offline.
-TARGETS="${TARGETS:-browser_response tds_tokens utf16}"
+TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn}"
 want() { [[ " ${TARGETS} " == *" $1 "* ]]; }
 
 # 1. SQL Browser response parser — standalone: no simdutf, no TDS sources, no
@@ -114,13 +114,15 @@ if want browser_response; then
 fi
 
 # 2 & 3 decode server strings via simdutf-backed Utf16LEDecode.
-if want tds_tokens || want utf16; then
+if want tds_tokens || want utf16 || want envchange_txn; then
 	ensure_simdutf
 	TDS_OBJS="$(compile_objs tds "${TDS_DECODE_SRCS[@]}")"
 	# 2. TDS token-stream decoder (COLMETADATA / ROW / type+length).
 	want tds_tokens && build_harness fuzz_tds_tokens fuzz_tds_tokens.cc ${TDS_OBJS}
 	# 3. UTF-16LE decoders (reuses the utf16.o compiled above).
 	want utf16 && build_harness fuzz_utf16 fuzz_utf16.cc "${WORK}/tds_utf16.o"
+	# 4. ENVCHANGE transaction-descriptor scan (FindBeginTxnDescriptor).
+	want envchange_txn && build_harness fuzz_envchange_txn fuzz_envchange_txn.cc ${TDS_OBJS}
 fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---

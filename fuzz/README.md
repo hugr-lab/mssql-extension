@@ -21,6 +21,7 @@ Two modes:
 | `fuzz_browser_response` | `mssql::ParseBrowserResponse(const uint8_t*, size_t)` | `src/connection/instance_resolver.cpp` | ✅ standalone (PoC) |
 | `fuzz_tds_tokens` | `tds::TokenParser::Feed` + `TryParseNext()` loop | `src/tds/tds_token_parser.cpp` (+ row reader, column metadata, types, utf16) | ✅ |
 | `fuzz_utf16` | `tds::encoding::Utf16LEDecode` / `LegacyUtf16LEDecode` | `src/tds/encoding/utf16.cpp` | ✅ (uses simdutf) |
+| `fuzz_envchange_txn` | `tds::FindBeginTxnDescriptor` | `src/tds/tds_token_parser.cpp` | ✅ |
 
 **Isolation finding:** the whole `src/tds/` parsing layer and
 `instance_resolver.cpp` have **zero DuckDB includes** (`grep -L duckdb/`), so the
@@ -40,11 +41,13 @@ propagates and crashes the process.
    type+length decoding. The main attack surface.
 2. **`ParseBrowserResponse`** (`fuzz_browser_response`) — clean `(data,len)`
    seam, the pipeline PoC.
-3. **ENVCHANGE token loop** in `src/connection/mssql_connection_provider.cpp`
-   (~L184–218): manual `offset`/`token_len` arithmetic incl.
-   `offset += token_len - 1` — a `uint16_t` underflow shape. The same loop shape
-   is reached through `fuzz_tds_tokens`'s ENVCHANGE path; audit this pattern
-   repo-wide (`grep -n 'token_len\|offset +='`).
+3. **ENVCHANGE transaction-descriptor scan** (`fuzz_envchange_txn`) — the
+   manual `offset`/`token_len` loop (incl. `offset += token_len - 1`, a
+   `uint16_t` underflow shape) was extracted from
+   `mssql_connection_provider.cpp` into the pure, hardened
+   `tds::FindBeginTxnDescriptor(data, len, out[8])` so it is fuzzable. The new
+   version keeps `offset` monotonic and bounds every read by `len`; fuzzing
+   confirms no server-advertised length causes an OOB or a hang.
 4. **`Utf16LEEncodeDirect` / `LegacyUtf16LEEncodeDirect`** — `fuzz_utf16`.
 
 ## Build & run locally (Docker, Linux)

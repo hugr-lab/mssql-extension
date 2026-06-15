@@ -67,24 +67,52 @@ int main() {
 	// --- sanity: a well-formed-enough ERROR token still parses without crashing.
 	// number[4] state[1] severity[1] msglen(US_VARCHAR=0) servername[1]=0 procname[1]=0 line[4]
 	{
-		std::vector<uint8_t> body = {/*number*/ 0x01,
-									 0x00,
-									 0x00,
-									 0x00,
+		std::vector<uint8_t> body = {/*number*/ 0x01,		  0x00, 0x00, 0x00,
 									 /*state*/ 0x01,
 									 /*severity*/ 0x10,
-									 /*msglen LE16*/ 0x00,
-									 0x00,
+									 /*msglen LE16*/ 0x00,	  0x00,
 									 /*servername len*/ 0x00,
 									 /*procname len*/ 0x00,
-									 /*line*/ 0x00,
-									 0x00,
-									 0x00,
-									 0x00};
+									 /*line*/ 0x00,			  0x00, 0x00, 0x00};
 		std::vector<uint8_t> err{0xAA, static_cast<uint8_t>(body.size() & 0xFF),
 								 static_cast<uint8_t>(body.size() >> 8)};
 		err.insert(err.end(), body.begin(), body.end());
 		DrainNoCrash("error_wellformed", err);
+	}
+
+	// --- FindBeginTxnDescriptor: ENVCHANGE transaction-descriptor scan ---
+	// (replaced the connection provider's hand-rolled `offset += token_len - 1` loop)
+	{
+		uint8_t out[8] = {0};
+		// Valid BEGIN_TRANS: E3 len 08 08 <desc 1..8> 00  (token_len = 11)
+		std::vector<uint8_t> valid = {0xE3, 0x0B, 0x00, 0x08, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 0x00};
+		bool found = FindBeginTxnDescriptor(valid.data(), valid.size(), out);
+		bool good = found;
+		for (int i = 0; i < 8; ++i) {
+			good = good && out[i] == static_cast<uint8_t>(i + 1);
+		}
+		if (!good) {
+			std::cerr << "FAIL: FindBeginTxnDescriptor did not extract a valid descriptor" << std::endl;
+			++g_failures;
+		} else {
+			std::cout << "ok: findtxn_valid" << std::endl;
+		}
+
+		// Malformed: must never read past the buffer or hang; result is don't-care.
+		const std::vector<std::vector<uint8_t>> malformed = {
+			{0xE3, 0x00, 0x00},								   // token_len == 0 (underflow shape)
+			{0xE3, 0x05, 0x00, 0x08, 0x08},					   // claims more body than present
+			{0xE3, 0x0B, 0x00, 0x08, 0x04, 1, 2, 3, 4, 0x00},  // new_len != 8
+			{0xE3, 0xFF, 0xFF, 0x08, 0x08, 1, 2, 3, 4},		   // huge token_len, short buffer
+			{0xE3},											   // truncated header
+			{0xFD, 0x00},									   // DONE then nothing
+			{},
+		};
+		for (const auto &v : malformed) {
+			uint8_t d[8] = {0};
+			(void)FindBeginTxnDescriptor(v.data(), v.size(), d);
+		}
+		std::cout << "ok: findtxn_malformed_no_oob" << std::endl;
 	}
 
 	if (g_failures) {
