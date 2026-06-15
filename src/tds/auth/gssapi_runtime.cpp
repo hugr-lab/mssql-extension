@@ -85,6 +85,10 @@ GssApiFns LoadGss() {
 	Resolve(h, "gss_delete_sec_context", "libgssapi_krb5", f.delete_sec_context);
 	Resolve(h, "gss_release_cred", "libgssapi_krb5", f.release_cred);
 	Resolve(h, "gss_release_name", "libgssapi_krb5", f.release_name);
+	// Resolved eagerly even though only keytab/raw/ccache-override modes use it:
+	// gss_acquire_cred_from is MIT >= 1.11 (2012), universally present. If a far
+	// older MIT lacked it, the whole table would fail to load -- including plain
+	// CredCache-default mode, which does not call it. Acceptable given the age.
 	Resolve(h, "gss_acquire_cred_from", "libgssapi_krb5", f.acquire_cred_from);
 	// Handle is intentionally not dlclose'd: the tables hold function
 	// pointers into it for the process lifetime.
