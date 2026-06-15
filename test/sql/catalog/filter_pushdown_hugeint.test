@@ -1,0 +1,109 @@
+# name: test/sql/catalog/filter_pushdown_hugeint.test
+# description: Regression test for spec 045 FR-020 (b) — HUGEINT filter literal correctness.
+# group: [sql]
+#
+# Spec 045 Phase 3 (US1, T022): filter pushdown of HUGEINT literals via
+# codec::integer::FormatSqlLiteral now renders bare digits (e.g., "12345")
+# instead of N'<digits>' string literals. This test FAILS on `main`-at-kickoff
+# and PASSES on spec-045 HEAD.
+#
+# Pre-spec-045 behavior:
+#   filter_encoder.cpp:ValueToSQLLiteral fell into the `default` arm for
+#   HUGEINT, emitting:  WHERE [col] = N'12345'
+#   SQL Server rejected this with type-coercion failure on a DECIMAL(38,0)
+#   column, OR silently coerced to an empty result set.
+#
+# Post-spec-045 behavior:
+#   codec::integer::FormatSqlLiteral renders:  WHERE [col] = 12345
+#   matching the DECIMAL(38,0) column type natively.
+#
+# Note: the table is seeded via T-SQL (mssql_exec) because HUGEINT BCP encoding
+# is deferred to spec 045 Phase 6. The filter pushdown path under test is on
+# the SCAN side and is not affected.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS hugeint_filter (TYPE mssql);
+
+# Create + populate a DECIMAL(38,0) column via direct T-SQL. DuckDB's catalog
+# scan exposes it as HUGEINT, so the filter constant in WHERE clauses below is
+# a HUGEINT literal — exercising the FR-020 (b) code path.
+statement ok
+SELECT mssql_exec('hugeint_filter', '
+IF OBJECT_ID(N''dbo.huge_pk_test'', N''U'') IS NOT NULL DROP TABLE dbo.huge_pk_test;
+CREATE TABLE dbo.huge_pk_test (
+    huge_val DECIMAL(38, 0) NOT NULL,
+    label    NVARCHAR(50)   NOT NULL
+);
+INSERT INTO dbo.huge_pk_test (huge_val, label) VALUES
+    (99999999999999999999999999, ''big''),
+    (12345, ''small''),
+    (-100, ''neg'');
+');
+
+# Refresh metadata so the catalog scan sees the new table.
+statement ok
+SELECT mssql_refresh_cache('hugeint_filter');
+
+# =============================================================================
+# Sanity: scan returns all three rows.
+# =============================================================================
+
+query IT
+SELECT huge_val, label FROM hugeint_filter.dbo.huge_pk_test ORDER BY huge_val;
+----
+-100	neg
+12345	small
+99999999999999999999999999	big
+
+# =============================================================================
+# Test 1: Equality filter on HUGEINT — small positive value
+# =============================================================================
+
+query IT
+SELECT huge_val, label FROM hugeint_filter.dbo.huge_pk_test WHERE huge_val = 12345::HUGEINT;
+----
+12345	small
+
+# =============================================================================
+# Test 2: Equality filter on HUGEINT — large positive value
+# =============================================================================
+
+query IT
+SELECT huge_val, label FROM hugeint_filter.dbo.huge_pk_test WHERE huge_val = 99999999999999999999999999::HUGEINT;
+----
+99999999999999999999999999	big
+
+# =============================================================================
+# Test 3: Equality filter on HUGEINT — negative value
+# =============================================================================
+
+query IT
+SELECT huge_val, label FROM hugeint_filter.dbo.huge_pk_test WHERE huge_val = (-100)::HUGEINT;
+----
+-100	neg
+
+# =============================================================================
+# Test 4: Inequality filter on HUGEINT (>) — positive values only
+# =============================================================================
+
+query IT
+SELECT huge_val, label FROM hugeint_filter.dbo.huge_pk_test
+WHERE huge_val > 0::HUGEINT
+ORDER BY huge_val;
+----
+12345	small
+99999999999999999999999999	big
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('hugeint_filter', 'DROP TABLE IF EXISTS dbo.huge_pk_test;');
+
+statement ok
+DETACH hugeint_filter;

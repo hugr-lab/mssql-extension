@@ -17,7 +17,8 @@ namespace tds {
 class TdsSocket {
 public:
 	TdsSocket();
-	~TdsSocket();
+	// noexcept (spec 047 T046k): destructor body wraps Close().
+	~TdsSocket() noexcept;
 
 	// Non-copyable
 	TdsSocket(const TdsSocket &) = delete;

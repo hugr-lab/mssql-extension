@@ -86,8 +86,15 @@ namespace tds {
 
 TdsSocket::TdsSocket() : fd_(-1), port_(0), connected_(false) {}
 
-TdsSocket::~TdsSocket() {
-	Close();
+TdsSocket::~TdsSocket() noexcept {
+	try {
+		Close();
+	} catch (const std::exception &e) {
+		// PR #118 review M1: debug-gated stderr surfaces the swallow.
+		MSSQL_SOCKET_DEBUG_LOG(1, "~TdsSocket: swallowed exception during Close: %s", e.what());
+	} catch (...) {
+		MSSQL_SOCKET_DEBUG_LOG(1, "~TdsSocket: swallowed unknown exception during Close");
+	}
 }
 
 TdsSocket::TdsSocket(TdsSocket &&other) noexcept

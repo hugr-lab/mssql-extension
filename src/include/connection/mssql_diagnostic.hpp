@@ -10,8 +10,31 @@
 
 namespace duckdb {
 
-// Global connection handle manager
-// Manages connections opened via mssql_open for diagnostic purposes
+// Global connection handle manager.
+//
+// Spec 047 design note (FR-010, T045):
+//   This singleton is RETAINED on purpose. The diagnostic API trio —
+//   mssql_open / mssql_close / mssql_ping — plus the mssql_close_all
+//   shutdown helper (FR-013) take a connection string (not a catalog
+//   name) by design, so there is no natural per-catalog owner to hold
+//   the handle map. Unlike the three removed singletons (MssqlPoolManager,
+//   MSSQLContextManager, MSSQLResultStreamRegistry) which had a clear
+//   catalog discriminator and were folded into MSSQLCatalog, the
+//   diagnostic handles are inherently process-scoped.
+//
+//   The four functions above are all marked [DEPRECATED] (FR-010 group);
+//   when they are removed in a future major release, this singleton goes
+//   with them — that is the planned cleanup for the last extension-
+//   internal process-wide state. The mssql_close_all() function (FR-013,
+//   added in spec 047) gives hosts a shutdown path so they can release
+//   sockets cleanly before that removal.
+//
+//   See `state_inventory.md` in specs/047-process-state-cleanup/ for the
+//   final classification of every process-wide static after spec 047:
+//   zero "migrate" entries, this manager + OS/library scratch are the
+//   legitimate remainder.
+//
+// Manages connections opened via mssql_open for diagnostic purposes.
 class MSSQLConnectionHandleManager {
 public:
 	static MSSQLConnectionHandleManager &Instance();
@@ -27,6 +50,13 @@ public:
 
 	// Check if handle exists
 	bool HasConnection(int64_t handle);
+
+	// Spec 047 FR-013: close every open handle in one shot. Returns the count
+	// of connections closed. Idempotent — a second call after closing returns 0.
+	// Used by hosts that want a clean shutdown path before tearing down the
+	// process: `SELECT mssql_close_all()` releases every diagnostic-API socket
+	// without forcing the user to track handles manually.
+	int64_t CloseAll();
 
 private:
 	MSSQLConnectionHandleManager() : next_handle_(1) {}
@@ -55,6 +85,14 @@ void MSSQLCloseFunction(DataChunk &args, ExpressionState &state, Vector &result)
 // Tests if a connection is alive by sending a minimal TDS packet
 // Returns true if connection responds, false otherwise
 void MSSQLPingFunction(DataChunk &args, ExpressionState &state, Vector &result);
+
+// mssql_close_all() -> INTEGER
+// [DEPRECATED] Closes every diagnostic connection opened via mssql_open and
+// returns the count of closed handles. Idempotent. Companion to mssql_open /
+// mssql_close / mssql_ping, all of which share the singleton
+// MSSQLConnectionHandleManager and will be removed together in a future major
+// release (see FR-010/FR-013, spec 047).
+void MSSQLCloseAllFunction(DataChunk &args, ExpressionState &state, Vector &result);
 
 // mssql_pool_stats table function
 // Returns statistics for connection pools associated with attached databases

@@ -1,0 +1,15 @@
+# Float/Double encode cases — DuckDB float/double → BCP wire bytes
+# format: type | value | expected_hex_bytes (LE)
+# Notes:
+#   - Float BCP wire: 1-byte length prefix (0x04) + 4 LE IEEE 754 bytes
+#   - Double BCP wire: 1-byte length prefix (0x08) + 8 LE IEEE 754 bytes
+#   - The length-prefix byte is the FLTNTYPE length discriminator and
+#     selects REAL (4) vs FLOAT (8) on the SQL Server side.
+FLOAT  | 0.0   | 04 00 00 00 00
+FLOAT  | 1.0   | 04 00 00 80 3F
+FLOAT  | -1.0  | 04 00 00 80 BF
+FLOAT  | 3.14  | 04 C3 F5 48 40
+DOUBLE | 0.0   | 08 00 00 00 00 00 00 00 00
+DOUBLE | 1.0   | 08 00 00 00 00 00 00 F0 3F
+DOUBLE | -1.0  | 08 00 00 00 00 00 00 F0 BF
+DOUBLE | 3.14  | 08 1F 85 EB 51 B8 1E 09 40

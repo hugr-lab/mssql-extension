@@ -37,7 +37,8 @@ public:
 	// Construct from a raw JWT access token
 	// Validates token format and parses claims
 	// Throws InvalidInputException if token is malformed
-	explicit ManualTokenAuthStrategy(const std::string &access_token, const std::string &database);
+	ManualTokenAuthStrategy(const std::string &access_token, const std::string &database,
+							const std::string &app_name = "");
 
 	//===----------------------------------------------------------------------===//
 	// AuthenticationStrategy interface
@@ -78,6 +79,7 @@ private:
 	std::vector<uint8_t> token_utf16le_;  // Pre-encoded UTF-16LE for FEDAUTH
 	mssql::azure::JwtClaims claims_;	  // Parsed JWT claims
 	std::string database_;				  // Target database name
+	std::string app_name_;				  // Spec 047 FR-014 — see SqlServerAuthStrategy for the contract.
 };
 
 }  // namespace tds

@@ -3,6 +3,7 @@
 
 #include "catalog/mssql_refresh_function.hpp"
 #include "catalog/mssql_catalog.hpp"
+#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -17,8 +18,8 @@ namespace duckdb {
 // Bind Function - Validates arguments at compile time
 //===----------------------------------------------------------------------===//
 
-static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, ScalarFunction &bound_function,
-													  vector<unique_ptr<Expression>> &arguments) {
+MSSQL_BIND_SCALAR_SIG(MSSQLRefreshCacheBind) {
+	MSSQL_BIND_SCALAR_PROLOGUE
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_refresh_cache: catalog_name must be a constant, not a parameter");
@@ -41,26 +42,20 @@ static unique_ptr<FunctionData> MSSQLRefreshCacheBind(ClientContext &context, Sc
 			throw InvalidInputException("mssql_refresh_cache: catalog name is required (got empty string)");
 		}
 
-		// Validate the catalog exists via MSSQLContextManager
-		auto &manager = MSSQLContextManager::Get(*context.db);
-		if (!manager.HasContext(catalog_name)) {
+		// Validate the catalog exists (Spec 047: per-catalog ownership)
+		try {
+			auto &catalog = Catalog::GetCatalog(context, catalog_name);
+			if (catalog.GetCatalogType() != "mssql") {
+				throw BinderException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)",
+									  catalog_name, catalog.GetCatalogType());
+			}
+		} catch (const BinderException &) {
+			throw;
+		} catch (const std::exception &) {
 			throw BinderException(
 				"mssql_refresh_cache: catalog '%s' not found. "
 				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
 				catalog_name, catalog_name);
-		}
-
-		// Verify it's an MSSQL catalog
-		auto ctx = manager.GetContext(catalog_name);
-		if (!ctx || !ctx->attached_db) {
-			throw BinderException("mssql_refresh_cache: catalog '%s' has no attached database", catalog_name);
-		}
-
-		// Check catalog type
-		auto &catalog = ctx->attached_db->GetCatalog();
-		if (catalog.GetCatalogType() != "mssql") {
-			throw BinderException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)", catalog_name,
-								  catalog.GetCatalogType());
 		}
 	}
 
@@ -86,22 +81,24 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 		// Get the client context
 		auto &client_context = state.GetContext();
 
-		// Get the MSSQL context
-		auto &manager = MSSQLContextManager::Get(*client_context.db);
-		auto ctx = manager.GetContext(catalog_name);
-		if (!ctx) {
+		// Get the MSSQL catalog (Spec 047: per-catalog ownership)
+		MSSQLCatalog *catalog_ptr = nullptr;
+		try {
+			auto &raw_catalog = Catalog::GetCatalog(client_context, catalog_name);
+			if (raw_catalog.GetCatalogType() != "mssql") {
+				throw InvalidInputException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)",
+											catalog_name, raw_catalog.GetCatalogType());
+			}
+			catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
+		} catch (const InvalidInputException &) {
+			throw;
+		} catch (const std::exception &) {
 			throw InvalidInputException(
 				"mssql_refresh_cache: catalog '%s' not found. "
 				"Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
 				catalog_name, catalog_name);
 		}
-
-		if (!ctx->attached_db) {
-			throw InvalidInputException("mssql_refresh_cache: catalog '%s' has no attached database", catalog_name);
-		}
-
-		// Get the MSSQL catalog
-		auto &catalog = ctx->attached_db->GetCatalog().Cast<MSSQLCatalog>();
+		auto &catalog = *catalog_ptr;
 
 		// Perform full cache refresh (invalidates and reloads all metadata)
 		catalog.RefreshCache(client_context);
@@ -119,7 +116,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
 						MSSQLRefreshCacheBind);
-	func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(func);
 }
 

@@ -1,0 +1,37 @@
+# Decimal DDL — DuckDB DECIMAL/HUGEINT → SQL Server type name
+#
+# Format:
+#   <width>|<scale>|<cfg>|<ctx>|<expected-text>
+#
+# cfg: "default" (CTASConfig{}) — DECIMAL DDL is invariant in cfg.
+# ctx ∈ {CreateTable, CtasCreateTable}. Per FR-027/FR-028 the Decimal
+# family produces byte-identical output for both contexts.
+#
+# Clamp rule (FR-017): SQL Server tops out at precision 38; values
+# above 38 clamp to 38. scale is clamped to ≤ precision.
+
+# === Normal precisions — pass through unchanged ===
+4|2|default|CreateTable|DECIMAL(4,2)
+4|2|default|CtasCreateTable|DECIMAL(4,2)
+9|0|default|CreateTable|DECIMAL(9,0)
+9|0|default|CtasCreateTable|DECIMAL(9,0)
+18|6|default|CreateTable|DECIMAL(18,6)
+18|6|default|CtasCreateTable|DECIMAL(18,6)
+19|4|default|CreateTable|DECIMAL(19,4)
+19|4|default|CtasCreateTable|DECIMAL(19,4)
+38|18|default|CreateTable|DECIMAL(38,18)
+38|18|default|CtasCreateTable|DECIMAL(38,18)
+38|0|default|CreateTable|DECIMAL(38,0)
+38|0|default|CtasCreateTable|DECIMAL(38,0)
+
+# === Precision overflow — clamp to 38 ===
+40|2|default|CreateTable|DECIMAL(38,2)
+40|2|default|CtasCreateTable|DECIMAL(38,2)
+50|0|default|CreateTable|DECIMAL(38,0)
+50|0|default|CtasCreateTable|DECIMAL(38,0)
+
+# === Scale > precision — clamp scale to precision ===
+4|6|default|CreateTable|DECIMAL(4,4)
+4|6|default|CtasCreateTable|DECIMAL(4,4)
+9|20|default|CreateTable|DECIMAL(9,9)
+9|20|default|CtasCreateTable|DECIMAL(9,9)

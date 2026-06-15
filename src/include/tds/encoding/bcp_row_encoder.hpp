@@ -79,18 +79,6 @@ public:
 	// sign: 0x00=negative, 0x01=non-negative
 	static void EncodeDecimal(vector<uint8_t> &buffer, const hugeint_t &value, uint8_t precision, uint8_t scale);
 
-	// Unicode string (NVARCHARTYPE 0xE7) - standard USHORT length prefix
-	// Wire format: [length:2 LE] [utf16le_bytes]
-	// NULL: [0xFFFF]
-	// Use for nvarchar(n) where n <= 4000
-	static void EncodeNVarchar(vector<uint8_t> &buffer, const string_t &value);
-
-	// Unicode string (NVARCHARTYPE 0xE7) - PLP (Partially Length-prefixed) format
-	// Wire format: [total_length:8 LE] [chunk_length:4 LE] [chunk_data] [terminator:4 = 0x00000000]
-	// NULL: [0xFFFFFFFFFFFFFFFF]
-	// Use for nvarchar(max) when max_length == 0xFFFF
-	static void EncodeNVarcharPLP(vector<uint8_t> &buffer, const string_t &value);
-
 	// Binary data (BIGVARBINARYTYPE 0xA5) - standard USHORT length prefix
 	// Wire format: [length:2 LE] [bytes]
 	// NULL: [0xFFFF]
@@ -120,11 +108,27 @@ public:
 
 	// DateTime2 (DATETIME2NTYPE 0x2A)
 	// Wire format: [length:1] [time_portion] [date:3 LE]
+	// Assumes ts is a µs-precision timestamp_t (DuckDB LogicalTypeId::TIMESTAMP).
+	// For other TIMESTAMP_{MS,NS,S} variants use EncodeDatetime2Raw and compute
+	// the components in the source's native precision (see codec::datetime).
 	static void EncodeDatetime2(vector<uint8_t> &buffer, timestamp_t ts, uint8_t scale);
+
+	// DateTime2 wire encoder from pre-computed (time_value, date_value, scale)
+	// components. Used by codec::datetime to bypass the µs-only path in
+	// EncodeDatetime2 — preserves full source precision for TIMESTAMP_NS into
+	// DATETIME2(7), TIMESTAMP_SEC into DATETIME2(0), etc. Components must
+	// already match `scale` (time_value = sub-day ticks at 10^(-scale) seconds;
+	// date_value = days since 0001-01-01).
+	static void EncodeDatetime2Raw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value, uint8_t scale);
 
 	// DateTimeOffset (DATETIMEOFFSETNTYPE 0x2B)
 	// Wire format: [length:1] [time] [date:3] [offset_minutes:2 signed LE]
 	static void EncodeDatetimeOffset(vector<uint8_t> &buffer, timestamp_t ts, int16_t offset_minutes, uint8_t scale);
+
+	// DateTimeOffset wire encoder from pre-computed components — see
+	// EncodeDatetime2Raw rationale.
+	static void EncodeDatetimeOffsetRaw(vector<uint8_t> &buffer, uint64_t time_value, uint32_t date_value,
+										int16_t offset_minutes, uint8_t scale);
 
 	//===----------------------------------------------------------------------===//
 	// NULL Encoding

@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -36,10 +35,16 @@ namespace duckdb {
 MSSQLQueryExecutor::MSSQLQueryExecutor(const std::string &context_name) : context_name_(context_name) {}
 
 void MSSQLQueryExecutor::ValidateContext(ClientContext &context) {
-	// Verify the context exists in the pool manager
-	auto *pool = MssqlPoolManager::Instance().GetPool(context_name_);
-
-	if (!pool) {
+	// Spec 047: validate via DuckDB catalog lookup (per-catalog pool ownership).
+	// Throws CatalogException when the alias is not attached; that maps to the
+	// same user-facing "context not found" UX as the singleton lookup did.
+	try {
+		auto &catalog = Catalog::GetCatalog(context, context_name_);
+		if (catalog.GetCatalogType() != "mssql") {
+			throw InvalidInputException("MSSQL context '%s' is attached as a non-MSSQL catalog type '%s'.",
+										context_name_.c_str(), catalog.GetCatalogType());
+		}
+	} catch (const std::exception &e) {
 		throw InvalidInputException("MSSQL context '%s' not found. Create it with ATTACH first.",
 									context_name_.c_str());
 	}

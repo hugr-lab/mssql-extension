@@ -1,0 +1,59 @@
+# Decimal literal — DuckDB DECIMAL/HUGEINT → T-SQL fragment
+#
+# Format:
+#   <precision>|<scale>|<unscaled-hugeint>|<ctx>|<expected-literal>
+#
+# ctx ∈ {Filter, InsertValues}. Per FR-022 the Decimal family produces
+# byte-identical output for both contexts (no surrounding wrapper —
+# bare numeric form: optional minus, integer part, optional dot,
+# fractional part with leading-zero pad if integer part is zero).
+#
+# Pre-spec-045 the Filter path used Value::ToString() which could
+# produce slightly different output for very small DECIMALs (e.g.
+# "0.0001" vs ".0001" or scientific notation). Post-spec-045 both
+# contexts unify on SerializeDecimal's manual fixed-point rendering.
+#
+# Hugeint values below are the *unscaled* stored representation;
+# precision/scale shape the output (where the decimal point goes).
+
+# === DECIMAL(4, 2) ===
+4|2|0|Filter|0.00
+4|2|0|InsertValues|0.00
+4|2|1000|Filter|10.00
+4|2|1000|InsertValues|10.00
+4|2|-1000|Filter|-10.00
+4|2|-1000|InsertValues|-10.00
+4|2|9999|Filter|99.99
+4|2|9999|InsertValues|99.99
+
+# === DECIMAL(9, 0) — integer-only decimal ===
+9|0|0|Filter|0
+9|0|0|InsertValues|0
+9|0|123456789|Filter|123456789
+9|0|123456789|InsertValues|123456789
+9|0|-123456789|Filter|-123456789
+
+# === DECIMAL(18, 6) — int64 storage ===
+18|6|123456|Filter|0.123456
+18|6|123456|InsertValues|0.123456
+18|6|1|Filter|0.000001
+18|6|1|InsertValues|0.000001
+18|6|-1|Filter|-0.000001
+
+# === DECIMAL(19, 4) — hugeint storage ===
+19|4|100000|Filter|10.0000
+19|4|100000|InsertValues|10.0000
+19|4|-100000|Filter|-10.0000
+
+# === DECIMAL(38, 18) — full precision hugeint ===
+38|18|1|Filter|0.000000000000000001
+38|18|1|InsertValues|0.000000000000000001
+38|18|-1|Filter|-0.000000000000000001
+
+# === HUGEINT routes through Decimal as if DECIMAL(38, 0) (FR-025) ===
+# These are HUGEINT values; renderer treats them as DECIMAL(38,0).
+38|0|0|Filter|0
+38|0|0|InsertValues|0
+38|0|123456789012345|Filter|123456789012345
+38|0|123456789012345|InsertValues|123456789012345
+38|0|-123456789012345|Filter|-123456789012345

@@ -48,7 +48,8 @@ struct TlsTdsContextImpl;
 class TlsTdsContext {
 public:
 	TlsTdsContext();
-	~TlsTdsContext();
+	// noexcept (spec 047 T046k): destructor body wraps tls->Close() in try/catch.
+	~TlsTdsContext() noexcept;
 
 	// Non-copyable
 	TlsTdsContext(const TlsTdsContext &) = delete;

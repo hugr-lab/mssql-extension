@@ -1,0 +1,102 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB MSSQL Extension — spec 045
+//
+// codec/literal_format.cpp
+//
+// Canonical 9-arm dispatcher. As each family migrates, its arm is
+// replaced with a direct call into codec::<family>::FormatSqlLiteral.
+//
+// Phase 6 (US3 sub-phases 1-7) — Boolean, Float, Decimal, Binary, DateTime,
+// Uuid arms wired. Integer and String arms landed in Phase 4/Phase 5. Money is
+// scan-decode-only (no FormatSqlLiteral); Money values route through the
+// Decimal family at the LogicalType level. All 9 families now route through
+// this dispatcher; Phase 7 will sweep the dispatch sites and unify DDL.
+//===----------------------------------------------------------------------===//
+
+#include "codec/literal_format.hpp"
+
+#include "codec/binary_codec.hpp"
+#include "codec/boolean_codec.hpp"
+#include "codec/datetime_codec.hpp"
+#include "codec/decimal_codec.hpp"
+#include "codec/float_codec.hpp"
+#include "codec/integer_codec.hpp"
+#include "codec/string_codec.hpp"
+#include "codec/type_family.hpp"
+#include "codec/uuid_codec.hpp"
+#include "duckdb/common/exception.hpp"
+
+namespace duckdb {
+namespace mssql {
+namespace codec {
+
+namespace {
+
+// Money is decode-only by design (DuckDB has no MONEY LogicalType — SQL Server
+// MONEY/SMALLMONEY/MONEYN tokens surface as DECIMAL at decode time). The Money
+// arm in either dispatcher is structurally unreachable: FamilyFromLogicalType
+// never returns Money. The throw is a compile-required exhaustiveness arm + a
+// runtime assertion that the LogicalType→family mapping hasn't drifted.
+[[noreturn]] void ThrowMoneyUnreachable(const char *fn_name, const LogicalType &type) {
+	throw InternalException(
+		"codec::%s: Money family has no LogicalType-side path — "
+		"SQL Server MONEY values surface as DECIMAL on decode; reached for type '%s'",
+		fn_name, type.ToString());
+}
+
+}  // namespace
+
+std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx) {
+	if (v.IsNull()) {
+		return "NULL";
+	}
+	switch (FamilyFromLogicalType(type)) {
+	case TypeFamily::Boolean:
+		return boolean::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Integer:
+		return integer::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Float:
+		return float_family::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Decimal:
+		return decimal::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Money:
+		ThrowMoneyUnreachable("FormatSqlLiteral", type);
+	case TypeFamily::String:
+		return string::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Binary:
+		return binary::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::DateTime:
+		return datetime::FormatSqlLiteral(v, type, ctx);
+	case TypeFamily::Uuid:
+		return uuid::FormatSqlLiteral(v, type, ctx);
+	}
+	throw InternalException("codec::FormatSqlLiteral: unreachable (TypeFamily enum exhausted)");
+}
+
+size_t EstimateLiteralSize(const LogicalType &type) {
+	switch (FamilyFromLogicalType(type)) {
+	case TypeFamily::Boolean:
+		return boolean::EstimateLiteralSize(type);
+	case TypeFamily::Integer:
+		return integer::EstimateLiteralSize(type);
+	case TypeFamily::Float:
+		return float_family::EstimateLiteralSize(type);
+	case TypeFamily::Decimal:
+		return decimal::EstimateLiteralSize(type);
+	case TypeFamily::Money:
+		ThrowMoneyUnreachable("EstimateLiteralSize", type);
+	case TypeFamily::String:
+		return string::EstimateLiteralSize(type);
+	case TypeFamily::Binary:
+		return binary::EstimateLiteralSize(type);
+	case TypeFamily::DateTime:
+		return datetime::EstimateLiteralSize(type);
+	case TypeFamily::Uuid:
+		return uuid::EstimateLiteralSize(type);
+	}
+	throw InternalException("codec::EstimateLiteralSize: unreachable (TypeFamily enum exhausted)");
+}
+
+}  // namespace codec
+}  // namespace mssql
+}  // namespace duckdb

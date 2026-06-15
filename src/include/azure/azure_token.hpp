@@ -9,13 +9,19 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include "azure_secret_reader.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
+
+// Forward declaration — full type pulled in via duckdb.hpp for callers.
+class DatabaseInstance;
+
 namespace mssql {
 namespace azure {
 
@@ -85,23 +91,65 @@ struct CachedToken {
 
 //===----------------------------------------------------------------------===//
 // TokenCache - Thread-safe token cache
+//
+// Spec 047 FR-012 (security hardening): cache keys are namespaced by
+// (DatabaseInstance address, cache_key). Without the namespace, two DuckDB
+// instances created in the same process that both define a secret called
+// `mssql_secret` would alias to the same cache row — instance B would
+// silently authenticate with instance A's already-acquired token even when
+// the two secrets resolve to different Azure principals.
+//
+// Lifetime note: entries are NOT proactively swept when a DatabaseInstance
+// is destroyed. The namespace is the raw `uintptr_t` address of the
+// instance, so entries belonging to a dead instance become unreachable
+// from new instances UNLESS the allocator reuses the same address — at
+// which point a stale row will be returned to the new instance for the
+// remainder of the row's TTL window (~1 h). Reaping would require a
+// `~DatabaseInstance` hook which DuckDB does not expose to extensions.
+//
+// **Eviction model**: the underlying map only shrinks via `Invalidate`,
+// `InvalidateByPrefix`, `Clear`, or overwrite in `SetToken`. TTL only
+// suppresses READS (`GetToken` returns empty when `CachedToken::IsValid()`
+// is false) — it does NOT erase the entry. The OnDetach path in
+// `MSSQLCatalog` calls `InvalidateByPrefix` to clear bare + tenant-suffixed
+// rows for the detached catalog, so the long-running-process accumulation
+// risk is bounded by the catalog churn rather than by TTL.
 //===----------------------------------------------------------------------===//
+
+// Hash for the (DatabaseInstance*-as-uintptr, cache_key) pair used as the
+// TokenCache map key. boost::hash_combine-equivalent; the std::pair specialization
+// is not in libstdc++ for unordered containers, so we provide our own.
+struct PairHash {
+	std::size_t operator()(const std::pair<std::uintptr_t, std::string> &p) const noexcept {
+		std::size_t h1 = std::hash<std::uintptr_t>{}(p.first);
+		std::size_t h2 = std::hash<std::string>{}(p.second);
+		return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+	}
+};
+
 class TokenCache {
 public:
 	// Get a cached token if available and valid (returns empty string if not found)
-	std::string GetToken(const std::string &secret_name);
+	std::string GetToken(DatabaseInstance &db, const std::string &cache_key);
 
 	// Check if a valid token exists in the cache
-	bool HasValidToken(const std::string &secret_name);
+	bool HasValidToken(DatabaseInstance &db, const std::string &cache_key);
 
 	// Store a token in the cache
-	void SetToken(const std::string &secret_name, const std::string &token,
+	void SetToken(DatabaseInstance &db, const std::string &cache_key, const std::string &token,
 				  std::chrono::system_clock::time_point expires_at);
 
-	// Invalidate a specific token
-	void Invalidate(const std::string &secret_name);
+	// Invalidate a specific token within a DatabaseInstance's namespace
+	void Invalidate(DatabaseInstance &db, const std::string &cache_key);
 
-	// Clear all cached tokens
+	// Invalidate every key in a DatabaseInstance's namespace whose cache_key
+	// starts with `prefix`. Use case: OnDetach must evict both the bare secret
+	// name AND its tenant-suffixed variants (`secret:tenant1`,
+	// `secret:tenant2`, ...) that interactive-auth paths build via
+	// `secret_name + ":" + tenant_id_override` in `AcquireToken`.
+	void InvalidateByPrefix(DatabaseInstance &db, const std::string &prefix);
+
+	// Clear all cached tokens (test/diagnostic only — does not respect namespacing)
 	void Clear();
 
 	// Get singleton instance
@@ -109,7 +157,7 @@ public:
 
 private:
 	std::mutex mutex_;
-	std::unordered_map<std::string, CachedToken> cache_;
+	std::unordered_map<std::pair<std::uintptr_t, std::string>, CachedToken, PairHash> cache_;
 };
 
 //===----------------------------------------------------------------------===//

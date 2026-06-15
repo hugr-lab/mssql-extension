@@ -42,17 +42,37 @@ struct PoolStatistics {
 	size_t acquire_count = 0;
 	size_t acquire_timeout_count = 0;
 	uint64_t acquire_wait_total_ms = 0;
-	size_t pinned_connections = 0;	// Connections pinned to active transactions
+	int64_t pinned_count = 0;  // Connections pinned to active transactions (spec 047 FR-005)
 };
 
 // Connection factory function type
 using ConnectionFactory = std::function<std::shared_ptr<TdsConnection>()>;
 
-// Thread-safe connection pool for a single database context
+// Thread-safe connection pool for a single database context.
+//
+// Spec 047 T046m — destruction contract:
+//   Sockets close immediately on pool destruction. In-flight TDS requests
+//   on other threads observe connection-reset on next read (EBADF / SSL
+//   read error). Server-side rollback of any open transactions happens
+//   via TCP FIN within seconds.
+//
+//   No graceful TDS ATTENTION cancel is sent during destruction — that
+//   would require a cross-thread write to a connection's socket, racing
+//   with the owning thread's read. The DuckDB extension contract
+//   requires query quiescence before `~AttachedDatabase` runs (and
+//   therefore before `~MSSQLCatalog` / `~ConnectionPool`); the debug
+//   `D_ASSERT(active_connections_.empty())` in Shutdown() surfaces
+//   any host that violates that contract.
+//
+//   Cooperative cancellation (atomic flag polled by the owner thread,
+//   per spec 047 Constraints / non-goals) is tracked as a follow-up
+//   spec — out of scope here.
 class ConnectionPool {
 public:
 	ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory);
-	~ConnectionPool();
+	// noexcept: destructor body wraps Shutdown() in try/catch — a throw from
+	// teardown during `~AttachedDatabase` unwind would invoke std::terminate.
+	~ConnectionPool() noexcept;
 
 	// Non-copyable, non-movable
 	ConnectionPool(const ConnectionPool &) = delete;
@@ -70,6 +90,14 @@ public:
 
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
+
+	// Pin counter — tracks connections currently pinned to active DuckDB
+	// transactions (spec 047 FR-005). Migrated from the deleted
+	// MssqlPoolManager::pinned_counts_ map. Lock-free; safe to call from any
+	// thread.
+	void IncrementPinned();
+	void DecrementPinned();
+	int64_t GetPinnedCount() const noexcept;
 
 	// Shutdown the pool (closes all connections)
 	void Shutdown();
@@ -99,6 +127,11 @@ private:
 	// Background cleanup
 	std::thread cleanup_thread_;
 	std::atomic<bool> shutdown_flag_;
+
+	// Pin counter (spec 047 FR-005). Separate from pool_mutex_ — pin counting
+	// is high-frequency on transaction begin/commit and should not contend
+	// with Acquire/Release.
+	std::atomic<int64_t> pinned_count_{0};
 
 	// Internal methods
 	void CleanupThreadFunc();

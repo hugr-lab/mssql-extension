@@ -211,6 +211,12 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	result->TrySetValue(MSSQL_SECRET_KRB5_REALM, input);
 	result->TrySetValue(MSSQL_SECRET_SPN, input);
 
+	// Spec 047 FR-014: LOGIN7 program_name. Both canonical and fallback
+	// names persist into the secret; FromSecret then reads the canonical
+	// first and falls back to the spaceless form if the canonical is unset.
+	result->TrySetValue(MSSQL_SECRET_APPLICATION_NAME, input);
+	result->TrySetValue(MSSQL_SECRET_APPLICATION_NAME_FALLBACK, input);
+
 	// Mark password as redacted (hidden in duckdb_secrets() output)
 	result->redact_keys.insert(MSSQL_SECRET_PASSWORD);
 
@@ -259,6 +265,11 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_KRB5_CREDCACHEFILE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_KRB5_REALM] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_SPN] = LogicalType::VARCHAR;
+
+	// Spec 047 FR-014: custom LOGIN7 program_name from secret. Two names:
+	// canonical underscore form + spaceless ADO.NET-style fallback.
+	create_func.named_parameters[MSSQL_SECRET_APPLICATION_NAME] = LogicalType::VARCHAR;
+	create_func.named_parameters[MSSQL_SECRET_APPLICATION_NAME_FALLBACK] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(std::move(create_func));
 }

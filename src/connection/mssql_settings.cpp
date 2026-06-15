@@ -48,6 +48,28 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
 							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_login7_max_packet - TEST-ONLY (issue #138). Lowers the LOGIN7 / SSPI
+	// integrated-auth fragmentation boundary so the multi-packet send path can be
+	// exercised without an AD-sized Kerberos PAC. 0 = production default (4096);
+	// effective values are clamped to [256, 32767] when the connection is built.
+	config.AddExtensionOption("mssql_login7_max_packet",
+							  "TEST-ONLY: max LOGIN7 TDS packet size in bytes for integrated auth (0 = default 4096)",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
+	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
+	// Used when resolving named instances (host\instance) via MC-SQLR.
+	// Short by design — Browser is on the critical path of every named-instance attach.
+	config.AddExtensionOption(
+		"mssql_browser_timeout_seconds",
+		"SQL Server Browser UDP query timeout in seconds for named-instance resolution (default: 3)",
+		LogicalType::BIGINT, Value::BIGINT(3), ValidatePositive, SetScope::GLOBAL);
+
+	// mssql_named_instance_resolution - Enable host\instance resolution via SQL Browser (spec 045)
+	// Escape hatch for environments that strip outbound UDP 1434.
+	config.AddExtensionOption("mssql_named_instance_resolution",
+							  "Enable SQL Server Browser (UDP 1434) resolution of host\\instance connection strings",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_idle_timeout - Idle connection timeout in seconds
 	config.AddExtensionOption("mssql_idle_timeout", "Idle connection timeout in seconds (0 = no timeout)",
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_IDLE_TIMEOUT), ValidateNonNegative,
@@ -62,6 +84,18 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_acquire_timeout", "Connection acquire timeout in seconds (0 = fail immediately)",
 							  LogicalType::BIGINT, Value::BIGINT(tds::DEFAULT_ACQUIRE_TIMEOUT), ValidateNonNegative,
 							  SetScope::GLOBAL);
+
+	// mssql_attach_validation_timeout - Spec 047 (US2): timeout for the
+	// eager TCP + LOGIN7 round-trip that ATTACH runs to surface bad
+	// credentials / unreachable host / wrong DB up front. 0 means use
+	// mssql_connection_timeout. Distinct from connection_timeout so
+	// operators can give ATTACH a shorter ceiling than steady-state
+	// queries (ATTACH is on the user's interactive path; query pool
+	// fills can tolerate a longer wait).
+	config.AddExtensionOption("mssql_attach_validation_timeout",
+							  "Timeout in seconds for the ATTACH-time credential round trip "
+							  "(0 = inherit mssql_connection_timeout). Spec 047 / US2.",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_query_timeout - Query execution timeout in seconds (0 = no timeout)
 	config.AddExtensionOption("mssql_query_timeout", "Query execution timeout in seconds (0 = no timeout, default: 30)",
@@ -256,6 +290,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 		config.metadata_timeout = static_cast<int>(val.GetValue<int64_t>());
 	}
 
+	if (context.TryGetCurrentSetting("mssql_login7_max_packet", val)) {
+		config.login7_max_packet = val.GetValue<int64_t>();
+	}
+
 	return config;
 }
 
@@ -281,6 +319,22 @@ int LoadMetadataTimeout(ClientContext &context) {
 		return static_cast<int>(val.GetValue<int64_t>());
 	}
 	return tds::DEFAULT_METADATA_TIMEOUT;  // Default: 300 seconds
+}
+
+// Spec 047 (US2): timeout for the eager ATTACH-time credential round trip.
+// 0 ⇒ fall back to mssql_connection_timeout (the steady-state ceiling).
+int LoadAttachValidationTimeout(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_attach_validation_timeout", val)) {
+		auto seconds = static_cast<int>(val.GetValue<int64_t>());
+		if (seconds > 0) {
+			return seconds;
+		}
+	}
+	if (context.TryGetCurrentSetting("mssql_connection_timeout", val)) {
+		return static_cast<int>(val.GetValue<int64_t>());
+	}
+	return tds::DEFAULT_CONNECTION_TIMEOUT;
 }
 
 //===----------------------------------------------------------------------===//

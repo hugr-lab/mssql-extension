@@ -1,0 +1,35 @@
+# Uuid decode cases — codec::uuid::DecodeFromTds
+# Format: wire-hex (16 bytes, TDS mixed-endian) | expected canonical UUID string
+#
+# Wire layout: Data1 LE (4) | Data2 LE (2) | Data3 LE (2) | Data4 BE (8)
+# Canonical:   Data1 BE     | Data2 BE     | Data3 BE     | Data4 BE  (all dash-separated)
+
+# All-zero — sentinel "nil UUID".
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | 00000000-0000-0000-0000-000000000000
+
+# All-ones — sentinel "max UUID".
+FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF | ffffffff-ffff-ffff-ffff-ffffffffffff
+
+# Classic example from RFC 4122 §3 — 6ba7b810-9dad-11d1-80b4-00c04fd430c8.
+# Data1 = 0x6ba7b810 LE -> 10 B8 A7 6B
+# Data2 = 0x9dad     LE -> AD 9D
+# Data3 = 0x11d1     LE -> D1 11
+# Data4 = 80 B4 00 C0 4F D4 30 C8 BE
+10 B8 A7 6B AD 9D D1 11 80 B4 00 C0 4F D4 30 C8 | 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+
+# Mixed-byte pattern to exercise every Data1/Data2/Data3 byte position.
+# UUID = 01234567-89ab-cdef-0123-456789abcdef
+# Data1 = 0x01234567 LE -> 67 45 23 01
+# Data2 = 0x89ab     LE -> AB 89
+# Data3 = 0xcdef     LE -> EF CD
+# Data4 = 01 23 45 67 89 AB CD EF BE
+67 45 23 01 AB 89 EF CD 01 23 45 67 89 AB CD EF | 01234567-89ab-cdef-0123-456789abcdef
+
+# Microsoft SQL Server sequential GUID example (high bit of Data4[0] set —
+# proves DuckDB's high-bit XOR for sortability does not corrupt round-trip).
+# UUID = c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d
+# Data1 = 0xc2c7f47e LE -> 7E F4 C7 C2
+# Data2 = 0x8edd     LE -> DD 8E
+# Data3 = 0x4e1f     LE -> 1F 4E
+# Data4 = 8A 3F AE F2 A1 8B 1C 2D BE
+7E F4 C7 C2 DD 8E 1F 4E 8A 3F AE F2 A1 8B 1C 2D | c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d

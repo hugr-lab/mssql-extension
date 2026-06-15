@@ -330,6 +330,43 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				// Build column mapping from source to target
 				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
 
+				// Issue #125: Drop target columns that have no matching source column (by name).
+				// These are columns the server fills itself — IDENTITY, DEFAULT-valued, or
+				// computed columns the source intentionally omits. INSERT BULK only needs the
+				// columns actually being loaded; SQL Server auto-generates the rest. Previously
+				// every target column was declared, so an unmapped IDENTITY column had NULL
+				// streamed into it and the load failed ("Cannot insert the value NULL into
+				// column ..." / "Incorrect syntax near the keyword 'with'").
+				{
+					vector<BCPColumnMetadata> mapped_columns;
+					vector<int32_t> mapped_mapping;
+					mapped_columns.reserve(gstate->columns.size());
+					mapped_mapping.reserve(gstate->column_mapping.size());
+					for (idx_t i = 0; i < gstate->columns.size(); i++) {
+						// column_mapping[i] is the source-column index feeding target column i,
+						// or -1 when no source column matches it by name. Keep only the mapped
+						// (>= 0) target columns; the -1 entries are server-generated (IDENTITY,
+						// DEFAULT, computed) and must be left out of INSERT BULK entirely.
+						if (gstate->column_mapping[i] >= 0) {
+							mapped_columns.push_back(gstate->columns[i]);
+							mapped_mapping.push_back(gstate->column_mapping[i]);
+						} else {
+							CopyDebugLog(1,
+										 "BCPCopyInitGlobal: omitting target column '%s' from INSERT BULK "
+										 "(no matching source column; server-generated, e.g. IDENTITY/DEFAULT)",
+										 gstate->columns[i].name.c_str());
+						}
+					}
+					if (mapped_columns.empty()) {
+						throw InvalidInputException(
+							"MSSQL COPY: no source columns match target table '%s' by name; "
+							"nothing to load. Ensure source column names match the target's columns.",
+							bdata.target.GetFullyQualifiedName());
+					}
+					gstate->columns = std::move(mapped_columns);
+					gstate->column_mapping = std::move(mapped_mapping);
+				}
+
 				// Check if we need to use column mapping (i.e., not a 1:1 positional match)
 				// Mapping is needed if: column counts differ, or any mapping != position
 				need_column_mapping = (bdata.source_names.size() != gstate->columns.size());
@@ -459,7 +496,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	}
 
 	// Check for interrupt (Ctrl+C) - allows user to cancel long-running COPY
-	if (context.client.interrupted) {
+	if (context.client.IsInterrupted()) {
 		CopyDebugLog(1, "BCPCopySink: INTERRUPT detected at start");
 		throw InterruptException();
 	}
@@ -483,7 +520,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 					 (unsigned long long)rows_written, write_ms);
 
 		// Check for interrupt after encoding
-		if (context.client.interrupted) {
+		if (context.client.IsInterrupted()) {
 			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after encoding");
 			throw InterruptException();
 		}
@@ -505,7 +542,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		}
 
 		// Check for interrupt after flush
-		if (context.client.interrupted) {
+		if (context.client.IsInterrupted()) {
 			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after flush");
 			throw InterruptException();
 		}
@@ -614,7 +651,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	auto &gdata = gstate.Cast<MSSQLCopyGlobalState>();
 
 	// Check for interrupt before starting heavy finalize
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 

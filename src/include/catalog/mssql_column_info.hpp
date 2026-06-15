@@ -31,6 +31,9 @@ struct MSSQLColumnInfo {
 	bool is_unicode;		 // True for NVARCHAR/NCHAR/NTEXT
 	bool is_utf8;			 // Derived from collation (_UTF8)
 	bool is_cast_required;	 // Unsupported type: needs CAST to NVARCHAR(MAX)
+	bool is_geometry;		 // True for SQL Server geometry/geography columns; table scan projects
+							 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
+							 // in a LogicalType::GEOMETRY() vector via the Binary codec.
 
 	// Default constructor
 	MSSQLColumnInfo();

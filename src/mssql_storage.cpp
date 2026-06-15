@@ -4,7 +4,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
-#include "connection/mssql_pool_manager.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -16,6 +15,8 @@
 #include "mssql_platform.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 #include "tds/tds_connection.hpp"
+
+#include <openssl/crypto.h>
 
 #include <cstdlib>
 
@@ -36,6 +37,103 @@ static int GetMssqlStorageDebugLevel() {
 	} while (0)
 
 namespace duckdb {
+
+//===----------------------------------------------------------------------===//
+// MSSQLConnectionInfo destructor — wipe bearer credentials
+//
+// SQL `password` and Azure AD `access_token` are bearer credentials that
+// should not linger in heap-recycled memory after the struct dies. Use
+// OPENSSL_cleanse rather than std::fill / memset so dead-store elimination
+// can't optimise the wipe away. Cheap (microseconds) and OpenSSL is
+// already linked extension-wide via vcpkg.
+//
+// `password.data()` returns a pointer to the storage in use (whether SSO
+// inline buffer or heap allocation). Wiping `size()` bytes covers the
+// live characters; subsequent `string` destruction releases the heap
+// allocation (if any) — by then it holds zeros.
+//===----------------------------------------------------------------------===//
+MSSQLConnectionInfo::~MSSQLConnectionInfo() {
+	if (!password.empty()) {
+		OPENSSL_cleanse(&password[0], password.size());
+	}
+	if (!access_token.empty()) {
+		OPENSSL_cleanse(&access_token[0], access_token.size());
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// ResolveAppName (Spec 047 US-AN / FR-014 / T065) — see header doc-comment
+//
+// Two-step normalization:
+//   1. Strip C0 controls (bytes 0x00–0x1F) and DEL (0x7F). LOGIN7
+//      program_name lands in `sys.dm_exec_sessions.program_name`,
+//      `sys.dm_exec_requests`, and the SQL Server error log; un-stripped
+//      `\r\n` would let an attacker who controls any ATTACH path inject
+//      fake log lines (CR/LF injection — flagged by PR #118 review H2).
+//   2. UTF-16 code unit clamp at 128, mirroring SQL Server's program_name
+//      limit and the wire encoding in `tds_protocol.cpp::BuildLogin7`.
+//      Walks the UTF-8 input forward by codepoint; counts UTF-16 code
+//      units (1 for BMP codepoints in 1/2/3-byte UTF-8 sequences, 2 for
+//      supplementary plane codepoints in 4-byte UTF-8 sequences =
+//      surrogate pair). Invalid UTF-8 bytes advance defensively by 1
+//      byte / 1 code unit so a malformed input still terminates rather
+//      than looping.
+//===----------------------------------------------------------------------===//
+string ResolveAppName(const MSSQLConnectionInfo &info) {
+	static constexpr size_t MAX_UTF16_CODE_UNITS = 128;
+	if (info.application_name.empty()) {
+		return "DuckDB MSSQL Extension";
+	}
+	// Step 1: strip C0 controls + DEL (log-injection defense).
+	string sanitized;
+	sanitized.reserve(info.application_name.size());
+	for (char ch : info.application_name) {
+		auto c = static_cast<unsigned char>(ch);
+		if (c >= 0x20 && c != 0x7F) {
+			sanitized.push_back(ch);
+		}
+	}
+	if (sanitized.empty()) {
+		return "DuckDB MSSQL Extension";
+	}
+	// Step 2: 128 UTF-16 code unit clamp.
+	const string &s = sanitized;
+	size_t byte_pos = 0;
+	size_t utf16_units = 0;
+	while (byte_pos < s.size() && utf16_units < MAX_UTF16_CODE_UNITS) {
+		auto c = static_cast<unsigned char>(s[byte_pos]);
+		size_t advance;
+		size_t units;
+		if (c < 0x80) {
+			advance = 1;
+			units = 1;	// ASCII
+		} else if ((c & 0xE0) == 0xC0) {
+			advance = 2;
+			units = 1;	// 2-byte UTF-8 → 1 UCS-2 code unit
+		} else if ((c & 0xF0) == 0xE0) {
+			advance = 3;
+			units = 1;	// 3-byte UTF-8 → 1 UCS-2 code unit
+		} else if ((c & 0xF8) == 0xF0) {
+			advance = 4;
+			units = 2;	// 4-byte UTF-8 → surrogate pair (2 code units)
+		} else {
+			advance = 1;
+			units = 1;	// invalid lead byte — defensive single-byte step
+		}
+		if (utf16_units + units > MAX_UTF16_CODE_UNITS) {
+			break;
+		}
+		if (byte_pos + advance > s.size()) {
+			break;	// truncated UTF-8 at end of input
+		}
+		byte_pos += advance;
+		utf16_units += units;
+	}
+	if (byte_pos == s.size()) {
+		return s;
+	}
+	return s.substr(0, byte_pos);
+}
 
 //===----------------------------------------------------------------------===//
 // MSSQLConnectionInfo implementation
@@ -148,6 +246,20 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->krb5_credcachefile = get_str("krb5_credcachefile");
 	result->krb5_realm = get_str("krb5_realm");
 	result->service_principal_name = get_str("service_principal_name");
+
+	// Spec 047 FR-014 (issue #82): LOGIN7 program_name from secret. Accept
+	// both `application_name` (underscore form, the existing convention for
+	// MSSQL secret fields) and `applicationname` (spaceless ADO.NET form).
+	// First non-empty wins; underscore form is the documented canonical key.
+	{
+		auto app_name_val = kv_secret.TryGetValue("application_name");
+		if (app_name_val.IsNull() || app_name_val.ToString().empty()) {
+			app_name_val = kv_secret.TryGetValue("applicationname");
+		}
+		if (!app_name_val.IsNull()) {
+			result->application_name = app_name_val.ToString();
+		}
+	}
 
 	result->connected = false;
 	return result;
@@ -315,6 +427,12 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 				} else if (lower_key == "integrated_security" || lower_key == "integratedsecurity" ||
 						   lower_key == "integrated-security") {
 					result["integrated_security"] = value;
+				} else if (lower_key == "applicationname" || lower_key == "application_name") {
+					// Spec 047 FR-014 (issue #82): URI keys cannot contain spaces, so
+					// `application name` is not a valid form here — accept the spaceless
+					// canonical variants only. Routes to the same `application_name`
+					// canonical key as the ADO.NET branch.
+					result["application_name"] = value;
 				} else {
 					result[key] = value;
 				}
@@ -471,6 +589,13 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 				   lower_key == "integrated security" || lower_key == "integrated-security") {
 			// ADO.NET canonical alias
 			result["integrated_security"] = value;
+		} else if (lower_key == "application name" || lower_key == "applicationname" || lower_key == "app name" ||
+				   lower_key == "application_name") {
+			// Spec 047 FR-014 (issue #82): LOGIN7 program_name. Recognise the
+			// ADO.NET canonical variants + the underscore form so the same
+			// `application_name=...` shape works in connection strings, URIs,
+			// and secrets.
+			result["application_name"] = value;
 		} else {
 			result[key] = value;
 		}
@@ -774,78 +899,16 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 		result->service_principal_name = get("service_principal_name");
 	}
 
+	// Spec 047 FR-014 (issue #82): custom LOGIN7 program_name. Routed through
+	// the canonical `application_name` key by both ADO.NET and URI parsers.
+	{
+		auto it = params.find("application_name");
+		if (it != params.end()) {
+			result->application_name = it->second;
+		}
+	}
+
 	result->connected = false;
-	return result;
-}
-
-//===----------------------------------------------------------------------===//
-// MSSQLContext implementation
-//===----------------------------------------------------------------------===//
-
-MSSQLContext::MSSQLContext(const string &name, const string &secret_name) : name(name), secret_name(secret_name) {}
-
-//===----------------------------------------------------------------------===//
-// MSSQLContextManager implementation
-//===----------------------------------------------------------------------===//
-
-// Static storage for context managers - keyed by DatabaseInstance pointer
-static case_insensitive_map_t<unique_ptr<MSSQLContextManager>> g_context_managers;
-static mutex g_context_managers_lock;
-
-MSSQLContextManager &MSSQLContextManager::Get(DatabaseInstance &db) {
-	lock_guard<mutex> guard(g_context_managers_lock);
-
-	// Use pointer address as unique key - cast to size_t for formatting
-	string db_key = StringUtil::Format("%llu", (unsigned long long)(uintptr_t)&db);
-
-	auto it = g_context_managers.find(db_key);
-	if (it == g_context_managers.end()) {
-		auto manager = make_uniq<MSSQLContextManager>();
-		auto &manager_ref = *manager;
-		g_context_managers[db_key] = std::move(manager);
-		return manager_ref;
-	}
-	return *it->second;
-}
-
-void MSSQLContextManager::RegisterContext(const string &name, shared_ptr<MSSQLContext> ctx) {
-	lock_guard<mutex> guard(lock);
-	if (contexts.find(name) != contexts.end()) {
-		throw CatalogException("MSSQL Error: Context '%s' already exists. Use a different name or DETACH first.", name);
-	}
-	contexts[name] = std::move(ctx);
-}
-
-void MSSQLContextManager::UnregisterContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	auto it = contexts.find(name);
-	if (it != contexts.end()) {
-		// Clean up: abort any in-progress queries, close connection
-		// For stub implementation, just remove from map
-		contexts.erase(it);
-	}
-}
-
-shared_ptr<MSSQLContext> MSSQLContextManager::GetContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	auto it = contexts.find(name);
-	if (it == contexts.end()) {
-		return nullptr;
-	}
-	return it->second;
-}
-
-bool MSSQLContextManager::HasContext(const string &name) {
-	lock_guard<mutex> guard(lock);
-	return contexts.find(name) != contexts.end();
-}
-
-vector<string> MSSQLContextManager::ListContexts() {
-	lock_guard<mutex> guard(lock);
-	vector<string> result;
-	for (auto &entry : contexts) {
-		result.push_back(entry.first);
-	}
 	return result;
 }
 
@@ -957,7 +1020,8 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 
 	// Attempt Azure AD authentication (FEDAUTH)
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
-	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt)) {
+	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt,
+									  ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
 		conn.Close();
@@ -1021,7 +1085,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 
 	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
-	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt)) {
+	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
 		conn.Close();
@@ -1082,7 +1146,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 	// Attempt authentication
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
-	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt)) {
+	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
@@ -1174,7 +1238,8 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
 	}
 
-	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt)) {
+	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, ResolveAppName(info),
+									 info.login7_max_packet)) {
 		string error = conn.GetLastError();
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
@@ -1202,6 +1267,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool schema_filter_specified = false;
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
+	bool lazy_validation = false;		// Spec 047 (US2): opt out of eager creds check
+	string application_name_option;		// Spec 047 (US-AN): ATTACH-level program_name override
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1229,6 +1296,21 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		} else if (lower_name == "order_pushdown") {
 			order_pushdown_option = it->second.GetValue<bool>() ? 1 : 0;
 			it = options.options.erase(it);
+		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
+			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
+			// Match the ADO.NET-style alias `LazyValidation` (lowercase via
+			// StringUtil::Lower) alongside the canonical `lazy_validation`.
+			lazy_validation = it->second.GetValue<bool>();
+			it = options.options.erase(it);
+		} else if (lower_name == "application_name" || lower_name == "applicationname" ||
+				   lower_name == "application name" || lower_name == "app name") {
+			// Spec 047 (US-AN / FR-014): ATTACH-level override for LOGIN7
+			// program_name. Accept the canonical underscore form, the spaceless
+			// ADO.NET-style alias, and the two ADO.NET spaced variants. Wins
+			// over connection-string / secret value via the precedence pattern
+			// established by schema_filter / table_filter (ATTACH > secret).
+			application_name_option = it->second.ToString();
+			it = options.options.erase(it);
 		} else {
 			++it;
 		}
@@ -1237,29 +1319,30 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Get connection string from info.path (the first argument to ATTACH)
 	string connection_string = info.path;
 
-	// Create context based on whether SECRET or connection string is provided
-	auto ctx = make_shared_ptr<MSSQLContext>(name, secret_name);
-	ctx->attached_db = &db;
+	// Build connection info based on whether SECRET or connection string is provided.
+	// Spec 047 T020: MSSQLContext / MSSQLContextManager singletons removed; the
+	// catalog itself is the per-instance owner of connection_info + pool.
+	shared_ptr<MSSQLConnectionInfo> connection_info;
 
 	if (!secret_name.empty()) {
 		// SECRET provided - use secret-based connection
-		ctx->connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
+		connection_info = MSSQLConnectionInfo::FromSecret(context, secret_name);
 	} else if (!connection_string.empty()) {
 		// Connection string provided - parse it
 		// If access_token or azure_secret is provided as option, allow missing user/password
 		bool azure_auth_option = !access_token.empty() || !azure_secret_name.empty();
-		ctx->connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
+		connection_info = MSSQLConnectionInfo::FromConnectionString(connection_string, azure_auth_option);
 
 		// Set access_token from ATTACH option if provided (Spec 032: takes precedence)
 		if (!access_token.empty()) {
-			ctx->connection_info->access_token = access_token;
-			ctx->connection_info->use_azure_auth = true;
-			ctx->connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
+			connection_info->access_token = access_token;
+			connection_info->use_azure_auth = true;
+			connection_info->auth_method = AuthMethod::MANUAL_TOKEN;  // Spec 042: keep enum in sync
 		} else if (!azure_secret_name.empty()) {
 			// Set azure_secret from ATTACH option if provided
-			ctx->connection_info->azure_secret_name = azure_secret_name;
-			ctx->connection_info->use_azure_auth = true;
-			ctx->connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
+			connection_info->azure_secret_name = azure_secret_name;
+			connection_info->use_azure_auth = true;
+			connection_info->auth_method = AuthMethod::AZURE_AD;  // Spec 042: keep enum in sync
 		}
 	} else {
 		// Neither SECRET nor connection string provided
@@ -1272,13 +1355,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 
 	// Apply ORDER BY pushdown option from ATTACH if specified (Spec 039)
 	if (order_pushdown_option >= 0) {
-		ctx->connection_info->order_pushdown = order_pushdown_option;
+		connection_info->order_pushdown = order_pushdown_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "ORDER_PUSHDOWN option from ATTACH: %s", order_pushdown_option ? "true" : "false");
 	}
 
 	// Apply CATALOG option from ATTACH if specified (overrides connection string/secret value)
 	if (catalog_option_specified) {
-		ctx->connection_info->catalog_enabled = catalog_enabled_option;
+		connection_info->catalog_enabled = catalog_enabled_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
 	}
 
@@ -1289,91 +1372,127 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		if (!error.empty()) {
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
-		ctx->connection_info->schema_filter = schema_filter_option;
+		connection_info->schema_filter = schema_filter_option;
 	}
 	if (table_filter_specified) {
 		auto error = MSSQLCatalogFilter::ValidatePattern(table_filter_option);
 		if (!error.empty()) {
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
-		ctx->connection_info->table_filter = table_filter_option;
+		connection_info->table_filter = table_filter_option;
+	}
+	if (!application_name_option.empty()) {
+		// Spec 047 FR-014: ATTACH-level value wins over connection-string /
+		// secret embedded value. ResolveAppName at the auth fan-out applies
+		// the 128-UTF-16-code-unit clamp + control-char strip.
+		connection_info->application_name = application_name_option;
 	}
 
 	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance
 	// Fabric endpoints don't support BCP/INSERT BULK, need fallback to INSERT
-	ctx->connection_info->is_fabric_endpoint = ctx->connection_info->IsFabricEndpoint();
-	if (ctx->connection_info->is_fabric_endpoint) {
+	connection_info->is_fabric_endpoint = connection_info->IsFabricEndpoint();
+	if (connection_info->is_fabric_endpoint) {
 		MSSQL_STORAGE_DEBUG_LOG(1, "Fabric endpoint detected: %s (BCP disabled, using INSERT fallback)",
-								ctx->connection_info->host.c_str());
+								connection_info->host.c_str());
 	}
 
-	// Validate connection before registering context or creating catalog
-	// This ensures we fail fast on invalid credentials
+	// Validate connection before creating the catalog so invalid credentials
+	// surface immediately rather than at first query.
+	//
+	// Spec 047 (US2): the eager-validation block below is governed by the
+	// `lazy_validation` ATTACH option. When the user opts out (typically
+	// container/orchestration startup where ATTACH must succeed even if the
+	// SQL Server isn't ready yet), the FEDAUTH and ManualToken paths still
+	// pre-build their tokens — those are local-only operations that don't
+	// hit the server — and only the actual TCP+LOGIN7 round trip is skipped.
+	// Errors will then surface on the first real query (today's pre-US2
+	// behaviour).
+	//
+	// The validation timeout itself is `mssql_attach_validation_timeout`
+	// (spec 047 T026), which defaults to `mssql_connection_timeout` so
+	// existing deployments see no observable change in the steady state.
 	auto pool_config = LoadPoolConfig(context);
+	// issue #138 (test-only): carry the LOGIN7 fragmentation boundary on the
+	// connection info so both the ATTACH-time validation and the per-connection
+	// pool factory (which only sees connection_info) can pass it through to
+	// AuthenticateIntegrated. 0 = production default (4096).
+	connection_info->login7_max_packet =
+		pool_config.login7_max_packet > 0 ? static_cast<size_t>(pool_config.login7_max_packet) : 0;
+	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
+	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
+							lazy_validation ? "true" : "false", attach_validation_timeout);
 
-	// For Azure auth, we need to acquire token and use FEDAUTH validation
 	std::vector<uint8_t> fedauth_token_utf16le;
-	if (!ctx->connection_info->access_token.empty()) {
+	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
-		MSSQL_STORAGE_DEBUG_LOG(1, "Manual token auth: validating token at ATTACH time");
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Manual token auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 
-		// Create auth strategy - this validates JWT format, audience, and expiration
-		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(ctx->connection_info->access_token,
-																		 ctx->connection_info->database);
+		// Create auth strategy - this validates JWT format, audience, and expiration.
+		// JWT-shape validation runs even under lazy_validation: it's local and
+		// catches obviously-malformed tokens up front (cheap; no network).
+		// app_name (spec 047 FR-014) threaded through so the validation-time and
+		// pool-time strategies agree on program_name (this strategy is throw-away
+		// for the validator's token-encode, but the pool factory in catalog
+		// Initialize builds its own with the same resolved name).
+		auto auth_strategy = tds::AuthStrategyFactory::CreateManualToken(
+			connection_info->access_token, connection_info->database, ResolveAppName(*connection_info));
 
 		// Get the pre-encoded UTF-16LE token for pool creation
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
-		// Validate actual connection to server using the pre-provided token
-		ValidateManualTokenConnection(*ctx->connection_info, fedauth_token_utf16le, pool_config.connection_timeout);
-	} else if (ctx->connection_info->use_azure_auth) {
-		// T027 (FR-006): Validate FEDAUTH connections at ATTACH time (fail-fast)
-		// This ensures invalid credentials are detected immediately, not on first query
-		MSSQL_STORAGE_DEBUG_LOG(1, "Azure auth: validating connection at ATTACH time");
-		ValidateAzureConnection(context, *ctx->connection_info, pool_config.connection_timeout);
-
-		// Build FEDAUTH token for pool factory (uses validated credentials)
-		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, ctx->connection_info->azure_secret_name);
+		if (!lazy_validation) {
+			ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, attach_validation_timeout);
+		}
+	} else if (connection_info->use_azure_auth) {
+		// Validate FEDAUTH connections at ATTACH time (fail-fast).
+		// Always acquire the token (it's needed by the pool factory anyway);
+		// only the TCP+LOGIN7 verification step is governed by lazy_validation.
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Azure auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
+		if (!lazy_validation) {
+			ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
+		}
+		// Build FEDAUTH token for pool factory (uses validated credentials when
+		// not lazy; on lazy path the token still has to exist for pool fills).
+		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, connection_info->azure_secret_name);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
-	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
-			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
+	} else if (connection_info->auth_method == AuthMethod::KRB5 ||
+			   connection_info->auth_method == AuthMethod::WINSSPI) {
 		// Spec 042 Phase 3 / 4: validate the integrated-auth connection at ATTACH
 		// time so credential / SPN / clock-skew errors surface immediately.
-		MSSQL_STORAGE_DEBUG_LOG(1, "Integrated Auth: validating connection at ATTACH time");
-		ValidateIntegratedAuthConnection(*ctx->connection_info, pool_config.connection_timeout);
-	} else {
-		ValidateConnection(*ctx->connection_info, pool_config.connection_timeout);
+		MSSQL_STORAGE_DEBUG_LOG(
+			1, "Integrated Auth: %s at ATTACH time",
+			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
+		if (!lazy_validation) {
+			ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
+		}
+	} else if (!lazy_validation) {
+		ValidateConnection(*connection_info, attach_validation_timeout);
 	}
 
-	// Register context (only reached if validation succeeds)
-	auto &manager = MSSQLContextManager::Get(*context.db);
-	manager.RegisterContext(name, ctx);
+	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the
+	// tds::PoolConfiguration the pool itself consumes. The MSSQLCatalog now
+	// owns its pool — no MssqlPoolManager singleton, no cross-instance map.
+	tds::PoolConfiguration tds_pool_config;
+	tds_pool_config.connection_limit = pool_config.connection_limit;
+	tds_pool_config.connection_cache = pool_config.connection_cache;
+	tds_pool_config.connection_timeout = pool_config.connection_timeout;
+	tds_pool_config.idle_timeout = pool_config.idle_timeout;
+	tds_pool_config.min_connections = pool_config.min_connections;
+	tds_pool_config.acquire_timeout = pool_config.acquire_timeout;
 
-	// Create connection pool for this context
-	if (!ctx->connection_info->access_token.empty() || ctx->connection_info->use_azure_auth) {
-		// Use Azure AD authentication pool (manual token or azure_secret)
-		MssqlPoolManager::Instance().GetOrCreatePoolWithAzureAuth(
-			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->database,
-			fedauth_token_utf16le, ctx->connection_info->use_encrypt);
-	} else if (ctx->connection_info->auth_method == AuthMethod::KRB5 ||
-			   ctx->connection_info->auth_method == AuthMethod::WINSSPI) {
-		// Spec 042: Integrated Authentication pool. Each new pool connection
-		// builds a fresh authenticator so kinit-refreshed tickets are picked up.
-		MssqlPoolManager::Instance().GetOrCreatePoolWithIntegratedAuth(name, pool_config, *ctx->connection_info);
-	} else {
-		// Use SQL authentication pool
-		MssqlPoolManager::Instance().GetOrCreatePool(
-			name, pool_config, ctx->connection_info->host, ctx->connection_info->port, ctx->connection_info->user,
-			ctx->connection_info->password, ctx->connection_info->database, ctx->connection_info->use_encrypt);
-	}
-
-	// Create MSSQLCatalog with connection info and access mode from options
-	// The catalog will use the connection pool to query SQL Server
-	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH
-	// catalog_enabled flag determines whether schema discovery is available
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, ctx->connection_info, options.access_mode,
-										   ctx->connection_info->catalog_enabled);
+	// Create MSSQLCatalog with connection info, pool config, FEDAUTH token,
+	// and access mode. The constructor stores them; Initialize() builds the
+	// pool inline based on connection_info_->auth_method.
+	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
+	// catalog_enabled flag determines whether schema discovery is available.
+	auto catalog_enabled = connection_info->catalog_enabled;
+	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
+										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
 	catalog->Initialize(false);
 
 	return std::move(catalog);

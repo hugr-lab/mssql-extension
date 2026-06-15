@@ -43,16 +43,19 @@ namespace encoding {
 namespace {
 
 inline bool IsAsciiString(const char *data, size_t len) {
-	size_t i = 0;
-	const uint64_t *ptr64 = reinterpret_cast<const uint64_t *>(data);
+	// `data` may come from a DuckDB string_t inline buffer that is only
+	// 4-byte aligned; a raw uint64_t cast is undefined behaviour. memcpy
+	// expresses the same SWAR fast path with defined alignment semantics
+	// — modern compilers fold it down to the identical load instruction.
 	const size_t chunks = len / 8;
 	for (size_t c = 0; c < chunks; c++) {
-		if (ptr64[c] & 0x8080808080808080ULL) {
+		uint64_t chunk;
+		std::memcpy(&chunk, data + c * 8, 8);
+		if (chunk & 0x8080808080808080ULL) {
 			return false;
 		}
 	}
-	i = chunks * 8;
-	for (; i < len; i++) {
+	for (size_t i = chunks * 8; i < len; i++) {
 		if (static_cast<uint8_t>(data[i]) & 0x80) {
 			return false;
 		}

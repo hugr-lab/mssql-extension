@@ -17,6 +17,10 @@ struct MSSQLPoolConfig {
 	int acquire_timeout = tds::DEFAULT_ACQUIRE_TIMEOUT;
 	int query_timeout = tds::DEFAULT_QUERY_TIMEOUT;		   // Query execution timeout in seconds (0 = infinite)
 	int metadata_timeout = tds::DEFAULT_METADATA_TIMEOUT;  // Metadata query timeout in seconds (0 = infinite)
+	// Test-only (issue #138): lowers the LOGIN7 / SSPI integrated-auth packet
+	// fragmentation boundary so the multi-packet path can be exercised without
+	// an AD-sized Kerberos PAC. 0 = production default (4096). Clamped at use.
+	int64_t login7_max_packet = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -55,6 +59,10 @@ int LoadQueryTimeout(ClientContext &context);
 
 // Load metadata query timeout setting (0 = no timeout)
 int LoadMetadataTimeout(ClientContext &context);
+
+// Load ATTACH credential-validation timeout (spec 047 / US2).
+// Returns mssql_attach_validation_timeout if > 0, else mssql_connection_timeout.
+int LoadAttachValidationTimeout(ClientContext &context);
 
 // Load statistics configuration from context settings
 MSSQLStatisticsConfig LoadStatisticsConfig(ClientContext &context);

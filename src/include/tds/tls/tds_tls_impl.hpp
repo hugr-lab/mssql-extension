@@ -37,7 +37,8 @@ using TlsRecvCallback = std::function<int(uint8_t *buf, size_t len, int timeout_
 class TlsImpl {
 public:
 	TlsImpl();
-	~TlsImpl();
+	// noexcept (spec 047 T046k): destructor body wraps Close() in try/catch.
+	~TlsImpl() noexcept;
 
 	// Non-copyable
 	TlsImpl(const TlsImpl &) = delete;

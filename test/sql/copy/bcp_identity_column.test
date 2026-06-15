@@ -1,0 +1,84 @@
+# name: test/sql/copy/bcp_identity_column.test
+# description: COPY ... TO (FORMAT 'bcp') against a table with an IDENTITY column, with and without the identity column in the source (regression for issue #125)
+# group: [mssql]
+#
+# Before the fix, the BCP COPY path declared ALL target columns (including an unmapped
+# IDENTITY column) in the INSERT BULK statement and streamed NULL for the identity, failing
+# with "Cannot insert the value NULL into column 'ID'" / "Incorrect syntax near 'with'".
+# The fix declares only the columns the source actually maps to:
+#   - source WITHOUT the identity column -> column omitted, SQL Server auto-generates it
+#   - source WITH the identity column    -> column loaded, explicit values preserved
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   Example: Server=localhost,1433;Database=testdb;User Id=sa;Password=YourPassword123
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# =============================================================================
+# Scenario A: source OMITS the identity column -> server auto-generates it
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.BcpIdentityAuto'',''U'') IS NOT NULL DROP TABLE dbo.BcpIdentityAuto');
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.BcpIdentityAuto (ID BIGINT NOT NULL IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(100), val INT)');
+
+statement ok
+CREATE TEMP TABLE bcp_src_auto (name VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO bcp_src_auto VALUES ('alpha', 10), ('beta', 20), ('gamma', 30);
+
+statement ok
+COPY bcp_src_auto TO 'mssql.dbo.BcpIdentityAuto' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Identity auto-assigned 1..3 in insertion order
+query ITI
+SELECT ID, name, val FROM mssql.dbo.BcpIdentityAuto ORDER BY ID;
+----
+1	alpha	10
+2	beta	20
+3	gamma	30
+
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.BcpIdentityAuto');
+
+# =============================================================================
+# Scenario B: source INCLUDES the identity column -> explicit values preserved
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.BcpIdentityKeep'',''U'') IS NOT NULL DROP TABLE dbo.BcpIdentityKeep');
+
+statement ok
+SELECT mssql_exec('mssql', 'CREATE TABLE dbo.BcpIdentityKeep (ID BIGINT NOT NULL IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(100), val INT)');
+
+statement ok
+CREATE TEMP TABLE bcp_src_keep (ID BIGINT, name VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO bcp_src_keep VALUES (100, 'alpha', 10), (200, 'beta', 20), (300, 'gamma', 30);
+
+statement ok
+COPY bcp_src_keep TO 'mssql.dbo.BcpIdentityKeep' (FORMAT 'bcp', CREATE_TABLE false);
+
+# Explicit identity values preserved (BCP keeps identity)
+query ITI
+SELECT ID, name, val FROM mssql.dbo.BcpIdentityKeep ORDER BY ID;
+----
+100	alpha	10
+200	beta	20
+300	gamma	30
+
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.BcpIdentityKeep');
+
+statement ok
+DETACH mssql;

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "codec/literal_format.hpp"
+#include "codec/string_codec.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -45,18 +47,6 @@ namespace mssql {
 //------------------------------------------------------------------------------
 // Utility Functions
 //------------------------------------------------------------------------------
-
-std::string FilterEncoder::EscapeStringLiteral(const std::string &str) {
-	std::string result;
-	result.reserve(str.size() + 10);
-	for (char c : str) {
-		result += c;
-		if (c == '\'') {
-			result += '\'';	 // Double the ' character
-		}
-	}
-	return result;
-}
 
 std::string FilterEncoder::EscapeBracketIdentifier(const std::string &identifier) {
 	std::string result;
@@ -127,72 +117,18 @@ bool FilterEncoder::GetArithmeticOperator(ExpressionType type, std::string &out_
 }
 
 std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalType &type) {
-	if (value.IsNull()) {
-		return "NULL";
-	}
-
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return value.GetValue<bool>() ? "1" : "0";
-
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UBIGINT:
-		return value.ToString();
-
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-		return value.ToString();
-
-	case LogicalTypeId::DECIMAL:
-		return value.ToString();
-
-	case LogicalTypeId::VARCHAR:
-		// Use N'' for NVARCHAR compatibility and escape single quotes
-		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
-
-	case LogicalTypeId::DATE: {
-		auto date_val = value.GetValue<date_t>();
-		return "'" + Date::ToString(date_val) + "'";
-	}
-
-	case LogicalTypeId::TIME:
-		// TIME is stored as microseconds since midnight
-		return "'" + value.ToString() + "'";
-
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		auto ts_val = value.GetValue<timestamp_t>();
-		return "'" + Timestamp::ToString(ts_val) + "'";
-	}
-
-	case LogicalTypeId::UUID: {
-		return "'" + value.ToString() + "'";
-	}
-
-	case LogicalTypeId::BLOB: {
-		// Convert blob to hex string for SQL Server
-		auto blob_val = value.GetValueUnsafe<string_t>();
-		std::string hex = "0x";
-		for (idx_t i = 0; i < blob_val.GetSize(); i++) {
-			char buf[3];
-			snprintf(buf, sizeof(buf), "%02X", (unsigned char)blob_val.GetData()[i]);
-			hex += buf;
+	// All supported families route through the canonical codec dispatcher
+	// (handles NULL + 9-arm family switch internally). Unsupported types
+	// throw NotImplementedException; fall back to a string-escaped form so
+	// filter pushdown still produces *something* valid for the SQL Server side
+	// (filter is then compared as text rather than rejected outright).
+	try {
+		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
+	} catch (const NotImplementedException &) {
+		if (value.IsNull()) {
+			return "NULL";
 		}
-		return hex;
-	}
-
-	default:
-		// For other types, try ToString and quote as string
-		return "N'" + EscapeStringLiteral(value.ToString()) + "'";
+		return "N'" + codec::string::EscapeSqlSingleQuotes(value.ToString()) + "'";
 	}
 }
 
@@ -880,13 +816,13 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 	std::string like_pattern;
 	if (lower_func == "prefix" || lower_func == "iprefix") {
 		// prefix: column LIKE 'pattern%'
-		like_pattern = "N'" + EscapeStringLiteral(escaped_pattern) + "%'";
+		like_pattern = "N'" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "%'";
 	} else if (lower_func == "suffix" || lower_func == "isuffix") {
 		// suffix: column LIKE '%pattern'
-		like_pattern = "N'%" + EscapeStringLiteral(escaped_pattern) + "'";
+		like_pattern = "N'%" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "'";
 	} else if (lower_func == "contains" || lower_func == "icontains") {
 		// contains: column LIKE '%pattern%'
-		like_pattern = "N'%" + EscapeStringLiteral(escaped_pattern) + "%'";
+		like_pattern = "N'%" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "%'";
 	} else {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: unknown LIKE pattern function %s", function_name.c_str());
 		return {"", false};

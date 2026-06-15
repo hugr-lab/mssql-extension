@@ -1,6 +1,7 @@
 #include "catalog/mssql_table_set.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_schema_entry.hpp"
@@ -35,20 +36,30 @@ MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
 
 optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const string &name) {
 	CATALOG_DEBUG(2, "GetEntry('%s.%s')", schema_.name.c_str(), name.c_str());
+
+	// Spec 052 Option D: stash a copy of the shared_ptr in the per-context
+	// MSSQLBindAnchors; it's released at QueryEnd. This keeps the entry alive
+	// from LookupEntry's return through any binder dereferences AND through
+	// GetScanFunction (no separate bind_data anchor needed). If a concurrent
+	// Invalidate moves entries_ to nothing, our anchor still holds the entry
+	// for the rest of this query.
+	shared_ptr<MSSQLTableEntry> anchored;
+
 	// 1. Check cached entries (fast path)
 	{
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
 		if (it != entries_.end()) {
 			CATALOG_DEBUG(2, "  -> cache hit for '%s'", name.c_str());
-			return it->second.get();
-		}
-
-		// If we've already tried to load this table and it wasn't found, return nullptr
-		if (attempted_tables_.find(name) != attempted_tables_.end()) {
+			anchored = it->second;	// shared_ptr copy under lock — refcount inc
+		} else if (attempted_tables_.find(name) != attempted_tables_.end()) {
 			CATALOG_DEBUG(2, "  -> already attempted, not found");
 			return nullptr;
 		}
+	}
+	if (anchored) {
+		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		return anchored.get();
 	}
 
 	// 2. If fully loaded and not found, table doesn't exist
@@ -87,8 +98,12 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		auto it = entries_.find(name);
 		if (it != entries_.end()) {
-			return it->second.get();
+			anchored = it->second;	// shared_ptr copy under lock
 		}
+	}
+	if (anchored) {
+		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		return anchored.get();
 	}
 	return nullptr;
 }
@@ -120,28 +135,58 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	// Pre-populating statistics avoids 200K+ individual DMV queries when
 	// duckdb_tables() calls GetStorageInfo() on each table entry.
 	auto &stats_provider = catalog.GetStatisticsProvider();
-	std::lock_guard<std::mutex> lock(entry_mutex_);
 
-	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
-		// Pre-populate statistics cache with approx_row_count from bulk metadata
-		stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+	// Phase 1: populate entries_ under entry_mutex_ and capture shared_ptr
+	// references for the callback phase. We collect refs rather than invoking
+	// callback() here so the lock can be released before user code runs —
+	// callbacks frequently call back into DuckDB binder paths that resolve
+	// virtual columns or sibling tables, which would re-enter LoadSingleEntry
+	// and block on entry_mutex_ (spec 052 singleflight grabs it first).
+	// shared_ptr copies in the snapshot keep entries alive even if a sibling
+	// thread fires Invalidate() between phase 1 and phase 2.
+	vector<shared_ptr<MSSQLTableEntry>> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(entry_mutex_);
+		cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+			stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
+			known_table_names_.insert(table_name);
 
-		// Update known_table_names_
-		known_table_names_.insert(table_name);
+			auto it = entries_.find(table_name);
+			if (it != entries_.end()) {
+				snapshot.push_back(it->second);
+				return;
+			}
 
-		// Skip if already loaded as entry
-		if (entries_.find(table_name) != entries_.end()) {
-			callback(*entries_[table_name]);
-			return;
-		}
+			auto entry = CreateTableEntry(table_meta);
+			if (entry) {
+				// Spec 052 T007: emplace-only (winner wins on race
+				// vs LoadSingleEntry). C++11-compatible pair access
+				// (CLAUDE.md ODR rule: no structured bindings).
+				auto insert_result = entries_.emplace(entry->name, std::move(entry));
+				snapshot.push_back(insert_result.first->second);
+			}
+		});
+	}
 
-		auto entry = CreateTableEntry(table_meta);
-		if (entry) {
-			auto &ref = *entry;
-			entries_[entry->name] = std::move(entry);
-			callback(ref);
-		}
-	});
+	// Spec 052 (Option D): anchor each entry in the per-ClientContext
+	// MSSQLBindAnchors BEFORE calling the user callback. The local snapshot
+	// only keeps entries alive for the duration of this Scan call, but
+	// DuckDB's catalog walkers (duckdb_tables, duckdb_schemas, etc.) collect
+	// raw pointers via callback in PHASE 1, then read columns / properties
+	// from those pointers in PHASE 2 after Scan returns. Without anchoring
+	// into BindAnchors, a concurrent Invalidate between phase 1 and phase 2
+	// turns those pointers into UAFs (ASan-caught in CI scenario 6 against
+	// duckdb_tables.cpp:111).
+	auto &bind_anchors = MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog());
+
+	// Phase 2: callback runs outside entry_mutex_. Snapshot holds shared_ptr
+	// so entries cannot disappear even if Invalidate() retires them mid-loop;
+	// BindAnchors then keeps them alive for the rest of the query (= until
+	// QueryEnd).
+	for (auto &entry_ptr : snapshot) {
+		bind_anchors.AnchorTable(entry_ptr);
+		callback(*entry_ptr);
+	}
 
 	names_loaded_.store(true);
 	is_fully_loaded_.store(true);
@@ -159,40 +204,73 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name) 
 	// Ensure cache settings are loaded (sets TTL)
 	catalog.EnsureCacheLoaded(context);
 
-	// Acquire connection for lazy loading
-	auto connection = pool.Acquire();
-	if (!connection) {
-		throw IOException("Failed to acquire connection for table loading");
+	// Spec 052 singleflight (FR-007): coordinate concurrent first-loads of the
+	// same table so only ONE thread issues the SQL Server round trip. Waiters
+	// re-check the cache after the owner finishes; on cache hit they return
+	// the owner's entry without a redundant fetch.
+	{
+		std::unique_lock<std::mutex> lock(entry_mutex_);
+		load_cv_.wait(lock, [this, &name]() { return loads_in_progress_.find(name) == loads_in_progress_.end(); });
+		// Owner-before-us may have already loaded or confirmed not-exists.
+		if (entries_.find(name) != entries_.end()) {
+			return true;
+		}
+		if (attempted_tables_.find(name) != attempted_tables_.end()) {
+			return false;
+		}
+		// Take the load slot. From here we are the sole fetcher for `name`.
+		loads_in_progress_.insert(name);
 	}
 
-	// Get metadata for this specific table only (does NOT load all tables in schema)
-	const MSSQLTableMetadata *table_meta;
+	// Owner of the load slot. The SQL Server round trip happens with no mutex
+	// held so different tables can load in parallel. The slot is released at
+	// the end (success, table-not-exists, or exception) under entry_mutex_,
+	// followed by notify_all() on load_cv_ to wake any waiters.
+	std::exception_ptr propagated;
+	shared_ptr<MSSQLTableEntry> fetched_entry;
+	bool table_exists = false;
+
 	try {
-		table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
-	} catch (...) {
+		auto connection = pool.Acquire();
+		if (!connection) {
+			throw IOException("Failed to acquire connection for table loading");
+		}
+		const MSSQLTableMetadata *table_meta = nullptr;
+		try {
+			table_meta = cache.GetTableMetadata(*connection, schema_.name, name);
+		} catch (...) {
+			pool.Release(std::move(connection));
+			throw;
+		}
 		pool.Release(std::move(connection));
-		throw;
+
+		if (table_meta) {
+			table_exists = true;
+			fetched_entry = CreateTableEntry(*table_meta);
+		}
+	} catch (...) {
+		propagated = std::current_exception();
 	}
 
-	pool.Release(std::move(connection));
-
-	if (!table_meta) {
-		// Table doesn't exist - mark as attempted so we don't retry
-		std::lock_guard<std::mutex> lock(entry_mutex_);
-		attempted_tables_.insert(name);
-		return false;
+	// Publish results + release the load slot. attempted_tables_ is set on
+	// success and on confirmed-not-exists; on exception it is NOT set so the
+	// next caller retries the fetch.
+	{
+		std::unique_lock<std::mutex> lock(entry_mutex_);
+		if (table_exists && fetched_entry) {
+			entries_.emplace(fetched_entry->name, std::move(fetched_entry));
+			attempted_tables_.insert(name);
+		} else if (!propagated && !table_exists) {
+			attempted_tables_.insert(name);
+		}
+		loads_in_progress_.erase(name);
 	}
+	load_cv_.notify_all();
 
-	// Create table entry and add to cache
-	auto entry = CreateTableEntry(*table_meta);
-	if (entry) {
-		std::lock_guard<std::mutex> lock(entry_mutex_);
-		entries_[entry->name] = std::move(entry);
-		attempted_tables_.insert(name);
-		return true;
+	if (propagated) {
+		std::rethrow_exception(propagated);
 	}
-
-	return false;
+	return table_exists;
 }
 
 bool MSSQLTableSet::IsLoaded() const {
@@ -203,6 +281,12 @@ void MSSQLTableSet::Invalidate() {
 	std::lock_guard<std::mutex> lock(load_mutex_);
 	is_fully_loaded_.store(false);
 	names_loaded_.store(false);
+	// Spec 052 (Option D): just clear entries_. In-flight binders that
+	// looked up an entry BEFORE this Invalidate are already anchored in
+	// their ClientContext's MSSQLBindAnchors (per the LookupEntry / GetEntry
+	// path that auto-anchors). Dropping our shared_ptr here decrements
+	// refcount, but the anchor's shared_ptr keeps the underlying entry alive
+	// until QueryEnd. New binds resolve fresh metadata (FR-006).
 	{
 		std::lock_guard<std::mutex> elock(entry_mutex_);
 		entries_.clear();
@@ -218,8 +302,12 @@ void MSSQLTableSet::Invalidate() {
 // Internal Methods
 //===----------------------------------------------------------------------===//
 
-unique_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
-	return make_uniq<MSSQLTableEntry>(schema_.catalog, schema_, metadata);
+shared_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
+	// Spec 052: make_shared_ptr (DuckDB's shared_ptr wrapper) so the entry is
+	// owned via shared_ptr from the moment of construction. Required for
+	// enable_shared_from_this to work in MSSQLTableEntry::GetScanFunction's
+	// bind-data anchor (shared_from_this()).
+	return make_shared_ptr<MSSQLTableEntry>(schema_.catalog, schema_, metadata);
 }
 
 void MSSQLTableSet::EnsureNamesLoaded(ClientContext &context) {

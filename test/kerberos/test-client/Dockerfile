@@ -6,6 +6,14 @@
 # that Linux DuckDB cannot LOAD (the magic bytes don't match ELF).
 #
 # Build context = repo root (set via docker-compose.yml `build.context: ../..`).
+#
+# Caching:
+#   * apt + simdutf layers above the `COPY . /src/` line are deterministic and
+#     get reused across CI runs via buildx + GHA cache (see kerberos.yml).
+#   * The compile step uses a BuildKit cache mount for /ccache so an
+#     incremental rebuild after a small source change reuses object files.
+#     The mount is local to the runner and not persisted across CI runs by
+#     default; locally it survives between `docker compose build` invocations.
 
 # ----------------------------------------------------------------------------
 # Stage 1: build the extension. Linux/glibc, matches the runtime stage's libc.
@@ -17,8 +25,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git pkg-config \
         libssl-dev libkrb5-dev \
-        ca-certificates curl \
+        ca-certificates curl ccache \
     && rm -rf /var/lib/apt/lists/*
+
+# Build simdutf from source. Spec 044 made find_package(simdutf CONFIG REQUIRED)
+# unconditional in CMakeLists.txt; the main CI build gets it via vcpkg, but
+# this Dockerfile uses plain apt + cmake (faster than spinning up vcpkg). Ubuntu
+# 24.04 doesn't ship libsimdutf-dev, so we build a pinned tag from upstream and
+# install into /usr/local where the next find_package call will pick it up.
+# Static + tests/benchmarks off keeps the install tiny (just a .a + headers +
+# the CMake config) and avoids a runtime libsimdutf.so dependency.
+ARG SIMDUTF_VERSION=v8.2.0
+RUN git clone --depth 1 --branch "${SIMDUTF_VERSION}" https://github.com/simdutf/simdutf.git /tmp/simdutf \
+    && cmake -S /tmp/simdutf -B /tmp/simdutf/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSIMDUTF_TESTS=OFF \
+        -DSIMDUTF_BENCHMARKS=OFF \
+        -DSIMDUTF_TOOLS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && cmake --build /tmp/simdutf/build --target install \
+    && rm -rf /tmp/simdutf
 
 WORKDIR /src
 
@@ -33,12 +60,19 @@ COPY . /src/
 # CMAKE_BUILD_PARALLEL_LEVEL=2 caps ninja parallelism so we don't OOM on
 # hosts with low Docker memory limits (DuckDB's compile is heap-heavy --
 # 4-way parallel needs ~8GB; 2-way fits in ~4GB).
-ENV CMAKE_BUILD_PARALLEL_LEVEL=2
-RUN GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON"
+#
+# ccache is wired through CMake's *_COMPILER_LAUNCHER hooks. The cache dir
+# lives in a BuildKit cache mount so it survives between layer rebuilds.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CCACHE_DIR=/ccache \
+    CCACHE_MAXSIZE=1G
+RUN --mount=type=cache,target=/ccache \
+    GEN=ninja make CMAKE_ARGS="-DENABLE_KRB5=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" \
+    && ccache --show-stats
 
 # ----------------------------------------------------------------------------
 # Stage 2: runtime test-client. krb5-user for kinit, libgssapi for runtime,
-# DuckDB CLI from the official release tarball.
+# DuckDB CLI is the one we built in stage 1 (see version-stamp note below).
 # ----------------------------------------------------------------------------
 FROM ubuntu:24.04
 
@@ -46,24 +80,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         krb5-user libgssapi-krb5-2 libssl3 \
-        ca-certificates curl unzip \
+        ca-certificates \
+        file \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the DuckDB CLI matching the extension's API. We pull the official
-# DuckDB binary so the test client doesn't depend on the host having duckdb
-# installed.
-ARG DUCKDB_VERSION=v1.4.3
-RUN ARCH="$(dpkg --print-architecture)" \
-    && case "${ARCH}" in \
-         amd64) URL_SUFFIX="linux-amd64" ;; \
-         arm64) URL_SUFFIX="linux-arm64" ;; \
-         *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;; \
-       esac \
-    && curl -fSL -o /tmp/duckdb.zip \
-        "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${URL_SUFFIX}.zip" \
-    && unzip /tmp/duckdb.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/duckdb \
-    && rm /tmp/duckdb.zip
+# Copy the DuckDB CLI built alongside the extension in the builder stage.
+# Using the official release tarball would mismatch the extension's stamped
+# DuckDB version: `git describe --tags --long` inside the shallow-cloned
+# `duckdb/` submodule has no reachable tag and falls back to the dummy
+# `v0.0.1`, which then refuses to LOAD into a CLI that reports `v1.4.x`.
+# The DuckDB build emits `build/release/duckdb` next to the extension, so
+# the two are guaranteed to come from the same source tree.
+COPY --from=builder /src/build/release/duckdb /usr/local/bin/duckdb
+RUN chmod +x /usr/local/bin/duckdb
 
 # Copy the extension from the Linux build stage. Sanity-check it's an ELF so
 # any future Dockerfile change that breaks the multi-stage chain fails loudly

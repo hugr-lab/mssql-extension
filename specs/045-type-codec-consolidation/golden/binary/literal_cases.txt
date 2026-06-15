@@ -1,0 +1,29 @@
+# Binary SQL literal — DuckDB BLOB → T-SQL literal text
+#
+# Format:
+#   <input-hex> | <ctx> | <expected-text>
+#
+# ctx is Filter or InsertValues. Per FR-022 the Binary family is
+# byte-identical across both: 0x<UPPERHEX> with no separators.
+# Pre-spec-045 both dispatch sites (filter_encoder + MSSQLValueSerializer)
+# already produced this exact text using %02X / [byte>>4] table lookup.
+# Empty BLOB renders as bare "0x" (legal T-SQL empty varbinary literal).
+
+# Empty
+|Filter|0x
+|InsertValues|0x
+
+# Single byte
+ff|Filter|0xFF
+ff|InsertValues|0xFF
+
+# 4 bytes
+de ad be ef|Filter|0xDEADBEEF
+de ad be ef|InsertValues|0xDEADBEEF
+
+# All byte values 0x00..0x0F (16 bytes)
+00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f|Filter|0x000102030405060708090A0B0C0D0E0F
+00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f|InsertValues|0x000102030405060708090A0B0C0D0E0F
+
+# 32 bytes (longer payload to exercise loop)
+de ad be ef ca fe ba be 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff 11 22 33 44 55 66 77 88|Filter|0xDEADBEEFCAFEBABE001122334455667788990AABBCCDDEEFF1122334455667788
