@@ -64,7 +64,7 @@ cannot be dropped until this exists.
 - [X] T009 [US1] Rewire all `gss_*` / `krb5_*` call sites in `src/tds/auth/krb5_test_function.cpp` through `GetGssApi()` / `GetKrb5()` so it carries no direct symbol references.
 - [X] T010 [US1] Confirm `src/include/tds/auth/krb5_authenticator.hpp` still includes the GSSAPI headers (types/handles needed) but references **no** GSSAPI function symbol — header stays link-clean and DuckDB-free.
 - [X] T011 [US1] CMakeLists.txt non-Apple branch (static ~lines 251–259 **and** loadable ~lines 293–297): **keep** `target_include_directories(... ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})`; **remove** `target_link_libraries(... ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})`; add `${CMAKE_DL_LIBS}` to the link line. Update the adjacent comment to note link-time deps are intentionally dropped on Linux (lazy `dlopen`). Apple branch unchanged.
-- [ ] T012 [US1] Build on Linux (`make`) and assert no GSSAPI/krb5 in `DT_NEEDED`: `ldd build/release/extension/mssql/mssql.duckdb_extension | grep -iE 'gssapi|krb5'` returns empty (SC-002).
+- [X] T012 [US1] Build on Linux (`make`) and assert no GSSAPI/krb5 in `DT_NEEDED`: `ldd build/release/extension/mssql/mssql.duckdb_extension | grep -iE 'gssapi|krb5'` returns empty (SC-002).
 - [ ] T013 [US1] Clean-image load test reproducing issue #161 (no Kerberos package): build/use a minimal image, `INSTALL mssql FROM local_build; LOAD mssql;` succeeds and a SQL-auth `ATTACH` works (SC-001, SC-005). Capture as a runnable script (e.g. under `test/` or documented in quickstart.md).
 
 **Checkpoint**: #161 is fixed — extension loads and works without the Kerberos runtime; no hard dependency remains.
@@ -81,7 +81,7 @@ cannot be dropped until this exists.
 
 - [ ] T014 [US2] Run the `test/kerberos/` stack end-to-end (`docker compose up -d --build` → `docker compose exec test-client /run-tests.sh`); confirm CredCache mode authenticates via the dlopened runtime with zero regression (FR-004, SC-003).
 - [ ] T015 [US2] Confirm keytab and raw modes (Linux, MIT extensions) still authenticate through the shim's `Krb5Fns` table; confirm `mssql_kerberos_auth_test(host)` returns the same SPN / principal / token-size output as before.
-- [ ] T016 [P] [US2] Confirm the macOS build still compiles and links against `-framework GSS` with the direct-address table, and that keytab/raw modes remain rejected at construction (behavior unchanged, FR-007).
+- [X] T016 [P] [US2] Confirm the macOS build still compiles and links against `-framework GSS` with the direct-address table, and that keytab/raw modes remain rejected at construction (behavior unchanged, FR-007).
 
 **Checkpoint**: Kerberos fully functional where the runtime is present, on Linux and macOS.
 
