@@ -13,6 +13,8 @@
 
 #if defined(MSSQL_ENABLE_KRB5)
 
+#include "tds/auth/gssapi_runtime.hpp"	// spec 053 (#161): lazy GSSAPI/krb5 loader
+
 #include <unistd.h>	 // getpid
 #include <cstdio>
 #include <cstdlib>
@@ -76,17 +78,20 @@ static const gss_OID kKrb5PrincipalNameOid = const_cast<gss_OID>(&kKrb5Principal
 
 // Append a gss_display_status message chain (for one of major / minor) into out.
 static void AppendGssStatusMessages(uint32_t code, int code_type, gss_OID mech, std::string &out) {
+	// Reached only while formatting a GSSAPI error, i.e. after GetGssApi()
+	// already loaded the runtime successfully -- this call will not throw.
+	const GssApiFns &gss = GetGssApi();
 	OM_uint32 msg_ctx = 0;
 	gss_buffer_desc msg_buf;
 	int safety = 0;	 // bound the loop so a misbehaving mech can't spin
 	do {
 		std::memset(&msg_buf, 0, sizeof(msg_buf));
 		OM_uint32 minor_ignored = 0;
-		OM_uint32 maj = gss_display_status(&minor_ignored, code, code_type, mech, &msg_ctx, &msg_buf);
+		OM_uint32 maj = gss.display_status(&minor_ignored, code, code_type, mech, &msg_ctx, &msg_buf);
 		if (maj != GSS_S_COMPLETE || msg_buf.length == 0 || msg_buf.value == nullptr) {
 			if (msg_buf.value && msg_buf.length > 0) {
 				OM_uint32 dummy = 0;
-				gss_release_buffer(&dummy, &msg_buf);
+				gss.release_buffer(&dummy, &msg_buf);
 			}
 			break;
 		}
@@ -95,7 +100,7 @@ static void AppendGssStatusMessages(uint32_t code, int code_type, gss_OID mech, 
 		}
 		out.append(static_cast<const char *>(msg_buf.value), msg_buf.length);
 		OM_uint32 dummy = 0;
-		gss_release_buffer(&dummy, &msg_buf);
+		gss.release_buffer(&dummy, &msg_buf);
 		if (++safety > 8) {
 			break;
 		}
@@ -269,6 +274,11 @@ void Krb5Authenticator::AcquireCredentials() {
 		return;
 	}
 
+	// Spec 053 (#161): first point in the connection lifecycle that touches
+	// GSSAPI. Loads libgssapi_krb5 on demand; throws Krb5RuntimeUnavailable
+	// (naming the package to install) if the runtime is absent.
+	const GssApiFns &gss = GetGssApi();
+
 	OM_uint32 major = 0;
 	OM_uint32 minor = 0;
 
@@ -304,7 +314,7 @@ void Krb5Authenticator::AcquireCredentials() {
 			gss_OID_set_desc mech_set;
 			mech_set.count = 1;
 			mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
-			major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
+			major = gss.acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE,
 										  &cred_store, &cred_, nullptr, nullptr);
 			if (GSS_ERROR(major)) {
 				ThrowGssError("gss_acquire_cred_from (ccache override)", major, minor);
@@ -346,7 +356,7 @@ void Krb5Authenticator::AcquireCredentials() {
 			}
 			name_buf.value = const_cast<char *>(principal_str.c_str());
 			name_buf.length = principal_str.size();
-			major = gss_import_name(&minor, &name_buf, kKrb5PrincipalNameOid, &desired_name);
+			major = gss.import_name(&minor, &name_buf, kKrb5PrincipalNameOid, &desired_name);
 			if (GSS_ERROR(major)) {
 				ThrowGssError("gss_import_name (keytab principal)", major, minor);
 			}
@@ -356,11 +366,11 @@ void Krb5Authenticator::AcquireCredentials() {
 		mech_set.count = 1;
 		mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
 
-		major = gss_acquire_cred_from(&minor, desired_name, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
+		major = gss.acquire_cred_from(&minor, desired_name, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
 									  &cred_, nullptr, nullptr);
 		if (desired_name != GSS_C_NO_NAME) {
 			OM_uint32 d = 0;
-			gss_release_name(&d, &desired_name);
+			gss.release_name(&d, &desired_name);
 		}
 		if (GSS_ERROR(major)) {
 			ThrowGssError("gss_acquire_cred_from (keytab)", major, minor);
@@ -372,8 +382,10 @@ void Krb5Authenticator::AcquireCredentials() {
 		// Run the krb5_get_init_creds_password flow into a MEMORY ccache, then
 		// hand the ccache to GSSAPI via gss_acquire_cred_from with ccache=MEMORY:.
 		// This is the same approach go-mssqldb takes for raw-credentials mode.
+		// Spec 053 (#161): krb5_* symbols come from the lazily-loaded libkrb5.
+		const Krb5Fns &k = GetKrb5();
 		krb5_context kctx = nullptr;
-		krb5_error_code kerr = krb5_init_context(&kctx);
+		krb5_error_code kerr = k.init_context(&kctx);
 		if (kerr) {
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_init_context failed (code " +
 									 std::to_string(static_cast<int>(kerr)) + ")");
@@ -385,25 +397,25 @@ void Krb5Authenticator::AcquireCredentials() {
 		}
 
 		krb5_principal client = nullptr;
-		kerr = krb5_parse_name(kctx, principal_str.c_str(), &client);
+		kerr = k.parse_name(kctx, principal_str.c_str(), &client);
 		if (kerr) {
-			krb5_free_context(kctx);
+			k.free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_parse_name failed for '" + principal_str +
 									 "' (code " + std::to_string(static_cast<int>(kerr)) + ")");
 		}
 
 		krb5_creds creds;
 		std::memset(&creds, 0, sizeof(creds));
-		kerr = krb5_get_init_creds_password(kctx, &creds, client, config_.raw_password.c_str(), nullptr, nullptr, 0,
-											nullptr, nullptr);
+		kerr = k.get_init_creds_password(kctx, &creds, client, config_.raw_password.c_str(), nullptr, nullptr, 0,
+										 nullptr, nullptr);
 		if (kerr) {
-			krb5_free_principal(kctx, client);
-			const char *kmsg = krb5_get_error_message(kctx, kerr);
+			k.free_principal(kctx, client);
+			const char *kmsg = k.get_error_message(kctx, kerr);
 			std::string err = "krb5_get_init_creds_password failed: " + std::string(kmsg ? kmsg : "(no detail)");
 			if (kmsg) {
-				krb5_free_error_message(kctx, kmsg);
+				k.free_error_message(kctx, kmsg);
 			}
-			krb5_free_context(kctx);
+			k.free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: " + err);
 		}
 
@@ -413,32 +425,32 @@ void Krb5Authenticator::AcquireCredentials() {
 		std::string ccname =
 			std::string("MEMORY:mssql_raw_") + principal_str + "_" + std::to_string(static_cast<long long>(getpid()));
 		krb5_ccache cc = nullptr;
-		kerr = krb5_cc_resolve(kctx, ccname.c_str(), &cc);
+		kerr = k.cc_resolve(kctx, ccname.c_str(), &cc);
 		if (kerr) {
-			krb5_free_cred_contents(kctx, &creds);
-			krb5_free_principal(kctx, client);
-			krb5_free_context(kctx);
+			k.free_cred_contents(kctx, &creds);
+			k.free_principal(kctx, client);
+			k.free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_resolve failed");
 		}
-		kerr = krb5_cc_initialize(kctx, cc, client);
+		kerr = k.cc_initialize(kctx, cc, client);
 		if (kerr) {
-			krb5_cc_close(kctx, cc);
-			krb5_free_cred_contents(kctx, &creds);
-			krb5_free_principal(kctx, client);
-			krb5_free_context(kctx);
+			k.cc_close(kctx, cc);
+			k.free_cred_contents(kctx, &creds);
+			k.free_principal(kctx, client);
+			k.free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_initialize failed (code " +
 									 std::to_string(static_cast<int>(kerr)) + ")");
 		}
-		kerr = krb5_cc_store_cred(kctx, cc, &creds);
+		kerr = k.cc_store_cred(kctx, cc, &creds);
 		if (kerr) {
-			krb5_cc_destroy(kctx, cc);	// closes the handle and unlinks from MEMORY: registry
-			krb5_free_cred_contents(kctx, &creds);
-			krb5_free_principal(kctx, client);
-			krb5_free_context(kctx);
+			k.cc_destroy(kctx, cc);	 // closes the handle and unlinks from MEMORY: registry
+			k.free_cred_contents(kctx, &creds);
+			k.free_principal(kctx, client);
+			k.free_context(kctx);
 			throw std::runtime_error("MSSQL Kerberos auth failed: krb5_cc_store_cred failed (code " +
 									 std::to_string(static_cast<int>(kerr)) + ")");
 		}
-		krb5_cc_close(kctx, cc);
+		k.cc_close(kctx, cc);
 
 		gss_key_value_element_desc elements[1];
 		elements[0].key = "ccache";
@@ -451,7 +463,7 @@ void Krb5Authenticator::AcquireCredentials() {
 		mech_set.count = 1;
 		mech_set.elements = const_cast<gss_OID>(kKrb5Oid);
 
-		major = gss_acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
+		major = gss.acquire_cred_from(&minor, GSS_C_NO_NAME, GSS_C_INDEFINITE, &mech_set, GSS_C_INITIATE, &cred_store,
 									  &cred_, nullptr, nullptr);
 
 		// Now that GSSAPI has its own internal copy of the credentials,
@@ -461,13 +473,13 @@ void Krb5Authenticator::AcquireCredentials() {
 		// (krb5_cc_close above invalidates the original handle).
 		{
 			krb5_ccache cc_to_destroy = nullptr;
-			if (krb5_cc_resolve(kctx, ccname.c_str(), &cc_to_destroy) == 0 && cc_to_destroy) {
-				krb5_cc_destroy(kctx, cc_to_destroy);
+			if (k.cc_resolve(kctx, ccname.c_str(), &cc_to_destroy) == 0 && cc_to_destroy) {
+				k.cc_destroy(kctx, cc_to_destroy);
 			}
 		}
-		krb5_free_cred_contents(kctx, &creds);
-		krb5_free_principal(kctx, client);
-		krb5_free_context(kctx);
+		k.free_cred_contents(kctx, &creds);
+		k.free_principal(kctx, client);
+		k.free_context(kctx);
 
 		if (GSS_ERROR(major)) {
 			ThrowGssError("gss_acquire_cred_from (raw ccache)", major, minor);
@@ -493,7 +505,7 @@ void Krb5Authenticator::AcquireCredentials() {
 	spn_buf.length = config_.spn.size();
 	const bool is_principal_form = config_.spn.find('/') != std::string::npos;
 	gss_OID spn_name_type = is_principal_form ? kKrb5PrincipalNameOid : kHostBasedServiceOid;
-	major = gss_import_name(&minor, &spn_buf, spn_name_type, &target_name_);
+	major = gss.import_name(&minor, &spn_buf, spn_name_type, &target_name_);
 	if (GSS_ERROR(major)) {
 		ThrowGssError("gss_import_name (SPN)", major, minor);
 	}
@@ -502,6 +514,9 @@ void Krb5Authenticator::AcquireCredentials() {
 }
 
 std::vector<uint8_t> Krb5Authenticator::DoSecContextStep(const uint8_t *input_blob, size_t input_blob_len) {
+	// GSSAPI is already loaded by the time we get here (AcquireCredentials ran
+	// first via InitialBytes); this returns the cached table.
+	const GssApiFns &gss = GetGssApi();
 	gss_buffer_desc input_token = GSS_C_EMPTY_BUFFER;
 	if (input_blob && input_blob_len > 0) {
 		input_token.value = const_cast<uint8_t *>(input_blob);
@@ -514,7 +529,7 @@ std::vector<uint8_t> Krb5Authenticator::DoSecContextStep(const uint8_t *input_bl
 	OM_uint32 time_rec = 0;
 	gss_OID actual_mech = GSS_C_NO_OID;
 
-	major = gss_init_sec_context(&minor, cred_, &ctx_, target_name_, kSpnegoOid,
+	major = gss.init_sec_context(&minor, cred_, &ctx_, target_name_, kSpnegoOid,
 								 GSS_C_MUTUAL_FLAG | GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_INTEG_FLAG,
 								 GSS_C_INDEFINITE, GSS_C_NO_CHANNEL_BINDINGS,
 								 (input_token.length > 0 ? &input_token : GSS_C_NO_BUFFER), &actual_mech, &output_token,
@@ -523,7 +538,7 @@ std::vector<uint8_t> Krb5Authenticator::DoSecContextStep(const uint8_t *input_bl
 	if (GSS_ERROR(major)) {
 		if (output_token.value) {
 			OM_uint32 d = 0;
-			gss_release_buffer(&d, &output_token);
+			gss.release_buffer(&d, &output_token);
 		}
 		ThrowGssError("gss_init_sec_context", major, minor, actual_mech);
 	}
@@ -535,7 +550,7 @@ std::vector<uint8_t> Krb5Authenticator::DoSecContextStep(const uint8_t *input_bl
 	}
 	if (output_token.value) {
 		OM_uint32 d = 0;
-		gss_release_buffer(&d, &output_token);
+		gss.release_buffer(&d, &output_token);
 	}
 
 	if (major == GSS_S_COMPLETE) {
@@ -565,19 +580,28 @@ std::vector<uint8_t> Krb5Authenticator::NextBytes(const std::vector<uint8_t> &se
 }
 
 void Krb5Authenticator::Free() {
+	// Nothing acquired means GSSAPI was never loaded -- avoid touching the
+	// runtime (and avoid loading it) when there is nothing to release. A
+	// non-null handle implies GetGssApi() already succeeded, so it won't throw.
+	if (ctx_ == GSS_C_NO_CONTEXT && cred_ == GSS_C_NO_CREDENTIAL && target_name_ == GSS_C_NO_NAME) {
+		complete_ = true;
+		acquired_ = false;
+		return;
+	}
+	const GssApiFns &gss = GetGssApi();
 	if (ctx_ != GSS_C_NO_CONTEXT) {
 		OM_uint32 d = 0;
-		gss_delete_sec_context(&d, &ctx_, GSS_C_NO_BUFFER);
+		gss.delete_sec_context(&d, &ctx_, GSS_C_NO_BUFFER);
 		ctx_ = GSS_C_NO_CONTEXT;
 	}
 	if (cred_ != GSS_C_NO_CREDENTIAL) {
 		OM_uint32 d = 0;
-		gss_release_cred(&d, &cred_);
+		gss.release_cred(&d, &cred_);
 		cred_ = GSS_C_NO_CREDENTIAL;
 	}
 	if (target_name_ != GSS_C_NO_NAME) {
 		OM_uint32 d = 0;
-		gss_release_name(&d, &target_name_);
+		gss.release_name(&d, &target_name_);
 		target_name_ = GSS_C_NO_NAME;
 	}
 	complete_ = true;

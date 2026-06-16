@@ -57,6 +57,58 @@ jobs:
           find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
 
   # ============================================================================
+  # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.
+  # Runs on every push/PR (unlike the heavy build job, which is manual).
+  # Spec 053 (#161): guards the lazy GSSAPI/krb5 linking so the regression
+  # cannot return — the shim must compile and add NO hard DT_NEEDED on the
+  # Kerberos runtime.
+  # ============================================================================
+  cpp-unit-tests:
+    name: C++ Unit Tests (${{ matrix.os.id }})
+    runs-on: ${{ matrix.os.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - id: linux
+            runner: ubuntu-latest
+          - id: macos
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Kerberos dev headers (Linux)
+        if: matrix.os.id == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev binutils pkg-config
+
+      - name: Build + run gssapi_runtime loader unit test (spec 053)
+        run: |
+          if [ "${{ matrix.os.id }}" = "macos" ]; then
+            clang++ -std=c++17 -pthread -DMSSQL_ENABLE_KRB5=1 -I src/include \
+              test/cpp/test_gssapi_runtime.cpp src/tds/auth/gssapi_runtime.cpp \
+              -framework GSS -o /tmp/test_gssapi_runtime
+          else
+            g++ -std=c++17 -pthread -DMSSQL_ENABLE_KRB5=1 -I src/include \
+              $(pkg-config --cflags krb5-gssapi krb5) \
+              test/cpp/test_gssapi_runtime.cpp src/tds/auth/gssapi_runtime.cpp \
+              -ldl -o /tmp/test_gssapi_runtime
+          fi
+          /tmp/test_gssapi_runtime
+
+      - name: Assert shim has no Kerberos DT_NEEDED (Linux)
+        if: matrix.os.id == 'linux'
+        run: |
+          echo "Dynamic deps of the shim test binary (must NOT list gssapi/krb5):"
+          readelf -d /tmp/test_gssapi_runtime | grep NEEDED || true
+          if readelf -d /tmp/test_gssapi_runtime | grep NEEDED | grep -iqE 'gssapi|krb5'; then
+            echo "::error::shim links the Kerberos runtime at load time — issue #161 regression (spec 053)."
+            exit 1
+          fi
+          echo "OK: shim resolves GSSAPI/krb5 lazily via dlopen; no hard dependency."
+
+  # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)
   # ============================================================================
@@ -112,7 +164,10 @@ jobs:
             brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build ccache
+            # libkrb5-dev enables the integrated-auth (Kerberos) build path so
+            # the shipped artifact contains the spec 053 dlopen shim; the
+            # readelf guard below then verifies it carries no hard DT_NEEDED.
+            sudo apt-get install -y ninja-build ccache libkrb5-dev
           fi
 
       # Cache ccache to speed up compilation
@@ -191,6 +246,21 @@ jobs:
             -o build/test/test_login7_encoding
           ./build/test/test_login7_encoding
           echo "::endgroup::"
+
+      # Spec 053 (#161): the shipped Linux extension must NOT hard-link the
+      # Kerberos runtime, or it fails to LOAD on images without it. GSSAPI/krb5
+      # are dlopen'd lazily, so they must be absent from DT_NEEDED.
+      - name: Verify lazy Kerberos linking on the extension (no DT_NEEDED) [Linux]
+        if: matrix.platform.os == 'linux'
+        run: |
+          EXT=build/release/extension/mssql/mssql.duckdb_extension
+          echo "Dynamic dependencies of $EXT:"
+          readelf -d "$EXT" | grep NEEDED || true
+          if readelf -d "$EXT" | grep NEEDED | grep -iqE 'gssapi|krb5'; then
+            echo "::error::Kerberos runtime is a hard (DT_NEEDED) dependency of the extension — issue #161 regression (spec 053)."
+            exit 1
+          fi
+          echo "OK: no gssapi/krb5 in DT_NEEDED — extension loads without the Kerberos runtime installed."
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7

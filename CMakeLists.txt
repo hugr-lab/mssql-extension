@@ -231,6 +231,9 @@ set(EXTENSION_SOURCES
 # Windows gets winsspi_authenticator.cpp via secur32.dll (Phase 4).
 if(MSSQL_KRB5_AVAILABLE)
     list(APPEND EXTENSION_SOURCES src/tds/auth/krb5_authenticator.cpp)
+    # Spec 053 (#161): runtime dlopen/dlsym shim for GSSAPI/krb5 so the Linux
+    # binary carries no link-time (DT_NEEDED) dependency on the Kerberos runtime.
+    list(APPEND EXTENSION_SOURCES src/tds/auth/gssapi_runtime.cpp)
 endif()
 if(MSSQL_SSPI_AVAILABLE)
     list(APPEND EXTENSION_SOURCES src/tds/auth/winsspi_authenticator.cpp)
@@ -268,14 +271,15 @@ if(MSSQL_KRB5_AVAILABLE)
     if(APPLE)
         target_link_libraries(${EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
     else()
-        # Order matters: krb5 (base) AFTER gssapi_krb5 so the linker resolves
-        # gssapi's references to krb5 symbols, then the krb5 SONAME is added
-        # to NEEDED. Without the explicit -lkrb5 the link fails with
-        # 'undefined reference to symbol krb5_free_error_message'.
+        # Spec 053 (#161): keep the GSSAPI/krb5 INCLUDE dirs (the headers are
+        # needed at build time for types/constants/OID structs) but DO NOT
+        # link the libraries. gssapi_runtime.cpp resolves the gss_*/krb5_*
+        # symbols at runtime via dlopen/dlsym, so the binary carries no
+        # DT_NEEDED on libgssapi_krb5.so.2 / libkrb5.so.3 and loads on images
+        # without the Kerberos runtime installed. Link libdl for dlopen.
         target_include_directories(${EXTENSION_NAME} PRIVATE
             ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
-        target_link_libraries(${EXTENSION_NAME}
-            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
+        target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
     endif()
 endif()
 
@@ -310,10 +314,12 @@ if(MSSQL_KRB5_AVAILABLE)
     if(APPLE)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${MSSQL_GSS_FRAMEWORK})
     else()
+        # Spec 053 (#161): headers only, no link-time GSSAPI/krb5 dependency.
+        # See the static-extension block above for the rationale (runtime
+        # dlopen via gssapi_runtime.cpp). Link libdl for dlopen.
         target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
             ${MSSQL_GSSAPI_INCLUDE_DIRS} ${MSSQL_KRB5_BASE_INCLUDE_DIRS})
-        target_link_libraries(${LOADABLE_EXTENSION_NAME}
-            ${MSSQL_GSSAPI_LIBRARIES} ${MSSQL_KRB5_BASE_LIBRARIES})
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
     endif()
 endif()
 
