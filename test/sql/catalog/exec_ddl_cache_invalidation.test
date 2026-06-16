@@ -1,10 +1,12 @@
 # name: test/sql/catalog/exec_ddl_cache_invalidation.test
-# description: DDL run via mssql_exec() invalidates the catalog metadata cache so subsequent catalog operations see real server-side state (regression for issue #151)
+# description: with mssql_exec_invalidate_cache enabled, DDL via mssql_exec() invalidates the catalog metadata cache so subsequent catalog operations see real server-side state (regression for issue #151)
 # group: [mssql]
 #
-# Before the fix, mssql_exec('DROP TABLE ...') (raw T-SQL) left the catalog cache
-# entry in place. A following CREATE TABLE IF NOT EXISTS then saw a stale "exists"
-# and skipped creation, and the next read failed with "Invalid object name".
+# mssql_exec_invalidate_cache defaults to FALSE (manual invalidation, like the
+# Postgres extension's postgres_execute). This test exercises the opt-in
+# auto-invalidation path: with the setting ON, mssql_exec('DROP TABLE ...')
+# invalidates the cache so a following CREATE TABLE IF NOT EXISTS no longer sees
+# a stale "exists" and the read no longer fails with "Invalid object name".
 #
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
@@ -15,6 +17,10 @@ require-env MSSQL_TESTDB_DSN
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+
+# Opt in to auto-invalidation (the default is false).
+statement ok
+SET mssql_exec_invalidate_cache = true;
 
 statement ok
 SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.ExecCacheTest'',''U'') IS NOT NULL DROP TABLE dbo.ExecCacheTest');

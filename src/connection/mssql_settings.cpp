@@ -116,12 +116,13 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_exec_invalidate_cache - Auto-invalidate the catalog cache after DDL run via mssql_exec()
-	// (issue #151). Disable to preserve a large manually-preloaded cache and invalidate yourself with
-	// mssql_invalidate_cache() / mssql_refresh_cache().
+	// (issue #151). DEFAULT FALSE: like the Postgres extension's postgres_execute, mssql_exec() does
+	// not touch the cache by default — invalidate manually with mssql_invalidate_cache() /
+	// mssql_refresh_cache() after schema-changing DDL. Set true to auto-invalidate.
 	config.AddExtensionOption(
 		"mssql_exec_invalidate_cache",
 		"Invalidate the catalog cache after DDL executed via mssql_exec() (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC)",
-		LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+		LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//
 	// Statistics Settings
@@ -521,7 +522,7 @@ bool LoadExecInvalidateCache(ClientContext &context) {
 	if (context.TryGetCurrentSetting("mssql_exec_invalidate_cache", val)) {
 		return val.GetValue<bool>();
 	}
-	return true;  // Default: auto-invalidate after mssql_exec() DDL (issue #151)
+	return false;  // Default: do NOT auto-invalidate; manual invalidation like postgres_execute (#151)
 }
 
 }  // namespace duckdb

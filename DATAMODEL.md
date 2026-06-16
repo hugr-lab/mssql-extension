@@ -304,7 +304,7 @@ flowchart TD
 
 Statements run through `mssql_exec()` are plain T-SQL — DuckDB never sees them, so it cannot invalidate the cache on its own. Spec/issue **#151**: `mssql_exec()` detects DDL keywords (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) and calls `InvalidateMetadataCache()` after a successful run. `INSERT`/`UPDATE`/`DELETE` do not invalidate anything, so transaction-pinned DML through `mssql_exec()` is unaffected.
 
-The auto-invalidation is gated by the `mssql_exec_invalidate_cache` setting (default `true`). Users with a large `mssql_preload_catalog` cache can set it `false` and invalidate at a chosen granularity with `mssql_invalidate_cache(catalog [, schema [, table]])`:
+The auto-invalidation is gated by the `mssql_exec_invalidate_cache` setting, which **defaults to `false`** (matching the Postgres extension's `postgres_execute`): by default `mssql_exec()` does not touch the cache and the caller invalidates at a chosen granularity with `mssql_invalidate_cache(catalog [, schema [, table]])`. Set the flag `true` to auto-invalidate after `mssql_exec()` DDL.
 
 | Granularity | Catalog call | Metadata cache | Table set |
 |---|---|---|---|

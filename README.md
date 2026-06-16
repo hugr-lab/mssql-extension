@@ -1039,7 +1039,7 @@ SELECT mssql_exec('sqlserver', 'CREATE UNIQUE INDEX IX_users_username ON dbo.use
 SELECT mssql_exec('sqlserver', 'DROP INDEX IX_users_email ON dbo.users');
 ```
 
-> **Note**: Schema-changing statements run through `mssql_exec()` (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) invalidate the metadata cache automatically, the same as standard DuckDB DDL. To preserve a large manually-preloaded cache, set `mssql_exec_invalidate_cache = false` and invalidate yourself with `mssql_invalidate_cache('sqlserver' [, schema [, table]])` (lazy, point-scoped) or `mssql_refresh_cache('sqlserver')` (eager full reload). You also need a manual invalidate to pick up changes made entirely out of band (e.g. by another client) while `mssql_catalog_cache_ttl` is `0`. See [Cache & invalidation](DATAMODEL.md#cache-invalidation) in `DATAMODEL.md` for how the two-layer cache works.
+> **Note**: After **schema-changing** DDL run through `mssql_exec()` (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`), invalidate the metadata cache yourself — the same as the Postgres extension's `postgres_execute`. By default (`mssql_exec_invalidate_cache = false`) `mssql_exec()` does **not** touch the cache, so use `mssql_invalidate_cache('sqlserver' [, schema [, table]])` (lazy, point-scoped) or `mssql_refresh_cache('sqlserver')` (eager full reload). Standard DuckDB-catalog DDL (e.g. `CREATE TABLE db.dbo.t`) still invalidates automatically. Set `mssql_exec_invalidate_cache = true` to make `mssql_exec()` DDL auto-invalidate too. The same manual step picks up changes made entirely out of band (e.g. by another client) while `mssql_catalog_cache_ttl` is `0`. See [Cache & invalidation](DATAMODEL.md#cache-invalidation) in `DATAMODEL.md` for how the two-layer cache works.
 
 ## Function Reference
 
@@ -1305,7 +1305,7 @@ Queries involving unsupported types will raise an error.
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
-| `mssql_exec_invalidate_cache` | BOOLEAN | true | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Set `false` to keep a large preloaded cache and invalidate manually with `mssql_invalidate_cache()`. |
+| `mssql_exec_invalidate_cache` | BOOLEAN | false | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Default `false` (like the Postgres extension's `postgres_execute`): invalidate manually with `mssql_invalidate_cache()` after schema-changing DDL. Set `true` to auto-invalidate. |
 | `mssql_attach_validation_timeout` | BIGINT | 0 | ≥0 | ATTACH-time eager-validation timeout (seconds). `0` inherits `mssql_connection_timeout`. Spec 047 FR-011. |
 
 ### Statistics Settings

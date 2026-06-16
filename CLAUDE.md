@@ -182,7 +182,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_metadata_timeout` | 300 | Metadata query timeout in seconds (0 = no timeout) |
 | `mssql_attach_validation_timeout` | 0 | ATTACH-time eager credential validation timeout in seconds (0 = inherit `mssql_connection_timeout`). Spec 047 FR-011. |
 | `mssql_catalog_cache_ttl` | 0 | Metadata cache TTL (0 = manual via `mssql_refresh_cache()`) |
-| `mssql_exec_invalidate_cache` | true | Auto-invalidate the catalog cache after DDL run via `mssql_exec()` (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC). Set false to preserve a large preloaded cache and invalidate manually with `mssql_invalidate_cache()`. Issue #151. |
+| `mssql_exec_invalidate_cache` | false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()` (CREATE/DROP/ALTER/TRUNCATE/RENAME/EXEC). Default `false` (like Postgres `postgres_execute`): invalidate manually with `mssql_invalidate_cache()`. Set `true` to auto-invalidate. Issue #151. |
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_rows_per_statement` | 1000 | Hard cap per INSERT |
 | `mssql_insert_max_sql_bytes` | 8MB (8388608) | INSERT SQL size limit |

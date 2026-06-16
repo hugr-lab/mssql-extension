@@ -22,16 +22,20 @@ SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.InvCacheTest'',''U'') IS NOT NULL
 statement ok
 SELECT mssql_exec('mssql', 'CREATE TABLE dbo.InvCacheTest (id INT)');
 
-query I
-SELECT COUNT(*) FROM mssql.dbo.InvCacheTest;
-----
-0
-
+# Default is now off (no auto-invalidation), so the table the raw mssql_exec just
+# created is not yet catalog-visible. mssql_invalidate_cache() makes it visible
+# (and returns true) — catalog granularity.
 query T
 SELECT mssql_invalidate_cache('mssql');
 ----
 true
 
+query I
+SELECT COUNT(*) FROM mssql.dbo.InvCacheTest;
+----
+0
+
+# schema and table granularities also return true
 query T
 SELECT mssql_invalidate_cache('mssql', 'dbo');
 ----

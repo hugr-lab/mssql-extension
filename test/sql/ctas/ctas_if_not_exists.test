@@ -10,6 +10,11 @@ require-env MSSQL_TEST_CONNECTION_STRING
 statement ok
 ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
+# This test mixes raw mssql_exec() DDL (DROP) with catalog DDL, so enable
+# auto-invalidation (mssql_exec_invalidate_cache defaults to false).
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
 # Clean up any existing test tables
 statement ok
 SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.IfNotExistsTest'', ''U'') IS NOT NULL DROP TABLE dbo.IfNotExistsTest');
