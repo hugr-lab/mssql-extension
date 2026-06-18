@@ -234,5 +234,13 @@ private:
 	DoneToken current_done_;
 };
 
+// Scan a server response (e.g. a BEGIN TRANSACTION reply) for the ENVCHANGE
+// BEGIN_TRANS (type 0x08) 8-byte transaction descriptor. Pure function over
+// untrusted server bytes (data/len) — fuzzable and unit-testable in isolation,
+// and the single source of truth used by the connection provider. Returns true
+// and fills out_descriptor[8] when found; false otherwise. Never reads past
+// `len` regardless of the server-supplied token lengths.
+bool FindBeginTxnDescriptor(const uint8_t *data, size_t len, uint8_t out_descriptor[8]);
+
 }  // namespace tds
 }  // namespace duckdb

@@ -1,0 +1,8 @@
+# Generated fuzzing artifacts
+out/
+work/
+findings/
+crash-*
+leak-*
+oom-*
+timeout-*

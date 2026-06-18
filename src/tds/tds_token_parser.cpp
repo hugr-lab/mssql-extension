@@ -383,6 +383,15 @@ bool TokenParser::ParseError() {
 		return false;
 	}
 
+	// The fixed prefix (number[4] + state[1] + severity[1]) must fit within the
+	// declared token length. The check above only guarantees the buffer holds
+	// `3 + token_length` bytes, so a (malicious) server under-declaring
+	// token_length < 6 would make the fixed reads below run past the buffer.
+	// Found by fuzzing: an ERROR token "AA 00 00" (token_length == 0).
+	if (token_length < 6) {
+		return false;
+	}
+
 	size_t offset = 3;	// Skip type and length
 
 	// Error number (4 bytes)
@@ -434,6 +443,13 @@ bool TokenParser::ParseInfo() {
 	uint16_t token_length = static_cast<uint16_t>(data[1]) | (static_cast<uint16_t>(data[2]) << 8);
 
 	if (Available() < 3 + token_length) {
+		return false;
+	}
+
+	// Same under-declared-length guard as ParseError: the fixed prefix
+	// (number[4] + state[1] + severity[1]) must fit within token_length, else
+	// the fixed reads below run past the buffer (e.g. INFO token "AB 00 00").
+	if (token_length < 6) {
 		return false;
 	}
 
@@ -495,6 +511,50 @@ bool TokenParser::ParseEnvChange() {
 	// for query execution (database context is already set)
 	ConsumeBytes(3 + token_length);
 	return true;
+}
+
+bool FindBeginTxnDescriptor(const uint8_t *data, size_t len, uint8_t out_descriptor[8]) {
+	// Hardened replacement for the hand-rolled loop that used to live inline in
+	// the connection provider (the `offset += token_len - 1` shape). Here `offset`
+	// only ever moves forward and every read is bounded by `len`, so a malicious
+	// server cannot drive an out-of-bounds read or a non-terminating scan no
+	// matter what token lengths it advertises.
+	size_t offset = 0;
+	while (offset < len) {
+		const uint8_t token_type = data[offset++];
+
+		if (token_type == 0xE3) {  // ENVCHANGE
+			if (offset + 2 > len) {
+				break;
+			}
+			const uint16_t token_len =
+				static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+			offset += 2;
+			// End of this token's data, clamped to the buffer — we never trust
+			// token_len to keep us inside `data`.
+			size_t token_end = offset + token_len;
+			if (token_end > len) {
+				token_end = len;
+			}
+
+			if (offset < len && data[offset] == 0x08) {	 // BEGIN_TRANS env_type
+				const size_t new_len_pos = offset + 1;
+				if (new_len_pos < len && data[new_len_pos] == 8 && new_len_pos + 1 + 8 <= len) {
+					for (int i = 0; i < 8; ++i) {
+						out_descriptor[i] = data[new_len_pos + 1 + i];
+					}
+					return true;
+				}
+			}
+			offset = token_end;	 // always forward, never past `len`
+		} else if (token_type == 0xFD || token_type == 0xFE || token_type == 0xFF) {
+			// DONE / DONEPROC / DONEINPROC: 12 bytes after the type byte.
+			offset += 12;
+		} else {
+			break;	// unknown token — stop (simplified scan)
+		}
+	}
+	return false;
 }
 
 }  // namespace tds

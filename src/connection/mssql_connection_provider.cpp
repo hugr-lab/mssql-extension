@@ -8,6 +8,7 @@
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_socket.hpp"
+#include "tds/tds_token_parser.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -180,46 +181,18 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		throw IOException("MSSQL: Failed to receive BEGIN TRANSACTION response: " + socket->GetLastError());
 	}
 
-	// Parse the response to extract the transaction descriptor from ENVCHANGE token
-	// ENVCHANGE token: 0xE3, length (2 bytes LE), type, newlen, newvalue, oldlen, [oldvalue]
-	// For BEGIN_TRANS (type 0x08): newvalue is the 8-byte transaction descriptor
-	bool found_transaction_descriptor = false;
-	size_t offset = 0;
-	while (offset < response.size()) {
-		uint8_t token_type = response[offset++];
-
-		if (token_type == 0xE3) {  // ENVCHANGE
-			if (offset + 2 > response.size())
-				break;
-			uint16_t token_len = response[offset] | (response[offset + 1] << 8);
-			offset += 2;
-
-			if (offset >= response.size())
-				break;
-			uint8_t env_type = response[offset++];
-
-			if (env_type == 0x08) {	 // BEGIN_TRANS
-				if (offset >= response.size())
-					break;
-				uint8_t new_len = response[offset++];
-				if (new_len == 8 && offset + 8 <= response.size()) {
-					// Store transaction descriptor in both transaction and connection
-					// Transaction stores it for reference, connection uses it in ExecuteBatch
-					txn->SetTransactionDescriptor(&response[offset]);
-					conn->SetTransactionDescriptor(&response[offset]);
-					found_transaction_descriptor = true;
-					MSSQL_CONN_LOG("GetConnection: Found transaction descriptor");
-				}
-			}
-			// Skip rest of this ENVCHANGE token
-			offset += token_len - 1;  // -1 because we already read env_type
-		} else if (token_type == 0xFD || token_type == 0xFE || token_type == 0xFF) {  // DONE/DONEPROC/DONEINPROC
-			// DONE tokens are 12 bytes total (1 type + 2 status + 2 curcmd + 8 rowcount) but we already read type
-			offset += 12;
-		} else {
-			// Unknown token, skip (this is a simplified parser)
-			break;
-		}
+	// Parse the (untrusted) server response for the ENVCHANGE BEGIN_TRANS 8-byte
+	// transaction descriptor. tds::FindBeginTxnDescriptor is a hardened, fuzzed,
+	// unit-tested scan that never reads past the buffer no matter what token
+	// lengths the server advertises (replaces a hand-rolled inline loop).
+	uint8_t descriptor[8];
+	bool found_transaction_descriptor = tds::FindBeginTxnDescriptor(response.data(), response.size(), descriptor);
+	if (found_transaction_descriptor) {
+		// SetTransactionDescriptor copies the 8 bytes (the local response/buffer
+		// here goes out of scope when GetConnection returns).
+		txn->SetTransactionDescriptor(descriptor);
+		conn->SetTransactionDescriptor(descriptor);
+		MSSQL_CONN_LOG("GetConnection: Found transaction descriptor");
 	}
 
 	if (!found_transaction_descriptor) {

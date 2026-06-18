@@ -1,0 +1,82 @@
+# AFL++/libFuzzer dictionary for the TDS token stream + SQL Browser parsers.
+# Helps the mutator hit token tags, data-type tokens and the magic length values
+# (0xFFFF PLP/null, 0xFFFFFFFFFFFFFFFF PLP-unknown) without guessing them byte by
+# byte. CmpLog/RedQueen covers the rest.
+
+# --- result-set token tags ---
+tok_colmetadata="\x81"
+tok_row="\xD1"
+tok_nbcrow="\xD2"
+tok_done="\xFD"
+tok_doneproc="\xFE"
+tok_doneinproc="\xFF"
+tok_error="\xAA"
+tok_info="\xAB"
+tok_envchange="\xE3"
+tok_loginack="\xAD"
+tok_returnstatus="\x79"
+tok_returnvalue="\xAC"
+tok_order="\xA9"
+tok_colinfo="\xA5"
+tok_sspi="\xED"
+tok_featureextack="\xAE"
+tok_tabname="\xA4"
+
+# --- data-type tokens (COLMETADATA / ROW value decoding) ---
+ty_int1="\x30"
+ty_int2="\x34"
+ty_int4="\x38"
+ty_int8="\x7F"
+ty_intn="\x26"
+ty_bitn="\x68"
+ty_flt4="\x3B"
+ty_flt8="\x3E"
+ty_fltn="\x6D"
+ty_decimaln="\x6A"
+ty_numericn="\x6C"
+ty_moneyn="\x6E"
+ty_guid="\x24"
+ty_daten="\x28"
+ty_timen="\x29"
+ty_datetime2n="\x2A"
+ty_dtoffsetn="\x2B"
+ty_bigvarchar="\xA7"
+ty_bigchar="\xAF"
+ty_bigvarbinary="\xA5"
+ty_nvarchar="\xE7"
+ty_nchar="\xEF"
+ty_ntext="\x63"
+ty_xml="\xF1"
+
+# --- ENVCHANGE subtypes ---
+env_database="\x01"
+env_language="\x02"
+env_charset="\x03"
+env_packetsize="\x04"
+env_collation="\x07"
+env_begintx="\x08"
+env_committx="\x09"
+env_rollbacktx="\x0A"
+env_routing="\x14"
+
+# --- TDS packet types (if a packet-level harness is added) ---
+pkt_sqlbatch="\x01"
+pkt_rpc="\x03"
+pkt_tabular="\x04"
+pkt_attention="\x06"
+pkt_bulkload="\x07"
+pkt_login7="\x10"
+pkt_prelogin="\x12"
+
+# --- magic length values ---
+len_plp_null="\xFF\xFF"
+len_plp_unknown="\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+len_charbin_null="\xFF\xFF\xFF\xFF"
+len_max_u16="\xFF\xFF"
+
+# --- SQL Browser (UDP/1434) markers ---
+br_opcode="\x05"
+br_instancename="InstanceName;"
+br_servername="ServerName;"
+br_tcp="tcp;"
+br_terminator=";;"
