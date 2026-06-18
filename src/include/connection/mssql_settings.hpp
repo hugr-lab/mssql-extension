@@ -110,4 +110,7 @@ constexpr bool DEFAULT_CTAS_USE_BCP = true;
 // Load CTAS BCP setting
 bool LoadCTASUseBCP(ClientContext &context);
 
+// Load whether mssql_exec() DDL auto-invalidates the catalog cache (issue #151)
+bool LoadExecInvalidateCache(ClientContext &context);
+
 }  // namespace duckdb
