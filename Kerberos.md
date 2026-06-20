@@ -13,6 +13,7 @@ End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
 - [Diagnostic function: `mssql_kerberos_auth_test`](#diagnostic-function-mssql_kerberos_auth_test)
 - [Diagnostic function: `mssql_winsspi_auth_test` (Windows)](#diagnostic-function-mssql_winsspi_auth_test-windows)
 - [Troubleshooting](#troubleshooting)
+  - [RC4 deprecation (CVE-2026-20833)](#rc4-deprecation-cve-2026-20833)
 - [Running the test stack locally](#running-the-test-stack-locally)
 - [Running the Windows SSPI test suite](#running-the-windows-sspi-test-suite)
 - [Reference](#reference)
@@ -566,6 +567,67 @@ MSSQL connection validation failed: MSSQL Kerberos auth failed: ...
 The TLS handshake (`Encrypt=yes`) happens before LOGIN7, so a TLS error is
 reported separately. Use `MSSQL_DEBUG=1` to see the PRELOGIN response and TLS
 handshake details on stderr.
+
+### RC4 deprecation (CVE-2026-20833)
+
+Microsoft is removing the KDC's willingness to issue **RC4-encrypted service
+tickets**. This is an Active Directory / KDC behavior change, not a SQL Server
+or extension change, but it can surface here as a sudden `Cannot generate SSPI
+context` or "Server not found in Kerberos database"-style failure on a
+connection that worked yesterday.
+
+**Does it affect this extension?** No — not the code. The extension never
+selects an encryption type. It hands the whole flow to the system GSSAPI /
+MIT-krb5 (or macOS GSS.framework) libraries via `gss_init_sec_context` with the
+SPNEGO mech; the ticket enctype is negotiated between your krb5 library, your
+`/etc/krb5.conf`, and the KDC. Modern MIT krb5 and Heimdal already default to
+**AES (AES256/AES128-SHA1)**, which is exactly what the hardened KDC keeps
+issuing. So a correctly configured client keeps working unchanged across the
+rollout.
+
+**Rollout timeline** (per the CVE guidance):
+
+| Date | Phase | Effect |
+|---|---|---|
+| 2026-01-13 | Audit | KDC logs warning events when RC4 is used; no behavior change |
+| 2026-04-14 | Enforced (revertible) | Default flips to AES-SHA1 only; admins can roll back via registry |
+| 2026-07 (July) | Final | Registry rollback removed; AES mandatory unless the account explicitly opts back into RC4 |
+
+**Where it bites in practice** — all of these are environment/AD fixes, identical
+for any Kerberos client (pyodbc, JDBC, go-mssqldb, us):
+
+1. **SQL Server service account is RC4-only.** If the account backing the SPN has
+   `msDS-SupportedEncryptionTypes` unset or set to RC4 only, the KDC will stop
+   issuing it tickets after enforcement. Fix on the AD side: set AES on the
+   account (`0x18` = AES128+AES256; `0x1C`/`0x24` keep RC4 alongside AES only if
+   you genuinely still need it).
+2. **Keytab generated with RC4 keys.** A keytab made with
+   `ktpass ... /crypto RC4-HMAC-NT` will stop authenticating. Regenerate with
+   `/crypto AES256-SHA1` (or `/crypto all`) and confirm with
+   `klist -k /path/to.keytab` that AES entries (`aes256-cts-hmac-sha1-96`) are
+   present. This is the one case the CVE guidance explicitly calls out for
+   third-party / keytab-based clients.
+3. **Client pinned to RC4 in `krb5.conf`.** Remove any
+   `default_tkt_enctypes`/`default_tgs_enctypes`/`permitted_enctypes` lines that
+   force `rc4-hmac` (`arcfour-hmac`). Leaving them unset lets the library use its
+   AES defaults — which is what you want.
+
+**Diagnosing it:** `mssql_kerberos_auth_test('host')` reproduces the client-side
+GSSAPI flow without touching SQL Server, so it isolates a KDC/enctype failure
+from a SQL login-mapping failure. On the host, `klist -e` after a `kinit` shows
+the actual enctype of your tickets — if you see `arcfour-hmac` where you expect
+`aes256-cts-hmac-sha1-96`, the account or keytab still needs AES.
+
+**Sources:**
+
+- [How to manage Kerberos KDC usage of RC4 for service account ticket issuance — CVE-2026-20833](https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc)
+  — the authoritative timeline, registry keys, and `msDS-SupportedEncryptionTypes` values.
+- [What is going on with RC4 in Kerberos? (Microsoft AskDS blog)](https://techcommunity.microsoft.com/blog/askds/what-is-going-on-with-rc4-in-kerberos/4489365)
+  — background on the deprecation and how to find accounts still relying on RC4.
+- [microsoft/Kerberos-Crypto](https://github.com/microsoft/Kerberos-Crypto)
+  — Microsoft's tooling/scripts to inventory which accounts and tickets are using RC4.
+- [SQLFingers: "Cannot generate SSPI context" — July RC4](https://www.sqlfingers.com/2026/06/cannot-generate-sspi-context-july-rc4.html)
+  — practitioner write-up of how this manifests specifically as a SQL Server SSPI error.
 
 ### WSL2 specifics
 
