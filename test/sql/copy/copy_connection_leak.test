@@ -22,11 +22,15 @@ CREATE TABLE varchar_data AS SELECT 'not_a_number' AS id FROM range(5) t(i);
 # T012: Test bind phase errors don't leak connections
 #
 
-# Store initial pool stats
+# Store initial pool stats.
+# Schema note (#152): mssql_pool_stats() no longer exposes a `pool_size` column
+# (the configured limit is not surfaced); use `total_connections` (current live
+# count = idle + active) instead. `total_connections_created` was renamed to
+# `connections_created`. After ATTACH the pool holds a single idle connection.
 query IIII
-SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT total_connections, idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-10	1	0	1
+1	1	0	1
 
 # Try COPY to non-existent catalog (should fail before connection acquired)
 statement error
@@ -36,9 +40,9 @@ not found
 
 # Verify pool stats unchanged
 query IIII
-SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT total_connections, idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-10	1	0	1
+1	1	0	1
 
 #
 # T013: Test sink phase errors release connections
@@ -53,9 +57,9 @@ CALL mssql_exec('db', 'CREATE TABLE dbo.int_table (id INT)');
 
 # Get current pool stats
 query IIII
-SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT total_connections, idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-10	1	0	1
+1	1	0	1
 
 # Try COPY with type mismatch (VARCHAR to INT) - should fail during sink
 statement error
@@ -65,9 +69,9 @@ type mismatch
 
 # Verify connection was released (not leaked)
 query IIII
-SELECT pool_size, idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT total_connections, idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-10	1	0	1
+1	1	0	1
 
 # Cleanup
 statement ok
@@ -82,7 +86,7 @@ CALL mssql_exec('db', 'DROP TABLE dbo.int_table');
 
 # Get current pool stats
 query III
-SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
 1	0	1
 
@@ -92,7 +96,7 @@ COPY test_data TO 'db.dbo.test_finalize' (FORMAT 'bcp', REPLACE true);
 
 # Verify connection was released after successful COPY
 query III
-SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
 1	0	1
 
@@ -106,7 +110,7 @@ DROP TABLE IF EXISTS db.dbo.test_finalize;
 
 # Store initial stats
 query III
-SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
 1	0	1
 
@@ -123,7 +127,7 @@ endloop
 
 # Verify no connections leaked after all failures
 query III
-SELECT idle_connections, active_connections, total_connections_created FROM mssql_pool_stats('db');
+SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
 1	0	1
 
