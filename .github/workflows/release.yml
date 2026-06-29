@@ -64,6 +64,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history + tags so extension-ci-tools' `git describe` stamps the
+          # version tag (vX.Y.Z) into the artifact metadata instead of a bare
+          # commit SHA (#149). Default shallow checkout can't see the tag.
+          fetch-depth: 0
 
       - name: Extract extension version from tag
         id: version
@@ -190,6 +195,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history + tags so extension-ci-tools' `git describe` stamps the
+          # version tag instead of a bare commit SHA (#149).
+          fetch-depth: 0
 
       - name: Extract extension version from tag
         id: version
@@ -314,6 +323,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history + tags so extension-ci-tools' `git describe` stamps the
+          # version tag instead of a bare commit SHA (#149).
+          fetch-depth: 0
 
       - name: Extract extension version from tag
         id: version
