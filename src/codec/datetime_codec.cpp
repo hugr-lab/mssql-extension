@@ -66,6 +66,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace duckdb {
@@ -228,7 +229,15 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 // bypassing the µs-intermediate that ConvertDatetime2 hard-codes. This is
 // lossless whenever target precision ≥ wire precision (DATETIME2(7) → TIMESTAMP_NS
 // preserves every 100-ns tick; DATETIME2(3) → TIMESTAMP_MS preserves every ms).
-int64_t Datetime2WireToNativeUnit(const uint8_t *data, size_t time_len, uint8_t wire_scale, LogicalTypeId target_type) {
+//
+// Returns false (leaving out_native untouched) when the value falls outside the
+// target variant's int64 range. SQL Server's datetime2 domain runs to
+// 9999-12-31, but TIMESTAMP_NS (int64 nanoseconds) only reaches ~2262-04-11, so
+// the far-future valid-to sentinel that temporal tables use (9999-12-31
+// 23:59:59.9999999) overflows. Caller emits SQL NULL rather than letting the
+// multiply silently wrap to a nonsense past instant (issue #168).
+bool Datetime2WireToNativeUnit(const uint8_t *data, size_t time_len, uint8_t wire_scale, LogicalTypeId target_type,
+							   int64_t &out_native) {
 	int64_t time_ticks = 0;
 	for (size_t i = 0; i < time_len; i++) {
 		time_ticks |= static_cast<int64_t>(data[i]) << (i * 8);
@@ -246,7 +255,23 @@ int64_t Datetime2WireToNativeUnit(const uint8_t *data, size_t time_len, uint8_t 
 	} else {
 		sub_day_ticks = time_ticks / (wire_per_sec / target_per_sec);
 	}
-	return static_cast<int64_t>(unix_days) * SECONDS_PER_DAY * target_per_sec + sub_day_ticks;
+
+	// Overflow-checked: out_native = unix_days * SECONDS_PER_DAY * target_per_sec + sub_day_ticks.
+	// ticks_per_day is at most 86400 * 1e9 ≈ 8.64e13 (fits int64); the unbounded
+	// factor is unix_days (±~2.9M over the full [0001,9999] datetime2 domain),
+	// which overflows int64 only for TIMESTAMP_NS outside ~[1677,2262].
+	int64_t ticks_per_day = SECONDS_PER_DAY * target_per_sec;
+	if (unix_days > std::numeric_limits<int64_t>::max() / ticks_per_day ||
+		unix_days < std::numeric_limits<int64_t>::min() / ticks_per_day) {
+		return false;
+	}
+	int64_t days_ticks = static_cast<int64_t>(unix_days) * ticks_per_day;
+	// sub_day_ticks is always >= 0, so only positive-direction add overflow is possible.
+	if (days_ticks > std::numeric_limits<int64_t>::max() - sub_day_ticks) {
+		return false;
+	}
+	out_native = days_ticks + sub_day_ticks;
+	return true;
 }
 
 size_t Datetime2TimeByteLen(uint8_t scale) {
@@ -285,7 +310,15 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		// TIMESTAMP_MS / TIMESTAMP / TIMESTAMP_NS) so the µs-bottleneck doesn't
 		// drop precision on DATETIME2(7) → TIMESTAMP_NS round-trips.
 		size_t time_len = Datetime2TimeByteLen(col.scale);
-		int64_t native = Datetime2WireToNativeUnit(bytes.data(), time_len, col.scale, out.GetType().id());
+		int64_t native;
+		if (!Datetime2WireToNativeUnit(bytes.data(), time_len, col.scale, out.GetType().id(), native)) {
+			// Value outside the target TIMESTAMP variant's range — e.g. a
+			// datetime2(7) far-future value (9999-12-31 temporal-table ValidTo
+			// sentinel) mapped to TIMESTAMP_NS, whose domain ends at ~2262.
+			// Emit SQL NULL instead of a silently-wrapped wrong instant (issue #168).
+			FlatVector::SetNull(out, row, true);
+			return;
+		}
 		FlatVector::GetData<timestamp_t>(out)[row] = timestamp_t(native);
 		return;
 	}

@@ -251,6 +251,49 @@ void TestDecodeDatetime2Scale6() {
 	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
 }
 
+void TestDecodeDatetime2Scale7NsInRange() {
+	std::cout << "Test: DecodeFromTds — DATETIME2(7) in-range → TIMESTAMP_NS lossless (issue #168 guard not over-eager)\n";
+	// 2024-01-15 14:30:00.1234567 — well within TIMESTAMP_NS's ~[1677,2262] window.
+	int64_t time_ticks = ((14LL * 3600 + 30 * 60) * 10000000LL) + 1234567LL;  // 100-ns ticks
+	auto target_date = duckdb::Date::FromDate(2024, 1, 15);
+	int32_t days_from_0001 = target_date.days + DAYS_0001_TO_EPOCH;
+	std::vector<uint8_t> wire(8);
+	for (int i = 0; i < 5; i++) {
+		wire[i] = static_cast<uint8_t>((time_ticks >> (i * 8)) & 0xFF);
+	}
+	wire[5] = static_cast<uint8_t>(days_from_0001 & 0xFF);
+	wire[6] = static_cast<uint8_t>((days_from_0001 >> 8) & 0xFF);
+	wire[7] = static_cast<uint8_t>((days_from_0001 >> 16) & 0xFF);
+	duckdb::Vector vec(LogicalType::TIMESTAMP_NS, 1);
+	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIME2, 7);
+	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
+	CHECK_TRUE(!duckdb::FlatVector::IsNull(vec, 0));
+	// ns since epoch = days_since_1970 * 86400 * 1e9 + time_ticks * 100
+	int64_t expected = static_cast<int64_t>(target_date.days) * 86400LL * 1000000000LL + time_ticks * 100LL;
+	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected);
+}
+
+void TestDecodeDatetime2FarFutureNull() {
+	std::cout << "Test: DecodeFromTds — DATETIME2(7) 9999-12-31 sentinel → TIMESTAMP_NS NULL (issue #168)\n";
+	// 9999-12-31 23:59:59.9999999 — the temporal-table ValidTo sentinel. This
+	// is past TIMESTAMP_NS's 2262-04-11 ceiling; before the fix the decode
+	// multiply wrapped to ~1816-03-30. Now it must surface as SQL NULL.
+	int64_t time_ticks = ((23LL * 3600 + 59 * 60 + 59) * 10000000LL) + 9999999LL;
+	auto target_date = duckdb::Date::FromDate(9999, 12, 31);
+	int32_t days_from_0001 = target_date.days + DAYS_0001_TO_EPOCH;
+	std::vector<uint8_t> wire(8);
+	for (int i = 0; i < 5; i++) {
+		wire[i] = static_cast<uint8_t>((time_ticks >> (i * 8)) & 0xFF);
+	}
+	wire[5] = static_cast<uint8_t>(days_from_0001 & 0xFF);
+	wire[6] = static_cast<uint8_t>((days_from_0001 >> 8) & 0xFF);
+	wire[7] = static_cast<uint8_t>((days_from_0001 >> 16) & 0xFF);
+	duckdb::Vector vec(LogicalType::TIMESTAMP_NS, 1);
+	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIME2, 7);
+	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
+	CHECK_TRUE(duckdb::FlatVector::IsNull(vec, 0));
+}
+
 void TestDecodeDatetimeOffset() {
 	std::cout << "Test: DecodeFromTds — DATETIMEOFFSET(7) reads UTC time directly\n";
 	// 14:30:00 UTC encoded as 100-ns ticks.
@@ -602,6 +645,8 @@ int main() {
 	TestDecodeDatetimen8();
 	TestDecodeDatetimen4();
 	TestDecodeDatetime2Scale6();
+	TestDecodeDatetime2Scale7NsInRange();
+	TestDecodeDatetime2FarFutureNull();
 	TestDecodeDatetimeOffset();
 
 	TestEncodeDateVector();
