@@ -1,7 +1,11 @@
 name: ClusterFuzzLite PR fuzzing
 # Per-PR regression gate: build the harnesses, fuzz only code changed in the PR
-# for a short budget, replay the seed corpus, and FAIL on any new ASan/UBSan
-# crash. Deep discovery is done locally (see fuzz/README.md), not here.
+# for a short budget, replay the seed corpus, and FAIL on any new ASan crash.
+# Deep discovery is done locally (see fuzz/README.md), not here.
+#
+# PRs run ASan only (fast feedback). UBSan is offloaded to a weekly batch run
+# (`ubsan-weekly` below) against the full corpus, so a UBSan regression is still
+# caught within the week without doubling every PR's fuzzing wall-time.
 on:
   pull_request:
     paths:
@@ -13,35 +17,61 @@ on:
       - 'fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
+  schedule:
+    # Weekly UBSan batch run against main (offloaded from the per-PR gate).
+    - cron: '47 3 * * 1'
 
 permissions:
   contents: read
 
 jobs:
   PR:
+    # ASan diff gate — runs on PRs only.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, undefined]   # ASan + UBSan, both mandatory
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build fuzzers (${{ matrix.sanitizer }})
+      - name: Build fuzzers (address)
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@v1
         with:
           language: c++
-          sanitizer: ${{ matrix.sanitizer }}
+          sanitizer: address
           # Fuzz the diff: instrument only the lines this PR touches.
           storage-repo: ''
 
-      - name: Run fuzzers (${{ matrix.sanitizer }})
+      - name: Run fuzzers (address)
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: 300
           mode: 'code-change'
-          sanitizer: ${{ matrix.sanitizer }}
+          sanitizer: address
+          output-sarif: true
+
+  ubsan-weekly:
+    # UBSan batch run — weekly schedule only (offloaded from the PR gate).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build fuzzers (undefined)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: c++
+          sanitizer: undefined
+          storage-repo: ''
+
+      - name: Run fuzzers (undefined)
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: 'batch'
+          sanitizer: undefined
           output-sarif: true
