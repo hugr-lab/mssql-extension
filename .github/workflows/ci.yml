@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Docs-only PRs skip CI (lint + C++ unit tests). Prose-scanning workflows
+    # (prompt-injection, secret scan) have their own triggers and still run.
+    # NOTE: if Lint / "C++ Unit Tests" are required status checks, GitHub treats
+    # a path-skipped required check as pending and can block docs PRs — either
+    # mark them non-required or add a passing stub. See PR description.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
     inputs:
       run_build:
@@ -182,7 +192,10 @@ jobs:
 
       - name: Configure ccache
         run: |
-          ccache --set-config=max_size=500M
+          # 2G (was 500M): a full DuckDB object set overflows 500M and evicts
+          # itself mid-build, so warm runs were partially cold. 2G holds the
+          # DuckDB + extension objects across runs for a much higher hit rate.
+          ccache --set-config=max_size=2G
           ccache --set-config=compression=true
           ccache -z
 
