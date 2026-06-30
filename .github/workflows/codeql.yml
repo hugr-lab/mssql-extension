@@ -4,21 +4,20 @@ name: CodeQL
 # (use-after-free, taint flow into format strings, crypto misuse, OOB reads).
 # Free for public repos. CodeQL traces a real CMake build so the analysis
 # sees the actual translation units, not a stub.
+#
+# Runs on push-to-main and a weekly schedule only — NOT per-PR. The build it
+# traces takes ~50 min (DuckDB + extension, ccache-free so the tracer sees every
+# TU), which dominated PR feedback time. Security drift between merges is caught
+# by the weekly cron and by the push-to-main run on the very next merge.
+# NOTE: if "Analyze (C/C++)" is a required status check in branch protection,
+# remove it from the required set — it no longer reports on PRs.
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'extension_config.cmake'
-      - '.github/workflows/codeql.yml'
   schedule:
     # Weekly scan against main so newly-added CodeQL queries (Microsoft ships
-    # them roughly monthly) get applied without waiting for the next PR.
+    # them roughly monthly) get applied, and to catch any drift between merges.
     - cron: '32 4 * * 1'
 
 concurrency:
