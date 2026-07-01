@@ -122,7 +122,7 @@ jobs:
       - name: Configure ccache
         shell: bash
         run: |
-          ccache --set-config=max_size=500M
+          ccache --set-config=max_size=2G
           ccache --set-config=compression=true
           ccache -z
 
@@ -253,7 +253,7 @@ jobs:
         shell: bash
         run: |
           choco install ccache ninja
-          ccache --set-config=max_size=500M
+          ccache --set-config=max_size=2G
           ccache --set-config=compression=true
           ccache -z
 
@@ -391,7 +391,7 @@ jobs:
         shell: bash
         run: |
           choco install ccache ninja
-          ccache --set-config=max_size=500M
+          ccache --set-config=max_size=2G
           ccache --set-config=compression=true
           ccache -z
 
