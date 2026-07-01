@@ -247,6 +247,23 @@ jobs:
           ./build/test/test_login7_encoding
           echo "::endgroup::"
 
+          echo "::group::test_datetime_codec (codec::datetime — issue #168 datetime2(7) overflow -> NULL)"
+          # Unlike the TDS-only test above, the codec test uses DuckDB
+          # Value/Vector/Date/Timestamp, so it links the libduckdb just built in
+          # this job (build/release/src). Mirrors the Makefile `test-codec-datetime`
+          # recipe: all src/codec/*.cpp + the encoding helpers, -lsimdutf -lduckdb.
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/codec/test_datetime_codec.cpp \
+            src/codec/*.cpp \
+            src/tds/encoding/utf16.cpp src/tds/encoding/datetime_encoding.cpp \
+            src/tds/encoding/decimal_encoding.cpp src/tds/encoding/guid_encoding.cpp \
+            -L "$PREFIX/lib" -lsimdutf \
+            -L build/release/src -lduckdb \
+            -o build/test/test_datetime_codec
+          LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_datetime_codec
+          echo "::endgroup::"
+
       # Spec 053 (#161): the shipped Linux extension must NOT hard-link the
       # Kerberos runtime, or it fails to LOAD on images without it. GSSAPI/krb5
       # are dlopen'd lazily, so they must be absent from DT_NEEDED.
