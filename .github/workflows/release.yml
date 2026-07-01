@@ -25,7 +25,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check clang-format
         run: |
@@ -63,7 +63,7 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so extension-ci-tools' `git describe` stamps the
           # version tag (vX.Y.Z) into the artifact metadata instead of a bare
@@ -194,7 +194,7 @@ jobs:
     needs: lint
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so extension-ci-tools' `git describe` stamps the
           # version tag instead of a bare commit SHA (#149).
@@ -322,7 +322,7 @@ jobs:
       CXX: g++
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so extension-ci-tools' `git describe` stamps the
           # version tag instead of a bare commit SHA (#149).
@@ -479,7 +479,7 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract extension version from tag
         id: version
@@ -534,7 +534,7 @@ jobs:
             artifact_suffix: windows_amd64_mingw
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract extension version from tag
         id: version
@@ -593,7 +593,7 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract extension version from tag
         id: version
@@ -646,7 +646,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract extension version from tag
         id: version
