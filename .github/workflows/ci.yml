@@ -182,7 +182,7 @@ jobs:
 
       # Cache ccache to speed up compilation
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.ccache
           key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -208,7 +208,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed
@@ -471,7 +471,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed
@@ -572,7 +572,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed

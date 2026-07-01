@@ -111,7 +111,7 @@ jobs:
 
       # Cache ccache to speed up compilation
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.ccache
           key: ccache-${{ matrix.platform.id }}-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -136,7 +136,7 @@ jobs:
 
       # Cache vcpkg installed packages
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed
@@ -235,7 +235,7 @@ jobs:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed
@@ -258,7 +258,7 @@ jobs:
           ccache -z
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/ccache
           key: ccache-windows_amd64-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
@@ -378,7 +378,7 @@ jobs:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
       - name: Cache vcpkg packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             vcpkg/installed
@@ -396,7 +396,7 @@ jobs:
           ccache -z
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/ccache
           key: ccache-windows_amd64_mingw-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
