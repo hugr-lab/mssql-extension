@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Full history so TruffleHog can scan every commit on the PR /
           # branch, not just the tip. Required for detecting secrets that
