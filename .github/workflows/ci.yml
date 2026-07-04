@@ -58,7 +58,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check clang-format
         run: |
@@ -85,7 +85,7 @@ jobs:
           - id: macos
             runner: macos-14
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Kerberos dev headers (Linux)
         if: matrix.os.id == 'linux'
@@ -147,7 +147,7 @@ jobs:
             vcpkg_triplet: arm64-osx
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout DuckDB submodule
         run: |
@@ -346,7 +346,7 @@ jobs:
             docker_available: false
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download extension artifact
         uses: actions/download-artifact@v8
@@ -403,7 +403,7 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download extension artifact
         uses: actions/download-artifact@v8
@@ -443,7 +443,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout DuckDB submodule
         shell: bash
@@ -529,7 +529,7 @@ jobs:
       CXX: g++
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout DuckDB submodule
         shell: bash
@@ -631,7 +631,7 @@ jobs:
             artifact_suffix: windows_amd64_mingw
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download extension artifact
         uses: actions/download-artifact@v8
@@ -666,7 +666,7 @@ jobs:
     environment: test
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download unittest artifact
         uses: actions/download-artifact@v8

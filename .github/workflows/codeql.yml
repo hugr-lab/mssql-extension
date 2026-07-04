@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         # We intentionally do NOT pass submodules: recursive here. The default
         # `submodules: false` is paired with an explicit duckdb-only init
         # below, which avoids cloning `extension-ci-tools` (used only by the
