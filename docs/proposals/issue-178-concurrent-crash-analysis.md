@@ -230,6 +230,36 @@ an invalidation epoch counter: `Invalidate`/`InvalidateEntry` bump it,
 * If Phase 1/2 uncovers a new race: fix + DATAMODEL.md invariant update in the
   same PR (per project policy).
 
+## Self-review round (multi-agent, high effort) — additional fixes
+
+A workflow-backed adversarial review of the first fix commit surfaced 10
+verified findings (5 root causes), all fixed in the follow-up commit:
+
+1. **Residual UAF**: `GetTableMetadata`'s raw-pointer return escaped the cache
+   mutex; `LoadSingleEntry` dereferenced it while `Refresh` /
+   `LoadAllTableMetadata` / TTL reloads freed the map node. → metadata is now
+   **copied out under the mutex** (`bool GetTableMetadata(..., out_meta)`).
+2. **Stale resurrection**: the invalidation epoch guard covered only Scan's
+   trailing flag stores; Scan's fill phase and `LoadSingleEntry`'s publication
+   could re-insert pre-invalidation entries after `Invalidate()` cleared them
+   (GetEntry's step-1 fast path serves entries_ unconditionally). → both
+   publications are now epoch-guarded; on a dirty epoch the entry is served to
+   the in-flight call only (anchored via out_entry / snapshot) and nothing
+   persists.
+3. **Negative-cache poisoning (TOCTOU)**: GetEntry step 4 read `names_loaded_`
+   before acquiring `names_mutex_`; a racing `Invalidate` could let it record a
+   permanent `attempted_tables_` negative for an existing table. → flag
+   re-checked under the lock (Invalidate stores the flag before clearing).
+4. **Lock-hold latency**: Scan held `names_mutex_`+`entry_mutex_` while blocking
+   on the cache mutex (held across metadata round trips by other threads),
+   stalling GetEntry's fast path for cached tables. → Scan restructured into
+   three passes; table-set locks and the cache mutex are never held together.
+5. **Empty-list latch**: `Refresh()`'s failure path left `schemas_` cleared with
+   `schemas_load_state_` still LOADED → every later lookup reported existing
+   tables missing until manual invalidation. → state reset to NOT_LOADED in the
+   catch. Dead `EnsureNamesLoaded` (unguarded flag publisher, no callers)
+   deleted.
+
 ## Artifacts from this investigation
 * New regression test: `test/sql/integration/issue178_concurrent_same_table.test`
   (8-connection same-table `concurrentloop`, big-table LIMIT → abandoned-stream path).

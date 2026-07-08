@@ -12,6 +12,7 @@
 namespace duckdb {
 
 class ClientContext;
+class MSSQLCatalog;
 
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
@@ -27,12 +28,26 @@ enum class MSSQLResultStreamState : uint8_t {
 
 class MSSQLResultStream {
 public:
-	// Create result stream with shared connection
-	// context_name is needed for returning connection to pool
-	// client_context is needed for transaction-aware connection release
+	// Create result stream with shared connection.
+	//
+	// Issue #178 review: the destructor must NOT touch any ClientContext — it can
+	// run on a worker thread while the client thread commits the query's
+	// transaction (TSan: MetaTransaction::Get vs TransactionContext::Commit on
+	// the same context). Instead the owning catalog and the pinned-ness of the
+	// connection are captured HERE, on the client thread:
+	//   owning_catalog     — pool owner for the destructor's release; non-owning.
+	//                        A live stream never outlives its catalog (streams
+	//                        registered on the catalog are members destroyed
+	//                        before connection_pool_; scan-local streams die at
+	//                        query end, and the pool's Shutdown() asserts
+	//                        quiescence).
+	//   transaction_pinned — true when the connection is pinned to an explicit
+	//                        DuckDB transaction; the destructor then just drops
+	//                        its reference (the MSSQLTransaction owns the pin).
 	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
-					  ClientContext *client_context = nullptr, int query_timeout_seconds = 30);
+					  MSSQLCatalog *owning_catalog = nullptr, bool transaction_pinned = false,
+					  int query_timeout_seconds = 30);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
@@ -137,9 +152,11 @@ private:
 	// Context name for pool release
 	string context_name_;
 
-	// Client context for transaction-aware connection release
-	// May be nullptr for non-transactional use
-	ClientContext *client_context_;
+	// Owning catalog (non-owning pointer) + pinned-ness, captured at construction
+	// on the client thread so the destructor never dereferences a ClientContext
+	// (issue #178 review: TSan race vs TransactionContext::Commit).
+	MSSQLCatalog *owning_catalog_;
+	bool transaction_pinned_;
 
 	// Query
 	string sql_;

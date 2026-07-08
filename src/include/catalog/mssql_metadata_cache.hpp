@@ -115,20 +115,15 @@ public:
 	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
 
 	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
-	// Does NOT load all tables in the schema. Returns nullptr if the table doesn't exist.
+	// Does NOT load all tables in the schema. Returns false if the table doesn't exist.
 	//
-	// LIFETIME CONTRACT (spec 052 US3 T017):
-	// The returned pointer is valid only until the NEXT InvalidateSchema /
-	// InvalidateTable / InvalidateAll / Refresh / BulkLoadAll call on this
-	// cache. Callers MUST copy the fields they need out before any other
-	// thread can invalidate (typically: immediately, as
-	// MSSQLTableSet::LoadSingleEntry does — it constructs an
-	// MSSQLTableEntry from the metadata then returns; the pointer is dead
-	// from that point onward). DO NOT store this pointer beyond the
-	// immediate call site, DO NOT dereference after releasing the
-	// connection. Adding a new caller? Audit it against this rule.
-	const MSSQLTableMetadata *GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
-											   const string &table_name);
+	// Issue #178 review: copies the metadata into out_meta UNDER the cache mutex.
+	// The previous raw-pointer return escaped the lock and was dereferenced by
+	// LoadSingleEntry while a concurrent Refresh / LoadAllTableMetadata /
+	// TTL-expired reload freed the map node — a residual use-after-free of the
+	// same class this cache's single-mutex rework eliminated.
+	bool GetTableMetadata(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+						  MSSQLTableMetadata &out_meta);
 
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.

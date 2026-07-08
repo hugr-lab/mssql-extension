@@ -230,8 +230,8 @@ vector<string> MSSQLMetadataCache::GetTableNames(tds::TdsConnection &connection,
 	return names;
 }
 
-const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection,
-															   const string &schema_name, const string &table_name) {
+bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
+										  const string &table_name, MSSQLTableMetadata &out_meta) {
 	// Only load schemas (fast — just schema names, no tables)
 	EnsureSchemasLoaded(connection);
 
@@ -241,7 +241,7 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 	auto schema_it = schemas_.find(schema_name);
 	if (schema_it == schemas_.end()) {
 		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — schema not found", schema_name.c_str(), table_name.c_str());
-		return nullptr;
+		return false;
 	}
 
 	auto &schema = schema_it->second;
@@ -252,7 +252,8 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 		!IsTTLExpired(table_it->second.columns_last_refresh, ttl_seconds_)) {
 		CACHE_DEBUG(2, "GetTableMetadata('%s.%s') — cache hit (%zu columns)", schema_name.c_str(), table_name.c_str(),
 					table_it->second.columns.size());
-		return &table_it->second;
+		out_meta = table_it->second;  // copy under mutex_ — see header contract
+		return true;
 	}
 
 	// Single-table query: load object type + columns in one round trip
@@ -338,7 +339,7 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 		schema.tables.erase(slot_it);
 		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — table not found on SQL Server", schema_name.c_str(),
 					table_name.c_str());
-		return nullptr;
+		return false;
 	}
 
 	// Cache the result (slot is already in the map)
@@ -348,7 +349,8 @@ const MSSQLTableMetadata *MSSQLMetadataCache::GetTableMetadata(tds::TdsConnectio
 	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns", schema_name.c_str(), table_name.c_str(),
 				table_meta.columns.size());
 
-	return &table_meta;
+	out_meta = table_meta;	// copy under mutex_ — see header contract
+	return true;
 }
 
 bool MSSQLMetadataCache::HasSchema(const string &schema_name) {
@@ -799,6 +801,11 @@ void MSSQLMetadataCache::Refresh(tds::TdsConnection &connection, const string &d
 		}
 	} catch (...) {
 		state_ = MSSQLCacheState::INVALID;
+		// Issue #178 review: schemas_ was cleared at the top of Refresh; if the
+		// reload threw, schemas_load_state_ must NOT remain LOADED (a stale
+		// LOADED over the emptied map made every later lookup report existing
+		// tables as missing until a manual invalidation).
+		schemas_load_state_ = CacheLoadState::NOT_LOADED;
 		throw;
 	}
 }

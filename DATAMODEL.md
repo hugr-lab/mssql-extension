@@ -276,7 +276,7 @@ classDiagram
     note for TokenCache "Spec 047 FR-012:<br/>two DatabaseInstances<br/>sharing a secret name<br/>do NOT alias"
 ```
 
-- `MSSQLMetadataCache` is incremental and lazy. Hand-out contract is documented in the header: the caller (`MSSQLTableSet::LoadSingleEntry`) copies the metadata immediately, so the cache's raw-pointer return is safe.
+- `MSSQLMetadataCache` is incremental and lazy. `GetTableMetadata` **copies** the metadata out under the cache mutex — the previous raw-pointer return escaped the lock and raced `Refresh` / bulk reloads freeing the map node (issue #178 review finding).
 - **Locking invariant (issue #178)**: ONE cache-wide `mutex_` guards `schemas_` and everything reachable through it (tables, columns, load states), plus `state_` / `database_collation_`. Loads hold it across their SQL round trip so partial state is never visible — concurrent metadata loads serialize by design. `ttl_seconds_` / `metadata_timeout_ms_` are atomics (written per-lookup by `EnsureCacheLoaded`, read by loaders mid-query while the mutex is held). The pre-#178 split (`mutex_` for Refresh/HasSchema, `schemas_mutex_` for everything else) let `Refresh()` free the whole map under a reader — TSan-confirmed UAF.
 - `MSSQLStatisticsProvider` returns stats by value; no raw-pointer hand-out.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.

@@ -54,9 +54,15 @@ public:
 	// Entry Loading
 	//===----------------------------------------------------------------------===//
 
-	// Load a single table entry by name (for GetEntry operations)
-	// Returns true if the table exists and was loaded, false otherwise
-	bool LoadSingleEntry(ClientContext &context, const string &name);
+	// Load a single table entry by name (for GetEntry operations).
+	// Returns true if the table exists.
+	//
+	// Issue #178 review: when an Invalidate() races the fetch, the entry is NOT
+	// published into entries_ (see the epoch guard in the implementation); it is
+	// handed back via out_entry instead so the calling query still gets a
+	// consistent entry (kept alive by MSSQLBindAnchors). out_entry is set only
+	// on the owner path — singleflight waiters find the entry in entries_.
+	bool LoadSingleEntry(ClientContext &context, const string &name, shared_ptr<MSSQLTableEntry> *out_entry = nullptr);
 
 	// Check if ALL entries are loaded
 	bool IsLoaded() const;
@@ -78,9 +84,6 @@ private:
 	// Spec 052: returns shared_ptr — entries co-owned by entries_ map and any
 	// in-flight bind data anchor (MSSQLCatalogScanBindData::table_entry_anchor_).
 	shared_ptr<MSSQLTableEntry> CreateTableEntry(const MSSQLTableMetadata &metadata);
-
-	// Ensure table names are loaded (no column queries, fast)
-	void EnsureNamesLoaded(ClientContext &context);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables

@@ -36,11 +36,12 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
-									 const string &context_name, ClientContext *client_context,
+									 const string &context_name, MSSQLCatalog *owning_catalog, bool transaction_pinned,
 									 int query_timeout_seconds)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
-	  client_context_(client_context),
+	  owning_catalog_(owning_catalog),
+	  transaction_pinned_(transaction_pinned),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
@@ -61,7 +62,15 @@ MSSQLResultStream::~MSSQLResultStream() {
 		Cancel();
 	}
 
-	// Return connection to the pool
+	// Return connection to the pool.
+	//
+	// Issue #178 review: this destructor can run on a WORKER thread during query
+	// teardown while the client thread commits the query's transaction — the old
+	// `Catalog::GetCatalog(*client_context_, ...)` path called
+	// MetaTransaction::Get on that context and raced
+	// TransactionContext::Commit's unique_ptr move (TSan-confirmed). The catalog
+	// and pinned-ness were captured at construction instead; no ClientContext is
+	// touched here.
 	if (connection_) {
 		auto conn_state = connection_->GetState();
 		if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
@@ -69,17 +78,17 @@ MSSQLResultStream::~MSSQLResultStream() {
 			connection_->Close();
 		}
 
-		// Spec 047: pool is owned by MSSQLCatalog (per-catalog ownership).
-		// Without a ClientContext we can't look up the catalog; the shared_ptr
-		// drop closes the connection on this thread — no leak, just no reuse.
-		// Same outcome when catalog lookup throws (catalog detached mid-query).
-		if (client_context_) {
+		if (transaction_pinned_) {
+			// The MSSQLTransaction owns the pin; just drop our reference.
+			connection_.reset();
+		} else if (owning_catalog_) {
 			try {
-				auto &catalog = Catalog::GetCatalog(*client_context_, context_name_);
-				auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-				ConnectionProvider::ReleaseConnection(*client_context_, mssql_catalog, std::move(connection_));
+				// Flag session reset (temp tables, SET options) for the next
+				// reuse — mirrors ConnectionProvider's autocommit release.
+				connection_->SetNeedsReset(true);
+				owning_catalog_->GetConnectionPool().Release(std::move(connection_));
 			} catch (...) {
-				// Catalog gone or release failed — drop the connection.
+				// Pool gone or release failed — drop the connection.
 				// shared_ptr destructor closes the socket.
 				connection_.reset();
 			}
