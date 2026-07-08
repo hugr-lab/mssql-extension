@@ -11,11 +11,10 @@
 
 // Debug logging for catalog operations
 static int GetCatalogDebugLevel() {
-	static int level = -1;
-	if (level == -1) {
+	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DEBUG");
-		level = env ? std::atoi(env) : 0;
-	}
+		return env ? std::atoi(env) : 0;
+	}();
 	return level;
 }
 
@@ -111,6 +110,10 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	CATALOG_DEBUG(1, "Scan('%s') — bulk loading all table metadata", schema_.name.c_str());
 
+	// Issue #178: snapshot the invalidation epoch BEFORE loading; the trailing
+	// names_loaded_/is_fully_loaded_ publication is skipped if it changed.
+	const uint64_t epoch_at_start = invalidation_epoch_.load();
+
 	auto &catalog = schema_.GetMSSQLCatalog();
 	auto &cache = catalog.GetMetadataCache();
 	auto &pool = catalog.GetConnectionPool();
@@ -144,8 +147,15 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	// and block on entry_mutex_ (spec 052 singleflight grabs it first).
 	// shared_ptr copies in the snapshot keep entries alive even if a sibling
 	// thread fires Invalidate() between phase 1 and phase 2.
+	//
+	// Issue #178 (D7): known_table_names_ is guarded by names_mutex_ everywhere
+	// else (GetEntry, EnsureNamesLoaded, Invalidate*); the insert below used to
+	// run under entry_mutex_ only — TSan caught it racing Invalidate()'s clear.
+	// names_mutex_ is taken BEFORE entry_mutex_ to match GetEntry's nesting
+	// order (its step-4 block acquires entry_mutex_ while holding names_mutex_).
 	vector<shared_ptr<MSSQLTableEntry>> snapshot;
 	{
+		std::lock_guard<std::mutex> nlock(names_mutex_);
 		std::lock_guard<std::mutex> lock(entry_mutex_);
 		cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
 			stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
@@ -188,8 +198,18 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 		callback(*entry_ptr);
 	}
 
-	names_loaded_.store(true);
-	is_fully_loaded_.store(true);
+	// Issue #178: publish the loaded flags ONLY if no Invalidate() landed since
+	// we started filling. An unconditional store here stomped a concurrent
+	// invalidation: flags TRUE over just-cleared containers made GetEntry
+	// answer "not found" for existing tables. load_mutex_ excludes
+	// Invalidate/InvalidateEntry while we compare-and-publish.
+	{
+		std::lock_guard<std::mutex> llock(load_mutex_);
+		if (invalidation_epoch_.load() == epoch_at_start) {
+			names_loaded_.store(true);
+			is_fully_loaded_.store(true);
+		}
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -279,6 +299,7 @@ bool MSSQLTableSet::IsLoaded() const {
 
 void MSSQLTableSet::Invalidate() {
 	std::lock_guard<std::mutex> lock(load_mutex_);
+	invalidation_epoch_.fetch_add(1);  // Issue #178: defeats a concurrent Scan's trailing flag publication
 	is_fully_loaded_.store(false);
 	names_loaded_.store(false);
 	// Spec 052 (Option D): just clear entries_. In-flight binders that
@@ -304,6 +325,7 @@ void MSSQLTableSet::InvalidateEntry(const string &name) {
 	// of this table is reflected on next access; every OTHER table's entry (and its cached
 	// column metadata) is preserved, so the expensive per-table metadata is not re-fetched.
 	std::lock_guard<std::mutex> lock(load_mutex_);
+	invalidation_epoch_.fetch_add(1);  // Issue #178: same guard as Invalidate()
 	is_fully_loaded_.store(false);
 	names_loaded_.store(false);
 	{

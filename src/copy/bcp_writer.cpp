@@ -33,11 +33,10 @@ constexpr uint16_t CURCMD_INSERT = 0x00C3;
 //===----------------------------------------------------------------------===//
 
 static int GetBCPDebugLevel() {
-	static int level = -1;
-	if (level == -1) {
+	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DEBUG");
-		level = env ? std::atoi(env) : 0;
-	}
+		return env ? std::atoi(env) : 0;
+	}();
 	return level;
 }
 

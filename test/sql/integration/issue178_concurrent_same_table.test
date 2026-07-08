@@ -1,0 +1,42 @@
+# name: test/sql/integration/issue178_concurrent_same_table.test
+# description: Issue #178 — concurrent scans of the SAME table from multiple connections crash
+# group: [integration]
+#
+# Repro for https://github.com/hugr-lab/mssql-extension/issues/178
+# Two (or more) client connections concurrently scanning the same attached table
+# crash the process, while a single connection or different tables work fine.
+# Run with: MSSQL_TEST_DSN='Server=localhost,1433;Database=master;User Id=sa;Password=...' \
+#   build/debug/test/unittest test/sql/integration/issue178_concurrent_same_table.test
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS mss (TYPE mssql);
+
+# Big enough that LIMIT 10 abandons the TDS stream mid-flight (as in the report)
+statement ok
+SELECT mssql_exec('mss', '
+IF OBJECT_ID(''dbo.Issue178Big'', ''U'') IS NULL
+BEGIN
+    CREATE TABLE dbo.Issue178Big (id INT PRIMARY KEY, val NVARCHAR(200));
+    WITH n AS (SELECT TOP 500000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i
+               FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+    INSERT INTO dbo.Issue178Big (id, val)
+    SELECT i, CONCAT(''row-value-padding-padding-padding-'', i) FROM n;
+END
+');
+
+# NOTE: no cache invalidation needed — a fresh unittest process binds cold.
+# (mssql_invalidate_cache also trips a debug-only ExpressionExecutor assertion
+# about CONSTANT_VECTOR folding — tracked separately from #178.)
+
+concurrentloop i 0 8
+
+query I
+SELECT count(*) FROM (SELECT * FROM mss.dbo.Issue178Big LIMIT 10);
+----
+10
+
+endloop

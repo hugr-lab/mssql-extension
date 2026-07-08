@@ -97,6 +97,15 @@ private:
 	std::atomic<bool> is_fully_loaded_;	 // True when ALL tables are loaded
 	std::mutex load_mutex_;				 // Loading synchronization
 	std::mutex entry_mutex_;			 // Entry access synchronization
+
+	// Issue #178: invalidation generation counter. Invalidate()/InvalidateEntry()
+	// increment it (under load_mutex_); Scan() snapshots it on entry and only
+	// publishes names_loaded_/is_fully_loaded_ = true at the end if no
+	// invalidation landed in between. Without this guard, an Invalidate racing
+	// between Scan's fill phase and its trailing flag stores left the flags
+	// TRUE over freshly-cleared containers — GetEntry then answered
+	// "table does not exist" for tables that exist (seen in harness scenario 6).
+	std::atomic<uint64_t> invalidation_epoch_{0};
 	// Spec 052: shared_ptr (was unique_ptr) so retired entries can flow into
 	// MSSQLCatalog::table_graveyard_ on Invalidate() while in-flight binders
 	// retain validity. Insertion is emplace-only (winner wins on race).

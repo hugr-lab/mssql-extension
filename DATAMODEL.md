@@ -277,6 +277,7 @@ classDiagram
 ```
 
 - `MSSQLMetadataCache` is incremental and lazy. Hand-out contract is documented in the header: the caller (`MSSQLTableSet::LoadSingleEntry`) copies the metadata immediately, so the cache's raw-pointer return is safe.
+- **Locking invariant (issue #178)**: ONE cache-wide `mutex_` guards `schemas_` and everything reachable through it (tables, columns, load states), plus `state_` / `database_collation_`. Loads hold it across their SQL round trip so partial state is never visible — concurrent metadata loads serialize by design. `ttl_seconds_` / `metadata_timeout_ms_` are atomics (written per-lookup by `EnsureCacheLoaded`, read by loaders mid-query while the mutex is held). The pre-#178 split (`mutex_` for Refresh/HasSchema, `schemas_mutex_` for everything else) let `Refresh()` free the whole map under a reader — TSan-confirmed UAF.
 - `MSSQLStatisticsProvider` returns stats by value; no raw-pointer hand-out.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
 - Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3).
@@ -423,6 +424,7 @@ sequenceDiagram
 | 047 | Per-catalog `unique_ptr<ConnectionPool>` (was process-wide); per-catalog `active_streams_`; `TokenCache` keyed by `(DatabaseInstance*, key)` |
 | 051 | `src/include/mssql_compat.hpp` — DuckDB API shims (header relocation, single-arg `BindScalarFunctionInput`) |
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
+| #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 
 ## Where to read the code
 
