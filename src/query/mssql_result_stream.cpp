@@ -15,11 +15,10 @@
 // Debug logging controlled by MSSQL_DEBUG environment variable
 // Set MSSQL_DEBUG=1 to enable, MSSQL_DEBUG=2 for verbose row-level logging
 static int GetDebugLevel() {
-	static int level = -1;
-	if (level == -1) {
+	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DEBUG");
-		level = env ? std::atoi(env) : 0;
-	}
+		return env ? std::atoi(env) : 0;
+	}();
 	return level;
 }
 
@@ -37,11 +36,12 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
-									 const string &context_name, ClientContext *client_context,
-									 int query_timeout_seconds)
+									 const string &context_name, weak_ptr<tds::ConnectionPool> pool_handle,
+									 bool transaction_pinned, int query_timeout_seconds)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
-	  client_context_(client_context),
+	  pool_handle_(std::move(pool_handle)),
+	  transaction_pinned_(transaction_pinned),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
@@ -62,7 +62,17 @@ MSSQLResultStream::~MSSQLResultStream() {
 		Cancel();
 	}
 
-	// Return connection to the pool
+	// Return connection to the pool.
+	//
+	// Issue #178 review: this destructor can run on a WORKER thread during query
+	// teardown while the client thread commits the query's transaction — the old
+	// `Catalog::GetCatalog(*client_context_, ...)` path called
+	// MetaTransaction::Get on that context and raced
+	// TransactionContext::Commit's unique_ptr move (TSan-confirmed). The pool
+	// weak_ptr and pinned-ness were captured at construction instead; no
+	// ClientContext is touched here, and a failed lock() (catalog torn down)
+	// degrades to dropping the connection — never a dangling dereference
+	// (PR #179 review).
 	if (connection_) {
 		auto conn_state = connection_->GetState();
 		if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
@@ -70,17 +80,19 @@ MSSQLResultStream::~MSSQLResultStream() {
 			connection_->Close();
 		}
 
-		// Spec 047: pool is owned by MSSQLCatalog (per-catalog ownership).
-		// Without a ClientContext we can't look up the catalog; the shared_ptr
-		// drop closes the connection on this thread — no leak, just no reuse.
-		// Same outcome when catalog lookup throws (catalog detached mid-query).
-		if (client_context_) {
+		if (transaction_pinned_) {
+			// The MSSQLTransaction owns the pin; just drop our reference.
+			connection_.reset();
+		} else if (auto pool = pool_handle_.lock()) {
 			try {
-				auto &catalog = Catalog::GetCatalog(*client_context_, context_name_);
-				auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-				ConnectionProvider::ReleaseConnection(*client_context_, mssql_catalog, std::move(connection_));
+				// Flag session reset (temp tables, SET options) for the next
+				// reuse — same as ConnectionProvider's autocommit release
+				// (the reset is a header bit on the next SQL_BATCH, not an
+				// extra round trip).
+				connection_->SetNeedsReset(true);
+				pool->Release(std::move(connection_));
 			} catch (...) {
-				// Catalog gone or release failed — drop the connection.
+				// Release failed — drop the connection.
 				// shared_ptr destructor closes the socket.
 				connection_.reset();
 			}

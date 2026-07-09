@@ -42,7 +42,8 @@ class LogicalUpdate;
 
 class MSSQLCatalog : public Catalog {
 public:
-	// Constructor (spec 047: catalog now owns its connection pool via unique_ptr).
+	// Constructor (spec 047: catalog owns its connection pool; sole strong ref —
+	// see connection_pool_ member comment).
 	// @param pool_config Pool sizing/timeout configuration translated from DuckDB settings.
 	// @param fedauth_token_utf16le Pre-acquired FEDAUTH token (UTF-16LE) for Azure/manual-token
 	//        auth paths; empty for SQL auth and integrated auth. Captured by the pool factory.
@@ -53,9 +54,9 @@ public:
 				 bool catalog_enabled = true);
 
 	// noexcept (spec 047 T046k): defaulted body destructs the per-catalog
-	// `unique_ptr<ConnectionPool>` (and other unique_ptr members), each of
-	// whose destructors is also `noexcept`. Marked explicit for grep-ability
-	// and to keep the teardown contract loud: a throw here during
+	// pool (catalog holds the sole strong reference) and other owned members,
+	// each of whose destructors is also `noexcept`. Marked explicit for
+	// grep-ability and to keep the teardown contract loud: a throw here during
 	// `~AttachedDatabase` unwind would invoke std::terminate.
 	~MSSQLCatalog() noexcept override;
 
@@ -115,6 +116,12 @@ public:
 
 	// Get connection pool for this catalog
 	tds::ConnectionPool &GetConnectionPool();
+
+	// Weak handle to the pool for result streams (issue #178 review). Lets
+	// ~MSSQLResultStream release its connection without dereferencing the
+	// catalog: lock() failure (catalog torn down) degrades to dropping the
+	// connection — a safe failure mode instead of UB on a dangling pointer.
+	weak_ptr<tds::ConnectionPool> GetConnectionPoolHandle() const;
 
 	// Get metadata cache
 	MSSQLMetadataCache &GetMetadataCache();
@@ -224,14 +231,19 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	string context_name_;									   // Attached context name
-	shared_ptr<MSSQLConnectionInfo> connection_info_;		   // Connection parameters
-	tds::PoolConfiguration pool_config_;					   // Pool config (spec 047)
-	std::vector<uint8_t> fedauth_token_utf16le_;			   // FEDAUTH token (spec 047)
-	AccessMode access_mode_;								   // READ_ONLY enforced
-	bool catalog_enabled_;									   // Catalog integration enabled
-	MSSQLCatalogFilter catalog_filter_;						   // Regex visibility filter
-	unique_ptr<tds::ConnectionPool> connection_pool_;		   // Connection pool (per-catalog owned, spec 047)
+	string context_name_;							   // Attached context name
+	shared_ptr<MSSQLConnectionInfo> connection_info_;  // Connection parameters
+	tds::PoolConfiguration pool_config_;			   // Pool config (spec 047)
+	std::vector<uint8_t> fedauth_token_utf16le_;	   // FEDAUTH token (spec 047)
+	AccessMode access_mode_;						   // READ_ONLY enforced
+	bool catalog_enabled_;							   // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;				   // Regex visibility filter
+	// Connection pool (per-catalog, spec 047). shared_ptr, but the catalog holds
+	// the ONLY strong reference — teardown stays deterministic at ~MSSQLCatalog.
+	// Result streams hold weak_ptr handles (issue #178 review); a transient
+	// lock() during a racing teardown at most defers ~ConnectionPool to that
+	// release call, never past it.
+	shared_ptr<tds::ConnectionPool> connection_pool_;
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	string database_collation_;								   // Database default collation

@@ -11,11 +11,10 @@
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetExecutorDebugLevel() {
-	static int level = -1;
-	if (level == -1) {
+	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DEBUG");
-		level = env ? std::atoi(env) : 0;
-	}
+		return env ? std::atoi(env) : 0;
+	}();
 	return level;
 }
 
@@ -82,10 +81,15 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	int query_timeout = LoadQueryTimeout(context);
 	MSSQL_EXEC_DEBUG_LOG(1, "Execute: query_timeout=%ds", query_timeout);
 
-	// Create result stream with the shared connection
-	// Pass client context for transaction-aware connection release in destructor
+	// Create result stream with the shared connection.
+	// Issue #178 review: pinned-ness and the pool handle are resolved HERE, on
+	// the client thread — the stream destructor may run on a worker thread and
+	// must not touch the ClientContext (TSan: MetaTransaction::Get raced
+	// TransactionContext::Commit).
+	const bool transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 	auto result_stream =
-		make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, &context, query_timeout);
+		make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, mssql_catalog.GetConnectionPoolHandle(),
+									 transaction_pinned, query_timeout);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)
 	// If Initialize() throws, result_stream destructor will release connection back to pool

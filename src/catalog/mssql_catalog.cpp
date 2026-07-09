@@ -216,7 +216,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	}
 	}
 
-	connection_pool_ = make_uniq<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
+	connection_pool_ = make_shared_ptr<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
 
 	// Skip metadata initialization when catalog integration is disabled
 	// (mssql_scan/mssql_exec will still work via raw queries)
@@ -776,6 +776,10 @@ void MSSQLCatalog::OnDetach(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 // MSSQL-specific Accessors
 //===----------------------------------------------------------------------===//
+
+weak_ptr<tds::ConnectionPool> MSSQLCatalog::GetConnectionPoolHandle() const {
+	return weak_ptr<tds::ConnectionPool>(connection_pool_);
+}
 
 tds::ConnectionPool &MSSQLCatalog::GetConnectionPool() {
 	if (!connection_pool_) {

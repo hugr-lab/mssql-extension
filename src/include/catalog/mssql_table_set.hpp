@@ -54,9 +54,15 @@ public:
 	// Entry Loading
 	//===----------------------------------------------------------------------===//
 
-	// Load a single table entry by name (for GetEntry operations)
-	// Returns true if the table exists and was loaded, false otherwise
-	bool LoadSingleEntry(ClientContext &context, const string &name);
+	// Load a single table entry by name (for GetEntry operations).
+	// Returns true if the table exists.
+	//
+	// Issue #178 review: when an Invalidate() races the fetch, the entry is NOT
+	// published into entries_ (see the epoch guard in the implementation); it is
+	// handed back via out_entry instead so the calling query still gets a
+	// consistent entry (kept alive by MSSQLBindAnchors). out_entry is set only
+	// on the owner path — singleflight waiters find the entry in entries_.
+	bool LoadSingleEntry(ClientContext &context, const string &name, shared_ptr<MSSQLTableEntry> *out_entry = nullptr);
 
 	// Check if ALL entries are loaded
 	bool IsLoaded() const;
@@ -79,9 +85,6 @@ private:
 	// in-flight bind data anchor (MSSQLCatalogScanBindData::table_entry_anchor_).
 	shared_ptr<MSSQLTableEntry> CreateTableEntry(const MSSQLTableMetadata &metadata);
 
-	// Ensure table names are loaded (no column queries, fast)
-	void EnsureNamesLoaded(ClientContext &context);
-
 	//===----------------------------------------------------------------------===//
 	// Member Variables
 	//===----------------------------------------------------------------------===//
@@ -97,6 +100,15 @@ private:
 	std::atomic<bool> is_fully_loaded_;	 // True when ALL tables are loaded
 	std::mutex load_mutex_;				 // Loading synchronization
 	std::mutex entry_mutex_;			 // Entry access synchronization
+
+	// Issue #178: invalidation generation counter. Invalidate()/InvalidateEntry()
+	// increment it (under load_mutex_); Scan() snapshots it on entry and only
+	// publishes names_loaded_/is_fully_loaded_ = true at the end if no
+	// invalidation landed in between. Without this guard, an Invalidate racing
+	// between Scan's fill phase and its trailing flag stores left the flags
+	// TRUE over freshly-cleared containers — GetEntry then answered
+	// "table does not exist" for tables that exist (seen in harness scenario 6).
+	std::atomic<uint64_t> invalidation_epoch_{0};
 	// Spec 052: shared_ptr (was unique_ptr) so retired entries can flow into
 	// MSSQLCatalog::table_graveyard_ on Invalidate() while in-flight binders
 	// retain validity. Insertion is emplace-only (winner wins on race).

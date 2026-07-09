@@ -489,11 +489,10 @@ static constexpr uint64_t PLP_UNKNOWN_MARKER = 0xFFFFFFFFFFFFFFFEULL;
 
 // Debug logging for PLP parsing
 static int GetPLPDebugLevel() {
-	static int level = -1;
-	if (level == -1) {
+	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DEBUG_PLP");
-		level = env ? std::atoi(env) : 0;
-	}
+		return env ? std::atoi(env) : 0;
+	}();
 	return level;
 }
 

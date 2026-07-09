@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
@@ -46,23 +47,14 @@ struct MSSQLTableMetadata {
 	vector<MSSQLColumnInfo> columns;  // Column metadata
 	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
 
-	// Incremental cache state for columns
+	// Incremental cache state for columns.
+	// Issue #178 (D6): all fields — including these states — are guarded by the
+	// cache-wide MSSQLMetadataCache::mutex_; the former per-table load_mutex is gone.
 	CacheLoadState columns_load_state = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point columns_last_refresh;
-	mutable std::mutex load_mutex;	// Per-table loading synchronization
 
 	// Default constructor
 	MSSQLTableMetadata() : object_type(MSSQLObjectType::TABLE), approx_row_count(0) {}
-
-	// Move constructor (mutex not movable)
-	MSSQLTableMetadata(MSSQLTableMetadata &&other) noexcept;
-
-	// Move assignment (mutex not movable)
-	MSSQLTableMetadata &operator=(MSSQLTableMetadata &&other) noexcept;
-
-	// Non-copyable (mutex not copyable)
-	MSSQLTableMetadata(const MSSQLTableMetadata &) = delete;
-	MSSQLTableMetadata &operator=(const MSSQLTableMetadata &) = delete;
 };
 
 //===----------------------------------------------------------------------===//
@@ -73,26 +65,18 @@ struct MSSQLSchemaMetadata {
 	string name;									   // Schema name
 	unordered_map<string, MSSQLTableMetadata> tables;  // Tables and views in schema
 
-	// Incremental cache state for table list
+	// Incremental cache state for table list.
+	// Issue #178 (D6): guarded by MSSQLMetadataCache::mutex_ (cache-wide); the
+	// former per-schema load_mutex is gone — it did NOT exclude readers holding
+	// the map mutex, which is exactly the race it pretended to prevent.
 	CacheLoadState tables_load_state = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point tables_last_refresh;
-	mutable std::mutex load_mutex;	// Per-schema loading synchronization
 
 	// Default constructor
 	MSSQLSchemaMetadata() = default;
 
 	// Explicit constructor with name
 	explicit MSSQLSchemaMetadata(const string &n) : name(n) {}
-
-	// Move constructor (mutex not movable)
-	MSSQLSchemaMetadata(MSSQLSchemaMetadata &&other) noexcept;
-
-	// Move assignment (mutex not movable)
-	MSSQLSchemaMetadata &operator=(MSSQLSchemaMetadata &&other) noexcept;
-
-	// Non-copyable (mutex not copyable)
-	MSSQLSchemaMetadata(const MSSQLSchemaMetadata &) = delete;
-	MSSQLSchemaMetadata &operator=(const MSSQLSchemaMetadata &) = delete;
 };
 
 //===----------------------------------------------------------------------===//
@@ -131,20 +115,15 @@ public:
 	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
 
 	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
-	// Does NOT load all tables in the schema. Returns nullptr if the table doesn't exist.
+	// Does NOT load all tables in the schema. Returns false if the table doesn't exist.
 	//
-	// LIFETIME CONTRACT (spec 052 US3 T017):
-	// The returned pointer is valid only until the NEXT InvalidateSchema /
-	// InvalidateTable / InvalidateAll / Refresh / BulkLoadAll call on this
-	// cache. Callers MUST copy the fields they need out before any other
-	// thread can invalidate (typically: immediately, as
-	// MSSQLTableSet::LoadSingleEntry does — it constructs an
-	// MSSQLTableEntry from the metadata then returns; the pointer is dead
-	// from that point onward). DO NOT store this pointer beyond the
-	// immediate call site, DO NOT dereference after releasing the
-	// connection. Adding a new caller? Audit it against this rule.
-	const MSSQLTableMetadata *GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
-											   const string &table_name);
+	// Issue #178 review: copies the metadata into out_meta UNDER the cache mutex.
+	// The previous raw-pointer return escaped the lock and was dereferenced by
+	// LoadSingleEntry while a concurrent Refresh / LoadAllTableMetadata /
+	// TTL-expired reload freed the map node — a residual use-after-free of the
+	// same class this cache's single-mutex rework eliminated.
+	bool GetTableMetadata(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+						  MSSQLTableMetadata &out_meta);
 
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
@@ -214,8 +193,10 @@ public:
 	// Set database default collation
 	void SetDatabaseCollation(const string &collation);
 
-	// Get database default collation
-	const string &GetDatabaseCollation() const;
+	// Get database default collation.
+	// Returns by VALUE: a reference would outlive the internal lock and race
+	// with Refresh() overwriting the string (issue #178 D6 audit).
+	string GetDatabaseCollation() const;
 
 	//===----------------------------------------------------------------------===//
 	// Incremental Cache Loading (Lazy Loading)
@@ -288,19 +269,31 @@ private:
 	// Member Variables
 	//===----------------------------------------------------------------------===//
 
-	mutable std::mutex mutex_;							  // Thread-safety for global operations
+	// Issue #178 (D6): ONE cache-wide mutex. It guards state_, schemas_ (the map
+	// AND everything reachable through it: tables, columns, load states),
+	// last_refresh_, database_collation_, schemas_load_state_ and
+	// schemas_last_refresh_. The previous split (`mutex_` for "global ops",
+	// `schemas_mutex_` for the map) had Refresh() freeing the whole map under
+	// one mutex while every reader iterated it under the other — a TSan-confirmed
+	// use-after-free. Loads intentionally hold this mutex across their SQL round
+	// trip so partial state is never visible; that also serialises concurrent
+	// metadata loads (correctness over parallel-load throughput).
+	mutable std::mutex mutex_;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
-	const MSSQLCatalogFilter *filter_ = nullptr;		  // Optional visibility filter (owned by MSSQLCatalog)
+	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
-	int64_t ttl_seconds_;								  // Cache TTL (0 = manual only)
-	int metadata_timeout_ms_ = 300000;					  // Metadata query timeout in ms (default 5 min)
 	string database_collation_;							  // Database default collation
 
-	// Incremental cache state for schema list (catalog-level)
+	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
+	// on every catalog lookup while loaders concurrently read them mid-query
+	// (ExecuteMetadataQuery runs WITH mutex_ held, so these must be lock-free).
+	std::atomic<int64_t> ttl_seconds_;		// Cache TTL (0 = manual only)
+	std::atomic<int> metadata_timeout_ms_;	// Metadata query timeout in ms (default 5 min)
+
+	// Incremental cache state for schema list (catalog-level) — guarded by mutex_
 	CacheLoadState schemas_load_state_ = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point schemas_last_refresh_;
-	mutable std::mutex schemas_mutex_;	// Schema list loading synchronization
 };
 
 }  // namespace duckdb
