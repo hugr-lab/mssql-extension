@@ -36,11 +36,11 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
-									 const string &context_name, MSSQLCatalog *owning_catalog, bool transaction_pinned,
-									 int query_timeout_seconds)
+									 const string &context_name, weak_ptr<tds::ConnectionPool> pool_handle,
+									 bool transaction_pinned, int query_timeout_seconds)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
-	  owning_catalog_(owning_catalog),
+	  pool_handle_(std::move(pool_handle)),
 	  transaction_pinned_(transaction_pinned),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
@@ -68,9 +68,11 @@ MSSQLResultStream::~MSSQLResultStream() {
 	// teardown while the client thread commits the query's transaction — the old
 	// `Catalog::GetCatalog(*client_context_, ...)` path called
 	// MetaTransaction::Get on that context and raced
-	// TransactionContext::Commit's unique_ptr move (TSan-confirmed). The catalog
-	// and pinned-ness were captured at construction instead; no ClientContext is
-	// touched here.
+	// TransactionContext::Commit's unique_ptr move (TSan-confirmed). The pool
+	// weak_ptr and pinned-ness were captured at construction instead; no
+	// ClientContext is touched here, and a failed lock() (catalog torn down)
+	// degrades to dropping the connection — never a dangling dereference
+	// (PR #179 review).
 	if (connection_) {
 		auto conn_state = connection_->GetState();
 		if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
@@ -81,14 +83,16 @@ MSSQLResultStream::~MSSQLResultStream() {
 		if (transaction_pinned_) {
 			// The MSSQLTransaction owns the pin; just drop our reference.
 			connection_.reset();
-		} else if (owning_catalog_) {
+		} else if (auto pool = pool_handle_.lock()) {
 			try {
 				// Flag session reset (temp tables, SET options) for the next
-				// reuse — mirrors ConnectionProvider's autocommit release.
+				// reuse — same as ConnectionProvider's autocommit release
+				// (the reset is a header bit on the next SQL_BATCH, not an
+				// extra round trip).
 				connection_->SetNeedsReset(true);
-				owning_catalog_->GetConnectionPool().Release(std::move(connection_));
+				pool->Release(std::move(connection_));
 			} catch (...) {
-				// Pool gone or release failed — drop the connection.
+				// Release failed — drop the connection.
 				// shared_ptr destructor closes the socket.
 				connection_.reset();
 			}

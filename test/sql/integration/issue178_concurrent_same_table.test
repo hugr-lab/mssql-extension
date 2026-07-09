@@ -15,7 +15,10 @@ require-env MSSQL_TEST_DSN
 statement ok
 ATTACH '${MSSQL_TEST_DSN}' AS mss (TYPE mssql);
 
-# Big enough that LIMIT 10 abandons the TDS stream mid-flight (as in the report)
+# Big enough that LIMIT 10 abandons the TDS stream mid-flight (as in the report).
+# The table is DELIBERATELY persistent (IF OBJECT_ID guard, no DROP): populating
+# 500k rows dominates this test's runtime, so reruns reuse it. Do NOT add a
+# DROP/re-create — concurrent CI runs against a shared server would race on setup.
 statement ok
 SELECT mssql_exec('mss', '
 IF OBJECT_ID(''dbo.Issue178Big'', ''U'') IS NULL

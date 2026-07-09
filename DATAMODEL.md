@@ -30,7 +30,7 @@ flowchart TD
         tx[MSSQLTransaction]
     end
     subgraph L2["Layer 2 — Pool (spec 047)"]
-        pool["ConnectionPool<br/>(per-catalog, unique_ptr)"]
+        pool["ConnectionPool<br/>(per-catalog; sole strong ref,<br/>streams hold weak_ptr)"]
     end
     subgraph L1["Layer 1 — Protocol (TDS)"]
         conn[TdsConnection]
@@ -150,7 +150,7 @@ classDiagram
         +LookupSchema()
         +RegisterStream(stream) uuid
         +RetrieveStream(uuid) stream
-        -connection_pool_ : unique_ptr~ConnectionPool~
+        -connection_pool_ : shared_ptr~ConnectionPool~ (sole strong ref)
         -metadata_cache_ : unique_ptr~MSSQLMetadataCache~
         -statistics_provider_ : unique_ptr~MSSQLStatisticsProvider~
         -schema_entries_ : map~string,shared_ptr~MSSQLSchemaEntry~~

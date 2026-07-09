@@ -14,6 +14,10 @@ namespace duckdb {
 class ClientContext;
 class MSSQLCatalog;
 
+namespace tds {
+class ConnectionPool;
+}  // namespace tds
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
@@ -33,21 +37,19 @@ public:
 	// Issue #178 review: the destructor must NOT touch any ClientContext — it can
 	// run on a worker thread while the client thread commits the query's
 	// transaction (TSan: MetaTransaction::Get vs TransactionContext::Commit on
-	// the same context). Instead the owning catalog and the pinned-ness of the
-	// connection are captured HERE, on the client thread:
-	//   owning_catalog     — pool owner for the destructor's release; non-owning.
-	//                        A live stream never outlives its catalog (streams
-	//                        registered on the catalog are members destroyed
-	//                        before connection_pool_; scan-local streams die at
-	//                        query end, and the pool's Shutdown() asserts
-	//                        quiescence).
+	// the same context). Instead the release targets are captured HERE, on the
+	// client thread:
+	//   pool_handle        — weak_ptr to the catalog's pool. lock() failure
+	//                        (catalog torn down) degrades to dropping the
+	//                        connection — a safe failure mode, never a dangling
+	//                        dereference (PR #179 review).
 	//   transaction_pinned — true when the connection is pinned to an explicit
 	//                        DuckDB transaction; the destructor then just drops
 	//                        its reference (the MSSQLTransaction owns the pin).
 	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
-					  MSSQLCatalog *owning_catalog = nullptr, bool transaction_pinned = false,
-					  int query_timeout_seconds = 30);
+					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
+					  bool transaction_pinned = false, int query_timeout_seconds = 30);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
@@ -152,10 +154,10 @@ private:
 	// Context name for pool release
 	string context_name_;
 
-	// Owning catalog (non-owning pointer) + pinned-ness, captured at construction
-	// on the client thread so the destructor never dereferences a ClientContext
-	// (issue #178 review: TSan race vs TransactionContext::Commit).
-	MSSQLCatalog *owning_catalog_;
+	// Release targets captured at construction on the client thread so the
+	// destructor never dereferences a ClientContext (issue #178 review: TSan
+	// race vs TransactionContext::Commit) nor a raw catalog pointer.
+	weak_ptr<tds::ConnectionPool> pool_handle_;
 	bool transaction_pinned_;
 
 	// Query
