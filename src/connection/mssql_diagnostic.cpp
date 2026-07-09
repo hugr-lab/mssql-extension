@@ -353,18 +353,27 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	//   - Connection string: "Server=host,port;Database=db;User Id=user;Password=pass"
 	//   - URI format: "mssql://user:password@host:port/database"
 	//   - Secret name (for backward compatibility)
+	// All four diagnostic functions are side-effecting (open/close sockets,
+	// network ping): VOLATILE keeps the optimizer from constant-folding them
+	// at plan time or caching results per row.
 	ScalarFunctionSet open_func("mssql_open");
-	open_func.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction));
+	ScalarFunction open_fn({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction);
+	open_fn.SetVolatile();
+	open_func.AddFunction(open_fn);
 	loader.RegisterFunction(open_func);
 
 	// [DEPRECATED] mssql_close(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet close_func("mssql_close");
-	close_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction));
+	ScalarFunction close_fn({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction);
+	close_fn.SetVolatile();
+	close_func.AddFunction(close_fn);
 	loader.RegisterFunction(close_func);
 
 	// [DEPRECATED] mssql_ping(handle BIGINT) -> BOOLEAN  (spec 047 FR-010, same group as mssql_open)
 	ScalarFunctionSet ping_func("mssql_ping");
-	ping_func.AddFunction(ScalarFunction({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction));
+	ScalarFunction ping_fn({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction);
+	ping_fn.SetVolatile();
+	ping_func.AddFunction(ping_fn);
 	loader.RegisterFunction(ping_func);
 
 	// [DEPRECATED] mssql_close_all() -> INTEGER  (spec 047 FR-013)
@@ -376,7 +385,9 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	// comment until the diagnostic API is retired and the singleton
 	// MSSQLConnectionHandleManager goes with it.
 	ScalarFunctionSet close_all_func("mssql_close_all");
-	close_all_func.AddFunction(ScalarFunction({}, LogicalType::INTEGER, MSSQLCloseAllFunction));
+	ScalarFunction close_all_fn({}, LogicalType::INTEGER, MSSQLCloseAllFunction);
+	close_all_fn.SetVolatile();
+	close_all_func.AddFunction(close_all_fn);
 	loader.RegisterFunction(close_all_func);
 
 	// mssql_pool_stats([context_name] VARCHAR) -> TABLE

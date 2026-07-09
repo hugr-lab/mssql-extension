@@ -450,6 +450,9 @@ ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 	ScalarFunction func(NAME, {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLExecExecute,
 						MSSQLExecBind);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	// Side-effecting (runs T-SQL on the server): VOLATILE stops the optimizer
+	// from constant-folding the call at plan time or caching it per row.
+	func.SetVolatile();
 	return func;
 }
 
