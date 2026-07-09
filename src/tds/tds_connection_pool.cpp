@@ -49,6 +49,13 @@ ConnectionPool::~ConnectionPool() noexcept {
 }
 
 void ConnectionPool::Shutdown() {
+	// Thread affinity (PR #179 review): with shared_ptr pool ownership this can
+	// run on WHATEVER thread drops the last strong reference — including a
+	// DuckDB worker thread inside ~MSSQLResultStream when its weak_ptr::lock()
+	// wins a race against DETACH. That is safe: joining cleanup_thread_ is
+	// legal from any thread (the cleanup thread holds no pool references, so a
+	// self-join is impossible), and everything below is self-contained.
+	//
 	// Spec 047 T046l: surface DuckDB quiescence-contract violations in debug
 	// builds via D_ASSERT. PR #118 review M2: also emit a release-mode warning
 	// — silent UB on a real quiescence violation is worse for operators than
@@ -200,11 +207,23 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 }
 
 void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
+	// Post-Shutdown contract (PR #179 review): drop, never enqueue. Under
+	// shared_ptr ownership this is belt-and-suspenders — Shutdown() only runs
+	// from ~ConnectionPool, which cannot execute while a Release caller still
+	// holds a strong reference (the ~MSSQLResultStream path holds one from
+	// weak_ptr::lock() for the duration of this call).
 	if (!conn || shutdown_flag_.load()) {
 		return;
 	}
 
 	std::lock_guard<std::mutex> lock(pool_mutex_);
+
+	// Re-check under the mutex: if a shutdown raced past the unlocked check
+	// above, close instead of enqueueing into a quiesced pool.
+	if (shutdown_flag_.load()) {
+		conn->Close();
+		return;
+	}
 
 	// Find and remove from active connections
 	uint64_t found_id = 0;
