@@ -200,17 +200,23 @@ static void WinSspiTestSpn(DataChunk &args, ExpressionState & /*state*/, Vector 
 #endif	// MSSQL_ENABLE_SSPI
 
 void RegisterWinSspiTestFunction(ExtensionLoader &loader) {
+	// All variants perform SSPI/network work and are non-deterministic:
+	// VOLATILE prevents plan-time constant folding (issue #178 D1).
+
 	// mssql_winsspi_auth_test(host)
 	ScalarFunction f1("mssql_winsspi_auth_test", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestHost);
+	f1.SetVolatile();
 	loader.RegisterFunction(f1);
 
 	// mssql_winsspi_auth_test(host, port)
 	ScalarFunction f2("mssql_winsspi_auth_test", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR,
 					  WinSspiTestHostPort);
+	f2.SetVolatile();
 	loader.RegisterFunction(f2);
 
 	// mssql_winsspi_auth_test_spn(spn)
 	ScalarFunction f3("mssql_winsspi_auth_test_spn", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestSpn);
+	f3.SetVolatile();
 	loader.RegisterFunction(f3);
 }
 

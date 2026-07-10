@@ -81,10 +81,15 @@ static void AzureAuthTestFunctionWithTenant(DataChunk &args, ExpressionState &st
 // RegisterAzureTestFunction
 //===----------------------------------------------------------------------===//
 void RegisterAzureTestFunction(ExtensionLoader &loader) {
+	// Both variants hit the network (OAuth2 token acquisition) and are
+	// non-deterministic: VOLATILE prevents plan-time constant folding
+	// (issue #178 D1).
+
 	// Version 1: secret_name only
 	ScalarFunction func1("mssql_azure_auth_test", {LogicalType::VARCHAR},  // secret_name
 						 LogicalType::VARCHAR,							   // return type
 						 AzureAuthTestFunction);
+	func1.SetVolatile();
 	loader.RegisterFunction(func1);
 
 	// Version 2: secret_name + tenant_id (for interactive auth)
@@ -92,6 +97,7 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 						 {LogicalType::VARCHAR, LogicalType::VARCHAR},	// secret_name, tenant_id
 						 LogicalType::VARCHAR,							// return type
 						 AzureAuthTestFunctionWithTenant);
+	func2.SetVolatile();
 	loader.RegisterFunction(func2);
 }
 

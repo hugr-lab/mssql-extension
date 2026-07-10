@@ -167,10 +167,16 @@ static void MSSQLInvalidateCacheExecute(DataChunk &args, ExpressionState &state,
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
+	// Both functions mutate the metadata cache: VOLATILE keeps the optimizer
+	// from constant-folding the call at plan time (which executed the side
+	// effect during optimization and tripped ExpressionExecutor's
+	// CONSTANT_VECTOR assertion in debug builds — issue #178 finding D1).
+
 	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
 						MSSQLRefreshCacheBind);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	func.SetVolatile();
 	loader.RegisterFunction(func);
 
 	// mssql_invalidate_cache(catalog [, schema [, table]]) -> BOOLEAN
@@ -180,6 +186,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 		  vector<LogicalType>{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
 		ScalarFunction overload("mssql_invalidate_cache", arg_types, LogicalType::BOOLEAN, MSSQLInvalidateCacheExecute);
 		overload.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		overload.SetVolatile();
 		invalidate.AddFunction(overload);
 	}
 	loader.RegisterFunction(invalidate);

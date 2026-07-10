@@ -31,9 +31,13 @@ BEGIN
 END
 ');
 
-# NOTE: no cache invalidation needed — a fresh unittest process binds cold.
-# (mssql_invalidate_cache also trips a debug-only ExpressionExecutor assertion
-# about CONSTANT_VECTOR folding — tracked separately from #178.)
+# Cold binds for every connection in the loop. This statement doubles as the
+# regression check for issue #178 finding D1: before mssql_invalidate_cache was
+# marked VOLATILE, the optimizer constant-folded it at plan time, which ran the
+# side effect during optimization and tripped ExpressionExecutor's
+# CONSTANT_VECTOR assertion on debug builds.
+statement ok
+SELECT mssql_invalidate_cache('mss');
 
 concurrentloop i 0 8
 

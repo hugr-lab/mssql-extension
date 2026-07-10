@@ -161,6 +161,8 @@ void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind);
 	func.varargs = LogicalType::VARCHAR;  // Optional schema_name
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	// Mutates the metadata cache: never constant-fold at plan time (issue #178 D1)
+	func.SetVolatile();
 	loader.RegisterFunction(func);
 }
 
