@@ -301,6 +301,30 @@ void TestEnvChangeZeroLenMidStreamContinues() {
 	std::cout << "  [ok] empty ENVCHANGE mid-stream skipped, following ERROR still parsed" << std::endl;
 }
 
+// Companion to the above on the SUCCESS path (roborev finding): an empty
+// ENVCHANGE preceding a LOGINACK must not derail the login -- the continue path
+// has to keep processing to the LOGINACK. Guards a future regression that
+// re-breaks the skip for the success flow, which the ERROR-path test wouldn't catch.
+void TestEnvChangeZeroLenBeforeLoginAckSucceeds() {
+	std::vector<uint8_t> stream = {static_cast<uint8_t>(TokenType::ENVCHANGE), 0x00, 0x00};	 // empty ENVCHANGE
+
+	std::vector<uint8_t> body;
+	body.push_back(0x01);			// Interface
+	AppendU32LE(body, 0x74000004);	// TDS 7.4 version
+	body.push_back(0x00);			// ProgName length (0 chars)
+	AppendU32LE(body, 0x00000000);	// ProgVersion
+	stream.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
+	AppendU16LE(stream, static_cast<uint16_t>(body.size()));
+	stream.insert(stream.end(), body.begin(), body.end());
+	AppendDoneToken(stream);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);  // LOGINACK after the empty ENVCHANGE still reached
+	CHECK(resp.error_number == 0);
+	std::cout << "  [ok] empty ENVCHANGE mid-stream skipped, following LOGINACK still succeeds" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -315,6 +339,7 @@ int main() {
 	TestFedAuthInfoOffsetOverflowRejected();
 	TestEnvChangeZeroLenNoOverread();
 	TestEnvChangeZeroLenMidStreamContinues();
+	TestEnvChangeZeroLenBeforeLoginAckSucceeds();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

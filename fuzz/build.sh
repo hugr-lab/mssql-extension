@@ -141,8 +141,12 @@ for t in browser_response tds_tokens utf16 envchange_txn login_response; do
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi
 done
-cp -f "${HERE}/tds.dict" "${OUT}/fuzz_tds_tokens.dict" 2>/dev/null || true
-cp -f "${HERE}/tds.dict" "${OUT}/fuzz_utf16.dict" 2>/dev/null || true
+# tds.dict guides every TDS token-stream harness. Mirror fuzz/run.sh, which
+# applies it to all non-browser_response targets, so CFLite fuzzers get the same
+# guidance as the local AFL++ campaign.
+for t in tds_tokens utf16 envchange_txn login_response; do
+	cp -f "${HERE}/tds.dict" "${OUT}/fuzz_${t}.dict" 2>/dev/null || true
+done
 
 echo ">> done. fuzzers in ${OUT}:"
 ls -1 "${OUT}" | sed 's/^/   /'
