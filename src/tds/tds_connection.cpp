@@ -854,8 +854,11 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
-			last_error_ = "Authentication failed (error " + std::to_string(login_response.error_number) +
-						  "): " + login_response.error_message;
+			// Include the ERROR-token State byte: for 18456 it is the only field
+			// that distinguishes a bad password from an inaccessible default/initial
+			// database or a disabled login (issue #164).
+			last_error_ = "Authentication failed (error " + std::to_string(login_response.error_number) + ", state " +
+						  std::to_string(login_response.error_state) + "): " + login_response.error_message;
 		} else {
 			last_error_ = "Authentication failed: " + login_response.error_message;
 		}

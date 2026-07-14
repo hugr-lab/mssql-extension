@@ -639,9 +639,12 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 									   (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
 				ptr += 4;
 
-				// Server name length
+				// Server name length. Clamp to the token's own extent, not the
+				// whole buffer, so a crafted name_len can't read into the tokens
+				// that follow the LOGINACK (issue #183; same class as the ERROR
+				// msg_len clamp below).
 				uint8_t name_len = *ptr++;
-				if (ptr + name_len * 2 <= end) {
+				if (ptr + static_cast<size_t>(name_len) * 2 <= loginack_end) {
 					response.server_name = ReadUTF16LE(ptr, name_len);
 				}
 			}
@@ -660,12 +663,18 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			if (ptr + len > end || len < 14)
 				break;
 
+			// Bound every field read below to the token's own declared extent, not
+			// the whole buffer, so a crafted length can't make us read into the next
+			// token (issue #183). token_end <= end by the check above.
+			const uint8_t *token_end = ptr + len;
+
 			// Error number (4 bytes, LE)
 			response.error_number = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) |
 									(static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
 			ptr += 4;
 
-			// State (1 byte)
+			// State (1 byte) -- disambiguates login failures (18456); see issue #164
+			response.error_state = ptr[0];
 			ptr++;
 			// Class (1 byte)
 			ptr++;
@@ -674,7 +683,7 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			uint16_t msg_len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 
-			if (ptr + msg_len * 2 <= end) {
+			if (ptr + static_cast<size_t>(msg_len) * 2 <= token_end) {
 				response.error_message = ReadUTF16LE(ptr, msg_len);
 			}
 
@@ -695,7 +704,15 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				break;
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
-			if (ptr + len <= end) {
+			if (ptr + len > end)
+				break;	// truncated ENVCHANGE
+			// Empty ENVCHANGE: the token type + 2-byte length are already consumed,
+			// so skipping preserves loop progress (no infinite loop) and does NOT
+			// abandon later tokens (e.g. a following ERROR). Reading env_data[0] with
+			// len == 0 would be a 1-byte heap over-read (found by fuzz_login_response).
+			if (len == 0)
+				continue;
+			{
 				const uint8_t *env_data = ptr;
 				// ENVCHANGE type is first byte
 				uint8_t env_type = env_data[0];
@@ -781,8 +798,6 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 					}
 				}
 				ptr += len;
-			} else {
-				break;
 			}
 		} else if (token_type == static_cast<uint8_t>(TokenType::INFO)) {
 			if (ptr + 2 > end)
@@ -837,11 +852,15 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: info_id=%d, data_len=%u, data_offset=%u", info_id, data_len,
 									  data_offset);
 
-				// Data is at token_start + data_offset
-				if (data_offset + data_len <= token_len) {
+				// Data is at token_start + data_offset. Validate WITHOUT overflow:
+				// data_offset + data_len can wrap (both attacker-controlled uint32),
+				// so a wrapped sum could pass "<= token_len" while data_offset alone
+				// points past token_end -> ReadUTF16LE reads wild memory (SEGV,
+				// found by fuzz_login_response). Rearranged so neither side wraps.
+				if (data_offset <= token_len && data_len <= token_len - data_offset) {
 					const uint8_t *opt_data = token_start + data_offset;
 					// Convert from UTF-16LE (data_len is in bytes, 2 bytes per char)
-					uint16_t char_count = data_len / 2;
+					uint16_t char_count = static_cast<uint16_t>(data_len / 2);
 					std::string value = ReadUTF16LE(opt_data, char_count);
 
 					if (info_id == FEDAUTHINFO_OPT_STS_URL) {

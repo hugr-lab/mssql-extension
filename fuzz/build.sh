@@ -103,7 +103,7 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 
 # TARGETS selects which harnesses to build (default: all). Lets CI / run.sh /
 # verification build a subset; e.g. TARGETS=browser_response builds offline.
-TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn}"
+TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_response}"
 want() { [[ " ${TARGETS} " == *" $1 "* ]]; }
 
 # 1. SQL Browser response parser — standalone: no simdutf, no TDS sources, no
@@ -125,14 +125,28 @@ if want tds_tokens || want utf16 || want envchange_txn; then
 	want envchange_txn && build_harness fuzz_envchange_txn fuzz_envchange_txn.cc ${TDS_OBJS}
 fi
 
+# 5. LOGIN7 response parser (ParseLoginResponse) — pre-auth token stream; distinct
+#    from tds_tokens' post-auth TokenParser. Needs tds_protocol/tds_packet, which
+#    the decode set above does not compile, so build its own object set.
+if want login_response; then
+	ensure_simdutf
+	LOGIN_OBJS="$(compile_objs login \
+		"${TDS}/tds_protocol.cpp" "${TDS}/tds_packet.cpp" "${TDS}/tds_types.cpp" "${TDS}/encoding/utf16.cpp")"
+	build_harness fuzz_login_response fuzz_login_response.cc ${LOGIN_OBJS}
+fi
+
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
-for t in browser_response tds_tokens utf16; do
+for t in browser_response tds_tokens utf16 envchange_txn login_response; do
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi
 done
-cp -f "${HERE}/tds.dict" "${OUT}/fuzz_tds_tokens.dict" 2>/dev/null || true
-cp -f "${HERE}/tds.dict" "${OUT}/fuzz_utf16.dict" 2>/dev/null || true
+# tds.dict guides every TDS token-stream harness. Mirror fuzz/run.sh, which
+# applies it to all non-browser_response targets, so CFLite fuzzers get the same
+# guidance as the local AFL++ campaign.
+for t in tds_tokens utf16 envchange_txn login_response; do
+	cp -f "${HERE}/tds.dict" "${OUT}/fuzz_${t}.dict" 2>/dev/null || true
+done
 
 echo ">> done. fuzzers in ${OUT}:"
 ls -1 "${OUT}" | sed 's/^/   /'

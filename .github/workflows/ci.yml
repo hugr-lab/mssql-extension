@@ -15,6 +15,13 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
+  schedule:
+    # Weekly regression build (Mondays 05:00 UTC). The heavy build job is
+    # manual-dispatch only, so without this the C++ unit tests it carries
+    # (incl. test_login_error_state, issue #164) and the integration suite get
+    # no automatic coverage between releases. Runs build + smoke + integration;
+    # Windows / Azure stay manual (cost, and #165 keeps MSVC red).
+    - cron: '0 5 * * 1'
   workflow_dispatch:
     inputs:
       run_build:
@@ -125,7 +132,7 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
@@ -260,6 +267,19 @@ jobs:
           ./build/test/test_login7_encoding
           echo "::endgroup::"
 
+          echo "::group::test_login_error_state (issue #164 — capture LOGIN7 18456 State byte)"
+          # TDS-only, like test_login7_encoding above: no libduckdb, just the
+          # protocol parser. Pins LoginResponse::error_state so 18456 failures
+          # surface the State that distinguishes bad password from inaccessible db.
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/test_login_error_state.cpp \
+            src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp src/tds/encoding/utf16.cpp \
+            -L "$PREFIX/lib" -lsimdutf \
+            -o build/test/test_login_error_state
+          ./build/test/test_login_error_state
+          echo "::endgroup::"
+
           echo "::group::test_datetime_codec (codec::datetime — issue #168 datetime2(7) overflow -> NULL)"
           # Unlike the TDS-only test above, the codec test uses DuckDB
           # Value/Vector/Date/Timestamp, so it links the libduckdb just built in
@@ -330,7 +350,7 @@ jobs:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
@@ -385,7 +405,7 @@ jobs:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' }}
 
     services:
       sqlserver:
