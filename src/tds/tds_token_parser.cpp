@@ -67,138 +67,161 @@ void TokenParser::CompactBuffer() {
 }
 
 ParsedTokenType TokenParser::TryParseNext() {
-	if (state_ == ParserState::Complete || state_ == ParserState::Error) {
-		// Return NeedMoreData to break out of all parsing loops
-		return ParsedTokenType::NeedMoreData;
-	}
-
-	// Need at least 1 byte for token type
-	if (Available() < 1) {
-		return ParsedTokenType::NeedMoreData;
-	}
-
-	uint8_t token_type = Current()[0];
-	TDS_PARSER_DEBUG(2, "TryParseNext: token_type=0x%02X, available=%zu", token_type, Available());
-
-	switch (static_cast<TokenType>(token_type)) {
-	case TokenType::COLMETADATA:
-		if (ParseColMetadata()) {
-			TDS_PARSER_DEBUG(1, "TryParseNext: returning ColMetadata (1)");
-			return ParsedTokenType::ColMetadata;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::ROW:
-		if (ParseRow()) {
-			return ParsedTokenType::Row;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::NBCROW:
-		if (ParseNBCRow()) {
-			return ParsedTokenType::Row;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::DONE:
-	case TokenType::DONEPROC:
-	case TokenType::DONEINPROC:
-		if (ParseDone()) {
-			return ParsedTokenType::Done;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::ERROR_TOKEN:
-		if (ParseError()) {
-			return ParsedTokenType::Error;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::INFO:
-		if (ParseInfo()) {
-			return ParsedTokenType::Info;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::ENVCHANGE:
-		if (ParseEnvChange()) {
-			return ParsedTokenType::EnvChange;
-		}
-		return ParsedTokenType::NeedMoreData;
-
-	case TokenType::ORDER:
-	case TokenType::RETURNSTATUS:
-	case TokenType::RETURNVALUE:
-	case TokenType::LOGINACK:
-	case TokenType::TABNAME:
-	case TokenType::COLINFO:
-		// Skip these tokens - they have a 2-byte length
-		if (Available() < 3) {
+	// Iterate rather than recurse. Skip-only tokens (the ORDER group, SSPI,
+	// FEDAUTHINFO) advance past their payload and `continue` to the next token.
+	// A long run of such tokens must not grow the stack (a `return TryParseNext()`
+	// tail-call is only optimized away with optimization on — not guaranteed at
+	// -O0 or under MSVC), and a token whose declared length overflows the buffer
+	// bound must not spin in place. Both were reachable via issue #185: a single
+	// FEDAUTHINFO with length 0xFFFFFFFB made `5 + token_length` wrap to 0, so the
+	// bound check passed, ConsumeBytes(0) made no progress, and the recursion
+	// looped forever. The length checks below now add in size_t so they cannot
+	// wrap, and ConsumeBytes always advances by at least the token header.
+	while (true) {
+		if (state_ == ParserState::Complete || state_ == ParserState::Error) {
+			// Return NeedMoreData to break out of all parsing loops
 			return ParsedTokenType::NeedMoreData;
 		}
-		{
-			uint16_t token_length = static_cast<uint16_t>(Current()[1]) | (static_cast<uint16_t>(Current()[2]) << 8);
-			if (Available() < 3 + token_length) {
-				return ParsedTokenType::NeedMoreData;
-			}
-			ConsumeBytes(3 + token_length);
-		}
-		return TryParseNext();	// Try next token
 
-	case TokenType::SSPI:
-		// SSPI (0xED) - Integrated Auth continuation token (Spec 042; [MS-TDS] 2.2.7.21)
-		// Standard 1+2+data layout: TokenType(1) + USHORT length(2) + Data(variable)
-		// In normal query streams this should never appear; only during LOGIN it does,
-		// and the LOGIN response parser handles it explicitly. Skip here defensively.
-		if (Available() < 3) {
+		// Need at least 1 byte for token type
+		if (Available() < 1) {
 			return ParsedTokenType::NeedMoreData;
 		}
-		{
-			uint16_t token_length = static_cast<uint16_t>(Current()[1]) | (static_cast<uint16_t>(Current()[2]) << 8);
-			if (Available() < 3 + token_length) {
-				return ParsedTokenType::NeedMoreData;
-			}
-			TDS_PARSER_DEBUG(1, "Skipping SSPI token (unexpected outside LOGIN); length=%u", token_length);
-			ConsumeBytes(3 + token_length);
-		}
-		return TryParseNext();
 
-	case TokenType::FEDAUTHINFO:
-		// FEDAUTHINFO (0xEE) - Azure AD authentication info from server (T019)
-		// This token has a 4-byte length (DWORD) unlike most other tokens
-		// MS-TDS 2.2.7.16: FEDAUTHINFO = TokenType(1) + TokenLength(4) + Data(variable)
-		// We just skip this token - the authentication info is not needed after successful login
-		TDS_PARSER_DEBUG(1, "Skipping FEDAUTHINFO token");
-		if (Available() < 5) {
+		uint8_t token_type = Current()[0];
+		TDS_PARSER_DEBUG(2, "TryParseNext: token_type=0x%02X, available=%zu", token_type, Available());
+
+		switch (static_cast<TokenType>(token_type)) {
+		case TokenType::COLMETADATA:
+			if (ParseColMetadata()) {
+				TDS_PARSER_DEBUG(1, "TryParseNext: returning ColMetadata (1)");
+				return ParsedTokenType::ColMetadata;
+			}
 			return ParsedTokenType::NeedMoreData;
-		}
-		{
-			// FEDAUTHINFO has 4-byte length (little-endian DWORD)
-			uint32_t token_length = static_cast<uint32_t>(Current()[1]) | (static_cast<uint32_t>(Current()[2]) << 8) |
-									(static_cast<uint32_t>(Current()[3]) << 16) |
-									(static_cast<uint32_t>(Current()[4]) << 24);
-			if (Available() < 5 + token_length) {
+
+		case TokenType::ROW:
+			if (ParseRow()) {
+				return ParsedTokenType::Row;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::NBCROW:
+			if (ParseNBCRow()) {
+				return ParsedTokenType::Row;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::DONE:
+		case TokenType::DONEPROC:
+		case TokenType::DONEINPROC:
+			if (ParseDone()) {
+				return ParsedTokenType::Done;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::ERROR_TOKEN:
+			if (ParseError()) {
+				return ParsedTokenType::Error;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::INFO:
+			if (ParseInfo()) {
+				return ParsedTokenType::Info;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::ENVCHANGE:
+			if (ParseEnvChange()) {
+				return ParsedTokenType::EnvChange;
+			}
+			return ParsedTokenType::NeedMoreData;
+
+		case TokenType::ORDER:
+		case TokenType::RETURNSTATUS:
+		case TokenType::RETURNVALUE:
+		case TokenType::LOGINACK:
+		case TokenType::TABNAME:
+		case TokenType::COLINFO:
+			// Skip these tokens - they have a 2-byte length
+			if (Available() < 3) {
 				return ParsedTokenType::NeedMoreData;
 			}
-			TDS_PARSER_DEBUG(1, "FEDAUTHINFO token: length=%u", token_length);
-			ConsumeBytes(5 + token_length);
-		}
-		return TryParseNext();	// Try next token
-
-	default:
-		// Unknown token - dump buffer for debugging
-		{
-			std::ostringstream hex_dump;
-			size_t dump_len = std::min(Available(), static_cast<size_t>(32));
-			for (size_t i = 0; i < dump_len; i++) {
-				hex_dump << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(Current()[i]) << " ";
+			{
+				uint16_t token_length =
+					static_cast<uint16_t>(Current()[1]) | (static_cast<uint16_t>(Current()[2]) << 8);
+				// Add in size_t so the bound cannot wrap (defensive; a 16-bit
+				// length + 3 cannot actually overflow, but keep every skip
+				// branch uniform with the FEDAUTHINFO fix below).
+				size_t token_end = static_cast<size_t>(token_length) + 3;
+				if (Available() < token_end) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				ConsumeBytes(token_end);
 			}
-			TDS_PARSER_DEBUG(1, "Unknown token 0x%02x at pos=%zu, buffer_size=%zu, available=%zu, hex: %s", token_type,
-							 buffer_pos_, buffer_.size(), Available(), hex_dump.str().c_str());
+			continue;  // Try next token
+
+		case TokenType::SSPI:
+			// SSPI (0xED) - Integrated Auth continuation token (Spec 042; [MS-TDS] 2.2.7.21)
+			// Standard 1+2+data layout: TokenType(1) + USHORT length(2) + Data(variable)
+			// In normal query streams this should never appear; only during LOGIN it does,
+			// and the LOGIN response parser handles it explicitly. Skip here defensively.
+			if (Available() < 3) {
+				return ParsedTokenType::NeedMoreData;
+			}
+			{
+				uint16_t token_length =
+					static_cast<uint16_t>(Current()[1]) | (static_cast<uint16_t>(Current()[2]) << 8);
+				size_t token_end = static_cast<size_t>(token_length) + 3;
+				if (Available() < token_end) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				TDS_PARSER_DEBUG(1, "Skipping SSPI token (unexpected outside LOGIN); length=%u", token_length);
+				ConsumeBytes(token_end);
+			}
+			continue;
+
+		case TokenType::FEDAUTHINFO:
+			// FEDAUTHINFO (0xEE) - Azure AD authentication info from server (T019)
+			// This token has a 4-byte length (DWORD) unlike most other tokens
+			// MS-TDS 2.2.7.16: FEDAUTHINFO = TokenType(1) + TokenLength(4) + Data(variable)
+			// We just skip this token - the authentication info is not needed after successful login
+			TDS_PARSER_DEBUG(1, "Skipping FEDAUTHINFO token");
+			if (Available() < 5) {
+				return ParsedTokenType::NeedMoreData;
+			}
+			{
+				// FEDAUTHINFO has 4-byte length (little-endian DWORD)
+				uint32_t token_length =
+					static_cast<uint32_t>(Current()[1]) | (static_cast<uint32_t>(Current()[2]) << 8) |
+					(static_cast<uint32_t>(Current()[3]) << 16) | (static_cast<uint32_t>(Current()[4]) << 24);
+				// Add in size_t: `5 + token_length` in 32-bit wraps for
+				// token_length >= 0xFFFFFFFB, which previously made the bound
+				// check pass and ConsumeBytes(0) spin forever (issue #185).
+				size_t token_end = static_cast<size_t>(token_length) + 5;
+				if (Available() < token_end) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				TDS_PARSER_DEBUG(1, "FEDAUTHINFO token: length=%u", token_length);
+				ConsumeBytes(token_end);
+			}
+			continue;  // Try next token
+
+		default:
+			// Unknown token - dump buffer for debugging
+			{
+				std::ostringstream hex_dump;
+				size_t dump_len = std::min(Available(), static_cast<size_t>(32));
+				for (size_t i = 0; i < dump_len; i++) {
+					hex_dump << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(Current()[i]) << " ";
+				}
+				TDS_PARSER_DEBUG(1, "Unknown token 0x%02x at pos=%zu, buffer_size=%zu, available=%zu, hex: %s",
+								 token_type, buffer_pos_, buffer_.size(), Available(), hex_dump.str().c_str());
+			}
+			parse_error_ = "Unknown token type: 0x" + std::to_string(token_type);
+			state_ = ParserState::Error;
+			return ParsedTokenType::None;
 		}
-		parse_error_ = "Unknown token type: 0x" + std::to_string(token_type);
-		state_ = ParserState::Error;
-		return ParsedTokenType::None;
 	}
 }
 
