@@ -15,6 +15,13 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
+  schedule:
+    # Weekly regression build (Mondays 05:00 UTC). The heavy build job is
+    # manual-dispatch only, so without this the C++ unit tests it carries
+    # (incl. test_login_error_state, issue #164) and the integration suite get
+    # no automatic coverage between releases. Runs build + smoke + integration;
+    # Windows / Azure stay manual (cost, and #165 keeps MSVC red).
+    - cron: '0 5 * * 1'
   workflow_dispatch:
     inputs:
       run_build:
@@ -125,7 +132,7 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
@@ -343,7 +350,7 @@ jobs:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
@@ -398,7 +405,7 @@ jobs:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' }}
 
     services:
       sqlserver:
