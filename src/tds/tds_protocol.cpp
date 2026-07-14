@@ -639,9 +639,12 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 									   (static_cast<uint32_t>(ptr[2]) << 8) | static_cast<uint32_t>(ptr[3]);
 				ptr += 4;
 
-				// Server name length
+				// Server name length. Clamp to the token's own extent, not the
+				// whole buffer, so a crafted name_len can't read into the tokens
+				// that follow the LOGINACK (issue #183; same class as the ERROR
+				// msg_len clamp below).
 				uint8_t name_len = *ptr++;
-				if (ptr + name_len * 2 <= end) {
+				if (ptr + static_cast<size_t>(name_len) * 2 <= loginack_end) {
 					response.server_name = ReadUTF16LE(ptr, name_len);
 				}
 			}

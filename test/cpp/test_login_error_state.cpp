@@ -211,6 +211,33 @@ void TestOverlongMsgLenClampedToToken() {
 	std::cout << "  [ok] over-long msg_len clamped to token extent (issue #183)" << std::endl;
 }
 
+// Hardening (issue #183, sibling of the ERROR clamp): a LOGINACK whose ServerName
+// length runs past the token's own extent must not absorb following bytes. Token
+// truthfully declares len=16 (interface + tdsver + namelen + "SQL"(6) + progver)
+// but ServerName claims 10 chars (20 bytes); 30 trailing bytes follow. The clamp
+// to loginack_end must reject it -> server_name empty, login still successful.
+void TestLoginAckOverlongServerNameClamped() {
+	std::vector<uint8_t> body;
+	body.push_back(0x01);			// Interface
+	AppendU32LE(body, 0x74000004);	// TDS 7.4 version
+	body.push_back(10);				// ServerName length claims 10 chars -- a lie
+	AppendUtf16LE(body, "SQL");		// ...but only 3 chars (6 bytes) present
+	AppendU32LE(body, 0);			// ProgVersion
+
+	std::vector<uint8_t> stream;
+	stream.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
+	AppendU16LE(stream, static_cast<uint16_t>(body.size()));  // truthful token length (16)
+	stream.insert(stream.end(), body.begin(), body.end());
+	stream.insert(stream.end(), 30, 0x00);	// room a naive parser could read into
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);
+	CHECK(resp.server_name.empty());  // over-long name_len clamped to token extent
+	CHECK(resp.error_state == 0);
+	std::cout << "  [ok] over-long LOGINACK server name clamped to token extent (issue #183)" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -221,6 +248,7 @@ int main() {
 	TestState4060CannotOpenDatabase();
 	TestSuccessLeavesStateZero();
 	TestOverlongMsgLenClampedToToken();
+	TestLoginAckOverlongServerNameClamped();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;
