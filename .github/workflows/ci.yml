@@ -260,6 +260,19 @@ jobs:
           ./build/test/test_login7_encoding
           echo "::endgroup::"
 
+          echo "::group::test_login_error_state (issue #164 — capture LOGIN7 18456 State byte)"
+          # TDS-only, like test_login7_encoding above: no libduckdb, just the
+          # protocol parser. Pins LoginResponse::error_state so 18456 failures
+          # surface the State that distinguishes bad password from inaccessible db.
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/test_login_error_state.cpp \
+            src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp src/tds/encoding/utf16.cpp \
+            -L "$PREFIX/lib" -lsimdutf \
+            -o build/test/test_login_error_state
+          ./build/test/test_login_error_state
+          echo "::endgroup::"
+
           echo "::group::test_datetime_codec (codec::datetime — issue #168 datetime2(7) overflow -> NULL)"
           # Unlike the TDS-only test above, the codec test uses DuckDB
           # Value/Vector/Date/Timestamp, so it links the libduckdb just built in

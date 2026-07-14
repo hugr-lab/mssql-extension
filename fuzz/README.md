@@ -22,6 +22,7 @@ Two modes:
 | `fuzz_tds_tokens` | `tds::TokenParser::Feed` + `TryParseNext()` loop | `src/tds/tds_token_parser.cpp` (+ row reader, column metadata, types, utf16) | ✅ |
 | `fuzz_utf16` | `tds::encoding::Utf16LEDecode` / `LegacyUtf16LEDecode` | `src/tds/encoding/utf16.cpp` | ✅ (uses simdutf) |
 | `fuzz_envchange_txn` | `tds::FindBeginTxnDescriptor` | `src/tds/tds_token_parser.cpp` | ✅ |
+| `fuzz_login_response` | `tds::TdsProtocol::ParseLoginResponse` | `src/tds/tds_protocol.cpp` (+ packet, types, utf16) | ✅ |
 
 **Isolation finding:** the whole `src/tds/` parsing layer and
 `instance_resolver.cpp` have **zero DuckDB includes** (`grep -L duckdb/`), so the

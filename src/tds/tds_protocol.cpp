@@ -660,12 +660,18 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			if (ptr + len > end || len < 14)
 				break;
 
+			// Bound every field read below to the token's own declared extent, not
+			// the whole buffer, so a crafted length can't make us read into the next
+			// token (issue #183). token_end <= end by the check above.
+			const uint8_t *token_end = ptr + len;
+
 			// Error number (4 bytes, LE)
 			response.error_number = ptr[0] | (static_cast<uint32_t>(ptr[1]) << 8) |
 									(static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
 			ptr += 4;
 
-			// State (1 byte)
+			// State (1 byte) -- disambiguates login failures (18456); see issue #164
+			response.error_state = ptr[0];
 			ptr++;
 			// Class (1 byte)
 			ptr++;
@@ -674,7 +680,7 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			uint16_t msg_len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
 
-			if (ptr + msg_len * 2 <= end) {
+			if (ptr + static_cast<size_t>(msg_len) * 2 <= token_end) {
 				response.error_message = ReadUTF16LE(ptr, msg_len);
 			}
 

@@ -28,6 +28,12 @@ struct LoginResponse {
 	uint32_t tds_version;
 	std::string error_message;
 	uint32_t error_number;
+	// SQL Server ERROR-token State byte (MS-TDS §2.2.7.10). For login failures
+	// (error 18456) the State disambiguates the true cause — bad password vs.
+	// inaccessible default/initial database vs. disabled login — which the raw
+	// "Login failed for user 'x'" text deliberately hides. 0 = no ERROR token /
+	// not captured. See issue #164.
+	uint32_t error_state = 0;
 	uint32_t negotiated_packet_size;  // Server-negotiated packet size from ENVCHANGE
 
 	// Routing info from ENVCHANGE type 20 (Azure SQL/Fabric gateway redirection)
