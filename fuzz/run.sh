@@ -4,7 +4,8 @@
 # do not run on the macOS host.
 #
 #   fuzz/run.sh <target> [seconds] [cores]
-#     <target>  : browser_response | tds_tokens | utf16   (default: browser_response)
+#     <target>  : browser_response | tds_tokens | utf16 | envchange_txn | login_response
+#                 (default: browser_response)
 #     seconds   : per-core wall-clock budget (default: 0 = run until Ctrl-C)
 #     cores     : parallel instances (default: nproc, capped at 8)
 #
@@ -17,8 +18,8 @@ CORES="${3:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${TARGET}" in
-	browser_response|tds_tokens|utf16|envchange_txn) ;;
-	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn)"; exit 2 ;;
+	browser_response|tds_tokens|utf16|envchange_txn|login_response) ;;
+	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response)"; exit 2 ;;
 esac
 BIN="fuzz_${TARGET}"
 

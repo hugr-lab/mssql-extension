@@ -136,7 +136,7 @@ if want login_response; then
 fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
-for t in browser_response tds_tokens utf16 login_response; do
+for t in browser_response tds_tokens utf16 envchange_txn login_response; do
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi

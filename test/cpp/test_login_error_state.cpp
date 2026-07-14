@@ -13,12 +13,17 @@
 // (the reporter could authenticate against a different DB in the same instance).
 // These tests pin the State byte into LoginResponse::error_state.
 //
-// Compile manually (macOS/brew example):
+// Build + run via the Makefile (matches the CI source set exactly):
+//   make test-login-error-state
+//
+// Or compile manually (macOS/brew example). The source list mirrors
+// .github/workflows/ci.yml — including tds_types.cpp, which CI links:
 //   c++ -std=c++17 -Isrc/include \
 //       -I/opt/homebrew/opt/simdutf/include \
 //       test/cpp/test_login_error_state.cpp \
 //       src/tds/tds_packet.cpp \
 //       src/tds/tds_protocol.cpp \
+//       src/tds/tds_types.cpp \
 //       src/tds/encoding/utf16.cpp \
 //       -L/opt/homebrew/opt/simdutf/lib -lsimdutf \
 //       -o build/test/test_login_error_state
@@ -280,6 +285,22 @@ void TestEnvChangeZeroLenNoOverread() {
 	std::cout << "  [ok] zero-length ENVCHANGE at buffer tail no longer over-reads (fuzz regression)" << std::endl;
 }
 
+// A zero-length ENVCHANGE mid-stream must be SKIPPED, not abandon the rest of the
+// stream: a following ERROR token still has to be parsed (roborev finding -- the
+// len==0 path now `continue`s instead of `break`ing). Regression against silently
+// losing a real login error behind a malformed empty ENVCHANGE.
+void TestEnvChangeZeroLenMidStreamContinues() {
+	std::vector<uint8_t> stream = {static_cast<uint8_t>(TokenType::ENVCHANGE), 0x00, 0x00};	 // empty ENVCHANGE
+	auto err = BuildErrorToken(18456, 40, 14, "Login failed for user 'app_user'.");
+	stream.insert(stream.end(), err.begin(), err.end());
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.error_number == 18456);	// ERROR after the empty ENVCHANGE still parsed
+	CHECK(resp.error_state == 40);
+	std::cout << "  [ok] empty ENVCHANGE mid-stream skipped, following ERROR still parsed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -293,6 +314,7 @@ int main() {
 	TestLoginAckOverlongServerNameClamped();
 	TestFedAuthInfoOffsetOverflowRejected();
 	TestEnvChangeZeroLenNoOverread();
+	TestEnvChangeZeroLenMidStreamContinues();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

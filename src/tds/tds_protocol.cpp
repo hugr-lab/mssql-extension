@@ -704,10 +704,15 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				break;
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
-			// len >= 1: a zero-length ENVCHANGE with the token at the buffer tail
-			// makes ptr == end, so reading env_data[0] below is a 1-byte heap
-			// overflow (found by fuzz_login_response). Require at least the type byte.
-			if (len >= 1 && ptr + len <= end) {
+			if (ptr + len > end)
+				break;	// truncated ENVCHANGE
+			// Empty ENVCHANGE: the token type + 2-byte length are already consumed,
+			// so skipping preserves loop progress (no infinite loop) and does NOT
+			// abandon later tokens (e.g. a following ERROR). Reading env_data[0] with
+			// len == 0 would be a 1-byte heap over-read (found by fuzz_login_response).
+			if (len == 0)
+				continue;
+			{
 				const uint8_t *env_data = ptr;
 				// ENVCHANGE type is first byte
 				uint8_t env_type = env_data[0];
@@ -793,8 +798,6 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 					}
 				}
 				ptr += len;
-			} else {
-				break;
 			}
 		} else if (token_type == static_cast<uint8_t>(TokenType::INFO)) {
 			if (ptr + 2 > end)
