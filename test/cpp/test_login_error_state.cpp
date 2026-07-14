@@ -265,6 +265,21 @@ void TestFedAuthInfoOffsetOverflowRejected() {
 	std::cout << "  [ok] FEDAUTHINFO wild data_offset rejected without OOB (fuzz regression)" << std::endl;
 }
 
+// Regression for a second crash fuzz_login_response found: a zero-length
+// ENVCHANGE (0xE3 + len 0x0000) as the last token makes ptr == end, and the
+// old `ptr + len <= end` guard let the code read env_data[0] one byte past the
+// heap buffer. The 3-byte input `E3 00 00` is the minimized reproducer. Must
+// parse without OOB.
+void TestEnvChangeZeroLenNoOverread() {
+	std::vector<uint8_t> stream = {static_cast<uint8_t>(TokenType::ENVCHANGE), 0x00, 0x00};
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);  // must not OOB
+
+	CHECK(resp.success == false);  // no LOGINACK -> not a successful login
+	CHECK(resp.has_routing == false);
+	std::cout << "  [ok] zero-length ENVCHANGE at buffer tail no longer over-reads (fuzz regression)" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -277,6 +292,7 @@ int main() {
 	TestOverlongMsgLenClampedToToken();
 	TestLoginAckOverlongServerNameClamped();
 	TestFedAuthInfoOffsetOverflowRejected();
+	TestEnvChangeZeroLenNoOverread();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

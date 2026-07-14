@@ -704,7 +704,10 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				break;
 			uint16_t len = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 			ptr += 2;
-			if (ptr + len <= end) {
+			// len >= 1: a zero-length ENVCHANGE with the token at the buffer tail
+			// makes ptr == end, so reading env_data[0] below is a 1-byte heap
+			// overflow (found by fuzz_login_response). Require at least the type byte.
+			if (len >= 1 && ptr + len <= end) {
 				const uint8_t *env_data = ptr;
 				// ENVCHANGE type is first byte
 				uint8_t env_type = env_data[0];
