@@ -238,6 +238,33 @@ void TestLoginAckOverlongServerNameClamped() {
 	std::cout << "  [ok] over-long LOGINACK server name clamped to token extent (issue #183)" << std::endl;
 }
 
+// Regression for the crash fuzz_login_response found (issue #164 harness): a
+// FEDAUTHINFO token (0xEE) whose InfoID declares data_offset + data_len that
+// OVERFLOWS uint32 passed the old "data_offset + data_len <= token_len" check
+// while data_offset alone pointed far past the token, so ReadUTF16LE dereferenced
+// wild memory (SEGV). The overflow-safe bound must reject it without crashing and
+// without populating sts_url / server_spn.
+void TestFedAuthInfoOffsetOverflowRejected() {
+	// token body = CountOfInfoIDs(4) + one InfoID{ id(1), data_len(4), data_offset(4) }
+	std::vector<uint8_t> tok;
+	AppendU32LE(tok, 1);		   // CountOfInfoIDs = 1
+	tok.push_back(0x01);		   // FedAuthInfoID = STS_URL
+	AppendU32LE(tok, 0x20);		   // DataLength = 32 bytes
+	AppendU32LE(tok, 0xFFFFFFF0);  // DataOffset -> 0xFFFFFFF0 + 0x20 wraps to 0x10
+
+	std::vector<uint8_t> stream;
+	stream.push_back(static_cast<uint8_t>(TokenType::FEDAUTHINFO));
+	AppendU32LE(stream, static_cast<uint32_t>(tok.size()));	 // TokenLength (4 bytes)
+	stream.insert(stream.end(), tok.begin(), tok.end());
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);  // must not crash
+
+	CHECK(resp.has_fedauth_info == true);  // token was seen...
+	CHECK(resp.sts_url.empty());		   // ...but the wild-offset field was rejected
+	CHECK(resp.server_spn.empty());
+	std::cout << "  [ok] FEDAUTHINFO wild data_offset rejected without OOB (fuzz regression)" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -249,6 +276,7 @@ int main() {
 	TestSuccessLeavesStateZero();
 	TestOverlongMsgLenClampedToToken();
 	TestLoginAckOverlongServerNameClamped();
+	TestFedAuthInfoOffsetOverflowRejected();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

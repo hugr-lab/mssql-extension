@@ -846,11 +846,15 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 				MSSQL_PROTO_DEBUG_LOG(2, "FEDAUTHINFO: info_id=%d, data_len=%u, data_offset=%u", info_id, data_len,
 									  data_offset);
 
-				// Data is at token_start + data_offset
-				if (data_offset + data_len <= token_len) {
+				// Data is at token_start + data_offset. Validate WITHOUT overflow:
+				// data_offset + data_len can wrap (both attacker-controlled uint32),
+				// so a wrapped sum could pass "<= token_len" while data_offset alone
+				// points past token_end -> ReadUTF16LE reads wild memory (SEGV,
+				// found by fuzz_login_response). Rearranged so neither side wraps.
+				if (data_offset <= token_len && data_len <= token_len - data_offset) {
 					const uint8_t *opt_data = token_start + data_offset;
 					// Convert from UTF-16LE (data_len is in bytes, 2 bytes per char)
-					uint16_t char_count = data_len / 2;
+					uint16_t char_count = static_cast<uint16_t>(data_len / 2);
 					std::string value = ReadUTF16LE(opt_data, char_count);
 
 					if (info_id == FEDAUTHINFO_OPT_STS_URL) {
