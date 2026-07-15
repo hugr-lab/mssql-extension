@@ -717,12 +717,25 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 8;
 	} else if (type_lower == "smallmoney") {
 		return 4;
-	} else if (type_lower == "varchar" || type_lower == "nvarchar" || type_lower == "char" || type_lower == "nchar") {
+	} else if (type_lower == "varchar" || type_lower == "char") {
 		// For (max), max_length is -1 in sys.columns
 		if (max_length == -1) {
 			return 0xFFFF;	// MAX indicator
 		}
-		// For nvarchar/nchar, max_length is in bytes (2 bytes per char)
+		// varchar/char data is transmitted as NVARCHAR over the BCP wire, so the
+		// declared length must be UTF-16 bytes: sys.columns reports single-byte
+		// characters, hence 2x. varchar(n) with n > 4000 exceeds the 8000-byte
+		// inline NVARCHAR limit and must be sent as nvarchar(max) (PLP).
+		if (max_length > 4000) {
+			return 0xFFFF;	// MAX indicator (PLP)
+		}
+		return static_cast<uint16_t>(max_length * 2);
+	} else if (type_lower == "nvarchar" || type_lower == "nchar") {
+		// For (max), max_length is -1 in sys.columns
+		if (max_length == -1) {
+			return 0xFFFF;	// MAX indicator
+		}
+		// For nvarchar/nchar, sys.columns max_length is already in bytes (2 bytes per char)
 		return static_cast<uint16_t>(max_length);
 	} else if (type_lower == "text" || type_lower == "ntext") {
 		return 0xFFFF;	// MAX indicator

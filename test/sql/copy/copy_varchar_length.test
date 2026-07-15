@@ -1,0 +1,76 @@
+# name: test/sql/copy/copy_varchar_length.test
+# description: Issue #181 regression — BCP COPY into an existing VARCHAR(n) column must
+#              accept n characters. The BCP wire declares varchar data as NVARCHAR
+#              (UTF-16), so the declared wire length must be 2x the sys.columns byte
+#              length, not the raw value (which halved the effective capacity).
+# group: [copy] [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_varchar_len_test');
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_varchar_len_test (
+    id INT NOT NULL,
+    s VARCHAR(10) NOT NULL,
+    c CHAR(10) NOT NULL,
+    ns NVARCHAR(10) NOT NULL
+)');
+
+# The issue #181 repro: 6 ASCII chars into VARCHAR(10) (failed before the fix
+# because the wire declared nvarchar(5)), plus the exact-capacity boundary.
+statement ok
+COPY (SELECT * FROM (VALUES
+    (1, 'aaaaaa', 'bbbbbb', 'cccccc'),
+    (2, '1234567890', 'abcdefghij', 'klmnopqrst')
+) AS t(id, s, c, ns)) TO 'mssql://db/dbo/copy_varchar_len_test' (FORMAT 'bcp', CREATE_TABLE false);
+
+# CHAR(10) pads with trailing spaces on the server; trim for comparison.
+query ITTT
+SELECT id, s, rtrim(c), ns FROM db.dbo.copy_varchar_len_test ORDER BY id;
+----
+1	aaaaaa	bbbbbb	cccccc
+2	1234567890	abcdefghij	klmnopqrst
+
+# A value that genuinely exceeds VARCHAR(10) must still be rejected (by the
+# server, not by the halved client-side wire declaration).
+statement error
+COPY (SELECT 3 AS id, '12345678901' AS s, 'x' AS c, 'x' AS ns)
+TO 'mssql://db/dbo/copy_varchar_len_test' (FORMAT 'bcp', CREATE_TABLE false);
+----
+
+# varchar(n) with n > 4000 exceeds the 8000-byte inline NVARCHAR wire limit
+# and must fall back to PLP (nvarchar(max)) transmission.
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_varchar_wide_test');
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_varchar_wide_test (
+    id INT NOT NULL,
+    s VARCHAR(8000) NOT NULL
+)');
+
+statement ok
+COPY (SELECT 1 AS id, repeat('x', 8000) AS s)
+TO 'mssql://db/dbo/copy_varchar_wide_test' (FORMAT 'bcp', CREATE_TABLE false);
+
+query II
+SELECT id, length(s) FROM db.dbo.copy_varchar_wide_test;
+----
+1	8000
+
+# Cleanup
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_varchar_len_test');
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_varchar_wide_test');
+
+statement ok
+DETACH db;
