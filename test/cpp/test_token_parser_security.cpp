@@ -64,6 +64,26 @@ int main() {
 	DrainNoCrash("empty", {});
 	DrainNoCrash("error_truncated_header", {0xAA, 0x05});  // length byte missing
 
+	// --- issue #185: FEDAUTHINFO (0xEE) length arithmetic must not wrap ---
+	// The 4-byte DWORD length is added to the 5-byte header. Computed in uint32
+	// this wraps for length >= 0xFFFFFFFB, so the bound check passed and the skip
+	// consumed 0 bytes -> the parser spun forever on the same token (a hang, not a
+	// crash). With the size_t fix each of these must return NeedMoreData promptly.
+	DrainNoCrash("fedauth_overflow_min", {0xEE, 0xFB, 0xFF, 0xFF, 0xFF});	// len 0xFFFFFFFB -> +5 wraps to 0
+	DrainNoCrash("fedauth_overflow_ffff", {0xEE, 0xFF, 0xFF, 0xFF, 0xFF});	// len 0xFFFFFFFF -> +5 wraps to 4
+	DrainNoCrash("fedauth_overflow_fffc", {0xEE, 0xFC, 0xFF, 0xFF, 0xFF});	// len 0xFFFFFFFC -> +5 wraps to 1
+	// A long run of minimal FEDAUTHINFO tokens must iterate, not recurse per token
+	// (a `return TryParseNext()` tail-call is not stack-safe without optimization).
+	{
+		std::vector<uint8_t> fed_run;
+		fed_run.reserve(5 * 100000);
+		for (int i = 0; i < 100000; ++i) {
+			const uint8_t tok[5] = {0xEE, 0x00, 0x00, 0x00, 0x00};	// FEDAUTHINFO, length 0
+			fed_run.insert(fed_run.end(), tok, tok + 5);
+		}
+		DrainNoCrash("fedauth_long_run_no_stack_overflow", fed_run);
+	}
+
 	// --- sanity: a well-formed-enough ERROR token still parses without crashing.
 	// number[4] state[1] severity[1] msglen(US_VARCHAR=0) servername[1]=0 procname[1]=0 line[4]
 	{
