@@ -40,7 +40,7 @@ SELECT mssql_exec('db', 'INSERT INTO dbo.scan_wide_varchar_test VALUES (
     REPLICATE(''b'', 4001),
     REPLICATE(''c'', 8000),
     REPLICATE(''d'', 5000),
-    REPLICATE(CAST(''e'' AS VARCHAR(MAX)), 9000),
+    REPLICATE(CAST(''é'' AS VARCHAR(MAX)), 9000),
     REPLICATE(CAST(''f'' AS VARCHAR(MAX)), 9000)
 )');
 
@@ -56,7 +56,7 @@ FROM db.dbo.scan_wide_varchar_test;
 # Content must survive intact, not just the length.
 query IIII
 SELECT v4000 = repeat('a', 4000), v8000 = repeat('c', 8000),
-       vmax = repeat('e', 9000), t = repeat('f', 9000)
+       vmax = repeat('é', 9000), t = repeat('f', 9000)
 FROM db.dbo.scan_wide_varchar_test;
 ----
 true	true	true	true
@@ -89,14 +89,18 @@ SELECT length(t) FROM db.dbo.scan_wide_varchar_test;
 ----
 9000
 
-# VARCHAR(MAX) is the one column the setting does govern: with it off the CAST is skipped and the
-# column comes back as collation-encoded bytes rather than NVARCHAR(MAX). This data is ASCII, so
-# the uncast read is still byte-identical — the point is that the opt-out branch is exercised at
-# all, since everything above pins down what the setting must NOT affect.
-query I
-SELECT length(vmax) FROM db.dbo.scan_wide_varchar_test;
+# VARCHAR(MAX) is the one column the setting does govern, and the fixture is deliberately
+# non-ASCII ('é') so the two branches are actually distinguishable: with the CAST the value
+# decodes correctly (asserted true above); without it the Latin1 bytes are read as-is and the
+# comparison fails. That mojibake IS the opt-out working as documented — the setting trades
+# correct decoding for TDS buffer capacity — and it is the only observable that separates the
+# branches. With ASCII data both paths return identical results, so a regression that silently
+# kept CASTing would go unnoticed.
+query II
+SELECT vmax = repeat('é', 9000) AS decodes_correctly, length(vmax) AS len
+FROM db.dbo.scan_wide_varchar_test;
 ----
-9000
+false	9000
 
 statement ok
 SET mssql_convert_varchar_max = true;

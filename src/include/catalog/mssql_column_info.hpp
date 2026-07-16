@@ -64,6 +64,12 @@ struct MSSQLColumnInfo {
 	// Check if type is a deprecated LOB (TEXT, NTEXT, IMAGE), for which sys.columns reports
 	// max_length 16 — the size of the in-row pointer, not of the data (which runs to 2 GB). Any
 	// length derived from that 16 is meaningless: these must be treated as MAX types.
+	//
+	// The right MAX target differs per type: TEXT/NTEXT are character data (NVARCHAR(MAX)), IMAGE
+	// is binary (VARBINARY(MAX)). This predicate says only "max_length is a pointer size, ignore
+	// it" — it is NOT a licence to give all three the same CAST. Routing IMAGE through
+	// NVARCHAR(MAX) would silently turn binary into a garbage string rather than failing. See
+	// issue #197 (NTEXT/IMAGE are unreadable through the catalog today).
 	static bool IsLegacyLobType(const string &sql_type_name);
 };
 
