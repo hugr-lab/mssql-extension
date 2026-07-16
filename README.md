@@ -1681,7 +1681,7 @@ VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`)
 
 `mssql_convert_varchar_max` governs *declared* `VARCHAR(MAX)` columns only. A `VARCHAR(4001..8000)` is converted to `NVARCHAR(MAX)` regardless of the setting, because no shorter NVARCHAR can hold it.
 
-> **Known gap**: the other two legacy LOB types, `NTEXT` and `IMAGE`, cannot be read through the catalog at all — the scan emits no CAST for them, and their native wire types (`0x63` / `0x22`) have no decoder, so the query fails rather than returning data. This is long-standing and not specific to the conversion above; `TEXT` only avoids it because it goes through the CAST path documented here. Track: [#194](https://github.com/hugr-lab/mssql-extension/issues/194).
+> **Known gap**: the other two legacy LOB types, `NTEXT` and `IMAGE`, cannot be read through the catalog at all — the scan emits no CAST for them, and their native wire types (`0x63` / `0x22`) have no decoder, so the query fails rather than returning data. This is long-standing and not specific to the conversion above; `TEXT` only avoids it because it goes through the CAST path documented here. Track: [#197](https://github.com/hugr-lab/mssql-extension/issues/197).
 
 > **Note**: Previously, `VARCHAR(n > 4000)` was converted to `NVARCHAR(4000)` and `TEXT` to `NVARCHAR(16)`, both of which silently truncated the value on read. Both now convert to `NVARCHAR(MAX)` and return the full value.
 
