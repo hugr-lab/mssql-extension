@@ -68,13 +68,22 @@ static bool NeedsNVarcharConversion(const MSSQLColumnInfo &col, bool convert_var
 	if (col.is_utf8) {
 		return false;  // UTF-8 is safe
 	}
-	// LOB handling depends on setting
+	// VARCHAR(MAX) handling depends on setting
 	// When convert_varchar_max is false, skip to preserve TDS buffer capacity (4096 bytes)
 	// When true, convert to NVARCHAR(MAX) for UTF-8 compatibility
-	if ((col.max_length == -1 || IsLegacyTextLob(col.sql_type_name)) && !convert_varchar_max) {
-		return false;  // LOB types - don't convert when setting is off
+	//
+	// The setting governs *declared*-MAX columns only (max_length == -1), matching its name and
+	// documented purpose. A varchar(4001..8000) is not VARCHAR(MAX): GetNVarcharLength promotes it
+	// to NVARCHAR(MAX) because no shorter NVARCHAR could hold it, not because the user asked for
+	// MAX, so the opt-out does not apply to it.
+	//
+	// TEXT is never opted out. Unlike varchar, it has no decodable uncast wire form: it is a known
+	// type (so is_cast_required is false) and dropping the CAST would put TDS_TYPE_TEXT (0x23) on
+	// the wire, which no codec handles — the read would fail outright rather than degrade.
+	if (col.max_length == -1 && !convert_varchar_max) {
+		return false;  // VARCHAR(MAX) - don't convert when setting is off
 	}
-	return true;  // Non-UTF8 CHAR/VARCHAR needs conversion
+	return true;  // Non-UTF8 CHAR/VARCHAR/TEXT needs conversion
 }
 
 // Get NVARCHAR length specification for CAST.

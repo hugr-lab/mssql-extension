@@ -1676,10 +1676,12 @@ VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`)
 | VARCHAR(n) where n ≤ 4000 | NVARCHAR(n) | Full data preserved |
 | VARCHAR(n) where n > 4000 | NVARCHAR(MAX) | Full data preserved. NVARCHAR has no inline length above 4000 characters, so these columns are sent as PLP. |
 | CHAR(n) | same as VARCHAR(n) | Full data preserved (blank-padded to `n` by SQL Server) |
-| TEXT | NVARCHAR(MAX) | Full data preserved; converted by default, disable with `mssql_convert_varchar_max = false` |
+| TEXT | NVARCHAR(MAX) | Full data preserved. Always converted — TEXT has no decodable unconverted wire form, so `mssql_convert_varchar_max` does not apply to it. |
 | VARCHAR(MAX) | NVARCHAR(MAX) | Converted by default; disable with `mssql_convert_varchar_max = false` |
 
-> **Note**: Before v0.2.2, `VARCHAR(n > 4000)` was converted to `NVARCHAR(4000)` and `TEXT` to `NVARCHAR(16)`, both of which silently truncated the value on read. Both now convert to `NVARCHAR(MAX)` and return the full value.
+`mssql_convert_varchar_max` governs *declared* `VARCHAR(MAX)` columns only. A `VARCHAR(4001..8000)` is converted to `NVARCHAR(MAX)` regardless of the setting, because no shorter NVARCHAR can hold it.
+
+> **Note**: Previously, `VARCHAR(n > 4000)` was converted to `NVARCHAR(4000)` and `TEXT` to `NVARCHAR(16)`, both of which silently truncated the value on read. Both now convert to `NVARCHAR(MAX)` and return the full value.
 
 **VARCHAR Encoding Setting:**
 

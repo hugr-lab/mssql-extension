@@ -64,6 +64,29 @@ FROM (SELECT length(v8000) AS n FROM mssql_scan('db', 'SELECT v8000 FROM dbo.sca
 ----
 true
 
+# mssql_convert_varchar_max = false must not break these columns.
+#
+# The setting governs declared VARCHAR(MAX) only. TEXT is never opted out: it is a known type
+# (is_cast_required = false), so dropping its CAST would put TDS_TYPE_TEXT (0x23) on the wire,
+# which no codec handles — the read fails outright rather than degrading. varchar(4001..8000) is
+# likewise still promoted to NVARCHAR(MAX), since no shorter NVARCHAR can hold it.
+statement ok
+SET mssql_convert_varchar_max = false;
+
+query IIII
+SELECT length(v4000), length(v4001), length(v8000), length(c5000)
+FROM db.dbo.scan_wide_varchar_test;
+----
+4000	4001	8000	5000
+
+query I
+SELECT length(t) FROM db.dbo.scan_wide_varchar_test;
+----
+9000
+
+statement ok
+SET mssql_convert_varchar_max = true;
+
 # Cleanup
 statement ok
 SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.scan_wide_varchar_test');
