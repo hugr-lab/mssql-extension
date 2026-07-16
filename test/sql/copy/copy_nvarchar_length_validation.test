@@ -112,14 +112,10 @@ COPY local_c TO 'mssql://db/dbo/copy_nv_91_c' (FORMAT 'bcp', CREATE_TABLE false)
 ----
 payload
 
-# NOTE: No post-test cleanup for scenario (c). The codec validation throws
-# mid-BCP-stream, which leaves the per-test ATTACH-scoped pool with a
-# corrupted connection (the server still expects more BCP data; subsequent
-# commands on that connection fail with "Failed to receive TDS packet").
-# Cleaning up the dangling SQL Server table is handled by the pre-test
-# `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` block at the file head, which
-# runs in a fresh DuckDB ATTACH for the next test invocation. Robust
-# in-flight BCP cancellation (ATTENTION token round-trip + state reset) is
-# tracked separately from spec 045 — it is a pre-existing limitation of
-# the COPY error path that becomes visible because Phase 5 introduces
-# client-side BCP validation for the first time.
+# Scenario (c) used to skip its cleanup: the codec validation throws mid-BCP-stream, and the
+# connection was then left checked out mid-bulk-load, so every later command on the pool failed.
+# Issue #191 fixed that — ~MSSQLCopyGlobalState now closes and discards the connection on this
+# path, so the next statement gets a fresh one and the table can be dropped here rather than
+# leaking to the next run.
+statement ok
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.copy_nv_91_c'', ''U'') IS NOT NULL DROP TABLE dbo.copy_nv_91_c');

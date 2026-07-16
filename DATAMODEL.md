@@ -30,7 +30,7 @@ flowchart TD
         tx[MSSQLTransaction]
     end
     subgraph L2["Layer 2 — Pool (spec 047)"]
-        pool["ConnectionPool<br/>(per-catalog; sole strong ref,<br/>streams hold weak_ptr)"]
+        pool["ConnectionPool<br/>(per-catalog; sole strong ref,<br/>streams + COPY hold weak_ptr)"]
     end
     subgraph L1["Layer 1 — Protocol (TDS)"]
         conn[TdsConnection]
@@ -136,6 +136,9 @@ classDiagram
 - One pool **per `MSSQLCatalog`** (no process-wide singleton — that was spec 047's headline fix). Lifetime is bounded by catalog lifetime.
 - Background `cleanup_thread_` reaps idle connections past `idle_timeout`.
 - DuckDB's quiescence contract requires every connection be released before `~MSSQLCatalog` runs; the pool's `Shutdown()` emits a warning + assertion if `active_connections_` is non-empty at teardown.
+- **Destructor-time release contract (issues #178 / #179, extended by #191)**: two holders keep a connection past the client thread's control flow — `MSSQLResultStream` and `MSSQLCopyGlobalState` (BCP COPY). Both take a `weak_ptr` handle to the pool (`MSSQLCatalog::GetConnectionPoolHandle()`) rather than a reference to the catalog, and both must touch **no `ClientContext`** in their destructor: it can run on a worker thread while the client thread commits the query's transaction (TSan-confirmed race). Release targets — the pool `weak_ptr` and a `transaction_pinned` flag — are therefore captured on the **client thread** at construction (`MSSQLResultStream`'s ctor, `BCPCopyInitGlobal`). A failed `lock()` means the catalog is gone and degrades to dropping the connection, never a dangling dereference.
+  - When `transaction_pinned`, the destructor only drops its reference: the `MSSQLTransaction` owns the pin and its own release path handles closing.
+  - Otherwise a connection left in a non-`Idle` state is closed before `Release`, which discards it (`Release` only recycles `Idle` connections) — that discard is what decrements `active_connections_`. For COPY this is the path that ends a half-sent `INSERT BULK`, rolling back its transaction and dropping the target-table locks (#191).
 
 ---
 

@@ -112,10 +112,23 @@ MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
 		return;
 	}
 
+	// Drop the writer before the connection: BCPWriter holds a `TdsConnection &`, and members are
+	// destroyed only after this body runs, so releasing the connection first would leave that
+	// reference dangling. BCPCopyFinalize resets the writer before releasing for the same reason.
+	writer.reset();
+
+	if (transaction_pinned) {
+		// The MSSQLTransaction owns the pin and its own release path already closes a non-Idle
+		// connection, so only drop our reference. Closing here would kill a connection the
+		// transaction still owns — and in the teardown window issue #178 describes, one the
+		// transaction may already have handed to another thread.
+		connection.reset();
+		return;
+	}
+
 	// A COPY that died mid-stream leaves the server awaiting bulk data on this session, so the
-	// connection is not reusable: closing it is what ends the session, rolls back the INSERT BULK
-	// transaction, and drops the locks it held on the target table. Returning it to the pool in
-	// that state would hand the next caller a connection stuck mid-bulk-load.
+	// connection is not reusable. Close it: that ends the session, which is what rolls back the
+	// INSERT BULK transaction and drops the locks it held on the target table.
 	auto conn_state = connection->GetState();
 	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
 		try {
@@ -125,15 +138,12 @@ MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
 		}
 	}
 
-	if (transaction_pinned) {
-		// The MSSQLTransaction owns the pin; just drop our reference.
-		connection.reset();
-		return;
-	}
-
 	if (auto pool = pool_handle.lock()) {
 		try {
 			connection->SetNeedsReset(true);
+			// The connection is already closed above; Release is called for pool accounting, and
+			// discards it precisely because it is no longer Idle (see ConnectionPool::Release).
+			// That discard is what decrements active_connections.
 			pool->Release(std::move(connection));
 		} catch (...) {
 			// Release failed - drop it; the shared_ptr destructor closes the socket.
