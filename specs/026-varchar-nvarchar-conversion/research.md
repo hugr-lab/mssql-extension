@@ -67,14 +67,24 @@ bool NeedsNVarcharConversion(const MSSQLColumnInfo &col) {
 
 ### 4. What is the NVARCHAR length calculation?
 
-**Decision**: Use `MIN(original_length, 4000)` for fixed-length VARCHAR, `MAX` for VARCHAR(MAX).
+> **SUPERSEDED.** The decision below was reversed: capping at NVARCHAR(4000) silently
+> truncated every `VARCHAR(4001..8000)` and `CHAR(4001..8000)` value read through the catalog,
+> and (unanticipated here — TEXT is not covered by this spec at all) truncated `TEXT` to **16**
+> characters, since `sys.columns.max_length` for TEXT is the 16-byte in-row pointer, not the
+> data length. The "must cap" rationale was wrong: a column wider than 4000 does have a valid
+> NVARCHAR target — `NVARCHAR(MAX)` — which is what VARCHAR(MAX) already used on this same path.
+> Wide columns now CAST to `NVARCHAR(MAX)` (PLP) and return the full value. See
+> `GetNVarcharLength` in `src/table_scan/table_scan.cpp` and
+> `test/sql/catalog/scan_wide_varchar_length.test`.
 
-**Rationale**:
+**Decision** (superseded): Use `MIN(original_length, 4000)` for fixed-length VARCHAR, `MAX` for VARCHAR(MAX).
+
+**Rationale** (superseded):
 - NVARCHAR maximum non-MAX length is 4000 characters
 - VARCHAR(MAX) is indicated by `max_length == -1` in MSSQLColumnInfo
 - VARCHAR(8000) at max → must cap at NVARCHAR(4000) with silent truncation
 
-**Length Mapping**:
+**Length Mapping** (superseded — 4001-8000 and TEXT now map to MAX):
 | VARCHAR Length | NVARCHAR Length |
 |----------------|-----------------|
 | 1-4000 | Same as VARCHAR |

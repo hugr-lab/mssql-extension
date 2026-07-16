@@ -1674,8 +1674,12 @@ VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`)
 | VARCHAR Length | Converted To | Notes |
 |----------------|--------------|-------|
 | VARCHAR(n) where n ≤ 4000 | NVARCHAR(n) | Full data preserved |
-| VARCHAR(n) where n > 4000 | NVARCHAR(4000) | Data may be truncated to 4000 characters |
+| VARCHAR(n) where n > 4000 | NVARCHAR(MAX) | Full data preserved. NVARCHAR has no inline length above 4000 characters, so these columns are sent as PLP. |
+| CHAR(n) | same as VARCHAR(n) | Full data preserved (blank-padded to `n` by SQL Server) |
+| TEXT | NVARCHAR(MAX) | Full data preserved; converted by default, disable with `mssql_convert_varchar_max = false` |
 | VARCHAR(MAX) | NVARCHAR(MAX) | Converted by default; disable with `mssql_convert_varchar_max = false` |
+
+> **Note**: Before v0.2.2, `VARCHAR(n > 4000)` was converted to `NVARCHAR(4000)` and `TEXT` to `NVARCHAR(16)`, both of which silently truncated the value on read. Both now convert to `NVARCHAR(MAX)` and return the full value.
 
 **VARCHAR Encoding Setting:**
 
@@ -1728,7 +1732,6 @@ The codec validates the input first and falls back to a slower scalar implementa
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
-- VARCHAR columns >4000 characters with non-UTF8 collations are truncated when queried via catalog (see VARCHAR Encoding above)
 - NVARCHAR(max) and VARCHAR(max) columns are not supported in the Microsoft Fabric Warehouse
 
 ## Third-Party Licenses

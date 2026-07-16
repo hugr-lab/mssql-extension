@@ -3,6 +3,8 @@
 // Feature: 001-pk-rowid-semantics (rowid support)
 
 #include "table_scan/table_scan.hpp"
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
@@ -41,6 +43,16 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 // VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
 //------------------------------------------------------------------------------
 
+// TEXT is a LOB: sys.columns reports max_length 16 for it — the size of the in-row pointer,
+// not of the data (which runs to 2 GB). It must be treated as a MAX type; deriving a CAST
+// length from that 16 truncated every TEXT column to 16 characters.
+static bool IsLegacyTextLob(const string &sql_type_name) {
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	return lower_type == "text";
+}
+
 // Check if column needs NVARCHAR conversion for UTF-8 compatibility
 // convert_varchar_max: if true, also convert VARCHAR(MAX) to NVARCHAR(MAX)
 static bool NeedsNVarcharConversion(const MSSQLColumnInfo &col, bool convert_varchar_max) {
@@ -56,25 +68,31 @@ static bool NeedsNVarcharConversion(const MSSQLColumnInfo &col, bool convert_var
 	if (col.is_utf8) {
 		return false;  // UTF-8 is safe
 	}
-	// VARCHAR(MAX) handling depends on setting
+	// LOB handling depends on setting
 	// When convert_varchar_max is false, skip to preserve TDS buffer capacity (4096 bytes)
 	// When true, convert to NVARCHAR(MAX) for UTF-8 compatibility
-	if (col.max_length == -1 && !convert_varchar_max) {
-		return false;  // MAX types - don't convert when setting is off
+	if ((col.max_length == -1 || IsLegacyTextLob(col.sql_type_name)) && !convert_varchar_max) {
+		return false;  // LOB types - don't convert when setting is off
 	}
 	return true;  // Non-UTF8 CHAR/VARCHAR needs conversion
 }
 
-// Get NVARCHAR length specification for CAST
-// Returns "MAX" for VARCHAR(MAX), caps at 4000 for large VARCHAR
-static std::string GetNVarcharLength(int16_t max_length) {
-	if (max_length == -1) {
+// Get NVARCHAR length specification for CAST.
+// Returns "MAX" for VARCHAR(MAX), for TEXT, and for any CHAR/VARCHAR wider than the 4000-
+// character inline NVARCHAR limit — such a column has no valid inline NVARCHAR length, so it
+// must go over the wire as PLP. (Mirrors the >4000 PLP fallback on the BCP write path in
+// SQLServerTypeMaxLength, src/copy/target_resolver.cpp.)
+static std::string GetNVarcharLength(const MSSQLColumnInfo &col) {
+	if (col.max_length == -1) {
 		return "MAX";  // VARCHAR(MAX) → NVARCHAR(MAX)
 	}
-	if (max_length > 4000) {
-		return "4000";	// Truncate to NVARCHAR max non-MAX length
+	if (IsLegacyTextLob(col.sql_type_name)) {
+		return "MAX";  // TEXT → NVARCHAR(MAX); its max_length of 16 is the pointer size
 	}
-	return std::to_string(max_length);
+	if (col.max_length > 4000) {
+		return "MAX";  // varchar(4001..8000) → NVARCHAR(MAX); NVARCHAR(4000) would truncate
+	}
+	return std::to_string(col.max_length);
 }
 
 // Build column expression for SELECT, applying NVARCHAR conversion if needed
@@ -103,7 +121,7 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 	}
 
 	if (NeedsNVarcharConversion(col, convert_varchar_max)) {
-		std::string nvarchar_len = GetNVarcharLength(col.max_length);
+		std::string nvarchar_len = GetNVarcharLength(col);
 		MSSQL_SCAN_DEBUG_LOG(2, "  NVARCHAR conversion: %s (%s, len=%d) → NVARCHAR(%s)", col_name.c_str(),
 							 col.sql_type_name.c_str(), col.max_length, nvarchar_len.c_str());
 		return "CAST(" + escaped_name + " AS NVARCHAR(" + nvarchar_len + ")) AS " + escaped_name;
