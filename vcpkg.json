@@ -6,11 +6,17 @@
     "openssl",
     "simdutf"
   ],
-  "builtin-baseline": "5ee5eee0d3e9c6098b24d263e9099edcdcef6631",
+  "$comment-builtin-baseline": "vcpkg 2026.06.24. Moved off 5ee5eee (openssl 3.4.1) because that baseline's version DB tops out at 3.4.1 -- vcpkg never packaged 3.4.2-3.4.6, so reaching a patched OpenSSL requires moving the baseline, not just the override.",
+  "builtin-baseline": "52c9e08cdf8580d2d9762f547d22b96fd81e82f2",
+  "$comment-overrides": "Both deps are pinned so that moving the baseline changes exactly one thing: OpenSSL. simdutf stays at 6.1.1 (the old baseline's version) even though the new baseline offers 8.2.0 -- a two-major-version codec jump does not belong in a security bump and would confound the MinGW result this change exists to test. openssl 3.5.4 is the newest 3.5.x in vcpkg; 3.5 is LTS (supported to 2030-04-08) whereas 3.4 goes EOL 2026-10-22.",
   "overrides": [
     {
       "name": "openssl",
-      "version": "3.4.1"
+      "version": "3.5.4"
+    },
+    {
+      "name": "simdutf",
+      "version": "6.1.1"
     }
   ]
 }
