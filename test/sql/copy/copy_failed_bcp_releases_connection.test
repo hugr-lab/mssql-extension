@@ -1,0 +1,56 @@
+# name: test/sql/copy/copy_failed_bcp_releases_connection.test
+# description: Issue #191 regression — a COPY that fails client-side must not leave its pooled
+#              connection checked out. The sink throws after INSERT BULK is on the wire, and
+#              DuckDB does not call copy_to_finalize on an errored COPY, so nothing released the
+#              connection: the pool kept it in Executing state with the bulk-load transaction
+#              open, holding locks on the target table until process exit. Every later statement
+#              touching that table then blocked until the query timeout.
+# group: [copy] [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_fail_release_test');
+
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.copy_fail_release_test (
+    s VARCHAR(10) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL
+)');
+
+# No connection is checked out before the COPY.
+query I
+SELECT active_connections FROM mssql_pool_stats('db');
+----
+0
+
+# 11 characters into VARCHAR(10): rejected by the client-side length check in the sink, which is
+# the path that leaked. The error itself is correct and expected.
+statement error
+COPY (SELECT '12345678901' AS s) TO 'mssql://db/dbo/copy_fail_release_test' (FORMAT 'bcp', CREATE_TABLE false);
+----
+overflow
+
+# The failed COPY must not have left a connection checked out.
+query I
+SELECT active_connections FROM mssql_pool_stats('db');
+----
+0
+
+# The real symptom: this DROP timed out before the fix, because the leaked connection still held
+# the bulk-load lock on the table.
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_fail_release_test');
+
+# The pool is still usable afterwards.
+query I
+SELECT 1 FROM mssql_scan('db', 'SELECT 1 AS x');
+----
+1
+
+statement ok
+DETACH db;

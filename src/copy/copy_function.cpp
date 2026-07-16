@@ -97,6 +97,54 @@ void RegisterMSSQLCopyFunctions(ExtensionLoader &loader) {
 	CopyDebugLog(1, "Registered 'bcp' COPY function");
 }
 
+//===----------------------------------------------------------------------===//
+// MSSQLCopyGlobalState destructor - last-resort connection release (issue #191)
+//===----------------------------------------------------------------------===//
+
+MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
+	// No-op on every path that already released: BCPCopyInitGlobal's error helper and
+	// BCPCopyFinalize (both success and error) reset() `connection`. This only fires when the sink
+	// threw and copy_to_finalize was never called — see the contract note on the declaration.
+	//
+	// Touch no ClientContext here (issue #178 / PR #179): this can run on a worker thread while
+	// the client thread commits the query's transaction.
+	if (!connection) {
+		return;
+	}
+
+	// A COPY that died mid-stream leaves the server awaiting bulk data on this session, so the
+	// connection is not reusable: closing it is what ends the session, rolls back the INSERT BULK
+	// transaction, and drops the locks it held on the target table. Returning it to the pool in
+	// that state would hand the next caller a connection stuck mid-bulk-load.
+	auto conn_state = connection->GetState();
+	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
+		try {
+			connection->Close();
+		} catch (...) {
+			// Ignore - the shared_ptr destructor closes the socket regardless.
+		}
+	}
+
+	if (transaction_pinned) {
+		// The MSSQLTransaction owns the pin; just drop our reference.
+		connection.reset();
+		return;
+	}
+
+	if (auto pool = pool_handle.lock()) {
+		try {
+			connection->SetNeedsReset(true);
+			pool->Release(std::move(connection));
+		} catch (...) {
+			// Release failed - drop it; the shared_ptr destructor closes the socket.
+			connection.reset();
+		}
+	} else {
+		// Catalog torn down - dropping is the safe failure mode.
+		connection.reset();
+	}
+}
+
 namespace mssql {
 
 // Forward declarations
@@ -250,6 +298,12 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		throw IOException("MSSQL COPY: Failed to acquire connection from pool");
 	}
 	CopyDebugLog(2, "BCPCopyInitGlobal: connection acquired");
+
+	// Capture the destructor's release targets here, on the client thread — it must not touch a
+	// ClientContext itself (issue #178 / PR #179). Covers the sink-throw path, where neither the
+	// helper below nor BCPCopyFinalize runs (issue #191).
+	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
+	gstate->transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 
 	// Helper to release connection on error
 	auto release_connection_on_error = [&]() {
