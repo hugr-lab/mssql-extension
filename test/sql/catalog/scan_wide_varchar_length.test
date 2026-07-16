@@ -1,0 +1,95 @@
+# name: test/sql/catalog/scan_wide_varchar_length.test
+# description: Catalog scans must not truncate wide CHAR/VARCHAR or TEXT columns. The non-UTF8
+#              NVARCHAR conversion (spec 026) derived the CAST length from sys.columns.max_length
+#              and capped it at NVARCHAR(4000), silently dropping data: varchar(8000) came back
+#              as 4000 chars, and TEXT as 16 (max_length for TEXT is the in-row pointer size).
+# group: [catalog] [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.scan_wide_varchar_test');
+
+# Non-UTF8 collation is what triggers the NVARCHAR conversion; a UTF-8 collation is
+# passed through unconverted and would not exercise this path.
+statement ok
+SELECT mssql_exec('db', 'CREATE TABLE dbo.scan_wide_varchar_test (
+    id INT NOT NULL,
+    v4000 VARCHAR(4000) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+    v4001 VARCHAR(4001) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+    v8000 VARCHAR(8000) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+    c5000 CHAR(5000) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+    vmax VARCHAR(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+    t TEXT COLLATE SQL_Latin1_General_CP1_CI_AS NULL
+)');
+
+statement ok
+SELECT mssql_exec('db', 'INSERT INTO dbo.scan_wide_varchar_test VALUES (
+    1,
+    REPLICATE(''a'', 4000),
+    REPLICATE(''b'', 4001),
+    REPLICATE(''c'', 8000),
+    REPLICATE(''d'', 5000),
+    REPLICATE(CAST(''e'' AS VARCHAR(MAX)), 9000),
+    REPLICATE(CAST(''f'' AS VARCHAR(MAX)), 9000)
+)');
+
+# Every length must match what the server actually stores. Before the fix this returned
+# 4000 / 4000 / 4000 for the wide columns and 16 for TEXT.
+# CHAR(5000) is blank-padded on the server, so its full width is 5000.
+query IIIIII
+SELECT length(v4000), length(v4001), length(v8000), length(c5000), length(vmax), length(t)
+FROM db.dbo.scan_wide_varchar_test;
+----
+4000	4001	8000	5000	9000	9000
+
+# Content must survive intact, not just the length.
+query IIII
+SELECT v4000 = repeat('a', 4000), v8000 = repeat('c', 8000),
+       vmax = repeat('e', 9000), t = repeat('f', 9000)
+FROM db.dbo.scan_wide_varchar_test;
+----
+true	true	true	true
+
+# The catalog scan must agree with a raw mssql_scan, which never applied the CAST.
+query I
+SELECT s.n = c.n
+FROM (SELECT length(v8000) AS n FROM mssql_scan('db', 'SELECT v8000 FROM dbo.scan_wide_varchar_test')) s,
+     (SELECT length(v8000) AS n FROM db.dbo.scan_wide_varchar_test) c;
+----
+true
+
+# mssql_convert_varchar_max = false must not break these columns.
+#
+# The setting governs declared VARCHAR(MAX) only. TEXT is never opted out: it is a known type
+# (is_cast_required = false), so dropping its CAST would put TDS_TYPE_TEXT (0x23) on the wire,
+# which no codec handles — the read fails outright rather than degrading. varchar(4001..8000) is
+# likewise still promoted to NVARCHAR(MAX), since no shorter NVARCHAR can hold it.
+statement ok
+SET mssql_convert_varchar_max = false;
+
+query IIII
+SELECT length(v4000), length(v4001), length(v8000), length(c5000)
+FROM db.dbo.scan_wide_varchar_test;
+----
+4000	4001	8000	5000
+
+query I
+SELECT length(t) FROM db.dbo.scan_wide_varchar_test;
+----
+9000
+
+statement ok
+SET mssql_convert_varchar_max = true;
+
+# Cleanup
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.scan_wide_varchar_test');
+
+statement ok
+DETACH db;

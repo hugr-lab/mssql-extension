@@ -39,8 +39,9 @@ SELECT [id], CAST([name] AS NVARCHAR(100)) AS [name], CAST([description] AS NVAR
 
 ## Limitations
 
-1. **VARCHAR >4000 truncation**: VARCHAR columns defined >4000 characters are truncated to 4000 when read.
-   - Only the column *definition* matters, not actual data length
+1. ~~**VARCHAR >4000 truncation**: VARCHAR columns defined >4000 characters are truncated to 4000 when read.~~
+   - **No longer applies.** VARCHAR/CHAR wider than 4000, and TEXT, now CAST to `NVARCHAR(MAX)` and
+     return the full value. See the SUPERSEDED note in `research.md`.
 
 2. **VARCHAR(MAX) buffer capacity**: VARCHAR(MAX) columns are converted to NVARCHAR(MAX) by default, which may halve the effective buffer capacity due to NVARCHAR's 2-byte encoding.
    - Disable with `SET mssql_convert_varchar_max = false` if you need maximum buffer capacity

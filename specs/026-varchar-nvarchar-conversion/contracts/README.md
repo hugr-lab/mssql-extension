@@ -17,10 +17,13 @@ This feature does not introduce new APIs. It modifies internal query generation 
 
 ### Length Mapping Contract
 
+Superseded for the 4001-8000 row — see the SUPERSEDED note in `research.md`.
+
 | Input (VARCHAR) | Output (NVARCHAR) |
 |-----------------|-------------------|
 | 1-4000 | Same length |
-| 4001-8000 | 4000 (truncated) |
+| 4001-8000 | MAX (was: 4000, which truncated) |
+| TEXT | MAX (was: 16, which truncated) |
 | MAX (-1) | MAX |
 
 ### Scope Contract

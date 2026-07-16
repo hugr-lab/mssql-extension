@@ -252,16 +252,25 @@ SELECT id, LEFT(varchar_4000, 6) FROM testdb_enc.dbo.TestVarcharLength WHERE id 
 ----
 1	aéaéaé
 
-# Test T027: VARCHAR(8000) with 5000 chars truncates to 4000 characters
-# Note: 2500 repetitions of "bé" = 5000 chars, but NVARCHAR(4000) truncates
+# Test T027: VARCHAR(8000) returns all 5000 characters.
+# 2500 repetitions of "bé" = 5000 chars. This originally asserted truncation to 4000:
+# spec 026 capped the CAST at NVARCHAR(4000) on the premise that a wider column had no
+# valid NVARCHAR target. It does — NVARCHAR(MAX) — which is what VARCHAR(MAX) columns
+# already used, so the cap only ever cost data. Now CASTs to NVARCHAR(MAX) instead.
 query II
 SELECT id, LEN(varchar_8000) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
 ----
-1	4000
+1	5000
 
-# Verify extended ASCII preserved even after truncation
+# Verify extended ASCII preserved
 query IT
 SELECT id, LEFT(varchar_8000, 6) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
+----
+1	bébébé
+
+# The tail must survive too — truncation at 4000 would have dropped it.
+query IT
+SELECT id, RIGHT(varchar_8000, 6) FROM testdb_enc.dbo.TestVarcharLength WHERE id = 1;
 ----
 1	bébébé
 
