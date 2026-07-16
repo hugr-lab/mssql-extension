@@ -3,8 +3,6 @@
 // Feature: 001-pk-rowid-semantics (rowid support)
 
 #include "table_scan/table_scan.hpp"
-#include <algorithm>
-#include <cctype>
 #include <cstdlib>
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
@@ -42,16 +40,6 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 //------------------------------------------------------------------------------
 // VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
 //------------------------------------------------------------------------------
-
-// TEXT is a LOB: sys.columns reports max_length 16 for it — the size of the in-row pointer,
-// not of the data (which runs to 2 GB). It must be treated as a MAX type; deriving a CAST
-// length from that 16 truncated every TEXT column to 16 characters.
-static bool IsLegacyTextLob(const string &sql_type_name) {
-	string lower_type = sql_type_name;
-	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
-				   [](unsigned char c) { return std::tolower(c); });
-	return lower_type == "text";
-}
 
 // Check if column needs NVARCHAR conversion for UTF-8 compatibility
 // convert_varchar_max: if true, also convert VARCHAR(MAX) to NVARCHAR(MAX)
@@ -95,7 +83,7 @@ static std::string GetNVarcharLength(const MSSQLColumnInfo &col) {
 	if (col.max_length == -1) {
 		return "MAX";  // VARCHAR(MAX) → NVARCHAR(MAX)
 	}
-	if (IsLegacyTextLob(col.sql_type_name)) {
+	if (MSSQLColumnInfo::IsLegacyLobType(col.sql_type_name)) {
 		return "MAX";  // TEXT → NVARCHAR(MAX); its max_length of 16 is the pointer size
 	}
 	if (col.max_length > 4000) {

@@ -60,6 +60,11 @@ struct MSSQLColumnInfo {
 
 	// Check if type is Unicode (NVARCHAR, NCHAR, NTEXT)
 	static bool IsUnicodeType(const string &sql_type_name);
+
+	// Check if type is a deprecated LOB (TEXT, NTEXT, IMAGE), for which sys.columns reports
+	// max_length 16 — the size of the in-row pointer, not of the data (which runs to 2 GB). Any
+	// length derived from that 16 is meaningless: these must be treated as MAX types.
+	static bool IsLegacyLobType(const string &sql_type_name);
 };
 
 }  // namespace duckdb

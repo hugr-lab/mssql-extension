@@ -3,7 +3,7 @@
 #              NVARCHAR conversion (spec 026) derived the CAST length from sys.columns.max_length
 #              and capped it at NVARCHAR(4000), silently dropping data: varchar(8000) came back
 #              as 4000 chars, and TEXT as 16 (max_length for TEXT is the in-row pointer size).
-# group: [catalog] [integration]
+# group: [sql]
 
 require mssql
 
@@ -27,6 +27,11 @@ SELECT mssql_exec('db', 'CREATE TABLE dbo.scan_wide_varchar_test (
     vmax VARCHAR(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
     t TEXT COLLATE SQL_Latin1_General_CP1_CI_AS NULL
 )');
+
+# Match the sibling DDL-then-query tests: pick up the new table rather than relying on the
+# catalog happening to load lazily after the CREATE.
+statement ok
+SELECT mssql_refresh_cache('db');
 
 statement ok
 SELECT mssql_exec('db', 'INSERT INTO dbo.scan_wide_varchar_test VALUES (
@@ -81,6 +86,15 @@ FROM db.dbo.scan_wide_varchar_test;
 
 query I
 SELECT length(t) FROM db.dbo.scan_wide_varchar_test;
+----
+9000
+
+# VARCHAR(MAX) is the one column the setting does govern: with it off the CAST is skipped and the
+# column comes back as collation-encoded bytes rather than NVARCHAR(MAX). This data is ASCII, so
+# the uncast read is still byte-identical — the point is that the opt-out branch is exercised at
+# all, since everything above pins down what the setting must NOT affect.
+query I
+SELECT length(vmax) FROM db.dbo.scan_wide_varchar_test;
 ----
 9000
 

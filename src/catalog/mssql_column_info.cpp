@@ -272,4 +272,12 @@ bool MSSQLColumnInfo::IsUnicodeType(const string &sql_type_name) {
 	return lower_type == "nchar" || lower_type == "nvarchar" || lower_type == "ntext";
 }
 
+bool MSSQLColumnInfo::IsLegacyLobType(const string &sql_type_name) {
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+
+	return lower_type == "text" || lower_type == "ntext" || lower_type == "image";
+}
+
 }  // namespace duckdb
