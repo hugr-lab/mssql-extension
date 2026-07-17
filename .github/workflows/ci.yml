@@ -153,6 +153,13 @@ jobs:
             docker_available: false
             vcpkg_triplet: arm64-osx
 
+    env:
+      # Send vcpkg's binary cache to a directory actions/cache persists (see
+      # the "Cache vcpkg binary packages" step). Without this, vcpkg falls back
+      # to its default files provider under $HOME/.cache/vcpkg/archives, which
+      # nothing caches -- so every run rebuilt OpenSSL from source.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+
     steps:
       - uses: actions/checkout@v7
 
@@ -213,17 +220,43 @@ jobs:
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Cache vcpkg's BINARY cache (the archives dir), not the install tree.
+      #
+      # The previous version cached vcpkg/installed + vcpkg/packages +
+      # vcpkg/buildtrees, which never worked: in manifest mode vcpkg installs
+      # into build/release/vcpkg_installed and looks for prebuilt archives in
+      # its binary cache, so none of those three paths were ever consulted.
+      # Runs 29339658347 and 29345077972 both logged
+      #   "Cache restored from key: vcpkg-x64-linux-..."   (a HIT)
+      #   "Building openssl:x64-linux@3.4.1..."            (rebuilt anyway)
+      # i.e. ~2 min of OpenSSL rebuild per run despite a green cache hit.
+      #
+      # Pointing VCPKG_BINARY_SOURCES at a `files` dir and caching THAT dir is
+      # what actually elides the rebuild. Archives are keyed by vcpkg's ABI
+      # hash, so a stale restore can't produce a wrong binary -- vcpkg simply
+      # misses and rebuilds. That makes the prefix restore-key safe.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-            vcpkg/buildtrees
-          key: vcpkg-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          # The primary key MUST be unique per run. actions/cache skips the
+          # post-run save on an exact primary-key hit (saveImpl.ts: "Cache hit
+          # occurred on the primary key ..., not saving cache."). With a stable
+          # key the cache would freeze after the first save: once the ABI hash
+          # drifts -- a runner-image compiler bump, or vcpkg master churn, since
+          # the clone above is unpinned -- vcpkg would rebuild every run and the
+          # fresh archives would never be persisted. That is the same silent
+          # no-op this whole change exists to kill.
+          #
+          # hashFiles('vcpkg.json') is kept only as a readable namespace marker;
+          # it is NOT sufficient on its own, because vcpkg.json's `version` is
+          # the extension's own version (rotates for the wrong reason) and it
+          # says nothing about compiler/triplet/vcpkg-tool (fails to rotate for
+          # the right one). The prefix restore-key below is what actually seeds
+          # each run, and it matches across hashes.
+          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-${{ matrix.platform.vcpkg_triplet }}-
+            vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-
 
       - name: Build Release
         env:
@@ -462,6 +495,15 @@ jobs:
     runs-on: windows-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
 
+    env:
+      # Must be set explicitly: run-vcpkg otherwise forces the dead x-gha
+      # provider on GitHub runners. Its own source says
+      #   "Allow users to define the vcpkg's binary source explicitly in the
+      #    workflow, in that case do not override it."
+      #   setVariableIfUndefined(VCPKG_BINARY_SOURCES, 'clear;x-gha,readwrite')
+      # so defining it here is the supported opt-out.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+
     steps:
       - uses: actions/checkout@v7
 
@@ -489,16 +531,20 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above, not
+      # the install tree -- see the linux/macos build job for why the old
+      # vcpkg/installed + vcpkg/packages paths never elided a rebuild.
+      # Namespace is the vcpkg triplet, deliberately NOT job- or workflow-scoped:
+      # release.yml's MSVC job uses the same triplet and shares this namespace,
+      # so a Windows build dispatched on main can seed the release build. See
+      # the linux/macos job for why the primary key carries github.run_id.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-msvc-x64-windows-static-release-
+            vcpkg-bincache-x64-windows-static-release-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -547,6 +593,9 @@ jobs:
     env:
       CC: gcc
       CXX: g++
+      # See the MSVC job: defining this is the supported way to stop run-vcpkg
+      # forcing the removed x-gha provider.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -590,16 +639,16 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above. This
+      # is the job that pays most for the old broken setup: run 29540869000
+      # spent 6.9 min compiling OpenSSL for x64-mingw-static from scratch.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-mingw-static-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-mingw-x64-mingw-static-
+            vcpkg-bincache-x64-mingw-static-
 
       - name: Build Release
         shell: bash

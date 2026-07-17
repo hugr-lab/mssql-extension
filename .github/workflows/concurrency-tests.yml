@@ -65,6 +65,9 @@ jobs:
       ASAN_OPTIONS: detect_stack_use_after_return=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
       GEN: ninja
+      # Point vcpkg's binary cache at a directory actions/cache persists; the
+      # default ($HOME/.cache/vcpkg/archives) is cached by nothing.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - name: Checkout
@@ -114,16 +117,29 @@ jobs:
           ccache --set-config=compression=true
           ccache -z
 
-      - name: Cache vcpkg packages
+      # Caches vcpkg's binary cache (archives), not the install tree -- see
+      # ci.yml for why the old vcpkg/installed + vcpkg/packages +
+      # vcpkg/buildtrees paths restored cleanly and rebuilt anyway.
+      # Namespaced by triplet (x64-linux) and shared with ci.yml/codeql.yml
+      # rather than scoped to this workflow. This workflow only ever runs on
+      # pull_request + workflow_dispatch, so it never writes a cache on the
+      # default branch -- and a cache written from refs/pull/N/merge can only
+      # be restored by re-runs of that same PR. A workflow-private namespace
+      # would therefore be cold on the first run of every PR, forever. Sharing
+      # the triplet namespace lets codeql.yml's push-to-main run seed it.
+      #
+      # Caveat: this job runs on ubuntu-latest while ci.yml/codeql.yml pin
+      # ubuntu-22.04, so a different compiler may make the seeded archives miss
+      # on ABI hash and rebuild. That is no worse than today and still correct
+      # (archives are ABI-named); aligning the runner images would make the
+      # seeding actually land, but that is a behaviour change for another PR.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-            vcpkg/buildtrees
-          key: vcpkg-concurrency-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-concurrency-
+            vcpkg-bincache-x64-linux-
 
       - name: Bootstrap vcpkg
         run: make vcpkg-setup

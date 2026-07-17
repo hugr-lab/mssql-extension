@@ -26,11 +26,17 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 .PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
 
 # Bootstrap vcpkg if not present.
-# Spec 052 PR #127 CI fix: check for the toolchain file specifically, not
-# just the directory. GitHub Actions cache restore creates an empty `vcpkg/`
-# parent when restoring `vcpkg/installed/` — the bare directory existed
-# without the bootstrap-shipped scripts, so `make debug` then ran without
-# -DCMAKE_TOOLCHAIN_FILE and find_package(simdutf) failed.
+# Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
+# the directory — a partially-populated `vcpkg/` (the bare directory without
+# the bootstrap-shipped scripts) would otherwise pass the guard, and `make
+# debug` would then run without -DCMAKE_TOOLCHAIN_FILE and fail in
+# find_package(simdutf).
+#
+# The original trigger was a GitHub Actions cache restore creating an empty
+# `vcpkg/` parent while restoring `vcpkg/installed/`. No workflow caches that
+# path any more (the vcpkg binary cache lives in `vcpkg_bincache/`), so that
+# specific route is gone — but the file check is strictly more robust than a
+# directory check, so it stays.
 vcpkg-setup:
 	@if [ ! -f "$(VCPKG_TOOLCHAIN)" ]; then \
 		echo "Bootstrapping vcpkg..."; \

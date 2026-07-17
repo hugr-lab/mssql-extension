@@ -44,23 +44,36 @@ jobs:
       fail-fast: false
       matrix:
         platform:
+          # vcpkg_triplet is what the binary cache is namespaced on, so it must
+          # match ci.yml's build matrix exactly -- that job runs on the weekly
+          # main-branch cron and is what can seed this workflow. Keying on
+          # platform.id instead would put releases in a namespace nothing on the
+          # default branch ever writes.
           - id: linux_amd64
             os: linux
             arch: amd64
             runner: ubuntu-22.04
             docker_available: true
+            vcpkg_triplet: x64-linux
 
           - id: linux_arm64
             os: linux
             arch: arm64
             runner: ubuntu-22.04-arm
             docker_available: true
+            vcpkg_triplet: arm64-linux
 
           - id: osx_arm64
             os: osx
             arch: arm64
             runner: macos-14
             docker_available: false
+            vcpkg_triplet: arm64-osx
+
+    env:
+      # Point vcpkg's binary cache at a directory actions/cache persists.
+      # The default is $HOME/.cache/vcpkg/archives, which nothing caches.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -134,16 +147,18 @@ jobs:
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches vcpkg's binary cache (archives), not the install tree. See
+      # ci.yml for the evidence that the old vcpkg/installed + vcpkg/packages
+      # paths restored cleanly and still rebuilt every dependency from source.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-${{ matrix.platform.id }}-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          # Triplet-namespaced (shared with ci.yml) + run_id-unique primary key.
+          # See ci.yml's build job for the full reasoning on both.
+          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-${{ matrix.platform.id }}-
+            vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-
 
       - name: Build Release
         run: |
@@ -193,6 +208,11 @@ jobs:
     runs-on: windows-latest
     needs: lint
 
+    env:
+      # Defining this is the supported opt-out from run-vcpkg forcing the
+      # removed x-gha provider (it uses setVariableIfUndefined). See ci.yml.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+
     steps:
       - uses: actions/checkout@v7
         with:
@@ -234,15 +254,13 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      - name: Cache vcpkg packages
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-msvc-x64-windows-static-release-
+            vcpkg-bincache-x64-windows-static-release-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -320,6 +338,8 @@ jobs:
     env:
       CC: gcc
       CXX: g++
+      # Opt out of run-vcpkg's dead x-gha default. See ci.yml.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -377,15 +397,13 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      - name: Cache vcpkg packages
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-mingw-static-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-mingw-x64-mingw-static-
+            vcpkg-bincache-x64-mingw-static-
 
       - name: Setup ccache
         shell: bash

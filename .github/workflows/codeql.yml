@@ -35,13 +35,29 @@ jobs:
       security-events: write
 
     env:
-      # Route vcpkg's binary cache through GitHub Actions' built-in cache so
-      # OpenSSL / libcurl / simdutf etc. aren't rebuilt from source on every
-      # run. Cold runs save ~10-15 min; warm runs save the entire vcpkg-install
-      # phase. Note: ccache is intentionally NOT used here because it
-      # short-circuits compiler invocations and CodeQL's tracer would miss
-      # those translation units, leaving holes in the analysis.
-      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+      # Route vcpkg's binary cache through a plain directory that actions/cache
+      # persists, so OpenSSL / simdutf aren't rebuilt from source every run.
+      #
+      # This used to say `clear;x-gha,readwrite`, which silently did nothing:
+      # vcpkg REMOVED the x-gha provider in vcpkg-tool#1662 (2025-04-29) after
+      # GitHub shut down the internal Actions Cache API it depended on. Because
+      # `clear` drops the default `files` provider and x-gha then resolves to
+      # nothing, the net effect was *zero* binary caching -- vcpkg emitted only
+      # a warning, so it looked fine.
+      #
+      # vcpkg-tool#1662 offers two migrations: GitHub Packages via NuGet, or
+      # actions/cache. We use the `files` provider + actions/cache: no PAT, no
+      # packages:write, and per-port granularity is preserved inside the dir.
+      # Archives are named by vcpkg's ABI hash, so a stale or partial restore
+      # can never yield a wrong binary -- worst case vcpkg misses and rebuilds.
+      # That is what makes the prefix `restore-keys` below safe.
+      #
+      # Note: ccache is intentionally NOT used here because it short-circuits
+      # compiler invocations and CodeQL's tracer would miss those translation
+      # units, leaving holes in the analysis. vcpkg binary caching is different
+      # in kind: it only elides *dependency* compilation, never the extension's
+      # own translation units, which are what this analysis is about.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - name: Checkout
@@ -56,15 +72,31 @@ jobs:
         # build needs (parquet decoders, etc.). extension-ci-tools is skipped.
         run: git submodule update --init --recursive duckdb
 
-      - name: Expose GitHub Actions cache env vars for vcpkg x-gha provider
-        # vcpkg's x-gha binary-source provider needs ACTIONS_CACHE_URL and
-        # ACTIONS_RUNTIME_TOKEN. GitHub injects them into actions/* steps but
-        # not into plain `run:` steps, so we re-export them via the toolkit.
-        uses: actions/github-script@v9
+      # The step that used to live here re-exported ACTIONS_CACHE_URL and
+      # ACTIONS_RUNTIME_TOKEN into the environment so vcpkg's x-gha provider
+      # could reach the Actions Cache service directly. x-gha is gone (see the
+      # VCPKG_BINARY_SOURCES comment above), and those variables feed nothing
+      # else here, so the step was pure dead weight and is removed.
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: vcpkg_bincache
+          # Namespaced by triplet (x64-linux), shared with ci.yml's linux build
+          # rather than scoped to this workflow: both run on ubuntu-22.04, and
+          # this job runs on push to main, so it seeds the default-branch cache
+          # that PR and dispatch runs are allowed to restore from.
+          #
+          # github.run_id keeps the primary key unique per run -- actions/cache
+          # skips the save on an exact primary hit, so a stable key would freeze
+          # the cache the first time the ABI hash drifts. hashFiles('vcpkg.json')
+          # is only a readable marker: vcpkg.json's `version` is the extension's
+          # own version, and it says nothing about compiler or vcpkg-tool, so it
+          # neither rotates when it should nor stays put when it should. The
+          # prefix restore-key is what seeds each run; it matches across hashes.
+          key: vcpkg-bincache-x64-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-x64-linux-
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
