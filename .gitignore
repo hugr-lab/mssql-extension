@@ -14,6 +14,9 @@ obj/
 # vcpkg
 vcpkg/
 vcpkg_installed/
+# vcpkg's binary cache (files provider). CI-only, but anyone reproducing a CI
+# failure locally by exporting the same VCPKG_BINARY_SOURCES gets one too.
+vcpkg_bincache/
 
 # IDE files
 .vscode/*

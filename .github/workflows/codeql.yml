@@ -82,12 +82,21 @@ jobs:
         uses: actions/cache@v6
         with:
           path: vcpkg_bincache
-          # vcpkg.json pins the dependency versions, so it is the right cache
-          # key. The prefix restore-key lets an older cache seed a run whose
-          # vcpkg.json changed -- safe because vcpkg validates by ABI hash.
-          key: vcpkg-bincache-codeql-ubuntu-22.04-${{ hashFiles('vcpkg.json') }}
+          # Namespaced by triplet (x64-linux), shared with ci.yml's linux build
+          # rather than scoped to this workflow: both run on ubuntu-22.04, and
+          # this job runs on push to main, so it seeds the default-branch cache
+          # that PR and dispatch runs are allowed to restore from.
+          #
+          # github.run_id keeps the primary key unique per run -- actions/cache
+          # skips the save on an exact primary hit, so a stable key would freeze
+          # the cache the first time the ABI hash drifts. hashFiles('vcpkg.json')
+          # is only a readable marker: vcpkg.json's `version` is the extension's
+          # own version, and it says nothing about compiler or vcpkg-tool, so it
+          # neither rotates when it should nor stays put when it should. The
+          # prefix restore-key is what seeds each run; it matches across hashes.
+          key: vcpkg-bincache-x64-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-bincache-codeql-ubuntu-22.04-
+            vcpkg-bincache-x64-linux-
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

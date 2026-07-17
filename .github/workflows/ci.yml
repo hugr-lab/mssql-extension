@@ -239,7 +239,22 @@ jobs:
         uses: actions/cache@v6
         with:
           path: vcpkg_bincache
-          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}
+          # The primary key MUST be unique per run. actions/cache skips the
+          # post-run save on an exact primary-key hit (saveImpl.ts: "Cache hit
+          # occurred on the primary key ..., not saving cache."). With a stable
+          # key the cache would freeze after the first save: once the ABI hash
+          # drifts -- a runner-image compiler bump, or vcpkg master churn, since
+          # the clone above is unpinned -- vcpkg would rebuild every run and the
+          # fresh archives would never be persisted. That is the same silent
+          # no-op this whole change exists to kill.
+          #
+          # hashFiles('vcpkg.json') is kept only as a readable namespace marker;
+          # it is NOT sufficient on its own, because vcpkg.json's `version` is
+          # the extension's own version (rotates for the wrong reason) and it
+          # says nothing about compiler/triplet/vcpkg-tool (fails to rotate for
+          # the right one). The prefix restore-key below is what actually seeds
+          # each run, and it matches across hashes.
+          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
             vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-
 
@@ -519,13 +534,17 @@ jobs:
       # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above, not
       # the install tree -- see the linux/macos build job for why the old
       # vcpkg/installed + vcpkg/packages paths never elided a rebuild.
+      # Namespace is the vcpkg triplet, deliberately NOT job- or workflow-scoped:
+      # release.yml's MSVC job uses the same triplet and shares this namespace,
+      # so a Windows build dispatched on main can seed the release build. See
+      # the linux/macos job for why the primary key carries github.run_id.
       - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
           path: vcpkg_bincache
-          key: vcpkg-bincache-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-bincache-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-bincache-windows-msvc-x64-windows-static-release-
+            vcpkg-bincache-x64-windows-static-release-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -627,9 +646,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: vcpkg_bincache
-          key: vcpkg-bincache-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-bincache-x64-mingw-static-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-bincache-windows-mingw-x64-mingw-static-
+            vcpkg-bincache-x64-mingw-static-
 
       - name: Build Release
         shell: bash
