@@ -213,13 +213,22 @@ JwtClaims ParseJwtClaims(const std::string &token) {
 
 std::string FormatTimestamp(int64_t unix_timestamp) {
 	std::time_t time = static_cast<std::time_t>(unix_timestamp);
-	std::tm *utc_tm = std::gmtime(&time);
-	if (!utc_tm) {
+
+	// std::gmtime returns a pointer into a shared static buffer; connection
+	// setup runs on pool worker threads, so use the reentrant variant.
+	std::tm utc_tm;
+#ifdef _WIN32
+	if (gmtime_s(&utc_tm, &time) != 0) {
 		return "invalid timestamp";
 	}
+#else
+	if (gmtime_r(&time, &utc_tm) == nullptr) {
+		return "invalid timestamp";
+	}
+#endif
 
 	char buffer[32];
-	std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S UTC", utc_tm);
+	std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S UTC", &utc_tm);
 	return std::string(buffer);
 }
 
