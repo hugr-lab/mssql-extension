@@ -106,3 +106,52 @@ jobs:
         uses: github/codeql-action/analyze@v4
         with:
           category: cpp
+          # Write SARIF to disk instead of uploading: the filter step below
+          # runs first. `failure-only` still uploads debug artifacts when the
+          # analysis itself fails, so we don't lose diagnostics.
+          output: sarif-results
+          upload: failure-only
+
+      - name: Keep unfiltered SARIF for debugging
+        # The filter is a denylist; if it ever drops something it shouldn't,
+        # the raw results are needed to prove it. Cheap insurance.
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: codeql-sarif-unfiltered
+          path: sarif-results/
+          retention-days: 14
+
+      - name: Filter vendored dependencies out of the results
+        # CodeQL analyzes every translation unit the build traces, which means
+        # the whole DuckDB submodule and everything vcpkg compiles from source
+        # (OpenSSL, simdutf). Those are upstream's bugs to fix, not ours, and
+        # they bury our own findings: at the time of writing 225 of 226 open
+        # alerts were vendored and exactly 1 was in src/.
+        #
+        # `paths-ignore` in a CodeQL config file does NOT work here -- it only
+        # applies to interpreted languages or to compiled languages analyzed
+        # without a build, and we must build DuckDB to link the extension. See
+        # https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+        # Filtering the SARIF before upload is the supported alternative.
+        #
+        # This is deliberately a denylist (drop known-vendored trees) rather
+        # than an allowlist (`-**/*` then `+src/**`). An allowlist would
+        # silently discard findings in any future first-party directory; a
+        # denylist fails loud -- new vendored noise shows up and we add it here.
+        uses: advanced-security/filter-sarif@v1
+        with:
+          patterns: |
+            -duckdb/**
+            -vcpkg/**
+          input: sarif-results/cpp.sarif
+          output: sarif-results/cpp.sarif
+
+      - name: Upload filtered SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: sarif-results/cpp.sarif
+          # Must match the analyze category above, otherwise the upload is
+          # treated as a separate configuration and the vendored alerts stay
+          # open instead of being superseded by this filtered run.
+          category: cpp
