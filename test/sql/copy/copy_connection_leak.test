@@ -36,7 +36,7 @@ SELECT total_connections, idle_connections, active_connections, connections_crea
 statement error
 COPY test_data TO 'nonexistent_catalog.dbo.test' (FORMAT 'bcp');
 ----
-not found
+does not exist
 
 # Verify pool stats unchanged
 query IIII
@@ -50,10 +50,10 @@ SELECT total_connections, idle_connections, active_connections, connections_crea
 
 # Create a target table with INT column
 statement ok
-CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_table'', ''U'') IS NOT NULL DROP TABLE dbo.int_table');
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.int_table'', ''U'') IS NOT NULL DROP TABLE dbo.int_table');
 
 statement ok
-CALL mssql_exec('db', 'CREATE TABLE dbo.int_table (id INT)');
+SELECT mssql_exec('db', 'CREATE TABLE dbo.int_table (id INT)');
 
 # Get current pool stats
 query IIII
@@ -75,7 +75,7 @@ SELECT total_connections, idle_connections, active_connections, connections_crea
 
 # Cleanup
 statement ok
-CALL mssql_exec('db', 'DROP TABLE dbo.int_table');
+SELECT mssql_exec('db', 'DROP TABLE dbo.int_table');
 
 #
 # T014: Test finalize phase errors release connections
