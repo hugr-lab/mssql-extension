@@ -432,7 +432,9 @@ jobs:
 
   # ============================================================================
   # Integration Test Job - SQL Server tests on Linux only
-  # (Manual trigger only via workflow_dispatch)
+  # Runs on the weekly schedule, and on workflow_dispatch when both run_build
+  # and run_integration_tests are set. Runs the smoke test plus the full
+  # SQLLogicTest suite (test/sql/**/*.test).
   # ============================================================================
   integration-test:
     name: Integration Test (linux_amd64)
@@ -470,9 +472,18 @@ jobs:
           name: duckdb-cli-linux_amd64
           path: cli
 
+      # The SQLLogicTest runner. The build job already produces and uploads it; this job just
+      # never downloaded it, which is why no .test file has ever run in CI (issue #192).
+      - name: Download unittest artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: unittest-linux_amd64
+          path: unittest
+
       - name: Setup executables
         run: |
           chmod +x cli/duckdb
+          chmod +x unittest/unittest
           chmod +x scripts/ci/integration_test.sh
 
       - name: Wait for SQL Server
@@ -481,9 +492,35 @@ jobs:
           timeout 120 bash -c 'until echo > /dev/tcp/localhost/1433 2>/dev/null; do sleep 5; done'
           echo "SQL Server is ready!"
 
-      - name: Run integration tests
+      # The service container starts bare. Locally `make docker-up` runs an init container that
+      # applies this script; the .test files expect the schema and seed rows it creates (TestDB
+      # plus master.dbo.test), and fail without them.
+      - name: Seed test database
         run: |
-          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18
+          # No -b (exit-on-error): init.sql does not run cleanly even against a fresh server —
+          # one AllDataTypes INSERT does DATEADD(day, id, col_datetime2) over a far-future seed
+          # row and trips "Msg 517 ... datetime2 ... overflow", terminating that statement. This
+          # is pre-existing and happens locally too (make docker-up prints it and carries on);
+          # the suite passes without those rows. -b here would fail every run for a benign,
+          # long-standing reason. integration_test.sh verifies the seed landed instead, so a
+          # genuinely broken seed is still caught rather than silently skipped. See #199.
+          /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P TestPassword1 -C -i docker/init/init.sql
+          /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P TestPassword1 -C -i docker/init/init-transaction-tests.sql
+          echo "Seed applied."
+
+      - name: Run integration tests
+        env:
+          MSSQL_TEST_HOST: localhost
+          MSSQL_TEST_PORT: 1433
+          MSSQL_TEST_USER: sa
+          MSSQL_TEST_PASS: TestPassword1
+          MSSQL_TEST_DB: master
+        run: |
+          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension ./unittest/unittest
 
   # ============================================================================
   # Windows Build Job - MSVC (Visual Studio 2022)

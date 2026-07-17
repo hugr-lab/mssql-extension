@@ -20,10 +20,10 @@ CREATE TABLE varchar_source AS SELECT 'text_value' AS id, 'name' AS name FROM ra
 
 # Create target with INT column
 statement ok
-CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
 
 statement ok
-CALL mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT, name NVARCHAR(100))');
+SELECT mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT, name NVARCHAR(100))');
 
 # Try COPY - should fail with type mismatch error mentioning column name
 statement error
@@ -33,7 +33,7 @@ type mismatch
 
 # Cleanup
 statement ok
-CALL mssql_exec('db', 'DROP TABLE dbo.int_target');
+SELECT mssql_exec('db', 'DROP TABLE dbo.int_target');
 
 statement ok
 DROP TABLE varchar_source;
@@ -48,14 +48,28 @@ CREATE TABLE bigint_source AS SELECT i::BIGINT AS id FROM range(5) t(i);
 
 # Create target with INT column (narrowing is allowed by BCP)
 statement ok
-CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DROP TABLE dbo.int_target');
 
 statement ok
-CALL mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT)');
+SELECT mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT)');
 
-# COPY should succeed (BIGINT to INT is compatible)
-statement ok
+# BIGINT into an INT column is a NARROWING conversion and must be refused, not silently
+# truncated: IsTypeCompatible (src/copy/target_resolver.cpp) is deliberately widening-only, so
+# BIGINT is compatible with `bigint` alone.
+#
+# This originally read "COPY should succeed (BIGINT to INT is compatible)" and expected
+# `statement ok`. It never could — the check and this test landed in the same commit (3c8ac8e,
+# spec 025) and contradicted each other from the start; CI never ran the .test files so nothing
+# caught it (issue #192). Note DuckDB's range()/COUNT()/integer literals are all BIGINT, so
+# reaching an INT target needs an explicit cast (see below).
+statement error
 COPY bigint_source TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
+----
+type mismatch
+
+# Casting the source to INTEGER is the supported route, and it must work.
+statement ok
+COPY (SELECT id::INTEGER AS id FROM bigint_source) TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
 
 # Verify data
 query I
@@ -65,7 +79,7 @@ SELECT COUNT(*) FROM db.dbo.int_target;
 
 # Cleanup
 statement ok
-CALL mssql_exec('db', 'DROP TABLE dbo.int_target');
+SELECT mssql_exec('db', 'DROP TABLE dbo.int_target');
 
 statement ok
 DROP TABLE bigint_source;
@@ -74,16 +88,19 @@ DROP TABLE bigint_source;
 # T023: Test error message format contains column name and types
 #
 
-# Create source with incompatible types
+# Create source with incompatible types.
+# A literal DATE, not CURRENT_DATE: the latter lives in the icu extension, which the test runner
+# does not load, so this failed with "Scalar Function with name current_date is not in the
+# catalog". The value is irrelevant here — only the DATE-vs-VARCHAR mismatch matters.
 statement ok
-CREATE TABLE date_source AS SELECT CURRENT_DATE AS date_col FROM range(3) t(i);
+CREATE TABLE date_source AS SELECT DATE '2024-01-15' AS date_col FROM range(3) t(i);
 
 # Create target with VARCHAR column (incompatible)
 statement ok
-CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.varchar_target'', ''U'') IS NOT NULL DROP TABLE dbo.varchar_target');
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.varchar_target'', ''U'') IS NOT NULL DROP TABLE dbo.varchar_target');
 
 statement ok
-CALL mssql_exec('db', 'CREATE TABLE dbo.varchar_target (date_col VARCHAR(10))');
+SELECT mssql_exec('db', 'CREATE TABLE dbo.varchar_target (date_col VARCHAR(10))');
 
 # Note: DATE to VARCHAR might actually work in some cases via implicit conversion
 # Let's test a more strict mismatch: BLOB to INT
@@ -91,10 +108,10 @@ statement ok
 CREATE TABLE blob_source AS SELECT '\x0102'::BLOB AS data_col FROM range(3) t(i);
 
 statement ok
-CALL mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target2'', ''U'') IS NOT NULL DROP TABLE dbo.int_target2');
+SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target2'', ''U'') IS NOT NULL DROP TABLE dbo.int_target2');
 
 statement ok
-CALL mssql_exec('db', 'CREATE TABLE dbo.int_target2 (data_col INT)');
+SELECT mssql_exec('db', 'CREATE TABLE dbo.int_target2 (data_col INT)');
 
 # COPY should fail with clear error message
 statement error
@@ -104,10 +121,10 @@ type mismatch
 
 # Cleanup
 statement ok
-CALL mssql_exec('db', 'DROP TABLE IF EXISTS dbo.varchar_target');
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.varchar_target');
 
 statement ok
-CALL mssql_exec('db', 'DROP TABLE IF EXISTS dbo.int_target2');
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.int_target2');
 
 statement ok
 DROP TABLE date_source;
