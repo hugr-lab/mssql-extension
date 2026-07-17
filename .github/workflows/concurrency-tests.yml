@@ -65,6 +65,9 @@ jobs:
       ASAN_OPTIONS: detect_stack_use_after_return=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
       GEN: ninja
+      # Point vcpkg's binary cache at a directory actions/cache persists; the
+      # default ($HOME/.cache/vcpkg/archives) is cached by nothing.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - name: Checkout
@@ -114,16 +117,16 @@ jobs:
           ccache --set-config=compression=true
           ccache -z
 
-      - name: Cache vcpkg packages
+      # Caches vcpkg's binary cache (archives), not the install tree -- see
+      # ci.yml for why the old vcpkg/installed + vcpkg/packages +
+      # vcpkg/buildtrees paths restored cleanly and rebuilt anyway.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-            vcpkg/buildtrees
-          key: vcpkg-concurrency-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-concurrency-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-concurrency-
+            vcpkg-bincache-concurrency-
 
       - name: Bootstrap vcpkg
         run: make vcpkg-setup
