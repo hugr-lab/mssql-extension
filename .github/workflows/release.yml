@@ -44,11 +44,22 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # vcpkg_triplet is what the binary cache is namespaced on, so it must
-          # match ci.yml's build matrix exactly -- that job runs on the weekly
-          # main-branch cron and is what can seed this workflow. Keying on
+          # vcpkg_triplet is what the binary cache is namespaced on. Keying on
           # platform.id instead would put releases in a namespace nothing on the
-          # default branch ever writes.
+          # default branch ever writes; using the triplet lets ci.yml's weekly
+          # main-branch cron seed this workflow.
+          #
+          # The agreement with ci.yml's matrix is convention only -- nothing
+          # here passes the value to vcpkg (the POSIX build below infers its
+          # triplet from the runner), so a mismatch costs cache hits silently
+          # rather than failing. Two consequences to keep in mind when editing
+          # either matrix:
+          #   - x64-linux and arm64-osx do have ci.yml counterparts, so those
+          #     two namespaces are genuinely seeded by the cron.
+          #   - arm64-linux does NOT: ci.yml has no ubuntu-22.04-arm build job,
+          #     so nothing on main ever writes that namespace and the linux_arm64
+          #     release build is cold on every tag. Adding an arm64 job to ci.yml
+          #     (or accepting the cold build) is the choice here, not renaming.
           - id: linux_amd64
             os: linux
             arch: amd64
@@ -173,6 +184,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         shell: bash
@@ -301,6 +323,17 @@ jobs:
             ../../duckdb
           cmake --build . --config Release
           Pop-Location
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         shell: bash
@@ -440,6 +473,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         shell: bash
