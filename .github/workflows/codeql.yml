@@ -134,6 +134,20 @@ jobs:
             ../../duckdb
           cmake --build . --config Release --target mssql_loadable_extension
 
+      # See ci.yml's build job for why the binary cache needs pruning. This is
+      # the job that matters most for it: push-to-main runs here are what seed
+      # the shared x64-linux namespace, so unpruned growth here propagates to
+      # every PR and tag build that restores from it.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
+
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:

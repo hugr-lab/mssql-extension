@@ -275,6 +275,23 @@ jobs:
             ../../duckdb
           cmake --build . --config Release
 
+      # actions/cache restores the previous generation's archives and vcpkg
+      # only ever adds to them, so without pruning this dir grows monotonically:
+      # ABI-named archives from superseded compilers / vcpkg baselines are never
+      # evicted, and each run's save carries the whole pile forward. Left alone
+      # it eats GitHub's 10 GB per-repo cache budget, at which point LRU starts
+      # silently dropping *other* caches (ccache, DuckDB). Runs before the
+      # post-job save; always() so a failed build still saves a pruned dir.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
+
       - name: Show ccache stats
         run: ccache -s
 
@@ -572,9 +589,18 @@ jobs:
       # the install tree -- see the linux/macos build job for why the old
       # vcpkg/installed + vcpkg/packages paths never elided a rebuild.
       # Namespace is the vcpkg triplet, deliberately NOT job- or workflow-scoped:
-      # release.yml's MSVC job uses the same triplet and shares this namespace,
-      # so a Windows build dispatched on main can seed the release build. See
-      # the linux/macos job for why the primary key carries github.run_id.
+      # release.yml's MSVC job uses the same triplet and shares this namespace.
+      #
+      # Caveat -- unlike the Linux/macOS namespaces, this one is NOT seeded
+      # automatically. Both Windows jobs are gated on
+      #   if: github.event_name == 'workflow_dispatch' && inputs.run_windows_build
+      # so the weekly cron (which does seed x64-linux / arm64-osx from main)
+      # never runs them. Only a manual main-branch dispatch with "Run Windows
+      # build jobs" ticked writes a cache on refs/heads/main; until someone
+      # does that, release.yml's MSVC job rebuilds OpenSSL from scratch on
+      # every tag. Adding `|| github.event_name == 'schedule'` here would fix
+      # that at the cost of two Windows builds per week on main.
+      # See the linux/macos job for why the primary key carries github.run_id.
       - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
@@ -603,6 +629,17 @@ jobs:
             ../../duckdb
           cmake --build . --config Release
           Pop-Location
+
+      # See the linux/macos build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
@@ -679,6 +716,8 @@ jobs:
       # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above. This
       # is the job that pays most for the old broken setup: run 29540869000
       # spent 6.9 min compiling OpenSSL for x64-mingw-static from scratch.
+      # Same seeding caveat as the MSVC job above: this namespace only gets a
+      # main-branch entry from a manual Windows dispatch, never from the cron.
       - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
@@ -703,6 +742,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See the linux/macos build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
