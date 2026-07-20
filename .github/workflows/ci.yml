@@ -496,11 +496,20 @@ jobs:
       # applies this script; the .test files expect the schema and seed rows it creates (TestDB
       # plus master.dbo.test), and fail without them.
       - name: Seed test database
+        env:
+          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
         run: |
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
-          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18
+          # Seed from inside the service container rather than installing mssql-tools18 on
+          # the runner. The image already ships /opt/mssql-tools18/bin/sqlcmd — the health
+          # check above is that exact binary, so a healthy service proves it is present.
+          #
+          # The host-side install was worse than redundant: it added packages.microsoft.com
+          # to apt, but the ubuntu-22.04 image already configures that same repo pinned to
+          # /usr/share/keyrings/microsoft-prod.gpg. Two Signed-By values for one source makes
+          # apt refuse to read *any* sources, so `apt-get update` exited 100 before installing
+          # anything and the seed never ran (CI run #566). See #199.
+          docker cp docker/init/init.sql "$SQLSERVER_ID:/tmp/init.sql"
+          docker cp docker/init/init-transaction-tests.sql "$SQLSERVER_ID:/tmp/init-transaction-tests.sql"
           # No -b (exit-on-error): init.sql does not run cleanly even against a fresh server —
           # one AllDataTypes INSERT does DATEADD(day, id, col_datetime2) over a far-future seed
           # row and trips "Msg 517 ... datetime2 ... overflow", terminating that statement. This
@@ -508,8 +517,10 @@ jobs:
           # the suite passes without those rows. -b here would fail every run for a benign,
           # long-standing reason. integration_test.sh verifies the seed landed instead, so a
           # genuinely broken seed is still caught rather than silently skipped. See #199.
-          /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P TestPassword1 -C -i docker/init/init.sql
-          /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P TestPassword1 -C -i docker/init/init-transaction-tests.sql
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -i /tmp/init.sql
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -i /tmp/init-transaction-tests.sql
           echo "Seed applied."
 
       - name: Run integration tests
