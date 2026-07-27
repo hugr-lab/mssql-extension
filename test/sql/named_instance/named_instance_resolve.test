@@ -1,0 +1,43 @@
+# name: test/sql/named_instance/named_instance_resolve.test
+# description: End-to-end named-instance resolution against the mock SQL Server
+#              Browser stack (spec 045, test/named-instance/). Requires that
+#              stack: browser.example.com advertising TESTINST -> sql.example.com:11433,
+#              a NamedInstTest database with dbo.Probe(id, payload). Gated on
+#              MSSQL_NAMED_INSTANCE_HOST so it is skipped in the ordinary suite.
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_NAMED_INSTANCE_HOST
+
+# Basic resolution: host\TESTINST resolves via the Browser to the instance's
+# TCP port, and the attached catalog reads the probe row.
+statement ok
+ATTACH 'Server=${MSSQL_NAMED_INSTANCE_HOST}\TESTINST;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS ni_basic (TYPE mssql);
+
+query IT
+SELECT id, payload FROM ni_basic.dbo.Probe ORDER BY id;
+----
+1	spec045 lives
+
+statement ok
+DETACH ni_basic;
+
+# Unknown instance: the Browser answers but has no such instance.
+statement error
+ATTACH 'Server=${MSSQL_NAMED_INSTANCE_HOST}\NONESUCH;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS ni_unknown (TYPE mssql);
+----
+not found
+
+# Explicit port skips the Browser entirely: host\TESTINST,11433 connects
+# straight to 11433 without a UDP round trip.
+statement ok
+ATTACH 'Server=${MSSQL_NAMED_INSTANCE_HOST}\TESTINST,11433;Database=NamedInstTest;User Id=sa;Password=TestPassword1;Encrypt=no' AS ni_explicit (TYPE mssql);
+
+query IT
+SELECT id, payload FROM ni_explicit.dbo.Probe ORDER BY id;
+----
+1	spec045 lives
+
+statement ok
+DETACH ni_explicit;

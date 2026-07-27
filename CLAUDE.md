@@ -196,6 +196,8 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `mssql_copy_tablock` | auto | Use TABLOCK hint for COPY/BCP (15-30% faster, blocks concurrent access). Auto-enabled for new tables when not explicitly set. |
 | `mssql_ctas_use_bcp` | true | Use BCP protocol for CTAS data transfer (2-10x faster than INSERT) |
 | `mssql_convert_varchar_max` | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries for UTF-8 compatibility |
+| `mssql_named_instance_resolution` | true | Resolve `Server=host\instance` to the instance's dynamic TCP port via the SQL Server Browser (UDP 1434) at ATTACH time (spec 045). Set `false` in environments that strip outbound UDP 1434 — a named instance then errors instead of silently using port 1433, and you connect with an explicit `Server=host,port`. |
+| `mssql_browser_timeout_seconds` | 3 | SQL Server Browser UDP query timeout in seconds for named-instance resolution. On the ATTACH critical path, so kept short; the resolver retries once. |
 | `mssql_login7_max_packet` | 0 | **Test-only** (issue #138). Max LOGIN7 TDS packet size (bytes) for integrated auth; lowers the fragmentation boundary so the multi-packet send path can be exercised without an AD-sized Kerberos PAC. 0 = production default (4096); effective values clamped to [256, 32767]. |
 
 ## ATTACH Options & Secret Parameters (Catalog Filters)
