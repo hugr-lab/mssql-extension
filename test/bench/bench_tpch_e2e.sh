@@ -136,6 +136,29 @@ time_step() {
 	printf '%s\t%s\t%s\t%s\n' "$step" "$seconds" "$rows" "$notes" | tee -a "$OUTPUT_FILE"
 }
 
+# Non-fatal variant: records FAILED and continues. Used for the #177
+# copy_sum_agg step, which is EXPECTED to fail on pre-spec-054 builds
+# (HUGEINT -> BCP threw NotImplemented before the T4 fix) — the pre-merge
+# release comparison runs this script against v0.2.x sides.
+time_step_optional() {
+	local step="$1"
+	local sql="$2"
+	local rows="$3"
+	local notes="$4"
+	local t0
+	local t1
+	local seconds
+	t0=$(date +%s.%N)
+	if ! run_sql "$sql" >/dev/null 2>&1; then
+		printf '%s\t-\t%s\t%s\n' "$step" "$rows" "FAILED (expected on pre-054 builds: #177) — $notes" |
+			tee -a "$OUTPUT_FILE"
+		return 0
+	fi
+	t1=$(date +%s.%N)
+	seconds=$(awk "BEGIN {printf \"%.3f\", $t1 - $t0}")
+	printf '%s\t%s\t%s\t%s\n' "$step" "$seconds" "$rows" "$notes" | tee -a "$OUTPUT_FILE"
+}
+
 {
 	echo "# bench_tpch_e2e output"
 	echo "# date: $(date -Iseconds 2>/dev/null || date)"
@@ -204,7 +227,7 @@ for SF in $SF_LIST; do
 
 	# SUM(BIGINT) → HUGEINT → DECIMAL(38,0) on the wire: the #177 regression
 	# case (works natively since spec 054 T4; no ::DECIMAL cast workaround).
-	time_step "copy_sum_agg_${SFX}" "
+	time_step_optional "copy_sum_agg_${SFX}" "
 		ATTACH '${SRC_DB}' AS src;
 		ATTACH '${DSN}' AS db (TYPE mssql);
 		COPY (SELECT l_returnflag, l_linestatus, SUM(l_orderkey) AS key_sum, COUNT(*) AS cnt

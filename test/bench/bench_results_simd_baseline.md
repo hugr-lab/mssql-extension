@@ -16,7 +16,7 @@ Status of the baseline capture (D6):
 | Micro: Linux x86_64 run | pending — needs a real x86_64 host (QEMU-on-ARM timing is meaningless); run `make bench-build && make bench-materialize` on a Linux box or CI runner |
 | e2e: TPC-H SF 0.01/0.1/1 median-of-3 | captured below (2026-07-28) |
 | Final phase-0 delta (T12): full D1+D3 re-run, gate check | captured below (2026-07-28) — gate PASS |
-| Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | pending (gates the phase-0 merge) |
+| Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | captured below (2026-07-28) — every step improved |
 
 ## Environment (macOS reference machine)
 
@@ -352,6 +352,47 @@ end to end (diff_check at every step), no e2e regression. e2e stays
 server-dominated as predicted — the wins show as modest improvements on
 the largest copy steps and become load-bearing at higher client
 concurrency / faster servers.
+
+## Pre-merge release comparison — v0.2.2 vs new build, SF 2 (2026-07-28)
+
+Maintainer requirement (D3 amendment): TPC-H at SF 2 — lineitem
+11,997,996 rows (≥ 10M) — 3 same-session interleaved pairs, median per
+step. Side A: stock DuckDB CLI v1.5.5 + the official v0.2.2 release
+artifact (`mssql-0.2.2-osx_arm64.duckdb_extension` from the GitHub
+release, loaded `-unsigned` and renamed to `mssql.duckdb_extension` —
+the entrypoint name derives from the filename; the community CDN still
+served 0.2.1 at capture time). Side B: this branch's bench-build CLI.
+`copy_sum_agg` runs via `time_step_optional` (would abort pre-054 sides
+on some #177 routes; at SF 2 through COPY+CREATE_TABLE it happens to
+succeed on v0.2.2).
+
+| step (seconds, median of 3) | v0.2.2 | new build | delta |
+| --- | --- | --- | --- |
+| copy_lineitem | 137.403 | 126.734 | **−7.8%** |
+| copy_orders | 29.150 | 26.614 | **−8.7%** |
+| copy_part | 6.082 | 4.571 | **−24.8%** |
+| copy_customer | 5.078 | 3.417 | **−32.7%** |
+| copy_sum_agg | 2.069 | 0.065 | −96.9% * |
+| scan_full_lineitem | 25.092 | 23.214 | **−7.5%** |
+| scan_strings | 2.067 | 0.799 | −61.3% * |
+| scan_lowcard | 7.064 | 5.874 | −16.8% |
+| scan_limit | 2.062 | 0.050 | −97.6% * |
+| q1_local | 10.089 | 8.914 | **−11.6%** |
+| q6_local | 2.068 | 0.386 | −81.3% * |
+
+\* v0.2.2 lacks the pool cleanup-thread wakeup fix (`9ce479d`), so every
+CLI invocation there carries ~2.0 s of teardown sleeps — the starred
+short steps are dominated by that fix (a real user-facing win of this
+branch: interactive queries drop from a 2 s floor to instant), and say
+little about the codec paths. The unstarred multi-second steps are where
+the W1–W4/R1 encode/decode work shows through the server-dominated e2e:
+string-heavy tables largest (part −25%, customer −33% — W3 single-pass
+NVARCHAR + the unaligned-simdutf fix), numeric-heavy smaller but solid
+(lineitem −8%, orders −9%, full scan −7.5%, Q1 −12%).
+
+Verdict: **every step improved; phase-0 merge unblocked.** Remaining
+open item in the status table: the Linux x86_64 micro run (needs a real
+x86_64 host).
 
 ## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
 
