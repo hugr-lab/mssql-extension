@@ -353,6 +353,34 @@ bench-utf16: release
 	@echo "Running UTF-16 codec microbenchmark..."
 	build/test/bench_utf16
 
+# Spec 054 D1: materialization microbenchmark (string decode / fixed decode /
+# bcp encode groups). Manual target; NOT part of `make test` or CI.
+# Links the RELEASE libduckdb (Vector/DataChunk symbols) + release simdutf,
+# compiles the codec sources at -O3 so the timed body matches shipped code.
+BENCH_MAT_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
+BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/datetime_encoding.cpp \
+    src/tds/encoding/decimal_encoding.cpp \
+    src/tds/encoding/guid_encoding.cpp
+
+bench-materialize: release
+	@echo "Building materialization microbenchmark (spec 054)..."
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(BENCH_MAT_FLAGS) $(BENCH_UTF16_INCLUDES) \
+	    test/cpp/bench_materialize.cpp \
+	    $(BENCH_MAT_SOURCES) \
+	    $(BENCH_UTF16_LIBS) \
+	    -L build/release/src -lduckdb \
+	    -o build/test/bench_materialize
+	@echo ""
+	@echo "Running materialization microbenchmark..."
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_materialize
+
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
 # test/cpp/codec/test_<family>_codec.cpp linked against src/codec/*.cpp.
