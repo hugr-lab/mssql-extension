@@ -74,6 +74,34 @@ Reading of the baseline (what the later phases target):
   dictionary win (phases 2+) has to come from emitting dictionary vectors,
   not from any caching in the current code.
 
+## Micro — fixed decode, CURRENT path (baseline, 2026-07-28)
+
+Per-family `codec::<family>::DecodeFromTds` into a 2048-row `DataChunk`;
+same protocol as the string table (median/p10/p90 of 400 chunk fills).
+int/float cells verified against independently reconstructed values;
+datetime/decimal/uuid additionally by decode-twice determinism.
+
+| cell | µs/chunk (median) | p10 | p90 | ns/value | wire in B |
+| --- | --- | --- | --- | --- | --- |
+| int1_utinyint | 3.5 | 3.5 | 4.2 | 1.7 | 2048 |
+| int2_smallint | 3.6 | 3.5 | 3.8 | 1.8 | 4096 |
+| int4_integer | 3.8 | 3.7 | 3.8 | 1.8 | 8192 |
+| int8_bigint | 3.7 | 3.5 | 4.5 | 1.8 | 16384 |
+| int8_bigint_null50 | 3.6 | 3.5 | 4.5 | 1.8 | 8000 |
+| float8_double | 4.4 | 4.4 | 4.5 | 2.2 | 16384 |
+| datetime2_s6_timestamp | 11.1 | 11.0 | 11.2 | 5.4 | 16384 |
+| decimal_p4s2_int16 | 34.5 | 31.0 | 37.5 | 16.9 | 10240 |
+| decimal_p18s6_int64 | 73.8 | 70.1 | 80.5 | 36.0 | 18432 |
+| decimal_p38s0_int128 | 167.3 | 155.9 | 180.3 | 81.7 | 34816 |
+| uuid | 4.1 | 3.7 | 4.2 | 2.0 | 32768 |
+
+Reading: integer/float/uuid decode is already near per-slot overhead
+(~1.7–2.2 ns/value ≈ the len0 string floor) — little headroom for phase-1
+kernels there. DATETIME2 is moderate (5.4 ns). **DECIMAL is the outlier**:
+17–82 ns/value, 10–45× the integer path, scaling with mantissa width
+(`ConvertDecimal`'s per-value big-number assembly) — the highest-value
+fixed-decode target for the phase-1 staging work.
+
 ## e2e — TPC-H smoke (NOT baseline; single run, SF 0.01 only)
 
 `test/bench/bench_tpch_e2e.sh`, 2026-07-28, single run (baseline capture with
