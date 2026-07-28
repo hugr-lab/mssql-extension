@@ -65,6 +65,9 @@ jobs:
       ASAN_OPTIONS: detect_stack_use_after_return=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
       GEN: ninja
+      # Point vcpkg's binary cache at a directory actions/cache persists; the
+      # default ($HOME/.cache/vcpkg/archives) is cached by nothing.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - name: Checkout
@@ -114,16 +117,39 @@ jobs:
           ccache --set-config=compression=true
           ccache -z
 
-      - name: Cache vcpkg packages
+      # Caches vcpkg's binary cache (archives), not the install tree -- see
+      # ci.yml for why the old vcpkg/installed + vcpkg/packages +
+      # vcpkg/buildtrees paths restored cleanly and rebuilt anyway.
+      # Reads the triplet namespace (x64-linux) shared with ci.yml/codeql.yml
+      # rather than one scoped to this workflow. This workflow only ever runs on
+      # pull_request + workflow_dispatch, so it never writes a cache on the
+      # default branch -- and a cache written from refs/pull/N/merge can only
+      # be restored by re-runs of that same PR. A fully workflow-private
+      # namespace would therefore be cold on the first run of every PR, forever.
+      # Reading the triplet namespace lets codeql.yml's push-to-main run seed it.
+      #
+      # This job runs on ubuntu-latest while ci.yml/codeql.yml pin ubuntu-22.04,
+      # so its compiler differs and the archives it builds carry a different
+      # vcpkg ABI hash. Reading the shared namespace is still worth it (a hit
+      # elides the build; a miss just rebuilds -- archives are ABI-named, so a
+      # stale restore can never produce a wrong binary), but WRITING into it
+      # would push ubuntu-latest archives that no 22.04 job can use, and every
+      # restore on both sides would drag the other's dead weight along.
+      #
+      # So: write to a runner-image-specific namespace that ci.yml's
+      # `vcpkg-bincache-x64-linux-` prefix does NOT match, and keep the shared
+      # namespace as a read-only second restore-key. Pinning this job to
+      # ubuntu-22.04 would let the sharing pay off properly, but the ASan/UBSan
+      # swapfile handling here is tuned to the ubuntu-latest image -- that is a
+      # behaviour change for another PR.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-            vcpkg/buildtrees
-          key: vcpkg-concurrency-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-ubuntulatest-x64-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-concurrency-
+            vcpkg-bincache-ubuntulatest-x64-linux-
+            vcpkg-bincache-x64-linux-
 
       - name: Bootstrap vcpkg
         run: make vcpkg-setup
@@ -133,6 +159,17 @@ jobs:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: make debug
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         if: always()

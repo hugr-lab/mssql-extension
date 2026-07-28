@@ -14,6 +14,32 @@ BEGIN
 END
 GO
 
+-- =============================================================================
+-- master.dbo.test — seed for catalog_discovery.test
+--
+-- That test attaches MSSQL_TEST_DSN, which defaults to Database=master (see the
+-- Makefile), and expects `dbo.test` to exist there: "we use master.dbo.test for
+-- testing". Everything else in this script lives in TestDB, so nothing created
+-- this table and the test could never pass. It went unnoticed because CI never
+-- ran the .test files (issue #192).
+--
+-- The test rewrites rows 98/99 and restores id=1 to 'A' as it goes, so it only
+-- needs a stable (1,'A'), (2,'B'), (3,'C') starting point.
+-- =============================================================================
+IF OBJECT_ID('master.dbo.test', 'U') IS NOT NULL DROP TABLE master.dbo.test;
+GO
+
+CREATE TABLE master.dbo.test (
+    id INT PRIMARY KEY,
+    name NVARCHAR(50)
+);
+GO
+
+INSERT INTO master.dbo.test (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C');
+GO
+PRINT 'master.dbo.test created';
+GO
+
 USE TestDB;
 GO
 

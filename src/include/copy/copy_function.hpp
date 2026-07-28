@@ -19,6 +19,7 @@ class ExtensionLoader;
 
 namespace tds {
 class TdsConnection;
+class ConnectionPool;
 }  // namespace tds
 
 //===----------------------------------------------------------------------===//
@@ -67,8 +68,33 @@ struct MSSQLCopyBindData : public TableFunctionData {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLCopyGlobalState : public GlobalFunctionData {
+	// Last-resort connection release (issue #191).
+	//
+	// BCPCopyInitGlobal and BCPCopyFinalize each release `connection` on the paths they own, and
+	// both reset() it, so this destructor is a no-op whenever either ran. It exists for the path
+	// neither covers: a throw from the sink (e.g. ValidateNVarcharLength rejecting an over-long
+	// value). DuckDB does not call copy_to_finalize on an errored COPY, so nothing released the
+	// connection — the pool kept it checked out in Executing state with the INSERT BULK
+	// transaction open, holding locks on the target table until the pool was torn down at process
+	// exit.
+	//
+	// Follows MSSQLResultStream's destructor contract (issue #178 / PR #179): touch NO
+	// ClientContext here — it can run on a worker thread while the client thread commits the
+	// query's transaction. The release targets below are captured on the client thread in
+	// BCPCopyInitGlobal instead.
+	~MSSQLCopyGlobalState();
+
 	// Pinned TDS connection for BulkLoad operations
 	std::shared_ptr<tds::TdsConnection> connection;
+
+	// Release targets captured in BCPCopyInitGlobal (see destructor note above).
+	//   pool_handle        — weak_ptr to the catalog's pool; a failed lock() (catalog torn down)
+	//                        degrades to dropping the connection, never a dangling dereference.
+	//   transaction_pinned — true when the connection is pinned to an explicit DuckDB
+	//                        transaction; the destructor then only drops its reference, since the
+	//                        MSSQLTransaction owns the pin.
+	weak_ptr<tds::ConnectionPool> pool_handle;
+	bool transaction_pinned = false;
 
 	// BCP packet writer (thread-safe)
 	unique_ptr<mssql::BCPWriter> writer;

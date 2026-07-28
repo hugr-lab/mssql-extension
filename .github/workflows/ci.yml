@@ -153,6 +153,13 @@ jobs:
             docker_available: false
             vcpkg_triplet: arm64-osx
 
+    env:
+      # Send vcpkg's binary cache to a directory actions/cache persists (see
+      # the "Cache vcpkg binary packages" step). Without this, vcpkg falls back
+      # to its default files provider under $HOME/.cache/vcpkg/archives, which
+      # nothing caches -- so every run rebuilt OpenSSL from source.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+
     steps:
       - uses: actions/checkout@v7
 
@@ -213,17 +220,43 @@ jobs:
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Cache vcpkg's BINARY cache (the archives dir), not the install tree.
+      #
+      # The previous version cached vcpkg/installed + vcpkg/packages +
+      # vcpkg/buildtrees, which never worked: in manifest mode vcpkg installs
+      # into build/release/vcpkg_installed and looks for prebuilt archives in
+      # its binary cache, so none of those three paths were ever consulted.
+      # Runs 29339658347 and 29345077972 both logged
+      #   "Cache restored from key: vcpkg-x64-linux-..."   (a HIT)
+      #   "Building openssl:x64-linux@3.4.1..."            (rebuilt anyway)
+      # i.e. ~2 min of OpenSSL rebuild per run despite a green cache hit.
+      #
+      # Pointing VCPKG_BINARY_SOURCES at a `files` dir and caching THAT dir is
+      # what actually elides the rebuild. Archives are keyed by vcpkg's ABI
+      # hash, so a stale restore can't produce a wrong binary -- vcpkg simply
+      # misses and rebuilds. That makes the prefix restore-key safe.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-            vcpkg/buildtrees
-          key: vcpkg-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          # The primary key MUST be unique per run. actions/cache skips the
+          # post-run save on an exact primary-key hit (saveImpl.ts: "Cache hit
+          # occurred on the primary key ..., not saving cache."). With a stable
+          # key the cache would freeze after the first save: once the ABI hash
+          # drifts -- a runner-image compiler bump, or vcpkg master churn, since
+          # the clone above is unpinned -- vcpkg would rebuild every run and the
+          # fresh archives would never be persisted. That is the same silent
+          # no-op this whole change exists to kill.
+          #
+          # hashFiles('vcpkg.json') is kept only as a readable namespace marker;
+          # it is NOT sufficient on its own, because vcpkg.json's `version` is
+          # the extension's own version (rotates for the wrong reason) and it
+          # says nothing about compiler/triplet/vcpkg-tool (fails to rotate for
+          # the right one). The prefix restore-key below is what actually seeds
+          # each run, and it matches across hashes.
+          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-${{ matrix.platform.vcpkg_triplet }}-
+            vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-
 
       - name: Build Release
         env:
@@ -241,6 +274,23 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # actions/cache restores the previous generation's archives and vcpkg
+      # only ever adds to them, so without pruning this dir grows monotonically:
+      # ABI-named archives from superseded compilers / vcpkg baselines are never
+      # evicted, and each run's save carries the whole pile forward. Left alone
+      # it eats GitHub's 10 GB per-repo cache budget, at which point LRU starts
+      # silently dropping *other* caches (ccache, DuckDB). Runs before the
+      # post-job save; always() so a failed build still saves a pruned dir.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         run: ccache -s
@@ -399,7 +449,9 @@ jobs:
 
   # ============================================================================
   # Integration Test Job - SQL Server tests on Linux only
-  # (Manual trigger only via workflow_dispatch)
+  # Runs on the weekly schedule, and on workflow_dispatch when both run_build
+  # and run_integration_tests are set. Runs the smoke test plus the full
+  # SQLLogicTest suite (test/sql/**/*.test).
   # ============================================================================
   integration-test:
     name: Integration Test (linux_amd64)
@@ -437,9 +489,18 @@ jobs:
           name: duckdb-cli-linux_amd64
           path: cli
 
+      # The SQLLogicTest runner. The build job already produces and uploads it; this job just
+      # never downloaded it, which is why no .test file has ever run in CI (issue #192).
+      - name: Download unittest artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: unittest-linux_amd64
+          path: unittest
+
       - name: Setup executables
         run: |
           chmod +x cli/duckdb
+          chmod +x unittest/unittest
           chmod +x scripts/ci/integration_test.sh
 
       - name: Wait for SQL Server
@@ -448,9 +509,46 @@ jobs:
           timeout 120 bash -c 'until echo > /dev/tcp/localhost/1433 2>/dev/null; do sleep 5; done'
           echo "SQL Server is ready!"
 
-      - name: Run integration tests
+      # The service container starts bare. Locally `make docker-up` runs an init container that
+      # applies this script; the .test files expect the schema and seed rows it creates (TestDB
+      # plus master.dbo.test), and fail without them.
+      - name: Seed test database
+        env:
+          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
         run: |
-          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension
+          # Seed from inside the service container rather than installing mssql-tools18 on
+          # the runner. The image already ships /opt/mssql-tools18/bin/sqlcmd — the health
+          # check above is that exact binary, so a healthy service proves it is present.
+          #
+          # The host-side install was worse than redundant: it added packages.microsoft.com
+          # to apt, but the ubuntu-22.04 image already configures that same repo pinned to
+          # /usr/share/keyrings/microsoft-prod.gpg. Two Signed-By values for one source makes
+          # apt refuse to read *any* sources, so `apt-get update` exited 100 before installing
+          # anything and the seed never ran (CI run #566). See #199.
+          docker cp docker/init/init.sql "$SQLSERVER_ID:/tmp/init.sql"
+          docker cp docker/init/init-transaction-tests.sql "$SQLSERVER_ID:/tmp/init-transaction-tests.sql"
+          # No -b (exit-on-error): init.sql does not run cleanly even against a fresh server —
+          # one AllDataTypes INSERT does DATEADD(day, id, col_datetime2) over a far-future seed
+          # row and trips "Msg 517 ... datetime2 ... overflow", terminating that statement. This
+          # is pre-existing and happens locally too (make docker-up prints it and carries on);
+          # the suite passes without those rows. -b here would fail every run for a benign,
+          # long-standing reason. integration_test.sh verifies the seed landed instead, so a
+          # genuinely broken seed is still caught rather than silently skipped. See #199.
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -i /tmp/init.sql
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -i /tmp/init-transaction-tests.sql
+          echo "Seed applied."
+
+      - name: Run integration tests
+        env:
+          MSSQL_TEST_HOST: localhost
+          MSSQL_TEST_PORT: 1433
+          MSSQL_TEST_USER: sa
+          MSSQL_TEST_PASS: TestPassword1
+          MSSQL_TEST_DB: master
+        run: |
+          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension ./unittest/unittest
 
   # ============================================================================
   # Windows Build Job - MSVC (Visual Studio 2022)
@@ -461,6 +559,15 @@ jobs:
     name: Build Windows (MSVC)
     runs-on: windows-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
+
+    env:
+      # Must be set explicitly: run-vcpkg otherwise forces the dead x-gha
+      # provider on GitHub runners. Its own source says
+      #   "Allow users to define the vcpkg's binary source explicitly in the
+      #    workflow, in that case do not override it."
+      #   setVariableIfUndefined(VCPKG_BINARY_SOURCES, 'clear;x-gha,readwrite')
+      # so defining it here is the supported opt-out.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -489,16 +596,29 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above, not
+      # the install tree -- see the linux/macos build job for why the old
+      # vcpkg/installed + vcpkg/packages paths never elided a rebuild.
+      # Namespace is the vcpkg triplet, deliberately NOT job- or workflow-scoped:
+      # release.yml's MSVC job uses the same triplet and shares this namespace.
+      #
+      # Caveat -- unlike the Linux/macOS namespaces, this one is NOT seeded
+      # automatically. Both Windows jobs are gated on
+      #   if: github.event_name == 'workflow_dispatch' && inputs.run_windows_build
+      # so the weekly cron (which does seed x64-linux / arm64-osx from main)
+      # never runs them. Only a manual main-branch dispatch with "Run Windows
+      # build jobs" ticked writes a cache on refs/heads/main; until someone
+      # does that, release.yml's MSVC job rebuilds OpenSSL from scratch on
+      # every tag. Adding `|| github.event_name == 'schedule'` here would fix
+      # that at the cost of two Windows builds per week on main.
+      # See the linux/macos job for why the primary key carries github.run_id.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-msvc-x64-windows-static-release-
+            vcpkg-bincache-x64-windows-static-release-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -520,6 +640,17 @@ jobs:
             ../../duckdb
           cmake --build . --config Release
           Pop-Location
+
+      # See the linux/macos build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
@@ -547,6 +678,9 @@ jobs:
     env:
       CC: gcc
       CXX: g++
+      # See the MSVC job: defining this is the supported way to stop run-vcpkg
+      # forcing the removed x-gha provider.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -590,16 +724,18 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches the binary-cache dir named by VCPKG_BINARY_SOURCES above. This
+      # is the job that pays most for the old broken setup: run 29540869000
+      # spent 6.9 min compiling OpenSSL for x64-mingw-static from scratch.
+      # Same seeding caveat as the MSVC job above: this namespace only gets a
+      # main-branch entry from a manual Windows dispatch, never from the cron.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-mingw-static-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-mingw-x64-mingw-static-
+            vcpkg-bincache-x64-mingw-static-
 
       - name: Build Release
         shell: bash
@@ -617,6 +753,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See the linux/macos build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7

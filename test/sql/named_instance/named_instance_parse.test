@@ -1,0 +1,44 @@
+# name: test/sql/named_instance/named_instance_parse.test
+# description: Named-instance (host\instance) parsing and gating (spec 045). These
+#              cases fail before any network I/O, so they need no SQL Server or
+#              SQL Server Browser — only the extension loaded.
+# group: [mssql]
+
+require mssql
+
+# An empty instance after the backslash is rejected at parse time.
+statement error
+ATTACH 'Server=localhost\;Database=db;User Id=u;Password=p' AS ni_empty (TYPE mssql);
+----
+empty instance name after backslash
+
+# Instance names allow only [A-Za-z0-9_$#]; a space is invalid.
+statement error
+ATTACH 'Server=localhost\bad inst;Database=db;User Id=u;Password=p' AS ni_space (TYPE mssql);
+----
+invalid character in instance name
+
+# A hyphen is likewise outside the grammar.
+statement error
+ATTACH 'Server=localhost\bad-inst;Database=db;User Id=u;Password=p' AS ni_hyphen (TYPE mssql);
+----
+invalid character in instance name
+
+# Instance names are capped at 16 characters.
+statement error
+ATTACH 'Server=localhost\ABCDEFGHIJKLMNOPQ;Database=db;User Id=u;Password=p' AS ni_long (TYPE mssql);
+----
+exceeds 16 characters
+
+# With resolution disabled, a named instance is a hard error rather than a
+# silent fall-back to port 1433. This throws before the Browser is queried.
+statement ok
+SET mssql_named_instance_resolution=false;
+
+statement error
+ATTACH 'Server=localhost\SQLEXPRESS;Database=db;User Id=u;Password=p' AS ni_disabled (TYPE mssql);
+----
+named-instance resolution is disabled
+
+statement ok
+SET mssql_named_instance_resolution=true;

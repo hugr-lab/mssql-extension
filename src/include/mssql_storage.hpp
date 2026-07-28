@@ -42,6 +42,19 @@ enum class AuthMethod : uint8_t {
 struct MSSQLConnectionInfo {
 	string host;
 	uint16_t port = 1433;
+
+	// Named-instance resolution (spec 045). When the Server host part carries a
+	// `\instance` suffix (ADO.NET `host\instance`, URI `host%5Cinstance`), the
+	// suffix is parsed out here and `host` keeps only the bare hostname. The
+	// port stays at its default until ResolveNamedInstance() queries the SQL
+	// Server Browser (UDP 1434) and fills in the instance's dynamic TCP port.
+	// Empty instance_name = default instance (no resolution).
+	string instance_name;
+	// True when the connection string gave an explicit `,port`. Suppresses
+	// Browser resolution — an explicit port always wins over the instance's
+	// advertised one, matching every other SQL Server client.
+	bool port_specified = false;
+
 	string database;
 	string user;
 	string password;
@@ -136,6 +149,16 @@ struct MSSQLConnectionInfo {
 	//   azure_auth - if true, user/password are optional (Azure AD authentication via azure_secret)
 	static shared_ptr<MSSQLConnectionInfo> FromConnectionString(const string &connection_string,
 																bool azure_auth = false);
+
+	// Resolve a named instance to its dynamic TCP port via the SQL Server
+	// Browser (spec 045). No-op unless instance_name is set and no explicit
+	// port was given. Reads mssql_named_instance_resolution (gate) and
+	// mssql_browser_timeout_seconds (UDP timeout) from context, sends one
+	// MC-SQLR query, and updates host/port with the advertised endpoint.
+	// Throws InvalidInputException if resolution is disabled, or IOException
+	// on an unreachable Browser / unknown instance. Called at ATTACH time,
+	// where a ClientContext (and thus the settings) is available.
+	void ResolveNamedInstance(ClientContext &context);
 
 	// Validate connection string format
 	// Returns: empty string if valid, error message if invalid

@@ -4,6 +4,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
+#include "connection/instance_resolver.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -18,6 +19,7 @@
 
 #include <openssl/crypto.h>
 
+#include <cctype>
 #include <cstdlib>
 
 // Debug logging (same pattern as tds_socket.cpp)
@@ -138,6 +140,33 @@ string ResolveAppName(const MSSQLConnectionInfo &info) {
 // MSSQLConnectionInfo implementation
 //===----------------------------------------------------------------------===//
 
+// Split a `host\instance` server string (spec 045). On return `host` holds the
+// bare hostname and the instance name (if any) is written to `instance_out`.
+// A default instance leaves instance_out empty. Validates the instance name
+// against SQL Server's grammar ([A-Za-z0-9_$#], <=16 chars, FR-010).
+static void SplitHostInstance(string &host, string &instance_out) {
+	auto backslash_pos = host.find('\\');
+	if (backslash_pos == string::npos) {
+		return;
+	}
+	string instance = host.substr(backslash_pos + 1);
+	host = host.substr(0, backslash_pos);
+	if (instance.empty()) {
+		throw InvalidInputException("MSSQL Error: empty instance name after backslash in Server");
+	}
+	if (instance.size() > 16) {
+		throw InvalidInputException("MSSQL Error: instance name '%s' exceeds 16 characters", instance);
+	}
+	for (char c : instance) {
+		auto uc = static_cast<unsigned char>(c);
+		if (!std::isalnum(uc) && c != '_' && c != '$' && c != '#') {
+			throw InvalidInputException(
+				"MSSQL Error: invalid character in instance name '%s' (allowed: letters, digits, _ $ #)", instance);
+		}
+	}
+	instance_out = instance;
+}
+
 shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &context, const string &secret_name) {
 	auto &secret_manager = SecretManager::Get(context);
 
@@ -164,6 +193,11 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	result->host = kv_secret.TryGetValue("host").ToString();
 	auto port_val = kv_secret.TryGetValue("port");
 	result->port = port_val.IsNull() ? 1433 : static_cast<uint16_t>(port_val.GetValue<int32_t>());
+	result->port_specified = !port_val.IsNull();
+	// Named instance via secret (spec 045): a `host\instance` value in the
+	// secret's host field is split the same way as the connection-string form,
+	// then resolved to a port at ATTACH time.
+	SplitHostInstance(result->host, result->instance_name);
 	result->database = kv_secret.TryGetValue("database").ToString();
 	result->user = kv_secret.TryGetValue("user").ToString();
 	result->password = kv_secret.TryGetValue("password").ToString();
@@ -381,12 +415,15 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 		host_port = rest;
 	}
 
-	// Parse host:port
+	// Parse host:port. URL-decode the host so a `%5C`-encoded instance
+	// separator (`host%5Cinstance`) becomes `host\instance` and flows through
+	// the same `\`-split as the ADO.NET form (spec 045 T021). The port digits
+	// carry no reserved characters, so they are left as-is.
 	auto colon_pos = host_port.rfind(':');
 	if (colon_pos != string::npos) {
-		result["server"] = host_port.substr(0, colon_pos) + "," + host_port.substr(colon_pos + 1);
+		result["server"] = UrlDecode(host_port.substr(0, colon_pos)) + "," + host_port.substr(colon_pos + 1);
 	} else {
-		result["server"] = host_port;
+		result["server"] = UrlDecode(host_port);
 	}
 
 	// Parse query parameters
@@ -820,10 +857,17 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	if (comma_pos != string::npos) {
 		result->host = server.substr(0, comma_pos);
 		result->port = static_cast<uint16_t>(std::stoi(server.substr(comma_pos + 1)));
+		result->port_specified = true;
 	} else {
 		result->host = server;
 		result->port = 1433;  // Default MSSQL port
 	}
+
+	// Named instance (spec 045): split a `host\instance` host part. The URI
+	// parser URL-decodes `%5C` to `\` before this, so both connection-string
+	// forms land here. The bare hostname stays in host; the instance name is
+	// resolved to a port later by ResolveNamedInstance() at ATTACH time.
+	SplitHostInstance(result->host, result->instance_name);
 
 	result->database = params["database"];
 	result->user = params["user"];
@@ -909,6 +953,49 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 
 	result->connected = false;
 	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Named-instance resolution (spec 045)
+//===----------------------------------------------------------------------===//
+
+void MSSQLConnectionInfo::ResolveNamedInstance(ClientContext &context) {
+	// Nothing to resolve for a default instance, and an explicit port always
+	// wins over the Browser-advertised one.
+	if (instance_name.empty() || port_specified) {
+		return;
+	}
+
+	Value val;
+	bool enabled = true;
+	if (context.TryGetCurrentSetting("mssql_named_instance_resolution", val)) {
+		enabled = val.GetValue<bool>();
+	}
+	if (!enabled) {
+		throw InvalidInputException(
+			"MSSQL Error: named-instance resolution is disabled; set mssql_named_instance_resolution=true "
+			"or connect with an explicit port (Server=host,port). Instance requested: '%s\\%s'",
+			host, instance_name);
+	}
+
+	int timeout_seconds = 3;
+	if (context.TryGetCurrentSetting("mssql_browser_timeout_seconds", val)) {
+		timeout_seconds = static_cast<int>(val.GetValue<int64_t>());
+	}
+
+	auto resolved = mssql::InstanceResolver::Resolve(host, instance_name, timeout_seconds);
+	if (!resolved.ok) {
+		// Surface the resolver's typed diagnostic verbatim (it already names the
+		// host + instance and distinguishes browser-down from instance-not-found).
+		throw IOException("MSSQL Error: %s", resolved.error.message);
+	}
+
+	// The Browser may advertise the engine on a different hostname than the one
+	// running Browser (failover cluster, two-hostname layouts); honour it.
+	if (!resolved.host.empty()) {
+		host = resolved.host;
+	}
+	port = resolved.port;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1386,6 +1473,15 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		// the 128-UTF-16-code-unit clamp + control-char strip.
 		connection_info->application_name = application_name_option;
 	}
+
+	// Spec 045: resolve a named instance (host\instance) to its dynamic TCP
+	// port via the SQL Server Browser. Runs here, at ATTACH, because the
+	// ClientContext — and thus mssql_named_instance_resolution /
+	// mssql_browser_timeout_seconds — is available. No-op for default
+	// instances and for connection strings that gave an explicit port. Must
+	// precede endpoint-type caching and the eager credential check below,
+	// both of which read the (now resolved) host/port.
+	connection_info->ResolveNamedInstance(context);
 
 	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance
 	// Fabric endpoints don't support BCP/INSERT BULK, need fallback to INSERT

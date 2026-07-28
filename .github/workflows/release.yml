@@ -44,23 +44,47 @@ jobs:
       fail-fast: false
       matrix:
         platform:
+          # vcpkg_triplet is what the binary cache is namespaced on. Keying on
+          # platform.id instead would put releases in a namespace nothing on the
+          # default branch ever writes; using the triplet lets ci.yml's weekly
+          # main-branch cron seed this workflow.
+          #
+          # The agreement with ci.yml's matrix is convention only -- nothing
+          # here passes the value to vcpkg (the POSIX build below infers its
+          # triplet from the runner), so a mismatch costs cache hits silently
+          # rather than failing. Two consequences to keep in mind when editing
+          # either matrix:
+          #   - x64-linux and arm64-osx do have ci.yml counterparts, so those
+          #     two namespaces are genuinely seeded by the cron.
+          #   - arm64-linux does NOT: ci.yml has no ubuntu-22.04-arm build job,
+          #     so nothing on main ever writes that namespace and the linux_arm64
+          #     release build is cold on every tag. Adding an arm64 job to ci.yml
+          #     (or accepting the cold build) is the choice here, not renaming.
           - id: linux_amd64
             os: linux
             arch: amd64
             runner: ubuntu-22.04
             docker_available: true
+            vcpkg_triplet: x64-linux
 
           - id: linux_arm64
             os: linux
             arch: arm64
             runner: ubuntu-22.04-arm
             docker_available: true
+            vcpkg_triplet: arm64-linux
 
           - id: osx_arm64
             os: osx
             arch: arm64
             runner: macos-14
             docker_available: false
+            vcpkg_triplet: arm64-osx
+
+    env:
+      # Point vcpkg's binary cache at a directory actions/cache persists.
+      # The default is $HOME/.cache/vcpkg/archives, which nothing caches.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -134,16 +158,18 @@ jobs:
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 
-      # Cache vcpkg installed packages
-      - name: Cache vcpkg packages
+      # Caches vcpkg's binary cache (archives), not the install tree. See
+      # ci.yml for the evidence that the old vcpkg/installed + vcpkg/packages
+      # paths restored cleanly and still rebuilt every dependency from source.
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-${{ matrix.platform.id }}-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          # Triplet-namespaced (shared with ci.yml) + run_id-unique primary key.
+          # See ci.yml's build job for the full reasoning on both.
+          key: vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-${{ matrix.platform.id }}-
+            vcpkg-bincache-${{ matrix.platform.vcpkg_triplet }}-
 
       - name: Build Release
         run: |
@@ -158,6 +184,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         shell: bash
@@ -192,6 +229,11 @@ jobs:
     name: Build (windows_amd64)
     runs-on: windows-latest
     needs: lint
+
+    env:
+      # Defining this is the supported opt-out from run-vcpkg forcing the
+      # removed x-gha provider (it uses setVariableIfUndefined). See ci.yml.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -234,15 +276,13 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      - name: Cache vcpkg packages
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-msvc-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-msvc-x64-windows-static-release-
+            vcpkg-bincache-x64-windows-static-release-
 
       - name: Setup Visual Studio Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -284,6 +324,17 @@ jobs:
           cmake --build . --config Release
           Pop-Location
 
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
+
       - name: Show ccache stats
         shell: bash
         run: ccache -s
@@ -320,6 +371,8 @@ jobs:
     env:
       CC: gcc
       CXX: g++
+      # Opt out of run-vcpkg's dead x-gha default. See ci.yml.
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
 
     steps:
       - uses: actions/checkout@v7
@@ -377,15 +430,13 @@ jobs:
         with:
           vcpkgGitCommitId: '65604f5075c64b18a84c30de400def13aad2e0ec'
 
-      - name: Cache vcpkg packages
+      - name: Cache vcpkg binary packages
         uses: actions/cache@v6
         with:
-          path: |
-            vcpkg/installed
-            vcpkg/packages
-          key: vcpkg-windows-mingw-x64-mingw-static-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg_bincache
+          key: vcpkg-bincache-x64-mingw-static-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-windows-mingw-x64-mingw-static-
+            vcpkg-bincache-x64-mingw-static-
 
       - name: Setup ccache
         shell: bash
@@ -422,6 +473,17 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
             ../../duckdb
           cmake --build . --config Release
+
+      # See ci.yml's build job for why the binary cache needs pruning.
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        shell: bash
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          echo "before: $(du -sh vcpkg_bincache | cut -f1)"
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+          echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Show ccache stats
         shell: bash

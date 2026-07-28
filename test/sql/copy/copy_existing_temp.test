@@ -33,7 +33,16 @@ SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_bigint');
 statement ok
 ROLLBACK;
 
-# Test 2: Copy to existing temp table with INT column (source is BIGINT)
+# Test 2: Copy to existing temp table with INT column — the target's INT metadata, not the
+# source's type, must drive the wire encoding.
+#
+# This originally copied `local_test` (BIGINT) straight into the INT column and expected it to
+# succeed. It never could: IsTypeCompatible (src/copy/target_resolver.cpp) is deliberately
+# widening-only — BIGINT is compatible with `bigint` alone — so a BIGINT source into an INT
+# target is rejected rather than silently narrowed. The check and this test arrived in the same
+# commit (3c8ac8e, spec 025) and contradicted each other from the start; nothing noticed because
+# CI never ran the .test files (issue #192). The source is cast to INTEGER so the test exercises
+# what it describes; the narrowing rejection is asserted separately below.
 statement ok
 BEGIN;
 
@@ -41,14 +50,24 @@ BEGIN;
 statement ok
 SELECT mssql_exec('db', 'CREATE TABLE #temp_int (id INT)');
 
-# Copy BIGINT to INT - should use target column metadata
 statement ok
-COPY local_test TO 'mssql://db/#temp_int' (FORMAT 'bcp', CREATE_TABLE false);
+CREATE TABLE local_test_int AS SELECT id::INTEGER AS id FROM local_test;
+
+statement ok
+COPY local_test_int TO 'mssql://db/#temp_int' (FORMAT 'bcp', CREATE_TABLE false);
 
 query I
 SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_int');
 ----
 10
+
+# The other half of the same rule: a BIGINT source into that INT column is a narrowing
+# conversion and must be refused, not silently truncated. This is what the original Test 2
+# expected to succeed.
+statement error
+COPY local_test TO 'mssql://db/#temp_int' (FORMAT 'bcp', CREATE_TABLE false);
+----
+type mismatch
 
 statement ok
 ROLLBACK;
@@ -87,9 +106,14 @@ BEGIN;
 statement ok
 SELECT mssql_exec('db', 'CREATE TABLE #temp_multi (id INT, name NVARCHAR(50), value FLOAT)');
 
-# Copy to existing temp table with different types - should use target column metadata
+# Copy to existing temp table with different types - the target's column metadata drives the
+# wire encoding. local_multi's id is BIGINT and the target is INT, which is a narrowing
+# conversion and refused (widening-only IsTypeCompatible — see Test 2), so cast it first.
 statement ok
-COPY local_multi TO 'mssql://db/#temp_multi' (FORMAT 'bcp', CREATE_TABLE false);
+CREATE TABLE local_multi_int AS SELECT id::INTEGER AS id, name, value FROM local_multi;
+
+statement ok
+COPY local_multi_int TO 'mssql://db/#temp_multi' (FORMAT 'bcp', CREATE_TABLE false);
 
 query I
 SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_multi');
