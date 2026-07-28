@@ -312,6 +312,15 @@ bool ValidateAlignedUtf16Le(const uint8_t *data, size_t byte_length, std::vector
 // Public simdutf-backed UTF-16LE conversion primitives.
 //===----------------------------------------------------------------------===//
 
+// D4 (spec 054): per-thread count of legacy-fallback conversions — see the
+// header comment on Utf16FallbackCount(). Incremented only on the fallback
+// (already-slow) path; never read on the fast path.
+static thread_local uint64_t utf16_fallback_count = 0;
+
+uint64_t Utf16FallbackCount() {
+	return utf16_fallback_count;
+}
+
 std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
 	if (input.empty()) {
 		return {};
@@ -321,6 +330,7 @@ std::vector<uint8_t> Utf16LEEncode(const std::string &input) {
 	const size_t src_len = input.size();
 
 	if (!simdutf::validate_utf8(src, src_len)) {
+		utf16_fallback_count++;
 		return LegacyUtf16LEEncode(input);
 	}
 
@@ -342,12 +352,14 @@ size_t Utf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *output)
 	}
 
 	if (!simdutf::validate_utf8(input, input_len)) {
+		utf16_fallback_count++;
 		return LegacyUtf16LEEncodeDirect(input, input_len, output);
 	}
 
 	// Defensive guard against unaligned output buffers; in practice every
 	// known call site passes a 2-byte-aligned destination.
 	if ((reinterpret_cast<uintptr_t>(output) & 0x1u) != 0u) {
+		utf16_fallback_count++;
 		return LegacyUtf16LEEncodeDirect(input, input_len, output);
 	}
 
@@ -375,6 +387,7 @@ std::string Utf16LEDecode(const uint8_t *data, size_t byte_length) {
 
 	std::vector<char16_t> aligned_scratch;
 	if (!ValidateAlignedUtf16Le(data, byte_length, aligned_scratch)) {
+		utf16_fallback_count++;
 		return LegacyUtf16LEDecode(data, byte_length);
 	}
 

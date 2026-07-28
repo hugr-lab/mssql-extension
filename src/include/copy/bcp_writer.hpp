@@ -44,6 +44,9 @@ public:
 	BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
 			  vector<int32_t> column_mapping = {});
 
+	// D4 (spec 054): prints the per-writer counter summary at MSSQL_DEBUG>=2.
+	~BCPWriter();
+
 	// Non-copyable
 	BCPWriter(const BCPWriter &) = delete;
 	BCPWriter &operator=(const BCPWriter &) = delete;
@@ -191,6 +194,23 @@ private:
 	// Used to send all data in a single message
 	// Note: Memory is released via swap trick in ResetForNextBatch()
 	vector<uint8_t> accumulator_buffer_;
+
+	// D4 (spec 054): per-writer debug counters, active only at MSSQL_DEBUG>=2
+	// (latched at construction). Mutated under write_mutex_ in WriteRows —
+	// plain integers, no extra atomics. values_per_family counts every
+	// (row × target column) encode INCLUDING NULLs (the NULL check happens
+	// inside BCPRowEncoder::EncodeRow, not visible here); family/PLP column
+	// counts are precomputed once in the constructor.
+	bool counters_enabled_ = false;
+	uint64_t counter_chunks_ = 0;
+	uint64_t counter_values_per_family_[9] = {};
+	uint64_t counter_unknown_family_values_ = 0;
+	uint64_t counter_plp_values_ = 0;
+	uint64_t counter_utf16_fallbacks_ = 0;
+	uint64_t counter_write_rows_us_ = 0;
+	uint64_t family_col_count_[9] = {};	 // columns per family (per row)
+	uint64_t unknown_family_col_count_ = 0;
+	uint64_t plp_col_count_ = 0;
 };
 
 }  // namespace mssql

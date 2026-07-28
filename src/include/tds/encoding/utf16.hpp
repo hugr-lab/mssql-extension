@@ -54,6 +54,16 @@ size_t Utf16LEByteLength(const std::string &input);
 /// converter when `output` is not 2-byte aligned (defensive guard).
 size_t Utf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *output);
 
+/// D4 debug counters (spec 054): number of conversions on THIS thread that
+/// took the legacy hand-rolled fallback instead of the simdutf fast path
+/// (invalid UTF input, plus the unaligned-output defensive guard in
+/// Utf16LEEncodeDirect). Thread-local so per-stream / per-writer deltas can
+/// be attributed without atomics: snapshot before a chunk, subtract after —
+/// each FillChunk / WriteRows call runs entirely on one thread. The sizing
+/// pass (Utf16LEByteLength) is deliberately NOT counted to avoid counting
+/// the same value twice on the size-then-encode path.
+uint64_t Utf16FallbackCount();
+
 //===----------------------------------------------------------------------===//
 // Test-only re-export of the private legacy hand-rolled converter.
 // Compiled only when MSSQL_BENCH_BUILD is defined (the microbenchmark and
