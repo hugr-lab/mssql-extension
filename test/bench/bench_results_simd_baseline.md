@@ -13,8 +13,8 @@ Status of the baseline capture (D6):
 | Micro: string-decode group, macOS ARM64 | captured below (2026-07-28) |
 | Micro: fixed-decode group, macOS ARM64 | captured below (2026-07-28) |
 | Micro: bcp-encode group, macOS ARM64 | captured below (2026-07-28) |
-| Micro: Linux x86_64 run | pending (T7) |
-| e2e: TPC-H SF 0.01/0.1/1 median-of-≥3 | pending (T7; single smoke run noted below) |
+| Micro: Linux x86_64 run | pending — needs a real x86_64 host (QEMU-on-ARM timing is meaningless); run `make bench-build && make bench-materialize` on a Linux box or CI runner |
+| e2e: TPC-H SF 0.01/0.1/1 median-of-3 | captured below (2026-07-28) |
 | Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | pending (gates the phase-0 merge) |
 
 ## Environment (macOS reference machine)
@@ -166,6 +166,46 @@ Reading of the baseline (what W1/W2 and phase 3 target):
   (`StringToUTF16LE`) plus the USHORT-prefixed append. DECIMAL encode
   (23.5 ns) is cheaper than DECIMAL decode (36.0) but still ~4.4× the
   datetime2 line — same big-number handling, milder than the decode side.
+
+## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
+
+`test/bench/bench_tpch_e2e.sh`, tree commit `722caf8`, 3 sequential full
+runs, median per step. SQL Server 2022 (amd64 image, emulated) in Docker on
+the reference macOS host; server and dockerized I/O are a CONSTANT term
+shared by any two builds compared on this host — these numbers are the
+no-regression comparison constants for the phase merges (the optimization
+signal lives in the micro tables above; acceptance gate: no step regresses
+> 3%, spec criterion 6). `dbgen` rows: lineitem 60,175 / 600,572 /
+6,001,215 at SF 0.01 / 0.1 / 1.
+
+| step (seconds, median of 3) | SF 0.01 | SF 0.1 | SF 1 |
+| --- | --- | --- | --- |
+| dbgen (excluded from comparison) | 0.172 | 0.986 | 6.428 |
+| copy_lineitem | 0.724 | 6.683 | 65.899 |
+| copy_orders | 0.199 | 1.440 | 13.643 |
+| copy_part | 0.083 | 0.305 | 2.361 |
+| copy_customer | 0.072 | 0.239 | 1.743 |
+| copy_sum_agg (#177 case) | 0.056 | 0.065 | 0.061 |
+| scan_full_lineitem | 0.169 | 1.221 | 11.667 |
+| scan_strings | 0.060 | 0.123 | 0.437 |
+| scan_lowcard | 0.078 | 0.337 | 3.041 |
+| scan_limit | 0.054 | 0.052 | 0.051 |
+| q1_local | 0.132 | 0.516 | 4.418 |
+| q6_local | 0.143 | 0.119 | 0.252 |
+
+Reading:
+
+- SF 1 throughput: BCP write ≈ 91k rows/s (copy_lineitem, 16 columns), full
+  scan ≈ 514k rows/s, 2-column low-cardinality scan ≈ 2.0M rows/s. These are
+  the end-to-end constants the micro-level decode/encode wins have to move.
+- Run-to-run spread is ≤ ~5% on multi-second steps (run 1 is typically the
+  slowest — cold caches); sub-100 ms steps are noise-dominated and serve
+  only as smoke checks, not regression evidence.
+- `scan_limit` is flat across SF (~0.05 s) — pure per-query/bind overhead,
+  confirming the pool-fix (`9ce479d`) removed the old 2 s floor.
+- `q6_local` stays sub-second even at SF 1: the selective filter is pushed
+  down, so almost nothing crosses the wire — a control step that measures
+  pushdown health rather than materialization.
 
 ## e2e — TPC-H smoke (NOT baseline; single run, SF 0.01 only)
 
