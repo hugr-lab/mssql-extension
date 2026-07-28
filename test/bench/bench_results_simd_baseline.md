@@ -252,6 +252,52 @@ beyond noise. Verified: unit tests + full SQL suite green (incl. the
 FR-023 wording test), `diff_check.sh` pre-T10 vs post-T10 build 13/13
 byte-identical (incl. the BCP write-back and its Cyrillic payloads).
 
+## Delta — R1 string decode without temporaries (T11, 2026-07-28)
+
+`codec::string::DecodeFromTds` now converts straight into the vector's
+string slot: `Utf8LengthFromUtf16LEView` (one validation + exact UTF-8
+length) → `StringVector::EmptyString(out, len)` →
+`Utf16LEDecodeValidInto` — no intermediate `std::string`. The trailing-
+space trim for fixed-length CHAR/NCHAR moved to the INPUT (a trailing
+U+0020 is a trailing 0x0020 unit / 0x20 byte — no other sequence produces
+one; bit-identical output). Single-byte CHAR/VARCHAR likewise appends the
+raw bytes directly. Invalid UTF-16 keeps the legacy per-value fallback.
+
+string-decode cells (ns/value, baseline → post-R1):
+
+| cell | baseline | post-R1 | speedup |
+| --- | --- | --- | --- |
+| len4_ascii | 19.7 | 17.2 | 1.1× |
+| len8_ascii | 21.5 | 21.4 | 1.0× |
+| len16_ascii | 23.3 | 18.8 | 1.2× |
+| len32_ascii | 45.7 | 17.9 | 2.6× |
+| len64_ascii | 46.5 | 23.8 | 2.0× |
+| len256_ascii | 85.8 | 58.3 | 1.5× |
+| len4096_ascii | 1007.6 | 911.8 | 1.1× |
+| len16_cyrillic | 50.6 | 24.9 | 2.0× |
+| len16_cjk | 54.3 | 26.2 | 2.1× |
+| len16_surrogate | 47.6 | 21.8 | 2.2× |
+| len16_null50 | 12.7 | 9.7 | 1.3× |
+| len16_lone_high_surrogate (invalid) | 64.1 | 67.2 | 0.95× |
+
+Reading of the delta:
+
+- The big win is exactly where the baseline predicted: past the 12-byte
+  string_t inline threshold (len32: 2.6×) and on non-ASCII (~2×) — the
+  `std::string` temporary's allocation + copy is gone, and the length is
+  computed exactly instead of worst-case.
+- Short inline strings (len8/len16) move little — they never allocated.
+  len0 regressed 5.6 → 10.4 ns (cross-TU call overhead now dominates the
+  empty case) — negligible in absolute terms, noted for honesty.
+- The invalid-input fallback pays one extra validation (~5%) — cold path,
+  contract unchanged.
+- e2e (alternating medians-of-3, SF 0.1): q1_local −4.7%, scan_strings
+  −32% (noisy step, right direction), scan_full +2.5% (lineitem strings
+  are short/low-card → inline path, within noise); copies flat.
+  Verified: unit + full SQL suite green; diff_check pre-T11 vs post-T11
+  13/13 byte-identical (incl. NCHAR trailing-space trim and empty-vs-NULL
+  MAX cells).
+
 ## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
 
 `test/bench/bench_tpch_e2e.sh`, tree commit `722caf8`, 3 sequential full

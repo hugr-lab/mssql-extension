@@ -179,30 +179,46 @@ std::string EscapeSqlSingleQuotes(const std::string &str) {
 }
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
-	std::string str;
+	// R1 (spec 054): decode straight into the vector's string slot — no
+	// intermediate std::string. Trailing-space trim for fixed-length
+	// CHAR/NCHAR happens on the INPUT (a trailing U+0020 is a trailing
+	// 0x0020 code unit / 0x20 byte — no other sequence produces one), which
+	// matches the old trim-the-UTF-8-output behaviour bit-for-bit.
+	const bool trim_trailing_spaces = col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_NCHAR;
 
 	if (col.type_id == tds::TDS_TYPE_NCHAR || col.type_id == tds::TDS_TYPE_NVARCHAR ||
 		col.type_id == tds::TDS_TYPE_XML) {
-		str = tds::encoding::Utf16LEDecode(bytes.data(), bytes.size());
-	} else {
-		// CHAR/VARCHAR are single-byte (collation-dependent in theory; in
-		// practice the test fixtures and the pre-spec-045 path treated the
-		// bytes as UTF-8 / CP1252 indistinguishably for ASCII).
-		str = std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+		size_t byte_len = bytes.size();
+		if (trim_trailing_spaces) {
+			while (byte_len >= 2 && bytes[byte_len - 2] == 0x20 && bytes[byte_len - 1] == 0x00) {
+				byte_len -= 2;
+			}
+		}
+		const size_t utf8_len = tds::encoding::Utf8LengthFromUtf16LEView(bytes.data(), byte_len);
+		if (utf8_len == SIZE_MAX) {
+			// Invalid UTF-16 — legacy per-value fallback, semantics unchanged.
+			std::string str = tds::encoding::Utf16LEDecode(bytes.data(), byte_len);
+			FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
+			return;
+		}
+		string_t slot = StringVector::EmptyString(out, utf8_len);
+		tds::encoding::Utf16LEDecodeValidInto(bytes.data(), byte_len, slot.GetDataWriteable());
+		slot.Finalize();
+		FlatVector::GetData<string_t>(out)[row] = slot;
+		return;
 	}
 
-	// Trim trailing spaces for fixed-length CHAR/NCHAR (matches
-	// TypeConverter::ConvertString bit-for-bit).
-	if (col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_NCHAR) {
-		size_t end = str.find_last_not_of(' ');
-		if (end != std::string::npos) {
-			str.erase(end + 1);
-		} else {
-			str.clear();
+	// CHAR/VARCHAR are single-byte (collation-dependent in theory; in
+	// practice the test fixtures and the pre-spec-045 path treated the
+	// bytes as UTF-8 / CP1252 indistinguishably for ASCII).
+	size_t len = bytes.size();
+	if (trim_trailing_spaces) {
+		while (len > 0 && bytes[len - 1] == 0x20) {
+			len--;
 		}
 	}
-
-	FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
+	FlatVector::GetData<string_t>(out)[row] =
+		StringVector::AddString(out, reinterpret_cast<const char *>(bytes.data()), len);
 }
 
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,

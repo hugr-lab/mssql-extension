@@ -65,6 +65,19 @@ size_t Utf16LEByteLengthView(const char *input, size_t input_len, bool &valid_ut
 /// back to the scalar legacy converter. Returns bytes written.
 size_t Utf16LEEncodeValidDirect(const char *input, size_t input_len, uint8_t *output);
 
+/// R1 (spec 054): decode-side sized single-validation pair. Validates the
+/// UTF-16LE input once and returns the UTF-8 byte length the conversion
+/// will produce, or SIZE_MAX when the input is invalid (caller then uses
+/// the legacy Utf16LEDecode fallback, unchanged semantics). Unaligned
+/// `data` is handled via an internal scratch copy.
+size_t Utf8LengthFromUtf16LEView(const uint8_t *data, size_t byte_length);
+
+/// R1 (spec 054): convert KNOWN-VALID UTF-16LE (per a prior
+/// Utf8LengthFromUtf16LEView call on the same bytes) directly into `out`
+/// — no re-validation, no intermediate std::string. `out` needs capacity
+/// for the length that call returned. Returns bytes written.
+size_t Utf16LEDecodeValidInto(const uint8_t *data, size_t byte_length, char *out);
+
 /// Encode UTF-8 directly into a caller-owned output buffer. Returns the
 /// number of UTF-16LE bytes written. `output` must have capacity for at
 /// least `input_len * 2` bytes. Falls back to the private hand-rolled

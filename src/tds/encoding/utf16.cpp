@@ -454,6 +454,49 @@ std::string Utf16LEDecode(const std::vector<uint8_t> &data) {
 	return Utf16LEDecode(data.data(), data.size());
 }
 
+size_t Utf8LengthFromUtf16LEView(const uint8_t *data, size_t byte_length) {
+	if (byte_length == 0) {
+		return 0;
+	}
+	const size_t code_units = byte_length / 2;
+	// TDS wire payloads come out of vector<uint8_t> (malloc-aligned), so the
+	// unaligned branch is defensive only.
+	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
+		const char16_t *src = reinterpret_cast<const char16_t *>(data);
+		if (!simdutf::validate_utf16le(src, code_units)) {
+			// NOT counted as a fallback — the caller's legacy decode call
+			// counts it once (Utf16FallbackCount contract).
+			return SIZE_MAX;
+		}
+		return simdutf::utf8_length_from_utf16le(src, code_units);
+	}
+	static thread_local std::vector<char16_t> scratch;
+	if (scratch.size() < code_units) {
+		scratch.resize(code_units);
+	}
+	std::memcpy(scratch.data(), data, code_units * 2);
+	if (!simdutf::validate_utf16le(scratch.data(), code_units)) {
+		return SIZE_MAX;
+	}
+	return simdutf::utf8_length_from_utf16le(scratch.data(), code_units);
+}
+
+size_t Utf16LEDecodeValidInto(const uint8_t *data, size_t byte_length, char *out) {
+	if (byte_length == 0) {
+		return 0;
+	}
+	const size_t code_units = byte_length / 2;
+	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
+		return simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(data), code_units, out);
+	}
+	static thread_local std::vector<char16_t> scratch;
+	if (scratch.size() < code_units) {
+		scratch.resize(code_units);
+	}
+	std::memcpy(scratch.data(), data, code_units * 2);
+	return simdutf::convert_valid_utf16le_to_utf8(scratch.data(), code_units, out);
+}
+
 //===----------------------------------------------------------------------===//
 // Test-only re-export of the private legacy hand-rolled converter.
 // Visible only when MSSQL_BENCH_BUILD is defined at compile time (the
