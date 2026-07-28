@@ -11,7 +11,8 @@ Status of the baseline capture (D6):
 | piece | status |
 | --- | --- |
 | Micro: string-decode group, macOS ARM64 | captured below (2026-07-28) |
-| Micro: fixed-decode + bcp-encode groups | pending (T6) |
+| Micro: fixed-decode group, macOS ARM64 | captured below (2026-07-28) |
+| Micro: bcp-encode group, macOS ARM64 | captured below (2026-07-28) |
 | Micro: Linux x86_64 run | pending (T7) |
 | e2e: TPC-H SF 0.01/0.1/1 median-of-≥3 | pending (T7; single smoke run noted below) |
 | Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | pending (gates the phase-0 merge) |
@@ -22,6 +23,8 @@ Status of the baseline capture (D6):
 - Compiler: Apple clang 17.0.0 (clang-1700.0.13.5), `-O3 -DMSSQL_BENCH_BUILD`
 - DuckDB: v1.5.5 (pinned submodule), release `libduckdb`; simdutf 6.1.1 (vcpkg release)
 - Tree: branch `spec/054-simd-baseline-quick-wins`, commit `703795d` + T1 harness
+  (string/fixed-decode groups); bcp-encode group captured at `46eb3e6` + T6p2
+  working tree
 - Invocation: `GEN=ninja make bench-materialize`
 - SQL Server (e2e smoke): mcr.microsoft.com/mssql/server:2022-latest (amd64,
   emulated) in Docker 28.5.1, localhost
@@ -101,6 +104,68 @@ kernels there. DATETIME2 is moderate (5.4 ns). **DECIMAL is the outlier**:
 17–82 ns/value, 10–45× the integer path, scaling with mantissa width
 (`ConvertDecimal`'s per-value big-number assembly) — the highest-value
 fixed-decode target for the phase-1 staging work.
+
+## Micro — BCP encode, CURRENT path (baseline, 2026-07-28)
+
+The production write shape: one `BCPRowEncoder::EncodeRow` call per row
+(family dispatch; `ToUnifiedFormat(1, …)` per cell in BOTH the NULL check and
+the codec value read) into one reused buffer (`clear()` keeps capacity, like
+the per-batch packet buffer). 2048-row single-column chunks; median/p10/p90
+of 400 chunk encodes. Dictionary inputs built with
+`Vector::Dictionary(dict, dict_size, sel, count)` — the construction the
+phase-2 scan will emit and phase-3 will detect via
+`DictionaryVector::DictionarySize`; NULL rows in dict cells point at a
+trailing NULL child slot. Correctness: byte-identical to a per-row
+`GetValue` + Value-encoder reference (DECIMAL referenced against the raw
+mantissa — the Value overload is documented legacy-divergent there, see
+`codec::decimal::EncodeToBcp(Value...)`).
+
+| cell | µs/chunk (median) | p10 | p90 | ns/value | wire out B |
+| --- | --- | --- | --- | --- | --- |
+| bigint_flat_unique | 37.5 | 36.8 | 41.5 | 18.3 | 18432 |
+| bigint_flat_card10 | 37.5 | 37.5 | 39.7 | 18.3 | 18432 |
+| bigint_dict1 | 46.9 | 46.6 | 49.8 | 22.9 | 18432 |
+| bigint_dict10 | 47.7 | 47.3 | 50.5 | 23.3 | 18432 |
+| bigint_dict100 | 48.4 | 47.5 | 53.0 | 23.6 | 18432 |
+| bigint_const | 30.2 | 29.9 | 33.3 | 14.8 | 18432 |
+| bigint_flat_unique_null50 | 30.2 | 29.4 | 33.2 | 14.7 | 10048 |
+| bigint_dict100_null50 | 37.9 | 36.5 | 41.0 | 18.5 | 10048 |
+| bigint_const_null | 14.2 | 14.2 | 14.3 | 6.9 | 2048 |
+| nvarchar16_flat_unique | 77.3 | 69.8 | 84.0 | 37.7 | 69632 |
+| nvarchar16_flat_card10 | 77.5 | 77.2 | 83.0 | 37.9 | 69632 |
+| nvarchar16_dict1 | 83.2 | 81.3 | 88.0 | 40.6 | 69632 |
+| nvarchar16_dict10 | 83.7 | 77.7 | 87.8 | 40.9 | 69632 |
+| nvarchar16_dict100 | 82.6 | 82.3 | 86.6 | 40.3 | 69632 |
+| nvarchar16_const | 67.7 | 67.0 | 71.9 | 33.1 | 69632 |
+| nvarchar16_flat_unique_null50 | 49.1 | 44.3 | 54.4 | 24.0 | 36096 |
+| decimal18s6_flat_unique | 48.2 | 48.1 | 51.2 | 23.5 | 20480 |
+| decimal18s6_dict100 | 51.8 | 51.1 | 55.4 | 25.3 | 20480 |
+| decimal18s6_const | 39.2 | 39.0 | 42.1 | 19.1 | 20480 |
+
+Reading of the baseline (what W1/W2 and phase 3 target):
+
+- Encode is ~10× decode per value for BIGINT (18.3 vs 1.8 ns): two
+  `ToUnifiedFormat` calls per cell (NULL check + value read) plus per-value
+  buffer append dominate over the 9 wire bytes actually produced. Even the
+  pure-NULL path (`bigint_const_null`) costs 6.9 ns/value — that is the
+  per-cell dispatch + null-check floor, and the direct headroom for the
+  W1/W2 format-hoisting quick wins.
+- The current path is representation-blind the WRONG way around: dictionary
+  inputs are 15–25% SLOWER than flat (per-cell sel indirection, no reuse of
+  the repeated value's encoding), and cardinality within a representation
+  does not matter (card10 ≈ unique for both flat and dict). Consequence for
+  phasing: if the phase-2 scan starts emitting dictionary vectors before the
+  phase-3 representation-aware encoder lands, scan→COPY round-trips will
+  mildly regress on the write side — phase 3 must detect
+  `DictionaryVector::DictionarySize` and encode each distinct value once.
+- Constant vectors are already the cheapest input (~20% under flat) but still
+  pay the full per-row encode; a constant-aware encoder (encode once, replay
+  bytes) would collapse `*_const` cells to near the buffer-append floor.
+- NVARCHAR encode (37.7 ns/value at 16 ASCII chars) is ~1.6× its decode
+  (23.3): UTF-8→UTF-16 conversion into a fresh `vector<uint8_t>` per value
+  (`StringToUTF16LE`) plus the USHORT-prefixed append. DECIMAL encode
+  (23.5 ns) is cheaper than DECIMAL decode (36.0) but still ~4.4× the
+  datetime2 line — same big-number handling, milder than the decode side.
 
 ## e2e — TPC-H smoke (NOT baseline; single run, SF 0.01 only)
 

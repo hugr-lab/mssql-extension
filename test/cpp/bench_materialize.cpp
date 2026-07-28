@@ -37,6 +37,8 @@
 #include "codec/integer_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
+#include "copy/target_resolver.hpp"
+#include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
@@ -44,14 +46,32 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace duckdb {
+namespace mssql {
+
+// The bench links bcp_row_encoder.cpp but NOT target_resolver.cpp (that TU
+// drags in the catalog / ClientContext). EncodeRow's NULL path needs this one
+// method; the body mirrors target_resolver.cpp verbatim.
+bool BCPColumnMetadata::IsVariableLengthUSHORT() const {
+	// NVARCHARTYPE (0xE7) and BIGVARBINARYTYPE (0xA5) use USHORTLEN
+	return tds_type_token == 0xE7 || tds_type_token == 0xA5;
+}
+
+}  // namespace mssql
+}  // namespace duckdb
 
 using duckdb::DataChunk;
 using duckdb::FlatVector;
@@ -514,10 +534,203 @@ std::vector<FixedCell> BuildFixedCells() {
 	return cells;
 }
 
+//===----------------------------------------------------------------------===//
+// BCP-encode group (T6 part 2): the CURRENT write path — one
+// BCPRowEncoder::EncodeRow call per row (family dispatch; per-cell
+// ToUnifiedFormat in BOTH the NULL check and the codec value read), on
+// flat-unique / flat-low-cardinality / dictionary {1,10,100} / constant
+// inputs × NULL ratios. Dictionary inputs are built with
+// Vector::Dictionary(dict, dict_size, sel, count) — the same construction
+// the phase-2 scan will emit and the phase-3 representation-aware encoder
+// will detect via DictionaryVector::DictionarySize; the current path is
+// expected to be representation-blind (dict ≈ flat at equal value bytes).
+//===----------------------------------------------------------------------===//
+
+enum class VecRep { FlatUnique, FlatLowCard, Dict, Constant };
+
+struct BcpCellSpec {
+	enum class Kind { Bigint, Varchar16, Decimal18s6 };
+	std::string name;
+	Kind kind = Kind::Bigint;
+	VecRep rep = VecRep::FlatUnique;
+	size_t card = 2048;	 // distinct values (FlatLowCard / Dict)
+	int null_pct = 0;
+};
+
+bool RowIsNull(int null_pct, idx_t row) {
+	return null_pct >= 100 || (null_pct > 0 && (row % 100) < static_cast<idx_t>(null_pct));
+}
+
+LogicalType BcpTypeFor(BcpCellSpec::Kind k) {
+	switch (k) {
+	case BcpCellSpec::Kind::Bigint:
+		return LogicalType::BIGINT;
+	case BcpCellSpec::Kind::Varchar16:
+		return LogicalType::VARCHAR;
+	case BcpCellSpec::Kind::Decimal18s6:
+		return LogicalType::DECIMAL(18, 6);
+	}
+	return LogicalType::BIGINT;
+}
+
+duckdb::Value MakeBcpValue(BcpCellSpec::Kind k, size_t id) {
+	using duckdb::Value;
+	switch (k) {
+	case BcpCellSpec::Kind::Bigint:
+		return Value::BIGINT(static_cast<int64_t>(RowValue(id)));
+	case BcpCellSpec::Kind::Varchar16: {
+		// 16 ASCII chars: 8-char body + 8 hex digits of the distinct id.
+		char s[17];
+		std::snprintf(s, sizeof(s), "abcdefgh%08lx", static_cast<unsigned long>(id) & 0xFFFFFFFFUL);
+		return Value(std::string(s, 16));
+	}
+	case BcpCellSpec::Kind::Decimal18s6:
+		// Mantissa < 10^18 so the precision-18 range guard never fires.
+		return Value::DECIMAL(static_cast<int64_t>(RowValue(id) % 1000000000000000000ULL), 18, 6);
+	}
+	return Value();
+}
+
+struct BcpFixture {
+	BcpCellSpec spec;
+	std::unique_ptr<Vector> dict_base;	// keep the dictionary child alive
+	std::unique_ptr<DataChunk> chunk;
+	duckdb::vector<duckdb::mssql::BCPColumnMetadata> cols;
+};
+
+BcpFixture BuildBcpFixture(const BcpCellSpec &s) {
+	BcpFixture f;
+	f.spec = s;
+	LogicalType type = BcpTypeFor(s.kind);
+	f.chunk.reset(new DataChunk());
+	f.chunk->Initialize(duckdb::Allocator::DefaultAllocator(), {type});
+	auto &vec = f.chunk->data[0];
+
+	switch (s.rep) {
+	case VecRep::FlatUnique:
+	case VecRep::FlatLowCard: {
+		const size_t card = (s.rep == VecRep::FlatUnique) ? CHUNK_ROWS : s.card;
+		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
+			vec.SetValue(row, RowIsNull(s.null_pct, row) ? duckdb::Value(type) : MakeBcpValue(s.kind, row % card));
+		}
+		break;
+	}
+	case VecRep::Dict: {
+		// NULL rows point at a trailing NULL child slot — the emission shape
+		// planned for the phase-2 scan.
+		const bool has_null = s.null_pct > 0;
+		const idx_t dict_size = s.card + (has_null ? 1 : 0);
+		f.dict_base.reset(new Vector(type, dict_size));
+		for (idx_t i = 0; i < s.card; ++i) {
+			f.dict_base->SetValue(i, MakeBcpValue(s.kind, i));
+		}
+		if (has_null) {
+			f.dict_base->SetValue(s.card, duckdb::Value(type));
+		}
+		duckdb::SelectionVector sel(CHUNK_ROWS);
+		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
+			sel.set_index(row, RowIsNull(s.null_pct, row) ? s.card : (row % s.card));
+		}
+		vec.Dictionary(*f.dict_base, dict_size, sel, CHUNK_ROWS);
+		break;
+	}
+	case VecRep::Constant:
+		vec.Reference(s.null_pct >= 100 ? duckdb::Value(type) : MakeBcpValue(s.kind, 0));
+		break;
+	}
+	f.chunk->SetCardinality(CHUNK_ROWS);
+
+	duckdb::mssql::BCPColumnMetadata col("c", type, true);
+	switch (s.kind) {
+	case BcpCellSpec::Kind::Bigint:
+		col.tds_type_token = 0x26;	// INTNTYPE
+		col.max_length = 8;
+		break;
+	case BcpCellSpec::Kind::Varchar16:
+		col.tds_type_token = 0xE7;	// NVARCHARTYPE, nvarchar(16) — non-PLP USHORT path
+		col.max_length = 32;
+		break;
+	case BcpCellSpec::Kind::Decimal18s6:
+		col.tds_type_token = 0x6A;	// DECIMALNTYPE
+		col.max_length = 9;
+		col.precision = 18;
+		col.scale = 6;
+		break;
+	}
+	f.cols.push_back(col);
+	return f;
+}
+
+// One chunk encode — production shape: EncodeRow per row into one buffer
+// (clear() keeps capacity, matching the reused per-batch packet buffer).
+size_t EncodeChunkCurrent(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
+	buf.clear();
+	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
+		duckdb::tds::encoding::BCPRowEncoder::EncodeRow(buf, *f.chunk, row, f.cols, nullptr);
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
+// Reference: the Value-based encoder over GetValue(row) (resolves dict /
+// constant indirection independently). Byte-identical output required.
+// DECIMAL is the one arm where the Value overload is documented as divergent
+// from the Vector overload (legacy parity: Value::GetValue<hugeint_t>()
+// rescales the mantissa — see codec::decimal::EncodeToBcp(Value...)), so the
+// reference encodes the raw mantissa directly for that kind.
+bool VerifyBcp(BcpFixture &f, const duckdb::vector<uint8_t> &got) {
+	using duckdb::tds::encoding::BCPRowEncoder;
+	duckdb::vector<uint8_t> ref;
+	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
+		duckdb::Value v = f.chunk->data[0].GetValue(row);
+		if (f.spec.kind == BcpCellSpec::Kind::Decimal18s6 && !v.IsNull()) {
+			BCPRowEncoder::EncodeDecimal(ref, duckdb::hugeint_t(v.GetValueUnsafe<int64_t>()), f.cols[0].precision,
+										 f.cols[0].scale);
+		} else {
+			BCPRowEncoder::EncodeValue(ref, v, f.cols[0]);
+		}
+	}
+	return ref.size() == got.size() && std::equal(ref.begin(), ref.end(), got.begin());
+}
+
+std::vector<BcpCellSpec> BuildBcpCells() {
+	using K = BcpCellSpec::Kind;
+	std::vector<BcpCellSpec> cells;
+	auto add = [&](K k, VecRep rep, size_t card, int nulls, const std::string &name) {
+		BcpCellSpec s;
+		s.kind = k;
+		s.rep = rep;
+		s.card = card;
+		s.null_pct = nulls;
+		s.name = name;
+		cells.push_back(s);
+	};
+
+	struct KindRow {
+		K kind;
+		const char *prefix;
+	};
+	for (const KindRow &kr : {KindRow {K::Bigint, "bigint"}, KindRow {K::Varchar16, "nvarchar16"}}) {
+		add(kr.kind, VecRep::FlatUnique, 2048, 0, std::string(kr.prefix) + "_flat_unique");
+		add(kr.kind, VecRep::FlatLowCard, 10, 0, std::string(kr.prefix) + "_flat_card10");
+		for (size_t card : {1, 10, 100}) {
+			add(kr.kind, VecRep::Dict, card, 0, std::string(kr.prefix) + "_dict" + std::to_string(card));
+		}
+		add(kr.kind, VecRep::Constant, 1, 0, std::string(kr.prefix) + "_const");
+		add(kr.kind, VecRep::FlatUnique, 2048, 50, std::string(kr.prefix) + "_flat_unique_null50");
+	}
+	add(K::Bigint, VecRep::Dict, 100, 50, "bigint_dict100_null50");
+	add(K::Bigint, VecRep::Constant, 1, 100, "bigint_const_null");
+	add(K::Decimal18s6, VecRep::FlatUnique, 2048, 0, "decimal18s6_flat_unique");
+	add(K::Decimal18s6, VecRep::Dict, 100, 0, "decimal18s6_dict100");
+	add(K::Decimal18s6, VecRep::Constant, 1, 0, "decimal18s6_const");
+	return cells;
+}
+
 }  // namespace
 
 int main() {
-	std::printf("[bench_materialize] spec 054 D1 — string decode group (current path)\n");
+	std::printf("[bench_materialize] spec 054 D1 — string-decode / fixed-decode / bcp-encode groups (current path)\n");
 	std::printf("group\tcell\tus_per_chunk_median\tus_p10\tus_p90\tns_per_value_median"
 				"\tutf16_in_bytes\tutf8_out_bytes\tcorrect\n");
 
@@ -570,6 +783,29 @@ int main() {
 					correct ? "PASS" : "FAIL");
 		} catch (std::exception &ex) {
 			std::fprintf(stderr, "cell %s threw: %s\n", fc.name.c_str(), ex.what());
+			failures++;
+		}
+	}
+
+	for (const auto &bspec : BuildBcpCells()) {
+		try {
+			BcpFixture f = BuildBcpFixture(bspec);
+			duckdb::vector<uint8_t> buf;
+			buf.reserve(1 << 20);
+
+			size_t out_bytes = EncodeChunkCurrent(f, buf);
+			bool correct = VerifyBcp(f, buf);
+			if (!correct) {
+				failures++;
+			}
+
+			auto r = TimeCell([&]() { EncodeChunkCurrent(f, buf); }, 400);
+
+			std::printf("bcp_encode_current\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t%zu\t%s\n", bspec.name.c_str(),
+						r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value, out_bytes,
+						correct ? "PASS" : "FAIL");
+		} catch (std::exception &ex) {
+			std::fprintf(stderr, "cell %s threw: %s\n", bspec.name.c_str(), ex.what());
 			failures++;
 		}
 	}

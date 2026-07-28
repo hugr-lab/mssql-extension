@@ -359,6 +359,7 @@ bench-utf16: release
 # compiles the codec sources at -O3 so the timed body matches shipped code.
 BENCH_MAT_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
 BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
+    src/tds/encoding/bcp_row_encoder.cpp \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
     src/tds/encoding/decimal_encoding.cpp \
