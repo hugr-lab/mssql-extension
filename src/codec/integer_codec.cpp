@@ -24,6 +24,7 @@
 
 #include "codec/integer_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
@@ -45,15 +46,6 @@ namespace codec {
 namespace integer {
 
 namespace {
-
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
 
 void AppendInt8Bcp(duckdb::vector<uint8_t> &buf, int8_t value) {
 	buf.push_back(1);
@@ -145,48 +137,50 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	(void)in;
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::TINYINT:
-		AppendInt8Bcp(buf, GetVectorValue<int8_t>(in, row));
+		AppendInt8Bcp(buf, FormatValue<int8_t>(fmt, row));
 		return;
 	case LogicalTypeId::UTINYINT:
-		AppendUInt8Bcp(buf, GetVectorValue<uint8_t>(in, row));
+		AppendUInt8Bcp(buf, FormatValue<uint8_t>(fmt, row));
 		return;
 	case LogicalTypeId::SMALLINT:
-		AppendInt16Bcp(buf, GetVectorValue<int16_t>(in, row));
+		AppendInt16Bcp(buf, FormatValue<int16_t>(fmt, row));
 		return;
 	case LogicalTypeId::USMALLINT:
 		// USMALLINT (0-65535) widens to int32 to fit without overflow.
-		AppendInt32Bcp(buf, static_cast<int32_t>(GetVectorValue<uint16_t>(in, row)));
+		AppendInt32Bcp(buf, static_cast<int32_t>(FormatValue<uint16_t>(fmt, row)));
 		return;
 	case LogicalTypeId::INTEGER:
-		AppendInt32Bcp(buf, GetVectorValue<int32_t>(in, row));
+		AppendInt32Bcp(buf, FormatValue<int32_t>(fmt, row));
 		return;
 	case LogicalTypeId::UINTEGER:
 		// UINTEGER (0-4B) widens to int64 to fit without overflow.
-		AppendInt64Bcp(buf, static_cast<int64_t>(GetVectorValue<uint32_t>(in, row)));
+		AppendInt64Bcp(buf, static_cast<int64_t>(FormatValue<uint32_t>(fmt, row)));
 		return;
 	case LogicalTypeId::BIGINT:
-		AppendInt64Bcp(buf, GetVectorValue<int64_t>(in, row));
+		AppendInt64Bcp(buf, FormatValue<int64_t>(fmt, row));
 		return;
 	case LogicalTypeId::UBIGINT: {
 		// UBIGINT (0-18e18) uses DECIMAL(20,0) on the wire — SQL Server BIGINT is signed.
 		// Two-argument hugeint_t(upper=0, lower=val) avoids sign issues when val > INT64_MAX.
-		uint64_t val = GetVectorValue<uint64_t>(in, row);
+		uint64_t val = FormatValue<uint64_t>(fmt, row);
 		tds::encoding::BCPRowEncoder::EncodeDecimal(buf, hugeint_t(0, val), col.precision, col.scale);
 		return;
 	}
 	case LogicalTypeId::HUGEINT: {
 		// #177: HUGEINT (e.g. SUM() over integers) encodes as DECIMAL(38,0),
 		// consistent with the DDL and literal paths.
-		hugeint_t val = GetVectorValue<hugeint_t>(in, row);
+		hugeint_t val = FormatValue<hugeint_t>(fmt, row);
 		CheckHugeintFitsDecimal38(val, col.name);
 		tds::encoding::BCPRowEncoder::EncodeDecimal(buf, val, col.precision, col.scale);
 		return;
 	}
 	case LogicalTypeId::UHUGEINT: {
-		uhugeint_t val = GetVectorValue<uhugeint_t>(in, row);
+		uhugeint_t val = FormatValue<uhugeint_t>(fmt, row);
 		CheckUhugeintFitsDecimal38(val, col.name);
 		// Guarded value is < 2^127, so the signed reinterpretation is lossless.
 		tds::encoding::BCPRowEncoder::EncodeDecimal(buf, hugeint_t(static_cast<int64_t>(val.upper), val.lower),
@@ -196,6 +190,12 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 	default:
 		throw NotImplementedException("codec::integer::EncodeToBcp: unsupported type %s", col.duckdb_type.ToString());
 	}
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

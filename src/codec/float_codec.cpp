@@ -23,6 +23,7 @@
 
 #include "codec/float_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 
@@ -39,15 +40,6 @@ namespace codec {
 namespace float_family {
 
 namespace {
-
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
 
 void AppendFloatBcp(duckdb::vector<uint8_t> &buf, float value) {
 	buf.push_back(4);
@@ -117,18 +109,25 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// Other sizes silently skip (mirror legacy ConvertFloat — defensive only).
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,
+				 duckdb::vector<uint8_t> &buf) {
 	switch (in.GetType().id()) {
 	case LogicalTypeId::FLOAT:
-		AppendFloatBcp(buf, GetVectorValue<float>(in, row));
+		AppendFloatBcp(buf, FormatValue<float>(fmt, row));
 		break;
 	case LogicalTypeId::DOUBLE:
-		AppendDoubleBcp(buf, GetVectorValue<double>(in, row));
+		AppendDoubleBcp(buf, FormatValue<double>(fmt, row));
 		break;
 	default:
 		throw InternalException("codec::float_family::EncodeToBcp: unexpected LogicalType '%s'",
 								in.GetType().ToString());
 	}
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {

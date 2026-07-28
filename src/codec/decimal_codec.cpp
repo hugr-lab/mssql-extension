@@ -33,6 +33,7 @@
 
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
+#include "codec/vector_format.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -53,27 +54,18 @@ namespace decimal {
 
 namespace {
 
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
-
 // Widen the value to hugeint based on DuckDB's PhysicalType. Mirrors
 // the dispatch in BCPRowEncoder::EncodeRow DECIMAL arm.
-hugeint_t WidenVectorToHugeint(Vector &vec, idx_t row_idx) {
+hugeint_t WidenVectorToHugeint(Vector &vec, const UnifiedVectorFormat &fmt, idx_t row_idx) {
 	switch (vec.GetType().InternalType()) {
 	case PhysicalType::INT16:
-		return hugeint_t(GetVectorValue<int16_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int16_t>(fmt, row_idx));
 	case PhysicalType::INT32:
-		return hugeint_t(GetVectorValue<int32_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int32_t>(fmt, row_idx));
 	case PhysicalType::INT64:
-		return hugeint_t(GetVectorValue<int64_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int64_t>(fmt, row_idx));
 	case PhysicalType::INT128:
-		return GetVectorValue<hugeint_t>(vec, row_idx);
+		return FormatValue<hugeint_t>(fmt, row_idx);
 	default:
 		throw InternalException("codec::decimal::EncodeToBcp: unexpected PhysicalType for DECIMAL");
 	}
@@ -116,10 +108,17 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	hugeint_t value = WidenVectorToHugeint(in, row);
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	hugeint_t value = WidenVectorToHugeint(in, fmt, row);
 	CheckMantissaFitsPrecision(value, col);
 	tds::encoding::BCPRowEncoder::EncodeDecimal(buf, value, col.precision, col.scale);
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

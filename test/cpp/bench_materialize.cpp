@@ -661,15 +661,37 @@ BcpFixture BuildBcpFixture(const BcpCellSpec &s) {
 	return f;
 }
 
-// One chunk encode — production shape: EncodeRow per row into one buffer
-// (clear() keeps capacity, matching the reused per-batch packet buffer).
-size_t EncodeChunkCurrent(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
+// Per-row compatibility path: EncodeRow per row into one buffer (clear()
+// keeps capacity). Pre-W1 this was the production shape (group
+// bcp_encode_current in the baseline tables); post-W1 it is the per-row
+// API (one format build per cell) and reports as bcp_encode_perrow.
+size_t EncodeChunkPerRow(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 	buf.clear();
 	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 		duckdb::tds::encoding::BCPRowEncoder::EncodeRow(buf, *f.chunk, row, f.cols, nullptr);
 	}
 	g_sink ^= buf.size();
 	return buf.size();
+}
+
+// Production shape post-W1/W2: one EncodeChunk call — per-column format /
+// encoder / NULL-kind hoisted once, 0xD1 ROW token written per row.
+size_t EncodeChunkHoisted(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
+	buf.clear();
+	duckdb::tds::encoding::BCPRowEncoder::EncodeChunk(buf, *f.chunk, f.cols, nullptr);
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
+// Hoisted output must equal the per-row path's output with one 0xD1 token
+// injected per row — old-vs-new byte equivalence inside one binary.
+bool VerifyHoisted(BcpFixture &f, const duckdb::vector<uint8_t> &got) {
+	duckdb::vector<uint8_t> expect;
+	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
+		expect.push_back(0xD1);
+		duckdb::tds::encoding::BCPRowEncoder::EncodeRow(expect, *f.chunk, row, f.cols, nullptr);
+	}
+	return expect.size() == got.size() && std::equal(expect.begin(), expect.end(), got.begin());
 }
 
 // Reference: the Value-based encoder over GetValue(row) (resolves dict /
@@ -793,17 +815,29 @@ int main() {
 			duckdb::vector<uint8_t> buf;
 			buf.reserve(1 << 20);
 
-			size_t out_bytes = EncodeChunkCurrent(f, buf);
+			size_t out_bytes = EncodeChunkPerRow(f, buf);
 			bool correct = VerifyBcp(f, buf);
 			if (!correct) {
 				failures++;
 			}
 
-			auto r = TimeCell([&]() { EncodeChunkCurrent(f, buf); }, 400);
+			auto r = TimeCell([&]() { EncodeChunkPerRow(f, buf); }, 400);
 
-			std::printf("bcp_encode_current\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t%zu\t%s\n", bspec.name.c_str(),
+			std::printf("bcp_encode_perrow\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t%zu\t%s\n", bspec.name.c_str(),
 						r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value, out_bytes,
 						correct ? "PASS" : "FAIL");
+
+			size_t hoisted_bytes = EncodeChunkHoisted(f, buf);
+			bool hoisted_correct = VerifyHoisted(f, buf);
+			if (!hoisted_correct) {
+				failures++;
+			}
+
+			auto rh = TimeCell([&]() { EncodeChunkHoisted(f, buf); }, 400);
+
+			std::printf("bcp_encode_hoisted\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t%zu\t%s\n", bspec.name.c_str(),
+						rh.median_us_per_chunk, rh.p10_us_per_chunk, rh.p90_us_per_chunk, rh.median_ns_per_value,
+						hoisted_bytes, hoisted_correct ? "PASS" : "FAIL");
 		} catch (std::exception &ex) {
 			std::fprintf(stderr, "cell %s threw: %s\n", bspec.name.c_str(), ex.what());
 			failures++;

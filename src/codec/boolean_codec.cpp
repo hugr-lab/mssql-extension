@@ -19,6 +19,7 @@
 
 #include "codec/boolean_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 
@@ -29,27 +30,23 @@ namespace mssql {
 namespace codec {
 namespace boolean {
 
-namespace {
-
-bool GetVectorBool(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<bool>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
-
-}  // namespace
-
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata & /*col*/, Vector &out, idx_t row) {
 	bool b = !bytes.empty() && bytes[0] != 0;
 	FlatVector::GetData<bool>(out)[row] = b;
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {
-	bool v = GetVectorBool(in, row);
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,
+				 duckdb::vector<uint8_t> &buf) {
+	(void)in;
+	bool v = FormatValue<bool>(fmt, row);
 	buf.push_back(1);
 	buf.push_back(v ? 0x01 : 0x00);
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {

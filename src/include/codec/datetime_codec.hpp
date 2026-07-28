@@ -48,6 +48,8 @@
 
 namespace duckdb {
 
+struct UnifiedVectorFormat;
+
 namespace tds {
 struct ColumnMetadata;
 }  // namespace tds
@@ -62,6 +64,11 @@ namespace codec {
 namespace datetime {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+// W1 (spec 054): format-threaded overload — fmt is built once per column per
+// chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
+// wraps it for per-row callers (builds the format per call).
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+                 duckdb::vector<uint8_t> &buf);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 // Single-Value overload for the BCPRowEncoder::EncodeValue public path.
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);

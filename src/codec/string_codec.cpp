@@ -9,6 +9,7 @@
 
 #include "codec/string_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "duckdb/common/exception.hpp"
@@ -29,15 +30,6 @@ namespace codec {
 namespace string {
 
 namespace {
-
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
 
 // Defer to the public EscapeSqlSingleQuotes API for in-module callers so
 // both this file and external callers (FilterEncoder LIKE emitter) share
@@ -178,10 +170,12 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	(void)in;
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::VARCHAR: {
-		auto str_val = GetVectorValue<string_t>(in, row);
+		auto str_val = FormatValue<string_t>(fmt, row);
 		EncodeNVarcharFromUtf8(str_val.GetData(), str_val.GetSize(), col, buf);
 		return;
 	}
@@ -189,7 +183,7 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 		// Render interval as canonical T-SQL-safe string before encoding.
 		// New behaviour for INTERVAL columns (FR-026 — DDL routes to
 		// NVARCHAR(50), encode routes to the canonical string form).
-		auto iv = GetVectorValue<interval_t>(in, row);
+		auto iv = FormatValue<interval_t>(fmt, row);
 		auto str = Interval::ToString(iv);
 		EncodeNVarcharFromUtf8(str.c_str(), str.size(), col, buf);
 		return;
@@ -197,6 +191,12 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 	default:
 		throw NotImplementedException("codec::string::EncodeToBcp: unsupported type %s", col.duckdb_type.ToString());
 	}
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

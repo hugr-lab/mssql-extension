@@ -130,9 +130,6 @@ private:
 	// Build COLMETADATA token into buffer
 	void BuildColmetadataToken(vector<uint8_t> &buffer);
 
-	// Build ROW token for a single row into buffer
-	void BuildRowToken(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx);
-
 	// Build DONE token into buffer
 	void BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count);
 

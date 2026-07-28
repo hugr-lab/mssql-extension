@@ -9,6 +9,7 @@
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
 #include "codec/uuid_codec.hpp"
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -26,19 +27,6 @@ constexpr int32_t DAYS_FROM_0001_TO_EPOCH = 719162;
 // Microseconds per day
 constexpr int64_t MICROS_PER_DAY = 86400000000LL;
 
-//===----------------------------------------------------------------------===//
-// Helper: Get value from vector (handles both flat and constant vectors)
-//===----------------------------------------------------------------------===//
-
-template <typename T>
-static T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);	 // We only need format info, not count
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
-
 // Money family is decode-only (DuckDB has no MONEY LogicalType — SQL Server
 // MONEY/SMALLMONEY/MONEYN tokens surface as DECIMAL on decode). The Money arm
 // in BCP encode is a compile-required exhaustiveness placeholder + runtime
@@ -51,92 +39,142 @@ static T GetVectorValue(Vector &vec, idx_t row_idx) {
 		type.ToString());
 }
 
-static bool IsVectorNull(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto idx = format.sel->get_index(row_idx);
-	return !format.validity.RowIsValid(idx);
+//===----------------------------------------------------------------------===//
+// W1+W2 (spec 054): per-column encode state, hoisted once per chunk.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// TDS BCP ROW token (written by EncodeChunk, one per row).
+constexpr uint8_t BCP_TOKEN_ROW = 0xD1;
+
+// Family encoder signature — the format-threaded codec overloads.
+using EncodeFn = void (*)(Vector &, const UnifiedVectorFormat &, idx_t, const mssql::BCPColumnMetadata &,
+						  vector<uint8_t> &);
+
+// Wire form of NULL for a column, resolved once (was an IsPLPType /
+// IsVariableLengthUSHORT branch pair per cell).
+enum class NullWireKind : uint8_t { Plp, VariableUShort, Fixed };
+
+[[noreturn]] static void EncodeMoneyUnreachable(Vector &vec, const UnifiedVectorFormat &, idx_t,
+												const mssql::BCPColumnMetadata &, vector<uint8_t> &) {
+	ThrowMoneyUnreachable(vec.GetType());
 }
 
+// W2: resolve the family encoder once per column (was a 9-way switch per row).
+EncodeFn ResolveEncoder(const mssql::BCPColumnMetadata &col) {
+	mssql::codec::TypeFamily family;
+	try {
+		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
+	} catch (const NotImplementedException &) {
+		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+	}
+	switch (family) {
+	case mssql::codec::TypeFamily::Boolean:
+		return mssql::codec::boolean::EncodeToBcp;
+	case mssql::codec::TypeFamily::Integer:
+		return mssql::codec::integer::EncodeToBcp;
+	case mssql::codec::TypeFamily::Float:
+		return mssql::codec::float_family::EncodeToBcp;
+	case mssql::codec::TypeFamily::Decimal:
+		return mssql::codec::decimal::EncodeToBcp;
+	case mssql::codec::TypeFamily::String:
+		return mssql::codec::string::EncodeToBcp;
+	case mssql::codec::TypeFamily::Binary:
+		return mssql::codec::binary::EncodeToBcp;
+	case mssql::codec::TypeFamily::Uuid:
+		return mssql::codec::uuid::EncodeToBcp;
+	case mssql::codec::TypeFamily::DateTime:
+		return mssql::codec::datetime::EncodeToBcp;
+	case mssql::codec::TypeFamily::Money:
+		return EncodeMoneyUnreachable;
+	}
+	return EncodeMoneyUnreachable;	// unreachable — switch is exhaustive
+}
+
+struct ColumnEncodeState {
+	Vector *vec = nullptr;	// nullptr → source column missing: NULL every row
+	UnifiedVectorFormat fmt;
+	EncodeFn encode = nullptr;
+	NullWireKind null_kind = NullWireKind::Fixed;
+};
+
+void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
+	switch (kind) {
+	case NullWireKind::Plp:
+		BCPRowEncoder::EncodeNullPLP(buffer);
+		return;
+	case NullWireKind::VariableUShort:
+		BCPRowEncoder::EncodeNullVariable(buffer);
+		return;
+	case NullWireKind::Fixed:
+		BCPRowEncoder::EncodeNullFixed(buffer);
+		return;
+	}
+}
+
+// Build the hoisted per-column state. `format_count` is the row count the
+// UnifiedVectorFormat is computed for (chunk size for EncodeChunk; row+1 for
+// the per-row EncodeRow compatibility path).
+void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssql::BCPColumnMetadata> &columns,
+						 const vector<int32_t> *column_mapping, vector<ColumnEncodeState> &states) {
+	states.resize(columns.size());
+	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
+		auto &col = columns[target_idx];
+		auto &state = states[target_idx];
+		state.null_kind = col.IsPLPType() ? NullWireKind::Plp
+										  : (col.IsVariableLengthUSHORT() ? NullWireKind::VariableUShort
+																		  : NullWireKind::Fixed);
+		// If source_idx is -1 or out of range, the column stays NULL for every row.
+		int32_t source_idx = column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
+		if (source_idx < 0 || static_cast<idx_t>(source_idx) >= chunk.ColumnCount()) {
+			continue;
+		}
+		state.vec = &chunk.data[source_idx];
+		state.vec->ToUnifiedFormat(format_count, state.fmt);
+		state.encode = ResolveEncoder(col);
+	}
+}
+
+// Encode one row from prepared states (no 0xD1 token byte).
+void EncodeRowFromStates(vector<uint8_t> &buffer, idx_t row_idx, const vector<mssql::BCPColumnMetadata> &columns,
+						 vector<ColumnEncodeState> &states) {
+	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
+		auto &state = states[target_idx];
+		if (!state.vec || mssql::codec::FormatIsNull(state.fmt, row_idx)) {
+			EncodeNullOfKind(buffer, state.null_kind);
+			continue;
+		}
+		state.encode(*state.vec, state.fmt, row_idx, columns[target_idx], buffer);
+	}
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
-// Row-Level Encoding
+// Chunk- and Row-Level Encoding
 //===----------------------------------------------------------------------===//
+
+void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
+								const vector<mssql::BCPColumnMetadata> &columns,
+								const vector<int32_t> *column_mapping) {
+	const idx_t row_count = chunk.size();
+	if (row_count == 0) {
+		return;
+	}
+	vector<ColumnEncodeState> states;
+	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
+	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
+		buffer.push_back(BCP_TOKEN_ROW);
+		EncodeRowFromStates(buffer, row_idx, columns, states);
+	}
+}
 
 void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx,
 							  const vector<mssql::BCPColumnMetadata> &columns, const vector<int32_t> *column_mapping) {
-	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
-		auto &col = columns[target_idx];
-
-		// Determine source column index
-		// If column_mapping is provided, use it; otherwise assume 1:1 positional mapping
-		int32_t source_idx = column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
-
-		// If source_idx is -1 or out of range, encode NULL for this target column
-		if (source_idx < 0 || static_cast<idx_t>(source_idx) >= chunk.ColumnCount()) {
-			// Encode NULL based on type
-			if (col.IsPLPType()) {
-				EncodeNullPLP(buffer);
-			} else if (col.IsVariableLengthUSHORT()) {
-				EncodeNullVariable(buffer);
-			} else {
-				EncodeNullFixed(buffer);
-			}
-			continue;
-		}
-
-		auto &vec = chunk.data[source_idx];
-
-		// Check for NULL (handles both flat and constant vectors)
-		if (IsVectorNull(vec, row_idx)) {
-			// Encode NULL based on type
-			if (col.IsPLPType()) {
-				EncodeNullPLP(buffer);
-			} else if (col.IsVariableLengthUSHORT()) {
-				EncodeNullVariable(buffer);
-			} else {
-				EncodeNullFixed(buffer);
-			}
-			continue;
-		}
-
-		// Family-level dispatch — the per-type LogicalTypeId fan-out lives
-		// inside FamilyFromLogicalType (spec 045). FamilyFromLogicalType throws
-		// NotImplementedException for unsupported types; rethrow with BCP-specific message.
-		mssql::codec::TypeFamily family;
-		try {
-			family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
-		} catch (const NotImplementedException &) {
-			throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
-		}
-		switch (family) {
-		case mssql::codec::TypeFamily::Boolean:
-			mssql::codec::boolean::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Integer:
-			mssql::codec::integer::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Float:
-			mssql::codec::float_family::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Decimal:
-			mssql::codec::decimal::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::String:
-			mssql::codec::string::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Binary:
-			mssql::codec::binary::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Uuid:
-			mssql::codec::uuid::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::DateTime:
-			mssql::codec::datetime::EncodeToBcp(vec, row_idx, col, buffer);
-			break;
-		case mssql::codec::TypeFamily::Money:
-			ThrowMoneyUnreachable(col.duckdb_type);
-		}
-	}
+	vector<ColumnEncodeState> states;
+	PrepareColumnStates(chunk, row_idx + 1, columns, column_mapping, states);
+	EncodeRowFromStates(buffer, row_idx, columns, states);
 }
 
 void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, const mssql::BCPColumnMetadata &col) {

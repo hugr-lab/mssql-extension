@@ -167,6 +167,63 @@ Reading of the baseline (what W1/W2 and phase 3 target):
   (23.5 ns) is cheaper than DECIMAL decode (36.0) but still ~4.4× the
   datetime2 line — same big-number handling, milder than the decode side.
 
+## Delta — W1+W2 hoisted BCP encode (T9, 2026-07-28)
+
+W1: `UnifiedVectorFormat` built once per column per chunk (was twice per
+CELL — null check + value read). W2: family encoder + NULL wire kind
+resolved once per column per chunk (was a 9-way switch + two branch pairs
+per cell). New production path `BCPRowEncoder::EncodeChunk` (writes the
+0xD1 ROW token per row — hoisted wire bytes below include it);
+`BCPWriter::WriteRows` switched to it; `BuildRowToken` deleted. Per-cell
+byte-equivalence against the per-row path asserted in-bench for all 19
+cells; `diff_check.sh` pre-W1 binary vs post-W1 build: 13/13 byte-identical
+(incl. the BCP write-back case). Bonus fix: uuid/binary codecs read via
+`FlatVector::GetData` before — wrong for dictionary/constant inputs; now
+format-based.
+
+| cell | baseline ns/value | hoisted ns/value | speedup |
+| --- | --- | --- | --- |
+| bigint_flat_unique | 18.3 | 8.2 | 2.2× |
+| bigint_flat_card10 | 18.3 | 8.5 | 2.2× |
+| bigint_dict1 | 22.9 | 8.3 | 2.8× |
+| bigint_dict10 | 23.3 | 8.3 | 2.8× |
+| bigint_dict100 | 23.6 | 8.5 | 2.8× |
+| bigint_const | 14.8 | 8.3 | 1.8× |
+| bigint_flat_unique_null50 | 14.7 | 6.0 | 2.5× |
+| bigint_dict100_null50 | 18.5 | 6.1 | 3.0× |
+| bigint_const_null | 6.9 | 3.9 | 1.8× |
+| nvarchar16_flat_unique | 37.7 | 27.4 | 1.4× |
+| nvarchar16_flat_card10 | 37.9 | 27.4 | 1.4× |
+| nvarchar16_dict1 | 40.6 | 27.9 | 1.5× |
+| nvarchar16_dict10 | 40.9 | 27.6 | 1.5× |
+| nvarchar16_dict100 | 40.3 | 28.1 | 1.4× |
+| nvarchar16_const | 33.1 | 27.6 | 1.2× |
+| nvarchar16_flat_unique_null50 | 24.0 | 15.7 | 1.5× |
+| decimal18s6_flat_unique | 23.5 | 12.4 | 1.9× |
+| decimal18s6_dict100 | 25.3 | 11.7 | 2.2× |
+| decimal18s6_const | 19.1 | 11.7 | 1.6× |
+
+Reading of the delta:
+
+- The dictionary penalty is GONE (dict cells now equal flat at ~8.3 ns for
+  bigint; were 15–25% slower) — the per-cell sel indirection cost was
+  entirely in the repeated ToUnifiedFormat, not in the sel lookup itself.
+  This unblocks the phase-2/3 sequencing concern from the baseline reading.
+- NULL handling floor halved (6.9 → 3.9 ns for a constant-NULL column;
+  null50 cells 2.5–3.0×) — the null check now reuses the hoisted format.
+- Remaining nvarchar cost (27.4 ns/value) is dominated by the per-value
+  UTF-16 conversion + double validation — the W3 target. DECIMAL encode is
+  down to 12 ns (big-number assembly remains).
+- The per-row `EncodeRow` API survives as a compatibility path only (bench
+  group renamed `bcp_encode_perrow`); it now heap-allocates its column
+  state per call and has NO production callers — do not reintroduce it in
+  hot paths.
+- e2e (same-session interleaved medians-of-3, SF 0.1): copy_lineitem
+  −7.5%, copy_customer −6.2%, scan steps flat (decode untouched);
+  sub-200 ms steps swing ±18% in both directions on untouched code —
+  noise, per the baseline note. Full D3 re-run happens after all D8 wins
+  (T12) against the recorded constants.
+
 ## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
 
 `test/bench/bench_tpch_e2e.sh`, tree commit `722caf8`, 3 sequential full

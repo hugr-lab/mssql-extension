@@ -29,6 +29,7 @@
 
 #include "codec/binary_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
@@ -71,14 +72,23 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		StringVector::AddStringOrBlob(out, reinterpret_cast<const char *>(bytes.data()), bytes.size());
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	auto data = FlatVector::GetData<string_t>(in);
-	const string_t &blob = data[row];
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	// Format-based access (was FlatVector::GetData — wrong for dictionary/
+	// constant inputs; fixed as part of the W1 hoisting, spec 054).
+	(void)in;
+	const string_t blob = FormatValue<string_t>(fmt, row);
 	if (col.IsPLPType()) {
 		tds::encoding::BCPRowEncoder::EncodeBinaryPLP(buf, blob);
 	} else {
 		tds::encoding::BCPRowEncoder::EncodeBinary(buf, blob);
 	}
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	UnifiedVectorFormat fmt;
+	in.ToUnifiedFormat(row + 1, fmt);
+	EncodeToBcp(in, fmt, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

@@ -157,12 +157,12 @@ idx_t BCPWriter::WriteRows(DataChunk &chunk) {
 	const uint64_t utf16_fallbacks_at_entry = counters_enabled_ ? tds::encoding::Utf16FallbackCount() : 0;
 
 	auto start_encode = Clock::now();
-	// Accumulate rows into the accumulator buffer
-	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-		// Build ROW token for this row
-		BuildRowToken(accumulator_buffer_, chunk, row_idx);
-		rows_written++;
-	}
+	// Accumulate all rows into the accumulator buffer. EncodeChunk writes the
+	// 0xD1 ROW token per row and hoists per-column state (UnifiedVectorFormat,
+	// family encoder, NULL wire kind) once per chunk (spec 054 W1+W2).
+	const vector<int32_t> *mapping_ptr = column_mapping_.empty() ? nullptr : &column_mapping_;
+	tds::encoding::BCPRowEncoder::EncodeChunk(accumulator_buffer_, chunk, columns_, mapping_ptr);
+	rows_written = row_count;
 	double encode_ms = ElapsedMs(start_encode);
 
 	size_t bytes_added = accumulator_buffer_.size() - buffer_start;
@@ -503,20 +503,6 @@ void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 		// Column name (B_VARCHAR format: length byte + UTF-16LE)
 		WriteUTF16LEString(buffer, col.name);
 	}
-}
-
-void BCPWriter::BuildRowToken(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx) {
-	// ROW token format:
-	// Token (1 byte): 0xD1
-	// Column values (variable): Type-specific encoding for each column
-
-	// Token
-	WriteUInt8(buffer, TOKEN_ROW);
-
-	// Encode all column values using BCPRowEncoder
-	// Pass column mapping if we have one (for name-based source-to-target mapping)
-	const vector<int32_t> *mapping_ptr = column_mapping_.empty() ? nullptr : &column_mapping_;
-	tds::encoding::BCPRowEncoder::EncodeRow(buffer, chunk, row_idx, columns_, mapping_ptr);
 }
 
 void BCPWriter::BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count) {

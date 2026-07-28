@@ -35,8 +35,25 @@ public:
 	// Row-Level Encoding
 	//===----------------------------------------------------------------------===//
 
+	// Encode ALL rows of a DataChunk into buffer, one 0xD1 ROW token per row
+	// (token byte INCLUDED, unlike EncodeRow). W1+W2 (spec 054): per-column
+	// state — UnifiedVectorFormat, resolved family encoder, NULL wire kind —
+	// is hoisted once per chunk instead of being rebuilt per cell. This is
+	// the production write path (BCPWriter::WriteRows).
+	// @param buffer Output buffer (appended to)
+	// @param chunk Source DataChunk (chunk.size() rows are encoded)
+	// @param columns Column metadata for type information (target columns)
+	// @param column_mapping Optional mapping: mapping[target_idx] = source_idx, or -1 for NULL
+	//                       If nullptr, assumes 1:1 positional mapping
+	static void EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
+							const vector<mssql::BCPColumnMetadata> &columns,
+							const vector<int32_t> *column_mapping = nullptr);
+
 	// Encode a complete row from DataChunk into buffer
 	// Iterates columns and calls type-specific encoders
+	// Per-row compatibility path: rebuilds the per-column state (formats,
+	// encoder resolution) on every call — prefer EncodeChunk for whole-chunk
+	// encoding.
 	// @param buffer Output buffer (ROW token data, not including 0xD1)
 	// @param chunk Source DataChunk
 	// @param row_idx Row index within the chunk
