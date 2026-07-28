@@ -14,6 +14,7 @@ Status of the baseline capture (D6):
 | Micro: fixed-decode + bcp-encode groups | pending (T6) |
 | Micro: Linux x86_64 run | pending (T7) |
 | e2e: TPC-H SF 0.01/0.1/1 median-of-≥3 | pending (T7; single smoke run noted below) |
+| Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | pending (gates the phase-0 merge) |
 
 ## Environment (macOS reference machine)
 

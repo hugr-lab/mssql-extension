@@ -23,7 +23,19 @@
 #   MSSQL_TEST_PASS         default: TestPassword1
 #   MSSQL_TEST_DB           default: TestDB
 #   MSSQL_BENCH_SF_LIST     default: "0.01 0.1 1"  (spec: SF 10 optional,
-#                           append it when the Docker volume allows)
+#                           append it when the Docker volume allows; the
+#                           pre-merge release comparison uses SF 2 so that
+#                           lineitem holds >= 10M rows)
+#   MSSQL_BENCH_LOAD_SQL    SQL prefix to load the mssql extension; empty
+#                           (default) relies on the bench-build CLI's
+#                           built-in mssql. For the pre-merge release
+#                           comparison run a STOCK duckdb CLI with e.g.
+#                             "INSTALL mssql FROM community; LOAD mssql;"
+#                           or an unsigned local build with
+#                             "LOAD '/abs/path/mssql.duckdb_extension';"
+#                           (dbgen autoloads core tpch in a stock CLI)
+#   MSSQL_BENCH_UNSIGNED    set to 1 to pass -unsigned (needed for LOAD of
+#                           a local unsigned extension into a stock CLI)
 #   MSSQL_BENCH_OUTPUT      default: /tmp/bench_tpch_e2e_<epoch>.txt
 #
 # Output:
@@ -49,6 +61,19 @@ USER="${MSSQL_TEST_USER:-sa}"
 PASS="${MSSQL_TEST_PASS:-TestPassword1}"
 DB="${MSSQL_TEST_DB:-TestDB}"
 SF_LIST="${MSSQL_BENCH_SF_LIST:-0.01 0.1 1}"
+LOAD_SQL="${MSSQL_BENCH_LOAD_SQL:-}"
+
+# Plain string (not an array): empty-array expansion errors under set -u on
+# macOS's bash 3.2. Single-token flag, so unquoted expansion is safe.
+UNSIGNED_FLAG=""
+if [ "${MSSQL_BENCH_UNSIGNED:-0}" = "1" ]; then
+	UNSIGNED_FLAG="-unsigned"
+fi
+
+# Every SQL invocation goes through this wrapper so LOAD_SQL applies uniformly.
+run_sql() {
+	"$DUCKDB_BIN" $UNSIGNED_FLAG -c "${LOAD_SQL} $1"
+}
 
 OUTPUT_DEFAULT="/tmp/bench_tpch_e2e_$(date +%s).txt"
 OUTPUT_FILE="${MSSQL_BENCH_OUTPUT:-$OUTPUT_DEFAULT}"
@@ -66,9 +91,10 @@ echo "[bench_tpch_e2e] Scale factors: ${SF_LIST}"
 echo "[bench_tpch_e2e] Output file: ${OUTPUT_FILE}"
 echo ""
 
-# Pre-flight: the CLI must have tpch (dbgen) AND mssql (ATTACH) built in.
+# Pre-flight: the CLI must provide tpch (dbgen) and mssql (built-in for a
+# bench-build CLI, or via MSSQL_BENCH_LOAD_SQL for a stock one).
 echo "[bench_tpch_e2e] Pre-flight: dbgen(sf=0) + ATTACH + SELECT 1..."
-preflight_out=$("$DUCKDB_BIN" -c "CALL dbgen(sf=0); ATTACH '${DSN}' AS db (TYPE mssql); SELECT 1 AS ok;" 2>&1)
+preflight_out=$(run_sql "CALL dbgen(sf=0); ATTACH '${DSN}' AS db (TYPE mssql); SELECT 1 AS ok;" 2>&1)
 if ! echo "$preflight_out" | grep -q "ok"; then
 	echo "ERROR: pre-flight failed. Build with 'make bench-build' and check the DSN. Last output:" >&2
 	echo "$preflight_out" >&2
@@ -100,9 +126,9 @@ time_step() {
 	local t1
 	local seconds
 	t0=$(date +%s.%N)
-	if ! "$DUCKDB_BIN" -c "$sql" >/dev/null 2>&1; then
+	if ! run_sql "$sql" >/dev/null 2>&1; then
 		echo "ERROR: step '$step' failed. Aborting." >&2
-		"$DUCKDB_BIN" -c "$(cleanup_sql)" >/dev/null 2>&1 || true
+		run_sql "$(cleanup_sql)" >/dev/null 2>&1 || true
 		exit 4
 	fi
 	t1=$(date +%s.%N)
@@ -128,7 +154,7 @@ for SF in $SF_LIST; do
 	echo "[bench_tpch_e2e] === SF ${SF} ==="
 
 	echo "[bench_tpch_e2e] Cleanup: dropping bench_tpch_* server tables..."
-	"$DUCKDB_BIN" -c "$(cleanup_sql)" >/dev/null 2>&1 || true
+	run_sql "$(cleanup_sql)" >/dev/null 2>&1 || true
 	rm -f "$SRC_DB"
 
 	# dbgen — data generation into a persistent DuckDB file so each step is a
@@ -230,12 +256,22 @@ for SF in $SF_LIST; do
 		ORDER BY l_returnflag, l_linestatus;
 	" "${LINEITEM_ROWS}" "TPC-H Q1 over attached table (scan + aggregate)"
 
+	time_step "q6_local_${SFX}" "
+		ATTACH '${DSN}' AS db (TYPE mssql);
+		SELECT SUM(l_extendedprice * l_discount) AS revenue
+		FROM db.dbo.bench_tpch_lineitem
+		WHERE l_shipdate >= DATE '1994-01-01'
+		  AND l_shipdate < DATE '1995-01-01'
+		  AND l_discount BETWEEN 0.05 AND 0.07
+		  AND l_quantity < 24;
+	" "${LINEITEM_ROWS}" "TPC-H Q6 over attached table (selective filter pushdown)"
+
 	rm -f "$SRC_DB"
 done
 
 echo ""
 echo "[bench_tpch_e2e] Cleanup: dropping bench_tpch_* server tables..."
-"$DUCKDB_BIN" -c "$(cleanup_sql)" >/dev/null 2>&1 || true
+run_sql "$(cleanup_sql)" >/dev/null 2>&1 || true
 
 {
 	echo ""

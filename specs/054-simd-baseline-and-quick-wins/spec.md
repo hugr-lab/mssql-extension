@@ -87,6 +87,17 @@ Steps per SF:
 | `scan_lowcard` | TDS→DuckDB | `l_shipmode`/`l_returnflag` projection (dictionary win case, phases 2+) |
 | `scan_limit` | TDS→DuckDB | `LIMIT 10` cold bind (per-chunk overhead / abandonment) |
 | `q1_local` | mixed | TPC-H Q1 over the attached table (scan + aggregate) |
+| `q6_local` | mixed | TPC-H Q6 over the attached table (selective filter → pushdown) |
+
+**Pre-merge release comparison (maintainer requirement, 2026-07-28):** before the
+phase-0 changes merge, deploy TPC-H on SQL Server at a scale where `lineitem`
+holds ≥ 10M rows (SF 2 ≈ 12M) and run the query steps of this script from
+DuckDB twice on the same server: once with the **current release**
+(stock DuckDB CLI + `INSTALL mssql FROM community`, v0.2.2) and once with the
+**new build** — medians of ≥ 3 runs, recorded side-by-side in the D6 file.
+The script supports this via `MSSQL_BENCH_LOAD_SQL` / `MSSQL_BENCH_UNSIGNED`
+(load the released or a local unsigned extension into a stock CLI; dbgen
+autoloads core tpch there).
 
 ### D4. Counters (debug-only, zero-risk instrumentation of the current paths)
 
@@ -189,6 +200,9 @@ After D8: re-run D1 + D3, append the delta column to the baseline file.
 4. No changes to shipped defaults, settings, or wire behavior; counters invisible unless
    `MSSQL_DEBUG>=2`.
 5. Design doc updated if any finding here contradicts it (append to §Appendix A).
+6. Pre-merge: the D3 release comparison (current release vs new build, TPC-H on
+   SQL Server with `lineitem` ≥ 10M rows, query steps from DuckDB, median of ≥ 3)
+   is recorded in the D6 file and shows no step regressing > 3%.
 
 ## 5. Task order
 

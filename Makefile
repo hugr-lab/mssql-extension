@@ -364,11 +364,14 @@ BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
     src/tds/encoding/decimal_encoding.cpp \
     src/tds/encoding/guid_encoding.cpp
 
-bench-materialize: release
+# Deliberately NOT dependent on `release`: re-running the release configure
+# here would drop tpch from a `make bench-build` tree (the two targets share
+# build/release). Requires an existing release build (either flavor).
+bench-materialize:
 	@echo "Building materialization microbenchmark (spec 054)..."
 	@mkdir -p build/test
-	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
-		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
+		echo "ERROR: no release build found; run 'make release' or 'make bench-build' first." >&2; \
 		exit 1; \
 	fi
 	$(CXX) $(BENCH_MAT_FLAGS) $(BENCH_UTF16_INCLUDES) \
