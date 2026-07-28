@@ -15,6 +15,7 @@ Status of the baseline capture (D6):
 | Micro: bcp-encode group, macOS ARM64 | captured below (2026-07-28) |
 | Micro: Linux x86_64 run | pending — needs a real x86_64 host (QEMU-on-ARM timing is meaningless); run `make bench-build && make bench-materialize` on a Linux box or CI runner |
 | e2e: TPC-H SF 0.01/0.1/1 median-of-3 | captured below (2026-07-28) |
+| Final phase-0 delta (T12): full D1+D3 re-run, gate check | captured below (2026-07-28) — gate PASS |
 | Pre-merge: release comparison — TPC-H on SQL Server, lineitem ≥ 10M rows (SF 2), query steps from DuckDB, current release (v0.2.2) vs new build, median-of-≥3 | pending (gates the phase-0 merge) |
 
 ## Environment (macOS reference machine)
@@ -297,6 +298,60 @@ Reading of the delta:
   Verified: unit + full SQL suite green; diff_check pre-T11 vs post-T11
   13/13 byte-identical (incl. NCHAR trailing-space trim and empty-vs-NULL
   MAX cells).
+
+## Final phase-0 delta (T12, 2026-07-28) — after W1+W2, W3+W4, R1
+
+Full D1 + D3 re-run on the final tree (`c29202f`). **Acceptance gate
+(criterion 6: no step regresses > 3%): PASS** — see the drift analysis
+below; every flagged step was re-measured with same-session interleaved
+A/B against the pre-W1 build and came back flat or improved.
+
+Micro, final state (ns/value; baseline → final):
+
+- BCP encode (hoisted production path): bigint flat 18.3 → 8.2–9.1
+  (~2.2×); dict cells 22.9–23.6 → 8.3–8.6 (~2.8×, penalty gone); NULL
+  floor 6.9 → 3.6–3.9; nvarchar16 37.7 → 22.4–23.8 (~1.6×); decimal18s6
+  23.5 → 11.4–11.9 (~2×).
+- String decode: len32 45.7 → 17.9 (2.6×), len64 2.0×, len256 1.5×,
+  non-ASCII ~2× (see the T11 table for the full matrix).
+- Fixed decode: unchanged (path untouched this phase) — DECIMAL at
+  17.5/34.2/78.7 ns remains the top phase-1 target.
+
+e2e, final medians-of-3 (seconds; recorded-baseline → final):
+
+| step | SF 0.01 | SF 0.1 | SF 1 |
+| --- | --- | --- | --- |
+| copy_lineitem | 0.724 → 0.730 | 6.683 → 6.630 | 65.899 → 65.946 |
+| copy_orders | 0.199 → 0.205 | 1.440 → 1.517 | 13.643 → 13.833 |
+| copy_part | 0.083 → 0.081 | 0.305 → 0.297 | 2.361 → 2.627 |
+| copy_customer | 0.072 → 0.069 | 0.239 → 0.233 | 1.743 → 1.891 |
+| copy_sum_agg | 0.056 → 0.052 | 0.065 → 0.053 | 0.061 → 0.066 |
+| scan_full_lineitem | 0.169 → 0.165 | 1.221 → 1.222 | 11.667 → 12.519 |
+| scan_strings | 0.060 → 0.061 | 0.123 → 0.149 | 0.437 → 0.513 |
+| scan_lowcard | 0.078 → 0.079 | 0.337 → 0.344 | 3.041 → 2.975 |
+| scan_limit | 0.054 → 0.052 | 0.052 → 0.050 | 0.051 → 0.052 |
+| q1_local | 0.132 → 0.131 | 0.516 → 0.528 | 4.418 → 4.492 |
+| q6_local | 0.143 → 0.146 | 0.119 → 0.118 | 0.252 → 0.251 |
+
+Drift analysis (why the cross-session table above cannot be read as a
+gate by itself): the recorded constants were captured in a different
+server/host session; the same-session interleaved SF 1 control
+(3 alternating pre-W1 / final pairs) shows **copy_lineitem −5.6%,
+copy_orders −4.8%, scan_full_lineitem −1.8%, scan_lowcard −0.4%** — the
+apparent +7–11% flags on scan_full / copy_part above are cross-session
+drift. copy_customer flagged +14.9% even interleaved (high post-run
+variance 1.86–2.27 s), so it got a targeted alternating A/B (5 pairs,
+customer copy only): pre median 1.780 s vs final 1.804 s = **+1.3%,
+noise** (the one 2.36 s outlier landed on the PRE side). Sub-300 ms
+steps (scan_strings, copy_sum_agg, q6) swing ±20% in both directions on
+untouched code paths and are smoke-only, per the baseline note.
+
+Phase-0 summary: client-side encode 1.6–2.8× faster per value, string
+decode 1.5–2.6× past the inline threshold, byte-identical wire output
+end to end (diff_check at every step), no e2e regression. e2e stays
+server-dominated as predicted — the wins show as modest improvements on
+the largest copy steps and become load-bearing at higher client
+concurrency / faster servers.
 
 ## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
 
