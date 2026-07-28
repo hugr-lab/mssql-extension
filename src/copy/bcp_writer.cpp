@@ -70,7 +70,10 @@ static double ElapsedMs(TimePoint start) {
 
 BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
 					 vector<int32_t> column_mapping)
-	: conn_(conn), target_(target), columns_(std::move(columns)), column_mapping_(std::move(column_mapping)),
+	: conn_(conn),
+	  target_(target),
+	  columns_(std::move(columns)),
+	  column_mapping_(std::move(column_mapping)),
 	  counters_enabled_(GetBCPDebugLevel() >= 2) {
 	// Pre-allocate buffer to reduce reallocation overhead
 	// Estimate: 100 bytes per column per row, reserve for 10K rows
@@ -100,7 +103,7 @@ BCPWriter::~BCPWriter() {
 		return;
 	}
 	static const char *kFamilyNames[9] = {"boolean", "integer", "float",	"decimal", "money",
-										  "string",  "binary",	"datetime", "uuid"};
+										  "string",	 "binary",	"datetime", "uuid"};
 	fprintf(stderr,
 			"[MSSQL COUNTERS] bcp writer close: rows=%llu chunks=%llu bytes_sent=%llu plp_values=%llu "
 			"utf16_fallback=%llu write_rows=%lluus\n",

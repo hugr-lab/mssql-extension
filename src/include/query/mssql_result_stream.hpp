@@ -206,11 +206,11 @@ private:
 		uint64_t nulls = 0;
 		uint64_t values_per_family[9] = {};	 // indexed by codec::TypeFamily
 		uint64_t unknown_family_values = 0;
-		uint64_t wire_bytes_in = 0;		 // TDS value bytes across all columns
-		uint64_t string_bytes_out = 0;	 // UTF-8 bytes written to string vectors
-		uint64_t plp_values = 0;		 // non-NULL values in PLP (MAX-typed) columns
-		uint64_t utf16_fallbacks = 0;	 // legacy-converter dispatches (invalid UTF-16)
-		uint64_t fill_total_us = 0;		 // wall time inside FillChunk, accumulated
+		uint64_t wire_bytes_in = 0;		// TDS value bytes across all columns
+		uint64_t string_bytes_out = 0;	// UTF-8 bytes written to string vectors
+		uint64_t plp_values = 0;		// non-NULL values in PLP (MAX-typed) columns
+		uint64_t utf16_fallbacks = 0;	// legacy-converter dispatches (invalid UTF-16)
+		uint64_t fill_total_us = 0;		// wall time inside FillChunk, accumulated
 		uint64_t fill_parse_us = 0;
 		uint64_t fill_read_us = 0;
 		uint64_t fill_process_us = 0;

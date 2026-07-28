@@ -31,9 +31,9 @@
 
 #include "codec/decimal_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
-#include "codec/vector_format.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/decimal.hpp"

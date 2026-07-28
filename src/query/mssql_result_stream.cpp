@@ -479,7 +479,7 @@ void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t 
 
 void MSSQLResultStream::PrintDebugCounters() {
 	static const char *kFamilyNames[9] = {"boolean", "integer", "float",	"decimal", "money",
-										  "string",  "binary",	"datetime", "uuid"};
+										  "string",	 "binary",	"datetime", "uuid"};
 	fprintf(stderr,
 			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
 			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%llu read=%llu process=%llu)\n",
