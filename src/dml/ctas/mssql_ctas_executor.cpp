@@ -49,9 +49,48 @@ static void DebugLog(int level, const char *format, ...) {
 // CTASExecutionState::Initialize
 //===----------------------------------------------------------------------===//
 
+CTASExecutionState::~CTASExecutionState() {
+	// No-op on paths that already released (FlushBCP success/error, AddChunkBCP
+	// error). Fires only when the sink died without reaching those. Touch no
+	// ClientContext here (issue #178): can run on a worker thread.
+	ReleaseBCPConnectionOnError();
+}
+
+void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
+	if (!connection) {
+		return;
+	}
+	// A CTAS that died mid-stream leaves the server awaiting bulk data on this
+	// session, so the connection is not reusable: closing it ends the session,
+	// rolls back the INSERT BULK transaction and drops the locks held on the
+	// target table. Returning it to the pool as-is would hand the next caller a
+	// connection stuck mid-bulk-load (observed as "Query timeout" on the next
+	// DDL statement).
+	auto conn_state = connection->GetState();
+	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
+		try {
+			connection->Close();
+		} catch (...) {
+			// Ignore — the shared_ptr destructor closes the socket regardless.
+		}
+	}
+	if (auto pool = pool_handle.lock()) {
+		try {
+			connection->SetNeedsReset(true);
+			pool->Release(std::move(connection));
+		} catch (...) {
+			connection.reset();
+		}
+	} else {
+		// Catalog torn down — dropping is the safe failure mode.
+		connection.reset();
+	}
+}
+
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
 									CTASConfig config_p) {
 	catalog = &catalog_ref;
+	pool_handle = catalog_ref.GetConnectionPoolHandle();
 	target = std::move(target_p);
 	columns = std::move(columns_p);
 	config = std::move(config_p);
@@ -475,44 +514,53 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk_rows,
 			 (unsigned long long)bcp_rows_in_batch);
 
-	// Write rows to BCP writer
-	idx_t written = bcp_writer->WriteRows(chunk);
-	bcp_rows_in_batch += written;
-	rows_produced += written;
+	try {
+		// Write rows to BCP writer
+		idx_t written = bcp_writer->WriteRows(chunk);
+		bcp_rows_in_batch += written;
+		rows_produced += written;
 
-	// Check if we need to flush the batch
-	if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
-		DebugLog(1, "BCP batch threshold reached (%llu >= %llu), flushing", (unsigned long long)bcp_rows_in_batch,
-				 (unsigned long long)config.bcp_flush_rows);
+		// Check if we need to flush the batch
+		if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
+			DebugLog(1, "BCP batch threshold reached (%llu >= %llu), flushing", (unsigned long long)bcp_rows_in_batch,
+					 (unsigned long long)config.bcp_flush_rows);
 
-		// Flush current batch
-		idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
-		rows_inserted += confirmed;
+			// Flush current batch
+			idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
+			rows_inserted += confirmed;
 
-		// Reset for next batch
-		bcp_writer->ResetForNextBatch();
-		bcp_rows_in_batch = 0;
+			// Reset for next batch
+			bcp_writer->ResetForNextBatch();
+			bcp_rows_in_batch = 0;
 
-		// Re-execute INSERT BULK for next batch
-		auto &pool = catalog->GetConnectionPool();
-		string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
-		for (idx_t i = 0; i < bcp_columns.size(); i++) {
-			if (i > 0) {
-				insert_bulk += ", ";
+			// Re-execute INSERT BULK for next batch
+			string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
+			for (idx_t i = 0; i < bcp_columns.size(); i++) {
+				if (i > 0) {
+					insert_bulk += ", ";
+				}
+				insert_bulk += "[" + bcp_columns[i].name + "] ";
+				insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
 			}
-			insert_bulk += "[" + bcp_columns[i].name + "] ";
-			insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
-		}
-		insert_bulk += ")";
-		if (config.bcp_tablock) {
-			insert_bulk += " WITH (TABLOCK)";
-		}
+			insert_bulk += ")";
+			if (config.bcp_tablock) {
+				insert_bulk += " WITH (TABLOCK)";
+			}
 
-		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
-		connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
+			auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
+			connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
 
-		// Write COLMETADATA for next batch
-		bcp_writer->WriteColmetadata();
+			// Write COLMETADATA for next batch
+			bcp_writer->WriteColmetadata();
+		}
+	} catch (...) {
+		// Row encode or batch flush failed mid-BCP-stream (e.g. the #177
+		// DECIMAL(38,0) range guard). Close and return the connection before
+		// the error propagates so the server rolls back the bulk load and
+		// releases its locks.
+		ReleaseBCPConnectionOnError();
+		bcp_writer.reset();
+		throw;
 	}
 }
 
@@ -551,13 +599,10 @@ void CTASExecutionState::FlushBCP(ClientContext &context) {
 
 		DebugLog(1, "BCP completed: %llu total rows transferred", (unsigned long long)rows_inserted);
 
-	} catch (std::exception &e) {
-		// Release connection on failure
-		if (connection) {
-			auto &pool = catalog->GetConnectionPool();
-			pool.Release(std::move(connection));
-			connection = nullptr;
-		}
+	} catch (std::exception &) {
+		// Release connection on failure. The stream died mid-bulk-load, so the
+		// connection must be closed, not reused (see ReleaseBCPConnectionOnError).
+		ReleaseBCPConnectionOnError();
 		bcp_writer.reset();
 		throw;
 	}

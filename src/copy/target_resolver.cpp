@@ -953,6 +953,14 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 			col.max_length = 9;	 // DECIMAL(20,0) needs 9 bytes
 		}
 
+		// Handle HUGEINT as DECIMAL(38,0) — #177 (SUM() aggregates return HUGEINT).
+		// COLMETADATA precision must match the codec's EncodeDecimal byte size.
+		if (source_types[i].id() == LogicalTypeId::HUGEINT) {
+			col.precision = 38;
+			col.scale = 0;
+			col.max_length = 17;  // DECIMAL(38,0) needs 17 bytes
+		}
+
 		// Handle scale for time types. Scale MUST match the source's native
 		// precision so the BCP wire COLMETADATA agrees with how the codec
 		// encodes the value (see codec::datetime::ComputeDatetime2Components +

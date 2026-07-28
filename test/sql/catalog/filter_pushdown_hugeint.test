@@ -17,9 +17,9 @@
 #   codec::integer::FormatSqlLiteral renders:  WHERE [col] = 12345
 #   matching the DECIMAL(38,0) column type natively.
 #
-# Note: the table is seeded via T-SQL (mssql_exec) because HUGEINT BCP encoding
-# is deferred to spec 045 Phase 6. The filter pushdown path under test is on
-# the SCAN side and is not affected.
+# Note: the table is seeded via T-SQL (mssql_exec) to keep this test focused on
+# the SCAN-side filter pushdown path (HUGEINT BCP encoding itself is covered by
+# copy_hugeint_bcp.test since issue #177).
 
 require mssql
 

@@ -8,9 +8,10 @@
 // UBIGINT, HUGEINT.
 //
 // Special handling within Integer:
-//   - HUGEINT and UHUGEINT BCP encode are deferred to the Decimal family
-//     migration (spec 045 Phase 6); arms throw NotImplementedException
-//     for now, preserving the pre-spec-045 default-arm behavior.
+//   - HUGEINT and UHUGEINT BCP encode delegate to BCPRowEncoder::EncodeDecimal
+//     as DECIMAL(38,0) (issue #177 — SUM() aggregates return HUGEINT), with a
+//     client-side range guard: |v| > 10^38-1 (39 digits) cannot fit
+//     DECIMAL(38,0) and raises InvalidInputException naming the column.
 //   - UBIGINT BCP encode delegates to BCPRowEncoder::EncodeDecimal with
 //     (precision=20, scale=0) because BCP wire has no UNSIGNED BIGINT.
 //   - UTINYINT / USMALLINT / UINTEGER widen on encode.

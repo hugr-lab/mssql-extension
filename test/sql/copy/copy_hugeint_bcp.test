@@ -1,0 +1,83 @@
+# name: test/sql/copy/copy_hugeint_bcp.test
+# description: Issue #177 — HUGEINT (SUM() output) through COPY (FORMAT 'bcp') and default CTAS
+# group: [copy]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+
+# SUM() over BIGINT returns HUGEINT — the exact repro from issue #177.
+statement ok
+CREATE TABLE hugeint_src AS SELECT range AS x FROM range(1000);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_sum;
+
+statement ok
+COPY (SELECT SUM(x) AS total FROM hugeint_src) TO 'mssql://db/dbo/copy_hugeint_sum' (FORMAT 'bcp', CREATE_TABLE true);
+
+# Target column is DECIMAL(38,0); SUM(0..999) = 499500.
+query I
+SELECT total FROM db.dbo.copy_hugeint_sum;
+----
+499500
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_sum;
+
+# Default CTAS path (mssql_ctas_use_bcp=true) hits the same BCP encoder.
+statement ok
+CREATE TABLE db.dbo.copy_hugeint_ctas AS SELECT SUM(x) AS total FROM hugeint_src;
+
+query I
+SELECT total FROM db.dbo.copy_hugeint_ctas;
+----
+499500
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_ctas;
+
+# DECIMAL(38,0) edges round-trip: ±(10^38 − 1), zero, int64 boundaries.
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_edges;
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    (99999999999999999999999999999999999999::HUGEINT),
+    (-99999999999999999999999999999999999999::HUGEINT),
+    (0::HUGEINT),
+    (9223372036854775807::HUGEINT),
+    (-9223372036854775808::HUGEINT)) t(v))
+TO 'mssql://db/dbo/copy_hugeint_edges' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT v FROM db.dbo.copy_hugeint_edges ORDER BY v;
+----
+-99999999999999999999999999999999999999
+-9223372036854775808
+0
+9223372036854775807
+99999999999999999999999999999999999999
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_edges;
+
+# 39-digit values cannot fit DECIMAL(38,0): clean client-side error, not a
+# mid-batch server failure. int128 max = 170141183460469231731687303715884105727.
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_guard;
+
+statement error
+COPY (SELECT 170141183460469231731687303715884105727::HUGEINT AS v)
+TO 'mssql://db/dbo/copy_hugeint_guard' (FORMAT 'bcp', CREATE_TABLE true);
+----
+out of range for DECIMAL(38,0)
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.copy_hugeint_guard;
+
+statement ok
+DROP TABLE hugeint_src;
