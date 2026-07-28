@@ -45,8 +45,7 @@ public:
 	// @param columns Column metadata for type information (target columns)
 	// @param column_mapping Optional mapping: mapping[target_idx] = source_idx, or -1 for NULL
 	//                       If nullptr, assumes 1:1 positional mapping
-	static void EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
-							const vector<mssql::BCPColumnMetadata> &columns,
+	static void EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk, const vector<mssql::BCPColumnMetadata> &columns,
 							const vector<int32_t> *column_mapping = nullptr);
 
 	// Encode a complete row from DataChunk into buffer

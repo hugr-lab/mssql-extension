@@ -48,6 +48,23 @@ std::string Utf16LEDecode(const std::vector<uint8_t> &data);
 /// Equal to `Utf16LEEncode(input).size()` but avoids the allocation.
 size_t Utf16LEByteLength(const std::string &input);
 
+/// W3 (spec 054): sized single-validation variant. Returns the UTF-16LE
+/// byte length AND reports the validation verdict in one call, so the
+/// caller can follow up with Utf16LEEncodeValidDirect without re-validating
+/// (one validate + one length + one convert per value total). On invalid
+/// input `valid_utf8` is false and the returned length comes from the
+/// legacy hand-rolled counter — consistent with what the legacy encode
+/// fallback will then produce.
+size_t Utf16LEByteLengthView(const char *input, size_t input_len, bool &valid_utf8);
+
+/// W3 (spec 054): convert KNOWN-VALID UTF-8 (as established by a prior
+/// Utf16LEByteLengthView call on the same bytes) without re-validating.
+/// `output` needs capacity for the length that call returned. Unlike
+/// Utf16LEEncodeDirect, an unaligned `output` stays on the simdutf path
+/// (converted via a thread-local scratch and memcpy'd) instead of falling
+/// back to the scalar legacy converter. Returns bytes written.
+size_t Utf16LEEncodeValidDirect(const char *input, size_t input_len, uint8_t *output);
+
 /// Encode UTF-8 directly into a caller-owned output buffer. Returns the
 /// number of UTF-16LE bytes written. `output` must have capacity for at
 /// least `input_len * 2` bytes. Falls back to the private hand-rolled

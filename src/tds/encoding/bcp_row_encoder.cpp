@@ -122,9 +122,9 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
 		auto &col = columns[target_idx];
 		auto &state = states[target_idx];
-		state.null_kind = col.IsPLPType() ? NullWireKind::Plp
-										  : (col.IsVariableLengthUSHORT() ? NullWireKind::VariableUShort
-																		  : NullWireKind::Fixed);
+		state.null_kind = col.IsPLPType()
+							  ? NullWireKind::Plp
+							  : (col.IsVariableLengthUSHORT() ? NullWireKind::VariableUShort : NullWireKind::Fixed);
 		// If source_idx is -1 or out of range, the column stays NULL for every row.
 		int32_t source_idx = column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
 		if (source_idx < 0 || static_cast<idx_t>(source_idx) >= chunk.ColumnCount()) {
@@ -162,6 +162,25 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 	if (row_count == 0) {
 		return;
 	}
+
+	// W4 (spec 054): reserve the accumulator once per chunk from a cheap
+	// per-row estimate, so the per-value appends below rarely reallocate.
+	// Fixed-width columns are exact (+1 length byte); variable/PLP columns
+	// use a modest payload guess — an under-estimate only costs a vector
+	// grow, an exact max_length bound could over-reserve by orders of
+	// magnitude (2048 rows x nvarchar(4000) = 16 MB).
+	size_t per_row_estimate = 1;  // 0xD1 ROW token
+	for (auto &col : columns) {
+		if (col.IsPLPType()) {
+			per_row_estimate += 8 + 4 + 64 + 4;
+		} else if (col.IsVariableLengthUSHORT()) {
+			per_row_estimate += 2 + MinValue<size_t>(col.max_length, 64);
+		} else {
+			per_row_estimate += 1 + col.max_length;
+		}
+	}
+	buffer.reserve(buffer.size() + row_count * per_row_estimate);
+
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
 	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {

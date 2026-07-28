@@ -91,38 +91,73 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 	buf.resize(start_pos + 8 + 4 + utf16_len + 4);
 }
 
-// FR-023 (issue #91) — pre-encode length check for non-PLP nvarchar(N).
-// `utf16_byte_len = Utf16LEByteLength(utf8)`; throws a clear, column-named
-// error when the value would not fit. PLP columns are skipped (the
-// max_length sentinel 0xFFFF means nvarchar(max), no client-side cap).
-void ValidateNVarcharLength(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col) {
-	if (col.IsPLPType()) {
-		return;
-	}
-	// Compute the byte count without allocating an output buffer. simdutf-
-	// backed via tds::encoding::Utf16LEByteLength (handles invalid input by
-	// falling back to the legacy hand-rolled counter — same contract as
-	// Utf16LEEncodeDirect).
-	std::string tmp(utf8_data, utf8_len);
-	size_t utf16_byte_len = tds::encoding::Utf16LEByteLength(tmp);
-	if (utf16_byte_len > col.max_length) {
+// Shared encode body taking already-resolved UTF-8 string view. Picks the
+// PLP / non-PLP path based on col, after running FR-023 validation.
+//
+// W3+W4 (spec 054): validate + length are computed ONCE per value
+// (Utf16LEByteLengthView), the FR-023 check reuses that length, and the
+// valid-input path appends at the exact final size (length prefix written
+// up front, conversion via Utf16LEEncodeValidDirect with no re-validation
+// and no oversize-resize-then-shrink). The pre-W3 flow validated twice and
+// allocated a temporary std::string per value. Invalid UTF-8 (cold path)
+// keeps the legacy append flow bit-for-bit.
+void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col,
+							duckdb::vector<uint8_t> &buf) {
+	bool valid_utf8 = false;
+	const size_t utf16_byte_len = tds::encoding::Utf16LEByteLengthView(utf8_data, utf8_len, valid_utf8);
+
+	// FR-023 (issue #91) — pre-encode length check for non-PLP nvarchar(N).
+	// PLP columns are skipped (max_length sentinel 0xFFFF = nvarchar(max),
+	// no client-side cap). Error wording is tested — do not change.
+	if (!col.IsPLPType() && utf16_byte_len > col.max_length) {
 		throw InvalidInputException(
 			"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
 			"but column max is %u code units (%u bytes)",
 			col.name, utf16_byte_len / 2, utf16_byte_len, col.max_length / 2, col.max_length);
 	}
-}
 
-// Shared encode body taking already-resolved UTF-8 string view. Picks the
-// PLP / non-PLP path based on col, after running FR-023 validation.
-void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col,
-							duckdb::vector<uint8_t> &buf) {
-	ValidateNVarcharLength(utf8_data, utf8_len, col);
-	if (col.IsPLPType()) {
-		AppendNVarcharPlp(buf, utf8_data, utf8_len);
-	} else {
-		AppendNVarcharNonPlp(buf, utf8_data, utf8_len);
+	if (!valid_utf8) {
+		// Cold path: legacy oversize-append flow, bit-identical to pre-W3.
+		if (col.IsPLPType()) {
+			AppendNVarcharPlp(buf, utf8_data, utf8_len);
+		} else {
+			AppendNVarcharNonPlp(buf, utf8_data, utf8_len);
+		}
+		return;
 	}
+
+	if (col.IsPLPType()) {
+		constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
+		if (utf16_byte_len == 0) {
+			// Empty PLP value: header + zero terminator, no data chunk.
+			AppendNVarcharPlp(buf, utf8_data, utf8_len);
+			return;
+		}
+		const size_t start = buf.size();
+		buf.resize(start + 8 + 4 + utf16_byte_len + 4);
+		uint8_t *out = buf.data() + start;
+		for (int i = 0; i < 8; i++) {
+			out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
+		}
+		const uint32_t chunk_len = static_cast<uint32_t>(utf16_byte_len);
+		out[8] = static_cast<uint8_t>(chunk_len & 0xFF);
+		out[9] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
+		out[10] = static_cast<uint8_t>((chunk_len >> 16) & 0xFF);
+		out[11] = static_cast<uint8_t>((chunk_len >> 24) & 0xFF);
+		tds::encoding::Utf16LEEncodeValidDirect(utf8_data, utf8_len, out + 12);
+		uint8_t *terminator = out + 12 + utf16_byte_len;
+		terminator[0] = 0x00;
+		terminator[1] = 0x00;
+		terminator[2] = 0x00;
+		terminator[3] = 0x00;
+		return;
+	}
+
+	const size_t start = buf.size();
+	buf.resize(start + 2 + utf16_byte_len);
+	buf[start] = static_cast<uint8_t>(utf16_byte_len & 0xFF);
+	buf[start + 1] = static_cast<uint8_t>((utf16_byte_len >> 8) & 0xFF);
+	tds::encoding::Utf16LEEncodeValidDirect(utf8_data, utf8_len, buf.data() + start + 2);
 }
 
 }  // namespace

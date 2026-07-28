@@ -380,6 +380,42 @@ size_t Utf16LEByteLength(const std::string &input) {
 	return simdutf::utf16_length_from_utf8(input.data(), input.size()) * 2;
 }
 
+size_t Utf16LEByteLengthView(const char *input, size_t input_len, bool &valid_utf8) {
+	if (input_len == 0) {
+		valid_utf8 = true;
+		return 0;
+	}
+	valid_utf8 = simdutf::validate_utf8(input, input_len);
+	if (!valid_utf8) {
+		// NOT counted as a fallback here — the follow-up encode call counts
+		// it once (see the Utf16FallbackCount contract in the header).
+		return LegacyUtf16LEByteLength(std::string(input, input_len));
+	}
+	return simdutf::utf16_length_from_utf8(input, input_len) * 2;
+}
+
+size_t Utf16LEEncodeValidDirect(const char *input, size_t input_len, uint8_t *output) {
+	if (input_len == 0) {
+		return 0;
+	}
+	if ((reinterpret_cast<uintptr_t>(output) & 0x1u) == 0u) {
+		char16_t *out = reinterpret_cast<char16_t *>(output);
+		return simdutf::convert_valid_utf8_to_utf16le(input, input_len, out) * 2;
+	}
+	// Unaligned destination (odd offset inside a packet buffer): convert via
+	// a reused thread-local scratch, then memcpy. Stays on the simdutf path —
+	// the old Utf16LEEncodeDirect fell back to the scalar legacy converter
+	// here, which silently serialized ~half of all BCP string values through
+	// the slow path (buffer parity is arbitrary after variable-width tokens).
+	static thread_local std::vector<char16_t> scratch;
+	if (scratch.size() < input_len) {
+		scratch.resize(input_len);
+	}
+	const size_t units = simdutf::convert_valid_utf8_to_utf16le(input, input_len, scratch.data());
+	std::memcpy(output, scratch.data(), units * 2);
+	return units * 2;
+}
+
 std::string Utf16LEDecode(const uint8_t *data, size_t byte_length) {
 	if (byte_length == 0) {
 		return {};

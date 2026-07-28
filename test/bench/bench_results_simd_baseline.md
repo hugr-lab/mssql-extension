@@ -224,6 +224,34 @@ Reading of the delta:
   noise, per the baseline note. Full D3 re-run happens after all D8 wins
   (T12) against the recorded constants.
 
+## Delta — W3+W4 single-pass NVARCHAR encode + accumulator reserve (T10, 2026-07-28)
+
+W3: `EncodeNVarcharFromUtf8` now validates + measures ONCE per value
+(`Utf16LEByteLengthView`) and converts with no re-validation
+(`Utf16LEEncodeValidDirect`); the per-value temporary `std::string` in the
+FR-023 check is gone, and the valid path appends at the exact final size
+(length prefix up front — no oversize-resize-then-shrink). Bonus: an
+unaligned destination now stays on the simdutf path via a thread-local
+scratch — the old code silently sent ~half of all BCP string values
+through the scalar legacy converter (buffer parity after variable-width
+tokens is arbitrary). Invalid UTF-8 keeps the legacy flow bit-for-bit;
+FR-023 wording unchanged. W4: `EncodeChunk` reserves the accumulator once
+per chunk from a per-row column estimate (fixed widths exact, modest
+guess for variable/PLP).
+
+nvarchar16 hoisted cells (ns/value): flat 27.4 → 22.9, dict100 28.1 →
+22.9, const 27.6 → 22.6, null50 15.7 → 14.0. Cumulative vs the pre-W1
+baseline: 37.7 → 22.9 = 1.65× on short-ASCII cells — the bench matrix is
+ASCII-16 only; the unaligned/simdutf fix should show larger effects on
+long or non-ASCII payloads (not separately benched here). Non-string
+cells unchanged (within noise) as expected.
+
+e2e (same-session alternating medians-of-3, SF 0.1): copy_customer −3.8%,
+copy_part −2.8%, copy_lineitem −1.8%, scans flat; no step regressed
+beyond noise. Verified: unit tests + full SQL suite green (incl. the
+FR-023 wording test), `diff_check.sh` pre-T10 vs post-T10 build 13/13
+byte-identical (incl. the BCP write-back and its Cyrillic payloads).
+
 ## e2e — TPC-H baseline (median of 3 full runs, SF 0.01 / 0.1 / 1, 2026-07-28)
 
 `test/bench/bench_tpch_e2e.sh`, tree commit `722caf8`, 3 sequential full
