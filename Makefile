@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -312,6 +312,16 @@ test-token-parser-security: debug
 	@echo ""
 	@echo "Running TDS token-parser security regression..."
 	build/test/test_token_parser_security
+
+# Spec 054 D2: benchmark build — release build with TPC-H (dbgen) enabled for
+# the e2e materialization benches (test/bench/bench_tpch_e2e.sh).
+# tpch must NOT go into extension_config.cmake (that file ships to community
+# builds); test/bench/bench_extension_config.cmake carries it and is prepended
+# here via the ci-tools EXTRA_EXTENSION_CONFIGS hook.
+# NOTE: a later plain `make`/`make release` reconfigures WITHOUT tpch (cmake
+# drops it on re-run) — re-run `make bench-build` before benchmarking.
+bench-build:
+	EXTRA_EXTENSION_CONFIGS='$(PROJ_DIR)test/bench/bench_extension_config.cmake' $(MAKE) release
 
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.

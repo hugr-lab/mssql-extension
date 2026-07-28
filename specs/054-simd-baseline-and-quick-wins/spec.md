@@ -133,6 +133,22 @@ Tests: `test/cpp/codec/test_integer_codec.cpp` — round-trip encode for 0, ±1,
 10^38−1, −(10^38−1); error for 10^38 and above; UHUGEINT edges. SQL-level regression in
 `test/sql/copy/` (SUM over BIGINT → COPY bcp; also CTAS default path). Closes #177.
 
+**As-landed divergence (commit `e12f418`):** the integer-codec arms alone were not enough.
+(a) `COPY … CREATE_TABLE true` reads the created table's metadata back, so a HUGEINT source
+column arrives as `DECIMAL(38,0)` and dispatches through the **Decimal** family — the same
+mantissa-fits-precision guard was added to `codec::decimal::EncodeToBcp` (both overloads),
+which also protects any decimal-target BCP from mid-batch server rejections.
+(b) `TargetResolver::GenerateColumnMetadata` emitted precision/scale **0/0** for HUGEINT in
+COLMETADATA; now 38/0 with max_length 17.
+(c) The CTAS BCP sink leaked its connection mid-bulk-load on a row-encode error, hanging the
+next DDL on the pool ("Query timeout") — fixed with the issue-#191 COPY pattern
+(`AddChunkBCP` catch + `FlushBCP` close-before-release + `~CTASExecutionState` last resort
+via a `weak_ptr` pool handle).
+(d) `SUM(UBIGINT)` returns HUGEINT (not UHUGEINT) in DuckDB v1.5.5, so UHUGEINT stays
+unwired in `FamilyFromLogicalType`; its codec arms are defensive and unit-tested only.
+(e) The guard forwards `col.precision/col.scale` (as the UBIGINT arm does) rather than
+literal 38/0, keeping the wire byte size in lockstep with COLMETADATA.
+
 ### D8. Phase-0 quick wins (after D6 is committed)
 
 Write path:
