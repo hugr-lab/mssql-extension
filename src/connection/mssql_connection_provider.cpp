@@ -242,4 +242,46 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 	// Do nothing - connection stays pinned
 }
 
+namespace mssql {
+
+void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
+								 bool transaction_pinned) noexcept {
+	if (!connection) {
+		return;
+	}
+
+	// Closing ends the session, rolls back the INSERT BULK transaction and
+	// drops the locks held on the target table (see the header contract).
+	auto conn_state = connection->GetState();
+	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
+		try {
+			connection->Close();
+		} catch (...) {
+			// Ignore — the shared_ptr destructor closes the socket regardless.
+		}
+	}
+
+	if (transaction_pinned) {
+		// The MSSQLTransaction owns the pin; just drop our reference.
+		connection.reset();
+		return;
+	}
+
+	if (auto pool = pool_handle.lock()) {
+		try {
+			connection->SetNeedsReset(true);
+			pool->Release(std::move(connection));
+		} catch (...) {
+			// Release failed — drop it; the shared_ptr destructor closes the socket.
+			connection.reset();
+		}
+	} else {
+		// Catalog torn down — dropping is the safe failure mode.
+		connection.reset();
+	}
+}
+
+}  // namespace mssql
+
 }  // namespace duckdb

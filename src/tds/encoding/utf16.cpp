@@ -292,18 +292,37 @@ size_t LegacyUtf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *o
 	return out_pos;
 }
 
-bool ValidateAlignedUtf16Le(const uint8_t *data, size_t byte_length, std::vector<char16_t> &scratch) {
-	if (byte_length == 0) {
-		return true;
+// Retention cap for the reusable per-thread scratch buffer, in char16_t
+// units (64K units = 128 KB per thread). Inputs above the cap are serviced
+// through the caller's local vector — freed at scope exit — so a single huge
+// nvarchar(max) value cannot pin ~2x its size in every worker thread for the
+// thread's remaining lifetime.
+constexpr size_t MAX_RETAINED_SCRATCH_UNITS = 64 * 1024;
+
+// Pick the scratch buffer for `units` char16_t: the grow-only per-thread
+// buffer below the retention cap, else the caller's `local`. The returned
+// buffer has size() >= units.
+std::vector<char16_t> &ScratchFor(size_t units, std::vector<char16_t> &local) {
+	static thread_local std::vector<char16_t> retained;
+	std::vector<char16_t> &chosen = units <= MAX_RETAINED_SCRATCH_UNITS ? retained : local;
+	if (chosen.size() < units) {
+		chosen.resize(units);
 	}
-	const bool aligned = (reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u;
-	const size_t code_units = byte_length / 2;
-	if (aligned) {
-		return simdutf::validate_utf16le(reinterpret_cast<const char16_t *>(data), code_units);
+	return chosen;
+}
+
+// Return a 2-byte-aligned char16_t view of `data` (code_units > 0). Aligned
+// input is returned directly; unaligned input is copied into a scratch
+// buffer (thread-local under the retention cap, else `local`) first. The
+// view is valid until the next ScratchFor/AlignedUtf16View call on this
+// thread or until `local` is destroyed, whichever the copy landed in.
+const char16_t *AlignedUtf16View(const uint8_t *data, size_t code_units, std::vector<char16_t> &local) {
+	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
+		return reinterpret_cast<const char16_t *>(data);
 	}
-	scratch.resize(code_units);
+	std::vector<char16_t> &scratch = ScratchFor(code_units, local);
 	std::memcpy(scratch.data(), data, code_units * 2);
-	return simdutf::validate_utf16le(scratch.data(), code_units);
+	return scratch.data();
 }
 
 }  // anonymous namespace
@@ -403,14 +422,12 @@ size_t Utf16LEEncodeValidDirect(const char *input, size_t input_len, uint8_t *ou
 		return simdutf::convert_valid_utf8_to_utf16le(input, input_len, out) * 2;
 	}
 	// Unaligned destination (odd offset inside a packet buffer): convert via
-	// a reused thread-local scratch, then memcpy. Stays on the simdutf path —
-	// the old Utf16LEEncodeDirect fell back to the scalar legacy converter
-	// here, which silently serialized ~half of all BCP string values through
-	// the slow path (buffer parity is arbitrary after variable-width tokens).
-	static thread_local std::vector<char16_t> scratch;
-	if (scratch.size() < input_len) {
-		scratch.resize(input_len);
-	}
+	// a scratch buffer, then memcpy. Stays on the simdutf path — the old
+	// Utf16LEEncodeDirect fell back to the scalar legacy converter here, which
+	// silently serialized ~half of all BCP string values through the slow
+	// path (buffer parity is arbitrary after variable-width tokens).
+	std::vector<char16_t> local;
+	std::vector<char16_t> &scratch = ScratchFor(input_len, local);
 	const size_t units = simdutf::convert_valid_utf8_to_utf16le(input, input_len, scratch.data());
 	std::memcpy(output, scratch.data(), units * 2);
 	return units * 2;
@@ -421,23 +438,12 @@ std::string Utf16LEDecode(const uint8_t *data, size_t byte_length) {
 		return {};
 	}
 
-	std::vector<char16_t> aligned_scratch;
-	if (!ValidateAlignedUtf16Le(data, byte_length, aligned_scratch)) {
+	const size_t code_units = byte_length / 2;
+	std::vector<char16_t> local;
+	const char16_t *src = AlignedUtf16View(data, code_units, local);
+	if (!simdutf::validate_utf16le(src, code_units)) {
 		utf16_fallback_count++;
 		return LegacyUtf16LEDecode(data, byte_length);
-	}
-
-	const size_t code_units = byte_length / 2;
-	const char16_t *src;
-	std::vector<char16_t> copy;
-	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
-		src = reinterpret_cast<const char16_t *>(data);
-	} else if (!aligned_scratch.empty()) {
-		src = aligned_scratch.data();
-	} else {
-		copy.resize(code_units);
-		std::memcpy(copy.data(), data, code_units * 2);
-		src = copy.data();
 	}
 
 	const size_t out_bytes = simdutf::utf8_length_from_utf16le(src, code_units);
@@ -460,25 +466,15 @@ size_t Utf8LengthFromUtf16LEView(const uint8_t *data, size_t byte_length) {
 	}
 	const size_t code_units = byte_length / 2;
 	// TDS wire payloads come out of vector<uint8_t> (malloc-aligned), so the
-	// unaligned branch is defensive only.
-	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
-		const char16_t *src = reinterpret_cast<const char16_t *>(data);
-		if (!simdutf::validate_utf16le(src, code_units)) {
-			// NOT counted as a fallback — the caller's legacy decode call
-			// counts it once (Utf16FallbackCount contract).
-			return SIZE_MAX;
-		}
-		return simdutf::utf8_length_from_utf16le(src, code_units);
-	}
-	static thread_local std::vector<char16_t> scratch;
-	if (scratch.size() < code_units) {
-		scratch.resize(code_units);
-	}
-	std::memcpy(scratch.data(), data, code_units * 2);
-	if (!simdutf::validate_utf16le(scratch.data(), code_units)) {
+	// unaligned copy inside AlignedUtf16View is defensive only.
+	std::vector<char16_t> local;
+	const char16_t *src = AlignedUtf16View(data, code_units, local);
+	if (!simdutf::validate_utf16le(src, code_units)) {
+		// NOT counted as a fallback — the caller's legacy decode call
+		// counts it once (Utf16FallbackCount contract).
 		return SIZE_MAX;
 	}
-	return simdutf::utf8_length_from_utf16le(scratch.data(), code_units);
+	return simdutf::utf8_length_from_utf16le(src, code_units);
 }
 
 size_t Utf16LEDecodeValidInto(const uint8_t *data, size_t byte_length, char *out) {
@@ -486,15 +482,9 @@ size_t Utf16LEDecodeValidInto(const uint8_t *data, size_t byte_length, char *out
 		return 0;
 	}
 	const size_t code_units = byte_length / 2;
-	if ((reinterpret_cast<uintptr_t>(data) & 0x1u) == 0u) {
-		return simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(data), code_units, out);
-	}
-	static thread_local std::vector<char16_t> scratch;
-	if (scratch.size() < code_units) {
-		scratch.resize(code_units);
-	}
-	std::memcpy(scratch.data(), data, code_units * 2);
-	return simdutf::convert_valid_utf16le_to_utf8(scratch.data(), code_units, out);
+	std::vector<char16_t> local;
+	const char16_t *src = AlignedUtf16View(data, code_units, local);
+	return simdutf::convert_valid_utf16le_to_utf8(src, code_units, out);
 }
 
 //===----------------------------------------------------------------------===//

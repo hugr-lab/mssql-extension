@@ -1,6 +1,7 @@
 #include "dml/ctas/mssql_ctas_executor.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_writer.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
@@ -57,34 +58,9 @@ CTASExecutionState::~CTASExecutionState() {
 }
 
 void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
-	if (!connection) {
-		return;
-	}
-	// A CTAS that died mid-stream leaves the server awaiting bulk data on this
-	// session, so the connection is not reusable: closing it ends the session,
-	// rolls back the INSERT BULK transaction and drops the locks held on the
-	// target table. Returning it to the pool as-is would hand the next caller a
-	// connection stuck mid-bulk-load (observed as "Query timeout" on the next
-	// DDL statement).
-	auto conn_state = connection->GetState();
-	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
-		try {
-			connection->Close();
-		} catch (...) {
-			// Ignore — the shared_ptr destructor closes the socket regardless.
-		}
-	}
-	if (auto pool = pool_handle.lock()) {
-		try {
-			connection->SetNeedsReset(true);
-			pool->Release(std::move(connection));
-		} catch (...) {
-			connection.reset();
-		}
-	} else {
-		// Catalog torn down — dropping is the safe failure mode.
-		connection.reset();
-	}
+	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError
+	// contract). CTAS never runs transaction-pinned.
+	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,

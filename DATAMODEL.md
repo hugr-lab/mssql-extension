@@ -122,6 +122,7 @@ classDiagram
         -cleanup_thread_ : thread
         -pool_mutex_ : mutex
         -available_cv_ : condition_variable
+        -cleanup_cv_ : condition_variable
     }
     class PoolConfiguration {
         +connection_limit
@@ -134,8 +135,9 @@ classDiagram
 ```
 
 - One pool **per `MSSQLCatalog`** (no process-wide singleton — that was spec 047's headline fix). Lifetime is bounded by catalog lifetime.
-- Background `cleanup_thread_` reaps idle connections past `idle_timeout`.
+- Background `cleanup_thread_` reaps idle connections past `idle_timeout`. It parks on its **own** `cleanup_cv_` (notified only by `Shutdown()`, so DETACH doesn't wait out a blind 1-second sleep); `available_cv_` is reserved for `Acquire()` waiters — the invariant is that `Release()`'s `notify_one` always reaches a thread blocked on pool exhaustion, never the cleanup thread (spec 054 review).
 - DuckDB's quiescence contract requires every connection be released before `~MSSQLCatalog` runs; the pool's `Shutdown()` emits a warning + assertion if `active_connections_` is non-empty at teardown.
+- COPY/CTAS bulk loads that die mid-BCP-stream must not return the connection as-is (the server still awaits bulk data). Both paths share one release protocol — `mssql::ReleaseBcpConnectionOnError` (`src/connection/mssql_connection_provider.cpp`): close if mid-stream, then `SetNeedsReset` + `Release` through the catalog's `weak_ptr` pool handle (a failed `lock()` = catalog torn down → drop). Worker-thread safe (issue #178); called from `~MSSQLCopyGlobalState` (issue #191) and `CTASExecutionState::ReleaseBCPConnectionOnError`.
 
 ---
 
@@ -356,17 +358,23 @@ classDiagram
     }
     class FamilyModule {
         <<per-family>>
-        EncodeToBcp(value, buffer)
-        DecodeFromTds(buffer) Value
+        EncodeToBcp(vec, fmt, row, col, buffer)
+        DecodeFromTds(buffer, col, out_vec, row)
         FormatSqlLiteral(value)
         FormatDdlTypeName(type)
     }
+    class BCPRowEncoder {
+        +EncodeChunk(buffer, chunk, columns, mapping)
+    }
     FamilyDispatcher ..> FamilyModule : delegates
     FamilyModule --> TypeFamily
+    BCPRowEncoder ..> FamilyModule : fn-pointer per column
 ```
 
 - One module per family under `src/codec/` (`boolean_codec.cpp`, `integer_codec.cpp`, etc.). Each owns its four operations (encode for BCP, decode from TDS, SQL literal formatting, DDL type-name rendering).
-- The two dispatchers are `literal_format.cpp` and `type_family.cpp`. LogicalType-side dispatch sites in the rest of the codebase collapse to a one-liner family lookup.
+- The two dispatchers are `literal_format.cpp` and `type_family.cpp`. LogicalType-side dispatch sites in the rest of the codebase collapse to a one-liner family lookup. `type_family.hpp` also owns `TYPE_FAMILY_COUNT` and `FamilyName()` — anything sized or labelled per family (the `MSSQL_DEBUG>=2` counter output) uses these, never a hand-sized `[9]` table.
+- **BCP encode contract (spec 054 W1/W2)**: production writes go through `BCPRowEncoder::EncodeChunk`, which builds one `UnifiedVectorFormat` per column per chunk, resolves each column's family encoder ONCE to a function pointer, precomputes the NULL wire kind (fixed / variable-USHORT / PLP), and emits the `0xD1` ROW token per row. Family `EncodeToBcp` overloads take the pre-built format (`vec, fmt, row, col, buffer`); shared accessors (`FormatValue` / `FormatIsNull`) and the per-row test shim (`EncodeToBcpViaFormat`) live in `codec/vector_format.hpp`. A new family or encode caller must implement/consume the fmt overload — the per-row `(Vector&, idx_t)` wrapper is a unit-test compatibility API only.
+- **TDS decode (spec 054 R1)**: `DecodeFromTds` writes straight into the output `Vector` slot (`StringVector::EmptyString` + valid-input UTF-16→UTF-8 conversion, no intermediate `std::string`); invalid UTF-16 (unpaired surrogates — legal UCS-2) falls back to the legacy decoder on the untrimmed payload with output-side CHAR/NCHAR space trim, preserving pre-054 semantics exactly.
 - TIMESTAMP_MS/NS/S/TZ round-trip through SQL Server `DATETIME2(3/7/0/7)` with the catalog and the codec reporting the same DuckDB type — closes the VIEW catalog-vs-runtime divergence (issue #89).
 
 ---

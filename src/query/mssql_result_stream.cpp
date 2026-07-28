@@ -478,8 +478,6 @@ void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t 
 }
 
 void MSSQLResultStream::PrintDebugCounters() {
-	static const char *kFamilyNames[9] = {"boolean", "integer", "float",	"decimal", "money",
-										  "string",	 "binary",	"datetime", "uuid"};
 	fprintf(stderr,
 			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
 			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%llu read=%llu process=%llu)\n",
@@ -489,10 +487,10 @@ void MSSQLResultStream::PrintDebugCounters() {
 			(unsigned long long)counters_.fill_total_us, (unsigned long long)counters_.fill_parse_us,
 			(unsigned long long)counters_.fill_read_us, (unsigned long long)counters_.fill_process_us);
 	std::string families;
-	for (int f = 0; f < 9; f++) {
+	for (uint8_t f = 0; f < mssql::codec::TYPE_FAMILY_COUNT; f++) {
 		if (counters_.values_per_family[f] > 0) {
 			families += " ";
-			families += kFamilyNames[f];
+			families += mssql::codec::FamilyName(static_cast<mssql::codec::TypeFamily>(f));
 			families += "=" + std::to_string(counters_.values_per_family[f]);
 		}
 	}

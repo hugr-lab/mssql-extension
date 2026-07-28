@@ -106,43 +106,9 @@ MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
 	// BCPCopyFinalize (both success and error) reset() `connection`. This only fires when the sink
 	// threw and copy_to_finalize was never called — see the contract note on the declaration.
 	//
-	// Touch no ClientContext here (issue #178 / PR #179): this can run on a worker thread while
-	// the client thread commits the query's transaction.
-	if (!connection) {
-		return;
-	}
-
-	// A COPY that died mid-stream leaves the server awaiting bulk data on this session, so the
-	// connection is not reusable: closing it is what ends the session, rolls back the INSERT BULK
-	// transaction, and drops the locks it held on the target table. Returning it to the pool in
-	// that state would hand the next caller a connection stuck mid-bulk-load.
-	auto conn_state = connection->GetState();
-	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
-		try {
-			connection->Close();
-		} catch (...) {
-			// Ignore - the shared_ptr destructor closes the socket regardless.
-		}
-	}
-
-	if (transaction_pinned) {
-		// The MSSQLTransaction owns the pin; just drop our reference.
-		connection.reset();
-		return;
-	}
-
-	if (auto pool = pool_handle.lock()) {
-		try {
-			connection->SetNeedsReset(true);
-			pool->Release(std::move(connection));
-		} catch (...) {
-			// Release failed - drop it; the shared_ptr destructor closes the socket.
-			connection.reset();
-		}
-	} else {
-		// Catalog torn down - dropping is the safe failure mode.
-		connection.reset();
-	}
+	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract) — worker-thread
+	// safe per issue #178 / PR #179.
+	mssql::ReleaseBcpConnectionOnError(connection, pool_handle, transaction_pinned);
 }
 
 namespace mssql {

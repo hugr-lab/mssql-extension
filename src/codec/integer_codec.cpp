@@ -193,9 +193,7 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 }
 
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	UnifiedVectorFormat fmt;
-	in.ToUnifiedFormat(row + 1, fmt);
-	EncodeToBcp(in, fmt, row, col, buf);
+	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

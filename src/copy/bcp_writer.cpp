@@ -102,8 +102,6 @@ BCPWriter::~BCPWriter() {
 	if (!counters_enabled_) {
 		return;
 	}
-	static const char *kFamilyNames[9] = {"boolean", "integer", "float",	"decimal", "money",
-										  "string",	 "binary",	"datetime", "uuid"};
 	fprintf(stderr,
 			"[MSSQL COUNTERS] bcp writer close: rows=%llu chunks=%llu bytes_sent=%llu plp_values=%llu "
 			"utf16_fallback=%llu write_rows=%lluus\n",
@@ -111,10 +109,10 @@ BCPWriter::~BCPWriter() {
 			(unsigned long long)bytes_sent_.load(), (unsigned long long)counter_plp_values_,
 			(unsigned long long)counter_utf16_fallbacks_, (unsigned long long)counter_write_rows_us_);
 	std::string families;
-	for (int f = 0; f < 9; f++) {
+	for (uint8_t f = 0; f < codec::TYPE_FAMILY_COUNT; f++) {
 		if (counter_values_per_family_[f] > 0) {
 			families += " ";
-			families += kFamilyNames[f];
+			families += codec::FamilyName(static_cast<codec::TypeFamily>(f));
 			families += "=" + std::to_string(counter_values_per_family_[f]);
 		}
 	}

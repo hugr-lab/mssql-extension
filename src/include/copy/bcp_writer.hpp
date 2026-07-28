@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include "codec/type_family.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 
@@ -200,12 +201,12 @@ private:
 	// counts are precomputed once in the constructor.
 	bool counters_enabled_ = false;
 	uint64_t counter_chunks_ = 0;
-	uint64_t counter_values_per_family_[9] = {};
+	uint64_t counter_values_per_family_[codec::TYPE_FAMILY_COUNT] = {};
 	uint64_t counter_unknown_family_values_ = 0;
 	uint64_t counter_plp_values_ = 0;
 	uint64_t counter_utf16_fallbacks_ = 0;
 	uint64_t counter_write_rows_us_ = 0;
-	uint64_t family_col_count_[9] = {};	 // columns per family (per row)
+	uint64_t family_col_count_[codec::TYPE_FAMILY_COUNT] = {};	// columns per family (per row)
 	uint64_t unknown_family_col_count_ = 0;
 	uint64_t plp_col_count_ = 0;
 };

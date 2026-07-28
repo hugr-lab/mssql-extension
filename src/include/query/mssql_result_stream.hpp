@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include "codec/type_family.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -204,7 +205,7 @@ private:
 	struct StreamDebugCounters {
 		uint64_t chunks = 0;
 		uint64_t nulls = 0;
-		uint64_t values_per_family[9] = {};	 // indexed by codec::TypeFamily
+		uint64_t values_per_family[mssql::codec::TYPE_FAMILY_COUNT] = {};  // indexed by codec::TypeFamily
 		uint64_t unknown_family_values = 0;
 		uint64_t wire_bytes_in = 0;		// TDS value bytes across all columns
 		uint64_t string_bytes_out = 0;	// UTF-8 bytes written to string vectors

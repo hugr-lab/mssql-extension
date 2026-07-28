@@ -46,19 +46,32 @@ void AppendNVarcharNonPlp(duckdb::vector<uint8_t> &buf, const char *input, size_
 	buf.resize(start_pos + 2 + utf16_len);
 }
 
+// Single-chunk PLP frame primitives — the wire layout (8-byte UNKNOWN-length
+// header, 4-byte LE chunk length, data, 4-byte zero terminator) is written in
+// exactly one place so the legacy and W3 append paths cannot drift apart.
+void WriteLe32(uint8_t *out, uint32_t v) {
+	out[0] = static_cast<uint8_t>(v & 0xFF);
+	out[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+	out[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+	out[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+}
+
+void WritePlpHeader(uint8_t *out) {
+	constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
+	for (int i = 0; i < 8; i++) {
+		out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
+	}
+}
+
 // Append a PLP-framed nvarchar(max) payload to `buf`. Mirrors
 // BCPRowEncoder::EncodeNVarcharPLP bit-for-bit.
 void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t input_len) {
-	constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
-
 	if (input_len == 0) {
-		for (int i = 0; i < 8; i++) {
-			buf.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
-		}
-		buf.push_back(0x00);
-		buf.push_back(0x00);
-		buf.push_back(0x00);
-		buf.push_back(0x00);
+		// Empty value: header + zero terminator, no data chunk.
+		const size_t start_pos = buf.size();
+		buf.resize(start_pos + 8 + 4);
+		WritePlpHeader(buf.data() + start_pos);
+		WriteLe32(buf.data() + start_pos + 8, 0);
 		return;
 	}
 
@@ -67,26 +80,11 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 	buf.resize(start_pos + 8 + 4 + max_utf16_len + 4);
 
 	uint8_t *out = buf.data() + start_pos;
-	for (int i = 0; i < 8; i++) {
-		out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
-	}
-	out += 8;
-
-	uint8_t *chunk_len_ptr = out;
-	out += 4;
-	size_t utf16_len = tds::encoding::Utf16LEEncodeDirect(input, input_len, out);
-	out += utf16_len;
-
-	uint32_t chunk_len = static_cast<uint32_t>(utf16_len);
-	chunk_len_ptr[0] = static_cast<uint8_t>(chunk_len & 0xFF);
-	chunk_len_ptr[1] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
-	chunk_len_ptr[2] = static_cast<uint8_t>((chunk_len >> 16) & 0xFF);
-	chunk_len_ptr[3] = static_cast<uint8_t>((chunk_len >> 24) & 0xFF);
-
-	out[0] = 0x00;
-	out[1] = 0x00;
-	out[2] = 0x00;
-	out[3] = 0x00;
+	WritePlpHeader(out);
+	uint8_t *chunk_len_ptr = out + 8;
+	size_t utf16_len = tds::encoding::Utf16LEEncodeDirect(input, input_len, chunk_len_ptr + 4);
+	WriteLe32(chunk_len_ptr, static_cast<uint32_t>(utf16_len));
+	WriteLe32(chunk_len_ptr + 4 + utf16_len, 0);
 
 	buf.resize(start_pos + 8 + 4 + utf16_len + 4);
 }
@@ -127,7 +125,6 @@ void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql:
 	}
 
 	if (col.IsPLPType()) {
-		constexpr uint64_t UNKNOWN_PLP_LEN = 0xFFFFFFFFFFFFFFFEULL;
 		if (utf16_byte_len == 0) {
 			// Empty PLP value: header + zero terminator, no data chunk.
 			AppendNVarcharPlp(buf, utf8_data, utf8_len);
@@ -136,20 +133,10 @@ void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql:
 		const size_t start = buf.size();
 		buf.resize(start + 8 + 4 + utf16_byte_len + 4);
 		uint8_t *out = buf.data() + start;
-		for (int i = 0; i < 8; i++) {
-			out[i] = static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF);
-		}
-		const uint32_t chunk_len = static_cast<uint32_t>(utf16_byte_len);
-		out[8] = static_cast<uint8_t>(chunk_len & 0xFF);
-		out[9] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
-		out[10] = static_cast<uint8_t>((chunk_len >> 16) & 0xFF);
-		out[11] = static_cast<uint8_t>((chunk_len >> 24) & 0xFF);
+		WritePlpHeader(out);
+		WriteLe32(out + 8, static_cast<uint32_t>(utf16_byte_len));
 		tds::encoding::Utf16LEEncodeValidDirect(utf8_data, utf8_len, out + 12);
-		uint8_t *terminator = out + 12 + utf16_byte_len;
-		terminator[0] = 0x00;
-		terminator[1] = 0x00;
-		terminator[2] = 0x00;
-		terminator[3] = 0x00;
+		WriteLe32(out + 12 + utf16_byte_len, 0);
 		return;
 	}
 
@@ -180,10 +167,14 @@ std::string EscapeSqlSingleQuotes(const std::string &str) {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
 	// R1 (spec 054): decode straight into the vector's string slot — no
-	// intermediate std::string. Trailing-space trim for fixed-length
-	// CHAR/NCHAR happens on the INPUT (a trailing U+0020 is a trailing
-	// 0x0020 code unit / 0x20 byte — no other sequence produces one), which
-	// matches the old trim-the-UTF-8-output behaviour bit-for-bit.
+	// intermediate std::string. For VALID UTF-16 the trailing-space trim for
+	// fixed-length CHAR/NCHAR happens on the INPUT (a trailing U+0020 is a
+	// trailing 0x0020 code unit / 0x20 byte, and a space can never be part of
+	// a surrogate pair — so the trim neither changes validity nor differs
+	// from the old trim-the-UTF-8-output behaviour). Invalid UTF-16 (e.g.
+	// unpaired surrogates, legal in UCS-2 collations) must go through the
+	// legacy decoder with the UNTRIMMED payload + output-side trim, exactly
+	// as every pre-054 release did.
 	const bool trim_trailing_spaces = col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_NCHAR;
 
 	if (col.type_id == tds::TDS_TYPE_NCHAR || col.type_id == tds::TDS_TYPE_NVARCHAR ||
@@ -196,8 +187,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		}
 		const size_t utf8_len = tds::encoding::Utf8LengthFromUtf16LEView(bytes.data(), byte_len);
 		if (utf8_len == SIZE_MAX) {
-			// Invalid UTF-16 — legacy per-value fallback, semantics unchanged.
-			std::string str = tds::encoding::Utf16LEDecode(bytes.data(), byte_len);
+			// Invalid UTF-16 — legacy per-value fallback on the FULL payload,
+			// then trim the decoded output (pre-054 semantics bit-for-bit).
+			std::string str = tds::encoding::Utf16LEDecode(bytes.data(), bytes.size());
+			if (trim_trailing_spaces) {
+				while (!str.empty() && str.back() == ' ') {
+					str.pop_back();
+				}
+			}
 			FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
 			return;
 		}
@@ -245,9 +242,7 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 }
 
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	UnifiedVectorFormat fmt;
-	in.ToUnifiedFormat(row + 1, fmt);
-	EncodeToBcp(in, fmt, row, col, buf);
+	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

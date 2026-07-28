@@ -179,7 +179,14 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 			per_row_estimate += 1 + col.max_length;
 		}
 	}
-	buffer.reserve(buffer.size() + row_count * per_row_estimate);
+	// Amplify to at least 2x the current capacity: reserve() allocates
+	// exactly what is requested, so asking for size+estimate every chunk
+	// would make capacity track size and memcpy the whole accumulator per
+	// chunk (quadratic across a large batch).
+	const size_t needed = buffer.size() + row_count * per_row_estimate;
+	if (needed > buffer.capacity()) {
+		buffer.reserve(MaxValue<size_t>(needed, 2 * buffer.capacity()));
+	}
 
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
