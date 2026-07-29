@@ -183,7 +183,31 @@ public:
 		return negotiated_packet_size_;
 	}
 
+	// Spec 055: set the TDS frame size to request in LOGIN7. Must be called
+	// BEFORE any Authenticate* call — LOGIN7 carries the request, and the server
+	// answers with min(requested, its own maximum) in the PACKETSIZE ENVCHANGE.
+	// It never negotiates upward, so the extension's long-standing habit of
+	// always asking for TDS_DEFAULT_PACKET_SIZE pinned every connection at 4096.
+	// 0 selects the default; anything else is clamped to [512, 32767].
+	void SetRequestedPacketSize(size_t packet_size) {
+		if (packet_size == 0) {
+			requested_packet_size_ = static_cast<uint32_t>(TDS_DEFAULT_PACKET_SIZE);
+			return;
+		}
+		if (packet_size < TDS_MIN_PACKET_SIZE) {
+			packet_size = TDS_MIN_PACKET_SIZE;
+		} else if (packet_size > TDS_MAX_PACKET_SIZE) {
+			packet_size = TDS_MAX_PACKET_SIZE;
+		}
+		requested_packet_size_ = static_cast<uint32_t>(packet_size);
+	}
+
 private:
+	// Size the socket's receive staging from the frame size the server confirmed
+	// (spec 055). Called from every login path once the PACKETSIZE ENVCHANGE has
+	// been applied. Reads are made in whole frames, several at a time.
+	void ApplyNegotiatedFraming();
+
 	std::unique_ptr<TdsSocket> socket_;
 	std::atomic<ConnectionState> state_;
 
@@ -205,6 +229,11 @@ private:
 
 	// TLS state
 	bool tls_enabled_;
+
+	// Frame size we ask for in LOGIN7 (spec 055). Defaults to the pre-055
+	// behaviour so anything that does not call SetRequestedPacketSize is
+	// unchanged.
+	uint32_t requested_packet_size_ = static_cast<uint32_t>(TDS_DEFAULT_PACKET_SIZE);
 
 	// Negotiated packet size from server (from ENVCHANGE during login)
 	uint32_t negotiated_packet_size_;

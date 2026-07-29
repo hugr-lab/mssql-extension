@@ -485,7 +485,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 	// Step 1: Send LOGIN7 with ADAL FEDAUTH extension (no token embedded)
 	TdsPacket login = TdsProtocol::BuildLogin7WithADAL(client_hostname, tds_server_name_, database, fedauth_echo_,
-													   login7_app_name, TDS_DEFAULT_PACKET_SIZE);
+													   login7_app_name, requested_packet_size_);
 	login.SetPacketId(next_packet_id_++);
 
 	// Debug: dump LOGIN7 payload (last 20 bytes should contain FEDAUTH extension)
@@ -625,6 +625,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 	spid_ = login_response.spid;
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
+	ApplyNegotiatedFraming();
 
 	// Check for routing (Azure SQL/Fabric gateway redirection)
 	if (login_response.has_routing) {
@@ -720,7 +721,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 	TdsPacket login =
 		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
-										 initial_blob, login7_app_name, TDS_DEFAULT_PACKET_SIZE);
+										 initial_blob, login7_app_name, requested_packet_size_);
 
 	// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
 	// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
@@ -757,6 +758,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		if (login_response.success) {
 			spid_ = login_response.spid;
 			negotiated_packet_size_ = login_response.negotiated_packet_size;
+			ApplyNegotiatedFraming();
 			MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: success after %d round(s), spid=%d, packet_size=%d",
 								 round + 1, spid_, negotiated_packet_size_);
 			database_ = database;
@@ -834,10 +836,13 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
 	// preserves the prior extension default.
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
-	// Request default packet size - server will negotiate up if it supports larger
-	// This allows the server to tell us its optimal packet size via ENVCHANGE
+	// Request our configured frame size. The server answers with
+	// min(requested, its own maximum) via the PACKETSIZE ENVCHANGE — it never
+	// raises the value on its own, so asking for the 4096 default (as this did
+	// unconditionally before spec 055) pinned every packet in both directions
+	// at 4096 for the life of the connection.
 	TdsPacket login =
-		TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name, TDS_DEFAULT_PACKET_SIZE);
+		TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name, requested_packet_size_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
@@ -868,10 +873,32 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	spid_ = login_response.spid;
 	// Use server-negotiated packet size from ENVCHANGE, or keep default if not received
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
+	ApplyNegotiatedFraming();
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: authentication successful, spid=%d, packet_size=%d", spid_,
 						 negotiated_packet_size_);
 
 	return true;
+}
+
+void TdsConnection::ApplyNegotiatedFraming() {
+	if (!socket_) {
+		return;
+	}
+	// Keep the staging buffer at a fixed byte budget rather than a fixed frame
+	// count: at the 4096 default that is many frames per recv(), and at the
+	// 32767 maximum it is still two, so a larger frame never costs more memory
+	// per connection than a small one. With a pool of 64 connections the budget
+	// below is the whole receive-side footprint.
+	uint32_t packet_size = negotiated_packet_size_;
+	if (packet_size < TDS_MIN_PACKET_SIZE) {
+		packet_size = static_cast<uint32_t>(TDS_DEFAULT_PACKET_SIZE);
+	}
+	uint32_t frames = static_cast<uint32_t>(TDS_RECV_BUFFER_TARGET_BYTES / packet_size);
+	if (frames < TDS_RECV_MIN_FRAMES) {
+		frames = TDS_RECV_MIN_FRAMES;
+	}
+	socket_->SetReceiveFraming(packet_size, frames);
+	MSSQL_CONN_DEBUG_LOG(1, "ApplyNegotiatedFraming: frame=%u bytes, %u frames per read", packet_size, frames);
 }
 
 bool TdsConnection::IsAlive() const {

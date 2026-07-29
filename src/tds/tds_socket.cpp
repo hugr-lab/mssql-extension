@@ -103,9 +103,12 @@ TdsSocket::TdsSocket(TdsSocket &&other) noexcept
 	  connected_(other.connected_),
 	  last_error_(std::move(other.last_error_)),
 	  tls_context_(std::move(other.tls_context_)),
-	  receive_buffer_(std::move(other.receive_buffer_)) {
+	  receive_buffer_(std::move(other.receive_buffer_)),
+	  receive_pos_(other.receive_pos_),
+	  recv_scratch_(std::move(other.recv_scratch_)) {
 	other.fd_ = -1;
 	other.connected_ = false;
+	other.receive_pos_ = 0;
 }
 
 TdsSocket &TdsSocket::operator=(TdsSocket &&other) noexcept {
@@ -118,8 +121,11 @@ TdsSocket &TdsSocket::operator=(TdsSocket &&other) noexcept {
 		last_error_ = std::move(other.last_error_);
 		tls_context_ = std::move(other.tls_context_);
 		receive_buffer_ = std::move(other.receive_buffer_);
+		receive_pos_ = other.receive_pos_;
+		recv_scratch_ = std::move(other.recv_scratch_);
 		other.fd_ = -1;
 		other.connected_ = false;
+		other.receive_pos_ = 0;
 	}
 	return *this;
 }
@@ -270,6 +276,7 @@ void TdsSocket::Close() {
 	}
 	connected_ = false;
 	receive_buffer_.clear();
+	receive_pos_ = 0;
 }
 
 bool TdsSocket::IsConnected() const {
@@ -289,6 +296,7 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: WARNING - clearing %zu leftover bytes in receive buffer",
 							   receive_buffer_.size());
 		receive_buffer_.clear();
+		receive_pos_ = 0;
 	}
 
 	if (!IsConnected()) {
@@ -648,31 +656,66 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	return received;
 }
 
+void TdsSocket::SetReceiveFraming(uint32_t packet_size, uint32_t frames) {
+	if (packet_size < TDS_MIN_PACKET_SIZE) {
+		packet_size = static_cast<uint32_t>(TDS_DEFAULT_PACKET_SIZE);
+	}
+	if (frames == 0) {
+		frames = 1;
+	}
+	const size_t scratch = static_cast<size_t>(packet_size) * frames;
+	recv_scratch_.assign(scratch, 0);
+	// The assembly buffer holds at least one whole frame beyond a full scratch
+	// read, so a frame split across two reads never forces a growth.
+	receive_buffer_.reserve(scratch + packet_size);
+	MSSQL_SOCKET_DEBUG_LOG(1, "SetReceiveFraming: packet_size=%u frames=%u scratch=%zuB", packet_size, frames, scratch);
+}
+
 bool TdsSocket::ReceivePacket(TdsPacket &packet, int timeout_ms) {
-	// Read until we have a complete packet
-	uint8_t temp_buffer[TDS_DEFAULT_PACKET_SIZE];
+	// Pre-negotiation fallback: SetReceiveFraming is called once the server has
+	// confirmed the frame size, so PRELOGIN/LOGIN7 still run on the default.
+	uint8_t default_scratch[TDS_DEFAULT_PACKET_SIZE];
 
 	while (true) {
-		// Try to parse from existing buffer
-		if (receive_buffer_.size() >= TDS_HEADER_SIZE) {
-			uint16_t expected_length = TdsPacket::GetPacketLength(receive_buffer_.data());
-			if (receive_buffer_.size() >= expected_length) {
-				// Have complete packet
-				size_t consumed = TdsPacket::Parse(receive_buffer_.data(), receive_buffer_.size(), packet);
+		// Try to parse from what is already buffered. Nothing is erased here —
+		// erase() from the front cost an O(n) memmove of the remaining bytes on
+		// EVERY packet, which is exactly the work a bigger frame is supposed to
+		// avoid. The cursor advances instead, and the tail is compacted once
+		// below, when it has been fully consumed.
+		const size_t buffered = receive_buffer_.size() - receive_pos_;
+		if (buffered >= TDS_HEADER_SIZE) {
+			const uint8_t *head = receive_buffer_.data() + receive_pos_;
+			uint16_t expected_length = TdsPacket::GetPacketLength(head);
+			if (buffered >= expected_length) {
+				size_t consumed = TdsPacket::Parse(head, buffered, packet);
 				if (consumed > 0) {
-					receive_buffer_.erase(receive_buffer_.begin(), receive_buffer_.begin() + consumed);
+					receive_pos_ += consumed;
+					if (receive_pos_ == receive_buffer_.size()) {
+						// Fully drained — reset instead of holding the allocation
+						// at an ever-growing offset.
+						receive_buffer_.clear();
+						receive_pos_ = 0;
+					}
 					return true;
 				}
 			}
 		}
 
-		// Need more data
-		ssize_t received = Receive(temp_buffer, sizeof(temp_buffer), timeout_ms);
+		// Compact before reading more, so the buffer does not grow without bound
+		// across a long result set. One memmove per read, not one per packet.
+		if (receive_pos_ > 0) {
+			receive_buffer_.erase(receive_buffer_.begin(), receive_buffer_.begin() + receive_pos_);
+			receive_pos_ = 0;
+		}
+
+		uint8_t *scratch = recv_scratch_.empty() ? default_scratch : recv_scratch_.data();
+		const size_t scratch_size = recv_scratch_.empty() ? sizeof(default_scratch) : recv_scratch_.size();
+		ssize_t received = Receive(scratch, scratch_size, timeout_ms);
 		if (received <= 0) {
 			return false;  // Timeout or error
 		}
 
-		receive_buffer_.insert(receive_buffer_.end(), temp_buffer, temp_buffer + received);
+		receive_buffer_.insert(receive_buffer_.end(), scratch, scratch + received);
 	}
 }
 

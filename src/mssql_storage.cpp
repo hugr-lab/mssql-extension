@@ -1094,6 +1094,7 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 
 	// Create a temporary connection to test Azure AD credentials
 	tds::TdsConnection conn;
+	conn.SetRequestedPacketSize(info.tds_packet_size);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
@@ -1159,6 +1160,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 
 	// Create a temporary connection to test the pre-provided token
 	tds::TdsConnection conn;
+	conn.SetRequestedPacketSize(info.tds_packet_size);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
@@ -1218,6 +1220,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 
 	// Create a temporary connection to test credentials
 	tds::TdsConnection conn;
+	conn.SetRequestedPacketSize(info.tds_packet_size);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
@@ -1298,6 +1301,7 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 							timeout_seconds);
 
 	tds::TdsConnection conn;
+	conn.SetRequestedPacketSize(info.tds_packet_size);
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
@@ -1513,6 +1517,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// AuthenticateIntegrated. 0 = production default (4096).
 	connection_info->login7_max_packet =
 		pool_config.login7_max_packet > 0 ? static_cast<size_t>(pool_config.login7_max_packet) : 0;
+	// Spec 055: TDS frame size requested at login. Bounds recv()/send() counts in
+	// both directions for the whole life of every pooled connection.
+	connection_info->tds_packet_size =
+		pool_config.tds_packet_size > 0 ? static_cast<size_t>(pool_config.tds_packet_size) : 0;
 	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
 	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
 							lazy_validation ? "true" : "false", attach_validation_timeout);

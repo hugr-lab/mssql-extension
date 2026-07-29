@@ -112,6 +112,12 @@ struct MSSQLConnectionInfo {
 	// test without an AD-sized Kerberos PAC. Clamped in AuthenticateIntegrated.
 	size_t login7_max_packet = 0;
 
+	// Spec 055: TDS frame size to request in LOGIN7, populated at ATTACH from
+	// mssql_tds_packet_size. 0 = the 4096 default. Carried here so both the
+	// ATTACH-time validation connection and the pool factory (which only sees
+	// connection_info) request the same size. Clamped to [512, 32767] at use.
+	size_t tds_packet_size = 0;
+
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//

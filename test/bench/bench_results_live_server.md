@@ -92,6 +92,107 @@ Two contributors, both fixable:
 A larger requested frame needs the receive side to follow, or the frame is just
 reassembled from the same number of `recv` calls.
 
+## D0 follow-up: most of the floor was our own instrumentation
+
+The first thing the floor decomposed into was the measuring apparatus.
+
+`MSSQLResultStream::FillChunk` called `std::chrono::steady_clock::now()` **four
+times per row, unconditionally** — a pair around `parser_.TryParseNext()` and a
+pair around `ProcessRow()`. On this machine a `now()` call costs 14.5 ns and a
+timed pair with its `duration_cast` costs 29.5 ns, so the loop spent **~59 ns per
+row** measuring itself. Present since spec 004 (`78f7629`, 2026-01-16), i.e.
+shipped in every release from v0.1.0 on.
+
+Two defects, both fixed:
+
+1. **Never gated.** Release builds paid for instrumentation nobody read. Now
+   latched on `MSSQL_DEBUG>=1` (`timing_enabled_`), matching the level at which
+   the FillChunk summary is printed.
+2. **Truncated to zero.** Intervals accumulated via
+   `duration_cast<microseconds>` — per *row*. A row is processed in ~100 ns, so
+   every one of those casts yielded 0 and `fill_process_us` reported
+   approximately nothing regardless of the work done. Only the rare, long socket
+   waits ever crossed a microsecond boundary. Accumulation is now in nanoseconds.
+
+Interleaved same-session A/B, two passes, 500k rows × 10 in-process iterations,
+client CPU ns/value:
+
+| family | before | after | delta |
+| --- | ---: | ---: | ---: |
+| bool | 78.8 | 28.0 | **−64%** |
+| int | 86.9 | 34.9 | −60% |
+| bigint | 99.3 | 45.4 | −54% |
+| dec38 | 136.2 | 89.7 | −34% |
+| str16 | 153.7 | 118.7 | −23% |
+
+The two passes agree within ~1%. The ~50 ns/row removed matches the 59 ns/row
+measured for the clock calls; narrow types, whose per-row budget was of the same
+order, gain the most.
+
+### What the floor is made of now
+
+With timing enabled at `MSSQL_DEBUG=1` (so these still carry ~29 ns/row of their
+own overhead, visible as most of `unaccounted`), 500k rows, wall ns/row:
+
+| family | total | parse | read | process | unaccounted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| bool | 150.7 | 21.3 | 81.7 | 18.2 | 29.5 |
+| bigint | 180.1 | 23.1 | 106.7 | 19.3 | 31.1 |
+| str16 | 259.3 | 26.9 | 171.1 | 30.1 | 31.2 |
+
+`read` is wall time inside `ReadMoreData` — mostly *waiting* on the server, not
+CPU; its CPU component is `recv` syscall overhead, which is the packet-size
+argument again. The client's own work splits roughly evenly between TDS
+token/row framing (`parse`, 21–27 ns/row) and per-value decode plus chunk fill
+(`process`, 18–30 ns/row).
+
+Do not read `MSSQL_DEBUG=2` numbers as a phase breakdown: level 2 also turns on
+per-row logging, which inflated `parse` to 467–529 ns/row in a first attempt.
+Use level 1 and aggregate the per-chunk `FillChunk:` lines.
+
+## TDS frame size — the other half of the floor
+
+The phase split above put the largest wall term in `read`, whose CPU component is
+`recv` syscall overhead. Three things were pinning it:
+
+1. The extension requested `TDS_DEFAULT_PACKET_SIZE` (4096) in LOGIN7 on every
+   connection — `tds_connection.cpp` claimed the server would "negotiate up",
+   which is not how TDS works: the server answers with `min(requested, its own
+   maximum)` and never raises it.
+2. `TdsSocket::ReceivePacket` read through a fixed `uint8_t[4096]` scratch, so a
+   larger frame would have been reassembled from the same number of `recv` calls.
+3. Every completed packet did `receive_buffer_.erase(begin, begin + consumed)` —
+   an O(n) memmove of everything still buffered, per packet.
+
+Fixed together: `mssql_tds_packet_size` setting plumbed into LOGIN7, receive
+staging sized to a 64 KB budget of whole frames (16 frames at 4096, 4 at 16384 —
+a byte budget, so a larger frame never costs more per-connection memory), and the
+packet cursor replacing the per-packet erase.
+
+Sweep, 500k rows × 15 mixed columns, medians of 3 (`MSSQL_BENCH_PACKET_SIZES`):
+
+| requested | granted | read CPU ns/val | write CPU ns/val | read wall | write wall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 4096 | 106.4 | 52.7 | 2.470 | 3.966 |
+| 8192 | 8000 | 84.9 | 43.1 | 1.432 | 3.456 |
+| 16384 | 16384 | **76.8** | **38.7** | **1.400** | 2.897 |
+| 32767 | 16384 | 76.8 | 40.1 | 1.394 | 2.561 |
+
+**Read −28% CPU and −43% wall; write −27% CPU.** Read `sys` alone went 0.380 →
+0.247 s.
+
+This SQL Server caps the grant at 16384, so the last two rows are the same
+configuration — their spread (38.7 vs 40.1 CPU, 2.897 vs 2.561 wall) is a useful
+noise estimate for these steps: ~4% on CPU, ~11% on wall. It also means we have
+**no evidence about servers that would grant more than 16384**.
+
+Default raised 4096 → 16384. The cost is server-side memory: SQL Server allocates
+network buffers per session, so 16 KB per pooled connection instead of 4 KB.
+`SET mssql_tds_packet_size=4096` restores the old behaviour exactly.
+
+Correctness: `diff_check.sh` 13/13 byte-identical against the pre-change build,
+including the PLP/MAX, embedded-NUL, collation and BCP write-back cases.
+
 ## Caveats
 
 - Client and server share one machine; server CPU competes with client CPU for

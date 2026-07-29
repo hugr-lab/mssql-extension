@@ -85,7 +85,18 @@ public:
 	// Clear receive buffer (useful before starting a new query)
 	void ClearReceiveBuffer() {
 		receive_buffer_.clear();
+		receive_pos_ = 0;
 	}
+
+	// Spec 055: size the receive staging buffer from the negotiated frame size.
+	// Called once after login, when the frame size is actually known.
+	//
+	// Two things depended on the old fixed 4096 scratch: a 32 KB frame was
+	// reassembled from eight recv() calls (the syscall count the larger frame was
+	// meant to remove), and every completed packet triggered an erase() from the
+	// front of receive_buffer_ — an O(n) memmove of everything still buffered.
+	// Reading whole frames at a time and consuming through a cursor removes both.
+	void SetReceiveFraming(uint32_t packet_size, uint32_t frames);
 
 private:
 	int fd_;				  // Socket file descriptor (-1 if closed)
@@ -97,8 +108,17 @@ private:
 	// TLS context for encrypted connections (null when TLS is not enabled)
 	std::unique_ptr<TlsTdsContext> tls_context_;
 
-	// Internal receive buffer for partial packet handling
+	// Internal receive buffer for partial packet handling.
+	// Consumed through receive_pos_ rather than erase(): a completed packet only
+	// advances the cursor, and the tail is compacted to the front once, when the
+	// cursor has caught up with the end (spec 055).
 	std::vector<uint8_t> receive_buffer_;
+	size_t receive_pos_ = 0;
+
+	// Staging buffer for recv(), sized to hold several whole TDS frames
+	// (SetReceiveFraming). Empty until sized; ReceivePacket then falls back to
+	// the pre-negotiation default.
+	std::vector<uint8_t> recv_scratch_;
 
 	// Helper to set non-blocking mode
 	bool SetNonBlocking(bool enable);

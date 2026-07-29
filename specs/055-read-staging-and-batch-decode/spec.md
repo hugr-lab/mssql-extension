@@ -22,13 +22,29 @@ phase 2 / spec 056).
 **Phase invariant:** after this phase the hot path contains **no per-value conversion call and no
 per-value type dispatch, for any family**. The only work that legitimately remains per value is:
 
-1. walking the TDS row framing (each value carries its own length prefix — the protocol gives no
-   other way to find the next value),
-2. the raw scatter row-major → column-major (a store per value),
+1. **one** walk over the row that reads the length prefix of each variable-length value (the
+   protocol gives no other way to find the next value; fixed-width columns need no walk at all,
+   and under NBCROW their offsets are arithmetic from the null bitmap),
+2. the raw scatter row-major → column-major (a store per value), fused into that same walk,
 3. constructing the output `string_t` / writing the decoded slot.
 
 The measured cost of that irreducible residue is the integer/float decode floor from the 054
 baseline: **1.7–2.2 ns/value**. Everything above it is what this phase removes.
+
+**Note what this phase is actually replacing — it is not "add staging to a path that had none".**
+The current read path already stages, into the wrong layout, and then re-reads it:
+
+- `RowReader::ReadRow` (`src/tds/tds_row_reader.cpp:11-33`) walks the row **and copies every
+  value's payload** into `RowData::values[col]`, a `std::vector<std::vector<uint8_t>>`
+  (`src/include/tds/tds_token_parser.hpp:81`) — one heap vector per column, `clear()`ed per value
+  per row;
+- `MSSQLResultStream::ProcessRow` then walks that row-major structure **again** and dispatches per
+  value into the codec.
+
+So the wire bytes are copied once and read twice, with a type dispatch in each pass. Staging does
+not add a copy — it redirects the copy that already happens into column-major buffers, after which
+conversion is one batch call per column and the second pass disappears entirely. This is why the
+§8 end-to-end prototype measured 21.4 → 5.8 ns/value **including** its staging cost.
 
 Prototypes for every strategy below were built in `test/cpp/bench_materialize.cpp` and measured
 before this spec was written; §8 records the numbers, and the deliverables are sized by them
@@ -104,6 +120,62 @@ staging does not remove, the rest of this spec gets re-sized before it is built.
 
 Lands first, ahead of D1 — it is measurement, touches no conversion, and is gated by nothing more
 than the existing suites.
+
+**Status: done, and it moved the baseline.** Three phase timers already existed in `FillChunk`
+(`parse` / `read` / `process`) but were broken in two ways, both shipped since spec 004 and
+present in every release from v0.1.0:
+
+- **never gated** — four `steady_clock::now()` calls per row in release builds, measured at
+  ~59 ns/row on this machine;
+- **truncated** — per-row intervals accumulated via `duration_cast<microseconds>`, so a ~100 ns
+  row contributed 0 and `fill_process_us` reported nothing.
+
+Gating them behind `MSSQL_DEBUG>=1` and accumulating in nanoseconds cut live read cost by
+**23–64%** (bool 78.8 → 28.0, bigint 99.3 → 45.4, str16 153.7 → 118.7 ns/value), interleaved
+same-session A/B over two passes agreeing within 1%.
+
+Consequences for the rest of this phase, which supersede §1.1's arithmetic:
+
+- the floor was roughly two thirds measurement apparatus, not architecture. The *real* remaining
+  per-row client work is `parse` 21–27 ns and `process` 18–30 ns;
+- both `parse` and `process` are in scope for staging, and an earlier draft of this note was wrong
+  to call `parse` irreducible. `parse` is not a bare framing walk: it copies every value into
+  row-major `RowData` scratch, which `process` then re-reads. Staging replaces that copy with a
+  column-major one and deletes the second pass — see §1;
+- with the apparatus gone, the codec share is larger than §1.1 estimated: str16 sits at 118.7
+  ns/value against a `process` phase of 30 ns/row, so the string decode win is now a materially
+  bigger fraction of what remains;
+- `read` phase is wall, not CPU — mostly waiting on the server. Its CPU part is `recv` syscall
+  overhead, which belongs to the TDS frame-size question, not to this spec.
+
+Re-run the live baseline after D5/D6 land and compare against the post-D0 column, not against the
+original one.
+
+### D0b. TDS frame size + multi-frame receive staging — **done**, read −28% CPU / −43% wall
+
+Added after D0 showed `read` to be the largest wall term, with `recv` syscall overhead as its CPU
+component. Three causes, fixed together:
+
+- LOGIN7 always requested `TDS_DEFAULT_PACKET_SIZE`. The comment at
+  `tds_connection.cpp` claimed the server would "negotiate up"; TDS does the opposite — the server
+  answers `min(requested, its maximum)` and never raises it. New setting `mssql_tds_packet_size`
+  (clamped [512, 32767]), plumbed through `MSSQLPoolConfig` → `MSSQLConnectionInfo` → all pool
+  factories and the ATTACH-validation connections, via `TdsConnection::SetRequestedPacketSize`.
+- `TdsSocket::ReceivePacket` read through a fixed `uint8_t[4096]`, so a bigger frame would have
+  been reassembled by the same number of `recv` calls. Receive staging is now sized to a **byte
+  budget** (`TDS_RECV_BUFFER_TARGET_BYTES`, 64 KB) of whole frames — 16 frames at 4096, 4 at
+  16384 — so raising the frame size never raises per-connection memory.
+- Every completed packet did `receive_buffer_.erase(begin, begin + consumed)`, an O(n) memmove of
+  the remaining bytes **per packet**. Replaced by a read cursor; the tail is compacted once per
+  `recv`, not once per packet.
+
+Measured (500k rows × 15 mixed columns, medians of 3): read 106.4 → 76.8 ns/value CPU and
+2.47 → 1.40 s wall, write 52.7 → 38.7 ns/value. Default raised 4096 → 16384
+(`TDS_PREFERRED_PACKET_SIZE`); this server caps the grant at 16384, so 32767 measured identically
+and nothing is known about servers that would grant more. `diff_check.sh` 13/13 byte-identical.
+
+Note this changes what the rest of the phase is measured against **again**: the post-D0b read
+baseline for the wide step is 76.8 ns/value, not 106.4.
 
 ### D1. DECIMAL decode kernel — measured 23×, lands first and standalone
 
@@ -471,7 +543,8 @@ Re-run the full D1 matrix + the D3 TPC-H e2e (SF 0.01/0.1/1) and append delta co
 ## 6. Task order
 
 ```text
-T0   D0 read-path phase timers + live-server decomposition  → numbers, re-size if surprising
+T0   D0 read-path phase timers + live-server decomposition  -> numbers, re-size if surprising
+T0b  D0b TDS frame size setting + multi-frame receive staging -> diff_check, sweep
 T1   D1 decimal kernel + fixture tests + endianness guard   → diff_check, micro delta
 T2   D11 bench pruning (keep shipped strategies + reference)
 T3   D3 ColumnStagingSet + ownership/watermark tests
