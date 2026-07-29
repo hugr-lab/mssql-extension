@@ -113,6 +113,38 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
+							Vector &out) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+	// Total over any byte pattern — a sign byte and a little-endian mantissa are
+	// just loads — so the loop runs over NULL rows too and stays branch-free.
+	if (col.precision <= 4) {
+		int16_t *result = FlatVector::GetData<int16_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int16_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else if (col.precision <= 9) {
+		int32_t *result = FlatVector::GetData<int32_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int32_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else if (col.precision <= 18) {
+		int64_t *result = FlatVector::GetData<int64_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int64_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else {
+		hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
+		}
+	}
+}
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	hugeint_t value = WidenVectorToHugeint(in, fmt, row);

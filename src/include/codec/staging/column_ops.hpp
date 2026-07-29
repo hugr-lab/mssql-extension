@@ -59,6 +59,10 @@ enum class AppendArm : uint8_t {
 	//! column-invariant, so the row loop carries neither.
 	P1StageFixed,
 	RawStageFixed,
+	//! DECIMAL/NUMERIC. Its own arm because it is the one fixed-width family
+	//! whose wire value may legitimately be SHORTER than the declared width;
+	//! the append zero-extends instead of rejecting it.
+	P1StageDecimal,
 	//! Framing and conversion both go through the legacy per-value path. This is
 	//! every family that does not yet have a batch kernel, plus the issue-#89
 	//! divergence case. Cost is identical to the pre-staging path — one copy into

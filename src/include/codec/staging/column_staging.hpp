@@ -297,6 +297,20 @@ struct ColumnStaging {
 		count++;
 	}
 
+	//! Stage a value SHORTER than the slot, zero-filling the rest.
+	//!
+	//! Only DECIMAL uses this. Its mantissa is little-endian, so widening a short
+	//! encoding with high zero bytes is exactly value-preserving — which is what
+	//! lets a server that sends fewer bytes than the precision declares stay on
+	//! the batch path instead of falling back to a per-value decode.
+	template <uint32_t STRIDE>
+	inline void AppendFixedPadded(const uint8_t *src, uint32_t length) {
+		uint8_t *dst = buffer.data() + count * STRIDE;
+		std::memcpy(dst, src, length);
+		std::memset(dst + length, 0, STRIDE - length);
+		count++;
+	}
+
 	//! Copy STRIDE bytes straight into the output vector for a Direct column.
 	//! Positional, like Fixed: no cursor to keep in step with NULLs.
 	//!

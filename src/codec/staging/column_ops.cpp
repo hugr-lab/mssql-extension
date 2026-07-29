@@ -155,6 +155,21 @@ bool IsStageableFixedWidth(uint32_t width) {
 	}
 }
 
+//! Wire width of a DECIMAL/NUMERIC column: one sign byte plus a mantissa sized
+//! by the declared precision.
+uint32_t DecimalWireWidth(uint8_t precision) {
+	if (precision <= 9) {
+		return 5;
+	}
+	if (precision <= 19) {
+		return 9;
+	}
+	if (precision <= 28) {
+		return 13;
+	}
+	return 17;
+}
+
 AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	const bool prefixed = HasOneBytePrefix(type_id);
 	switch (width) {
@@ -212,6 +227,14 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		ops.direct_write = true;
 		return ops;
 	}
+	if ((column.type_id == tds::TDS_TYPE_DECIMAL || column.type_id == tds::TDS_TYPE_NUMERIC) && column.precision > 0 &&
+		column.precision <= 38) {
+		ops.kind = StagingKind::Fixed;
+		ops.arm = AppendArm::P1StageDecimal;
+		ops.stride = DecimalWireWidth(column.precision);
+		return ops;
+	}
+
 	// Fixed-width families with a batch kernel: UNIQUEIDENTIFIER and the temporal
 	// types. DATETIME and SMALLDATETIME arrive bare; everything else carries the
 	// one-byte length prefix.

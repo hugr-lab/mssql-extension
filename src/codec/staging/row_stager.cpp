@@ -7,6 +7,8 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "codec/datetime_codec.hpp"
+#include "codec/decimal_codec.hpp"
+#include "codec/money_codec.hpp"
 #include "codec/staging/binary_finalize.hpp"
 #include "codec/staging/string_finalize.hpp"
 #include "codec/staging/uuid_finalize.hpp"
@@ -81,6 +83,41 @@ inline size_t AppendPrefixedFixed(ColumnStaging &st, const uint8_t *p) {
 //!
 //! `default` is unreachable: ResolveColumnOps only chooses these arms for a
 //! width listed in IsStageableFixedWidth.
+//! DECIMAL's append: like AppendPrefixedFixed, but a value shorter than the
+//! declared width is zero-extended rather than rejected. The mantissa is
+//! little-endian, so that is exactly value-preserving, and it keeps a server
+//! that trims trailing zero bytes on the batch path.
+template <uint32_t STRIDE>
+inline size_t AppendPrefixedDecimal(ColumnStaging &st, const uint8_t *p) {
+	const uint32_t len = p[0];
+	if (len == STRIDE) {
+		st.AppendFixed<STRIDE>(p + 1);
+		return 1 + STRIDE;
+	}
+	if (len == 0) {
+		st.AppendNull();
+		return 1;
+	}
+	if (len < STRIDE) {
+		st.AppendFixedPadded<STRIDE>(p + 1, len);
+		return 1 + len;
+	}
+	ThrowBadPrefix(STRIDE, len);
+}
+
+inline size_t AppendStagedDecimal(ColumnStaging &st, const uint8_t *p) {
+	switch (st.stride) {
+	case 5:
+		return AppendPrefixedDecimal<5>(st, p);
+	case 9:
+		return AppendPrefixedDecimal<9>(st, p);
+	case 13:
+		return AppendPrefixedDecimal<13>(st, p);
+	default:
+		return AppendPrefixedDecimal<17>(st, p);
+	}
+}
+
 template <bool PREFIXED>
 inline size_t AppendStagedFixed(ColumnStaging &st, const uint8_t *p) {
 	switch (st.stride) {
@@ -195,6 +232,9 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		case AppendArm::RawStageFixed:
 			p += AppendStagedFixed<false>(arena_.Column(c), p);
 			break;
+		case AppendArm::P1StageDecimal:
+			p += AppendStagedDecimal(arena_.Column(c), p);
+			break;
 		case AppendArm::P2StageString: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
 			if (length == 0xFFFF) {
@@ -298,6 +338,9 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::RawStageFixed:
 			p += AppendStagedFixed<false>(arena_.Column(c), p);
 			break;
+		case AppendArm::P1StageDecimal:
+			p += AppendStagedDecimal(arena_.Column(c), p);
+			break;
 		case AppendArm::P2StageString: {
 			// The length prefix stays in an NBC row; the bitmap only decided that
 			// a value is present at all, which the branch above already handled.
@@ -339,11 +382,17 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			FinalizeStringColumn(st, row_count, *targets_[c]);
 		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
 			FinalizeBinaryColumn(st, row_count, *targets_[c]);
+		} else if (ops_[c].arm == AppendArm::P1StageDecimal) {
+			decimal::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
 		} else if (ops_[c].arm == AppendArm::P1StageFixed || ops_[c].arm == AppendArm::RawStageFixed) {
 			// Which kernel is a property of the column, so it is decided here,
 			// once, and the kernel's own loop carries no dispatch at all.
-			if ((*metadata_)[c].type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+			const uint8_t type_id = (*metadata_)[c].type_id;
+			if (type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
 				FinalizeUuidColumn(st, row_count, *targets_[c]);
+			} else if (type_id == tds::TDS_TYPE_MONEY || type_id == tds::TDS_TYPE_SMALLMONEY ||
+					   type_id == tds::TDS_TYPE_MONEYN) {
+				money::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
 			} else {
 				datetime::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
 			}

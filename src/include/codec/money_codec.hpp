@@ -16,6 +16,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -42,6 +43,11 @@ namespace codec {
 namespace money {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch decode of a staged MONEY / SMALLMONEY column (spec 055 D6). The width
+//! is a property of the column, so the 8-byte and 4-byte forms are separate
+//! loops rather than a per-value length test.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx);
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
