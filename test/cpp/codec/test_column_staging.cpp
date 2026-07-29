@@ -19,9 +19,12 @@
 // Build & run:
 //   make test-column-staging
 
+#include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "tds/encoding/type_converter.hpp"
+#include "tds/tds_types.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -29,7 +32,9 @@
 #include <vector>
 
 using duckdb::idx_t;
+using duckdb::mssql::codec::staging::ColumnOps;
 using duckdb::mssql::codec::staging::ColumnStaging;
+using duckdb::mssql::codec::staging::ResolveColumnOps;
 using duckdb::mssql::codec::staging::StagingArena;
 using duckdb::mssql::codec::staging::StagingKind;
 
@@ -239,6 +244,81 @@ void TestWatermarkRetainsThenReleases() {
 	CHECK_EQ(col.LengthAt(0), 1u, "usable after shrink");
 }
 
+void TestColumnOpsResolution() {
+	std::cout << "[7] ColumnOps: per-column classification (D4)..." << std::endl;
+	using duckdb::LogicalType;
+	using duckdb::tds::ColumnMetadata;
+	using duckdb::tds::encoding::TypeConverter;
+
+	auto meta = [](uint8_t type_id, int32_t max_length) {
+		ColumnMetadata c;
+		c.type_id = type_id;
+		c.max_length = max_length;
+		return c;
+	};
+	// Resolve against the type the wire itself implies — the agreeing case.
+	auto resolve = [](const ColumnMetadata &c) { return ResolveColumnOps(c, TypeConverter::GetDuckDBType(c)); };
+
+	// Integers and IEEE floats: wire bytes ARE the DuckDB representation.
+	struct DirectCase {
+		uint8_t type_id;
+		int32_t max_length;
+		uint32_t stride;
+	};
+	const DirectCase direct_cases[] = {
+		{duckdb::tds::TDS_TYPE_TINYINT, 1, 1}, {duckdb::tds::TDS_TYPE_SMALLINT, 2, 2},
+		{duckdb::tds::TDS_TYPE_INT, 4, 4},	   {duckdb::tds::TDS_TYPE_BIGINT, 8, 8},
+		{duckdb::tds::TDS_TYPE_REAL, 4, 4},	   {duckdb::tds::TDS_TYPE_FLOAT, 8, 8},
+		{duckdb::tds::TDS_TYPE_INTN, 1, 1},	   {duckdb::tds::TDS_TYPE_INTN, 2, 2},
+		{duckdb::tds::TDS_TYPE_INTN, 4, 4},	   {duckdb::tds::TDS_TYPE_INTN, 8, 8},
+		{duckdb::tds::TDS_TYPE_FLOATN, 4, 4},  {duckdb::tds::TDS_TYPE_FLOATN, 8, 8},
+	};
+	for (const auto &c : direct_cases) {
+		const ColumnOps ops = resolve(meta(c.type_id, c.max_length));
+		CHECK_TRUE(ops.direct_write, "direct-writable type takes the bypass");
+		CHECK_TRUE(ops.kind == StagingKind::Direct, "direct-writable type is StagingKind::Direct");
+		CHECK_EQ(ops.stride, c.stride, "direct stride matches the wire width");
+		CHECK_TRUE(!ops.needs_value_fallback, "direct type needs no per-value fallback");
+	}
+
+	// BIT is deliberately not direct: the wire byte is not guaranteed to be 0/1
+	// and DuckDB's bool must be.
+	const ColumnOps bit_ops = resolve(meta(duckdb::tds::TDS_TYPE_BIT, 1));
+	CHECK_TRUE(!bit_ops.direct_write, "BIT is not direct-written");
+	CHECK_TRUE(bit_ops.kind == StagingKind::Fixed, "BIT stages Fixed for normalisation");
+
+	// Fixed width, conversion required.
+	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_UNIQUEIDENTIFIER, 16)).kind == StagingKind::Fixed,
+			   "GUID is Fixed (byte-order swap)");
+	CHECK_EQ(resolve(meta(duckdb::tds::TDS_TYPE_UNIQUEIDENTIFIER, 16)).stride, 16u, "GUID stride");
+	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_MONEY, 8)).kind == StagingKind::Fixed, "MONEY is Fixed");
+
+	// Variable length.
+	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).kind == StagingKind::Var, "NVARCHAR is Var");
+	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_BIGVARBINARY, 16)).kind == StagingKind::Var, "VARBINARY is Var");
+	CHECK_TRUE(!resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).direct_write, "Var is never direct-written");
+
+	// The issue-#89 guard, resolved once per column: when the vector we write
+	// into disagrees with what the wire implies, the column must fall back to
+	// the per-value converter rather than take a batch path with the wrong
+	// physical type.
+	const ColumnOps mismatched = ResolveColumnOps(meta(duckdb::tds::TDS_TYPE_INT, 4), LogicalType::VARCHAR);
+	CHECK_TRUE(mismatched.needs_value_fallback, "type disagreement forces the per-value fallback");
+	CHECK_TRUE(!mismatched.direct_write, "type disagreement never direct-writes");
+	CHECK_TRUE(mismatched.kind == StagingKind::Var, "fallback columns stage as Var");
+
+	// An unknown wire type must resolve, not throw — the per-value path owns
+	// that error so it can name the column.
+	bool threw = false;
+	try {
+		const ColumnOps unknown = ResolveColumnOps(meta(0x00, 0), LogicalType::VARCHAR);
+		CHECK_TRUE(unknown.needs_value_fallback, "unknown wire type falls back");
+	} catch (...) {
+		threw = true;
+	}
+	CHECK_TRUE(!threw, "unknown wire type does not throw during resolution");
+}
+
 }  // namespace
 
 int main() {
@@ -253,6 +333,7 @@ int main() {
 		TestPayloadCapIsChecked();
 		TestArenaAddressStability();
 		TestWatermarkRetainsThenReleases();
+		TestColumnOpsResolution();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

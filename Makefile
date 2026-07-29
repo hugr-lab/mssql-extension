@@ -396,6 +396,9 @@ test-column-staging: release
 	$(CXX) $(CODEC_STAGING_TEST_FLAGS) -I src/include -I duckdb/src/include \
 	    test/cpp/codec/test_column_staging.cpp \
 	    src/codec/staging/column_staging.cpp \
+	    src/codec/staging/column_ops.cpp \
+	    src/tds/encoding/type_converter.cpp \
+	    src/tds/tds_column_metadata.cpp \
 	    -L build/release/src -lduckdb \
 	    -o build/test/test_column_staging
 	@echo ""
