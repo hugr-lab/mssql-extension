@@ -15,12 +15,25 @@ namespace mssql {
 namespace codec {
 namespace staging {
 
-void ColumnStaging::ThrowPayloadOverflow(idx_t offset, uint32_t length) {
-	throw InvalidInputException(
-		"MSSQL: staged column payload would reach %llu bytes (offset %llu + length %u), past the %llu-byte cap. "
-		"This indicates a corrupt length prefix on the wire rather than legitimate data.",
-		static_cast<unsigned long long>(offset) + length, static_cast<unsigned long long>(offset), length,
-		static_cast<unsigned long long>(MAX_STAGING_PAYLOAD_BYTES));
+void ColumnStaging::GrowPayload(idx_t needed) {
+	// `needed` derives from a length prefix read off the wire. The cap is the one
+	// place that is bounded: this repo already fuzzes the token parser for
+	// exactly this shape of input (test_token_parser_security), and without the
+	// bound a corrupt prefix would both wrap the uint32_t offsets and ask the
+	// allocator for an arbitrary size.
+	if (needed > MAX_STAGING_PAYLOAD_BYTES) {
+		throw InvalidInputException(
+			"MSSQL: staged column payload would reach %llu bytes, past the %llu-byte cap. This indicates a corrupt "
+			"length prefix on the wire rather than legitimate data.",
+			static_cast<unsigned long long>(needed), static_cast<unsigned long long>(MAX_STAGING_PAYLOAD_BYTES));
+	}
+	// Double, so a steady stream allocates once and then never again — capacity
+	// is retained across chunks by the arena.
+	idx_t target = buffer.size() * 2;
+	if (target < needed) {
+		target = needed;
+	}
+	buffer.resize(target);
 }
 
 }  // namespace staging

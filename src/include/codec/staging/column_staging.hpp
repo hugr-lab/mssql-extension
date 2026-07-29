@@ -70,24 +70,78 @@ static const idx_t VALIDITY_WORDS_PER_CHUNK = (STANDARD_VECTOR_SIZE + 63) / 64;
 //! values would have to average 128 KB each to reach it.
 static const idx_t MAX_STAGING_PAYLOAD_BYTES = 256ULL * 1024ULL * 1024ULL;
 
+//! Per-column budget for preallocating a column's PROVABLE worst case.
+//!
+//! For a non-MAX variable column the declared type bounds every value exactly
+//! (nvarchar(16) is at most 32 bytes on the wire), so max_length *
+//! STANDARD_VECTOR_SIZE is the largest payload a chunk can possibly produce.
+//! Reserving that up front means the column can never resize again — not
+//! "rarely", never.
+//!
+//! It is only worth doing while the bound is cheap. nvarchar(16) needs 64 KB and
+//! nvarchar(200) 800 KB, but nvarchar(4000) would demand 16 MB per column for a
+//! width real data almost never reaches. Past this budget the high-water mark
+//! finds the actual size within a chunk or two and the column is resize-free
+//! from then on anyway.
+static const idx_t STAGING_PREALLOC_BUDGET_BYTES = 2ULL * 1024ULL * 1024ULL;
+
+//! Starting payload capacity for columns with no usable bound (PLP / MAX types).
+static const idx_t STAGING_UNBOUNDED_INITIAL_BYTES = 64ULL * 1024ULL;
+
 //===----------------------------------------------------------------------===//
 // StagingKind
 //===----------------------------------------------------------------------===//
 
-//! How a column's raw wire bytes are staged. Resolved once per column; the
-//! append switch has exactly these three arms.
+//! How a column's raw wire bytes are staged. Resolved once per column and used
+//! as the append switch's selector.
+//!
+//! The Direct family is split by width ON PURPOSE. A `memcpy` whose size is a
+//! runtime value compiles to a call into libc; the same copy with the size in
+//! the type is one unaligned `mov`, and `count * STRIDE` folds into the
+//! addressing mode instead of an `imul`. Measured on the arena's real shape
+//! (columns on the heap, 4 columns x 2048 rows): **1.63 -> 0.62 ns/value**.
+//! Four arms in a switch that is invariant for a whole column costs nothing —
+//! the predictor is right every time.
 enum class StagingKind : uint8_t {
 	//! 1:1 fixed width, wire representation identical to DuckDB's — the value is
 	//! stored straight into the output vector and finalize is a no-op beyond
-	//! validity. No staging buffer is used at all.
-	Direct = 0,
+	//! validity. No staging buffer is used at all. Suffix = bytes per value;
+	//! these are the only widths TDS produces for a 1:1 type (TINYINT/BIT,
+	//! SMALLINT, INT/REAL, BIGINT/FLOAT).
+	Direct1 = 0,
+	Direct2 = 1,
+	Direct4 = 2,
+	Direct8 = 3,
 	//! Fixed width, but the wire form needs a conversion pass (DECIMAL mantissa,
-	//! datetime, GUID byte order). Staged contiguously at `stride` bytes.
-	Fixed = 1,
+	//! datetime, GUID byte order). Staged contiguously at `stride` bytes. Not
+	//! split by width: the widths are many, and the conversion kernel that
+	//! follows dwarfs the copy.
+	Fixed = 4,
 	//! Variable length (NVARCHAR, VARBINARY, PLP). Payload is contiguous with
 	//! per-value offset and length.
-	Var = 2
+	Var = 5
 };
+
+//! Direct arms are ordered first, so this is one comparison.
+inline bool IsDirectKind(StagingKind kind) {
+	return kind <= StagingKind::Direct8;
+}
+
+//! Map a 1:1 width to its arm. Only 1, 2, 4 and 8 reach here — the caller
+//! (ResolveColumnOps) proves the width is a DuckDB physical type's size before
+//! classifying a column as direct.
+inline StagingKind DirectKindForWidth(uint32_t width) {
+	switch (width) {
+	case 1:
+		return StagingKind::Direct1;
+	case 2:
+		return StagingKind::Direct2;
+	case 4:
+		return StagingKind::Direct4;
+	default:
+		return StagingKind::Direct8;
+	}
+}
 
 //===----------------------------------------------------------------------===//
 // ColumnStaging
@@ -105,23 +159,37 @@ struct ColumnStaging {
 	//===--------------------------------------------------------------------===//
 	// Per-chunk state
 	//===--------------------------------------------------------------------===//
-	//! Direct only: where the next value is written, inside the DuckDB vector.
-	//! Re-pointed at the start of every chunk; never retained past it.
+	//! Direct only: base of the output vector's data. Row N is written at
+	//! `direct_dst + N * stride`. Re-pointed at the start of every chunk; never
+	//! retained past it.
 	uint8_t *direct_dst = nullptr;
 
+	//! These are `unsafe_vector`, i.e. duckdb::vector<T, false>, DELIBERATELY.
+	//! The default duckdb::vector bounds-checks every operator[] **in release
+	//! builds too** (MemorySafety<true>::ENABLED is unconditionally true), which
+	//! would put a branch and a size() load on every AppendNull and every Var
+	//! append. The bound is structural, not hopeful: each array is sized for a
+	//! whole chunk in Configure and `count` cannot exceed STANDARD_VECTOR_SIZE,
+	//! because the chunk loop closes the chunk at that point. Debug builds still
+	//! check — MemorySafety forces ENABLED on under DEBUG regardless of SAFE.
+	//!
 	//! Fixed: `count * stride` raw bytes. Var: the contiguous payload.
-	duckdb::vector<uint8_t> buffer;
+	duckdb::unsafe_vector<uint8_t> buffer;
 	//! Var only: byte offset and byte length of each value inside `buffer`.
 	//! Length is always in BYTES, never code units — a fixed contract, because
 	//! the two differ for UTF-16 and mixing them is a silent corruption.
-	duckdb::vector<uint32_t> offsets;
-	duckdb::vector<uint32_t> lengths;
+	duckdb::unsafe_vector<uint32_t> offsets;
+	duckdb::unsafe_vector<uint32_t> lengths;
 
 	//! One bit per row, 1 = valid. Laid out exactly like duckdb::ValidityMask.
-	duckdb::vector<uint64_t> validity_words;
+	duckdb::unsafe_vector<uint64_t> validity_words;
 
 	//! Rows staged so far in this chunk.
 	idx_t count = 0;
+	//! Var only: payload bytes used. `buffer` is sized to CAPACITY, not to use —
+	//! vector::resize() value-initialises the new bytes, and we memcpy over them
+	//! immediately, so resizing per value would write every payload byte twice.
+	idx_t payload_used = 0;
 
 	//===--------------------------------------------------------------------===//
 	// Flags computed during append (D5 consumes them, D3 only records them)
@@ -132,25 +200,45 @@ struct ColumnStaging {
 	//! A staged value ends in an unpaired high surrogate, so a bulk conversion
 	//! spanning the delimiter could pair it with the delimiter itself.
 	bool boundary_risky = false;
+	//! The payload was preallocated to this column's provable worst case, so it
+	//! can never grow and must never be shrunk.
+	bool payload_bounded = false;
 
 	//===--------------------------------------------------------------------===//
 	// Setup
 	//===--------------------------------------------------------------------===//
 
-	//! Configure the column once, after COLMETADATA. Sizes the fixed-capacity
-	//! arrays; the payload grows on demand and keeps its high-water capacity.
-	void Configure(StagingKind kind_p, uint32_t stride_p) {
+	//! Configure the column once, after COLMETADATA.
+	//!
+	//! `max_value_bytes` is the declared upper bound on ONE value's wire size,
+	//! from the column metadata; 0 means unbounded (PLP / MAX types). Every
+	//! allocation this column will ever make happens here whenever that bound is
+	//! usable — see STAGING_PREALLOC_BUDGET_BYTES.
+	void Configure(StagingKind kind_p, uint32_t stride_p, uint32_t max_value_bytes = 0) {
 		kind = kind_p;
 		stride = stride_p;
+		payload_bounded = false;
 		validity_words.resize(VALIDITY_WORDS_PER_CHUNK);
 		if (kind == StagingKind::Var) {
 			offsets.resize(STANDARD_VECTOR_SIZE);
 			lengths.resize(STANDARD_VECTOR_SIZE);
+			// The provable worst case for a whole chunk. uint64 arithmetic: a
+			// declared max_length near 0xFFFF times 2048 overflows uint32.
+			const idx_t bound = static_cast<idx_t>(max_value_bytes) * STANDARD_VECTOR_SIZE;
+			if (max_value_bytes > 0 && bound <= STAGING_PREALLOC_BUDGET_BYTES) {
+				buffer.resize(bound);
+				// Nothing can exceed this, so growth is now unreachable and the
+				// arena must not shrink it back into reach.
+				payload_bounded = true;
+			} else if (buffer.size() < STAGING_UNBOUNDED_INITIAL_BYTES) {
+				buffer.resize(STAGING_UNBOUNDED_INITIAL_BYTES);
+			}
 		} else {
 			offsets.clear();
 			lengths.clear();
 		}
 		if (kind == StagingKind::Fixed) {
+			// Exact and final: a fixed-width column's chunk payload is known.
 			buffer.resize(static_cast<idx_t>(stride) * STANDARD_VECTOR_SIZE);
 		}
 		BeginChunk(nullptr);
@@ -164,9 +252,7 @@ struct ColumnStaging {
 		direct_dst = direct_dst_p;
 		saw_embedded_nul = false;
 		boundary_risky = false;
-		if (kind == StagingKind::Var) {
-			buffer.clear();
-		}
+		payload_used = 0;
 		// All-valid by default: NULLs clear their bit, which is the rarer case
 		// and keeps the common path free of validity work.
 		for (idx_t i = 0; i < validity_words.size(); i++) {
@@ -178,28 +264,21 @@ struct ColumnStaging {
 	// Append (hot path — trivially inlinable, no dispatch of its own)
 	//===--------------------------------------------------------------------===//
 
-	//! Mark the row at `count` NULL and advance. Valid for every kind.
+	//! Mark the row at `count` NULL and advance.
+	//!
+	//! A NULL is a BIT AND NOTHING ELSE — same model as DuckDB's own vectors, and
+	//! the reason this has no branch and does not consult `kind`:
+	//!
+	//! - Direct and Fixed address positionally (row * stride), so a NULL row's
+	//!   slot simply keeps whatever was there. Every Fixed kernel is total over
+	//!   any byte pattern (decimal is a load, GUID a byte swap, money a load), so
+	//!   a branch-free pass across it produces a value the mask discards.
+	//! - Var cannot be addressed positionally, so its finalize must consult the
+	//!   mask no matter what — which makes writing an offset/length for a NULL
+	//!   row work that the mask already covers. Those slots are therefore
+	//!   UNDEFINED on NULL rows, by contract.
 	inline void AppendNull() {
-		validity_words[count / 64] &= ~(static_cast<uint64_t>(1) << (count % 64));
-		if (kind == StagingKind::Var) {
-			// A NULL still needs an offset/length slot so finalize can walk rows
-			// positionally. Zero length, offset at the current payload end.
-			offsets[count] = static_cast<uint32_t>(buffer.size());
-			lengths[count] = 0;
-		} else if (kind == StagingKind::Fixed) {
-			// Zero the slot rather than leaving whatever the previous chunk put
-			// there. The whole point of batch decode is a branch-free kernel over
-			// all `count` rows, so a NULL slot IS read — leaving it stale would
-			// feed a previous chunk's bytes into the decoder and make the output
-			// for NULL rows nondeterministic (validity hides it from SQL, but not
-			// from sanitizers, tests, or anything that hashes the vector).
-			std::memset(buffer.data() + count * stride, 0, stride);
-		} else {
-			// Direct writes into the DuckDB vector, where NULL slots are
-			// conventionally left undefined and the validity mask governs — this
-			// matches what DuckDB's own scanners do. Only the cursor advances.
-			direct_dst += stride;
-		}
+		validity_words[count >> 6] &= ~(static_cast<uint64_t>(1) << (count & 63));
 		count++;
 	}
 
@@ -214,22 +293,30 @@ struct ColumnStaging {
 		count++;
 	}
 
-	//! Copy `stride` bytes straight into the output vector for a Direct column.
+	//! Copy STRIDE bytes straight into the output vector for a Direct column.
+	//! Positional, like Fixed: no cursor to keep in step with NULLs.
+	//!
+	//! STRIDE is a template parameter rather than the `stride` member so the copy
+	//! is a single sized store and the offset is an addressing-mode scale. The
+	//! caller picks the instantiation from `kind`, which is column-invariant.
+	template <uint32_t STRIDE>
 	inline void AppendDirect(const uint8_t *src) {
-		std::memcpy(direct_dst, src, stride);
-		direct_dst += stride;
+		std::memcpy(direct_dst + count * STRIDE, src, STRIDE);
 		count++;
 	}
 
 	//! Stage a variable-length value. Returns the destination so the caller can
 	//! write the payload itself when it would otherwise copy twice.
 	inline uint8_t *AppendVarSlot(uint32_t length) {
-		const idx_t offset = buffer.size();
-		// Checked: a corrupt length prefix must not wrap a uint32_t offset.
-		if (offset + length > MAX_STAGING_PAYLOAD_BYTES) {
-			ThrowPayloadOverflow(offset, length);
+		const idx_t offset = payload_used;
+		const idx_t needed = offset + length;
+		if (needed > buffer.size()) {
+			// The one place the payload can grow. `length` came off the wire, so
+			// this is also where a corrupt length prefix is caught — before it
+			// can wrap the uint32_t offsets or ask for an absurd allocation.
+			GrowPayload(needed);
 		}
-		buffer.resize(offset + length);
+		payload_used = needed;
 		offsets[count] = static_cast<uint32_t>(offset);
 		lengths[count] = length;
 		count++;
@@ -256,19 +343,27 @@ struct ColumnStaging {
 		return kind == StagingKind::Var ? buffer.data() + offsets[row] : buffer.data() + row * stride;
 	}
 
+	//! Var: undefined on NULL rows (see AppendNull) — check IsValid first.
 	inline uint32_t LengthAt(idx_t row) const {
 		return kind == StagingKind::Var ? lengths[row] : stride;
 	}
 
+	//! Payload bytes used this chunk (Var). `buffer.size()` is capacity.
+	inline idx_t PayloadSize() const {
+		return payload_used;
+	}
+
 	//! Bytes currently retained by this column, for the arena's watermark policy.
 	idx_t RetainedBytes() const {
-		return static_cast<idx_t>(buffer.capacity()) + offsets.capacity() * sizeof(uint32_t) +
+		return static_cast<idx_t>(buffer.size()) + offsets.capacity() * sizeof(uint32_t) +
 			   lengths.capacity() * sizeof(uint32_t) + validity_words.capacity() * sizeof(uint64_t);
 	}
 
 private:
-	//! Out of line: keeps the throw path off the inlined append.
-	static void ThrowPayloadOverflow(idx_t offset, uint32_t length);
+	//! Out of line: growth and the wire-corruption error stay off the inlined
+	//! append body. Growth doubles, so a steady stream allocates once and then
+	//! never again — the capacity is retained across chunks.
+	void GrowPayload(idx_t needed);
 };
 
 //===----------------------------------------------------------------------===//
@@ -330,7 +425,7 @@ public:
 	//! realloc against any workload that alternates chunk sizes.
 	void EndChunk() {
 		for (idx_t i = 0; i < columns_.size(); i++) {
-			const idx_t used = columns_[i]->buffer.size();
+			const idx_t used = columns_[i]->payload_used;
 			if (used > peak_bytes_[i]) {
 				peak_bytes_[i] = used;
 			}
@@ -341,13 +436,16 @@ public:
 		chunks_since_evaluation_ = 0;
 		for (idx_t i = 0; i < columns_.size(); i++) {
 			ColumnStaging &col = *columns_[i];
-			const idx_t capacity = col.buffer.capacity();
+			const idx_t capacity = col.buffer.size();
 			const idx_t peak = peak_bytes_[i];
-			if (capacity > MIN_RETAINED_BYTES && capacity > peak * SHRINK_SLACK_FACTOR) {
-				duckdb::vector<uint8_t> shrunk;
-				shrunk.reserve(peak * 2 > MIN_RETAINED_BYTES ? peak * 2 : MIN_RETAINED_BYTES);
+			// A bounded column already holds exactly its worst case and is small
+			// by construction; releasing it would only make growth reachable
+			// again.
+			if (!col.payload_bounded && capacity > MIN_RETAINED_BYTES && capacity > peak * SHRINK_SLACK_FACTOR) {
+				const idx_t target = peak * 2 > MIN_RETAINED_BYTES ? peak * 2 : MIN_RETAINED_BYTES;
+				duckdb::unsafe_vector<uint8_t> shrunk(target);
 				col.buffer.swap(shrunk);
-				col.buffer.clear();
+				col.payload_used = 0;
 			}
 			peak_bytes_[i] = 0;
 		}

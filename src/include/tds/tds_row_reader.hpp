@@ -34,17 +34,20 @@ public:
 	// Skip a NBC row without parsing (fast path for drain)
 	bool SkipNBCRow(const uint8_t *data, size_t length, size_t &bytes_consumed);
 
-private:
-	// Skip a single column value (returns bytes to skip, 0 if more data needed)
+	// Single-value entry points. Public because the staged read path
+	// (codec::staging::RowStager, spec 055) walks a row column by column and
+	// falls back to these for families that do not yet have a batch kernel —
+	// reusing the framing logic rather than duplicating it, which is what keeps
+	// the two paths byte-identical.
+	// All return bytes consumed, or 0 if more data is needed.
 	size_t SkipValue(const uint8_t *data, size_t length, size_t col_idx);
-	// Read a single column value
-	// Returns bytes consumed, 0 if more data needed
 	size_t ReadValue(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 
 	// NBC variants - for non-NULL columns in NBC rows (no length prefix for nullable types)
 	size_t SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx);
 	size_t ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 
+private:
 	// Type-specific readers
 	size_t ReadFixedType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value);
 

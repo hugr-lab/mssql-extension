@@ -65,11 +65,9 @@ uint32_t FixedWireWidth(const tds::ColumnMetadata &column) {
 //! two's complement / IEEE-754, which is exactly DuckDB's in-memory layout on
 //! every platform this builds for.
 //!
-//! BIT is deliberately NOT here. The wire byte is nominally 0/1 but nothing in
-//! the protocol guarantees it, and DuckDB's bool must be exactly 0 or 1 —
-//! storing a stray 2 would produce a value that compares and hashes
-//! inconsistently. It costs one normalising pass to be certain, so BIT stays
-//! Fixed.
+//! BIT qualifies too: TDS defines it as exactly 0 or 1 (NULL travels in the
+//! length prefix of BITN, not in the value byte), which is precisely DuckDB's
+//! one-byte bool. There is no third value to normalise away.
 bool IsDirectWritable(const tds::ColumnMetadata &column, uint32_t width) {
 	switch (column.type_id) {
 	case tds::TDS_TYPE_TINYINT:
@@ -84,12 +82,47 @@ bool IsDirectWritable(const tds::ColumnMetadata &column, uint32_t width) {
 		return width == 4;
 	case tds::TDS_TYPE_FLOAT:
 		return width == 8;
+	case tds::TDS_TYPE_BIT:
+	case tds::TDS_TYPE_BITN:
+		return width == 1;
 	case tds::TDS_TYPE_INTN:
 		return width == 1 || width == 2 || width == 4 || width == 8;
 	case tds::TDS_TYPE_FLOATN:
 		return width == 4 || width == 8;
 	default:
 		return false;
+	}
+}
+
+//! Does this type carry a one-byte length prefix on the wire?
+//!
+//! Only the direct-writable set is classified here — everything else takes the
+//! Convert arm, which re-derives framing through the legacy reader and so needs
+//! no answer from us.
+bool HasOneBytePrefix(uint8_t type_id) {
+	switch (type_id) {
+	case tds::TDS_TYPE_INTN:
+	case tds::TDS_TYPE_BITN:
+	case tds::TDS_TYPE_FLOATN:
+		return true;
+	default:
+		// TINYINT, BIT, SMALLINT, INT, BIGINT, REAL, FLOAT: the non-nullable
+		// forms, sent as bare value bytes.
+		return false;
+	}
+}
+
+AppendArm DirectArm(uint8_t type_id, uint32_t width) {
+	const bool prefixed = HasOneBytePrefix(type_id);
+	switch (width) {
+	case 1:
+		return prefixed ? AppendArm::P1Direct1 : AppendArm::RawDirect1;
+	case 2:
+		return prefixed ? AppendArm::P1Direct2 : AppendArm::RawDirect2;
+	case 4:
+		return prefixed ? AppendArm::P1Direct4 : AppendArm::RawDirect4;
+	default:
+		return prefixed ? AppendArm::P1Direct8 : AppendArm::RawDirect8;
 	}
 }
 
@@ -122,8 +155,16 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	}
 
 	const uint32_t width = FixedWireWidth(column);
-	if (width > 0 && IsDirectWritable(column, width)) {
-		ops.kind = StagingKind::Direct;
+	// A direct write stores wire bytes into the output vector at `width` stride,
+	// so the wire width MUST equal the width DuckDB reserves per slot. The two
+	// come from different files (FixedWireWidth here, GetDuckDBType in the type
+	// converter) and today they agree for every direct type — TINYINT/BIT are one
+	// byte in both, REAL/FLOAT four, and so on. Proving it here, once per column,
+	// means a future remapping degrades to staging instead of writing 1 byte into
+	// a 2-byte slot.
+	if (width > 0 && IsDirectWritable(column, width) && width == GetTypeIdSize(target_type.InternalType())) {
+		ops.kind = DirectKindForWidth(width);
+		ops.arm = DirectArm(column.type_id, width);
 		ops.stride = width;
 		ops.direct_write = true;
 		return ops;
@@ -141,6 +182,12 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// follow-up, not a correctness matter: Var stages the same bytes and only
 	// costs an offset/length pair per value.
 	ops.kind = StagingKind::Var;
+	// A non-MAX variable column declares its widest possible value, which bounds
+	// a whole chunk exactly. PLP/MAX declares nothing, so it stays 0 and the
+	// buffer finds its size from the data instead.
+	if (!column.IsPLPType() && column.max_length > 0) {
+		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+	}
 	return ops;
 }
 

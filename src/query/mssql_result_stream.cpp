@@ -271,6 +271,19 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	// Reset chunk for new data - DuckDB already initialized it with correct types
 	chunk.Reset();
 
+	// Staged read path (spec 055 T5). Not used with target_vectors_: those are
+	// STRUCT children owned by the caller, and publishing a whole column's
+	// validity mask at once would overwrite what the caller already wrote there.
+	const bool staged = target_vectors_.empty() && !column_metadata_.empty();
+	if (staged) {
+		ResolveStagedTargets(chunk);
+		if (!stager_.IsConfigured()) {
+			stager_.Configure(column_metadata_, staged_targets_);
+			parser_.SetRawRowMode(true);
+		}
+		stager_.BeginChunk(staged_targets_);
+	}
+
 	const idx_t max_rows = STANDARD_VECTOR_SIZE;  // 2048
 	idx_t row_count = 0;
 	uint64_t parse_time_ns = 0;
@@ -293,7 +306,21 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 		switch (token) {
 		case tds::ParsedTokenType::Row: {
 			PhaseTimer process_timer(timing_enabled_);
-			ProcessRow(chunk, row_count++);
+			if (staged) {
+				const uint8_t *row = parser_.GetRawRow();
+				const size_t row_length = parser_.GetRawRowLength();
+				if (counters_enabled_) {
+					counters_.wire_bytes_in += row_length;
+				}
+				if (parser_.IsRawRowNBC()) {
+					stager_.StageNBCRow(row, row_length, row_count);
+				} else {
+					stager_.StageRow(row, row_length, row_count);
+				}
+				row_count++;
+			} else {
+				ProcessRow(chunk, row_count++);
+			}
 			process_timer.Stop(process_time_ns);
 			rows_read_++;
 			break;
@@ -393,6 +420,12 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	}
 
 exit_loop:
+	if (staged) {
+		stager_.FinalizeChunk(row_count, counters_enabled_);
+		if (counters_enabled_) {
+			CountChunkForDebug(chunk, row_count);
+		}
+	}
 	chunk.SetCardinality(row_count);
 
 	// Log timing summary
@@ -464,6 +497,58 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 
 	if (counters_enabled_) {
 		CountRowForDebug(chunk, row_idx, cols_to_fill);
+	}
+}
+
+void MSSQLResultStream::ResolveStagedTargets(DataChunk &chunk) {
+	const idx_t column_count = column_metadata_.size();
+	// Same rules ProcessRow applies, hoisted out of the row loop. target_vectors_
+	// is excluded by the caller, so only two of the three cases can arise here.
+	idx_t cols_to_fill;
+	if (columns_to_fill_ != static_cast<idx_t>(-1)) {
+		cols_to_fill = std::min(columns_to_fill_, column_count);
+	} else {
+		cols_to_fill = std::min(column_count, chunk.ColumnCount());
+	}
+
+	staged_targets_.assign(column_count, nullptr);
+	for (idx_t col_idx = 0; col_idx < cols_to_fill; col_idx++) {
+		staged_targets_[col_idx] =
+			output_column_mapping_.empty() ? &chunk.data[col_idx] : &chunk.data[output_column_mapping_[col_idx]];
+	}
+}
+
+void MSSQLResultStream::CountChunkForDebug(DataChunk &chunk, idx_t row_count) {
+	(void)chunk;
+	const auto string_family = static_cast<uint8_t>(mssql::codec::TypeFamily::String);
+	const idx_t counted = std::min(counter_col_family_.size(), staged_targets_.size());
+	for (idx_t col_idx = 0; col_idx < counted; col_idx++) {
+		Vector *target = staged_targets_[col_idx];
+		if (target == nullptr) {
+			continue;
+		}
+		const idx_t nulls = stager_.ChunkNulls(col_idx);
+		const idx_t values = row_count - nulls;
+		counters_.nulls += nulls;
+
+		const uint8_t family = counter_col_family_[col_idx];
+		if (family < mssql::codec::TYPE_FAMILY_COUNT) {
+			counters_.values_per_family[family] += values;
+		} else {
+			counters_.unknown_family_values += values;
+		}
+		if (counter_col_plp_[col_idx]) {
+			counters_.plp_values += values;
+		}
+		if (family == string_family && target->GetType().InternalType() == PhysicalType::VARCHAR) {
+			const string_t *strings = FlatVector::GetData<string_t>(*target);
+			const auto &mask = FlatVector::Validity(*target);
+			for (idx_t row = 0; row < row_count; row++) {
+				if (mask.RowIsValid(row)) {
+					counters_.string_bytes_out += strings[row].GetSize();
+				}
+			}
+		}
 	}
 }
 

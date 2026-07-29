@@ -5,9 +5,10 @@
 // this layer stages raw wire bytes column-major and knows nothing about types.
 //
 // Covers:
-//   - append semantics for all three StagingKinds (Direct / Fixed / Var),
-//   - validity: all-valid by default, NULLs clear their bit, NULL rows still
-//     occupy a positional offset/length slot for Var,
+//   - append semantics for every StagingKind (Direct1/2/4/8 / Fixed / Var),
+//   - validity: all-valid by default, NULLs clear their bit and nothing else —
+//     Direct and Fixed address positionally, Var's offset/length are undefined
+//     on a NULL row,
 //   - the checked-arithmetic cap on payload growth (a corrupt length prefix
 //     must raise, not wrap a uint32_t offset),
 //   - arena ownership: ColumnStaging addresses stay stable across chunks
@@ -34,6 +35,8 @@
 using duckdb::idx_t;
 using duckdb::mssql::codec::staging::ColumnOps;
 using duckdb::mssql::codec::staging::ColumnStaging;
+using duckdb::mssql::codec::staging::DirectKindForWidth;
+using duckdb::mssql::codec::staging::IsDirectKind;
 using duckdb::mssql::codec::staging::ResolveColumnOps;
 using duckdb::mssql::codec::staging::StagingArena;
 using duckdb::mssql::codec::staging::StagingKind;
@@ -77,7 +80,8 @@ void TestVarAppendAndReadBack() {
 	CHECK_EQ(col.count, static_cast<idx_t>(4), "four rows staged");
 	CHECK_EQ(col.LengthAt(0), 5u, "row 0 length");
 	CHECK_EQ(col.LengthAt(1), 0u, "row 1 length (empty, not NULL)");
-	CHECK_EQ(col.LengthAt(2), 0u, "row 2 length (NULL)");
+	// Row 2's offset/length are deliberately NOT checked: they are undefined on
+	// NULL rows, because a NULL is only a bit in the mask.
 	CHECK_EQ(col.LengthAt(3), 9u, "row 3 length");
 
 	CHECK_TRUE(col.IsValid(0), "row 0 valid");
@@ -88,7 +92,7 @@ void TestVarAppendAndReadBack() {
 	CHECK_TRUE(std::memcmp(col.ValueAt(0), a.data(), 5) == 0, "row 0 payload");
 	CHECK_TRUE(std::memcmp(col.ValueAt(3), c.data(), 9) == 0, "row 3 payload");
 	// Payload is contiguous: total equals the sum of the lengths.
-	CHECK_EQ(col.buffer.size(), static_cast<idx_t>(14), "payload is contiguous and exactly the sum of lengths");
+	CHECK_EQ(col.PayloadSize(), static_cast<idx_t>(14), "payload is contiguous and exactly the sum of lengths");
 }
 
 void TestFixedAndDirectAppend() {
@@ -107,26 +111,25 @@ void TestFixedAndDirectAppend() {
 	// Layout is POSITIONAL: row N lives at N * stride, so row 2 is at byte 16,
 	// not packed at byte 8. Finalize indexes by row number with no cursor.
 	CHECK_TRUE(std::memcmp(fixed.buffer.data() + 16, &v1, 8) == 0, "row 2 at its positional offset");
+	// The NULL slot is left as-is: every Fixed kernel is total over any byte
+	// pattern, so a branch-free pass across it yields a value validity discards.
 	CHECK_TRUE(std::memcmp(fixed.ValueAt(2), &v1, 8) == 0, "ValueAt agrees with the positional layout");
-	// The NULL slot is zeroed, so a branch-free kernel reading every row cannot
-	// pick up stale bytes from the previous chunk.
-	uint64_t zero = 0;
-	CHECK_TRUE(std::memcmp(fixed.ValueAt(1), &zero, 8) == 0, "NULL slot zeroed for branch-free decode");
 
 	// Direct writes into caller-owned storage (the DuckDB vector), so the
 	// destination pointer advances even for NULLs to keep row positions aligned.
 	std::vector<uint8_t> out(4 * 4, 0xAA);
 	ColumnStaging direct;
-	direct.Configure(StagingKind::Direct, 4);
+	direct.Configure(StagingKind::Direct4, 4);
 	direct.BeginChunk(out.data());
 	uint32_t d0 = 0x01020304u;
 	uint32_t d2 = 0x0A0B0C0Du;
-	direct.AppendDirect(reinterpret_cast<const uint8_t *>(&d0));
+	direct.AppendDirect<4>(reinterpret_cast<const uint8_t *>(&d0));
 	direct.AppendNull();
-	direct.AppendDirect(reinterpret_cast<const uint8_t *>(&d2));
+	direct.AppendDirect<4>(reinterpret_cast<const uint8_t *>(&d2));
 	CHECK_TRUE(std::memcmp(out.data(), &d0, 4) == 0, "direct row 0 written into the output vector");
-	CHECK_TRUE(out[4] == 0xAA, "direct NULL row left untouched");
-	CHECK_TRUE(std::memcmp(out.data() + 8, &d2, 4) == 0, "direct row 2 lands at its own row offset");
+	CHECK_TRUE(out[4] == 0xAA, "direct NULL row left untouched — the mask governs");
+	CHECK_TRUE(std::memcmp(out.data() + 8, &d2, 4) == 0, "direct row 2 lands at its positional offset");
+	CHECK_TRUE(!direct.IsValid(1), "direct NULL recorded in the mask only");
 }
 
 void TestValidityDefaultsToValid() {
@@ -215,7 +218,7 @@ void TestWatermarkRetainsThenReleases() {
 	col.BeginChunk(nullptr);
 	col.AppendVar(blob.data(), static_cast<uint32_t>(blob.size()));
 	arena.EndChunk();
-	const idx_t after_big = col.buffer.capacity();
+	const idx_t after_big = col.buffer.size();
 	CHECK_TRUE(after_big >= big, "capacity grew to hold the outlier");
 
 	// A steady run of small chunks. Capacity is retained through the first whole
@@ -226,7 +229,7 @@ void TestWatermarkRetainsThenReleases() {
 		col.BeginChunk(nullptr);
 		col.AppendVar(&small, 1);
 		arena.EndChunk();
-		CHECK_TRUE(col.buffer.capacity() == after_big, "capacity retained through the interval containing the outlier");
+		CHECK_TRUE(col.buffer.size() == after_big, "capacity retained through the interval containing the outlier");
 	}
 
 	// The next interval contains only small chunks, so its evaluation releases.
@@ -235,8 +238,8 @@ void TestWatermarkRetainsThenReleases() {
 		col.AppendVar(&small, 1);
 		arena.EndChunk();
 	}
-	CHECK_TRUE(col.buffer.capacity() < after_big, "outlier released after a full quiet interval");
-	CHECK_TRUE(col.buffer.capacity() >= StagingArena::MIN_RETAINED_BYTES, "never shrinks below the floor");
+	CHECK_TRUE(col.buffer.size() < after_big, "outlier released after a full quiet interval");
+	CHECK_TRUE(col.buffer.size() >= StagingArena::MIN_RETAINED_BYTES, "never shrinks below the floor");
 
 	// And the column still works after the shrink.
 	col.BeginChunk(nullptr);
@@ -276,16 +279,17 @@ void TestColumnOpsResolution() {
 	for (const auto &c : direct_cases) {
 		const ColumnOps ops = resolve(meta(c.type_id, c.max_length));
 		CHECK_TRUE(ops.direct_write, "direct-writable type takes the bypass");
-		CHECK_TRUE(ops.kind == StagingKind::Direct, "direct-writable type is StagingKind::Direct");
+		CHECK_TRUE(IsDirectKind(ops.kind), "direct-writable type gets a Direct arm");
+		CHECK_TRUE(ops.kind == DirectKindForWidth(c.stride), "the Direct arm carries the width");
 		CHECK_EQ(ops.stride, c.stride, "direct stride matches the wire width");
 		CHECK_TRUE(!ops.needs_value_fallback, "direct type needs no per-value fallback");
 	}
 
-	// BIT is deliberately not direct: the wire byte is not guaranteed to be 0/1
-	// and DuckDB's bool must be.
+	// BIT is direct: TDS defines the value byte as exactly 0 or 1 (NULL lives in
+	// BITN's length prefix), which is DuckDB's one-byte bool. Nothing to convert.
 	const ColumnOps bit_ops = resolve(meta(duckdb::tds::TDS_TYPE_BIT, 1));
-	CHECK_TRUE(!bit_ops.direct_write, "BIT is not direct-written");
-	CHECK_TRUE(bit_ops.kind == StagingKind::Fixed, "BIT stages Fixed for normalisation");
+	CHECK_TRUE(bit_ops.direct_write, "BIT is direct-written — no third value exists to normalise");
+	CHECK_EQ(bit_ops.stride, 1u, "BIT stride");
 
 	// Fixed width, conversion required.
 	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_UNIQUEIDENTIFIER, 16)).kind == StagingKind::Fixed,
@@ -297,6 +301,8 @@ void TestColumnOpsResolution() {
 	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).kind == StagingKind::Var, "NVARCHAR is Var");
 	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_BIGVARBINARY, 16)).kind == StagingKind::Var, "VARBINARY is Var");
 	CHECK_TRUE(!resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).direct_write, "Var is never direct-written");
+	CHECK_EQ(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).max_value_bytes, 32u,
+			 "declared width is carried through for preallocation");
 
 	// The issue-#89 guard, resolved once per column: when the vector we write
 	// into disagrees with what the wire implies, the column must fall back to
@@ -319,6 +325,54 @@ void TestColumnOpsResolution() {
 	CHECK_TRUE(!threw, "unknown wire type does not throw during resolution");
 }
 
+void TestPreallocatedBoundNeverResizes() {
+	std::cout << "[8] prealloc: a bounded column never resizes (D3)..." << std::endl;
+	// nvarchar(16) is 32 wire bytes per value, so a chunk cannot exceed
+	// 32 * STANDARD_VECTOR_SIZE. Preallocating that makes growth unreachable.
+	const uint32_t per_value = 32;
+	ColumnStaging col;
+	col.Configure(StagingKind::Var, 0, per_value);
+	CHECK_TRUE(col.payload_bounded, "narrow column reports a provable bound");
+	const idx_t reserved = col.buffer.size();
+	CHECK_EQ(reserved, static_cast<idx_t>(per_value) * STANDARD_VECTOR_SIZE, "reserved exactly the worst case");
+
+	// Fill a full chunk with worst-case values: the buffer must not move.
+	std::vector<uint8_t> value(per_value, 0x41);
+	const uint8_t *base_before = col.buffer.data();
+	col.BeginChunk(nullptr);
+	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+		col.AppendVar(value.data(), per_value);
+	}
+	CHECK_EQ(col.buffer.size(), reserved, "capacity unchanged after a worst-case chunk");
+	CHECK_TRUE(col.buffer.data() == base_before, "payload never reallocated");
+	CHECK_EQ(col.PayloadSize(), reserved, "worst-case chunk exactly fills the reservation");
+
+	// The arena must not shrink it back into reach of growth.
+	StagingArena arena;
+	arena.Configure(1);
+	arena.Column(0).Configure(StagingKind::Var, 0, per_value);
+	const idx_t bounded_size = arena.Column(0).buffer.size();
+	const uint8_t small = 1;
+	for (idx_t i = 0; i < StagingArena::SHRINK_INTERVAL_CHUNKS * 2 + 2; i++) {
+		arena.Column(0).BeginChunk(nullptr);
+		arena.Column(0).AppendVar(&small, 1);
+		arena.EndChunk();
+	}
+	CHECK_EQ(arena.Column(0).buffer.size(), bounded_size, "bounded column is never shrunk");
+
+	// An unbounded column (PLP / MAX) has no such guarantee and starts small.
+	ColumnStaging unbounded;
+	unbounded.Configure(StagingKind::Var, 0, 0);
+	CHECK_TRUE(!unbounded.payload_bounded, "PLP column has no provable bound");
+	CHECK_EQ(unbounded.buffer.size(), duckdb::mssql::codec::staging::STAGING_UNBOUNDED_INITIAL_BYTES,
+			 "unbounded column starts at the initial size");
+
+	// A bound too large to prepay is not preallocated; growth handles it.
+	ColumnStaging wide;
+	wide.Configure(StagingKind::Var, 0, 8000);	// nvarchar(4000)
+	CHECK_TRUE(!wide.payload_bounded, "over-budget bound is not prepaid");
+}
+
 }  // namespace
 
 int main() {
@@ -334,6 +388,7 @@ int main() {
 		TestArenaAddressStability();
 		TestWatermarkRetainsThenReleases();
 		TestColumnOpsResolution();
+		TestPreallocatedBoundNeverResizes();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

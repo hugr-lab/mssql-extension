@@ -190,6 +190,36 @@ public:
 		skip_rows_ = skip;
 	}
 
+	//! Raw-row mode (spec 055 T5): a ROW/NBCROW token is located and bounded but
+	//! NOT decomposed into RowData. The caller gets the row's wire bytes and walks
+	//! them itself, staging column-major.
+	//!
+	//! The point is not to save the RowData copy alone — it is that the row is
+	//! handed over ONLY once it is provably complete, because SkipRow already
+	//! established its exact length. The caller's walk therefore needs no
+	//! "do I have enough bytes" test per value and no rollback when a row
+	//! straddles a receive boundary, which is what makes a check-free hot loop
+	//! possible at all.
+	//!
+	//! GetRow() returns stale data in this mode; the two are mutually exclusive.
+	void SetRawRowMode(bool enabled) {
+		raw_row_mode_ = enabled;
+	}
+
+	//! Wire bytes of the row last returned as ParsedTokenType::Row, valid until
+	//! the next TryParseNext() call (which is when the bytes are consumed).
+	const uint8_t *GetRawRow() const {
+		return buffer_.data() + raw_row_offset_;
+	}
+	size_t GetRawRowLength() const {
+		return raw_row_length_;
+	}
+	//! True when the row carries a NULL bitmap (NBCROW) instead of per-value
+	//! NULL markers.
+	bool IsRawRowNBC() const {
+		return raw_row_nbc_;
+	}
+
 	// Check if we have column metadata
 	bool HasColumnMetadata() const {
 		return !columns_.empty();
@@ -221,6 +251,16 @@ private:
 	ParserState state_;
 	std::string parse_error_;
 	bool skip_rows_ = false;  // Skip ROW content during drain
+
+	//! Raw-row mode state. The consume of a raw row is DEFERRED to the next
+	//! TryParseNext() rather than done inside ParseRow: ConsumeBytes compacts the
+	//! buffer, which erases from the front and would invalidate the pointer we
+	//! just handed the caller.
+	bool raw_row_mode_ = false;
+	size_t raw_row_offset_ = 0;
+	size_t raw_row_length_ = 0;
+	bool raw_row_nbc_ = false;
+	size_t pending_consume_ = 0;
 
 	// Buffer
 	std::vector<uint8_t> buffer_;

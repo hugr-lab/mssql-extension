@@ -22,8 +22,43 @@ namespace mssql {
 namespace codec {
 namespace staging {
 
+//! The single per-value dispatch of the staged row walk.
+//!
+//! Wire framing and destination handling are FUSED into one selector rather than
+//! kept as two nested switches. Both are column-invariant, so either way the
+//! predictor is right every time — but two switches mean two indirect jumps per
+//! value, and the whole per-value budget is a couple of nanoseconds.
+//!
+//! The prefix in the name is the framing:
+//!   Raw — the value has no length prefix (TDS's non-nullable fixed types).
+//!   P1  — one length byte, 0 meaning NULL (the *N nullable variants).
+//! The suffix is the width in bytes.
+enum class AppendArm : uint8_t {
+	RawDirect1 = 0,
+	RawDirect2 = 1,
+	RawDirect4 = 2,
+	RawDirect8 = 3,
+	P1Direct1 = 4,
+	P1Direct2 = 5,
+	P1Direct4 = 6,
+	P1Direct8 = 7,
+	//! Framing and conversion both go through the legacy per-value path. This is
+	//! every family that does not yet have a batch kernel, plus the issue-#89
+	//! divergence case. Cost is identical to the pre-staging path — one copy into
+	//! a reused scratch buffer, then TypeConverter::ConvertValue — so a family
+	//! without a kernel is not made slower by staging existing.
+	Convert = 8,
+	//! Parsed for its length only; the value is discarded. Columns the query does
+	//! not project (COUNT(*), a narrower output chunk) still have to be walked to
+	//! find where the next column starts.
+	Skip = 9
+};
+
 //! Everything the staged path needs to know about one column, decided once.
 struct ColumnOps {
+	//! The per-value arm. Set by ResolveColumnOps; the caller downgrades it to
+	//! Skip for columns it does not intend to fill.
+	AppendArm arm = AppendArm::Convert;
 	//! Which append arm the row reader uses for this column.
 	StagingKind kind = StagingKind::Var;
 	//! Bytes per value for Direct / Fixed; 0 for Var.
@@ -38,6 +73,11 @@ struct ColumnOps {
 	//! can do that (issue #89). Today that check is a branch on every cell
 	//! (type_converter.cpp:275); here it is a column-level property.
 	bool needs_value_fallback = false;
+	//! Var only: the declared upper bound on ONE value's wire size, in bytes, or
+	//! 0 when the type has no bound (PLP / MAX). Lets the staging buffer be
+	//! preallocated to a chunk's provable worst case, so a narrow column never
+	//! resizes at all.
+	uint32_t max_value_bytes = 0;
 };
 
 //! Resolve a column.

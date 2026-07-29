@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include "codec/staging/row_stager.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -142,6 +143,13 @@ private:
 	// Process parsed row into DataChunk
 	void ProcessRow(DataChunk &chunk, idx_t row_idx);
 
+	// Staged read path (spec 055 T5). Resolve the output vector for each SQL
+	// column exactly once per chunk, applying the same target_vectors_ /
+	// output_column_mapping_ / columns_to_fill_ rules ProcessRow applies per row.
+	// A column the query does not fill gets a null entry and is walked for its
+	// length only.
+	void ResolveStagedTargets(DataChunk &chunk);
+
 	// Handle cancellation draining
 	void DrainAfterCancel();
 
@@ -199,6 +207,14 @@ private:
 	// If non-empty, these vectors are used instead of chunk.data
 	vector<Vector *> target_vectors_;
 
+	// Staged read path (spec 055 T5): one walk of each row, column-major where
+	// the wire form is already DuckDB's. Not used when target_vectors_ is set —
+	// those vectors are STRUCT children the caller owns and may have written
+	// validity into already, and the staged path publishes a whole column's
+	// validity mask at once.
+	mssql::codec::staging::RowStager stager_;
+	std::vector<Vector *> staged_targets_;
+
 	// D4 (spec 054): per-stream debug counters, active only at MSSQL_DEBUG>=2
 	// (counters_enabled_ latched at construction). Plain integers — a stream
 	// is filled from one thread at a time. Printed once on destruction.
@@ -225,6 +241,11 @@ private:
 	// Count one processed row into counters_ (called from ProcessRow when
 	// counters_enabled_; keeps the conversion hot loop untouched).
 	void CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t cols_to_fill);
+
+	// Staged-path equivalent, once per chunk instead of once per row. Everything
+	// it needs is derivable from the finished chunk plus the stager's per-column
+	// NULL counts, so the staged walk itself carries no counter code at all.
+	void CountChunkForDebug(DataChunk &chunk, idx_t row_count);
 
 	// Print the close summary to stderr (destructor, counters_enabled_ only).
 	void PrintDebugCounters();
