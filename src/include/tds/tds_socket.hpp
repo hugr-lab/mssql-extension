@@ -89,7 +89,7 @@ public:
 
 	// Clear receive buffer (useful before starting a new query)
 	void ClearReceiveBuffer() {
-		receive_buffer_.clear();
+		receive_len_ = 0;
 		receive_pos_ = 0;
 	}
 
@@ -114,17 +114,22 @@ private:
 	std::unique_ptr<TlsTdsContext> tls_context_;
 
 	// Internal receive buffer for partial packet handling.
-	// Consumed through receive_pos_ rather than erase(): a completed packet only
-	// advances the cursor, and the tail is compacted to the front once, when the
-	// cursor has caught up with the end (spec 055).
+	//
+	// Its vector SIZE is capacity, not content — `receive_len_` says how much is
+	// valid and `receive_pos_` how much has been consumed. Letting the vector's
+	// own size track the content would mean resize() before every recv(), and
+	// resize() value-initialises the bytes the recv() is about to overwrite:
+	// a whole extra pass over the read buffer, every read, for nothing.
+	//
+	// A completed packet only advances the cursor; the tail is compacted to the
+	// front once, when the cursor has caught up with the end (spec 055).
 	std::vector<uint8_t> receive_buffer_;
+	size_t receive_len_ = 0;
 	size_t receive_pos_ = 0;
 
-	// Staging buffer for recv(), sized to hold several whole TDS frames
-	// (SetReceiveFraming). Empty until sized; ReceivePacket then falls back to
-	// the pre-negotiation default.
 	//! Bytes per recv(). Not a buffer: reads go straight into the tail of
-	//! receive_buffer_.
+	//! receive_buffer_, which SetReceiveFraming sizes to hold one read plus a
+	//! straddling frame.
 	size_t recv_read_size_ = TDS_DEFAULT_PACKET_SIZE;
 
 	//! Frame assembly. NextPacket is the single place TDS framing happens.

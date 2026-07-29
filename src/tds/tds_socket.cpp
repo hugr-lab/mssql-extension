@@ -104,10 +104,12 @@ TdsSocket::TdsSocket(TdsSocket &&other) noexcept
 	  last_error_(std::move(other.last_error_)),
 	  tls_context_(std::move(other.tls_context_)),
 	  receive_buffer_(std::move(other.receive_buffer_)),
+	  receive_len_(other.receive_len_),
 	  receive_pos_(other.receive_pos_),
 	  recv_read_size_(other.recv_read_size_) {
 	other.fd_ = -1;
 	other.connected_ = false;
+	other.receive_len_ = 0;
 	other.receive_pos_ = 0;
 }
 
@@ -121,10 +123,12 @@ TdsSocket &TdsSocket::operator=(TdsSocket &&other) noexcept {
 		last_error_ = std::move(other.last_error_);
 		tls_context_ = std::move(other.tls_context_);
 		receive_buffer_ = std::move(other.receive_buffer_);
+		receive_len_ = other.receive_len_;
 		receive_pos_ = other.receive_pos_;
 		recv_read_size_ = other.recv_read_size_;
 		other.fd_ = -1;
 		other.connected_ = false;
+		other.receive_len_ = 0;
 		other.receive_pos_ = 0;
 	}
 	return *this;
@@ -275,7 +279,7 @@ void TdsSocket::Close() {
 		fd_ = -1;
 	}
 	connected_ = false;
-	receive_buffer_.clear();
+	receive_len_ = 0;
 	receive_pos_ = 0;
 }
 
@@ -292,12 +296,12 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: starting (timeout=%dms, fd=%d, packet_id=%d)", timeout_ms, fd_, packet_id);
 
 	// Clear any leftover data in receive buffer before TLS
-	if (!receive_buffer_.empty()) {
+	if (receive_len_ > receive_pos_) {
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: WARNING - clearing %zu leftover bytes in receive buffer",
-							   receive_buffer_.size());
-		receive_buffer_.clear();
-		receive_pos_ = 0;
+							   receive_len_ - receive_pos_);
 	}
+	receive_len_ = 0;
+	receive_pos_ = 0;
 
 	if (!IsConnected()) {
 		last_error_ = "Cannot enable TLS: not connected";
@@ -689,9 +693,12 @@ void TdsSocket::SetReceiveFraming(uint32_t packet_size, uint32_t frames) {
 	// Nothing is staged in a scratch buffer any more — recv() reads into the tail
 	// of the assembly buffer — so this is only the read granularity.
 	recv_read_size_ = scratch;
-	// The assembly buffer holds at least one whole frame beyond a full scratch
-	// read, so a frame split across two reads never forces a growth.
-	receive_buffer_.reserve(scratch + packet_size);
+	receive_len_ = 0;
+	receive_pos_ = 0;
+	// Sized ONCE, here: one full read plus a whole frame, so a frame split across
+	// two reads never forces a growth. resize() rather than reserve() because
+	// this vector's size is its capacity — the content length is receive_len_.
+	receive_buffer_.resize(scratch + packet_size);
 	MSSQL_SOCKET_DEBUG_LOG(1, "SetReceiveFraming: packet_size=%u frames=%u read=%zuB", packet_size, frames, scratch);
 }
 
@@ -703,14 +710,13 @@ const uint8_t *TdsSocket::NextPacket(size_t &packet_length, int timeout_ms) {
 	// next receive call on this socket: receive_pos_ advances now, but the buffer
 	// is only cleared or compacted at the top of the NEXT call.
 	while (true) {
-		if (receive_pos_ > 0 && receive_pos_ == receive_buffer_.size()) {
-			// Fully drained — reset instead of holding the allocation at an
-			// ever-growing offset. Capacity is retained.
-			receive_buffer_.clear();
+		if (receive_pos_ > 0 && receive_pos_ == receive_len_) {
+			// Fully drained — rewind instead of walking an ever-growing offset.
+			receive_len_ = 0;
 			receive_pos_ = 0;
 		}
 
-		const size_t buffered = receive_buffer_.size() - receive_pos_;
+		const size_t buffered = receive_len_ - receive_pos_;
 		if (buffered >= TDS_HEADER_SIZE) {
 			const uint8_t *head = receive_buffer_.data() + receive_pos_;
 			const uint16_t expected_length = TdsPacket::GetPacketLength(head);
@@ -721,10 +727,15 @@ const uint8_t *TdsSocket::NextPacket(size_t &packet_length, int timeout_ms) {
 			}
 		}
 
-		// Compact before reading more, so the buffer does not grow without bound
-		// across a long result set. One memmove per read, not one per packet.
+		// Compact before reading more: move the straddling tail to the front so
+		// the read always has a full read_size of room. One memmove per read, not
+		// one per packet, and it moves at most one frame.
 		if (receive_pos_ > 0) {
-			receive_buffer_.erase(receive_buffer_.begin(), receive_buffer_.begin() + receive_pos_);
+			const size_t tail = receive_len_ - receive_pos_;
+			if (tail > 0) {
+				std::memmove(receive_buffer_.data(), receive_buffer_.data() + receive_pos_, tail);
+			}
+			receive_len_ = tail;
 			receive_pos_ = 0;
 		}
 
@@ -767,21 +778,24 @@ bool TdsSocket::ReceivePayloadView(const uint8_t *&payload, size_t &payload_leng
 }
 
 bool TdsSocket::FillReceiveBuffer(int timeout_ms) {
-	// recv() straight into the tail of the assembly buffer.
+	// recv() straight into the tail of the assembly buffer, with no resize.
 	//
-	// The scratch buffer this replaces was a full extra pass over every byte:
-	// read into scratch, then insert() the same bytes into receive_buffer_.
-	// Growing the buffer and reading into its tail lands them where they are
-	// needed the first time.
-	const size_t read_size = recv_read_size_;
-	const size_t used = receive_buffer_.size();
-	receive_buffer_.resize(used + read_size);
-	const ssize_t received = Receive(receive_buffer_.data() + used, read_size, timeout_ms);
+	// Two passes over the read buffer used to happen here for no reason: a
+	// scratch buffer that was immediately insert()ed into this one, and then —
+	// once that was removed — a resize() that value-initialised the very bytes
+	// recv() was about to write. The vector is sized once in SetReceiveFraming
+	// and `receive_len_` carries the content length instead.
+	const size_t room = receive_buffer_.size() - receive_len_;
+	if (room < recv_read_size_) {
+		// Only reachable before SetReceiveFraming has run (PRELOGIN/LOGIN7 on the
+		// default frame size) or if a peer sent a frame larger than negotiated.
+		receive_buffer_.resize(receive_len_ + recv_read_size_);
+	}
+	const ssize_t received = Receive(receive_buffer_.data() + receive_len_, recv_read_size_, timeout_ms);
 	if (received <= 0) {
-		receive_buffer_.resize(used);
 		return false;
 	}
-	receive_buffer_.resize(used + static_cast<size_t>(received));
+	receive_len_ += static_cast<size_t>(received);
 	return true;
 }
 
