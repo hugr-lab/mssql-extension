@@ -1,0 +1,268 @@
+// test/cpp/codec/test_column_staging.cpp
+// Unit tests for codec::staging (spec 055 D3 — staging structures and ownership).
+//
+// Does NOT require a running SQL Server instance. No conversion is exercised:
+// this layer stages raw wire bytes column-major and knows nothing about types.
+//
+// Covers:
+//   - append semantics for all three StagingKinds (Direct / Fixed / Var),
+//   - validity: all-valid by default, NULLs clear their bit, NULL rows still
+//     occupy a positional offset/length slot for Var,
+//   - the checked-arithmetic cap on payload growth (a corrupt length prefix
+//     must raise, not wrap a uint32_t offset),
+//   - arena ownership: ColumnStaging addresses stay stable across chunks
+//     (the row reader caches them for a whole chunk),
+//   - the watermark policy: capacity is retained across chunks, and an outlier
+//     chunk is released after SHRINK_INTERVAL_CHUNKS instead of pinning memory
+//     for the life of the stream.
+//
+// Build & run:
+//   make test-column-staging
+
+#include "codec/staging/column_staging.hpp"
+
+#include "duckdb/common/exception.hpp"
+
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
+
+using duckdb::idx_t;
+using duckdb::mssql::codec::staging::ColumnStaging;
+using duckdb::mssql::codec::staging::StagingArena;
+using duckdb::mssql::codec::staging::StagingKind;
+
+namespace {
+
+int failures = 0;
+
+#define CHECK_TRUE(expr, label)                                                    \
+	do {                                                                           \
+		if (!(expr)) {                                                             \
+			std::cerr << "FAIL: " << (label) << " (" << #expr << ")" << std::endl; \
+			failures++;                                                            \
+		}                                                                          \
+	} while (0)
+
+#define CHECK_EQ(actual, expected, label)                                                            \
+	do {                                                                                             \
+		auto a_ = (actual);                                                                          \
+		auto e_ = (expected);                                                                        \
+		if (!(a_ == e_)) {                                                                           \
+			std::cerr << "FAIL: " << (label) << " — got " << a_ << ", expected " << e_ << std::endl; \
+			failures++;                                                                              \
+		}                                                                                            \
+	} while (0)
+
+void TestVarAppendAndReadBack() {
+	std::cout << "[1] Var: append, offsets, lengths, read-back..." << std::endl;
+	ColumnStaging col;
+	col.Configure(StagingKind::Var, 0);
+	col.BeginChunk(nullptr);
+
+	const std::string a = "hello";
+	const std::string b = "";
+	const std::string c = "worldwide";
+	col.AppendVar(reinterpret_cast<const uint8_t *>(a.data()), static_cast<uint32_t>(a.size()));
+	col.AppendVar(reinterpret_cast<const uint8_t *>(b.data()), 0);
+	col.AppendNull();
+	col.AppendVar(reinterpret_cast<const uint8_t *>(c.data()), static_cast<uint32_t>(c.size()));
+
+	CHECK_EQ(col.count, static_cast<idx_t>(4), "four rows staged");
+	CHECK_EQ(col.LengthAt(0), 5u, "row 0 length");
+	CHECK_EQ(col.LengthAt(1), 0u, "row 1 length (empty, not NULL)");
+	CHECK_EQ(col.LengthAt(2), 0u, "row 2 length (NULL)");
+	CHECK_EQ(col.LengthAt(3), 9u, "row 3 length");
+
+	CHECK_TRUE(col.IsValid(0), "row 0 valid");
+	CHECK_TRUE(col.IsValid(1), "row 1 valid — empty is not NULL");
+	CHECK_TRUE(!col.IsValid(2), "row 2 NULL");
+	CHECK_TRUE(col.IsValid(3), "row 3 valid");
+
+	CHECK_TRUE(std::memcmp(col.ValueAt(0), a.data(), 5) == 0, "row 0 payload");
+	CHECK_TRUE(std::memcmp(col.ValueAt(3), c.data(), 9) == 0, "row 3 payload");
+	// Payload is contiguous: total equals the sum of the lengths.
+	CHECK_EQ(col.buffer.size(), static_cast<idx_t>(14), "payload is contiguous and exactly the sum of lengths");
+}
+
+void TestFixedAndDirectAppend() {
+	std::cout << "[2] Fixed / Direct: strided append..." << std::endl;
+
+	ColumnStaging fixed;
+	fixed.Configure(StagingKind::Fixed, 8);
+	fixed.BeginChunk(nullptr);
+	uint64_t v0 = 0x0102030405060708ULL;
+	uint64_t v1 = 0x1112131415161718ULL;
+	fixed.AppendFixed(reinterpret_cast<const uint8_t *>(&v0));
+	fixed.AppendNull();
+	fixed.AppendFixed(reinterpret_cast<const uint8_t *>(&v1));
+	CHECK_EQ(fixed.count, static_cast<idx_t>(3), "three rows");
+	CHECK_TRUE(!fixed.IsValid(1), "middle row NULL");
+	// Layout is POSITIONAL: row N lives at N * stride, so row 2 is at byte 16,
+	// not packed at byte 8. Finalize indexes by row number with no cursor.
+	CHECK_TRUE(std::memcmp(fixed.buffer.data() + 16, &v1, 8) == 0, "row 2 at its positional offset");
+	CHECK_TRUE(std::memcmp(fixed.ValueAt(2), &v1, 8) == 0, "ValueAt agrees with the positional layout");
+	// The NULL slot is zeroed, so a branch-free kernel reading every row cannot
+	// pick up stale bytes from the previous chunk.
+	uint64_t zero = 0;
+	CHECK_TRUE(std::memcmp(fixed.ValueAt(1), &zero, 8) == 0, "NULL slot zeroed for branch-free decode");
+
+	// Direct writes into caller-owned storage (the DuckDB vector), so the
+	// destination pointer advances even for NULLs to keep row positions aligned.
+	std::vector<uint8_t> out(4 * 4, 0xAA);
+	ColumnStaging direct;
+	direct.Configure(StagingKind::Direct, 4);
+	direct.BeginChunk(out.data());
+	uint32_t d0 = 0x01020304u;
+	uint32_t d2 = 0x0A0B0C0Du;
+	direct.AppendDirect(reinterpret_cast<const uint8_t *>(&d0));
+	direct.AppendNull();
+	direct.AppendDirect(reinterpret_cast<const uint8_t *>(&d2));
+	CHECK_TRUE(std::memcmp(out.data(), &d0, 4) == 0, "direct row 0 written into the output vector");
+	CHECK_TRUE(out[4] == 0xAA, "direct NULL row left untouched");
+	CHECK_TRUE(std::memcmp(out.data() + 8, &d2, 4) == 0, "direct row 2 lands at its own row offset");
+}
+
+void TestValidityDefaultsToValid() {
+	std::cout << "[3] validity: all-valid by default, reset per chunk..." << std::endl;
+	ColumnStaging col;
+	col.Configure(StagingKind::Var, 0);
+	col.BeginChunk(nullptr);
+	for (idx_t i = 0; i < 130; i++) {
+		col.AppendNull();
+	}
+	for (idx_t i = 0; i < 130; i++) {
+		CHECK_TRUE(!col.IsValid(i), "row marked NULL across word boundaries");
+	}
+	// A new chunk must not inherit the previous chunk's NULL bits.
+	col.BeginChunk(nullptr);
+	const uint8_t byte = 0x7F;
+	for (idx_t i = 0; i < 130; i++) {
+		col.AppendVar(&byte, 1);
+	}
+	for (idx_t i = 0; i < 130; i++) {
+		CHECK_TRUE(col.IsValid(i), "validity reset to all-valid at chunk start");
+	}
+	CHECK_EQ(col.count, static_cast<idx_t>(130), "count reset per chunk");
+}
+
+void TestPayloadCapIsChecked() {
+	std::cout << "[4] checked arithmetic: payload cap raises instead of wrapping..." << std::endl;
+	ColumnStaging col;
+	col.Configure(StagingKind::Var, 0);
+	col.BeginChunk(nullptr);
+
+	// A corrupt length prefix claiming more than the cap must throw rather than
+	// overflow the uint32_t offsets. Nothing is allocated for it.
+	bool threw = false;
+	try {
+		col.AppendVarSlot(0xFFFFFFFFu);
+	} catch (const duckdb::InvalidInputException &) {
+		threw = true;
+	}
+	CHECK_TRUE(threw, "oversized value raises InvalidInputException");
+}
+
+void TestArenaAddressStability() {
+	std::cout << "[5] arena: column addresses stable across chunks..." << std::endl;
+	StagingArena arena;
+	arena.Configure(3);
+	CHECK_EQ(arena.ColumnCount(), static_cast<idx_t>(3), "three columns");
+
+	ColumnStaging *before[3];
+	for (idx_t i = 0; i < 3; i++) {
+		arena.Column(i).Configure(StagingKind::Var, 0);
+		before[i] = &arena.Column(i);
+	}
+	const uint8_t byte = 1;
+	for (int chunk = 0; chunk < 10; chunk++) {
+		for (idx_t i = 0; i < 3; i++) {
+			arena.Column(i).BeginChunk(nullptr);
+			for (int r = 0; r < 100; r++) {
+				arena.Column(i).AppendVar(&byte, 1);
+			}
+		}
+		arena.EndChunk();
+	}
+	for (idx_t i = 0; i < 3; i++) {
+		CHECK_TRUE(before[i] == &arena.Column(i), "column address unchanged after ten chunks");
+	}
+
+	// Reconfiguring with the SAME column count reuses the buffers — the
+	// multi-statement scan case, where a second result set must not realloc.
+	arena.Configure(3);
+	for (idx_t i = 0; i < 3; i++) {
+		CHECK_TRUE(before[i] == &arena.Column(i), "same column count reuses existing staging");
+	}
+}
+
+void TestWatermarkRetainsThenReleases() {
+	std::cout << "[6] watermark: retain capacity, release an outlier..." << std::endl;
+	StagingArena arena;
+	arena.Configure(1);
+	ColumnStaging &col = arena.Column(0);
+	col.Configure(StagingKind::Var, 0);
+
+	// One outlier chunk well above the shrink floor.
+	const idx_t big = StagingArena::MIN_RETAINED_BYTES * 16;
+	std::vector<uint8_t> blob(big, 0x5A);
+	col.BeginChunk(nullptr);
+	col.AppendVar(blob.data(), static_cast<uint32_t>(blob.size()));
+	arena.EndChunk();
+	const idx_t after_big = col.buffer.capacity();
+	CHECK_TRUE(after_big >= big, "capacity grew to hold the outlier");
+
+	// A steady run of small chunks. Capacity is retained through the first whole
+	// interval: the outlier fell inside it, so that evaluation still sees a large
+	// peak and must not shrink. Reallocating here is exactly what this avoids.
+	const uint8_t small = 0x11;
+	for (idx_t i = 0; i < StagingArena::SHRINK_INTERVAL_CHUNKS; i++) {
+		col.BeginChunk(nullptr);
+		col.AppendVar(&small, 1);
+		arena.EndChunk();
+		CHECK_TRUE(col.buffer.capacity() == after_big, "capacity retained through the interval containing the outlier");
+	}
+
+	// The next interval contains only small chunks, so its evaluation releases.
+	for (idx_t i = 0; i < StagingArena::SHRINK_INTERVAL_CHUNKS; i++) {
+		col.BeginChunk(nullptr);
+		col.AppendVar(&small, 1);
+		arena.EndChunk();
+	}
+	CHECK_TRUE(col.buffer.capacity() < after_big, "outlier released after a full quiet interval");
+	CHECK_TRUE(col.buffer.capacity() >= StagingArena::MIN_RETAINED_BYTES, "never shrinks below the floor");
+
+	// And the column still works after the shrink.
+	col.BeginChunk(nullptr);
+	col.AppendVar(&small, 1);
+	CHECK_EQ(col.LengthAt(0), 1u, "usable after shrink");
+}
+
+}  // namespace
+
+int main() {
+	std::cout << "============================================================" << std::endl;
+	std::cout << "codec::staging unit tests (spec 055 D3)" << std::endl;
+	std::cout << "============================================================" << std::endl;
+
+	try {
+		TestVarAppendAndReadBack();
+		TestFixedAndDirectAppend();
+		TestValidityDefaultsToValid();
+		TestPayloadCapIsChecked();
+		TestArenaAddressStability();
+		TestWatermarkRetainsThenReleases();
+	} catch (const std::exception &e) {
+		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
+		return 2;
+	}
+
+	std::cout << "============================================================" << std::endl;
+	if (failures > 0) {
+		std::cerr << failures << " assertion(s) failed." << std::endl;
+		return 1;
+	}
+	std::cout << "ALL TESTS PASSED" << std::endl;
+	return 0;
+}

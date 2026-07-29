@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -384,6 +384,22 @@ bench-materialize:
 	@echo ""
 	@echo "Running materialization microbenchmark..."
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_materialize
+
+
+# Spec 055 D3: column staging structures + arena ownership/watermark tests.
+# Pure in-memory — no SQL Server, no conversion. Links libduckdb for idx_t /
+# duckdb::vector and the exception types only.
+CODEC_STAGING_TEST_FLAGS := -std=c++17 -O1 -pthread -Wno-deprecated-declarations
+test-column-staging: release
+	@echo "Building codec::staging unit test (spec 055 D3)..."
+	@mkdir -p build/test
+	$(CXX) $(CODEC_STAGING_TEST_FLAGS) -I src/include -I duckdb/src/include \
+	    test/cpp/codec/test_column_staging.cpp \
+	    src/codec/staging/column_staging.cpp \
+	    -L build/release/src -lduckdb \
+	    -o build/test/test_column_staging
+	@echo ""
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
