@@ -164,6 +164,26 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 		return length >= 1 + data_length ? 1 + data_length : 0;
 	}
 
+	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
+	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
+	// else on the wire is framed this way.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE: {
+		if (length < 1)
+			return 0;
+		const size_t pointer_len = data[0];
+		if (pointer_len == 0)
+			return 1;  // NULL
+		const size_t header = 1 + pointer_len + 8 + 4;
+		if (length < header)
+			return 0;
+		uint32_t data_length;
+		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		const size_t total = header + data_length;
+		return length >= total ? total : 0;
+	}
+
 	// XML (always PLP)
 	case TDS_TYPE_XML:
 		return SkipPLPType(data, length);
@@ -794,6 +814,26 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 			return 0;
 		uint8_t actual_length = data[0];
 		return length >= 1 + actual_length ? 1 + actual_length : 0;
+	}
+
+	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
+	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
+	// else on the wire is framed this way.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE: {
+		if (length < 1)
+			return 0;
+		const size_t pointer_len = data[0];
+		if (pointer_len == 0)
+			return 1;  // NULL
+		const size_t header = 1 + pointer_len + 8 + 4;
+		if (length < header)
+			return 0;
+		uint32_t data_length;
+		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		const size_t total = header + data_length;
+		return length >= total ? total : 0;
 	}
 
 	// XML (always PLP)

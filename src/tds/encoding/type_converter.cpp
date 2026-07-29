@@ -128,12 +128,19 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_XML:
 		return LogicalType::VARCHAR;
 
+	// Legacy LOBs (issue #197). Decoded natively since spec 055: the wire bytes
+	// behind their text-pointer framing are ordinary CHAR / NCHAR / BINARY.
+	// A catalog scan still casts them server-side, which also normalises TEXT's
+	// collation; this mapping is what makes raw mssql_scan work on them too.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+		return LogicalType::VARCHAR;
+	case TDS_TYPE_IMAGE:
+		return LogicalType::BLOB;
+
 	// Unsupported types
 	case TDS_TYPE_UDT:
 	case TDS_TYPE_SQL_VARIANT:
-	case TDS_TYPE_IMAGE:
-	case TDS_TYPE_TEXT:
-	case TDS_TYPE_NTEXT:
 		throw InvalidInputException(
 			"MSSQL Error: Unsupported SQL Server type '%s' (0x%02X) for column '%s'. "
 			"Consider casting to VARCHAR or excluding this column.",
@@ -177,6 +184,9 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_DATETIMEOFFSET:
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 	case TDS_TYPE_XML:
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE:
 		return true;
 	default:
 		return false;

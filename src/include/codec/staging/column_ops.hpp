@@ -65,6 +65,12 @@ enum class AppendArm : uint8_t {
 	//! non-MAX forms use — and finalizes through the very same kernels.
 	PlpStageString,
 	PlpStageBinary,
+	//! The pre-2005 LOBs (TEXT, NTEXT, IMAGE). Their row framing is unlike any
+	//! other — a text pointer and a timestamp ahead of a 4-byte length — but the
+	//! bytes behind it are ordinary, so they stage into the same Var slot and
+	//! finalize through the same two kernels.
+	LobStageString,
+	LobStageBinary,
 	//! DECIMAL/NUMERIC. Its own arm because it is the one fixed-width family
 	//! whose wire value may legitimately be SHORTER than the declared width;
 	//! the append zero-extends instead of rejecting it.

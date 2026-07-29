@@ -382,6 +382,45 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 		break;
 	}
 
+	// Legacy LOBs (issue #197). Their TYPE_INFO is unlike anything else: a 4-byte
+	// LONGLEN, a collation for the two text forms, and then the source TABLE NAME
+	// in parts — a field no other type carries. Without parsing all of it the
+	// COLMETADATA stream desynchronises, which is why these columns used to kill
+	// the connection before a single row arrived rather than fail on decode.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE: {
+		if (offset + 4 > length)
+			return false;
+		// LONGLEN runs to 2^31-1. max_length is the 16-bit declared width
+		// elsewhere, so flag these as PLP-like instead of truncating it.
+		offset += 4;
+		column.max_length = 0xFFFF;
+		if (column.type_id != TDS_TYPE_IMAGE) {
+			if (offset + 5 > length)
+				return false;
+			column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+							   (static_cast<uint32_t>(data[offset + 2]) << 16) |
+							   (static_cast<uint32_t>(data[offset + 3]) << 24);
+			offset += 5;
+		}
+		// TableName: 1 byte part count, then each part as US_VARCHAR.
+		if (offset >= length)
+			return false;
+		uint8_t num_parts = data[offset++];
+		for (uint8_t part = 0; part < num_parts; part++) {
+			if (offset + 2 > length)
+				return false;
+			uint16_t char_count = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+			offset += 2;
+			const size_t byte_len = static_cast<size_t>(char_count) * 2;
+			if (offset + byte_len > length)
+				return false;
+			offset += byte_len;
+		}
+		break;
+	}
+
 	default:
 		throw std::runtime_error("Unsupported SQL Server type: " + column.GetTypeName());
 	}

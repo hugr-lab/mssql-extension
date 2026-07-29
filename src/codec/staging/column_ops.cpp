@@ -301,6 +301,23 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 
 	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
 
+	// The legacy LOBs. A catalog scan casts them server-side and never produces
+	// them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
+	// they are decoded natively too rather than left as the one shape the
+	// extension cannot read.
+	if (column.type_id == tds::TDS_TYPE_NTEXT) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::LobStageString;
+		return ops;
+	}
+	if (column.type_id == tds::TDS_TYPE_TEXT || column.type_id == tds::TDS_TYPE_IMAGE) {
+		// TEXT is single-byte like CHAR/VARCHAR: collation handling lives in the
+		// scan's SELECT list, not here.
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::LobStageBinary;
+		return ops;
+	}
+
 	// UTF-16 string columns take the batch decode (D5), MAX forms included: the
 	// chunk list is assembled incrementally into the same staged layout.
 	//

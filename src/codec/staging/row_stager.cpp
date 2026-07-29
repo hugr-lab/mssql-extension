@@ -36,11 +36,15 @@ static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 //! Cold: the extension has no framing for this wire type, so no value of it can
 //! be read. Thrown when a value ARRIVES, not at column resolution, so a query
 //! that selects such a column and returns no rows still succeeds.
+//!
+//! A guard rather than a path anyone is expected to hit: the types with no
+//! framing (TEXT/NTEXT/IMAGE uncast, UDT, SQL_VARIANT) break the COLMETADATA
+//! parse first, upstream of here. Catalog scans never produce them at all —
+//! BuildColumnExpression casts them server-side.
 [[noreturn]] void ThrowUnsupportedType(const tds::ColumnMetadata &column) {
 	throw InvalidInputException(
-		"MSSQL: column '%s' arrives as TDS type 0x%02X, which this extension cannot decode. TEXT, NTEXT and IMAGE are "
-		"readable through a catalog scan (which casts them server-side) but not through raw mssql_scan(); UDT and "
-		"SQL_VARIANT are not supported at all. Cast the column in the query instead.",
+		"MSSQL: column '%s' arrives as TDS type 0x%02X, which this extension cannot decode. CAST it in the query to a "
+		"type it can — NVARCHAR(MAX) for text-like values, VARBINARY(MAX) for binary ones.",
 		column.name, column.type_id);
 }
 
@@ -170,6 +174,32 @@ inline size_t AppendStagedFixed(ColumnStaging &st, const uint8_t *p) {
 //!
 //! No bounds tests: the caller is handed a row only once SkipRow has proved the
 //! whole of it is buffered, so every chunk header and every chunk body is here.
+//! Assemble one legacy-LOB value (TEXT/NTEXT/IMAGE). Returns bytes consumed.
+//!
+//! Framing: a one-byte text-pointer length (0 means NULL), the pointer, an
+//! 8-byte row timestamp, then a 4-byte data length. Only the data is the value.
+//! As with PLP, no bounds tests — the row is handed over only once SkipRow has
+//! proved all of it is buffered.
+template <bool DELIMITED>
+inline size_t AppendLob(ColumnStaging &st, const uint8_t *p) {
+	const uint32_t pointer_len = p[0];
+	if (pointer_len == 0) {
+		st.AppendNull();
+		return 1;
+	}
+	const size_t header = 1 + pointer_len + 8 + 4;
+	uint32_t data_length;
+	std::memcpy(&data_length, p + 1 + pointer_len + 8, 4);
+	if (DELIMITED) {
+		st.BeginVar();
+		std::memcpy(st.ExtendVar(data_length), p + header, data_length);
+		st.FinishVarDelimited();
+	} else {
+		st.AppendVar(p + header, data_length);
+	}
+	return header + data_length;
+}
+
 template <bool DELIMITED>
 inline size_t AppendPlp(ColumnStaging &st, const uint8_t *p) {
 	uint64_t total;
@@ -248,7 +278,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 		if (ops_[i].arm < AppendArm::Unsupported) {
 			arena_.Column(i).Configure(ops_[i].kind, ops_[i].stride, ops_[i].max_value_bytes);
 		}
-		if (ops_[i].arm == AppendArm::PlpStageString || ops_[i].arm == AppendArm::PlpStageBinary) {
+		if (ops_[i].arm >= AppendArm::PlpStageString && ops_[i].arm <= AppendArm::LobStageBinary) {
 			unbounded_columns_.push_back(i);
 		}
 	}
@@ -349,6 +379,12 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		case AppendArm::PlpStageBinary:
 			p += AppendPlp<false>(arena_.Column(c), p);
 			break;
+		case AppendArm::LobStageString:
+			p += AppendLob<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::LobStageBinary:
+			p += AppendLob<false>(arena_.Column(c), p);
+			break;
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
@@ -439,6 +475,12 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::PlpStageBinary:
 			p += AppendPlp<false>(arena_.Column(c), p);
 			break;
+		case AppendArm::LobStageString:
+			p += AppendLob<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::LobStageBinary:
+			p += AppendLob<false>(arena_.Column(c), p);
+			break;
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
@@ -459,10 +501,12 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 		const ColumnStaging &st = arena_.Column(c);
 		if (ops_[c].needs_value_fallback) {
 			FinalizeFallbackColumn(st, row_count, (*metadata_)[c], *targets_[c]);
-		} else if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString) {
+		} else if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString ||
+				   ops_[c].arm == AppendArm::LobStageString) {
 			// One conversion for the whole column (D5).
 			FinalizeStringColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
-		} else if (ops_[c].arm == AppendArm::P2StageBinary || ops_[c].arm == AppendArm::PlpStageBinary) {
+		} else if (ops_[c].arm == AppendArm::P2StageBinary || ops_[c].arm == AppendArm::PlpStageBinary ||
+				   ops_[c].arm == AppendArm::LobStageBinary) {
 			FinalizeBinaryColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
 		} else if (ops_[c].arm == AppendArm::P1StageDecimal) {
 			decimal::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
