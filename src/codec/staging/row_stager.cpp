@@ -6,6 +6,7 @@
 
 #include "codec/staging/row_stager.hpp"
 
+#include "codec/staging/binary_finalize.hpp"
 #include "codec/staging/string_finalize.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
@@ -141,6 +142,21 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 			p += 2 + length;
 			break;
 		}
+		case AppendArm::P2StageBinary: {
+			// Its own arm rather than sharing the string one: binary needs no
+			// separator, because its output offsets ARE its input offsets. Two wasted
+			// bytes per value is 12% of a 16-byte blob, which is more than a
+			// perfectly predicted extra switch arm costs.
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			if (length == 0xFFFF) {
+				arena_.Column(c).AppendNull();
+				p += 2;
+				break;
+			}
+			arena_.Column(c).AppendVar(p + 2, length);
+			p += 2 + length;
+			break;
+		}
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValue(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -220,6 +236,12 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 			p += 2 + length;
 			break;
 		}
+		case AppendArm::P2StageBinary: {
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			arena_.Column(c).AppendVar(p + 2, length);
+			p += 2 + length;
+			break;
+		}
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValueNBC(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -245,6 +267,8 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 		if (ops_[c].arm == AppendArm::P2StageString) {
 			// One conversion for the whole column (D5).
 			FinalizeStringColumn(st, row_count, *targets_[c]);
+		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
+			FinalizeBinaryColumn(st, row_count, *targets_[c]);
 		}
 		// Values went straight into the vector; only validity is still ours. Scan
 		// first so an all-valid column — the overwhelmingly common one — never

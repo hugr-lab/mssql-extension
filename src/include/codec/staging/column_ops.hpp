@@ -46,6 +46,9 @@ enum class AppendArm : uint8_t {
 	//! Staged raw into the column buffer and decoded in one batch at finalize
 	//! (spec 055 D5). Only UTF-16 string columns take this arm today.
 	P2StageString = 8,
+	//! Same framing, but the wire bytes ARE the value: VARBINARY needs no
+	//! conversion, only one allocation and one copy for the whole column.
+	P2StageBinary = 9,
 	//! Framing and conversion both go through the legacy per-value path. This is
 	//! every family that does not yet have a batch kernel, plus the issue-#89
 	//! divergence case. Cost is identical to the pre-staging path — one copy into
@@ -54,11 +57,11 @@ enum class AppendArm : uint8_t {
 	//! Ordered AFTER every staging arm on purpose: "does this column stage?" is
 	//! then one comparison rather than a helper, and it stays one comparison when
 	//! Convert is deleted — which it will be, once every family has a kernel.
-	Convert = 9,
+	Convert = 10,
 	//! Parsed for its length only; the value is discarded. Columns the query does
 	//! not project (COUNT(*), a narrower output chunk) still have to be walked to
 	//! find where the next column starts.
-	Skip = 10
+	Skip = 11
 };
 
 //! Everything the staged path needs to know about one column, decided once.

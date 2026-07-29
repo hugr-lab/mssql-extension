@@ -194,6 +194,17 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		return ops;
 	}
 
+	// VARBINARY: no conversion at all, so the batch path is one allocation and
+	// one copy per column instead of one of each per value. PLP is excluded for
+	// the same reason as strings — the chunked form has no length up front.
+	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
+	if (binary && !column.IsPLPType() && column.max_length > 0) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::P2StageBinary;
+		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+		return ops;
+	}
+
 	// Everything else: variable length on the wire (strings, binary, PLP), or
 	// fixed width with a precision-dependent size (DECIMAL, DATE, TIME,
 	// DATETIME2, DATETIMEOFFSET). Both stage as Var — the second group could be
