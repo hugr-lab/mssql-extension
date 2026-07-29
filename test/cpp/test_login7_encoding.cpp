@@ -397,10 +397,12 @@ void TestSimdutfByteEquivalence() {
 		buf_simd.resize(n_simd);
 		CHECK_TRUE(buf_legacy == buf_simd, std::string("direct-encode bytes mismatch for input: ") + input);
 
-		// Decode direction
-		const auto round_legacy = encoding::testing::LegacyUtf16LEDecode(legacy.data(), legacy.size());
+		// Decode direction. The hand-rolled decoder was deleted in spec 055 D2
+		// (it swallowed the unit after an unpaired surrogate); both encodings
+		// are valid UTF-16 here, so one decoder round-trips both.
+		const auto round_legacy = encoding::Utf16LEDecode(legacy.data(), legacy.size());
 		const auto round_simd = encoding::Utf16LEDecode(simd.data(), simd.size());
-		CHECK_STR_EQ(round_legacy, input, std::string("legacy round-trip: ") + input);
+		CHECK_STR_EQ(round_legacy, input, std::string("legacy-encoded round-trip: ") + input);
 		CHECK_STR_EQ(round_simd, input, std::string("simdutf round-trip: ") + input);
 	}
 }
@@ -437,6 +439,62 @@ void TestSimdutfInvalidInputFallback() {
 		const auto legacy = encoding::testing::LegacyUtf16LEEncode(s);
 		CHECK_TRUE(simd == legacy, "invalid-UTF-8 fallback matches legacy output");
 	}
+}
+
+//===----------------------------------------------------------------------===//
+// Test 9: UTF-16LE decode of ill-formed input uses standard U+FFFD replacement
+//
+// SQL Server NVARCHAR is UCS-2, so unpaired surrogates are legal on the wire.
+// Spec 055 D2 replaced the hand-rolled lenient decoder, which did NOT implement
+// replacement: it consumed the code unit *after* an unpaired high surrogate
+// before emitting one U+FFFD, and dropped a trailing high surrogate with no
+// output at all. Both lost data. These fixtures pin the standard semantics —
+// one replacement per ill-formed unit, decoding resumes at the next unit.
+//===----------------------------------------------------------------------===//
+
+void TestUtf16DecodeReplacement() {
+	std::cout << "[9] UTF-16LE decode: standard U+FFFD replacement..." << std::endl;
+	const std::string FFFD = "\xEF\xBF\xBD";
+
+	auto decode = [](const std::vector<uint16_t> &units) {
+		std::vector<uint8_t> bytes;
+		bytes.reserve(units.size() * 2);
+		for (uint16_t u : units) {
+			bytes.push_back(static_cast<uint8_t>(u & 0xFF));
+			bytes.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+		}
+		return encoding::Utf16LEDecode(bytes.data(), bytes.size());
+	};
+
+	// The swallowing bug: an unpaired high surrogate followed by 'A'.
+	// Legacy produced just U+FFFD and lost the 'A'.
+	CHECK_STR_EQ(decode({0xD800, 0x0041}), FFFD + "A", "unpaired high surrogate keeps the next character");
+
+	// The dropped-value bug: a high surrogate in the final position.
+	// Legacy produced an empty string.
+	CHECK_STR_EQ(decode({0x0041, 0xD800}), "A" + FFFD, "trailing high surrogate becomes a replacement");
+
+	// Lone low surrogate.
+	CHECK_STR_EQ(decode({0x0041, 0xDC00, 0x0042}), "A" + FFFD + "B", "lone low surrogate replaced in place");
+
+	// Two consecutive high surrogates: two replacements, not one.
+	CHECK_STR_EQ(decode({0xD800, 0xD800, 0x0041}), FFFD + FFFD + "A", "one replacement per ill-formed unit");
+
+	// A valid surrogate pair must still decode to its astral code point
+	// (U+10437) and must not be touched by the replacement path.
+	CHECK_STR_EQ(decode({0xD801, 0xDC37}), "\xF0\x90\x90\xB7", "valid surrogate pair survives");
+
+	// Valid pair adjacent to an unpaired one.
+	CHECK_STR_EQ(decode({0xD801, 0xDC37, 0xD800}), std::string("\xF0\x90\x90\xB7") + FFFD,
+				 "valid pair then unpaired high surrogate");
+
+	// Non-ASCII BMP text around an ill-formed unit stays intact.
+	CHECK_STR_EQ(decode({0x00DC, 0xDC00, 0x00E9}), std::string("\xC3\x9C") + FFFD + "\xC3\xA9",
+				 "multi-byte BMP neighbours preserved");
+
+	// Well-formed input must not go anywhere near the replacement path.
+	CHECK_STR_EQ(decode({0x0041, 0x0042, 0x0043}), "ABC", "valid input unchanged");
+	CHECK_STR_EQ(encoding::Utf16LEDecode(nullptr, 0), "", "empty input");
 }
 
 }  // namespace
@@ -523,6 +581,7 @@ int main() {
 		TestAsciiRegression();
 		TestSimdutfByteEquivalence();
 		TestSimdutfInvalidInputFallback();
+		TestUtf16DecodeReplacement();
 		TestLogin7SspiFragmentation();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;

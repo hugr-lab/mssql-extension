@@ -109,7 +109,6 @@ namespace testing {
 /// microbenchmark and the LOGIN7 spec-043 bit-identity unit test. Do not
 /// depend on this symbol from production code.
 std::vector<uint8_t> LegacyUtf16LEEncode(const std::string &input);
-std::string LegacyUtf16LEDecode(const uint8_t *data, size_t byte_length);
 size_t LegacyUtf16LEByteLength(const std::string &input);
 size_t LegacyUtf16LEEncodeDirect(const char *input, size_t input_len, uint8_t *output);
 

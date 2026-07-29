@@ -1,0 +1,69 @@
+# name: test/sql/query/unpaired_surrogates.test
+# description: NVARCHAR values with unpaired surrogates decode with standard U+FFFD replacement
+# group: [query]
+
+# SQL Server NVARCHAR is UCS-2, so an unpaired surrogate is a legal stored value
+# and must not fail a query. simdutf is strictly conformant and rejects such
+# input, so the extension has a lenient fallback.
+#
+# Before spec 055 D2 that fallback was a hand-rolled decoder which did not
+# implement replacement, and lost data:
+#
+#   NCHAR(0xD800) + 'A'   decoded to  EF BF BD        -- the 'A' was swallowed
+#   'A' + NCHAR(0xD800)   decoded to  41              -- the surrogate vanished
+#
+# Standard behaviour (matching Python's utf-16-le errors='replace', and every
+# other conformant decoder) is one U+FFFD per ill-formed code unit with decoding
+# resuming at the next unit. These fixtures pin that.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS surr_db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('surr_db', 'DROP TABLE IF EXISTS dbo.SurrogateTest');
+
+statement ok
+SELECT mssql_exec('surr_db', 'CREATE TABLE dbo.SurrogateTest (id INT, c NVARCHAR(16))');
+
+# 1: unpaired high surrogate followed by a character  -> replacement + character
+# 2: unpaired high surrogate in the final position    -> character + replacement
+# 3: unpaired low surrogate between characters        -> replacement in place
+# 4: two consecutive high surrogates                  -> one replacement each
+# 5: a VALID surrogate pair (U+10437)                 -> untouched
+statement ok
+SELECT mssql_exec('surr_db', 'INSERT INTO dbo.SurrogateTest VALUES
+    (1, NCHAR(0xD800) + N''A''),
+    (2, N''A'' + NCHAR(0xD800)),
+    (3, N''A'' + NCHAR(0xDC00) + N''B''),
+    (4, NCHAR(0xD800) + NCHAR(0xD800) + N''A''),
+    (5, NCHAR(0xD801) + NCHAR(0xDC37))');
+
+query IT
+SELECT id, to_hex(encode(c)) FROM surr_db.dbo.SurrogateTest ORDER BY id;
+----
+1	EFBFBD41
+2	41EFBFBD
+3	41EFBFBD42
+4	EFBFBDEFBFBD41
+5	F09090B7
+
+# Character counts follow: each ill-formed unit contributes exactly one
+# character, and the valid pair stays a single code point.
+query II
+SELECT id, length(c) FROM surr_db.dbo.SurrogateTest ORDER BY id;
+----
+1	2
+2	2
+3	3
+4	3
+5	1
+
+statement ok
+SELECT mssql_exec('surr_db', 'DROP TABLE IF EXISTS dbo.SurrogateTest');
+
+statement ok
+DETACH surr_db;

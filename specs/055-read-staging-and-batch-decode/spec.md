@@ -220,7 +220,25 @@ Tests: extend `test/cpp/codec/test_decimal_codec.cpp` with a table-driven wire�
 every magnitude length (1..16 bytes), both signs, zero (sign byte 0 must give `0`, not `-0`), and
 the DECIMAL(38,x) extremes, asserted against the current implementation kept as reference.
 
-### D2. UTF-16 fallback: standard U+FFFD substitution, legacy converter deleted
+### D2. UTF-16 fallback: standard U+FFFD substitution, legacy converter deleted — **done**
+
+Landed. The data loss was confirmed end to end against a live server before the change, not
+argued from the code: `NCHAR(0xD800) + N'A'` decoded to `EFBFBD` — the `A` swallowed — and
+`N'A' + NCHAR(0xD800)` decoded to `41`, the surrogate gone with no replacement at all. Both now
+decode to the standard two-character result.
+
+The probe is `simdutf::validate_utf16le_with_errors`, not a conversion entry point: every
+`convert_*` writes through its output pointer and cannot be used to locate an error. Each valid
+run between errors is converted in bulk, so the loop is SIMD everywhere except the splices.
+
+All expectations were validated against an independent reference (Python `utf-16-le`,
+`errors='replace'`) rather than against our own reasoning, byte for byte. Fixtures: Test 9 in
+`test/cpp/test_login7_encoding.cpp` (unit) and `test/sql/query/unpaired_surrogates.test`
+(integration, real NVARCHAR values from SQL Server). `diff_check.sh` 13/13 byte-identical — none
+of its 13 queries contains an unpaired surrogate, so nothing there moved.
+
+The ENCODE direction (UTF-8 → UTF-16LE on invalid UTF-8) keeps its legacy fallback; only the
+decode converter was deleted.
 
 SQL Server `NVARCHAR` is UCS-2, so unpaired surrogates are legal on the wire and must not turn a
 query into an error. simdutf is strictly standards-conformant and rejects them, which is why a
