@@ -6,8 +6,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_settings.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "mssql_compat.hpp"		// For FlatVector header relocation (spec 051 M2)
@@ -857,6 +862,68 @@ static BindInfo GetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 }
 
 //------------------------------------------------------------------------------
+// Serialization
+//------------------------------------------------------------------------------
+// These callbacks are NOT optional bookkeeping — without them the scan produces
+// WRONG RESULTS.
+//
+// DuckDB's common-subplan optimizer (added in v1.5.4) identifies equal subplans
+// by SERIALIZING each operator and hashing the bytes. For a LOGICAL_GET,
+// FunctionSerializer::Serialize writes the bind data only when the function has
+// both callbacks set; otherwise it writes just the function name and signature.
+// Everything that identifies which table this scan reads — schema, table, and
+// the pushdown clauses we build ourselves — lives in MSSQLCatalogScanBindData,
+// so without serialization two scans of DIFFERENT tables with the same output
+// shape hash identically. The optimizer then materializes one of them as a CTE
+// and feeds it to both consumers: `SELECT min(c) FROM t1 UNION ALL
+// SELECT min(c) FROM t2` silently returns t1's data twice.
+//
+// (MSSQLCatalogScanBindData::Equals is correct but never consulted here — this
+// optimizer compares serialized bytes, not FunctionData::Equals.)
+//
+// Serialize exactly the fields that determine the generated T-SQL. Everything
+// else in the bind data (column lists, PK/rowid metadata) is derived from the
+// table itself and is therefore implied by schema+table.
+static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
+								 const TableFunction &function) {
+	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
+	serializer.WriteProperty(100, "context_name", bind_data.context_name);
+	serializer.WriteProperty(101, "schema_name", bind_data.schema_name);
+	serializer.WriteProperty(102, "table_name", bind_data.table_name);
+	// Pushdown state: two scans of the SAME table with different pushed-down
+	// predicates must not collapse into one either.
+	serializer.WriteProperty(103, "complex_filter_where_clause", bind_data.complex_filter_where_clause);
+	serializer.WriteProperty(104, "order_by_clause", bind_data.order_by_clause);
+	serializer.WriteProperty(105, "top_n", bind_data.top_n);
+}
+
+static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	auto context_name = deserializer.ReadProperty<string>(100, "context_name");
+	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
+	auto table_name = deserializer.ReadProperty<string>(102, "table_name");
+	auto complex_filter_where_clause = deserializer.ReadProperty<string>(103, "complex_filter_where_clause");
+	auto order_by_clause = deserializer.ReadProperty<string>(104, "order_by_clause");
+	auto top_n = deserializer.ReadProperty<int64_t>(105, "top_n");
+
+	// Rebuild through the catalog entry so the column/PK metadata comes from the
+	// live catalog rather than from stale serialized copies.
+	auto &context = deserializer.Get<ClientContext &>();
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, context_name, schema_name, table_name);
+	unique_ptr<FunctionData> bind_data;
+	entry.GetScanFunction(context, bind_data);
+	if (!bind_data) {
+		throw SerializationException("MSSQL: could not rebind catalog scan for %s.%s.%s", context_name, schema_name,
+									 table_name);
+	}
+
+	auto &result = bind_data->Cast<MSSQLCatalogScanBindData>();
+	result.complex_filter_where_clause = complex_filter_where_clause;
+	result.order_by_clause = order_by_clause;
+	result.top_n = top_n;
+	return bind_data;
+}
+
+//------------------------------------------------------------------------------
 // Public Interface
 //------------------------------------------------------------------------------
 
@@ -887,6 +954,12 @@ TableFunction GetCatalogScanFunction() {
 
 	// Note: We don't set filter_prune = true because that can cause issues with
 	// the DataChunk column count when filter-only columns are excluded
+
+	// Required for correctness, not just for plan persistence — see the comment
+	// above CatalogScanSerialize. Both callbacks must be set: DuckDB only
+	// serializes bind data when HasSerializationCallbacks() is true.
+	func.serialize = CatalogScanSerialize;
+	func.deserialize = CatalogScanDeserialize;
 
 	return func;
 }

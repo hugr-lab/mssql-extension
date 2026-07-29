@@ -1,0 +1,98 @@
+# name: test/sql/query/multi_table_subplan.test
+# description: Two catalog scans of DIFFERENT tables in one query must not collapse into one
+# group: [query]
+
+# Regression test for the common-subplan wrong-results bug.
+#
+# DuckDB's common-subplan optimizer (v1.5.4+) identifies equal subplans by
+# serializing each operator and hashing the bytes. A LOGICAL_GET only carries
+# its bind data into that signature when the table function has serialize AND
+# deserialize callbacks. mssql_catalog_scan had neither, so the schema/table
+# names -- which live only in MSSQLCatalogScanBindData -- were absent from the
+# signature. Two scans of different tables with the same output shape then
+# hashed identically, one was materialized as a CTE, and BOTH consumers read
+# the first table's rows.
+#
+# The bug needs same-shaped scans (identical projected column names and types)
+# to trigger, which is why both fixtures below use a single column named `c`.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS subplan_db (TYPE mssql);
+
+statement ok
+CREATE OR REPLACE TABLE subplan_db.dbo.SubplanA (c VARCHAR);
+
+statement ok
+CREATE OR REPLACE TABLE subplan_db.dbo.SubplanB (c VARCHAR);
+
+statement ok
+INSERT INTO subplan_db.dbo.SubplanA VALUES ('aaa'), ('aab');
+
+statement ok
+INSERT INTO subplan_db.dbo.SubplanB VALUES ('bbb'), ('bbc');
+
+# UNION ALL of two same-shaped aggregates -- the original repro
+query TT
+SELECT 'A' AS t, min(c) AS v FROM subplan_db.dbo.SubplanA
+UNION ALL
+SELECT 'B' AS t, min(c) AS v FROM subplan_db.dbo.SubplanB
+ORDER BY t;
+----
+A	aaa
+B	bbb
+
+# Scalar subqueries in one projection
+query TT
+SELECT (SELECT min(c) FROM subplan_db.dbo.SubplanA) AS a,
+       (SELECT min(c) FROM subplan_db.dbo.SubplanB) AS b;
+----
+aaa	bbb
+
+# Three-way: the third branch must not pick up the first either
+query TT
+SELECT 'A' AS t, max(c) AS v FROM subplan_db.dbo.SubplanA
+UNION ALL
+SELECT 'B' AS t, max(c) AS v FROM subplan_db.dbo.SubplanB
+UNION ALL
+SELECT 'A2' AS t, max(c) AS v FROM subplan_db.dbo.SubplanA
+ORDER BY t;
+----
+A	aab
+A2	aab
+B	bbc
+
+# Plain UNION ALL without aggregation
+query T
+SELECT c FROM subplan_db.dbo.SubplanA
+UNION ALL
+SELECT c FROM subplan_db.dbo.SubplanB
+ORDER BY c;
+----
+aaa
+aab
+bbb
+bbc
+
+# Same table twice with DIFFERENT pushed-down filters: deduplicating these
+# would be just as wrong, so the filter clauses are part of the signature too.
+query TT
+SELECT 'lo' AS t, count(*) AS n FROM subplan_db.dbo.SubplanA WHERE c = 'aaa'
+UNION ALL
+SELECT 'hi' AS t, count(*) AS n FROM subplan_db.dbo.SubplanA WHERE c = 'aab'
+ORDER BY t;
+----
+hi	1
+lo	1
+
+statement ok
+DROP TABLE subplan_db.dbo.SubplanA;
+
+statement ok
+DROP TABLE subplan_db.dbo.SubplanB;
+
+statement ok
+DETACH subplan_db;
