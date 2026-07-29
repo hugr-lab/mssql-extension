@@ -103,9 +103,9 @@ void TestFixedAndDirectAppend() {
 	fixed.BeginChunk(nullptr);
 	uint64_t v0 = 0x0102030405060708ULL;
 	uint64_t v1 = 0x1112131415161718ULL;
-	fixed.AppendFixed(reinterpret_cast<const uint8_t *>(&v0));
+	fixed.AppendFixed<8>(reinterpret_cast<const uint8_t *>(&v0));
 	fixed.AppendNull();
-	fixed.AppendFixed(reinterpret_cast<const uint8_t *>(&v1));
+	fixed.AppendFixed<8>(reinterpret_cast<const uint8_t *>(&v1));
 	CHECK_EQ(fixed.count, static_cast<idx_t>(3), "three rows");
 	CHECK_TRUE(!fixed.IsValid(1), "middle row NULL");
 	// Layout is POSITIONAL: row N lives at N * stride, so row 2 is at byte 16,

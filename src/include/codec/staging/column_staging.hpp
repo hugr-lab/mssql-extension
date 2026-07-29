@@ -288,8 +288,12 @@ struct ColumnStaging {
 	//! a NULL leaves a (zeroed) hole. Finalize therefore indexes straight by row
 	//! number and needs no separate cursor, which is what makes a branch-free
 	//! kernel possible.
+	//! STRIDE is a template parameter for the same reason AppendDirect's is: a
+	//! memcpy whose size is a runtime value compiles to a libc call, and
+	//! count * STRIDE folds into the addressing mode instead of a multiply.
+	template <uint32_t STRIDE>
 	inline void AppendFixed(const uint8_t *src) {
-		std::memcpy(buffer.data() + count * stride, src, stride);
+		std::memcpy(buffer.data() + count * STRIDE, src, STRIDE);
 		count++;
 	}
 

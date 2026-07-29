@@ -127,6 +127,7 @@ set(EXTENSION_SOURCES
     src/codec/staging/row_stager.cpp
     src/codec/staging/string_finalize.cpp
     src/codec/staging/binary_finalize.cpp
+    src/codec/staging/uuid_finalize.cpp
     src/codec/literal_format.cpp
     src/codec/boolean_codec.cpp
     src/codec/integer_codec.cpp

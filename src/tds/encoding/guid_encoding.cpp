@@ -37,26 +37,37 @@ void GuidEncoding::ReorderGuidBytes(const uint8_t *input, uint8_t *output) {
 }
 
 hugeint_t GuidEncoding::ConvertGuid(const uint8_t *data) {
-	// Reorder bytes to standard UUID format
-	uint8_t reordered[16];
-	ReorderGuidBytes(data, reordered);
+	// The byte shuffle above decomposes into WORD operations, which is what this
+	// does instead of moving sixteen bytes one at a time through a scratch array.
+	//
+	// Reversing Data1's four bytes and then reading them big-endian is exactly
+	// reading them little-endian in the first place — the two reversals cancel.
+	// Same for Data2 and Data3. Only Data4 keeps its wire order, and reading it
+	// big-endian is one byte swap of a 64-bit load.
+	//
+	// Little-endian host is already assumed throughout the read path (the 1:1
+	// integer columns are stored straight from the wire).
+	uint32_t data1;
+	uint16_t data2;
+	uint16_t data3;
+	std::memcpy(&data1, data, 4);
+	std::memcpy(&data2, data + 4, 2);
+	std::memcpy(&data3, data + 6, 2);
 
-	// Convert to hugeint_t (big-endian)
-	uint64_t upper = static_cast<uint64_t>(reordered[0]) << 56 | static_cast<uint64_t>(reordered[1]) << 48 |
-					 static_cast<uint64_t>(reordered[2]) << 40 | static_cast<uint64_t>(reordered[3]) << 32 |
-					 static_cast<uint64_t>(reordered[4]) << 24 | static_cast<uint64_t>(reordered[5]) << 16 |
-					 static_cast<uint64_t>(reordered[6]) << 8 | static_cast<uint64_t>(reordered[7]);
-	uint64_t lower = static_cast<uint64_t>(reordered[8]) << 56 | static_cast<uint64_t>(reordered[9]) << 48 |
-					 static_cast<uint64_t>(reordered[10]) << 40 | static_cast<uint64_t>(reordered[11]) << 32 |
-					 static_cast<uint64_t>(reordered[12]) << 24 | static_cast<uint64_t>(reordered[13]) << 16 |
-					 static_cast<uint64_t>(reordered[14]) << 8 | static_cast<uint64_t>(reordered[15]);
+	const uint64_t upper =
+		(static_cast<uint64_t>(data1) << 32) | (static_cast<uint64_t>(data2) << 16) | static_cast<uint64_t>(data3);
+	// Written as a byte-wise big-endian assembly on purpose: every compiler
+	// recognises this shape and emits a single rev/bswap.
+	const uint64_t lower = static_cast<uint64_t>(data[8]) << 56 | static_cast<uint64_t>(data[9]) << 48 |
+						   static_cast<uint64_t>(data[10]) << 40 | static_cast<uint64_t>(data[11]) << 32 |
+						   static_cast<uint64_t>(data[12]) << 24 | static_cast<uint64_t>(data[13]) << 16 |
+						   static_cast<uint64_t>(data[14]) << 8 | static_cast<uint64_t>(data[15]);
 
-	// DuckDB expects UUID with high bit flipped for sortability
-	// See duckdb/src/common/types/uuid.cpp
+	// DuckDB stores UUIDs with the high bit flipped so that the integer order
+	// matches the textual order (duckdb/src/common/types/uuid.cpp).
 	hugeint_t result;
 	result.upper = static_cast<int64_t>(upper ^ (uint64_t(1) << 63));
 	result.lower = lower;
-
 	return result;
 }
 

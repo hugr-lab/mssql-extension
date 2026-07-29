@@ -33,22 +33,30 @@ namespace staging {
 //!   Raw — the value has no length prefix (TDS's non-nullable fixed types).
 //!   P1  — one length byte, 0 meaning NULL (the *N nullable variants).
 //! The suffix is the width in bytes.
+//!
+//! Values are positional on purpose and deliberately NOT written out: Convert
+//! and Skip must stay last (see below), and every new staging arm otherwise
+//! renumbers them for no reason.
 enum class AppendArm : uint8_t {
-	RawDirect1 = 0,
-	RawDirect2 = 1,
-	RawDirect4 = 2,
-	RawDirect8 = 3,
-	P1Direct1 = 4,
-	P1Direct2 = 5,
-	P1Direct4 = 6,
-	P1Direct8 = 7,
+	RawDirect1,
+	RawDirect2,
+	RawDirect4,
+	RawDirect8,
+	P1Direct1,
+	P1Direct2,
+	P1Direct4,
+	P1Direct8,
 	//! P2 — two length bytes, 0xFFFF meaning NULL: TDS's variable-length forms.
 	//! Staged raw into the column buffer and decoded in one batch at finalize
 	//! (spec 055 D5). Only UTF-16 string columns take this arm today.
-	P2StageString = 8,
+	P2StageString,
 	//! Same framing, but the wire bytes ARE the value: VARBINARY needs no
 	//! conversion, only one allocation and one copy for the whole column.
-	P2StageBinary = 9,
+	P2StageBinary,
+	//! P1 framing (one length byte, 0 = NULL) with a 16-byte value staged for a
+	//! batch kernel: UNIQUEIDENTIFIER, whose wire form is mixed-endian and needs
+	//! reassembling into DuckDB's sortable UUID.
+	P1StageUuid,
 	//! Framing and conversion both go through the legacy per-value path. This is
 	//! every family that does not yet have a batch kernel, plus the issue-#89
 	//! divergence case. Cost is identical to the pre-staging path — one copy into
@@ -57,11 +65,11 @@ enum class AppendArm : uint8_t {
 	//! Ordered AFTER every staging arm on purpose: "does this column stage?" is
 	//! then one comparison rather than a helper, and it stays one comparison when
 	//! Convert is deleted — which it will be, once every family has a kernel.
-	Convert = 10,
+	Convert,
 	//! Parsed for its length only; the value is discarded. Columns the query does
 	//! not project (COUNT(*), a narrower output chunk) still have to be walked to
 	//! find where the next column starts.
-	Skip = 11
+	Skip
 };
 
 //! Everything the staged path needs to know about one column, decided once.

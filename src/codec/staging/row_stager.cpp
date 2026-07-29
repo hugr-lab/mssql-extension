@@ -8,6 +8,7 @@
 
 #include "codec/staging/binary_finalize.hpp"
 #include "codec/staging/string_finalize.hpp"
+#include "codec/staging/uuid_finalize.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -42,6 +43,23 @@ inline size_t AppendPrefixedDirect(ColumnStaging &st, const uint8_t *p) {
 	const uint32_t len = p[0];
 	if (len == STRIDE) {
 		st.AppendDirect<STRIDE>(p + 1);
+		return 1 + STRIDE;
+	}
+	if (len == 0) {
+		st.AppendNull();
+		return 1;
+	}
+	ThrowBadPrefix(STRIDE, len);
+}
+
+//! One value on a 1-byte-prefixed column staged for a batch kernel. Same shape
+//! as AppendPrefixedDirect, but the bytes go to the staging buffer instead of
+//! straight into the output vector.
+template <uint32_t STRIDE>
+inline size_t AppendPrefixedFixed(ColumnStaging &st, const uint8_t *p) {
+	const uint32_t len = p[0];
+	if (len == STRIDE) {
+		st.AppendFixed<STRIDE>(p + 1);
 		return 1 + STRIDE;
 	}
 	if (len == 0) {
@@ -130,6 +148,9 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 			break;
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
+			break;
+		case AppendArm::P1StageUuid:
+			p += AppendPrefixedFixed<16>(arena_.Column(c), p);
 			break;
 		case AppendArm::P2StageString: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
@@ -228,6 +249,9 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
 			break;
+		case AppendArm::P1StageUuid:
+			p += AppendPrefixedFixed<16>(arena_.Column(c), p);
+			break;
 		case AppendArm::P2StageString: {
 			// The length prefix stays in an NBC row; the bitmap only decided that
 			// a value is present at all, which the branch above already handled.
@@ -269,6 +293,8 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			FinalizeStringColumn(st, row_count, *targets_[c]);
 		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
 			FinalizeBinaryColumn(st, row_count, *targets_[c]);
+		} else if (ops_[c].arm == AppendArm::P1StageUuid) {
+			FinalizeUuidColumn(st, row_count, *targets_[c]);
 		}
 		// Values went straight into the vector; only validity is still ours. Scan
 		// first so an all-valid column — the overwhelmingly common one — never

@@ -169,6 +169,14 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		ops.direct_write = true;
 		return ops;
 	}
+	if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+		// Fixed 16 bytes, mixed-endian, converted by arithmetic — a straight
+		// batch loop with no branch and no allocation.
+		ops.kind = StagingKind::Fixed;
+		ops.arm = AppendArm::P1StageUuid;
+		ops.stride = width;
+		return ops;
+	}
 	if (width > 0) {
 		ops.kind = StagingKind::Fixed;
 		ops.stride = width;
