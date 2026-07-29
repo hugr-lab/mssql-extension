@@ -105,7 +105,7 @@ TdsSocket::TdsSocket(TdsSocket &&other) noexcept
 	  tls_context_(std::move(other.tls_context_)),
 	  receive_buffer_(std::move(other.receive_buffer_)),
 	  receive_pos_(other.receive_pos_),
-	  recv_scratch_(std::move(other.recv_scratch_)) {
+	  recv_read_size_(other.recv_read_size_) {
 	other.fd_ = -1;
 	other.connected_ = false;
 	other.receive_pos_ = 0;
@@ -122,7 +122,7 @@ TdsSocket &TdsSocket::operator=(TdsSocket &&other) noexcept {
 		tls_context_ = std::move(other.tls_context_);
 		receive_buffer_ = std::move(other.receive_buffer_);
 		receive_pos_ = other.receive_pos_;
-		recv_scratch_ = std::move(other.recv_scratch_);
+		recv_read_size_ = other.recv_read_size_;
 		other.fd_ = -1;
 		other.connected_ = false;
 		other.receive_pos_ = 0;
@@ -344,9 +344,16 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	int socket_fd = fd_;
 	uint8_t &pkt_id = packet_id;
 
-	// Buffer for extra TLS data from large TDS packets
-	// (server may send large TLS records that mbedTLS reads in small chunks)
+	// Buffer for extra TLS data from large TDS packets: OpenSSL asks the BIO for
+	// a record header first and the record body second, so a 16 KB TDS packet is
+	// handed out in several pieces and the rest has to be held here.
+	//
+	// Drained with a cursor rather than erase(). erase() from the front memmoves
+	// the whole remainder on EVERY call, and OpenSSL's first call of each record
+	// asks for five bytes — so a full frame was being memmoved once per record
+	// just to hand back a header.
 	auto tls_recv_buffer = std::make_shared<std::vector<uint8_t>>();
+	auto tls_recv_pos = std::make_shared<size_t>(0);
 
 	// Send buffer - accumulate TLS data and send in batches like FreeTDS does
 	auto tls_send_buffer = std::make_shared<std::vector<uint8_t>>();
@@ -410,11 +417,12 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	// Receive callback: unwrap TLS data from TDS PRELOGIN packet
 	// Uses tls_recv_buffer to buffer extra data from large TDS packets
 	// Captures flush_send_buffer to send pending data before receiving (like FreeTDS does)
-	TlsRecvCallback recv_cb = [socket_fd, tls_recv_buffer, tls_send_buffer, flush_send_buffer](uint8_t *buf, size_t len,
-																							   int timeout_ms) -> int {
+	TlsRecvCallback recv_cb = [socket_fd, tls_recv_buffer, tls_recv_pos, tls_send_buffer, flush_send_buffer](
+								  uint8_t *buf, size_t len, int timeout_ms) -> int {
 		auto &recv_buffer = *tls_recv_buffer;
+		size_t &recv_pos = *tls_recv_pos;
 		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: request %zu bytes (recv_buffer=%zu, send_buffer=%zu, timeout=%d)", len,
-							   recv_buffer.size(), tls_send_buffer->size(), timeout_ms);
+							   recv_buffer.size() - recv_pos, tls_send_buffer->size(), timeout_ms);
 
 		// Like FreeTDS: flush send buffer before trying to receive
 		// This ensures all pending TLS data is sent as a single TDS packet
@@ -426,12 +434,19 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 		}
 
 		// First, return data from buffer if we have any
-		if (!recv_buffer.empty()) {
-			size_t to_copy = std::min(len, recv_buffer.size());
-			std::memcpy(buf, recv_buffer.data(), to_copy);
-			recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + to_copy);
+		const size_t buffered = recv_buffer.size() - recv_pos;
+		if (buffered > 0) {
+			size_t to_copy = std::min(len, buffered);
+			std::memcpy(buf, recv_buffer.data() + recv_pos, to_copy);
+			recv_pos += to_copy;
+			if (recv_pos == recv_buffer.size()) {
+				// Fully drained: reset rather than hold the allocation at an
+				// ever-growing offset. Capacity is retained for the next packet.
+				recv_buffer.clear();
+				recv_pos = 0;
+			}
 			MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: returned %zu bytes from buffer (%zu remaining)", to_copy,
-								   recv_buffer.size());
+								   recv_buffer.size() - recv_pos);
 			return static_cast<int>(to_copy);
 		}
 
@@ -480,9 +495,15 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 			return -1;
 		}
 
-		// Read full payload into temporary buffer
+		// Read the payload straight into the buffer that will hold the remainder.
+		// This used to allocate a fresh vector per TDS packet — one malloc, one
+		// value-initialisation and one free for every 16 KB frame of the result
+		// set, all of it discarded a few lines later.
 		size_t payload_len = pkt_len - 8;
-		std::vector<uint8_t> payload(payload_len);
+		recv_buffer.clear();
+		recv_pos = 0;
+		recv_buffer.resize(payload_len);
+		std::vector<uint8_t> &payload = recv_buffer;
 
 		size_t payload_read = 0;
 		while (payload_read < payload_len) {
@@ -503,14 +524,15 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 
 		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: read TDS payload of %zu bytes", payload_len);
 
-		// Copy what we can to the output buffer, store rest in our buffer
+		// Hand out what was asked for; the rest stays where it already is, behind
+		// the cursor. The old code copied the remainder into a second buffer,
+		// which was a full extra pass over almost every byte of every frame.
 		size_t to_copy = std::min(len, payload_len);
 		std::memcpy(buf, payload.data(), to_copy);
-
-		if (payload_len > to_copy) {
-			// Store extra data in buffer for next call
-			recv_buffer.insert(recv_buffer.end(), payload.begin() + to_copy, payload.end());
-			MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: buffered %zu extra bytes", payload_len - to_copy);
+		recv_pos = to_copy;
+		if (recv_pos == recv_buffer.size()) {
+			recv_buffer.clear();
+			recv_pos = 0;
 		}
 
 		MSSQL_SOCKET_DEBUG_LOG(2, "TLS-TDS Recv: returning %zu bytes of TLS data", to_copy);
@@ -664,40 +686,38 @@ void TdsSocket::SetReceiveFraming(uint32_t packet_size, uint32_t frames) {
 		frames = 1;
 	}
 	const size_t scratch = static_cast<size_t>(packet_size) * frames;
-	recv_scratch_.assign(scratch, 0);
+	// Nothing is staged in a scratch buffer any more — recv() reads into the tail
+	// of the assembly buffer — so this is only the read granularity.
+	recv_read_size_ = scratch;
 	// The assembly buffer holds at least one whole frame beyond a full scratch
 	// read, so a frame split across two reads never forces a growth.
 	receive_buffer_.reserve(scratch + packet_size);
-	MSSQL_SOCKET_DEBUG_LOG(1, "SetReceiveFraming: packet_size=%u frames=%u scratch=%zuB", packet_size, frames, scratch);
+	MSSQL_SOCKET_DEBUG_LOG(1, "SetReceiveFraming: packet_size=%u frames=%u read=%zuB", packet_size, frames, scratch);
 }
 
-bool TdsSocket::ReceivePacket(TdsPacket &packet, int timeout_ms) {
-	// Pre-negotiation fallback: SetReceiveFraming is called once the server has
-	// confirmed the frame size, so PRELOGIN/LOGIN7 still run on the default.
-	uint8_t default_scratch[TDS_DEFAULT_PACKET_SIZE];
-
+const uint8_t *TdsSocket::NextPacket(size_t &packet_length, int timeout_ms) {
+	// The one frame-assembly loop. Both receive entry points differ only in what
+	// they do with the bytes, so the framing lives here once.
+	//
+	// The returned view points into the assembly buffer and stays valid until the
+	// next receive call on this socket: receive_pos_ advances now, but the buffer
+	// is only cleared or compacted at the top of the NEXT call.
 	while (true) {
-		// Try to parse from what is already buffered. Nothing is erased here —
-		// erase() from the front cost an O(n) memmove of the remaining bytes on
-		// EVERY packet, which is exactly the work a bigger frame is supposed to
-		// avoid. The cursor advances instead, and the tail is compacted once
-		// below, when it has been fully consumed.
+		if (receive_pos_ > 0 && receive_pos_ == receive_buffer_.size()) {
+			// Fully drained — reset instead of holding the allocation at an
+			// ever-growing offset. Capacity is retained.
+			receive_buffer_.clear();
+			receive_pos_ = 0;
+		}
+
 		const size_t buffered = receive_buffer_.size() - receive_pos_;
 		if (buffered >= TDS_HEADER_SIZE) {
 			const uint8_t *head = receive_buffer_.data() + receive_pos_;
-			uint16_t expected_length = TdsPacket::GetPacketLength(head);
+			const uint16_t expected_length = TdsPacket::GetPacketLength(head);
 			if (buffered >= expected_length) {
-				size_t consumed = TdsPacket::Parse(head, buffered, packet);
-				if (consumed > 0) {
-					receive_pos_ += consumed;
-					if (receive_pos_ == receive_buffer_.size()) {
-						// Fully drained — reset instead of holding the allocation
-						// at an ever-growing offset.
-						receive_buffer_.clear();
-						receive_pos_ = 0;
-					}
-					return true;
-				}
+				packet_length = expected_length;
+				receive_pos_ += expected_length;
+				return head;
 			}
 		}
 
@@ -708,15 +728,61 @@ bool TdsSocket::ReceivePacket(TdsPacket &packet, int timeout_ms) {
 			receive_pos_ = 0;
 		}
 
-		uint8_t *scratch = recv_scratch_.empty() ? default_scratch : recv_scratch_.data();
-		const size_t scratch_size = recv_scratch_.empty() ? sizeof(default_scratch) : recv_scratch_.size();
-		ssize_t received = Receive(scratch, scratch_size, timeout_ms);
-		if (received <= 0) {
-			return false;  // Timeout or error
+		if (!FillReceiveBuffer(timeout_ms)) {
+			return nullptr;
 		}
-
-		receive_buffer_.insert(receive_buffer_.end(), scratch, scratch + received);
 	}
+}
+
+bool TdsSocket::ReceivePacket(TdsPacket &packet, int timeout_ms) {
+	size_t packet_length = 0;
+	const uint8_t *head = NextPacket(packet_length, timeout_ms);
+	if (head == nullptr) {
+		return false;  // Timeout or error
+	}
+	// Parse validates the length and throws on a malformed header, which is the
+	// behaviour the pre-login callers rely on.
+	return TdsPacket::Parse(head, packet_length, packet) > 0;
+}
+
+bool TdsSocket::ReceivePayloadView(const uint8_t *&payload, size_t &payload_length, int timeout_ms) {
+	// The streaming read path needs the payload bytes in the token parser and
+	// nothing else from the packet. ReceivePacket copied them into
+	// TdsPacket::payload_ so the caller could copy them again — two passes over
+	// every byte of the result set to move it eight bytes to the left. Handing
+	// back a view leaves exactly one copy, the one the parser genuinely needs to
+	// assemble tokens across packet boundaries.
+	size_t packet_length = 0;
+	const uint8_t *head = NextPacket(packet_length, timeout_ms);
+	if (head == nullptr) {
+		return false;
+	}
+	if (packet_length < TDS_HEADER_SIZE || packet_length > TDS_MAX_PACKET_SIZE) {
+		last_error_ = "Invalid TDS packet length";
+		return false;
+	}
+	payload = head + TDS_HEADER_SIZE;
+	payload_length = packet_length - TDS_HEADER_SIZE;
+	return true;
+}
+
+bool TdsSocket::FillReceiveBuffer(int timeout_ms) {
+	// recv() straight into the tail of the assembly buffer.
+	//
+	// The scratch buffer this replaces was a full extra pass over every byte:
+	// read into scratch, then insert() the same bytes into receive_buffer_.
+	// Growing the buffer and reading into its tail lands them where they are
+	// needed the first time.
+	const size_t read_size = recv_read_size_;
+	const size_t used = receive_buffer_.size();
+	receive_buffer_.resize(used + read_size);
+	const ssize_t received = Receive(receive_buffer_.data() + used, read_size, timeout_ms);
+	if (received <= 0) {
+		receive_buffer_.resize(used);
+		return false;
+	}
+	receive_buffer_.resize(used + static_cast<size_t>(received));
+	return true;
 }
 
 bool TdsSocket::ReceiveMessage(std::vector<uint8_t> &message, int timeout_ms) {

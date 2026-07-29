@@ -62,6 +62,11 @@ public:
 	// Returns true if packet received, false on timeout/error
 	bool ReceivePacket(TdsPacket &packet, int timeout_ms);
 
+	//! View of the next packet's PAYLOAD, valid until the next receive call on
+	//! this socket. Lets the streaming read path skip the copy into
+	//! TdsPacket::payload_, which it immediately copied again.
+	bool ReceivePayloadView(const uint8_t *&payload, size_t &payload_length, int timeout_ms);
+
 	// Receive all packets until EOM (End Of Message)
 	// Returns accumulated payload from all packets
 	bool ReceiveMessage(std::vector<uint8_t> &message, int timeout_ms);
@@ -118,7 +123,14 @@ private:
 	// Staging buffer for recv(), sized to hold several whole TDS frames
 	// (SetReceiveFraming). Empty until sized; ReceivePacket then falls back to
 	// the pre-negotiation default.
-	std::vector<uint8_t> recv_scratch_;
+	//! Bytes per recv(). Not a buffer: reads go straight into the tail of
+	//! receive_buffer_.
+	size_t recv_read_size_ = TDS_DEFAULT_PACKET_SIZE;
+
+	//! Frame assembly. NextPacket is the single place TDS framing happens.
+	const uint8_t *NextPacket(size_t &packet_length, int timeout_ms);
+	//! recv() one read's worth into the tail of the assembly buffer.
+	bool FillReceiveBuffer(int timeout_ms);
 
 	// Helper to set non-blocking mode
 	bool SetNonBlocking(bool enable);

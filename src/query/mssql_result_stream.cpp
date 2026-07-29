@@ -635,16 +635,17 @@ bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
 		return false;
 	}
 
-	tds::TdsPacket packet;
-	if (!socket->ReceivePacket(packet, timeout_ms)) {
+	// Feed from a view into the socket's assembly buffer. The payload used to be
+	// copied into a TdsPacket first and copied into the parser second — two
+	// passes over every byte to move it eight bytes to the left.
+	const uint8_t *payload = nullptr;
+	size_t payload_length = 0;
+	if (!socket->ReceivePayloadView(payload, payload_length, timeout_ms)) {
 		last_socket_error_ = socket->GetLastError();
 		return false;
 	}
-
-	// Feed only the payload to the parser (not the header)
-	const auto &payload = packet.GetPayload();
-	if (!payload.empty()) {
-		parser_.Feed(payload);
+	if (payload_length > 0) {
+		parser_.Feed(payload, payload_length);
 	}
 
 	return true;
