@@ -97,6 +97,12 @@ struct ColumnOps {
 	//! can do that (issue #89). Today that check is a branch on every cell
 	//! (type_converter.cpp:275); here it is a column-level property.
 	bool needs_value_fallback = false;
+	//! Fixed-length CHAR/NCHAR: SQL Server pads to the declared width, and the
+	//! shipped decode strips those trailing spaces. Applied to the OUTPUT here,
+	//! which is exactly equivalent — a 0x20 byte in UTF-8 can only be U+0020,
+	//! never a continuation byte — and unlike an input-side trim it is equally
+	//! correct when the payload turns out to be invalid UTF-16.
+	bool trim_trailing_spaces = false;
 	//! Var only: the declared upper bound on ONE value's wire size, in bytes, or
 	//! 0 when the type has no bound (PLP / MAX). Lets the staging buffer be
 	//! preallocated to a chunk's provable worst case, so a narrow column never

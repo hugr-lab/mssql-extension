@@ -56,7 +56,7 @@ namespace staging {
 //! Handles invalid UTF-16 (unpaired surrogates are legal in UCS-2 collations) by
 //! falling the whole column back to the per-value replacing decoder, which is
 //! the same U+FFFD behaviour the per-value path produces.
-void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out);
+void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out, bool trim_trailing_spaces);
 
 }  // namespace staging
 }  // namespace codec

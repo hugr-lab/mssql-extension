@@ -97,6 +97,25 @@ size_t ConvertReplacingInvalid(const char16_t *src, size_t units, char *dst) {
 	return out;
 }
 
+//! Length with trailing 0x20 bytes removed. Applying the fixed-length CHAR trim
+//! to the OUTPUT is exactly equivalent to trimming the UTF-16 input — a 0x20
+//! byte is never a UTF-8 continuation byte — and unlike an input-side trim it
+//! stays correct when the payload is invalid UTF-16 and gets U+FFFD
+//! substitution, which is why the batch path can cover NCHAR at all.
+inline uint32_t TrimTrailingSpaces(const char *data, uint32_t len) {
+	while (len > 0 && data[len - 1] == ' ') {
+		len--;
+	}
+	return len;
+}
+
+//! Store one value, trimmed or not. TRIM is a template parameter so the branch
+//! resolves per column, not per value.
+template <bool TRIM>
+inline void StoreValue(string_t *result, idx_t row, const char *data, uint32_t len) {
+	result[row] = string_t(data, TRIM ? TrimTrailingSpaces(data, len) : len);
+}
+
 //! Re-split a column in which some value contains a U+0000 of its own.
 //!
 //! Such a unit produces a zero byte that is indistinguishable from a separator,
@@ -114,6 +133,7 @@ size_t ConvertReplacingInvalid(const char16_t *src, size_t units, char *dst) {
 //! Both cursors only ever move forward, so this is two linear passes over the
 //! column — one across the input units, one across the output bytes — not a
 //! per-value scan.
+template <bool TRIM>
 void SplitWithEmbeddedNuls(const ColumnStaging &st, idx_t count, const char16_t *src, const char *blob, size_t written,
 						   string_t *result) {
 	size_t in_unit = 0;
@@ -136,14 +156,15 @@ void SplitWithEmbeddedNuls(const ColumnStaging &st, idx_t count, const char16_t 
 				pos++;
 			}
 		}
-		result[row] = string_t(blob + out_pos, static_cast<uint32_t>(pos - out_pos));
+		StoreValue<TRIM>(result, row, blob + out_pos, static_cast<uint32_t>(pos - out_pos));
 		out_pos = pos + 1;
 	}
 }
 
 }  // namespace
 
-void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out) {
+template <bool TRIM>
+static void FinalizeStringColumnImpl(const ColumnStaging &st, idx_t count, Vector &out) {
 	string_t *result = FlatVector::GetData<string_t>(out);
 	const idx_t units = st.PayloadSize() / 2;
 
@@ -190,7 +211,7 @@ void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out) {
 			if (!st.IsValid(row)) {
 				continue;
 			}
-			result[row] = string_t(blob + st.offsets[row] / 2, st.lengths[row] / 2);
+			StoreValue<TRIM>(result, row, blob + st.offsets[row] / 2, st.lengths[row] / 2);
 		}
 		return;
 	}
@@ -215,7 +236,7 @@ void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out) {
 			continue;
 		}
 		const size_t delimiter = FindDelimiter(blob, offset + st.lengths[row] / 2, written);
-		result[row] = string_t(blob + offset, static_cast<uint32_t>(delimiter - offset));
+		StoreValue<TRIM>(result, row, blob + offset, static_cast<uint32_t>(delimiter - offset));
 		offset = delimiter + 1;
 	}
 
@@ -226,7 +247,15 @@ void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out) {
 	// unit while staging it, which would put a pass over the payload on the hot
 	// path to catch a case that then still has to be handled here.
 	if (offset != written) {
-		SplitWithEmbeddedNuls(st, count, src, blob, written, result);
+		SplitWithEmbeddedNuls<TRIM>(st, count, src, blob, written, result);
+	}
+}
+
+void FinalizeStringColumn(const ColumnStaging &st, idx_t count, Vector &out, bool trim_trailing_spaces) {
+	if (trim_trailing_spaces) {
+		FinalizeStringColumnImpl<true>(st, count, out);
+	} else {
+		FinalizeStringColumnImpl<false>(st, count, out);
 	}
 }
 

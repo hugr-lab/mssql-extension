@@ -29,7 +29,7 @@ namespace staging {
 //!
 //! NULL rows are left untouched — their offset/length slots are undefined by
 //! ColumnStaging's contract, and validity is published separately.
-void FinalizeBinaryColumn(const ColumnStaging &st, idx_t count, Vector &out);
+void FinalizeBinaryColumn(const ColumnStaging &st, idx_t count, Vector &out, bool trim_trailing_spaces);
 
 }  // namespace staging
 }  // namespace codec

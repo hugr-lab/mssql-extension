@@ -15,7 +15,19 @@ namespace mssql {
 namespace codec {
 namespace staging {
 
-void FinalizeBinaryColumn(const ColumnStaging &st, idx_t count, Vector &out) {
+//! Length of `data[0..len)` with trailing 0x20 bytes removed.
+//!
+//! Safe on UTF-8 as well as on single-byte text: 0x20 is never a continuation
+//! byte, so a trailing space can only be U+0020 and never the tail of a
+//! multi-byte character.
+static inline uint32_t TrimTrailingSpaces(const char *data, uint32_t len) {
+	while (len > 0 && data[len - 1] == ' ') {
+		len--;
+	}
+	return len;
+}
+
+void FinalizeBinaryColumn(const ColumnStaging &st, idx_t count, Vector &out, bool trim_trailing_spaces) {
 	string_t *result = FlatVector::GetData<string_t>(out);
 	const idx_t payload = st.PayloadSize();
 
@@ -43,6 +55,18 @@ void FinalizeBinaryColumn(const ColumnStaging &st, idx_t count, Vector &out) {
 	char *const blob = blob_slot.GetDataWriteable();
 	std::memcpy(blob, st.buffer.data(), payload);
 
+	// Two loops rather than a test per value: whether the column is fixed-length
+	// CHAR is decided by its type, not its data.
+	if (trim_trailing_spaces) {
+		for (idx_t row = 0; row < count; row++) {
+			if (!st.IsValid(row)) {
+				continue;
+			}
+			const char *value = blob + st.offsets[row];
+			result[row] = string_t(value, TrimTrailingSpaces(value, st.lengths[row]));
+		}
+		return;
+	}
 	for (idx_t row = 0; row < count; row++) {
 		if (!st.IsValid(row)) {
 			continue;

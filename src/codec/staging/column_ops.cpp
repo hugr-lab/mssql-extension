@@ -259,21 +259,30 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		return ops;
 	}
 
-	// UTF-16 string columns take the batch decode (T10). Deliberately narrow:
+	// UTF-16 string columns take the batch decode (D5). PLP/MAX is still excluded
+	// — its value arrives as a chunk list with no length known up front, which
+	// the Var slot cannot express yet.
 	//
-	//  - PLP/MAX is excluded because its value arrives as a chunk list with no
-	//    length known up front, which the Var slot cannot express yet.
-	//  - NCHAR/CHAR are excluded because their trailing-space trim must happen on
-	//    the UNTRIMMED payload when the value turns out to be invalid UTF-16
-	//    (the pre-054 semantics T9 preserved); trimming at staging time would
-	//    throw those bytes away before we know.
-	//
-	// What is left — NVARCHAR and XML — is the overwhelming majority of real
-	// string data.
-	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_XML;
+	// NCHAR is included: its trailing-space trim moves to the OUTPUT, where it is
+	// equally correct on invalid UTF-16. See ColumnOps::trim_trailing_spaces.
+	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_NCHAR ||
+							  column.type_id == tds::TDS_TYPE_XML;
 	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageString;
+		ops.trim_trailing_spaces = column.type_id == tds::TDS_TYPE_NCHAR;
+		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+		return ops;
+	}
+
+	// Single-byte CHAR/VARCHAR: the wire bytes go into the VARCHAR vector as they
+	// are — collation handling lives in the scan's SELECT list (spec 026), not
+	// here — so this is the same one-allocation-one-copy shape as VARBINARY.
+	const bool single_byte_char = column.type_id == tds::TDS_TYPE_BIGCHAR || column.type_id == tds::TDS_TYPE_BIGVARCHAR;
+	if (single_byte_char && !column.IsPLPType() && column.max_length > 0) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::P2StageBinary;
+		ops.trim_trailing_spaces = column.type_id == tds::TDS_TYPE_BIGCHAR;
 		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
 		return ops;
 	}

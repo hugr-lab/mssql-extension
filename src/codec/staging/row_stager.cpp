@@ -379,9 +379,9 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 		const ColumnStaging &st = arena_.Column(c);
 		if (ops_[c].arm == AppendArm::P2StageString) {
 			// One conversion for the whole column (D5).
-			FinalizeStringColumn(st, row_count, *targets_[c]);
+			FinalizeStringColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
 		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
-			FinalizeBinaryColumn(st, row_count, *targets_[c]);
+			FinalizeBinaryColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
 		} else if (ops_[c].arm == AppendArm::P1StageDecimal) {
 			decimal::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
 		} else if (ops_[c].arm == AppendArm::P1StageFixed || ops_[c].arm == AppendArm::RawStageFixed) {
