@@ -53,10 +53,12 @@ enum class AppendArm : uint8_t {
 	//! Same framing, but the wire bytes ARE the value: VARBINARY needs no
 	//! conversion, only one allocation and one copy for the whole column.
 	P2StageBinary,
-	//! P1 framing (one length byte, 0 = NULL) with a 16-byte value staged for a
-	//! batch kernel: UNIQUEIDENTIFIER, whose wire form is mixed-endian and needs
-	//! reassembling into DuckDB's sortable UUID.
-	P1StageUuid,
+	//! Fixed-width value staged for a batch kernel, with (P1) and without (Raw) a
+	//! one-byte length prefix. The width lives in ColumnOps::stride and the
+	//! kernel is chosen at finalize from the column's TDS type — both are
+	//! column-invariant, so the row loop carries neither.
+	P1StageFixed,
+	RawStageFixed,
 	//! Framing and conversion both go through the legacy per-value path. This is
 	//! every family that does not yet have a batch kernel, plus the issue-#89
 	//! divergence case. Cost is identical to the pre-staging path — one copy into

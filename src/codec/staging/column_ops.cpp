@@ -112,6 +112,49 @@ bool HasOneBytePrefix(uint8_t type_id) {
 	}
 }
 
+//! Wire width of a temporal column, or 0 if it is not one.
+//!
+//! DATE is always three bytes; TIME/DATETIME2/DATETIMEOFFSET carry a
+//! scale-dependent time field with a fixed date (and offset) suffix. Every one
+//! of them is fixed for a given COLUMN, which is what makes them stageable.
+uint32_t TemporalWireWidth(const tds::ColumnMetadata &column) {
+	const uint32_t time_len = column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+	switch (column.type_id) {
+	case tds::TDS_TYPE_DATE:
+		return 3;
+	case tds::TDS_TYPE_TIME:
+		return time_len;
+	case tds::TDS_TYPE_DATETIME2:
+		return 3 + time_len;
+	case tds::TDS_TYPE_DATETIMEOFFSET:
+		return 5 + time_len;
+	default:
+		return 0;
+	}
+}
+
+//! Widths the staged-fixed append can copy with a compile-time size. A column
+//! whose width is not here stays on the per-value path rather than paying for a
+//! runtime-sized memcpy, which is a libc call.
+bool IsStageableFixedWidth(uint32_t width) {
+	switch (width) {
+	case 3:
+	case 4:
+	case 5:
+	case 6:
+	case 7:
+	case 8:
+	case 9:
+	case 10:
+	case 13:
+	case 16:
+	case 17:
+		return true;
+	default:
+		return false;
+	}
+}
+
 AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	const bool prefixed = HasOneBytePrefix(type_id);
 	switch (width) {
@@ -169,13 +212,23 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		ops.direct_write = true;
 		return ops;
 	}
-	if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
-		// Fixed 16 bytes, mixed-endian, converted by arithmetic — a straight
-		// batch loop with no branch and no allocation.
-		ops.kind = StagingKind::Fixed;
-		ops.arm = AppendArm::P1StageUuid;
-		ops.stride = width;
-		return ops;
+	// Fixed-width families with a batch kernel: UNIQUEIDENTIFIER and the temporal
+	// types. DATETIME and SMALLDATETIME arrive bare; everything else carries the
+	// one-byte length prefix.
+	const uint32_t fixed_width = width > 0 ? width : TemporalWireWidth(column);
+	if (fixed_width > 0 && IsStageableFixedWidth(fixed_width)) {
+		const bool staged_family =
+			column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER || column.type_id == tds::TDS_TYPE_DATE ||
+			column.type_id == tds::TDS_TYPE_TIME || column.type_id == tds::TDS_TYPE_DATETIME2 ||
+			column.type_id == tds::TDS_TYPE_DATETIMEOFFSET || column.type_id == tds::TDS_TYPE_DATETIME ||
+			column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_DATETIMEN;
+		if (staged_family) {
+			const bool bare = column.type_id == tds::TDS_TYPE_DATETIME || column.type_id == tds::TDS_TYPE_SMALLDATETIME;
+			ops.kind = StagingKind::Fixed;
+			ops.arm = bare ? AppendArm::RawStageFixed : AppendArm::P1StageFixed;
+			ops.stride = fixed_width;
+			return ops;
+		}
 	}
 	if (width > 0) {
 		ops.kind = StagingKind::Fixed;

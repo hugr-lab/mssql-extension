@@ -6,6 +6,7 @@
 
 #include "codec/staging/row_stager.hpp"
 
+#include "codec/datetime_codec.hpp"
 #include "codec/staging/binary_finalize.hpp"
 #include "codec/staging/string_finalize.hpp"
 #include "codec/staging/uuid_finalize.hpp"
@@ -67,6 +68,45 @@ inline size_t AppendPrefixedFixed(ColumnStaging &st, const uint8_t *p) {
 		return 1;
 	}
 	ThrowBadPrefix(STRIDE, len);
+}
+
+//! Stage a fixed-width value whose width is a runtime property of the column.
+//!
+//! The switch is what keeps the copy compile-time sized — a memcpy with a
+//! runtime length is a call into libc, which costs more than a perfectly
+//! predicted branch on a value that never changes within a column. It lives in
+//! one place, called from one arm in each walk, so the two walks cannot drift
+//! apart: forgetting a width here is a compile error in neither, but forgetting
+//! an ARM is caught by -Wswitch.
+//!
+//! `default` is unreachable: ResolveColumnOps only chooses these arms for a
+//! width listed in IsStageableFixedWidth.
+template <bool PREFIXED>
+inline size_t AppendStagedFixed(ColumnStaging &st, const uint8_t *p) {
+	switch (st.stride) {
+	case 3:
+		return PREFIXED ? AppendPrefixedFixed<3>(st, p) : (st.AppendFixed<3>(p), 3);
+	case 4:
+		return PREFIXED ? AppendPrefixedFixed<4>(st, p) : (st.AppendFixed<4>(p), 4);
+	case 5:
+		return PREFIXED ? AppendPrefixedFixed<5>(st, p) : (st.AppendFixed<5>(p), 5);
+	case 6:
+		return PREFIXED ? AppendPrefixedFixed<6>(st, p) : (st.AppendFixed<6>(p), 6);
+	case 7:
+		return PREFIXED ? AppendPrefixedFixed<7>(st, p) : (st.AppendFixed<7>(p), 7);
+	case 8:
+		return PREFIXED ? AppendPrefixedFixed<8>(st, p) : (st.AppendFixed<8>(p), 8);
+	case 9:
+		return PREFIXED ? AppendPrefixedFixed<9>(st, p) : (st.AppendFixed<9>(p), 9);
+	case 10:
+		return PREFIXED ? AppendPrefixedFixed<10>(st, p) : (st.AppendFixed<10>(p), 10);
+	case 13:
+		return PREFIXED ? AppendPrefixedFixed<13>(st, p) : (st.AppendFixed<13>(p), 13);
+	case 16:
+		return PREFIXED ? AppendPrefixedFixed<16>(st, p) : (st.AppendFixed<16>(p), 16);
+	default:
+		return PREFIXED ? AppendPrefixedFixed<17>(st, p) : (st.AppendFixed<17>(p), 17);
+	}
 }
 
 }  // namespace
@@ -149,8 +189,11 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
 			break;
-		case AppendArm::P1StageUuid:
-			p += AppendPrefixedFixed<16>(arena_.Column(c), p);
+		case AppendArm::P1StageFixed:
+			p += AppendStagedFixed<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::RawStageFixed:
+			p += AppendStagedFixed<false>(arena_.Column(c), p);
 			break;
 		case AppendArm::P2StageString: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
@@ -249,8 +292,11 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
 			break;
-		case AppendArm::P1StageUuid:
-			p += AppendPrefixedFixed<16>(arena_.Column(c), p);
+		case AppendArm::P1StageFixed:
+			p += AppendStagedFixed<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::RawStageFixed:
+			p += AppendStagedFixed<false>(arena_.Column(c), p);
 			break;
 		case AppendArm::P2StageString: {
 			// The length prefix stays in an NBC row; the bitmap only decided that
@@ -293,8 +339,14 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			FinalizeStringColumn(st, row_count, *targets_[c]);
 		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
 			FinalizeBinaryColumn(st, row_count, *targets_[c]);
-		} else if (ops_[c].arm == AppendArm::P1StageUuid) {
-			FinalizeUuidColumn(st, row_count, *targets_[c]);
+		} else if (ops_[c].arm == AppendArm::P1StageFixed || ops_[c].arm == AppendArm::RawStageFixed) {
+			// Which kernel is a property of the column, so it is decided here,
+			// once, and the kernel's own loop carries no dispatch at all.
+			if ((*metadata_)[c].type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+				FinalizeUuidColumn(st, row_count, *targets_[c]);
+			} else {
+				datetime::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
+			}
 		}
 		// Values went straight into the vector; only validity is still ours. Scan
 		// first so an all-valid column — the overwhelmingly common one — never

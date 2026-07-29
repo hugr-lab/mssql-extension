@@ -341,6 +341,91 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 }
 
 //===----------------------------------------------------------------------===//
+// DecodeChunkFromStaging — one kernel per column, no dispatch in the row loop
+//===----------------------------------------------------------------------===//
+
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
+							Vector &out) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+
+	switch (col.type_id) {
+	case TDS_TYPE_DATE: {
+		date_t *result = FlatVector::GetData<date_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DateTimeEncoding::ConvertDate(base + row * stride);
+		}
+		return;
+	}
+	case TDS_TYPE_TIME: {
+		dtime_t *result = FlatVector::GetData<dtime_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DateTimeEncoding::ConvertTime(base + row * stride, col.scale);
+		}
+		return;
+	}
+	case TDS_TYPE_DATETIME: {
+		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
+		}
+		return;
+	}
+	case TDS_TYPE_SMALLDATETIME: {
+		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(base + row * stride);
+		}
+		return;
+	}
+	case TDS_TYPE_DATETIMEN: {
+		// Length-dispatched in the per-value path, but the width is a property of
+		// the COLUMN, so the choice is made once here instead of per value.
+		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		if (stride == 8) {
+			for (idx_t row = 0; row < count; row++) {
+				result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
+			}
+		} else {
+			for (idx_t row = 0; row < count; row++) {
+				result[row] = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(base + row * stride);
+			}
+		}
+		return;
+	}
+	case TDS_TYPE_DATETIME2: {
+		// The one temporal kernel that is not total: a datetime2 beyond the
+		// target variant's range becomes SQL NULL (issue #168), so this loop has
+		// to know which rows carry real values rather than a stale slot.
+		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		const size_t time_len = Datetime2TimeByteLen(col.scale);
+		const LogicalTypeId target = out.GetType().id();
+		for (idx_t row = 0; row < count; row++) {
+			if (!st.IsValid(row)) {
+				continue;
+			}
+			int64_t native;
+			if (!Datetime2WireToNativeUnit(base + row * stride, time_len, col.scale, target, native)) {
+				FlatVector::SetNull(out, row, true);
+				continue;
+			}
+			result[row] = timestamp_t(native);
+		}
+		return;
+	}
+	case TDS_TYPE_DATETIMEOFFSET: {
+		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(base + row * stride, col.scale);
+		}
+		return;
+	}
+	default:
+		throw InvalidInputException("codec::datetime::DecodeChunkFromStaging: unexpected TDS type 0x%02X", col.type_id);
+	}
+}
+
+//===----------------------------------------------------------------------===//
 // EncodeToBcp — Vector overload
 //===----------------------------------------------------------------------===//
 
