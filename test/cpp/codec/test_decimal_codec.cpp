@@ -31,6 +31,7 @@
 #include "codec/literal_context.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/type_family.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -230,6 +231,51 @@ void TestRenderMoneyAsString() {
 	CHECK_EQ(duckdb::mssql::codec::decimal::RenderMoneyAsString(money), std::string("1.5000"));
 }
 
+void TestEncodeToBcpMantissaRangeGuard() {
+	std::cout << "Test: EncodeToBcp mantissa exceeding target precision raises InvalidInputException (#177)\n";
+
+	// HUGEINT source feeding a decimal(38,0) target column (COPY CREATE_TABLE
+	// reads created-table metadata back, so this dispatches via Decimal family).
+	duckdb::mssql::BCPColumnMetadata col;
+	col.name = "total";
+	col.duckdb_type = LogicalType::HUGEINT;
+	col.precision = 38;
+	col.scale = 0;
+	col.max_length = 17;
+
+	// In range: 10^38 − 1 encodes fine.
+	const hugeint_t max38 = duckdb::Hugeint::POWERS_OF_TEN[38] - 1;
+	duckdb::vector<uint8_t> buf;
+	duckdb::mssql::codec::decimal::EncodeToBcp(Value::HUGEINT(max38), col, buf);
+	CHECK_EQ(buf.size(), static_cast<size_t>(18));	// [17][sign][16-byte mantissa]
+
+	// Out of range: 10^38 (39 digits) must fail client-side, naming the column.
+	bool threw = false;
+	try {
+		duckdb::vector<uint8_t> guard_buf;
+		duckdb::mssql::codec::decimal::EncodeToBcp(Value::HUGEINT(duckdb::Hugeint::POWERS_OF_TEN[38]), col, guard_buf);
+	} catch (const duckdb::InvalidInputException &ex) {
+		threw = true;
+		std::string msg(ex.what());
+		CHECK_TRUE(msg.find("out of range for DECIMAL(38,0)") != std::string::npos);
+		CHECK_TRUE(msg.find("total") != std::string::npos);
+	}
+	CHECK_TRUE(threw);
+
+	// Narrower target: mantissa 10^20 into decimal(20,0) is one digit too many.
+	col.precision = 20;
+	col.max_length = 9;
+	bool threw_narrow = false;
+	try {
+		duckdb::vector<uint8_t> narrow_buf;
+		duckdb::mssql::codec::decimal::EncodeToBcp(Value::HUGEINT(duckdb::Hugeint::POWERS_OF_TEN[20]), col, narrow_buf);
+	} catch (const duckdb::InvalidInputException &ex) {
+		threw_narrow = true;
+		CHECK_TRUE(std::string(ex.what()).find("out of range for DECIMAL(20,0)") != std::string::npos);
+	}
+	CHECK_TRUE(threw_narrow);
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +288,7 @@ int main() {
 	TestDispatcherRoutingDecimal();
 	TestRenderAsStringMatchesLiteral();
 	TestRenderMoneyAsString();
+	TestEncodeToBcpMantissaRangeGuard();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";

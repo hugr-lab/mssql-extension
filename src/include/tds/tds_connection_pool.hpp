@@ -116,9 +116,13 @@ private:
 	std::queue<ConnectionMetadata> idle_connections_;
 	std::unordered_map<uint64_t, std::shared_ptr<TdsConnection>> active_connections_;
 
-	// Synchronization
+	// Synchronization. available_cv_ is reserved for Acquire() waiters —
+	// Release()'s notify_one must always reach a thread blocked on pool
+	// exhaustion. The cleanup thread parks on its own cleanup_cv_ (notified
+	// only by Shutdown()) so it can never consume that wakeup.
 	mutable std::mutex pool_mutex_;
 	std::condition_variable available_cv_;
+	std::condition_variable cleanup_cv_;
 
 	// Statistics
 	PoolStatistics stats_;

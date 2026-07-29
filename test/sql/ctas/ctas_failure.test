@@ -47,26 +47,24 @@ SELECT * FROM mssql_fail.dbo.ctas_fail_test;
 1	initial
 
 # =============================================================================
-# HUGEINT — DDL succeeds (DECIMAL(38,0)), BCP encoding deferred
+# HUGEINT — out-of-range value fails client-side (#177 range guard)
 # =============================================================================
 #
 # Spec 045 Phase 3 (FR-025 / FR-028): HUGEINT and UHUGEINT map to DECIMAL(38,0)
-# in BOTH CREATE-TABLE and CTAS DDL contexts. The DDL phase succeeds; BCP data
-# encoding for HUGEINT still throws (Phase 6 / T069). Net effect for CTAS: an
-# empty table is created and the row insert fails. The error text contains
-# "HUGEINT".
-#
-# Use a value within DECIMAL(38,0) range — earlier 2^127-1 exceeds the
-# SQL Server type capacity and would mask the BCP throw with a numeric overflow.
+# in BOTH CREATE-TABLE and CTAS DDL contexts. Since issue #177 the BCP data
+# phase encodes in-range HUGEINT values (see ctas_types.test); a 39-digit value
+# like 2^127−1 exceeds DECIMAL(38,0) and fails with a client-side range error
+# before any row is sent. Net effect for CTAS: an empty table is created and
+# the data phase fails.
 
 statement ok
 DROP TABLE IF EXISTS mssql_fail.dbo.ctas_fail_unsupported;
 
 statement error
 CREATE TABLE mssql_fail.dbo.ctas_fail_unsupported AS
-SELECT 99999999999999999999999999999999999999::HUGEINT AS huge_val;
+SELECT 170141183460469231731687303715884105727::HUGEINT AS huge_val;
 ----
-HUGEINT
+out of range for DECIMAL(38,0)
 
 # DDL did create the (now empty) table; drop before continuing.
 statement ok

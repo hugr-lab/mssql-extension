@@ -4,7 +4,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
+#include "codec/type_family.hpp"
 #include "duckdb/common/exception.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/utf16.hpp"
@@ -68,12 +70,58 @@ static double ElapsedMs(TimePoint start) {
 
 BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vector<BCPColumnMetadata> columns,
 					 vector<int32_t> column_mapping)
-	: conn_(conn), target_(target), columns_(std::move(columns)), column_mapping_(std::move(column_mapping)) {
+	: conn_(conn),
+	  target_(target),
+	  columns_(std::move(columns)),
+	  column_mapping_(std::move(column_mapping)),
+	  counters_enabled_(GetBCPDebugLevel() >= 2) {
 	// Pre-allocate buffer to reduce reallocation overhead
 	// Estimate: 100 bytes per column per row, reserve for 10K rows
 	// This will grow as needed but reduces initial reallocations
 	size_t estimated_row_size = columns_.size() * 100;
 	accumulator_buffer_.reserve(estimated_row_size * 10000);  // ~1MB initial
+
+	// D4 (spec 054): every row encodes every target column, so per-family
+	// value counts are rows × per-family column counts — precompute the
+	// latter once (same FamilyFromLogicalType dispatch EncodeRow uses).
+	if (counters_enabled_) {
+		for (const auto &col : columns_) {
+			try {
+				family_col_count_[static_cast<uint8_t>(codec::FamilyFromLogicalType(col.duckdb_type))]++;
+			} catch (...) {
+				unknown_family_col_count_++;
+			}
+			if (col.IsPLPType()) {
+				plp_col_count_++;
+			}
+		}
+	}
+}
+
+BCPWriter::~BCPWriter() {
+	if (!counters_enabled_) {
+		return;
+	}
+	fprintf(stderr,
+			"[MSSQL COUNTERS] bcp writer close: rows=%llu chunks=%llu bytes_sent=%llu plp_values=%llu "
+			"utf16_fallback=%llu write_rows=%lluus\n",
+			(unsigned long long)rows_sent_.load(), (unsigned long long)counter_chunks_,
+			(unsigned long long)bytes_sent_.load(), (unsigned long long)counter_plp_values_,
+			(unsigned long long)counter_utf16_fallbacks_, (unsigned long long)counter_write_rows_us_);
+	std::string families;
+	for (uint8_t f = 0; f < codec::TYPE_FAMILY_COUNT; f++) {
+		if (counter_values_per_family_[f] > 0) {
+			families += " ";
+			families += codec::FamilyName(static_cast<codec::TypeFamily>(f));
+			families += "=" + std::to_string(counter_values_per_family_[f]);
+		}
+	}
+	if (counter_unknown_family_values_ > 0) {
+		families += " unknown=" + std::to_string(counter_unknown_family_values_);
+	}
+	if (!families.empty()) {
+		fprintf(stderr, "[MSSQL COUNTERS]   values/family (incl. NULLs):%s\n", families.c_str());
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -105,19 +153,33 @@ idx_t BCPWriter::WriteRows(DataChunk &chunk) {
 	idx_t rows_written = 0;
 	idx_t row_count = chunk.size();
 	size_t buffer_start = accumulator_buffer_.size();
+	// D4: thread-local snapshot — the delta after the encode loop is this
+	// call's fallbacks (the loop runs on the calling thread, under the mutex).
+	const uint64_t utf16_fallbacks_at_entry = counters_enabled_ ? tds::encoding::Utf16FallbackCount() : 0;
 
 	auto start_encode = Clock::now();
-	// Accumulate rows into the accumulator buffer
-	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-		// Build ROW token for this row
-		BuildRowToken(accumulator_buffer_, chunk, row_idx);
-		rows_written++;
-	}
+	// Accumulate all rows into the accumulator buffer. EncodeChunk writes the
+	// 0xD1 ROW token per row and hoists per-column state (UnifiedVectorFormat,
+	// family encoder, NULL wire kind) once per chunk (spec 054 W1+W2).
+	const vector<int32_t> *mapping_ptr = column_mapping_.empty() ? nullptr : &column_mapping_;
+	tds::encoding::BCPRowEncoder::EncodeChunk(accumulator_buffer_, chunk, columns_, mapping_ptr);
+	rows_written = row_count;
 	double encode_ms = ElapsedMs(start_encode);
 
 	size_t bytes_added = accumulator_buffer_.size() - buffer_start;
 	rows_sent_.fetch_add(rows_written);
 	rows_in_batch_.fetch_add(rows_written);
+
+	if (counters_enabled_ && rows_written > 0) {
+		counter_chunks_++;
+		for (int f = 0; f < 9; f++) {
+			counter_values_per_family_[f] += rows_written * family_col_count_[f];
+		}
+		counter_unknown_family_values_ += rows_written * unknown_family_col_count_;
+		counter_plp_values_ += rows_written * plp_col_count_;
+		counter_utf16_fallbacks_ += tds::encoding::Utf16FallbackCount() - utf16_fallbacks_at_entry;
+		counter_write_rows_us_ += static_cast<uint64_t>(ElapsedMs(start_lock) * 1000.0);
+	}
 
 	// Log timing if debug enabled
 	if (GetBCPDebugLevel() >= 1) {
@@ -442,20 +504,6 @@ void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 		// Column name (B_VARCHAR format: length byte + UTF-16LE)
 		WriteUTF16LEString(buffer, col.name);
 	}
-}
-
-void BCPWriter::BuildRowToken(vector<uint8_t> &buffer, DataChunk &chunk, idx_t row_idx) {
-	// ROW token format:
-	// Token (1 byte): 0xD1
-	// Column values (variable): Type-specific encoding for each column
-
-	// Token
-	WriteUInt8(buffer, TOKEN_ROW);
-
-	// Encode all column values using BCPRowEncoder
-	// Pass column mapping if we have one (for name-based source-to-target mapping)
-	const vector<int32_t> *mapping_ptr = column_mapping_.empty() ? nullptr : &column_mapping_;
-	tds::encoding::BCPRowEncoder::EncodeRow(buffer, chunk, row_idx, columns_, mapping_ptr);
 }
 
 void BCPWriter::BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count) {

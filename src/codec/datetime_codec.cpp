@@ -52,6 +52,7 @@
 
 #include "codec/datetime_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -83,15 +84,6 @@ using duckdb::tds::TDS_TYPE_DATETIMEN;
 using duckdb::tds::TDS_TYPE_DATETIMEOFFSET;
 using duckdb::tds::TDS_TYPE_SMALLDATETIME;
 using duckdb::tds::TDS_TYPE_TIME;
-
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
 
 //===----------------------------------------------------------------------===//
 // Canonical text renderers — shared between FormatSqlLiteral and
@@ -352,13 +344,15 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 // EncodeToBcp — Vector overload
 //===----------------------------------------------------------------------===//
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	(void)in;
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::DATE:
-		tds::encoding::BCPRowEncoder::EncodeDate(buf, GetVectorValue<date_t>(in, row));
+		tds::encoding::BCPRowEncoder::EncodeDate(buf, FormatValue<date_t>(fmt, row));
 		return;
 	case LogicalTypeId::TIME:
-		tds::encoding::BCPRowEncoder::EncodeTime(buf, GetVectorValue<dtime_t>(in, row), col.scale);
+		tds::encoding::BCPRowEncoder::EncodeTime(buf, FormatValue<dtime_t>(fmt, row), col.scale);
 		return;
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
@@ -366,7 +360,7 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 	case LogicalTypeId::TIMESTAMP_SEC: {
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(GetVectorValue<timestamp_t>(in, row).value, col.duckdb_type.id(), col.scale,
+		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, col.duckdb_type.id(), col.scale,
 								   time_value, date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 		return;
@@ -375,7 +369,7 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 		// DuckDB stores TIMESTAMP_TZ as UTC µs; offset 0 on the wire.
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(GetVectorValue<timestamp_t>(in, row).value, LogicalTypeId::TIMESTAMP_TZ, col.scale,
+		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, LogicalTypeId::TIMESTAMP_TZ, col.scale,
 								   time_value, date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
 		return;
@@ -384,6 +378,10 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 		throw NotImplementedException("codec::datetime::EncodeToBcp: unexpected DuckDB type '%s'",
 									  col.duckdb_type.ToString());
 	}
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
 
 //===----------------------------------------------------------------------===//

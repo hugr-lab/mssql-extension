@@ -73,10 +73,17 @@ void ConnectionPool::Shutdown() {
 	// even if the trailing assert later throws.
 	const size_t leaked = active_connections_.size();
 
-	// Signal shutdown
-	shutdown_flag_.store(true);
+	// Signal shutdown. The flag is set under pool_mutex_ so the cleanup
+	// thread cannot check it (false) and then enter its cv wait AFTER the
+	// notify below — that missed-wakeup race would put the join back on the
+	// 1-second wait_for timeout.
+	{
+		std::lock_guard<std::mutex> signal_lock(pool_mutex_);
+		shutdown_flag_.store(true);
+	}
 
-	// Wake up cleanup thread
+	// Wake up cleanup thread (its own CV) and any Acquire() waiters.
+	cleanup_cv_.notify_all();
 	available_cv_.notify_all();
 
 	// Wait for cleanup thread to finish (do this BEFORE the assert that may
@@ -333,8 +340,17 @@ bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection> &conn) {
 
 void ConnectionPool::CleanupThreadFunc() {
 	while (!shutdown_flag_.load()) {
-		// Sleep for 1 second between cleanup cycles
-		std::this_thread::sleep_for(std::chrono::seconds(1));
+		// Wait up to 1 second between cleanup cycles. Waits on cleanup_cv_
+		// (which Shutdown() notifies) instead of a blind sleep: ~ConnectionPool
+		// joins this thread, so a plain sleep_for(1s) here made every DETACH /
+		// catalog teardown — and with it every short-lived CLI session — pay up
+		// to a full second before the pool could shut down. Must NOT wait on
+		// available_cv_: a predicated wait there consumes Release()'s
+		// notify_one meant for a pool-exhausted Acquire() waiter.
+		{
+			std::unique_lock<std::mutex> wait_lock(pool_mutex_);
+			cleanup_cv_.wait_for(wait_lock, std::chrono::seconds(1), [this] { return shutdown_flag_.load(); });
+		}
 
 		if (shutdown_flag_.load()) {
 			break;

@@ -8,9 +8,10 @@
 // UBIGINT, HUGEINT.
 //
 // Special handling within Integer:
-//   - HUGEINT and UHUGEINT BCP encode are deferred to the Decimal family
-//     migration (spec 045 Phase 6); arms throw NotImplementedException
-//     for now, preserving the pre-spec-045 default-arm behavior.
+//   - HUGEINT and UHUGEINT BCP encode delegate to BCPRowEncoder::EncodeDecimal
+//     as DECIMAL(38,0) (issue #177 — SUM() aggregates return HUGEINT), with a
+//     client-side range guard: |v| > 10^38-1 (39 digits) cannot fit
+//     DECIMAL(38,0) and raises InvalidInputException naming the column.
 //   - UBIGINT BCP encode delegates to BCPRowEncoder::EncodeDecimal with
 //     (precision=20, scale=0) because BCP wire has no UNSIGNED BIGINT.
 //   - UTINYINT / USMALLINT / UINTEGER widen on encode.
@@ -40,6 +41,8 @@
 
 namespace duckdb {
 
+struct UnifiedVectorFormat;
+
 namespace tds {
 struct ColumnMetadata;
 }  // namespace tds
@@ -54,6 +57,11 @@ namespace codec {
 namespace integer {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+// W1 (spec 054): format-threaded overload — fmt is built once per column per
+// chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
+// wraps it for per-row callers (builds the format per call).
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 // Overload for the single-Value path (BCPRowEncoder::EncodeValue public API).
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);

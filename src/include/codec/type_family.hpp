@@ -41,6 +41,37 @@ enum class TypeFamily : uint8_t {
 	Uuid,
 };
 
+// Number of TypeFamily values. Anything sized per family (e.g. the D4 debug
+// counter arrays) must use this constant so adding a 10th family cannot
+// silently overflow a hand-sized [9] array.
+constexpr uint8_t TYPE_FAMILY_COUNT = 9;
+
+// Lower-case display name for a TypeFamily (D4 debug counter output).
+// Defined here, next to the enum, so name table and enum move in lockstep.
+inline const char *FamilyName(TypeFamily family) {
+	switch (family) {
+	case TypeFamily::Boolean:
+		return "boolean";
+	case TypeFamily::Integer:
+		return "integer";
+	case TypeFamily::Float:
+		return "float";
+	case TypeFamily::Decimal:
+		return "decimal";
+	case TypeFamily::Money:
+		return "money";
+	case TypeFamily::String:
+		return "string";
+	case TypeFamily::Binary:
+		return "binary";
+	case TypeFamily::DateTime:
+		return "datetime";
+	case TypeFamily::Uuid:
+		return "uuid";
+	}
+	return "unknown";
+}
+
 // Post-spec-045 both DdlContext values produce byte-identical T-SQL for
 // the same (LogicalType, CTASConfig) inputs (FR-024..FR-028). The enum
 // is retained for API uniformity across family `FormatDdlTypeName`

@@ -4,11 +4,13 @@
 #include <cstdlib>
 #include <iostream>
 #include "catalog/mssql_catalog.hpp"
+#include "codec/type_family.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/encoding/type_converter.hpp"
+#include "tds/encoding/utf16.hpp"
 #include "tds/tds_packet.hpp"
 #include "tds/tds_socket.hpp"
 
@@ -45,7 +47,8 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
-	  rows_read_(0) {
+	  rows_read_(0),
+	  counters_enabled_(GetDebugLevel() >= 2) {
 	// Convert timeout from seconds to milliseconds
 	// 0 = no timeout (use INT_MAX for effectively infinite wait)
 	// Otherwise, multiply by 1000 to convert to milliseconds
@@ -57,6 +60,12 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 }
 
 MSSQLResultStream::~MSSQLResultStream() {
+	// D4 (spec 054): close summary. fprintf only — must stay safe on a worker
+	// thread (see the connection-release comment below).
+	if (counters_enabled_) {
+		PrintDebugCounters();
+	}
+
 	// If we're still in streaming state, try to cancel
 	if (state_ == MSSQLResultStreamState::Streaming) {
 		Cancel();
@@ -140,6 +149,24 @@ bool MSSQLResultStream::Initialize() {
 					column_types_.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
 				}
 
+				// D4 (spec 054): precompute per-column decode family + PLP-ness
+				// for the debug counters (FamilyFromTdsType is the same dispatch
+				// TypeConverter::ConvertValue uses per value).
+				if (counters_enabled_) {
+					counter_col_family_.clear();
+					counter_col_plp_.clear();
+					for (const auto &col : column_metadata_) {
+						uint8_t family = 0xFF;
+						try {
+							family = static_cast<uint8_t>(mssql::codec::FamilyFromTdsType(col.type_id));
+						} catch (...) {
+							// Unknown wire type — counted as unknown_family_values.
+						}
+						counter_col_family_.push_back(family);
+						counter_col_plp_.push_back(col.max_length == 0xFFFF);
+					}
+				}
+
 				row_reader_ = make_uniq<tds::RowReader>(parsed_columns);
 				state_ = MSSQLResultStreamState::Streaming;
 				return true;
@@ -220,6 +247,9 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	uint64_t parse_time_us = 0;
 	uint64_t read_time_us = 0;
 	uint64_t process_time_us = 0;
+	// D4: snapshot the thread-local fallback counter; the delta at exit is
+	// this call's fallbacks (FillChunk runs entirely on one thread).
+	const uint64_t utf16_fallbacks_at_entry = counters_enabled_ ? tds::encoding::Utf16FallbackCount() : 0;
 
 	while (row_count < max_rows && state_ == MSSQLResultStreamState::Streaming) {
 		// Check for cancellation periodically
@@ -347,6 +377,17 @@ exit_loop:
 					(unsigned long long)row_count, (long)total_us, (long)parse_time_us, (long)read_time_us,
 					(long)process_time_us);
 
+	if (counters_enabled_) {
+		if (row_count > 0) {
+			counters_.chunks++;
+		}
+		counters_.fill_total_us += static_cast<uint64_t>(total_us);
+		counters_.fill_parse_us += parse_time_us;
+		counters_.fill_read_us += read_time_us;
+		counters_.fill_process_us += process_time_us;
+		counters_.utf16_fallbacks += tds::encoding::Utf16FallbackCount() - utf16_fallbacks_at_entry;
+	}
+
 	return row_count;
 }
 
@@ -394,6 +435,70 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
 												   column_metadata_[col_idx], *target_vector, row_idx);
+	}
+
+	if (counters_enabled_) {
+		CountRowForDebug(chunk, row_idx, cols_to_fill);
+	}
+}
+
+void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t cols_to_fill) {
+	const auto &row = parser_.GetRow();
+	const auto string_family = static_cast<uint8_t>(mssql::codec::TypeFamily::String);
+	for (idx_t col_idx = 0; col_idx < cols_to_fill && col_idx < counter_col_family_.size(); col_idx++) {
+		counters_.wire_bytes_in += row.values[col_idx].size();
+		if (row.null_mask[col_idx]) {
+			counters_.nulls++;
+			continue;
+		}
+		const uint8_t family = counter_col_family_[col_idx];
+		if (family < 9) {
+			counters_.values_per_family[family]++;
+		} else {
+			counters_.unknown_family_values++;
+		}
+		if (counter_col_plp_[col_idx]) {
+			counters_.plp_values++;
+		}
+		if (family == string_family) {
+			// Same 3-way target resolution as the conversion loop above.
+			Vector *target_vector;
+			if (!target_vectors_.empty()) {
+				target_vector = target_vectors_[col_idx];
+			} else if (!output_column_mapping_.empty()) {
+				target_vector = &chunk.data[output_column_mapping_[col_idx]];
+			} else {
+				target_vector = &chunk.data[col_idx];
+			}
+			if (target_vector->GetType().InternalType() == PhysicalType::VARCHAR) {
+				counters_.string_bytes_out += FlatVector::GetData<string_t>(*target_vector)[row_idx].GetSize();
+			}
+		}
+	}
+}
+
+void MSSQLResultStream::PrintDebugCounters() {
+	fprintf(stderr,
+			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
+			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%llu read=%llu process=%llu)\n",
+			(unsigned long long)rows_read_, (unsigned long long)counters_.chunks, (unsigned long long)counters_.nulls,
+			(unsigned long long)counters_.wire_bytes_in, (unsigned long long)counters_.string_bytes_out,
+			(unsigned long long)counters_.plp_values, (unsigned long long)counters_.utf16_fallbacks,
+			(unsigned long long)counters_.fill_total_us, (unsigned long long)counters_.fill_parse_us,
+			(unsigned long long)counters_.fill_read_us, (unsigned long long)counters_.fill_process_us);
+	std::string families;
+	for (uint8_t f = 0; f < mssql::codec::TYPE_FAMILY_COUNT; f++) {
+		if (counters_.values_per_family[f] > 0) {
+			families += " ";
+			families += mssql::codec::FamilyName(static_cast<mssql::codec::TypeFamily>(f));
+			families += "=" + std::to_string(counters_.values_per_family[f]);
+		}
+	}
+	if (counters_.unknown_family_values > 0) {
+		families += " unknown=" + std::to_string(counters_.unknown_family_values);
+	}
+	if (!families.empty()) {
+		fprintf(stderr, "[MSSQL COUNTERS]   values/family:%s\n", families.c_str());
 	}
 }
 

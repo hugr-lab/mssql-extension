@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -313,6 +313,16 @@ test-token-parser-security: debug
 	@echo "Running TDS token-parser security regression..."
 	build/test/test_token_parser_security
 
+# Spec 054 D2: benchmark build — release build with TPC-H (dbgen) enabled for
+# the e2e materialization benches (test/bench/bench_tpch_e2e.sh).
+# tpch must NOT go into extension_config.cmake (that file ships to community
+# builds); test/bench/bench_extension_config.cmake carries it and is prepended
+# here via the ci-tools EXTRA_EXTENSION_CONFIGS hook.
+# NOTE: a later plain `make`/`make release` reconfigures WITHOUT tpch (cmake
+# drops it on re-run) — re-run `make bench-build` before benchmarking.
+bench-build:
+	EXTRA_EXTENSION_CONFIGS='$(PROJ_DIR)test/bench/bench_extension_config.cmake' $(MAKE) release
+
 # Spec 044: codec microbenchmark — simdutf vs legacy hand-rolled converter.
 # Manual target; NOT part of `make test` or any CI workflow.
 # Requires `make debug` first to populate build/debug/vcpkg_installed.
@@ -343,6 +353,38 @@ bench-utf16: release
 	@echo "Running UTF-16 codec microbenchmark..."
 	build/test/bench_utf16
 
+# Spec 054 D1: materialization microbenchmark (string decode / fixed decode /
+# bcp encode groups). Manual target; NOT part of `make test` or CI.
+# Links the RELEASE libduckdb (Vector/DataChunk symbols) + release simdutf,
+# compiles the codec sources at -O3 so the timed body matches shipped code.
+BENCH_MAT_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
+BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
+    src/tds/encoding/bcp_row_encoder.cpp \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/datetime_encoding.cpp \
+    src/tds/encoding/decimal_encoding.cpp \
+    src/tds/encoding/guid_encoding.cpp
+
+# Deliberately NOT dependent on `release`: re-running the release configure
+# here would drop tpch from a `make bench-build` tree (the two targets share
+# build/release). Requires an existing release build (either flavor).
+bench-materialize:
+	@echo "Building materialization microbenchmark (spec 054)..."
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
+		echo "ERROR: no release build found; run 'make release' or 'make bench-build' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(BENCH_MAT_FLAGS) $(BENCH_UTF16_INCLUDES) \
+	    test/cpp/bench_materialize.cpp \
+	    $(BENCH_MAT_SOURCES) \
+	    $(BENCH_UTF16_LIBS) \
+	    -L build/release/src -lduckdb \
+	    -o build/test/bench_materialize
+	@echo ""
+	@echo "Running materialization microbenchmark..."
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_materialize
+
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
 # test/cpp/codec/test_<family>_codec.cpp linked against src/codec/*.cpp.
@@ -372,7 +414,11 @@ CODEC_TEST_ENCODING_SOURCES := \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
     src/tds/encoding/decimal_encoding.cpp \
-    src/tds/encoding/guid_encoding.cpp
+    src/tds/encoding/guid_encoding.cpp \
+    src/tds/encoding/bcp_row_encoder.cpp
+# bcp_row_encoder.cpp is required: integer/decimal EncodeToBcp call
+# BCPRowEncoder::EncodeDecimal, which is defined there (not in a codec source).
+# Without it `make test-codec-integer` / `test-codec-decimal` fail to link.
 # CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
 # migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
 CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)

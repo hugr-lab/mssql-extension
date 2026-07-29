@@ -157,23 +157,38 @@ SELECT * FROM mssql_ctas_types.dbo.ctas_decimal_precision;
 12345678901234567890.12345
 
 # =============================================================================
-# Unsupported / Restricted Types
+# HUGEINT (issue #177) / Unsupported / Restricted Types
 # =============================================================================
 #
 # Per spec 045 Phase 3 (FR-025 / FR-028 DDL unification): HUGEINT and UHUGEINT
-# now map to DECIMAL(38,0) in BOTH the CREATE-TABLE and CTAS DDL contexts. The
-# DDL phase therefore succeeds; the BCP data-insert phase still throws until
-# the Decimal family migration lands (spec 045 Phase 6 / T069). The expected
-# error text matches the BCP NotImplementedException, which contains "HUGEINT".
+# map to DECIMAL(38,0) in BOTH the CREATE-TABLE and CTAS DDL contexts. Since
+# issue #177 the BCP data phase encodes HUGEINT as DECIMAL(38,0) too, so CTAS
+# over a HUGEINT projection succeeds end-to-end up to ±(10^38−1); 39-digit
+# values raise a client-side range error before any row is sent.
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_hugeint;
+
+# 10^38−1 (38 digits) — DECIMAL(38,0) max — round-trips through default (BCP) CTAS.
+statement ok
+CREATE TABLE mssql_ctas_types.dbo.ctas_hugeint AS SELECT 99999999999999999999999999999999999999::HUGEINT AS val;
+
+query I
+SELECT val FROM mssql_ctas_types.dbo.ctas_hugeint;
+----
+99999999999999999999999999999999999999
+
+statement ok
+DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_hugeint;
 
 statement ok
 DROP TABLE IF EXISTS mssql_ctas_types.dbo.ctas_fail;
 
-# HUGEINT — DDL maps to DECIMAL(38,0); BCP encoding pending (spec 045 Phase 6)
+# int128 max has 39 digits — cannot fit DECIMAL(38,0); clean client-side error (#177).
 statement error
-CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 99999999999999999999999999999999999999::HUGEINT AS val;
+CREATE TABLE mssql_ctas_types.dbo.ctas_fail AS SELECT 170141183460469231731687303715884105727::HUGEINT AS val;
 ----
-HUGEINT
+out of range for DECIMAL(38,0)
 
 # CTAS partially created the table at DDL phase; drop it before the next case.
 statement ok

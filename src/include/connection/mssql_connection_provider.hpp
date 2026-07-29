@@ -1,5 +1,7 @@
 #pragma once
 
+#include "duckdb/common/shared_ptr.hpp"
+
 #include <memory>
 
 namespace duckdb {
@@ -9,6 +11,7 @@ class MSSQLCatalog;
 
 namespace tds {
 class TdsConnection;
+class ConnectionPool;
 }  // namespace tds
 
 //===----------------------------------------------------------------------===//
@@ -70,5 +73,27 @@ public:
 	//! @return true if SQL Server transaction is active on pinned connection
 	static bool IsSqlServerTransactionActive(ClientContext &context, MSSQLCatalog &catalog);
 };
+
+namespace mssql {
+
+//! Release a connection that may have died mid-BCP bulk-load back to its pool.
+//! A COPY/CTAS that dies mid-stream leaves the server awaiting bulk data on
+//! the session, so the connection is closed first (ends the session, rolls
+//! back the INSERT BULK transaction, drops the target-table locks); returning
+//! it as-is would hand the next caller a connection stuck mid-bulk-load.
+//! Shared by ~MSSQLCopyGlobalState (issue #191) and
+//! CTASExecutionState::ReleaseBCPConnectionOnError — keep ONE copy of this
+//! protocol. Safe on worker threads (touches no ClientContext, issue #178);
+//! `connection` is always null on return.
+//! @param connection The (possibly mid-BCP) connection; reset on return
+//! @param pool_handle weak_ptr to the owning catalog's pool; a failed lock()
+//!        (catalog torn down) drops the connection instead
+//! @param transaction_pinned true if an MSSQLTransaction owns the pin — the
+//!        reference is dropped without a pool Release
+void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
+								 bool transaction_pinned) noexcept;
+
+}  // namespace mssql
 
 }  // namespace duckdb

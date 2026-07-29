@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include "codec/type_family.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -197,6 +198,38 @@ private:
 	// Used for composite PK rowid-only case where we write to STRUCT children
 	// If non-empty, these vectors are used instead of chunk.data
 	vector<Vector *> target_vectors_;
+
+	// D4 (spec 054): per-stream debug counters, active only at MSSQL_DEBUG>=2
+	// (counters_enabled_ latched at construction). Plain integers — a stream
+	// is filled from one thread at a time. Printed once on destruction.
+	struct StreamDebugCounters {
+		uint64_t chunks = 0;
+		uint64_t nulls = 0;
+		uint64_t values_per_family[mssql::codec::TYPE_FAMILY_COUNT] = {};  // indexed by codec::TypeFamily
+		uint64_t unknown_family_values = 0;
+		uint64_t wire_bytes_in = 0;		// TDS value bytes across all columns
+		uint64_t string_bytes_out = 0;	// UTF-8 bytes written to string vectors
+		uint64_t plp_values = 0;		// non-NULL values in PLP (MAX-typed) columns
+		uint64_t utf16_fallbacks = 0;	// legacy-converter dispatches (invalid UTF-16)
+		uint64_t fill_total_us = 0;		// wall time inside FillChunk, accumulated
+		uint64_t fill_parse_us = 0;
+		uint64_t fill_read_us = 0;
+		uint64_t fill_process_us = 0;
+	};
+
+	// Count one processed row into counters_ (called from ProcessRow when
+	// counters_enabled_; keeps the conversion hot loop untouched).
+	void CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t cols_to_fill);
+
+	// Print the close summary to stderr (destructor, counters_enabled_ only).
+	void PrintDebugCounters();
+
+	bool counters_enabled_ = false;
+	StreamDebugCounters counters_;
+	// Per-column decode family (value = codec::TypeFamily, 0xFF = unknown)
+	// and PLP-ness, precomputed once after COLMETADATA.
+	std::vector<uint8_t> counter_col_family_;
+	std::vector<bool> counter_col_plp_;
 
 	// Timeouts
 	int read_timeout_ms_ = 30000;  // Normal read timeout (30 seconds)

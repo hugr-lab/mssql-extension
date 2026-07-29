@@ -33,6 +33,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -326,6 +327,59 @@ void TestRenderAsString() {
 	CHECK_EQ(rendered_nil, std::string("00000000-0000-0000-0000-000000000000"));
 }
 
+// W1 latent fix (spec 054): uuid::EncodeToBcp used FlatVector::GetData[row],
+// which is wrong for CONSTANT/DICTIONARY inputs (table functions may legally
+// emit those). It now reads through a UnifiedVectorFormat. Prove both shapes
+// resolve to the same bytes as the equivalent flat encode.
+void TestEncodeConstantDictionaryVectors() {
+	std::cout << "Test: EncodeToBcp reads CONSTANT/DICTIONARY UUID vectors via format (W1 latent fix)\n";
+
+	BCPColumnMetadata col = MakeBCPColumn();
+	const char *uuids[] = {
+		"00000000-0000-0000-0000-000000000000",
+		"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"01234567-89ab-cdef-0123-456789abcdef",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+	};
+
+	auto encode_flat = [&](const char *canonical) {
+		duckdb::Vector fv(LogicalType::UUID, 1);
+		fv.SetValue(0, Value::UUID(canonical));
+		duckdb::vector<uint8_t> b;
+		duckdb::mssql::codec::uuid::EncodeToBcp(fv, 0, col, b);
+		return b;
+	};
+
+	// CONSTANT vector: any row index resolves to the single value (a raw
+	// FlatVector::GetData[row] read would walk off the 1-element backing array).
+	{
+		duckdb::Vector cv(Value::UUID(uuids[1]));
+		duckdb::vector<uint8_t> b;
+		duckdb::mssql::codec::uuid::EncodeToBcp(cv, 3, col, b);
+		CHECK_TRUE(b == encode_flat(uuids[1]));
+	}
+
+	// DICTIONARY vector: reversing selection over a 4-value child. Row i must
+	// resolve through fmt.sel to child[3 - i].
+	{
+		duckdb::Vector child(LogicalType::UUID, 4);
+		for (duckdb::idx_t i = 0; i < 4; i++) {
+			child.SetValue(i, Value::UUID(uuids[i]));
+		}
+		duckdb::SelectionVector sel(4);
+		for (duckdb::idx_t i = 0; i < 4; i++) {
+			sel.set_index(i, 3 - i);
+		}
+		duckdb::Vector dv(LogicalType::UUID);
+		dv.Slice(child, sel, 4);
+		for (duckdb::idx_t i = 0; i < 4; i++) {
+			duckdb::vector<uint8_t> b;
+			duckdb::mssql::codec::uuid::EncodeToBcp(dv, i, col, b);
+			CHECK_TRUE(b == encode_flat(uuids[3 - i]));
+		}
+	}
+}
+
 }  // namespace
 
 int main() {
@@ -338,6 +392,7 @@ int main() {
 	TestEncodeVectorRfc4122();
 	TestEncodeValueHighBit();
 	TestEncodeValueMixedPattern();
+	TestEncodeConstantDictionaryVectors();
 	TestEncodeDecodeRoundTrip();
 	TestFormatSqlLiteralByteIdentity();
 	TestFormatDdlTypeNameByteIdentity();

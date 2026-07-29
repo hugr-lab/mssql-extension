@@ -31,6 +31,7 @@
 
 #include "codec/decimal_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
@@ -53,29 +54,44 @@ namespace decimal {
 
 namespace {
 
-template <typename T>
-T GetVectorValue(Vector &vec, idx_t row_idx) {
-	UnifiedVectorFormat format;
-	vec.ToUnifiedFormat(1, format);
-	auto data = UnifiedVectorFormat::GetData<T>(format);
-	auto idx = format.sel->get_index(row_idx);
-	return data[idx];
-}
-
 // Widen the value to hugeint based on DuckDB's PhysicalType. Mirrors
 // the dispatch in BCPRowEncoder::EncodeRow DECIMAL arm.
-hugeint_t WidenVectorToHugeint(Vector &vec, idx_t row_idx) {
+hugeint_t WidenVectorToHugeint(Vector &vec, const UnifiedVectorFormat &fmt, idx_t row_idx) {
 	switch (vec.GetType().InternalType()) {
 	case PhysicalType::INT16:
-		return hugeint_t(GetVectorValue<int16_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int16_t>(fmt, row_idx));
 	case PhysicalType::INT32:
-		return hugeint_t(GetVectorValue<int32_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int32_t>(fmt, row_idx));
 	case PhysicalType::INT64:
-		return hugeint_t(GetVectorValue<int64_t>(vec, row_idx));
+		return hugeint_t(FormatValue<int64_t>(fmt, row_idx));
 	case PhysicalType::INT128:
-		return GetVectorValue<hugeint_t>(vec, row_idx);
+		return FormatValue<hugeint_t>(fmt, row_idx);
 	default:
 		throw InternalException("codec::decimal::EncodeToBcp: unexpected PhysicalType for DECIMAL");
+	}
+}
+
+// #177: SQL Server rejects a row whose mantissa exceeds the declared precision
+// with a mid-batch "Invalid data for type numeric" that aborts the whole BCP
+// stream. Guard client-side instead: |mantissa| must fit in `precision` digits.
+// Reached e.g. when a HUGEINT source feeds a DECIMAL(38,0) target column
+// (COPY CREATE_TABLE reads the created table's metadata back, so the column
+// dispatches through the Decimal family, not Integer).
+void CheckMantissaFitsPrecision(const hugeint_t &value, const mssql::BCPColumnMetadata &col) {
+	if (col.precision == 0 || col.precision > 38) {
+		return;	 // malformed metadata — let the server decide
+	}
+	// Bound both ends directly rather than negating `value` first: Hugeint::Negate
+	// on HUGEINT min (-2^127) overflows int128, so an abs-then-compare guard let
+	// that value slip (or threw a raw overflow). +/-(10^precision - 1) are both
+	// representable for precision <= 38, so the check is exact for every input.
+	const hugeint_t max = Hugeint::POWERS_OF_TEN[col.precision] - 1;
+	const hugeint_t min = Hugeint::Negate(max);
+	if (Hugeint::GreaterThan(value, max) || Hugeint::GreaterThan(min, value)) {
+		throw InvalidInputException(
+			"MSSQL: DECIMAL value (mantissa %s, scale %d) in column \"%s\" is out of range for DECIMAL(%d,%d)",
+			Hugeint::ToString(value), static_cast<int>(col.scale), col.name, static_cast<int>(col.precision),
+			static_cast<int>(col.scale));
 	}
 }
 
@@ -97,9 +113,15 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	hugeint_t value = WidenVectorToHugeint(in, row);
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	hugeint_t value = WidenVectorToHugeint(in, fmt, row);
+	CheckMantissaFitsPrecision(value, col);
 	tds::encoding::BCPRowEncoder::EncodeDecimal(buf, value, col.precision, col.scale);
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
@@ -108,7 +130,9 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	// BCPRowEncoder::EncodeValue DECIMAL arm did the same. Keep that behavior
 	// here for parity — the dispatcher always reaches the Vector overload in
 	// practice (BCPRowEncoder::EncodeRow path).
-	tds::encoding::BCPRowEncoder::EncodeDecimal(buf, value.GetValue<hugeint_t>(), col.precision, col.scale);
+	hugeint_t mantissa = value.GetValue<hugeint_t>();
+	CheckMantissaFitsPrecision(mantissa, col);
+	tds::encoding::BCPRowEncoder::EncodeDecimal(buf, mantissa, col.precision, col.scale);
 }
 
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext /*ctx*/) {

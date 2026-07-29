@@ -24,6 +24,7 @@
 
 #include "codec/uuid_codec.hpp"
 
+#include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "duckdb/common/exception.hpp"
@@ -97,12 +98,20 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 // Encode (DuckDB → TDS BCP)
 //===----------------------------------------------------------------------===//
 
-void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {
-	auto uuid = FlatVector::GetData<hugeint_t>(in)[row];
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,
+				 duckdb::vector<uint8_t> &buf) {
+	// Format-based access (was FlatVector::GetData — wrong for dictionary/
+	// constant inputs; fixed as part of the W1 hoisting, spec 054).
+	(void)in;
+	auto uuid = FormatValue<hugeint_t>(fmt, row);
 	buf.push_back(GUID_LENGTH_PREFIX);
 	const size_t start = buf.size();
 	buf.resize(start + GUID_WIRE_SIZE);
 	EncodeHugeIntToWire(uuid, buf.data() + start);
+}
+
+void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata & /*col*/, duckdb::vector<uint8_t> &buf) {

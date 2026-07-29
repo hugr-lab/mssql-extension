@@ -8,6 +8,7 @@
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
 #include "tds/tds_connection.hpp"
+#include "tds/tds_connection_pool.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -75,6 +76,11 @@ struct CTASExecutionState {
 	// Connection (pinned for duration)
 	std::shared_ptr<tds::TdsConnection> connection;
 
+	// Weak handle to the catalog's pool so error/teardown paths can release the
+	// connection without touching the catalog pointer (issue #191 pattern from
+	// MSSQLCopyGlobalState; a failed lock() means the catalog is torn down).
+	weak_ptr<tds::ConnectionPool> pool_handle;
+
 	// Catalog reference for cache invalidation
 	MSSQLCatalog *catalog = nullptr;
 
@@ -86,6 +92,16 @@ struct CTASExecutionState {
 	std::chrono::steady_clock::time_point start_time;
 
 	CTASExecutionState() = default;
+
+	// Last-resort release of a connection left mid-BCP-stream by a sink error
+	// (mirrors MSSQLCopyGlobalState::~MSSQLCopyGlobalState, issue #191).
+	~CTASExecutionState();
+
+	// Close (if mid-stream) and return the BCP connection to the pool after an
+	// error. A connection abandoned mid-bulk-load must not be reused: closing
+	// the socket is what rolls back the INSERT BULK transaction server-side and
+	// drops the target-table locks. Safe to call repeatedly / with no connection.
+	void ReleaseBCPConnectionOnError() noexcept;
 
 	// Initialize for execution
 	void Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
