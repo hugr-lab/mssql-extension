@@ -193,6 +193,32 @@ network buffers per session, so 16 KB per pooled connection instead of 4 KB.
 Correctness: `diff_check.sh` 13/13 byte-identical against the pre-change build,
 including the PLP/MAX, embedded-NUL, collation and BCP write-back cases.
 
+## DECIMAL decode kernel (spec 055 D1)
+
+`DecimalEncoding::ConvertDecimal` ran a full 128-bit multiply-accumulate **per
+byte** (`magnitude = magnitude * 256 + data[i]`) — up to sixteen 128-bit
+multiplies to decode one value. TDS already sends the magnitude in exactly the
+byte order an int128 wants, so the whole thing is two loads.
+
+Interleaved same-session A/B on top of the frame change, two passes, client CPU
+ns/value:
+
+| family | before | after | delta |
+| --- | ---: | ---: | ---: |
+| dec38 — DECIMAL(38,10) | 75.8 | **41.8** | **−45%** |
+| dec18 — DECIMAL(18,4) | 45.8 | 33.3 | −27% |
+| bigint — untouched control | 34.9 | 35.1 | ±0 |
+
+The `bigint` control is the point: it shares every part of the path except the
+kernel and did not move, so the delta is the kernel and not drift.
+DECIMAL(38,10) now decodes at roughly BIGINT cost.
+
+Correctness: `diff_check.sh` 13/13 byte-identical; new fixtures in
+`test/cpp/codec/test_decimal_codec.cpp` pin the byte contract (sign byte,
+little-endian magnitude, every length 1–16 compared against a byte-by-byte
+reference, 10^38−1 both signs, the 8/9-byte word boundary). Big-endian hosts and
+malformed lengths above 16 magnitude bytes keep the old portable loop.
+
 ## Caveats
 
 - Client and server share one machine; server CPU competes with client CPU for

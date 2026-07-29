@@ -177,7 +177,15 @@ and nothing is known about servers that would grant more. `diff_check.sh` 13/13 
 Note this changes what the rest of the phase is measured against **again**: the post-D0b read
 baseline for the wide step is 76.8 ns/value, not 106.4.
 
-### D1. DECIMAL decode kernel — measured 23×, lands first and standalone
+### D1. DECIMAL decode kernel — **done**, live dec38 −45%
+
+Landed. Live A/B on top of D0b, interleaved, two passes: DECIMAL(38,10) 75.8 → 41.8 ns/value
+(−45%), DECIMAL(18,4) 45.8 → 33.3 (−27%), with BIGINT as an untouched control at 34.9 → 35.1
+(±0) — so the delta is the kernel, not drift. DECIMAL(38,10) now decodes at roughly BIGINT cost.
+The direct little-endian load is guarded on `__BYTE_ORDER__`/MSVC; big-endian hosts and malformed
+lengths beyond 16 magnitude bytes fall back to the original portable loop, so the overflow
+behaviour on garbage input is unchanged. `diff_check.sh` 13/13 byte-identical; byte-contract
+fixtures added to `test/cpp/codec/test_decimal_codec.cpp`.
 
 `DecimalEncoding::ConvertDecimal` (`src/tds/encoding/decimal_encoding.cpp:8-24`) assembles the
 magnitude with a **full 128-bit multiply-add per byte**:

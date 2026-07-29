@@ -33,6 +33,7 @@
 #include "codec/type_family.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
+#include "tds/encoding/decimal_encoding.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
@@ -276,6 +277,94 @@ void TestEncodeToBcpMantissaRangeGuard() {
 	CHECK_TRUE(threw_narrow);
 }
 
+// ---------------------------------------------------------------------------
+// Spec 055 D1: DecimalEncoding::ConvertDecimal wire-magnitude kernel.
+//
+// The old implementation ran a 128-bit multiply-accumulate per byte; the
+// current one loads the little-endian magnitude directly into the int128 words.
+// These fixtures pin the byte-level contract that makes that legal: sign byte
+// first (0 = negative), magnitude little-endian, any length up to 16 bytes, and
+// the >16 fallback still going through the portable path.
+void TestConvertDecimalWireKernel() {
+	std::cout << "\nTest: DecimalEncoding::ConvertDecimal wire-magnitude kernel (spec 055 D1)\n";
+	using duckdb::tds::encoding::DecimalEncoding;
+
+	// Empty payload (NULL magnitude) -> 0
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(nullptr, 0) == hugeint_t(0));
+
+	// Positive, single magnitude byte
+	const uint8_t one[] = {1, 0x01};
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(one, sizeof(one)) == hugeint_t(1));
+
+	// Negative sign byte is 0
+	const uint8_t minus_one[] = {0, 0x01};
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(minus_one, sizeof(minus_one)) == hugeint_t(-1));
+
+	// Zero magnitude keeps its sign-free value either way
+	const uint8_t pos_zero[] = {1, 0x00};
+	const uint8_t neg_zero[] = {0, 0x00};
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(pos_zero, sizeof(pos_zero)) == hugeint_t(0));
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(neg_zero, sizeof(neg_zero)) == hugeint_t(0));
+
+	// Little-endian ordering: 0x0201 = 513
+	const uint8_t le_two[] = {1, 0x01, 0x02};
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(le_two, sizeof(le_two)) == hugeint_t(513));
+
+	// 4-byte bucket (precision <= 9 on the wire)
+	const uint8_t four[] = {1, 0x78, 0x56, 0x34, 0x12};
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(four, sizeof(four)) == hugeint_t(0x12345678));
+
+	// Exactly 8 magnitude bytes — the boundary where the high word starts
+	const uint8_t eight[] = {1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+	hugeint_t max_u64;
+	max_u64.lower = 0xFFFFFFFFFFFFFFFFULL;
+	max_u64.upper = 0;
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(eight, sizeof(eight)) == max_u64);
+
+	// 9 magnitude bytes — first byte of the high word
+	const uint8_t nine[] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+	hugeint_t two_pow_64;
+	two_pow_64.lower = 0;
+	two_pow_64.upper = 1;
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(nine, sizeof(nine)) == two_pow_64);
+
+	// Full 16-byte magnitude: 10^38 - 1, the widest DECIMAL SQL Server can send
+	hugeint_t max_decimal38 = hugeint_t(1);
+	for (int i = 0; i < 38; i++) {
+		max_decimal38 = max_decimal38 * hugeint_t(10);
+	}
+	max_decimal38 = max_decimal38 - hugeint_t(1);
+	uint8_t wide[17];
+	wide[0] = 1;
+	{
+		// Serialise max_decimal38 little-endian into the magnitude bytes.
+		uint64_t lower = max_decimal38.lower;
+		uint64_t upper = static_cast<uint64_t>(max_decimal38.upper);
+		for (int i = 0; i < 8; i++) {
+			wide[1 + i] = static_cast<uint8_t>((lower >> (8 * i)) & 0xFF);
+			wide[9 + i] = static_cast<uint8_t>((upper >> (8 * i)) & 0xFF);
+		}
+	}
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(wide, sizeof(wide)) == max_decimal38);
+	wide[0] = 0;
+	CHECK_TRUE(DecimalEncoding::ConvertDecimal(wide, sizeof(wide)) == -max_decimal38);
+
+	// Every length from 1 to 16 magnitude bytes must agree with a byte-by-byte
+	// reference built the way the pre-055 implementation did.
+	for (size_t mag = 1; mag <= 16; mag++) {
+		uint8_t buf[17];
+		buf[0] = 1;
+		for (size_t i = 0; i < mag; i++) {
+			buf[1 + i] = static_cast<uint8_t>(0x10 + i * 7);
+		}
+		hugeint_t expected(0);
+		for (size_t i = mag; i >= 1; i--) {
+			expected = expected * hugeint_t(256) + hugeint_t(buf[i]);
+		}
+		CHECK_TRUE(DecimalEncoding::ConvertDecimal(buf, mag + 1) == expected);
+	}
+}
+
 }  // namespace
 
 int main() {
@@ -289,6 +378,7 @@ int main() {
 	TestRenderAsStringMatchesLiteral();
 	TestRenderMoneyAsString();
 	TestEncodeToBcpMantissaRangeGuard();
+	TestConvertDecimalWireKernel();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";
