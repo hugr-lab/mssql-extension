@@ -10,7 +10,7 @@
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/common.hpp"		   // For COLUMN_IDENTIFIER_ROW_ID
+#include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
@@ -881,22 +881,44 @@ static BindInfo GetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 // (MSSQLCatalogScanBindData::Equals is correct but never consulted here — this
 // optimizer compares serialized bytes, not FunctionData::Equals.)
 //
-// Serialize exactly the fields that determine the generated T-SQL. Everything
-// else in the bind data (column lists, PK/rowid metadata) is derived from the
-// table itself and is therefore implied by schema+table.
+// Which fields have to be here, and why — verified against the optimizer order
+// in duckdb/src/optimizer/optimizer.cpp:
+//
+//   context/schema/table               load-bearing: the whole bug.
+//   complex_filter_where_clause        load-bearing: FILTER_PUSHDOWN (:156) runs
+//                                      BEFORE COMMON_SUBPLAN (:253), so two scans
+//                                      of the SAME table can reach the optimizer
+//                                      already carrying different WHERE clauses,
+//                                      and this string is the only place they
+//                                      differ (simple TableFilters are already
+//                                      serialized by LogicalGet itself).
+//   order_by_clause / top_n            NOT load-bearing for the signature: they
+//                                      are set by our own optimizer extension,
+//                                      which DuckDB runs as OptimizerType::
+//                                      EXTENSION (:332) — after COMMON_SUBPLAN.
+//                                      Both are still empty when the signature is
+//                                      taken. Serialized for round-trip fidelity,
+//                                      not for distinctness.
+//
+// Everything else in the bind data (column lists, PK/rowid metadata) is derived
+// from the table and is therefore implied by schema+table.
 static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
 								 const TableFunction &function) {
 	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
 	serializer.WriteProperty(100, "context_name", bind_data.context_name);
 	serializer.WriteProperty(101, "schema_name", bind_data.schema_name);
 	serializer.WriteProperty(102, "table_name", bind_data.table_name);
-	// Pushdown state: two scans of the SAME table with different pushed-down
-	// predicates must not collapse into one either.
 	serializer.WriteProperty(103, "complex_filter_where_clause", bind_data.complex_filter_where_clause);
 	serializer.WriteProperty(104, "order_by_clause", bind_data.order_by_clause);
 	serializer.WriteProperty(105, "top_n", bind_data.top_n);
 }
 
+// NOTE: nothing in DuckDB round-trips a logical plan today — the only caller of
+// LogicalOperator::Deserialize is the generated serializer itself, and the
+// common-subplan optimizer only ever serializes. This exists because
+// HasSerializationCallbacks() requires both halves before bind data is written
+// at all, so it is currently unexercised by any test. Keep it obvious rather
+// than clever, and validate defensively.
 static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserializer, TableFunction &function) {
 	auto context_name = deserializer.ReadProperty<string>(100, "context_name");
 	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
@@ -905,9 +927,19 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto order_by_clause = deserializer.ReadProperty<string>(104, "order_by_clause");
 	auto top_n = deserializer.ReadProperty<int64_t>(105, "top_n");
 
+	auto &context = deserializer.Get<ClientContext &>();
+
+	// The alias may since have been detached and re-attached over a different
+	// storage type. Cast<MSSQLCatalogScanBindData> below is unchecked in release
+	// builds, so confirm the catalog is still ours before trusting the entry.
+	auto &catalog = Catalog::GetCatalog(context, context_name);
+	if (catalog.GetCatalogType() != "mssql") {
+		throw SerializationException("MSSQL: catalog \"%s\" is no longer an MSSQL catalog (now \"%s\")", context_name,
+									 catalog.GetCatalogType());
+	}
+
 	// Rebuild through the catalog entry so the column/PK metadata comes from the
 	// live catalog rather than from stale serialized copies.
-	auto &context = deserializer.Get<ClientContext &>();
 	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, context_name, schema_name, table_name);
 	unique_ptr<FunctionData> bind_data;
 	entry.GetScanFunction(context, bind_data);

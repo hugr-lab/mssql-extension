@@ -77,8 +77,9 @@ aab
 bbb
 bbc
 
-# Same table twice with DIFFERENT pushed-down filters: deduplicating these
-# would be just as wrong, so the filter clauses are part of the signature too.
+# Same table twice with different SIMPLE filters. These become TableFilter
+# objects, which LogicalGet already serializes itself, so this case was never
+# broken -- it is here to keep it that way.
 query TT
 SELECT 'lo' AS t, count(*) AS n FROM subplan_db.dbo.SubplanA WHERE c = 'aaa'
 UNION ALL
@@ -87,6 +88,30 @@ ORDER BY t;
 ----
 hi	1
 lo	1
+
+# Same table twice with different COMPLEX filters. This is the case the
+# serialized complex_filter_where_clause actually protects: expressions like
+# year(d) = N cannot be expressed as a TableFilter, so they live only in our
+# bind data -- and DuckDB runs FILTER_PUSHDOWN (optimizer.cpp:156) before
+# COMMON_SUBPLAN (:253), so both scans reach the optimizer already carrying
+# different WHERE clauses that are invisible to a signature without them.
+statement ok
+CREATE OR REPLACE TABLE subplan_db.dbo.SubplanC (c VARCHAR, d DATE);
+
+statement ok
+INSERT INTO subplan_db.dbo.SubplanC VALUES ('y2024', DATE '2024-06-01'), ('y2025', DATE '2025-06-01');
+
+query TT
+SELECT 'a' AS t, min(c) AS v FROM subplan_db.dbo.SubplanC WHERE year(d) = 2024
+UNION ALL
+SELECT 'b' AS t, min(c) AS v FROM subplan_db.dbo.SubplanC WHERE year(d) = 2025
+ORDER BY t;
+----
+a	y2024
+b	y2025
+
+statement ok
+DROP TABLE subplan_db.dbo.SubplanC;
 
 statement ok
 DROP TABLE subplan_db.dbo.SubplanA;
