@@ -6,6 +6,7 @@
 
 #include "codec/staging/row_stager.hpp"
 
+#include "codec/staging/string_finalize.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -69,7 +70,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 			continue;
 		}
 		ops_[i] = ResolveColumnOps(metadata[i], target->GetType());
-		if (ops_[i].direct_write) {
+		if (ops_[i].arm < AppendArm::Convert) {
 			arena_.Column(i).Configure(ops_[i].kind, ops_[i].stride, ops_[i].max_value_bytes);
 		}
 	}
@@ -81,13 +82,16 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 	targets_.resize(ops_.size(), nullptr);
 	for (idx_t i = 0; i < ops_.size(); i++) {
 		convert_nulls_[i] = 0;
-		if (!ops_[i].direct_write) {
+		if (ops_[i].arm >= AppendArm::Convert) {
 			continue;
 		}
 		// Direct columns write through the output vector's own storage, so the
 		// data pointer has to be re-taken every chunk: DataChunk::Reset restores
 		// each vector from its cache and is free to hand back different memory.
-		arena_.Column(i).BeginChunk(reinterpret_cast<uint8_t *>(FlatVector::GetData(*targets_[i])));
+		// Columns that stage into their own buffer take no pointer at all.
+		uint8_t *direct_dst =
+			ops_[i].direct_write ? reinterpret_cast<uint8_t *>(FlatVector::GetData(*targets_[i])) : nullptr;
+		arena_.Column(i).BeginChunk(direct_dst);
 	}
 }
 
@@ -126,6 +130,17 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
 			break;
+		case AppendArm::P2StageString: {
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			if (length == 0xFFFF) {
+				arena_.Column(c).AppendNull();
+				p += 2;
+				break;
+			}
+			arena_.Column(c).AppendVarDelimited(p + 2, length);
+			p += 2 + length;
+			break;
+		}
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValue(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -197,6 +212,14 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::P1Direct8:
 			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
 			break;
+		case AppendArm::P2StageString: {
+			// The length prefix stays in an NBC row; the bitmap only decided that
+			// a value is present at all, which the branch above already handled.
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			arena_.Column(c).AppendVarDelimited(p + 2, length);
+			p += 2 + length;
+			break;
+		}
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValueNBC(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -214,11 +237,15 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 	const idx_t words = (row_count + 63) / 64;
 	for (idx_t c = 0; c < ops_.size(); c++) {
-		if (!ops_[c].direct_write) {
+		if (ops_[c].arm >= AppendArm::Convert) {
 			chunk_nulls_[c] = convert_nulls_[c];
 			continue;
 		}
 		const ColumnStaging &st = arena_.Column(c);
+		if (ops_[c].arm == AppendArm::P2StageString) {
+			// One conversion for the whole column (D5).
+			FinalizeStringColumn(st, row_count, *targets_[c]);
+		}
 		// Values went straight into the vector; only validity is still ours. Scan
 		// first so an all-valid column — the overwhelmingly common one — never
 		// forces DuckDB to allocate a mask it does not need.

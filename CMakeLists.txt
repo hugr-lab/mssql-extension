@@ -125,6 +125,7 @@ set(EXTENSION_SOURCES
     src/codec/staging/column_staging.cpp
     src/codec/staging/column_ops.cpp
     src/codec/staging/row_stager.cpp
+    src/codec/staging/string_finalize.cpp
     src/codec/literal_format.cpp
     src/codec/boolean_codec.cpp
     src/codec/integer_codec.cpp

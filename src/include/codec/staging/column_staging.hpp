@@ -331,6 +331,25 @@ struct ColumnStaging {
 		}
 	}
 
+	//! Stage a UTF-16LE value followed by a U+0000 code unit.
+	//!
+	//! The delimiter is what lets the whole column be converted in ONE simdutf
+	//! call and still be split back into values: a code unit of zero converts to
+	//! a single 0x00 byte, so the values are separated in the output too. Without
+	//! it the output offsets of a column containing any multi-byte character
+	//! cannot be derived from the input offsets at all, and the only alternative
+	//! is a conversion call per value.
+	//!
+	//! `lengths[]` records the value WITHOUT its delimiter, so the ASCII fast
+	//! path's arithmetic is unchanged and finalize never has to subtract.
+	inline void AppendVarDelimited(const uint8_t *src, uint32_t length) {
+		uint8_t *dst = AppendVarSlot(length + 2);
+		std::memcpy(dst, src, length);
+		dst[length] = 0;
+		dst[length + 1] = 0;
+		lengths[count - 1] = length;
+	}
+
 	//===--------------------------------------------------------------------===//
 	// Read-back helpers (finalize side)
 	//===--------------------------------------------------------------------===//

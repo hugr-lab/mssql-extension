@@ -175,6 +175,25 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		return ops;
 	}
 
+	// UTF-16 string columns take the batch decode (T10). Deliberately narrow:
+	//
+	//  - PLP/MAX is excluded because its value arrives as a chunk list with no
+	//    length known up front, which the Var slot cannot express yet.
+	//  - NCHAR/CHAR are excluded because their trailing-space trim must happen on
+	//    the UNTRIMMED payload when the value turns out to be invalid UTF-16
+	//    (the pre-054 semantics T9 preserved); trimming at staging time would
+	//    throw those bytes away before we know.
+	//
+	// What is left — NVARCHAR and XML — is the overwhelming majority of real
+	// string data.
+	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_XML;
+	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::P2StageString;
+		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+		return ops;
+	}
+
 	// Everything else: variable length on the wire (strings, binary, PLP), or
 	// fixed width with a precision-dependent size (DECIMAL, DATE, TIME,
 	// DATETIME2, DATETIMEOFFSET). Both stage as Var — the second group could be
