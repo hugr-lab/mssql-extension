@@ -61,6 +61,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // Public helper: render raw bytes as the canonical 0x<UPPERHEX> literal text.
 // Used by the issue-#89 VARCHAR-fallback path in TypeConverter::ConvertValue
 // for binary TDS payloads landing in a VARCHAR-typed vector.
+std::string RenderAsString(const uint8_t *bytes, size_t size);
 std::string RenderAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace binary

@@ -35,14 +35,19 @@ public:
 	// Get human-readable type name for error messages
 	static std::string GetTypeName(uint8_t type_id);
 
-private:
-	// Type-specific converters (all 9 type families migrated to codec — spec 045 Phase 6 complete)
-
 	// Issue #89 fallback: render a non-string TDS value as a string and write into a VARCHAR
 	// destination vector. Used when catalog-declared type (VARCHAR) disagrees with the runtime
 	// TDS column type (e.g. for views that CAST(... AS DECIMAL) internally).
+	//
+	// Public because the staged read path (spec 055) resolves the divergence per COLUMN and
+	// calls this from its own finalize loop, rather than testing it per cell.
+	static void WriteAsStringFallback(const uint8_t *value, size_t size, const tds::ColumnMetadata &column,
+									  Vector &vector, idx_t row_idx);
 	static void WriteAsStringFallback(const std::vector<uint8_t> &value, const tds::ColumnMetadata &column,
 									  Vector &vector, idx_t row_idx);
+
+private:
+	// Type-specific converters (all 9 type families migrated to codec — spec 045 Phase 6 complete)
 
 	// True if the TDS type tag is a character type (no fallback rendering needed).
 	static bool IsStringTdsType(uint8_t type_id);

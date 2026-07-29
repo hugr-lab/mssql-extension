@@ -117,8 +117,12 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 	return 2 + 8192 * 2;
 }
 
+std::string RenderAsString(const uint8_t *bytes, size_t size) {
+	return HexRender(bytes, size);
+}
+
 std::string RenderAsString(const std::vector<uint8_t> &bytes) {
-	return HexRender(bytes.data(), bytes.size());
+	return RenderAsString(bytes.data(), bytes.size());
 }
 
 }  // namespace binary

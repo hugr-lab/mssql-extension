@@ -69,15 +69,15 @@ enum class AppendArm : uint8_t {
 	//! whose wire value may legitimately be SHORTER than the declared width;
 	//! the append zero-extends instead of rejecting it.
 	P1StageDecimal,
-	//! Framing and conversion both go through the legacy per-value path. This is
-	//! every family that does not yet have a batch kernel, plus the issue-#89
-	//! divergence case. Cost is identical to the pre-staging path — one copy into
-	//! a reused scratch buffer, then TypeConverter::ConvertValue — so a family
-	//! without a kernel is not made slower by staging existing.
-	//! Ordered AFTER every staging arm on purpose: "does this column stage?" is
-	//! then one comparison rather than a helper, and it stays one comparison when
-	//! Convert is deleted — which it will be, once every family has a kernel.
-	Convert,
+	//! The wire type has no staged framing at all, so no value of it can be read.
+	//! TEXT/NTEXT/IMAGE via raw mssql_scan, UDT and SQL_VARIANT land here; the
+	//! shipped row reader cannot decode them either. It throws when a value
+	//! ARRIVES rather than at column resolution, so a query that selects such a
+	//! column but returns no rows keeps succeeding, as it does today.
+	//!
+	//! Ordered AFTER every staging arm: "does this column stage?" is one
+	//! comparison.
+	Unsupported,
 	//! Parsed for its length only; the value is discarded. Columns the query does
 	//! not project (COUNT(*), a narrower output chunk) still have to be walked to
 	//! find where the next column starts.
@@ -88,7 +88,7 @@ enum class AppendArm : uint8_t {
 struct ColumnOps {
 	//! The per-value arm. Set by ResolveColumnOps; the caller downgrades it to
 	//! Skip for columns it does not intend to fill.
-	AppendArm arm = AppendArm::Convert;
+	AppendArm arm = AppendArm::Unsupported;
 	//! Which append arm the row reader uses for this column.
 	StagingKind kind = StagingKind::Var;
 	//! Bytes per value for Direct / Fixed; 0 for Var.
@@ -97,11 +97,12 @@ struct ColumnOps {
 	//! be stored into the output vector with no conversion whatsoever. This is
 	//! the "direct-write bypass": no staging buffer, no finalize kernel.
 	bool direct_write = false;
-	//! True when the column must go through the per-value legacy converter
-	//! instead of a batch kernel. Set when the catalog-declared type and the
-	//! type actually arriving on the wire disagree — a view with an inline CAST
-	//! can do that (issue #89). Today that check is a branch on every cell
-	//! (type_converter.cpp:275); here it is a column-level property.
+	//! The catalog-declared type and the type on the wire disagree — a view with
+	//! an inline CAST does that (issue #89). The column still stages by its WIRE
+	//! framing like any other; only the kernel changes, to one that renders each
+	//! value as text. That rendering has no bulk primitive, but it is still one
+	//! loop per column with the dispatch resolved once, and the row walk keeps a
+	//! single shape.
 	bool needs_value_fallback = false;
 	//! Fixed-length CHAR/NCHAR: SQL Server pads to the declared width, and the
 	//! shipped decode strips those trailing spaces. Applied to the OUTPUT here,

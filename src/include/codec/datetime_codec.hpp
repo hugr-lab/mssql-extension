@@ -93,6 +93,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // (no SQL quoting / CAST wrapper) for insertion into a VARCHAR vector.
 // Dispatches on col.type_id + bytes.size() to cover every TDS temporal
 // wire format.
+std::string RenderAsString(const uint8_t *bytes, size_t size, const tds::ColumnMetadata &col);
 std::string RenderAsString(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col);
 
 }  // namespace datetime

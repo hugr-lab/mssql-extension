@@ -170,6 +170,40 @@ uint32_t DecimalWireWidth(uint8_t precision) {
 	return 17;
 }
 
+//! Is a wire/target pair that is NOT an exact match still one a kernel handles?
+//!
+//! Two of them exist, and both would otherwise be misread as the stale catalog
+//! of issue #89 — sending every datetime2(7) and every spatial column down the
+//! render-as-text path.
+//!
+//! Type equality is the wrong test here, and physical equality alone is not
+//! enough either: DECIMAL(18,2) and DECIMAL(18,4) share a physical type and
+//! mean different numbers. So the exemptions are named one by one.
+bool IsSupportedRetarget(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	switch (column.type_id) {
+	case tds::TDS_TYPE_DATETIME2:
+		// The kernel converts into the target's own unit, so every TIMESTAMP
+		// variant is a destination it can write.
+		switch (target_type.id()) {
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS:
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_NS:
+			return true;
+		default:
+			return false;
+		}
+	case tds::TDS_TYPE_BIGBINARY:
+	case tds::TDS_TYPE_BIGVARBINARY:
+		// Raw bytes into any string_t-backed target. Spatial columns arrive this
+		// way: the scan auto-projects STAsBinary(), so the wire says VARBINARY
+		// while the catalog says GEOMETRY.
+		return target_type.InternalType() == PhysicalType::VARCHAR;
+	default:
+		return false;
+	}
+}
+
 AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	const bool prefixed = HasOneBytePrefix(type_id);
 	switch (width) {
@@ -189,28 +223,29 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	ColumnOps ops;
 
-	// The wire type must agree with the vector we are writing into. A view with
-	// an inline CAST can make the catalog promise VARCHAR while TDS delivers
+	// Does the wire type agree with the vector being written into? A view with an
+	// inline CAST can make the catalog promise VARCHAR while TDS delivers
 	// something else (issue #89); the scan can also CAST VARCHAR to NVARCHAR
-	// itself (spec 026). Resolving that disagreement here, once, keeps the
-	// per-cell branch out of the hot path — and makes the safe answer the
-	// default: anything we cannot prove matches goes down the legacy per-value
-	// path rather than into a batch kernel with the wrong physical type.
+	// itself (spec 026).
+	//
+	// Resolving that once, here, keeps the check off the per-cell path. The
+	// column still stages by its WIRE framing — the bytes are the bytes — and
+	// only the finalize kernel changes, to one that renders each value as text.
+	// What it must NOT do is write wire bytes straight into a vector of a
+	// different physical type, so a divergent column never takes a direct write.
 	LogicalType wire_type;
 	try {
 		wire_type = tds::encoding::TypeConverter::GetDuckDBType(column);
 	} catch (const std::exception &) {
-		// Unknown wire type — the per-value converter owns the error path (D8).
-		ops.kind = StagingKind::Var;
-		ops.needs_value_fallback = true;
+		// A type GetDuckDBType does not know cannot be framed either. Initialize()
+		// already threw on it while building the column list, so this is
+		// unreachable from the stream — but it must not silently pick a framing.
+		ops.arm = AppendArm::Unsupported;
 		return ops;
 	}
 
-	if (wire_type != target_type) {
-		ops.kind = StagingKind::Var;
-		ops.needs_value_fallback = true;
-		return ops;
-	}
+	const bool diverges = wire_type != target_type && !IsSupportedRetarget(column, target_type);
+	ops.needs_value_fallback = diverges;
 
 	const uint32_t width = FixedWireWidth(column);
 	// A direct write stores wire bytes into the output vector at `width` stride,
@@ -220,7 +255,8 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// byte in both, REAL/FLOAT four, and so on. Proving it here, once per column,
 	// means a future remapping degrades to staging instead of writing 1 byte into
 	// a 2-byte slot.
-	if (width > 0 && IsDirectWritable(column, width) && width == GetTypeIdSize(target_type.InternalType())) {
+	if (!diverges && width > 0 && IsDirectWritable(column, width) &&
+		width == GetTypeIdSize(target_type.InternalType())) {
 		ops.kind = DirectKindForWidth(width);
 		ops.arm = DirectArm(column.type_id, width);
 		ops.stride = width;
@@ -244,9 +280,13 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 			column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER || column.type_id == tds::TDS_TYPE_DATE ||
 			column.type_id == tds::TDS_TYPE_TIME || column.type_id == tds::TDS_TYPE_DATETIME2 ||
 			column.type_id == tds::TDS_TYPE_DATETIMEOFFSET || column.type_id == tds::TDS_TYPE_DATETIME ||
-			column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_DATETIMEN;
+			column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_DATETIMEN ||
+			column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
+			column.type_id == tds::TDS_TYPE_MONEYN;
 		if (staged_family) {
-			const bool bare = column.type_id == tds::TDS_TYPE_DATETIME || column.type_id == tds::TDS_TYPE_SMALLDATETIME;
+			const bool bare = column.type_id == tds::TDS_TYPE_DATETIME ||
+							  column.type_id == tds::TDS_TYPE_SMALLDATETIME || column.type_id == tds::TDS_TYPE_MONEY ||
+							  column.type_id == tds::TDS_TYPE_SMALLMONEY;
 			ops.kind = StagingKind::Fixed;
 			ops.arm = bare ? AppendArm::RawStageFixed : AppendArm::P1StageFixed;
 			ops.stride = fixed_width;
@@ -268,6 +308,13 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// equally correct on invalid UTF-16. See ColumnOps::trim_trailing_spaces.
 	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_NCHAR ||
 							  column.type_id == tds::TDS_TYPE_XML;
+	if (utf16_string && column.IsPLPType()) {
+		// Same staged layout and the same finalize kernel as the bounded form;
+		// only the framing differs, because the value arrives as a chunk list.
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::PlpStageString;
+		return ops;
+	}
 	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageString;
@@ -304,19 +351,11 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		return ops;
 	}
 
-	// Everything else: variable length on the wire (strings, binary, PLP), or
-	// fixed width with a precision-dependent size (DECIMAL, DATE, TIME,
-	// DATETIME2, DATETIMEOFFSET). Both stage as Var — the second group could be
-	// narrowed to Fixed once its per-column width is derived, which is a
-	// follow-up, not a correctness matter: Var stages the same bytes and only
-	// costs an offset/length pair per value.
-	ops.kind = StagingKind::Var;
-	// A non-MAX variable column declares its widest possible value, which bounds
-	// a whole chunk exactly. PLP/MAX declares nothing, so it stays 0 and the
-	// buffer finds its size from the data instead.
-	if (!column.IsPLPType() && column.max_length > 0) {
-		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
-	}
+	// Nothing above claimed it. The types that reach here are the legacy LOBs
+	// (TEXT / NTEXT / IMAGE) when they arrive without the catalog's server-side
+	// CAST, plus UDT and SQL_VARIANT — none of which the shipped row reader can
+	// decode either. Say so instead of inventing a framing.
+	ops.arm = AppendArm::Unsupported;
 	return ops;
 }
 

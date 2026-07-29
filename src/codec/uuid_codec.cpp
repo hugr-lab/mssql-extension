@@ -151,12 +151,16 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 // Issue-#89 fallback — render wire bytes as canonical lowercase text.
 //===----------------------------------------------------------------------===//
 
-std::string RenderAsString(const std::vector<uint8_t> &bytes) {
-	if (bytes.size() != GUID_WIRE_SIZE) {
-		throw InvalidInputException("codec::uuid::RenderAsString: expected 16 wire bytes, got %zu", bytes.size());
+std::string RenderAsString(const uint8_t *bytes, size_t size) {
+	if (size != GUID_WIRE_SIZE) {
+		throw InvalidInputException("codec::uuid::RenderAsString: expected 16 wire bytes, got %zu", size);
 	}
-	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes.data());
+	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes);
 	return UUID::ToString(guid);
+}
+
+std::string RenderAsString(const std::vector<uint8_t> &bytes) {
+	return RenderAsString(bytes.data(), bytes.size());
 }
 
 }  // namespace uuid

@@ -33,6 +33,17 @@ static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 //! the NULL marker cannot come from a conforming server, so it is a corrupt or
 //! hostile stream. Keeping the throw out of the append body keeps the hot arm
 //! down to a compare and a sized store.
+//! Cold: the extension has no framing for this wire type, so no value of it can
+//! be read. Thrown when a value ARRIVES, not at column resolution, so a query
+//! that selects such a column and returns no rows still succeeds.
+[[noreturn]] void ThrowUnsupportedType(const tds::ColumnMetadata &column) {
+	throw InvalidInputException(
+		"MSSQL: column '%s' arrives as TDS type 0x%02X, which this extension cannot decode. TEXT, NTEXT and IMAGE are "
+		"readable through a catalog scan (which casts them server-side) but not through raw mssql_scan(); UDT and "
+		"SQL_VARIANT are not supported at all. Cast the column in the query instead.",
+		column.name, column.type_id);
+}
+
 [[noreturn]] void ThrowBadPrefix(uint32_t expected, uint32_t actual) {
 	throw InvalidInputException(
 		"MSSQL: fixed-width column arrived with a %u-byte length prefix where %u or 0 (NULL) was required. The TDS "
@@ -187,6 +198,33 @@ inline size_t AppendPlp(ColumnStaging &st, const uint8_t *p) {
 	return offset;
 }
 
+//! Issue #89: the catalog's type and the wire type disagree, so no family
+//! kernel applies — the wire bytes would land in a vector of a different
+//! physical type. The shipped behaviour renders each value as text when the
+//! destination is VARCHAR, which is what a view with an inline CAST produces.
+//!
+//! Rendering a value as text has no bulk primitive, but this is still one loop
+//! per column with the dispatch resolved once, and the row walk keeps a single
+//! shape: the column stages exactly like any other.
+void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out) {
+	if (out.GetType().id() != LogicalTypeId::VARCHAR) {
+		// Anything else would be writing one physical type into another. The
+		// pre-staging path dispatched on the TDS type here and corrupted the
+		// vector; naming the mismatch is strictly better.
+		throw InvalidInputException(
+			"MSSQL: column '%s' is declared %s in the catalog but SQL Server returned TDS type 0x%02X. This happens "
+			"when a VIEW casts a column and the cached catalog is stale. Re-attach the database, or use mssql_scan() "
+			"with an explicit CAST.",
+			col.name, out.GetType().ToString(), col.type_id);
+	}
+	for (idx_t row = 0; row < count; row++) {
+		if (!st.IsValid(row)) {
+			continue;
+		}
+		tds::encoding::TypeConverter::WriteAsStringFallback(st.ValueAt(row), st.LengthAt(row), col, out, row);
+	}
+}
+
 }  // namespace
 
 void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, const std::vector<Vector *> &targets) {
@@ -195,7 +233,6 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 
 	const idx_t column_count = metadata.size();
 	ops_.assign(column_count, ColumnOps());
-	convert_nulls_.assign(column_count, 0);
 	chunk_nulls_.assign(column_count, 0);
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
@@ -208,7 +245,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 			continue;
 		}
 		ops_[i] = ResolveColumnOps(metadata[i], target->GetType());
-		if (ops_[i].arm < AppendArm::Convert) {
+		if (ops_[i].arm < AppendArm::Unsupported) {
 			arena_.Column(i).Configure(ops_[i].kind, ops_[i].stride, ops_[i].max_value_bytes);
 		}
 		if (ops_[i].arm == AppendArm::PlpStageString || ops_[i].arm == AppendArm::PlpStageBinary) {
@@ -223,8 +260,7 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 	targets_.assign(targets.begin(), targets.end());
 	targets_.resize(ops_.size(), nullptr);
 	for (idx_t i = 0; i < ops_.size(); i++) {
-		convert_nulls_[i] = 0;
-		if (ops_[i].arm >= AppendArm::Convert) {
+		if (ops_[i].arm >= AppendArm::Unsupported) {
 			continue;
 		}
 		// Direct columns write through the output vector's own storage, so the
@@ -313,13 +349,8 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		case AppendArm::PlpStageBinary:
 			p += AppendPlp<false>(arena_.Column(c), p);
 			break;
-		case AppendArm::Convert: {
-			bool is_null = false;
-			p += reader_->ReadValue(p, static_cast<size_t>(end - p), c, scratch_, is_null);
-			tds::encoding::TypeConverter::ConvertValue(scratch_, is_null, (*metadata_)[c], *targets_[c], row_idx);
-			convert_nulls_[c] += is_null ? 1 : 0;
-			break;
-		}
+		case AppendArm::Unsupported:
+			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
 			p += reader_->SkipValue(p, static_cast<size_t>(end - p), c);
 			break;
@@ -339,16 +370,11 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		// to be consulted before the arm — this is why the NBC walk is a separate
 		// function instead of a flag inside the regular one.
 		if ((bitmap[c >> 3] & (1u << (c & 7))) != 0) {
-			switch (ops_[c].arm) {
-			case AppendArm::Skip:
-				break;
-			case AppendArm::Convert:
-				FlatVector::SetNull(*targets_[c], row_idx, true);
-				convert_nulls_[c]++;
-				break;
-			default:
+			// A NULL in an NBC row carries no bytes at all, so even an
+			// unsupported type costs nothing here — it is only a value of one
+			// that cannot be read.
+			if (ops_[c].arm < AppendArm::Unsupported) {
 				arena_.Column(c).AppendNull();
-				break;
 			}
 			continue;
 		}
@@ -413,12 +439,8 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		case AppendArm::PlpStageBinary:
 			p += AppendPlp<false>(arena_.Column(c), p);
 			break;
-		case AppendArm::Convert: {
-			bool is_null = false;
-			p += reader_->ReadValueNBC(p, static_cast<size_t>(end - p), c, scratch_, is_null);
-			tds::encoding::TypeConverter::ConvertValue(scratch_, is_null, (*metadata_)[c], *targets_[c], row_idx);
-			break;
-		}
+		case AppendArm::Unsupported:
+			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
 			p += reader_->SkipValueNBC(p, static_cast<size_t>(end - p), c);
 			break;
@@ -430,12 +452,14 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 	const idx_t words = (row_count + 63) / 64;
 	for (idx_t c = 0; c < ops_.size(); c++) {
-		if (ops_[c].arm >= AppendArm::Convert) {
-			chunk_nulls_[c] = convert_nulls_[c];
+		if (ops_[c].arm >= AppendArm::Unsupported) {
+			chunk_nulls_[c] = 0;
 			continue;
 		}
 		const ColumnStaging &st = arena_.Column(c);
-		if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString) {
+		if (ops_[c].needs_value_fallback) {
+			FinalizeFallbackColumn(st, row_count, (*metadata_)[c], *targets_[c]);
+		} else if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString) {
 			// One conversion for the whole column (D5).
 			FinalizeStringColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
 		} else if (ops_[c].arm == AppendArm::P2StageBinary || ops_[c].arm == AppendArm::PlpStageBinary) {

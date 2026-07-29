@@ -617,41 +617,41 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 // RenderAsString (issue #89 fallback)
 //===----------------------------------------------------------------------===//
 
-std::string RenderAsString(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col) {
+std::string RenderAsString(const uint8_t *bytes, size_t size, const tds::ColumnMetadata &col) {
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
-		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
+		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes);
 		return FormatDateText(d);
 	}
 	case TDS_TYPE_TIME: {
-		dtime_t t = tds::encoding::DateTimeEncoding::ConvertTime(bytes.data(), col.scale);
+		dtime_t t = tds::encoding::DateTimeEncoding::ConvertTime(bytes, col.scale);
 		return FormatTimeText(t);
 	}
 	case TDS_TYPE_DATETIME: {
-		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
+		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes);
 		return FormatTimestampText(ts);
 	}
 	case TDS_TYPE_SMALLDATETIME: {
-		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes.data());
+		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes);
 		return FormatTimestampText(ts);
 	}
 	case TDS_TYPE_DATETIME2: {
-		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime2(bytes.data(), col.scale);
+		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime2(bytes, col.scale);
 		return FormatTimestampText(ts);
 	}
 	case TDS_TYPE_DATETIMEN: {
 		timestamp_t ts;
-		if (bytes.size() == 8) {
-			ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
-		} else if (bytes.size() == 4) {
-			ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes.data());
+		if (size == 8) {
+			ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes);
+		} else if (size == 4) {
+			ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes);
 		} else {
-			throw InvalidInputException("Invalid DATETIMEN length: %d", bytes.size());
+			throw InvalidInputException("Invalid DATETIMEN length: %d", size);
 		}
 		return FormatTimestampText(ts);
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
-		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes.data(), col.scale);
+		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes, col.scale);
 		// Wire stores UTC + display offset; render UTC text + +00:00 so
 		// downstream string consumers see an unambiguous instant.
 		return FormatTimestampText(ts) + FormatTzOffset(0);
@@ -659,6 +659,10 @@ std::string RenderAsString(const std::vector<uint8_t> &bytes, const tds::ColumnM
 	default:
 		throw InvalidInputException("codec::datetime::RenderAsString: unexpected TDS type 0x%02X", col.type_id);
 	}
+}
+
+std::string RenderAsString(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col) {
+	return RenderAsString(bytes.data(), bytes.size(), col);
 }
 
 }  // namespace datetime

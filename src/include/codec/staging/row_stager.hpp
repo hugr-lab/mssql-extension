@@ -119,13 +119,6 @@ private:
 	std::vector<ColumnOps> ops_;
 	//! Output vectors for this chunk, indexed by SQL column. Null for Skip.
 	std::vector<Vector *> targets_;
-	//! Reused per-value buffer for the Convert arm — the same single copy the
-	//! legacy path makes into RowData, not an extra one.
-	std::vector<uint8_t> scratch_;
-	//! NULLs counted on the Convert arm, per column. Incremented unconditionally:
-	//! that arm already pays for a full per-value conversion, so a branchless
-	//! add there is invisible, and it keeps a flag off the Direct arms entirely.
-	std::vector<idx_t> convert_nulls_;
 	//! Per-column NULL count for the chunk just finalized (D4 counters).
 	std::vector<idx_t> chunk_nulls_;
 	//! Columns whose staged size is not bounded by their declared width (PLP).

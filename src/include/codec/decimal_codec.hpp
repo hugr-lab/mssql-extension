@@ -69,11 +69,13 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // fixed-point string. Reused by the VARCHAR-fallback path in the
 // dispatcher (issue #89) — same output as FormatSqlLiteral on the
 // equivalent Value.
+std::string RenderAsString(const uint8_t *bytes, size_t size, uint8_t precision, uint8_t scale);
 std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale);
 
 // Render a SQL-Server MONEY (8-byte) or SMALLMONEY (4-byte) wire
 // payload as a fixed-point string with 4 decimal places. Used by the
 // VARCHAR-fallback for MONEY/SMALLMONEY/MONEYN columns.
+std::string RenderMoneyAsString(const uint8_t *bytes, size_t size);
 std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace decimal

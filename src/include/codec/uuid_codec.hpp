@@ -61,6 +61,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" form (no quotes). Used by the
 // issue-#89 VARCHAR-fallback path in TypeConverter::ConvertValue for
 // UNIQUEIDENTIFIER TDS payloads landing in a VARCHAR-typed vector.
+std::string RenderAsString(const uint8_t *bytes, size_t size);
 std::string RenderAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace uuid

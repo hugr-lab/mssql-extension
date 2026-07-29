@@ -218,24 +218,32 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 	return 45;
 }
 
-std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale) {
+std::string RenderAsString(const uint8_t *bytes, size_t size, uint8_t precision, uint8_t scale) {
 	(void)precision;  // SerializeDecimal does not need precision for fixed-point rendering.
-	hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertDecimal(bytes.data(), bytes.size());
+	hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertDecimal(bytes, size);
 	return MSSQLValueSerializer::SerializeDecimal(int_value, /*width*/ 38, scale);
 }
 
-std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes) {
+std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale) {
+	return RenderAsString(bytes.data(), bytes.size(), precision, scale);
+}
+
+std::string RenderMoneyAsString(const uint8_t *bytes, size_t size) {
 	// SQL Server MONEY is 8 bytes (value × 10000, scale 4). SMALLMONEY is 4 bytes
 	// (same scaling). Both map to DECIMAL(*, 4) for rendering.
 	hugeint_t int_value;
-	if (bytes.size() == 8) {
-		int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes.data());
-	} else if (bytes.size() == 4) {
-		int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes.data());
+	if (size == 8) {
+		int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes);
+	} else if (size == 4) {
+		int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes);
 	} else {
-		throw InvalidInputException("codec::decimal::RenderMoneyAsString: unexpected wire length %zu", bytes.size());
+		throw InvalidInputException("codec::decimal::RenderMoneyAsString: unexpected wire length %zu", size);
 	}
 	return MSSQLValueSerializer::SerializeDecimal(int_value, /*width*/ 19, /*scale*/ 4);
+}
+
+std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes) {
+	return RenderMoneyAsString(bytes.data(), bytes.size());
 }
 
 }  // namespace decimal
