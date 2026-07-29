@@ -211,10 +211,15 @@ private:
 		uint64_t string_bytes_out = 0;	// UTF-8 bytes written to string vectors
 		uint64_t plp_values = 0;		// non-NULL values in PLP (MAX-typed) columns
 		uint64_t utf16_fallbacks = 0;	// legacy-converter dispatches (invalid UTF-16)
-		uint64_t fill_total_us = 0;		// wall time inside FillChunk, accumulated
-		uint64_t fill_parse_us = 0;
-		uint64_t fill_read_us = 0;
-		uint64_t fill_process_us = 0;
+		// Phase timing, accumulated in NANOSECONDS. Microseconds were wrong here:
+		// these intervals are per row, a row is processed in ~100 ns, and
+		// duration_cast<microseconds> truncated every one of them to zero — so
+		// fill_process reported ~0 no matter how much work it did. Only the rare,
+		// long socket waits ever crossed a microsecond boundary.
+		uint64_t fill_total_ns = 0;	   // wall time inside FillChunk, accumulated
+		uint64_t fill_parse_ns = 0;	   // TDS token/row framing
+		uint64_t fill_read_ns = 0;	   // socket wait (server + network term)
+		uint64_t fill_process_ns = 0;  // per-value decode + chunk fill
 	};
 
 	// Count one processed row into counters_ (called from ProcessRow when
@@ -225,6 +230,13 @@ private:
 	void PrintDebugCounters();
 
 	bool counters_enabled_ = false;
+	// Phase timing is opt-in (MSSQL_DEBUG>=1), separately from the counters
+	// (>=2), because the FillChunk summary log lives at level 1. It has to be
+	// gated at all because steady_clock::now() costs ~15 ns per call on ARM64
+	// and the fill loop took FOUR of them per row — ~59 ns/row measured, on a
+	// path whose entire per-row budget is of that order. It was unconditional
+	// in release builds, so every user paid for instrumentation nobody read.
+	bool timing_enabled_ = false;
 	StreamDebugCounters counters_;
 	// Per-column decode family (value = codec::TypeFamily, 0xFF = unknown)
 	// and PLP-ness, precomputed once after COLMETADATA.

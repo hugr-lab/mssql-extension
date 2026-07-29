@@ -435,6 +435,15 @@ plain increments behind the existing debug-level check): draft §13 list verbati
 `string_row_fallbacks`, `embedded_nul_fallbacks`, `invalid_utf_fallbacks`, raw/materialized
 bytes, conversion ns). These are the calibration inputs for the §3.5 cost policy.
 
+**"Zero-cost when disabled" is a requirement, not a description — and it has been violated
+before.** Counting is cheap; *timing* is not. `FillChunk` carried four ungated
+`steady_clock::now()` calls per row from spec 004 through v0.2.2 — ~59 ns/row on ARM64, on a path
+whose entire per-row client budget is of that order; gating them cut live read cost by 23–64%
+(spec 055 D0, `test/bench/bench_results_live_server.md`). Any timer added here must be latched at
+construction and must accumulate in **nanoseconds**: the same code accumulated per-row intervals
+via `duration_cast<microseconds>`, which truncated every ~100 ns row to zero and made the phase
+it measured report approximately nothing.
+
 ---
 
 ## 8. Settings
