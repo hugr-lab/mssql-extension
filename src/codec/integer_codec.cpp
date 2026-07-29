@@ -88,8 +88,14 @@ const hugeint_t &MaxDecimal38() {
 }
 
 void CheckHugeintFitsDecimal38(const hugeint_t &value, const std::string &col_name) {
-	hugeint_t abs_value = value.upper < 0 ? Hugeint::Negate(value) : value;
-	if (Hugeint::GreaterThan(abs_value, MaxDecimal38())) {
+	// Bound both ends directly instead of negating `value`: Hugeint::Negate on
+	// HUGEINT min (-2^127) is itself out of int128 range, so the old
+	// abs-then-compare let that one value slip the guard (or threw a raw
+	// overflow). +/-(10^38-1) are both representable (< 2^127), so the range
+	// check is exact and keeps the column-named message for every input.
+	const hugeint_t &max = MaxDecimal38();
+	const hugeint_t min = Hugeint::Negate(max);
+	if (Hugeint::GreaterThan(value, max) || Hugeint::GreaterThan(min, value)) {
 		throw InvalidInputException(
 			"MSSQL: HUGEINT value %s in column \"%s\" is out of range for DECIMAL(38,0) (max 38 digits)",
 			Hugeint::ToString(value), col_name);

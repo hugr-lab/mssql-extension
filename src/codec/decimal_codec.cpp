@@ -81,8 +81,13 @@ void CheckMantissaFitsPrecision(const hugeint_t &value, const mssql::BCPColumnMe
 	if (col.precision == 0 || col.precision > 38) {
 		return;	 // malformed metadata — let the server decide
 	}
-	hugeint_t abs_value = value.upper < 0 ? Hugeint::Negate(value) : value;
-	if (Hugeint::GreaterThan(abs_value, Hugeint::POWERS_OF_TEN[col.precision] - 1)) {
+	// Bound both ends directly rather than negating `value` first: Hugeint::Negate
+	// on HUGEINT min (-2^127) overflows int128, so an abs-then-compare guard let
+	// that value slip (or threw a raw overflow). +/-(10^precision - 1) are both
+	// representable for precision <= 38, so the check is exact for every input.
+	const hugeint_t max = Hugeint::POWERS_OF_TEN[col.precision] - 1;
+	const hugeint_t min = Hugeint::Negate(max);
+	if (Hugeint::GreaterThan(value, max) || Hugeint::GreaterThan(min, value)) {
 		throw InvalidInputException(
 			"MSSQL: DECIMAL value (mantissa %s, scale %d) in column \"%s\" is out of range for DECIMAL(%d,%d)",
 			Hugeint::ToString(value), static_cast<int>(col.scale), col.name, static_cast<int>(col.precision),

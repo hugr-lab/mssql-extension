@@ -414,7 +414,11 @@ CODEC_TEST_ENCODING_SOURCES := \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
     src/tds/encoding/decimal_encoding.cpp \
-    src/tds/encoding/guid_encoding.cpp
+    src/tds/encoding/guid_encoding.cpp \
+    src/tds/encoding/bcp_row_encoder.cpp
+# bcp_row_encoder.cpp is required: integer/decimal EncodeToBcp call
+# BCPRowEncoder::EncodeDecimal, which is defined there (not in a codec source).
+# Without it `make test-codec-integer` / `test-codec-decimal` fail to link.
 # CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
 # migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
 CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)

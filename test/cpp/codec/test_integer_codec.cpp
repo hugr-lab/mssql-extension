@@ -28,6 +28,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -332,6 +333,90 @@ void TestEncodeToBcpUhugeint() {
 	}
 }
 
+void TestEncodeToBcpHugeintMinEdge() {
+	std::cout << "Test: EncodeToBcp HUGEINT min (-2^127) is rejected, not silently sent (#177 edge)\n";
+
+	// HUGEINT min = -2^127 has 39 digits, so it must be rejected like any other
+	// out-of-range value. It is the one input the old abs-then-compare guard
+	// could mishandle: Hugeint::Negate(min) is not representable in int128.
+	const hugeint_t int128_min(std::numeric_limits<int64_t>::min(), 0);
+	auto col = MakeDecimal38Col(LogicalType::HUGEINT);
+
+	// Value overload.
+	{
+		duckdb::vector<uint8_t> buf;
+		bool threw = false;
+		try {
+			duckdb::mssql::codec::integer::EncodeToBcp(Value::HUGEINT(int128_min), col, buf);
+		} catch (const duckdb::InvalidInputException &ex) {
+			threw = true;
+			CHECK_TRUE(std::string(ex.what()).find("out of range for DECIMAL(38,0)") != std::string::npos);
+		}
+		CHECK_TRUE(threw);
+		CHECK_TRUE(buf.empty());
+	}
+
+	// Vector overload — same rejection.
+	{
+		duckdb::Vector vec(LogicalType::HUGEINT);
+		vec.SetValue(0, Value::HUGEINT(int128_min));
+		duckdb::vector<uint8_t> buf;
+		bool threw = false;
+		try {
+			duckdb::mssql::codec::integer::EncodeToBcp(vec, 0, col, buf);
+		} catch (const duckdb::InvalidInputException &) {
+			threw = true;
+		}
+		CHECK_TRUE(threw);
+	}
+}
+
+void TestEncodeToBcpDictionaryConstantVectors() {
+	std::cout << "Test: EncodeToBcp reads CONSTANT/DICTIONARY vectors through the format (W1, spec 054)\n";
+
+	auto col = MakeDecimal38Col(LogicalType::HUGEINT);
+	const hugeint_t vals[] = {hugeint_t(0, 7), hugeint_t(0, 42), hugeint_t(-1), duckdb::Hugeint::POWERS_OF_TEN[38] - 1};
+
+	// Reference: flat-vector encode of a single value at row 0.
+	auto encode_flat = [&](const hugeint_t &v) {
+		duckdb::Vector fv(LogicalType::HUGEINT);
+		fv.SetValue(0, Value::HUGEINT(v));
+		duckdb::vector<uint8_t> b;
+		duckdb::mssql::codec::integer::EncodeToBcp(fv, 0, col, b);
+		return b;
+	};
+
+	// CONSTANT vector: any row index must resolve to the single constant value.
+	// (A raw FlatVector::GetData[row] read would walk off the 1-element array.)
+	{
+		duckdb::Vector cv(Value::HUGEINT(vals[1]));	 // Value ctor → constant vector
+		duckdb::vector<uint8_t> b;
+		duckdb::mssql::codec::integer::EncodeToBcp(cv, 3, col, b);
+		CHECK_TRUE(b == encode_flat(vals[1]));
+	}
+
+	// DICTIONARY vector: a reversing selection over a 4-value child. Row i must
+	// resolve through fmt.sel to child[3 - i] (a FlatVector::GetData[i] read
+	// would return the wrong element).
+	{
+		duckdb::Vector child(LogicalType::HUGEINT, 4);
+		for (idx_t i = 0; i < 4; i++) {
+			child.SetValue(i, Value::HUGEINT(vals[i]));
+		}
+		duckdb::SelectionVector sel(4);
+		for (idx_t i = 0; i < 4; i++) {
+			sel.set_index(i, 3 - i);
+		}
+		duckdb::Vector dv(LogicalType::HUGEINT);
+		dv.Slice(child, sel, 4);
+		for (idx_t i = 0; i < 4; i++) {
+			duckdb::vector<uint8_t> b;
+			duckdb::mssql::codec::integer::EncodeToBcp(dv, i, col, b);
+			CHECK_TRUE(b == encode_flat(vals[3 - i]));
+		}
+	}
+}
+
 }  // namespace
 
 int main() {
@@ -344,7 +429,9 @@ int main() {
 	TestNullLiteral();
 	TestEncodeToBcpHugeintRoundTrip();
 	TestEncodeToBcpHugeintRangeGuard();
+	TestEncodeToBcpHugeintMinEdge();
 	TestEncodeToBcpUhugeint();
+	TestEncodeToBcpDictionaryConstantVectors();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";
