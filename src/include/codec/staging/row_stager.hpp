@@ -84,6 +84,25 @@ public:
 	//! counted per value — a branch there would cost more than the append itself.
 	void FinalizeChunk(idx_t row_count, bool collect_nulls);
 
+	//! Has this chunk staged more than `budget` bytes in its MAX-typed columns?
+	//!
+	//! Checked once per ROW, so it must cost nothing when there is nothing to
+	//! check. A bounded column's whole chunk is at most max_length * 2048, so only
+	//! MAX-typed columns can reach a budget at all — and a result set that has
+	//! none exits on a member test, with no call and no loop. (It first shipped as
+	//! an out-of-line call summing every column, which cost a measured +5.8% on an
+	//! all-bigint scan that could never trip it.)
+	inline bool StagedBytesExceed(idx_t budget) const {
+		if (!has_unbounded_column_) {
+			return false;
+		}
+		idx_t total = 0;
+		for (idx_t i = 0; i < unbounded_columns_.size(); i++) {
+			total += arena_.Column(unbounded_columns_[i]).PayloadSize();
+		}
+		return total >= budget;
+	}
+
 	//! NULLs in column `c` during the chunk just finalized. Meaningful only when
 	//! FinalizeChunk was asked to collect them.
 	idx_t ChunkNulls(idx_t c) const {
@@ -109,6 +128,9 @@ private:
 	std::vector<idx_t> convert_nulls_;
 	//! Per-column NULL count for the chunk just finalized (D4 counters).
 	std::vector<idx_t> chunk_nulls_;
+	//! Columns whose staged size is not bounded by their declared width (PLP).
+	std::vector<idx_t> unbounded_columns_;
+	bool has_unbounded_column_ = false;
 	const std::vector<tds::ColumnMetadata> *metadata_ = nullptr;
 	unique_ptr<tds::RowReader> reader_;
 	bool configured_ = false;

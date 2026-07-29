@@ -259,9 +259,10 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 		return ops;
 	}
 
-	// UTF-16 string columns take the batch decode (D5). PLP/MAX is still excluded
-	// — its value arrives as a chunk list with no length known up front, which
-	// the Var slot cannot express yet.
+	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
+
+	// UTF-16 string columns take the batch decode (D5), MAX forms included: the
+	// chunk list is assembled incrementally into the same staged layout.
 	//
 	// NCHAR is included: its trailing-space trim moves to the OUTPUT, where it is
 	// equally correct on invalid UTF-16. See ColumnOps::trim_trailing_spaces.
@@ -279,6 +280,13 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// are — collation handling lives in the scan's SELECT list (spec 026), not
 	// here — so this is the same one-allocation-one-copy shape as VARBINARY.
 	const bool single_byte_char = column.type_id == tds::TDS_TYPE_BIGCHAR || column.type_id == tds::TDS_TYPE_BIGVARCHAR;
+	if ((single_byte_char || binary) && column.IsPLPType()) {
+		// VARCHAR(MAX) and VARBINARY(MAX): raw bytes either way, so the same
+		// kernel as their bounded forms.
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::PlpStageBinary;
+		return ops;
+	}
 	if (single_byte_char && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageBinary;
@@ -288,9 +296,7 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	}
 
 	// VARBINARY: no conversion at all, so the batch path is one allocation and
-	// one copy per column instead of one of each per value. PLP is excluded for
-	// the same reason as strings — the chunked form has no length up front.
-	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
+	// one copy per column instead of one of each per value.
 	if (binary && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageBinary;

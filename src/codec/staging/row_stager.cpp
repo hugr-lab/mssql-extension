@@ -25,6 +25,10 @@ namespace staging {
 
 namespace {
 
+//! PLP total-length markers (MS-TDS): all bits set means NULL, one less means
+//! the total is not declared and only the chunk terminator ends the value.
+static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
+
 //! Out of line and cold: a length prefix that is neither the declared width nor
 //! the NULL marker cannot come from a conforming server, so it is a corrupt or
 //! hostile stream. Keeping the throw out of the append body keeps the hot arm
@@ -146,6 +150,43 @@ inline size_t AppendStagedFixed(ColumnStaging &st, const uint8_t *p) {
 	}
 }
 
+//! Assemble one PLP value into the staging buffer. Returns bytes consumed.
+//!
+//! The value arrives as a chunk list whose total length may be declared UNKNOWN,
+//! which is why it cannot use the sized AppendVar: the slot is opened, extended
+//! per chunk, and only then given its length. `DELIMITED` appends the U+0000
+//! separator the UTF-16 batch decode splits on.
+//!
+//! No bounds tests: the caller is handed a row only once SkipRow has proved the
+//! whole of it is buffered, so every chunk header and every chunk body is here.
+template <bool DELIMITED>
+inline size_t AppendPlp(ColumnStaging &st, const uint8_t *p) {
+	uint64_t total;
+	std::memcpy(&total, p, 8);
+	if (total == PLP_NULL_MARKER) {
+		st.AppendNull();
+		return 8;
+	}
+	size_t offset = 8;
+	st.BeginVar();
+	while (true) {
+		uint32_t chunk_length;
+		std::memcpy(&chunk_length, p + offset, 4);
+		offset += 4;
+		if (chunk_length == 0) {
+			break;
+		}
+		std::memcpy(st.ExtendVar(chunk_length), p + offset, chunk_length);
+		offset += chunk_length;
+	}
+	if (DELIMITED) {
+		st.FinishVarDelimited();
+	} else {
+		st.FinishVar();
+	}
+	return offset;
+}
+
 }  // namespace
 
 void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, const std::vector<Vector *> &targets) {
@@ -156,6 +197,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 	ops_.assign(column_count, ColumnOps());
 	convert_nulls_.assign(column_count, 0);
 	chunk_nulls_.assign(column_count, 0);
+	unbounded_columns_.clear();
 	arena_.Configure(column_count);
 
 	for (idx_t i = 0; i < column_count; i++) {
@@ -169,7 +211,11 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 		if (ops_[i].arm < AppendArm::Convert) {
 			arena_.Column(i).Configure(ops_[i].kind, ops_[i].stride, ops_[i].max_value_bytes);
 		}
+		if (ops_[i].arm == AppendArm::PlpStageString || ops_[i].arm == AppendArm::PlpStageBinary) {
+			unbounded_columns_.push_back(i);
+		}
 	}
+	has_unbounded_column_ = !unbounded_columns_.empty();
 	configured_ = true;
 }
 
@@ -261,6 +307,12 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 			p += 2 + length;
 			break;
 		}
+		case AppendArm::PlpStageString:
+			p += AppendPlp<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::PlpStageBinary:
+			p += AppendPlp<false>(arena_.Column(c), p);
+			break;
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValue(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -355,6 +407,12 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 			p += 2 + length;
 			break;
 		}
+		case AppendArm::PlpStageString:
+			p += AppendPlp<true>(arena_.Column(c), p);
+			break;
+		case AppendArm::PlpStageBinary:
+			p += AppendPlp<false>(arena_.Column(c), p);
+			break;
 		case AppendArm::Convert: {
 			bool is_null = false;
 			p += reader_->ReadValueNBC(p, static_cast<size_t>(end - p), c, scratch_, is_null);
@@ -377,10 +435,10 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			continue;
 		}
 		const ColumnStaging &st = arena_.Column(c);
-		if (ops_[c].arm == AppendArm::P2StageString) {
+		if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString) {
 			// One conversion for the whole column (D5).
 			FinalizeStringColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
-		} else if (ops_[c].arm == AppendArm::P2StageBinary) {
+		} else if (ops_[c].arm == AppendArm::P2StageBinary || ops_[c].arm == AppendArm::PlpStageBinary) {
 			FinalizeBinaryColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
 		} else if (ops_[c].arm == AppendArm::P1StageDecimal) {
 			decimal::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);

@@ -318,6 +318,13 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 					stager_.StageRow(row, row_length, row_count);
 				}
 				row_count++;
+				// A MAX-typed column can stage megabytes per row, so a chunk is
+				// closed on staged BYTES as well as on rows. DataChunk is allowed
+				// to be short; without this, 2048 rows of large values would be
+				// buffered in full before DuckDB saw any of them.
+				if (stager_.StagedBytesExceed(mssql::codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES)) {
+					goto exit_loop;
+				}
 			} else {
 				ProcessRow(chunk, row_count++);
 			}

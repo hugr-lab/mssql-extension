@@ -64,11 +64,24 @@ namespace staging {
 //! finalize can memcpy them straight into the output vector.
 static const idx_t VALIDITY_WORDS_PER_CHUNK = (STANDARD_VECTOR_SIZE + 63) / 64;
 
-//! Offsets into a column's per-chunk payload are uint32_t. This cap keeps every
-//! offset representable with a wide margin and turns a corrupt length prefix
-//! into a clear error rather than a wrapped offset. A single chunk of 2048
-//! values would have to average 128 KB each to reach it.
-static const idx_t MAX_STAGING_PAYLOAD_BYTES = 256ULL * 1024ULL * 1024ULL;
+//! Offsets into a column's per-chunk payload are uint32_t, so this is the point
+//! past which one would wrap. It is set just under 2 GB, which is also SQL
+//! Server's own limit for a MAX-typed value — so a single legal value always
+//! fits, and anything past it is a corrupt length rather than data.
+//!
+//! This is NOT the memory policy. A chunk stops accepting rows long before
+//! here, at STAGING_CHUNK_PAYLOAD_BUDGET_BYTES; the cap only exists to make the
+//! arithmetic safe.
+static const idx_t MAX_STAGING_PAYLOAD_BYTES = 2047ULL * 1024ULL * 1024ULL;
+
+//! Total staged bytes across a chunk's columns after which the chunk is closed
+//! early, even though it holds fewer than STANDARD_VECTOR_SIZE rows.
+//!
+//! Only MAX-typed columns can reach it: a bounded column's whole chunk is at
+//! most max_length * 2048. Without it, 2048 rows of megabyte blobs would stage
+//! gigabytes before anything was handed to DuckDB. A DataChunk is allowed to be
+//! short, so ending early costs a slightly smaller chunk and nothing else.
+static const idx_t STAGING_CHUNK_PAYLOAD_BUDGET_BYTES = 32ULL * 1024ULL * 1024ULL;
 
 //! Per-column budget for preallocating a column's PROVABLE worst case.
 //!
@@ -347,6 +360,46 @@ struct ColumnStaging {
 		if (length > 0) {
 			std::memcpy(dst, src, length);
 		}
+	}
+
+	//===--------------------------------------------------------------------===//
+	// Incremental variable-length append (PLP)
+	//===--------------------------------------------------------------------===//
+	//
+	// A PLP value arrives as a chunk list and may declare its total length
+	// UNKNOWN, so the slot cannot be sized up front the way AppendVarSlot needs.
+	// Begin/Extend/Finish record the offset first, grow as chunks arrive, and
+	// only then write the length.
+
+	inline void BeginVar() {
+		offsets[count] = static_cast<uint32_t>(payload_used);
+	}
+
+	//! Reserve `length` more bytes for the value being built and return where to
+	//! write them.
+	inline uint8_t *ExtendVar(uint32_t length) {
+		const idx_t offset = payload_used;
+		const idx_t needed = offset + length;
+		if (needed > buffer.size()) {
+			GrowPayload(needed);
+		}
+		payload_used = needed;
+		return buffer.data() + offset;
+	}
+
+	//! Close the value: everything appended since BeginVar is its content.
+	inline void FinishVar() {
+		lengths[count] = static_cast<uint32_t>(payload_used - offsets[count]);
+		count++;
+	}
+
+	//! Close a value that carries a trailing delimiter, which is NOT part of it.
+	inline void FinishVarDelimited() {
+		uint8_t *dst = ExtendVar(2);
+		dst[0] = 0;
+		dst[1] = 0;
+		lengths[count] = static_cast<uint32_t>(payload_used - offsets[count] - 2);
+		count++;
 	}
 
 	//! Stage a UTF-16LE value followed by a U+0000 code unit.

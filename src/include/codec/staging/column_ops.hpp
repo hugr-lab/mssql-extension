@@ -59,6 +59,12 @@ enum class AppendArm : uint8_t {
 	//! column-invariant, so the row loop carries neither.
 	P1StageFixed,
 	RawStageFixed,
+	//! MAX-typed columns (NVARCHAR(MAX), VARCHAR(MAX), VARBINARY(MAX), XML). The
+	//! value arrives as a chunk list, possibly with its total length declared
+	//! UNKNOWN, so it is assembled incrementally into the same Var slot the
+	//! non-MAX forms use — and finalizes through the very same kernels.
+	PlpStageString,
+	PlpStageBinary,
 	//! DECIMAL/NUMERIC. Its own arm because it is the one fixed-width family
 	//! whose wire value may legitimately be SHORTER than the declared width;
 	//! the append zero-extends instead of rejecting it.
