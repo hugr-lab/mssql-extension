@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -404,47 +404,43 @@ test-column-staging: release
 	@echo ""
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
 
-# Spec 059 D1b: the staged path's ROW / NBCROW walks over synthetic rows.
+# Staged-read-path C++ tests (specs 055 / 059).
 #
-# Links more than test-column-staging because it drives the whole walk: every
-# family codec (the finalize kernels), the encoding helpers they call, and the
-# legacy row reader (the Skip arm). Nothing here reaches target_resolver, so the
-# catalog is not dragged in and this stays a unit test.
+# Both targets go through test/cpp/codec/run_staging_test.sh so the source list
+# lives in exactly ONE place, shared with the CI job — a second copy is exactly
+# the drift the framing test exists to catch. The vcpkg prefix is passed in
+# rather than derived inside the script: make and CI each already know their own
+# triplet.
 #
-# NOT compiled with -DNDEBUG, on purpose: both walks end with
-# `D_ASSERT(p == end)`, which is the framing check — it fires when a walk
-# consumes a different number of bytes than the row holds.
-ROW_STAGER_TEST_VCPKG_INSTALLED := build/release/vcpkg_installed
-ROW_STAGER_TEST_VCPKG_TRIPLET := $(shell ls $(ROW_STAGER_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
-ROW_STAGER_TEST_FLAGS := -std=c++17 -O1 -pthread -Wno-deprecated-declarations
+# test-row-stager         (spec 059 D1b) — the ROW / NBCROW walks over synthetic
+#                         rows, decoded and checked value by value.
+# test-row-stager-framing (spec 055 T5)  — the same walks pinned against
+#                         RowReader::SkipRow, which is what makes their absence
+#                         of per-value bounds checks safe.
+#
+# ASan hangs at process init on Darwin 25.5, so on a macOS dev box the sanitized
+# binary cannot run at all and SANITIZE=0 is passed there. That keeps the
+# assertions; CI runs both legs sanitized (its macOS runner is older and fine),
+# so the heap-over-read half is covered there.
+STAGING_TEST_SANITIZE := $(shell [ "$$(uname)" = "Darwin" ] && echo 0 || echo 1)
+
 test-row-stager: release
-	@echo "Building RowStager unit test (spec 059 D1b)..."
-	@mkdir -p build/test
-	@if [ -z "$(ROW_STAGER_TEST_VCPKG_TRIPLET)" ]; then \
-		echo "ERROR: $(ROW_STAGER_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
 		exit 1; \
 	fi
-	$(CXX) $(ROW_STAGER_TEST_FLAGS) -I src/include -I duckdb/src/include \
-	    -I $(ROW_STAGER_TEST_VCPKG_INSTALLED)/$(ROW_STAGER_TEST_VCPKG_TRIPLET)/include \
-	    test/cpp/codec/test_row_stager.cpp \
-	    $(wildcard src/codec/*.cpp) \
-	    src/codec/staging/column_staging.cpp \
-	    src/codec/staging/column_ops.cpp \
-	    src/codec/staging/row_stager.cpp \
-	    src/tds/encoding/utf16.cpp \
-	    src/tds/encoding/datetime_encoding.cpp \
-	    src/tds/encoding/decimal_encoding.cpp \
-	    src/tds/encoding/guid_encoding.cpp \
-	    src/tds/encoding/bcp_row_encoder.cpp \
-	    src/tds/encoding/type_converter.cpp \
-	    src/tds/tds_row_reader.cpp \
-	    src/tds/tds_column_metadata.cpp \
-	    src/tds/tds_types.cpp \
-	    -L $(ROW_STAGER_TEST_VCPKG_INSTALLED)/$(ROW_STAGER_TEST_VCPKG_TRIPLET)/lib -lsimdutf \
-	    -L build/release/src -lduckdb \
-	    -o build/test/test_row_stager
-	@echo ""
-	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_row_stager
+	SANITIZE=$(STAGING_TEST_SANITIZE) test/cpp/codec/run_staging_test.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) \
+	    test/cpp/codec/test_row_stager.cpp build/release
+
+test-row-stager-framing: release
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	SANITIZE=$(STAGING_TEST_SANITIZE) test/cpp/codec/run_staging_test.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) \
+	    test/cpp/codec/test_row_stager_framing.cpp build/release
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs

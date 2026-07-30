@@ -10,10 +10,24 @@ The data is fetched and aggregated *with DuckDB itself* (dogfooding) — the sam
         the same snapshot archived once per ISO week -> our time series.
 
 DuckDB (httpfs + read_json) does the fetch/aggregation; this script renders the
-result into docs/assets/download-metrics.svg (a self-contained SVG line chart
-that GitHub renders inline — README HTML is sanitized, so no JS/WASM there) and
-rewrites the managed block in README.md delimited by
-  <!-- DOWNLOAD-METRICS:START --> ... <!-- DOWNLOAD-METRICS:END -->
+result into a self-contained SVG line chart (GitHub sanitizes README HTML, so no
+JS/WASM there) and can rewrite the managed blocks in README.md delimited by
+  <!-- METRICS-BADGES:START --> ... <!-- METRICS-BADGES:END -->
+  <!-- METRICS-CHART:START --> ... <!-- METRICS-CHART:END -->
+
+Two modes:
+
+  --svg-only PATH   render the chart to PATH and touch nothing else. This is
+                    what the weekly workflow uses: the SVG is published to
+                    GitHub Pages, so the chart stays current with NO commit to
+                    the repository. `main` is a protected branch — a scheduled
+                    job cannot push to it, and used to fail every Monday with
+                    GH006 for exactly that reason.
+
+  (no arguments)    additionally rewrite the README blocks. Run by hand when the
+                    badge row or the chart section itself changes; the numbers in
+                    them are live (a dynamic shields badge, a Pages-hosted image)
+                    and do not need a weekly commit.
 
 See https://duckdb.org/community_extensions/download_metrics
 """
@@ -365,22 +379,30 @@ def pages_url():
 
 
 def build_chart_block(version, total_last_week):
-    today = datetime.date.today().isoformat()
+    """The chart section. Deliberately carries NO numbers of its own.
+
+    Anything written here can only change by committing to `main`, which is
+    protected — so the freshness lives outside the file instead: the chart is an
+    image served from GitHub Pages and regenerated weekly, and the downloads
+    figure is a dynamic shields badge in the row above. `version` and
+    `total_last_week` stay in the signature because the caller has them and a
+    future block may want them; today they are only logged.
+    """
     return "\n".join(
         [
             CHART_BEGIN,
             "",
             "### 📈 Community Extension Downloads",
             "",
-            "![Weekly downloads of the mssql DuckDB community extension](docs/assets/download-metrics.svg)",
+            "[![Weekly downloads of the mssql DuckDB community extension](%sdownload-metrics.svg)](%s)"
+            % (pages_url(), "https://duckdb.org/community_extensions/download_metrics"),
             "",
             "📊 **[Interactive chart](%s)** — queried live in your browser with DuckDB-Wasm." % pages_url(),
             "",
-            "> Latest published version **v%s** · **%s** downloads in the trailing 7 days "
-            "(snapshot %s UTC). Counts are a Cloudflare estimate of `INSTALL mssql FROM community` "
-            "events, aggregated across DuckDB versions and platforms. "
-            "Source: [DuckDB Community Extensions download metrics](https://duckdb.org/community_extensions/download_metrics)."
-            % (version, fmt_full(total_last_week), today),
+            "> Regenerated weekly and served from GitHub Pages, so it stays current without a commit. "
+            "Counts are a Cloudflare estimate of `INSTALL mssql FROM community` events, aggregated "
+            "across DuckDB versions and platforms. "
+            "Source: [DuckDB Community Extensions download metrics](https://duckdb.org/community_extensions/download_metrics).",
             "",
             CHART_END,
         ]
@@ -414,6 +436,19 @@ def splice_chart(text, block):
 
 # --------------------------------------------------------------------------- #
 def main():
+    svg_out = SVG
+    readme = True
+    args = sys.argv[1:]
+    if args and args[0] == "--svg-only":
+        if len(args) != 2:
+            print("usage: update_download_metrics.py [--svg-only PATH]", file=sys.stderr)
+            return 2
+        svg_out = args[1]
+        readme = False
+    elif args:
+        print("usage: update_download_metrics.py [--svg-only PATH]", file=sys.stderr)
+        return 2
+
     try:
         total_last_week = fetch_total_last_week()
         points = fetch_series()
@@ -425,10 +460,13 @@ def main():
           % (version, total_last_week, len(points)))
 
     # SVG
-    os.makedirs(os.path.dirname(SVG), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(svg_out)), exist_ok=True)
     svg = build_svg(points, total_last_week)
-    with open(SVG, "w", encoding="utf-8") as fh:
+    with open(svg_out, "w", encoding="utf-8") as fh:
         fh.write(svg)
+    print("wrote %s" % svg_out)
+    if not readme:
+        return 0
 
     # README
     with open(README, encoding="utf-8") as fh:
