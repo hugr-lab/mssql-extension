@@ -1,0 +1,134 @@
+# name: test/sql/query/nbc_row.test
+# description: NBCROW (0xD2) rows round-trip through the staged read path
+# group: [query]
+
+# SQL Server sends a row as NBCROW (0xD2) — a null bitmap ahead of the values,
+# with the NULL columns carrying no bytes at all — only when the bitmap is
+# CHEAPER than the per-value NULL markers it replaces. That is pure byte
+# economics, measured against a live server while writing this file:
+#
+#   bitmap size   = ceil(columns / 8) bytes
+#   markers saved = 1 byte per NULL in a fixed-width column (the zero length
+#                   prefix), 2 for NVARCHAR/VARBINARY (0xFFFF), 8 for a MAX type
+#                   (the PLP NULL marker)
+#
+# So two NULL integers among eleven columns is a TIE — 2 bytes either way — and
+# the server sends a plain ROW (0xD1). Not knowing that is how this fixture was
+# first written to test the wrong walk while passing.
+#
+# The NBC walk had no coverage at all before spec 059: every other .test file
+# here is far narrower, so none of them ever produced one, and the walk shipped
+# with an out-of-bounds read (PR #213). Both scans below were confirmed 0xD2 with
+# MSSQL_DEBUG=2 — all six rows of the small fixture, all 3000 of the bulk one.
+#
+# The per-arm assertions and the nbc_rows counter live in
+# test/cpp/codec/test_row_stager.cpp, which needs no server.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS nbc_db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('nbc_db', 'DROP TABLE IF EXISTS dbo.NbcRowTest');
+
+# Ten nullable columns spanning all three staging shapes: Direct (int/bigint/bit
+# go straight into the output vector), Fixed (decimal/date/guid/money stage for a
+# batch kernel) and Var (nvarchar/varbinary/nvarchar(max)).
+statement ok
+SELECT mssql_exec('nbc_db', 'CREATE TABLE dbo.NbcRowTest (
+    id INT NOT NULL,
+    i INT NULL,
+    b BIGINT NULL,
+    flag BIT NULL,
+    amount DECIMAL(18,2) NULL,
+    d DATE NULL,
+    g UNIQUEIDENTIFIER NULL,
+    m MONEY NULL,
+    s NVARCHAR(50) NULL,
+    v VARBINARY(16) NULL,
+    big NVARCHAR(MAX) NULL)');
+
+# Each row's NULLs are placed so the bitmap actually pays for itself: every row
+# NULLs at least one column whose plain-ROW marker is wider than a byte —
+# NVARCHAR(MAX) alone costs 8 (the PLP NULL marker), NVARCHAR and VARBINARY 2.
+# Two one-byte NULLs of eleven columns is a TIE against the 2-byte bitmap and
+# the server sends a plain ROW; verified with MSSQL_DEBUG=2 while writing this.
+#
+# Each column is also NULL in some row and present in another, so both halves of
+# every arm run.
+statement ok
+SELECT mssql_exec('nbc_db', 'INSERT INTO dbo.NbcRowTest (id, i, b, flag, amount, d, g, m, s, v, big) VALUES
+    (1, NULL, NULL, 1, 123.45, ''2024-01-15'', ''12345678-9abc-def0-1122-334455667788'', 12.3456, N''first'', 0x0102, NULL),
+    (2, 42, 9876543210, NULL, NULL, ''2024-02-29'', ''00000000-0000-0000-0000-000000000001'', 0.0001, N''second'', NULL, N''plp two''),
+    (3, -7, -1, 0, -0.05, NULL, NULL, -99.9999, NULL, 0x, N''''),
+    (4, 0, 0, 1, 0.00, ''0001-01-01'', ''ffffffff-ffff-ffff-ffff-ffffffffffff'', 0, NULL, NULL, NULL),
+    (5, 2147483647, 9223372036854775807, 0, 9999999999999999.99, ''9999-12-31'', ''abcdefab-cdef-abcd-efab-cdefabcdefab'', NULL, N''fifth'', 0xDEADBEEF, NULL),
+    (6, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)');
+
+# Row 3 is checked separately below: it carries EMPTY values, which a
+# tab-separated expectation block cannot express unambiguously.
+query IIIIITTTTTT
+SELECT id, i, b, flag, amount, d, g, m, s, to_hex(v), big
+FROM nbc_db.dbo.NbcRowTest WHERE id <> 3 ORDER BY id;
+----
+1	NULL	NULL	true	123.45	2024-01-15	12345678-9abc-def0-1122-334455667788	12.3456	first	0102	NULL
+2	42	9876543210	NULL	NULL	2024-02-29	00000000-0000-0000-0000-000000000001	0.0001	second	NULL	plp two
+4	0	0	true	0.00	0001-01-01	ffffffff-ffff-ffff-ffff-ffffffffffff	0.0000	NULL	NULL	NULL
+5	2147483647	9223372036854775807	false	9999999999999999.99	9999-12-31	abcdefab-cdef-abcd-efab-cdefabcdefab	NULL	fifth	DEADBEEF	NULL
+6	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+# Row 3: an empty NVARCHAR(MAX) and an empty VARBINARY are values, not NULLs —
+# a zero-length PLP value and a zero-length P2 value respectively, which the
+# staged path must distinguish from the NULL forms (0xFFFF... and 0xFFFF).
+query IIIIIII
+SELECT id, i, b, flag, amount, length(big), octet_length(v)
+FROM nbc_db.dbo.NbcRowTest WHERE id = 3;
+----
+3	-7	-1	false	-0.05	0	0
+
+# Row 6 is entirely NULL past the id: the wire form is a bitmap and nothing else.
+query I
+SELECT COUNT(*) FROM nbc_db.dbo.NbcRowTest
+WHERE id = 6 AND i IS NULL AND b IS NULL AND flag IS NULL AND amount IS NULL AND d IS NULL
+  AND g IS NULL AND m IS NULL AND s IS NULL AND v IS NULL AND big IS NULL;
+----
+1
+
+# Now across a chunk boundary. STANDARD_VECTOR_SIZE is 2048, so 3000 rows means
+# the arena is reused and BeginChunk re-takes the Direct columns' destination —
+# untested before spec 059, because every other fixture here is a handful of
+# rows. Generated server-side rather than by a client loop.
+statement ok
+SELECT mssql_exec('nbc_db', 'INSERT INTO dbo.NbcRowTest (id, i, b, flag, amount, d, g, m, s, v, big)
+SELECT TOP 3000
+    1000 + ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 3 = 0 THEN NULL ELSE 7 END,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 3 = 1 THEN NULL ELSE 8 END,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 2 = 0 THEN NULL ELSE 1 END,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 2 = 1 THEN NULL ELSE 1.50 END,
+    NULL, NULL, NULL,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 5 = 0 THEN NULL ELSE N''bulk'' END,
+    NULL,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 7 = 0 THEN NULL ELSE N''bulk plp'' END
+FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+# Every column is aggregated in ONE query on purpose: a narrower projection is a
+# narrower result set, and the server would then price the bitmap against fewer
+# NULLs and send plain ROWs — the fixture would keep passing while testing the
+# other walk again. COUNT(col) counts non-NULLs, so this pins the bitmap; the
+# SUMs pin the values that travelled beside it.
+query IIIIIIIIIIIIII
+SELECT COUNT(*), COUNT(i), COUNT(b), COUNT(flag), COUNT(amount), COUNT(d), COUNT(g), COUNT(m),
+       COUNT(s), COUNT(v), COUNT(big), SUM(i), SUM(b), SUM(amount)
+FROM nbc_db.dbo.NbcRowTest WHERE id > 1000;
+----
+3000	2000	2000	1500	1500	0	0	0	2400	0	2572	14000	16000	2250.00
+
+statement ok
+SELECT mssql_exec('nbc_db', 'DROP TABLE dbo.NbcRowTest');
+
+statement ok
+DETACH nbc_db;

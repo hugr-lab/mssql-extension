@@ -365,7 +365,7 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 	}
 }
 
-void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
+size_t RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 	const uint8_t *p = row;
 	const uint8_t *const end = row + row_length;
 	const idx_t column_count = ops_.size();
@@ -458,9 +458,13 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 		}
 	}
 	D_ASSERT(p == end);
+	return static_cast<size_t>(p - row);
 }
 
-void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
+size_t RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
+	if (counters_enabled_) {
+		counters_.nbc_rows++;
+	}
 	const idx_t column_count = ops_.size();
 	const uint8_t *const bitmap = row;
 	const uint8_t *p = row + (column_count + 7) / 8;
@@ -565,6 +569,7 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		}
 	}
 	D_ASSERT(p == end);
+	return static_cast<size_t>(p - row);
 }
 
 void RowStager::FinalizeChunk(idx_t row_count) {

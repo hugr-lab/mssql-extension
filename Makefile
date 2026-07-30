@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -403,6 +403,48 @@ test-column-staging: release
 	    -o build/test/test_column_staging
 	@echo ""
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
+
+# Spec 059 D1b: the staged path's ROW / NBCROW walks over synthetic rows.
+#
+# Links more than test-column-staging because it drives the whole walk: every
+# family codec (the finalize kernels), the encoding helpers they call, and the
+# legacy row reader (the Skip arm). Nothing here reaches target_resolver, so the
+# catalog is not dragged in and this stays a unit test.
+#
+# NOT compiled with -DNDEBUG, on purpose: both walks end with
+# `D_ASSERT(p == end)`, which is the framing check — it fires when a walk
+# consumes a different number of bytes than the row holds.
+ROW_STAGER_TEST_VCPKG_INSTALLED := build/release/vcpkg_installed
+ROW_STAGER_TEST_VCPKG_TRIPLET := $(shell ls $(ROW_STAGER_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
+ROW_STAGER_TEST_FLAGS := -std=c++17 -O1 -pthread -Wno-deprecated-declarations
+test-row-stager: release
+	@echo "Building RowStager unit test (spec 059 D1b)..."
+	@mkdir -p build/test
+	@if [ -z "$(ROW_STAGER_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(ROW_STAGER_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(ROW_STAGER_TEST_FLAGS) -I src/include -I duckdb/src/include \
+	    -I $(ROW_STAGER_TEST_VCPKG_INSTALLED)/$(ROW_STAGER_TEST_VCPKG_TRIPLET)/include \
+	    test/cpp/codec/test_row_stager.cpp \
+	    $(wildcard src/codec/*.cpp) \
+	    src/codec/staging/column_staging.cpp \
+	    src/codec/staging/column_ops.cpp \
+	    src/codec/staging/row_stager.cpp \
+	    src/tds/encoding/utf16.cpp \
+	    src/tds/encoding/datetime_encoding.cpp \
+	    src/tds/encoding/decimal_encoding.cpp \
+	    src/tds/encoding/guid_encoding.cpp \
+	    src/tds/encoding/bcp_row_encoder.cpp \
+	    src/tds/encoding/type_converter.cpp \
+	    src/tds/tds_row_reader.cpp \
+	    src/tds/tds_column_metadata.cpp \
+	    src/tds/tds_types.cpp \
+	    -L $(ROW_STAGER_TEST_VCPKG_INSTALLED)/$(ROW_STAGER_TEST_VCPKG_TRIPLET)/lib -lsimdutf \
+	    -L build/release/src -lduckdb \
+	    -o build/test/test_row_stager
+	@echo ""
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_row_stager
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs

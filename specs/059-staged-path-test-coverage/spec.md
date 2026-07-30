@@ -50,22 +50,40 @@ is why this spec is small.
 ### The verified recipe
 
 SQL Server emits NBCROW only when the null bitmap costs less than the per-value
-NULL markers it replaces. Measured against a real server, table of 8 columns:
+NULL markers it replaces. **It is byte economics, not a column count** — the
+"≥ 8 columns and ≥ 2 NULLs" rule this spec first recorded is an approximation
+that misleads: it is right for 8 columns of integers and wrong for 11.
 
-| row | token |
-| --- | --- |
-| 1 NULL of 8 columns | `0xD1` ROW |
-| **2 NULLs of 8 columns** | **`0xD2` NBCROW** |
-| all NULL | `0xD2` NBCROW |
+```
+bitmap size   = ceil(columns / 8) bytes
+markers saved = 1 byte per NULL in a fixed-width column (the zero length prefix)
+                2 for NVARCHAR / VARBINARY (0xFFFF)
+                8 for a MAX type (the PLP NULL marker)
+```
 
-So: **≥ 8 nullable columns and ≥ 2 NULLs per row**. Anything narrower silently
-gets a plain ROW and the test measures nothing — which is exactly how the path
-ended up with no coverage.
+NBCROW is sent when the second exceeds the first. Measured against a live
+server, 2026-07-30, on an 11-column table:
+
+| row | saved | bitmap | token |
+| --- | --- | --- | --- |
+| 2 NULL integers | 2 | 2 | `0xD1` ROW (a tie loses) |
+| 2 NULL integers + 1 NULL `NVARCHAR(MAX)` | 10 | 2 | `0xD2` NBCROW |
+| all NULL | 27 | 2 | `0xD2` NBCROW |
+
+The first row of that table is how `nbc_row.test` was first written: it passed
+while testing the other walk.
+
+**Projection width is part of the recipe.** The server prices the bitmap against
+the RESULT SET, not the table, so a query that projects four columns of an
+eleven-column fixture gets plain ROWs. Every NBC assertion must therefore be
+made through a wide projection — which is why the bulk case in `nbc_row.test`
+aggregates all eleven columns in one query rather than in three readable ones.
 
 Confirm the token with `MSSQL_DEBUG=2` and
-`grep -c "token_type=0xD2"`; the parser logs every token type.
+`grep -o "token_type=0xD[12]" | sort | uniq -c`; the parser logs every token
+type.
 
-### D1a — a counter, so the test cannot lie
+### D1a — a counter, so the test cannot lie — **DONE**
 
 Add `nbc_rows` to the D10 staging counters (`StagingCounters`, incremented in
 `StageNBCRow` — once per ROW, not per value). Without it, an NBCROW test that
@@ -73,7 +91,15 @@ stops producing NBCROWs — a server upgrade changes the heuristic, a column is
 added, the fixture drifts — keeps passing while testing the other walk. With it,
 the test asserts the path was entered.
 
-### D1b — unit tests over synthetic NBC rows
+**As landed it sits behind `counters_enabled_`, like every other counter here.**
+The first version did not, on the argument that a counter gated at
+`MSSQL_DEBUG>=2` cannot be asserted by a test — which is false for a unit test
+that constructs its own `RowStager` and can simply call `EnableCounters()`. The
+walks must not carry work that exists only for a test; and gated, the counter is
+still real diagnostics, because which of the two walks a workload spends its
+time in is not something the schema tells you.
+
+### D1b — unit tests over synthetic NBC rows — **DONE**
 
 `StageNBCRow` takes a raw byte pointer, so the tests construct rows directly and
 need no server. Cases:
@@ -88,11 +114,27 @@ need no server. Cases:
   the byte boundary;
 - all columns NULL — the row is bitmap-only, zero value bytes.
 
-### D1c — one integration test that actually produces NBCROWs
+Landed as `test/cpp/codec/test_row_stager.cpp` (`make test-row-stager`, wired
+into CI beside `test_column_staging`), with one case beyond the list above: the
+same logical row staged through BOTH walks, asserted to produce identical
+output. Every arm's wire bytes are hand-written, which is the third independent
+statement of the framing that D2 needs anyway.
 
-`test/sql/query/nbc_row.test`: 8+ nullable columns of mixed families (one
-Direct, one Fixed, one Var), rows carrying 2+ NULLs each, > 2048 rows so it
-crosses a chunk boundary as well. Asserts values and NULLs round-trip.
+Two mutants were run to prove the tests can fail: inverting the bitmap
+convention in the builder, and reverting the PR #213 guard. The first reports
+failures AND trips `D_ASSERT(p == end)`; the second aborts on that assertion
+inside the 0xFFFF case. So the debug-build lever below is already doing its job.
+
+### D1c — one integration test that actually produces NBCROWs — **DONE**
+
+`test/sql/query/nbc_row.test`: eleven columns of mixed families (Direct, Fixed,
+Var, PLP), each row NULLing at least one wide-marker column so the bitmap
+actually pays for itself, plus a 3000-row bulk case that crosses the 2048-row
+chunk boundary. Asserts values and NULLs round-trip, including empty-vs-NULL for
+a zero-length `NVARCHAR(MAX)` and `VARBINARY`.
+
+Both scans verified 0xD2 with `MSSQL_DEBUG=2` — and the first draft of the
+fixture was NOT, which is why the recipe above was rewritten.
 
 ---
 

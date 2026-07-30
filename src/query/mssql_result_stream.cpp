@@ -660,12 +660,14 @@ void MSSQLResultStream::PrintStagingCounters() {
 				 static_cast<double>(sc.kernel_ns[k]) / static_cast<double>(sc.kernel_values[k]));
 		kernels += buf;
 	}
-	if (kernels.empty() && sc.direct_values == 0) {
+	if (kernels.empty() && sc.direct_values == 0 && sc.nbc_rows == 0) {
 		return;
 	}
-	fprintf(stderr, "[MSSQL COUNTERS]   staging: direct_bypass=%llu grow=%llu shrink=%llu peak_payload=%lluB\n",
-			(unsigned long long)sc.direct_values, (unsigned long long)arena.GrowEvents(),
-			(unsigned long long)arena.ShrinkEvents(), (unsigned long long)arena.PeakPayloadBytes());
+	fprintf(stderr,
+			"[MSSQL COUNTERS]   staging: direct_bypass=%llu nbc_rows=%llu grow=%llu shrink=%llu peak_payload=%lluB\n",
+			(unsigned long long)sc.direct_values, (unsigned long long)sc.nbc_rows,
+			(unsigned long long)arena.GrowEvents(), (unsigned long long)arena.ShrinkEvents(),
+			(unsigned long long)arena.PeakPayloadBytes());
 	fprintf(stderr, "[MSSQL COUNTERS]   columns: prealloc_bounded=%llu prealloc_capped=%llu unbounded=%llu\n",
 			(unsigned long long)sc.prealloc_bounded_columns, (unsigned long long)sc.prealloc_capped_columns,
 			(unsigned long long)sc.unbounded_columns);

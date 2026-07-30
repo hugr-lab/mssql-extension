@@ -47,6 +47,15 @@ namespace staging {
 //! is reachable from the per-value path, which is why the whole block can be
 //! filled without a branch anywhere near an append.
 struct StagingCounters {
+	//! Rows that arrived as NBCROW (0xD2) rather than ROW (0xD1). The one field
+	//! counted per ROW rather than per column-chunk, so it sits behind the same
+	//! gate as the rest and costs a predicted branch when they are off.
+	//!
+	//! Worth having beyond the tests: whether a workload's rows arrive NBC
+	//! decides which of two walks its time is spent in, and the server's choice
+	//! depends on the result set's shape, so it is not something you can read off
+	//! the schema (spec 059 D1a).
+	uint64_t nbc_rows = 0;
 	//! Wire bytes staged, and time spent publishing them, by kernel. `staged` is
 	//! 0 for the direct kernels by construction: those values never enter a
 	//! staging buffer at all.
@@ -115,8 +124,13 @@ public:
 
 	//! Walk one row. `row`/`row_length` are the token's payload exactly as it sits
 	//! on the wire, NULL bitmap included for the NBC form.
-	void StageRow(const uint8_t *row, size_t row_length, idx_t row_idx);
-	void StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx);
+	//!
+	//! Returns bytes consumed, which for a well-framed row equals `row_length` —
+	//! the walk already computes it for the debug assertion, so the tests that
+	//! compare this walk against `RowReader::SkipValue` get it for free (spec 059
+	//! D2), and spec 058 needs the parser to learn it from here.
+	size_t StageRow(const uint8_t *row, size_t row_length, idx_t row_idx);
+	size_t StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx);
 
 	//! Publish staged state into the output vectors and close the chunk.
 	void FinalizeChunk(idx_t row_count);
