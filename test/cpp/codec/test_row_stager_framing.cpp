@@ -321,12 +321,61 @@ void Run(const Case &c, bool nbc, bool null_via_bitmap = false) {
 //! NBCROW form with the value NULL via the bitmap. Every column type has to
 //! survive all three; the shipped code has a separate switch for the second and
 //! third, and only the first is exercised by the bench matrix.
+//! Same walk, but with the column under test PROJECTED AWAY (null target).
+//!
+//! `AppendArm::Skip` is the one staged arm that delegates straight back to the
+//! legacy reader mid-walk (`p += reader_ptr_->SkipValue(...)`), and it is taken
+//! for every column DuckDB projects away — the common case on a wide table. It
+//! is therefore the arm where the two framings are most directly spliced
+//! together, and the canary is the only thing that can catch a mismatch, since
+//! the skipped column produces no output to check.
+void RunSkipped(const Case &c, bool nbc) {
+	const std::string what = c.label + (nbc ? " [NBCROW, projected away]" : " [ROW, projected away]");
+
+	std::vector<ColumnMetadata> meta;
+	meta.push_back(c.col);
+	meta.push_back(CanaryCol());
+
+	std::vector<uint8_t> row;
+	if (nbc) {
+		row.push_back(0x00);
+	}
+	row.insert(row.end(), c.wire.begin(), c.wire.end());
+	AppendLe32(row, static_cast<uint32_t>(CANARY));
+
+	std::unique_ptr<uint8_t[]> exact(new uint8_t[row.size()]);
+	std::memcpy(exact.get(), row.data(), row.size());
+
+	Vector canary(LogicalType::INTEGER);
+	std::vector<Vector *> targets;
+	targets.push_back(nullptr);	 // projected away -> AppendArm::Skip
+	targets.push_back(&canary);
+
+	RowStager stager;
+	stager.Configure(meta, targets);
+	CHECK_TRUE(stager.IsSkipped(0), what + ": null target resolves to the Skip arm");
+	stager.BeginChunk(targets);
+	if (nbc) {
+		stager.StageNBCRow(exact.get(), row.size(), 0);
+	} else {
+		stager.StageRow(exact.get(), row.size(), 0);
+	}
+	stager.FinalizeChunk(1);
+
+	CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY, what + ": canary survives the skipped column");
+}
+
 void RunAllForms(const Case &c) {
 	Run(c, /*nbc=*/false);
 	if (!c.row_framing_only) {
 		Run(c, /*nbc=*/true);
 	}
 	Run(c, /*nbc=*/true, /*null_via_bitmap=*/true);
+	// Fourth shape: the same value with the column projected away.
+	RunSkipped(c, /*nbc=*/false);
+	if (!c.row_framing_only) {
+		RunSkipped(c, /*nbc=*/true);
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -564,6 +613,17 @@ void TestNbcNullSentinelIsNotALength() {
 		{"nchar(50)", MakeCol("c", tds::TDS_TYPE_NCHAR, 100)},
 	};
 
+	// Two outcomes are acceptable — reject the malformed prefix outright (what
+	// the shipped guard does), or decode it as NULL in step with SkipValueNBC.
+	// Reading it as a LENGTH is the bug.
+	//
+	// "Any throw" would not be an assertion, though: if ResolveColumnOps ever
+	// degraded one of these types to Unsupported, ThrowUnsupportedType would fire
+	// and the case would pass without the 0xFFFF path being reached at all. So a
+	// throw must NAME the sentinel, and every case must land on one of the two
+	// acceptable outcomes rather than silently falling through.
+	int accounted_for = 0;
+
 	for (const Sentinel &s : sentinels) {
 		std::vector<ColumnMetadata> meta;
 		meta.push_back(s.col);
@@ -600,22 +660,243 @@ void TestNbcNullSentinelIsNotALength() {
 		// assertion — that IS the report. A throw is also acceptable behaviour;
 		// what must not happen is a 65535-byte read.
 		bool threw = false;
+		std::string message;
 		try {
 			stager.StageNBCRow(exact.get(), row.size(), 0);
 			stager.FinalizeChunk(1);
-		} catch (const duckdb::Exception &) {
+		} catch (const duckdb::Exception &e) {
 			threw = true;
+			message = e.what();
 		}
 
 		if (threw) {
-			// Rejecting the malformed prefix outright is fine; the point is that
-			// it is not consumed as a length.
+			// Rejecting the sentinel outright is what the shipped guard does —
+			// but it has to be the SENTINEL that was rejected, not some unrelated
+			// failure that never exercised this path.
+			CHECK_TRUE(message.find("0xFFFF") != std::string::npos,
+					   std::string(s.label) + ": throw names the 0xFFFF sentinel — got: " + message);
+			accounted_for++;
 			continue;
 		}
+		// The other acceptable outcome: NULL, in step with SkipValueNBC.
+		accounted_for++;
 		CHECK_TRUE(!FlatVector::Validity(under_test).RowIsValid(0),
 				   std::string(s.label) + ": 0xFFFF sentinel decodes as NULL, not a 65535-byte value");
 		CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY,
 				 std::string(s.label) + ": canary INT survives the sentinel");
+	}
+
+	CHECK_EQ(accounted_for, static_cast<int>(sizeof(sentinels) / sizeof(sentinels[0])),
+			 "every sentinel column type landed on an acceptable outcome");
+}
+
+//===--------------------------------------------------------------------===//
+// [3] NBC bitmap width across a byte boundary
+//===--------------------------------------------------------------------===//
+
+//! The NULL bitmap's width is computed independently in each walk —
+//! `(column_count + 7) / 8` in StageNBCRow, `(columns_.size() + 7) / 8` in
+//! SkipNBCRow — and it offsets EVERY column in the row, so a drift there
+//! misframes the whole result set rather than one value.
+//!
+//! Two columns cannot detect that: `(2+7)/8` and `(2+8)/8` and `2/8 + 1` all
+//! give 1, so nearly any wrong formula agrees with the right one. The widths
+//! below are chosen to discriminate:
+//!
+//!   8 columns  -> correct 1, `(n+8)/8` gives 2   (catches an off-by-one up)
+//!   9 columns  -> correct 2, `n/8` gives 1       (catches an off-by-one down)
+//!   16, 17     -> the same pair one byte along
+//!
+//! `null_index >= 8` additionally puts a NULL in the SECOND bitmap byte, so the
+//! bit addressing (`c >> 3`, `1u << (c & 7)`) is exercised past the first byte
+//! too — that indexing is duplicated between the two walks as well.
+void RunBitmapWidth(idx_t column_count, int null_index) {
+	const std::string what = "NBC bitmap, " + std::to_string(static_cast<unsigned long long>(column_count)) +
+							 " columns, null@" + std::to_string(null_index);
+
+	// The canary is the LAST column and must always be present — nulling it via
+	// the bitmap would omit its bytes and make the fixture, not the stager,
+	// wrong. A second-bitmap-byte NULL therefore needs at least 10 columns.
+	CHECK_TRUE(null_index < static_cast<int>(column_count) - 1,
+			   what + ": fixture nulls a filler column, never the canary");
+
+	std::vector<ColumnMetadata> meta;
+	for (idx_t i = 0; i + 1 < column_count; i++) {
+		meta.push_back(MakeCol("filler", tds::TDS_TYPE_INT, 4));
+	}
+	meta.push_back(CanaryCol());
+
+	const size_t bitmap_bytes = (column_count + 7) / 8;
+	std::vector<uint8_t> row(bitmap_bytes, 0);
+	if (null_index >= 0) {
+		row[null_index >> 3] |= static_cast<uint8_t>(1u << (null_index & 7));
+	}
+	for (idx_t i = 0; i + 1 < column_count; i++) {
+		if (static_cast<int>(i) == null_index) {
+			continue;  // NBC omits the bytes entirely
+		}
+		AppendLe32(row, static_cast<uint32_t>(0x1000 + i));
+	}
+	AppendLe32(row, static_cast<uint32_t>(CANARY));
+
+	RowReader reader(meta);
+	size_t consumed = 0;
+	CHECK_TRUE(reader.SkipNBCRow(row.data(), row.size(), consumed), what + ": RowReader bounds the row");
+	CHECK_EQ(consumed, row.size(), what + ": RowReader consumes the whole row");
+
+	std::unique_ptr<uint8_t[]> exact(new uint8_t[row.size()]);
+	std::memcpy(exact.get(), row.data(), row.size());
+
+	std::vector<Vector> storage;
+	storage.reserve(column_count);
+	for (idx_t i = 0; i < column_count; i++) {
+		storage.emplace_back(LogicalType::INTEGER);
+	}
+	std::vector<Vector *> targets;
+	for (idx_t i = 0; i < column_count; i++) {
+		targets.push_back(&storage[i]);
+	}
+
+	RowStager stager;
+	stager.Configure(meta, targets);
+	stager.BeginChunk(targets);
+	stager.StageNBCRow(exact.get(), row.size(), 0);
+	stager.FinalizeChunk(1);
+
+	// The canary is last, so it only lands correctly if the bitmap width AND
+	// every column before it were framed identically by both walks.
+	CHECK_EQ(FlatVector::GetData<int32_t>(storage[column_count - 1])[0], CANARY, what + ": canary survives");
+	for (idx_t i = 0; i + 1 < column_count; i++) {
+		if (static_cast<int>(i) == null_index) {
+			CHECK_TRUE(!FlatVector::Validity(storage[i]).RowIsValid(0), what + ": bitmap NULL decodes as NULL");
+			continue;
+		}
+		CHECK_EQ(FlatVector::GetData<int32_t>(storage[i])[0], static_cast<int32_t>(0x1000 + i),
+				 what + ": filler column value");
+	}
+}
+
+void TestNbcBitmapWidth() {
+	std::cout << "[3] NBC bitmap width across a byte boundary..." << std::endl;
+	RunBitmapWidth(8, -1);	// correct 1 byte; (n+8)/8 would read 2
+	RunBitmapWidth(8, 3);
+	RunBitmapWidth(9, -1);	// correct 2 bytes; n/8 would read 1
+	RunBitmapWidth(9, 7);	// last bit of the first byte
+	RunBitmapWidth(10, 8);	// NULL in the SECOND bitmap byte
+	RunBitmapWidth(16, 9);
+	RunBitmapWidth(17, 15);
+	// A NULL in the THIRD bitmap byte needs index >= 16, and the canary occupies
+	// the last column — so 18 columns, not 17.
+	RunBitmapWidth(18, 16);
+}
+
+//===--------------------------------------------------------------------===//
+// [4] Malformed-but-bounded prefixes
+//===--------------------------------------------------------------------===//
+
+//! Rows that are COMPLETE but not well-formed still reach the unbounded walk.
+//!
+//! `RowReader::SkipValue` does not validate a prefix against the column's
+//! declared width — it returns `1 + data_length` for any one-byte prefix and
+//! `2 + length` for any two-byte one, so long as the bytes are buffered. A
+//! corrupt or hostile stream can therefore hand the stager an `INTN(4)` whose
+//! prefix says 3, or a `varbinary(4)` whose prefix declares 60000 bytes that
+//! genuinely follow. Those land on `ThrowBadPrefix` and on `AppendVarSlot`'s
+//! growth path respectively — the exact guards that are one edit away from a
+//! mis-sized memcpy — and neither was covered by the well-formed matrix.
+//!
+//! The contract asserted here is: either throw, or consume in step with
+//! `SkipValue`. Silently consuming a different number of bytes is the failure.
+struct MalformedCase {
+	std::string label;
+	ColumnMetadata col;
+	std::vector<uint8_t> wire;
+	//! Empty means "must not throw"; otherwise the message must contain this.
+	std::string expect_throw_containing;
+};
+
+void RunMalformed(const MalformedCase &c) {
+	std::vector<ColumnMetadata> meta;
+	meta.push_back(c.col);
+	meta.push_back(CanaryCol());
+
+	std::vector<uint8_t> row = c.wire;
+	AppendLe32(row, static_cast<uint32_t>(CANARY));
+
+	// The premise: RowReader accepts it and bounds it at exactly this length.
+	RowReader reader(meta);
+	size_t consumed = 0;
+	CHECK_TRUE(reader.SkipRow(row.data(), row.size(), consumed), c.label + ": RowReader still bounds the row");
+	CHECK_EQ(consumed, row.size(), c.label + ": RowReader consumes the whole malformed row");
+
+	std::unique_ptr<uint8_t[]> exact(new uint8_t[row.size()]);
+	std::memcpy(exact.get(), row.data(), row.size());
+
+	Vector under_test(TypeConverter::GetDuckDBType(c.col));
+	Vector canary(LogicalType::INTEGER);
+	std::vector<Vector *> targets;
+	targets.push_back(&under_test);
+	targets.push_back(&canary);
+
+	RowStager stager;
+	stager.Configure(meta, targets);
+	stager.BeginChunk(targets);
+
+	std::string message;
+	bool threw = false;
+	try {
+		stager.StageRow(exact.get(), row.size(), 0);
+		stager.FinalizeChunk(1);
+	} catch (const duckdb::Exception &e) {
+		threw = true;
+		message = e.what();
+	}
+
+	if (!c.expect_throw_containing.empty()) {
+		CHECK_TRUE(threw, c.label + ": rejects the malformed prefix");
+		if (threw) {
+			CHECK_TRUE(message.find(c.expect_throw_containing) != std::string::npos,
+					   c.label + ": rejected for the right reason — got: " + message);
+		}
+		return;
+	}
+	CHECK_TRUE(!threw, c.label + ": accepted without throwing — got: " + message);
+	if (!threw) {
+		CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY, c.label + ": canary survives");
+	}
+}
+
+void TestMalformedButBoundedPrefixes() {
+	std::cout << "[4] malformed-but-bounded prefixes..." << std::endl;
+
+	std::vector<MalformedCase> cases;
+	// A prefix that is neither the declared width nor 0. SkipValue consumes
+	// 1 + len; the stager must reject rather than copy `len` bytes into a slot
+	// sized for the declared width.
+	cases.push_back({"INTN(4) prefix=3", MakeCol("c", tds::TDS_TYPE_INTN, 4), P1({1, 2, 3}), "length prefix"});
+	cases.push_back(
+		{"INTN(4) prefix=8", MakeCol("c", tds::TDS_TYPE_INTN, 4), P1({1, 2, 3, 4, 5, 6, 7, 8}), "length prefix"});
+	cases.push_back({"DATE prefix=7", MakeCol("c", tds::TDS_TYPE_DATE, 3), P1({1, 2, 3, 4, 5, 6, 7}), "length prefix"});
+	cases.push_back({"UNIQUEIDENTIFIER prefix=8", MakeCol("c", tds::TDS_TYPE_UNIQUEIDENTIFIER, 16),
+					 P1({1, 2, 3, 4, 5, 6, 7, 8}), "length prefix"});
+	// DECIMAL zero-extends a SHORT mantissa (covered in [1]) but must still
+	// reject one wider than the declared precision allows.
+	cases.push_back({"DECIMAL(9,2) prefix=9", MakeCol("c", tds::TDS_TYPE_DECIMAL, 5, 9, 2),
+					 P1({1, 2, 3, 4, 5, 6, 7, 8, 9}), "length prefix"});
+	// An odd UTF-16 byte count breaks the batch decode's delimiter walk, which
+	// is why the staging arm rejects it up front.
+	cases.push_back(
+		{"NVARCHAR odd length", MakeCol("c", tds::TDS_TYPE_NVARCHAR, 40), P2({0x41, 0x00, 0x42}), "code units"});
+
+	// Not malformed enough to reject: the bytes really are there, so the stager
+	// must stage all 60000 of them and stay in step. This is the growth path of
+	// a column whose declared bound said 4 bytes per value.
+	std::vector<uint8_t> big(60000, 0xAB);
+	cases.push_back(
+		{"VARBINARY(4) declaring 60000 present bytes", MakeCol("c", tds::TDS_TYPE_BIGVARBINARY, 4), P2(big), ""});
+
+	for (const MalformedCase &c : cases) {
+		RunMalformed(c);
 	}
 }
 
@@ -629,6 +910,8 @@ int main() {
 	try {
 		TestFramingAgreesWithRowReader();
 		TestNbcNullSentinelIsNotALength();
+		TestNbcBitmapWidth();
+		TestMalformedButBoundedPrefixes();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

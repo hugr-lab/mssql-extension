@@ -412,50 +412,17 @@ test-column-staging: release
 # checks safe, and the two framings live in different files with nothing else
 # pinning them together.
 #
-# Built with ASan+UBSan on purpose (like test-token-parser-security): half the
-# coverage is "a framing slip reads past the row", which is a sanitizer report
-# rather than a failed assertion. -fno-sanitize-recover makes the first one
-# fatal. Links the RELEASE libduckdb, which is not itself instrumented — that is
-# fine, the interposed allocator still tracks the test's own heap blocks, and
-# each row is placed in an exact-sized `new uint8_t[n]`.
-ROW_STAGER_TEST_FLAGS := -std=c++17 -g -O1 -pthread -Wno-deprecated-declarations \
-    -fsanitize=address,undefined -fno-sanitize-recover=all
-ROW_STAGER_TEST_SOURCES := \
-    $(wildcard src/codec/*.cpp) \
-    src/codec/staging/column_staging.cpp \
-    src/codec/staging/column_ops.cpp \
-    src/codec/staging/row_stager.cpp \
-    src/tds/tds_row_reader.cpp \
-    src/tds/tds_column_metadata.cpp \
-    src/tds/tds_types.cpp \
-    src/tds/encoding/type_converter.cpp \
-    src/tds/encoding/utf16.cpp \
-    src/tds/encoding/datetime_encoding.cpp \
-    src/tds/encoding/decimal_encoding.cpp \
-    src/tds/encoding/guid_encoding.cpp \
-    src/tds/encoding/bcp_row_encoder.cpp
-
+# The compile+run lives in test/cpp/codec/run_row_stager_framing.sh so this
+# target and the CI job share ONE source list — a second copy is exactly the
+# drift this test exists to catch. The vcpkg prefix is passed in rather than
+# derived inside the script: make and CI each already know their own triplet.
 test-row-stager-framing: release
-	@echo "Building RowStager framing tests (spec 055 T5, ASan+UBSan)..."
-	@mkdir -p build/test
-	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
-		echo "ERROR: no release build found; run 'make release' first." >&2; \
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
 		exit 1; \
 	fi
-	$(CXX) $(ROW_STAGER_TEST_FLAGS) $(BENCH_UTF16_INCLUDES) \
-	    test/cpp/codec/test_row_stager_framing.cpp \
-	    $(ROW_STAGER_TEST_SOURCES) \
-	    $(BENCH_UTF16_LIBS) \
-	    -L build/release/src -lduckdb \
-	    -o build/test/test_row_stager_framing
-	@echo ""
-	# detect_leaks=0: libduckdb is not instrumented and its static initialisers
-	# hold allocations for process lifetime, which LeakSanitizer (on by default
-	# on Linux) would report as leaks that have nothing to do with this test.
-	# Buffer overflows — the thing being tested for — are unaffected.
-	ASAN_OPTIONS=detect_leaks=0 \
-	    DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src \
-	    build/test/test_row_stager_framing
+	test/cpp/codec/run_row_stager_framing.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) build/release
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
