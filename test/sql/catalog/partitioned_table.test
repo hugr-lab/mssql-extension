@@ -1,0 +1,121 @@
+# name: test/sql/catalog/partitioned_table.test
+# description: Partitioned tables must not duplicate columns or under-report rows (issue #85)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS part_db (TYPE mssql);
+
+# =============================================================================
+# Setup: a table spread over 4 partitions by a clustered index
+#
+# sys.partitions holds one row per partition. Any metadata query that joins it
+# directly returns each column 4 times here, which used to abort catalog load
+# with "Column with name log_ts already exists!".
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('part_db', $$
+IF OBJECT_ID('dbo.PartLog') IS NOT NULL DROP TABLE dbo.PartLog;
+IF EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = 'ps_part_log')
+    DROP PARTITION SCHEME ps_part_log;
+IF EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = 'pf_part_log')
+    DROP PARTITION FUNCTION pf_part_log;
+$$);
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE PARTITION FUNCTION pf_part_log (DATETIME2(7))
+AS RANGE RIGHT FOR VALUES ('2024-02-01', '2024-03-01', '2024-04-01')
+$$);
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE PARTITION SCHEME ps_part_log AS PARTITION pf_part_log ALL TO ([PRIMARY])
+$$);
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE TABLE dbo.PartLog (log_ts DATETIME2(7) NOT NULL, message NVARCHAR(255))
+$$);
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE CLUSTERED INDEX ix_part_log ON dbo.PartLog (log_ts) ON ps_part_log (log_ts)
+$$);
+
+# Two rows in partition 1, one in partition 3, none in partitions 2 and 4.
+statement ok
+SELECT mssql_exec('part_db', $$
+INSERT INTO dbo.PartLog (log_ts, message) VALUES
+    ('2024-01-15', 'jan a'), ('2024-01-20', 'jan b'), ('2024-03-10', 'mar')
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+# =============================================================================
+# Columns are reported once, not once per partition
+# =============================================================================
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartLog'
+ORDER BY column_index;
+----
+log_ts	TIMESTAMP_NS
+message	VARCHAR
+
+# The table itself appears once in the catalog
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartLog';
+----
+1
+
+# =============================================================================
+# Rows read correctly, and each row exactly once
+# =============================================================================
+
+query IT
+SELECT log_ts, message FROM part_db.dbo.PartLog ORDER BY log_ts;
+----
+2024-01-15 00:00:00	jan a
+2024-01-20 00:00:00	jan b
+2024-03-10 00:00:00	mar
+
+query I
+SELECT count(*) FROM part_db.dbo.PartLog;
+----
+3
+
+# =============================================================================
+# Cardinality estimate is the sum over partitions, not one arbitrary partition
+# (partition 1 holds 2 rows, partition 3 holds 1; picking either would be wrong)
+# =============================================================================
+
+query I
+SELECT estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartLog';
+----
+3
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('part_db', $$
+DROP TABLE dbo.PartLog;
+DROP PARTITION SCHEME ps_part_log;
+DROP PARTITION FUNCTION pf_part_log;
+$$);
+
+statement ok
+DETACH part_db;

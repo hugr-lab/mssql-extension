@@ -25,6 +25,14 @@ namespace duckdb {
 // SQL Queries for Metadata Discovery
 //===----------------------------------------------------------------------===//
 
+// Row counts come from a pre-aggregated sys.partitions subquery, never a direct
+// join: sys.partitions holds one row PER PARTITION, so joining it raw multiplies
+// every object (and every column) by the partition count. On a partitioned table
+// that surfaced as "Column with name <x> already exists!" (issue #85) and, silently,
+// as an approx_rows taken from one arbitrary partition instead of the whole table.
+// index_id IN (0, 1) selects the heap (0) or the clustered index (1) — a table has
+// exactly one of the two, so SUM() does not double-count.
+
 // Query to discover all user schemas (including empty ones)
 // Excludes system schemas: INFORMATION_SCHEMA (3), sys (4), and other built-in schemas
 // Note: ORDER BY is appended dynamically after optional filter clauses
@@ -46,7 +54,10 @@ SELECT
     o.type AS object_type,
     ISNULL(p.rows, 0) AS approx_rows
 FROM sys.objects o
-LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+           FROM sys.partitions
+           WHERE index_id IN (0, 1)
+           GROUP BY object_id) p ON p.object_id = o.object_id
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
   AND SCHEMA_NAME(o.schema_id) = '%s')";
@@ -68,7 +79,10 @@ SELECT
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+           FROM sys.partitions
+           WHERE index_id IN (0, 1)
+           GROUP BY object_id) p ON p.object_id = o.object_id
 WHERE o.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
 )";
@@ -93,7 +107,10 @@ FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN sys.partitions p ON o.object_id = p.object_id AND p.index_id IN (0, 1)
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+           FROM sys.partitions
+           WHERE index_id IN (0, 1)
+           GROUP BY object_id) p ON p.object_id = o.object_id
 WHERE s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
