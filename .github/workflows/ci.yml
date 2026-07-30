@@ -368,6 +368,21 @@ jobs:
             echo "::endgroup::"
           done
 
+          # spec 055: the staging structures. `make test-column-staging` existed
+          # from the day they landed but nothing invoked it, so the whole staged
+          # read path's unit test ran only on developer machines.
+          echo "::group::test_column_staging"
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/codec/test_column_staging.cpp \
+            src/codec/staging/column_staging.cpp src/codec/staging/column_ops.cpp \
+            src/tds/encoding/type_converter.cpp src/tds/tds_column_metadata.cpp \
+            -L "$PREFIX/lib" -lsimdutf \
+            -L build/release/src -lduckdb \
+            -o build/test/test_column_staging
+          LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_column_staging
+          echo "::endgroup::"
+
       # Spec 053 (#161): the shipped Linux extension must NOT hard-link the
       # Kerberos runtime, or it fails to LOAD on images without it. GSSAPI/krb5
       # are dlopen'd lazily, so they must be absent from DT_NEEDED.

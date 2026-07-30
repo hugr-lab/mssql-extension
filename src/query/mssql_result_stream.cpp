@@ -48,7 +48,8 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
 	  rows_read_(0),
-	  counters_enabled_(GetDebugLevel() >= 2) {
+	  counters_enabled_(GetDebugLevel() >= 2),
+	  timing_enabled_(GetDebugLevel() >= 1) {
 	// Convert timeout from seconds to milliseconds
 	// 0 = no timeout (use INT_MAX for effectively infinite wait)
 	// Otherwise, multiply by 1000 to convert to milliseconds
@@ -56,6 +57,11 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 		read_timeout_ms_ = INT_MAX;	 // Effectively infinite timeout
 	} else {
 		read_timeout_ms_ = query_timeout_seconds * 1000;
+	}
+	if (counters_enabled_) {
+		// D10: latched here, before any COLMETADATA, because the stager counts
+		// per-column sizing decisions as it resolves them.
+		stager_.EnableCounters();
 	}
 }
 
@@ -222,8 +228,36 @@ bool MSSQLResultStream::Initialize() {
 	return state_ == MSSQLResultStreamState::Streaming || state_ == MSSQLResultStreamState::Complete;
 }
 
+namespace {
+
+// Opt-in phase timer. steady_clock::now() is ~15 ns per call here, and the fill
+// loop below runs two of these per row, so an ungated version costs about as
+// much as the work it measures. When disabled it is a predictable branch and
+// no clock read at all.
+struct PhaseTimer {
+	const bool enabled;
+	std::chrono::steady_clock::time_point start;
+
+	explicit PhaseTimer(bool enabled_p) : enabled(enabled_p) {
+		if (enabled) {
+			start = std::chrono::steady_clock::now();
+		}
+	}
+	// Accumulate in nanoseconds: these intervals are per row (~100 ns), so
+	// truncating each to whole microseconds would report zero for all of them.
+	void Stop(uint64_t &accum_ns) const {
+		if (!enabled) {
+			return;
+		}
+		accum_ns += static_cast<uint64_t>(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+	}
+};
+
+}  // namespace
+
 idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
-	auto chunk_start = std::chrono::steady_clock::now();
+	PhaseTimer chunk_timer(timing_enabled_);
 
 	if (state_ == MSSQLResultStreamState::Complete || state_ == MSSQLResultStreamState::Error) {
 		return 0;
@@ -242,11 +276,24 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	// Reset chunk for new data - DuckDB already initialized it with correct types
 	chunk.Reset();
 
+	// Staged read path (spec 055 T5). Not used with target_vectors_: those are
+	// STRUCT children owned by the caller, and publishing a whole column's
+	// validity mask at once would overwrite what the caller already wrote there.
+	const bool staged = target_vectors_.empty() && !column_metadata_.empty();
+	if (staged) {
+		ResolveStagedTargets(chunk);
+		if (!stager_.IsConfigured()) {
+			stager_.Configure(column_metadata_, staged_targets_);
+			parser_.SetRawRowMode(true);
+		}
+		stager_.BeginChunk(staged_targets_);
+	}
+
 	const idx_t max_rows = STANDARD_VECTOR_SIZE;  // 2048
 	idx_t row_count = 0;
-	uint64_t parse_time_us = 0;
-	uint64_t read_time_us = 0;
-	uint64_t process_time_us = 0;
+	uint64_t parse_time_ns = 0;
+	uint64_t read_time_ns = 0;
+	uint64_t process_time_ns = 0;
 	// D4: snapshot the thread-local fallback counter; the delta at exit is
 	// this call's fallbacks (FillChunk runs entirely on one thread).
 	const uint64_t utf16_fallbacks_at_entry = counters_enabled_ ? tds::encoding::Utf16FallbackCount() : 0;
@@ -257,18 +304,36 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 			break;
 		}
 
-		auto parse_start = std::chrono::steady_clock::now();
+		PhaseTimer parse_timer(timing_enabled_);
 		tds::ParsedTokenType token = parser_.TryParseNext();
-		auto parse_end = std::chrono::steady_clock::now();
-		parse_time_us += std::chrono::duration_cast<std::chrono::microseconds>(parse_end - parse_start).count();
+		parse_timer.Stop(parse_time_ns);
 
 		switch (token) {
 		case tds::ParsedTokenType::Row: {
-			auto process_start = std::chrono::steady_clock::now();
-			ProcessRow(chunk, row_count++);
-			auto process_end = std::chrono::steady_clock::now();
-			process_time_us +=
-				std::chrono::duration_cast<std::chrono::microseconds>(process_end - process_start).count();
+			PhaseTimer process_timer(timing_enabled_);
+			if (staged) {
+				const uint8_t *row = parser_.GetRawRow();
+				const size_t row_length = parser_.GetRawRowLength();
+				if (counters_enabled_) {
+					counters_.wire_bytes_in += row_length;
+				}
+				if (parser_.IsRawRowNBC()) {
+					stager_.StageNBCRow(row, row_length, row_count);
+				} else {
+					stager_.StageRow(row, row_length, row_count);
+				}
+				row_count++;
+				// A MAX-typed column can stage megabytes per row, so a chunk is
+				// closed on staged BYTES as well as on rows. DataChunk is allowed
+				// to be short; without this, 2048 rows of large values would be
+				// buffered in full before DuckDB saw any of them.
+				if (stager_.StagedBytesExceed(mssql::codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES)) {
+					goto exit_loop;
+				}
+			} else {
+				ProcessRow(chunk, row_count++);
+			}
+			process_timer.Stop(process_time_ns);
 			rows_read_++;
 			break;
 		}
@@ -321,10 +386,9 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 				throw IOException("TDS parse error: " + parser_.GetParseError());
 			}
 			{
-				auto read_start = std::chrono::steady_clock::now();
+				PhaseTimer read_timer(timing_enabled_);
 				bool read_ok = ReadMoreData(read_timeout_ms_);
-				auto read_end = std::chrono::steady_clock::now();
-				read_time_us += std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start).count();
+				read_timer.Stop(read_time_ns);
 				if (!read_ok) {
 					if (row_count > 0) {
 						// Return what we have
@@ -368,23 +432,29 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 	}
 
 exit_loop:
+	if (staged) {
+		stager_.FinalizeChunk(row_count);
+		if (counters_enabled_) {
+			CountChunkForDebug(chunk, row_count);
+		}
+	}
 	chunk.SetCardinality(row_count);
 
 	// Log timing summary
-	auto chunk_end = std::chrono::steady_clock::now();
-	auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end - chunk_start).count();
-	MSSQL_DEBUG_LOG(1, "FillChunk: %llu rows, total=%ldus, parse=%ldus, read=%ldus, process=%ldus",
-					(unsigned long long)row_count, (long)total_us, (long)parse_time_us, (long)read_time_us,
-					(long)process_time_us);
+	uint64_t total_ns = 0;
+	chunk_timer.Stop(total_ns);
+	MSSQL_DEBUG_LOG(1, "FillChunk: %llu rows, total=%lluns, parse=%lluns, read=%lluns, process=%lluns",
+					(unsigned long long)row_count, (unsigned long long)total_ns, (unsigned long long)parse_time_ns,
+					(unsigned long long)read_time_ns, (unsigned long long)process_time_ns);
 
 	if (counters_enabled_) {
 		if (row_count > 0) {
 			counters_.chunks++;
 		}
-		counters_.fill_total_us += static_cast<uint64_t>(total_us);
-		counters_.fill_parse_us += parse_time_us;
-		counters_.fill_read_us += read_time_us;
-		counters_.fill_process_us += process_time_us;
+		counters_.fill_total_ns += total_ns;
+		counters_.fill_parse_ns += parse_time_ns;
+		counters_.fill_read_ns += read_time_ns;
+		counters_.fill_process_ns += process_time_ns;
 		counters_.utf16_fallbacks += tds::encoding::Utf16FallbackCount() - utf16_fallbacks_at_entry;
 	}
 
@@ -442,6 +512,58 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 	}
 }
 
+void MSSQLResultStream::ResolveStagedTargets(DataChunk &chunk) {
+	const idx_t column_count = column_metadata_.size();
+	// Same rules ProcessRow applies, hoisted out of the row loop. target_vectors_
+	// is excluded by the caller, so only two of the three cases can arise here.
+	idx_t cols_to_fill;
+	if (columns_to_fill_ != static_cast<idx_t>(-1)) {
+		cols_to_fill = std::min(columns_to_fill_, column_count);
+	} else {
+		cols_to_fill = std::min(column_count, chunk.ColumnCount());
+	}
+
+	staged_targets_.assign(column_count, nullptr);
+	for (idx_t col_idx = 0; col_idx < cols_to_fill; col_idx++) {
+		staged_targets_[col_idx] =
+			output_column_mapping_.empty() ? &chunk.data[col_idx] : &chunk.data[output_column_mapping_[col_idx]];
+	}
+}
+
+void MSSQLResultStream::CountChunkForDebug(DataChunk &chunk, idx_t row_count) {
+	(void)chunk;
+	const auto string_family = static_cast<uint8_t>(mssql::codec::TypeFamily::String);
+	const idx_t counted = std::min(counter_col_family_.size(), staged_targets_.size());
+	for (idx_t col_idx = 0; col_idx < counted; col_idx++) {
+		Vector *target = staged_targets_[col_idx];
+		if (target == nullptr) {
+			continue;
+		}
+		const idx_t nulls = stager_.ChunkNulls(col_idx);
+		const idx_t values = row_count - nulls;
+		counters_.nulls += nulls;
+
+		const uint8_t family = counter_col_family_[col_idx];
+		if (family < mssql::codec::TYPE_FAMILY_COUNT) {
+			counters_.values_per_family[family] += values;
+		} else {
+			counters_.unknown_family_values += values;
+		}
+		if (counter_col_plp_[col_idx]) {
+			counters_.plp_values += values;
+		}
+		if (family == string_family && target->GetType().InternalType() == PhysicalType::VARCHAR) {
+			const string_t *strings = FlatVector::GetData<string_t>(*target);
+			const auto &mask = FlatVector::Validity(*target);
+			for (idx_t row = 0; row < row_count; row++) {
+				if (mask.RowIsValid(row)) {
+					counters_.string_bytes_out += strings[row].GetSize();
+				}
+			}
+		}
+	}
+}
+
 void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t cols_to_fill) {
 	const auto &row = parser_.GetRow();
 	const auto string_family = static_cast<uint8_t>(mssql::codec::TypeFamily::String);
@@ -480,12 +602,26 @@ void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t 
 void MSSQLResultStream::PrintDebugCounters() {
 	fprintf(stderr,
 			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
-			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%llu read=%llu process=%llu)\n",
+			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%lluus read=%lluus process=%lluus)\n",
 			(unsigned long long)rows_read_, (unsigned long long)counters_.chunks, (unsigned long long)counters_.nulls,
 			(unsigned long long)counters_.wire_bytes_in, (unsigned long long)counters_.string_bytes_out,
 			(unsigned long long)counters_.plp_values, (unsigned long long)counters_.utf16_fallbacks,
-			(unsigned long long)counters_.fill_total_us, (unsigned long long)counters_.fill_parse_us,
-			(unsigned long long)counters_.fill_read_us, (unsigned long long)counters_.fill_process_us);
+			(unsigned long long)(counters_.fill_total_ns / 1000), (unsigned long long)(counters_.fill_parse_ns / 1000),
+			(unsigned long long)(counters_.fill_read_ns / 1000),
+			(unsigned long long)(counters_.fill_process_ns / 1000));
+
+	// Per-row breakdown — the form spec 055 D0 actually needs. `unaccounted` is
+	// total minus the three measured phases: chunk setup/teardown, the loop
+	// itself, and the timing calls that remain when timing is on.
+	if (rows_read_ > 0) {
+		const double rows = static_cast<double>(rows_read_);
+		const uint64_t measured_ns = counters_.fill_parse_ns + counters_.fill_read_ns + counters_.fill_process_ns;
+		const double unaccounted_ns =
+			counters_.fill_total_ns > measured_ns ? static_cast<double>(counters_.fill_total_ns - measured_ns) : 0.0;
+		fprintf(stderr, "[MSSQL COUNTERS]   ns/row: total=%.1f parse=%.1f read=%.1f process=%.1f unaccounted=%.1f\n",
+				counters_.fill_total_ns / rows, counters_.fill_parse_ns / rows, counters_.fill_read_ns / rows,
+				counters_.fill_process_ns / rows, unaccounted_ns / rows);
+	}
 	std::string families;
 	for (uint8_t f = 0; f < mssql::codec::TYPE_FAMILY_COUNT; f++) {
 		if (counters_.values_per_family[f] > 0) {
@@ -500,6 +636,57 @@ void MSSQLResultStream::PrintDebugCounters() {
 	if (!families.empty()) {
 		fprintf(stderr, "[MSSQL COUNTERS]   values/family:%s\n", families.c_str());
 	}
+	PrintStagingCounters();
+}
+
+//! D10 (spec 055): what the staged path itself did. Printed only for a stream
+//! that took it — the legacy per-value path leaves every one of these at zero,
+//! and three empty lines are worse than none.
+void MSSQLResultStream::PrintStagingCounters() {
+	const auto &sc = stager_.Counters();
+	const auto &arena = stager_.Arena();
+
+	std::string kernels;
+	for (uint8_t k = 0; k < mssql::codec::staging::FINALIZE_KERNEL_COUNT; k++) {
+		if (sc.kernel_values[k] == 0) {
+			continue;
+		}
+		// ns/value is the number to read: it is directly comparable with the
+		// micro-benchmark's per-family cells.
+		char buf[192];
+		snprintf(buf, sizeof(buf), " %s=%lluv/%lluB/%.1fns",
+				 mssql::codec::staging::FinalizeKernelName(static_cast<mssql::codec::staging::FinalizeKernel>(k)),
+				 (unsigned long long)sc.kernel_values[k], (unsigned long long)sc.staged_bytes[k],
+				 static_cast<double>(sc.kernel_ns[k]) / static_cast<double>(sc.kernel_values[k]));
+		kernels += buf;
+	}
+	if (kernels.empty() && sc.direct_values == 0) {
+		return;
+	}
+	fprintf(stderr, "[MSSQL COUNTERS]   staging: direct_bypass=%llu grow=%llu shrink=%llu peak_payload=%lluB\n",
+			(unsigned long long)sc.direct_values, (unsigned long long)arena.GrowEvents(),
+			(unsigned long long)arena.ShrinkEvents(), (unsigned long long)arena.PeakPayloadBytes());
+	fprintf(stderr, "[MSSQL COUNTERS]   columns: prealloc_bounded=%llu prealloc_capped=%llu unbounded=%llu\n",
+			(unsigned long long)sc.prealloc_bounded_columns, (unsigned long long)sc.prealloc_capped_columns,
+			(unsigned long long)sc.unbounded_columns);
+	if (!kernels.empty()) {
+		fprintf(stderr, "[MSSQL COUNTERS]   kernels (values/staged bytes/ns per value):%s\n", kernels.c_str());
+	}
+
+	std::string boundaries;
+	for (uint8_t b = 0; b < mssql::codec::staging::BOUNDARY_STRATEGY_COUNT; b++) {
+		if (sc.boundary[b] == 0) {
+			continue;
+		}
+		boundaries += " ";
+		boundaries +=
+			mssql::codec::staging::BoundaryStrategyName(static_cast<mssql::codec::staging::BoundaryStrategy>(b));
+		boundaries += "=" + std::to_string(sc.boundary[b]);
+	}
+	if (!boundaries.empty() || sc.replaced_units > 0) {
+		fprintf(stderr, "[MSSQL COUNTERS]   string boundaries (column-chunks):%s replaced_units=%llu\n",
+				boundaries.c_str(), (unsigned long long)sc.replaced_units);
+	}
 }
 
 bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
@@ -511,16 +698,17 @@ bool MSSQLResultStream::ReadMoreData(int timeout_ms) {
 		return false;
 	}
 
-	tds::TdsPacket packet;
-	if (!socket->ReceivePacket(packet, timeout_ms)) {
+	// Feed from a view into the socket's assembly buffer. The payload used to be
+	// copied into a TdsPacket first and copied into the parser second — two
+	// passes over every byte to move it eight bytes to the left.
+	const uint8_t *payload = nullptr;
+	size_t payload_length = 0;
+	if (!socket->ReceivePayloadView(payload, payload_length, timeout_ms)) {
 		last_socket_error_ = socket->GetLastError();
 		return false;
 	}
-
-	// Feed only the payload to the parser (not the header)
-	const auto &payload = packet.GetPayload();
-	if (!payload.empty()) {
-		parser_.Feed(payload);
+	if (payload_length > 0) {
+		parser_.Feed(payload, payload_length);
 	}
 
 	return true;

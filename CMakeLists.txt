@@ -122,6 +122,9 @@ set(EXTENSION_SOURCES
     # foundational dispatch helpers + per-family stubs; family bodies are
     # populated in Phase 3 (US1 Integer MVP) onwards.
     src/codec/type_family.cpp
+    src/codec/staging/column_staging.cpp
+    src/codec/staging/column_ops.cpp
+    src/codec/staging/row_stager.cpp
     src/codec/literal_format.cpp
     src/codec/boolean_codec.cpp
     src/codec/integer_codec.cpp

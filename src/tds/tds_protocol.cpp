@@ -726,7 +726,17 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 					if (new_val_len > 0 && 2 + new_val_len * 2 <= len) {
 						std::string packet_size_str = ReadUTF16LE(env_data + 2, new_val_len);
 						try {
-							response.negotiated_packet_size = std::stoul(packet_size_str);
+							// Clamped to the protocol's own range HERE, at the one place the
+							// value enters from the wire, because it then reaches both the
+							// receive framing (which sizes a buffer from it) and the send-side
+							// packet splitters (which subtract the header from it). MS-TDS
+							// defines 512..32767; a server answering outside that is
+							// non-conforming, and taking it at face value turns an ENVCHANGE
+							// into a multi-gigabyte allocation per pooled connection.
+							const unsigned long parsed = std::stoul(packet_size_str);
+							if (parsed >= TDS_MIN_PACKET_SIZE && parsed <= TDS_MAX_PACKET_SIZE) {
+								response.negotiated_packet_size = static_cast<uint32_t>(parsed);
+							}
 						} catch (...) {
 							// Ignore parse errors
 						}

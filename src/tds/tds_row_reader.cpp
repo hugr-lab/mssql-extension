@@ -6,6 +6,18 @@
 namespace duckdb {
 namespace tds {
 
+namespace {
+//! Largest value a TEXT / IMAGE column can hold — SQL Server's own limit for the
+//! type. A 4-byte wire length can declare far more than that, and no other
+//! read-path framing field can: the 2-byte forms are bounded at 65535 and PLP's
+//! chunk lengths are checked against the bytes actually present.
+//!
+//! Anything the staging layer would also refuse is caught slightly earlier, at
+//! its own (lower) MAX_STAGING_PAYLOAD_BYTES, with its own message. This bound
+//! exists for the values that are not merely too big to stage but impossible.
+constexpr uint32_t MAX_LOB_VALUE_BYTES = 2147483647u;
+}  // namespace
+
 RowReader::RowReader(const std::vector<ColumnMetadata> &columns) : columns_(columns) {}
 
 bool RowReader::ReadRow(const uint8_t *data, size_t length, size_t &bytes_consumed, RowData &row) {
@@ -162,6 +174,39 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 			return 0;
 		uint8_t data_length = data[0];
 		return length >= 1 + data_length ? 1 + data_length : 0;
+	}
+
+	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
+	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
+	// else on the wire is framed this way.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE: {
+		if (length < 1)
+			return 0;
+		const size_t pointer_len = data[0];
+		if (pointer_len == 0)
+			return 1;  // NULL
+		const size_t header = 1 + pointer_len + 8 + 4;
+		if (length < header)
+			return 0;
+		uint32_t data_length;
+		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		if (data_length > MAX_LOB_VALUE_BYTES) {
+			// A 4-byte length is the only framing field on the read path that can
+			// declare more than a value could ever be. Returning 0 here would mean
+			// "need more data", and the parser would buffer the whole rest of the
+			// stream waiting for bytes that are never coming.
+			// std::runtime_error, not a DuckDB exception: this layer is compiled
+			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
+			// path, which is what makes it fuzzable at all. Every other throw in
+			// this file is the same for the same reason.
+			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
+									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
+									 "-byte maximum for the type. The TDS stream is malformed.");
+		}
+		const size_t total = header + data_length;
+		return length >= total ? total : 0;
 	}
 
 	// XML (always PLP)
@@ -794,6 +839,39 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 			return 0;
 		uint8_t actual_length = data[0];
 		return length >= 1 + actual_length ? 1 + actual_length : 0;
+	}
+
+	// Legacy LOBs (TEXT/NTEXT/IMAGE): 1-byte text-pointer length (0 = NULL), the
+	// pointer itself, an 8-byte timestamp, then a 4-byte data length. Nothing
+	// else on the wire is framed this way.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE: {
+		if (length < 1)
+			return 0;
+		const size_t pointer_len = data[0];
+		if (pointer_len == 0)
+			return 1;  // NULL
+		const size_t header = 1 + pointer_len + 8 + 4;
+		if (length < header)
+			return 0;
+		uint32_t data_length;
+		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		if (data_length > MAX_LOB_VALUE_BYTES) {
+			// A 4-byte length is the only framing field on the read path that can
+			// declare more than a value could ever be. Returning 0 here would mean
+			// "need more data", and the parser would buffer the whole rest of the
+			// stream waiting for bytes that are never coming.
+			// std::runtime_error, not a DuckDB exception: this layer is compiled
+			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
+			// path, which is what makes it fuzzable at all. Every other throw in
+			// this file is the same for the same reason.
+			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
+									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
+									 "-byte maximum for the type. The TDS stream is malformed.");
+		}
+		const size_t total = header + data_length;
+		return length >= total ? total : 0;
 	}
 
 	// XML (always PLP)

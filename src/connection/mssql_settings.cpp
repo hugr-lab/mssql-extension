@@ -56,6 +56,27 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "TEST-ONLY: max LOGIN7 TDS packet size in bytes for integrated auth (0 = default 4096)",
 							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_tds_packet_size - TDS frame size requested in LOGIN7 (spec 055).
+	// The server replies with min(requested, its own maximum) in the PACKETSIZE
+	// ENVCHANGE and never raises it on its own, so this value is the ceiling for
+	// every subsequent packet in BOTH directions: it bounds how many recv() calls
+	// a result set costs and how many send() calls a BCP batch costs.
+	// Protocol range is [512, 32767]; values outside it are clamped when the
+	// connection is built.
+	//
+	// Default raised from the 4096 the extension had always requested. Measured
+	// against SQL Server 2022 (500k rows x 15 mixed columns, medians of 3, see
+	// test/bench/bench_results_live_server.md): client CPU per value 106.4 -> 76.8
+	// on read and 52.7 -> 38.7 on write, read wall 2.47s -> 1.40s. That server
+	// caps the grant at 16384, so requesting 32767 measured identically and we
+	// have no evidence either way about servers that would grant more.
+	// The cost is server-side memory: SQL Server allocates network buffers per
+	// session, so this is 16 KB per pooled connection rather than 4 KB.
+	config.AddExtensionOption("mssql_tds_packet_size",
+							  "TDS frame size in bytes requested at login, clamped to [512, 32767] (default: 16384)",
+							  LogicalType::BIGINT, Value::BIGINT(static_cast<int64_t>(tds::TDS_PREFERRED_PACKET_SIZE)),
+							  ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
 	// Short by design — Browser is on the critical path of every named-instance attach.
@@ -301,6 +322,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_login7_max_packet", val)) {
 		config.login7_max_packet = val.GetValue<int64_t>();
+	}
+
+	if (context.TryGetCurrentSetting("mssql_tds_packet_size", val)) {
+		config.tds_packet_size = val.GetValue<int64_t>();
 	}
 
 	return config;

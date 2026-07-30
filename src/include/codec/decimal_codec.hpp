@@ -19,6 +19,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -48,6 +49,11 @@ namespace codec {
 namespace decimal {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch decode of a staged DECIMAL/NUMERIC column (spec 055 D6). DuckDB's
+//! storage width follows the declared precision, which is a property of the
+//! COLUMN — so the loop is chosen once and carries no dispatch.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
@@ -63,11 +69,13 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // fixed-point string. Reused by the VARCHAR-fallback path in the
 // dispatcher (issue #89) — same output as FormatSqlLiteral on the
 // equivalent Value.
+std::string RenderAsString(const uint8_t *bytes, size_t size, uint8_t precision, uint8_t scale);
 std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale);
 
 // Render a SQL-Server MONEY (8-byte) or SMALLMONEY (4-byte) wire
 // payload as a fixed-point string with 4 decimal places. Used by the
 // VARCHAR-fallback for MONEY/SMALLMONEY/MONEYN columns.
+std::string RenderMoneyAsString(const uint8_t *bytes, size_t size);
 std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace decimal

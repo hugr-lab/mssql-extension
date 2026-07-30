@@ -36,6 +36,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -64,6 +65,18 @@ namespace codec {
 namespace datetime {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch decode of a staged temporal column (spec 055 D6).
+//!
+//! Lives here rather than under codec/staging because it needs this family's
+//! own wire helpers (the datetime2 scale table and its range check). Only the
+//! kernel is chosen once per column; the row loop carries no dispatch.
+//!
+//! Runs over every row, NULL ones included, except for DATETIME2 — whose range
+//! check can itself produce a SQL NULL (issue #168) and so must know which rows
+//! are real. Everywhere else the conversion is total over any byte pattern, so
+//! a NULL row's stale slot yields a value the validity mask discards.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
@@ -80,6 +93,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // (no SQL quoting / CAST wrapper) for insertion into a VARCHAR vector.
 // Dispatches on col.type_id + bytes.size() to cover every TDS temporal
 // wire format.
+std::string RenderAsString(const uint8_t *bytes, size_t size, const tds::ColumnMetadata &col);
 std::string RenderAsString(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col);
 
 }  // namespace datetime

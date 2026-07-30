@@ -62,6 +62,11 @@ public:
 	// Returns true if packet received, false on timeout/error
 	bool ReceivePacket(TdsPacket &packet, int timeout_ms);
 
+	//! View of the next packet's PAYLOAD, valid until the next receive call on
+	//! this socket. Lets the streaming read path skip the copy into
+	//! TdsPacket::payload_, which it immediately copied again.
+	bool ReceivePayloadView(const uint8_t *&payload, size_t &payload_length, int timeout_ms);
+
 	// Receive all packets until EOM (End Of Message)
 	// Returns accumulated payload from all packets
 	bool ReceiveMessage(std::vector<uint8_t> &message, int timeout_ms);
@@ -84,8 +89,19 @@ public:
 
 	// Clear receive buffer (useful before starting a new query)
 	void ClearReceiveBuffer() {
-		receive_buffer_.clear();
+		receive_len_ = 0;
+		receive_pos_ = 0;
 	}
+
+	// Spec 055: size the receive staging buffer from the negotiated frame size.
+	// Called once after login, when the frame size is actually known.
+	//
+	// Two things depended on the old fixed 4096 scratch: a 32 KB frame was
+	// reassembled from eight recv() calls (the syscall count the larger frame was
+	// meant to remove), and every completed packet triggered an erase() from the
+	// front of receive_buffer_ — an O(n) memmove of everything still buffered.
+	// Reading whole frames at a time and consuming through a cursor removes both.
+	void SetReceiveFraming(uint32_t packet_size, uint32_t frames);
 
 private:
 	int fd_;				  // Socket file descriptor (-1 if closed)
@@ -97,8 +113,29 @@ private:
 	// TLS context for encrypted connections (null when TLS is not enabled)
 	std::unique_ptr<TlsTdsContext> tls_context_;
 
-	// Internal receive buffer for partial packet handling
+	// Internal receive buffer for partial packet handling.
+	//
+	// Its vector SIZE is capacity, not content — `receive_len_` says how much is
+	// valid and `receive_pos_` how much has been consumed. Letting the vector's
+	// own size track the content would mean resize() before every recv(), and
+	// resize() value-initialises the bytes the recv() is about to overwrite:
+	// a whole extra pass over the read buffer, every read, for nothing.
+	//
+	// A completed packet only advances the cursor; the tail is compacted to the
+	// front once, when the cursor has caught up with the end (spec 055).
 	std::vector<uint8_t> receive_buffer_;
+	size_t receive_len_ = 0;
+	size_t receive_pos_ = 0;
+
+	//! Bytes per recv(). Not a buffer: reads go straight into the tail of
+	//! receive_buffer_, which SetReceiveFraming sizes to hold one read plus a
+	//! straddling frame.
+	size_t recv_read_size_ = TDS_DEFAULT_PACKET_SIZE;
+
+	//! Frame assembly. NextPacket is the single place TDS framing happens.
+	const uint8_t *NextPacket(size_t &packet_length, int timeout_ms);
+	//! recv() one read's worth into the tail of the assembly buffer.
+	bool FillReceiveBuffer(int timeout_ms);
 
 	// Helper to set non-blocking mode
 	bool SetNonBlocking(bool enable);

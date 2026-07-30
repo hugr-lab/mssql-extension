@@ -128,12 +128,19 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_XML:
 		return LogicalType::VARCHAR;
 
+	// Legacy LOBs (issue #197). Decoded natively since spec 055: the wire bytes
+	// behind their text-pointer framing are ordinary CHAR / NCHAR / BINARY.
+	// A catalog scan still casts them server-side, which also normalises TEXT's
+	// collation; this mapping is what makes raw mssql_scan work on them too.
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+		return LogicalType::VARCHAR;
+	case TDS_TYPE_IMAGE:
+		return LogicalType::BLOB;
+
 	// Unsupported types
 	case TDS_TYPE_UDT:
 	case TDS_TYPE_SQL_VARIANT:
-	case TDS_TYPE_IMAGE:
-	case TDS_TYPE_TEXT:
-	case TDS_TYPE_NTEXT:
 		throw InvalidInputException(
 			"MSSQL Error: Unsupported SQL Server type '%s' (0x%02X) for column '%s'. "
 			"Consider casting to VARCHAR or excluding this column.",
@@ -177,6 +184,9 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_DATETIMEOFFSET:
 	case TDS_TYPE_UNIQUEIDENTIFIER:
 	case TDS_TYPE_XML:
+	case TDS_TYPE_TEXT:
+	case TDS_TYPE_NTEXT:
+	case TDS_TYPE_IMAGE:
 		return true;
 	default:
 		return false;
@@ -361,51 +371,51 @@ bool TypeConverter::IsStringTdsType(uint8_t type_id) {
 
 namespace {
 
-std::string FormatIntegerFallback(const std::vector<uint8_t> &value) {
+std::string FormatIntegerFallback(const uint8_t *value, size_t size) {
 	// Mirror codec::integer::DecodeFromTds size-dispatch — TINYINT is unsigned (0-255),
 	// SMALLINT/INT/BIGINT are signed.
-	switch (value.size()) {
+	switch (size) {
 	case 1:
 		return std::to_string(static_cast<unsigned int>(value[0]));
 	case 2: {
 		int16_t v = 0;
-		std::memcpy(&v, value.data(), 2);
+		std::memcpy(&v, value, 2);
 		return std::to_string(v);
 	}
 	case 4: {
 		int32_t v = 0;
-		std::memcpy(&v, value.data(), 4);
+		std::memcpy(&v, value, 4);
 		return std::to_string(v);
 	}
 	case 8: {
 		int64_t v = 0;
-		std::memcpy(&v, value.data(), 8);
+		std::memcpy(&v, value, 8);
 		return std::to_string(v);
 	}
 	default:
-		throw InvalidInputException("VARCHAR fallback: unexpected integer length %zu", value.size());
+		throw InvalidInputException("VARCHAR fallback: unexpected integer length %zu", size);
 	}
 }
 
-std::string FormatFloatFallback(const std::vector<uint8_t> &value) {
+std::string FormatFloatFallback(const uint8_t *value, size_t size) {
 	std::ostringstream oss;
-	if (value.size() == 4) {
+	if (size == 4) {
 		float f = 0;
-		std::memcpy(&f, value.data(), 4);
+		std::memcpy(&f, value, 4);
 		oss << std::setprecision(9) << f;
-	} else if (value.size() == 8) {
+	} else if (size == 8) {
 		double d = 0;
-		std::memcpy(&d, value.data(), 8);
+		std::memcpy(&d, value, 8);
 		oss << std::setprecision(17) << d;
 	} else {
-		throw InvalidInputException("VARCHAR fallback: unexpected float length %zu", value.size());
+		throw InvalidInputException("VARCHAR fallback: unexpected float length %zu", size);
 	}
 	return oss.str();
 }
 
 }  // namespace
 
-void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, const ColumnMetadata &column,
+void TypeConverter::WriteAsStringFallback(const uint8_t *value, size_t size, const ColumnMetadata &column,
 										  Vector &vector, idx_t row_idx) {
 	std::string rendered;
 	switch (column.type_id) {
@@ -414,32 +424,32 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 	case TDS_TYPE_INT:
 	case TDS_TYPE_BIGINT:
 	case TDS_TYPE_INTN:
-		rendered = FormatIntegerFallback(value);
+		rendered = FormatIntegerFallback(value, size);
 		break;
 	case TDS_TYPE_BIT:
 	case TDS_TYPE_BITN:
-		rendered = (!value.empty() && value[0] != 0) ? "1" : "0";
+		rendered = (size > 0 && value[0] != 0) ? "1" : "0";
 		break;
 	case TDS_TYPE_REAL:
 	case TDS_TYPE_FLOAT:
 	case TDS_TYPE_FLOATN:
-		rendered = FormatFloatFallback(value);
+		rendered = FormatFloatFallback(value, size);
 		break;
 	case TDS_TYPE_DECIMAL:
 	case TDS_TYPE_NUMERIC:
-		rendered = mssql::codec::decimal::RenderAsString(value, column.precision, column.scale);
+		rendered = mssql::codec::decimal::RenderAsString(value, size, column.precision, column.scale);
 		break;
 	case TDS_TYPE_MONEY:
 	case TDS_TYPE_SMALLMONEY:
 	case TDS_TYPE_MONEYN:
-		rendered = mssql::codec::decimal::RenderMoneyAsString(value);
+		rendered = mssql::codec::decimal::RenderMoneyAsString(value, size);
 		break;
 	case TDS_TYPE_UNIQUEIDENTIFIER:
-		rendered = mssql::codec::uuid::RenderAsString(value);
+		rendered = mssql::codec::uuid::RenderAsString(value, size);
 		break;
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
-		rendered = mssql::codec::binary::RenderAsString(value);
+		rendered = mssql::codec::binary::RenderAsString(value, size);
 		break;
 	case TDS_TYPE_DATE:
 	case TDS_TYPE_TIME:
@@ -448,7 +458,7 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 	case TDS_TYPE_DATETIME2:
 	case TDS_TYPE_DATETIMEN:
 	case TDS_TYPE_DATETIMEOFFSET:
-		rendered = mssql::codec::datetime::RenderAsString(value, column);
+		rendered = mssql::codec::datetime::RenderAsString(value, size, column);
 		break;
 	default:
 		throw InvalidInputException(
@@ -459,6 +469,11 @@ void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, con
 			column.type_id);
 	}
 	FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, rendered);
+}
+
+void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, const ColumnMetadata &column,
+										  Vector &vector, idx_t row_idx) {
+	WriteAsStringFallback(value.data(), value.size(), column, vector, row_idx);
 }
 
 }  // namespace encoding

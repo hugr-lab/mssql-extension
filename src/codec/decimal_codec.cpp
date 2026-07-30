@@ -113,6 +113,38 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
+							Vector &out) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+	// Total over any byte pattern — a sign byte and a little-endian mantissa are
+	// just loads — so the loop runs over NULL rows too and stays branch-free.
+	if (col.precision <= 4) {
+		int16_t *result = FlatVector::GetData<int16_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int16_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else if (col.precision <= 9) {
+		int32_t *result = FlatVector::GetData<int32_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int32_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else if (col.precision <= 18) {
+		int64_t *result = FlatVector::GetData<int64_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] =
+				static_cast<int64_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
+		}
+	} else {
+		hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
+		}
+	}
+}
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	hugeint_t value = WidenVectorToHugeint(in, fmt, row);
@@ -186,24 +218,32 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 	return 45;
 }
 
-std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale) {
+std::string RenderAsString(const uint8_t *bytes, size_t size, uint8_t precision, uint8_t scale) {
 	(void)precision;  // SerializeDecimal does not need precision for fixed-point rendering.
-	hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertDecimal(bytes.data(), bytes.size());
+	hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertDecimal(bytes, size);
 	return MSSQLValueSerializer::SerializeDecimal(int_value, /*width*/ 38, scale);
 }
 
-std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes) {
+std::string RenderAsString(const std::vector<uint8_t> &bytes, uint8_t precision, uint8_t scale) {
+	return RenderAsString(bytes.data(), bytes.size(), precision, scale);
+}
+
+std::string RenderMoneyAsString(const uint8_t *bytes, size_t size) {
 	// SQL Server MONEY is 8 bytes (value × 10000, scale 4). SMALLMONEY is 4 bytes
 	// (same scaling). Both map to DECIMAL(*, 4) for rendering.
 	hugeint_t int_value;
-	if (bytes.size() == 8) {
-		int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes.data());
-	} else if (bytes.size() == 4) {
-		int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes.data());
+	if (size == 8) {
+		int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes);
+	} else if (size == 4) {
+		int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes);
 	} else {
-		throw InvalidInputException("codec::decimal::RenderMoneyAsString: unexpected wire length %zu", bytes.size());
+		throw InvalidInputException("codec::decimal::RenderMoneyAsString: unexpected wire length %zu", size);
 	}
 	return MSSQLValueSerializer::SerializeDecimal(int_value, /*width*/ 19, /*scale*/ 4);
+}
+
+std::string RenderMoneyAsString(const std::vector<uint8_t> &bytes) {
+	return RenderMoneyAsString(bytes.data(), bytes.size());
 }
 
 }  // namespace decimal

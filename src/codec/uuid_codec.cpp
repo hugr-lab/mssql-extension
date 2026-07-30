@@ -19,7 +19,9 @@
 //
 // Also defines codec::uuid::RenderAsString — a public helper used by
 // TypeConverter::WriteAsStringFallback for the issue-#89 path
-// (catalog says VARCHAR but TDS returns UNIQUEIDENTIFIER).
+// (catalog says VARCHAR but TDS returns UNIQUEIDENTIFIER) — and
+// DecodeChunkFromStaging, the family's batch decode for the staged read
+// path (spec 055 D6).
 //===----------------------------------------------------------------------===//
 
 #include "codec/uuid_codec.hpp"
@@ -148,15 +150,32 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 }
 
 //===----------------------------------------------------------------------===//
+// Batch decode from staging (spec 055 D6)
+//===----------------------------------------------------------------------===//
+
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata & /*col*/,
+							Vector &out) {
+	hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+	const uint8_t *src = st.buffer.data();
+	for (idx_t row = 0; row < count; row++) {
+		result[row] = tds::encoding::GuidEncoding::ConvertGuid(src + row * GUID_WIRE_SIZE);
+	}
+}
+
+//===----------------------------------------------------------------------===//
 // Issue-#89 fallback — render wire bytes as canonical lowercase text.
 //===----------------------------------------------------------------------===//
 
-std::string RenderAsString(const std::vector<uint8_t> &bytes) {
-	if (bytes.size() != GUID_WIRE_SIZE) {
-		throw InvalidInputException("codec::uuid::RenderAsString: expected 16 wire bytes, got %zu", bytes.size());
+std::string RenderAsString(const uint8_t *bytes, size_t size) {
+	if (size != GUID_WIRE_SIZE) {
+		throw InvalidInputException("codec::uuid::RenderAsString: expected 16 wire bytes, got %zu", size);
 	}
-	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes.data());
+	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes);
 	return UUID::ToString(guid);
+}
+
+std::string RenderAsString(const std::vector<uint8_t> &bytes) {
+	return RenderAsString(bytes.data(), bytes.size());
 }
 
 }  // namespace uuid

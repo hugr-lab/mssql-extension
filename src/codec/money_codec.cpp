@@ -51,6 +51,27 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	}
 }
 
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata & /*col*/,
+							Vector &out) {
+	const uint8_t *const base = st.buffer.data();
+	const uint32_t stride = st.stride;
+	if (stride == 8) {
+		// MONEY -> DECIMAL(19,4), hugeint storage.
+		hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+		for (idx_t row = 0; row < count; row++) {
+			result[row] = tds::encoding::DecimalEncoding::ConvertMoney(base + row * stride);
+		}
+		return;
+	}
+	// SMALLMONEY -> DECIMAL(10,4), int64 storage; ConvertSmallMoney returns the
+	// sign-extended int32 in .lower.
+	int64_t *result = FlatVector::GetData<int64_t>(out);
+	for (idx_t row = 0; row < count; row++) {
+		result[row] =
+			static_cast<int64_t>(tds::encoding::DecimalEncoding::ConvertSmallMoney(base + row * stride).lower);
+	}
+}
+
 }  // namespace money
 }  // namespace codec
 }  // namespace mssql

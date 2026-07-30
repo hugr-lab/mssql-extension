@@ -18,6 +18,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -46,6 +47,14 @@ namespace codec {
 namespace uuid {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch decode of a staged UNIQUEIDENTIFIER column (spec 055 D6).
+//!
+//! Runs over EVERY row, NULLs included, with no validity test. Staging is
+//! positional for fixed-width columns — row N is always at N * 16 — and the byte
+//! swap is total over any 16 bytes, so a NULL row produces a value the mask
+//! discards. A branch to skip it would cost more than the swap it saves.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
@@ -61,6 +70,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" form (no quotes). Used by the
 // issue-#89 VARCHAR-fallback path in TypeConverter::ConvertValue for
 // UNIQUEIDENTIFIER TDS payloads landing in a VARCHAR-typed vector.
+std::string RenderAsString(const uint8_t *bytes, size_t size);
 std::string RenderAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace uuid

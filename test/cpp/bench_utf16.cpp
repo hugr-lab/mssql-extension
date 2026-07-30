@@ -46,7 +46,6 @@ using duckdb::tds::encoding::Utf16LEDecode;
 using duckdb::tds::encoding::Utf16LEEncode;
 using duckdb::tds::encoding::Utf16LEEncodeDirect;
 using duckdb::tds::encoding::testing::LegacyUtf16LEByteLength;
-using duckdb::tds::encoding::testing::LegacyUtf16LEDecode;
 using duckdb::tds::encoding::testing::LegacyUtf16LEEncode;
 using duckdb::tds::encoding::testing::LegacyUtf16LEEncodeDirect;
 
@@ -240,7 +239,9 @@ FixtureResult RunFixture(const FixtureSpec &f) {
 	legacy_direct.resize(legacy_n);
 
 	const auto simd_decode_back = Utf16LEDecode(simd_encode.data(), simd_encode.size());
-	const auto legacy_decode_back = LegacyUtf16LEDecode(legacy_encode.data(), legacy_encode.size());
+	// Spec 055 D2 deleted the hand-rolled decoder; decode both encodings
+	// with the shipped one (the fixtures here are valid UTF-16).
+	const auto legacy_decode_back = Utf16LEDecode(legacy_encode.data(), legacy_encode.size());
 
 	const size_t simd_byte_len = Utf16LEByteLength(f.utf8);
 	const size_t legacy_byte_len = LegacyUtf16LEByteLength(f.utf8);

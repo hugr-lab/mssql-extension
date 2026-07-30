@@ -48,14 +48,27 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 // VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
 //------------------------------------------------------------------------------
 
-// TEXT is a LOB: sys.columns reports max_length 16 for it — the size of the in-row pointer,
-// not of the data (which runs to 2 GB). It must be treated as a MAX type; deriving a CAST
-// length from that 16 truncated every TEXT column to 16 characters.
-static bool IsLegacyTextLob(const string &sql_type_name) {
+// The three pre-2005 LOB types. sys.columns reports max_length 16 for all of them — the size of
+// the in-row pointer, not of the data, which runs to 2 GB — so any CAST length derived from it
+// truncates. All three are "known" types, so is_cast_required is false and nothing else rewrites
+// them; without an explicit CAST their wire forms (TEXT 0x23, NTEXT 0x63, IMAGE 0x22) reach a
+// codec layer that has no decoder for any of them (issue #197).
+enum class LegacyLob : uint8_t { None, Text, NText, Image };
+
+static LegacyLob LegacyLobKind(const string &sql_type_name) {
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
-	return lower_type == "text";
+	if (lower_type == "text") {
+		return LegacyLob::Text;
+	}
+	if (lower_type == "ntext") {
+		return LegacyLob::NText;
+	}
+	if (lower_type == "image") {
+		return LegacyLob::Image;
+	}
+	return LegacyLob::None;
 }
 
 // Check if column needs NVARCHAR conversion for UTF-8 compatibility
@@ -100,8 +113,8 @@ static std::string GetNVarcharLength(const MSSQLColumnInfo &col) {
 	if (col.max_length == -1) {
 		return "MAX";  // VARCHAR(MAX) → NVARCHAR(MAX)
 	}
-	if (IsLegacyTextLob(col.sql_type_name)) {
-		return "MAX";  // TEXT → NVARCHAR(MAX); its max_length of 16 is the pointer size
+	if (LegacyLobKind(col.sql_type_name) != LegacyLob::None) {
+		return "MAX";  // TEXT/NTEXT → NVARCHAR(MAX); their max_length of 16 is the pointer size
 	}
 	if (col.max_length > 4000) {
 		return "MAX";  // varchar(4001..8000) → NVARCHAR(MAX); NVARCHAR(4000) would truncate
@@ -124,6 +137,23 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 		MSSQL_SCAN_DEBUG_LOG(2, "  Geometry rewrite: %s (%s) → STAsBinary()", col_name.c_str(),
 							 col.sql_type_name.c_str());
 		return escaped_name + ".STAsBinary() AS " + escaped_name;
+	}
+
+	// NTEXT and IMAGE reach here uncast and unreadable (issue #197). Neither is caught by the
+	// NVARCHAR conversion below: ntext is flagged is_unicode, so that path returns early
+	// treating it as already safe, and image is not a text type at all. Image also needs a
+	// BINARY target, so it cannot share the NVARCHAR rewrite.
+	//
+	// TEXT needs nothing here — NeedsNVarcharConversion already claims it, and GetNVarcharLength
+	// answers MAX.
+	const LegacyLob lob_kind = LegacyLobKind(col.sql_type_name);
+	if (lob_kind == LegacyLob::NText) {
+		MSSQL_SCAN_DEBUG_LOG(2, "  Legacy LOB rewrite: %s (ntext) → NVARCHAR(MAX)", col_name.c_str());
+		return "CAST(" + escaped_name + " AS NVARCHAR(MAX)) AS " + escaped_name;
+	}
+	if (lob_kind == LegacyLob::Image) {
+		MSSQL_SCAN_DEBUG_LOG(2, "  Legacy LOB rewrite: %s (image) → VARBINARY(MAX)", col_name.c_str());
+		return "CAST(" + escaped_name + " AS VARBINARY(MAX)) AS " + escaped_name;
 	}
 
 	// Unsupported SQL Server types (hierarchyid, sql_variant, CLR UDTs, etc.)

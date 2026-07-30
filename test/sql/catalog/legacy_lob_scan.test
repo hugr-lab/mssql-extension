@@ -1,0 +1,132 @@
+# name: test/sql/catalog/legacy_lob_scan.test
+# description: TEXT / NTEXT / IMAGE columns are readable through a catalog scan.
+#   Issue #197: all three are "known" SQL Server types, so is_cast_required is false
+#   and nothing rewrote them; their uncast wire forms (TEXT 0x23, NTEXT 0x63,
+#   IMAGE 0x22) have no decoder, and the query died with "Connection closed while
+#   waiting for COLMETADATA". Spec 055 D9 rewrites them server-side:
+#     TEXT, NTEXT -> CAST(... AS NVARCHAR(MAX))
+#     IMAGE       -> CAST(... AS VARBINARY(MAX))
+#   which puts them on the PLP path the rest of the MAX types already use.
+#
+#   The native wire form is decoded as well, so raw mssql_scan — which has no
+#   catalog metadata to rewrite from — reads them too. Their COLMETADATA carries
+#   a source TABLE NAME that no other type has; not parsing it desynchronised the
+#   stream, which is why the failure looked like a dropped connection rather than
+#   a decode error.
+# group: [sql]
+#
+# Deliberately covered: NULL rows, empty (non-NULL) values, and values past the
+# 4000/8000 limits of the bounded types — sys.columns reports max_length 16 for
+# all three (the in-row pointer, not the data), so a CAST length derived from it
+# would silently truncate.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS lob (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('lob', 'DROP TABLE IF EXISTS dbo.LegacyLobScan');
+
+statement ok
+SELECT mssql_exec('lob', 'CREATE TABLE dbo.LegacyLobScan (id INT PRIMARY KEY, t TEXT, nt NTEXT, im IMAGE)');
+
+statement ok
+SELECT mssql_exec('lob', 'INSERT INTO dbo.LegacyLobScan VALUES (1, ''hello text'', N''naive ntext'', 0xDEADBEEF)');
+
+statement ok
+SELECT mssql_exec('lob', 'INSERT INTO dbo.LegacyLobScan VALUES (2, NULL, NULL, NULL)');
+
+statement ok
+SELECT mssql_exec('lob', 'INSERT INTO dbo.LegacyLobScan VALUES (3, '''', N'''', 0x)');
+
+# 9000 units each: past varchar's 8000 and nvarchar's 4000, so a bounded CAST
+# would truncate. The ntext value is non-ASCII on purpose — it exercises the
+# UTF-16 batch decode's non-arithmetic boundary path rather than the ASCII one.
+statement ok
+SELECT mssql_exec('lob', 'INSERT INTO dbo.LegacyLobScan VALUES (4,
+    REPLICATE(CAST(''x'' AS VARCHAR(MAX)), 9000),
+    REPLICATE(CAST(NCHAR(0x044B) AS NVARCHAR(MAX)), 9000),
+    CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), 9000) AS VARBINARY(MAX)))');
+
+# The rewrite must not change what the catalog reports: TEXT/NTEXT stay VARCHAR,
+# IMAGE stays BLOB.
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT id, t, nt, im FROM lob.dbo.LegacyLobScan)
+ORDER BY column_name;
+----
+id	INTEGER
+im	BLOB
+nt	VARCHAR
+t	VARCHAR
+
+# The regression itself: this used to fail before COLMETADATA ever arrived.
+query IIII
+SELECT id, t, nt, octet_length(im) FROM lob.dbo.LegacyLobScan WHERE id = 1;
+----
+1	hello text	naive ntext	4
+
+query IIII
+SELECT id, t IS NULL, nt IS NULL, im IS NULL FROM lob.dbo.LegacyLobScan WHERE id = 2;
+----
+2	true	true	true
+
+# Empty is not NULL, in all three.
+query IIIIII
+SELECT id, t, nt, octet_length(im), t IS NULL, nt IS NULL FROM lob.dbo.LegacyLobScan WHERE id = 3;
+----
+3	(empty)	(empty)	0	false	false
+
+# Past the bounded limits, with the value's own content checked rather than just
+# its length — a truncating CAST would keep the prefix and shorten the string.
+query IIIII
+SELECT id, length(t), length(nt), octet_length(im), nt = repeat(chr(1099), 9000)
+FROM lob.dbo.LegacyLobScan WHERE id = 4;
+----
+4	9000	9000	9000	true
+
+query I
+SELECT count(*) FROM lob.dbo.LegacyLobScan;
+----
+4
+
+# Raw mssql_scan has no catalog metadata and so applies no rewrite — it reads the
+# native wire form. That used to break the COLMETADATA parse (these three carry a
+# 4-byte length, a collation and a source TABLE NAME, a field no other type has)
+# and drop the connection. Both the metadata and the row framing — a text
+# pointer and a timestamp ahead of a 4-byte length — are parsed now, so the same
+# values come back through either path.
+query IIII
+SELECT id, t, nt, octet_length(im)
+FROM mssql_scan('lob', 'SELECT id, t, nt, im FROM dbo.LegacyLobScan WHERE id = 1');
+----
+1	hello text	naive ntext	4
+
+query IIIII
+SELECT id, length(t), length(nt), octet_length(im), nt = repeat(chr(1099), 9000)
+FROM mssql_scan('lob', 'SELECT id, t, nt, im FROM dbo.LegacyLobScan WHERE id = 4');
+----
+4	9000	9000	9000	true
+
+# NULL and empty survive the text-pointer framing too: a zero-length pointer is
+# the NULL marker, which is a different thing from a zero-length value.
+query IIII
+SELECT id, t IS NULL, nt IS NULL, im IS NULL
+FROM mssql_scan('lob', 'SELECT id, t, nt, im FROM dbo.LegacyLobScan WHERE id = 2');
+----
+2	true	true	true
+
+query IIIII
+SELECT id, t, nt, octet_length(im), t IS NULL
+FROM mssql_scan('lob', 'SELECT id, t, nt, im FROM dbo.LegacyLobScan WHERE id = 3');
+----
+3	(empty)	(empty)	0	false
+
+statement ok
+SELECT mssql_exec('lob', 'DROP TABLE IF EXISTS dbo.LegacyLobScan');
+
+statement ok
+DETACH lob;

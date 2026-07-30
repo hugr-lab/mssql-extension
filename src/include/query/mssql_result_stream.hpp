@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include "codec/staging/row_stager.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -142,6 +143,13 @@ private:
 	// Process parsed row into DataChunk
 	void ProcessRow(DataChunk &chunk, idx_t row_idx);
 
+	// Staged read path (spec 055 T5). Resolve the output vector for each SQL
+	// column exactly once per chunk, applying the same target_vectors_ /
+	// output_column_mapping_ / columns_to_fill_ rules ProcessRow applies per row.
+	// A column the query does not fill gets a null entry and is walked for its
+	// length only.
+	void ResolveStagedTargets(DataChunk &chunk);
+
 	// Handle cancellation draining
 	void DrainAfterCancel();
 
@@ -199,6 +207,14 @@ private:
 	// If non-empty, these vectors are used instead of chunk.data
 	vector<Vector *> target_vectors_;
 
+	// Staged read path (spec 055 T5): one walk of each row, column-major where
+	// the wire form is already DuckDB's. Not used when target_vectors_ is set —
+	// those vectors are STRUCT children the caller owns and may have written
+	// validity into already, and the staged path publishes a whole column's
+	// validity mask at once.
+	mssql::codec::staging::RowStager stager_;
+	std::vector<Vector *> staged_targets_;
+
 	// D4 (spec 054): per-stream debug counters, active only at MSSQL_DEBUG>=2
 	// (counters_enabled_ latched at construction). Plain integers — a stream
 	// is filled from one thread at a time. Printed once on destruction.
@@ -211,20 +227,41 @@ private:
 		uint64_t string_bytes_out = 0;	// UTF-8 bytes written to string vectors
 		uint64_t plp_values = 0;		// non-NULL values in PLP (MAX-typed) columns
 		uint64_t utf16_fallbacks = 0;	// legacy-converter dispatches (invalid UTF-16)
-		uint64_t fill_total_us = 0;		// wall time inside FillChunk, accumulated
-		uint64_t fill_parse_us = 0;
-		uint64_t fill_read_us = 0;
-		uint64_t fill_process_us = 0;
+		// Phase timing, accumulated in NANOSECONDS. Microseconds were wrong here:
+		// these intervals are per row, a row is processed in ~100 ns, and
+		// duration_cast<microseconds> truncated every one of them to zero — so
+		// fill_process reported ~0 no matter how much work it did. Only the rare,
+		// long socket waits ever crossed a microsecond boundary.
+		uint64_t fill_total_ns = 0;	   // wall time inside FillChunk, accumulated
+		uint64_t fill_parse_ns = 0;	   // TDS token/row framing
+		uint64_t fill_read_ns = 0;	   // socket wait (server + network term)
+		uint64_t fill_process_ns = 0;  // per-value decode + chunk fill
 	};
 
 	// Count one processed row into counters_ (called from ProcessRow when
 	// counters_enabled_; keeps the conversion hot loop untouched).
 	void CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t cols_to_fill);
 
+	// Staged-path equivalent, once per chunk instead of once per row. Everything
+	// it needs is derivable from the finished chunk plus the stager's per-column
+	// NULL counts, so the staged walk itself carries no counter code at all.
+	void CountChunkForDebug(DataChunk &chunk, idx_t row_count);
+
 	// Print the close summary to stderr (destructor, counters_enabled_ only).
 	void PrintDebugCounters();
+	// The staged path's own block (spec 055 D10): per-kernel time and staged
+	// bytes, the direct-write bypass, string boundary strategies, and the
+	// arena's sizing decisions. Silent for a stream that never staged.
+	void PrintStagingCounters();
 
 	bool counters_enabled_ = false;
+	// Phase timing is opt-in (MSSQL_DEBUG>=1), separately from the counters
+	// (>=2), because the FillChunk summary log lives at level 1. It has to be
+	// gated at all because steady_clock::now() costs ~15 ns per call on ARM64
+	// and the fill loop took FOUR of them per row — ~59 ns/row measured, on a
+	// path whose entire per-row budget is of that order. It was unconditional
+	// in release builds, so every user paid for instrumentation nobody read.
+	bool timing_enabled_ = false;
 	StreamDebugCounters counters_;
 	// Per-column decode family (value = codec::TypeFamily, 0xFF = unknown)
 	// and PLP-ness, precomputed once after COLMETADATA.

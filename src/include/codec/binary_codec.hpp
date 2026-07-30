@@ -19,6 +19,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -47,6 +48,16 @@ namespace codec {
 namespace binary {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch decode of a staged column whose wire bytes ARE the value (spec 055 D6):
+//! VARBINARY, and single-byte CHAR/VARCHAR, whose collation handling lives in
+//! the scan's SELECT list (spec 026) rather than here.
+//!
+//! One allocation and one copy for the whole column, in place of one of each per
+//! value. Fixed-length CHAR is padded to its declared width by SQL Server and
+//! the trailing spaces are stripped — that rule is a property of the TDS type,
+//! so it is derived here from `col` rather than passed in.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
@@ -61,6 +72,7 @@ size_t EstimateLiteralSize(const LogicalType &type);
 // Public helper: render raw bytes as the canonical 0x<UPPERHEX> literal text.
 // Used by the issue-#89 VARCHAR-fallback path in TypeConverter::ConvertValue
 // for binary TDS payloads landing in a VARCHAR-typed vector.
+std::string RenderAsString(const uint8_t *bytes, size_t size);
 std::string RenderAsString(const std::vector<uint8_t> &bytes);
 
 }  // namespace binary

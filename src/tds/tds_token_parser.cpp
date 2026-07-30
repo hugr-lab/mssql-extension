@@ -43,6 +43,11 @@ void TokenParser::Reset() {
 	current_error_ = TdsError();
 	current_info_ = TdsInfo();
 	current_done_ = DoneToken();
+	// The buffer is gone, so a deferred consume would advance past live data of
+	// the next result set.
+	pending_consume_ = 0;
+	raw_row_offset_ = 0;
+	raw_row_length_ = 0;
 }
 
 void TokenParser::Feed(const uint8_t *data, size_t length) {
@@ -77,6 +82,15 @@ ParsedTokenType TokenParser::TryParseNext() {
 	// bound check passed, ConsumeBytes(0) made no progress, and the recursion
 	// looped forever. The length checks below now add in size_t so they cannot
 	// wrap, and ConsumeBytes always advances by at least the token header.
+	// Raw-row mode defers the consume of the previous row to here, so the bytes
+	// stayed addressable while the caller walked them. Doing it inside ParseRow
+	// would compact the buffer out from under the pointer we handed out.
+	if (pending_consume_ > 0) {
+		const size_t count = pending_consume_;
+		pending_consume_ = 0;
+		ConsumeBytes(count);
+	}
+
 	while (true) {
 		if (state_ == ParserState::Complete || state_ == ParserState::Error) {
 			// Return NeedMoreData to break out of all parsing loops
@@ -282,6 +296,21 @@ bool TokenParser::ParseRow() {
 		return true;
 	}
 
+	// Raw-row mode: bound the row and hand its bytes up untouched. SkipRow walks
+	// the length prefixes without copying, so returning true here means the whole
+	// row is in the buffer — the caller's column walk can then run without a
+	// single bounds test.
+	if (raw_row_mode_) {
+		if (!reader.SkipRow(data, length, bytes_consumed)) {
+			return false;  // Need more data
+		}
+		raw_row_offset_ = buffer_pos_ + 1;
+		raw_row_length_ = bytes_consumed;
+		raw_row_nbc_ = false;
+		pending_consume_ = 1 + bytes_consumed;
+		return true;
+	}
+
 	// Normal path: full parsing
 	current_row_.Clear();
 	try {
@@ -321,6 +350,19 @@ bool TokenParser::ParseNBCRow() {
 			return false;  // Need more data
 		}
 		ConsumeBytes(1 + bytes_consumed);
+		return true;
+	}
+
+	// Raw-row mode — see ParseRow. `bytes_consumed` spans the NULL bitmap too, so
+	// the caller receives the row exactly as it sits on the wire.
+	if (raw_row_mode_) {
+		if (!reader.SkipNBCRow(data, length, bytes_consumed)) {
+			return false;  // Need more data
+		}
+		raw_row_offset_ = buffer_pos_ + 1;
+		raw_row_length_ = bytes_consumed;
+		raw_row_nbc_ = true;
+		pending_consume_ = 1 + bytes_consumed;
 		return true;
 	}
 

@@ -21,6 +21,11 @@ struct MSSQLPoolConfig {
 	// fragmentation boundary so the multi-packet path can be exercised without
 	// an AD-sized Kerberos PAC. 0 = production default (4096). Clamped at use.
 	int64_t login7_max_packet = 0;
+	// TDS frame size requested in LOGIN7, in bytes. The server answers with
+	// min(requested, its own maximum) via the PACKETSIZE ENVCHANGE; it never
+	// raises the value on its own, so whatever we ask for here is the ceiling
+	// for every subsequent packet in both directions. 0 = tds::DEFAULT_TDS_PACKET_SIZE.
+	int64_t tds_packet_size = 0;
 };
 
 //===----------------------------------------------------------------------===//

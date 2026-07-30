@@ -142,8 +142,11 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
 		auto token = fedauth_token_utf16le_;
-		factory = [host, port, database, encrypt, token, app_name]() -> std::shared_ptr<tds::TdsConnection> {
+		auto tds_packet_size = connection_info_->tds_packet_size;
+		factory = [host, port, database, encrypt, token, app_name,
+				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
+			conn->SetRequestedPacketSize(tds_packet_size);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
@@ -162,6 +165,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		MSSQLConnectionInfo info_copy = *connection_info_;
 		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
+			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
 			if (!conn->Connect(info_copy.host, info_copy.port)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
 						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
@@ -201,9 +205,11 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto password = connection_info_->password;
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
-		factory = [host, port, username, password, database, encrypt,
-				   app_name]() -> std::shared_ptr<tds::TdsConnection> {
+		auto tds_packet_size = connection_info_->tds_packet_size;
+		factory = [host, port, username, password, database, encrypt, app_name,
+				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
+			conn->SetRequestedPacketSize(tds_packet_size);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}

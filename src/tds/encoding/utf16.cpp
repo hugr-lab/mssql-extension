@@ -18,8 +18,16 @@
 //   1. Pre-validate via simdutf::validate_utf8 (encode direction) or
 //      validate_utf16le (decode direction).
 //   2. Valid input -> SIMD fast path via convert_valid_*.
-//   3. Invalid input -> private LegacyUtf16LE* fallback, preserving the
-//      pre-spec-043 "skip invalid bytes, continue" semantics bit-for-bit.
+//   3. Invalid input:
+//      - DECODE (UTF-16LE -> UTF-8): standard U+FFFD substitution, one
+//        replacement per ill-formed code unit, decoding resumes at the next
+//        unit (DecodeUtf16LeReplacing). Spec 055 D2 replaced the hand-rolled
+//        converter here: it consumed the unit *following* an unpaired high
+//        surrogate before emitting its single replacement, and dropped a
+//        trailing high surrogate entirely — silent data loss, not replacement.
+//      - ENCODE (UTF-8 -> UTF-16LE): private LegacyUtf16LE* fallback, still
+//        preserving the pre-spec-043 "skip invalid bytes, continue" semantics
+//        bit-for-bit.
 //   4. Never throws on invalid input.
 //===----------------------------------------------------------------------===//
 
@@ -139,48 +147,6 @@ std::vector<uint8_t> LegacyUtf16LEEncode(const std::string &input) {
 		return result;
 	}
 	Utf8ToUtf16LEGeneral(input.data(), input.size(), result);
-	return result;
-}
-
-std::string LegacyUtf16LEDecode(const uint8_t *data, size_t byte_length) {
-	std::string result;
-	result.reserve(byte_length);
-	size_t i = 0;
-	while (i + 1 < byte_length) {
-		uint16_t code_unit = static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
-		i += 2;
-		uint32_t codepoint;
-		if (code_unit >= 0xD800 && code_unit <= 0xDBFF) {
-			if (i + 1 >= byte_length)
-				break;
-			uint16_t low_surrogate = static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8);
-			i += 2;
-			if (low_surrogate >= 0xDC00 && low_surrogate <= 0xDFFF) {
-				codepoint = 0x10000 + ((static_cast<uint32_t>(code_unit - 0xD800) << 10) | (low_surrogate - 0xDC00));
-			} else {
-				codepoint = 0xFFFD;
-			}
-		} else if (code_unit >= 0xDC00 && code_unit <= 0xDFFF) {
-			codepoint = 0xFFFD;
-		} else {
-			codepoint = code_unit;
-		}
-		if (codepoint <= 0x7F) {
-			result.push_back(static_cast<char>(codepoint));
-		} else if (codepoint <= 0x7FF) {
-			result.push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
-			result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-		} else if (codepoint <= 0xFFFF) {
-			result.push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
-			result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-		} else if (codepoint <= 0x10FFFF) {
-			result.push_back(static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07)));
-			result.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-		}
-	}
 	return result;
 }
 
@@ -325,6 +291,57 @@ const char16_t *AlignedUtf16View(const uint8_t *data, size_t code_units, std::ve
 	return scratch.data();
 }
 
+// Decode UTF-16LE that is NOT valid UTF-16, using standard U+FFFD substitution.
+//
+// SQL Server NVARCHAR is UCS-2, so an unpaired surrogate is a legal value on the
+// wire and must not fail a query. simdutf is strictly conformant and rejects it,
+// hence this path.
+//
+// Semantics are WHATWG maximal-subpart: each ill-formed code unit becomes
+// exactly one U+FFFD, and decoding resumes at the NEXT unit. That matters — the
+// hand-rolled converter this replaces consumed the unit *after* an unpaired high
+// surrogate before emitting its single replacement, so `D800 0041` lost the 'A'
+// entirely, and a high surrogate in the final position produced no output at
+// all. Both were silent data loss rather than replacement.
+//
+// simdutf has no lossy mode (checked through 6.1.1), so the loop converts each
+// valid run in bulk and splices replacements between them. Bulk conversion of
+// the runs is why this is also ~1.3x faster than the scalar converter it
+// replaces (spec 055 D2).
+std::string DecodeUtf16LeReplacing(const char16_t *src, size_t code_units) {
+	static const char kReplacement[] = "\xEF\xBF\xBD";	// U+FFFD
+
+	std::string result;
+	// One replacement per unit is the worst case; 3 bytes/unit also covers every
+	// well-formed BMP run, so a single reserve holds for both.
+	result.reserve(code_units * 3);
+
+	size_t pos = 0;
+	while (pos < code_units) {
+		// Locate the next ill-formed unit WITHOUT converting: the conversion
+		// entry points all write through their output pointer, so they cannot be
+		// used as a probe.
+		const simdutf::result r = simdutf::validate_utf16le_with_errors(src + pos, code_units - pos);
+		const bool ok = r.error == simdutf::error_code::SUCCESS;
+		const size_t valid_units = ok ? code_units - pos : r.count;
+
+		if (valid_units > 0) {
+			const size_t out_bytes = simdutf::utf8_length_from_utf16le(src + pos, valid_units);
+			const size_t base = result.size();
+			result.resize(base + out_bytes);
+			if (out_bytes > 0) {
+				simdutf::convert_valid_utf16le_to_utf8(src + pos, valid_units, &result[base]);
+			}
+		}
+		if (ok) {
+			return result;
+		}
+		result.append(kReplacement, 3);
+		pos += valid_units + 1;	 // step over exactly the offending unit
+	}
+	return result;
+}
+
 }  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -443,7 +460,7 @@ std::string Utf16LEDecode(const uint8_t *data, size_t byte_length) {
 	const char16_t *src = AlignedUtf16View(data, code_units, local);
 	if (!simdutf::validate_utf16le(src, code_units)) {
 		utf16_fallback_count++;
-		return LegacyUtf16LEDecode(data, byte_length);
+		return DecodeUtf16LeReplacing(src, code_units);
 	}
 
 	const size_t out_bytes = simdutf::utf8_length_from_utf16le(src, code_units);
@@ -501,10 +518,6 @@ namespace testing {
 
 std::vector<uint8_t> LegacyUtf16LEEncode(const std::string &input) {
 	return ::duckdb::tds::encoding::LegacyUtf16LEEncode(input);
-}
-
-std::string LegacyUtf16LEDecode(const uint8_t *data, size_t byte_length) {
-	return ::duckdb::tds::encoding::LegacyUtf16LEDecode(data, byte_length);
 }
 
 size_t LegacyUtf16LEByteLength(const std::string &input) {
