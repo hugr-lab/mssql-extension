@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager-framing help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -403,6 +403,59 @@ test-column-staging: release
 	    -o build/test/test_column_staging
 	@echo ""
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
+
+# Spec 055 T5: RowStager differential framing tests.
+#
+# Pure in-memory — no SQL Server. Asserts that the staged row walk consumes
+# EXACTLY the bytes RowReader::SkipRow/SkipNBCRow bounded, for every staged wire
+# form. That agreement is what makes the walk's absence of per-value bounds
+# checks safe, and the two framings live in different files with nothing else
+# pinning them together.
+#
+# Built with ASan+UBSan on purpose (like test-token-parser-security): half the
+# coverage is "a framing slip reads past the row", which is a sanitizer report
+# rather than a failed assertion. -fno-sanitize-recover makes the first one
+# fatal. Links the RELEASE libduckdb, which is not itself instrumented — that is
+# fine, the interposed allocator still tracks the test's own heap blocks, and
+# each row is placed in an exact-sized `new uint8_t[n]`.
+ROW_STAGER_TEST_FLAGS := -std=c++17 -g -O1 -pthread -Wno-deprecated-declarations \
+    -fsanitize=address,undefined -fno-sanitize-recover=all
+ROW_STAGER_TEST_SOURCES := \
+    $(wildcard src/codec/*.cpp) \
+    src/codec/staging/column_staging.cpp \
+    src/codec/staging/column_ops.cpp \
+    src/codec/staging/row_stager.cpp \
+    src/tds/tds_row_reader.cpp \
+    src/tds/tds_column_metadata.cpp \
+    src/tds/tds_types.cpp \
+    src/tds/encoding/type_converter.cpp \
+    src/tds/encoding/utf16.cpp \
+    src/tds/encoding/datetime_encoding.cpp \
+    src/tds/encoding/decimal_encoding.cpp \
+    src/tds/encoding/guid_encoding.cpp \
+    src/tds/encoding/bcp_row_encoder.cpp
+
+test-row-stager-framing: release
+	@echo "Building RowStager framing tests (spec 055 T5, ASan+UBSan)..."
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
+		echo "ERROR: no release build found; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(ROW_STAGER_TEST_FLAGS) $(BENCH_UTF16_INCLUDES) \
+	    test/cpp/codec/test_row_stager_framing.cpp \
+	    $(ROW_STAGER_TEST_SOURCES) \
+	    $(BENCH_UTF16_LIBS) \
+	    -L build/release/src -lduckdb \
+	    -o build/test/test_row_stager_framing
+	@echo ""
+	# detect_leaks=0: libduckdb is not instrumented and its static initialisers
+	# hold allocations for process lifetime, which LeakSanitizer (on by default
+	# on Linux) would report as leaks that have nothing to do with this test.
+	# Buffer overflows — the thing being tested for — are unaffected.
+	ASAN_OPTIONS=detect_leaks=0 \
+	    DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src \
+	    build/test/test_row_stager_framing
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
