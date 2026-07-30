@@ -163,7 +163,8 @@ inline idx_t Utf8UpperBound(idx_t units) {
 	return units * 3;
 }
 
-//! Run length beyond which memchr's call overhead pays for itself (D5).
+//! Average bytes one value's delimiter search covers before memchr's call
+//! overhead pays for itself (D5).
 static const size_t MEMCHR_THRESHOLD_BYTES = 64;
 
 //! First 0x00 byte at or after `from`, or `limit` if there is none.
@@ -175,10 +176,17 @@ static const size_t MEMCHR_THRESHOLD_BYTES = 64;
 //! Short runs are swept eight bytes at a time by the classic zero-byte word
 //! test; long runs go to memchr, which is SIMD in libc but whose call overhead
 //! only pays off once there is enough to scan. No count-trailing-zeros
-//! intrinsic: once a word is known to hold a zero its eight bytes are checked
-//! directly, which keeps this portable to MSVC.
+//! intrinsic in the sweep: once a word is known to hold a zero its eight bytes
+//! are checked directly, which keeps this portable to MSVC.
+//!
+//! Which one wins is a property of the COLUMN — how far its values sit from
+//! their delimiter — so it is a template parameter resolved once by the caller,
+//! not a test per value. Testing the distance to the end of the blob instead
+//! answers a different question entirely: the blob is the whole column, tens of
+//! kilobytes of it, so that test picks memchr for every value of every column.
+template <bool MEMCHR>
 inline size_t FindDelimiter(const char *data, size_t from, size_t limit) {
-	if (limit - from >= MEMCHR_THRESHOLD_BYTES) {
+	if (MEMCHR) {
 		const void *hit = std::memchr(data + from, 0, limit - from);
 		return hit ? static_cast<size_t>(static_cast<const char *>(hit) - data) : limit;
 	}
@@ -267,6 +275,9 @@ inline void StoreValue(string_t *result, idx_t row, const char *data, uint32_t l
 //! Both cursors only ever move forward, so this is two linear passes over the
 //! column — one across the input units, one across the output bytes — not a
 //! per-value scan.
+//!
+//! Always the sweep: a column that reaches here has already had every value's
+//! delimiter located once, so the runs here are the same short ones.
 template <bool TRIM>
 void SplitWithEmbeddedNuls(const staging::ColumnStaging &st, idx_t count, const char16_t *src, const char *blob,
 						   size_t written, string_t *result) {
@@ -285,7 +296,7 @@ void SplitWithEmbeddedNuls(const staging::ColumnStaging &st, idx_t count, const 
 		}
 		size_t pos = out_pos;
 		for (size_t k = 0; k < zeros; k++) {
-			pos = FindDelimiter(blob, pos, written);
+			pos = FindDelimiter<false>(blob, pos, written);
 			if (k + 1 < zeros) {
 				pos++;
 			}
@@ -309,7 +320,7 @@ void SplitWithEmbeddedNuls(const staging::ColumnStaging &st, idx_t count, const 
 //! bench matrix is single-script, so such a bug passes the whole of it.
 //!
 //! Returns where the walk ended, which the caller checks against `written`.
-template <bool TRIM>
+template <bool TRIM, bool MEMCHR>
 size_t WalkDelimited(const staging::ColumnStaging &st, idx_t count, const char *blob, size_t written,
 					 string_t *result) {
 	size_t offset = 0;
@@ -317,7 +328,7 @@ size_t WalkDelimited(const staging::ColumnStaging &st, idx_t count, const char *
 		if (!st.IsValid(row)) {
 			continue;
 		}
-		const size_t delimiter = FindDelimiter(blob, offset + st.lengths[row] / 2, written);
+		const size_t delimiter = FindDelimiter<MEMCHR>(blob, offset + st.lengths[row] / 2, written);
 		StoreValue<TRIM>(result, row, blob + offset, static_cast<uint32_t>(delimiter - offset));
 		offset = delimiter + 1;
 	}
@@ -380,7 +391,19 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 	// Multi-byte characters are present, so an output offset no longer follows
 	// from its input offset. The conversion was still ONE call; the U+0000 unit
 	// staged after each value separates the values in the output too.
-	const size_t offset = WalkDelimited<TRIM>(st, count, blob, written, result);
+	//
+	// Each search starts at the value's own unit count and ends at its delimiter,
+	// so the whole column's searching covers exactly (output bytes - input units)
+	// — the delimiters cancel, one byte against one unit. Divided by the values
+	// that produced it, that is the average run one search sees, and it decides
+	// the search for the column at the cost of a single division.
+	//
+	// `values` cannot be zero: reaching here means units > 0, which means some
+	// row staged a payload, which means some row was not NULL.
+	const idx_t values = count - st.null_count;
+	const bool use_memchr = (written - units) / values >= MEMCHR_THRESHOLD_BYTES;
+	const size_t offset = use_memchr ? WalkDelimited<TRIM, true>(st, count, blob, written, result)
+									 : WalkDelimited<TRIM, false>(st, count, blob, written, result);
 
 	// Exactly one delimiter per staged value means the walk lands exactly on the
 	// end of the output. Anything else means a value contained a U+0000 of its

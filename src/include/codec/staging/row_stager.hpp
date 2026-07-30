@@ -78,11 +78,7 @@ public:
 	void StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx);
 
 	//! Publish staged state into the output vectors and close the chunk.
-	//!
-	//! `collect_nulls` is the D4 counters' only cost on this path: it turns on a
-	//! per-column popcount of the staged validity, once per chunk. Nothing is
-	//! counted per value — a branch there would cost more than the append itself.
-	void FinalizeChunk(idx_t row_count, bool collect_nulls);
+	void FinalizeChunk(idx_t row_count);
 
 	//! Has this chunk staged more than `budget` bytes in its MAX-typed columns?
 	//!
@@ -103,8 +99,8 @@ public:
 		return total >= budget;
 	}
 
-	//! NULLs in column `c` during the chunk just finalized. Meaningful only when
-	//! FinalizeChunk was asked to collect them.
+	//! NULLs in column `c` during the chunk just finalized. Counted by the append
+	//! arm, so this is free and always available (D4/D10 counters).
 	idx_t ChunkNulls(idx_t c) const {
 		return chunk_nulls_[c];
 	}

@@ -491,7 +491,7 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 	D_ASSERT(p == end);
 }
 
-void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
+void RowStager::FinalizeChunk(idx_t row_count) {
 	const idx_t words = (row_count + 63) / 64;
 	for (idx_t c = 0; c < ops_.size(); c++) {
 		if (ops_[c].arm >= AppendArm::Unsupported) {
@@ -528,18 +528,12 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
 			break;
 		}
-		// Values went straight into the vector; only validity is still ours. Scan
-		// first so an all-valid column — the overwhelmingly common one — never
-		// forces DuckDB to allocate a mask it does not need.
-		bool any_null = false;
-		for (idx_t w = 0; w < words; w++) {
-			if (st.validity_words[w] != ~static_cast<uint64_t>(0)) {
-				any_null = true;
-				break;
-			}
-		}
-		chunk_nulls_[c] = 0;
-		if (!any_null) {
+		// Values went straight into the vector; only validity is still ours. An
+		// all-valid column — the overwhelmingly common one — must not force
+		// DuckDB to allocate a mask it does not need, and the append arm already
+		// counted the NULLs, so that costs one test rather than a scan.
+		chunk_nulls_[c] = st.null_count;
+		if (st.null_count == 0) {
 			continue;
 		}
 		ValidityMask &mask = FlatVector::Validity(*targets_[c]);
@@ -548,11 +542,6 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 		// ColumnStaging keeps validity in this shape to begin with. Bits past
 		// row_count are still set from BeginChunk and are ignored downstream.
 		std::memcpy(mask.GetData(), st.validity_words.data(), words * sizeof(uint64_t));
-		if (collect_nulls) {
-			for (idx_t r = 0; r < row_count; r++) {
-				chunk_nulls_[c] += st.IsValid(r) ? 0 : 1;
-			}
-		}
 	}
 	arena_.EndChunk();
 }

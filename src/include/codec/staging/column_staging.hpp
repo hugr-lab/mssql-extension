@@ -199,6 +199,11 @@ struct ColumnStaging {
 
 	//! Rows staged so far in this chunk.
 	idx_t count = 0;
+	//! NULLs among them. One increment on the NULL arm — which is the only arm
+	//! that can produce one — in exchange for two loops per column per chunk:
+	//! finalize no longer scans the validity words to find out whether the mask
+	//! is worth publishing, and the debug counters no longer popcount it.
+	idx_t null_count = 0;
 	//! Var only: payload bytes used. `buffer` is sized to CAPACITY, not to use —
 	//! vector::resize() value-initialises the new bytes, and we memcpy over them
 	//! immediately, so resizing per value would write every payload byte twice.
@@ -262,6 +267,7 @@ struct ColumnStaging {
 	//! is ignored otherwise.
 	void BeginChunk(uint8_t *direct_dst_p) {
 		count = 0;
+		null_count = 0;
 		direct_dst = direct_dst_p;
 		saw_embedded_nul = false;
 		boundary_risky = false;
@@ -293,6 +299,7 @@ struct ColumnStaging {
 	inline void AppendNull() {
 		validity_words[count >> 6] &= ~(static_cast<uint64_t>(1) << (count & 63));
 		count++;
+		null_count++;
 	}
 
 	//! Stage `stride` bytes for a Fixed column.

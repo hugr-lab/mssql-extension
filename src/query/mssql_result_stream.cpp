@@ -428,7 +428,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 
 exit_loop:
 	if (staged) {
-		stager_.FinalizeChunk(row_count, counters_enabled_);
+		stager_.FinalizeChunk(row_count);
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
 		}
