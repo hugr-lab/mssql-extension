@@ -36,6 +36,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "codec/staging/column_staging.hpp"
 #include "codec/type_family.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -64,6 +65,42 @@ namespace codec {
 namespace string {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+//! Batch UTF-16LE -> UTF-8 decode of a staged column (spec 055 D5/T10).
+//!
+//! WHAT THE PER-VALUE PATH DOES, PER VALUE
+//!   1. Utf8LengthFromUtf16LEView  — a full pass that both validates and counts
+//!   2. StringVector::EmptyString  — an allocation in the vector's string heap
+//!   3. Utf16LEDecodeValidInto     — a second pass that converts
+//! Step 1 costs MORE than step 3 (measured 36.6 vs ~21 ns at 200 characters),
+//! and it exists only to size step 2.
+//!
+//! WHAT THIS DOES
+//! One conversion call for the entire column, into one allocation. simdutf's
+//! checked converter validates and converts in the same pass and returns the
+//! byte count, so the length pass disappears rather than being made faster.
+//!
+//! The count also answers, for free, whether the column was pure ASCII: if the
+//! output is exactly as many BYTES as the input had code UNITS, every unit
+//! produced one byte. Value boundaries in the output are then the staged byte
+//! offsets halved — no delimiter search, no per-value bookkeeping.
+//!
+//! Measured against the per-value path, ns/value (2048-row chunks, real Vector):
+//!
+//!   chars   per-value   one alloc + no length pass   + single call
+//!       4        14.8                          7.0            3.1
+//!      16        18.0                          7.1            2.2
+//!     200        58.0                         20.1           11.5
+//!
+//! `st` must hold raw UTF-16LE wire bytes appended with AppendVarDelimited,
+//! `count` rows staged, and validity in its mask. NULL rows are left untouched —
+//! their offset/length slots are undefined by ColumnStaging's contract.
+//!
+//! Invalid UTF-16 (unpaired surrogates are legal in a UCS-2 collation) is
+//! handled in bulk runs with standard U+FFFD substitution; there is no per-value
+//! step on that path either. Fixed-length NCHAR's trailing-space trim is a
+//! property of the TDS type, so it is derived from `col` rather than passed in.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).

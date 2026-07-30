@@ -90,11 +90,45 @@ enum class AppendArm : uint8_t {
 	Skip
 };
 
+//! Which batch kernel publishes a staged column into its output vector.
+//!
+//! Resolved once per column, alongside the append arm, so finalize is a switch
+//! on one column-invariant value rather than a chain of tests over the arm and
+//! the TDS type re-run for every column of every chunk.
+//!
+//! Every entry but Text and None names a type family, and the kernel it names is
+//! that family's `DecodeChunkFromStaging` in `src/codec/<family>_codec.cpp` —
+//! the same module that owns the family's per-value decode, its BCP encode and
+//! its literal rendering (spec 045). There is no second home for decode logic.
+enum class FinalizeKernel : uint8_t {
+	//! Nothing to do: the values were written straight into the output vector
+	//! (direct write), or the column is skipped, or no value of it can be read.
+	//! Validity is still published, by the stager itself.
+	None = 0,
+	String,
+	Binary,
+	Uuid,
+	Decimal,
+	Money,
+	Datetime,
+	//! The catalog type and the wire type diverge (issue #89): each value is
+	//! rendered as text. The one kernel that is not a family batch decode.
+	Text
+};
+
+//! Number of FinalizeKernel values, for counter arrays.
+static const uint8_t FINALIZE_KERNEL_COUNT = 8;
+
+//! Short lowercase name, for the debug counters.
+const char *FinalizeKernelName(FinalizeKernel kernel);
+
 //! Everything the staged path needs to know about one column, decided once.
 struct ColumnOps {
 	//! The per-value arm. Set by ResolveColumnOps; the caller downgrades it to
 	//! Skip for columns it does not intend to fill.
 	AppendArm arm = AppendArm::Unsupported;
+	//! Which batch kernel publishes the column at the end of the chunk.
+	FinalizeKernel kernel = FinalizeKernel::None;
 	//! Which append arm the row reader uses for this column.
 	StagingKind kind = StagingKind::Var;
 	//! Bytes per value for Direct / Fixed; 0 for Var.
@@ -110,12 +144,6 @@ struct ColumnOps {
 	//! loop per column with the dispatch resolved once, and the row walk keeps a
 	//! single shape.
 	bool needs_value_fallback = false;
-	//! Fixed-length CHAR/NCHAR: SQL Server pads to the declared width, and the
-	//! shipped decode strips those trailing spaces. Applied to the OUTPUT here,
-	//! which is exactly equivalent — a 0x20 byte in UTF-8 can only be U+0020,
-	//! never a continuation byte — and unlike an input-side trim it is equally
-	//! correct when the payload turns out to be invalid UTF-16.
-	bool trim_trailing_spaces = false;
 	//! Var only: the declared upper bound on ONE value's wire size, in bytes, or
 	//! 0 when the type has no bound (PLP / MAX). Lets the staging buffer be
 	//! preallocated to a chunk's provable worst case, so a narrow column never

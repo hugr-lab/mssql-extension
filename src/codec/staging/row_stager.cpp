@@ -6,12 +6,12 @@
 
 #include "codec/staging/row_stager.hpp"
 
+#include "codec/binary_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/money_codec.hpp"
-#include "codec/staging/binary_finalize.hpp"
-#include "codec/staging/string_finalize.hpp"
-#include "codec/staging/uuid_finalize.hpp"
+#include "codec/string_codec.hpp"
+#include "codec/uuid_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -499,29 +499,34 @@ void RowStager::FinalizeChunk(idx_t row_count, bool collect_nulls) {
 			continue;
 		}
 		const ColumnStaging &st = arena_.Column(c);
-		if (ops_[c].needs_value_fallback) {
-			FinalizeFallbackColumn(st, row_count, (*metadata_)[c], *targets_[c]);
-		} else if (ops_[c].arm == AppendArm::P2StageString || ops_[c].arm == AppendArm::PlpStageString ||
-				   ops_[c].arm == AppendArm::LobStageString) {
-			// One conversion for the whole column (D5).
-			FinalizeStringColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
-		} else if (ops_[c].arm == AppendArm::P2StageBinary || ops_[c].arm == AppendArm::PlpStageBinary ||
-				   ops_[c].arm == AppendArm::LobStageBinary) {
-			FinalizeBinaryColumn(st, row_count, *targets_[c], ops_[c].trim_trailing_spaces);
-		} else if (ops_[c].arm == AppendArm::P1StageDecimal) {
-			decimal::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
-		} else if (ops_[c].arm == AppendArm::P1StageFixed || ops_[c].arm == AppendArm::RawStageFixed) {
-			// Which kernel is a property of the column, so it is decided here,
-			// once, and the kernel's own loop carries no dispatch at all.
-			const uint8_t type_id = (*metadata_)[c].type_id;
-			if (type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
-				FinalizeUuidColumn(st, row_count, *targets_[c]);
-			} else if (type_id == tds::TDS_TYPE_MONEY || type_id == tds::TDS_TYPE_SMALLMONEY ||
-					   type_id == tds::TDS_TYPE_MONEYN) {
-				money::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
-			} else {
-				datetime::DecodeChunkFromStaging(st, row_count, (*metadata_)[c], *targets_[c]);
-			}
+		const tds::ColumnMetadata &meta = (*metadata_)[c];
+		// Which kernel is a property of the column, resolved with the append arm
+		// after COLMETADATA, so this is one switch on one invariant value and the
+		// kernel's own loop carries no dispatch at all.
+		switch (ops_[c].kernel) {
+		case FinalizeKernel::None:
+			break;
+		case FinalizeKernel::String:
+			string::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Binary:
+			binary::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Uuid:
+			uuid::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Decimal:
+			decimal::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Money:
+			money::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Datetime:
+			datetime::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
+		case FinalizeKernel::Text:
+			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
+			break;
 		}
 		// Values went straight into the vector; only validity is still ours. Scan
 		// first so an all-valid column — the overwhelmingly common one — never

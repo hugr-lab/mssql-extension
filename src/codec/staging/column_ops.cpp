@@ -218,9 +218,56 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 	}
 }
 
-}  // namespace
+//! Which kernel publishes the column, given the arm the walk will use.
+//!
+//! One switch in one place, so a new staging arm cannot be added without saying
+//! how it finalizes: there is no `default`, and -Wswitch makes the omission a
+//! build failure rather than a column that silently publishes nothing.
+FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &column) {
+	if (ops.needs_value_fallback) {
+		// Wins over the family: the bytes staged are the WIRE type's, and the
+		// output vector is a different type entirely (issue #89).
+		return FinalizeKernel::Text;
+	}
+	switch (ops.arm) {
+	case AppendArm::RawDirect1:
+	case AppendArm::RawDirect2:
+	case AppendArm::RawDirect4:
+	case AppendArm::RawDirect8:
+	case AppendArm::P1Direct1:
+	case AppendArm::P1Direct2:
+	case AppendArm::P1Direct4:
+	case AppendArm::P1Direct8:
+	case AppendArm::Unsupported:
+	case AppendArm::Skip:
+		return FinalizeKernel::None;
+	case AppendArm::P2StageString:
+	case AppendArm::PlpStageString:
+	case AppendArm::LobStageString:
+		return FinalizeKernel::String;
+	case AppendArm::P2StageBinary:
+	case AppendArm::PlpStageBinary:
+	case AppendArm::LobStageBinary:
+		return FinalizeKernel::Binary;
+	case AppendArm::P1StageDecimal:
+		return FinalizeKernel::Decimal;
+	case AppendArm::P1StageFixed:
+	case AppendArm::RawStageFixed:
+		// Three families share the staged-fixed framing; the TDS type says which.
+		if (column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER) {
+			return FinalizeKernel::Uuid;
+		}
+		if (column.type_id == tds::TDS_TYPE_MONEY || column.type_id == tds::TDS_TYPE_SMALLMONEY ||
+			column.type_id == tds::TDS_TYPE_MONEYN) {
+			return FinalizeKernel::Money;
+		}
+		return FinalizeKernel::Datetime;
+	}
+	return FinalizeKernel::None;
+}
 
-ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+//! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
+ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	ColumnOps ops;
 
 	// Does the wire type agree with the vector being written into? A view with an
@@ -322,7 +369,8 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// chunk list is assembled incrementally into the same staged layout.
 	//
 	// NCHAR is included: its trailing-space trim moves to the OUTPUT, where it is
-	// equally correct on invalid UTF-16. See ColumnOps::trim_trailing_spaces.
+	// equally correct on invalid UTF-16. The kernel derives that from the TDS
+	// type itself, so the rule lives with the family that applies it.
 	const bool utf16_string = column.type_id == tds::TDS_TYPE_NVARCHAR || column.type_id == tds::TDS_TYPE_NCHAR ||
 							  column.type_id == tds::TDS_TYPE_XML;
 	if (utf16_string && column.IsPLPType()) {
@@ -335,7 +383,6 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageString;
-		ops.trim_trailing_spaces = column.type_id == tds::TDS_TYPE_NCHAR;
 		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
 		return ops;
 	}
@@ -354,7 +401,6 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	if (single_byte_char && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageBinary;
-		ops.trim_trailing_spaces = column.type_id == tds::TDS_TYPE_BIGCHAR;
 		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
 		return ops;
 	}
@@ -373,6 +419,36 @@ ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType 
 	// CAST, plus UDT and SQL_VARIANT — none of which the shipped row reader can
 	// decode either. Say so instead of inventing a framing.
 	ops.arm = AppendArm::Unsupported;
+	return ops;
+}
+
+}  // namespace
+
+const char *FinalizeKernelName(FinalizeKernel kernel) {
+	switch (kernel) {
+	case FinalizeKernel::None:
+		return "none";
+	case FinalizeKernel::String:
+		return "string";
+	case FinalizeKernel::Binary:
+		return "binary";
+	case FinalizeKernel::Uuid:
+		return "uuid";
+	case FinalizeKernel::Decimal:
+		return "decimal";
+	case FinalizeKernel::Money:
+		return "money";
+	case FinalizeKernel::Datetime:
+		return "datetime";
+	case FinalizeKernel::Text:
+		return "text";
+	}
+	return "?";
+}
+
+ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	ColumnOps ops = ResolveAppend(column, target_type);
+	ops.kernel = ResolveKernel(ops, column);
 	return ops;
 }
 

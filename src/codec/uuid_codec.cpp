@@ -19,7 +19,9 @@
 //
 // Also defines codec::uuid::RenderAsString — a public helper used by
 // TypeConverter::WriteAsStringFallback for the issue-#89 path
-// (catalog says VARCHAR but TDS returns UNIQUEIDENTIFIER).
+// (catalog says VARCHAR but TDS returns UNIQUEIDENTIFIER) — and
+// DecodeChunkFromStaging, the family's batch decode for the staged read
+// path (spec 055 D6).
 //===----------------------------------------------------------------------===//
 
 #include "codec/uuid_codec.hpp"
@@ -145,6 +147,19 @@ std::string FormatDdlTypeName(const LogicalType & /*type*/, const mssql::CTASCon
 size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 	// "'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'" = 32 hex + 4 dashes + 2 quotes = 38.
 	return 38;
+}
+
+//===----------------------------------------------------------------------===//
+// Batch decode from staging (spec 055 D6)
+//===----------------------------------------------------------------------===//
+
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata & /*col*/,
+							Vector &out) {
+	hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+	const uint8_t *src = st.buffer.data();
+	for (idx_t row = 0; row < count; row++) {
+		result[row] = tds::encoding::GuidEncoding::ConvertGuid(src + row * GUID_WIRE_SIZE);
+	}
 }
 
 //===----------------------------------------------------------------------===//
