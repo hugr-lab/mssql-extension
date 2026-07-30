@@ -195,6 +195,32 @@ see §0, it is a normal link.
 
 ---
 
+## D5 — the string kernel's untested corners — **DONE**, and it found a shipped bug
+
+The `SplitWithEmbeddedNuls` case below turned out to be more than a coverage gap: the
+condition that triggers it was wrong, so values containing `U+0000` decoded silently
+wrong on the shipped path. Live server, `N'ab' + NCHAR(0x00C4) + NCHAR(0)` followed by
+`N'c'`: out came `abÄ` and `\0c`. SQL Server stores `U+0000` in NVARCHAR — verified,
+not assumed — and spec 055 named it as the one hazard the delimiter scheme has.
+
+Full account, including the three measured alternatives and why the delimiter cannot be
+changed, is in `specs/055-read-staging-and-batch-decode/spec.md` beside the rule it
+broke. The fix: the boundary walk no longer skips to each value's lower bound, which is
+what made "did the walk end on the last byte" an exact test again.
+
+Landed tests, all in `test/cpp/codec/test_row_stager.cpp`:
+
+- every boundary strategy asserted through the D10 counters (ASCII offsets, word sweep,
+  memchr) rather than assumed from the data;
+- the mixed-script trap the kernel's own comment names — a value whose UTF-8 length falls
+  strictly between `u` and `2u`, which every single-script bench fixture misses;
+- `U+0000` both in the middle of a value and at its END (the second is the defect);
+- NCHAR trailing-space trim over INVALID UTF-16, the stated reason the trim moved to the
+  output side;
+- the `needs_value_fallback` / `FinalizeKernel::Text` path (issue #89).
+
+The original list follows.
+
 ## D5 — the string kernel's untested corners
 
 From the PR #213 review, all in `src/codec/string_codec.cpp`:

@@ -21,7 +21,11 @@
 //   - ROW and NBCROW forms of the same logical row producing identical output;
 //   - the nbc_rows counter, without which every test here could silently stop
 //     testing the NBC walk. The fixture enables the D10 counters the way
-//     MSSQL_DEBUG>=2 does, so nothing in the walks exists solely for a test.
+//     MSSQL_DEBUG>=2 does, so nothing in the walks exists solely for a test;
+//   - D2: every framing shape (bare / P1 / P2 / PLP / LOB, both row forms)
+//     consumed byte-for-byte identically by the walk and by
+//     RowReader::SkipValue — the two independent switches whose agreement is
+//     the walk's entire memory-safety argument.
 //
 // Build & run:
 //   make test-row-stager
@@ -46,6 +50,7 @@
 
 using duckdb::idx_t;
 using duckdb::LogicalType;
+using duckdb::LogicalTypeId;
 using duckdb::Vector;
 using duckdb::mssql::codec::staging::AppendArm;
 using duckdb::mssql::codec::staging::RowStager;
@@ -147,6 +152,22 @@ Wire PlpNull() {
 	return Wire(8, 0xFF);
 }
 
+//! PLP whose total length is declared UNKNOWN — what a server streaming a MAX
+//! value actually sends. Only the terminator ends the value.
+Wire PlpUnknown(const std::vector<Wire> &chunks) {
+	Wire out = Plp(chunks);
+	const uint64_t unknown = 0xFFFFFFFFFFFFFFFEULL;
+	std::memcpy(out.data(), &unknown, 8);
+	return out;
+}
+
+//! Filler for the framing matrix, where only the byte COUNT is under test.
+//! Zeros rather than a pattern: every finalize kernel still runs over the staged
+//! value, and zero is in range for all of them (day 0, midnight, decimal 0).
+Wire Zeros(size_t n) {
+	return Wire(n, 0);
+}
+
 //! Legacy LOB (TEXT/NTEXT/IMAGE): a one-byte text-pointer length, the pointer,
 //! an 8-byte row timestamp, then a 4-byte data length. Only the data is value.
 Wire Lob(const Wire &value) {
@@ -163,6 +184,20 @@ Wire Lob(const Wire &value) {
 
 Wire LobNull() {
 	return Wire(1, 0);
+}
+
+//! Explicit UTF-16LE code units, for the values ASCII cannot express.
+Wire Units(const std::vector<uint16_t> &units) {
+	Wire out;
+	for (uint16_t u : units) {
+		out.push_back(static_cast<uint8_t>(u & 0xFF));
+		out.push_back(static_cast<uint8_t>(u >> 8));
+	}
+	return out;
+}
+
+Wire RepeatUnit(uint16_t unit, size_t n) {
+	return Units(std::vector<uint16_t>(n, unit));
 }
 
 //! ASCII as UTF-16LE, which is what every N-typed column carries.
@@ -301,6 +336,15 @@ public:
 	void Add(const ColumnMetadata &meta, bool skipped = false) {
 		metadata_.push_back(meta);
 		skipped_.push_back(skipped);
+		targets_types_.push_back(LogicalType(LogicalTypeId::INVALID));
+	}
+
+	//! A column whose OUTPUT type is not the one the wire implies — a view with an
+	//! inline CAST against a stale catalog (issue #89).
+	void AddDiverging(const ColumnMetadata &meta, const LogicalType &target_type) {
+		metadata_.push_back(meta);
+		skipped_.push_back(false);
+		targets_types_.push_back(target_type);
 	}
 
 	void Configure() {
@@ -315,7 +359,10 @@ public:
 				targets_.push_back(nullptr);
 				continue;
 			}
-			owned_.push_back(std::unique_ptr<Vector>(new Vector(TypeConverter::GetDuckDBType(metadata_[i]))));
+			const LogicalType type = targets_types_[i].id() == LogicalTypeId::INVALID
+										 ? TypeConverter::GetDuckDBType(metadata_[i])
+										 : targets_types_[i];
+			owned_.push_back(std::unique_ptr<Vector>(new Vector(type)));
 			targets_.push_back(owned_.back().get());
 		}
 		stager_.Configure(metadata_, targets_);
@@ -349,9 +396,17 @@ public:
 		return stager_;
 	}
 
+	//! The metadata the stager was configured with — so a test can build a SECOND,
+	//! independent RowReader over the same columns and compare framing (D2).
+	const std::vector<ColumnMetadata> &metadata() const {
+		return metadata_;
+	}
+
 private:
 	std::vector<ColumnMetadata> metadata_;
 	std::vector<bool> skipped_;
+	//! INVALID means "whatever the wire type implies" — the ordinary case.
+	std::vector<LogicalType> targets_types_;
 	std::vector<std::unique_ptr<Vector>> owned_;
 	std::vector<Vector *> targets_;
 	RowStager stager_;
@@ -588,16 +643,403 @@ void TestNbcRowCounter() {
 	CHECK_EQ(f.stager().Counters().nbc_rows, static_cast<uint64_t>(6), "two NBC rows per chunk, three chunks");
 }
 
+//===--------------------------------------------------------------------===//
+// D2 — the differential framing test
+//
+// The staged walk carries NO bounds test per value. Its whole safety argument is
+// that the parser hands up a row whose length `RowReader::SkipValue` established,
+// and that the walk then consumes exactly those bytes. Those are two independent
+// switch statements over the same wire types in two different files, with
+// nothing tying them together — and that gap is precisely how the NBC 0xFFFF
+// defect got in: SkipValueNBC returned 2, the walk consumed 65537.
+//
+// So: every framing shape, through both, byte for byte. A sentinel column
+// follows the column under test, because agreeing on a byte COUNT and consuming
+// the RIGHT bytes are different claims and only the sentinel tests the second.
+//===--------------------------------------------------------------------===//
+
+struct FramingCase {
+	const char *label;
+	ColumnMetadata meta;
+	Wire value;
+	//! The type's NULL form in a plain ROW; empty for the bare fixed types, which
+	//! have none — TDS sends a nullable one as its *N variant instead.
+	Wire null_wire;
+};
+
+//! Follows every column under test. Bare INT: the shortest framing there is, so
+//! a preceding over-read lands in it rather than past the row, and its value is
+//! a pattern no length prefix or filler byte could produce.
+ColumnMetadata SentinelMeta() {
+	return Meta(duckdb::tds::TDS_TYPE_INT, 4);
+}
+const size_t SENTINEL_BYTES = 4;
+const char *const SENTINEL_TEXT = "1515870810";	 // 0x5A5A5A5A
+
+Wire SentinelWire() {
+	return Bare({0x5A, 0x5A, 0x5A, 0x5A});
+}
+
+std::vector<FramingCase> FramingMatrix() {
+	using namespace duckdb::tds;
+	std::vector<FramingCase> m;
+
+	// Bare: no prefix at all, width implied by the type.
+	m.push_back({"bare TINYINT", Meta(TDS_TYPE_TINYINT, 1), Zeros(1), Wire()});
+	m.push_back({"bare BIT", Meta(TDS_TYPE_BIT, 1), Zeros(1), Wire()});
+	m.push_back({"bare SMALLINT", Meta(TDS_TYPE_SMALLINT, 2), Zeros(2), Wire()});
+	m.push_back({"bare INT", Meta(TDS_TYPE_INT, 4), Zeros(4), Wire()});
+	m.push_back({"bare BIGINT", Meta(TDS_TYPE_BIGINT, 8), Zeros(8), Wire()});
+	m.push_back({"bare REAL", Meta(TDS_TYPE_REAL, 4), Zeros(4), Wire()});
+	m.push_back({"bare FLOAT", Meta(TDS_TYPE_FLOAT, 8), Zeros(8), Wire()});
+	m.push_back({"bare MONEY", Meta(TDS_TYPE_MONEY, 8), Zeros(8), Wire()});
+	m.push_back({"bare SMALLMONEY", Meta(TDS_TYPE_SMALLMONEY, 4), Zeros(4), Wire()});
+	m.push_back({"bare DATETIME", Meta(TDS_TYPE_DATETIME, 8), Zeros(8), Wire()});
+	m.push_back({"bare SMALLDATETIME", Meta(TDS_TYPE_SMALLDATETIME, 4), Zeros(4), Wire()});
+
+	// P1: one length byte, 0 meaning NULL. Every declared width of every *N
+	// variant, because the width lives in the metadata and the two sides read it
+	// from different places — the walk from a resolved stride, the parser from
+	// the byte on the wire.
+	m.push_back({"P1 INTN(1)", Meta(TDS_TYPE_INTN, 1), P1(Zeros(1)), P1Null()});
+	m.push_back({"P1 INTN(2)", Meta(TDS_TYPE_INTN, 2), P1(Zeros(2)), P1Null()});
+	m.push_back({"P1 INTN(4)", Meta(TDS_TYPE_INTN, 4), P1(Zeros(4)), P1Null()});
+	m.push_back({"P1 INTN(8)", Meta(TDS_TYPE_INTN, 8), P1(Zeros(8)), P1Null()});
+	m.push_back({"P1 BITN", Meta(TDS_TYPE_BITN, 1), P1(Zeros(1)), P1Null()});
+	m.push_back({"P1 FLOATN(4)", Meta(TDS_TYPE_FLOATN, 4), P1(Zeros(4)), P1Null()});
+	m.push_back({"P1 FLOATN(8)", Meta(TDS_TYPE_FLOATN, 8), P1(Zeros(8)), P1Null()});
+	m.push_back({"P1 MONEYN(4)", Meta(TDS_TYPE_MONEYN, 4), P1(Zeros(4)), P1Null()});
+	m.push_back({"P1 MONEYN(8)", Meta(TDS_TYPE_MONEYN, 8), P1(Zeros(8)), P1Null()});
+	m.push_back({"P1 DATETIMEN(4)", Meta(TDS_TYPE_DATETIMEN, 4), P1(Zeros(4)), P1Null()});
+	m.push_back({"P1 DATETIMEN(8)", Meta(TDS_TYPE_DATETIMEN, 8), P1(Zeros(8)), P1Null()});
+	m.push_back({"P1 GUID", Meta(TDS_TYPE_UNIQUEIDENTIFIER, 16), P1(Zeros(16)), P1Null()});
+	m.push_back({"P1 DATE", Meta(TDS_TYPE_DATE, 3), P1(Zeros(3)), P1Null()});
+
+	// The scale-dependent temporal widths: 3 bytes of time up to scale 2, 4 up to
+	// 4, 5 beyond — plus a 3-byte date, and 2 more for an offset. The walk derives
+	// this from the scale; the parser reads the length byte. Every boundary of
+	// that arithmetic is here.
+	const uint8_t scales[] = {0, 2, 3, 4, 5, 7};
+	for (uint8_t scale : scales) {
+		const size_t time_len = scale <= 2 ? 3 : (scale <= 4 ? 4 : 5);
+		ColumnMetadata t = Meta(TDS_TYPE_TIME, 0, 0, scale);
+		m.push_back({"P1 TIME", t, P1(Zeros(time_len)), P1Null()});
+		ColumnMetadata dt2 = Meta(TDS_TYPE_DATETIME2, 0, 0, scale);
+		m.push_back({"P1 DATETIME2", dt2, P1(Zeros(3 + time_len)), P1Null()});
+		ColumnMetadata dto = Meta(TDS_TYPE_DATETIMEOFFSET, 0, 0, scale);
+		m.push_back({"P1 DATETIMEOFFSET", dto, P1(Zeros(5 + time_len)), P1Null()});
+	}
+
+	// DECIMAL: width from the declared precision, at each of its four steps.
+	m.push_back({"P1 DECIMAL(9,2)", Meta(TDS_TYPE_DECIMAL, 5, 9, 2), P1(Zeros(5)), P1Null()});
+	m.push_back({"P1 DECIMAL(19,4)", Meta(TDS_TYPE_DECIMAL, 9, 19, 4), P1(Zeros(9)), P1Null()});
+	m.push_back({"P1 NUMERIC(28,0)", Meta(TDS_TYPE_NUMERIC, 13, 28, 0), P1(Zeros(13)), P1Null()});
+	m.push_back({"P1 NUMERIC(38,10)", Meta(TDS_TYPE_NUMERIC, 17, 38, 10), P1(Zeros(17)), P1Null()});
+	// The one fixed-width family whose value may legitimately arrive SHORTER than
+	// its declared width: a server that trims trailing zero bytes of the mantissa.
+	// The walk zero-extends and must still consume only what arrived.
+	m.push_back({"P1 DECIMAL(19,4) trimmed", Meta(TDS_TYPE_DECIMAL, 9, 19, 4), P1(Zeros(5)), P1Null()});
+
+	// P2: two length bytes, 0xFFFF meaning NULL.
+	m.push_back({"P2 NVARCHAR", Meta(TDS_TYPE_NVARCHAR, 20), P2(Utf16("ab")), P2Null()});
+	m.push_back({"P2 NVARCHAR empty", Meta(TDS_TYPE_NVARCHAR, 20), P2(Wire()), P2Null()});
+	m.push_back({"P2 NCHAR", Meta(TDS_TYPE_NCHAR, 20), P2(Utf16("ab")), P2Null()});
+	m.push_back({"P2 VARCHAR", Meta(TDS_TYPE_BIGVARCHAR, 8), P2(Ascii("abc")), P2Null()});
+	m.push_back({"P2 CHAR", Meta(TDS_TYPE_BIGCHAR, 8), P2(Ascii("abc")), P2Null()});
+	m.push_back({"P2 VARBINARY", Meta(TDS_TYPE_BIGVARBINARY, 8), P2(Zeros(3)), P2Null()});
+	m.push_back({"P2 VARBINARY empty", Meta(TDS_TYPE_BIGVARBINARY, 8), P2(Wire()), P2Null()});
+	m.push_back({"P2 BINARY", Meta(TDS_TYPE_BIGBINARY, 8), P2(Zeros(8)), P2Null()});
+
+	// PLP: 8-byte total, chunk list, terminator. Multi-chunk and the UNKNOWN
+	// total are what a streaming server actually sends.
+	std::vector<Wire> nchunks;
+	nchunks.push_back(Utf16("He"));
+	nchunks.push_back(Utf16("llo"));
+	std::vector<Wire> bchunks;
+	bchunks.push_back(Ascii("xy"));
+	bchunks.push_back(Ascii("z"));
+	m.push_back({"PLP NVARCHAR(MAX)", Meta(TDS_TYPE_NVARCHAR, 0xFFFF), Plp(nchunks), PlpNull()});
+	m.push_back({"PLP NVARCHAR(MAX) unknown-length", Meta(TDS_TYPE_NVARCHAR, 0xFFFF), PlpUnknown(nchunks), PlpNull()});
+	m.push_back({"PLP NVARCHAR(MAX) empty", Meta(TDS_TYPE_NVARCHAR, 0xFFFF), Plp(std::vector<Wire>()), PlpNull()});
+	m.push_back({"PLP XML", Meta(TDS_TYPE_XML, 0xFFFF), Plp(nchunks), PlpNull()});
+	m.push_back({"PLP VARCHAR(MAX)", Meta(TDS_TYPE_BIGVARCHAR, 0xFFFF), Plp(bchunks), PlpNull()});
+	m.push_back({"PLP VARBINARY(MAX)", Meta(TDS_TYPE_BIGVARBINARY, 0xFFFF), Plp(bchunks), PlpNull()});
+	m.push_back(
+		{"PLP VARBINARY(MAX) unknown-length", Meta(TDS_TYPE_BIGVARBINARY, 0xFFFF), PlpUnknown(bchunks), PlpNull()});
+
+	// The legacy LOBs: the only framing on the wire with a text pointer.
+	m.push_back({"LOB TEXT", Meta(TDS_TYPE_TEXT, 0xFFFF), Lob(Ascii("txt")), LobNull()});
+	m.push_back({"LOB NTEXT", Meta(TDS_TYPE_NTEXT, 0xFFFF), Lob(Utf16("Ok")), LobNull()});
+	m.push_back({"LOB IMAGE", Meta(TDS_TYPE_IMAGE, 0xFFFF), Lob(Zeros(5)), LobNull()});
+	return m;
+}
+
+//! Does this case even resolve to a staging arm? A mis-specified fixture would
+//! otherwise throw out of the walk and take the whole binary down with it.
+bool Stageable(const FramingCase &c) {
+	const duckdb::mssql::codec::staging::ColumnOps ops =
+		duckdb::mssql::codec::staging::ResolveColumnOps(c.meta, TypeConverter::GetDuckDBType(c.meta));
+	return ops.arm < AppendArm::Unsupported;
+}
+
+void TestFramingMatchesSkipValue() {
+	std::cout << "[7] framing: the walk and RowReader::SkipValue agree, byte for byte..." << std::endl;
+	const std::vector<FramingCase> matrix = FramingMatrix();
+
+	for (const FramingCase &c : matrix) {
+		CHECK_TRUE(Stageable(c), c.label);
+		if (!Stageable(c)) {
+			continue;
+		}
+		// Value present, then the same case with the type's ROW NULL form.
+		for (int nulled = 0; nulled < 2; nulled++) {
+			const Wire &under_test = nulled ? c.null_wire : c.value;
+			if (nulled && under_test.empty()) {
+				continue;  // bare types have no NULL form in a plain ROW
+			}
+			Fixture f;
+			f.Add(c.meta);
+			f.Add(SentinelMeta());
+			f.Configure();
+			f.BeginChunk();
+
+			const Wire row = Cat(under_test, SentinelWire());
+			// A second, independent RowReader over the same columns: this is the
+			// implementation the parser bounds rows with, and the one the walk must
+			// not diverge from.
+			duckdb::tds::RowReader reference(f.metadata());
+			const size_t skipped = reference.SkipValue(row.data(), row.size(), 0);
+			CHECK_TRUE(skipped > 0, c.label);
+
+			const size_t consumed = f.StageRow(row, 0);
+			f.FinalizeChunk(1);
+
+			CHECK_EQ(consumed, row.size(), c.label);
+			CHECK_EQ(consumed - SENTINEL_BYTES, skipped, c.label);
+			CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), c.label);
+			if (nulled) {
+				CHECK_TRUE(f.IsNull(0, 0), c.label);
+			}
+		}
+	}
+}
+
+void TestFramingMatchesSkipValueNBC() {
+	std::cout << "[8] framing: the NBC walk and RowReader::SkipValueNBC agree..." << std::endl;
+	const std::vector<FramingCase> matrix = FramingMatrix();
+	const Wire bitmap = NullBitmap(std::vector<bool>(2, false));
+
+	for (const FramingCase &c : matrix) {
+		if (!Stageable(c)) {
+			continue;  // already reported by the plain-ROW pass
+		}
+		Fixture f;
+		f.Add(c.meta);
+		f.Add(SentinelMeta());
+		f.Configure();
+		f.BeginChunk();
+
+		const Wire row = Cat(Cat(bitmap, c.value), SentinelWire());
+		duckdb::tds::RowReader reference(f.metadata());
+		const size_t skipped = reference.SkipValueNBC(row.data() + bitmap.size(), row.size() - bitmap.size(), 0);
+		CHECK_TRUE(skipped > 0, c.label);
+
+		const size_t consumed = f.StageNBCRow(row, 0);
+		f.FinalizeChunk(1);
+
+		CHECK_EQ(consumed, row.size(), c.label);
+		CHECK_EQ(consumed - bitmap.size() - SENTINEL_BYTES, skipped, c.label);
+		CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), c.label);
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// D5 — the string kernel's corners
+//
+// The batch decode converts a whole column in ONE simdutf call and then splits
+// the result on the U+0000 staged after each value. Which split it uses is a
+// property of the column, decided once, so a given fixture only ever exercises
+// one branch — and the bench matrix that drove the design is single-script, so
+// several of these branches had never run at all.
+//===--------------------------------------------------------------------===//
+
+typedef duckdb::mssql::codec::staging::BoundaryStrategy Boundary;
+
+//! How the column just decoded found its value boundaries. Read from the D10
+//! counters, which the fixture enables — so the branch a case exercises is
+//! asserted rather than assumed from its data.
+uint64_t BoundaryCount(Fixture &f, Boundary strategy) {
+	return f.stager().Counters().boundary[static_cast<uint8_t>(strategy)];
+}
+
+//! One NVARCHAR/NCHAR column, one row per value, decoded.
+void DecodeStrings(Fixture &f, const std::vector<Wire> &values) {
+	f.Configure();
+	f.BeginChunk();
+	for (size_t i = 0; i < values.size(); i++) {
+		const Wire row = P2(values[i]);
+		f.StageRow(row, static_cast<idx_t>(i));
+	}
+	f.FinalizeChunk(static_cast<idx_t>(values.size()));
+}
+
+void TestStringBoundaryStrategies() {
+	std::cout << "[9] string kernel: every boundary strategy, and the mixed-script trap..." << std::endl;
+
+	// Pure ASCII: no boundary search at all — a value's output offset is its
+	// staged offset halved, and the verdict is free (written == units).
+	{
+		Fixture f;
+		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 40));
+		std::vector<Wire> values;
+		values.push_back(Utf16("alpha"));
+		values.push_back(Utf16(""));
+		values.push_back(Utf16("beta"));
+		DecodeStrings(f, values);
+		CHECK_EQ(f.ValueAt(0, 0), std::string("alpha"), "ascii value 0");
+		CHECK_EQ(f.ValueAt(0, 1), std::string(""), "ascii empty value");
+		CHECK_EQ(f.ValueAt(0, 2), std::string("beta"), "ascii value 2");
+		CHECK_EQ(BoundaryCount(f, Boundary::AsciiOffsets), static_cast<uint64_t>(1), "ASCII column takes the offsets");
+	}
+
+	// The mixed-script trap the kernel's comment names: a value whose UTF-8 length
+	// falls STRICTLY between its unit count and twice it. Searching from the unit
+	// count is correct; probing at 2u lands past this value's delimiter and merges
+	// it with the next. Every bench fixture is single-script, so a 2u probe would
+	// pass the entire matrix — this is the case that fails it.
+	{
+		Fixture f;
+		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 40));
+		std::vector<Wire> values;
+		values.push_back(Cat(Utf16("aaaa"), Units({0x00C4})));	// 5 units, 6 bytes
+		values.push_back(Utf16("bbbbbb"));
+		DecodeStrings(f, values);
+		CHECK_EQ(f.ValueAt(0, 0), std::string("aaaa\xC3\x84"), "mixed-script value keeps its own boundary");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("bbbbbb"), "the next value is not swallowed");
+		CHECK_EQ(BoundaryCount(f, Boundary::Sweep), static_cast<uint64_t>(1), "short runs take the word sweep");
+	}
+
+	// Long runs take memchr instead — a choice made once per column from the
+	// average length of one value's output. 120 CJK units are 360 bytes, past the
+	// 256-byte threshold where a call into memchr starts beating the word sweep.
+	{
+		Fixture f;
+		// A bounded NVARCHAR, NOT 0xFFFF: that value means MAX, which is PLP-framed
+		// and would not read these P2 rows at all.
+		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 400));
+		std::vector<Wire> values;
+		values.push_back(RepeatUnit(0x4E00, 120));
+		values.push_back(RepeatUnit(0x4E00, 120));
+		DecodeStrings(f, values);
+		std::string expected;
+		for (int i = 0; i < 120; i++) {
+			expected += "\xE4\xB8\x80";
+		}
+		CHECK_EQ(f.ValueAt(0, 0), expected, "CJK value 0 at three bytes per unit");
+		CHECK_EQ(f.ValueAt(0, 1), expected, "CJK value 1");
+		CHECK_EQ(BoundaryCount(f, Boundary::Memchr), static_cast<uint64_t>(1), "long runs take memchr");
+	}
+}
+
+void TestStringEmbeddedNuls() {
+	std::cout << "[10] string kernel: a value carrying its own U+0000..." << std::endl;
+
+	// A U+0000 inside the data is legal in UCS-2 and produces a zero byte
+	// indistinguishable from the separator staged after each value.
+	//
+	// The second case is the one that mattered: a value ENDING in U+0000. Its own
+	// zero gets taken as its delimiter, and the next value's unit-count skip then
+	// jumps over the real one — so the walk still consumes exactly one zero per
+	// value and still lands exactly on the end of the output. The shipped check
+	// was that landing position, so it saw nothing and two strings came out
+	// silently wrong. Found here; the trigger is now a zero-byte count.
+	{
+		Fixture f;
+		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 40));
+		std::vector<Wire> values;
+		values.push_back(Units({0x00C4, 0x0000, 'b'}));	 // NUL in the middle
+		values.push_back(Utf16("c"));
+		DecodeStrings(f, values);
+		CHECK_EQ(f.ValueAt(0, 0),
+				 std::string("\xC3\x84\x00"
+							 "b",
+							 4),
+				 "U+0000 in the middle of a value");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("c"), "the value after it");
+	}
+	{
+		Fixture f;
+		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 40));
+		std::vector<Wire> values;
+		values.push_back(Units({'a', 'b', 0x00C4, 0x0000}));  // NUL LAST
+		values.push_back(Utf16("c"));
+		DecodeStrings(f, values);
+		CHECK_EQ(f.ValueAt(0, 0), std::string("ab\xC3\x84\x00", 5), "a value ending in U+0000 keeps it");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("c"), "and does not steal the next value's delimiter");
+		CHECK_EQ(BoundaryCount(f, Boundary::EmbeddedNul), static_cast<uint64_t>(1), "the re-split ran");
+	}
+}
+
+void TestNcharTrim() {
+	std::cout << "[11] string kernel: NCHAR trailing-space trim, valid and invalid input..." << std::endl;
+
+	// NCHAR is blank-padded to its declared width. The trim moved to the OUTPUT
+	// with spec 055 precisely so it stays correct when the payload is invalid
+	// UTF-16 and goes through U+FFFD substitution — which is what this asserts.
+	Fixture f;
+	f.Add(Meta(duckdb::tds::TDS_TYPE_NCHAR, 40));
+	std::vector<Wire> values;
+	values.push_back(Utf16("ab    "));
+	values.push_back(Units({0xD800, 'A', ' ', ' '}));  // unpaired surrogate, then padding
+	values.push_back(Utf16("    "));
+	DecodeStrings(f, values);
+	CHECK_EQ(f.ValueAt(0, 0), std::string("ab"), "padding trimmed");
+	CHECK_EQ(f.ValueAt(0, 1),
+			 std::string("\xEF\xBF\xBD"
+						 "A"),
+			 "replacement char kept, padding still trimmed");
+	CHECK_EQ(f.ValueAt(0, 2), std::string(""), "all-padding trims to empty");
+	CHECK_EQ(f.stager().Counters().replaced_units, static_cast<uint64_t>(1), "one code unit replaced");
+}
+
+void TestDivergingColumnRendersAsText() {
+	std::cout << "[12] issue #89: a column whose output type disagrees with the wire..." << std::endl;
+
+	// A view with an inline CAST against a stale catalog: the wire says INT, the
+	// vector is VARCHAR. The column must still stage by its WIRE framing and
+	// render each value as text — not throw, which is what it did until PR #213,
+	// and not write four raw bytes into a string_t.
+	Fixture f;
+	f.AddDiverging(Meta(duckdb::tds::TDS_TYPE_INT, 4), LogicalType::VARCHAR);
+	f.Add(SentinelMeta());
+	f.Configure();
+	f.BeginChunk();
+
+	const Wire row = Cat(Bare({42, 0, 0, 0}), SentinelWire());
+	const size_t consumed = f.StageRow(row, 0);
+	f.FinalizeChunk(1);
+
+	CHECK_EQ(consumed, row.size(), "a diverging column is framed by its wire type");
+	CHECK_EQ(f.ValueAt(0, 0), std::string("42"), "rendered as text");
+	CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), "the sentinel still decodes");
+}
+
 }  // namespace
 
 int main() {
-	std::cout << "=== RowStager unit tests (spec 059 D1b) ===" << std::endl;
+	std::cout << "=== RowStager unit tests (spec 059 D1b + D2 + D5) ===" << std::endl;
 	TestBitmapConvention();
 	TestEveryArmPresent();
 	TestEveryArmNulledByTheBitmap();
 	TestNullPrefixOnAPresentColumn();
 	TestRowAndNbcRowAgree();
 	TestNbcRowCounter();
+	TestFramingMatchesSkipValue();
+	TestFramingMatchesSkipValueNBC();
+	TestStringBoundaryStrategies();
+	TestStringEmbeddedNuls();
+	TestNcharTrim();
+	TestDivergingColumnRendersAsText();
 
 	if (failures == 0) {
 		std::cout << "\nAll RowStager tests passed." << std::endl;
