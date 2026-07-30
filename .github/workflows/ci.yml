@@ -383,27 +383,30 @@ jobs:
           LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_column_staging
           echo "::endgroup::"
 
-          # spec 059 D1b: the ROW / NBCROW walks themselves. A live server only
-          # sends NBCROW when the null bitmap is cheaper than the NULL markers it
-          # replaces, so no `.test` file had ever produced one — which is how the
-          # walk shipped with an out-of-bounds read. These rows are synthetic and
-          # need no server. Deliberately no -DNDEBUG: the `D_ASSERT(p == end)`
-          # that ends both walks IS the framing check.
-          echo "::group::test_row_stager"
-          "${CXX:-c++}" -std=c++17 -O1 -pthread -Wno-deprecated-declarations \
-            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
-            test/cpp/codec/test_row_stager.cpp \
-            src/codec/*.cpp \
-            src/codec/staging/column_staging.cpp src/codec/staging/column_ops.cpp \
-            src/codec/staging/row_stager.cpp \
-            src/tds/encoding/utf16.cpp src/tds/encoding/datetime_encoding.cpp \
-            src/tds/encoding/decimal_encoding.cpp src/tds/encoding/guid_encoding.cpp \
-            src/tds/encoding/bcp_row_encoder.cpp src/tds/encoding/type_converter.cpp \
-            src/tds/tds_row_reader.cpp src/tds/tds_column_metadata.cpp src/tds/tds_types.cpp \
-            -L "$PREFIX/lib" -lsimdutf \
-            -L build/release/src -lduckdb \
-            -o build/test/test_row_stager
-          LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_row_stager
+          # The staged ROW / NBCROW walks. A live server only sends NBCROW when
+          # the null bitmap is cheaper than the NULL markers it replaces, so no
+          # `.test` file had ever produced one — which is how the walk shipped
+          # with an out-of-bounds read. These rows are synthetic and need no
+          # server.
+          #
+          # Both go through the same script `make test-row-stager*` runs, so the
+          # source list, sanitizer flags and ASAN_OPTIONS live in exactly one
+          # place — a second copy here is precisely the drift the framing test
+          # exists to catch. Neither is built with -DNDEBUG, on purpose: the
+          # `D_ASSERT(p == end)` ending both walks IS the framing check.
+          #
+          # Sanitized on BOTH legs, deliberately: ASan hangs at process init on
+          # Darwin 25.5 dev boxes — which is why `make test-row-stager*` passes
+          # SANITIZE=0 there — but the macOS runner is older and runs it green,
+          # so CI keeps coverage a dev box cannot have locally.
+          echo "::group::test_row_stager (spec 059 D1b — ROW/NBCROW walks decoded)"
+          ./test/cpp/codec/run_staging_test.sh \
+            "$PREFIX" test/cpp/codec/test_row_stager.cpp build/release
+          echo "::endgroup::"
+
+          echo "::group::test_row_stager_framing (spec 055 T5 — staged walk vs RowReader)"
+          ./test/cpp/codec/run_staging_test.sh \
+            "$PREFIX" test/cpp/codec/test_row_stager_framing.cpp build/release
           echo "::endgroup::"
 
       # Spec 053 (#161): the shipped Linux extension must NOT hard-link the
