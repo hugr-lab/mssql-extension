@@ -330,7 +330,12 @@ std::string DecodeUtf16LeReplacing(const char16_t *src, size_t code_units) {
 			const size_t base = result.size();
 			result.resize(base + out_bytes);
 			if (out_bytes > 0) {
-				simdutf::convert_valid_utf16le_to_utf8(src + pos, valid_units, &result[base]);
+				// The byte count is already known — utf8_length_from_utf16le just
+				// computed it over the same run simdutf declared valid — so the
+				// return is discarded. Assigned rather than (void)-cast because
+				// GCC ignores a void cast on warn_unused_result.
+				const size_t written = simdutf::convert_valid_utf16le_to_utf8(src + pos, valid_units, &result[base]);
+				(void)written;
 			}
 		}
 		if (ok) {
