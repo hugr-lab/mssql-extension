@@ -383,7 +383,12 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 	if (utf16_string && !column.IsPLPType() && column.max_length > 0) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::P2StageString;
-		ops.max_value_bytes = static_cast<uint32_t>(column.max_length);
+		// +2 for the U+0000 the batch decode splits on: it is staged with the
+		// value and is part of what one value COSTS in the buffer. Without it a
+		// full chunk of maximum-length values overruns the "provable worst case"
+		// by exactly two bytes per row, so the column both grows and keeps
+		// claiming it cannot — which is what the D10 grow counter reported.
+		ops.max_value_bytes = static_cast<uint32_t>(column.max_length) + 2;
 		return ops;
 	}
 

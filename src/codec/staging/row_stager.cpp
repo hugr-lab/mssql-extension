@@ -16,6 +16,7 @@
 #include "mssql_compat.hpp"
 #include "tds/encoding/type_converter.hpp"
 
+#include <chrono>
 #include <cstring>
 
 namespace duckdb {
@@ -266,7 +267,6 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 	chunk_nulls_.assign(column_count, 0);
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
-
 	for (idx_t i = 0; i < column_count; i++) {
 		Vector *target = i < targets.size() ? targets[i] : nullptr;
 		if (target == nullptr) {
@@ -277,6 +277,18 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 		ops_[i] = ResolveColumnOps(metadata[i], target->GetType());
 		if (ops_[i].arm < AppendArm::Unsupported) {
 			arena_.Column(i).Configure(ops_[i].kind, ops_[i].stride, ops_[i].max_value_bytes);
+			if (counters_enabled_ && ops_[i].kind == StagingKind::Var) {
+				// How the column's payload got sized. Only Var columns have a
+				// choice — Fixed takes its exact chunk size and Direct stages
+				// nothing at all.
+				if (ops_[i].max_value_bytes == 0) {
+					counters_.unbounded_columns++;
+				} else if (arena_.Column(i).payload_bounded) {
+					counters_.prealloc_bounded_columns++;
+				} else {
+					counters_.prealloc_capped_columns++;
+				}
+			}
 		}
 		if (ops_[i].arm >= AppendArm::PlpStageString && ops_[i].arm <= AppendArm::LobStageBinary) {
 			unbounded_columns_.push_back(i);
@@ -500,6 +512,10 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		const ColumnStaging &st = arena_.Column(c);
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
+		std::chrono::steady_clock::time_point started;
+		if (counters_enabled_) {
+			started = std::chrono::steady_clock::now();
+		}
 		// Which kernel is a property of the column, resolved with the append arm
 		// after COLMETADATA, so this is one switch on one invariant value and the
 		// kernel's own loop carries no dispatch at all.
@@ -528,6 +544,11 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
 			break;
 		}
+		if (counters_enabled_) {
+			const auto elapsed = std::chrono::steady_clock::now() - started;
+			CountColumn(c, st, row_count,
+						static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+		}
 		// Values went straight into the vector; only validity is still ours. An
 		// all-valid column — the overwhelmingly common one — must not force
 		// DuckDB to allocate a mask it does not need, and the append arm already
@@ -544,6 +565,29 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		std::memcpy(mask.GetData(), st.validity_words.data(), words * sizeof(uint64_t));
 	}
 	arena_.EndChunk();
+}
+
+void RowStager::CountColumn(idx_t c, const ColumnStaging &st, idx_t row_count, uint64_t elapsed_ns) {
+	const uint8_t kernel = static_cast<uint8_t>(ops_[c].kernel);
+	const idx_t values = row_count - st.null_count;
+	counters_.kernel_ns[kernel] += elapsed_ns;
+	counters_.kernel_values[kernel] += values;
+
+	if (ops_[c].direct_write) {
+		// The bypass: no staging buffer was touched, so there are no staged
+		// bytes to attribute — only values that skipped the whole mechanism.
+		counters_.direct_values += values;
+	} else if (ops_[c].kind == StagingKind::Var) {
+		counters_.staged_bytes[kernel] += st.PayloadSize();
+	} else {
+		// Fixed is positional, so a NULL row occupies a slot but copies nothing.
+		counters_.staged_bytes[kernel] += values * st.stride;
+	}
+
+	if (st.boundary != BoundaryStrategy::None) {
+		counters_.boundary[static_cast<uint8_t>(st.boundary)]++;
+	}
+	counters_.replaced_units += st.replaced_units;
 }
 
 }  // namespace staging

@@ -58,6 +58,11 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	} else {
 		read_timeout_ms_ = query_timeout_seconds * 1000;
 	}
+	if (counters_enabled_) {
+		// D10: latched here, before any COLMETADATA, because the stager counts
+		// per-column sizing decisions as it resolves them.
+		stager_.EnableCounters();
+	}
 }
 
 MSSQLResultStream::~MSSQLResultStream() {
@@ -630,6 +635,57 @@ void MSSQLResultStream::PrintDebugCounters() {
 	}
 	if (!families.empty()) {
 		fprintf(stderr, "[MSSQL COUNTERS]   values/family:%s\n", families.c_str());
+	}
+	PrintStagingCounters();
+}
+
+//! D10 (spec 055): what the staged path itself did. Printed only for a stream
+//! that took it — the legacy per-value path leaves every one of these at zero,
+//! and three empty lines are worse than none.
+void MSSQLResultStream::PrintStagingCounters() {
+	const auto &sc = stager_.Counters();
+	const auto &arena = stager_.Arena();
+
+	std::string kernels;
+	for (uint8_t k = 0; k < mssql::codec::staging::FINALIZE_KERNEL_COUNT; k++) {
+		if (sc.kernel_values[k] == 0) {
+			continue;
+		}
+		// ns/value is the number to read: it is directly comparable with the
+		// micro-benchmark's per-family cells.
+		char buf[192];
+		snprintf(buf, sizeof(buf), " %s=%lluv/%lluB/%.1fns",
+				 mssql::codec::staging::FinalizeKernelName(static_cast<mssql::codec::staging::FinalizeKernel>(k)),
+				 (unsigned long long)sc.kernel_values[k], (unsigned long long)sc.staged_bytes[k],
+				 static_cast<double>(sc.kernel_ns[k]) / static_cast<double>(sc.kernel_values[k]));
+		kernels += buf;
+	}
+	if (kernels.empty() && sc.direct_values == 0) {
+		return;
+	}
+	fprintf(stderr, "[MSSQL COUNTERS]   staging: direct_bypass=%llu grow=%llu shrink=%llu peak_payload=%lluB\n",
+			(unsigned long long)sc.direct_values, (unsigned long long)arena.GrowEvents(),
+			(unsigned long long)arena.ShrinkEvents(), (unsigned long long)arena.PeakPayloadBytes());
+	fprintf(stderr, "[MSSQL COUNTERS]   columns: prealloc_bounded=%llu prealloc_capped=%llu unbounded=%llu\n",
+			(unsigned long long)sc.prealloc_bounded_columns, (unsigned long long)sc.prealloc_capped_columns,
+			(unsigned long long)sc.unbounded_columns);
+	if (!kernels.empty()) {
+		fprintf(stderr, "[MSSQL COUNTERS]   kernels (values/staged bytes/ns per value):%s\n", kernels.c_str());
+	}
+
+	std::string boundaries;
+	for (uint8_t b = 0; b < mssql::codec::staging::BOUNDARY_STRATEGY_COUNT; b++) {
+		if (sc.boundary[b] == 0) {
+			continue;
+		}
+		boundaries += " ";
+		boundaries +=
+			mssql::codec::staging::BoundaryStrategyName(static_cast<mssql::codec::staging::BoundaryStrategy>(b));
+		boundaries += "=" + std::to_string(sc.boundary[b]);
+	}
+	if (!boundaries.empty() || sc.replaced_units > 0) {
+		fprintf(stderr, "[MSSQL COUNTERS]   string boundaries (column-chunks):%s replaced_units=%llu\n",
+				boundaries.c_str(), (unsigned long long)sc.replaced_units);
 	}
 }
 

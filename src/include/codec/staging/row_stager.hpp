@@ -41,6 +41,33 @@ namespace mssql {
 namespace codec {
 namespace staging {
 
+//! What the staged path did, for `MSSQL_DEBUG>=2` (spec 055 D10).
+//!
+//! Every field is accumulated PER COLUMN PER CHUNK or per event — nothing here
+//! is reachable from the per-value path, which is why the whole block can be
+//! filled without a branch anywhere near an append.
+struct StagingCounters {
+	//! Wire bytes staged, and time spent publishing them, by kernel. `staged` is
+	//! 0 for the direct kernels by construction: those values never enter a
+	//! staging buffer at all.
+	uint64_t staged_bytes[FINALIZE_KERNEL_COUNT] = {};
+	uint64_t kernel_ns[FINALIZE_KERNEL_COUNT] = {};
+	uint64_t kernel_values[FINALIZE_KERNEL_COUNT] = {};
+	//! Values that bypassed staging entirely — wire form was DuckDB's, so they
+	//! were stored straight into the output vector.
+	uint64_t direct_values = 0;
+	//! String column-chunks by how their boundaries were found.
+	uint64_t boundary[BOUNDARY_STRATEGY_COUNT] = {};
+	//! Code units replaced with U+FFFD (invalid UTF-16, legal in UCS-2).
+	uint64_t replaced_units = 0;
+	//! Columns by how their payload was sized, counted once per result set.
+	//! `capped` is the interesting one: a bound existed but was too large to
+	//! preallocate, so the column finds its size by growing.
+	uint64_t prealloc_bounded_columns = 0;
+	uint64_t prealloc_capped_columns = 0;
+	uint64_t unbounded_columns = 0;
+};
+
 //! Walks TDS row bytes into DuckDB vectors, column-major where it pays.
 //!
 //! Owned by MSSQLResultStream, one per stream, reused across chunks and result
@@ -55,6 +82,20 @@ public:
 	//! `metadata` must outlive this stager: the walk reads column metadata on the
 	//! Convert arm, and the legacy reader holds a reference to it.
 	void Configure(const std::vector<tds::ColumnMetadata> &metadata, const std::vector<Vector *> &targets);
+
+	//! Turn on the D10 counters. Latched once, at MSSQL_DEBUG>=2, by the stream
+	//! that owns this stager. Off, finalize takes no clock readings at all —
+	//! steady_clock::now() costs ~15 ns and would otherwise be paid twice per
+	//! column per chunk for a line nobody reads.
+	void EnableCounters() {
+		counters_enabled_ = true;
+	}
+	const StagingCounters &Counters() const {
+		return counters_;
+	}
+	const StagingArena &Arena() const {
+		return arena_;
+	}
 
 	//! True once Configure has run for the current result set.
 	bool IsConfigured() const {
@@ -111,6 +152,10 @@ public:
 	}
 
 private:
+	//! Fold one finished column into the counters. Out of line and called only
+	//! when they are on.
+	void CountColumn(idx_t c, const ColumnStaging &st, idx_t row_count, uint64_t elapsed_ns);
+
 	StagingArena arena_;
 	std::vector<ColumnOps> ops_;
 	//! Output vectors for this chunk, indexed by SQL column. Null for Skip.
@@ -123,6 +168,8 @@ private:
 	const std::vector<tds::ColumnMetadata> *metadata_ = nullptr;
 	unique_ptr<tds::RowReader> reader_;
 	bool configured_ = false;
+	bool counters_enabled_ = false;
+	StagingCounters counters_;
 };
 
 }  // namespace staging

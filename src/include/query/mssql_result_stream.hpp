@@ -249,6 +249,10 @@ private:
 
 	// Print the close summary to stderr (destructor, counters_enabled_ only).
 	void PrintDebugCounters();
+	// The staged path's own block (spec 055 D10): per-kernel time and staged
+	// bytes, the direct-write bypass, string boundary strategies, and the
+	// arena's sizing decisions. Silent for a stream that never staged.
+	void PrintStagingCounters();
 
 	bool counters_enabled_ = false;
 	// Phase timing is opt-in (MSSQL_DEBUG>=1), separately from the counters

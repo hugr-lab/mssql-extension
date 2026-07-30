@@ -144,10 +144,12 @@ struct ColumnOps {
 	//! loop per column with the dispatch resolved once, and the row walk keeps a
 	//! single shape.
 	bool needs_value_fallback = false;
-	//! Var only: the declared upper bound on ONE value's wire size, in bytes, or
-	//! 0 when the type has no bound (PLP / MAX). Lets the staging buffer be
-	//! preallocated to a chunk's provable worst case, so a narrow column never
-	//! resizes at all.
+	//! Var only: the most bytes ONE value can occupy IN THE STAGING BUFFER, or 0
+	//! when the type has no bound (PLP / MAX). Lets the buffer be preallocated to
+	//! a chunk's provable worst case, so a narrow column never resizes at all.
+	//!
+	//! Buffer cost, not wire size: a delimited string column stages a U+0000
+	//! after every value, and those two bytes are as real as the value's own.
 	uint32_t max_value_bytes = 0;
 };
 

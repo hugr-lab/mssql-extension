@@ -15,7 +15,24 @@ namespace mssql {
 namespace codec {
 namespace staging {
 
+const char *BoundaryStrategyName(BoundaryStrategy strategy) {
+	switch (strategy) {
+	case BoundaryStrategy::None:
+		return "none";
+	case BoundaryStrategy::AsciiOffsets:
+		return "ascii";
+	case BoundaryStrategy::SkipSweep:
+		return "skip+sweep";
+	case BoundaryStrategy::SkipMemchr:
+		return "skip+memchr";
+	case BoundaryStrategy::EmbeddedNul:
+		return "embedded-nul";
+	}
+	return "?";
+}
+
 void ColumnStaging::GrowPayload(idx_t needed) {
+	grow_events++;
 	// `needed` derives from a length prefix read off the wire. The cap is the one
 	// place that is bounded: this repo already fuzzes the token parser for
 	// exactly this shape of input (test_token_parser_security), and without the

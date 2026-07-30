@@ -157,6 +157,36 @@ inline StagingKind DirectKindForWidth(uint32_t width) {
 }
 
 //===----------------------------------------------------------------------===//
+// BoundaryStrategy
+//===----------------------------------------------------------------------===//
+
+//! How a string column's batch decode located its value boundaries (D10).
+//!
+//! Which one a column takes is the single most useful thing to know when a
+//! string-heavy scan is slower than expected: the arithmetic path does no
+//! searching at all, and the two walks differ by an order of magnitude in what
+//! they cost per byte scanned.
+enum class BoundaryStrategy : uint8_t {
+	//! No boundaries to find: the column staged nothing, or is not a string.
+	None = 0,
+	//! Output bytes equalled input units, so every offset is an input offset
+	//! halved. No search ran.
+	AsciiOffsets,
+	//! Delimiter walk from each value's lower bound, swept a word at a time.
+	SkipSweep,
+	//! Delimiter walk from each value's lower bound, via memchr.
+	SkipMemchr,
+	//! A value contained a U+0000 of its own, so the walk was redone against the
+	//! input's own zero units.
+	EmbeddedNul
+};
+
+static const uint8_t BOUNDARY_STRATEGY_COUNT = 5;
+
+//! Short name, for the debug counters.
+const char *BoundaryStrategyName(BoundaryStrategy strategy);
+
+//===----------------------------------------------------------------------===//
 // ColumnStaging
 //===----------------------------------------------------------------------===//
 
@@ -209,18 +239,30 @@ struct ColumnStaging {
 	//! immediately, so resizing per value would write every payload byte twice.
 	idx_t payload_used = 0;
 
-	//===--------------------------------------------------------------------===//
-	// Flags computed during append (D5 consumes them, D3 only records them)
-	//===--------------------------------------------------------------------===//
-	//! A staged value contained a U+0000 code unit, so it cannot be told apart
-	//! from the delimiter and the delimited fast path must not be used.
-	bool saw_embedded_nul = false;
-	//! A staged value ends in an unpaired high surrogate, so a bulk conversion
-	//! spanning the delimiter could pair it with the delimiter itself.
-	bool boundary_risky = false;
 	//! The payload was preallocated to this column's provable worst case, so it
 	//! can never grow and must never be shrunk.
 	bool payload_bounded = false;
+	//! Times this column's payload had to grow. Written by GrowPayload, which is
+	//! out of line and cold; a bounded column can never touch it.
+	idx_t grow_events = 0;
+
+	//===--------------------------------------------------------------------===//
+	// Finalize outcome (D10 counters)
+	//===--------------------------------------------------------------------===//
+	//
+	// What the batch kernel DID with the column, as opposed to what was staged
+	// into it. The kernels take the staging by const reference because they do
+	// not touch the staged bytes; a report about their own pass is not staged
+	// data, hence `mutable`. One store per column per chunk, so it is
+	// unconditional — a test for whether the counters are on would cost more
+	// than writing it.
+
+	//! Set by the string kernel; None for every other family.
+	mutable BoundaryStrategy boundary = BoundaryStrategy::None;
+	//! Code units the string kernel replaced with U+FFFD because the payload was
+	//! not valid UTF-16 (legal in a UCS-2 collation, so this is data, not
+	//! corruption). The error path's only per-value work in the whole scan.
+	mutable idx_t replaced_units = 0;
 
 	//===--------------------------------------------------------------------===//
 	// Setup
@@ -269,8 +311,8 @@ struct ColumnStaging {
 		count = 0;
 		null_count = 0;
 		direct_dst = direct_dst_p;
-		saw_embedded_nul = false;
-		boundary_risky = false;
+		boundary = BoundaryStrategy::None;
+		replaced_units = 0;
 		payload_used = 0;
 		// All-valid by default: NULLs clear their bit, which is the rarer case
 		// and keeps the common path free of validity work.
@@ -526,6 +568,11 @@ public:
 			if (used > peak_bytes_[i]) {
 				peak_bytes_[i] = used;
 			}
+			if (used > peak_payload_bytes_) {
+				// All-time, across every column and interval — the number that
+				// says how much a MAX-typed column really asked for (D10).
+				peak_payload_bytes_ = used;
+			}
 		}
 		if (++chunks_since_evaluation_ < SHRINK_INTERVAL_CHUNKS) {
 			return;
@@ -543,6 +590,7 @@ public:
 				duckdb::unsafe_vector<uint8_t> shrunk(target);
 				col.buffer.swap(shrunk);
 				col.payload_used = 0;
+				shrink_events_++;
 			}
 			peak_bytes_[i] = 0;
 		}
@@ -557,10 +605,31 @@ public:
 		return total;
 	}
 
+	//! Largest payload any one column held in any one chunk, for the life of the
+	//! arena. With the grow and shrink counts, this is the memory profile the
+	//! spec's criterion 5.7 asks to see: capacity returning to the watermark
+	//! rather than growing monotonically (D10).
+	idx_t PeakPayloadBytes() const {
+		return peak_payload_bytes_;
+	}
+	idx_t ShrinkEvents() const {
+		return shrink_events_;
+	}
+	//! Growth is counted per column, where it happens.
+	idx_t GrowEvents() const {
+		idx_t total = 0;
+		for (idx_t i = 0; i < columns_.size(); i++) {
+			total += columns_[i]->grow_events;
+		}
+		return total;
+	}
+
 private:
 	duckdb::vector<duckdb::unique_ptr<ColumnStaging>> columns_;
 	duckdb::vector<idx_t> peak_bytes_;
 	idx_t chunks_since_evaluation_;
+	idx_t peak_payload_bytes_ = 0;
+	idx_t shrink_events_ = 0;
 };
 
 }  // namespace staging

@@ -218,7 +218,7 @@ inline size_t FindDelimiter(const char *data, size_t from, size_t limit) {
 //! per-value step: the delimiters staged between values survive, because
 //! U+FFFD contains no zero byte and a U+0000 unit is valid input that is never
 //! the thing being replaced.
-size_t ConvertReplacingInvalid(const char16_t *src, size_t units, char *dst) {
+size_t ConvertReplacingInvalid(const char16_t *src, size_t units, char *dst, idx_t &replaced) {
 	static const char REPLACEMENT[] = "\xEF\xBF\xBD";
 	size_t in = 0;
 	size_t out = 0;
@@ -235,6 +235,7 @@ size_t ConvertReplacingInvalid(const char16_t *src, size_t units, char *dst) {
 		std::memcpy(dst + out, REPLACEMENT, 3);
 		out += 3;
 		in += valid_units + 1;
+		replaced++;
 	}
 	return out;
 }
@@ -373,7 +374,7 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 	// detected without a separate validation pass.
 	size_t written = simdutf::convert_utf16le_to_utf8(src, units, blob);
 	if (written == 0) {
-		written = ConvertReplacingInvalid(src, units, blob);
+		written = ConvertReplacingInvalid(src, units, blob, st.replaced_units);
 	} else if (written == units) {
 		// Every code unit produced exactly one byte, so the column is pure ASCII
 		// and a value's output offset is its staged byte offset halved. The
@@ -385,6 +386,7 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 			}
 			StoreValue<TRIM>(result, row, blob + st.offsets[row] / 2, st.lengths[row] / 2);
 		}
+		st.boundary = staging::BoundaryStrategy::AsciiOffsets;
 		return;
 	}
 
@@ -402,6 +404,7 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 	// row staged a payload, which means some row was not NULL.
 	const idx_t values = count - st.null_count;
 	const bool use_memchr = (written - units) / values >= MEMCHR_THRESHOLD_BYTES;
+	st.boundary = use_memchr ? staging::BoundaryStrategy::SkipMemchr : staging::BoundaryStrategy::SkipSweep;
 	const size_t offset = use_memchr ? WalkDelimited<TRIM, true>(st, count, blob, written, result)
 									 : WalkDelimited<TRIM, false>(st, count, blob, written, result);
 
@@ -413,6 +416,7 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 	// path to catch a case that then still has to be handled here.
 	if (offset != written) {
 		SplitWithEmbeddedNuls<TRIM>(st, count, src, blob, written, result);
+		st.boundary = staging::BoundaryStrategy::EmbeddedNul;
 	}
 }
 
