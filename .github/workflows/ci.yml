@@ -383,6 +383,13 @@ jobs:
           LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_column_staging
           echo "::endgroup::"
 
+          echo "::group::test_row_stager_framing (spec 055 T5 — staged walk vs RowReader, ASan+UBSan)"
+          # Same script `make test-row-stager-framing` runs, so the source list,
+          # sanitizer flags and ASAN_OPTIONS live in exactly one place — a second
+          # copy here is precisely the drift this test exists to catch.
+          ./test/cpp/codec/run_row_stager_framing.sh "$PREFIX" build/release
+          echo "::endgroup::"
+
       # Spec 053 (#161): the shipped Linux extension must NOT hard-link the
       # Kerberos runtime, or it fails to LOAD on images without it. GSSAPI/krb5
       # are dlopen'd lazily, so they must be absent from DT_NEEDED.

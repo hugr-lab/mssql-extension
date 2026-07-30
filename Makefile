@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager-framing help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -403,6 +403,26 @@ test-column-staging: release
 	    -o build/test/test_column_staging
 	@echo ""
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
+
+# Spec 055 T5: RowStager differential framing tests.
+#
+# Pure in-memory — no SQL Server. Asserts that the staged row walk consumes
+# EXACTLY the bytes RowReader::SkipRow/SkipNBCRow bounded, for every staged wire
+# form. That agreement is what makes the walk's absence of per-value bounds
+# checks safe, and the two framings live in different files with nothing else
+# pinning them together.
+#
+# The compile+run lives in test/cpp/codec/run_row_stager_framing.sh so this
+# target and the CI job share ONE source list — a second copy is exactly the
+# drift this test exists to catch. The vcpkg prefix is passed in rather than
+# derived inside the script: make and CI each already know their own triplet.
+test-row-stager-framing: release
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	test/cpp/codec/run_row_stager_framing.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) build/release
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs
