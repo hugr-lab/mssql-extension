@@ -67,6 +67,17 @@ static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 //! NEXT value searches from past the end — `limit - from` underflows and memchr
 //! reads out of bounds. SkipValue accepts any 2-byte length, so a corrupt or
 //! hostile stream reaches here; a conforming server never does.
+//! In an NBC row a NULL is expressed by the bitmap, so a value the bitmap calls
+//! present cannot also carry the 0xFFFF NULL prefix. SkipValueNBC is lenient
+//! about it — it returns 2 and lets the row through — so the check has to be
+//! here, and it has to be a throw: taking 0xFFFF as a LENGTH copies 65535 bytes
+//! from beyond the row, and past the receive buffer for a row near its tail.
+[[noreturn]] void ThrowNbcNullPrefix() {
+	throw InvalidInputException(
+		"MSSQL: a column marked present by an NBC row's null bitmap carries the 0xFFFF NULL length prefix. The TDS "
+		"stream is malformed.");
+}
+
 [[noreturn]] void ThrowOddUtf16Length(uint32_t length) {
 	throw InvalidInputException(
 		"MSSQL: a UTF-16 column arrived with a %u-byte value, which is not a whole number of 2-byte code units. The "
@@ -160,6 +171,10 @@ inline size_t AppendStagedDecimal(ColumnStaging &st, const uint8_t *p) {
 template <bool PREFIXED>
 inline size_t AppendStagedFixed(ColumnStaging &st, const uint8_t *p) {
 	switch (st.stride) {
+	case 1:
+		return PREFIXED ? AppendPrefixedFixed<1>(st, p) : (st.AppendFixed<1>(p), 1);
+	case 2:
+		return PREFIXED ? AppendPrefixedFixed<2>(st, p) : (st.AppendFixed<2>(p), 2);
 	case 3:
 		return PREFIXED ? AppendPrefixedFixed<3>(st, p) : (st.AppendFixed<3>(p), 3);
 	case 4:
@@ -509,6 +524,11 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 			// The length prefix stays in an NBC row; the bitmap only decided that
 			// a value is present at all, which the branch above already handled.
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			if (length == 0xFFFF) {
+				// Explicit, not left to the parity test below: 0xFFFF happens to be
+				// odd, so the UTF-16 check would catch it today, but that is luck.
+				ThrowNbcNullPrefix();
+			}
 			if (length & 1) {
 				ThrowOddUtf16Length(length);
 			}
@@ -518,6 +538,9 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 		}
 		case AppendArm::P2StageBinary: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			if (length == 0xFFFF) {
+				ThrowNbcNullPrefix();
+			}
 			staging_[c]->AppendVar(p + 2, length);
 			p += 2 + length;
 			break;
@@ -600,10 +623,17 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		ValidityMask &mask = FlatVector::Validity(*targets_[c]);
 		mask.EnsureWritable();
-		// Same layout on both sides (64-bit words, 1 = valid), which is why
-		// ColumnStaging keeps validity in this shape to begin with. Bits past
-		// row_count are still set from BeginChunk and are ignored downstream.
-		std::memcpy(mask.GetData(), st.validity_words.data(), words * sizeof(uint64_t));
+		// AND, not memcpy: a kernel may have set NULLs of its own before this runs
+		// — datetime does, for a datetime2 whose value does not fit the target
+		// variant (issue #168) — and overwriting the mask would silently republish
+		// those rows as valid, with a slot the kernel never wrote. Same layout on
+		// both sides (64-bit words, 1 = valid), which is why ColumnStaging keeps
+		// validity in this shape. Bits past row_count are set from BeginChunk and
+		// are ignored downstream.
+		uint64_t *published = mask.GetData();
+		for (idx_t w = 0; w < words; w++) {
+			published[w] &= st.validity_words[w];
+		}
 	}
 	arena_.EndChunk();
 }

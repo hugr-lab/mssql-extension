@@ -1,7 +1,6 @@
 #include "tds/tds_row_reader.hpp"
 #include <cstring>
 #include <stdexcept>
-#include "duckdb/common/exception.hpp"
 #include "tds/tds_types.hpp"
 
 namespace duckdb {
@@ -198,10 +197,13 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 			// declare more than a value could ever be. Returning 0 here would mean
 			// "need more data", and the parser would buffer the whole rest of the
 			// stream waiting for bytes that are never coming.
-			throw InvalidInputException(
-				"MSSQL: a TEXT/NTEXT/IMAGE value declares %u bytes, past the %u-byte maximum for the type. The TDS "
-				"stream is malformed.",
-				data_length, static_cast<uint32_t>(MAX_LOB_VALUE_BYTES));
+			// std::runtime_error, not a DuckDB exception: this layer is compiled
+			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
+			// path, which is what makes it fuzzable at all. Every other throw in
+			// this file is the same for the same reason.
+			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
+									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
+									 "-byte maximum for the type. The TDS stream is malformed.");
 		}
 		const size_t total = header + data_length;
 		return length >= total ? total : 0;
@@ -860,10 +862,13 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 			// declare more than a value could ever be. Returning 0 here would mean
 			// "need more data", and the parser would buffer the whole rest of the
 			// stream waiting for bytes that are never coming.
-			throw InvalidInputException(
-				"MSSQL: a TEXT/NTEXT/IMAGE value declares %u bytes, past the %u-byte maximum for the type. The TDS "
-				"stream is malformed.",
-				data_length, static_cast<uint32_t>(MAX_LOB_VALUE_BYTES));
+			// std::runtime_error, not a DuckDB exception: this layer is compiled
+			// standalone by the fuzz harness (fuzz/build.sh) with no DuckDB include
+			// path, which is what makes it fuzzable at all. Every other throw in
+			// this file is the same for the same reason.
+			throw std::runtime_error("TEXT/NTEXT/IMAGE value declares " + std::to_string(data_length) +
+									 " bytes, past the " + std::to_string(MAX_LOB_VALUE_BYTES) +
+									 "-byte maximum for the type. The TDS stream is malformed.");
 		}
 		const size_t total = header + data_length;
 		return length >= total ? total : 0;

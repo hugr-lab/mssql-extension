@@ -209,8 +209,12 @@ constexpr size_t TDS_PREFERRED_PACKET_SIZE = 16384;
 
 // Spec 055: receive staging budget. Each connection reads whole TDS frames,
 // several per recv(), into a buffer of about this size — a byte budget rather
-// than a frame count, so raising the frame size does not raise per-connection
-// memory (at 4096 that is 16 frames, at 32767 it is 2).
+// than a frame count, so raising the frame size BOUNDS per-connection memory
+// instead of scaling it (at 4096 that is 16 frames, at 32767 it is 2).
+//
+// Bounded, not flat: the buffer is the budget plus one whole frame, so it grows
+// from ~68 KB at a 4096-byte frame to ~96 KB at 32767. With the default 64-
+// connection pool that is ~4.4 MB to ~6 MB of receive buffer in total.
 constexpr size_t TDS_RECV_BUFFER_TARGET_BYTES = 64 * 1024;
 constexpr uint32_t TDS_RECV_MIN_FRAMES = 2;
 

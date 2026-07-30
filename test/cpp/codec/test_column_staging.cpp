@@ -33,9 +33,11 @@
 #include <vector>
 
 using duckdb::idx_t;
+using duckdb::mssql::codec::staging::AppendArm;
 using duckdb::mssql::codec::staging::ColumnOps;
 using duckdb::mssql::codec::staging::ColumnStaging;
 using duckdb::mssql::codec::staging::DirectKindForWidth;
+using duckdb::mssql::codec::staging::FinalizeKernel;
 using duckdb::mssql::codec::staging::IsDirectKind;
 using duckdb::mssql::codec::staging::ResolveColumnOps;
 using duckdb::mssql::codec::staging::StagingArena;
@@ -301,8 +303,13 @@ void TestColumnOpsResolution() {
 	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).kind == StagingKind::Var, "NVARCHAR is Var");
 	CHECK_TRUE(resolve(meta(duckdb::tds::TDS_TYPE_BIGVARBINARY, 16)).kind == StagingKind::Var, "VARBINARY is Var");
 	CHECK_TRUE(!resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).direct_write, "Var is never direct-written");
-	CHECK_EQ(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).max_value_bytes, 32u,
-			 "declared width is carried through for preallocation");
+	// 32 wire bytes + the 2-byte U+0000 the batch decode splits on: max_value_bytes
+	// is what one value COSTS IN THE BUFFER, not its wire size. Sizing on the wire
+	// size left a full chunk of maximum-length values two bytes per row short of
+	// its "provable worst case", so the column grew while still claiming it could
+	// not — which the D10 grow counter reported on its first run.
+	CHECK_EQ(resolve(meta(duckdb::tds::TDS_TYPE_NVARCHAR, 32)).max_value_bytes, 34u,
+			 "declared width plus the delimiter is carried through for preallocation");
 
 	// The issue-#89 guard, resolved once per column: when the vector we write
 	// into disagrees with what the wire implies, the column must fall back to
@@ -311,14 +318,27 @@ void TestColumnOpsResolution() {
 	const ColumnOps mismatched = ResolveColumnOps(meta(duckdb::tds::TDS_TYPE_INT, 4), LogicalType::VARCHAR);
 	CHECK_TRUE(mismatched.needs_value_fallback, "type disagreement forces the per-value fallback");
 	CHECK_TRUE(!mismatched.direct_write, "type disagreement never direct-writes");
-	CHECK_TRUE(mismatched.kind == StagingKind::Var, "fallback columns stage as Var");
+	// It must STAGE — the original assertion demanded Var specifically, which is
+	// over-specified: the Text kernel reads Fixed staging positionally and a
+	// diverging INT has a fixed wire width. What actually matters is that the
+	// column has an arm at all. It did not: the resolver set kind and stride and
+	// left arm at Unsupported, so a diverging integer column THREW instead of
+	// rendering as text, defeating the issue-#89 fallback for exactly the types
+	// it exists to rescue.
+	CHECK_TRUE(mismatched.arm < AppendArm::Unsupported, "fallback columns stage rather than throw");
+	CHECK_TRUE(mismatched.kernel == FinalizeKernel::Text, "fallback columns finalize through the text kernel");
 
 	// An unknown wire type must resolve, not throw — the per-value path owns
 	// that error so it can name the column.
 	bool threw = false;
 	try {
 		const ColumnOps unknown = ResolveColumnOps(meta(0x00, 0), LogicalType::VARCHAR);
-		CHECK_TRUE(unknown.needs_value_fallback, "unknown wire type falls back");
+		// NOT needs_value_fallback: falling back means staging the wire bytes and
+		// rendering them, and for a type GetDuckDBType cannot name there is no
+		// framing to stage by. Unsupported is the honest answer — and it defers the
+		// error to the moment a value arrives, so a query selecting such a column
+		// with no rows still succeeds. Resolving without throwing is the contract.
+		CHECK_TRUE(unknown.arm == AppendArm::Unsupported, "unknown wire type resolves to Unsupported, not a throw");
 	} catch (...) {
 		threw = true;
 	}

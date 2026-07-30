@@ -138,6 +138,8 @@ uint32_t TemporalWireWidth(const tds::ColumnMetadata &column) {
 //! runtime-sized memcpy, which is a libc call.
 bool IsStageableFixedWidth(uint32_t width) {
 	switch (width) {
+	case 1:
+	case 2:
 	case 3:
 	case 4:
 	case 5:
@@ -341,8 +343,16 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		}
 	}
 	if (width > 0) {
+		// Only a DIVERGING column reaches here: without a divergence a fixed-width
+		// type is either direct-written or claimed by the staged-fixed families
+		// above. It still needs an arm — leaving it Unsupported made the issue-#89
+		// fallback throw for exactly the integer, float and BIT types it exists to
+		// rescue, instead of rendering them as text the way the pre-055 path did.
+		// The Text kernel reads Fixed staging positionally, so Fixed is the right
+		// shape; only the arm was missing.
 		ops.kind = StagingKind::Fixed;
 		ops.stride = width;
+		ops.arm = HasOneBytePrefix(column.type_id) ? AppendArm::P1StageFixed : AppendArm::RawStageFixed;
 		return ops;
 	}
 

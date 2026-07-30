@@ -157,3 +157,53 @@ its own.
 - **Hash quality on adversarial data** — see the prefix-hash finding; full-value hashing with
   equality confirmation is the invariant.
 - **rowid interaction** — criterion 7.2.
+
+---
+
+## 6. The downstream question, answered — 2026-07-30
+
+§5 said string dictionaries could only be justified by DOWNSTREAM benefit, since
+spec 055 killed the decode-side argument. That benefit has now been measured,
+without implementing dictionary emission.
+
+**Method.** The same 20M rows in two local DuckDB tables — one written under
+`PRAGMA force_compression='dictionary'`, one `'uncompressed'` — so the operators
+above the scan see exactly the vector types this spec would create. Confirmed via
+`pragma_storage_info` that the two really differ. Interleaved, order rotated,
+three passes, `.timer on`, `threads=4`. Columns: `s100` (100 distinct),
+`s10` (10 distinct).
+
+| query | dictionary | flat | delta |
+| --- | ---: | ---: | ---: |
+| `GROUP BY s100` | 0.016 | 0.057 | **−72%** |
+| `GROUP BY s10` | 0.014 | 0.048 | −71% |
+| `count(DISTINCT s100)` | 0.004 | 0.032 | −87% |
+| `JOIN` on the string | 0.034 | 0.069 | −51% |
+| `GROUP BY` on two string keys | 0.034 | 0.065 | −48% |
+| equality filter | 0.014 | 0.016 | −12% |
+| **`ORDER BY s100 LIMIT 5`** | 0.048 | 0.016 | **+200%** |
+
+**The benefit is real and large — and still not enough.** The GROUP BY saving is
+0.041 s over 20M rows = **2.05 ns/row** of wall time. At `threads=4` the CPU
+saving is roughly 4× that, so call it ~8 ns/row. This spec's own §2 measured
+string dictionary DETECTION at **13–21 ns/value**. Detection therefore costs
+more than the downstream benefit, just as it costs more than the decode benefit.
+
+Two corrections, both against the dictionary:
+
+- The measured dictionary is built ONCE for the whole column at write time and
+  reused by every scan. This spec would rebuild one per 2048-row chunk, which is
+  a strictly worse ratio — the same detection cost amortized over far fewer rows.
+- `ORDER BY` is 3× SLOWER on dictionary input. Any emission policy would have to
+  predict the consumer, which the scan cannot do.
+
+**Verdict: string dictionaries do not ship.** Not for lack of downstream value —
+it is there — but because detecting the dictionary costs more than having it
+saves, on both sides of the ledger. They would only pay if the dictionary
+arrived for free, and TDS does not carry one.
+
+What survives from this spec: CONSTANT detection (a miss costs 0.0 — the
+detector exits at the second distinct value) and fixed-width dictionaries
+(0.4 ns detection). Both are small wins; neither justifies a phase of its own.
+**Recommendation: fold the CONSTANT/fixed-width part into whatever phase next
+touches the scan, and close this spec.**
