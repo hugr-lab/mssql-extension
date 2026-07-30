@@ -228,3 +228,85 @@ malformed lengths above 16 magnitude bytes keep the old portable loop.
   in `read − ctl`; it is not free in absolute terms (8.4 ns/value at str16).
 - Single run of medians-of-3. Cross-session drift applies as in spec 054: only
   interleaved same-session A/B counts as regression evidence.
+
+---
+
+# Spec 055 — full-path result
+
+Three builds, interleaved in ONE session, pass order rotated (A,B,C / C,A,B /
+B,C,A), medians of 3 reps each, 500k rows, threads=1:
+
+- **preD0** — `duckdb_before_d0`, the branch's starting point, before any spec
+  055 commit.
+- **branch** — `1f63bad`, the last commit still on the per-value read path
+  (D0 phase-timer gating, D0b 16 KB frames and the receive-staging change, D1
+  decimal kernel, T9 UTF-16 decoder and T3/D4 staging structures are all already
+  in it).
+- **tip** — `5e90735`, the whole staged path.
+
+Client CPU ns/value.
+
+## Read
+
+| family | preD0 | branch | tip | tip vs branch | tip vs preD0 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| bigint | 97.6 | 33.2 | **23.4** | −29.5% | −76.0% |
+| int | 86.6 | 40.8 | **21.6** | −47.1% | −75.1% |
+| double | 102.0 | 35.8 | **25.6** | −28.5% | −74.9% |
+| bool | 80.2 | 42.0 | **30.6** | −27.1% | −61.8% |
+| date | 84.4 | 27.4 | **21.6** | −21.2% | −74.4% |
+| ts — DATETIME2(6) | 100.8 | 37.0 | **28.2** | −23.8% | −72.0% |
+| dec18 | 93.0 | 33.6 | **28.6** | −14.9% | −69.2% |
+| dec38 | 135.6 | 39.0 | **33.6** | −13.8% | −75.2% |
+| uuid | 116.4 | 45.8 | **35.2** | −23.1% | −69.8% |
+| blob — VARBINARY(16) | 122.8 | 56.0 | **41.2** | −26.4% | −66.4% |
+| str4 | 108.0 | 49.8 | **31.8** | −36.1% | −70.6% |
+| str16 | 153.0 | 94.8 | **67.6** | −28.7% | −55.8% |
+| str16u — non-ASCII | 142.2 | 89.0 | **53.4** | −40.0% | −62.4% |
+| str200 | 768.4 | 619.2 | **529.4** | −14.5% | −31.1% |
+| str16max — PLP framing | 193.6 | 118.0 | **84.4** | −28.5% | −56.4% |
+| strnull — 50% NULL | 121.6 | 56.4 | **37.2** | −34.0% | −69.4% |
+| **wide, 15 cols, min()** | 90.5 | 74.3 | **57.2** | **−23.0%** | **−36.8%** |
+| **wide, full drain** | 129.5 | 112.5 | **97.7** | −13.2% | −24.6% |
+
+Per-pass, for the load-bearing steps — the three sides do not overlap anywhere:
+
+```
+read_bigint     preD0 [95.8 98.0 97.6]  branch [33.2 33.8 33.2]  tip [24.6 23.4 23.2]
+read_str16      preD0 [152.2 153.6 153.0] branch [94.8 93.0 94.8] tip [68.0 65.2 67.6]
+read_wide_min   preD0 [98.3 90.5 88.5]  branch [74.3 75.1 73.6]  tip [57.2 60.0 56.1]
+read_str200     preD0 [768.4 765.4 770.0] branch [616.0 636.8 619.2] tip [525.4 544.8 529.4]
+```
+
+The local-table controls (`ctl_*`, same query shape against a DuckDB table) are
+unmoved across all three sides — the largest absolute drift is 0.2 ns on a
+2.2 ns step. The machine was stable for the whole run.
+
+`str200` is the weakest relative gain and should be: at 400 wire bytes per value
+it is bandwidth-bound, and no amount of dispatch removal changes how long it
+takes to move 400 bytes.
+
+## Write
+
+**No signal, and none expected** — spec 055 does not touch the write path. The
+write steps' per-pass spread is ±50% (`write_bigint` branch `[23, 46, 37]`, tip
+`[42, 34, 38]`), because they are short and dominated by server-side work. Any
+per-family write delta in this table would be noise; they are omitted rather
+than reported. The write path is spec 057's subject.
+
+## What the D10 counters say about the same workload
+
+Reading 500k rows of `NVARCHAR(16)` + non-ASCII `NVARCHAR(16)` + `BIGINT` +
+`DECIMAL(38,10)`:
+
+```
+staging: direct_bypass=500000 grow=0 shrink=0 peak_payload=69632B
+columns: prealloc_bounded=2 prealloc_capped=0 unbounded=0
+kernels (values/staged bytes/ns per value): none=500000v/0B/0.0ns
+    string=1000000v/29000000B/3.1ns decimal=500000v/8500000B/5.2ns
+string boundaries (column-chunks): ascii=245 skip+sweep=245 replaced_units=0
+```
+
+The batch kernels are 3–5 ns/value against a whole-path 21–34 ns/value. **The
+decode is no longer the read path's cost centre** — which is what spec 058
+(read framing) exists to look at next.
