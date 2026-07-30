@@ -261,12 +261,22 @@ void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::Col
 void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, const std::vector<Vector *> &targets) {
 	metadata_ = &metadata;
 	reader_ = make_uniq<tds::RowReader>(metadata);
+	reader_ptr_ = reader_.get();
 
 	const idx_t column_count = metadata.size();
 	ops_.assign(column_count, ColumnOps());
 	chunk_nulls_.assign(column_count, 0);
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
+	// Bind the staging addresses ONCE. They are stable for as long as the arena
+	// keeps this column count, which is exactly why it owns its columns through
+	// unique_ptr — see the member's comment for what reaching through the arena
+	// per value actually costs.
+	staging_.resize(column_count);
+	for (idx_t i = 0; i < column_count; i++) {
+		staging_[i] = &arena_.Column(i);
+	}
+
 	for (idx_t i = 0; i < column_count; i++) {
 		Vector *target = i < targets.size() ? targets[i] : nullptr;
 		if (target == nullptr) {
@@ -291,7 +301,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 			}
 		}
 		if (ops_[i].arm >= AppendArm::PlpStageString && ops_[i].arm <= AppendArm::LobStageBinary) {
-			unbounded_columns_.push_back(i);
+			unbounded_columns_.push_back(staging_[i]);
 		}
 	}
 	has_unbounded_column_ = !unbounded_columns_.empty();
@@ -311,7 +321,7 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 		// Columns that stage into their own buffer take no pointer at all.
 		uint8_t *direct_dst =
 			ops_[i].direct_write ? reinterpret_cast<uint8_t *>(FlatVector::GetData(*targets_[i])) : nullptr;
-		arena_.Column(i).BeginChunk(direct_dst);
+		staging_[i]->BeginChunk(direct_dst);
 	}
 }
 
@@ -323,50 +333,50 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 	for (idx_t c = 0; c < column_count; c++) {
 		switch (ops_[c].arm) {
 		case AppendArm::RawDirect1:
-			arena_.Column(c).AppendDirect<1>(p);
+			staging_[c]->AppendDirect<1>(p);
 			p += 1;
 			break;
 		case AppendArm::RawDirect2:
-			arena_.Column(c).AppendDirect<2>(p);
+			staging_[c]->AppendDirect<2>(p);
 			p += 2;
 			break;
 		case AppendArm::RawDirect4:
-			arena_.Column(c).AppendDirect<4>(p);
+			staging_[c]->AppendDirect<4>(p);
 			p += 4;
 			break;
 		case AppendArm::RawDirect8:
-			arena_.Column(c).AppendDirect<8>(p);
+			staging_[c]->AppendDirect<8>(p);
 			p += 8;
 			break;
 		case AppendArm::P1Direct1:
-			p += AppendPrefixedDirect<1>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<1>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct2:
-			p += AppendPrefixedDirect<2>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<2>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct4:
-			p += AppendPrefixedDirect<4>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<4>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct8:
-			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<8>(*staging_[c], p);
 			break;
 		case AppendArm::P1StageFixed:
-			p += AppendStagedFixed<true>(arena_.Column(c), p);
+			p += AppendStagedFixed<true>(*staging_[c], p);
 			break;
 		case AppendArm::RawStageFixed:
-			p += AppendStagedFixed<false>(arena_.Column(c), p);
+			p += AppendStagedFixed<false>(*staging_[c], p);
 			break;
 		case AppendArm::P1StageDecimal:
-			p += AppendStagedDecimal(arena_.Column(c), p);
+			p += AppendStagedDecimal(*staging_[c], p);
 			break;
 		case AppendArm::P2StageString: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
 			if (length == 0xFFFF) {
-				arena_.Column(c).AppendNull();
+				staging_[c]->AppendNull();
 				p += 2;
 				break;
 			}
-			arena_.Column(c).AppendVarDelimited(p + 2, length);
+			staging_[c]->AppendVarDelimited(p + 2, length);
 			p += 2 + length;
 			break;
 		}
@@ -377,30 +387,30 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 			// perfectly predicted extra switch arm costs.
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
 			if (length == 0xFFFF) {
-				arena_.Column(c).AppendNull();
+				staging_[c]->AppendNull();
 				p += 2;
 				break;
 			}
-			arena_.Column(c).AppendVar(p + 2, length);
+			staging_[c]->AppendVar(p + 2, length);
 			p += 2 + length;
 			break;
 		}
 		case AppendArm::PlpStageString:
-			p += AppendPlp<true>(arena_.Column(c), p);
+			p += AppendPlp<true>(*staging_[c], p);
 			break;
 		case AppendArm::PlpStageBinary:
-			p += AppendPlp<false>(arena_.Column(c), p);
+			p += AppendPlp<false>(*staging_[c], p);
 			break;
 		case AppendArm::LobStageString:
-			p += AppendLob<true>(arena_.Column(c), p);
+			p += AppendLob<true>(*staging_[c], p);
 			break;
 		case AppendArm::LobStageBinary:
-			p += AppendLob<false>(arena_.Column(c), p);
+			p += AppendLob<false>(*staging_[c], p);
 			break;
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
-			p += reader_->SkipValue(p, static_cast<size_t>(end - p), c);
+			p += reader_ptr_->SkipValue(p, static_cast<size_t>(end - p), c);
 			break;
 		}
 	}
@@ -422,81 +432,81 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 			// unsupported type costs nothing here — it is only a value of one
 			// that cannot be read.
 			if (ops_[c].arm < AppendArm::Unsupported) {
-				arena_.Column(c).AppendNull();
+				staging_[c]->AppendNull();
 			}
 			continue;
 		}
 
 		switch (ops_[c].arm) {
 		case AppendArm::RawDirect1:
-			arena_.Column(c).AppendDirect<1>(p);
+			staging_[c]->AppendDirect<1>(p);
 			p += 1;
 			break;
 		case AppendArm::RawDirect2:
-			arena_.Column(c).AppendDirect<2>(p);
+			staging_[c]->AppendDirect<2>(p);
 			p += 2;
 			break;
 		case AppendArm::RawDirect4:
-			arena_.Column(c).AppendDirect<4>(p);
+			staging_[c]->AppendDirect<4>(p);
 			p += 4;
 			break;
 		case AppendArm::RawDirect8:
-			arena_.Column(c).AppendDirect<8>(p);
+			staging_[c]->AppendDirect<8>(p);
 			p += 8;
 			break;
 		// The *N variants keep their length prefix in an NBC row; the bitmap only
 		// says whether the value is there at all.
 		case AppendArm::P1Direct1:
-			p += AppendPrefixedDirect<1>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<1>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct2:
-			p += AppendPrefixedDirect<2>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<2>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct4:
-			p += AppendPrefixedDirect<4>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<4>(*staging_[c], p);
 			break;
 		case AppendArm::P1Direct8:
-			p += AppendPrefixedDirect<8>(arena_.Column(c), p);
+			p += AppendPrefixedDirect<8>(*staging_[c], p);
 			break;
 		case AppendArm::P1StageFixed:
-			p += AppendStagedFixed<true>(arena_.Column(c), p);
+			p += AppendStagedFixed<true>(*staging_[c], p);
 			break;
 		case AppendArm::RawStageFixed:
-			p += AppendStagedFixed<false>(arena_.Column(c), p);
+			p += AppendStagedFixed<false>(*staging_[c], p);
 			break;
 		case AppendArm::P1StageDecimal:
-			p += AppendStagedDecimal(arena_.Column(c), p);
+			p += AppendStagedDecimal(*staging_[c], p);
 			break;
 		case AppendArm::P2StageString: {
 			// The length prefix stays in an NBC row; the bitmap only decided that
 			// a value is present at all, which the branch above already handled.
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
-			arena_.Column(c).AppendVarDelimited(p + 2, length);
+			staging_[c]->AppendVarDelimited(p + 2, length);
 			p += 2 + length;
 			break;
 		}
 		case AppendArm::P2StageBinary: {
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
-			arena_.Column(c).AppendVar(p + 2, length);
+			staging_[c]->AppendVar(p + 2, length);
 			p += 2 + length;
 			break;
 		}
 		case AppendArm::PlpStageString:
-			p += AppendPlp<true>(arena_.Column(c), p);
+			p += AppendPlp<true>(*staging_[c], p);
 			break;
 		case AppendArm::PlpStageBinary:
-			p += AppendPlp<false>(arena_.Column(c), p);
+			p += AppendPlp<false>(*staging_[c], p);
 			break;
 		case AppendArm::LobStageString:
-			p += AppendLob<true>(arena_.Column(c), p);
+			p += AppendLob<true>(*staging_[c], p);
 			break;
 		case AppendArm::LobStageBinary:
-			p += AppendLob<false>(arena_.Column(c), p);
+			p += AppendLob<false>(*staging_[c], p);
 			break;
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
-			p += reader_->SkipValueNBC(p, static_cast<size_t>(end - p), c);
+			p += reader_ptr_->SkipValueNBC(p, static_cast<size_t>(end - p), c);
 			break;
 		}
 	}
@@ -510,7 +520,7 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 			chunk_nulls_[c] = 0;
 			continue;
 		}
-		const ColumnStaging &st = arena_.Column(c);
+		const ColumnStaging &st = *staging_[c];
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
 		std::chrono::steady_clock::time_point started;
 		if (counters_enabled_) {

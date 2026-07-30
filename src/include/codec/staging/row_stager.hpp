@@ -135,7 +135,7 @@ public:
 		}
 		idx_t total = 0;
 		for (idx_t i = 0; i < unbounded_columns_.size(); i++) {
-			total += arena_.Column(unbounded_columns_[i]).PayloadSize();
+			total += unbounded_columns_[i]->PayloadSize();
 		}
 		return total >= budget;
 	}
@@ -158,15 +158,28 @@ private:
 
 	StagingArena arena_;
 	std::vector<ColumnOps> ops_;
+	//! The staging for column c, bound once per result set.
+	//!
+	//! The arena holds its columns behind unique_ptr precisely so their addresses
+	//! are stable, and this is why: reaching them through the arena costs TWO
+	//! out-of-line calls per value — duckdb::vector's bounds check and
+	//! duckdb::unique_ptr's null check, both of which can throw and therefore
+	//! neither inline nor fold. In the hottest loop in the extension, that was
+	//! two calls before every single append. A plain pointer array has neither.
+	std::vector<ColumnStaging *> staging_;
 	//! Output vectors for this chunk, indexed by SQL column. Null for Skip.
 	std::vector<Vector *> targets_;
 	//! Per-column NULL count for the chunk just finalized (D4 counters).
 	std::vector<idx_t> chunk_nulls_;
 	//! Columns whose staged size is not bounded by their declared width (PLP).
-	std::vector<idx_t> unbounded_columns_;
+	//! Pointers, not indices: this list is walked once per ROW.
+	std::vector<ColumnStaging *> unbounded_columns_;
 	bool has_unbounded_column_ = false;
 	const std::vector<tds::ColumnMetadata> *metadata_ = nullptr;
 	unique_ptr<tds::RowReader> reader_;
+	//! Same reason as `staging_`: duckdb::unique_ptr's operator-> is a checked,
+	//! out-of-line, throwing call, and the Skip arm takes it once per value.
+	tds::RowReader *reader_ptr_ = nullptr;
 	bool configured_ = false;
 	bool counters_enabled_ = false;
 	StagingCounters counters_;
