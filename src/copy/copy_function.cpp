@@ -496,6 +496,21 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			insert_bulk += " WITH (ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows) + ")";
 		}
 
+		// RESEARCH HOOK (spec 057, not a supported interface): append extra
+		// INSERT BULK hints verbatim, e.g. MSSQL_BCP_EXTRA_HINTS='ORDER(id ASC)'.
+		// Exists to measure what the server does with hints we do not send yet;
+		// remove or replace with a real COPY option before this branch lands.
+		if (const char *extra = std::getenv("MSSQL_BCP_EXTRA_HINTS")) {
+			if (*extra) {
+				const auto with_pos = insert_bulk.rfind(" WITH (");
+				if (with_pos == string::npos) {
+					insert_bulk += " WITH (" + string(extra) + ")";
+				} else {
+					insert_bulk.insert(insert_bulk.size() - 1, ", " + string(extra));
+				}
+			}
+		}
+
 		CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
 
 		// Cache the INSERT BULK SQL for re-execution on batch flush

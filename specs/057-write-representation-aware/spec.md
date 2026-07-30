@@ -902,3 +902,353 @@ But the BCP wire is packed: row starts are not 8- or 16-byte aligned, and
 streaming-store instructions generally require alignment. The idea only becomes
 testable together with D5b (encode directly into wire frames), where the layout
 is ours to choose — measure it there, not here.
+
+## Helping the server: what we can tell it, measured (2026-07-31)
+
+Today the only hint we send is `TABLOCK` (plus `ROWS_PER_BATCH` on the COPY
+path — CTAS omits it, an asymmetry worth closing). Two further ideas were
+measured against the live server, 1M rows, three interleaved A/B pairs.
+
+### `ORDER(key ASC)` — real, −11.8%, and safe to expose
+
+Declaring the stream pre-sorted on the clustered index key lets the server skip
+its own sort. Target: 8-column table with a clustered index on `id`, source
+sorted by `id`.
+
+| pair | no hint | `ORDER(id ASC)` |
+| --- | --- | --- |
+| 1 | 2.403 s | 2.069 s |
+| 2 | 2.347 s | 2.084 s |
+| 3 | 2.313 s | 1.908 s |
+
+Median 2.347 → 2.069, **−11.8%**, every pair in the same direction.
+
+**A false promise fails loudly — this is what makes it safe.** Feeding
+descending data while claiming `ORDER(id ASC)`:
+
+```
+Cannot bulk load. The bulk data stream was incorrectly specified as sorted...
+Sort order incorrect for the following two rows:
+primary key of first row: (199999), primary key of second row: (199998).
+```
+
+Nothing lands; the whole load is rejected. So the hint cannot silently corrupt a
+table, which is what would otherwise make it too dangerous to offer. It still
+must not be set automatically from a plan's claimed ordering unless the sink is
+order-preserving — but as an explicit COPY option it is sound.
+
+### Wire column order — no effect, and the reason it cannot have one
+
+Sending fixed-width columns first (matching how SQL Server groups the physical
+row: fixed data, then null bitmap, then variable offsets and data) against the
+table's declared interleaved order. COPY maps by column NAME, so this needed no
+code change — just a reordered `SELECT`.
+
+| pair | declared order | fixed-width first |
+| --- | --- | --- |
+| 1 | 1.097 s | 1.385 s |
+| 2 | 1.111 s | 1.137 s |
+| 3 | 1.090 s | 1.090 s |
+
+At best identical, on median slightly worse.
+
+**Re-run on a wide, string-heavy row, because the first fixture was too narrow
+to conclude from.** 44 columns — 20 × `NVARCHAR(100)` each carrying 180 wire
+bytes, plus 16 BIGINT, 4 DATETIME2(7), 4 BIT — measured at **~4096 bytes per row
+on disk**, half the 8060 limit and forty times the first fixture. 100k rows:
+
+| pair | declared order | fixed-width first |
+| --- | --- | --- |
+| 1 | 2.216 s | 2.274 s |
+| 2 | 2.359 s | 2.416 s |
+| 3 | 2.533 s | 2.552 s |
+
+Same answer, three pairs of three: reordering is consistently ~2-3% *slower*.
+
+The server does assemble each row in its own cache before it reaches a page, so
+the objection is sound in principle. It does not bite because even a 4 KB row —
+and the 8060-byte maximum — is far inside L1 (128 KB per performance core on
+this machine, 32-48 KB on typical server parts). Whatever order the fields
+arrive in, the row under construction stays resident. Intra-row scatter has
+nothing to cost. The server-side costs that do matter are at page and log
+granularity, and those are reached with TABLOCK, compression and batch hints,
+not with field order.
+
+**Dropped.** Recorded so it is not re-proposed: the idea is plausible, the
+measurement is flat, and the mechanism explains why.
+
+## Sorting, ORDER and parallelism against a clustered index (2026-07-31)
+
+The first `ORDER` measurement was flawed: the source was sorted in a separate
+statement, so the sort cost sat outside the timed COPY. Redone with the sort
+inside the measured statement and a genuinely unordered source
+(`hash(i) % 1000000`), 1M rows into an 8-column table with a clustered index on
+`id`, three interleaved passes, medians:
+
+| | wall | vs today |
+| --- | --- | --- |
+| A — unordered source, no hint (**what users get today**) | 3.734 s | 1× |
+| C — DuckDB sorts, no hint | 2.360 s | **−37%** |
+| B — DuckDB sorts + `ORDER(id ASC)` | **2.015 s** | **−46%** |
+
+**The sort is the win, not the hint.** Ordered rows enter a clustered index by
+appending to the end of the leaf level; unordered rows land all over it and split
+pages. That is −37% before we tell the server anything. The hint adds a further
+−15% (2.360 → 2.015) by letting it skip its own sort, consistent with the −11.8%
+measured earlier when both sides were already sorted.
+
+DuckDB's sort costs 2.2-2.7 s of CPU, but it parallelises and barely shows in
+wall time — the server-side saving dominates it. This is the answer to "who
+should sort": DuckDB, on many cores, rather than SQL Server on the insert path.
+
+### Parallel sessions: `ORDER` is fine, TABLOCK is not
+
+Four sessions, disjoint sorted key ranges, 4M rows total (the 4-session rows are
+directly comparable to each other — same volume, same hint, only TABLOCK
+differs):
+
+| sessions | hint | TABLOCK | wall | per 1M rows |
+| --- | --- | --- | --- | --- |
+| 1 | ORDER | on | 2.63 s (1M) | 2.63 |
+| 4 | — | on | 8.97 s (4M) | 2.24 |
+| 4 | ORDER | on | 8.42 s (4M) | 2.11 |
+| 4 | ORDER | **off** | **4.81 s (4M)** | **1.20** |
+
+- **`ORDER` survives parallelism.** No session failed. The server validates sort
+  order *per bulk-load stream*, not globally, so N sessions each sending their
+  own sorted range is legal. Range-partitioning the input is therefore the
+  natural shape for `PARALLEL N` into a clustered index.
+- **TABLOCK serialises parallel load into a clustered index.** With it, four
+  sessions manage 2.11 s/M against one session's 2.63 — almost no scaling.
+  Without it, 1.20 s/M: **1.75× faster on identical work.** Heaps are the
+  opposite case (BU locks are mutually compatible, which is why TABLOCK measured
+  1.6× there).
+
+**This contradicts the current auto-TABLOCK policy** (issue #45: enable it for
+newly created tables). Correct for a heap, wrong for a clustered-index target
+under parallel load. The policy needs the target's index shape as an input, not
+just its newness.
+
+Caveat to re-check on a real server: without TABLOCK the inserts are fully
+logged, so on a database in FULL recovery the trade-off may shift. The container
+used here is in SIMPLE.
+
+## Revised TABLOCK policy — the full decision table, measured
+
+Every cell measured on the live container, 8-column table, medians of 2-3
+interleaved passes. The heap rows load 4M rows across 4 sessions; the clustered
+rows are normalised per 1M.
+
+| target | sessions | TABLOCK on | TABLOCK off | verdict |
+| --- | --- | --- | --- | --- |
+| heap | 1 | 11.37 s | 14.42 s | **on** (1.27×) |
+| heap | 4 | **1.70 s** | 11.97 s | **on** (7.0×) |
+| clustered index | 1 | 2.185 s | 2.166 s | neutral |
+| clustered index | 4 | 2.11 s/M | **1.20 s/M** | **off** (1.75×) |
+
+Two locks, two opposite behaviours. On a heap, concurrent bulk loaders take
+mutually compatible BU locks, so TABLOCK is not merely an optimisation — without
+it four sessions are **seven times slower** than with it, far more than the
+"15-30%" the current setting documents. Against a clustered index the same hint
+serialises the loaders, and dropping it buys 1.75×.
+
+**The rule that follows needs no conditionals:** heap → TABLOCK on; clustered
+index → TABLOCK off. Single-session clustered load is neutral, so it costs
+nothing to decide by target shape alone and ignore the degree.
+
+This replaces the issue-#45 policy (enable for newly created tables). Newness is
+the wrong input: a freshly created table is a heap *until an index is created on
+it*, which is exactly the case CTAS-then-index hits. The input must be the
+target's index shape.
+
+**What we must learn to see first.** The clustered index is currently invisible
+to the extension: primary-key discovery filters on `kc.type = 'PK'`, so an index
+like the article's — clustered, not a primary key — is never noticed. Discovery
+needs `sys.indexes.type = 1` plus its key columns and their direction from
+`sys.index_columns` (`key_ordinal > 0`, `is_descending_key`). That same metadata
+is what the sort injection below needs, so it is one addition serving both.
+
+## Sorting on the DuckDB side: where it can be injected
+
+Measured worth −37% into a clustered index before any hint (§ above), so the
+question is only where the sort goes.
+
+| path | hook | can we inject? |
+| --- | --- | --- |
+| `INSERT INTO d.t SELECT ...` | `MSSQLCatalog::PlanInsert` | yes — we build the physical plan |
+| `CREATE TABLE d.t AS SELECT ...` | `MSSQLCatalog::PlanCreateTableAs` | yes, but a new table has no index yet |
+| `COPY src TO 'd.t' (FORMAT bcp)` | `CopyFunction` | **no** — the plan is not ours |
+
+The COPY gap closes through the **optimizer extension** we already register
+(`MSSQLOptimizer::Optimize`, `src/table_scan/mssql_optimizer.cpp`), which
+receives the whole `unique_ptr<LogicalOperator>` and can rewrite it — including
+wrapping a copy-to-file's child in a `LogicalOrder`. That makes one mechanism
+serve every path, rather than two hooks that behave differently.
+
+Conditions the injection must respect, in order:
+
+1. **Only for a clustered-index target**, on its key columns, in its declared
+   direction — a heap gains nothing from sorted input and would pay for the sort.
+2. **Never on top of a user's own `ORDER BY`** on the same key; and if the user
+   ordered by something else, theirs wins and we do not add the hint.
+3. **The `ORDER` hint follows the sort, not the other way round.** The hint is
+   only sound when the sink actually receives rows in that order, which requires
+   `preserve_insertion_order` and a serialising sink; with `PARALLEL N` each
+   session must own a disjoint key range (measured legal — the server validates
+   per stream, § above).
+4. **It must be defeatable.** A user who knows their input is already ordered, or
+   who does not want to pay for a sort, needs an off switch.
+
+## Fabric Warehouse now accepts TDS bulk load (2026-07 — recheck, user)
+
+The extension disables BCP for Fabric endpoints
+(`copy_function.cpp`, `mssql_ctas_planner.cpp`, gated on
+`is_fabric_endpoint`) because the protocol was not supported there. That is no
+longer true.
+
+Microsoft Learn, *Ingest Data into Your Warehouse Using BCP API (Preview)*
+(doc dated 2026-07-01, updated 2026-07-03):
+<https://learn.microsoft.com/en-us/fabric/data-warehouse/ingest-data-bulk-copy>
+
+> The BCP tool (bcp utility), .NET `SqlBulkCopy` class, and Java
+> `SQLServerBulkCopy` class ... use the BCP API and TDS bulk-load protocol
+
+— i.e. exactly the protocol this extension implements. **Status is preview**, not
+GA.
+
+Three constraints that land directly on our code:
+
+1. **Microsoft Entra ID authentication only.** "SQL authentication (username and
+   password) isn't supported in Warehouse." So the gate cannot simply be removed
+   — BCP against Fabric is only viable when the connection is FEDAUTH.
+2. **`TableLock` is ignored**, along with `CheckConstraints`, `KeepNulls` and
+   `FireTriggers`: "bulk copy in Fabric Data Warehouse ignores them and uses
+   default service behavior." The whole TABLOCK decision table above is
+   inapplicable there. `ORDER` and `ROWS_PER_BATCH` are *not* named in the
+   ignored list, which is not the same as being honoured — test, do not assume.
+3. **Batch size wants 150 MB–1 GB, starting at 250–500 MB.** `mssql_copy_flush_rows`
+   counts ROWS only (`BCPConfig::flush_rows`), with no byte threshold anywhere on
+   the BCP path. At the 100 000-row default that is ~10 MB for a narrow table and
+   ~400 MB for the 4 KB-row fixture above — the same setting meaning two very
+   different things. A byte-based flush threshold is needed regardless of Fabric;
+   Fabric just makes it unavoidable.
+
+Microsoft still recommends `COPY INTO` over BCP where files can be staged, so
+BCP is the path for "data is already in the client", which is precisely the
+DuckDB case.
+
+**Actions, and the order is forced by what can be tested.**
+
+1. **Byte-based flush threshold — do now.** It is a defect independent of
+   Fabric: `flush_rows = 100000` means ~10 MB on a narrow table and ~400 MB on
+   the 4 KB-row fixture measured above, so the one knob means two different
+   things. Needs no Fabric endpoint.
+2. **Lifting the Fabric gate — last, and gated on hardware we do not have.**
+   The feature is preview and our TDS implementation has never been exercised
+   against a Fabric endpoint, so the gate should become "off unless the user
+   asks *and* the connection is Entra" rather than being removed. Shipping that
+   without a live test would be replacing a clear error with an unclear one.
+
+**Verification is deferred: no warehouse available.** The user removed the
+Fabric warehouse from their subscription to stop it accruing cost (2026-07-31),
+so the questions below stay open until one is stood up again — deliberately, not
+by oversight:
+
+- is our hand-built `INSERT BULK` statement accepted at all;
+- what Fabric does with `ORDER` and `ROWS_PER_BATCH` (absent from the ignored
+  list, which is not the same as honoured);
+- whether error reporting matches SQL Server's well enough for our parser.
+
+Synapse dedicated pools are unaffected — never gated, BCP works there today.
+
+## Requirements that shape the write path (user, 2026-07-31)
+
+Recorded as constraints on everything above, with the places they collide with
+what has already been measured called out — those collisions are the design
+work, not the requirements themselves.
+
+### 1. Defaults for how we CREATE tables in SQL Server
+
+Today `CREATE_TABLE true` produces `nvarchar(max)` for every string column,
+which measured **4.1× slower** than the same load into a properly typed table
+and is what blocks a columnstore target (§ "External validation"). The defaults
+that need deciding, each already backed by a measurement in this document:
+
+- **string width** — must come from the sizing policy (target metadata, MSSQL
+  source catalog, an explicit cast, or a setting), never `MAX` by default;
+- **heap vs clustered index** — decides the TABLOCK policy and whether sorting
+  pays at all;
+- **compression** — `PAGE` halves storage for +63% load time, `ROW` gives −41%
+  for +17%; a user choice, but only effective *because* we send TABLOCK.
+
+### 2. Plain INSERT uses BCP only when there is no RETURNING
+
+Bulk load returns no rows, so `RETURNING` keeps the existing batched-`VALUES` +
+`OUTPUT INSERTED` path. The dispatch is per statement, not per connection.
+
+### 3. Inside a transaction there is no parallel write
+
+N connections cannot share one SQL Server transaction (connection pinning maps a
+DuckDB transaction to one server-side transaction), so the degree is forced to 1
+whenever the statement runs inside an explicit transaction. This is exactly the
+case streaming exists for: it buys −20% at one session and nothing at four
+(§ "Streaming does not stack with parallelism"), so the two features cover
+disjoint situations rather than competing.
+
+### 4. Parallel by default, with a setting
+
+Measured: four sessions beat one by 2.8×, and eight were slower than four
+(5.09 s vs 4.64 s) — **but that saturation point is an artefact of the test host,
+not a property of SQL Server** (see the measurement-validity note below). A
+ceiling is still needed; where it sits is unknown until this is re-run against a
+native server.
+
+The degree cannot be a standalone setting either. It has to be derived from, at
+least: DuckDB's own thread count (writing with more streams than DuckDB has
+threads produces nothing), the connection-pool limit (`mssql_connection_limit`,
+default 64) since each stream holds a connection for the duration and must not
+starve readers, and § "Revised TABLOCK policy" — on a clustered-index target
+parallelism only pays with TABLOCK *off*. Mechanism still to be designed.
+
+### 5. UPDATE / DELETE move to temp tables filled by BCP
+
+This makes the write path carry DML volume too, not just COPY — every
+optimisation here compounds. Two constraints follow that are easy to miss:
+
+- **A `#temp` table is session-scoped — and that is the intended design, not a
+  problem to solve.** The fill and the UPDATE are part of ONE transaction, hence
+  one pinned connection and a session temp table. By § 3 that already forces a
+  single stream, so parallel fill never arises and neither `##global` temps nor
+  a real staging table are needed. The constraint to keep in mind is only that
+  the BCP fill and the DML must not be allowed to land on different pooled
+  connections.
+- **A temp table is a heap** unless we index it, so TABLOCK is the right default
+  there per the decision table; and if the subsequent UPDATE joins on a key, an
+  index on the temp table may be worth more than the fill saving. Measure before
+  assuming.
+
+
+## Measurement validity: the test server runs under emulation
+
+Every server-side number in this document was measured against SQL Server in
+Docker on Apple Silicon, i.e. an amd64 image under emulation. That inflates the
+server's share of wall-clock time, which systematically **overstates server-side
+wins and understates client-side ones**.
+
+What survives and what does not:
+
+- **Directions hold**, because each has a mechanism that does not depend on CPU
+  speed: unordered rows split pages in a clustered index (sorting wins), BU locks
+  are mutually compatible so TABLOCK lets heap loaders run concurrently, TABLOCK
+  serialises clustered-index loaders, and a declared sort order lets the server
+  skip its own.
+- **Magnitudes do not.** −37% for sorting, 7× for TABLOCK on a heap, 1.75× for
+  dropping it on a clustered index, −11.8% for `ORDER`: all are upper bounds
+  biased toward the server. Re-measure on native hardware before quoting any of
+  them outside this document.
+- **The parallel saturation point is not measurable here at all.** "Eight
+  sessions are slower than four" says something about an emulated server on a
+  laptop, nothing about a real one.
+
+The client-side microbenchmarks (§ "Columnar scatter measured", § "Wide rows")
+are unaffected — they never touch the server.
