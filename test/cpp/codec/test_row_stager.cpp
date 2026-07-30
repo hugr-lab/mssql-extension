@@ -40,6 +40,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "tds/encoding/type_converter.hpp"
+#include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
 
 #include <cstring>
@@ -282,8 +283,13 @@ std::vector<ArmCase> AllArms() {
 		{"BITN / P1Direct1", Meta(TDS_TYPE_BITN, 1), AppendArm::P1Direct1, P1(Bare({0})), P1Null(), "false"});
 
 	// MONEY: two int32s, high first, in units of 1/10000. 123456 -> 12.3456.
+	// The negative case is not decoration: its high word is -1, and assembling the
+	// 64-bit value by shifting that left was undefined behaviour until spec 059's
+	// fuzz run caught it — on ordinary data, not a hostile stream.
 	cases.push_back({"MONEY / RawStageFixed", Meta(TDS_TYPE_MONEY, 8), AppendArm::RawStageFixed,
 					 Bare({0, 0, 0, 0, 0x40, 0xE2, 0x01, 0x00}), Wire(), "12.3456"});
+	cases.push_back({"MONEY negative / RawStageFixed", Meta(TDS_TYPE_MONEY, 8), AppendArm::RawStageFixed,
+					 Bare({0xFF, 0xFF, 0xFF, 0xFF, 0xC0, 0x1D, 0xFE, 0xFF}), Wire(), "-12.3456"});
 	// DATE: three bytes, days since 0001-01-01. 738899 = 2024-01-15.
 	cases.push_back({"DATE / P1StageFixed", Meta(TDS_TYPE_DATE, 3), AppendArm::P1StageFixed,
 					 P1(Bare({0x53, 0x46, 0x0B})), P1Null(), "2024-01-15"});
@@ -853,6 +859,39 @@ void TestFramingMatchesSkipValueNBC() {
 	}
 }
 
+void TestFramingNbcBitmapNull() {
+	std::cout << "[8b] framing: the NBC walk with the column NULLed by the bitmap..." << std::endl;
+	// The third row form, and the one neither pass above covers: the column is
+	// present in the metadata but absent from the row entirely. SkipValueNBC is
+	// never consulted for it — the bitmap answers instead — so the assertion is
+	// that the column consumes NOTHING and the sentinel behind it still decodes.
+	// (Suggested by @oluies' review of PR #213, whose own differential test
+	// carries this variant.)
+	const std::vector<FramingCase> matrix = FramingMatrix();
+	std::vector<bool> nulls(2, false);
+	nulls[0] = true;
+	const Wire bitmap = NullBitmap(nulls);
+
+	for (const FramingCase &c : matrix) {
+		if (!Stageable(c)) {
+			continue;
+		}
+		Fixture f;
+		f.Add(c.meta);
+		f.Add(SentinelMeta());
+		f.Configure();
+		f.BeginChunk();
+
+		const Wire row = Cat(bitmap, SentinelWire());
+		const size_t consumed = f.StageNBCRow(row, 0);
+		f.FinalizeChunk(1);
+
+		CHECK_EQ(consumed, row.size(), c.label);
+		CHECK_TRUE(f.IsNull(0, 0), c.label);
+		CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), c.label);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // D5 — the string kernel's corners
 //
@@ -1024,6 +1063,150 @@ void TestDivergingColumnRendersAsText() {
 	CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), "the sentinel still decodes");
 }
 
+void TestDatetimeDayRange() {
+	std::cout << "[13] a DATETIME day count no conforming server can send..." << std::endl;
+
+	// Found by the spec-059 fuzz harness in seconds: DATETIME is the one temporal
+	// type whose day field is a full signed 32-bit number, and the conversion
+	// multiplies it by 86'400'000'000. Past ~1.07e8 days that overflowed int64 —
+	// undefined behaviour, reachable by any server that sends the bytes.
+	//
+	// The conversion now assembles through an unsigned type, so such a value
+	// wraps to a meaningless timestamp instead. Meaningless is the contract: the
+	// bytes are outside the type's own range and there is no right answer. What
+	// must hold is that the row still FRAMES correctly — 8 bytes consumed, the
+	// column after it untouched — and that nothing traps.
+	Fixture f;
+	f.Add(Meta(duckdb::tds::TDS_TYPE_DATETIME, 8));
+	f.Add(SentinelMeta());
+	f.Configure();
+	f.BeginChunk();
+
+	Wire row = Bare({0x00, 0x00, 0x00, 0x80});	// days = INT32_MIN, the reduced fuzz case
+	row = Cat(row, Bare({0, 0, 0, 0}));			// ticks
+	row = Cat(row, SentinelWire());
+
+	const size_t consumed = f.StageRow(row, 0);
+	f.FinalizeChunk(1);
+	CHECK_EQ(consumed, row.size(), "an out-of-range DATETIME is still framed as eight bytes");
+	CHECK_EQ(f.ValueAt(1, 0), std::string(SENTINEL_TEXT), "and the column behind it is untouched");
+
+	// The legal extremes still decode, which is what a range check would have
+	// risked breaking. 1753-01-01 is -53690 days from 1900-01-01, 9999-12-31 is
+	// 2958463.
+	Fixture ok;
+	ok.Add(Meta(duckdb::tds::TDS_TYPE_DATETIME, 8));
+	ok.Configure();
+	ok.BeginChunk();
+	Wire low = Bare({0x46, 0x2E, 0xFF, 0xFF});	// -53690
+	low = Cat(low, Bare({0, 0, 0, 0}));
+	Wire high = Bare({0x7F, 0x24, 0x2D, 0x00});	 // 2958463
+	high = Cat(high, Bare({0, 0, 0, 0}));
+	ok.StageRow(low, 0);
+	ok.StageRow(high, 1);
+	ok.FinalizeChunk(2);
+	CHECK_EQ(ok.ValueAt(0, 0), std::string("1753-01-01 00:00:00"), "the earliest legal DATETIME");
+	CHECK_EQ(ok.ValueAt(0, 1), std::string("9999-12-31 00:00:00"), "the latest legal DATETIME");
+}
+
+void TestImpossibleDeclaredWidth() {
+	std::cout << "[14] a fixed-width type declaring a width no server can send..." << std::endl;
+
+	// The second fuzz finding. A DATETIMEN declaring 52 bytes is claimed by
+	// neither the direct nor the staged-fixed branch, so it fell through to the
+	// issue-#89 fallback — which took the width on trust and picked the arm from
+	// a predicate that thought DATETIMEN was unprefixed. Result: the parser
+	// consumed the value's one-byte NULL prefix, the walk copied SEVENTEEN bytes
+	// (the staged-fixed switch's default), and the row's framing diverged. The
+	// D_ASSERT caught it here; a release build would have read past the row.
+	//
+	// Every fixed-width type with an impossible width must now resolve to
+	// Unsupported: there is no framing to stage it by, and nothing to rescue.
+	const uint8_t fixed_types[] = {duckdb::tds::TDS_TYPE_INTN, duckdb::tds::TDS_TYPE_FLOATN,
+								   duckdb::tds::TDS_TYPE_MONEYN, duckdb::tds::TDS_TYPE_DATETIMEN,
+								   duckdb::tds::TDS_TYPE_BITN};
+	const uint16_t impossible[] = {11, 12, 14, 15, 18, 52, 255};
+	for (uint8_t type_id : fixed_types) {
+		for (uint16_t width : impossible) {
+			const ColumnMetadata meta = Meta(type_id, width);
+			LogicalType target;
+			try {
+				target = TypeConverter::GetDuckDBType(meta);
+			} catch (const std::exception &) {
+				continue;  // the type converter rejects it first, which is also fine
+			}
+			const duckdb::mssql::codec::staging::ColumnOps ops =
+				duckdb::mssql::codec::staging::ResolveColumnOps(meta, target);
+			CHECK_TRUE(ops.arm == AppendArm::Unsupported, "an impossible declared width stages by nothing");
+		}
+	}
+
+	// And the walk says so when a value arrives, rather than reading the row's
+	// one byte as seventeen. This is the reduced fuzz input.
+	Fixture f;
+	f.Add(Meta(duckdb::tds::TDS_TYPE_DATETIMEN, 52));
+	f.Configure();
+	f.BeginChunk();
+	const Wire row = Bare({0x00});	// a NULL DATETIMEN: one length byte, zero
+	std::string message;
+	try {
+		f.StageRow(row, 0);
+	} catch (const duckdb::InvalidInputException &e) {
+		message = e.what();
+	}
+	CHECK_TRUE(message.find("cannot decode") != std::string::npos, "the column is named, not mis-framed");
+
+	// The legal widths still stage, or the guard would have broken the type.
+	for (uint16_t width : {4u, 8u}) {
+		const ColumnMetadata meta = Meta(duckdb::tds::TDS_TYPE_DATETIMEN, static_cast<uint16_t>(width));
+		const duckdb::mssql::codec::staging::ColumnOps ops =
+			duckdb::mssql::codec::staging::ResolveColumnOps(meta, TypeConverter::GetDuckDBType(meta));
+		CHECK_TRUE(ops.arm == AppendArm::P1StageFixed, "a legal DATETIMEN keeps its length-prefixed arm");
+		CHECK_EQ(ops.stride, static_cast<uint32_t>(width), "and its declared width");
+	}
+}
+
+void TestTemporalScaleIsBounded() {
+	std::cout << "[15] a fractional-second scale outside 0..7..." << std::endl;
+
+	// The fourth fuzz finding, and the only one caught in the metadata rather
+	// than in a value. Everything downstream scales by ten to the power of this
+	// byte — `Pow10(scale)` overflows int64 past 18, which is undefined
+	// behaviour — so it is checked once, where it is parsed, rather than at each
+	// use on the per-value path. MS-TDS caps TIME / DATETIME2 / DATETIMEOFFSET
+	// at 7.
+	//
+	// COLMETADATA payload: column count, then UserType, Flags, the type byte, the
+	// scale, and a zero-length column name.
+	const uint8_t types[] = {duckdb::tds::TDS_TYPE_TIME, duckdb::tds::TDS_TYPE_DATETIME2,
+							 duckdb::tds::TDS_TYPE_DATETIMEOFFSET};
+	for (uint8_t type_id : types) {
+		for (int scale = 0; scale <= 8; scale++) {
+			Wire meta = Bare({0x01, 0x00});		   // one column
+			meta = Cat(meta, Bare({0, 0, 0, 0}));  // UserType
+			meta = Cat(meta, Bare({0x09, 0x00}));  // Flags: nullable
+			meta = Cat(meta, Bare({type_id}));	   //
+			meta = Cat(meta, Bare({scale}));	   // the byte under test
+			meta = Cat(meta, Bare({0x00}));		   // empty column name
+
+			std::vector<ColumnMetadata> columns;
+			size_t consumed = 0;
+			bool threw = false;
+			try {
+				duckdb::tds::ColumnMetadataParser::Parse(meta.data(), meta.size(), consumed, columns);
+			} catch (const std::exception &) {
+				threw = true;
+			}
+			if (scale <= 7) {
+				CHECK_TRUE(!threw, "a legal scale parses");
+				CHECK_EQ(static_cast<int>(columns.size()), 1, "a legal scale yields its column");
+			} else {
+				CHECK_TRUE(threw, "a scale past 7 is rejected where it is parsed");
+			}
+		}
+	}
+}
+
 }  // namespace
 
 int main() {
@@ -1036,10 +1219,14 @@ int main() {
 	TestNbcRowCounter();
 	TestFramingMatchesSkipValue();
 	TestFramingMatchesSkipValueNBC();
+	TestFramingNbcBitmapNull();
 	TestStringBoundaryStrategies();
 	TestStringEmbeddedNuls();
 	TestNcharTrim();
 	TestDivergingColumnRendersAsText();
+	TestDatetimeDayRange();
+	TestImpossibleDeclaredWidth();
+	TestTemporalScaleIsBounded();
 
 	if (failures == 0) {
 		std::cout << "\nAll RowStager tests passed." << std::endl;

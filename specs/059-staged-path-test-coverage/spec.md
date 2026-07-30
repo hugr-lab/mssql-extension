@@ -163,6 +163,24 @@ note) this catches over-reads directly rather than by inference.
 
 ---
 
+## D3 — the chunk boundary — **DONE**
+
+`test/sql/query/staged_chunk_boundary.test`: 5000 rows over Direct/Fixed/Var
+columns with NULLs, values checked either side of both 2048-row seams; the same
+scan repeated at `mssql_tds_packet_size = 512`; and 60 values of 500k characters
+for the payload budget.
+
+Both mechanisms were verified to actually fire rather than assumed — the failure
+mode this whole spec exists to avoid. `MSSQL_DEBUG=2` reports `chunks=2` for the
+60-row budget table (2048-row chunks would give one), and the socket log shows
+`packet_size=512` negotiated with the server.
+
+One loose end noted, not chased: that same counter line reads `rows=59` for a
+60-row scan while `COUNT(*)` returns 60. The data is right and the counter is
+debug-only, but it is an off-by-one somewhere in the accounting.
+
+The original notes follow.
+
 ## D3 — the chunk boundary
 
 No existing SQL test crosses one: both spec-055 `.test` files use ≤ 5 rows, and

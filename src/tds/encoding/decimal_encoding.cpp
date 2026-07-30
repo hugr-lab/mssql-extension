@@ -71,7 +71,15 @@ hugeint_t DecimalEncoding::ConvertMoney(const uint8_t *data) {
 	std::memcpy(&high, data, 4);
 	std::memcpy(&low, data + 4, 4);
 
-	int64_t value = (static_cast<int64_t>(high) << 32) | static_cast<uint32_t>(low);
+	// Assembled through an unsigned type on purpose. `high` is negative for every
+	// negative amount — MONEY -0.0001 is the 64-bit value -1, so its high word is
+	// -1 too — and shifting a negative value left is undefined behaviour, not
+	// merely implementation-defined. It had been there since the type landed,
+	// firing on ordinary data rather than anything hostile; nothing caught it
+	// because the conversion layer was never fuzzed until spec 059 D4.
+	const uint64_t bits = (static_cast<uint64_t>(static_cast<uint32_t>(high)) << 32) | static_cast<uint32_t>(low);
+	int64_t value = 0;
+	std::memcpy(&value, &bits, sizeof(value));
 	return hugeint_t(value);
 }
 

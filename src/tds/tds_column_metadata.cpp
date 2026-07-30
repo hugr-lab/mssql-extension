@@ -330,25 +330,25 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 	case TDS_TYPE_DATE:
 		break;
 
-	// TIME (1 byte scale)
+	// TIME / DATETIME2 / DATETIMEOFFSET (1 byte scale)
+	//
+	// The scale is checked HERE, once per column, because every consumer of it
+	// scales by ten to that power: `Pow10(scale)` overflows int64 past 18, which
+	// is undefined behaviour, and the fuzz harness reached it (spec 059 D4).
+	// Checking at each use would put the test on the per-value path to catch
+	// something the metadata already knows. MS-TDS caps these at 7.
 	case TDS_TYPE_TIME:
-		if (offset >= length)
-			return false;
-		column.scale = data[offset++];
-		break;
-
-	// DATETIME2 (1 byte scale)
 	case TDS_TYPE_DATETIME2:
-		if (offset >= length)
-			return false;
-		column.scale = data[offset++];
-		break;
-
-	// DATETIMEOFFSET (1 byte scale)
 	case TDS_TYPE_DATETIMEOFFSET:
 		if (offset >= length)
 			return false;
 		column.scale = data[offset++];
+		if (column.scale > 7) {
+			throw std::runtime_error("Column '" + column.name + "' declares fractional-second scale " +
+									 std::to_string(column.scale) +
+									 "; TIME, DATETIME2 and DATETIMEOFFSET allow 0..7. "
+									 "The TDS stream is malformed.");
+		}
 		break;
 
 	// XML type: 1 byte SCHEMA_PRESENT flag, optional schema info
