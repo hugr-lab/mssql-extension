@@ -1,14 +1,26 @@
 name: Deploy metrics page
 
-# Publishes web/ (the DuckDB-Wasm interactive download-metrics chart) to
-# GitHub Pages. Requires Settings -> Pages -> "Build and deployment" Source
-# set to "GitHub Actions". Served at https://<owner>.github.io/<repo>/.
+# Publishes web/ (the DuckDB-Wasm interactive download-metrics chart) to GitHub
+# Pages, together with the static SVG the README embeds. Requires Settings ->
+# Pages -> "Build and deployment" Source set to "GitHub Actions". Served at
+# https://<owner>.github.io/<repo>/.
+#
+# The weekly schedule is why the SVG is rendered here rather than committed. It
+# used to be refreshed by a job that wrote docs/assets/download-metrics.svg and
+# pushed to `main` — a protected branch, so every Monday it failed with "GH006:
+# Protected branch update failed ... Changes must be made through a pull
+# request". Publishing the image to Pages keeps the chart current with no
+# commit, no weekly pull request to approve, and no token that can write to
+# main: this workflow holds `contents: read`.
 
 on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC (the weekly archive refreshes daily ~04:00Z)
   push:
     branches: [main]
     paths:
       - "web/**"
+      - "scripts/update_download_metrics.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -29,9 +41,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install DuckDB CLI
+        # Pinned version + checksum (not "latest"): this CLI fetches and
+        # aggregates the metrics, so it must be exactly the reviewed bytes.
+        # Update both values together when bumping.
+        env:
+          DUCKDB_VERSION: v1.5.3
+          DUCKDB_SHA256: 35caef1fecbc8d7e2c07de4fd2cdefc5189ec9ba9e1cca228fb1a1c48cc52a8a
+        run: |
+          curl -fsSL -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          echo "${DUCKDB_SHA256}  /tmp/duckdb.zip" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          unzip -o /tmp/duckdb.zip -d "$HOME/.local/bin"
+          "$HOME/.local/bin/duckdb" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the site — web/ plus a freshly rendered chart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir -p _site
+          cp -r web/. _site/
+          # --svg-only renders the chart and touches nothing else. The README
+          # points at this URL, so the image carries the freshness.
+          python3 scripts/update_download_metrics.py --svg-only _site/download-metrics.svg
+          ls -l _site
+
       - uses: actions/configure-pages@v6
+
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: web
+          path: _site
+
       - id: deployment
         uses: actions/deploy-pages@v5
