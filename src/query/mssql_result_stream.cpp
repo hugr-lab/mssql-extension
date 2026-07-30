@@ -48,7 +48,15 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
 	  rows_read_(0),
-	  counters_enabled_(GetDebugLevel() >= 2),
+	  // Both at level 1, and deliberately so. The counters report per-phase
+	  // nanoseconds, and level 2 turns on a per-TOKEN fprintf that sits INSIDE
+	  // TryParseNext — the very function the parse timer wraps. Measured on a
+	  // 200k-row scan, that inflates `parse` from ~22 to 1133 ns/row and collapses
+	  // the socket wait from ~128 to 12, because the server has all the time in
+	  // the world to deliver while the client is writing to stderr. The numbers
+	  // did not merely get noisy at level 2; they inverted, naming parsing as 95%
+	  // of the work when it is ~11%.
+	  counters_enabled_(GetDebugLevel() >= 1),
 	  timing_enabled_(GetDebugLevel() >= 1) {
 	// Convert timeout from seconds to milliseconds
 	// 0 = no timeout (use INT_MAX for effectively infinite wait)
@@ -600,6 +608,12 @@ void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t 
 }
 
 void MSSQLResultStream::PrintDebugCounters() {
+	if (GetDebugLevel() >= 2) {
+		// Say it where the numbers are read, not only in a comment: at this level
+		// the per-token log below is inside the timed parse.
+		fprintf(stderr, "[MSSQL COUNTERS] NOTE: MSSQL_DEBUG>=2 logs every token from inside the timed parse; the "
+						"phase numbers below measure that logging. Use MSSQL_DEBUG=1 for timings.\n");
+	}
 	fprintf(stderr,
 			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
 			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%lluus read=%lluus process=%lluus)\n",

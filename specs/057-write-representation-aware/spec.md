@@ -200,3 +200,506 @@ family by construction, and for strings after the bulk conversion.
 - **Cache invalidation across chunks**: the span cache is keyed by child index, which is only
   meaningful for the current chunk's dictionary. Reset per chunk (keep capacity, drop contents) —
   a stale span from the previous chunk would silently corrupt the wire stream.
+
+---
+
+# Reconnaissance, 2026-07-30 — the premise does not survive measurement
+
+This spec was scoped around making the BCP encoder cheaper: representation-aware
+encoding, dictionary and constant vectors handled without materialising, a
+pre-sized accumulator. Before building any of it, the write path was decomposed
+against a live server. **The encoder is 5% of the write.**
+
+500k rows × 4 columns (BIGINT, BIGINT, DECIMAL(18,2), NVARCHAR(40)) = 2M values,
+local SQL Server 2022 in Docker, heap target, default `mssql_copy_flush_rows`:
+
+| phase | total | ns/value | share of wall |
+| --- | --- | --- | --- |
+| encode (`BCPRowEncoder::EncodeChunk`) | 43.1 ms | 21.6 | **5%** |
+| packet build + send | 61.1 ms | 30.5 | 7% |
+| **waiting for the server to confirm the batch** | **705.0 ms** | **352.5** | **86%** |
+| whole statement | 823 ms | 411 | 100% |
+
+The client and the server work strictly in turn: accumulate a batch (~98k rows),
+send it, then block until the server has inserted it. During those 705 ms the
+client is idle; during the encode and send the server is.
+
+## What that means for this spec
+
+**Representation-aware encoding targets ~5% of write wall time**, and only the
+part of it that is not already hidden. Dictionary and constant inputs would make
+that 5% smaller; nothing else changes. The D5b argument in this spec — that the
+copy chain and one `send` per packet dominate — is refuted: build + send is 7%,
+and the system time for the whole statement is under 1%.
+
+**The leverage is overlap, not throughput.** Encoding batch N+1 while the server
+digests batch N hides essentially all client work behind the 86%. Upper bound on
+the win: the 12% the client currently spends serialised ahead of the wait, so
+call it ~14% of wall including the flush handshake. That is 2-3× what perfecting
+the encoder could yield, and it does not touch the encoder at all.
+
+Batch size is the one knob that already moves this, and it is nearly exhausted:
+25k rows → 0.93 s, 100k (default) → 0.78 s, 500k (single batch) → 0.75 s.
+
+## Conditions on the above
+
+The target is a heap with no indexes and TABLOCK available — the server's
+best case, and it still takes 86%. A table with indexes or a busy server moves
+further in the same direction. A slow network would raise the send share; on
+loopback it is 7%.
+
+## Recommendation
+
+Re-scope 057 from "make the encoder faster" to "stop waiting", and prove the
+bound before building: a prototype that double-buffers the accumulator and
+sends batch N while encoding N+1, measured on the same fixture. If it does not
+show ~10%+, the write path is finished as far as the client is concerned and
+this spec closes.
+
+## Measurement notes, so the numbers are reproducible
+
+- **`MSSQL_DEBUG=1` inflates the client's own CPU roughly 4×** on this path
+  (0.047 s → 0.194 s for the same statement). Phase shares are taken from the
+  instrumented run; absolute client cost must come from an uninstrumented one.
+- **`.timer on` reports `user` across all DuckDB threads**, and it is not stable
+  for this statement — three identical runs gave 0.19, 0.04 and 0.85 s while
+  wall stayed within 5%. Use it for wall, not for attribution.
+- The read path's counters were moved to `MSSQL_DEBUG=1` in this branch for the
+  same reason: at level 2 the parser logs every token from inside the timed
+  parse, which inflated `parse` from 22 to 1133 ns/row and collapsed the socket
+  wait from 128 to 12 — the numbers did not get noisy, they inverted.
+
+---
+
+# Re-scope, 2026-07-30 — the write is bound by what we ASK the server to do
+
+Continued reconnaissance found three defects and one opportunity, all on the
+server side of the wire, and together they are worth an order of magnitude —
+against the 5% this spec was scoped around. Same fixture throughout: 500k rows
+× 4 columns (BIGINT, BIGINT, DECIMAL(18,2), NVARCHAR(40)), local SQL Server
+2022, `.timer on` wall time, medians of three.
+
+| what is being done | wall | vs achievable |
+| --- | --- | --- |
+| **today's default, `COPY ... CREATE_TABLE true`** | **1.68 s** | **4.5×** |
+| sized column, TABLOCK missing (existing table) | 0.78 s | 2.1× |
+| NVARCHAR(MAX) target, TABLOCK on | 1.04 s | 2.8× |
+| sized column + TABLOCK | **0.37 s** | 1× |
+| four concurrent sessions, sized + TABLOCK | ~0.13 s | 0.35× |
+
+## 1. TABLOCK is not applied on the CREATE_TABLE path — a defect
+
+The documented rule is "auto-enabled for new tables when not explicitly set".
+It does not reach the config: `BCPCopyBind: create_table=1 ... tablock=0`.
+Setting it by hand takes the same load from 1.70 s to 1.06 s. Free to fix.
+
+Worth extending to an EMPTY existing table — the situation is identical and one
+`SELECT TOP 1` before the load settles it. Not to a non-empty one: TABLOCK
+blocks concurrent access, which is why it is not simply the default.
+
+**The win is not minimal logging.** Recovery model makes no difference here:
+FULL 0.783 / SIMPLE 0.785 without TABLOCK, FULL 0.384 / SIMPLE 0.369 with it.
+It is the bulk path — table-level locking removes the per-page latching and
+allows bulk allocation.
+
+## 2. Every string column is created NVARCHAR(MAX) — 2.7×
+
+`target_resolver.cpp` maps `LogicalTypeId::VARCHAR` to `nvarchar(max)`, and so
+does `codec::string::FormatDdlTypeName`. Measured against the same data in a
+sized column: 1.04 s vs 0.37 s.
+
+**The shortcut does not exist — measured.** The obvious cheap fix is to keep
+creating MAX columns but declare a sized type in the BCP COLMETADATA, so values
+travel with a 2-byte length instead of PLP. SQL Server rejects it outright:
+
+    Invalid column type from bcp client for colid 4
+
+The client's declared type has to be compatible with the target column, and
+`NVARCHAR(4000)` into `NVARCHAR(MAX)` is not. (The reverse *is* allowed and we
+already rely on it — XML is declared as `NVARCHAR(MAX)` and the server converts.)
+So wire framing follows the column type, and the only lever is the column type.
+
+**And the penalty is not the storage engine.** A server-side
+`INSERT ... WITH (TABLOCK) SELECT` of the same 500k rows takes 0.217 s into
+`NVARCHAR(40)` and 0.207 s into `NVARCHAR(MAX)` — identical. The 2.7× lives
+entirely in the bulk-load path's handling of a PLP column.
+
+**Design (maintainer's, 2026-07-30): custom types carrying the size.**
+
+```
+loader.RegisterType("MSSQL_VARCHAR",  LogicalType::VARCHAR, BindVarchar);
+loader.RegisterType("MSSQL_NVARCHAR", LogicalType::VARCHAR, BindNVarchar);
+```
+
+The bind functions put the flavour (varchar / nvarchar) and the length into the
+type's modifiers, so a user writes `col::MSSQL_VARCHAR(20)` in a CTAS, a COPY or
+a `CREATE TABLE`, and the cast is physically free — the base type is VARCHAR and
+the alias travels on the `LogicalType`. CTAS/COPY and DDL then emit
+`VARCHAR(20)` / `NVARCHAR(20)` instead of MAX.
+
+Decisions still open:
+
+- **Reads**: should a scan surface `MSSQL_NVARCHAR(20)` instead of `VARCHAR`?
+  It would preserve sizes across table-to-table copies, at the cost of a
+  non-standard type in every result schema. Probably a setting, default off.
+- **No modifier**: `MSSQL_VARCHAR` bare should stay MAX, as today.
+- **Overflow: truncate, do not error** (maintainer's call). Two traps:
+  Three regimes, and the limit means something different in each. Measured on
+  SQL Server 2022, collation `SQL_Latin1_General_CP1_CI_AS`:
+
+  | target | the limit counts | measured |
+  | --- | --- | --- |
+  | `NVARCHAR(20)` | 20 **two-byte units** | 20 BMP chars fit; **10 emoji fit exactly** (10 surrogate pairs = 20 units); 11 emoji fail with error 2628 |
+  | `VARCHAR(20)`, legacy SBCS collation | 20 **bytes of the code page** | 20 × `é` fit (CP1252 has it); 10 × `字` stored as `??????????` — the server replaces what the code page cannot represent |
+  | `VARCHAR(20)`, `_UTF8` collation (2019+) | 20 **bytes of UTF-8** | 1-4 bytes per character |
+
+  So "NVARCHAR(20) holds 20 characters" is true for BMP text and wrong for
+  anything supplementary — a character outside the BMP costs two units. The
+  truncation must therefore:
+
+  - **cut on character boundaries**, never mid-UTF-8-sequence, and never between
+    the halves of a surrogate pair — that produces an unpaired surrogate, the
+    same class of garbage spec 055 spent a release fixing on the read side. A
+    pair goes in whole or not at all;
+  - **be driven by the target column's collation, not only its declared length.**
+    The collation id is already parsed into `ColumnMetadata::collation`.
+
+  **A consequence that gates `MSSQL_VARCHAR`.** Today we never create a
+  single-byte column — everything becomes NVARCHAR — so the read path's
+  code-page handling is never exercised. It is broken: a `VARCHAR(20)` holding
+  20 × `é` (CP1252 `0xE9`) reads back as 20 replacement characters, because the
+  scan hands those bytes to DuckDB labelled UTF-8. Shipping `MSSQL_VARCHAR`
+  without fixing that (spec 026 territory, `BuildColumnExpression` in
+  `table_scan.cpp`) would turn a latent bug into a common one. Either fix it
+  first, or restrict the type to ASCII and say so.
+
+  Truncation is data loss either way. Count it and report the count when the
+  COPY finishes; losing values silently is a bad trade even when it is chosen
+  deliberately.
+
+## 3. Parallel sessions scale — measured, not assumed
+
+Four concurrent `COPY` sessions into the same heap, each with TABLOCK, loaded
+1M rows in 0.381 s against 1.052 s for one session doing the same work — **2.8×**,
+with four process startups included in the parallel figure. SQL Server grants
+concurrent bulk-update locks, so the sessions do not serialise.
+
+Proposed surface: `COPY ... TO ... WITH (FORMAT bcp, PARALLEL 4)`, N pooled
+connections, one `BCPWriter` and accumulator each.
+
+Constraints that decide the design:
+
+- **Heap only.** With a rowstore clustered index SQL Server serialises the load;
+  detect and fall back to one session.
+- **TABLOCK on every session**, or they block each other instead of sharing.
+- **Autocommit only.** Inside an explicit DuckDB transaction the writes must
+  share one SQL Server transaction, and N connections cannot. Fall back to one.
+- A failure in one session has to abort the rest.
+
+## 4. Client-side work stays, and gets hidden rather than removed
+
+Framing and encoding do not go away. With the server side fixed they become a
+larger share of a much smaller total, which is the argument for overlapping
+them: prepare batch N+1 while the server digests N. Bounded at ~14% of today's
+wall (§ previous section), and worth re-measuring once 1-3 land, because the
+share changes.
+
+## Revised order of work
+
+1. **The TABLOCK defect** — free, 1.6× on the default path.
+2. **Custom sized types** — 2.7×, and it is the only item that also improves
+   reads and storage.
+3. **PARALLEL N** — 2.8× on top, with the fallbacks above.
+4. **Overlap encode with send/wait** — the original spec's territory, re-measured
+   after the above.
+
+The representation-aware encoding this spec was named for (dictionary and
+constant inputs encoded without materialising) targets the 5% — see
+"Decision, 2026-07-30" at the end of this document, which overrides the ordering
+above: it and streaming are both mandatory and land first, not last.
+
+## The client-side options, ranked by what they actually return
+
+| approach | effect | basis |
+| --- | --- | --- |
+| N connections in parallel | **2.8×** | measured: 1M rows, 1 session 1.052 s vs 4 sessions 0.381 s |
+| sized columns instead of MAX | **2.7×** | measured: 1.04 s vs 0.37 s |
+| fix the TABLOCK defect | 1.6-2× | measured: 1.70 s vs 1.06 s (new table), 0.78 vs 0.37 (existing) |
+| stream packets as they fill, inside a batch | ~12% | derived: encode 43 ms + send 61 ms of an 823 ms wall, all of it currently ahead of the server's 705 ms |
+| parallelise only the encoding | ≤4% | encode is 5% of wall |
+| simply shrink the batch | **−20%** | measured: 25k rows/batch 0.93 s vs 100k 0.78 s |
+
+**A smaller buffer on its own is a pessimisation** — more batches means more
+round trips, and each one is a full stop. It only pays as part of the next item.
+
+**Streaming inside a batch is the right form of that idea.** Today `WriteRows`
+appends to a 4 MB accumulator and nothing goes out until the flush, so the
+server first learns of the data when the client has finished encoding all of it:
+the timeline is [encode 43][send 61][server 705] and the first two are pure
+latency. BULK LOAD is a stream — the server inserts as packets arrive — so the
+client should send each packet as it fills and keep encoding. The client's work
+then hides under the server's, which is where the ~12% comes from. It needs no
+second connection and no DDL change, which makes it the cheapest of the four.
+
+**Parallel encoding alone is not worth doing.** Encoding is 5% of wall; four
+threads on it buy 4% at best, and the same four threads with their own
+connections and accumulators buy 2.8×. The parallelism belongs at the connection
+level, not inside the encoder.
+
+## Streaming inside a batch — prototyped and measured
+
+Built behind an env var and measured in one binary. `WriteRows` sends whole
+packets out of the accumulator as soon as eight are available, keeping one back
+so the message never ends early, and the flush sends the remainder plus DONE
+with EOM as before.
+
+| rows | accumulate whole batch | stream as it fills | delta |
+| --- | --- | --- | --- |
+| 500k × 4 cols | 0.387 s | 0.348 s | **−10%** |
+| 2M × 4 cols | 1.558 s | 1.396 s | **−10%** |
+
+Correct, not just fast: `SUM(id)`, `SUM(v)`, `SUM(amt)` and `SUM(hash(s))` all
+match the source exactly after a streamed load.
+
+**The one protocol trap.** `BuildBulkLoadMultiPacket` marks the last packet of
+whatever buffer it is given as end-of-message, so streaming a partial buffer
+through it would terminate the batch early and the server would insert a
+fraction of the rows. The prototype uses a separate sender that never sets EOM;
+only the final flush does.
+
+**What a production version needs beyond the prototype:**
+
+- **No `erase` from the front of the accumulator.** The prototype memmoves the
+  remainder of a 4 MB buffer on every send. The read path solved exactly this in
+  spec 055 D0b with a cursor instead of erasing — do the same here.
+- Interrupt checks between packets, so a cancelled COPY stops mid-batch.
+- A decision on when to start streaming. Eight packets was picked to be
+  obviously past the metadata; the real trigger should be "one packet is full".
+- Interaction with `FlushBatch`/`Finalize` re-verified under the batch-size
+  setting, and with the mutex when the sink runs on several threads.
+
+## External validation: reproducing the "13× slower than FastTransfer" gap
+
+<https://blog.arpe.io/import-parquet-into-sqlserver-duckdb-vs-fasttransfer> loads
+38M rows × 44 columns of Parquet into SQL Server: our extension 553 s,
+FastTransfer 42 s, and 16 GB vs 283 MB on disk. Same protocol on both sides —
+FastTransfer's `msbulk` is .NET SqlBulkCopy, i.e. TDS BULK LOAD — and the same
+reader, DuckDB. The article's own conclusion: *"The reading side is the same.
+The gap is entirely in how SQL Server rows get written."*
+
+**Reproduced locally**, on a table shaped like theirs (44 columns, ~10 of them
+short string codes, 2M rows = 88M values; their screenshot of the generated
+schema shows `nvarchar(max)` on every string column):
+
+| step | time | ns/value | vs today |
+| --- | --- | --- | --- |
+| **today: `CREATE_TABLE true` → nvarchar(max), heap** | **59.29 s** | 674 | 1× |
+| sized string columns | 14.42 s | 164 | 4.1× |
+| + TABLOCK | 11.37 s | 129 | 5.2× |
+| + 2 sessions | 6.85 s | 78 | 8.7× |
+| **+ 4 sessions** | **4.64 s** | **53** | **12.8×** |
+| + 8 sessions | 5.09 s | 58 | 11.7× |
+
+**12.8× against their 13×.** The whole gap is our defaults, on the same wire.
+Their run already passed `TABLOCK true` explicitly, so for them it decomposed
+into the schema (~3-4×) and `--degree -2`, which their documentation defines as
+*cores ÷ 2* — the default, roughly 8 threads on a normal machine — against our
+single connection.
+
+Two things that only measurement shows:
+
+- **Parallelism saturates.** Eight sessions are slower than four here (5.09 vs
+  4.64). `PARALLEL N` needs a sane default and a ceiling, not "half the cores".
+- **A columnstore target is slower to LOAD, and that is fine.** On the narrow
+  fixture: heap 3.19 s vs clustered columnstore 7.37 s, but 204 MB vs 30 MB on
+  disk. Their 56× storage advantage comes from the columnstore, not their speed
+  — and `nvarchar(max)` is what blocks it, which is why the two findings are the
+  same finding.
+- **`flush_rows` default 100000 sits 2400 rows below SQL Server's 102400-row
+  threshold** for writing compressed rowgroups directly instead of through the
+  delta store. Crossing it is worth 12% on a columnstore target (8.33 → 7.37 s).
+
+## Streaming does not stack with parallelism
+
+Measured on the same wide fixture:
+
+| | 1 session | 4 sessions |
+| --- | --- | --- |
+| accumulate the whole batch | 11.9 s | 4.70 s |
+| stream packets as they fill | **9.5 s (−20%)** | 4.56 s (noise) |
+
+They are the same overlap. Four sessions already hide the client's work behind
+each other's server waits, so there is nothing left for streaming to hide.
+
+**This decides the plan's shape.** `PARALLEL N` is the lever; streaming is the
+fallback for where parallelism cannot go — inside an explicit transaction (N
+connections cannot share one SQL Server transaction), against a target that
+forbids concurrent bulk load, or when only one connection is available. It is
+also strictly cheaper to build: no connection management, no failure fan-out.
+
+## Storage options on the target — measured, 2026-07-30
+
+Asked because the article's 56× storage advantage came from the target's
+definition, not from its client. Same 44-column fixture as above, 500k rows,
+single session, TABLOCK on, two passes (they agreed to within 0.1 s):
+
+| target | load | size | vs plain heap |
+| --- | --- | --- | --- |
+| heap, no compression | **2.4 s** | 172.1 MB | 1× |
+| heap, `DATA_COMPRESSION = ROW` | 2.8 s (+17%) | 102.3 MB | −41% |
+| heap, `DATA_COMPRESSION = PAGE` | 3.9 s (+63%) | **84.6 MB** | −51% |
+| clustered index, no compression | 3.7 s | 176.6 MB | +3% |
+| clustered index, PAGE + `OPTIMIZE_FOR_SEQUENTIAL_KEY` | 5.1 s | 85.6 MB | −50% |
+
+**Compression is applied during the load, not after it — but only because we
+send TABLOCK.** A bulk insert into a PAGE-compressed heap without a table lock
+stores rows uncompressed until someone rebuilds. So the TABLOCK defect in § 1 is
+not only a 1.6× speed bug: on a compressed target it silently costs the user the
+compression they asked for. Both fixes are the same fix.
+
+**`OPTIMIZE_FOR_SEQUENTIAL_KEY` does nothing for us.** Isolated from compression
+and measured where it could only help — four concurrent sessions into a clustered
+index on a sequential key, TABLOCK off so that page latches are actually
+contended:
+
+| | pass 1 | pass 2 |
+| --- | --- | --- |
+| OFF | 1.45 s | 2.02 s |
+| ON | 1.46 s | 1.63 s |
+
+Noise in both directions. The reason is structural, not a fixture artefact: the
+four workers write disjoint ascending ranges, so they land on different B-tree
+pages and there is no hot last page for the option to relieve. It is an OLTP knob
+for many sessions inserting the newest key. Do not set it, and do not recommend
+it in the COPY documentation.
+
+The actionable part of this section is the choice we hand the user, not a
+default we impose: PAGE halves storage for two thirds more load time, ROW gives
+41% for 17%. The extension's job is (a) to keep TABLOCK on so that either
+actually takes effect, and (b) not to create the target as `nvarchar(max)`, which
+is what blocks columnstore — the far bigger storage lever (§ "External
+validation").
+
+## Drive-by: issue #85, partitioned tables were unreadable
+
+Found while looking at `WITH (DATA_COMPRESSION = ...)`, because the reproduction
+needs a partitioned clustered index. `SELECT * FROM d.dbo.log` on a partitioned
+table failed with `Catalog Error: Column with name log_ts already exists!`.
+
+Three metadata queries in `mssql_metadata_cache.cpp` joined `sys.partitions`
+directly to pick up `p.rows`. That view holds **one row per partition**, so on a
+four-partition table every object and every column came back four times. A plain
+clustered index reads fine; only partitioning triggers it. Fixed by joining a
+pre-aggregated subquery (`SUM([rows]) ... GROUP BY object_id`).
+
+The same join also caused a silent second bug: `approx_rows` took whichever
+partition the join happened to surface — typically an empty one — so the planner
+saw a partitioned table as nearly empty and its cardinality estimates, join
+orders and the statistics provider (which already did `SUM`) disagreed. Both are
+one fix.
+
+Regression test `test/sql/catalog/partitioned_table.test`: four partitions with
+rows in two of them, asserting the column list, that the table appears once, the
+rows themselves, and `estimated_size = 3` — a value no single partition holds, so
+the test cannot pass by picking one. Verified to fail with the exact issue-#85
+error when the fix is reverted.
+
+## Decision, 2026-07-30 — representation-aware encoding and streaming are both mandatory
+
+Ruled by the user, overriding the measurement-derived ordering in "Revised order
+of work". Recording it with what the measurements do and do not support, so the
+plan is honest about which parts are backed by numbers:
+
+- **Representation-aware encoding is mandatory, not optional.** The measurement
+  that ranked it last stands — the encoder is ~5% of wall on a correctly defined
+  target, and 4.0-5.0× on the encoder is a few percent end-to-end. What that
+  measurement does not capture is that it is the only item here that is *ours*:
+  the TABLOCK fix, sized types and `PARALLEL N` all buy their multiples by
+  changing what we ask the server to do, and every one of them can be taken away
+  by a user's DDL or by a target that forbids concurrent load. The encoder's win
+  is unconditional and compounds with all of them, and it is what keeps the write
+  path on the same rule as the read path: no per-value conversion, one batch call
+  per column.
+- **Streaming lands immediately, not as a fallback.** It stays true that it does
+  not stack with parallelism (−20% at one session, noise at four), so its value
+  is in the configurations parallelism cannot reach — an explicit transaction, a
+  target that refuses concurrent bulk load, a single available connection. Those
+  are not edge cases for a database extension, and it is the cheapest item to
+  build: no connection management, no failure fan-out.
+
+Both therefore move ahead of `PARALLEL N` in build order, with the TABLOCK defect
+and sized types still first because they are free and large. The production
+requirements for streaming listed above stay binding — in particular the cursor
+instead of `erase` from the front of the accumulator, and never letting a partial
+buffer set EOM.
+
+## Open design items raised 2026-07-30 (user), with what is measured and what is not
+
+### 1. Where the column length can come from — Parquet is not a source
+
+Checked, and the usual framing ("COPY loses the length from Parquet") is wrong in
+a way that matters for the design:
+
+```
+CREATE TABLE t (a VARCHAR(20), b VARCHAR);  -->  duckdb_columns(): a VARCHAR, b VARCHAR
+```
+
+DuckDB discards the string length modifier at `CREATE TABLE`, before any file is
+involved; `VARCHAR(20)` and `VARCHAR` are the same type. Parquet has nowhere to
+carry it either — a string column is `BYTE_ARRAY` / `UTF8` with no length.
+`DECIMAL(9,2)` by contrast survives both (DuckDB keeps precision/scale, Parquet
+stores `DecimalType`), which is why numeric columns are created correctly today
+and string columns are not.
+
+So there is no plumbing fix. A sized target column can only come from:
+
+1. **an existing target table** — already works, and is why "insert into a
+   properly created table" measured 4.1× faster than `CREATE_TABLE true`;
+2. **our own type with a modifier** — `MSSQL_NVARCHAR(50)`, applied by the user
+   as a cast in the SELECT feeding COPY. `RegisterType` with type modifiers
+   supports this;
+3. **an explicit COPY option** — a per-column type map, or a single default
+   maximum length for string columns.
+
+Data-derived sizing (scan the first batch, take the longest value) is rejected:
+a later batch that exceeds the guess fails the whole load, and the failure comes
+from data the user never saw.
+
+### 2. `WITH (...)` options on the created table
+
+Follows directly from the storage measurements above: `DATA_COMPRESSION = PAGE |
+ROW` is a real user-facing choice (−51% / −41% size), and it only takes effect
+during the load because we send TABLOCK. Exposing it as a COPY option next to the
+type map keeps the two things that must agree in one place.
+`OPTIMIZE_FOR_SEQUENTIAL_KEY` is deliberately **not** exposed — measured neutral,
+see above.
+
+### 3. Truncating an existing target as a COPY option
+
+Wanted, and cheap. Must be explicit and separately named (not folded into an
+existing flag) because it destroys data the user did not name in the statement;
+and it should run in the same connection as the load so an aborted COPY cannot
+leave the table empty *and* unloaded.
+
+### 4. Choosing the degree of parallelism
+
+Proposed inputs: the COPY parameters at create time, and the target's metadata
+when inserting into an existing table — in particular "clustered index → single
+stream".
+
+The clustered-index rule is **not supported by measurement**: four concurrent
+sessions loading into a clustered index on a sequential key completed correctly
+and at the same speed as the OFSK variant (400k rows, § above). The user's own
+note ("хотя это ни на что не влияет") matches what the numbers show.
+
+What does constrain the degree, and should drive it instead:
+
+- **An explicit transaction** — N connections cannot share one SQL Server
+  transaction, so the degree is forced to 1. This is the case streaming exists
+  for.
+- **TABLOCK against a clustered index** — concurrent bulk load into a heap is
+  fine (BU locks are mutually compatible), but the clustered-index case under
+  TABLOCK needs measuring before a default is chosen; the parallel run above
+  deliberately set `mssql_copy_tablock = false`.
+- **Saturation** — eight sessions were slower than four on the wide fixture
+  (5.09 vs 4.64 s). The default needs a ceiling, not "half the cores".
