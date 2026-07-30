@@ -37,6 +37,7 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -359,22 +360,26 @@ public:
 		// a test reads — and a test that owns its stager can simply turn it on.
 		// Enabling them also puts the counter-folding code itself under test.
 		stager_.EnableCounters();
+		// A real DataChunk, not loose vectors: the stream fills one of these and
+		// calls Reset() on it between chunks, which is what restores FLAT vectors
+		// and clean validity after the constant path (spec 056) leaves one
+		// CONSTANT. A fixture that reset nothing would test a state production
+		// never sees — and it did, until the BeginChunk assertion said so.
+		duckdb::vector<LogicalType> types;
 		for (size_t i = 0; i < metadata_.size(); i++) {
-			if (skipped_[i]) {
-				owned_.push_back(nullptr);
-				targets_.push_back(nullptr);
-				continue;
-			}
-			const LogicalType type = targets_types_[i].id() == LogicalTypeId::INVALID
-										 ? TypeConverter::GetDuckDBType(metadata_[i])
-										 : targets_types_[i];
-			owned_.push_back(std::unique_ptr<Vector>(new Vector(type)));
-			targets_.push_back(owned_.back().get());
+			types.push_back(targets_types_[i].id() == LogicalTypeId::INVALID
+								? TypeConverter::GetDuckDBType(metadata_[i])
+								: targets_types_[i]);
+		}
+		chunk_.Initialize(duckdb::Allocator::DefaultAllocator(), types);
+		for (size_t i = 0; i < metadata_.size(); i++) {
+			targets_.push_back(skipped_[i] ? nullptr : &chunk_.data[i]);
 		}
 		stager_.Configure(metadata_, targets_);
 	}
 
 	void BeginChunk() {
+		chunk_.Reset();
 		stager_.BeginChunk(targets_);
 	}
 	size_t StageRow(const Wire &row, idx_t row_idx) {
@@ -390,12 +395,17 @@ public:
 	//! What column `c` holds at `row`, rendered — "NULL" for a NULL, so a wrong
 	//! NULL and a wrong value read the same way in the failure output.
 	std::string ValueAt(size_t c, idx_t row) {
-		const duckdb::Value v = owned_[c]->GetValue(row);
+		const duckdb::Value v = chunk_.data[c].GetValue(row);
 		return v.IsNull() ? std::string("NULL") : v.ToString();
 	}
 
+	//! CONSTANT or FLAT — the spec-056 emission is asserted, not assumed.
+	bool IsConstant(size_t c) {
+		return chunk_.data[c].GetVectorType() == duckdb::VectorType::CONSTANT_VECTOR;
+	}
+
 	bool IsNull(size_t c, idx_t row) {
-		return owned_[c]->GetValue(row).IsNull();
+		return chunk_.data[c].GetValue(row).IsNull();
 	}
 
 	RowStager &stager() {
@@ -413,7 +423,7 @@ private:
 	std::vector<bool> skipped_;
 	//! INVALID means "whatever the wire type implies" — the ordinary case.
 	std::vector<LogicalType> targets_types_;
-	std::vector<std::unique_ptr<Vector>> owned_;
+	duckdb::DataChunk chunk_;
 	std::vector<Vector *> targets_;
 	RowStager stager_;
 };
@@ -967,15 +977,22 @@ void TestStringBoundaryStrategies() {
 		// and would not read these P2 rows at all.
 		f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 400));
 		std::vector<Wire> values;
+		// Distinct on purpose: two identical values are a CONSTANT column-chunk
+		// (spec 056) and never reach a boundary walk at all.
 		values.push_back(RepeatUnit(0x4E00, 120));
-		values.push_back(RepeatUnit(0x4E00, 120));
+		values.push_back(Cat(RepeatUnit(0x4E00, 119), Units({0x4E8C})));
 		DecodeStrings(f, values);
 		std::string expected;
 		for (int i = 0; i < 120; i++) {
 			expected += "\xE4\xB8\x80";
 		}
+		std::string expected2;
+		for (int i = 0; i < 119; i++) {
+			expected2 += "\xE4\xB8\x80";
+		}
+		expected2 += "\xE4\xBA\x8C";
 		CHECK_EQ(f.ValueAt(0, 0), expected, "CJK value 0 at three bytes per unit");
-		CHECK_EQ(f.ValueAt(0, 1), expected, "CJK value 1");
+		CHECK_EQ(f.ValueAt(0, 1), expected2, "CJK value 1");
 		CHECK_EQ(BoundaryCount(f, Boundary::Memchr), static_cast<uint64_t>(1), "long runs take memchr");
 	}
 }
@@ -1207,6 +1224,116 @@ void TestTemporalScaleIsBounded() {
 	}
 }
 
+void TestConstantEmission() {
+	std::cout << "[16] constant column-chunks (spec 056)..." << std::endl;
+
+	// A uniform column-chunk is published as a CONSTANT vector: the decode
+	// collapses from N values to one, so the win is on the scan itself and not
+	// only downstream. Every arm is covered — Direct (already in the vector,
+	// nothing decoded at all), Fixed and Var.
+	const std::vector<ArmCase> cases = AllArms();
+	for (size_t i = 0; i < cases.size(); i++) {
+		// Direct columns are deliberately left flat: they have no decode to
+		// collapse, so scanning them for uniformity buys only a downstream
+		// constant and measured at +0.26 ns/value to do it.
+		const bool collapses =
+			!duckdb::mssql::codec::staging::ResolveColumnOps(cases[i].meta, TypeConverter::GetDuckDBType(cases[i].meta))
+				 .direct_write;
+		Fixture f;
+		f.Add(cases[i].meta);
+		f.Configure();
+		f.BeginChunk();
+		for (idx_t row = 0; row < 8; row++) {
+			f.StageRow(cases[i].value, row);
+		}
+		f.FinalizeChunk(8);
+		CHECK_EQ(f.IsConstant(0), collapses, cases[i].label);
+		// Correctness is the point, not the vector type: every row must still read
+		// back as the value, through the same accessor a consumer would use.
+		for (idx_t row = 0; row < 8; row++) {
+			CHECK_EQ(f.ValueAt(0, row), std::string(cases[i].expected), cases[i].label);
+		}
+	}
+
+	// One differing row — and the LAST one, so a detector that stops early is
+	// caught — must keep the column flat and decode every value.
+	for (size_t i = 0; i < cases.size(); i++) {
+		if (cases[i].null_wire.empty()) {
+			continue;  // no NULL form to differ with in a plain ROW
+		}
+		Fixture f;
+		f.Add(cases[i].meta);
+		f.Configure();
+		f.BeginChunk();
+		for (idx_t row = 0; row < 7; row++) {
+			f.StageRow(cases[i].value, row);
+		}
+		f.StageRow(cases[i].null_wire, 7);
+		f.FinalizeChunk(8);
+		CHECK_TRUE(!f.IsConstant(0), cases[i].label);
+		CHECK_EQ(f.ValueAt(0, 0), std::string(cases[i].expected), cases[i].label);
+		CHECK_EQ(f.ValueAt(0, 6), std::string(cases[i].expected), cases[i].label);
+		CHECK_TRUE(f.IsNull(0, 7), cases[i].label);
+	}
+}
+
+void TestConstantAllNullAndReuse() {
+	std::cout << "[17] all-NULL chunks, and a vector reused across chunks..." << std::endl;
+
+	// All NULL: detected by comparing two counters, no kernel runs, and the
+	// vector is CONSTANT-NULL.
+	Fixture f;
+	f.Add(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 40));
+	f.Add(Meta(duckdb::tds::TDS_TYPE_INTN, 4));
+	f.Configure();
+	f.BeginChunk();
+	for (idx_t row = 0; row < 5; row++) {
+		f.StageRow(Cat(P2Null(), P1Null()), row);
+	}
+	f.FinalizeChunk(5);
+	CHECK_TRUE(f.IsConstant(0), "all-NULL string column is constant");
+	CHECK_TRUE(f.IsConstant(1), "all-NULL integer column is constant");
+	for (idx_t row = 0; row < 5; row++) {
+		CHECK_TRUE(f.IsNull(0, row), "every row NULL");
+		CHECK_TRUE(f.IsNull(1, row), "every row NULL");
+	}
+
+	// The same vectors, chunk after chunk: constant, then mixed, then all-NULL.
+	// This is the reuse hazard — a CONSTANT vector carried into the next chunk
+	// would hand the Direct arm a one-value view to write into, and stale NULL
+	// bits would republish rows as NULL. DataChunk::Reset is what prevents both,
+	// and the fixture goes through it exactly as the stream does.
+	f.BeginChunk();
+	for (idx_t row = 0; row < 4; row++) {
+		f.StageRow(Cat(P2(Utf16("same")), P1(Bare({7, 0, 0, 0}))), row);
+	}
+	f.FinalizeChunk(4);
+	CHECK_TRUE(f.IsConstant(0), "second chunk: uniform again");
+	CHECK_TRUE(!f.IsConstant(1), "a uniform INTN is left flat — no decode to collapse");
+	CHECK_EQ(f.ValueAt(0, 3), std::string("same"), "second chunk value");
+	CHECK_EQ(f.ValueAt(1, 3), std::string("7"), "second chunk integer");
+
+	f.BeginChunk();
+	f.StageRow(Cat(P2(Utf16("a")), P1(Bare({1, 0, 0, 0}))), 0);
+	f.StageRow(Cat(P2(Utf16("b")), P1(Bare({2, 0, 0, 0}))), 1);
+	f.StageRow(Cat(P2Null(), P1Null()), 2);
+	f.FinalizeChunk(3);
+	CHECK_TRUE(!f.IsConstant(0), "third chunk: mixed values stay flat");
+	CHECK_EQ(f.ValueAt(0, 0), std::string("a"), "flat after constant: row 0");
+	CHECK_EQ(f.ValueAt(0, 1), std::string("b"), "flat after constant: row 1");
+	CHECK_TRUE(f.IsNull(0, 2), "flat after constant: row 2 NULL");
+	CHECK_EQ(f.ValueAt(1, 0), std::string("1"), "integer row 0");
+	CHECK_EQ(f.ValueAt(1, 1), std::string("2"), "integer row 1");
+	CHECK_TRUE(f.IsNull(1, 2), "integer row 2 NULL");
+
+	// A single-row chunk stays flat: there is nothing to collapse.
+	f.BeginChunk();
+	f.StageRow(Cat(P2(Utf16("solo")), P1(Bare({9, 0, 0, 0}))), 0);
+	f.FinalizeChunk(1);
+	CHECK_TRUE(!f.IsConstant(0), "a one-row chunk is not worth collapsing");
+	CHECK_EQ(f.ValueAt(0, 0), std::string("solo"), "one-row value");
+}
+
 }  // namespace
 
 int main() {
@@ -1227,6 +1354,8 @@ int main() {
 	TestDatetimeDayRange();
 	TestImpossibleDeclaredWidth();
 	TestTemporalScaleIsBounded();
+	TestConstantEmission();
+	TestConstantAllNullAndReuse();
 
 	if (failures == 0) {
 		std::cout << "\nAll RowStager tests passed." << std::endl;

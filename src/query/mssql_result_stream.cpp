@@ -668,6 +668,10 @@ void MSSQLResultStream::PrintStagingCounters() {
 			(unsigned long long)sc.direct_values, (unsigned long long)sc.nbc_rows,
 			(unsigned long long)arena.GrowEvents(), (unsigned long long)arena.ShrinkEvents(),
 			(unsigned long long)arena.PeakPayloadBytes());
+	if (sc.constant_columns > 0 || sc.constant_null_columns > 0) {
+		fprintf(stderr, "[MSSQL COUNTERS]   constant column-chunks: uniform=%llu all_null=%llu\n",
+				(unsigned long long)sc.constant_columns, (unsigned long long)sc.constant_null_columns);
+	}
 	fprintf(stderr, "[MSSQL COUNTERS]   columns: prealloc_bounded=%llu prealloc_capped=%llu unbounded=%llu\n",
 			(unsigned long long)sc.prealloc_bounded_columns, (unsigned long long)sc.prealloc_capped_columns,
 			(unsigned long long)sc.unbounded_columns);

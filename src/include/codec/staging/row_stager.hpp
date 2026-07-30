@@ -69,6 +69,11 @@ struct StagingCounters {
 	uint64_t boundary[BOUNDARY_STRATEGY_COUNT] = {};
 	//! Code units replaced with U+FFFD (invalid UTF-16, legal in UCS-2).
 	uint64_t replaced_units = 0;
+	//! Column-chunks published as a CONSTANT vector (spec 056): every value the
+	//! same, or every value NULL. The second is counted apart because it costs
+	//! nothing to detect and skips the kernel outright.
+	uint64_t constant_columns = 0;
+	uint64_t constant_null_columns = 0;
 	//! Columns by how their payload was sized, counted once per result set.
 	//! `capped` is the interesting one: a bound existed but was too large to
 	//! preallocate, so the column finds its size by growing.
@@ -169,6 +174,16 @@ private:
 	//! Fold one finished column into the counters. Out of line and called only
 	//! when they are on.
 	void CountColumn(idx_t c, const ColumnStaging &st, idx_t row_count, uint64_t elapsed_ns);
+
+	//! Publish the column as a CONSTANT vector when every row holds the same
+	//! value, or every row is NULL (spec 056). Returns true when it did, in which
+	//! case no kernel runs and no flat validity is published.
+	//!
+	//! Cheap to fail: a mixed-NULL column exits on a counter comparison, and a
+	//! column of distinct values exits at row 1.
+	bool TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::ColumnMetadata &meta, idx_t row_count);
+	//! Decode row 0 into slot 0 for a staged family, one call per column-chunk.
+	void DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::ColumnMetadata &meta, Vector &out);
 
 	StagingArena arena_;
 	std::vector<ColumnOps> ops_;
