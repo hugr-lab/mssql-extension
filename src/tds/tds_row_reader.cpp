@@ -1,10 +1,23 @@
 #include "tds/tds_row_reader.hpp"
 #include <cstring>
 #include <stdexcept>
+#include "duckdb/common/exception.hpp"
 #include "tds/tds_types.hpp"
 
 namespace duckdb {
 namespace tds {
+
+namespace {
+//! Largest value a TEXT / IMAGE column can hold — SQL Server's own limit for the
+//! type. A 4-byte wire length can declare far more than that, and no other
+//! read-path framing field can: the 2-byte forms are bounded at 65535 and PLP's
+//! chunk lengths are checked against the bytes actually present.
+//!
+//! Anything the staging layer would also refuse is caught slightly earlier, at
+//! its own (lower) MAX_STAGING_PAYLOAD_BYTES, with its own message. This bound
+//! exists for the values that are not merely too big to stage but impossible.
+constexpr uint32_t MAX_LOB_VALUE_BYTES = 2147483647u;
+}  // namespace
 
 RowReader::RowReader(const std::vector<ColumnMetadata> &columns) : columns_(columns) {}
 
@@ -180,6 +193,16 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 			return 0;
 		uint32_t data_length;
 		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		if (data_length > MAX_LOB_VALUE_BYTES) {
+			// A 4-byte length is the only framing field on the read path that can
+			// declare more than a value could ever be. Returning 0 here would mean
+			// "need more data", and the parser would buffer the whole rest of the
+			// stream waiting for bytes that are never coming.
+			throw InvalidInputException(
+				"MSSQL: a TEXT/NTEXT/IMAGE value declares %u bytes, past the %u-byte maximum for the type. The TDS "
+				"stream is malformed.",
+				data_length, static_cast<uint32_t>(MAX_LOB_VALUE_BYTES));
+		}
 		const size_t total = header + data_length;
 		return length >= total ? total : 0;
 	}
@@ -832,6 +855,16 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 			return 0;
 		uint32_t data_length;
 		std::memcpy(&data_length, data + 1 + pointer_len + 8, 4);
+		if (data_length > MAX_LOB_VALUE_BYTES) {
+			// A 4-byte length is the only framing field on the read path that can
+			// declare more than a value could ever be. Returning 0 here would mean
+			// "need more data", and the parser would buffer the whole rest of the
+			// stream waiting for bytes that are never coming.
+			throw InvalidInputException(
+				"MSSQL: a TEXT/NTEXT/IMAGE value declares %u bytes, past the %u-byte maximum for the type. The TDS "
+				"stream is malformed.",
+				data_length, static_cast<uint32_t>(MAX_LOB_VALUE_BYTES));
+		}
 		const size_t total = header + data_length;
 		return length >= total ? total : 0;
 	}

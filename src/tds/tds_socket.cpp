@@ -503,6 +503,15 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 		// This used to allocate a fresh vector per TDS packet — one malloc, one
 		// value-initialisation and one free for every 16 KB frame of the result
 		// set, all of it discarded a few lines later.
+		if (pkt_len < TDS_HEADER_SIZE) {
+			// Before the subtraction, because it is unsigned: a declared length of
+			// 3 makes payload_len SIZE_MAX-4, and the resize() below then throws
+			// std::length_error from inside a std::function that OpenSSL invokes
+			// through a C function pointer. This runs during the handshake, before
+			// the peer's certificate is validated.
+			MSSQL_SOCKET_DEBUG_LOG(1, "TLS-TDS Recv: packet length %u is shorter than the header", pkt_len);
+			return -1;
+		}
 		size_t payload_len = pkt_len - 8;
 		recv_buffer.clear();
 		recv_pos = 0;
@@ -720,6 +729,16 @@ const uint8_t *TdsSocket::NextPacket(size_t &packet_length, int timeout_ms) {
 		if (buffered >= TDS_HEADER_SIZE) {
 			const uint8_t *head = receive_buffer_.data() + receive_pos_;
 			const uint16_t expected_length = TdsPacket::GetPacketLength(head);
+			if (expected_length < TDS_HEADER_SIZE) {
+				// A frame cannot be shorter than its own header. Rejected HERE
+				// rather than by the caller: `buffered >= expected_length` is
+				// trivially true for such a length, so returning it would advance
+				// the cursor by 0-7 bytes and park the socket on the same bytes
+				// forever, reporting a timeout instead of a malformed stream.
+				last_error_ = "Invalid TDS packet length: " + std::to_string(expected_length) +
+							  " is shorter than the 8-byte header";
+				return nullptr;
+			}
 			if (buffered >= expected_length) {
 				packet_length = expected_length;
 				receive_pos_ += expected_length;

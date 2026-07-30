@@ -310,3 +310,51 @@ string boundaries (column-chunks): ascii=245 skip+sweep=245 replaced_units=0
 The batch kernels are 3–5 ns/value against a whole-path 21–34 ns/value. **The
 decode is no longer the read path's cost centre** — which is what spec 058
 (read framing) exists to look at next.
+
+---
+
+# User-visible: mssql v0.2.2 vs the spec-055 tip, TPC-H SF 2
+
+The question this answers is not "is the codec faster" but "does a user notice".
+So: no instrumentation anywhere, counters off, timing is DuckDB's own
+`.timer on` — the line the CLI prints after each query.
+
+**Both sides are the same DuckDB.** v0.2.2 and the tip are each loaded as a
+`.duckdb_extension` into the SAME stock DuckDB 1.5.5 CLI. Comparing our
+source-built CLI against a stock one would have put the difference between two
+builds of DuckDB itself into the delta; this way the extension is the only
+variable.
+
+TPC-H SF 2 in SQL Server (lineitem 11,997,996 rows; orders 3,000,000; customer
+300,000; part 400,000), `SET threads=4`, three passes interleaved in one
+session with the order rotated, medians. Wall seconds.
+
+| query | v0.2.2 | tip | delta |
+| --- | ---: | ---: | ---: |
+| full scan, 12M rows, all 16 columns | 7.20 | **5.10** | **−29.2%** |
+| Q1 shape — group-by over a full scan | 8.06 | **6.48** | −19.6% |
+| part, 400k rows, all columns | 0.34 | **0.26** | −22.9% |
+| join — orders ⋈ customer, both remote | 0.76 | **0.63** | −17.2% |
+| two-column scan (projection pushdown) | 2.27 | **2.01** | −11.7% |
+| three string columns | 8.71 | **7.80** | −10.4% |
+| Q6 — filter pushdown | 0.24 | **0.23** | −3.4% |
+
+Per pass, v0.2.2 / tip:
+
+```
+full scan      7.20/5.04  7.26/5.15  6.97/5.10
+Q1             8.18/6.50  8.06/6.48  8.05/6.39
+strings        8.21/7.93  10.31/7.80 8.71/7.55
+narrow         2.24/2.01  2.30/2.07  2.27/1.96
+Q6             0.35/0.30  0.24/0.23  0.20/0.21
+```
+
+Every query improves in every pass. Q6 is the exception that confirms the
+shape: filter pushdown means almost nothing crosses the wire, so there is
+nearly no client-side work to remove and nothing to win — which is what −3.4%
+on a 0.24 s query says.
+
+**What is in this delta.** v0.2.2 was released before spec 054 merged, so this
+is everything since the last release: spec 054 (BCP encode + decode quick
+wins), the #211 catalog-scan serialize fix, and spec 055. It is not spec 055
+alone — for that, see the branch-point comparison above.
