@@ -55,3 +55,9 @@ duckdb_unittest_tempdir/
 future-spec/
 future-specs/
 posts/
+
+# The download-metrics chart is generated, not committed: it is published to
+# GitHub Pages by .github/workflows/pages.yml and embedded in the README from
+# there. A local run of scripts/update_download_metrics.py drops a copy here for
+# eyeballing; committing it would resurrect a file that goes stale weekly.
+docs/assets/download-metrics.svg

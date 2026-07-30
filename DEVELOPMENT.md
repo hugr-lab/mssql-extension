@@ -430,28 +430,38 @@ endpoints:
 - `download-stats-weekly/{year}/{week}.json` — the same snapshot archived per
   ISO week (the time series; an unpublished current week 404s and is skipped)
 
-It renders `docs/assets/download-metrics.svg` (self-contained, no JS) and
+It renders a self-contained SVG (no JS) and, when run without arguments, also
 rewrites two managed regions in `README.md`:
 
 | Region markers | Content |
 |---|---|
 | `<!-- METRICS-BADGES:START/END -->` | Badge row above the title (CI, DuckDB version, release, downloads/week, license, stars) |
-| `<!-- METRICS-CHART:START/END -->` | Chart heading, SVG, link to the interactive page, summary line |
+| `<!-- METRICS-CHART:START/END -->` | Chart heading, the Pages-hosted chart image, link to the interactive page |
 
 Anything outside the markers is never touched; the script is idempotent
 (re-runs produce no diff).
 
+**Neither region carries a number that goes stale.** The downloads figure is a
+dynamic shields badge and the chart is an image fetched from Pages, so both stay
+current without anyone committing anything. That is deliberate: `main` is a
+protected branch, so a scheduled job *cannot* push to it — the weekly refresh
+used to fail every Monday with `GH006: Protected branch update failed`.
+
+Run the script by hand only when the badge row or the chart section itself
+changes; the weekly workflow uses `--svg-only`, which writes the chart and
+touches nothing else.
+
 ### Workflows
 
-- `.github/workflows/update-metrics.yml` — weekly cron (Mon 06:17 UTC) +
-  `workflow_dispatch`; installs the DuckDB CLI, runs the script, commits
-  `README.md` + the SVG only when changed. Holds `contents: write`, so the
-  CLI download is **pinned by version and sha256** — when bumping, update
-  `DUCKDB_VERSION` and `DUCKDB_SHA256` together in the same `env:` block.
-- `.github/workflows/pages.yml` — deploys `web/` to GitHub Pages on pushes to
-  `main` touching `web/`. Serves the DuckDB-Wasm interactive chart at
-  <https://hugr-lab.github.io/mssql-extension/> (same `read_json` queries,
-  run client-side; CDN imports are pinned to exact versions).
+- `.github/workflows/pages.yml` — weekly cron (Mon 06:17 UTC), pushes to `main`
+  touching `web/` or the metrics script, and `workflow_dispatch`. Installs the
+  DuckDB CLI, renders the chart with `--svg-only`, and deploys `web/` plus that
+  image to GitHub Pages: the interactive DuckDB-Wasm chart at
+  <https://hugr-lab.github.io/mssql-extension/> and the static one at
+  `/download-metrics.svg`, which the README embeds. The CLI download is **pinned
+  by version and sha256** — when bumping, update `DUCKDB_VERSION` and
+  `DUCKDB_SHA256` together in the same `env:` block. The workflow holds
+  `contents: read`; nothing here can write to the repository.
 
 ### Running locally
 
