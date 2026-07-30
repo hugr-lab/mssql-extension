@@ -436,6 +436,11 @@ struct ColumnStaging {
 		return buffer.data() + offset;
 	}
 
+	//! Bytes appended since BeginVar — the length of the value still being built.
+	inline idx_t PendingVarLength() const {
+		return payload_used - offsets[count];
+	}
+
 	//! Close the value: everything appended since BeginVar is its content.
 	inline void FinishVar() {
 		lengths[count] = static_cast<uint32_t>(payload_used - offsets[count]);

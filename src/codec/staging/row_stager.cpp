@@ -56,6 +56,25 @@ static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 		actual, expected);
 }
 
+//! A UTF-16 value must be a whole number of code units. This is not a taste
+//! check — it is what makes the batch decode's boundary walk provable.
+//!
+//! Each staged value carries a U+0000 code unit after it, and the walk relies on
+//! that unit converting to exactly one 0x00 byte. At an ODD length the two zero
+//! bytes straddle a code-unit boundary and become the low half of one unit and
+//! the high half of the next, so they convert to no zero byte at all: the walk
+//! then finds no delimiter for that value, runs to the end of the blob, and the
+//! NEXT value searches from past the end — `limit - from` underflows and memchr
+//! reads out of bounds. SkipValue accepts any 2-byte length, so a corrupt or
+//! hostile stream reaches here; a conforming server never does.
+[[noreturn]] void ThrowOddUtf16Length(uint32_t length) {
+	throw InvalidInputException(
+		"MSSQL: a UTF-16 column arrived with a %u-byte value, which is not a whole number of 2-byte code units. The "
+		"TDS "
+		"stream is malformed.",
+		length);
+}
+
 //! One value on a 1-byte-prefixed direct column.
 //!
 //! `len == STRIDE` is the only fast case, and testing it first means the single
@@ -192,6 +211,9 @@ inline size_t AppendLob(ColumnStaging &st, const uint8_t *p) {
 	uint32_t data_length;
 	std::memcpy(&data_length, p + 1 + pointer_len + 8, 4);
 	if (DELIMITED) {
+		if (data_length & 1) {
+			ThrowOddUtf16Length(data_length);
+		}
 		st.BeginVar();
 		std::memcpy(st.ExtendVar(data_length), p + header, data_length);
 		st.FinishVarDelimited();
@@ -222,6 +244,9 @@ inline size_t AppendPlp(ColumnStaging &st, const uint8_t *p) {
 		offset += chunk_length;
 	}
 	if (DELIMITED) {
+		if (st.PendingVarLength() & 1) {
+			ThrowOddUtf16Length(static_cast<uint32_t>(st.PendingVarLength()));
+		}
 		st.FinishVarDelimited();
 	} else {
 		st.FinishVar();
@@ -376,6 +401,9 @@ void RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx) {
 				p += 2;
 				break;
 			}
+			if (length & 1) {
+				ThrowOddUtf16Length(length);
+			}
 			staging_[c]->AppendVarDelimited(p + 2, length);
 			p += 2 + length;
 			break;
@@ -481,6 +509,9 @@ void RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_idx
 			// The length prefix stays in an NBC row; the bitmap only decided that
 			// a value is present at all, which the branch above already handled.
 			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+			if (length & 1) {
+				ThrowOddUtf16Length(length);
+			}
 			staging_[c]->AppendVarDelimited(p + 2, length);
 			p += 2 + length;
 			break;
