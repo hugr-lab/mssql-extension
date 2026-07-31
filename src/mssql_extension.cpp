@@ -7,6 +7,7 @@
 #include "copy/copy_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
@@ -47,12 +48,16 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 // stated, and this is the only mechanism available on the CTAS path, which has
 // no options syntax.
 //
-// Bound to a plain VARCHAR carrying the length in ExtensionTypeInfo, and
-// deliberately WITHOUT an alias: an aliased VARCHAR is a distinct type for
-// binding, and every operation on it — upper(), ||, =, LIKE, IS NULL,
-// count(DISTINCT) — fails with "No function matches". Extension info alone is
-// invisible to overload resolution and still reaches DDL generation, which is
-// exactly the pair of properties needed. Measured both ways; see spec 060 § 2a.
+// Bound to a VARCHAR carrying the length in ExtensionTypeInfo, WITH an alias —
+// and the alias is not optional. Without it the type looks like a plain VARCHAR
+// to function binding (which is nicer: upper(), ||, = and LIKE keep working),
+// but it then crashes the binder outright: `CREATE TABLE t (a MSSQL_NVARCHAR(50));
+// INSERT INTO t VALUES ('x')` segfaults on a stack overflow, in plain DuckDB with
+// no catalog involved. DuckDB supports extension types only in their aliased
+// form. The cost is that operations on the type need a cast back, which is
+// acceptable because this type exists to DECLARE a target column: it is written
+// last, feeding the sink — `upper(cust)::MSSQL_NVARCHAR(50)` — and nothing is
+// applied to it afterwards. Measured both ways; see spec 060 § 2a.
 //===----------------------------------------------------------------------===//
 
 static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {
@@ -69,6 +74,7 @@ static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {
 		throw BinderException("MSSQL_NVARCHAR(n): n must be between 1 and 4000 (use VARCHAR for MAX)");
 	}
 	auto type = LogicalType(LogicalTypeId::VARCHAR);
+	type.SetAlias("MSSQL_NVARCHAR");
 	auto info = make_uniq<ExtensionTypeInfo>();
 	info->modifiers.emplace_back(Value::INTEGER(length));
 	type.SetExtensionInfo(std::move(info));
@@ -103,8 +109,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 9. Register COPY functions (bcp format)
 	RegisterMSSQLCopyFunctions(loader);
 
-	// Spec 060: parameterised target types (DDL-facing; see the note above).
-	loader.RegisterType("MSSQL_NVARCHAR", LogicalType::VARCHAR, BindMssqlNVarchar);
+	// Spec 060: parameterised target types (see the note above).
+	{
+		auto nvarchar_type = LogicalType(LogicalTypeId::VARCHAR);
+		nvarchar_type.SetAlias("MSSQL_NVARCHAR");
+		loader.RegisterType("MSSQL_NVARCHAR", nvarchar_type, BindMssqlNVarchar);
+		// The alias is required (it is what keeps the binder from recursing), but
+		// on its own it makes the type opaque to every VARCHAR function. Both
+		// directions are registered as implicit no-op casts at cost 0: the values
+		// ARE varchars, so overload resolution should reach upper(), ||, LIKE and
+		// the rest without the user writing a cast back.
+		loader.RegisterCastFunction(nvarchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::NopCast), 0);
+		loader.RegisterCastFunction(LogicalType::VARCHAR, nvarchar_type, BoundCastInfo(DefaultCasts::NopCast), 0);
+	}
 
 	// 10. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments

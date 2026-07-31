@@ -1,4 +1,6 @@
 #include "catalog/mssql_column_info.hpp"
+#include "duckdb/common/extension_type_info.hpp"
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include "duckdb/common/exception.hpp"
@@ -170,6 +172,14 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		return LogicalType::VARCHAR;
 	}
 	if (lower_type == "nchar" || lower_type == "nvarchar" || lower_type == "ntext") {
+		if (max_length > 0 && lower_type != "ntext" && std::getenv("MSSQL_ANNOTATE_CATALOG")) {
+			auto type = LogicalType(LogicalTypeId::VARCHAR);
+			type.SetAlias("MSSQL_NVARCHAR");
+			auto info = make_uniq<ExtensionTypeInfo>();
+			info->modifiers.emplace_back(Value::INTEGER(max_length / 2));
+			type.SetExtensionInfo(std::move(info));
+			return type;
+		}
 		return LogicalType::VARCHAR;  // Unicode also maps to VARCHAR in DuckDB
 	}
 

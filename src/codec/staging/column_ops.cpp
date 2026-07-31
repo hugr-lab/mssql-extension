@@ -309,7 +309,15 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 
-	const bool diverges = wire_type != target_type && !IsSupportedRetarget(column, target_type);
+	// Spec 060: two VARCHARs never diverge from each other, whatever annotations
+	// they carry. LogicalType equality compares the aux info too, so a catalog
+	// column reporting the declared nvarchar(n) bound would otherwise "diverge"
+	// from the plain VARCHAR the wire produces and render every value as text.
+	// The guard's real question — is the catalog claiming a DIFFERENT type than
+	// the wire sends — is unaffected: VARCHAR against INTEGER still differs by id.
+	const bool same_type = wire_type == target_type || (wire_type.id() == LogicalTypeId::VARCHAR &&
+														target_type.id() == LogicalTypeId::VARCHAR);
+	const bool diverges = !same_type && !IsSupportedRetarget(column, target_type);
 	ops.needs_value_fallback = diverges;
 
 	const uint32_t width = FixedWireWidth(column);

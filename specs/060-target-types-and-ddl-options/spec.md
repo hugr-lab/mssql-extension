@@ -52,63 +52,71 @@ The one thing that must be proved before anything is built on it: that the alias
 and extension info **survive the plan** as far as `copy_to_bind`'s `sql_types`
 and the CTAS column list. That is D1's acceptance test, not an assumption.
 
-## 2a. Probed — and both probes changed the design
+## 2a. Probed — the alias is required, and the alias-free form crashes DuckDB
 
-**Register the type WITHOUT an alias.** The first attempt followed the demo
-literally and called `SetAlias("MSSQL_NVARCHAR")` on the bound type. That makes
-it a distinct type for binding, and *everything* on it fails with "No function
-matches": `upper()`, `||`, `length()`, `=`, `LIKE`, `IS NULL`,
-`count(DISTINCT)`. Dropping the alias — registration reduces to
-`RegisterType("MSSQL_NVARCHAR", LogicalType::VARCHAR, BindNVarchar)` and the
-bind function returns a VARCHAR carrying only `ExtensionTypeInfo` — keeps both
-properties at once: the value behaves as an ordinary VARCHAR everywhere, and the
-modifier still reaches DDL generation. **The alias was the whole problem; the
-extension info is invisible to overload resolution.**
+Three experiments, and the second one reversed the conclusion of the first.
 
-Verified end to end: `COPY (SELECT 'hello'::MSSQL_NVARCHAR(50) AS cust) TO ...`
-creates `nvarchar` with `max_length = 100` on the server — `nvarchar(50)`, 50
-UTF-16 units — while an uncast column beside it stays `nvarchar(max)`.
+**Registering WITHOUT an alias looks better and is wrong.** Following the demo
+literally — `SetAlias("MSSQL_NVARCHAR")` on the bound type — makes it a distinct
+type for binding, and every operation on it fails with "No function matches":
+`upper()`, `||`, `length()`, `=`, `LIKE`, `IS NULL`, `count(DISTINCT)`. Dropping
+the alias fixes all of that: the value behaves as an ordinary VARCHAR while the
+modifier still reaches DDL generation.
 
-**CTAS does not go through that mapper.** The same cast through
-`CREATE TABLE d.dbo.x AS SELECT ...` still produced `nvarchar(max)`: the CTAS
-path maps types with `MSSQLDDLTranslator::MapLogicalTypeToCTAS`, a second,
-independent translator. Both must be taught, and the duplication is itself the
-finding — one decision made in two places is how a feature ends up working on
-one path and not the other.
+**But an anonymous extension type crashes the binder.** With no alias:
 
-### The catalog must NOT report these types — it crashes
+```sql
+CREATE TABLE t (a MSSQL_NVARCHAR(50));
+INSERT INTO t VALUES ('x');            -- SIGSEGV, exit 139
+```
+
+No MSSQL catalog, no attached database — plain DuckDB. `INSERT ... SELECT` on
+the same table is fine, and a bare cast is fine; the trigger is binding a VALUES
+list against a column whose type carries `ExtensionTypeInfo` with no alias. The
+signature is a stack overflow (`EXC_BAD_ACCESS` in `LogicalType::GetInternalType`
+with an unwindable-past stack), i.e. unbounded recursion at bind time.
+
+| form | `upper(col)` | `INSERT ... VALUES` |
+| --- | --- | --- |
+| with alias | binder error | **works** |
+| without alias | works | **SIGSEGV** |
+
+So DuckDB supports extension types only in their aliased form; the alias-free
+variant passes function binding by looking like a VARCHAR and then breaks the
+part of the binder that needs a real type. **Use the alias.** The ergonomic cost
+lands entirely on a type that exists to *declare* a target column: it is written
+in a cast that feeds the sink, and nothing is applied to it afterwards.
+`upper(cust)::MSSQL_NVARCHAR(50)` — cast last — is the shape that matters and it
+works.
+
+**Report upstream.** An extension can produce a type that segfaults the binder,
+with the repro above. Whether DuckDB should reject an anonymous extension type
+at registration or handle it, a stack overflow is not the answer.
+
+### The catalog must NOT report these types
 
 The attractive version is to have the catalog surface a source column's declared
 length, so a target created from an MSSQL source inherits it with no cast at all.
-It was implemented and it *worked*: with one further change — narrowing the
+It was implemented and it *worked* — with one further change, narrowing the
 issue-#89 divergence guard in `ResolveColumnOps`, which compares whole
 `LogicalType`s and so treated an annotated VARCHAR as diverging from the plain
-VARCHAR the wire produces — `COPY (SELECT * FROM d.dbo.Src) TO 'd.dbo.Dst'`
+VARCHAR the wire produces, `COPY (SELECT * FROM d.dbo.Src) TO 'd.dbo.Dst'`
 created `Dst.cust` as `nvarchar(50)`, carried from the source with no user input.
 
-Then the suite crashed. `test/sql/insert/insert_errors.test` segfaults (exit
-139); a plain `INSERT INTO <mssql table> VALUES (...)` is enough. The signature
-is a stack overflow — `EXC_BAD_ACCESS` inside `LogicalType::GetInternalType`
-with a corrupted stack — most plausibly the binder reconciling a plain-VARCHAR
-source against an annotated-VARCHAR target, inserting a cast whose result still
-compares unequal. Not diagnosed further, because the conclusion does not depend
-on the mechanism.
+It is rejected all the same, and for a reason independent of that: the catalog
+would have to report the type in its **alias-free** form to keep every string
+column usable, which is exactly the form that crashes. The aliased form would
+make every string column of every attached table unusable without a cast.
+Reverted, with the guard change.
 
-**Direction matters, and the safe direction is the one we need.** Measured
-separately:
+### CTAS uses a second translator
 
-| shape | result |
-| --- | --- |
-| annotated TARGET (from the catalog), plain source | **crash** |
-| annotated SOURCE (from a cast), plain target — `INSERT INTO t SELECT ...::MSSQL_NVARCHAR(50)` | OK |
-| same via `INSERT INTO t VALUES (...::MSSQL_NVARCHAR(50))` | OK |
-| same via `CREATE TABLE ... AS SELECT ...::MSSQL_NVARCHAR(50)` | OK |
-| into a local DuckDB table | OK |
-
-All of them land the right data. So the types are safe exactly where the design
-puts them — stated by the user in the SELECT, read when the target is created —
-and unsafe only in the direction that was never required. **The catalog keeps
-reporting plain VARCHAR; the divergence-guard change is reverted with it.**
+The same cast through `CREATE TABLE d.dbo.x AS SELECT ...` still produced
+`nvarchar(max)`: that path maps types with
+`MSSQLDDLTranslator::MapLogicalTypeToCTAS`, independent of
+`TargetResolver::GetSQLServerTypeDeclaration`. Both must be taught, and the
+duplication is itself the finding — one decision made in two places is how a
+feature ends up working on one path and silently not on the other.
 
 ### D3 is already satisfied
 
