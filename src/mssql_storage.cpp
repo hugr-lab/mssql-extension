@@ -1095,6 +1095,7 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 	// Create a temporary connection to test Azure AD credentials
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
@@ -1161,6 +1162,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 	// Create a temporary connection to test the pre-provided token
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
@@ -1221,6 +1223,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	// Create a temporary connection to test credentials
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
@@ -1302,6 +1305,7 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
@@ -1521,6 +1525,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// both directions for the whole life of every pooled connection.
 	connection_info->tds_packet_size =
 		pool_config.tds_packet_size > 0 ? static_cast<size_t>(pool_config.tds_packet_size) : 0;
+	// Issue #225: ask for UTF-8 unless the user turned the request off.
+	connection_info->utf8_support = pool_config.utf8_support;
 	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
 	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
 							lazy_validation ? "true" : "false", attach_validation_timeout);

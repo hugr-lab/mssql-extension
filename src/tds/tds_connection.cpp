@@ -841,8 +841,8 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	// raises the value on its own, so asking for the 4096 default (as this did
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
-	TdsPacket login =
-		TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name, requested_packet_size_);
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
+											   requested_packet_size_, request_utf8_support_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
@@ -857,6 +857,9 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	}
 
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+	// Only a feature we actually asked for may be treated as granted: the server
+	// answers requests, so an ack for anything else is not ours to honour.
+	utf8_support_acked_ = request_utf8_support_ && login_response.utf8_support_acked;
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
 			// Include the ERROR-token State byte: for 18456 it is the only field

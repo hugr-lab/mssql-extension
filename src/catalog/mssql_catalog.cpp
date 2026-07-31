@@ -143,10 +143,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto encrypt = connection_info_->use_encrypt;
 		auto token = fedauth_token_utf16le_;
 		auto tds_packet_size = connection_info_->tds_packet_size;
-		factory = [host, port, database, encrypt, token, app_name,
-				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
+		auto utf8_support = connection_info_->utf8_support;
+		factory = [host, port, database, encrypt, token, app_name, tds_packet_size,
+				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
+			conn->SetRequestUtf8Support(utf8_support);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
@@ -166,6 +168,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
+			conn->SetRequestUtf8Support(info_copy.utf8_support);
 			if (!conn->Connect(info_copy.host, info_copy.port)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
 						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
@@ -206,10 +209,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
 		auto tds_packet_size = connection_info_->tds_packet_size;
-		factory = [host, port, username, password, database, encrypt, app_name,
-				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
+		auto utf8_support = connection_info_->utf8_support;
+		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size,
+				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
+			conn->SetRequestUtf8Support(utf8_support);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}

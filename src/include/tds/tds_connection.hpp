@@ -202,6 +202,19 @@ public:
 		requested_packet_size_ = static_cast<uint32_t>(packet_size);
 	}
 
+	// Issue #225: whether LOGIN7 advertises UTF8SUPPORT. Server support is not
+	// assumed — the acknowledgement in FEATUREEXTACK is what decides, and
+	// UTF8SupportAcked() reports it after login.
+	void SetRequestUtf8Support(bool request) {
+		request_utf8_support_ = request;
+	}
+
+	// True only if this connection asked for UTF8SUPPORT and the server acked it,
+	// i.e. UTF-8-collation columns arrive as UTF-8 rather than transcoded UTF-16.
+	bool UTF8SupportAcked() const {
+		return utf8_support_acked_;
+	}
+
 private:
 	// Size the socket's receive staging from the frame size the server confirmed
 	// (spec 055). Called from every login path once the PACKETSIZE ENVCHANGE has
@@ -210,6 +223,10 @@ private:
 
 	std::unique_ptr<TdsSocket> socket_;
 	std::atomic<ConnectionState> state_;
+
+	// Issue #225: requested in LOGIN7, confirmed by FEATUREEXTACK.
+	bool request_utf8_support_ = true;
+	bool utf8_support_acked_ = false;
 
 	// Connection info
 	std::string host_;

@@ -118,6 +118,12 @@ struct MSSQLConnectionInfo {
 	// connection_info) request the same size. Clamped to [512, 32767] at use.
 	size_t tds_packet_size = 0;
 
+	// Issue #225: advertise UTF8SUPPORT in LOGIN7, from mssql_utf8_support.
+	// Carried here for the same reason as tds_packet_size — the pool factory only
+	// sees connection_info, and every connection in a pool must ask for the same
+	// wire form or two connections would decode the same column differently.
+	bool utf8_support = true;
+
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//

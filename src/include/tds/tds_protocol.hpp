@@ -49,6 +49,14 @@ struct LoginResponse {
 	// SSPI token data (Spec 042 -- Integrated Auth continuation)
 	bool has_sspi_token = false;	  // True if a 0xED SSPI token appeared in this response
 	std::vector<uint8_t> sspi_token;  // Raw blob from the server for IAuthenticator::NextBytes()
+
+	// FEATUREEXTACK (0xAE) -- the server's answer to the LOGIN7 feature extensions.
+	// A feature is accepted iff it appears here; a server that does not support one
+	// simply omits it. Only features this client actually requested may be honoured:
+	// the caller knows what it sent, so it decides, and these are raw observations.
+	bool has_feature_ext_ack = false;
+	bool fedauth_acked = false;		  // FeatureId 0x02
+	bool utf8_support_acked = false;  // FeatureId 0x0A -- UTF-8 collations arrive as UTF-8
 };
 
 // TDS Protocol message builders and parsers
@@ -79,9 +87,14 @@ public:
 	//   database - initial database to connect to
 	//   app_name - application name (optional, for server logging)
 	//   packet_size - requested packet size (default 4096)
+	//   request_utf8_support - advertise the UTF8SUPPORT feature extension ([MS-TDS] 2.2.6.5).
+	//     A server that supports it then sends UTF-8-collation columns as UTF-8 (0xA7) instead
+	//     of transcoding them to UTF-16 (0xE7), which halves the wire bytes for ASCII-heavy
+	//     data and lets the client copy them straight into the vector. A server that does not
+	//     support it omits the acknowledgement and keeps sending UTF-16, so asking is safe.
 	static TdsPacket BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								 const std::string &database, const std::string &app_name = "DuckDB MSSQL Extension",
-								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE, bool request_utf8_support = true);
 
 	// Parse LOGIN7 response (LOGINACK token and potential errors)
 	static LoginResponse ParseLoginResponse(const std::vector<uint8_t> &data);

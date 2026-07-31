@@ -205,7 +205,8 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string &password) {
 }
 
 TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
-								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
+								   const std::string &database, const std::string &app_name, uint32_t packet_size,
+								   bool request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 fixed header is 94 bytes; variable-length strings follow.
@@ -225,15 +226,15 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields
 	// still carry an ib* pointing to the next-available byte position).
-	// Spec/issue #225 experiment: advertise UTF8SUPPORT. The Extension slot (the
-	// field MS-TDS calls Unused/ibExtension) points at a DWORD placed after the
-	// variable strings, and that DWORD holds the offset of the feature list.
-	const bool want_utf8_support = std::getenv("MSSQL_UTF8SUPPORT") != nullptr;
+	// Issue #225: advertise UTF8SUPPORT. The Extension slot (the field MS-TDS
+	// calls Unused/ibExtension) points at a DWORD placed after the variable
+	// strings, and that DWORD holds the offset of the feature list.
+	const bool want_utf8_support = request_utf8_support;
 	uint16_t unused1_offset = var_offset;
 	uint16_t unused1_len = 0;
 	if (want_utf8_support) {
-		unused1_len = 4;   // cbExtension = the DWORD only, per MS-TDS
-		var_offset += 4;   // the DWORD itself
+		unused1_len = 4;  // cbExtension = the DWORD only, per MS-TDS
+		var_offset += 4;  // the DWORD itself
 	}
 	uint16_t cltintname_offset = var_offset;
 	uint16_t cltintname_len = 0;
@@ -403,11 +404,11 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendPayload(field_database.utf16le_bytes);
 	if (want_utf8_support) {
 		// UTF8_SUPPORT ([MS-TDS] 2.2.6.5): FeatureId 0x0A, one data byte saying
-		// the client understands UTF-8, then the 0xFF terminator.
-		packet.AppendByte(0x0A);
+		// the client understands UTF-8, then the terminator.
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT));
 		packet.AppendUInt32LE(1);
 		packet.AppendByte(0x01);
-		packet.AppendByte(0xFF);
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
 	}
 
 	return packet;
@@ -932,6 +933,45 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			response.has_sspi_token = true;
 			response.sspi_token.assign(ptr, ptr + blob_len);
 			ptr += blob_len;
+		} else if (token_type == static_cast<uint8_t>(TokenType::FEATUREEXTACK)) {
+			// [MS-TDS] 2.2.7.11. NOT a length-prefixed token: it is a run of
+			//   FeatureId(1) | FeatureAckDataLen(4, LE) | FeatureAckData(n)
+			// ending at FeatureId 0xFF. The generic "skip a USHORT length" branch
+			// below reads the first two bytes of the first entry as a length --
+			// for the UTF8_SUPPORT ack (0x0A 0x01 00 00 00 ...) that is 0x010A =
+			// 266 bytes -- and walks off the token. Today that lands past the end
+			// of the buffer, after everything this parser needs has already been
+			// read, so nothing breaks; it is luck, not design, and it has been
+			// misparsing the FEDAUTH ack (0x02) since Azure AD support shipped.
+			response.has_feature_ext_ack = true;
+			while (ptr < end) {
+				const uint8_t feature_id = *ptr++;
+				if (feature_id == static_cast<uint8_t>(FeatureExtId::TERMINATOR)) {
+					break;
+				}
+				if (ptr + 4 > end) {
+					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK truncated in length of feature 0x%02X", feature_id);
+					ptr = end;
+					break;
+				}
+				const uint32_t data_len = static_cast<uint32_t>(ptr[0]) | (static_cast<uint32_t>(ptr[1]) << 8) |
+										  (static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
+				ptr += 4;
+				if (data_len > static_cast<uint32_t>(end - ptr)) {
+					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK feature 0x%02X claims %u bytes, %zu available", feature_id,
+										  data_len, static_cast<size_t>(end - ptr));
+					ptr = end;
+					break;
+				}
+				MSSQL_PROTO_DEBUG_LOG(2, "FEATUREEXTACK: feature=0x%02X len=%u first=0x%02X", feature_id, data_len,
+									  data_len > 0 ? ptr[0] : 0);
+				if (feature_id == static_cast<uint8_t>(FeatureExtId::FEDAUTH)) {
+					response.fedauth_acked = true;
+				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
+					response.utf8_support_acked = true;
+				}
+				ptr += data_len;
+			}
 		} else {
 			// Unknown token - try to skip by reading length if available
 			// Most tokens have 2-byte length after token type
