@@ -225,8 +225,16 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields
 	// still carry an ib* pointing to the next-available byte position).
+	// Spec/issue #225 experiment: advertise UTF8SUPPORT. The Extension slot (the
+	// field MS-TDS calls Unused/ibExtension) points at a DWORD placed after the
+	// variable strings, and that DWORD holds the offset of the feature list.
+	const bool want_utf8_support = std::getenv("MSSQL_UTF8SUPPORT") != nullptr;
 	uint16_t unused1_offset = var_offset;
 	uint16_t unused1_len = 0;
+	if (want_utf8_support) {
+		unused1_len = 4;   // cbExtension = the DWORD only, per MS-TDS
+		var_offset += 4;   // the DWORD itself
+	}
 	uint16_t cltintname_offset = var_offset;
 	uint16_t cltintname_len = 0;
 	uint16_t language_off = var_offset;
@@ -234,6 +242,9 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 
 	Login7VarField field_database = EncodeLogin7VarField("Database", database, var_offset);
 
+	// Everything after Database is zero-length, so this is where the variable
+	// block ends and the feature list begins.
+	const uint32_t feature_ext_offset = var_offset;
 	uint16_t sspi_offset = var_offset;
 	uint16_t sspi_len = 0;
 	uint16_t atchdb_offset = var_offset;
@@ -242,6 +253,10 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	uint16_t changepass_len = 0;
 
 	uint32_t total_length = var_offset;
+	if (want_utf8_support) {
+		// FeatureId(1) + FeatureDataLen(4) + FeatureData(1) + Terminator(1)
+		total_length += 7;
+	}
 
 	// Build fixed header (94 bytes)
 
@@ -287,6 +302,9 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// Offset 27: OptionFlags3 (1 byte)
 	// Various TDS 7.2+ options
 	uint8_t flags3 = 0x00;
+	if (want_utf8_support) {
+		flags3 |= 0x10;	 // fExtension — feature extension data is present
+	}
 	packet.AppendByte(flags3);
 
 	// Offset 28: ClientTimeZone (4 bytes, LE) - minutes from UTC
@@ -378,7 +396,19 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendPayload(field_password.utf16le_bytes);
 	packet.AppendPayload(field_appname.utf16le_bytes);
 	packet.AppendPayload(field_servername.utf16le_bytes);
+	if (want_utf8_support) {
+		// The Extension field points HERE; this DWORD points at the feature list.
+		packet.AppendUInt32LE(feature_ext_offset);
+	}
 	packet.AppendPayload(field_database.utf16le_bytes);
+	if (want_utf8_support) {
+		// UTF8_SUPPORT ([MS-TDS] 2.2.6.5): FeatureId 0x0A, one data byte saying
+		// the client understands UTF-8, then the 0xFF terminator.
+		packet.AppendByte(0x0A);
+		packet.AppendUInt32LE(1);
+		packet.AppendByte(0x01);
+		packet.AppendByte(0xFF);
+	}
 
 	return packet;
 }

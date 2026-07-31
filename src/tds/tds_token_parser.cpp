@@ -151,6 +151,46 @@ ParsedTokenType TokenParser::TryParseNext() {
 			}
 			return ParsedTokenType::NeedMoreData;
 
+		case TokenType::FEATUREEXTACK: {
+			// [MS-TDS] 2.2.7.11: not a length-prefixed token. It is a sequence of
+			// (FeatureId:1, FeatureAckDataLen:4, FeatureAckData:n) repeated until
+			// a FeatureId of 0xFF terminates it. The uniform 2-byte-length skip
+			// below would misparse it, so it gets its own walk.
+			size_t pos = 1;	 // past the token byte
+			for (;;) {
+				if (Available() < pos + 1) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				const uint8_t feature_id = Current()[pos];
+				pos += 1;
+				if (feature_id == 0xFF) {
+					break;
+				}
+				if (Available() < pos + 4) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				const uint32_t data_len = static_cast<uint32_t>(Current()[pos]) |
+										  (static_cast<uint32_t>(Current()[pos + 1]) << 8) |
+										  (static_cast<uint32_t>(Current()[pos + 2]) << 16) |
+										  (static_cast<uint32_t>(Current()[pos + 3]) << 24);
+				pos += 4;
+				if (Available() < pos + static_cast<size_t>(data_len)) {
+					return ParsedTokenType::NeedMoreData;
+				}
+				if (const char *dbg = std::getenv("MSSQL_DEBUG_FEATUREACK")) {
+					(void)dbg;
+					fprintf(stderr, "[FEATUREEXTACK] feature=0x%02X len=%u data=%s\n", feature_id, data_len,
+							data_len > 0 ? "" : "<empty>");
+					for (uint32_t i = 0; i < data_len; i++) {
+						fprintf(stderr, "  byte[%u]=0x%02X\n", i, Current()[pos + i]);
+					}
+				}
+				pos += data_len;
+			}
+			ConsumeBytes(pos);
+			break;
+		}
+
 		case TokenType::ORDER:
 		case TokenType::RETURNSTATUS:
 		case TokenType::RETURNVALUE:
