@@ -7,6 +7,7 @@
 #include "copy/target_resolver.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/client_context.hpp"

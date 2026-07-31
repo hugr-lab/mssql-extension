@@ -6,6 +6,7 @@
 #include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
@@ -37,6 +38,43 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 }
 
 // Internal function to register extension functionality
+//===----------------------------------------------------------------------===//
+// Spec 060 — parameterised target types
+//
+// MSSQL_NVARCHAR(n) states the type a CREATE/CTAS/COPY target column should get.
+// DuckDB drops the VARCHAR length modifier at CREATE TABLE and Parquet carries
+// no string length, so the bound cannot be plumbed from a source — it has to be
+// stated, and this is the only mechanism available on the CTAS path, which has
+// no options syntax.
+//
+// Bound to a plain VARCHAR carrying the length in ExtensionTypeInfo, and
+// deliberately WITHOUT an alias: an aliased VARCHAR is a distinct type for
+// binding, and every operation on it — upper(), ||, =, LIKE, IS NULL,
+// count(DISTINCT) — fails with "No function matches". Extension info alone is
+// invisible to overload resolution and still reaches DDL generation, which is
+// exactly the pair of properties needed. Measured both ways; see spec 060 § 2a.
+//===----------------------------------------------------------------------===//
+
+static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {
+	auto &modifiers = input.modifiers;
+	if (modifiers.size() != 1) {
+		throw BinderException("MSSQL_NVARCHAR takes exactly one modifier: MSSQL_NVARCHAR(n)");
+	}
+	auto &val = modifiers[0].GetValue();
+	if (val.IsNull() || val.type() != LogicalType::INTEGER) {
+		throw BinderException("MSSQL_NVARCHAR(n): n must be a non-NULL integer");
+	}
+	auto length = val.GetValue<int32_t>();
+	if (length < 1 || length > 4000) {
+		throw BinderException("MSSQL_NVARCHAR(n): n must be between 1 and 4000 (use VARCHAR for MAX)");
+	}
+	auto type = LogicalType(LogicalTypeId::VARCHAR);
+	auto info = make_uniq<ExtensionTypeInfo>();
+	info->modifiers.emplace_back(Value::INTEGER(length));
+	type.SetExtensionInfo(std::move(info));
+	return type;
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// 1. Register secrets
 	RegisterMSSQLSecretType(loader);
@@ -64,6 +102,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 9. Register COPY functions (bcp format)
 	RegisterMSSQLCopyFunctions(loader);
+
+	// Spec 060: parameterised target types (DDL-facing; see the note above).
+	loader.RegisterType("MSSQL_NVARCHAR", LogicalType::VARCHAR, BindMssqlNVarchar);
 
 	// 10. Register utility functions (mssql_version)
 	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments

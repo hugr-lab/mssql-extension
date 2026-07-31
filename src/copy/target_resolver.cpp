@@ -3,6 +3,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "copy/bcp_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1005,6 +1006,17 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 //===----------------------------------------------------------------------===//
 
 string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type) {
+	// Spec 060: an explicit MSSQL_* cast states the target column's type, and it
+	// is the ONLY way to say so on the CTAS path, which has no options syntax.
+	// The bound type is a plain DuckDB type carrying its modifier in extension
+	// info, so nothing downstream of here changes — only the DDL text.
+	if (duckdb_type.id() == LogicalTypeId::VARCHAR && duckdb_type.HasExtensionInfo()) {
+		const auto &modifiers = duckdb_type.GetExtensionInfo()->modifiers;
+		if (modifiers.size() == 1 && !modifiers[0].value.IsNull()) {
+			return StringUtil::Format("nvarchar(%d)", modifiers[0].value.GetValue<int32_t>());
+		}
+	}
+
 	switch (duckdb_type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return "bit";
