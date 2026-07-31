@@ -64,8 +64,13 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 	std::memcpy(&days, data, 4);
 	std::memcpy(&ticks, data + 4, 4);
 
-	// Convert to days since 1970-01-01
-	int32_t unix_days = days - DAYS_FROM_1900_TO_EPOCH;
+	// Convert to days since 1970-01-01. Widened before the subtraction: `days` is
+	// a full signed 32-bit field, so INT32_MIN - 25567 overflows int32 — undefined
+	// behaviour on a value only a corrupt stream can produce. Caught by UBSan once
+	// test_row_stager started building sanitized (#217's script). For every legal
+	// day count the result is unchanged, and the unsigned assembly below already
+	// handles the meaningless-but-defined case the same way.
+	const int64_t unix_days = static_cast<int64_t>(days) - DAYS_FROM_1900_TO_EPOCH;
 
 	// Convert ticks to microseconds (1 tick = 1/300 second)
 	// microseconds = ticks * 1000000 / 300 = ticks * 10000 / 3
