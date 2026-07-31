@@ -114,6 +114,72 @@ statement ok
 SET mssql_utf8_support = true;
 
 # =============================================================================
+# Double-byte collations. A varchar under CP932/936/949/950 stores two bytes per
+# character, so it is the shape most likely to break an encoding change — and it
+# is the one shape the fixtures above do not contain, since UTF-8 and UTF-16 are
+# both wide by design.
+#
+# The feature must not touch these columns at all: it only changes the wire form
+# of collations whose fUTF8 bit is set. What keeps them readable is the scan's
+# own server-side CAST to NVARCHAR (spec 026), which is independent of
+# UTF8SUPPORT — so both settings must return identical text.
+#
+# Verified against SQL Server 2022: Chinese_PRC_CI_AS is code page 936 and stores
+# 汉字测试 in 8 bytes; Japanese_CI_AS is 932 and stores 日本語テスト in 12.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('u8_db', $$
+IF OBJECT_ID('dbo.Utf8Dbcs') IS NOT NULL DROP TABLE dbo.Utf8Dbcs;
+CREATE TABLE dbo.Utf8Dbcs (
+    id INT NOT NULL,
+    v_cn VARCHAR(100) COLLATE Chinese_PRC_CI_AS NULL,
+    v_jp VARCHAR(100) COLLATE Japanese_CI_AS NULL,
+    n    NVARCHAR(100) NULL
+);
+INSERT INTO dbo.Utf8Dbcs (id, v_cn, v_jp, n) VALUES
+    (1, N'汉字测试', N'日本語テスト', N'汉字测试'),
+    (2, N'mixed 汉字 ascii', N'mixed 日本語 ascii', N'mixed 汉字 ascii'),
+    (3, NULL, NULL, NULL);
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query ITTT
+SELECT id, v_cn, v_jp, n FROM u8_db.dbo.Utf8Dbcs ORDER BY id;
+----
+1	汉字测试	日本語テスト	汉字测试
+2	mixed 汉字 ascii	mixed 日本語 ascii	mixed 汉字 ascii
+3	NULL	NULL	NULL
+
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query ITTT
+SELECT id, v_cn, v_jp, n FROM u8_db.dbo.Utf8Dbcs ORDER BY id;
+----
+1	汉字测试	日本語テスト	汉字测试
+2	mixed 汉字 ascii	mixed 日本語 ascii	mixed 汉字 ascii
+3	NULL	NULL	NULL
+
+# Character counts, not byte counts: 汉字测试 is 4 characters however the server
+# stored it, and a code-page round trip that lost anything would not land here.
+query III
+SELECT id, length(v_cn), length(v_jp) FROM u8_db.dbo.Utf8Dbcs WHERE id = 1;
+----
+1	4	6
+
+statement ok
+SET mssql_utf8_support = true;
+
+statement ok
+SELECT mssql_exec('u8_db', $$DROP TABLE dbo.Utf8Dbcs;$$);
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 
