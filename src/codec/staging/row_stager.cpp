@@ -359,6 +359,11 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 		// data pointer has to be re-taken every chunk: DataChunk::Reset restores
 		// each vector from its cache and is free to hand back different memory.
 		// Columns that stage into their own buffer take no pointer at all.
+		// A chunk always starts FLAT: MSSQLResultStream::FillChunk calls
+		// DataChunk::Reset, whose ResetFromCache restores the type and validity.
+		// The constant path (spec 056) leaves vectors CONSTANT, and a CONSTANT one
+		// here would hand `direct_dst` a single-value view to write 2048 rows into.
+		D_ASSERT(targets_[i]->GetVectorType() == VectorType::FLAT_VECTOR);
 		uint8_t *direct_dst =
 			ops_[i].direct_write ? reinterpret_cast<uint8_t *>(FlatVector::GetData(*targets_[i])) : nullptr;
 		staging_[i]->BeginChunk(direct_dst);
@@ -581,6 +586,10 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		const ColumnStaging &st = *staging_[c];
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
+		if (TryEmitConstant(c, st, meta, row_count)) {
+			chunk_nulls_[c] = st.null_count;
+			continue;
+		}
 		std::chrono::steady_clock::time_point started;
 		if (counters_enabled_) {
 			started = std::chrono::steady_clock::now();
@@ -641,6 +650,161 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 	}
 	arena_.EndChunk();
+}
+
+//! Is every value the same? Callers reach these only for an all-valid column, so
+//! there are no NULL slots to step over.
+//!
+//! Each returns on the first difference, which is what makes the miss free: a
+//! column of distinct values costs one comparison, not a scan.
+namespace {
+
+//! One slot compared as a machine word rather than through memcmp, which is a
+//! call into libc per value — measured at ~1.7 ns/value against ~0.3 for this.
+//! memcpy for the load, not a cast: the staging buffer is byte-addressed.
+template <typename T>
+inline bool SlotsRepeat(const uint8_t *data, idx_t count) {
+	T first;
+	std::memcpy(&first, data, sizeof(T));
+	for (idx_t row = 1; row < count; row++) {
+		T value;
+		std::memcpy(&value, data + row * sizeof(T), sizeof(T));
+		if (value != first) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool BytesRepeat(const uint8_t *data, uint32_t stride, idx_t count) {
+	switch (stride) {
+	case 1:
+		return SlotsRepeat<uint8_t>(data, count);
+	case 2:
+		return SlotsRepeat<uint16_t>(data, count);
+	case 4:
+		return SlotsRepeat<uint32_t>(data, count);
+	case 8:
+		return SlotsRepeat<uint64_t>(data, count);
+	default:
+		// The odd widths — 3, 5-7, 9, 10, 13, 16, 17 — belong to the temporal,
+		// GUID and DECIMAL families, where the decode this saves dwarfs the
+		// comparison either way.
+		for (idx_t row = 1; row < count; row++) {
+			if (std::memcmp(data + row * stride, data, stride) != 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+}
+
+bool StagedVarRepeats(const ColumnStaging &st, idx_t count) {
+	const uint32_t length = st.lengths[0];
+	const uint8_t *const first = st.buffer.data() + st.offsets[0];
+	for (idx_t row = 1; row < count; row++) {
+		// Length first: it rejects most columns before a byte is compared.
+		if (st.lengths[row] != length || std::memcmp(st.buffer.data() + st.offsets[row], first, length) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+}  // namespace
+
+bool RowStager::TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::ColumnMetadata &meta, idx_t row_count) {
+	if (row_count < 2) {
+		// One row is trivially uniform, but a one-row chunk has nothing to save
+		// and the vector is already correct as a flat one.
+		return false;
+	}
+	Vector &out = *targets_[c];
+
+	// All NULL. Free to detect — two numbers already in hand — and it skips the
+	// kernel entirely, which is the whole win for a column a query does not
+	// populate. Common in wide tables.
+	if (st.null_count == row_count) {
+		out.SetVectorType(VectorType::CONSTANT_VECTOR);
+		ConstantVector::SetNull(out, true);
+		if (counters_enabled_) {
+			counters_.constant_null_columns++;
+		}
+		return true;
+	}
+	// A NULL among values cannot be uniform, and this rejects it before any value
+	// is looked at.
+	if (st.null_count != 0) {
+		return false;
+	}
+
+	// Only columns whose values still have to be DECODED are scanned for
+	// uniformity. A direct-write column has no decode to collapse — its values
+	// were stored into the output vector as they arrived — so the scan buys
+	// nothing here and only a downstream constant, which measured at +0.26
+	// ns/value on a uniform BIGINT column against a decode saving of zero. The
+	// families that do decode measured -14% (DECIMAL) and -16% (NVARCHAR).
+	//
+	// The all-NULL case above deliberately still applies to them: it is detected
+	// by comparing two counters, never looks at a value, and skips publishing the
+	// validity mask.
+	if (ops_[c].direct_write) {
+		return false;
+	}
+	if (ops_[c].kind == StagingKind::Var) {
+		if (!StagedVarRepeats(st, row_count)) {
+			return false;
+		}
+	} else if (!BytesRepeat(st.buffer.data(), st.stride, row_count)) {
+		return false;
+	}
+
+	// Decode row 0 alone. This is the family's per-VALUE entry point, called once
+	// per column per chunk — not a per-value path — and it is preferred to calling
+	// the batch kernel with count = 1 because the string kernel sizes its work
+	// from the whole staged payload and would convert all 2048 values to publish
+	// one.
+	DecodeFirstValue(c, st, meta, out);
+	out.SetVectorType(VectorType::CONSTANT_VECTOR);
+	if (counters_enabled_) {
+		counters_.constant_columns++;
+	}
+	return true;
+}
+
+//! Publish row 0 into slot 0, by family. Only the staged kernels come here;
+//! a direct-write column already has its value in place.
+void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::ColumnMetadata &meta, Vector &out) {
+	if (ops_[c].kernel == FinalizeKernel::Text) {
+		// The issue-#89 fallback is row-indexed already, so one row is one row.
+		FinalizeFallbackColumn(st, 1, meta, out);
+		return;
+	}
+	const uint8_t *const value = st.ValueAt(0);
+	const std::vector<uint8_t> bytes(value, value + st.LengthAt(0));
+	switch (ops_[c].kernel) {
+	case FinalizeKernel::String:
+		string::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Binary:
+		binary::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Uuid:
+		uuid::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Decimal:
+		decimal::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Money:
+		money::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Datetime:
+		datetime::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::None:
+	case FinalizeKernel::Text:
+		break;
+	}
 }
 
 void RowStager::CountColumn(idx_t c, const ColumnStaging &st, idx_t row_count, uint64_t elapsed_ns) {

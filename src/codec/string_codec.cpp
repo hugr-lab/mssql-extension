@@ -472,8 +472,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// as every pre-054 release did.
 	const bool trim_trailing_spaces = col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_NCHAR;
 
+	// NTEXT belongs here too: its payload is UTF-16 exactly like NVARCHAR, only
+	// its ROW framing differs (a text pointer, spec 055 D9). It was missing while
+	// nothing called this entry point for it — the legacy path could not read
+	// NTEXT at all before #197 — and the omission surfaced the moment the spec-056
+	// constant path decoded one value through here and got the bytes read as
+	// single-byte characters.
 	if (col.type_id == tds::TDS_TYPE_NCHAR || col.type_id == tds::TDS_TYPE_NVARCHAR ||
-		col.type_id == tds::TDS_TYPE_XML) {
+		col.type_id == tds::TDS_TYPE_XML || col.type_id == tds::TDS_TYPE_NTEXT) {
 		size_t byte_len = bytes.size();
 		if (trim_trailing_spaces) {
 			while (byte_len >= 2 && bytes[byte_len - 2] == 0x20 && bytes[byte_len - 1] == 0x00) {

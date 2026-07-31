@@ -207,3 +207,157 @@ detector exits at the second distinct value) and fixed-width dictionaries
 (0.4 ns detection). Both are small wins; neither justifies a phase of its own.
 **Recommendation: fold the CONSTANT/fixed-width part into whatever phase next
 touches the scan, and close this spec.**
+
+---
+
+# Reopened for CONSTANT only (2026-07-30)
+
+The verdict above stands for dictionaries but rested on one number that turns
+out to be a property of the prototype rather than of the problem: **13-21 ns per
+value to detect**. That prototype hashed values generically. When the value fits
+in a 64-bit word — INT, BIGINT, and any string of at most 8 bytes — the value
+*is* the key: no hashing of bytes, no `memcmp`, no pointer chasing, just open
+addressing on a power-of-two table.
+
+Re-measured on that shape, 2048-row chunks (ns per value):
+
+| detector | 1 distinct | 16 | 128 | 1024 | 2048 |
+| --- | --- | --- | --- | --- | --- |
+| CONSTANT check, int32 | 0.49 | ~0 | ~0 | ~0 | ~0 |
+| CONSTANT check, int64 | 0.28 | ~0 | ~0 | ~0 | ~0 |
+| dictionary build, int32 | 0.46 | 0.47 | 0.74 | 0.88 | 0.88 |
+| dictionary build, int64 | 0.46 | 0.47 | 0.78 | 0.93 | 0.89 |
+| dictionary build, 3-char strings | 1.81 | 1.86 | 1.83 | 1.90 | 1.86 |
+| dictionary build, 5-char strings | 2.55 | 2.24 | 2.40 | 2.40 | 2.44 |
+
+Against a decode of ~1.8 ns/value for integers and ~2.1 for short ASCII strings.
+
+**Dictionaries stay closed, for the corrected reason.** The scan-side economics
+are now fine for integers (0.5-0.9 ns), but the deciding half is downstream and
+unchanged: GROUP BY / DISTINCT / JOIN 2-3.5× faster, **`ORDER BY` 3× slower**,
+and the scan cannot know which it is feeding. Emitting one is a bet on the
+consumer. Revisit only with an end-to-end measurement on both shapes.
+
+**CONSTANT ships.** It is the one case that is not a bet:
+
+- a miss costs nothing — the detector exits at the second distinct value, and
+  the mixed-NULL case exits on a counter comparison before looking at any value;
+- a hit costs 0.3-0.5 ns per value;
+- unlike a dictionary, a constant vector has a fast path in essentially every
+  DuckDB operator, so there is no consumer for which it is a pessimisation;
+- and on a hit the batch decode collapses from N values to **one** — the scan
+  itself gets faster, so the win does not depend on downstream at all.
+
+## Implementation
+
+Hook: `RowStager::FinalizeChunk`, per column, ahead of the kernel switch. Three
+cases, ordered so the common one exits first:
+
+1. `st.null_count == row_count` → the column-chunk is entirely NULL.
+   `ConstantVector::SetNull(out, true)` and no kernel runs at all. Detected by
+   comparing two numbers already in hand.
+2. `st.null_count != 0` → mixed NULLs, cannot be constant. One comparison, then
+   the normal kernel.
+3. `st.null_count == 0` → scan for equality; on success decode row 0 alone.
+
+### The equality scan, per arm
+
+- **Direct** (`ops.direct_write`): the values are already in the output vector,
+  written there as they arrived. Compare `stride` bytes at row *i* against row 0
+  and, on success, only `out.SetVectorType(VectorType::CONSTANT_VECTOR)` — row
+  0's value is already at offset 0, so this copies **nothing**.
+- **Fixed**: same comparison against `st.buffer` at `stride`.
+- **Var**: `st.lengths[i] == st.lengths[0]` first, then `memcmp` — length alone
+  rejects most columns before a byte is read.
+
+### Decoding the single value
+
+On a hit the family's existing per-value entry point — `codec::<family>::
+DecodeFromTds(st.ValueAt(0), col, out, 0)` — writes slot 0, and the vector is
+then marked constant. That is one call per column per chunk, not a per-value
+path, and it avoids teaching every batch kernel a "just row 0" mode. The string
+kernel in particular sizes its work from `st.PayloadSize()`, i.e. the whole
+column, so calling it with `count = 1` would convert everything and save nothing.
+
+### Invariants this relies on
+
+`MSSQLResultStream::FillChunk` calls `chunk.Reset()` before filling
+(`mssql_result_stream.cpp:277`), and `DataChunk::Reset` → `ResetFromCache` sets
+`vector_type = FLAT_VECTOR` and resets validity. So a constant vector never
+survives into the next chunk, where `BeginChunk` re-takes `direct_dst` from
+`FlatVector::GetData` and would otherwise be handed a one-value buffer. A
+`D_ASSERT` on the vector type in `BeginChunk` pins that for any future caller at
+no release cost.
+
+**Columns feeding `pk_direct_to_rowid` must be excluded.** In that mode the
+stream writes PK values straight into the rowid vector rather than into a plain
+output column, so the constant path does not apply. The composite-PK paths are
+safe as they stand: they copy with `VectorOperations::Copy`, which is
+vector-type aware. Resolve the exclusion once, in `Configure`, as a per-column
+flag.
+
+### Tests
+
+- a constant chunk for each of Direct / Fixed / Var → CONSTANT emitted, value
+  correct;
+- an all-NULL chunk → CONSTANT and NULL, with no kernel run;
+- a mixed-NULL chunk → stays FLAT;
+- a chunk that differs **only in its last row** → stays FLAT (the detector must
+  not stop early);
+- two consecutive chunks, constant then not, then all-NULL — the reset hazard;
+- a scan with a rowid column over a constant PK.
+
+### Acceptance
+
+The wins to show: a constant column-chunk costs less than a flat one (the decode
+collapses to one value), and nothing else regresses — the miss path is measured
+against the current build on the same interleaved A/B discipline as spec 055.
+
+## As landed
+
+Two things changed against the plan above, both because a measurement said so.
+
+**Only columns that decode take the uniformity scan.** The plan scanned every
+arm, including direct-write ones, on the reasoning that a uniform Direct column
+costs a comparison and a single store. It does — and it saves nothing, because
+there is no decode to collapse: measured **+0.26 ns/value** on a uniform BIGINT
+column for a downstream constant alone. Restricted to the staged families, the
+scan is a pure win and the miss stays free:
+
+| column | uniform | distinct | delta |
+| --- | --- | --- | --- |
+| BIGINT (direct) | 2.26 | 2.27 | 0 |
+| DECIMAL(18,2) | 4.81 | 5.59 | **-14%** |
+| NVARCHAR(16) | 6.72 | 7.88 | **-15%** |
+
+The **all-NULL** case still applies to every column including Direct: it is two
+counters compared, never looks at a value, and skips publishing the validity
+mask.
+
+An earlier version of the detector used `memcmp` per value and measured +1.7
+ns/value on BIGINT — a call into libc where a word compare belongs. Typed loads
+brought that to +0.26 before the restriction removed it entirely.
+
+**The `pk_direct_to_rowid` exclusion turned out to be unnecessary.** That mode
+writes PK values into a plain output vector and `PopulateRowIdVector` returns
+without touching it; the composite paths copy through `VectorOperations::Copy`,
+which is vector-type aware. The real hazard was elsewhere: `CountChunkForDebug`
+reads every row through `FlatVector::GetData`, which on a constant vector counts
+whatever is left in the buffer. Debug-only, and fixed with the change.
+
+## What the tests caught
+
+- **NTEXT decoded as single-byte text.** The constant path publishes row 0
+  through the family's per-value entry, and `string::DecodeFromTds` listed
+  NCHAR / NVARCHAR / XML as UTF-16 but not NTEXT — which was invisible while
+  nothing called it for NTEXT, since the legacy path could not read the type at
+  all before #197. Fixed in `string_codec.cpp`.
+- **A test fixture that reset nothing.** The unit tests reused loose vectors
+  across chunks, a state production never sees because `FillChunk` calls
+  `DataChunk::Reset`. The `D_ASSERT` in `BeginChunk` fired on the first run; the
+  fixture now holds a real `DataChunk` and resets it, so the reuse path under
+  test is the one that ships.
+
+Gates: 17 unit blocks, the full local integration suite, and `diff_check.sh`
+byte-identical across 13 queries against a build without the constant path —
+including the NULL, empty-value, embedded-U+0000, PLP and BCP write-back cases.
