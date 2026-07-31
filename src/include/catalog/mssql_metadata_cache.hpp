@@ -47,6 +47,20 @@ struct MSSQLTableMetadata {
 	vector<MSSQLColumnInfo> columns;  // Column metadata
 	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
 
+	// Physical shape of the target, from the same aggregated sys.partitions
+	// subquery that produces approx_row_count — no extra round trip.
+	//
+	// The write path needs both: the TABLOCK decision is opposite for a heap and
+	// a clustered index (a heap wants it, a clustered index is serialised by it),
+	// and sorted input only pays into a clustered index. A clustered index that
+	// is not a primary key is invisible to primary-key discovery, which filters
+	// on kc.type = 'PK', so this is the only place the extension learns of one.
+	//
+	// index_id 0 is a heap and 1 is a clustered index; a table has exactly one of
+	// the two. Views and objects with no partition rows report heap / 0.
+	bool has_clustered_index = false;
+	idx_t partition_count = 0;
+
 	// Incremental cache state for columns.
 	// Issue #178 (D6): all fields — including these states — are guarded by the
 	// cache-wide MSSQLMetadataCache::mutex_; the former per-table load_mutex is gone.

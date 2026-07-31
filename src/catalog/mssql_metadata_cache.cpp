@@ -52,9 +52,12 @@ static const char *TABLE_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     o.name AS object_name,
     o.type AS object_type,
-    ISNULL(p.rows, 0) AS approx_rows
+    ISNULL(p.rows, 0) AS approx_rows,
+    ISNULL(p.index_id, 0) AS index_id,
+    ISNULL(p.partition_count, 0) AS partition_count
 FROM sys.objects o
-LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows],
+                  MAX(index_id) AS index_id, COUNT(*) AS partition_count
            FROM sys.partitions
            WHERE index_id IN (0, 1)
            GROUP BY object_id) p ON p.object_id = o.object_id
@@ -75,11 +78,14 @@ SELECT
     c.precision,
     c.scale,
     c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name
+    ISNULL(c.collation_name, '') AS collation_name,
+    ISNULL(p.index_id, 0) AS index_id,
+    ISNULL(p.partition_count, 0) AS partition_count
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows],
+                  MAX(index_id) AS index_id, COUNT(*) AS partition_count
            FROM sys.partitions
            WHERE index_id IN (0, 1)
            GROUP BY object_id) p ON p.object_id = o.object_id
@@ -102,12 +108,15 @@ SELECT
     c.precision,
     c.scale,
     c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name
+    ISNULL(c.collation_name, '') AS collation_name,
+    ISNULL(p.index_id, 0) AS index_id,
+    ISNULL(p.partition_count, 0) AS partition_count
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows]
+LEFT JOIN (SELECT object_id, SUM([rows]) AS [rows],
+                  MAX(index_id) AS index_id, COUNT(*) AS partition_count
            FROM sys.partitions
            WHERE index_id IN (0, 1)
            GROUP BY object_id) p ON p.object_id = o.object_id
@@ -301,7 +310,9 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 
 	bool first_row = true;
 	ExecuteMetadataQuery(connection, query, [this, &table_meta, &first_row](const vector<string> &values) {
-		if (values.size() < 10) {
+		// 12 columns: object_type, approx_rows, the eight per-column fields, then
+		// index_id and partition_count. The guard has to cover the LAST index read.
+		if (values.size() < 12) {
 			return;
 		}
 
@@ -318,6 +329,20 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			} catch (...) {
 				table_meta.approx_row_count = 0;
 			}
+			// Physical shape from the same aggregated subquery (see the header):
+			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
+			// partitioned object. Both drive the write path's TABLOCK and sort
+			// decisions. Per object, so it belongs in the first-row branch.
+			try {
+				table_meta.has_clustered_index = std::stoi(values[10]) == 1;
+				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[11]));
+			} catch (...) {
+				table_meta.has_clustered_index = false;
+				table_meta.partition_count = 0;
+			}
+			CACHE_DEBUG(2, "table shape: %s clustered=%d partitions=%llu rows=%llu", table_meta.name.c_str(),
+						table_meta.has_clustered_index ? 1 : 0, (unsigned long long)table_meta.partition_count,
+						(unsigned long long)table_meta.approx_row_count);
 		}
 
 		// Parse column info
@@ -478,7 +503,9 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 	schema.tables.clear();
 
 	ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
-		if (values.size() < 12) {
+		// 14 columns: schema, object, type, approx_rows, the eight per-column
+		// fields, then index_id and partition_count. Guard the LAST index read.
+		if (values.size() < 14) {
 			return;
 		}
 
@@ -514,6 +541,16 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
 			} catch (...) {
 				table_meta.approx_row_count = 0;
+			}
+			// Physical shape from the same aggregated subquery (see the header):
+			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
+			// partitioned object. Both drive the write path's TABLOCK and sort decisions.
+			try {
+				table_meta.has_clustered_index = std::stoi(values[12]) == 1;
+				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[13]));
+			} catch (...) {
+				table_meta.has_clustered_index = false;
+				table_meta.partition_count = 0;
 			}
 			schema.tables.emplace(current_table, std::move(table_meta));
 			auto table_it = schema.tables.find(current_table);
@@ -637,7 +674,9 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		idx_t schema_columns = 0;
 
 		ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
-			if (values.size() < 12) {
+			// 14 columns: schema, object, type, approx_rows, the eight per-column
+			// fields, then index_id and partition_count. Guard the LAST index read.
+			if (values.size() < 14) {
 				return;
 			}
 
@@ -680,6 +719,16 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
 					} catch (...) {
 						table_meta.approx_row_count = 0;
+					}
+					// Physical shape from the same aggregated subquery (see the header):
+					// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
+					// partitioned object. Both drive the write path's TABLOCK and sort decisions.
+					try {
+						table_meta.has_clustered_index = std::stoi(values[12]) == 1;
+						table_meta.partition_count = static_cast<idx_t>(std::stoll(values[13]));
+					} catch (...) {
+						table_meta.has_clustered_index = false;
+						table_meta.partition_count = 0;
 					}
 
 					tables.emplace(current_table, std::move(table_meta));
@@ -992,7 +1041,9 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 		query += "\nORDER BY o.name";
 
 		ExecuteMetadataQuery(connection, query, [&schema](const vector<string> &values) {
-			if (values.size() >= 3) {
+			// 5 columns: object_name, object_type, approx_rows, index_id,
+			// partition_count. Guard the LAST index read, not the first.
+			if (values.size() >= 5) {
 				MSSQLTableMetadata table_meta;
 				table_meta.name = values[0];
 
@@ -1010,6 +1061,16 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
 				} catch (...) {
 					table_meta.approx_row_count = 0;
+				}
+				// Physical shape from the same aggregated subquery (see the header):
+				// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
+				// partitioned object. Both drive the write path's TABLOCK and sort decisions.
+				try {
+					table_meta.has_clustered_index = std::stoi(values[3]) == 1;
+					table_meta.partition_count = static_cast<idx_t>(std::stoll(values[4]));
+				} catch (...) {
+					table_meta.has_clustered_index = false;
+					table_meta.partition_count = 0;
 				}
 
 				// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
@@ -1152,7 +1213,9 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 	auto &schema_meta = schemas_[schema_name];
 
 	ExecuteMetadataQuery(connection, query, [&schema_meta](const vector<string> &values) {
-		if (values.size() >= 3) {
+		// 5 columns: object_name, object_type, approx_rows, index_id,
+		// partition_count. Guard the LAST index read, not the first.
+		if (values.size() >= 5) {
 			MSSQLTableMetadata table_meta;
 			table_meta.name = values[0];
 
@@ -1171,6 +1234,16 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
 			} catch (...) {
 				table_meta.approx_row_count = 0;
+			}
+			// Physical shape from the same aggregated subquery (see the header):
+			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
+			// partitioned object. Both drive the write path's TABLOCK and sort decisions.
+			try {
+				table_meta.has_clustered_index = std::stoi(values[3]) == 1;
+				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[4]));
+			} catch (...) {
+				table_meta.has_clustered_index = false;
+				table_meta.partition_count = 0;
 			}
 
 			schema_meta.tables[table_meta.name] = std::move(table_meta);

@@ -23,6 +23,8 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS part_db (TYPE mssql);
 statement ok
 SELECT mssql_exec('part_db', $$
 IF OBJECT_ID('dbo.PartLog') IS NOT NULL DROP TABLE dbo.PartLog;
+IF OBJECT_ID('dbo.PartHeap') IS NOT NULL DROP TABLE dbo.PartHeap;
+IF OBJECT_ID('dbo.PartNone') IS NOT NULL DROP TABLE dbo.PartNone;
 IF EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = 'ps_part_log')
     DROP PARTITION SCHEME ps_part_log;
 IF EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = 'pf_part_log')
@@ -107,12 +109,95 @@ WHERE database_name = 'part_db' AND table_name = 'PartLog';
 3
 
 # =============================================================================
+# US1.3: projection pushdown — the generated T-SQL must project each column
+# once. A duplicated column reaches SQL Server as `SELECT log_ts, log_ts ...`
+# and fails there, so a successful single-column read is the observable proof.
+# =============================================================================
+
+query I
+SELECT log_ts FROM part_db.dbo.PartLog ORDER BY log_ts LIMIT 1;
+----
+2024-01-15 00:00:00
+
+query I
+SELECT count(message) FROM part_db.dbo.PartLog WHERE message LIKE 'jan%';
+----
+2
+
+# =============================================================================
+# US1.4: a partitioned HEAP — same partition scheme, no clustered index.
+# sys.partitions multiplies rows for index_id = 0 exactly as it does for 1, so
+# the heap case has to be covered separately or half the fix is untested.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE TABLE dbo.PartHeap (log_ts DATETIME2(7) NOT NULL, message NVARCHAR(255))
+    ON ps_part_log (log_ts);
+INSERT INTO dbo.PartHeap (log_ts, message) VALUES
+    ('2024-01-05', 'h jan'), ('2024-02-05', 'h feb'), ('2024-04-05', 'h apr');
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartHeap'
+ORDER BY column_index;
+----
+log_ts	TIMESTAMP_NS
+message	VARCHAR
+
+query I
+SELECT count(*) FROM part_db.dbo.PartHeap;
+----
+3
+
+query I
+SELECT estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartHeap';
+----
+3
+
+# =============================================================================
+# US2.2: the single-partition case must be unchanged — this is the 99% path,
+# and a SUM() over one partition has to give exactly what the old direct join
+# gave. Without this control the aggregation could be wrong in the common case
+# and every assertion above would still pass.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('part_db', $$
+IF OBJECT_ID('dbo.PartNone') IS NOT NULL DROP TABLE dbo.PartNone;
+CREATE TABLE dbo.PartNone (id INT NOT NULL, note NVARCHAR(50));
+INSERT INTO dbo.PartNone (id, note) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartNone';
+----
+2
+
+query I
+SELECT estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartNone';
+----
+5
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 
 statement ok
 SELECT mssql_exec('part_db', $$
 DROP TABLE dbo.PartLog;
+DROP TABLE dbo.PartHeap;
+DROP TABLE dbo.PartNone;
 DROP PARTITION SCHEME ps_part_log;
 DROP PARTITION FUNCTION pf_part_log;
 $$);
