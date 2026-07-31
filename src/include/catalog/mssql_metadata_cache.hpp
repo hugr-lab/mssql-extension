@@ -38,6 +38,18 @@ enum class CacheLoadState : uint8_t {
 };
 
 //===----------------------------------------------------------------------===//
+// Physical structure of a table, as sys.indexes.type reports it for the base
+// structure (index_id 0 or 1). Values are SQL Server's own, so the mapping is
+// checkable against sys.indexes without a translation table.
+//===----------------------------------------------------------------------===//
+
+enum class MSSQLIndexKind : uint8_t {
+	HEAP = 0,					//!< no clustered index; bulk load wants TABLOCK
+	CLUSTERED = 1,				//!< clustered rowstore; TABLOCK serialises loaders
+	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; wants TABLOCK again
+};
+
+//===----------------------------------------------------------------------===//
 // TableMetadata - Cached table/view metadata
 //===----------------------------------------------------------------------===//
 
@@ -50,15 +62,19 @@ struct MSSQLTableMetadata {
 	// Physical shape of the target, from the same aggregated sys.partitions
 	// subquery that produces approx_row_count — no extra round trip.
 	//
-	// The write path needs both: the TABLOCK decision is opposite for a heap and
-	// a clustered index (a heap wants it, a clustered index is serialised by it),
-	// and sorted input only pays into a clustered index. A clustered index that
-	// is not a primary key is invisible to primary-key discovery, which filters
-	// on kc.type = 'PK', so this is the only place the extension learns of one.
+	// The write path needs it: the TABLOCK decision is opposite for a heap and a
+	// clustered rowstore index (a heap wants it, a clustered index is serialised
+	// by it), and sorted input only pays into a clustered index. A clustered
+	// index that is not a primary key is invisible to primary-key discovery,
+	// which filters on kc.type = 'PK', so this is the only place the extension
+	// learns of one.
 	//
-	// index_id 0 is a heap and 1 is a clustered index; a table has exactly one of
-	// the two. Views and objects with no partition rows report heap / 0.
-	bool has_clustered_index = false;
+	// NOT a bool, deliberately. A clustered COLUMNSTORE index reports index_id 1
+	// in sys.partitions exactly as a rowstore one does, and the right TABLOCK
+	// answer for it is the opposite — so a `has_clustered_index` flag would be
+	// accurate by its name and misleading to its only consumer. The kind comes
+	// from sys.indexes.type, which separates them.
+	MSSQLIndexKind index_kind = MSSQLIndexKind::HEAP;
 	idx_t partition_count = 0;
 
 	// Incremental cache state for columns.

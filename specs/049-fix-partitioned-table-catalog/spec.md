@@ -40,14 +40,24 @@ error when the fix is reverted.
   test already present.
 
 **Added beyond the plan:** the same aggregated subquery now also reports the
-object's physical shape — `has_clustered_index` (from `index_id`) and
-`partition_count` — on `MSSQLTableMetadata`, at no extra round trip. Spec 057's
-write path needs both: the TABLOCK decision is opposite for a heap and a
-clustered index, and sorted input only pays into a clustered index. A clustered
-index that is not a primary key is invisible to primary-key discovery (it
-filters on `kc.type = 'PK'`), so this is the only place the extension can learn
-of one. Verified against `sys.indexes` ground truth for a heap, a
-single-partition clustered table and a four-partition clustered table.
+object's physical shape — `index_kind` and `partition_count` on
+`MSSQLTableMetadata`, at no extra round trip. Spec 057's write path needs both:
+the TABLOCK decision is opposite for a heap and a clustered index, and sorted
+input only pays into a clustered index. A clustered index that is not a primary
+key is invisible to primary-key discovery (it filters on `kc.type = 'PK'`), so
+this is the only place the extension can learn of one.
+
+`index_kind` is a typed `MSSQLIndexKind`, not a `has_clustered_index` bool, and
+self-review is what changed it: a clustered **columnstore** index reports
+`index_id = 1` in `sys.partitions` exactly as a rowstore one does, so the bool
+would have been true for it — while the TABLOCK answer for a columnstore is the
+opposite of the answer for a clustered rowstore. The kind therefore comes from
+`sys.indexes.type` (0 heap / 1 clustered / 5 clustered columnstore), which
+separates them. Verified against ground truth for all three shapes plus a
+four-partition clustered table. The extra `LEFT JOIN sys.indexes` costs nothing
+measurable: whichever variant runs first in an A/B pays ~1000 µs and the second
+~600 µs regardless of which is which, so the apparent difference is position
+bias, not the join.
 
 ---
 
