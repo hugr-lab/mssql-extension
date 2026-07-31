@@ -88,6 +88,13 @@ char / varchar / text with a code page
     branch is never worse on the wire. (Exception worth knowing: a handful of CP1252
     punctuation code points — € ‰ † — are 3 bytes in UTF-8. Rare enough not to gate on.)
 
+    The double-byte exclusion is REASONING, NOT MEASUREMENT. A CJK character is 2 bytes
+    in a CP932/936/949/950 varchar and 3 in UTF-8, so casting one should inflate — but the
+    measured inflation in this note (29.8 → 32.9 MB, +10%) is for an `nvarchar` source, not
+    a double-byte `varchar` one. Measure before relying on the exclusion. What IS measured
+    for double-byte columns is that today's path — the server-side CAST to NVARCHAR — reads
+    them correctly with the feature on and off; `test/sql/query/utf8_support.test` pins it.
+
 nchar / nvarchar / ntext
     → if utf8_support_acked and mssql_server_side_utf8 and a UTF-8 target is available:
           CAST(col COLLATE <utf8> AS VARCHAR(m))
