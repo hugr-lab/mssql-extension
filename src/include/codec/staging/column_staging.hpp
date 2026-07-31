@@ -172,10 +172,10 @@ enum class BoundaryStrategy : uint8_t {
 	//! Output bytes equalled input units, so every offset is an input offset
 	//! halved. No search ran.
 	AsciiOffsets,
-	//! Delimiter walk from each value's lower bound, swept a word at a time.
-	SkipSweep,
-	//! Delimiter walk from each value's lower bound, via memchr.
-	SkipMemchr,
+	//! Delimiter walk over every output byte, swept a word at a time.
+	Sweep,
+	//! Delimiter walk over every output byte, via memchr.
+	Memchr,
 	//! A value contained a U+0000 of its own, so the walk was redone against the
 	//! input's own zero units.
 	EmbeddedNul

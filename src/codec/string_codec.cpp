@@ -165,7 +165,14 @@ inline idx_t Utf8UpperBound(idx_t units) {
 
 //! Average bytes one value's delimiter search covers before memchr's call
 //! overhead pays for itself (D5).
-static const size_t MEMCHR_THRESHOLD_BYTES = 64;
+//!
+//! 256, not the 64 this shipped with: that number belonged to a walk that
+//! skipped to each value's lower bound and so searched only the tail. The walk
+//! now starts at the value itself (see WalkDelimited), which makes the run the
+//! value's whole length — and at 80-112 bytes a call into memchr measured
+//! WORSE than the word sweep (11.4 vs 8.2 ns/value). Past ~256 it wins clearly,
+//! and by 1 KB values it is worth 28%.
+static const size_t MEMCHR_THRESHOLD_BYTES = 256;
 
 //! First 0x00 byte at or after `from`, or `limit` if there is none.
 //!
@@ -309,16 +316,25 @@ void SplitWithEmbeddedNuls(const staging::ColumnStaging &st, idx_t count, const 
 
 //! The boundary walk for a column that is not pure ASCII.
 //!
-//! The search starts at the value's own unit count, never before it: every
-//! UTF-16 unit yields at least one UTF-8 byte, so a value's output cannot be
-//! shorter than its input in units, and the first zero byte at or after that
-//! point is provably this value's delimiter.
+//! Every byte is examined, in order, and each value takes the next zero byte as
+//! its delimiter. That is what makes the caller's end-position check EXACT, and
+//! it is the whole reason this does not skip.
 //!
-//! Only the LOWER bound may be used to skip. Jumping to a guessed position such
-//! as twice the unit count is a correctness bug, not a missed optimization: a
-//! mixed-script value whose real length falls between u and 2u would land on a
-//! LATER value's delimiter and silently merge two strings. Every fixture in the
-//! bench matrix is single-script, so such a bug passes the whole of it.
+//! It used to skip to the value's own unit count first — a legal lower bound,
+//! since every UTF-16 unit yields at least one UTF-8 byte, and worth 20-50% on
+//! this kernel. It was also unsound. A value ending in U+0000 has its own zero
+//! sitting at exactly that lower bound, so the search takes it for the
+//! delimiter; the REAL delimiter one byte later then falls inside the next
+//! value's skipped region and is jumped clean over. One zero per value is still
+//! consumed, the walk still lands exactly on `written`, and two strings come out
+//! silently wrong — which is what shipped, and what the spec-059 tests caught.
+//!
+//! Every unconsumed zero has to end up somewhere the walk can see, and without a
+//! skip the only place left is past the end. Keeping the skip means proving no
+//! value carries a U+0000, and every way of proving that costs more than the
+//! skip saves: counting the output's zeros is +55-90%, and detecting them while
+//! staging is +1.5-4.1 ns on every value of every string column, pure ASCII
+//! included.
 //!
 //! Returns where the walk ended, which the caller checks against `written`.
 template <bool TRIM, bool MEMCHR>
@@ -329,7 +345,7 @@ size_t WalkDelimited(const staging::ColumnStaging &st, idx_t count, const char *
 		if (!st.IsValid(row)) {
 			continue;
 		}
-		const size_t delimiter = FindDelimiter<MEMCHR>(blob, offset + st.lengths[row] / 2, written);
+		const size_t delimiter = FindDelimiter<MEMCHR>(blob, offset, written);
 		StoreValue<TRIM>(result, row, blob + offset, static_cast<uint32_t>(delimiter - offset));
 		offset = delimiter + 1;
 	}
@@ -394,26 +410,32 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 	// from its input offset. The conversion was still ONE call; the U+0000 unit
 	// staged after each value separates the values in the output too.
 	//
-	// Each search starts at the value's own unit count and ends at its delimiter,
-	// so the whole column's searching covers exactly (output bytes - input units)
-	// — the delimiters cancel, one byte against one unit. Divided by the values
-	// that produced it, that is the average run one search sees, and it decides
-	// the search for the column at the cost of a single division.
+	// Each search covers one value, start to delimiter, so the average run is
+	// simply the output divided by the values that produced it — one division to
+	// pick the search for the whole column.
+	//
+	// It used to divide (written - units) instead, the length of the tail a
+	// skipping search would have covered. With the skip gone that measured the
+	// wrong thing, and badly: mostly-ASCII text expands by a fraction of a byte
+	// per unit, so a column of 4 KB values scored ~0.2 and swept 4 KB a word at a
+	// time instead of calling memchr once. Correcting the metric is worth 25-28%
+	// on values of a kilobyte and up.
 	//
 	// `values` cannot be zero: reaching here means units > 0, which means some
 	// row staged a payload, which means some row was not NULL.
 	const idx_t values = count - st.null_count;
-	const bool use_memchr = (written - units) / values >= MEMCHR_THRESHOLD_BYTES;
-	st.boundary = use_memchr ? staging::BoundaryStrategy::SkipMemchr : staging::BoundaryStrategy::SkipSweep;
+	const bool use_memchr = written / values >= MEMCHR_THRESHOLD_BYTES;
+	st.boundary = use_memchr ? staging::BoundaryStrategy::Memchr : staging::BoundaryStrategy::Sweep;
 	const size_t offset = use_memchr ? WalkDelimited<TRIM, true>(st, count, blob, written, result)
 									 : WalkDelimited<TRIM, false>(st, count, blob, written, result);
 
-	// Exactly one delimiter per staged value means the walk lands exactly on the
-	// end of the output. Anything else means a value contained a U+0000 of its
-	// own, which shifts every boundary after it. This check is exact and costs
-	// one comparison per chunk — as opposed to scanning each value for a zero
-	// unit while staging it, which would put a pass over the payload on the hot
-	// path to catch a case that then still has to be handled here.
+	// The walk consumes the first `values` zero bytes of the output, in order and
+	// without skipping any. So it ends on the last byte if and only if the output
+	// holds exactly one zero per value — that is, if and only if no value carried
+	// a U+0000 of its own. One comparison, and it is exact.
+	//
+	// It is exact only because the walk does not skip; see WalkDelimited for the
+	// case that made the same comparison lie when it did.
 	if (offset != written) {
 		SplitWithEmbeddedNuls<TRIM>(st, count, src, blob, written, result);
 		st.boundary = staging::BoundaryStrategy::EmbeddedNul;

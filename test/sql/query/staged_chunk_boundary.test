@@ -1,0 +1,120 @@
+# name: test/sql/query/staged_chunk_boundary.test
+# description: The staged read path across chunk boundaries, frame boundaries and its payload budget
+# group: [query]
+
+# Everything here is about the seams the staged path (spec 055) has and the
+# earlier fixtures did not reach: both spec-055 .test files use five rows or
+# fewer, and STANDARD_VECTOR_SIZE is 2048. Untested until spec 059 D3:
+#
+#   - arena reuse across chunks, and BeginChunk re-taking each Direct column's
+#     destination — DataChunk::Reset is free to hand back different memory;
+#   - a chunk closed EARLY by STAGING_CHUNK_PAYLOAD_BUDGET_BYTES (32 MB), which
+#     produces a short DataChunk mid-result-set;
+#   - rows straddling TDS frames, which is what the partial-row path exists for.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS chunk_db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('chunk_db', 'DROP TABLE IF EXISTS dbo.ChunkBoundary');
+
+# One column of each staging shape: Direct (values land straight in the output
+# vector, so this is the one that notices a moved destination), Fixed (staged
+# for a batch kernel) and Var (staged with NULLs interleaved).
+statement ok
+SELECT mssql_exec('chunk_db', 'CREATE TABLE dbo.ChunkBoundary (
+    id INT NOT NULL,
+    direct_col BIGINT NULL,
+    fixed_col DATE NULL,
+    var_col NVARCHAR(60) NULL)');
+
+# 5000 rows: two full chunks and a partial third. Generated server-side.
+statement ok
+SELECT mssql_exec('chunk_db', 'INSERT INTO dbo.ChunkBoundary (id, direct_col, fixed_col, var_col)
+SELECT TOP 5000
+    ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 4 = 0 THEN NULL
+         ELSE CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS BIGINT) * 1000000 END,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 5 = 0 THEN NULL
+         ELSE DATEADD(day, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 3000, ''2000-01-01'') END,
+    CASE WHEN ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 3 = 0 THEN NULL
+         ELSE N''Grüße '' + CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS NVARCHAR(10)) END
+FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+# Values and NULLs both survive the chunk seams: a Direct column whose
+# destination moved would show up as wrong values, not as a wrong count.
+query IIIII
+SELECT COUNT(*), COUNT(direct_col), COUNT(fixed_col), COUNT(var_col), SUM(direct_col)
+FROM chunk_db.dbo.ChunkBoundary;
+----
+5000	3750	4000	3334	9375000000000
+
+# The rows either side of each 2048-row seam decode correctly — the check that
+# an off-by-one in the chunk close would break.
+query IITT
+SELECT id, direct_col, fixed_col, var_col FROM chunk_db.dbo.ChunkBoundary
+WHERE id IN (2047, 2048, 2049, 4095, 4096, 4097) ORDER BY id;
+----
+2047	2047000000	2005-08-09	Grüße 2047
+2048	NULL	2005-08-10	Grüße 2048
+2049	2049000000	2005-08-11	NULL
+4095	4095000000	NULL	NULL
+4096	NULL	2003-01-01	Grüße 4096
+4097	4097000000	2003-01-02	Grüße 4097
+
+# Straddling frames: 512 bytes is the smallest the clamp allows, and these rows
+# are far wider, so nearly every row crosses a frame boundary and the partial-row
+# path runs on nearly all of them. Same answers as above or the path is broken.
+statement ok
+SET mssql_tds_packet_size = 512;
+
+query IIII
+SELECT COUNT(*), COUNT(direct_col), COUNT(fixed_col), COUNT(var_col)
+FROM chunk_db.dbo.ChunkBoundary;
+----
+5000	3750	4000	3334
+
+query IITT
+SELECT id, direct_col, fixed_col, var_col FROM chunk_db.dbo.ChunkBoundary
+WHERE id IN (2048, 4096) ORDER BY id;
+----
+2048	NULL	2005-08-10	Grüße 2048
+4096	NULL	2003-01-01	Grüße 4096
+
+statement ok
+RESET mssql_tds_packet_size;
+
+# The payload budget: STAGING_CHUNK_PAYLOAD_BUDGET_BYTES is 32 MB, so ~40 rows
+# of a 1 MB NVARCHAR(MAX) close a chunk long before 2048 rows and hand a SHORT
+# DataChunk downstream. Nothing else in the suite produces one.
+statement ok
+SELECT mssql_exec('chunk_db', 'DROP TABLE IF EXISTS dbo.ChunkBudget');
+
+statement ok
+SELECT mssql_exec('chunk_db', 'CREATE TABLE dbo.ChunkBudget (id INT, big NVARCHAR(MAX))');
+
+statement ok
+SELECT mssql_exec('chunk_db', 'INSERT INTO dbo.ChunkBudget
+SELECT TOP 60 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+       REPLICATE(CAST(N''x'' AS NVARCHAR(MAX)), 500000)
+FROM sys.all_objects');
+
+# 60 values of 500k characters each: 60 MB of payload, so the budget trips
+# roughly twice. Lengths, not contents, so the assertion stays readable.
+query III
+SELECT COUNT(*), MIN(length(big)), MAX(length(big)) FROM chunk_db.dbo.ChunkBudget;
+----
+60	500000	500000
+
+statement ok
+SELECT mssql_exec('chunk_db', 'DROP TABLE dbo.ChunkBudget');
+
+statement ok
+SELECT mssql_exec('chunk_db', 'DROP TABLE dbo.ChunkBoundary');
+
+statement ok
+DETACH chunk_db;

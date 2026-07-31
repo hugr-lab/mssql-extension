@@ -1,4 +1,5 @@
 #include "tds/encoding/datetime_encoding.hpp"
+
 #include <cstring>
 
 namespace duckdb {
@@ -70,7 +71,24 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 	// microseconds = ticks * 1000000 / 300 = ticks * 10000 / 3
 	int64_t microseconds = (static_cast<int64_t>(ticks) * 10000) / 3;
 
-	return timestamp_t(static_cast<int64_t>(unix_days) * MICROS_PER_DAY + microseconds);
+	// Assembled through an unsigned type, like ConvertMoney and for the same
+	// reason. This is the ONE temporal conversion whose day field is a full signed
+	// 32-bit number — the others read three bytes or a uint16 and cannot reach far
+	// enough — so past ~1.07e8 days the multiply overflows int64, which is
+	// undefined behaviour. Found by the spec-059 fuzz harness in seconds
+	// (`-788529845 * 86400000000`). Unsigned overflow is defined, so a day count
+	// like that now yields a wrapped, meaningless timestamp.
+	//
+	// Meaningless is the honest answer: DATETIME stops at 9999-12-31, no
+	// conforming server sends such a day count, and there is no correct value to
+	// produce for one. Rejecting it with a named error instead was measured at
+	// +0.2 ns on EVERY legal value of every DATETIME column — a fifth of this
+	// kernel — to reword a case only a corrupt stream reaches.
+	const uint64_t bits =
+		static_cast<uint64_t>(unix_days) * static_cast<uint64_t>(MICROS_PER_DAY) + static_cast<uint64_t>(microseconds);
+	int64_t value = 0;
+	std::memcpy(&value, &bits, sizeof(value));
+	return timestamp_t(value);
 }
 
 timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t *data, uint8_t scale) {

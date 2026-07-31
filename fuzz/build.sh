@@ -135,6 +135,50 @@ if want login_response; then
 	build_harness fuzz_login_response fuzz_login_response.cc ${LOGIN_OBJS}
 fi
 
+# 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
+#    codec::staging::RowStager. Deliberately NOT in the default TARGETS — it is
+#    the only harness here that links libduckdb, because the stager writes into
+#    duckdb::Vector, and a sanitizer build of DuckDB is far too heavy for the
+#    per-PR ClusterFuzzLite run. Build it where a libduckdb already exists:
+#
+#      MSSQL_DUCKDB_INC=duckdb/src/include MSSQL_DUCKDB_LIB=build/release/src \
+#      TARGETS=row_stager fuzz/build.sh
+#
+#    Then run it like any other libFuzzer target; see fuzz/README.md.
+if want row_stager; then
+	if [[ -z "${MSSQL_DUCKDB_INC:-}" || -z "${MSSQL_DUCKDB_LIB:-}" ]]; then
+		echo "ERROR: row_stager needs MSSQL_DUCKDB_INC and MSSQL_DUCKDB_LIB (a built libduckdb)." >&2
+		exit 1
+	fi
+	ensure_simdutf
+	STAGER_SRCS=(
+		"${REPO}/src/codec/staging/row_stager.cpp"
+		"${REPO}/src/codec/staging/column_staging.cpp"
+		"${REPO}/src/codec/staging/column_ops.cpp"
+		"${TDS}/tds_token_parser.cpp"
+		"${TDS}/tds_row_reader.cpp"
+		"${TDS}/tds_column_metadata.cpp"
+		"${TDS}/tds_types.cpp"
+		"${TDS}/encoding/utf16.cpp"
+		"${TDS}/encoding/datetime_encoding.cpp"
+		"${TDS}/encoding/decimal_encoding.cpp"
+		"${TDS}/encoding/guid_encoding.cpp"
+		"${TDS}/encoding/bcp_row_encoder.cpp"
+		"${TDS}/encoding/type_converter.cpp"
+		"${REPO}/src/dml/insert/mssql_value_serializer.cpp"
+	)
+	# The family codecs supply the finalize kernels.
+	for f in "${REPO}"/src/codec/*.cpp; do
+		STAGER_SRCS+=("${f}")
+	done
+	INC="${INC} -I${MSSQL_DUCKDB_INC}"
+	STAGER_OBJS="$(compile_objs stager "${STAGER_SRCS[@]}")"
+	echo ">> linking fuzz_row_stager"
+	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
+		"${HERE}/fuzz_row_stager.cc" ${STAGER_OBJS} "${SIMDUTF_OBJ}" \
+		-L"${MSSQL_DUCKDB_LIB}" -lduckdb ${FUZZ_ENGINE} -o "${OUT}/fuzz_row_stager"
+fi
+
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response; do
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
@@ -144,7 +188,7 @@ done
 # tds.dict guides every TDS token-stream harness. Mirror fuzz/run.sh, which
 # applies it to all non-browser_response targets, so CFLite fuzzers get the same
 # guidance as the local AFL++ campaign.
-for t in tds_tokens utf16 envchange_txn login_response; do
+for t in tds_tokens utf16 envchange_txn login_response row_stager; do
 	cp -f "${HERE}/tds.dict" "${OUT}/fuzz_${t}.dict" 2>/dev/null || true
 done
 

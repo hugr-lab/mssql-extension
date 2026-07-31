@@ -96,18 +96,34 @@ bool IsDirectWritable(const tds::ColumnMetadata &column, uint32_t width) {
 
 //! Does this type carry a one-byte length prefix on the wire?
 //!
-//! Only the direct-writable set is classified here — everything else takes the
-//! Convert arm, which re-derives framing through the legacy reader and so needs
-//! no answer from us.
+//! Every fixed-width type FixedWireWidth answers for is classified here, not
+//! just the direct-writable ones. The nullable *N variants and
+//! UNIQUEIDENTIFIER are length-prefixed; the non-nullable forms — TINYINT, BIT,
+//! SMALLINT, INT, BIGINT, REAL, FLOAT, MONEY, SMALLMONEY, DATETIME,
+//! SMALLDATETIME — are sent as bare value bytes.
+//!
+//! MONEYN, DATETIMEN and UNIQUEIDENTIFIER were missing. That was invisible while
+//! the only caller was the direct-writable path — they never reach it — and then
+//! the issue-#89 fallback below started asking too and was told a DATETIMEN is
+//! bare, so the walk read a prefixed value as raw bytes while the parser
+//! consumed its one-byte NULL prefix. Found by the spec-059 fuzz harness; in a
+//! release build that is a heap over-read and every column after it decodes from
+//! the wrong offset.
+//!
+//! The width guard in that fallback is what actually closes the hole, and with
+//! it these three cases are unreachable again. They are corrected anyway because
+//! the answer was simply WRONG about the wire format, and the next caller to ask
+//! would walk into the same trap.
 bool HasOneBytePrefix(uint8_t type_id) {
 	switch (type_id) {
 	case tds::TDS_TYPE_INTN:
 	case tds::TDS_TYPE_BITN:
 	case tds::TDS_TYPE_FLOATN:
+	case tds::TDS_TYPE_MONEYN:
+	case tds::TDS_TYPE_DATETIMEN:
+	case tds::TDS_TYPE_UNIQUEIDENTIFIER:
 		return true;
 	default:
-		// TINYINT, BIT, SMALLINT, INT, BIGINT, REAL, FLOAT: the non-nullable
-		// forms, sent as bare value bytes.
 		return false;
 	}
 }
@@ -343,13 +359,25 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		}
 	}
 	if (width > 0) {
-		// Only a DIVERGING column reaches here: without a divergence a fixed-width
-		// type is either direct-written or claimed by the staged-fixed families
-		// above. It still needs an arm — leaving it Unsupported made the issue-#89
-		// fallback throw for exactly the integer, float and BIT types it exists to
-		// rescue, instead of rendering them as text the way the pre-055 path did.
-		// The Text kernel reads Fixed staging positionally, so Fixed is the right
-		// shape; only the arm was missing.
+		// A DIVERGING column reaches here (without a divergence a fixed-width type
+		// is either direct-written or claimed by the staged-fixed families above),
+		// and so does any *N variant whose declared width is not a width the staged
+		// append can copy. It still needs an arm — leaving it Unsupported made the
+		// issue-#89 fallback throw for exactly the integer, float and BIT types it
+		// exists to rescue, instead of rendering them as text the way the pre-055
+		// path did. The Text kernel reads Fixed staging positionally, so Fixed is
+		// the right shape.
+		//
+		// The width has to be one AppendStagedFixed actually has a case for.
+		// Without this test it took `stride` on trust and fell into the switch's
+		// default, which copies SEVENTEEN bytes: a DATETIMEN declaring 52 then had
+		// 17 bytes read out of a one-byte NULL value. No conforming server sends
+		// such a width, so there is nothing to rescue — say so instead, and let the
+		// error name the column when a value arrives.
+		if (!IsStageableFixedWidth(width)) {
+			ops.arm = AppendArm::Unsupported;
+			return ops;
+		}
 		ops.kind = StagingKind::Fixed;
 		ops.stride = width;
 		ops.arm = HasOneBytePrefix(column.type_id) ? AppendArm::P1StageFixed : AppendArm::RawStageFixed;

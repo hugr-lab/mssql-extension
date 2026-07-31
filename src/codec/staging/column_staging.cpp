@@ -21,10 +21,10 @@ const char *BoundaryStrategyName(BoundaryStrategy strategy) {
 		return "none";
 	case BoundaryStrategy::AsciiOffsets:
 		return "ascii";
-	case BoundaryStrategy::SkipSweep:
-		return "skip+sweep";
-	case BoundaryStrategy::SkipMemchr:
-		return "skip+memchr";
+	case BoundaryStrategy::Sweep:
+		return "sweep";
+	case BoundaryStrategy::Memchr:
+		return "memchr";
 	case BoundaryStrategy::EmbeddedNul:
 		return "embedded-nul";
 	}

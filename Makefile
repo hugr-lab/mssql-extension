@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager-framing help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -404,25 +404,43 @@ test-column-staging: release
 	@echo ""
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/test_column_staging
 
-# Spec 055 T5: RowStager differential framing tests.
+# Staged-read-path C++ tests (specs 055 / 059).
 #
-# Pure in-memory — no SQL Server. Asserts that the staged row walk consumes
-# EXACTLY the bytes RowReader::SkipRow/SkipNBCRow bounded, for every staged wire
-# form. That agreement is what makes the walk's absence of per-value bounds
-# checks safe, and the two framings live in different files with nothing else
-# pinning them together.
+# Both targets go through test/cpp/codec/run_staging_test.sh so the source list
+# lives in exactly ONE place, shared with the CI job — a second copy is exactly
+# the drift the framing test exists to catch. The vcpkg prefix is passed in
+# rather than derived inside the script: make and CI each already know their own
+# triplet.
 #
-# The compile+run lives in test/cpp/codec/run_row_stager_framing.sh so this
-# target and the CI job share ONE source list — a second copy is exactly the
-# drift this test exists to catch. The vcpkg prefix is passed in rather than
-# derived inside the script: make and CI each already know their own triplet.
+# test-row-stager         (spec 059 D1b) — the ROW / NBCROW walks over synthetic
+#                         rows, decoded and checked value by value.
+# test-row-stager-framing (spec 055 T5)  — the same walks pinned against
+#                         RowReader::SkipRow, which is what makes their absence
+#                         of per-value bounds checks safe.
+#
+# ASan hangs at process init on Darwin 25.5, so on a macOS dev box the sanitized
+# binary cannot run at all and SANITIZE=0 is passed there. That keeps the
+# assertions; CI runs both legs sanitized (its macOS runner is older and fine),
+# so the heap-over-read half is covered there.
+STAGING_TEST_SANITIZE := $(shell [ "$$(uname)" = "Darwin" ] && echo 0 || echo 1)
+
+test-row-stager: release
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	SANITIZE=$(STAGING_TEST_SANITIZE) test/cpp/codec/run_staging_test.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) \
+	    test/cpp/codec/test_row_stager.cpp build/release
+
 test-row-stager-framing: release
 	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ]; then \
 		echo "ERROR: $(BENCH_UTF16_VCPKG_INSTALLED) has no triplet subdir; run 'make release' first." >&2; \
 		exit 1; \
 	fi
-	test/cpp/codec/run_row_stager_framing.sh \
-	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) build/release
+	SANITIZE=$(STAGING_TEST_SANITIZE) test/cpp/codec/run_staging_test.sh \
+	    $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET) \
+	    test/cpp/codec/test_row_stager_framing.cpp build/release
 
 # Spec 045: per-type-family codec unit tests
 # Pattern target: `make test-codec-<family>` builds and runs

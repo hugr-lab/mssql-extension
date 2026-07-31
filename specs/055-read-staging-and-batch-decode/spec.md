@@ -336,6 +336,46 @@ Correctness rules that must be in the code as comments, not just here:
   longer delimiter adds nothing — the only hazard is `U+0000` in the data itself, and a two-unit
   delimiter is equally defeated by two consecutive NULs in the data. Handle it with the
   `saw_embedded_nul` gate (exact, detected during staging), never with a rarer delimiter.
+
+  > **What actually shipped, and the defect it caused (found by spec 059, fixed 2026-07-30).**
+  > `saw_embedded_nul` was dropped during implementation — it cost a scan per value on the
+  > staging path — and replaced by a post-hoc test: does the boundary walk end exactly on the
+  > last output byte? That is NOT equivalent. The walk consumes one zero per value but not
+  > necessarily *its own*: a value ending in `U+0000` has that zero sitting exactly at the
+  > lower bound the search starts from, so it is taken for the delimiter, and the real one —
+  > one byte later — falls inside the NEXT value's skipped prefix and is jumped over. Zeros
+  > consumed still equal values, the walk still lands on `written`, and two strings come out
+  > silently wrong. Live server, `N'ab' + NCHAR(0x00C4) + NCHAR(0)` followed by `N'c'`,
+  > decoded as `abÄ` and `\0c`.
+  >
+  > The fix is to stop skipping: with the walk examining every byte in order, no zero can be
+  > jumped, so "did it end on the last byte" becomes exact and free. The alternatives were
+  > measured and are worse: counting the output's zero bytes is +55-90%; a per-value
+  > conversion, which would make boundaries exact by construction, is 5-6x; and this spec's
+  > own `saw_embedded_nul` costs +1.5-4.1 ns/value at staging and taxes EVERY string column,
+  > including the pure-ASCII ones that pay nothing today. (Measured with the count's result
+  > consumed — an earlier reading of "free" was dead-code elimination.)
+  >
+  > **The memchr threshold had to move with it.** It divided `written - units` — the tail a
+  > skipping search covered — by the values. With the walk starting at the value instead,
+  > the run is the value's whole output, and mostly-ASCII text expands by a fraction of a
+  > byte per unit: a column of 4 KB values scored ~0.2 against a threshold of 64 and swept
+  > kilobytes a word at a time. Metric corrected to `written / values`, constant raised to
+  > 256 (at 80-112 bytes a memchr call still loses to the sweep: 11.4 vs 8.2 ns/value).
+  > Worth 25-29% on values of a kilobyte and up, and it stops the regression growing with
+  > length: 4 KB values went +86% -> +40%.
+  >
+  > Final cost of the correctness fix, per value in the kernel: ~0 on pure ASCII and on CJK,
+  > +22% on short Latin-1, +34-48% on long Latin-1. End to end on a live server — 300k rows
+  > of German text in NVARCHAR(100), 20 scans, interleaved — client CPU 0.31s -> 0.32s.
+  >
+  > No delimiter can fix this. The output alphabet is closed: whatever bytes we plant, data
+  > can produce them. The only sound escape is out-of-band boundaries — recover each value's
+  > end by counting UTF-16 units in the output (1-3 bytes = one unit, 4 = two) against the
+  > `u_i` staging already knows, with no delimiter staged at all. That is sound by
+  > construction and drops the delimiter's own cost (2 bytes staged and converted per value),
+  > but it does NOT bring the skip back: counting units in a skipped span still means reading
+  > it. Worth measuring as its own change.
 - **Never probe a guessed boundary position.** Jumping to a guess such as `seg + 2*u_i` (the
   2-bytes-per-unit position) is unsafe: for a value whose real length falls between `u_i` and
   `2*u_i` — any mixed-script value, e.g. `"Привет 123"` — the guess can land on a *later* value's
