@@ -48,12 +48,16 @@ the moment the server sends 0xA7.
 **Per column, from catalog metadata:**
 
 - `sql_type_name`, `is_unicode`, `max_length`, `collation_name`.
-- **proposed addition**: `COLLATIONPROPERTY(c.collation_name, 'CodePage')` as one more
-  column in the existing metadata queries — no extra round trip. It answers both questions
-  that matter and is more robust than matching `_UTF8` on the name:
-  - `65001` → the column is already UTF-8;
-  - `932 / 936 / 949 / 950` → a double-byte East Asian code page, where UTF-8 *inflates*;
-  - anything else → single-byte, where UTF-8 is never larger than UTF-16.
+- **`COLLATIONPROPERTY` is NOT available.** It looked like the robust way to answer both
+  questions that matter — `65001` means the column is already UTF-8, `932 / 936 / 949 / 950`
+  mean a double-byte East Asian code page where UTF-8 *inflates* — and it folds into an
+  existing query at no extra round trip. But **Fabric Warehouse does not support it and
+  closes the connection outright** rather than returning an error (verified against a live
+  warehouse). Putting it in the catalog metadata queries would break catalog loading on
+  Fabric entirely. UTF-8 detection therefore stays on the collation name's `_UTF8` suffix,
+  which is what `MSSQLColumnInfo::is_utf8` already does; the double-byte case has to be
+  recognised by name prefix (`Chinese_`, `Japanese_`, `Korean_`) or left to the opt-in
+  setting below.
 
 **Settings:**
 
@@ -160,12 +164,15 @@ correctly — it simply does not get the speed-up.
 
 The algorithm deliberately never asks "is this Fabric?". It asks whether the feature was
 acked, what the database collation is, and whether a UTF-8 collation exists — all observable.
-The notes below are context, and the two marked *unverified* have not been tested against a
-live endpoint.
+The notes below are context; the one marked *unverified* has not been tested against a live
+endpoint.
 
-- **Fabric Warehouse** stores strings as UTF-8 and its database collation is a UTF-8 one, so
-  its columns report code page 65001 and take the first branch: no cast at all, and the
-  LOGIN7 feature alone delivers the win. *Unverified against a live warehouse.*
+- **Fabric Warehouse — verified against a live warehouse.** Its database collation is
+  `Latin1_General_100_BIN2_UTF8` and every string column reports it, so Fabric takes the
+  first branch: no cast at all, and the LOGIN7 feature alone delivers the win. It logs in
+  through ADAL, acknowledges UTF8SUPPORT, and measured **1,020,060 → 540,030 wire bytes**
+  (1.89x) over 10,000 rows of three varchar columns. That the collation it standardises on
+  is exactly the one this note picks as a cast target is a happy accident worth keeping.
 - **Synapse dedicated SQL pool** — UTF-8 collation support needs checking. If UTF8SUPPORT is
   not acked, or the collation probe comes back NULL, every branch above falls through to
   today's path with no special-casing. *Unverified.*
@@ -188,6 +195,9 @@ live endpoint.
   server, so their byte layout is pinned by `test/cpp/test_login7_encoding.cpp` instead: the
   record's declared Length must equal the bytes produced, and the feature list must parse the
   way a server would.
+- **Fabric's T-SQL surface is narrower than SQL Server's**, and it fails by closing the
+  connection rather than raising. Anything added to a shared metadata query has to be tried
+  there before it ships — `COLLATIONPROPERTY` is the example that cost this note a section.
 - **The client's UTF8_SUPPORT request carries NO data — `FeatureDataLen` is 0.** Only the
   server's acknowledgement has a byte. Sending a data byte is accepted by SQL Server 2022,
   which acks and switches the wire form anyway, but makes **Azure SQL reject the login** with
