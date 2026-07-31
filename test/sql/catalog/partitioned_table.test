@@ -24,7 +24,9 @@ statement ok
 SELECT mssql_exec('part_db', $$
 IF OBJECT_ID('dbo.PartLog') IS NOT NULL DROP TABLE dbo.PartLog;
 IF OBJECT_ID('dbo.PartHeap') IS NOT NULL DROP TABLE dbo.PartHeap;
+IF OBJECT_ID('dbo.PartCci') IS NOT NULL DROP TABLE dbo.PartCci;
 IF OBJECT_ID('dbo.PartNone') IS NOT NULL DROP TABLE dbo.PartNone;
+IF OBJECT_ID('partsch.PartOnly') IS NOT NULL DROP TABLE partsch.PartOnly;
 IF EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = 'ps_part_log')
     DROP PARTITION SCHEME ps_part_log;
 IF EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = 'pf_part_log')
@@ -161,6 +163,131 @@ WHERE database_name = 'part_db' AND table_name = 'PartHeap';
 3
 
 # =============================================================================
+# US1.5: a partitioned clustered COLUMNSTORE. This is the shape that motivates
+# recording sys.indexes.type at all: a CCI reports index_id = 1 in sys.partitions
+# exactly as a clustered rowstore index does, so it multiplies rows identically —
+# but its type is 5, and the write path's TABLOCK answer for it is the opposite
+# of the rowstore one. Verified against SQL Server 2022: index_id 1, type 5.
+#
+# What index_kind actually parses to is pinned in test/cpp/test_index_kind.cpp;
+# it has no SQL-visible surface until the write path consumes it.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('part_db', $$
+IF OBJECT_ID('dbo.PartCci') IS NOT NULL DROP TABLE dbo.PartCci;
+CREATE TABLE dbo.PartCci (log_ts DATETIME2(7) NOT NULL, message NVARCHAR(255))
+    ON ps_part_log (log_ts);
+INSERT INTO dbo.PartCci (log_ts, message) VALUES
+    ('2024-01-08', 'cci jan'), ('2024-01-09', 'cci jan b'), ('2024-03-08', 'cci mar');
+CREATE CLUSTERED COLUMNSTORE INDEX cci_part_log ON dbo.PartCci ON ps_part_log (log_ts);
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartCci'
+ORDER BY column_index;
+----
+log_ts	TIMESTAMP_NS
+message	VARCHAR
+
+query IT
+SELECT log_ts, message FROM part_db.dbo.PartCci ORDER BY log_ts;
+----
+2024-01-08 00:00:00	cci jan
+2024-01-09 00:00:00	cci jan b
+2024-03-08 00:00:00	cci mar
+
+# Two rows in partition 1, one in partition 3 — the sum, not one partition
+query I
+SELECT estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartCci';
+----
+3
+
+# =============================================================================
+# US1.6: the bulk preload path. BulkLoadAll is a THIRD parser with its own
+# SELECT list and its own guard — it is not reached by anything above, since
+# duckdb_columns() drives the per-table and per-schema loaders instead. It had
+# the identical defect (one row per partition per column), so the fix is only
+# half-verified without a preload of the very same tables.
+# =============================================================================
+
+# A dedicated schema holding exactly one partitioned table, so the preload's own
+# counters can be asserted exactly. They come straight out of BulkLoadAll's parse
+# loop, not from the cache, so this is the one assertion here that observes the
+# bulk path directly: a load that multiplied by partitions reports 8 columns.
+statement ok
+SELECT mssql_exec('part_db', $$
+IF OBJECT_ID('partsch.PartOnly') IS NOT NULL DROP TABLE partsch.PartOnly;
+IF SCHEMA_ID('partsch') IS NULL EXEC('CREATE SCHEMA partsch');
+$$);
+
+statement ok
+SELECT mssql_exec('part_db', $$
+CREATE TABLE partsch.PartOnly (log_ts DATETIME2(7) NOT NULL, message NVARCHAR(255))
+    ON ps_part_log (log_ts);
+INSERT INTO partsch.PartOnly (log_ts, message) VALUES
+    ('2024-01-11', 'p jan'), ('2024-03-11', 'p mar');
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+query I
+SELECT mssql_preload_catalog('part_db', 'partsch');
+----
+Preloaded schema 'partsch': 1 tables, 2 columns
+
+query I
+SELECT estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name = 'PartOnly';
+----
+2
+
+statement ok
+SELECT mssql_invalidate_cache('part_db');
+
+statement ok
+SELECT mssql_preload_catalog('part_db');
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartLog'
+ORDER BY column_index;
+----
+log_ts	TIMESTAMP_NS
+message	VARCHAR
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'part_db' AND table_name = 'PartCci'
+ORDER BY column_index;
+----
+log_ts	TIMESTAMP_NS
+message	VARCHAR
+
+# Each partitioned table appears once, with the summed row count — a preload
+# that multiplied rows would report 4 tables' worth of columns and one
+# partition's worth of rows.
+query III
+SELECT table_name, column_count, estimated_size FROM duckdb_tables()
+WHERE database_name = 'part_db' AND table_name IN ('PartLog', 'PartHeap', 'PartCci')
+ORDER BY table_name;
+----
+PartCci	2	3
+PartHeap	2	3
+PartLog	2	3
+
+query I
+SELECT count(*) FROM part_db.dbo.PartHeap;
+----
+3
+
+# =============================================================================
 # US2.2: the single-partition case must be unchanged — this is the 99% path,
 # and a SUM() over one partition has to give exactly what the old direct join
 # gave. Without this control the aggregation could be wrong in the common case
@@ -197,9 +324,12 @@ statement ok
 SELECT mssql_exec('part_db', $$
 DROP TABLE dbo.PartLog;
 DROP TABLE dbo.PartHeap;
+DROP TABLE dbo.PartCci;
 DROP TABLE dbo.PartNone;
+DROP TABLE partsch.PartOnly;
 DROP PARTITION SCHEME ps_part_log;
 DROP PARTITION FUNCTION pf_part_log;
+DROP SCHEMA partsch;
 $$);
 
 statement ok

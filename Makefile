@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing help
+.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -261,6 +261,24 @@ test-gssapi-runtime:
 	@echo ""
 	@echo "Running gssapi_runtime unit test..."
 	build/test/test_gssapi_runtime
+
+# Spec 049 (#85): MSSQLIndexKind / sys.indexes.type mapping unit test.
+# Pure in-memory — no SQL Server, no vcpkg, and nothing to link: the mapper is
+# in a self-contained header, so -I src/include is the whole dependency.
+# This is what keeps the catalog's index_kind honest until the write path
+# consumes it (PR #223 review).
+INDEX_KIND_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+INDEX_KIND_TEST_INCLUDES := -I src/include
+
+test-index-kind:
+	@echo "Building MSSQLIndexKind unit test (spec 049, #85)..."
+	@mkdir -p build/test
+	$(CXX) $(INDEX_KIND_TEST_FLAGS) $(INDEX_KIND_TEST_INCLUDES) \
+	    test/cpp/test_index_kind.cpp \
+	    -o build/test/test_index_kind
+	@echo ""
+	@echo "Running MSSQLIndexKind unit test..."
+	build/test/test_index_kind
 
 # Spec 045: SQL Server Browser parser unit tests (Phase 0).
 # Pure unit test — no SQL Server, no vcpkg, no DuckDB linkage required.

@@ -7,6 +7,7 @@
 #include <vector>
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_index_kind.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -35,18 +36,6 @@ enum class CacheLoadState : uint8_t {
 	LOADING = 1,	 // Currently being loaded (by another thread)
 	LOADED = 2,		 // Successfully loaded and valid
 	STALE = 3		 // TTL expired, needs refresh on next access
-};
-
-//===----------------------------------------------------------------------===//
-// Physical structure of a table, as sys.indexes.type reports it for the base
-// structure (index_id 0 or 1). Values are SQL Server's own, so the mapping is
-// checkable against sys.indexes without a translation table.
-//===----------------------------------------------------------------------===//
-
-enum class MSSQLIndexKind : uint8_t {
-	HEAP = 0,					//!< no clustered index; bulk load wants TABLOCK
-	CLUSTERED = 1,				//!< clustered rowstore; TABLOCK serialises loaders
-	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; wants TABLOCK again
 };
 
 //===----------------------------------------------------------------------===//

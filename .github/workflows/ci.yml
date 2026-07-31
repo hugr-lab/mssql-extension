@@ -125,6 +125,18 @@ jobs:
           fi
           echo "OK: shim resolves GSSAPI/krb5 lazily via dlopen; no hard dependency."
 
+      # Spec 049 (#85): the catalog records the target's physical shape, but
+      # nothing consumes it until the write path lands. This is what would
+      # notice the sys.indexes.type mapping being renumbered or inverted —
+      # in particular type 5 (clustered COLUMNSTORE), which reports index_id 1
+      # exactly like a rowstore index but wants the opposite TABLOCK answer.
+      # Self-contained header: no submodule checkout, nothing to link.
+      - name: Build + run MSSQLIndexKind unit test (spec 049)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_index_kind.cpp -o /tmp/test_index_kind
+          /tmp/test_index_kind
+
   # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)

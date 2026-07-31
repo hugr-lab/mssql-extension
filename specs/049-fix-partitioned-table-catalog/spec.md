@@ -59,6 +59,29 @@ measurable: whichever variant runs first in an A/B pays ~1000 µs and the second
 ~600 µs regardless of which is which, so the apparent difference is position
 bias, not the join.
 
+**Review follow-ups (PR #223).** Three things changed after review:
+
+- **The bulk preload path was untested, and it was broken.** `mssql_preload_catalog()`
+  goes through `BulkLoadAll`, a third parser with its own SELECT list and guard
+  that nothing above reached. Reintroducing the multiplication in the shared bulk
+  template only (dropping the `GROUP BY`, keeping the column count) makes it report
+  `1 tables, 8 columns` for a two-column table on four partitions — the counters
+  come straight from the parse loop, not the cache, so US1.6 asserts them exactly
+  and cannot pass vacuously.
+- **A partitioned clustered COLUMNSTORE fixture (US1.5)** closes the gap between
+  the enum's rationale and the evidence: it is the shape the enum exists for, and
+  it was the one shape the test did not cover.
+- **`index_kind` and `partition_count` had no consumer**, so nothing would have
+  noticed them regressing. The mapping now lives in a self-contained header
+  (`src/include/catalog/mssql_index_kind.hpp`) and is pinned by
+  `test/cpp/test_index_kind.cpp`, which runs in the light CI job on every PR — no
+  submodule, nothing to link. The end-to-end value stays unobservable from SQL
+  until the write path consumes it; that is stated in the test rather than implied.
+  The five per-site comments said `index_id` where the code reads
+  `sys.indexes.type` — corrected — and the parse now publishes both values
+  together, so a malformed `partition_count` no longer discards an `index_kind`
+  that parsed fine.
+
 ---
 
 ## User Scenarios & Testing *(mandatory)*

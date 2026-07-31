@@ -151,30 +151,25 @@ ORDER BY c.column_id
 )";
 
 //===----------------------------------------------------------------------===//
-// sys.indexes.type -> MSSQLIndexKind
+// Physical shape of the object, parsed out of the aggregated sys.partitions
+// subquery. index_type and partition_count always sit last in the SELECT list,
+// so each caller passes their own indices.
 //
-// Only the base structure reaches here (the queries filter index_id IN (0, 1)),
-// so 0/1/5 are exhaustive. Anything else means SQL Server grew a structure this
-// build has not been taught about: report HEAP, which is the conservative
-// answer for the write path — it is the only kind whose TABLOCK decision is
-// safe when the structure is unknown.
+// The two values are parsed into locals and published together: a malformed
+// partition_count must not discard an index_type that parsed fine.
 //===----------------------------------------------------------------------===//
 
-static MSSQLIndexKind IndexKindFromSysIndexesType(const string &raw) {
-	int type_value = 0;
+static void ParseTableShape(const vector<string> &values, idx_t index_type_idx, idx_t partition_count_idx,
+							MSSQLTableMetadata &table_meta) {
+	const MSSQLIndexKind kind = MSSQLIndexKindFromSysIndexesType(values[index_type_idx]);
+	idx_t partitions = 0;
 	try {
-		type_value = std::stoi(raw);
+		partitions = static_cast<idx_t>(std::stoll(values[partition_count_idx]));
 	} catch (...) {
-		return MSSQLIndexKind::HEAP;
+		partitions = 0;
 	}
-	switch (type_value) {
-	case 1:
-		return MSSQLIndexKind::CLUSTERED;
-	case 5:
-		return MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
-	default:
-		return MSSQLIndexKind::HEAP;
-	}
+	table_meta.index_kind = kind;
+	table_meta.partition_count = partitions;
 }
 
 //===----------------------------------------------------------------------===//
@@ -360,16 +355,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 				table_meta.approx_row_count = 0;
 			}
 			// Physical shape from the same aggregated subquery (see the header):
-			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
-			// partitioned object. Both drive the write path's TABLOCK and sort
-			// decisions. Per object, so it belongs in the first-row branch.
-			try {
-				table_meta.index_kind = IndexKindFromSysIndexesType(values[10]);
-				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[11]));
-			} catch (...) {
-				table_meta.index_kind = MSSQLIndexKind::HEAP;
-				table_meta.partition_count = 0;
-			}
+			// values[10] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+			// object. Both drive the write path's TABLOCK and sort decisions.
+			// Per object, so it belongs in the first-row branch.
+			ParseTableShape(values, 10, 11, table_meta);
 			CACHE_DEBUG(2, "table shape: %s kind=%d partitions=%llu rows=%llu", table_meta.name.c_str(),
 						(int)table_meta.index_kind, (unsigned long long)table_meta.partition_count,
 						(unsigned long long)table_meta.approx_row_count);
@@ -573,15 +563,10 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 				table_meta.approx_row_count = 0;
 			}
 			// Physical shape from the same aggregated subquery (see the header):
-			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
-			// partitioned object. Both drive the write path's TABLOCK and sort decisions.
-			try {
-				table_meta.index_kind = IndexKindFromSysIndexesType(values[12]);
-				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[13]));
-			} catch (...) {
-				table_meta.index_kind = MSSQLIndexKind::HEAP;
-				table_meta.partition_count = 0;
-			}
+			// values[12] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+			// object. Both drive the write path's TABLOCK and sort decisions.
+			ParseTableShape(values, 12, 13, table_meta);
 			schema.tables.emplace(current_table, std::move(table_meta));
 			auto table_it = schema.tables.find(current_table);
 			current_table_meta = &table_it->second;
@@ -751,15 +736,11 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 						table_meta.approx_row_count = 0;
 					}
 					// Physical shape from the same aggregated subquery (see the header):
-					// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
-					// partitioned object. Both drive the write path's TABLOCK and sort decisions.
-					try {
-						table_meta.index_kind = IndexKindFromSysIndexesType(values[12]);
-						table_meta.partition_count = static_cast<idx_t>(std::stoll(values[13]));
-					} catch (...) {
-						table_meta.index_kind = MSSQLIndexKind::HEAP;
-						table_meta.partition_count = 0;
-					}
+					// values[12] is sys.indexes.type — 1 clustered rowstore, 5
+					// clustered COLUMNSTORE, 0 heap — and partition_count > 1 marks
+					// a partitioned object. Both drive the write path's TABLOCK and
+					// sort decisions.
+					ParseTableShape(values, 12, 13, table_meta);
 
 					tables.emplace(current_table, std::move(table_meta));
 					table_it = tables.find(current_table);
@@ -1093,15 +1074,10 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 					table_meta.approx_row_count = 0;
 				}
 				// Physical shape from the same aggregated subquery (see the header):
-				// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
-				// partitioned object. Both drive the write path's TABLOCK and sort decisions.
-				try {
-					table_meta.index_kind = IndexKindFromSysIndexesType(values[3]);
-					table_meta.partition_count = static_cast<idx_t>(std::stoll(values[4]));
-				} catch (...) {
-					table_meta.index_kind = MSSQLIndexKind::HEAP;
-					table_meta.partition_count = 0;
-				}
+				// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+				// object. Both drive the write path's TABLOCK and sort decisions.
+				ParseTableShape(values, 3, 4, table_meta);
 
 				// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
 				schema.tables.emplace(table_meta.name, std::move(table_meta));
@@ -1266,15 +1242,10 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 				table_meta.approx_row_count = 0;
 			}
 			// Physical shape from the same aggregated subquery (see the header):
-			// index_id 1 is a clustered index, 0 a heap; partition_count > 1 marks a
-			// partitioned object. Both drive the write path's TABLOCK and sort decisions.
-			try {
-				table_meta.index_kind = IndexKindFromSysIndexesType(values[3]);
-				table_meta.partition_count = static_cast<idx_t>(std::stoll(values[4]));
-			} catch (...) {
-				table_meta.index_kind = MSSQLIndexKind::HEAP;
-				table_meta.partition_count = 0;
-			}
+			// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+			// object. Both drive the write path's TABLOCK and sort decisions.
+			ParseTableShape(values, 3, 4, table_meta);
 
 			schema_meta.tables[table_meta.name] = std::move(table_meta);
 		}
