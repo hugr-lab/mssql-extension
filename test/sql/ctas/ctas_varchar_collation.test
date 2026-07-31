@@ -67,6 +67,32 @@ WHERE table_name = 'CtasVarcharCollation' AND column_name = 's' LIMIT 1;
 VARCHAR	true
 
 # =============================================================================
+# mssql_utf8_collation picks which UTF-8 collation is asked for. It matters
+# because the collation is stored in the schema and governs every later
+# comparison against the column, so a Latin1 default is wrong for a database
+# that is not Latin1-based.
+# =============================================================================
+
+statement ok
+SET mssql_utf8_collation = 'Cyrillic_General_100_CI_AS_SC_UTF8';
+
+statement ok
+DROP TABLE IF EXISTS ctas_col.dbo.CtasVarcharCyrillic;
+
+statement ok
+CREATE TABLE ctas_col.dbo.CtasVarcharCyrillic AS
+SELECT * FROM (VALUES ('Привет мир'), ('漢字とかな')) t(s);
+
+query T
+SELECT s FROM ctas_col.dbo.CtasVarcharCyrillic ORDER BY s;
+----
+Привет мир
+漢字とかな
+
+statement ok
+SET mssql_utf8_collation = 'Latin1_General_100_CI_AS_SC_UTF8';
+
+# =============================================================================
 # The default (NVARCHAR) is unchanged: it never had this problem, and nothing
 # about the fix should have moved it.
 # =============================================================================
@@ -94,6 +120,7 @@ SELECT s FROM ctas_col.dbo.CtasNvarcharControl ORDER BY s;
 statement ok
 SELECT mssql_exec('ctas_col', $$
 DROP TABLE dbo.CtasVarcharCollation;
+DROP TABLE dbo.CtasVarcharCyrillic;
 DROP TABLE dbo.CtasNvarcharControl;
 $$);
 

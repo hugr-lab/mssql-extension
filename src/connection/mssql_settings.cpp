@@ -243,6 +243,22 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
 							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
 
+	// mssql_utf8_collation - collation for VARCHAR targets (issue #225).
+	// Only consulted when mssql_ctas_text_type is VARCHAR and the server granted
+	// UTF8SUPPORT at login. The default is the UTF-8 sibling of the usual
+	// Latin1 defaults; override it when the database's own collation is not
+	// Latin1-based, since this collation is stored in the schema and governs
+	// every later comparison against the column. Empty means "add no COLLATE
+	// clause", which lets the column inherit the database default — right when
+	// that default is already UTF-8, and the way back to the pre-#225 behaviour
+	// otherwise. The name is not validated here: SQL Server rejects an unknown
+	// collation by name, which is a clearer error than anything this could say.
+	config.AddExtensionOption("mssql_utf8_collation",
+							  "Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "
+							  "(default: Latin1_General_100_CI_AS_SC_UTF8; empty inherits the database default)",
+							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), nullptr,
+							  SetScope::GLOBAL);
+
 	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer
 	// BCP is 2-10x faster than batched INSERT statements
 	config.AddExtensionOption("mssql_ctas_use_bcp",
@@ -496,6 +512,11 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 	// Load text_type setting
 	if (context.TryGetCurrentSetting("mssql_ctas_text_type", val)) {
 		config.text_type = CTASConfig::ParseTextType(val.ToString());
+	}
+
+	// Load the UTF-8 collation for VARCHAR targets (issue #225)
+	if (context.TryGetCurrentSetting("mssql_utf8_collation", val)) {
+		config.utf8_collation = val.IsNull() ? string() : val.ToString();
 	}
 
 	// Inherit INSERT settings for batch insert phase (when use_bcp = false)

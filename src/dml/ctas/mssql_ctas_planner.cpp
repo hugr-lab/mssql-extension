@@ -42,9 +42,9 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	// Only ask for a UTF-8 collation when the server granted UTF8SUPPORT, since a
 	// server without the feature has no UTF-8 collations either and the DDL would
 	// fail. When the database default is already UTF-8 (Fabric), inherit it.
-	if (config.text_type == CTASTextType::VARCHAR && catalog.UTF8SupportAcked() &&
+	if (config.text_type == CTASTextType::VARCHAR && !config.utf8_collation.empty() && catalog.UTF8SupportAcked() &&
 		!StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
-		config.varchar_collation = MSSQL_DEFAULT_UTF8_COLLATION;
+		config.varchar_collation = config.utf8_collation;
 		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s (UTF8SUPPORT granted)",
 							   config.varchar_collation.c_str());
 	}

@@ -29,6 +29,10 @@ struct CTASConfig {
 	// From mssql_ctas_text_type setting
 	CTASTextType text_type = CTASTextType::NVARCHAR;
 
+	// From mssql_utf8_collation — the collation to ASK for. Whether it is used
+	// at all depends on the server granting UTF8SUPPORT; see varchar_collation.
+	string utf8_collation = MSSQL_DEFAULT_UTF8_COLLATION;
+
 	// Collation to attach to a VARCHAR target column, or empty to inherit the
 	// database default (issue #225). Only ever set when the server granted
 	// UTF8SUPPORT: without it, a VARCHAR column takes the database's code page
