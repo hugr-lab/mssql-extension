@@ -2,8 +2,87 @@
 
 **Feature Branch**: `049-fix-partitioned-table-catalog`
 **Created**: 2026-05-19
-**Status**: Draft
+**Status**: Implemented — 2026-07-31
 **Input**: User description: "Fix issue #85 — querying a SQL Server table with a partitioned clustered index fails with `Catalog Error: Column with name <col> already exists!`. Root cause: the three catalog metadata queries in `src/catalog/mssql_metadata_cache.cpp` join `sys.partitions` without aggregating, so for an N-partition table every column row is multiplied N times. Fix the queries, add a regression test, and confirm tables with single partitions still report the same row counts."
+
+## As landed (2026-07-31)
+
+Implemented as diagnosed: all three metadata queries in
+`src/catalog/mssql_metadata_cache.cpp` now join a **pre-aggregated**
+`sys.partitions` subquery (`SUM([rows]) ... GROUP BY object_id`) instead of the
+view directly, which fixes the column multiplication (US1) and the
+arbitrary-partition row count (US2) with one change.
+
+Regression test `test/sql/catalog/partitioned_table.test` covers US1.1-1.4 and
+US2.1-2.2: columns reported once, the table listed once, rows read once,
+`estimated_size = 3` across four partitions (a value no single partition holds,
+so the assertion cannot pass by picking one), projection pushdown, a partitioned
+**heap** (`index_id = 0` multiplies exactly as `1` does), and a single-partition
+control so the 99% path is pinned too. Verified to fail with the exact issue-#85
+error when the fix is reverted.
+
+**Divergences from the plan, deliberate:**
+
+- **T001/T002 (seed partitioned tables via `docker/init`) not done.** The test
+  creates and drops its own partition function, scheme and tables inline, so it
+  is self-contained and needs no container rebuild to run. That is strictly more
+  portable than a seeded fixture; the cost is a slightly longer test.
+- **T009a-d (separate pushdown / insert / DML / COPY test files) not written.**
+  Verified manually instead: INSERT, `COPY ... (FORMAT 'bcp')`, filter pushdown
+  and the cardinality estimate all work against a partitioned clustered-index
+  table. UPDATE/DELETE are rejected there, but for an unrelated pre-existing
+  reason — they require a primary key for the rowid path, and the fixture had a
+  clustered index that is not a PK. Projection pushdown is covered in the main
+  test file rather than a separate one.
+- **T010/T011 (C++ test asserting the SQL template literals) not done.** It
+  would need the file-local templates exposed through accessors — production
+  surface added solely for a test that is weaker than the SQL-level regression
+  test already present.
+
+**Added beyond the plan:** the same aggregated subquery now also reports the
+object's physical shape — `index_kind` and `partition_count` on
+`MSSQLTableMetadata`, at no extra round trip. Spec 057's write path needs both:
+the TABLOCK decision is opposite for a heap and a clustered index, and sorted
+input only pays into a clustered index. A clustered index that is not a primary
+key is invisible to primary-key discovery (it filters on `kc.type = 'PK'`), so
+this is the only place the extension can learn of one.
+
+`index_kind` is a typed `MSSQLIndexKind`, not a `has_clustered_index` bool, and
+self-review is what changed it: a clustered **columnstore** index reports
+`index_id = 1` in `sys.partitions` exactly as a rowstore one does, so the bool
+would have been true for it — while the TABLOCK answer for a columnstore is the
+opposite of the answer for a clustered rowstore. The kind therefore comes from
+`sys.indexes.type` (0 heap / 1 clustered / 5 clustered columnstore), which
+separates them. Verified against ground truth for all three shapes plus a
+four-partition clustered table. The extra `LEFT JOIN sys.indexes` costs nothing
+measurable: whichever variant runs first in an A/B pays ~1000 µs and the second
+~600 µs regardless of which is which, so the apparent difference is position
+bias, not the join.
+
+**Review follow-ups (PR #223).** Three things changed after review:
+
+- **The bulk preload path was untested, and it was broken.** `mssql_preload_catalog()`
+  goes through `BulkLoadAll`, a third parser with its own SELECT list and guard
+  that nothing above reached. Reintroducing the multiplication in the shared bulk
+  template only (dropping the `GROUP BY`, keeping the column count) makes it report
+  `1 tables, 8 columns` for a two-column table on four partitions — the counters
+  come straight from the parse loop, not the cache, so US1.6 asserts them exactly
+  and cannot pass vacuously.
+- **A partitioned clustered COLUMNSTORE fixture (US1.5)** closes the gap between
+  the enum's rationale and the evidence: it is the shape the enum exists for, and
+  it was the one shape the test did not cover.
+- **`index_kind` and `partition_count` had no consumer**, so nothing would have
+  noticed them regressing. The mapping now lives in a self-contained header
+  (`src/include/catalog/mssql_index_kind.hpp`) and is pinned by
+  `test/cpp/test_index_kind.cpp`, which runs in the light CI job on every PR — no
+  submodule, nothing to link. The end-to-end value stays unobservable from SQL
+  until the write path consumes it; that is stated in the test rather than implied.
+  The five per-site comments said `index_id` where the code reads
+  `sys.indexes.type` — corrected — and the parse now publishes both values
+  together, so a malformed `partition_count` no longer discards an `index_kind`
+  that parsed fine.
+
+---
 
 ## User Scenarios & Testing *(mandatory)*
 

@@ -7,6 +7,7 @@
 #include <vector>
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_index_kind.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -46,6 +47,24 @@ struct MSSQLTableMetadata {
 	MSSQLObjectType object_type;	  // TABLE or VIEW
 	vector<MSSQLColumnInfo> columns;  // Column metadata
 	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
+
+	// Physical shape of the target, from the same aggregated sys.partitions
+	// subquery that produces approx_row_count — no extra round trip.
+	//
+	// The write path needs it: the TABLOCK decision is opposite for a heap and a
+	// clustered rowstore index (a heap wants it, a clustered index is serialised
+	// by it), and sorted input only pays into a clustered index. A clustered
+	// index that is not a primary key is invisible to primary-key discovery,
+	// which filters on kc.type = 'PK', so this is the only place the extension
+	// learns of one.
+	//
+	// NOT a bool, deliberately. A clustered COLUMNSTORE index reports index_id 1
+	// in sys.partitions exactly as a rowstore one does, and the right TABLOCK
+	// answer for it is the opposite — so a `has_clustered_index` flag would be
+	// accurate by its name and misleading to its only consumer. The kind comes
+	// from sys.indexes.type, which separates them.
+	MSSQLIndexKind index_kind = MSSQLIndexKind::HEAP;
+	idx_t partition_count = 0;
 
 	// Incremental cache state for columns.
 	// Issue #178 (D6): all fields — including these states — are guarded by the
