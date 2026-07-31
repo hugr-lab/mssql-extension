@@ -14,6 +14,13 @@ namespace mssql {
 constexpr bool MSSQL_DEFAULT_CTAS_DROP_ON_FAILURE = false;
 constexpr const char *MSSQL_DEFAULT_CTAS_TEXT_TYPE = "NVARCHAR";
 
+// Collation given to a VARCHAR target when the server granted UTF8SUPPORT.
+// CI_AS rather than BIN2: this collation is stored in the schema and governs
+// every comparison against the column afterwards, so it has to match what a
+// user gets from the usual database defaults, not silently make the column
+// case- and accent-sensitive.
+constexpr const char *MSSQL_DEFAULT_UTF8_COLLATION = "Latin1_General_100_CI_AS_SC_UTF8";
+
 // Text type policy for CTAS DDL generation
 enum class CTASTextType { NVARCHAR, VARCHAR };
 
@@ -21,6 +28,19 @@ enum class CTASTextType { NVARCHAR, VARCHAR };
 struct CTASConfig {
 	// From mssql_ctas_text_type setting
 	CTASTextType text_type = CTASTextType::NVARCHAR;
+
+	// From mssql_utf8_collation — the collation to ASK for. Whether it is used
+	// at all depends on the server granting UTF8SUPPORT; see varchar_collation.
+	string utf8_collation = MSSQL_DEFAULT_UTF8_COLLATION;
+
+	// Collation to attach to a VARCHAR target column, or empty to inherit the
+	// database default (issue #225). Only ever set when the server granted
+	// UTF8SUPPORT: without it, a VARCHAR column takes the database's code page
+	// and everything outside that page is replaced by '?' ON INSERT — silently.
+	// Empty is also the right answer when the database default is already a
+	// UTF-8 collation, as it is on Fabric: inheriting is cleaner than imposing
+	// a Latin1 one.
+	string varchar_collation;
 
 	// From mssql_ctas_drop_on_failure setting
 	bool drop_on_failure = MSSQL_DEFAULT_CTAS_DROP_ON_FAILURE;

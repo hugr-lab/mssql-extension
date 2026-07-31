@@ -1,0 +1,190 @@
+# name: test/sql/query/utf8_support.test
+# description: UTF8SUPPORT changes the wire form of UTF-8 collation columns, never the value (issue #225)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# A column declared with a UTF-8 collation arrives as UTF-8 (TDS 0xA7) when the
+# server acknowledges UTF8SUPPORT, and as server-transcoded UTF-16 (0xE7) when
+# it does not. Both are correct; only the byte count differs. What must never
+# differ is the value, so the same rows are read twice — once per wire form —
+# and compared against literals.
+#
+# Non-ASCII is the whole point here: an ASCII-only fixture passes even if one
+# path mangles everything outside the database's code page.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS u8_db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('u8_db', $$
+IF OBJECT_ID('dbo.Utf8Wire') IS NOT NULL DROP TABLE dbo.Utf8Wire;
+CREATE TABLE dbo.Utf8Wire (
+    id INT NOT NULL,
+    v_utf8 VARCHAR(200) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL,
+    v_nchar NVARCHAR(200) NULL
+);
+-- Every literal is N'...': a bare 'literal' is parsed in the DATABASE's code
+-- page before it is ever stored, so on a CP1252 database the Cyrillic and CJK
+-- rows would land in the table already destroyed as '?'. The column being
+-- UTF-8 does not save them — the loss happens at parse time, not at assignment.
+INSERT INTO dbo.Utf8Wire (id, v_utf8, v_nchar) VALUES
+    (1, N'plain ascii',       N'plain ascii'),
+    (2, N'Привет мир',        N'Привет мир'),
+    (3, N'漢字とかな',         N'漢字とかな'),
+    (4, N'emoji ' + NCHAR(0xD83D) + NCHAR(0xDE00), N'emoji ' + NCHAR(0xD83D) + NCHAR(0xDE00)),
+    (5, N'euro ' + NCHAR(0x20AC), N'euro ' + NCHAR(0x20AC)),
+    (6, NULL,                 NULL);
+$$);
+
+# =============================================================================
+# Default: the feature is requested. A UTF-8 collation column then arrives as
+# UTF-8 and is copied into the vector without the UTF-16 decode.
+# =============================================================================
+
+statement ok
+SET mssql_utf8_support = true;
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query IT
+SELECT id, v_utf8 FROM u8_db.dbo.Utf8Wire ORDER BY id;
+----
+1	plain ascii
+2	Привет мир
+3	漢字とかな
+4	emoji 😀
+5	euro €
+6	NULL
+
+# Character counts, not byte counts: proves the value decoded as text rather
+# than arriving as a run of bytes DuckDB happens to accept.
+query II
+SELECT id, length(v_utf8) FROM u8_db.dbo.Utf8Wire WHERE v_utf8 IS NOT NULL ORDER BY id;
+----
+1	11
+2	10
+3	5
+4	7
+5	6
+
+# =============================================================================
+# Opt-out: the same rows, fetched as UTF-16 because the request is not sent.
+# Every value must be identical — this is the fallback the whole feature has to
+# degrade to.
+# =============================================================================
+
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query IT
+SELECT id, v_utf8 FROM u8_db.dbo.Utf8Wire ORDER BY id;
+----
+1	plain ascii
+2	Привет мир
+3	漢字とかな
+4	emoji 😀
+5	euro €
+6	NULL
+
+# An NVARCHAR column is untouched by the feature in either direction; it is the
+# control that says the fixture itself is sound.
+query IT
+SELECT id, v_nchar FROM u8_db.dbo.Utf8Wire ORDER BY id;
+----
+1	plain ascii
+2	Привет мир
+3	漢字とかな
+4	emoji 😀
+5	euro €
+6	NULL
+
+statement ok
+SET mssql_utf8_support = true;
+
+# =============================================================================
+# Double-byte collations. A varchar under CP932/936/949/950 stores two bytes per
+# character, so it is the shape most likely to break an encoding change — and it
+# is the one shape the fixtures above do not contain, since UTF-8 and UTF-16 are
+# both wide by design.
+#
+# The feature must not touch these columns at all: it only changes the wire form
+# of collations whose fUTF8 bit is set. What keeps them readable is the scan's
+# own server-side CAST to NVARCHAR (spec 026), which is independent of
+# UTF8SUPPORT — so both settings must return identical text.
+#
+# Verified against SQL Server 2022: Chinese_PRC_CI_AS is code page 936 and stores
+# 汉字测试 in 8 bytes; Japanese_CI_AS is 932 and stores 日本語テスト in 12.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('u8_db', $$
+IF OBJECT_ID('dbo.Utf8Dbcs') IS NOT NULL DROP TABLE dbo.Utf8Dbcs;
+CREATE TABLE dbo.Utf8Dbcs (
+    id INT NOT NULL,
+    v_cn VARCHAR(100) COLLATE Chinese_PRC_CI_AS NULL,
+    v_jp VARCHAR(100) COLLATE Japanese_CI_AS NULL,
+    n    NVARCHAR(100) NULL
+);
+INSERT INTO dbo.Utf8Dbcs (id, v_cn, v_jp, n) VALUES
+    (1, N'汉字测试', N'日本語テスト', N'汉字测试'),
+    (2, N'mixed 汉字 ascii', N'mixed 日本語 ascii', N'mixed 汉字 ascii'),
+    (3, NULL, NULL, NULL);
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query ITTT
+SELECT id, v_cn, v_jp, n FROM u8_db.dbo.Utf8Dbcs ORDER BY id;
+----
+1	汉字测试	日本語テスト	汉字测试
+2	mixed 汉字 ascii	mixed 日本語 ascii	mixed 汉字 ascii
+3	NULL	NULL	NULL
+
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+SELECT mssql_invalidate_cache('u8_db');
+
+query ITTT
+SELECT id, v_cn, v_jp, n FROM u8_db.dbo.Utf8Dbcs ORDER BY id;
+----
+1	汉字测试	日本語テスト	汉字测试
+2	mixed 汉字 ascii	mixed 日本語 ascii	mixed 汉字 ascii
+3	NULL	NULL	NULL
+
+# Character counts, not byte counts: 汉字测试 is 4 characters however the server
+# stored it, and a code-page round trip that lost anything would not land here.
+query III
+SELECT id, length(v_cn), length(v_jp) FROM u8_db.dbo.Utf8Dbcs WHERE id = 1;
+----
+1	4	6
+
+statement ok
+SET mssql_utf8_support = true;
+
+statement ok
+SELECT mssql_exec('u8_db', $$DROP TABLE dbo.Utf8Dbcs;$$);
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('u8_db', $$DROP TABLE dbo.Utf8Wire;$$);
+
+statement ok
+DETACH u8_db;

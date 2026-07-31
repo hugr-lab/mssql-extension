@@ -485,7 +485,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 	// Step 1: Send LOGIN7 with ADAL FEDAUTH extension (no token embedded)
 	TdsPacket login = TdsProtocol::BuildLogin7WithADAL(client_hostname, tds_server_name_, database, fedauth_echo_,
-													   login7_app_name, requested_packet_size_);
+													   login7_app_name, requested_packet_size_, request_utf8_support_);
 	login.SetPacketId(next_packet_id_++);
 
 	// Debug: dump LOGIN7 payload (last 20 bytes should contain FEDAUTH extension)
@@ -533,6 +533,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 	}
 
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+	NoteFeatureAcks(login_response);
 
 	// Check if we received FEDAUTHINFO token (ADAL workflow)
 	if (login_response.has_fedauth_info) {
@@ -610,6 +611,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 		// Parse final response
 		login_response = TdsProtocol::ParseLoginResponse(response);
+		NoteFeatureAcks(login_response);
 	}
 
 	// Check for success
@@ -721,7 +723,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 	TdsPacket login =
 		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
-										 initial_blob, login7_app_name, requested_packet_size_);
+										 initial_blob, login7_app_name, requested_packet_size_, request_utf8_support_);
 
 	// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
 	// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
@@ -755,6 +757,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		}
 
 		LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+		NoteFeatureAcks(login_response);
 		if (login_response.success) {
 			spid_ = login_response.spid;
 			negotiated_packet_size_ = login_response.negotiated_packet_size;
@@ -841,8 +844,8 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	// raises the value on its own, so asking for the 4096 default (as this did
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
-	TdsPacket login =
-		TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name, requested_packet_size_);
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
+											   requested_packet_size_, request_utf8_support_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
@@ -857,6 +860,7 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	}
 
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+	NoteFeatureAcks(login_response);
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
 			// Include the ERROR-token State byte: for 18456 it is the only field

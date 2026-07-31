@@ -1069,7 +1069,7 @@ static string TranslateConnectionError(const string &error, const string &host, 
 // Azure AD Connection Validation
 //===----------------------------------------------------------------------===//
 
-void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &info, int timeout_seconds) {
+void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(
 		1, "ValidateAzureConnection: host=%s port=%d database=%s azure_secret=%s encrypt=%s timeout=%ds",
 		info.host.c_str(), info.port, info.database.c_str(), info.azure_secret_name.c_str(),
@@ -1095,6 +1095,7 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 	// Create a temporary connection to test Azure AD credentials
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
@@ -1114,6 +1115,7 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 		conn.Close();
 		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
 	}
+	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication succeeded");
 
 	// Test query
@@ -1152,7 +1154,7 @@ void ValidateAzureConnection(ClientContext &context, const MSSQLConnectionInfo &
 // Manual Token Connection Validation (Spec 032)
 //===----------------------------------------------------------------------===//
 
-void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
+void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
 								   int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
@@ -1161,6 +1163,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 	// Create a temporary connection to test the pre-provided token
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
@@ -1179,6 +1182,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 		conn.Close();
 		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
 	}
+	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH succeeded");
 
 	// Test query
@@ -1213,7 +1217,7 @@ void ValidateManualTokenConnection(const MSSQLConnectionInfo &info, const std::v
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation complete");
 }
 
-void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
 							info.use_encrypt ? "yes" : "no", timeout_seconds);
@@ -1221,6 +1225,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 	// Create a temporary connection to test credentials
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
@@ -1243,6 +1248,7 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", translated);
 	}
+	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication succeeded");
 
 	// If TLS is enabled, execute a simple validation query to verify TLS data path works
@@ -1295,13 +1301,14 @@ void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
 // Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
 // instead of at first query.
 //===----------------------------------------------------------------------===//
-void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds) {
+void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
 							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
 							timeout_seconds);
 
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
+	conn.SetRequestUtf8Support(info.utf8_support);
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
 		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
@@ -1334,6 +1341,7 @@ void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeo
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
 	}
+	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
 
 	conn.Close();
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: success");
@@ -1521,6 +1529,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// both directions for the whole life of every pooled connection.
 	connection_info->tds_packet_size =
 		pool_config.tds_packet_size > 0 ? static_cast<size_t>(pool_config.tds_packet_size) : 0;
+	// Issue #225: ask for UTF-8 unless the user turned the request off.
+	connection_info->utf8_support = pool_config.utf8_support;
 	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
 	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
 							lazy_validation ? "true" : "false", attach_validation_timeout);

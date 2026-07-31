@@ -36,6 +36,34 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	// Load CTAS configuration from settings
 	CTASConfig config = CTASConfig::Load(context);
 
+	// Issue #225: a VARCHAR target only round-trips non-ASCII if its collation is
+	// a UTF-8 one. Without that, SQL Server converts on INSERT to the database's
+	// code page and replaces anything outside it with '?' — no error, no warning,
+	// and nothing downstream can tell, because '?' is valid UTF-8.
+	//
+	// The database default already being UTF-8 (Fabric) is the one case where
+	// inheriting is right, and an empty mssql_utf8_collation is the documented
+	// way to ask for the old behaviour deliberately.
+	if (config.text_type == CTASTextType::VARCHAR && !config.utf8_collation.empty() &&
+		!StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
+		// Unknown is treated as granted, NOT as declined. Declined means the
+		// server has no UTF-8 collations at all and the DDL below would fail
+		// with a clear message; unknown means only that no connection could be
+		// borrowed to ask. Reading either as "skip the collation" would turn a
+		// transient pool timeout into a silently lossy table.
+		const auto support = catalog.UTF8SupportState();
+		if (support == MSSQLCatalog::Utf8Support::Declined) {
+			throw NotImplementedException(
+				"CREATE TABLE AS with mssql_ctas_text_type='VARCHAR' needs a UTF-8 collation, and this server did not "
+				"grant the TDS UTF8SUPPORT feature (SQL Server 2019 introduced both). A VARCHAR column here would take "
+				"the database's code page and lose every character outside it on insert. Use the default "
+				"mssql_ctas_text_type='NVARCHAR', or set mssql_utf8_collation='' to accept that loss deliberately.");
+		}
+		config.varchar_collation = config.utf8_collation;
+		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s (UTF8SUPPORT %s)", config.varchar_collation.c_str(),
+							   support == MSSQLCatalog::Utf8Support::Granted ? "granted" : "not observed");
+	}
+
 	// T042-T045 (Bug 0.7): Check for Fabric endpoint and disable BCP if detected
 	// Microsoft Fabric doesn't support INSERT BULK/BCP protocol
 	const auto &conn_info = catalog.GetConnectionInfo();

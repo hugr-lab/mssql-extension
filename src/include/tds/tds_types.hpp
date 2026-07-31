@@ -116,8 +116,9 @@ enum class TokenType : uint8_t {
 	RETURNSTATUS = 0x79,
 	ORDER = 0xA9,
 	RETURNVALUE = 0xAC,
-	SSPI = 0xED,		// SSPI token stream (Integrated Auth continuation, Spec 042; [MS-TDS] 2.2.7.21)
-	FEDAUTHINFO = 0xEE	// FEDAUTH info from server (Azure AD authentication)
+	SSPI = 0xED,		   // SSPI token stream (Integrated Auth continuation, Spec 042; [MS-TDS] 2.2.7.21)
+	FEATUREEXTACK = 0xAE,  // Server's answer to LOGIN7 feature extensions ([MS-TDS] 2.2.7.11)
+	FEDAUTHINFO = 0xEE	   // FEDAUTH info from server (Azure AD authentication)
 };
 
 // DONE Token Status Flags

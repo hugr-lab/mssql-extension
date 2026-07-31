@@ -118,6 +118,12 @@ struct MSSQLConnectionInfo {
 	// connection_info) request the same size. Clamped to [512, 32767] at use.
 	size_t tds_packet_size = 0;
 
+	// Issue #225: advertise UTF8SUPPORT in LOGIN7, from mssql_utf8_support.
+	// Carried here for the same reason as tds_packet_size — the pool factory only
+	// sees connection_info, and every connection in a pool must ask for the same
+	// wire form or two connections would decode the same column differently.
+	bool utf8_support = true;
+
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//
@@ -133,6 +139,14 @@ struct MSSQLConnectionInfo {
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
 	//===----------------------------------------------------------------------===//
 	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)
+
+	// Issue #225: did the server grant the LOGIN7 UTF8SUPPORT feature? Observed by
+	// the ATTACH-time validation login, which happens on every non-lazy attach, so
+	// it costs nothing extra. Tri-state because "false" and "never asked" are
+	// different answers: -1 = not observed (lazy_validation skipped the login),
+	// 0 = declined, 1 = granted. MSSQLCatalog::UTF8SupportAcked() resolves -1 by
+	// borrowing a pooled connection the first time anything needs the answer.
+	int8_t utf8_support_acked = -1;
 
 	// Check if this connection targets an Azure endpoint
 	// Azure endpoints require Azure AD auth support and TLS hostname verification

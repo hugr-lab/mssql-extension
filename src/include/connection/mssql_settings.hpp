@@ -26,6 +26,11 @@ struct MSSQLPoolConfig {
 	// raises the value on its own, so whatever we ask for here is the ceiling
 	// for every subsequent packet in both directions. 0 = tds::DEFAULT_TDS_PACKET_SIZE.
 	int64_t tds_packet_size = 0;
+	// Advertise the UTF8SUPPORT feature extension in LOGIN7 (issue #225). Asking is
+	// safe on any server: one that does not support it omits the acknowledgement and
+	// keeps sending UTF-16, so this is an opt-OUT for environments that want the
+	// pre-#225 wire form back.
+	bool utf8_support = true;
 };
 
 //===----------------------------------------------------------------------===//

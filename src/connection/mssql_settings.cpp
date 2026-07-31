@@ -27,6 +27,22 @@ static void ValidateNonNegative(ClientContext &context, SetScope scope, Value &p
 	}
 }
 
+// A collation name goes into generated DDL as a bare identifier — COLLATE takes
+// no quoting in T-SQL — so it is checked here rather than concatenated blind.
+// SQL Server's own collation names are letters, digits and underscores only.
+static void ValidateCollationName(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	const auto name = parameter.ToString();
+	for (const char c : name) {
+		const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+		if (!ok) {
+			throw InvalidInputException("Invalid collation name '%s': expected letters, digits and underscores", name);
+		}
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
@@ -76,6 +92,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "TDS frame size in bytes requested at login, clamped to [512, 32767] (default: 16384)",
 							  LogicalType::BIGINT, Value::BIGINT(static_cast<int64_t>(tds::TDS_PREFERRED_PACKET_SIZE)),
 							  ValidateNonNegative, SetScope::GLOBAL);
+
+	// mssql_utf8_support - advertise UTF8SUPPORT in LOGIN7 (issue #225).
+	// With it, a column whose collation is a UTF-8 one arrives as UTF-8 (0xA7)
+	// instead of being transcoded to UTF-16 (0xE7) for us: half the wire bytes for
+	// ASCII-heavy data, and the client copies the bytes straight into the vector
+	// instead of running the UTF-16 batch decode. Measured on 1M rows of ~41-char
+	// values: 85.8 MB -> 43.9 MB on the wire, 0.44 s -> 0.25 s wall.
+	// Requesting it is safe everywhere — a server that does not support the feature
+	// simply omits the acknowledgement and nothing changes — so this exists to turn
+	// the request OFF, not on.
+	config.AddExtensionOption("mssql_utf8_support",
+							  "Advertise the UTF8SUPPORT feature in LOGIN7 so UTF-8 collation columns arrive as "
+							  "UTF-8 instead of UTF-16 (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
@@ -229,6 +259,22 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
 							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
 
+	// mssql_utf8_collation - collation for VARCHAR targets (issue #225).
+	// Only consulted when mssql_ctas_text_type is VARCHAR and the server granted
+	// UTF8SUPPORT at login. The default is the UTF-8 sibling of the usual
+	// Latin1 defaults; override it when the database's own collation is not
+	// Latin1-based, since this collation is stored in the schema and governs
+	// every later comparison against the column. Empty means "add no COLLATE
+	// clause", which lets the column inherit the database default — right when
+	// that default is already UTF-8, and the way back to the pre-#225 behaviour
+	// otherwise. The name is not validated here: SQL Server rejects an unknown
+	// collation by name, which is a clearer error than anything this could say.
+	config.AddExtensionOption("mssql_utf8_collation",
+							  "Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "
+							  "(default: Latin1_General_100_CI_AS_SC_UTF8; empty inherits the database default)",
+							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName,
+							  SetScope::GLOBAL);
+
 	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer
 	// BCP is 2-10x faster than batched INSERT statements
 	config.AddExtensionOption("mssql_ctas_use_bcp",
@@ -326,6 +372,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_tds_packet_size", val)) {
 		config.tds_packet_size = val.GetValue<int64_t>();
+	}
+
+	if (context.TryGetCurrentSetting("mssql_utf8_support", val)) {
+		config.utf8_support = val.GetValue<bool>();
 	}
 
 	return config;
@@ -478,6 +528,11 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 	// Load text_type setting
 	if (context.TryGetCurrentSetting("mssql_ctas_text_type", val)) {
 		config.text_type = CTASConfig::ParseTextType(val.ToString());
+	}
+
+	// Load the UTF-8 collation for VARCHAR targets (issue #225)
+	if (context.TryGetCurrentSetting("mssql_utf8_collation", val)) {
+		config.utf8_collation = val.IsNull() ? string() : val.ToString();
 	}
 
 	// Inherit INSERT settings for batch insert phase (when use_bcp = false)

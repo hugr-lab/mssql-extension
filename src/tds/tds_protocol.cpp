@@ -204,8 +204,32 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string &password) {
 	return encoded;
 }
 
+//===----------------------------------------------------------------------===//
+// UTF8_SUPPORT feature extension ([MS-TDS] 2.2.6.5), issue #225.
+//
+// FeatureId(1) + FeatureDataLen(4), and the length is ZERO: the client only
+// declares that it understands UTF-8, and it is the SERVER's acknowledgement
+// that carries a data byte. The asymmetry is easy to get wrong and expensive to
+// get wrong: a data byte here is tolerated by SQL Server 2022 (it acks and
+// switches the wire form anyway) but makes Azure SQL reject the login outright
+// with error 18456, "Authentication failed" — indistinguishable from a bad
+// password. Found by running the Azure suite; no local server reproduces it.
+//
+// Every builder emits the same two fields and each computes its own record
+// length, so the size is a named constant rather than a literal repeated beside
+// four separate arithmetic expressions.
+//===----------------------------------------------------------------------===//
+
+static constexpr uint32_t UTF8_SUPPORT_EXT_LEN = 1 + 4;
+
+static void AppendUtf8SupportFeature(TdsPacket &packet) {
+	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT));
+	packet.AppendUInt32LE(0);
+}
+
 TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
-								   const std::string &database, const std::string &app_name, uint32_t packet_size) {
+								   const std::string &database, const std::string &app_name, uint32_t packet_size,
+								   bool request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 fixed header is 94 bytes; variable-length strings follow.
@@ -225,8 +249,6 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields
 	// still carry an ib* pointing to the next-available byte position).
-	uint16_t unused1_offset = var_offset;
-	uint16_t unused1_len = 0;
 	uint16_t cltintname_offset = var_offset;
 	uint16_t cltintname_len = 0;
 	uint16_t language_off = var_offset;
@@ -234,6 +256,21 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 
 	Login7VarField field_database = EncodeLogin7VarField("Database", database, var_offset);
 
+	// Issue #225: advertise UTF8SUPPORT. The Extension slot (the field MS-TDS
+	// calls Unused/ibExtension) points at a DWORD that holds the offset of the
+	// feature list. Both go AFTER every variable string — the same placement the
+	// FEDAUTH and ADAL builders use — so the string region stays contiguous and
+	// nothing between HostName and Database moves.
+	const bool want_utf8_support = request_utf8_support;
+	uint16_t unused1_offset = var_offset;
+	uint16_t unused1_len = 0;
+	if (want_utf8_support) {
+		unused1_len = 4;  // cbExtension = the DWORD only, per MS-TDS
+		var_offset += 4;  // the DWORD itself
+	}
+
+	// The feature list begins where the variable block ends.
+	const uint32_t feature_ext_offset = var_offset;
 	uint16_t sspi_offset = var_offset;
 	uint16_t sspi_len = 0;
 	uint16_t atchdb_offset = var_offset;
@@ -242,6 +279,9 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	uint16_t changepass_len = 0;
 
 	uint32_t total_length = var_offset;
+	if (want_utf8_support) {
+		total_length += UTF8_SUPPORT_EXT_LEN + 1;  // feature + terminator
+	}
 
 	// Build fixed header (94 bytes)
 
@@ -287,6 +327,9 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// Offset 27: OptionFlags3 (1 byte)
 	// Various TDS 7.2+ options
 	uint8_t flags3 = 0x00;
+	if (want_utf8_support) {
+		flags3 |= 0x10;	 // fExtension — feature extension data is present
+	}
 	packet.AppendByte(flags3);
 
 	// Offset 28: ClientTimeZone (4 bytes, LE) - minutes from UTC
@@ -379,6 +422,13 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	packet.AppendPayload(field_appname.utf16le_bytes);
 	packet.AppendPayload(field_servername.utf16le_bytes);
 	packet.AppendPayload(field_database.utf16le_bytes);
+	if (want_utf8_support) {
+		// The Extension field points HERE; this DWORD points at the feature list,
+		// which follows immediately.
+		packet.AppendUInt32LE(feature_ext_offset);
+		AppendUtf8SupportFeature(packet);
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
+	}
 
 	return packet;
 }
@@ -397,15 +447,18 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 //===----------------------------------------------------------------------===//
 TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
 										   const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
-										   const std::string &app_name, uint32_t packet_size) {
+										   const std::string &app_name, uint32_t packet_size,
+										   bool request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
-	uint16_t hostname_len = static_cast<uint16_t>(client_hostname.size());
+	// Field lengths are UTF-16 CODE UNITS, not UTF-8 bytes. Taking .size() of the
+	// std::string (as this did) is only right for ASCII: a non-ASCII hostname,
+	// app name, server name or database made every later offset and the record's
+	// own Length too large, so the server read a LOGIN7 that claimed more bytes
+	// than were sent. Same defect spec 043 fixed for BuildLogin7; the shared
+	// encoder is the fix here too.
 	uint16_t username_len = 0;	// integrated auth: not used
 	uint16_t password_len = 0;	// integrated auth: not used
-	uint16_t appname_len = static_cast<uint16_t>(app_name.size());
-	uint16_t servername_len = static_cast<uint16_t>(server_name.size());
-	uint16_t database_len = static_cast<uint16_t>(database.size());
 
 	// SSPI blob length handling: cbSSPI is 16-bit; for blobs > 65535 bytes,
 	// cbSSPI is sentinel 0xFFFF and cbSSPILong (32-bit at offset 86) holds the
@@ -423,24 +476,38 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	// Individual offsets that precede the SSPI region fit in 16 bits (all the
 	// UTF-16 fields combined are tiny). The total length and the SSPI blob
 	// itself are the 32-bit values.
-	uint32_t var_offset = 94;
-	uint16_t hostname_offset = static_cast<uint16_t>(var_offset);
-	var_offset += hostname_len * 2;
+	// One accumulator, advanced only by the encoder. An earlier draft kept a
+	// second one and stepped it by hand with the same byte counts; the two are
+	// required to agree, and nothing would have caught them drifting apart when
+	// a field is added. Every zero-length field's ib* is just the next encoded
+	// field's ib, so no separate bookkeeping is needed for them either.
+	//
+	// The encoder caps each field at 128 UTF-16 code units, so this stays far
+	// inside 16 bits; only the SSPI blob is big, and it is added after.
+	uint16_t vf_offset = 94;
+	Login7VarField field_hostname = EncodeLogin7VarField("HostName", client_hostname, vf_offset);
+	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, vf_offset);
+	Login7VarField field_servername = EncodeLogin7VarField("ServerName", server_name, vf_offset);
+	Login7VarField field_database = EncodeLogin7VarField("Database", database, vf_offset);
 
-	uint16_t username_offset = static_cast<uint16_t>(var_offset);  // length 0
-	uint16_t password_offset = static_cast<uint16_t>(var_offset);
-	uint16_t appname_offset = static_cast<uint16_t>(var_offset);
-	var_offset += appname_len * 2;
+	uint16_t hostname_offset = field_hostname.ib;
+	uint16_t hostname_len = field_hostname.cch;
+	uint16_t appname_offset = field_appname.ib;
+	uint16_t appname_len = field_appname.cch;
+	uint16_t servername_offset = field_servername.ib;
+	uint16_t servername_len = field_servername.cch;
+	uint16_t database_offset = field_database.ib;
+	uint16_t database_len = field_database.cch;
 
-	uint16_t servername_offset = static_cast<uint16_t>(var_offset);
-	var_offset += servername_len * 2;
+	// UserName / Password sit between HostName and AppName; CltIntName / Language
+	// between ServerName and Database. All four are empty, so they point at the
+	// next field's start.
+	uint16_t username_offset = field_appname.ib;
+	uint16_t password_offset = field_appname.ib;
+	uint16_t cltintname_offset = field_database.ib;
+	uint16_t language_offset = field_database.ib;
 
-	uint16_t unused1_offset = static_cast<uint16_t>(var_offset);
-	uint16_t cltintname_offset = static_cast<uint16_t>(var_offset);
-	uint16_t language_offset = static_cast<uint16_t>(var_offset);
-
-	uint16_t database_offset = static_cast<uint16_t>(var_offset);
-	var_offset += database_len * 2;
+	uint32_t var_offset = vf_offset;
 
 	// SSPI blob position. The OFFSET (ibSSPI) is 16-bit per the TDS spec --
 	// blobs cannot start past 64 KB into the LOGIN7 record. That's fine: the
@@ -458,7 +525,19 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	uint16_t atchdb_offset = static_cast<uint16_t>(var_offset > 0xFFFF ? 0xFFFF : var_offset);
 	uint16_t changepass_offset = atchdb_offset;
 
+	// Issue #225: the Extension slot (what MS-TDS calls Unused) carries a DWORD
+	// holding the offset of the feature list. Both sit after EVERY other variable
+	// field, the SSPI blob included, so turning the feature on moves nothing that
+	// was already there. Without it the slot keeps its historical length of 0.
+	uint16_t unused1_offset = static_cast<uint16_t>(var_offset > 0xFFFF ? 0xFFFF : var_offset);
+	uint16_t unused1_len = 0;
+	uint32_t feature_ext_offset = 0;
 	uint32_t total_length = var_offset;
+	if (request_utf8_support) {
+		unused1_len = 4;  // cbExtension = the DWORD only
+		feature_ext_offset = var_offset + 4;
+		total_length += 4 + UTF8_SUPPORT_EXT_LEN + 1;  // DWORD + feature + terminator
+	}
 
 	// Fixed header (94 bytes)
 
@@ -487,8 +566,8 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 
 	// TypeFlags
 	packet.AppendByte(0x00);
-	// OptionFlags3
-	packet.AppendByte(0x00);
+	// OptionFlags3: fExtension (0x10) says the Extension slot is populated.
+	packet.AppendByte(request_utf8_support ? 0x10 : 0x00);
 	// ClientTimeZone
 	packet.AppendUInt32LE(0);
 	// ClientLCID
@@ -513,7 +592,7 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 
 	// Unused/Extension
 	packet.AppendUInt16LE(unused1_offset);
-	packet.AppendUInt16LE(0);
+	packet.AppendUInt16LE(unused1_len);
 
 	// CltIntName
 	packet.AppendUInt16LE(cltintname_offset);
@@ -548,15 +627,23 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	packet.AppendUInt32LE(sspi_long_len);
 
 	// Variable data section
-	packet.AppendUTF16LE(client_hostname);
+	packet.AppendPayload(field_hostname.utf16le_bytes);
 	// username / password fields contribute zero bytes
-	packet.AppendUTF16LE(app_name);
-	packet.AppendUTF16LE(server_name);
-	packet.AppendUTF16LE(database);
+	packet.AppendPayload(field_appname.utf16le_bytes);
+	packet.AppendPayload(field_servername.utf16le_bytes);
+	packet.AppendPayload(field_database.utf16le_bytes);
 
 	// SSPI initial blob (raw bytes, NOT UTF-16)
 	if (!sspi_initial_blob.empty()) {
 		packet.AppendPayload(sspi_initial_blob);
+	}
+
+	if (request_utf8_support) {
+		// The Extension field points HERE; this DWORD points at the feature list,
+		// which follows immediately.
+		packet.AppendUInt32LE(feature_ext_offset);
+		AppendUtf8SupportFeature(packet);
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
 	}
 
 	return packet;
@@ -902,6 +989,45 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 			response.has_sspi_token = true;
 			response.sspi_token.assign(ptr, ptr + blob_len);
 			ptr += blob_len;
+		} else if (token_type == static_cast<uint8_t>(TokenType::FEATUREEXTACK)) {
+			// [MS-TDS] 2.2.7.11. NOT a length-prefixed token: it is a run of
+			//   FeatureId(1) | FeatureAckDataLen(4, LE) | FeatureAckData(n)
+			// ending at FeatureId 0xFF. The generic "skip a USHORT length" branch
+			// below reads the first two bytes of the first entry as a length --
+			// for the UTF8_SUPPORT ack (0x0A 0x01 00 00 00 ...) that is 0x010A =
+			// 266 bytes -- and walks off the token. Today that lands past the end
+			// of the buffer, after everything this parser needs has already been
+			// read, so nothing breaks; it is luck, not design, and it has been
+			// misparsing the FEDAUTH ack (0x02) since Azure AD support shipped.
+			response.has_feature_ext_ack = true;
+			while (ptr < end) {
+				const uint8_t feature_id = *ptr++;
+				if (feature_id == static_cast<uint8_t>(FeatureExtId::TERMINATOR)) {
+					break;
+				}
+				if (ptr + 4 > end) {
+					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK truncated in length of feature 0x%02X", feature_id);
+					ptr = end;
+					break;
+				}
+				const uint32_t data_len = static_cast<uint32_t>(ptr[0]) | (static_cast<uint32_t>(ptr[1]) << 8) |
+										  (static_cast<uint32_t>(ptr[2]) << 16) | (static_cast<uint32_t>(ptr[3]) << 24);
+				ptr += 4;
+				if (data_len > static_cast<uint32_t>(end - ptr)) {
+					MSSQL_PROTO_DEBUG_LOG(1, "FEATUREEXTACK feature 0x%02X claims %u bytes, %zu available", feature_id,
+										  data_len, static_cast<size_t>(end - ptr));
+					ptr = end;
+					break;
+				}
+				MSSQL_PROTO_DEBUG_LOG(2, "FEATUREEXTACK: feature=0x%02X len=%u first=0x%02X", feature_id, data_len,
+									  data_len > 0 ? ptr[0] : 0);
+				if (feature_id == static_cast<uint8_t>(FeatureExtId::FEDAUTH)) {
+					response.fedauth_acked = true;
+				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
+					response.utf8_support_acked = true;
+				}
+				ptr += data_len;
+			}
 		} else {
 			// Unknown token - try to skip by reading length if available
 			// Most tokens have 2-byte length after token type
@@ -1457,7 +1583,8 @@ TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_r
 
 TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname, const std::string &server_name,
 											  const std::string &database, const std::vector<uint8_t> &fedauth_token,
-											  bool fedauth_echo, const std::string &app_name, uint32_t packet_size) {
+											  bool fedauth_echo, const std::string &app_name, uint32_t packet_size,
+											  bool request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 with FEDAUTH uses feature extensions (MS-TDS 2.2.7)
@@ -1524,7 +1651,9 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Total length calculation
 	// var_offset includes: Fixed header (94) + all variable strings + ExtensionDWORD (4)
 	// Add: FEDAUTH extension + Terminator (1)
-	uint32_t total_length = var_offset + fedauth_ext_len + 1;
+	// Issue #225: UTF8_SUPPORT rides along in the same feature list, before the
+	// terminator. A server that does not support it acks only FEDAUTH.
+	uint32_t total_length = var_offset + fedauth_ext_len + (request_utf8_support ? UTF8_SUPPORT_EXT_LEN : 0) + 1;
 
 	// Build fixed header (94 bytes)
 
@@ -1679,6 +1808,10 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Token (UTF-16LE encoded access token)
 	packet.AppendPayload(fedauth_token);
 
+	if (request_utf8_support) {
+		AppendUtf8SupportFeature(packet);
+	}
+
 	// Feature terminator
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
 
@@ -1687,7 +1820,7 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 
 TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, const std::string &server_name,
 										   const std::string &database, bool fedauth_echo, const std::string &app_name,
-										   uint32_t packet_size) {
+										   uint32_t packet_size, bool request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 with ADAL FEDAUTH workflow (per go-mssqldb implementation)
@@ -1724,7 +1857,9 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	uint32_t fedauth_ext_len = 1 + 4 + fedauth_data_len;  // FeatureId + FeatureDataLen + FeatureData
 
 	// Total length = fixed header + variable strings + extension DWORD + FEDAUTH extension + terminator
-	uint32_t total_length = var_offset + fedauth_ext_len + 1;
+	// Issue #225: UTF8_SUPPORT rides along in the same feature list, before the
+	// terminator. A server that does not support it acks only FEDAUTH.
+	uint32_t total_length = var_offset + fedauth_ext_len + (request_utf8_support ? UTF8_SUPPORT_EXT_LEN : 0) + 1;
 
 	// Build fixed header (94 bytes)
 
@@ -1865,6 +2000,10 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	uint8_t fedauth_options = (FEDAUTH_LIBRARY_ADAL << 1) | (fedauth_echo ? 1 : 0);
 	packet.AppendByte(fedauth_options);
 	packet.AppendByte(FEDAUTH_ADAL_WORKFLOW_PASSWORD);	// Service Principal uses Password workflow
+
+	if (request_utf8_support) {
+		AppendUtf8SupportFeature(packet);
+	}
 
 	// Feature terminator
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));

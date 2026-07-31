@@ -143,10 +143,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto encrypt = connection_info_->use_encrypt;
 		auto token = fedauth_token_utf16le_;
 		auto tds_packet_size = connection_info_->tds_packet_size;
-		factory = [host, port, database, encrypt, token, app_name,
-				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
+		auto utf8_support = connection_info_->utf8_support;
+		factory = [host, port, database, encrypt, token, app_name, tds_packet_size,
+				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
+			conn->SetRequestUtf8Support(utf8_support);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
@@ -166,6 +168,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
+			conn->SetRequestUtf8Support(info_copy.utf8_support);
 			if (!conn->Connect(info_copy.host, info_copy.port)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
 						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
@@ -206,10 +209,12 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto database = connection_info_->database;
 		auto encrypt = connection_info_->use_encrypt;
 		auto tds_packet_size = connection_info_->tds_packet_size;
-		factory = [host, port, username, password, database, encrypt, app_name,
-				   tds_packet_size]() -> std::shared_ptr<tds::TdsConnection> {
+		auto utf8_support = connection_info_->utf8_support;
+		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size,
+				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
+			conn->SetRequestUtf8Support(utf8_support);
 			if (!conn->Connect(host, port)) {
 				return nullptr;
 			}
@@ -804,6 +809,35 @@ MSSQLStatisticsProvider &MSSQLCatalog::GetStatisticsProvider() {
 
 const string &MSSQLCatalog::GetDatabaseCollation() const {
 	return database_collation_;
+}
+
+MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
+	const int8_t cached = utf8_support_acked_.load(std::memory_order_relaxed);
+	if (cached >= 0) {
+		return cached == 1 ? Utf8Support::Granted : Utf8Support::Declined;
+	}
+	// The ATTACH-time validation login already answered this on every non-lazy
+	// attach, and it is carried on the connection info the same way
+	// is_fabric_endpoint is.
+	const int8_t from_attach = connection_info_ ? connection_info_->utf8_support_acked : -1;
+	if (from_attach >= 0) {
+		utf8_support_acked_.store(from_attach, std::memory_order_relaxed);
+		return from_attach == 1 ? Utf8Support::Granted : Utf8Support::Declined;
+	}
+
+	// Only a lazy attach gets here: no login has happened yet at ATTACH time.
+	// Borrow whatever the pool has rather than opening a connection for the
+	// question. If it cannot hand one over, leave the answer unobserved rather
+	// than caching a guess — the next caller retries.
+	auto &pool = GetConnectionPool();
+	auto conn = pool.Acquire();
+	if (!conn) {
+		return Utf8Support::Unknown;
+	}
+	const bool acked = conn->UTF8SupportAcked();
+	pool.Release(conn);
+	utf8_support_acked_.store(acked ? 1 : 0, std::memory_order_relaxed);
+	return acked ? Utf8Support::Granted : Utf8Support::Declined;
 }
 
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
