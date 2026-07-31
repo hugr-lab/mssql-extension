@@ -60,11 +60,11 @@ SELECT sum(length(s)) FROM ctas_col.dbo.CtasVarcharCollation;
 
 # The column is a single-byte varchar — the point of the setting — and it is the
 # collation, not the type, that makes it lossless.
-query TT
-SELECT data_type, s IS NOT NULL FROM duckdb_columns(), ctas_col.dbo.CtasVarcharCollation
-WHERE table_name = 'CtasVarcharCollation' AND column_name = 's' LIMIT 1;
+query T
+SELECT data_type FROM duckdb_columns()
+WHERE database_name = 'ctas_col' AND table_name = 'CtasVarcharCollation' AND column_name = 's';
 ----
-VARCHAR	true
+VARCHAR
 
 # =============================================================================
 # mssql_utf8_collation picks which UTF-8 collation is asked for. It matters
@@ -91,6 +91,19 @@ SELECT s FROM ctas_col.dbo.CtasVarcharCyrillic ORDER BY s;
 
 statement ok
 SET mssql_utf8_collation = 'Latin1_General_100_CI_AS_SC_UTF8';
+
+# The name lands in generated DDL as a bare identifier — COLLATE takes no
+# quoting in T-SQL — so anything that is not a collation name is rejected at SET
+# time rather than concatenated into a CREATE TABLE.
+statement error
+SET mssql_utf8_collation = 'Latin1_General_100_CI_AS_SC_UTF8; DROP TABLE dbo.CtasVarcharCollation';
+----
+Invalid collation name
+
+statement error
+SET mssql_utf8_collation = 'has spaces';
+----
+Invalid collation name
 
 # =============================================================================
 # The default (NVARCHAR) is unchanged: it never had this problem, and nothing

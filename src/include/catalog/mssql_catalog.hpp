@@ -133,11 +133,17 @@ public:
 	// Get database default collation
 	const string &GetDatabaseCollation() const;
 
-	//! True when this server granted the LOGIN7 UTF8SUPPORT feature (issue #225).
+	//! Did this server grant the LOGIN7 UTF8SUPPORT feature (issue #225)?
 	//! Every connection in the pool asks for the same thing, so one observation
 	//! answers for all of them; it is taken from an already-logged-in pooled
 	//! connection and cached, never by opening one for the question.
-	bool UTF8SupportAcked();
+	//!
+	//! Tri-state on purpose. Callers that pick a column's collation from this
+	//! must not read a failure to observe as "declined": that answer creates a
+	//! code-page column, which loses data silently and permanently, so a
+	//! transient pool timeout would become table corruption.
+	enum class Utf8Support : uint8_t { Unknown, Declined, Granted };
+	Utf8Support UTF8SupportState();
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

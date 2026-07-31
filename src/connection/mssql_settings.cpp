@@ -27,6 +27,22 @@ static void ValidateNonNegative(ClientContext &context, SetScope scope, Value &p
 	}
 }
 
+// A collation name goes into generated DDL as a bare identifier — COLLATE takes
+// no quoting in T-SQL — so it is checked here rather than concatenated blind.
+// SQL Server's own collation names are letters, digits and underscores only.
+static void ValidateCollationName(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	const auto name = parameter.ToString();
+	for (const char c : name) {
+		const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+		if (!ok) {
+			throw InvalidInputException("Invalid collation name '%s': expected letters, digits and underscores", name);
+		}
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
@@ -256,7 +272,7 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_utf8_collation",
 							  "Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "
 							  "(default: Latin1_General_100_CI_AS_SC_UTF8; empty inherits the database default)",
-							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), nullptr,
+							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName,
 							  SetScope::GLOBAL);
 
 	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer

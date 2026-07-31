@@ -811,10 +811,10 @@ const string &MSSQLCatalog::GetDatabaseCollation() const {
 	return database_collation_;
 }
 
-bool MSSQLCatalog::UTF8SupportAcked() {
+MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
 	const int8_t cached = utf8_support_acked_.load(std::memory_order_relaxed);
 	if (cached >= 0) {
-		return cached == 1;
+		return cached == 1 ? Utf8Support::Granted : Utf8Support::Declined;
 	}
 	// The ATTACH-time validation login already answered this on every non-lazy
 	// attach, and it is carried on the connection info the same way
@@ -822,7 +822,7 @@ bool MSSQLCatalog::UTF8SupportAcked() {
 	const int8_t from_attach = connection_info_ ? connection_info_->utf8_support_acked : -1;
 	if (from_attach >= 0) {
 		utf8_support_acked_.store(from_attach, std::memory_order_relaxed);
-		return from_attach == 1;
+		return from_attach == 1 ? Utf8Support::Granted : Utf8Support::Declined;
 	}
 
 	// Only a lazy attach gets here: no login has happened yet at ATTACH time.
@@ -832,12 +832,12 @@ bool MSSQLCatalog::UTF8SupportAcked() {
 	auto &pool = GetConnectionPool();
 	auto conn = pool.Acquire();
 	if (!conn) {
-		return false;
+		return Utf8Support::Unknown;
 	}
 	const bool acked = conn->UTF8SupportAcked();
 	pool.Release(conn);
 	utf8_support_acked_.store(acked ? 1 : 0, std::memory_order_relaxed);
-	return acked;
+	return acked ? Utf8Support::Granted : Utf8Support::Declined;
 }
 
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {

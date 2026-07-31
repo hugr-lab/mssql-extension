@@ -476,33 +476,38 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	// Individual offsets that precede the SSPI region fit in 16 bits (all the
 	// UTF-16 fields combined are tiny). The total length and the SSPI blob
 	// itself are the 32-bit values.
-	uint32_t var_offset = 94;
+	// One accumulator, advanced only by the encoder. An earlier draft kept a
+	// second one and stepped it by hand with the same byte counts; the two are
+	// required to agree, and nothing would have caught them drifting apart when
+	// a field is added. Every zero-length field's ib* is just the next encoded
+	// field's ib, so no separate bookkeeping is needed for them either.
+	//
+	// The encoder caps each field at 128 UTF-16 code units, so this stays far
+	// inside 16 bits; only the SSPI blob is big, and it is added after.
 	uint16_t vf_offset = 94;
 	Login7VarField field_hostname = EncodeLogin7VarField("HostName", client_hostname, vf_offset);
 	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, vf_offset);
 	Login7VarField field_servername = EncodeLogin7VarField("ServerName", server_name, vf_offset);
+	Login7VarField field_database = EncodeLogin7VarField("Database", database, vf_offset);
 
 	uint16_t hostname_offset = field_hostname.ib;
 	uint16_t hostname_len = field_hostname.cch;
-	var_offset += static_cast<uint32_t>(field_hostname.utf16le_bytes.size());
-
-	uint16_t username_offset = static_cast<uint16_t>(var_offset);  // length 0
-	uint16_t password_offset = static_cast<uint16_t>(var_offset);
 	uint16_t appname_offset = field_appname.ib;
 	uint16_t appname_len = field_appname.cch;
-	var_offset += static_cast<uint32_t>(field_appname.utf16le_bytes.size());
-
 	uint16_t servername_offset = field_servername.ib;
 	uint16_t servername_len = field_servername.cch;
-	var_offset += static_cast<uint32_t>(field_servername.utf16le_bytes.size());
-
-	uint16_t cltintname_offset = static_cast<uint16_t>(var_offset);
-	uint16_t language_offset = static_cast<uint16_t>(var_offset);
-
-	Login7VarField field_database = EncodeLogin7VarField("Database", database, vf_offset);
 	uint16_t database_offset = field_database.ib;
 	uint16_t database_len = field_database.cch;
-	var_offset += static_cast<uint32_t>(field_database.utf16le_bytes.size());
+
+	// UserName / Password sit between HostName and AppName; CltIntName / Language
+	// between ServerName and Database. All four are empty, so they point at the
+	// next field's start.
+	uint16_t username_offset = field_appname.ib;
+	uint16_t password_offset = field_appname.ib;
+	uint16_t cltintname_offset = field_database.ib;
+	uint16_t language_offset = field_database.ib;
+
+	uint32_t var_offset = vf_offset;
 
 	// SSPI blob position. The OFFSET (ibSSPI) is 16-bit per the TDS spec --
 	// blobs cannot start past 64 KB into the LOGIN7 record. That's fine: the
