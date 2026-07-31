@@ -36,6 +36,19 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	// Load CTAS configuration from settings
 	CTASConfig config = CTASConfig::Load(context);
 
+	// Issue #225: a VARCHAR target only round-trips non-ASCII if its collation is
+	// a UTF-8 one. Without that, SQL Server converts on INSERT to the database's
+	// code page and replaces anything outside it with '?' — no error, no warning.
+	// Only ask for a UTF-8 collation when the server granted UTF8SUPPORT, since a
+	// server without the feature has no UTF-8 collations either and the DDL would
+	// fail. When the database default is already UTF-8 (Fabric), inherit it.
+	if (config.text_type == CTASTextType::VARCHAR && catalog.UTF8SupportAcked() &&
+		!StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
+		config.varchar_collation = MSSQL_DEFAULT_UTF8_COLLATION;
+		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s (UTF8SUPPORT granted)",
+							   config.varchar_collation.c_str());
+	}
+
 	// T042-T045 (Bug 0.7): Check for Fabric endpoint and disable BCP if detected
 	// Microsoft Fabric doesn't support INSERT BULK/BCP protocol
 	const auto &conn_info = catalog.GetConnectionInfo();

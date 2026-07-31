@@ -1,0 +1,101 @@
+# name: test/sql/ctas/ctas_varchar_collation.test
+# description: a VARCHAR CTAS target must be collated UTF-8, or non-ASCII is destroyed on insert (issue #225)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# mssql_ctas_text_type = 'VARCHAR' asks for a single-byte column. Which bytes it
+# can hold is decided by its COLLATION, and a varchar column created without one
+# inherits the database's code page. SQL Server then converts on INSERT and
+# replaces everything outside that page with '?' — no error, no warning, and the
+# read path cannot tell the difference afterwards because '?' is valid UTF-8.
+#
+# Before the fix, this test's three non-ASCII rows came back as ??????, ????? and
+# a CP1252 euro byte. The fix asks for a UTF-8 collation when the server granted
+# UTF8SUPPORT at login, which is also what puts the column on the read path's
+# direct-copy branch.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ctas_col (TYPE mssql);
+
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR';
+
+statement ok
+DROP TABLE IF EXISTS ctas_col.dbo.CtasVarcharCollation;
+
+statement ok
+CREATE TABLE ctas_col.dbo.CtasVarcharCollation AS
+SELECT * FROM (VALUES
+    ('plain ascii'),
+    ('Привет мир'),
+    ('漢字とかな'),
+    ('emoji 😀'),
+    ('euro €')
+) t(s);
+
+# The values must survive the round trip unchanged. Character counts are asserted
+# too: a '?' replacement keeps the row readable and the same length in characters
+# for Cyrillic, so comparing the text alone is the assertion that bites.
+query T
+SELECT s FROM ctas_col.dbo.CtasVarcharCollation ORDER BY s;
+----
+emoji 😀
+euro €
+plain ascii
+Привет мир
+漢字とかな
+
+query I
+SELECT sum(length(s)) FROM ctas_col.dbo.CtasVarcharCollation;
+----
+39
+
+# The column is a single-byte varchar — the point of the setting — and it is the
+# collation, not the type, that makes it lossless.
+query TT
+SELECT data_type, s IS NOT NULL FROM duckdb_columns(), ctas_col.dbo.CtasVarcharCollation
+WHERE table_name = 'CtasVarcharCollation' AND column_name = 's' LIMIT 1;
+----
+VARCHAR	true
+
+# =============================================================================
+# The default (NVARCHAR) is unchanged: it never had this problem, and nothing
+# about the fix should have moved it.
+# =============================================================================
+
+statement ok
+SET mssql_ctas_text_type = 'NVARCHAR';
+
+statement ok
+DROP TABLE IF EXISTS ctas_col.dbo.CtasNvarcharControl;
+
+statement ok
+CREATE TABLE ctas_col.dbo.CtasNvarcharControl AS
+SELECT * FROM (VALUES ('Привет мир'), ('漢字とかな')) t(s);
+
+query T
+SELECT s FROM ctas_col.dbo.CtasNvarcharControl ORDER BY s;
+----
+Привет мир
+漢字とかな
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ctas_col', $$
+DROP TABLE dbo.CtasVarcharCollation;
+DROP TABLE dbo.CtasNvarcharControl;
+$$);
+
+statement ok
+DETACH ctas_col;

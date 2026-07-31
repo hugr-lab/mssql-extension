@@ -596,7 +596,13 @@ std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &
 	(void)ctx;	// String DDL is identical in both DdlContext values (FR-027 / FR-028).
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR:
-		return cfg.text_type == mssql::CTASTextType::VARCHAR ? "VARCHAR(MAX)" : "NVARCHAR(MAX)";
+		if (cfg.text_type != mssql::CTASTextType::VARCHAR) {
+			return "NVARCHAR(MAX)";
+		}
+		// A VARCHAR target stores bytes in its collation's code page, so the
+		// collation is part of the type here — not a comparison detail. See
+		// CTASConfig::varchar_collation.
+		return cfg.varchar_collation.empty() ? "VARCHAR(MAX)" : "VARCHAR(MAX) COLLATE " + cfg.varchar_collation;
 	case LogicalTypeId::INTERVAL:
 		// FR-026 — canonical DuckDB interval strings fit comfortably in 50
 		// chars (e.g. "9999 years 11 months 30 days 23:59:59.999999" — 44

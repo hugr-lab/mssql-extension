@@ -140,6 +140,14 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)
 
+	// Issue #225: did the server grant the LOGIN7 UTF8SUPPORT feature? Observed by
+	// the ATTACH-time validation login, which happens on every non-lazy attach, so
+	// it costs nothing extra. Tri-state because "false" and "never asked" are
+	// different answers: -1 = not observed (lazy_validation skipped the login),
+	// 0 = declined, 1 = granted. MSSQLCatalog::UTF8SupportAcked() resolves -1 by
+	// borrowing a pooled connection the first time anything needs the answer.
+	int8_t utf8_support_acked = -1;
+
 	// Check if this connection targets an Azure endpoint
 	// Azure endpoints require Azure AD auth support and TLS hostname verification
 	bool IsAzureEndpoint() const;

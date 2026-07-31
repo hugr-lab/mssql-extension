@@ -811,6 +811,35 @@ const string &MSSQLCatalog::GetDatabaseCollation() const {
 	return database_collation_;
 }
 
+bool MSSQLCatalog::UTF8SupportAcked() {
+	const int8_t cached = utf8_support_acked_.load(std::memory_order_relaxed);
+	if (cached >= 0) {
+		return cached == 1;
+	}
+	// The ATTACH-time validation login already answered this on every non-lazy
+	// attach, and it is carried on the connection info the same way
+	// is_fabric_endpoint is.
+	const int8_t from_attach = connection_info_ ? connection_info_->utf8_support_acked : -1;
+	if (from_attach >= 0) {
+		utf8_support_acked_.store(from_attach, std::memory_order_relaxed);
+		return from_attach == 1;
+	}
+
+	// Only a lazy attach gets here: no login has happened yet at ATTACH time.
+	// Borrow whatever the pool has rather than opening a connection for the
+	// question. If it cannot hand one over, leave the answer unobserved rather
+	// than caching a guess — the next caller retries.
+	auto &pool = GetConnectionPool();
+	auto conn = pool.Acquire();
+	if (!conn) {
+		return false;
+	}
+	const bool acked = conn->UTF8SupportAcked();
+	pool.Release(conn);
+	utf8_support_acked_.store(acked ? 1 : 0, std::memory_order_relaxed);
+	return acked;
+}
+
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
 	return *connection_info_;
 }

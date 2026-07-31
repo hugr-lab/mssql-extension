@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -132,6 +133,12 @@ public:
 	// Get database default collation
 	const string &GetDatabaseCollation() const;
 
+	//! True when this server granted the LOGIN7 UTF8SUPPORT feature (issue #225).
+	//! Every connection in the pool asks for the same thing, so one observation
+	//! answers for all of them; it is taken from an already-logged-in pooled
+	//! connection and cached, never by opening one for the question.
+	bool UTF8SupportAcked();
+
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;
 
@@ -213,6 +220,9 @@ protected:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
+	// Issue #225: -1 = not observed yet, 0 = declined, 1 = granted.
+	std::atomic<int8_t> utf8_support_acked_{-1};
+
 	//===----------------------------------------------------------------------===//
 	// Internal Methods
 	//===----------------------------------------------------------------------===//
