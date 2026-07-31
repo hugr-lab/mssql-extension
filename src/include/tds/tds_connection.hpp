@@ -216,6 +216,14 @@ public:
 	}
 
 private:
+	// Issue #225: record what the server granted. Assignment, not accumulation —
+	// a routed reconnect logs in again, and the new server's answer is the one
+	// that counts. Only a feature this client asked for can be granted: the
+	// server answers requests, so an ack for anything else is not ours to honour.
+	void NoteFeatureAcks(const LoginResponse &login_response) {
+		utf8_support_acked_ = request_utf8_support_ && login_response.utf8_support_acked;
+	}
+
 	// Size the socket's receive staging from the frame size the server confirmed
 	// (spec 055). Called from every login path once the PACKETSIZE ENVCHANGE has
 	// been applied. Reads are made in whole frames, several at a time.

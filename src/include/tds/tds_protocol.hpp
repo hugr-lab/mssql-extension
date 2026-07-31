@@ -115,7 +115,8 @@ public:
 											const std::string &database, const std::vector<uint8_t> &fedauth_token,
 											bool fedauth_echo = false,
 											const std::string &app_name = "DuckDB MSSQL Extension",
-											uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+											uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
+											bool request_utf8_support = true);
 
 	// Build LOGIN7 packet for Integrated Authentication (Kerberos / SSPI) -- Spec 042
 	//
@@ -135,7 +136,8 @@ public:
 	static TdsPacket BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
 										 const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
 										 const std::string &app_name = "DuckDB MSSQL Extension",
-										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
+										 bool request_utf8_support = true);
 
 	// Build SSPI Message continuation packet -- Spec 042
 	//
@@ -161,7 +163,8 @@ public:
 	static TdsPacket BuildLogin7WithADAL(const std::string &client_hostname, const std::string &server_name,
 										 const std::string &database, bool fedauth_echo = false,
 										 const std::string &app_name = "DuckDB MSSQL Extension",
-										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE);
+										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
+										 bool request_utf8_support = true);
 
 	// Build FEDAUTH_TOKEN packet to send access token after receiving FEDAUTHINFO
 	// Used in ADAL workflow: server sends FEDAUTHINFO with STS URL, client fetches token,

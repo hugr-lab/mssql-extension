@@ -183,7 +183,15 @@ live endpoint.
   fallback in `ParseLoginResponse` read the UTF8 ack as a 266-byte length; it had been
   misparsing the FEDAUTH ack the same way since Azure AD support shipped. Fixed — the token
   now has its own walk.
-- **Only the SQL-authentication LOGIN7 builder advertises the feature so far.** The FedAuth,
-  ADAL and SSPI builders each construct their own feature-extension block, and Fabric —
-  where UTF-8 storage is native and the win is largest — logs in through ADAL. Extending
-  them is the obvious next step and needs a live endpoint to verify.
+- **All four LOGIN7 builders advertise the feature** (SQL auth, SSPI — which is also the
+  Kerberos path — FedAuth and ADAL). Three of them cannot be reached from the local test
+  server, so their byte layout is pinned by `test/cpp/test_login7_encoding.cpp` instead: the
+  record's declared Length must equal the bytes produced, and the feature list must parse the
+  way a server would.
+- **The client's UTF8_SUPPORT request carries NO data — `FeatureDataLen` is 0.** Only the
+  server's acknowledgement has a byte. Sending a data byte is accepted by SQL Server 2022,
+  which acks and switches the wire form anyway, but makes **Azure SQL reject the login** with
+  error 18456, "Authentication failed for user ..." — indistinguishable from a wrong
+  password. Isolated by probing: an empty feature list connects, `AZURESQLSUPPORT` with a
+  data byte connects, `UTF8_SUPPORT` with a data byte does not. No local server reproduces
+  it; only running the Azure suite found it.
