@@ -168,6 +168,35 @@ family by construction, and for strings after the bulk conversion.
   path (§3a) and expected to help every family, since it removes per-byte capacity checks rather
   than per-type work. Sequence it **before** D1–D3 — the representation paths inherit it, and
   measuring them on top of the old append shape would attribute its win to them.
+
+  **The shape, and why it is not simply "reserve more".** The write path must obey the same rule as
+  the read path — one batch call per column, no per-value dispatch — but the BCP wire is
+  **row-major**: a row carries all its columns consecutively. Column-wise encoding into a row-major
+  buffer is therefore two passes over the chunk, not one:
+
+  1. **Lengths.** Per column, produce each row's wire length. Fixed-width families know it without
+     looking at the data (`1 + width`, or the NULL form), so this pass is arithmetic on the
+     validity mask alone. Strings and binaries get theirs from the bulk conversion they already
+     have to do — the UTF-16 length is a by-product, not an extra pass.
+  2. **Row offsets.** Sum the columns' lengths per row, prefix-sum into `row_offset[]`, resize the
+     accumulator **once**. This is where the ~10 ns/value goes: the current path discovers the size
+     one `push_back` at a time.
+  3. **Scatter.** Per column, one loop over rows writing through `dst + cursor[r]` and advancing
+     `cursor[r]` by that value's length. `cursor[]` is a 2048-entry array touched sequentially;
+     the write is strided, but the loop carries no branch on type, no capacity check and no
+     indirect call — the family kernel is resolved once per column, exactly like `ColumnOps` on
+     the read side (spec 055 D6a).
+
+  Two consequences worth stating up front, because they constrain the kernels:
+
+  - A column's kernel never sees the row token or its neighbours; it is handed `dst`, `cursor[]`,
+    the vector and its format, and owns only its own bytes. That is what makes CONSTANT and
+    DICTIONARY (D1–D3) a change inside one kernel rather than a change to the row loop.
+  - `cursor[]` must be updated by every column including the ones that write nothing (NULL rows
+    still occupy their fixed marker), so length and scatter must agree exactly. The framing test
+    that pins the read walk against `RowReader` (#217) has no counterpart here — the equivalent
+    gate is criterion 5.1, byte-identical wire output against the shipped encoder, which must run
+    over every family and every representation before this lands.
 - **D6** Counters: encodes-per-chunk vs rows-per-chunk per column, representation taken
   (flat/const/dict), cache hit rate — the evidence that the path is doing what it claims.
 - **D7** Issue [#153](https://github.com/hugr-lab/mssql-extension/issues/153) policy decision:
@@ -703,3 +732,173 @@ What does constrain the degree, and should drive it instead:
   deliberately set `mssql_copy_tablock = false`.
 - **Saturation** — eight sessions were slower than four on the wide fixture
   (5.09 vs 4.64 s). The default needs a ceiling, not "half the cores".
+
+## Sizing policy — where the buffer size comes from (user, 2026-07-31)
+
+Rejected: a measurement pass over the chunk to discover how many bytes it will
+occupy. The objection is right, and it splits into two questions that the
+two-pass sketch in D5a had conflated.
+
+### The buffer size needs no pass at all
+
+An upper bound is enough to allocate, and the bound is already in hand:
+`BCPColumnMetadata::max_length` per column gives a per-row ceiling
+(`1|2|8 + max_length`), so the whole chunk is one allocation computed from
+metadata. Nothing looks at the data.
+
+Resolution order for a column's bound, once per COPY at bind time:
+
+1. **The target table** — already known for every COPY into an existing table,
+   which is also the fast path (§ "External validation": 4.1× over
+   `CREATE_TABLE true`).
+2. **The source**, when the source is an MSSQL table — `max_length` from that
+   catalog, including a different attached database.
+3. **An explicit cast by the user** to an MSSQL type carrying a modifier
+   (`MSSQL_NVARCHAR(50)`) — the custom-types item, which this makes load-bearing
+   rather than cosmetic.
+4. **A setting / COPY option** — a default string length, and per-column
+   overrides in the COPY statement.
+
+**Parquet is not a source of string lengths, measured.** A Parquet string column
+is `BYTE_ARRAY` with the `UTF8` logical type and carries no length, and DuckDB
+drops the `VARCHAR(n)` modifier at `CREATE TABLE` before any file is involved —
+`VARCHAR(20)` and `VARCHAR` are the same type in DuckDB. `DECIMAL(9,2)` survives
+both (DuckDB keeps precision/scale, Parquet stores `DecimalType`), which is why
+numeric columns are already created correctly and string columns are not. So
+step 2 covers numerics from Parquet and nothing else; strings fall to 3 or 4.
+
+`MAX`/PLP columns have no bound by definition. They keep a grow path, and that
+is one more reason the extension must stop *creating* `nvarchar(max)` by default.
+
+### Row offsets still depend on the data — so the shape changes instead
+
+A packed wire means `nvarchar(50)` holding `'ab'` writes 2 bytes, not 50, so the
+start of row r+1 is not derivable from bounds. That does not require a second
+pass over the data; it requires not writing straight into the wire buffer:
+
+- **conversion stays one vectorized call per column**, into staging — the mirror
+  of the read path;
+- **lengths fall out of that conversion** as a by-product (the UTF-16 converter
+  already returns what it wrote), so they are never computed separately;
+- **one sequential assembly pass** memcpys the staged spans into the wire in row
+  order. No dispatch, no capacity check, no conversion — a gather.
+
+Over the data that is: convert once, copy once. The shipped path also copies
+once, but through per-byte `push_back` with a capacity check and an indirect
+call per value, which is where the ~10 ns/value of §3a lives.
+
+**All-fixed-width chunks skip staging entirely.** With no variable-length column
+in the row, the row stride is a constant computed from metadata, so each column
+scatters directly into the wire at `base + r*stride + col_offset` — no staging,
+no assembly, zero copies. Common for numeric tables, and the case where the
+current per-value path is already cheapest in absolute terms (bigint 8.2
+ns/value) and therefore hardest to beat by any shape that adds a copy.
+
+## Columnar scatter measured — and it subsumes representation-awareness for fixed-width families
+
+Prototype `EncodeChunkColumnarFixed` in `test/cpp/bench_materialize.cpp`, integer
+family, macOS ARM64, 2048-row chunks, median of 400. Wire output byte-identical
+to the shipped encoder on every cell (PASS). Sizing reads **metadata and the
+validity mask only** — never a value — exactly as the sizing policy above
+requires.
+
+| cell | shipped | repr-aware | columnar | vs shipped |
+| --- | --- | --- | --- | --- |
+| bigint_flat_unique | 8.2 | 8.0 | **2.1** | **3.9×** |
+| bigint_flat_card10 | 9.2 | 8.7 | **1.8** | **5.1×** |
+| bigint_const | 9.2 | 3.9 | **2.1** | **4.4×** |
+| bigint_dict1 | 8.5 | 4.3 | **1.8** | **4.7×** |
+| bigint_dict10 | 8.8 | 4.9 | **1.8** | **4.9×** |
+| bigint_dict100 | 8.8 | 5.7 | **1.8** | **4.9×** |
+| bigint_flat_unique_null50 | 6.6 | 6.2 | 5.5 | 1.2× |
+| bigint_dict100_null50 | 6.1 | 5.6 | 5.1 | 1.2× |
+| bigint_const_null | 3.6 | 3.8 | 3.9 | **0.92× (worse)** |
+
+**The headline is the const/dict rows, not the flat one.** Columnar reaches 1.8-2.1
+ns/value on CONSTANT and DICTIONARY inputs *without knowing they are constant or
+dictionary* — better than representation-aware encoding achieves by knowing
+(3.9-5.7). Once the per-value work is one length-byte store plus one width-sized
+store, there is nothing for representation-awareness to save: it exists to avoid
+repeating an expensive conversion, and there is no longer an expensive
+conversion to repeat.
+
+**This inverts the spec's own premise.** D1-D3 remain justified only where the
+per-value conversion is genuinely costly — strings, where UTF-16 conversion is
+the work (23.6 ns/value flat today). For every fixed-width family, D5a replaces
+them. Build order follows: D5a first and broadly, D1-D3 narrowed to the string
+family, and the dictionary A/B that §3's caveat demands is only needed for
+strings.
+
+**Where it does not win yet, stated plainly:**
+
+- **NULL-heavy columns: 1.2×.** The all-valid path is a constant stride with no
+  bookkeeping; the moment any column has a NULL, the prototype falls to a
+  per-row cursor with a validity branch per value. That branch is the whole
+  difference (5.2 vs 1.8).
+
+  **Removing the branch was tried and is worse — do not retry it.** The
+  branchless form writes the length byte as `w * valid`, advances the cursor by
+  `1 + w * valid`, memcpys the payload unconditionally (on a NULL row those
+  bytes land in the slot the next column overwrites) and writes the ROW tokens
+  last from a saved `row_start`, so a trailing spill cannot clobber the next
+  row's token. Measured: null50 **5.5 → 7.6**, all-NULL constant **3.9 → 7.3**.
+  It trades one well-predicted branch for an unconditional 8-byte write per NULL
+  row, a multiply that stops the loop vectorizing, and a third pass over the
+  rows. The branch was never the problem.
+
+  What is left to try is bulk sizing rather than branchless scatter: a popcount
+  per 64-bit mask word gives a column's payload count directly, so the row-size
+  loop can stop consulting the mask bit by bit. That attacks the sizing half,
+  which the all-valid path skips entirely and the NULL path does not.
+- **All-NULL constant regresses 3.6 → 3.9.** The shipped path already writes one
+  byte per row there, so the sizing pass is pure overhead. Needs the same
+  early-out D2 was going to give it — which is the one piece of the original
+  representation plan that survives for fixed-width families.
+
+## Wide rows: the per-column pass degrades, blocking fixes it (user, 2026-07-31)
+
+The columnar numbers above were measured on a **single-column** chunk, which is
+the shape's most favourable case: with one 8-byte column the row stride is 10
+bytes, six rows share a cache line and a per-column pass is nearly sequential. A
+44-column target has a stride of ~400 bytes, so every store in a per-column pass
+lands on its own line and the next column walks the same 2048 lines again, by
+which time they are gone.
+
+Measured (`BuildWideFixture` / `WideColFull` / `WideColBlocked` / `WideRowMajor`
+in `test/cpp/bench_materialize.cpp`; BIGINT columns, all valid, 2048 rows,
+median of 200, ns/value; every variant byte-identical to the shipped encoder):
+
+| ncols | shipped | col full pass | blk 32 | blk 64 | blk 128 | blk 256 | row-major |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8.14 | 0.53 | 0.55 | 0.53 | 0.61 | 0.63 | 0.63 |
+| 4 | 7.21 | 0.42 | 0.37 | 0.38 | 0.40 | 0.40 | 1.20 |
+| 16 | 7.67 | **1.01** | 0.42 | 0.42 | 0.42 | 0.52 | 1.14 |
+| 44 | 7.83 | **0.80** | 0.43 | 0.39 | **0.36** | 0.39 | 1.29 |
+
+(These are lower than §"Columnar scatter measured" because this fixture writes
+straight from `FlatVector` data with no `UnifiedVectorFormat`/`sel` indirection
+and no NULL handling. They compare *shapes*, not absolute production cost.)
+
+**Two findings, and they point the same way:**
+
+1. **The full per-column pass costs width.** 0.42 at 4 columns, 1.01 at 16 — same
+   work per value, 2.4× the time. Blocking removes it entirely: 0.36–0.43, flat
+   across every width tested. Block size is a plateau from 32 to 128; 64–128 is
+   the sweet spot at width, and 256 starts to slip at 16 columns.
+2. **Row-major sequential writing is worse, not better** (1.14–1.29 at width).
+   It makes the write pattern ideal and the *read* pattern terrible: every row
+   touches all N source arrays. The cache problem does not disappear by choosing
+   the other axis — it moves.
+
+So the shape is neither "one pass per column" nor "one pass per row": **columnar
+transformation, blocked assembly**. Rows in blocks of ~64–128; within a block,
+walk the columns. The staged column data and the block's slice of the wire stay
+resident together. This is also what the string prototype found independently
+(§3a/D5b: 6.6 → 5.9 with 256-row blocking), so the same block loop serves both.
+
+**Non-temporal stores — not tested, and here is the condition.** Writing the
+wire past the cache is attractive because the CPU never reads those bytes back.
+But the BCP wire is packed: row starts are not 8- or 16-byte aligned, and
+streaming-store instructions generally require alignment. The idea only becomes
+testable together with D5b (encode directly into wire frames), where the layout
+is ours to choose — measure it there, not here.
