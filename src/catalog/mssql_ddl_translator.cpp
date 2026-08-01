@@ -125,9 +125,16 @@ string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {
 // Type Mapping: DuckDB -> SQL Server
 //===----------------------------------------------------------------------===//
 
-string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
+string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type, const string &varchar_collation) {
 	try {
-		return DispatchDdlTypeName(type, mssql::CTASConfig{}, mssql::codec::DdlContext::CreateTable);
+		// Spec 060: the only field DDL generation reads out of a CTASConfig here is
+		// the collation, and an MSSQL_VARCHAR(n) column needs it for the same
+		// reason mssql_ctas_text_type='VARCHAR' does — without it SQL Server
+		// converts to the database code page on insert and replaces everything
+		// outside it with '?', silently (issue #225).
+		mssql::CTASConfig cfg;
+		cfg.varchar_collation = varchar_collation;
+		return DispatchDdlTypeName(type, cfg, mssql::codec::DdlContext::CreateTable);
 	} catch (const NotImplementedException &) {
 		// Preserve legacy non-CTAS error message for unsupported types.
 		throw NotImplementedException("Cannot map DuckDB type '%s' to SQL Server type", type.ToString());
@@ -138,7 +145,7 @@ string MSSQLDDLTranslator::MapTypeToSQLServer(const LogicalType &type) {
 // Column Definition Building
 //===----------------------------------------------------------------------===//
 
-string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column) {
+string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column, const string &varchar_collation) {
 	string result;
 
 	// Column name
@@ -146,7 +153,7 @@ string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column)
 	result += " ";
 
 	// Column type
-	result += MapTypeToSQLServer(column.GetType());
+	result += MapTypeToSQLServer(column.GetType(), varchar_collation);
 
 	// Don't explicitly specify NULL/NOT NULL here - let SQL Server use its defaults
 	// or let constraints (PRIMARY KEY, NOT NULL) override this.
@@ -172,15 +179,16 @@ string MSSQLDDLTranslator::TranslateDropSchema(const string &schema_name) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
-												const ColumnList &columns) {
+												const ColumnList &columns, const string &varchar_collation) {
 	// Delegate to the overload with empty constraints
 	vector<unique_ptr<Constraint>> empty_constraints;
-	return TranslateCreateTable(schema_name, table_name, columns, empty_constraints);
+	return TranslateCreateTable(schema_name, table_name, columns, empty_constraints, varchar_collation);
 }
 
 string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const string &table_name,
 												const ColumnList &columns,
-												const vector<unique_ptr<Constraint>> &constraints) {
+												const vector<unique_ptr<Constraint>> &constraints,
+												const string &varchar_collation) {
 	if (columns.empty()) {
 		throw InvalidInputException("CREATE TABLE requires at least one column");
 	}
@@ -197,7 +205,7 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 			result += ", ";
 		}
 		first = false;
-		result += BuildColumnDefinition(column);
+		result += BuildColumnDefinition(column, varchar_collation);
 	}
 
 	// Process constraints - look for PRIMARY KEY

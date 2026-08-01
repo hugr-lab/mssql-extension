@@ -9,6 +9,7 @@
 
 #include "codec/string_codec.hpp"
 
+#include "codec/target_string_type.hpp"
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -594,6 +595,16 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx) {
 	(void)ctx;	// String DDL is identical in both DdlContext values (FR-027 / FR-028).
+
+	// Spec 060: an MSSQL_VARCHAR / MSSQL_NVARCHAR annotation states this column's
+	// type outright, whether it came from a cast or was carried here by the
+	// catalog from an attached source. Both DDL translators reach this function,
+	// so teaching it covers CREATE TABLE and CREATE TABLE AS SELECT at once.
+	TargetStringType target_string;
+	if (TryGetTargetStringType(type, target_string)) {
+		return FormatTargetStringDdl(target_string, cfg.varchar_collation);
+	}
+
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR:
 		if (cfg.text_type != mssql::CTASTextType::VARCHAR) {

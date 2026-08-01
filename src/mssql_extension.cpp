@@ -64,7 +64,7 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 
 static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode) {
 	const char *name = unicode ? "MSSQL_NVARCHAR" : "MSSQL_VARCHAR";
-	const int32_t limit = unicode ? codec::MAX_NVARCHAR_LENGTH : codec::MAX_VARCHAR_LENGTH;
+	const int32_t limit = unicode ? mssql::codec::MAX_NVARCHAR_LENGTH : mssql::codec::MAX_VARCHAR_LENGTH;
 	const idx_t max_modifiers = unicode ? 1 : 2;
 
 	auto &modifiers = input.modifiers;
@@ -74,7 +74,7 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 										"MSSQL_VARCHAR(n) or MSSQL_VARCHAR(n, 'collation')");
 	}
 
-	codec::TargetStringType spec;
+	mssql::codec::TargetStringType spec;
 	spec.unicode = unicode;
 
 	auto &length_val = modifiers[0].GetValue();
@@ -95,13 +95,13 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 			throw BinderException("MSSQL_VARCHAR(n, collation): collation must be a non-NULL string");
 		}
 		spec.collation = collation_val.ToString();
-		if (!codec::IsValidCollationName(spec.collation)) {
+		if (!mssql::codec::IsValidCollationName(spec.collation)) {
 			throw BinderException("Invalid collation name '%s': expected letters, digits and underscores",
 								  spec.collation);
 		}
 	}
 
-	return codec::MakeTargetStringType(spec);
+	return mssql::codec::MakeTargetStringType(spec);
 }
 
 static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {

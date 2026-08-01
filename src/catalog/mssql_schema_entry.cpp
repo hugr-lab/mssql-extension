@@ -2,6 +2,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "codec/target_string_type.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
@@ -130,8 +131,21 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// Extract constraints (includes PRIMARY KEY, UNIQUE, etc.)
 	auto &constraints = base_info.constraints;
 
+	// Spec 060: an MSSQL_VARCHAR(n) column needs a UTF-8 collation or SQL Server
+	// converts to the database code page on insert and drops everything outside
+	// it, silently (issue #225). Same rule as CTAS and COPY, resolved in one place
+	// on the catalog so the three cannot drift.
+	bool wants_varchar = false;
+	for (auto &column : columns.Logical()) {
+		if (mssql::codec::NeedsVarcharCollation(column.GetType())) {
+			wants_varchar = true;
+			break;
+		}
+	}
+	const string varchar_collation = mssql_catalog.ResolveVarcharCollation(transaction.GetContext(), wants_varchar);
+
 	// Generate T-SQL for CREATE TABLE (with constraints)
-	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints);
+	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints, varchar_collation);
 
 	// Execute DDL on SQL Server
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);

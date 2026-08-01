@@ -145,6 +145,17 @@ public:
 	enum class Utf8Support : uint8_t { Unknown, Declined, Granted };
 	Utf8Support UTF8SupportState();
 
+	//! Spec 060: the collation to give varchar columns a statement is about to
+	//! create, or empty for "emit no COLLATE clause". Every path that creates a
+	//! table — CREATE TABLE, CTAS, COPY — must reach the same answer, so the rule
+	//! lives here rather than three times over: an empty mssql_utf8_collation is
+	//! the documented opt-out, a database default that is already UTF-8 (Fabric)
+	//! is inherited rather than overridden, and a server that declined
+	//! UTF8SUPPORT gets an error instead of a silently lossy column.
+	//! @param wants_varchar false short-circuits to empty — the overwhelmingly
+	//!        common case, where nothing asked for a single-byte column.
+	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar);
+
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;
 

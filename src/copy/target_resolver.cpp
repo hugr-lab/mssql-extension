@@ -337,45 +337,25 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 // ResolveVarcharCollation
 //===----------------------------------------------------------------------===//
 
-//! Issue #225: a varchar column round-trips non-ASCII only if its collation is a
-//! UTF-8 one. Without that, SQL Server converts on INSERT to the database's code
-//! page and replaces everything outside it with '?' — no error, and nothing
-//! downstream can tell, because '?' is valid UTF-8.
-//!
-//! Only reached when a column actually asked for MSSQL_VARCHAR and named no
-//! collation itself. Resolved once per COPY, not per column.
-static string ResolveVarcharCollation(ClientContext &context, tds::TdsConnection &conn, const BCPCopyTarget &target,
-									  const BCPCopyConfig &config, const vector<LogicalType> &source_types) {
-	bool needs_collation = false;
+//! Issue #225 / spec 060: a varchar column round-trips non-ASCII only if its
+//! collation is a UTF-8 one. The rule lives on MSSQLCatalog so this path cannot
+//! drift from CREATE TABLE and CTAS; all this does is answer whether any column
+//! asked for a single-byte column without naming a collation itself. Resolved
+//! once per COPY, not per column.
+static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarget &target,
+									  const vector<LogicalType> &source_types) {
+	bool wants_varchar = false;
 	for (const auto &type : source_types) {
-		::duckdb::codec::TargetStringType spec;
-		if (::duckdb::codec::TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty()) {
-			needs_collation = true;
+		if (codec::NeedsVarcharCollation(type)) {
+			wants_varchar = true;
 			break;
 		}
 	}
-	if (!needs_collation || config.utf8_collation.empty()) {
-		// An empty mssql_utf8_collation is the documented way to ask for the
-		// pre-#225 behaviour deliberately.
+	if (!wants_varchar) {
 		return string();
 	}
-
-	// The database default already being UTF-8 (Fabric) is the one case where
-	// inheriting is right: imposing a Latin1 collation would also impose its
-	// case- and accent-sensitivity on every later comparison.
 	auto &catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
-	if (StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
-		return string();
-	}
-
-	if (!conn.UTF8SupportAcked()) {
-		throw NotImplementedException(
-			"MSSQL COPY: MSSQL_VARCHAR(n) needs a UTF-8 collation, and this server did not grant the TDS UTF8SUPPORT "
-			"feature (SQL Server 2019 introduced both). A varchar column here would take the database's code page and "
-			"lose every character outside it on insert. Cast to MSSQL_NVARCHAR(n) instead, name a collation with "
-			"MSSQL_VARCHAR(n, 'collation'), or set mssql_utf8_collation='' to accept that loss deliberately.");
-	}
-	return config.utf8_collation;
+	return catalog.ResolveVarcharCollation(context, true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -434,7 +414,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	config.is_new_table = false;
 
 	// Spec 060: resolve once per statement, not once per column.
-	config.varchar_collation = ResolveVarcharCollation(context, conn, target, config, source_types);
+	config.varchar_collation = ResolveVarcharCollation(context, target, source_types);
 
 	if (table_exists) {
 		if (is_view) {
@@ -1062,9 +1042,9 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	// the catalog from an attached source. The bound type is a plain DuckDB type
 	// with the size in extension info, so nothing downstream of here changes —
 	// only the DDL text.
-	::duckdb::codec::TargetStringType target_string;
-	if (::duckdb::codec::TryGetTargetStringType(duckdb_type, target_string)) {
-		return ::duckdb::codec::FormatTargetStringDdl(target_string, varchar_collation);
+	codec::TargetStringType target_string;
+	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		return codec::FormatTargetStringDdl(target_string, varchar_collation);
 	}
 
 	switch (duckdb_type.id()) {
@@ -1211,6 +1191,23 @@ uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 //===----------------------------------------------------------------------===//
 
 uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
+	// Spec 060: without this the INSERT BULK declaration says nvarchar(max) for a
+	// column the same statement created as nvarchar(50), and the encoder's
+	// overflow guard — which reads this number — never fires at all. CTAS reaches
+	// this path for every column; COPY reaches it when replacing a table.
+	//
+	// Every char type travels as NVARCHAR, so the unit here is UTF-16 BYTES.
+	// MSSQL_VARCHAR(n) counts n bytes of UTF-8 in the target column, and n UTF-8
+	// bytes never hold more than n characters, so 2n is an upper bound on the wire
+	// — permissive, never rejecting a value the column would have accepted.
+	codec::TargetStringType target_string;
+	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		const int32_t wire_bytes = target_string.length * 2;
+		// Past 8000 bytes the inline NVARCHAR form is out of room and the value
+		// has to travel as PLP, exactly as an oversized existing column does.
+		return wire_bytes > 8000 ? 0xFFFF : static_cast<uint16_t>(wire_bytes);
+	}
+
 	switch (duckdb_type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return 1;

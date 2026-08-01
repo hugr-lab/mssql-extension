@@ -77,7 +77,8 @@ public:
 	//! @param table_name Target table name
 	//! @param columns Column list with definitions
 	//! @return T-SQL statement
-	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns);
+	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns,
+									   const string &varchar_collation = "");
 
 	//! Generate CREATE TABLE T-SQL from column definitions and constraints
 	//! @param schema_name Target schema
@@ -86,7 +87,8 @@ public:
 	//! @param constraints Table constraints (PRIMARY KEY, UNIQUE, etc.)
 	//! @return T-SQL statement
 	static string TranslateCreateTable(const string &schema_name, const string &table_name, const ColumnList &columns,
-									   const vector<unique_ptr<Constraint>> &constraints);
+									   const vector<unique_ptr<Constraint>> &constraints,
+									   const string &varchar_collation = "");
 
 	//! Generate DROP TABLE T-SQL
 	//! @param schema_name Schema containing table
@@ -157,7 +159,9 @@ public:
 	//! Map DuckDB LogicalType to SQL Server type string
 	//! @param type DuckDB type
 	//! @return SQL Server type string
-	static string MapTypeToSQLServer(const LogicalType &type);
+	//! @param varchar_collation collation for an MSSQL_VARCHAR(n) column that
+	//!        names none of its own; empty emits no COLLATE clause
+	static string MapTypeToSQLServer(const LogicalType &type, const string &varchar_collation = "");
 
 	//===----------------------------------------------------------------------===//
 	// CTAS-Specific Methods
@@ -188,7 +192,7 @@ public:
 
 private:
 	//! Build column definition string for CREATE TABLE or ADD COLUMN
-	static string BuildColumnDefinition(const ColumnDefinition &column);
+	static string BuildColumnDefinition(const ColumnDefinition &column, const string &varchar_collation = "");
 };
 
 }  // namespace duckdb

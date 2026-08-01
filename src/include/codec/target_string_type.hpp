@@ -18,10 +18,11 @@
 
 #pragma once
 
-#include "duckdb/common/string.hpp"
+#include <string>
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 //! A string column's stated SQL Server type.
@@ -35,7 +36,7 @@ struct TargetStringType {
 	//! Collation for a varchar column. Empty means "fall back to
 	//! mssql_utf8_collation", which in turn may be empty to inherit the
 	//! database default. Meaningless for nvarchar, which has no code page.
-	string collation;
+	std::string collation;
 };
 
 //! Longest n SQL Server accepts before the type must become MAX.
@@ -53,12 +54,18 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result);
 //! the type states none. An empty collation emits no COLLATE clause at all, so
 //! the column inherits the database default — correct on Fabric, and the
 //! documented way back to pre-#225 behaviour.
-string FormatTargetStringDdl(const TargetStringType &spec, const string &fallback_collation);
+std::string FormatTargetStringDdl(const TargetStringType &spec, const std::string &fallback_collation);
+
+//! True when this type asks for a single-byte column and names no collation of
+//! its own, so the statement has to supply one. A column that named its own
+//! needs nothing, and neither does nvarchar.
+bool NeedsVarcharCollation(const LogicalType &type);
 
 //! A collation name reaches T-SQL as a bare identifier — COLLATE takes no
 //! quoting — so anything that is not one must be refused before it is
 //! concatenated into a CREATE TABLE.
-bool IsValidCollationName(const string &name);
+bool IsValidCollationName(const std::string &name);
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb

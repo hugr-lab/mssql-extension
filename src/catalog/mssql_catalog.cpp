@@ -840,6 +840,43 @@ MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
 	return acked ? Utf8Support::Granted : Utf8Support::Declined;
 }
 
+string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_varchar) {
+	if (!wants_varchar) {
+		return string();
+	}
+
+	Value setting;
+	string requested;
+	if (context.TryGetCurrentSetting("mssql_utf8_collation", setting)) {
+		requested = setting.IsNull() ? string() : setting.ToString();
+	}
+	if (requested.empty()) {
+		// The documented way to ask for the pre-#225 behaviour deliberately.
+		return string();
+	}
+
+	// A database default that is already UTF-8 (Fabric) is the one case where
+	// inheriting is right: imposing a Latin1 collation would also impose its
+	// case- and accent-sensitivity on every later comparison against the column.
+	if (StringUtil::EndsWith(StringUtil::Upper(GetDatabaseCollation()), "_UTF8")) {
+		return string();
+	}
+
+	// Unknown is treated as granted, NOT as declined. Declined means the server
+	// has no UTF-8 collations at all and the DDL will fail with a clear message;
+	// unknown means only that no connection could be borrowed to ask. Reading
+	// either as "skip the collation" would turn a transient pool timeout into a
+	// silently lossy table.
+	if (UTF8SupportState() == Utf8Support::Declined) {
+		throw NotImplementedException(
+			"A VARCHAR column needs a UTF-8 collation, and this server did not grant the TDS UTF8SUPPORT feature "
+			"(SQL Server 2019 introduced both). The column would take the database's code page and lose every "
+			"character outside it on insert, silently. Use NVARCHAR instead, name a collation with "
+			"MSSQL_VARCHAR(n, 'collation'), or set mssql_utf8_collation='' to accept that loss deliberately.");
+	}
+	return requested;
+}
+
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
 	return *connection_info_;
 }

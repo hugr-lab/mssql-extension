@@ -4,6 +4,7 @@
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
+namespace mssql {
 namespace codec {
 
 //! The alias IS the type identity: one integer modifier cannot say whether it
@@ -52,24 +53,29 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 	result.length = info.modifiers[0].value.GetValue<int32_t>();
 
 	const auto entry = info.properties.find(COLLATION_PROPERTY);
-	result.collation = entry == info.properties.end() ? string() : entry->second.ToString();
+	result.collation = entry == info.properties.end() ? std::string() : entry->second.ToString();
 	return true;
 }
 
-string FormatTargetStringDdl(const TargetStringType &spec, const string &fallback_collation) {
+std::string FormatTargetStringDdl(const TargetStringType &spec, const std::string &fallback_collation) {
 	if (spec.unicode) {
 		return StringUtil::Format("nvarchar(%d)", spec.length);
 	}
 
-	string ddl = StringUtil::Format("varchar(%d)", spec.length);
-	const string &collation = spec.collation.empty() ? fallback_collation : spec.collation;
+	std::string ddl = StringUtil::Format("varchar(%d)", spec.length);
+	const std::string &collation = spec.collation.empty() ? fallback_collation : spec.collation;
 	if (!collation.empty()) {
 		ddl += " COLLATE " + collation;
 	}
 	return ddl;
 }
 
-bool IsValidCollationName(const string &name) {
+bool NeedsVarcharCollation(const LogicalType &type) {
+	TargetStringType spec;
+	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();
+}
+
+bool IsValidCollationName(const std::string &name) {
 	if (name.empty()) {
 		return false;
 	}
@@ -83,4 +89,5 @@ bool IsValidCollationName(const string &name) {
 }
 
 }  // namespace codec
+}  // namespace mssql
 }  // namespace duckdb
