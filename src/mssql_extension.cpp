@@ -8,6 +8,7 @@
 #include "copy/copy_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -98,6 +99,18 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 		if (!mssql::codec::IsValidCollationName(spec.collation)) {
 			throw BinderException("Invalid collation name '%s': expected letters, digits and underscores",
 								  spec.collation);
+		}
+		// A single-byte column under a non-UTF-8 collation stores its code page,
+		// and SQL Server replaces every character outside it with '?' ON INSERT —
+		// no error, and nothing downstream can tell, because '?' is valid UTF-8.
+		// That is issue #225's trap, and offering it per column would reopen it.
+		// The type exists to size a column, not to choose a code page.
+		if (!StringUtil::EndsWith(StringUtil::Upper(spec.collation), "_UTF8")) {
+			throw BinderException(
+				"MSSQL_VARCHAR(n, '%s'): collation must be a UTF-8 one (a _UTF8 suffix). A single-byte column under "
+				"any other collation silently replaces every character outside its code page with '?' on insert. Use "
+				"MSSQL_NVARCHAR(n) to store UTF-16 instead.",
+				spec.collation);
 		}
 	}
 

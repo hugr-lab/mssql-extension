@@ -620,6 +620,41 @@ CREATE TABLE mssql_db.dbo.report AS
 `varchar(50)`, so the same `n` in the two types does not hold the same data —
 50 bytes of UTF-8 is about 16 Cyrillic characters.
 
+#### Naming a collation
+
+`MSSQL_VARCHAR` takes an optional second argument: the collation for that one
+column. Without it the column gets `mssql_utf8_collation`.
+
+```sql
+CREATE TABLE mssql_db.dbo.customers (
+    email  MSSQL_VARCHAR(320),                                        -- session default
+    city   MSSQL_VARCHAR(100, 'Cyrillic_General_100_CI_AS_SC_UTF8'),  -- this column only
+    code   MSSQL_VARCHAR(16,  'Latin1_General_100_BIN2_UTF8')         -- binary ordering
+);
+
+-- Works the same in a cast, so CTAS and COPY can name it too
+COPY (SELECT city::MSSQL_VARCHAR(100, 'Cyrillic_General_100_CI_AS_SC_UTF8') AS city FROM staging)
+    TO 'mssql://mssql_db/dbo/cities' (FORMAT 'bcp');
+```
+
+The collation is stored in the schema and governs every later comparison
+against the column, which is why it is worth naming deliberately rather than
+inheriting: `_CI_AS` is case-insensitive and accent-sensitive, `_BIN2` orders by
+code point. Pick the one your data is actually compared with.
+
+It has to be a **UTF-8** collation (a `_UTF8` suffix). A single-byte column
+under any other collation silently replaces every character outside its code
+page with `?` on insert — the trap issue #225 closed — so the extension does not
+offer the choice. `MSSQL_NVARCHAR` takes no collation argument at all: it stores
+UTF-16 and has no code page to get wrong.
+
+Only letters, digits and underscores are accepted; the name reaches T-SQL as a
+bare identifier, so anything else is rejected at bind time rather than
+concatenated into a `CREATE TABLE`.
+
+On Microsoft Fabric only two collations exist and both are UTF-8; naming any
+other is refused before the DDL is built. See [AZURE.md](AZURE.md#two-collations-both-utf-8).
+
 #### Using them with COPY
 
 `COPY TO` takes its column types from the query it is given, so the cast goes in
