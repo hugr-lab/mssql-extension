@@ -315,8 +315,8 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 	// from the plain VARCHAR the wire produces and render every value as text.
 	// The guard's real question — is the catalog claiming a DIFFERENT type than
 	// the wire sends — is unaffected: VARCHAR against INTEGER still differs by id.
-	const bool same_type = wire_type == target_type || (wire_type.id() == LogicalTypeId::VARCHAR &&
-														target_type.id() == LogicalTypeId::VARCHAR);
+	const bool same_type = wire_type == target_type ||
+						   (wire_type.id() == LogicalTypeId::VARCHAR && target_type.id() == LogicalTypeId::VARCHAR);
 	const bool diverges = !same_type && !IsSupportedRetarget(column, target_type);
 	ops.needs_value_fallback = diverges;
 

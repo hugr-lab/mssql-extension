@@ -2,13 +2,14 @@
 #include "azure/azure_test_function.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
+#include "codec/target_string_type.hpp"
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
-#include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -42,11 +43,11 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 //===----------------------------------------------------------------------===//
 // Spec 060 — parameterised target types
 //
-// MSSQL_NVARCHAR(n) states the type a CREATE/CTAS/COPY target column should get.
-// DuckDB drops the VARCHAR length modifier at CREATE TABLE and Parquet carries
-// no string length, so the bound cannot be plumbed from a source — it has to be
-// stated, and this is the only mechanism available on the CTAS path, which has
-// no options syntax.
+// MSSQL_NVARCHAR(n) and MSSQL_VARCHAR(n [, collation]) state the type a
+// CREATE/CTAS/COPY target column should get. DuckDB drops the VARCHAR length
+// modifier at CREATE TABLE and Parquet carries no string length, so the bound
+// cannot be plumbed from a source — it has to be stated, and a cast is the only
+// mechanism available on the CTAS path, which has no options syntax.
 //
 // Bound to a VARCHAR carrying the length in ExtensionTypeInfo, WITH an alias —
 // and the alias is not optional. Without it the type looks like a plain VARCHAR
@@ -54,31 +55,61 @@ static void MssqlVersionFunction(DataChunk &args, ExpressionState &state, Vector
 // but it then crashes the binder outright: `CREATE TABLE t (a MSSQL_NVARCHAR(50));
 // INSERT INTO t VALUES ('x')` segfaults on a stack overflow, in plain DuckDB with
 // no catalog involved. DuckDB supports extension types only in their aliased
-// form. The cost is that operations on the type need a cast back, which is
-// acceptable because this type exists to DECLARE a target column: it is written
-// last, feeding the sink — `upper(cust)::MSSQL_NVARCHAR(50)` — and nothing is
-// applied to it afterwards. Measured both ways; see spec 060 § 2a.
+// form. The cost is paid back by the implicit no-op casts registered below.
+// Measured both ways; see spec 060 § 2a.
+//
+// Only these two. CHAR/NCHAR pad, and BINARY/VARBINARY already round-trip
+// through varbinary(max) without loss — none of them has a problem to solve.
 //===----------------------------------------------------------------------===//
 
-static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {
+static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode) {
+	const char *name = unicode ? "MSSQL_NVARCHAR" : "MSSQL_VARCHAR";
+	const int32_t limit = unicode ? codec::MAX_NVARCHAR_LENGTH : codec::MAX_VARCHAR_LENGTH;
+	const idx_t max_modifiers = unicode ? 1 : 2;
+
 	auto &modifiers = input.modifiers;
-	if (modifiers.size() != 1) {
-		throw BinderException("MSSQL_NVARCHAR takes exactly one modifier: MSSQL_NVARCHAR(n)");
+	if (modifiers.empty() || modifiers.size() > max_modifiers) {
+		throw BinderException(unicode ? "MSSQL_NVARCHAR takes one modifier: MSSQL_NVARCHAR(n)"
+									  : "MSSQL_VARCHAR takes one or two modifiers: "
+										"MSSQL_VARCHAR(n) or MSSQL_VARCHAR(n, 'collation')");
 	}
-	auto &val = modifiers[0].GetValue();
-	if (val.IsNull() || val.type() != LogicalType::INTEGER) {
-		throw BinderException("MSSQL_NVARCHAR(n): n must be a non-NULL integer");
+
+	codec::TargetStringType spec;
+	spec.unicode = unicode;
+
+	auto &length_val = modifiers[0].GetValue();
+	if (length_val.IsNull() || !length_val.type().IsIntegral()) {
+		throw BinderException("%s(n): n must be a non-NULL integer", name);
 	}
-	auto length = val.GetValue<int32_t>();
-	if (length < 1 || length > 4000) {
-		throw BinderException("MSSQL_NVARCHAR(n): n must be between 1 and 4000 (use VARCHAR for MAX)");
+	spec.length = length_val.DefaultCastAs(LogicalType::INTEGER).GetValue<int32_t>();
+	if (spec.length < 1 || spec.length > limit) {
+		// n is SQL Server's own unit for the type named: UTF-16 code units for
+		// nvarchar, BYTES for varchar. Past the limit SQL Server requires MAX,
+		// which is what a plain VARCHAR already asks for.
+		throw BinderException("%s(n): n must be between 1 and %d (use VARCHAR for MAX)", name, limit);
 	}
-	auto type = LogicalType(LogicalTypeId::VARCHAR);
-	type.SetAlias("MSSQL_NVARCHAR");
-	auto info = make_uniq<ExtensionTypeInfo>();
-	info->modifiers.emplace_back(Value::INTEGER(length));
-	type.SetExtensionInfo(std::move(info));
-	return type;
+
+	if (modifiers.size() == 2) {
+		auto &collation_val = modifiers[1].GetValue();
+		if (collation_val.IsNull() || collation_val.type().id() != LogicalTypeId::VARCHAR) {
+			throw BinderException("MSSQL_VARCHAR(n, collation): collation must be a non-NULL string");
+		}
+		spec.collation = collation_val.ToString();
+		if (!codec::IsValidCollationName(spec.collation)) {
+			throw BinderException("Invalid collation name '%s': expected letters, digits and underscores",
+								  spec.collation);
+		}
+	}
+
+	return codec::MakeTargetStringType(spec);
+}
+
+static LogicalType BindMssqlNVarchar(BindLogicalTypeInput &input) {
+	return BindMssqlStringType(input, true);
+}
+
+static LogicalType BindMssqlVarchar(BindLogicalTypeInput &input) {
+	return BindMssqlStringType(input, false);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -110,17 +141,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterMSSQLCopyFunctions(loader);
 
 	// Spec 060: parameterised target types (see the note above).
+	//
+	// The alias is required (it is what keeps the binder from recursing), but on
+	// its own it makes the type opaque to every VARCHAR function. Both directions
+	// are registered as implicit no-op casts at cost 0: the values ARE varchars,
+	// so overload resolution reaches upper(), ||, LIKE and the rest without the
+	// user writing a cast back. With the catalog reporting these types, that path
+	// carries every query against every attached table, not just cast columns.
 	{
 		auto nvarchar_type = LogicalType(LogicalTypeId::VARCHAR);
 		nvarchar_type.SetAlias("MSSQL_NVARCHAR");
 		loader.RegisterType("MSSQL_NVARCHAR", nvarchar_type, BindMssqlNVarchar);
-		// The alias is required (it is what keeps the binder from recursing), but
-		// on its own it makes the type opaque to every VARCHAR function. Both
-		// directions are registered as implicit no-op casts at cost 0: the values
-		// ARE varchars, so overload resolution should reach upper(), ||, LIKE and
-		// the rest without the user writing a cast back.
 		loader.RegisterCastFunction(nvarchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::NopCast), 0);
 		loader.RegisterCastFunction(LogicalType::VARCHAR, nvarchar_type, BoundCastInfo(DefaultCasts::NopCast), 0);
+
+		auto varchar_type = LogicalType(LogicalTypeId::VARCHAR);
+		varchar_type.SetAlias("MSSQL_VARCHAR");
+		loader.RegisterType("MSSQL_VARCHAR", varchar_type, BindMssqlVarchar);
+		loader.RegisterCastFunction(varchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::NopCast), 0);
+		loader.RegisterCastFunction(LogicalType::VARCHAR, varchar_type, BoundCastInfo(DefaultCasts::NopCast), 0);
 	}
 
 	// 10. Register utility functions (mssql_version)

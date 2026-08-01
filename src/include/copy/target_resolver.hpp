@@ -210,8 +210,11 @@ struct TargetResolver {
 	// @param target The target table
 	// @param source_types DuckDB types to map to SQL Server
 	// @param source_names Column names
+	// @param varchar_collation Collation for varchar columns with no collation of
+	//        their own; empty emits no COLLATE clause. Resolved by ValidateTarget.
 	static void CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
-							const vector<LogicalType> &source_types, const vector<string> &source_names);
+							const vector<LogicalType> &source_types, const vector<string> &source_names,
+							const string &varchar_collation);
 
 	// Drop a table if it exists
 	// @param conn TDS connection for SQL execution
@@ -266,8 +269,10 @@ struct TargetResolver {
 
 	// Get SQL Server type declaration for CREATE TABLE
 	// @param duckdb_type DuckDB logical type
+	// @param varchar_collation Collation for an MSSQL_VARCHAR(n) column that names
+	//        none of its own; empty emits no COLLATE clause
 	// @return SQL Server type string (e.g., "int", "nvarchar(max)")
-	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type);
+	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation = "");
 
 	// Map DuckDB type to TDS type token
 	// @param duckdb_type DuckDB logical type

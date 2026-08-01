@@ -1,10 +1,11 @@
 #include "copy/target_resolver.hpp"
 
 #include "catalog/mssql_catalog.hpp"
+#include "codec/target_string_type.hpp"
 #include "copy/bcp_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -333,6 +334,51 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 }
 
 //===----------------------------------------------------------------------===//
+// ResolveVarcharCollation
+//===----------------------------------------------------------------------===//
+
+//! Issue #225: a varchar column round-trips non-ASCII only if its collation is a
+//! UTF-8 one. Without that, SQL Server converts on INSERT to the database's code
+//! page and replaces everything outside it with '?' — no error, and nothing
+//! downstream can tell, because '?' is valid UTF-8.
+//!
+//! Only reached when a column actually asked for MSSQL_VARCHAR and named no
+//! collation itself. Resolved once per COPY, not per column.
+static string ResolveVarcharCollation(ClientContext &context, tds::TdsConnection &conn, const BCPCopyTarget &target,
+									  const BCPCopyConfig &config, const vector<LogicalType> &source_types) {
+	bool needs_collation = false;
+	for (const auto &type : source_types) {
+		::duckdb::codec::TargetStringType spec;
+		if (::duckdb::codec::TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty()) {
+			needs_collation = true;
+			break;
+		}
+	}
+	if (!needs_collation || config.utf8_collation.empty()) {
+		// An empty mssql_utf8_collation is the documented way to ask for the
+		// pre-#225 behaviour deliberately.
+		return string();
+	}
+
+	// The database default already being UTF-8 (Fabric) is the one case where
+	// inheriting is right: imposing a Latin1 collation would also impose its
+	// case- and accent-sensitivity on every later comparison.
+	auto &catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+	if (StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
+		return string();
+	}
+
+	if (!conn.UTF8SupportAcked()) {
+		throw NotImplementedException(
+			"MSSQL COPY: MSSQL_VARCHAR(n) needs a UTF-8 collation, and this server did not grant the TDS UTF8SUPPORT "
+			"feature (SQL Server 2019 introduced both). A varchar column here would take the database's code page and "
+			"lose every character outside it on insert. Cast to MSSQL_NVARCHAR(n) instead, name a collation with "
+			"MSSQL_VARCHAR(n, 'collation'), or set mssql_utf8_collation='' to accept that loss deliberately.");
+	}
+	return config.utf8_collation;
+}
+
+//===----------------------------------------------------------------------===//
 // TargetResolver::ValidateTarget
 //===----------------------------------------------------------------------===//
 
@@ -387,6 +433,9 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// Track whether we're creating a new table for auto-TABLOCK (Issue #45)
 	config.is_new_table = false;
 
+	// Spec 060: resolve once per statement, not once per column.
+	config.varchar_collation = ResolveVarcharCollation(context, conn, target, config, source_types);
+
 	if (table_exists) {
 		if (is_view) {
 			throw InvalidInputException("MSSQL COPY: Cannot COPY to a view. Target '%s' is a view.",
@@ -397,7 +446,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Drop and recreate
 			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
-			CreateTable(conn, target, source_types, source_names);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
 		} else {
@@ -411,7 +460,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		// Table doesn't exist
 		if (config.create_table) {
 			DebugLog(1, "ValidateTarget: CREATE_TABLE=true, creating table");
-			CreateTable(conn, target, source_types, source_names);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation);
 			// Newly created table
 			config.is_new_table = true;
 		} else {
@@ -428,7 +477,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 //===----------------------------------------------------------------------===//
 
 void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
-								 const vector<LogicalType> &source_types, const vector<string> &source_names) {
+								 const vector<LogicalType> &source_types, const vector<string> &source_names,
+								 const string &varchar_collation) {
 	if (source_types.size() != source_names.size()) {
 		throw InvalidInputException("MSSQL COPY: Column types and names count mismatch");
 	}
@@ -440,7 +490,8 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 		if (i > 0) {
 			sql += ",\n";
 		}
-		sql += "  [" + source_names[i] + "] " + GetSQLServerTypeDeclaration(source_types[i]) + " NULL";
+		sql +=
+			"  [" + source_names[i] + "] " + GetSQLServerTypeDeclaration(source_types[i], varchar_collation) + " NULL";
 	}
 
 	sql += "\n)";
@@ -1005,16 +1056,15 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 // TargetResolver::GetSQLServerTypeDeclaration
 //===----------------------------------------------------------------------===//
 
-string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type) {
-	// Spec 060: an explicit MSSQL_* cast states the target column's type, and it
-	// is the ONLY way to say so on the CTAS path, which has no options syntax.
-	// The bound type is a plain DuckDB type carrying its modifier in extension
-	// info, so nothing downstream of here changes — only the DDL text.
-	if (duckdb_type.id() == LogicalTypeId::VARCHAR && duckdb_type.HasExtensionInfo()) {
-		const auto &modifiers = duckdb_type.GetExtensionInfo()->modifiers;
-		if (modifiers.size() == 1 && !modifiers[0].value.IsNull()) {
-			return StringUtil::Format("nvarchar(%d)", modifiers[0].value.GetValue<int32_t>());
-		}
+string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation) {
+	// Spec 060: an MSSQL_VARCHAR / MSSQL_NVARCHAR annotation states the target
+	// column's type, whether it came from an explicit cast or was carried here by
+	// the catalog from an attached source. The bound type is a plain DuckDB type
+	// with the size in extension info, so nothing downstream of here changes —
+	// only the DDL text.
+	::duckdb::codec::TargetStringType target_string;
+	if (::duckdb::codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		return ::duckdb::codec::FormatTargetStringDdl(target_string, varchar_collation);
 	}
 
 	switch (duckdb_type.id()) {

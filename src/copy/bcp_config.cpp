@@ -20,6 +20,10 @@ BCPCopyConfig LoadBCPCopyConfig(ClientContext &context) {
 		config.tablock_explicit = true;
 	}
 
+	if (context.TryGetCurrentSetting("mssql_utf8_collation", val)) {
+		config.utf8_collation = val.IsNull() ? string() : val.ToString();
+	}
+
 	return config;
 }
 

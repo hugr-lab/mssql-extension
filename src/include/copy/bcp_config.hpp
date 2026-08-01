@@ -54,6 +54,18 @@ struct BCPCopyConfig {
 	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
 	bool is_new_table = false;
 
+	// From mssql_utf8_collation — the collation to give a varchar column this COPY
+	// creates, when the column's own MSSQL_VARCHAR(n) annotation names none.
+	// Without it the column takes the database code page and SQL Server replaces
+	// everything outside it with '?' on insert, silently (issue #225). Empty is the
+	// documented way to inherit the database default, which is correct on Fabric.
+	string utf8_collation;
+
+	// The collation actually applied, resolved once per statement in
+	// ValidateTarget: empty unless some column asked for MSSQL_VARCHAR(n) without
+	// naming one, and the database default is not already UTF-8.
+	string varchar_collation;
+
 	// Check if data should be flushed to SQL Server
 	// Returns true when accumulated rows reach flush_rows threshold
 	bool ShouldFlushToServer(idx_t accumulated_rows) const {
