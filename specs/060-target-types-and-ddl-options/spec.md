@@ -1,6 +1,6 @@
 # Spec 060 — Target column types and DDL options
 
-**Status:** Draft — D1/D2/D3 scoped against a measured baseline (§ 3, § 4)
+**Status:** Implemented — PR #230. See § 9 for what shipped beyond this draft and what did not.
 **Date:** 2026-07-31, revised 2026-08-01
 **Depends on:** spec 049 (target's `index_kind` / `partition_count` in the catalog cache — PR #223); issue #225 (the UTF8SUPPORT ack and `mssql_utf8_collation`, which is what makes the single-byte types safe — PR #227)
 **Feeds:** spec 057 (the write path's sizing policy resolves a column bound from what this spec adds)
@@ -298,10 +298,14 @@ collation is the silent-`?` trap of #225 and must not come back one column at a
 time.
 
 What it buys: half the storage for ASCII-ish data, and the direct-copy read path
-of #225 on every later scan. What it does **not** buy: a smaller write wire —
-BCP still sends every char type as `TDS_TYPE_NVARCHAR` and the server converts
-on insert. That is PR #227's write-path item, out of scope here, said out loud
-so nobody benchmarks for a win this spec does not deliver.
+of #225 on every later scan.
+
+~~What it does **not** buy: a smaller write wire.~~ It does, in the end. This
+paragraph said BCP would keep sending every char type as `TDS_TYPE_NVARCHAR`
+and that shrinking the write wire was PR #227's separate item. That turned out
+to be one afternoon's work on top of what D1 already carries — the annotation
+says the target is a UTF-8 varchar, which is exactly the fact the encoder
+needed — so it shipped here. See § 9.
 
 ### D2 — the catalog reports these types, and a setting turns that off
 
@@ -450,3 +454,65 @@ today's behaviour.
 - **Type names are user-facing and permanent.** `MSSQL_NVARCHAR` follows the
   extension's namespace convention; picking anything shorter risks colliding
   with a future DuckDB type.
+
+
+---
+
+## 9. What shipped, and what this draft got wrong
+
+Written after the fact, because two of the judgements above did not survive
+contact with a server.
+
+### Beyond the draft
+
+- **The UTF-8 write path.** § D1 said this spec would not shrink the write
+  wire. It does: a UTF-8 `varchar`/`char` target now receives UTF-8 bytes
+  declared as `BIGVARCHAR`, instead of being transcoded to UTF-16 for the
+  server to transcode back. Measured −51% client CPU on long strings and
+  35 → 19 wire bytes for a 16-character value. Two things had to be learned
+  the hard way: the server reads the payload by the collation in the `INSERT
+  BULK` **statement text**, not the one in COLMETADATA (`Привет` arrived as
+  `ÐŸÑ€Ð¸Ð²ÐµÑ‚` until the column list carried `COLLATE`), and the choice
+  belongs where the encoder is resolved **once per column** — a per-value test
+  cost the untouched nvarchar path ~20 ns.
+- **Microsoft Fabric**, which this draft does not mention at all. BCP works
+  there now, so the CTAS INSERT fallback and the COPY refusal are gone. In
+  their place are guarantees, because a warehouse's limits are real: no
+  `nvarchar` at all (Delta Parquet has no UTF-16 type), exactly two collations
+  and both UTF-8, no indexes and no page compression. All verified against a
+  live warehouse rather than read off the documentation, which was wrong about
+  three of them.
+
+### Corrections to this draft
+
+- § 3's claim that a temp table follows the database's collation is wrong. A
+  `#temp` lives in tempdb and takes **tempdb's**, which is not UTF-8 even when
+  the database is. Found on Fabric, reproduced locally.
+- § D1's "no MAX form" still holds, but for a reason the draft did not give:
+  `mssql_default_string_length = 0` is the MAX form, and it is the default.
+
+### Left undone
+
+- **`TIME` disagrees between the two create paths**: CTAS emits `TIME(7)`,
+  COPY's auto-create `time(6)`. Both lossless — DuckDB's `TIME` is
+  microseconds — but it is the same "one decision in several places" this spec
+  is about. Left because two C++ tests pin the CTAS value and changing either
+  side is a behaviour change with no correctness benefit.
+- **`datetimeoffset` on Fabric.** We emit it for `TIMESTAMP WITH TIME ZONE`
+  and a warehouse refuses it, so such a column cannot be created there. Not
+  guarded; the date/time mapping is its own piece of work.
+- **`ROWS_PER_BATCH` on CTAS** (D8 in the original draft) — untouched.
+- **`char` / `nchar` sources report as `mssql_varchar(n)` / `mssql_nvarchar(n)`.**
+  The data is the same; the space padding is not. A consequence of not adding
+  types without a problem to solve.
+
+### Spun off
+
+- **Spec 061** — collation-aware ORDER BY pushdown. Enabling
+  `mssql_order_pushdown` by default was considered and rejected here: measured,
+  it returns a different SET of rows under `LIMIT`, because the server sorts
+  linguistically and DuckDB by code point. A `_BIN2` collation is the case
+  where the two provably agree.
+- **Spec 062** — INSERT via BCP. `INSERT INTO … SELECT` is the one write path
+  still building T-SQL text; `RETURNING` is the only thing that genuinely
+  requires it.
