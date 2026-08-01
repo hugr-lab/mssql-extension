@@ -384,20 +384,27 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 //! drift from CREATE TABLE and CTAS; all this does is answer whether any column
 //! asked for a single-byte column without naming a collation itself. Resolved
 //! once per COPY, not per column.
-static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarget &target,
+static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarget &target, const BCPCopyConfig &config,
 									  const vector<LogicalType> &source_types) {
-	bool wants_varchar = false;
-	for (const auto &type : source_types) {
-		if (codec::NeedsVarcharCollation(type)) {
-			wants_varchar = true;
-			break;
+	// Two ways a single-byte column gets created here, and BOTH need a collation:
+	// a column that asked for MSSQL_VARCHAR(n) without naming one, and the
+	// session setting that turns EVERY unannotated VARCHAR into one. Missing the
+	// second is how 'Привет' reached a CP1252 database as '??????' through COPY
+	// while CTAS handled it correctly — issue #225's trap, one path at a time.
+	bool wants_varchar = config.text_type_varchar;
+	if (!wants_varchar) {
+		for (const auto &type : source_types) {
+			if (codec::NeedsVarcharCollation(type)) {
+				wants_varchar = true;
+				break;
+			}
 		}
 	}
 	if (!wants_varchar) {
 		return string();
 	}
 	auto &catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
-	return catalog.ResolveVarcharCollation(context, true);
+	return catalog.ResolveVarcharCollation(context, true, target.IsTempTable());
 }
 
 //===----------------------------------------------------------------------===//
@@ -462,7 +469,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		target_catalog.ValidateStringTargets(source_types);
 		target_catalog.ValidateTableOptions(config.table_options);
 	}
-	config.varchar_collation = ResolveVarcharCollation(context, target, source_types);
+	config.varchar_collation = ResolveVarcharCollation(context, target, config, source_types);
 
 	if (table_exists) {
 		if (is_view) {

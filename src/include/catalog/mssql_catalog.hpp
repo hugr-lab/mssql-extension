@@ -155,7 +155,10 @@ public:
 	//! UTF8SUPPORT gets an error instead of a silently lossy column.
 	//! @param wants_varchar false short-circuits to empty — the overwhelmingly
 	//!        common case, where nothing asked for a single-byte column.
-	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar);
+	//! @param target_is_temp a #temp table lives in tempdb and inherits TEMPDB's
+	//!        collation, not the database's, so the "already UTF-8, inherit"
+	//!        shortcut does not hold for it.
+	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar, bool target_is_temp = false);
 
 	//! Does this endpoint have no NVARCHAR at all? True on Fabric Data Warehouse,
 	//! which stores tables as Delta Parquet and has no UTF-16 type to map onto:

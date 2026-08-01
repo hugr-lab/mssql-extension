@@ -841,7 +841,7 @@ MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
 	return acked ? Utf8Support::Granted : Utf8Support::Declined;
 }
 
-string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_varchar) {
+string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_varchar, bool target_is_temp) {
 	if (!wants_varchar) {
 		return string();
 	}
@@ -856,11 +856,25 @@ string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_
 		return string();
 	}
 
-	// A database default that is already UTF-8 (Fabric) is the one case where
+	// A database default that is already UTF-8 (Fabric) is the case where
 	// inheriting is right: imposing a Latin1 collation would also impose its
 	// case- and accent-sensitivity on every later comparison against the column.
+	//
+	// Except for a TEMP table, which does not inherit it. A #temp lives in
+	// tempdb and takes TEMPDB's collation — the server default, and typically
+	// not UTF-8 even when the database is. Verified on a UTF-8 database: a temp
+	// varchar column came back SQL_Latin1_General_CP1_CI_AS and 'Привет' landed
+	// as '??????'. Naming the database's own collation puts the temp column back
+	// in step with the permanent tables around it, and on Fabric — where every
+	// string column is a varchar, so this is the whole of it — that name is one
+	// of the two a warehouse accepts.
 	if (StringUtil::EndsWith(StringUtil::Upper(GetDatabaseCollation()), "_UTF8")) {
-		return string();
+		if (!target_is_temp) {
+			return string();
+		}
+		// The name reaches T-SQL as a bare identifier. It came from the server,
+		// but it is concatenated into DDL, so it is checked like any other.
+		return mssql::codec::IsValidCollationName(GetDatabaseCollation()) ? GetDatabaseCollation() : requested;
 	}
 
 	// Unknown is treated as granted, NOT as declined. Declined means the server
