@@ -620,6 +620,39 @@ CREATE TABLE mssql_db.dbo.report AS
 `varchar(50)`, so the same `n` in the two types does not hold the same data —
 50 bytes of UTF-8 is about 16 Cyrillic characters.
 
+#### Using them with COPY
+
+`COPY TO` takes its column types from the query it is given, so the cast goes in
+the SELECT list — the same place it goes for CTAS:
+
+```sql
+-- one column at a time
+COPY (
+    SELECT id,
+           email::MSSQL_VARCHAR(320) AS email,
+           name::MSSQL_NVARCHAR(100) AS name,
+           notes                                  -- left alone: nvarchar(max)
+    FROM staging
+) TO 'mssql://mssql_db/dbo/customers' (FORMAT 'bcp');
+
+-- or size every unannotated string column at once, for this statement only
+COPY (SELECT * FROM staging)
+    TO 'mssql://mssql_db/dbo/customers' (FORMAT 'bcp', STRING_LENGTH 200);
+
+-- shape the table it creates
+COPY (SELECT * FROM staging)
+    TO 'mssql://mssql_db/dbo/facts' (FORMAT 'bcp', TABLE_KIND 'columnstore', TABLOCK true);
+```
+
+A cast wins over `STRING_LENGTH`, which wins over
+`mssql_default_string_length`. Copying **from** an attached MSSQL table needs
+none of them: the catalog already reports the source's declared types, so the
+target inherits them.
+
+These options apply only when COPY **creates** the target. Loading into a table
+that already exists uses that table's types, and `STRING_LENGTH` / `TABLE_KIND`
+are ignored — COPY does not restructure someone else's table.
+
 The bound is **informational on the DuckDB side**. The value is an ordinary
 DuckDB string, and nothing truncates it there; the length is enforced when the
 data is written, with an error naming the column, and by SQL Server.
@@ -730,30 +763,47 @@ SELECT * FROM sqlserver.dbo.transactions WHERE date = CURRENT_DATE;
 
 ### Type Mapping
 
-DuckDB types are automatically mapped to SQL Server types:
+DuckDB types are mapped to SQL Server types as follows. The same mapping is used
+by CTAS and by `COPY TO` when it creates the target.
 
 | DuckDB Type | SQL Server Type |
 |-------------|-----------------|
 | `BOOLEAN` | `BIT` |
-| `TINYINT` | `TINYINT` |
+| `TINYINT`, `UTINYINT` | `TINYINT` |
 | `SMALLINT` | `SMALLINT` |
-| `INTEGER` | `INT` |
-| `BIGINT` | `BIGINT` |
+| `USMALLINT`, `INTEGER` | `INT` |
+| `UINTEGER`, `BIGINT` | `BIGINT` |
+| `UBIGINT` | `DECIMAL(20,0)` |
+| `HUGEINT`, `UHUGEINT` | `DECIMAL(38,0)` |
 | `FLOAT` | `REAL` |
 | `DOUBLE` | `FLOAT` |
-| `DECIMAL(p,s)` | `DECIMAL(p,s)` (max 38) |
-| `VARCHAR` | `NVARCHAR(MAX)` |
+| `DECIMAL(p,s)` | `DECIMAL(p,s)` (p clamped to 38) |
+| `VARCHAR` | `NVARCHAR(MAX)` — **configurable**, see below |
 | `BLOB` | `VARBINARY(MAX)` |
+| `UUID` | `UNIQUEIDENTIFIER` |
 | `DATE` | `DATE` |
 | `TIME` | `TIME(7)` |
-| `TIMESTAMP` | `DATETIME2(7)` |
+| `TIMESTAMP` | `DATETIME2(6)` — µs, DuckDB's own precision |
+| `TIMESTAMP_MS` | `DATETIME2(3)` |
+| `TIMESTAMP_NS` | `DATETIME2(7)` — 100 ns, lossy by 2 digits |
+| `TIMESTAMP_S` | `DATETIME2(0)` |
 | `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET(7)` |
-| `UUID` | `UNIQUEIDENTIFIER` |
+| `INTERVAL` | `NVARCHAR(50)` — canonical DuckDB interval text |
 
-**Unsupported types** (will error with clear message):
-- `HUGEINT`, `UHUGEINT` - Consider casting to `DECIMAL(38,0)`
-- `INTERVAL` - No SQL Server equivalent
-- `LIST`, `STRUCT`, `MAP`, `ARRAY` - No SQL Server equivalent
+**Unsupported types** (will error with a clear message):
+
+- `LIST`, `STRUCT`, `MAP`, `ARRAY`, `UNION`, `ENUM` — no SQL Server equivalent
+
+The `VARCHAR` row is the only one you can change, and it is the one worth
+changing: `nvarchar(max)` is an off-row LOB and measured 4.1× slower to load
+than a sized column. See
+[Target Column Types and Table Shape](#target-column-types-and-table-shape) for
+`MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`, `mssql_default_string_length` and
+`mssql_ctas_text_type`.
+
+> **Note**: `COPY TO`'s auto-create currently emits `time(6)` where CTAS emits
+> `TIME(7)` for a DuckDB `TIME`. Both are lossless — DuckDB's `TIME` is
+> microseconds — but the two paths disagree.
 
 ### CTAS Settings
 
