@@ -94,6 +94,9 @@ string BCPCopyTarget::GetBracketedTable() const {
 //! constant covers every UTF-8 target.
 static const std::array<uint8_t, 5> UTF8_WIRE_COLLATION = {0x09, 0x04, 0xD0, 0x24, 0x00};
 
+//! Past this many bytes a varchar column has to be MAX, and travels as PLP.
+static constexpr int32_t MAX_INLINE_VARCHAR_BYTES = 8000;
+
 //! Does this target column hold UTF-8 bytes? Only a char type can, and only
 //! under a collation whose name ends in _UTF8 — the same test #225 uses on the
 //! read side, and the reason it is a name test is that Fabric refuses
@@ -1085,16 +1088,18 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 			const bool annotated_varchar = codec::TryGetTargetStringType(source_types[i], spec) && !spec.unicode;
 			const bool plain_varchar_target = single_byte_text && source_types[i].id() == LogicalTypeId::VARCHAR;
 			if (annotated_varchar || plain_varchar_target) {
+				// Empty means we cannot name a UTF-8 collation for this target, so
+				// the column stays on the transcoding path — which is the right
+				// answer for a code-page target, where sending UTF-8 bytes would
+				// be read in that code page and mangled.
 				const string &collation = spec.collation.empty() ? varchar_collation : spec.collation;
 				if (!collation.empty()) {
-					if (!annotated_varchar) {
-						// No stated length: the column is varchar(max), and MAX on
-						// the wire is the same 0xFFFF sentinel either way.
-						spec.length = 0x10000;
-					}
 					col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
-					// Both sides count bytes now, so the length is not doubled.
-					col.max_length = spec.length > 8000 ? 0xFFFF : static_cast<uint16_t>(spec.length);
+					// Both sides count bytes now, so the length is not doubled the
+					// way an nvarchar declaration doubles it. An unannotated column
+					// stated no length and is varchar(max) — the PLP sentinel.
+					const bool is_max = !annotated_varchar || spec.length > MAX_INLINE_VARCHAR_BYTES;
+					col.max_length = is_max ? 0xFFFF : static_cast<uint16_t>(spec.length);
 					col.collation = UTF8_WIRE_COLLATION;
 					col.collation_name = collation;
 				}
