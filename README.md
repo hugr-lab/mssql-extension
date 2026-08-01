@@ -587,6 +587,114 @@ FROM mssql_scan('sqlserver', '
 
 **Constraint**: Only one statement in the batch may produce a result set. Batches with multiple SELECTs will return a clear error message.
 
+## Target Column Types and Table Shape
+
+Every path that creates a SQL Server table — `CREATE TABLE`, `CREATE TABLE AS
+SELECT`, `COPY TO` — used to give string columns `nvarchar(max)`. That is a poor
+default for a table you are about to load: it measured **4.1× slower** to load
+than a sized target, and it is stored as an off-row LOB.
+
+Nothing below changes unless you ask for it: with no cast, no option and no
+setting, the DDL is byte-identical to previous releases.
+
+### Stating a column's type
+
+`MSSQL_NVARCHAR(n)` and `MSSQL_VARCHAR(n [, collation])` state the type a target
+column should get. They bind to a plain DuckDB `VARCHAR`, so every string
+function keeps working on them.
+
+```sql
+CREATE TABLE mssql_db.dbo.customers (
+    id       INTEGER,
+    email    MSSQL_VARCHAR(320),      -- varchar(320), UTF-8 collated
+    name     MSSQL_NVARCHAR(100)      -- nvarchar(100)
+);
+
+-- The same types state a target for CTAS and COPY, which have no DDL of their own
+CREATE TABLE mssql_db.dbo.report AS
+    SELECT id, upper(name)::MSSQL_NVARCHAR(100) AS name FROM local_table;
+```
+
+`n` is **SQL Server's own unit** for the type named: UTF-16 code units for
+`MSSQL_NVARCHAR`, **bytes** for `MSSQL_VARCHAR`. `MSSQL_VARCHAR(50)` is exactly
+`varchar(50)`, so the same `n` in the two types does not hold the same data —
+50 bytes of UTF-8 is about 16 Cyrillic characters.
+
+The bound is **informational on the DuckDB side**. The value is an ordinary
+DuckDB string, and nothing truncates it there; the length is enforced when the
+data is written, with an error naming the column, and by SQL Server.
+
+A `MSSQL_VARCHAR` column is given a UTF-8 collation (`mssql_utf8_collation`), or
+the one you name in the second argument. Without a UTF-8 collation a single-byte
+column silently replaces every character outside the database's code page with
+`?` on insert, so this is not optional: on a server that never granted the TDS
+`UTF8SUPPORT` feature the statement errors instead.
+
+### Types reported by the catalog
+
+Attached tables report their declared string types, so a target created from an
+MSSQL source inherits them with no cast at all:
+
+```sql
+-- dst gets src's column types, including lengths and collations
+COPY (SELECT * FROM mssql_db.dbo.src) TO 'mssql://mssql_db/dbo/dst' (FORMAT 'bcp');
+```
+
+```console
+D DESCRIBE SELECT email FROM mssql_db.dbo.customers;
+┌─────────────┬────────────────────┐
+│ column_name │    column_type     │
+│  email      │ MSSQL_VARCHAR(320) │
+└─────────────┴────────────────────┘
+```
+
+Set `mssql_catalog_native_types = false` to report a bare `VARCHAR` as before —
+useful for tooling that matches on the literal type name. Table entries are
+cached, so call `mssql_invalidate_cache()` to apply the change to tables already
+loaded.
+
+### Defaults for unannotated columns
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | Type an unannotated `VARCHAR` gets from CTAS **and** COPY: `NVARCHAR` or `VARCHAR` |
+| `mssql_default_string_length` | BIGINT | `0` | Length for an unannotated `VARCHAR` column (0 = MAX) |
+| `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of a created table: `HEAP` or `COLUMNSTORE` |
+| `mssql_catalog_native_types` | BOOLEAN | `true` | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for attached string columns |
+| `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_CI_AS_SC_UTF8` | Collation for created `varchar` columns; empty inherits the database default |
+
+`mssql_default_string_length` says "no string in this data is longer than n".
+Anything longer fails with an error naming the column, before the batch is sent.
+Above SQL Server's inline limit (4000 for `nvarchar`, 8000 for `varchar`) the
+column stays MAX. A cast beats this for anything but a uniform schema.
+
+### Table shape: `CREATE TABLE ... WITH (...)`
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `table_kind` | `HEAP`, `COLUMNSTORE` | `COLUMNSTORE` adds a clustered columnstore index |
+| `clustered_index` | column list | Clustered rowstore index over those key columns |
+| `data_compression` | `PAGE`, `ROW`, `NONE` | Table compression |
+
+```sql
+CREATE TABLE mssql_db.dbo.facts (id BIGINT, amount DECIMAL(18,2))
+    WITH (table_kind = 'columnstore');
+
+CREATE TABLE mssql_db.dbo.orders (id BIGINT, placed_at TIMESTAMP)
+    WITH (clustered_index = 'id', data_compression = 'PAGE');
+```
+
+The index is created **before** the load, not after: a clustered columnstore
+built after the rows are in place costs a full rebuild, while building it first
+lets the load write compressed rowgroups directly.
+
+`DATA_COMPRESSION` applies during a bulk load only when the load takes a table
+lock — see `mssql_copy_tablock`. Without it the rows land uncompressed and stay
+that way until someone rebuilds, which is not what the statement asked for.
+
+An option name that is not in the table above is an error, not a silently
+ignored request.
+
 ## CREATE TABLE AS SELECT (CTAS)
 
 Create SQL Server tables directly from DuckDB query results.
@@ -652,8 +760,13 @@ DuckDB types are automatically mapped to SQL Server types:
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `mssql_ctas_use_bcp` | BOOLEAN | `true` | Use BCP protocol for data transfer (2-10x faster than INSERT) |
-| `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | Text column type: `NVARCHAR` or `VARCHAR` |
+| `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | Text column type: `NVARCHAR` or `VARCHAR`. Also governs COPY |
 | `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if data transfer phase fails |
+
+Column lengths and the table's shape come from
+[Target Column Types and Table Shape](#target-column-types-and-table-shape) —
+cast a column to `MSSQL_NVARCHAR(n)` in the SELECT list to size it, since CTAS
+has no options syntax of its own.
 
 ```sql
 -- Disable BCP for legacy INSERT mode (slower, but compatible)
@@ -776,6 +889,50 @@ COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 |---------|------|---------|-------------|
 | `mssql_copy_flush_rows` | BIGINT | 100000 | Rows before flushing to SQL Server (0 = flush at end only) |
 | `mssql_copy_tablock` | BOOLEAN | false | Use TABLOCK hint for 15-30% better performance (blocks concurrent access) |
+
+### COPY TO Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `CREATE_TABLE` | BOOLEAN | `true` | Create the target if it does not exist |
+| `REPLACE` | BOOLEAN | `false` | Drop and recreate the target, discarding its definition |
+| `TRUNCATE` | BOOLEAN | `false` | Empty an existing target, **keeping** its definition |
+| `TABLOCK` | BOOLEAN | from setting | Table-level lock for the load |
+| `FLUSH_ROWS` | BIGINT | from setting | Rows buffered before each flush |
+| `STRING_LENGTH` | BIGINT | from setting | Length for unannotated `VARCHAR` columns this COPY creates (0 = MAX) |
+| `TABLE_KIND` | VARCHAR | from setting | `HEAP` or `COLUMNSTORE` for a table this COPY creates |
+
+```sql
+-- Reload a table without losing its indexes, permissions or partitioning
+COPY data TO 'sqlserver.dbo.facts' (FORMAT 'bcp', TRUNCATE true);
+
+-- Create a sized columnstore target in one statement
+COPY data TO 'sqlserver.dbo.facts' (FORMAT 'bcp', TABLE_KIND 'columnstore', STRING_LENGTH 200);
+```
+
+`TRUNCATE` and `REPLACE` both destroy rows the statement does not name, and they
+are not interchangeable: `REPLACE` also discards the table's definition, while
+`TRUNCATE` keeps it. `TRUNCATE` needs `ALTER` on the table and is refused by SQL
+Server when a foreign key references it. It runs on the same connection as the
+load, so an aborted COPY cannot leave the table both empty and unloaded.
+
+#### Temp tables need a transaction
+
+A `#temp` table belongs to the **connection** that created it, and SQL Server
+drops it when that connection is released. Outside a transaction each statement
+takes whatever connection the pool hands out, so a COPY into a `#temp` and a
+later read of it are not guaranteed to see the same table — and usually will
+not. A DuckDB transaction pins one connection for its whole extent:
+
+```sql
+BEGIN TRANSACTION;
+COPY (SELECT * FROM staging) TO 'sqlserver..#batch' (FORMAT 'bcp');
+CREATE TABLE result AS SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #batch');
+COMMIT;
+```
+
+The same applies to `##global` temp tables for the load itself, though those
+survive for other sessions to read.
 
 ### Performance Characteristics
 
