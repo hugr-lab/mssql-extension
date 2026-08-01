@@ -36,13 +36,7 @@ namespace duckdb {
 // Helper: Create a CreateTableInfo from MSSQL metadata
 //===----------------------------------------------------------------------===//
 
-//! Spec 060: does this catalog report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
-//! its string columns, or a bare VARCHAR? Read from the global setting here
-//! rather than threaded through the metadata cache, because this is the one
-//! place that decides what DuckDB is told. Entries are cached, so a change
-//! applies to entries built afterwards — mssql_invalidate_cache() to apply it
-//! to the ones already loaded.
-static bool ReportsNativeTypes(Catalog &catalog) {
+bool MSSQLReportsNativeTypes(Catalog &catalog) {
 	Value setting;
 	if (!DBConfig::GetConfig(catalog.GetDatabase()).TryGetCurrentSetting("mssql_catalog_native_types", setting)) {
 		return true;
@@ -71,7 +65,7 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	: TableCatalogEntry(catalog, schema,
 						[&]() -> CreateTableInfo & {
 							static thread_local CreateTableInfo info;
-							info = MakeTableInfo(metadata, ReportsNativeTypes(catalog));
+							info = MakeTableInfo(metadata, MSSQLReportsNativeTypes(catalog));
 							return info;
 						}()),
 	  mssql_columns_(metadata.columns),
@@ -105,7 +99,7 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	// Store ALL column information - the query will use only projected columns.
 	// Spec 060: these must be the same types the entry declared above, or the
 	// scan's output disagrees with the column list DuckDB resolved names against.
-	const bool native_types = ReportsNativeTypes(catalog);
+	const bool native_types = MSSQLReportsNativeTypes(catalog);
 	for (const auto &col : mssql_columns_) {
 		catalog_bind_data->all_column_names.push_back(col.name);
 		catalog_bind_data->all_types.push_back(native_types ? col.NativeDuckDBType() : col.duckdb_type);

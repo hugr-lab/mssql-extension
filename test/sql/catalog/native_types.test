@@ -160,6 +160,45 @@ SELECT c_nvarchar FROM nt.dbo.NativeTypeDst;
 Привет
 
 # =============================================================================
+# INSERT against the annotated columns. Two separate failures are pinned here.
+#
+# The literal: the binder wraps 'inserted' in a cast to MSSQL_NVARCHAR(50), and
+# constant folding in the expression rewriter runs that cast at plan time. A
+# cast registered as NopCast is `Vector::Reference`, which demands the two types
+# be equal down to the extension info — so this aborted on every assert-enabled
+# build while release silently reinterpreted.
+#
+# Be clear about what these queries do and do not guard. Both types share a
+# physical representation, so a release build reinterprets and returns exactly
+# these values whether the cast is right or wrong — the rows below pass either
+# way. They fail only where D_ASSERT is live: `make test-debug` and the debug
+# concurrency stress, which is what actually caught this. They are here to put
+# the two paths under that build, not to detect the bug from a result.
+#
+# RETURNING: the binder resolves it against the ColumnDefinition types, so the
+# insert's physical operator must declare those same annotated types. It emits
+# the whole row and the projection picks a column out, so every column's type
+# has to agree, not just the one named here.
+# =============================================================================
+
+statement ok
+INSERT INTO nt.dbo.NativeTypeDst (c_nvarchar, c_varchar, c_max)
+  VALUES ('inserted', 'ascii', 'max');
+
+query T
+INSERT INTO nt.dbo.NativeTypeDst (c_nvarchar, c_varchar, c_max)
+  VALUES ('returned', 'ascii', 'max') RETURNING c_nvarchar;
+----
+returned
+
+query TT
+SELECT c_nvarchar, c_varchar FROM nt.dbo.NativeTypeDst
+WHERE c_varchar = 'ascii' ORDER BY c_nvarchar;
+----
+inserted	ascii
+returned	ascii
+
+# =============================================================================
 # mssql_catalog_native_types = false restores the pre-spec-060 output, for
 # tooling that matches on the literal string 'VARCHAR'. Entries are cached, so
 # the switch applies to entries loaded afterwards — hence the invalidate.

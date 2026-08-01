@@ -551,11 +551,17 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	target.has_identity_column = false;
 	target.identity_column_index = 0;
 
+	// Spec 060: must match what the catalog told DuckDB about these columns —
+	// the binder resolved RETURNING against those types, and MSSQLPhysicalInsert
+	// references the parser's chunk straight into DuckDB's, which requires the
+	// types to be equal down to the extension info.
+	const bool native_types = MSSQLReportsNativeTypes(*this);
+
 	for (idx_t i = 0; i < mssql_columns.size(); i++) {
 		auto &col = mssql_columns[i];
 		MSSQLInsertColumn insert_col;
 		insert_col.name = col.name;
-		insert_col.duckdb_type = col.duckdb_type;
+		insert_col.duckdb_type = native_types ? col.NativeDuckDBType() : col.duckdb_type;
 		insert_col.mssql_type = col.sql_type_name;
 		insert_col.is_identity = false;	 // Will be detected below if needed
 		insert_col.is_nullable = col.is_nullable;

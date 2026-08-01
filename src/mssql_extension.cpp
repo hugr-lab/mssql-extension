@@ -158,18 +158,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// so overload resolution reaches upper(), ||, LIKE and the rest without the
 	// user writing a cast back. With the catalog reporting these types, that path
 	// carries every query against every attached table, not just cast columns.
+	//
+	// ReinterpretCast, NOT NopCast: NopCast is `result.Reference(source)`, and
+	// Vector::Reference requires the two types to be FULLY equal — it compares
+	// the alias and the extension info, not just the LogicalTypeId. VARCHAR and
+	// MSSQL_NVARCHAR(64) share an id, so the release build silently reinterprets
+	// while the debug build trips `D_ASSERT(other.GetType() == GetType())`. That
+	// is what the concurrency stress caught: constant folding in the expression
+	// rewriter folds the literal in `INSERT ... VALUES ('x')` through this cast,
+	// so every writer aborted on iteration 0 in the assert-enabled build.
+	// Reinterpret is the operation actually wanted here — same physical layout,
+	// different logical type — and it permits exactly that.
 	{
 		auto nvarchar_type = LogicalType(LogicalTypeId::VARCHAR);
 		nvarchar_type.SetAlias("MSSQL_NVARCHAR");
 		loader.RegisterType("MSSQL_NVARCHAR", nvarchar_type, BindMssqlNVarchar);
-		loader.RegisterCastFunction(nvarchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::NopCast), 0);
-		loader.RegisterCastFunction(LogicalType::VARCHAR, nvarchar_type, BoundCastInfo(DefaultCasts::NopCast), 0);
+		loader.RegisterCastFunction(nvarchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::ReinterpretCast),
+									0);
+		loader.RegisterCastFunction(LogicalType::VARCHAR, nvarchar_type, BoundCastInfo(DefaultCasts::ReinterpretCast),
+									0);
 
 		auto varchar_type = LogicalType(LogicalTypeId::VARCHAR);
 		varchar_type.SetAlias("MSSQL_VARCHAR");
 		loader.RegisterType("MSSQL_VARCHAR", varchar_type, BindMssqlVarchar);
-		loader.RegisterCastFunction(varchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::NopCast), 0);
-		loader.RegisterCastFunction(LogicalType::VARCHAR, varchar_type, BoundCastInfo(DefaultCasts::NopCast), 0);
+		loader.RegisterCastFunction(varchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::ReinterpretCast),
+									0);
+		loader.RegisterCastFunction(LogicalType::VARCHAR, varchar_type, BoundCastInfo(DefaultCasts::ReinterpretCast),
+									0);
 	}
 
 	// 10. Register utility functions (mssql_version)
