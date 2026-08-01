@@ -457,7 +457,11 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 	// Spec 060: refuse a string type this server cannot store before any DDL is
 	// generated, then resolve the collation once per statement, not per column.
-	Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>().ValidateStringTargets(source_types);
+	{
+		auto &target_catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+		target_catalog.ValidateStringTargets(source_types);
+		target_catalog.ValidateTableOptions(config.table_options);
+	}
 	config.varchar_collation = ResolveVarcharCollation(context, target, source_types);
 
 	if (table_exists) {

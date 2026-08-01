@@ -926,6 +926,26 @@ void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	}
 }
 
+void MSSQLCatalog::ValidateTableOptions(const MSSQLTableOptions &options) {
+	if (!RequiresSingleByteText()) {
+		return;
+	}
+	// Verified against a live warehouse: table_kind and clustered_index both come
+	// back as "CREATE INDEX is not a supported statement type", data_compression
+	// as "The DATA COMPRESSION keyword is not supported in the CREATE TABLE
+	// statement". Delta Parquet has no indexes, and compresses itself.
+	if (options.kind != MSSQLTableKind::HEAP) {
+		throw NotImplementedException(
+			"Microsoft Fabric stores tables as Delta Parquet and supports no indexes, so table_kind and "
+			"clustered_index cannot be applied there. Omit them — a warehouse is already columnar.");
+	}
+	if (!options.data_compression.empty()) {
+		throw NotImplementedException(
+			"DATA_COMPRESSION is not available on Microsoft Fabric: a warehouse stores tables as Delta Parquet, "
+			"which carries its own compression. Omit the option.");
+	}
+}
+
 ErrorData MSSQLCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	auto &base = info.Base().Cast<CreateTableInfo>();
 	// PARTITIONED BY and SORTED BY stay rejected by the base implementation:

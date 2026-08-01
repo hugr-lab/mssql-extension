@@ -10,6 +10,7 @@
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -168,6 +169,13 @@ public:
 	//! outside the two it supports — both UTF-8, and fixed when the warehouse was
 	//! created. Everywhere else this is a no-op.
 	void ValidateStringTargets(const vector<LogicalType> &types);
+
+	//! Spec 060: refuse table properties this server cannot apply. A Fabric
+	//! warehouse stores tables as Delta Parquet: it has no indexes of any kind
+	//! and no page compression, so table_kind, clustered_index and
+	//! data_compression all fail there — with server messages that name neither
+	//! the option the user wrote nor the reason. Elsewhere this is a no-op.
+	void ValidateTableOptions(const MSSQLTableOptions &options);
 
 	//! Spec 060 D5: accept `CREATE TABLE ... WITH (...)`. DuckDB parses the
 	//! clause into CreateTableInfo::options for every catalog and the base

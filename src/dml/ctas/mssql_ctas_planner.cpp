@@ -55,6 +55,7 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 		config.text_type = CTASTextType::VARCHAR;
 	}
 	catalog.ValidateStringTargets(child_plan.types);
+	catalog.ValidateTableOptions(config.table_options);
 
 	bool wants_varchar = config.text_type == CTASTextType::VARCHAR;
 	if (!wants_varchar) {

@@ -156,6 +156,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// clustered index of either kind is its own statement and follows it.
 	MSSQLTableOptions table_options = MSSQLTableOptions::FromSettings(transaction.GetContext());
 	table_options.ApplyWithClause(base_info.options);
+	mssql_catalog.ValidateTableOptions(table_options);
 
 	// Generate T-SQL for CREATE TABLE (with constraints). The translator ends the
 	// statement with ');', so a table-option suffix has to go before that
