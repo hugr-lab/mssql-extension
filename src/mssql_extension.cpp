@@ -100,18 +100,15 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 			throw BinderException("Invalid collation name '%s': expected letters, digits and underscores",
 								  spec.collation);
 		}
-		// A single-byte column under a non-UTF-8 collation stores its code page,
-		// and SQL Server replaces every character outside it with '?' ON INSERT —
-		// no error, and nothing downstream can tell, because '?' is valid UTF-8.
-		// That is issue #225's trap, and offering it per column would reopen it.
-		// The type exists to size a column, not to choose a code page.
-		if (!StringUtil::EndsWith(StringUtil::Upper(spec.collation), "_UTF8")) {
-			throw BinderException(
-				"MSSQL_VARCHAR(n, '%s'): collation must be a UTF-8 one (a _UTF8 suffix). A single-byte column under "
-				"any other collation silently replaces every character outside its code page with '?' on insert. Use "
-				"MSSQL_NVARCHAR(n) to store UTF-16 instead.",
-				spec.collation);
-		}
+		// A code-page collation is allowed here on purpose. Issue #225's trap was
+		// the ABSENCE of a choice — mssql_ctas_text_type='VARCHAR' produced a
+		// column in whatever code page the database happened to use, which the
+		// user never picked and could not see. A collation spelled out by name is
+		// the opposite of that, it is what SQL Server itself accepts, and
+		// mssql_utf8_collation already takes any name globally. Refusing it here
+		// would only mean the extension cannot reproduce a schema that exists.
+		// The consequence — characters outside the code page become '?' on insert
+		// — is the user's to accept, and is documented where the argument is.
 	}
 
 	return mssql::codec::MakeTargetStringType(spec);

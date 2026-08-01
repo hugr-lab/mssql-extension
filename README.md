@@ -642,11 +642,17 @@ against the column, which is why it is worth naming deliberately rather than
 inheriting: `_CI_AS` is case-insensitive and accent-sensitive, `_BIN2` orders by
 code point. Pick the one your data is actually compared with.
 
-It has to be a **UTF-8** collation (a `_UTF8` suffix). A single-byte column
-under any other collation silently replaces every character outside its code
-page with `?` on insert — the trap issue #225 closed — so the extension does not
-offer the choice. `MSSQL_NVARCHAR` takes no collation argument at all: it stores
-UTF-16 and has no code page to get wrong.
+A **non-UTF-8 collation is accepted**, and it means what it says: the column
+stores that collation's code page, and SQL Server replaces every character
+outside it with `?` on insert — no error, and nothing downstream can tell,
+because `?` is valid UTF-8. That is a real choice with a real cost, worth making
+when you are reproducing an existing schema or know the data is inside the page;
+it is the same thing SQL Server does for any client. What the extension will not
+do is make that choice *for* you, which is what issue #225 was about — omit the
+argument and you get `mssql_utf8_collation`, never the database's code page.
+
+`MSSQL_NVARCHAR` takes no collation argument at all: it stores UTF-16 and has no
+code page to get wrong.
 
 Only letters, digits and underscores are accepted; the name reaches T-SQL as a
 bare identifier, so anything else is rejected at bind time rather than

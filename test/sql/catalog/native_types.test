@@ -76,23 +76,18 @@ SELECT length(c_varchar || repeat('x', 100)) FROM nt.dbo.NativeTypeSrc;
 110
 
 # =============================================================================
-# The per-column collation argument, and the one thing it will not do. A
-# single-byte column under a non-UTF-8 collation stores its code page, and SQL
-# Server replaces everything outside it with '?' on insert — issue #225's trap.
-# Offering it here would reopen it one column at a time, so it is refused at
-# bind time rather than at the server.
+# The per-column collation argument. Any collation SQL Server has is accepted,
+# including a code-page one: issue #225's trap was the ABSENCE of a choice —
+# a column in whatever code page the database happened to use — not a collation
+# spelled out by name. What is still refused is a name that is not one.
 # =============================================================================
 
-query TT
+query TTT
 SELECT 'x'::MSSQL_VARCHAR(50, 'Cyrillic_General_100_CI_AS_SC_UTF8') AS cyr,
-       'y'::MSSQL_VARCHAR(16, 'Latin1_General_100_BIN2_UTF8') AS bin2;
+       'y'::MSSQL_VARCHAR(16, 'Latin1_General_100_BIN2_UTF8') AS bin2,
+       'z'::MSSQL_VARCHAR(50, 'Latin1_General_100_CI_AS') AS code_page;
 ----
-x	y
-
-statement error
-SELECT 'x'::MSSQL_VARCHAR(50, 'Latin1_General_100_CI_AS');
-----
-collation must be a UTF-8 one
+x	y	z
 
 statement error
 SELECT 'x'::MSSQL_VARCHAR(50, 'nonsense; DROP TABLE t');
