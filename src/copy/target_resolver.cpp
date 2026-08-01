@@ -470,6 +470,11 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		target_catalog.ValidateTableOptions(config.table_options);
 	}
 	config.varchar_collation = ResolveVarcharCollation(context, target, config, source_types);
+	if (config.text_type_varchar || !config.varchar_collation.empty()) {
+		config.wire_varchar_collation = Catalog::GetCatalog(context, target.catalog_name)
+											.Cast<MSSQLCatalog>()
+											.WireVarcharCollation(config.varchar_collation);
+	}
 
 	if (table_exists) {
 		if (is_view) {
@@ -1052,7 +1057,9 @@ vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_
 //===----------------------------------------------------------------------===//
 
 vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<LogicalType> &source_types,
-																 const vector<string> &source_names) {
+																 const vector<string> &source_names,
+																 const string &varchar_collation,
+																 bool single_byte_text) {
 	vector<BCPColumnMetadata> columns;
 	columns.reserve(source_types.size());
 
@@ -1065,6 +1072,34 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		// Map DuckDB type to TDS type
 		col.tds_type_token = GetTDSTypeToken(source_types[i]);
 		col.max_length = GetTDSMaxLength(source_types[i]);
+
+		// Spec 060 / issue #225 (write side): the same UTF-8 retarget the
+		// existing-table path does, for the paths that build metadata from
+		// DuckDB types instead — CTAS always, and COPY when it replaces the
+		// table. Without this CTAS declared nvarchar(50) on the wire for a
+		// column it had just created as varchar(50), so every value was
+		// transcoded to UTF-16 for the server to transcode back — the whole of
+		// the string path on Fabric, where nvarchar does not exist.
+		{
+			codec::TargetStringType spec;
+			const bool annotated_varchar = codec::TryGetTargetStringType(source_types[i], spec) && !spec.unicode;
+			const bool plain_varchar_target = single_byte_text && source_types[i].id() == LogicalTypeId::VARCHAR;
+			if (annotated_varchar || plain_varchar_target) {
+				const string &collation = spec.collation.empty() ? varchar_collation : spec.collation;
+				if (!collation.empty()) {
+					if (!annotated_varchar) {
+						// No stated length: the column is varchar(max), and MAX on
+						// the wire is the same 0xFFFF sentinel either way.
+						spec.length = 0x10000;
+					}
+					col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
+					// Both sides count bytes now, so the length is not doubled.
+					col.max_length = spec.length > 8000 ? 0xFFFF : static_cast<uint16_t>(spec.length);
+					col.collation = UTF8_WIRE_COLLATION;
+					col.collation_name = collation;
+				}
+			}
+		}
 
 		// Handle precision/scale for decimal types
 		if (source_types[i].id() == LogicalTypeId::DECIMAL) {

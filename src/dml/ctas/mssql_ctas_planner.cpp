@@ -67,6 +67,9 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 		}
 	}
 	config.varchar_collation = catalog.ResolveVarcharCollation(context, wants_varchar);
+	if (wants_varchar) {
+		config.wire_varchar_collation = catalog.WireVarcharCollation(config.varchar_collation);
+	}
 	if (!config.varchar_collation.empty()) {
 		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s", config.varchar_collation.c_str());
 	}

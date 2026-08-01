@@ -896,6 +896,20 @@ bool MSSQLCatalog::RequiresSingleByteText() const {
 	return connection_info_ && connection_info_->is_fabric_endpoint;
 }
 
+string MSSQLCatalog::WireVarcharCollation(const string &ddl_collation) const {
+	if (!ddl_collation.empty()) {
+		return ddl_collation;
+	}
+	// The DDL said nothing because the database's own collation is already what
+	// the column wants. The wire has no such default, so name it.
+	const string &db_collation = GetDatabaseCollation();
+	if (StringUtil::EndsWith(StringUtil::Upper(db_collation), "_UTF8") &&
+		mssql::codec::IsValidCollationName(db_collation)) {
+		return db_collation;
+	}
+	return string();
+}
+
 void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	if (!RequiresSingleByteText()) {
 		return;

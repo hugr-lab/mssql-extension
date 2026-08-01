@@ -441,13 +441,17 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				}
 			} catch (...) {
 				// If we can't get target metadata (e.g., table was just created), use source types
-				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
+																		 bdata.config.wire_varchar_collation,
+																		 bdata.config.text_type_varchar);
 				CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 			}
 		} else {
 			// Table was replaced or created, use source types
-			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
+																	 bdata.config.wire_varchar_collation,
+																	 bdata.config.text_type_varchar);
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
 

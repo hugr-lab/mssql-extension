@@ -48,6 +48,12 @@ struct CTASConfig {
 	// VARCHAR has always meant, so an unset session behaves exactly as before.
 	int32_t default_string_length = 0;
 
+	// Collation to NAME in the INSERT BULK column list for a single-byte column,
+	// or empty to keep it on the UTF-16 wire. Not the same as varchar_collation:
+	// that one may be empty because the database's own collation is already
+	// right, and the wire inherits nothing.
+	string wire_varchar_collation;
+
 	// Shape of the table CTAS creates — mssql_default_table_kind (spec 060 D9).
 	// CTAS has no options syntax of its own, so the setting is the only dial.
 	MSSQLTableOptions table_options;

@@ -269,8 +269,14 @@ struct TargetResolver {
 	// @param source_types DuckDB logical types
 	// @param source_names Column names
 	// @return Vector of BCPColumnMetadata for COLMETADATA token generation
+	// @param varchar_collation collation for a column whose type states varchar
+	//        but names none itself; empty leaves the column on the UTF-16 wire
+	// @param varchar_collation collation for a column whose type states varchar
+	//        but names none itself; empty leaves such a column on the UTF-16 wire
 	static vector<BCPColumnMetadata> GenerateColumnMetadata(const vector<LogicalType> &source_types,
-															const vector<string> &source_names);
+															const vector<string> &source_names,
+															const string &varchar_collation = "",
+															bool single_byte_text = false);
 
 	//===----------------------------------------------------------------------===//
 	// Type Mapping

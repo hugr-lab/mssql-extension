@@ -167,6 +167,17 @@ public:
 	//! Verified against a live warehouse, not inferred from the docs.
 	bool RequiresSingleByteText() const;
 
+	//! Spec 060 / issue #225 (write side): the collation to name in the INSERT
+	//! BULK column list for a single-byte column, or empty for "keep it on the
+	//! UTF-16 wire". A DIFFERENT question from ResolveVarcharCollation, which
+	//! answers what goes in the DDL: there, empty means "inherit the database's",
+	//! which is right and cheap. On the wire nothing is inherited — the server
+	//! reads the payload by the collation in the statement text, so sending UTF-8
+	//! needs a UTF-8 name, and the database's own is the one to use when the DDL
+	//! did not need to say anything. Empty when the database is a code page,
+	//! which keeps such a target on the transcoding path where it belongs.
+	string WireVarcharCollation(const string &ddl_collation) const;
+
 	//! Spec 060: refuse a string type this server cannot store, before it reaches
 	//! the DDL. On Fabric that is any NVARCHAR annotation, and any collation
 	//! outside the two it supports — both UTF-8, and fixed when the warehouse was

@@ -74,6 +74,11 @@ struct BCPCopyConfig {
 	// naming one, and the database default is not already UTF-8.
 	string varchar_collation;
 
+	// Collation to NAME in the INSERT BULK column list for a single-byte column,
+	// or empty to keep it on the UTF-16 wire. See CTASConfig for why this is not
+	// the same question as varchar_collation.
+	string wire_varchar_collation;
+
 	// From mssql_ctas_text_type — what an unannotated DuckDB VARCHAR becomes.
 	// The SAME setting drives CTAS, so the two table-creating paths cannot
 	// disagree about it (spec 060 D7).
