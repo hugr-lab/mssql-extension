@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -279,6 +279,64 @@ test-index-kind:
 	@echo ""
 	@echo "Running MSSQLIndexKind unit test..."
 	build/test/test_index_kind
+
+# ---------------------------------------------------------------------------
+# Standalone C++ unit tests (no Catch, no SQL Server, own main()).
+#
+# These 12 files existed in test/cpp/ for a long time WITHOUT being built by
+# anything — not CMake, not this Makefile, not CI. Nothing compiled them, so
+# nothing noticed when the code moved underneath: four expectations were stale
+# (HUGEINT and INTERVAL "unsupported" since spec 045 made them DECIMAL(38,0) and
+# NVARCHAR(50); TIMESTAMP as DATETIME2(7); an identifier-quoting case with one
+# bracket too many), and one described output the code no longer produced. A
+# test nobody runs is documentation that looks like a guarantee.
+#
+# They link against the built extension archive, so `make` (release) first.
+# ---------------------------------------------------------------------------
+STANDALONE_TEST_SOURCES := \
+    test/cpp/test_ddl_translator.cpp \
+    test/cpp/test_ctas_type_mapping.cpp \
+    test/cpp/test_catalog_filter.cpp \
+    test/cpp/codec/test_binary_codec.cpp \
+    test/cpp/codec/test_boolean_codec.cpp \
+    test/cpp/codec/test_datetime_codec.cpp \
+    test/cpp/codec/test_decimal_codec.cpp \
+    test/cpp/codec/test_float_codec.cpp \
+    test/cpp/codec/test_integer_codec.cpp \
+    test/cpp/codec/test_money_codec.cpp \
+    test/cpp/codec/test_string_codec.cpp \
+    test/cpp/codec/test_uuid_codec.cpp
+
+STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include
+STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
+STANDALONE_TEST_UNAME := $(shell uname -s)
+ifeq ($(STANDALONE_TEST_UNAME),Darwin)
+STANDALONE_TEST_PLATFORM_LIBS := -framework GSS -framework CoreFoundation -framework Security
+else
+STANDALONE_TEST_PLATFORM_LIBS := -lgssapi_krb5 -ldl -lrt
+endif
+
+test-cpp: release
+	@echo "Building standalone C++ unit tests..."
+	@mkdir -p build/test
+	@if [ ! -f build/release/extension/mssql/libmssql_extension.a ]; then \
+		echo "ERROR: build/release/extension/mssql/libmssql_extension.a missing; run 'make' first." >&2; \
+		exit 1; \
+	fi
+	@fail=0; \
+	libs="build/release/extension/mssql/libmssql_extension.a build/release/src/libduckdb_static.a \
+	      $$(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
+	      build/release/src/libduckdb_static.a \
+	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a"; \
+	for f in $(STANDALONE_TEST_SOURCES); do \
+		n=$$(basename $$f .cpp); \
+		$(CXX) $(STANDALONE_TEST_FLAGS) $(STANDALONE_TEST_INCLUDES) $$f $$libs $(STANDALONE_TEST_PLATFORM_LIBS) \
+		    -o build/test/$$n 2>build/test/$$n.log || { echo "  BUILD FAIL $$n (see build/test/$$n.log)"; fail=1; continue; }; \
+		if build/test/$$n >build/test/$$n.out 2>&1; then echo "  PASS $$n"; \
+		else echo "  FAIL $$n"; tail -5 build/test/$$n.out; fail=1; fi; \
+	done; \
+	exit $$fail
 
 # Spec 045: SQL Server Browser parser unit tests (Phase 0).
 # Pure unit test — no SQL Server, no vcpkg, no DuckDB linkage required.

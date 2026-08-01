@@ -82,8 +82,8 @@ void test_quote_identifier_special() {
 	// Closing bracket at end
 	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo]"), "[foo]]]");
 
-	// Only closing bracket
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]"), "[]]]]");
+	// Only closing bracket: [ + the doubled ] + the closing ] = four characters
+	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]"), "[]]]");
 
 	// Opening bracket (no escaping needed for [)
 	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo[bar"), "[foo[bar]");

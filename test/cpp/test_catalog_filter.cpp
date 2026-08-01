@@ -262,17 +262,20 @@ static void TestSQLLikeSinglePatterns() {
 	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^dbo$", "s.name"),
 			  "s.name LIKE 'dbo'");
 
-	// Prefix: ^tbl_ → col LIKE 'tbl_%'
+	// Prefix: ^tbl_ → col LIKE 'tbl[_]%'. The underscore is a LIKE wildcard, and
+	// the regex meant it literally, so it has to be escaped or 'tbl_%' would
+	// also match tblX.
 	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^tbl_", "o.name"),
-			  "o.name LIKE 'tbl_%'");
+			  "o.name LIKE 'tbl[_]%'");
 
 	// Unanchored substring: order → col LIKE '%order%'
 	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("order", "o.name"),
 			  "o.name LIKE '%order%'");
 
-	// Wildcard: ^tbl_.* → col LIKE 'tbl_%'
+	// Wildcard: ^tbl_.* → col LIKE 'tbl[_]%'. The .* supplies the trailing
+	// wildcard, so the unanchored end must not add a second one.
 	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("^tbl_.*", "o.name"),
-			  "o.name LIKE 'tbl_%'");
+			  "o.name LIKE 'tbl[_]%'");
 
 	// Empty returns empty
 	ASSERT_EQ(MSSQLCatalogFilter::TryRegexToSQLLike("", "col"), string(""));
@@ -313,7 +316,7 @@ static void TestSQLLikeAlternationOR() {
 
 	// ^(tbl_.*|fact_.*) → prefix alternation with OR
 	string result = MSSQLCatalogFilter::TryRegexToSQLLike("^(tbl_.*|fact_.*)$", "o.name");
-	ASSERT_EQ(result, "(o.name LIKE 'tbl_%' OR o.name LIKE 'fact_%')");
+	ASSERT_EQ(result, "(o.name LIKE 'tbl[_]%' OR o.name LIKE 'fact[_]%')");
 
 	// Unanchored alternation: top-level a|b
 	result = MSSQLCatalogFilter::TryRegexToSQLLike("orders|products", "o.name");
@@ -321,7 +324,7 @@ static void TestSQLLikeAlternationOR() {
 
 	// Prefix only (no $): ^(tbl_|fact_)
 	result = MSSQLCatalogFilter::TryRegexToSQLLike("^(tbl_|fact_)", "o.name");
-	ASSERT_EQ(result, "(o.name LIKE 'tbl_%' OR o.name LIKE 'fact_%')");
+	ASSERT_EQ(result, "(o.name LIKE 'tbl[_]%' OR o.name LIKE 'fact[_]%')");
 
 	std::cout << "  TestSQLLikeAlternationOR PASSED" << std::endl;
 }

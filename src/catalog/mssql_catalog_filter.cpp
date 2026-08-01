@@ -184,13 +184,17 @@ static string ConvertSinglePatternToLike(const string &pattern, const string &co
 		i++;
 	}
 
+	// A wildcard the pattern already produced makes the anchor's own redundant:
+	// `^tbl_.*` converts to `tbl[_]%` and then, being unanchored at the end,
+	// would collect a second `%`. `%%` matches the same set as `%`, so this is
+	// cosmetic — but it is generated SQL that a user reads.
 	string full_like;
-	if (!anchored_start) {
+	if (!anchored_start && (like_pattern.empty() || like_pattern.front() != '%')) {
 		full_like = "%" + like_pattern;
 	} else {
 		full_like = like_pattern;
 	}
-	if (!anchored_end) {
+	if (!anchored_end && (full_like.empty() || full_like.back() != '%')) {
 		full_like += "%";
 	}
 

@@ -359,6 +359,33 @@ jobs:
           LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src ./build/test/test_datetime_codec
           echo "::endgroup::"
 
+          # Three unit tests that were in the tree but built by NOTHING — not
+          # CMake, not the Makefile, not this workflow. Nobody compiled them,
+          # so nobody noticed the code moving underneath: HUGEINT and INTERVAL
+          # were still asserted "unsupported" after spec 045 gave them
+          # DECIMAL(38,0) and NVARCHAR(50), TIMESTAMP was still DATETIME2(7),
+          # an identifier-quoting case had one bracket too many, and the LIKE
+          # conversion tests predated underscore escaping. All four were wrong
+          # about the CODE, not the other way round.
+          for t in test_ddl_translator test_ctas_type_mapping test_catalog_filter; do
+            case "$t" in
+              test_catalog_filter) EXTRA="src/catalog/mssql_catalog_filter.cpp" ;;
+              *)                   EXTRA="src/catalog/mssql_ddl_translator.cpp" ;;
+            esac
+            echo "::group::${t}"
+            "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+              -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+              "test/cpp/${t}.cpp" src/codec/*.cpp $EXTRA \
+              src/tds/encoding/utf16.cpp src/tds/encoding/decimal_encoding.cpp \
+              src/tds/encoding/guid_encoding.cpp src/tds/encoding/datetime_encoding.cpp \
+              src/tds/encoding/bcp_row_encoder.cpp \
+              -L "$PREFIX/lib" -lsimdutf \
+              -L build/release/src -lduckdb \
+              -o "build/test/${t}"
+            LD_LIBRARY_PATH=build/release/src DYLD_LIBRARY_PATH=build/release/src "./build/test/${t}"
+            echo "::endgroup::"
+          done
+
           # spec 054: run the remaining per-family codec unit tests. Only
           # datetime ran in CI before, so the #177 HUGEINT guard and the W1
           # dictionary/constant fixes had no CI coverage. Same link set as
