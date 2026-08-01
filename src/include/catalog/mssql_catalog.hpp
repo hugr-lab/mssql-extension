@@ -156,6 +156,19 @@ public:
 	//!        common case, where nothing asked for a single-byte column.
 	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar);
 
+	//! Does this endpoint have no NVARCHAR at all? True on Fabric Data Warehouse,
+	//! which stores tables as Delta Parquet and has no UTF-16 type to map onto:
+	//! its own documentation says to use char/varchar instead, and `CREATE TABLE
+	//! (v nvarchar(50))` is refused with "not supported in this edition".
+	//! Verified against a live warehouse, not inferred from the docs.
+	bool RequiresSingleByteText() const;
+
+	//! Spec 060: refuse a string type this server cannot store, before it reaches
+	//! the DDL. On Fabric that is any NVARCHAR annotation, and any collation
+	//! outside the two it supports — both UTF-8, and fixed when the warehouse was
+	//! created. Everywhere else this is a no-op.
+	void ValidateStringTargets(const vector<LogicalType> &types);
+
 	//! Spec 060 D5: accept `CREATE TABLE ... WITH (...)`. DuckDB parses the
 	//! clause into CreateTableInfo::options for every catalog and the base
 	//! implementation rejects it; SQL Server has real table properties to put

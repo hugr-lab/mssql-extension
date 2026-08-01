@@ -1,5 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
+#include "codec/target_string_type.hpp"
 
 #include "azure/azure_token.hpp"
 #include "catalog/mssql_bind_anchors.hpp"
@@ -875,6 +876,54 @@ string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_
 			"MSSQL_VARCHAR(n, 'collation'), or set mssql_utf8_collation='' to accept that loss deliberately.");
 	}
 	return requested;
+}
+
+bool MSSQLCatalog::RequiresSingleByteText() const {
+	return connection_info_ && connection_info_->is_fabric_endpoint;
+}
+
+void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
+	if (!RequiresSingleByteText()) {
+		return;
+	}
+
+	// Fabric Data Warehouse allows exactly these two, both UTF-8, and the choice
+	// is fixed when the warehouse is created. Anything else is rejected by the
+	// server with "...is not a valid collation", which is a worse place to find
+	// out than here.
+	static const char *const FABRIC_COLLATIONS[] = {"LATIN1_GENERAL_100_BIN2_UTF8",
+													"LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8"};
+
+	for (const auto &type : types) {
+		mssql::codec::TargetStringType spec;
+		if (!mssql::codec::TryGetTargetStringType(type, spec)) {
+			continue;
+		}
+		if (spec.unicode) {
+			throw NotImplementedException(
+				"MSSQL_NVARCHAR is not available on Microsoft Fabric: a warehouse stores tables as Delta Parquet and "
+				"has no UTF-16 type, so nvarchar columns cannot be created there. Use MSSQL_VARCHAR(n) — its "
+				"collation is UTF-8, so it holds the same characters, counting BYTES rather than UTF-16 units.");
+		}
+		if (spec.collation.empty()) {
+			continue;
+		}
+		const string upper = StringUtil::Upper(spec.collation);
+		bool supported = false;
+		for (const char *candidate : FABRIC_COLLATIONS) {
+			if (upper == candidate) {
+				supported = true;
+				break;
+			}
+		}
+		if (!supported) {
+			throw NotImplementedException(
+				"Collation '%s' is not available on Microsoft Fabric, which supports only "
+				"Latin1_General_100_BIN2_UTF8 and Latin1_General_100_CI_AS_KS_WS_SC_UTF8 — both UTF-8, and fixed when "
+				"the warehouse was created. Omit the collation to inherit the warehouse's own.",
+				spec.collation);
+		}
+	}
 }
 
 ErrorData MSSQLCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {

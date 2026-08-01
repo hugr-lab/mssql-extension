@@ -245,6 +245,16 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		// Ignore unknown options (may be standard COPY options)
 	}
 
+	// Fabric Data Warehouse has no nvarchar type at all, so the setting cannot be
+	// honoured there and nvarchar(max) — the default everywhere else — is refused
+	// by the server. Verified against a live warehouse.
+	{
+		auto &target_catalog = Catalog::GetCatalog(context, bind_data->target.catalog_name).Cast<MSSQLCatalog>();
+		if (target_catalog.RequiresSingleByteText()) {
+			bind_data->config.text_type_varchar = true;
+		}
+	}
+
 	// Spec 060: stamp the session's default target type onto every unannotated
 	// VARCHAR here, once, so table creation, the INSERT BULK declaration and the
 	// encoder's length guard all read one annotation. A column that already
@@ -280,16 +290,6 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 
 	// Check write access
 	mssql_catalog.CheckWriteAccess("COPY TO");
-
-	// T042 (Bug 0.7): Check for Fabric endpoint - BCP/INSERT BULK is not supported
-	const auto &conn_info = mssql_catalog.GetConnectionInfo();
-	if (conn_info.is_fabric_endpoint) {
-		throw NotImplementedException(
-			"MSSQL COPY: Microsoft Fabric does not support INSERT BULK (BCP protocol). "
-			"Use CREATE TABLE AS SELECT (CTAS) instead, which auto-falls back to INSERT mode: "
-			"CREATE TABLE %s AS SELECT ... FROM source_table;",
-			bdata.target.GetFullyQualifiedName());
-	}
 
 	// Acquire a connection from the pool
 	// For BCP, we need an exclusive connection that will remain in Executing state

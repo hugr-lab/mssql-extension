@@ -215,7 +215,8 @@ struct TargetResolver {
 	//        their own; empty emits no COLLATE clause. Resolved by ValidateTarget.
 	static void CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
 							const vector<LogicalType> &source_types, const vector<string> &source_names,
-							const string &varchar_collation, const MSSQLTableOptions &table_options);
+							const string &varchar_collation, const MSSQLTableOptions &table_options,
+							bool single_byte_text);
 
 	// Drop a table if it exists
 	// @param conn TDS connection for SQL execution
@@ -273,7 +274,11 @@ struct TargetResolver {
 	// @param varchar_collation Collation for an MSSQL_VARCHAR(n) column that names
 	//        none of its own; empty emits no COLLATE clause
 	// @return SQL Server type string (e.g., "int", "nvarchar(max)")
-	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation = "");
+	// @param single_byte_text emit varchar rather than nvarchar for an
+	//        unannotated VARCHAR — mssql_ctas_text_type='VARCHAR', or a Fabric
+	//        warehouse, which has no nvarchar type at all
+	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation = "",
+											  bool single_byte_text = false);
 
 	// Map DuckDB type to TDS type token
 	// @param duckdb_type DuckDB logical type

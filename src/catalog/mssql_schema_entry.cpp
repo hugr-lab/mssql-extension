@@ -136,6 +136,12 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// converts to the database code page on insert and drops everything outside
 	// it, silently (issue #225). Same rule as CTAS and COPY, resolved in one place
 	// on the catalog so the three cannot drift.
+	vector<LogicalType> column_types;
+	for (auto &column : columns.Logical()) {
+		column_types.push_back(column.GetType());
+	}
+	mssql_catalog.ValidateStringTargets(column_types);
+
 	bool wants_varchar = false;
 	for (auto &column : columns.Logical()) {
 		if (mssql::codec::NeedsVarcharCollation(column.GetType())) {

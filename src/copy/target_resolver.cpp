@@ -413,7 +413,9 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// Track whether we're creating a new table for auto-TABLOCK (Issue #45)
 	config.is_new_table = false;
 
-	// Spec 060: resolve once per statement, not once per column.
+	// Spec 060: refuse a string type this server cannot store before any DDL is
+	// generated, then resolve the collation once per statement, not per column.
+	Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>().ValidateStringTargets(source_types);
 	config.varchar_collation = ResolveVarcharCollation(context, target, source_types);
 
 	if (table_exists) {
@@ -426,7 +428,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Drop and recreate
 			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
-			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options,
+						config.text_type_varchar);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
 		} else {
@@ -458,7 +461,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		// Table doesn't exist
 		if (config.create_table) {
 			DebugLog(1, "ValidateTarget: CREATE_TABLE=true, creating table");
-			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options,
+						config.text_type_varchar);
 			// Newly created table
 			config.is_new_table = true;
 		} else {
@@ -476,7 +480,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
 								 const vector<LogicalType> &source_types, const vector<string> &source_names,
-								 const string &varchar_collation, const MSSQLTableOptions &table_options) {
+								 const string &varchar_collation, const MSSQLTableOptions &table_options,
+								 bool single_byte_text) {
 	if (source_types.size() != source_names.size()) {
 		throw InvalidInputException("MSSQL COPY: Column types and names count mismatch");
 	}
@@ -488,8 +493,8 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 		if (i > 0) {
 			sql += ",\n";
 		}
-		sql +=
-			"  [" + source_names[i] + "] " + GetSQLServerTypeDeclaration(source_types[i], varchar_collation) + " NULL";
+		sql += "  [" + source_names[i] + "] " +
+			   GetSQLServerTypeDeclaration(source_types[i], varchar_collation, single_byte_text) + " NULL";
 	}
 
 	sql += "\n)";
@@ -1069,7 +1074,8 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 // TargetResolver::GetSQLServerTypeDeclaration
 //===----------------------------------------------------------------------===//
 
-string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation) {
+string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation,
+												   bool single_byte_text) {
 	// Spec 060: an MSSQL_VARCHAR / MSSQL_NVARCHAR annotation states the target
 	// column's type, whether it came from an explicit cast or was carried here by
 	// the catalog from an attached source. The bound type is a plain DuckDB type
@@ -1118,8 +1124,15 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 		return StringUtil::Format("decimal(%d,%d)", width, scale);
 	}
 
-	case LogicalTypeId::VARCHAR:
-		return "nvarchar(max)";
+	case LogicalTypeId::VARCHAR: {
+		if (!single_byte_text) {
+			return "nvarchar(max)";
+		}
+		// A single-byte target is only correct with a UTF-8 collation; an empty
+		// one means the database default already is one (Fabric), which is the
+		// case that matters most here since Fabric has no nvarchar at all.
+		return varchar_collation.empty() ? "varchar(max)" : "varchar(max) COLLATE " + varchar_collation;
+	}
 
 	case LogicalTypeId::BLOB:
 		return "varbinary(max)";

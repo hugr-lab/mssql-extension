@@ -47,6 +47,15 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	// so it needs the same collation. A column that named its own needs neither,
 	// and the rule itself lives on the catalog so CREATE TABLE, CTAS and COPY
 	// cannot drift apart on it.
+	// Fabric has no NVARCHAR at all, so the setting cannot be honoured there and
+	// nvarchar(max) — the default everywhere else — fails outright. Forcing
+	// VARCHAR is what makes CTAS work on a warehouse; its collation is UTF-8, so
+	// nothing is lost but the unit the length counts in.
+	if (catalog.RequiresSingleByteText()) {
+		config.text_type = CTASTextType::VARCHAR;
+	}
+	catalog.ValidateStringTargets(child_plan.types);
+
 	bool wants_varchar = config.text_type == CTASTextType::VARCHAR;
 	if (!wants_varchar) {
 		for (const auto &type : child_plan.types) {
@@ -59,14 +68,6 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	config.varchar_collation = catalog.ResolveVarcharCollation(context, wants_varchar);
 	if (!config.varchar_collation.empty()) {
 		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s", config.varchar_collation.c_str());
-	}
-
-	// T042-T045 (Bug 0.7): Check for Fabric endpoint and disable BCP if detected
-	// Microsoft Fabric doesn't support INSERT BULK/BCP protocol
-	const auto &conn_info = catalog.GetConnectionInfo();
-	if (conn_info.is_fabric_endpoint && config.use_bcp) {
-		CTAS_PLANNER_DEBUG_LOG(1, "Fabric endpoint detected, disabling BCP mode (INSERT BULK not supported)");
-		config.use_bcp = false;
 	}
 
 	// Extract target table information
