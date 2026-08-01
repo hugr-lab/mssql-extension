@@ -1,0 +1,178 @@
+# name: test/sql/catalog/native_types.test
+# description: the catalog states a string column's declared SQL Server type (spec 060)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Every string column of an attached table used to report a bare VARCHAR, which
+# meant a target created from it became nvarchar(max) — 4.1x slower to load and
+# what blocks a columnstore target. The catalog now states the declared type, so
+# the length travels in the type and no cast has to be written by anyone.
+#
+# The annotation is INFORMATIONAL on the DuckDB side: the type binds to a plain
+# VARCHAR, so n neither constrains nor truncates a value here. It bites at the
+# write boundary and on the server.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS nt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('nt', $$
+IF OBJECT_ID('dbo.NativeTypeSrc') IS NOT NULL DROP TABLE dbo.NativeTypeSrc;
+CREATE TABLE dbo.NativeTypeSrc (
+    c_nvarchar  nvarchar(50),
+    c_nchar     nchar(8),
+    c_varchar   varchar(30),
+    c_max       nvarchar(max),
+    c_int       int
+);
+INSERT INTO dbo.NativeTypeSrc VALUES (N'Привет', N'abc', 'ascii only', N'unbounded 漢字', 7);
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('nt');
+
+# nvarchar/nchar count UTF-16 code units, varchar counts bytes — each reported in
+# SQL Server's own unit for the type. A MAX column stays a plain VARCHAR, which
+# is already what MAX means, and non-string columns are untouched.
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'nt' AND table_name = 'NativeTypeSrc'
+ORDER BY column_index;
+----
+c_nvarchar	MSSQL_NVARCHAR(50)
+c_nchar	MSSQL_NVARCHAR(8)
+c_varchar	MSSQL_VARCHAR(30)
+c_max	VARCHAR
+c_int	INTEGER
+
+# The scan is unaffected: the values come back exactly as before. BuildColumnExpression
+# decides its SELECT list from the SQL Server metadata, not from the LogicalType,
+# so annotating the type cannot disturb the query it builds.
+query TTTTI
+SELECT c_nvarchar, trim(c_nchar), c_varchar, c_max, c_int FROM nt.dbo.NativeTypeSrc;
+----
+Привет	abc	ascii only	unbounded 漢字	7
+
+# And the values behave as ordinary strings — the implicit no-op casts registered
+# with the types are what keep every VARCHAR function reachable.
+query TIT
+SELECT upper(c_nvarchar), length(c_nvarchar), c_nvarchar || '!' FROM nt.dbo.NativeTypeSrc;
+----
+ПРИВЕТ	6	Привет!
+
+# n does NOT constrain a DuckDB value: this is longer than the column it came
+# from and nothing here objects.
+query I
+SELECT length(c_varchar || repeat('x', 100)) FROM nt.dbo.NativeTypeSrc;
+----
+110
+
+# =============================================================================
+# Filter pushdown must survive the annotation. It did not at first: DuckDB
+# reaches a VARCHAR overload through the implicit no-op cast registered with
+# these types, and the filter encoder had no arm for a cast, so LIKE stopped
+# being pushed and the whole column was fetched and filtered on the client.
+#
+# Results alone cannot catch that — they stay correct either way. What changes is
+# WHERE the filtering happens, so the assertion is on the plan: a filter DuckDB
+# kept for itself appears as a FILTER operator above the scan, and a filter that
+# reached SQL Server does not.
+#
+# (Asking the server instead — via sys.dm_exec_query_stats for our literal — was
+# tried and is flaky: the DMV row does not appear synchronously with the query.)
+# =============================================================================
+
+query II
+EXPLAIN SELECT count(*) FROM nt.dbo.NativeTypeSrc WHERE c_varchar LIKE 'zq7pushmark%';
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+query I
+SELECT count(*) FROM nt.dbo.NativeTypeSrc WHERE c_varchar LIKE 'zq7pushmark%';
+----
+0
+
+# =============================================================================
+# The point of it: a target created from this source inherits the column types,
+# with no cast written by the user.
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS nt.dbo.NativeTypeDst;
+
+statement ok
+COPY (SELECT c_nvarchar, c_nchar, c_varchar, c_max FROM nt.dbo.NativeTypeSrc)
+  TO 'mssql://nt/dbo/NativeTypeDst' (FORMAT 'bcp');
+
+# max_length is bytes: nvarchar(50) is 100, varchar(30) is 30, MAX is -1.
+# The source's own collation travels with a varchar column, so the target holds
+# exactly what the source held — inheriting the session's UTF-8 collation instead
+# would silently change how many characters fit into those 30 bytes.
+query TTI
+SELECT name, type_name, max_length FROM mssql_scan('nt', $$
+SELECT c.name, t.name AS type_name, c.max_length
+FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID('dbo.NativeTypeDst') ORDER BY c.column_id
+$$);
+----
+c_nvarchar	nvarchar	100
+c_nchar	nvarchar	16
+c_varchar	varchar	30
+c_max	nvarchar	-1
+
+query T
+SELECT c_nvarchar FROM nt.dbo.NativeTypeDst;
+----
+Привет
+
+# =============================================================================
+# mssql_catalog_native_types = false restores the pre-spec-060 output, for
+# tooling that matches on the literal string 'VARCHAR'. Entries are cached, so
+# the switch applies to entries loaded afterwards — hence the invalidate.
+# =============================================================================
+
+statement ok
+SET mssql_catalog_native_types = false;
+
+statement ok
+SELECT mssql_invalidate_cache('nt');
+
+query II
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'nt' AND table_name = 'NativeTypeSrc'
+ORDER BY column_index;
+----
+c_nvarchar	VARCHAR
+c_nchar	VARCHAR
+c_varchar	VARCHAR
+c_max	VARCHAR
+c_int	INTEGER
+
+query T
+SELECT c_nvarchar FROM nt.dbo.NativeTypeSrc;
+----
+Привет
+
+statement ok
+SET mssql_catalog_native_types = true;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('nt', $$
+DROP TABLE dbo.NativeTypeSrc;
+DROP TABLE dbo.NativeTypeDst;
+$$);
+
+statement ok
+DETACH nt;

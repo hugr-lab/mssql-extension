@@ -74,7 +74,7 @@ WHERE database_name = 'part_db' AND table_name = 'PartLog'
 ORDER BY column_index;
 ----
 log_ts	TIMESTAMP_NS
-message	VARCHAR
+message	MSSQL_NVARCHAR(255)
 
 # The table itself appears once in the catalog
 query I
@@ -149,7 +149,7 @@ WHERE database_name = 'part_db' AND table_name = 'PartHeap'
 ORDER BY column_index;
 ----
 log_ts	TIMESTAMP_NS
-message	VARCHAR
+message	MSSQL_NVARCHAR(255)
 
 query I
 SELECT count(*) FROM part_db.dbo.PartHeap;
@@ -192,7 +192,7 @@ WHERE database_name = 'part_db' AND table_name = 'PartCci'
 ORDER BY column_index;
 ----
 log_ts	TIMESTAMP_NS
-message	VARCHAR
+message	MSSQL_NVARCHAR(255)
 
 query IT
 SELECT log_ts, message FROM part_db.dbo.PartCci ORDER BY log_ts;
@@ -260,7 +260,7 @@ WHERE database_name = 'part_db' AND table_name = 'PartLog'
 ORDER BY column_index;
 ----
 log_ts	TIMESTAMP_NS
-message	VARCHAR
+message	MSSQL_NVARCHAR(255)
 
 query II
 SELECT column_name, data_type FROM duckdb_columns()
@@ -268,7 +268,7 @@ WHERE database_name = 'part_db' AND table_name = 'PartCci'
 ORDER BY column_index;
 ----
 log_ts	TIMESTAMP_NS
-message	VARCHAR
+message	MSSQL_NVARCHAR(255)
 
 # Each partitioned table appears once, with the summed row count — a preload
 # that multiplied rows would report 4 tables' worth of columns and one

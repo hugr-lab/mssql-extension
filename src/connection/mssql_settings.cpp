@@ -275,6 +275,23 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName,
 							  SetScope::GLOBAL);
 
+	// mssql_catalog_native_types - report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
+	// the string columns of attached tables instead of a bare VARCHAR (spec 060).
+	// On by default, because it is what lets a target inherit its source's
+	// declared lengths with no cast written by anyone: COPY (SELECT * FROM
+	// d.dbo.Src) TO 'd.dbo.Dst' reproduces Src's column types. The cost is that
+	// DESCRIBE and duckdb_columns() print the annotated name, so tooling that
+	// matches on the literal string "VARCHAR" sees something new — that is what
+	// this setting turns off. The values are ordinary DuckDB strings either way,
+	// and n constrains nothing on the DuckDB side.
+	//
+	// Read when a table entry is built, so a change applies to entries loaded
+	// afterwards; call mssql_invalidate_cache() to apply it to cached ones.
+	config.AddExtensionOption("mssql_catalog_native_types",
+							  "Report MSSQL_VARCHAR(n)/MSSQL_NVARCHAR(n) for attached string columns instead of "
+							  "VARCHAR (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer
 	// BCP is 2-10x faster than batched INSERT statements
 	config.AddExtensionOption("mssql_ctas_use_bcp",

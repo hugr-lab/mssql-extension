@@ -36,13 +36,27 @@ namespace duckdb {
 // Helper: Create a CreateTableInfo from MSSQL metadata
 //===----------------------------------------------------------------------===//
 
-static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata) {
+//! Spec 060: does this catalog report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
+//! its string columns, or a bare VARCHAR? Read from the global setting here
+//! rather than threaded through the metadata cache, because this is the one
+//! place that decides what DuckDB is told. Entries are cached, so a change
+//! applies to entries built afterwards — mssql_invalidate_cache() to apply it
+//! to the ones already loaded.
+static bool ReportsNativeTypes(Catalog &catalog) {
+	Value setting;
+	if (!DBConfig::GetConfig(catalog.GetDatabase()).TryGetCurrentSetting("mssql_catalog_native_types", setting)) {
+		return true;
+	}
+	return setting.IsNull() ? true : setting.GetValue<bool>();
+}
+
+static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata, bool native_types) {
 	CreateTableInfo info;
 	info.table = metadata.name;
 
 	// Build column definitions
 	for (const auto &col : metadata.columns) {
-		ColumnDefinition column_def(col.name, col.duckdb_type);
+		ColumnDefinition column_def(col.name, native_types ? col.NativeDuckDBType() : col.duckdb_type);
 		info.columns.AddColumn(std::move(column_def));
 	}
 
@@ -57,7 +71,7 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	: TableCatalogEntry(catalog, schema,
 						[&]() -> CreateTableInfo & {
 							static thread_local CreateTableInfo info;
-							info = MakeTableInfo(metadata);
+							info = MakeTableInfo(metadata, ReportsNativeTypes(catalog));
 							return info;
 						}()),
 	  mssql_columns_(metadata.columns),
@@ -88,10 +102,13 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	// no per-bind-data anchor needed here.
 	catalog_bind_data->table_entry = this;
 
-	// Store ALL column information - the query will use only projected columns
+	// Store ALL column information - the query will use only projected columns.
+	// Spec 060: these must be the same types the entry declared above, or the
+	// scan's output disagrees with the column list DuckDB resolved names against.
+	const bool native_types = ReportsNativeTypes(catalog);
 	for (const auto &col : mssql_columns_) {
 		catalog_bind_data->all_column_names.push_back(col.name);
-		catalog_bind_data->all_types.push_back(col.duckdb_type);
+		catalog_bind_data->all_types.push_back(native_types ? col.NativeDuckDBType() : col.duckdb_type);
 	}
 
 	// Store extended column metadata for VARCHAR→NVARCHAR conversion (Spec 026)

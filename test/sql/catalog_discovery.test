@@ -37,11 +37,15 @@ test
 #
 # Test 3: Describe table columns
 #
+# `name` is nvarchar(50) on the server. Spec 060 has the catalog state that
+# rather than a bare VARCHAR, so a target created from this column inherits its
+# declared length instead of becoming nvarchar(max); mssql_catalog_native_types
+# restores the old output. The values are ordinary DuckDB strings either way.
 query II
 SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'mssql_catalog' AND schema_name = 'dbo' AND table_name = 'test' ORDER BY column_name;
 ----
 id	INTEGER
-name	VARCHAR
+name	MSSQL_NVARCHAR(50)
 
 #
 # Test 4: Query via catalog namespace
