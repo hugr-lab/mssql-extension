@@ -940,6 +940,7 @@ survive for other sessions to read.
 - **Streaming**: Bounded memory usage regardless of dataset size
 - **Throughput**: ~300K rows/s for simple rows, ~10K rows/s for wide rows (500+ chars × 10 columns)
 - **TABLOCK**: Enables table-level locking and minimal logging for faster inserts
+- **UTF-8 targets**: a `varchar` column under a UTF-8 collation receives UTF-8 bytes as they are, rather than being transcoded to UTF-16 for the server to transcode back. Measured at half the wire bytes for ASCII-ish data (35 → 19 bytes for a 16-character value) and −51% client CPU on long strings. An `nvarchar` target is unaffected. This is the whole of the string path on Microsoft Fabric, where every string column is a UTF-8 `varchar`
 
 ### COPY TO Behavior
 
@@ -1891,7 +1892,8 @@ The codec validates the input first and falls back to a slower scalar implementa
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
-- NVARCHAR(max) and VARCHAR(max) columns are not supported in the Microsoft Fabric Warehouse
+- Microsoft Fabric Warehouse has no `nvarchar` type at all, and no `datetimeoffset` — so a `TIMESTAMP WITH TIME ZONE` column cannot be created there. `varchar(max)` is supported. See [AZURE.md](AZURE.md#microsoft-fabric)
+- A `#temp` table cannot be a BCP target on Microsoft Fabric: the load fails inside Fabric with an I/O error against a parquet file. Load into a permanent table
 
 ## Third-Party Licenses
 
