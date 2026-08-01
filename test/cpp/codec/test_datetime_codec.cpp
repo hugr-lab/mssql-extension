@@ -477,7 +477,7 @@ void TestFormatDdlTypeNameByteIdentity() {
 	};
 	std::vector<Case> cases = {
 		{LogicalType::DATE, "DATE"},
-		{LogicalType::TIME, "TIME(7)"},
+		{LogicalType::TIME, "TIME(6)"},
 		{LogicalType::TIMESTAMP, "DATETIME2(6)"},
 		{LogicalType::TIMESTAMP_MS, "DATETIME2(3)"},
 		{LogicalType::TIMESTAMP_NS, "DATETIME2(7)"},

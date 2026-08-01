@@ -174,7 +174,7 @@ void test_ctas_datetime() {
 	CTASConfig config;
 
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::DATE, config), "DATE");
-	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIME, config), "TIME(7)");
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIME, config), "TIME(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIMESTAMP, config), "DATETIME2(7)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIMESTAMP_TZ, config), "DATETIMEOFFSET(7)");
 

@@ -158,7 +158,7 @@ void test_map_type_datetime() {
 	std::cout << "\n=== Test: MapTypeToSQLServer - Date/Time ===" << std::endl;
 
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::DATE), "DATE");
-	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIME), "TIME(7)");
+	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIME), "TIME(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIMESTAMP), "DATETIME2(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIMESTAMP_TZ), "DATETIMEOFFSET(7)");
 

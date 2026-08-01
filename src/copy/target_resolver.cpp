@@ -1146,6 +1146,9 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		// declaring scale=0 for a TIMESTAMP_MS value drops every millisecond).
 		switch (source_types[i].id()) {
 		case LogicalTypeId::TIME:
+			col.scale = 6;		 // µs (DuckDB native)
+			col.max_length = 5;	 // time(6) alone — no date part, unlike DATETIME2
+			break;
 		case LogicalTypeId::TIMESTAMP:
 			col.scale = 6;		 // µs (DuckDB native)
 			col.max_length = 8;	 // 5 bytes time(6) + 3 bytes date
