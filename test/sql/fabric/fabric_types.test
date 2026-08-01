@@ -1,0 +1,167 @@
+# name: test/sql/fabric/fabric_types.test
+# description: Microsoft Fabric Data Warehouse — string types, collations and the UTF-8 write path (spec 060)
+# group: [fabric]
+
+# Requires a live Fabric warehouse and a bearer token for it:
+#
+#   export AZURE_WH_HOST="xyz.datawarehouse.fabric.microsoft.com"
+#   export AZURE_WH_NAME="my_warehouse"
+#   export AZURE_WH_TOKEN=$(az account get-access-token \
+#       --resource https://database.windows.net/ --query accessToken -o tsv)
+#
+# A pre-obtained token rather than an azure secret with PROVIDER
+# credential_chain: the `cli` provider shells out to `az`, which the test runner
+# does not let it do, and the chain then falls through to whatever service
+# principal happens to be in the environment — which failed here with "CREATE
+# TABLE permission denied" while the same chain worked from the CLI. A token
+# needs no subprocess and no extension, and it is the identity you meant.
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server=${AZURE_WH_HOST};Database=${AZURE_WH_NAME}' AS wh (
+    TYPE mssql,
+    ACCESS_TOKEN '${AZURE_WH_TOKEN}'
+);
+
+# =============================================================================
+# A warehouse is UTF-8 and single-byte. Its collation is one of exactly two,
+# both UTF-8, fixed when the warehouse was created — and it has NO nvarchar at
+# all: tables are stored as Delta Parquet, which has no UTF-16 type.
+#
+# That makes nvarchar(max), the extension's default everywhere else, unusable
+# here. Everything below exists because of that.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.FabricTypes');
+
+statement ok
+SELECT mssql_exec('wh', 'CREATE TABLE dbo.FabricTypes (id int, s varchar(200), mx varchar(max))');
+
+statement ok
+SELECT mssql_invalidate_cache('wh');
+
+# varchar(max) IS supported on a warehouse (16 MB), and the collation comes back
+# with a _UTF8 suffix — which is what the write path keys on. Note the absence of
+# COLLATIONPROPERTY anywhere: Fabric closes the connection on it, so the suffix
+# of the name is the test, here and in the extension.
+query TT
+SELECT name, collation_name FROM mssql_scan('wh', $$
+SELECT c.name, ISNULL(c.collation_name, '') AS collation_name
+FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.FabricTypes') ORDER BY c.column_id
+$$);
+----
+id	(empty)
+s	Latin1_General_100_BIN2_UTF8
+mx	Latin1_General_100_BIN2_UTF8
+
+# =============================================================================
+# The write path. Every string column on a warehouse is a UTF-8 varchar, so BCP
+# sends the bytes as they are — declared BIGVARCHAR with the column's own
+# collation — instead of transcoding to UTF-16 for the server to transcode back.
+# Non-ASCII round-tripping is the assertion that proves the bytes were read as
+# UTF-8 and not as some code page.
+# =============================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    (1, 'Привет мир', '漢字とかな'),
+    (2, 'emoji 😀', 'ascii only'),
+    (3, '', 'пусто рядом')
+) t(id, s, mx)) TO 'wh.dbo.FabricTypes' (FORMAT 'bcp', CREATE_TABLE false);
+
+query ITT
+SELECT id, s, mx FROM wh.dbo.FabricTypes ORDER BY id;
+----
+1	Привет мир	漢字とかな
+2	emoji 😀	ascii only
+3	(empty)	пусто рядом
+
+# =============================================================================
+# Auto-create. Both table-creating paths must produce varchar, not nvarchar —
+# CTAS through the forced text type, COPY through the same flag.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.FabricCtas');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.FabricCopy');
+
+statement ok
+CREATE TABLE wh.dbo.FabricCtas AS SELECT 1 AS id, 'Привет' AS txt;
+
+statement ok
+COPY (SELECT 2 AS id, 'мир' AS txt) TO 'wh.dbo.FabricCopy' (FORMAT 'bcp');
+
+query TTT
+SELECT tbl, col, type_name FROM mssql_scan('wh', $$
+SELECT o.name AS tbl, c.name AS col, t.name AS type_name
+FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id
+JOIN sys.types t ON t.user_type_id = c.user_type_id
+WHERE o.name IN ('FabricCtas', 'FabricCopy') AND c.name = 'txt' ORDER BY o.name
+$$);
+----
+FabricCopy	txt	varchar
+FabricCtas	txt	varchar
+
+query T
+SELECT txt FROM wh.dbo.FabricCtas;
+----
+Привет
+
+query T
+SELECT txt FROM wh.dbo.FabricCopy;
+----
+мир
+
+# =============================================================================
+# What the extension refuses, and why it refuses it here rather than letting the
+# server do it: the server's message names neither the alternative nor the two
+# collations that would have worked.
+# =============================================================================
+
+statement error
+CREATE TABLE wh.dbo.FabricBad AS SELECT 'x'::MSSQL_NVARCHAR(50) AS v;
+----
+MSSQL_NVARCHAR is not available on Microsoft Fabric
+
+statement error
+CREATE TABLE wh.dbo.FabricBad AS SELECT 'x'::MSSQL_VARCHAR(50, 'Cyrillic_General_100_CI_AS_SC_UTF8') AS v;
+----
+is not available on Microsoft Fabric
+
+# The one Fabric also supports is accepted.
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.FabricColl');
+
+statement ok
+CREATE TABLE wh.dbo.FabricColl AS
+    SELECT 'Привет'::MSSQL_VARCHAR(50, 'Latin1_General_100_CI_AS_KS_WS_SC_UTF8') AS v;
+
+query T
+SELECT v FROM wh.dbo.FabricColl;
+----
+Привет
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('wh', $$
+DROP TABLE IF EXISTS dbo.FabricTypes;
+DROP TABLE IF EXISTS dbo.FabricCtas;
+DROP TABLE IF EXISTS dbo.FabricCopy;
+DROP TABLE IF EXISTS dbo.FabricColl;
+$$);
+
+statement ok
+DETACH wh;

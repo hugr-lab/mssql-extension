@@ -77,12 +77,42 @@ string BCPCopyTarget::GetBracketedTable() const {
 }
 
 //===----------------------------------------------------------------------===//
+// UTF-8 on the write wire (spec 060 / issue #225)
+//===----------------------------------------------------------------------===//
+
+//! Latin1_General_100_CI_AS_SC_UTF8, as the server itself sends it in
+//! COLMETADATA: LCID 0x0409, flags 0x4D (fIgnoreCase | fIgnoreWidth |
+//! fIgnoreKana | fUTF8), version 2, SortId 0. Read off the wire rather than
+//! derived from a table — COLLATIONPROPERTY's CollationID is a different
+//! namespace and Fabric closes the connection on it.
+//!
+//! A CONSTANT is correct here, and the existing code is the proof: every string
+//! column has always been declared SQL_Latin1_General_CP1_CI_AS whatever the
+//! target's own collation was, and loads into differently-collated columns work.
+//! The declared collation tells the server how to READ the bytes; it then
+//! converts into the column's own. Code page 65001 reads any UTF-8, so one
+//! constant covers every UTF-8 target.
+static const std::array<uint8_t, 5> UTF8_WIRE_COLLATION = {0x09, 0x04, 0xD0, 0x24, 0x00};
+
+//! Does this target column hold UTF-8 bytes? Only a char type can, and only
+//! under a collation whose name ends in _UTF8 — the same test #225 uses on the
+//! read side, and the reason it is a name test is that Fabric refuses
+//! COLLATIONPROPERTY.
+static bool IsUtf8CharColumn(const string &type_name, const string &collation_name) {
+	const string lower = StringUtil::Lower(type_name);
+	if (lower != "varchar" && lower != "char") {
+		return false;
+	}
+	return StringUtil::EndsWith(StringUtil::Upper(collation_name), "_UTF8");
+}
+
+//===----------------------------------------------------------------------===//
 // BCPColumnMetadata Implementation
 //===----------------------------------------------------------------------===//
 
 bool BCPColumnMetadata::IsVariableLengthUSHORT() const {
-	// NVARCHARTYPE (0xE7) and BIGVARBINARYTYPE (0xA5) use USHORTLEN
-	return tds_type_token == 0xE7 || tds_type_token == 0xA5;
+	// NVARCHARTYPE (0xE7), BIGVARCHRTYPE (0xA7) and BIGVARBINARYTYPE (0xA5) use USHORTLEN
+	return tds_type_token == 0xE7 || tds_type_token == 0xA7 || tds_type_token == 0xA5;
 }
 
 bool BCPColumnMetadata::IsFixedLength() const {
@@ -138,6 +168,18 @@ string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
 			// max_length is in bytes, nvarchar is 2 bytes per character
 			return "nvarchar(" + std::to_string(max_length / 2) + ")";
 		}
+
+	case tds::TDS_TYPE_BIGVARCHAR: {
+		// A UTF-8 target: max_length is BYTES and the payload is UTF-8, so the
+		// number goes through unchanged rather than halved. The COLLATE clause
+		// is what makes the server read the payload as UTF-8 — see the note on
+		// BCPColumnMetadata::collation_name.
+		string decl = max_length == 0xFFFF ? "varchar(max)" : "varchar(" + std::to_string(max_length) + ")";
+		if (!collation_name.empty()) {
+			decl += " COLLATE " + collation_name;
+		}
+		return decl;
+	}
 
 	case tds::TDS_TYPE_BIGVARBINARY:
 		if (max_length == 0xFFFF) {
@@ -848,7 +890,8 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM tempdb.sys.columns c "
 			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
@@ -856,7 +899,8 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM sys.columns c "
 			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
@@ -890,6 +934,19 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		// Map SQL Server type to TDS type token
 		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
 		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision);
+
+		// Spec 060 / issue #225 (write side): a char column under a UTF-8
+		// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
+		// UTF-8 collation sends them as they are, instead of transcoding to
+		// UTF-16 here for the server to transcode back. max_length goes through
+		// unhalved because both sides now count bytes.
+		const string &collation_name = result.rows[i].size() > 6 ? result.rows[i][6] : string();
+		if (IsUtf8CharColumn(type_name, collation_name)) {
+			col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
+			col.max_length = max_length < 0 ? 0xFFFF : static_cast<uint16_t>(max_length);
+			col.collation = UTF8_WIRE_COLLATION;
+			col.collation_name = collation_name;
+		}
 
 		// Set a reasonable DuckDB type for encoding purposes
 		// This is used by BCPRowEncoder to know how to encode the data

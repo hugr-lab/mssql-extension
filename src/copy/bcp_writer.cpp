@@ -453,7 +453,8 @@ void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 			WriteUInt8(buffer, col.scale);
 			break;
 
-		case tds::TDS_TYPE_NVARCHAR:  // 0xE7 - Unicode string
+		case tds::TDS_TYPE_NVARCHAR:	// 0xE7 - Unicode string
+		case tds::TDS_TYPE_BIGVARCHAR:	// 0xA7 - single-byte string; UTF-8 when the collation says so
 			WriteUInt16LE(buffer, col.max_length);
 			// Collation (5 bytes)
 			for (int i = 0; i < 5; i++) {

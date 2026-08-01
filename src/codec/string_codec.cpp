@@ -531,6 +531,49 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	}
 }
 
+// Spec 060 / issue #225 (write side): when the target column is a UTF-8
+// varchar, the bytes already in the vector ARE the wire form. No transcode, one
+// memcpy, and half the bytes on the socket for ASCII-ish data — the write-path
+// mirror of what UTF8SUPPORT did for reads.
+//
+// The length guard lands in the right unit here for free. Against an nvarchar
+// column the bound is UTF-16 code units, which is what the value costs there;
+// against a UTF-8 varchar the column holds BYTES, and comparing code units to a
+// byte bound is what let an over-long value past the client and into a
+// server-side truncation error (spec 060 § 3).
+void EncodeVarcharUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col,
+					   duckdb::vector<uint8_t> &buf) {
+	if (!col.IsPLPType() && utf8_len > col.max_length) {
+		throw InvalidInputException(
+			"MSSQL: VARCHAR column '%s' overflow: value is %zu UTF-8 bytes but column max is %u bytes", col.name,
+			utf8_len, col.max_length);
+	}
+
+	if (col.IsPLPType()) {
+		const size_t start = buf.size();
+		buf.resize(start + 8 + (utf8_len > 0 ? 4 + utf8_len : 0) + 4);
+		uint8_t *out = buf.data() + start;
+		WritePlpHeader(out);
+		if (utf8_len > 0) {
+			WriteLe32(out + 8, static_cast<uint32_t>(utf8_len));
+			memcpy(out + 12, utf8_data, utf8_len);
+			WriteLe32(out + 12 + utf8_len, 0);
+		} else {
+			// Empty PLP value: header then terminator, no data chunk.
+			WriteLe32(out + 8, 0);
+		}
+		return;
+	}
+
+	const size_t start = buf.size();
+	buf.resize(start + 2 + utf8_len);
+	buf[start] = static_cast<uint8_t>(utf8_len & 0xFF);
+	buf[start + 1] = static_cast<uint8_t>((utf8_len >> 8) & 0xFF);
+	if (utf8_len > 0) {
+		memcpy(buf.data() + start + 2, utf8_data, utf8_len);
+	}
+}
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	(void)in;
@@ -554,6 +597,27 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	}
 }
 
+void EncodeToBcpUtf8(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+					 duckdb::vector<uint8_t> &buf) {
+	(void)in;
+	switch (col.duckdb_type.id()) {
+	case LogicalTypeId::VARCHAR: {
+		auto str_val = FormatValue<string_t>(fmt, row);
+		EncodeVarcharUtf8(str_val.GetData(), str_val.GetSize(), col, buf);
+		return;
+	}
+	case LogicalTypeId::INTERVAL: {
+		auto iv = FormatValue<interval_t>(fmt, row);
+		auto str = Interval::ToString(iv);
+		EncodeVarcharUtf8(str.c_str(), str.size(), col, buf);
+		return;
+	}
+	default:
+		throw NotImplementedException("codec::string::EncodeToBcpUtf8: unsupported type %s",
+									  col.duckdb_type.ToString());
+	}
+}
+
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
@@ -562,7 +626,11 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::VARCHAR: {
 		auto str_val = value.ToString();
-		EncodeNVarcharFromUtf8(str_val.data(), str_val.size(), col, buf);
+		if (col.tds_type_token == tds::TDS_TYPE_BIGVARCHAR) {
+			EncodeVarcharUtf8(str_val.data(), str_val.size(), col, buf);
+		} else {
+			EncodeNVarcharFromUtf8(str_val.data(), str_val.size(), col, buf);
+		}
 		return;
 	}
 	case LogicalTypeId::INTERVAL: {

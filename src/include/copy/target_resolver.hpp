@@ -108,6 +108,13 @@ struct BCPColumnMetadata {
 	// Collation bytes for character types (5 bytes)
 	std::array<uint8_t, 5> collation = {0x09, 0x04, 0xD0, 0x00, 0x34};	// Latin1_General_CI_AS default
 
+	// Collation NAME for the INSERT BULK column list, or empty. Not redundant
+	// with the bytes above: the server reads the incoming bytes according to the
+	// collation in the STATEMENT TEXT, not the one in COLMETADATA. Without it a
+	// varchar column takes the database default, and UTF-8 bytes arrive decoded
+	// as that code page — verified by watching 'Привет' land as 'ÐŸÑ€Ð¸Ð²ÐµÑ‚'.
+	string collation_name;
+
 	// Default constructor
 	BCPColumnMetadata() = default;
 

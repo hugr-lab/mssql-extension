@@ -142,7 +142,17 @@ str16u|c_str16u|NVARCHAR(16)|non-ASCII, multi-byte UTF-8
 str200|c_str200|NVARCHAR(200)|long strings
 str16max|c_str16|NVARCHAR(MAX)|same payload, PLP framing
 strnull|c_strnull|NVARCHAR(16)|50% NULL
+vstr16|c_str16|VARCHAR(16) COLLATE Latin1_General_100_CI_AS_SC_UTF8|len16 ASCII into a UTF-8 varchar target
+vstr16u|c_str16u|VARCHAR(32) COLLATE Latin1_General_100_CI_AS_SC_UTF8|non-ASCII into a UTF-8 varchar target
+vstr200|c_str200|VARCHAR(200) COLLATE Latin1_General_100_CI_AS_SC_UTF8|long strings into a UTF-8 varchar target
+vstrmax|c_str16|VARCHAR(MAX) COLLATE Latin1_General_100_CI_AS_SC_UTF8|same payload, PLP framing, UTF-8 target
 "
+
+# The four vstr* families exist for one comparison: every char column goes onto
+# the BCP wire declared NVARCHAR and transcoded to UTF-16, so a UTF-8 varchar
+# target is filled by transcoding twice — once here, once on the server. The
+# nvarchar families beside them are the control: whatever a UTF-8 write path
+# does, they must not move.
 
 WIDE_COLS="c_bigint, c_int, c_double, c_dec18, c_dec38, c_bool, c_date, c_ts, c_uuid, c_blob, c_str4, c_str16, c_str16u, c_str200, c_strnull"
 WIDE_DDL="c_bigint BIGINT, c_int INT, c_double FLOAT(53), c_dec18 DECIMAL(18,4), c_dec38 DECIMAL(38,10), c_bool BIT, c_date DATE, c_ts DATETIME2(6), c_uuid UNIQUEIDENTIFIER, c_blob VARBINARY(16), c_str4 NVARCHAR(4), c_str16 NVARCHAR(16), c_str16u NVARCHAR(16), c_str200 NVARCHAR(200), c_strnull NVARCHAR(16)"

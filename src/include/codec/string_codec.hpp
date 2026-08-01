@@ -106,6 +106,14 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // wraps it for per-row callers (builds the format per call).
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf);
+
+//! Spec 060 / issue #225 (write side): the UTF-8 twin of EncodeToBcp, for a
+//! target column that holds UTF-8 bytes. A SEPARATE entry point rather than a
+//! branch inside EncodeToBcp — BCPRowEncoder resolves the encoder once per
+//! column, so the row loop must not carry a test the column already answered.
+//! Measured: the branch cost the untouched nvarchar path ~20 ns/value.
+void EncodeToBcpUtf8(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+					 duckdb::vector<uint8_t> &buf);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 // Overload for the single-Value path (BCPRowEncoder::EncodeValue public API).
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
