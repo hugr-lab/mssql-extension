@@ -1,8 +1,8 @@
 # Spec 060 — Target column types and DDL options
 
-**Status:** Draft
-**Date:** 2026-07-31
-**Depends on:** spec 049 (target's `index_kind` / `partition_count` in the catalog cache — PR #223)
+**Status:** Draft — D1/D2/D3 scoped against a measured baseline (§ 3, § 4)
+**Date:** 2026-07-31, revised 2026-08-01
+**Depends on:** spec 049 (target's `index_kind` / `partition_count` in the catalog cache — PR #223); issue #225 (the UTF8SUPPORT ack and `mssql_utf8_collation`, which is what makes the single-byte types safe — PR #227)
 **Feeds:** spec 057 (the write path's sizing policy resolves a column bound from what this spec adds)
 
 ---
@@ -118,9 +118,12 @@ The same cast through `CREATE TABLE d.dbo.x AS SELECT ...` still produced
 duplication is itself the finding — one decision made in two places is how a
 feature ends up working on one path and silently not on the other.
 
-### D3 is already satisfied
+*(Superseded by § 4: there are four such places, not two, and the other two
+decide the wire declaration and the client-side length bound.)*
 
-An over-long value on the BCP path already fails with our own error naming the
+### D3 is NOT already satisfied — the guard counts the wrong thing for `varchar`
+
+An over-long value on the BCP path does fail with our own error naming the
 column, the value's length and the limit, in both units:
 
 ```
@@ -128,91 +131,322 @@ MSSQL: NVARCHAR column 'cust' overflow: value is 60 UCS-2 code units
 (120 UTF-16LE bytes) but column max is 50 code units (100 bytes)
 ```
 
-That is the guard from spec 045 / issue #91 (character-vs-byte length). D3
-reduces to covering it by a test on each path rather than writing anything new.
+That is the guard from spec 045 / issue #91, and it is right for `nvarchar`.
+It is **wrong for `varchar`**, because the two types do not count the same unit
+(§ 3). Verified by loading ten Cyrillic characters — ten UCS-2 code units,
+twenty UTF-8 bytes — into a UTF-8-collated `varchar(10)`:
 
-## 3. Where a column's target type comes from
+```
+IO Error: MSSQL COPY: Failed to finalize BCP stream: ... "MSSQL: BCP failed:
+String or binary data would be truncated in table 'TestDB.dbo.T060Vc',
+column 'v'. Truncated value: 'Приве'."
+```
+
+The client bound passed the value and the server rejected it. The failure is at
+least loud — nothing is silently truncated — but it arrives from the server at
+*finalize* time, after the whole batch has been sent, wrapped in a JSON
+envelope, rather than from our own guard before the first byte goes out.
+
+## 3. What `n` means, per type — measured
+
+The unit is not a property of the number. Four columns, one `CREATE TABLE`,
+`sys.columns` immediately after:
+
+| column | `max_length` | `collation_name` |
+| --- | --- | --- |
+| `varchar(10) COLLATE Latin1_General_100_CI_AS_SC_UTF8` | 10 | `..._SC_UTF8` |
+| `varchar(10)` (database default) | 10 | `SQL_Latin1_General_CP1_CI_AS` |
+| `nvarchar(10)` | 20 | `SQL_Latin1_General_CP1_CI_AS` |
+| `char(10) COLLATE Latin1_General_100_CI_AS_SC_UTF8` | 10 | `..._SC_UTF8` |
+
+**`max_length` alone cannot tell a UTF-8 `varchar(10)` from a code-page
+`varchar(10)`** — both report 10 — yet one holds ten *bytes* (two to three
+Cyrillic characters) and the other ten *characters*. Only `collation_name`
+separates them. Any code that turns a declared length into a client-side bound
+therefore needs the collation as an input, and today none of it has one.
+
+So `varchar(n)` has three regimes, and only the middle one is what the current
+code assumes:
+
+- **UTF-8 collation** — `n` is UTF-8 bytes. Exactly computable on the client,
+  since the value is already UTF-8 in the vector. Over-long input is **rejected**
+  by the server (probe above).
+- **Single-byte code page** — `n` is bytes, and bytes equal characters. Today's
+  `max_length * 2` doubling is accidentally correct here. Over-long input is not
+  the risk; *unrepresentable* input is: ten Cyrillic characters INSERT into a
+  CP1252 `varchar(10)` as `3F3F3F3F3F3F3F3F3F3F`, which is the silent loss #225
+  closed for the columns we create.
+- **DBCS code page (932/936/949/950)** — `n` is bytes, and a character costs one
+  or two of them. Not computable client-side without the code page tables. Stays
+  a server-side error, and this spec does not pretend otherwise.
+
+`nvarchar(n)` has one regime: `n` is UTF-16 code units, `max_length` is `2n`,
+and a supplementary character costs two units. That is what the existing guard
+measures, which is why it is right there and only there.
+
+## 4. Where the type and the size are decided today — four sites
+
+The spec previously said two translators. There are four, and they disagree:
+
+| # | site | reached from | what it does with a `VARCHAR` |
+| --- | --- | --- | --- |
+| 1 | `codec::string::FormatDdlTypeName` | CTAS creates the table | `NVARCHAR(MAX)`, or `VARCHAR(MAX) COLLATE <mssql_utf8_collation>` under `mssql_ctas_text_type='VARCHAR'` (#225). Ignores any annotation. |
+| 2 | `TargetResolver::GetSQLServerTypeDeclaration(LogicalType)` | COPY creates the table | reads the annotation (the § 2a probe); otherwise `nvarchar(max)` |
+| 3 | `GetTDSTypeToken` + `GetMaxLength(LogicalType)`, via `GenerateColumnMetadata` | the `INSERT BULK` declaration and the client guard — **CTAS always**, COPY when `overwrite` | `TDS_TYPE_NVARCHAR` / `0xFFFF` unconditionally, so on those paths the guard never fires at all |
+| 4 | `GetMaxLength(type_name, max_length, precision)`, via `GetExistingTableColumnMetadata` | COPY into a table that exists — **including one we created a moment earlier** | reads server metadata; `varchar`/`char` are doubled to UTF-16 bytes, which is where the wrong unit of § 3 enters |
+
+`BCPColumnMetadata::GetSQLServerTypeDeclaration()` then renders the `INSERT
+BULK` column text from whatever (3) or (4) produced.
+
+Site 4 is why the `MSSQL_NVARCHAR(50)` overflow above reports our own error:
+`ValidateTarget` creates the table, and COPY then re-reads the *server's*
+metadata rather than trusting the types it just wrote. CTAS never does that, so
+its `INSERT BULK` always declares `nvarchar(max)` no matter what the table says.
+
+Verified on today's build (`e05c569` + this branch):
+
+```
+tbl       | col   | type_name | max_length
+T060Copy  | sized | nvarchar  |        100   -- COPY honours MSSQL_NVARCHAR(50)
+T060Copy  | plain | nvarchar  |         -1
+T060Ctas  | sized | nvarchar  |         -1   -- CTAS ignores it
+T060Ctas  | plain | nvarchar  |         -1
+```
+
+## 5. Where a column's target type comes from
 
 Resolution order, first match wins:
 
 1. **The existing target table.** Already the case, and already the fast path —
    the 4.1× above is precisely the gap between creating the table and inserting
    into a properly created one. Nothing to add.
-2. **An explicit cast to an MSSQL type**: `CAST(cust AS MSSQL_NVARCHAR(50))`.
-   The only mechanism available to `CREATE TABLE ... AS SELECT`, which has no
-   options syntax — so it is load-bearing, not sugar.
-3. **A per-column COPY option**: `column_types {'cust': 'nvarchar(50)'}`.
-   Convenient when the user does not want to rewrite the SELECT list.
-4. **A default**: `mssql_default_string_length` (a setting) or `string_length`
-   (a COPY option). Applies to every string column with no other answer.
-5. **Fallback `nvarchar(max)`** — today's behaviour, kept for compatibility but
-   no longer the silent default when 4 has a value.
+2. **The column's own type**, either from an explicit cast —
+   `CAST(cust AS MSSQL_NVARCHAR(50))` — or **carried from an attached MSSQL
+   source by the catalog** (D2), which is the case that needs no user input at
+   all: `COPY (SELECT * FROM d.dbo.Src) TO 'd.dbo.Dst'` reproduces `Src`'s
+   declared lengths.
+3. **A per-statement COPY option** for the maximum string length (D8).
+4. **A session default**: `mssql_default_string_length` (D9), MAX by default so
+   nothing changes for anyone who does not set it.
+5. **Fallback `nvarchar(max)`** — today's behaviour, reached only when 2–4 are
+   all silent.
 
 **Data-derived sizing is rejected.** Scanning the first batch to take the longest
 value guesses; a later batch that exceeds the guess fails the whole load, and the
 failure comes from data the user never saw.
 
-## 4. Deliverables
+## 6. Deliverables
 
-- **D1 Parameterised MSSQL types.** `MSSQL_NVARCHAR(n)`, `MSSQL_VARCHAR(n)`,
-  `MSSQL_NCHAR(n)`, `MSSQL_CHAR(n)`, `MSSQL_VARBINARY(n)`. Bound to their
-  natural DuckDB physical type with the modifier in extension info.
-  **Acceptance:** the modifier is readable at DDL generation for all three
-  paths — `CREATE TABLE AS SELECT`, `INSERT INTO ... SELECT`, and
-  `COPY ... TO ... (FORMAT 'bcp')`.
-- **D2 DDL generation honours them, in BOTH translators.**
-  `TargetResolver::GetSQLServerTypeDeclaration` (COPY) reads the extension info
-  instead of mapping `VARCHAR` → `nvarchar(max)` unconditionally — done in the
-  probe — and `MSSQLDDLTranslator::MapLogicalTypeToCTAS` must do the same, or
-  the feature works on COPY and silently not on CTAS. Merging the two is
-  preferable to teaching both.
-- **D3 Length semantics — already implemented, needs tests only.** The BCP
-  encoder's existing overflow guard (spec 045 / issue #91) reports the column,
-  the value's length and the limit in both code units and bytes. Cover it on
-  each path; write nothing new unless a path is found that bypasses it.
-- **D4 `WITH (...)` options at creation.** `DATA_COMPRESSION = PAGE | ROW`
-  measured −51% / −41% on storage for +63% / +17% on load time (spec 057). Must
-  be documented together with TABLOCK, because compression is applied **during**
-  a bulk load only when the load takes a table lock — otherwise rows land
-  uncompressed until someone rebuilds, and the user silently does not get what
-  they asked for. `OPTIMIZE_FOR_SEQUENTIAL_KEY` is deliberately **not** exposed:
-  measured neutral under four concurrent loaders, because they write disjoint
-  ascending ranges and there is no hot last page for it to relieve.
-- **D5 A per-column type map as a COPY option** (resolution step 3).
-- **D6 `mssql_default_string_length`** (resolution step 4), plus its COPY-option
-  form.
-- **D7 Truncate the target as an explicit COPY option.** Must be separately
-  named — it destroys data the statement does not name — and must run on the
-  same connection as the load, so an aborted COPY cannot leave the table both
-  empty and unloaded.
-- **D8 `ROWS_PER_BATCH` on the CTAS path.** COPY sends it, CTAS does not; there
-  is no reason for the asymmetry.
+### D1 — two types, and only two
 
-## 5. Acceptance criteria
+| type | binds to | emits | `n` counts | range |
+| --- | --- | --- | --- | --- |
+| `MSSQL_NVARCHAR(n)` | VARCHAR | `nvarchar(n)` | UTF-16 code units | 1–4000 |
+| `MSSQL_VARCHAR(n [, collation])` | VARCHAR | `varchar(n) COLLATE <c>` | **bytes** | 1–8000 |
+
+No `CHAR`/`NCHAR`/`BINARY`/`VARBINARY`. A type earns its place by solving a
+problem, and those do not have one: `blob` already round-trips through
+`varbinary(max)` without loss or surprise, and the fixed-length pair only adds
+space padding. `varchar` and `nvarchar` are where the cost is — § 1's 4.1× and
+§ 3's unit confusion.
+
+One integer modifier cannot say whether it means `varchar` or `nvarchar`, so
+**the alias is the type identity** and the modifier is only the size. The alias
+was forced on us by the binder crash in § 2a; it turns out to be load-bearing
+rather than a tax.
+
+`n` is SQL Server's own unit for the type named: `MSSQL_VARCHAR(50)` **is**
+`varchar(50)`, byte for byte, and `MSSQL_NVARCHAR(50)` is `nvarchar(50)`.
+Reinterpreting `n` as characters and widening the column would make the DDL we
+emit differ from the DDL the user wrote. The consequence, stated plainly because
+it will surprise someone: the same `n` in the two types does not hold the same
+data — 50 bytes of UTF-8 is 16 Cyrillic characters (§ 3).
+
+**The optional second modifier is the collation**, and that is what makes the
+byte count computable: `MSSQL_VARCHAR(50, 'Cyrillic_General_100_CI_AS_SC_UTF8')`.
+It is what goes into the `COLLATE` clause, and it is what tells the client-side
+bound which unit to count in. Omitted, it falls back to `mssql_utf8_collation`.
+
+**The bound is informational on the DuckDB side.** The type binds to a plain
+`VARCHAR`, so DuckDB neither enforces `n` nor truncates to it — a longer value
+sits in the vector untouched. Enforcement exists at exactly two places: our own
+guard at the write boundary (below), and the server. Anyone reading
+`mssql_varchar(50)` in a `DESCRIBE` and inferring a constraint is reading it
+wrong, and the documentation must say so.
+
+**The length guard, in the right unit.** § 2a's probe showed the existing guard
+is right for `nvarchar` and wrong for `varchar`. With the collation in hand:
+
+- `nvarchar` — UTF-16 code units. Unchanged.
+- `varchar` under a UTF-8 collation — UTF-8 bytes, compared against the bytes
+  already in the vector. Cheaper than the UCS-2 count it replaces, not dearer.
+- `varchar` under a single-byte code page — the existing doubled bound is
+  already correct; leave it.
+- DBCS — not computable client-side without the code page tables. Stays a
+  server error, documented, not pretended away.
+
+This needs the collation to reach `BCPColumnMetadata`, so
+`GetExistingTableColumnMetadata`'s query gains `collation_name` and the metadata
+gains a "length is in bytes" flag. Match the `_UTF8` suffix, **not**
+`COLLATIONPROPERTY` — #225 found Fabric closes the connection rather than
+answering it.
+
+**`MSSQL_VARCHAR` requires the UTF8SUPPORT ack**, on the gate CTAS already uses
+for `mssql_ctas_text_type='VARCHAR'` (`MSSQLCatalog::UTF8SupportState()` — throw
+on `Declined`, proceed on `Unknown`). A single-byte column with no UTF-8
+collation is the silent-`?` trap of #225 and must not come back one column at a
+time.
+
+What it buys: half the storage for ASCII-ish data, and the direct-copy read path
+of #225 on every later scan. What it does **not** buy: a smaller write wire —
+BCP still sends every char type as `TDS_TYPE_NVARCHAR` and the server converts
+on insert. That is PR #227's write-path item, out of scope here, said out loud
+so nobody benchmarks for a win this spec does not deliver.
+
+### D2 — the catalog reports these types, and a setting turns that off
+
+Attached MSSQL tables report `mssql_varchar(n)` / `mssql_nvarchar(n)` for their
+string columns instead of a bare `VARCHAR`. This is the resolution step that
+needs no user input at all: `COPY (SELECT * FROM d.dbo.Src) TO 'd.dbo.Dst'`
+reproduces `Src`'s declared lengths because they travelled in the types.
+
+It was already built and measured behind the `MSSQL_ANNOTATE_CATALOG` env var
+(§ 2a): it works, and it changes what `DESCRIBE` prints —
+
+```
+col_nvarchar  varchar              ->  col_nvarchar  mssql_nvarchar(100)
+col_nchar     varchar              ->  col_nchar     mssql_nvarchar(10)
+```
+
+— which is why it stayed behind a flag pending a deliberate decision. The
+decision: **on by default**, with a setting to restore the plain `VARCHAR`
+output for anyone whose tooling reads type names.
+
+### D3 — `CREATE TABLE` / `ALTER TABLE` emit the stated type
+
+`MSSQLDDLTranslator` produces `varchar(n) COLLATE <c>` / `nvarchar(n)` where it
+produces `nvarchar(max)` today. This is the path a user reaches by writing the
+column type directly, and it is the one that must agree with D2: a table created
+here, then read back through the catalog, reports the type it was created with.
+
+### D4 — CTAS and COPY translate the types when they create the target
+
+One resolver — `TryResolveTargetType(const LogicalType &)` returning
+`{sql_name, length, collation}`, plus one formatter for the DDL text — feeding
+**all four** sites of § 4. Teaching four independent switches the same fact is
+precisely how a feature ends up working on COPY and silently not on CTAS, which
+§ 4 measured.
+
+Sites 3 and 4 are not only about DDL text: `GetMaxLength` must stop returning
+`0xFFFF` unconditionally, or CTAS keeps declaring `nvarchar(max)` in `INSERT
+BULK` for a column it created as `nvarchar(50)` — and the guard of D1 never
+fires there. `GetTDSTypeToken` stays `TDS_TYPE_NVARCHAR` for every char type;
+that is the wire form and it is unchanged here.
+
+Coverage must include the two paths that bypass the guard entirely today — CTAS
+always, and COPY with `overwrite` — asserting **our** error, not the server's.
+
+### D5 — `CREATE TABLE ... WITH (...)` for SQL Server table properties
+
+DuckDB already parses a `WITH` clause into `CreateTableInfo::options` and only
+`Catalog::SupportsCreateTable` rejects it — a **virtual**, so `MSSQLCatalog`
+overrides it and the options arrive at `MSSQLSchemaEntry::CreateTable` with no
+parser work at all. Verified: plain DuckDB answers `WITH clause is not supported
+for tables in a duckdb catalog`, i.e. it parsed fine and the catalog declined.
+
+Options: the table kind — heap or **clustered columnstore**, which is where § 1's
+storage advantage comes from — a clustered index key list, and
+`DATA_COMPRESSION = PAGE | ROW`, measured at −51% / −41% storage for +63% / +17%
+load time (spec 057). Compression must be documented together with TABLOCK:
+it applies **during** a bulk load only when the load takes a table lock,
+otherwise rows land uncompressed until someone rebuilds and the user silently
+does not get what they asked for. `OPTIMIZE_FOR_SEQUENTIAL_KEY` is deliberately
+not exposed — measured neutral under four concurrent loaders, which write
+disjoint ascending ranges and leave no hot last page for it to relieve.
+
+`PARTITIONED BY` and `SORTED BY` are rejected by the same virtual and are
+adjacent to a clustered index, but they are not in scope here; spec 049 covers
+reading partitioned tables, not creating them.
+
+### D6 — the scan builds the right query for the annotated types
+
+With D2 on, the catalog's column types carry an alias and modifiers, and
+`BuildColumnExpression` in `table_scan.cpp` decides the `SELECT` expression from
+them. It must keep both existing behaviours intact: the UTF-8 direct-copy path
+of #225, and the non-UTF8 collation handling of spec 026. The divergence guard
+in `ResolveColumnOps` already had to learn that two `VARCHAR`s never diverge
+whatever they carry (§ 2a); this is the same class of change one layer up.
+
+### D7 — one option decides the type for an unannotated `VARCHAR`
+
+CTAS and COPY must consult the **same** option. Today `mssql_ctas_text_type`
+serves CTAS only, so the two paths can disagree about a plain DuckDB `VARCHAR`.
+
+### D8 — COPY options: target table kind, and maximum string length
+
+Per statement, overriding the session defaults of D9: which kind of table to
+create (heap / clustered), and the maximum length to give an unannotated string
+column.
+
+### D9 — session defaults for table kind and string length
+
+`mssql_default_string_length` defaults to MAX, so a user who sets nothing sees
+byte-identical DDL to today's. The default table kind likewise starts at
+today's behaviour.
+
+## 7. Acceptance criteria
 
 1. A `COPY` that creates its target produces sized string columns, and loading
    into it is within noise of loading into a hand-created table with the same
    types — i.e. the 4.1× gap closes.
 2. Every existing test passes unchanged: with no MSSQL type, no option and no
    setting, DDL generation is byte-identical to today's.
-3. A too-long value fails with our error naming the column, on every path.
-4. `DATA_COMPRESSION` produces a compressed table **after the load**, not after
+3. A too-long value fails with **our** error naming the column, on every path —
+   including CTAS and COPY-with-`overwrite`, which bypass the guard today, and
+   including a UTF-8 `varchar(n)`, where the bound is bytes.
+4. The same cast produces the same server type on **all** of COPY, CTAS and
+   `INSERT ... SELECT`, asserted from `sys.columns` (`type_name`, `max_length`,
+   `collation_name`) — the § 4 table is the shape of that assertion, and today
+   it fails on row 3.
+5. `MSSQL_VARCHAR(n)` round-trips non-ASCII byte-for-byte, and is refused with a
+   clear error when the server declined UTF8SUPPORT.
+6. `DATA_COMPRESSION` produces a compressed table **after the load**, not after
    a later rebuild — asserted on `sys.dm_db_partition_stats` page counts, which
    is what caught the TABLOCK coupling in the first place.
-5. Round trip: a table created through the new types reads back with the same
-   declared types via the catalog.
+7. Round trip: a table created through the new types reads back with the same
+   declared types via the catalog, and `COPY (SELECT * FROM d.dbo.Src) TO
+   'd.dbo.Dst'` gives `Dst` the same column types as `Src` with no cast written
+   by the user.
+8. With the D2 setting off, `DESCRIBE` and `duckdb_columns()` report exactly
+   what they report today.
+9. A `WITH (...)` clause naming an option we do not support is an error naming
+   the option, not a silently ignored request.
 
-## 6. Risks
+## 8. Risks
 
 - ~~**Alias survival through the plan is the whole foundation.**~~ Settled by
   the probe in § 2a: it survives for COPY, and CTAS needs its own mapper taught.
   The residual risk moved to the opposite side — an aliased type is invisible to
   every function overload, which is why § 2a confines these types to DDL.
-- **`MSSQL_VARCHAR(n)` and collations.** A `VARCHAR` target column is
-  code-page-encoded; the extension's non-UTF8 collation handling lives in the
-  scan rewrite, not the codec layer. Sizing a `VARCHAR(n)` column is therefore
-  the easy half; writing correct bytes into it is not, and may restrict D1 to
-  the `N`-prefixed types in a first cut.
+- ~~**`MSSQL_VARCHAR(n)` and collations** may restrict D1 to the `N`-prefixed
+  types in a first cut.~~ Answered by #225 (merged as `e05c569`): a `varchar`
+  column the extension creates already asks for `mssql_utf8_collation`, so the
+  bytes written into it are correct, and the same ack is available here through
+  `MSSQLCatalog::UTF8SupportState()`. What survives is narrower and is now D3 —
+  `n` counts **bytes** for these types, and every client-side bound derived from
+  it must know the collation to be right (§ 3).
+- **A second aliased extension type with implicit casts to and from `VARCHAR`.**
+  § 2a registered one and measured it. Two of them create a cast path between
+  each other — `MSSQL_VARCHAR(10)` to `MSSQL_NVARCHAR(20)` resolves through
+  `VARCHAR` twice, both hops at cost 0 — and ambiguity in overload resolution is
+  a plausible failure that a single registered type could not have shown. Verify
+  before building on it; § 2a reversed its own conclusion once already.
+- **D2 makes every attached string column carry an alias.** § 2a rejected the
+  catalog annotation partly because the alias-free form crashes and the aliased
+  form was thought to make columns unusable — the implicit casts of `b7a15fa`
+  are what changed that. They are now on the path of every query against every
+  attached MSSQL table, not just the columns someone casts. Whatever the casts
+  cost, the whole extension pays it.
 - **Type names are user-facing and permanent.** `MSSQL_NVARCHAR` follows the
   extension's namespace convention; picking anything shorter risks colliding
   with a future DuckDB type.
