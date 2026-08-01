@@ -426,13 +426,31 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Drop and recreate
 			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
-			CreateTable(conn, target, source_types, source_names, config.varchar_collation);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
 			ValidateExistingTableSchema(conn, target, source_types, source_names);
+
+			// Spec 060 D7: empty it first if asked, keeping its definition. On THIS
+			// connection, which is the one the load runs on: routing it elsewhere
+			// would let an aborted COPY leave the table both empty and unloaded,
+			// and inside a DuckDB transaction the load's own rows would not see
+			// the truncate.
+			if (config.truncate) {
+				const string truncate_sql = "TRUNCATE TABLE " + target.GetFullyQualifiedName();
+				DebugLog(1, "ValidateTarget: TRUNCATE=true, emptying %s", target.GetFullyQualifiedName().c_str());
+				auto truncate_result = MSSQLSimpleQuery::Execute(conn, truncate_sql);
+				if (!truncate_result.success) {
+					throw InvalidInputException(
+						"MSSQL COPY: Failed to truncate '%s': %s. TRUNCATE needs ALTER on the table and is refused "
+						"when a foreign key references it — use replace to recreate the table instead.",
+						target.GetFullyQualifiedName(), truncate_result.error_message);
+				}
+			}
+
 			// Appending to existing table, not a new table
 			config.is_new_table = false;
 		}
@@ -440,7 +458,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		// Table doesn't exist
 		if (config.create_table) {
 			DebugLog(1, "ValidateTarget: CREATE_TABLE=true, creating table");
-			CreateTable(conn, target, source_types, source_names, config.varchar_collation);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options);
 			// Newly created table
 			config.is_new_table = true;
 		} else {
@@ -458,7 +476,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
 								 const vector<LogicalType> &source_types, const vector<string> &source_names,
-								 const string &varchar_collation) {
+								 const string &varchar_collation, const MSSQLTableOptions &table_options) {
 	if (source_types.size() != source_names.size()) {
 		throw InvalidInputException("MSSQL COPY: Column types and names count mismatch");
 	}
@@ -475,6 +493,7 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 	}
 
 	sql += "\n)";
+	sql += table_options.CreateTableSuffix();
 
 	DebugLog(2, "CreateTable SQL: %s", sql.c_str());
 
@@ -482,6 +501,20 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 	if (!result.success) {
 		throw InvalidInputException("MSSQL COPY: Failed to create table '%s': %s", target.GetFullyQualifiedName(),
 									result.error_message);
+	}
+
+	// Spec 060 D5: a clustered index of either kind is its own DDL statement. It
+	// goes in BEFORE the load on purpose — a clustered columnstore built after
+	// the rows are in place costs a full rebuild, and building it first is what
+	// lets the load write compressed rowgroups directly.
+	const string post_create = table_options.PostCreateStatement(target.schema_name, target.table_name);
+	if (!post_create.empty()) {
+		DebugLog(2, "CreateTable post-create SQL: %s", post_create.c_str());
+		auto index_result = MSSQLSimpleQuery::Execute(conn, post_create);
+		if (!index_result.success) {
+			throw InvalidInputException("MSSQL COPY: Failed to create index on '%s': %s",
+										target.GetFullyQualifiedName(), index_result.error_message);
+		}
 	}
 
 	DebugLog(1, "CreateTable: created %s with %llu columns", target.GetFullyQualifiedName().c_str(),

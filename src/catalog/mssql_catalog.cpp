@@ -877,6 +877,17 @@ string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_
 	return requested;
 }
 
+ErrorData MSSQLCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
+	auto &base = info.Base().Cast<CreateTableInfo>();
+	// PARTITIONED BY and SORTED BY stay rejected by the base implementation:
+	// SQL Server expresses both, but through partition schemes and index keys
+	// that this spec does not build. Only the WITH clause is claimed here.
+	if (base.partition_keys.empty() && base.sort_keys.empty()) {
+		return ErrorData();
+	}
+	return Catalog::SupportsCreateTable(info);
+}
+
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {
 	return *connection_info_;
 }

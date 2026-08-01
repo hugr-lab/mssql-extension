@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <vector>
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -214,7 +215,7 @@ struct TargetResolver {
 	//        their own; empty emits no COLLATE clause. Resolved by ValidateTarget.
 	static void CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
 							const vector<LogicalType> &source_types, const vector<string> &source_names,
-							const string &varchar_collation);
+							const string &varchar_collation, const MSSQLTableOptions &table_options);
 
 	// Drop a table if it exists
 	// @param conn TDS connection for SQL execution

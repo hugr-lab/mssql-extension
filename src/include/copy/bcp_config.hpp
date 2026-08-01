@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -31,6 +32,13 @@ struct BCPCopyConfig {
 
 	// Drop and recreate table if it exists
 	bool overwrite = false;
+
+	// Empty an EXISTING table before loading, keeping its definition — indexes,
+	// permissions, the columnstore index someone built on it. Separately named
+	// from `replace` on purpose: both destroy rows the statement does not name,
+	// but replace also discards the table's shape, and the two are not
+	// interchangeable for a target that was set up deliberately (spec 060 D7).
+	bool truncate = false;
 
 	// Rows before flushing to SQL Server (0 = flush only at end)
 	// This controls memory usage on SQL Server - data is buffered until flush
@@ -65,6 +73,20 @@ struct BCPCopyConfig {
 	// ValidateTarget: empty unless some column asked for MSSQL_VARCHAR(n) without
 	// naming one, and the database default is not already UTF-8.
 	string varchar_collation;
+
+	// From mssql_ctas_text_type — what an unannotated DuckDB VARCHAR becomes.
+	// The SAME setting drives CTAS, so the two table-creating paths cannot
+	// disagree about it (spec 060 D7).
+	bool text_type_varchar = false;
+
+	// From mssql_default_string_length, or the per-statement string_length option.
+	// 0 means MAX, which is what a plain VARCHAR has always meant.
+	int32_t default_string_length = 0;
+
+	// Shape of a table this COPY creates — mssql_default_table_kind, or the
+	// per-statement table_kind option (spec 060 D8). Ignored when the target
+	// already exists: COPY does not restructure someone else's table.
+	MSSQLTableOptions table_options;
 
 	// Check if data should be flushed to SQL Server
 	// Returns true when accumulated rows reach flush_rows threshold

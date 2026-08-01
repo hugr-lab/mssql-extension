@@ -61,6 +61,15 @@ std::string FormatTargetStringDdl(const TargetStringType &spec, const std::strin
 //! needs nothing, and neither does nvarchar.
 bool NeedsVarcharCollation(const LogicalType &type);
 
+//! Spec 060 D7/D9: stamp the session's default target type onto a plain VARCHAR,
+//! so every downstream site — both DDL translators, the INSERT BULK declaration
+//! and the length guard — reads one annotation instead of learning the policy
+//! four times over. Types that already state something are returned untouched,
+//! as is anything that is not a VARCHAR.
+//! @param length 0 leaves the type alone: MAX is what a plain VARCHAR means, and
+//!        is the default so that nothing changes for anyone who sets nothing.
+LogicalType ApplyDefaultStringType(const LogicalType &type, bool unicode, int32_t length, const std::string &collation);
+
 //! A collation name reaches T-SQL as a bare identifier — COLLATE takes no
 //! quoting — so anything that is not one must be refused before it is
 //! concatenated into a CREATE TABLE.

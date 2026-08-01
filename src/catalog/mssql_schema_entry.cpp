@@ -2,6 +2,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "catalog/mssql_table_options.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enum_util.hpp"
@@ -144,11 +145,33 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	}
 	const string varchar_collation = mssql_catalog.ResolveVarcharCollation(transaction.GetContext(), wants_varchar);
 
-	// Generate T-SQL for CREATE TABLE (with constraints)
+	// Spec 060 D5: SQL Server table properties from CREATE TABLE ... WITH (...),
+	// over the session defaults. DATA_COMPRESSION rides inside the CREATE; a
+	// clustered index of either kind is its own statement and follows it.
+	MSSQLTableOptions table_options = MSSQLTableOptions::FromSettings(transaction.GetContext());
+	table_options.ApplyWithClause(base_info.options);
+
+	// Generate T-SQL for CREATE TABLE (with constraints). The translator ends the
+	// statement with ');', so a table-option suffix has to go before that
+	// terminator rather than after it.
 	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints, varchar_collation);
+	const string suffix = table_options.CreateTableSuffix();
+	if (!suffix.empty()) {
+		const auto terminator = tsql.find_last_of(';');
+		if (terminator == string::npos) {
+			tsql += suffix;
+		} else {
+			tsql.insert(terminator, suffix);
+		}
+	}
 
 	// Execute DDL on SQL Server
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
+
+	const string post_create = table_options.PostCreateStatement(name, table_name);
+	if (!post_create.empty()) {
+		mssql_catalog.ExecuteDDL(transaction.GetContext(), post_create);
+	}
 
 	// Point invalidation: invalidate schema's table list and local table set
 	mssql_catalog.InvalidateSchemaTableSet(name);

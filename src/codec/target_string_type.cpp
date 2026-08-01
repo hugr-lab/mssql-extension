@@ -70,6 +70,27 @@ std::string FormatTargetStringDdl(const TargetStringType &spec, const std::strin
 	return ddl;
 }
 
+LogicalType ApplyDefaultStringType(const LogicalType &type, bool unicode, int32_t length,
+								   const std::string &collation) {
+	if (length <= 0 || type.id() != LogicalTypeId::VARCHAR || type.HasAlias()) {
+		return type;
+	}
+	// Past SQL Server's inline limit the column has to be MAX, which is what the
+	// unannotated type already asks for.
+	const int32_t limit = unicode ? MAX_NVARCHAR_LENGTH : MAX_VARCHAR_LENGTH;
+	if (length > limit) {
+		return type;
+	}
+
+	TargetStringType spec;
+	spec.unicode = unicode;
+	spec.length = length;
+	if (!unicode) {
+		spec.collation = collation;
+	}
+	return MakeTargetStringType(spec);
+}
+
 bool NeedsVarcharCollation(const LogicalType &type) {
 	TargetStringType spec;
 	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();

@@ -133,6 +133,7 @@ set(EXTENSION_SOURCES
     src/codec/money_codec.cpp
     src/codec/string_codec.cpp
     src/codec/target_string_type.cpp
+    src/catalog/mssql_table_options.cpp
     src/codec/binary_codec.cpp
     src/codec/datetime_codec.cpp
     src/codec/uuid_codec.cpp

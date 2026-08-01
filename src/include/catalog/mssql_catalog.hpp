@@ -156,6 +156,14 @@ public:
 	//!        common case, where nothing asked for a single-byte column.
 	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar);
 
+	//! Spec 060 D5: accept `CREATE TABLE ... WITH (...)`. DuckDB parses the
+	//! clause into CreateTableInfo::options for every catalog and the base
+	//! implementation rejects it; SQL Server has real table properties to put
+	//! there — the table's shape and its compression. The option NAMES are
+	//! validated where they are applied, so an unsupported one is still an error
+	//! rather than a silently ignored request.
+	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
+
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;
 

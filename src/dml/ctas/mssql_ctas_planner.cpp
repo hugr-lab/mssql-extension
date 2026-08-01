@@ -151,12 +151,18 @@ vector<CTASColumnDef> CTASPlanner::MapColumns(const LogicalCreateTable &op, Phys
 		// Column name
 		col_def.name = col.GetName();
 
-		// DuckDB type from child plan
-		col_def.duckdb_type = child_types[col_idx];
+		// DuckDB type from child plan. Spec 060: a plain VARCHAR picks up the
+		// session's default target type here, once, so the DDL text, the INSERT
+		// BULK declaration and the encoder's length guard all read the same
+		// annotation rather than each learning the policy separately. A column
+		// that states its own type is left alone.
+		col_def.duckdb_type =
+			codec::ApplyDefaultStringType(child_types[col_idx], config.text_type != CTASTextType::VARCHAR,
+										  config.default_string_length, config.varchar_collation);
 
 		// Map to SQL Server type using CTAS-specific mapper (FR-012, FR-013)
 		try {
-			col_def.mssql_type = MSSQLDDLTranslator::MapLogicalTypeToCTAS(child_types[col_idx], config);
+			col_def.mssql_type = MSSQLDDLTranslator::MapLogicalTypeToCTAS(col_def.duckdb_type, config);
 		} catch (NotImplementedException &e) {
 			// Enhance error message with column name (FR-012)
 			throw NotImplementedException("CTAS failed for column '%s': %s", col_def.name, e.what());
