@@ -113,6 +113,30 @@ detect_sqlcmd() {
 	SQLCMD_MODE="sidecar"
 }
 
+# sql_batch — run a SQL batch supplied on STDIN.
+#
+# NOT `-Q "<multi-line string>"`. Passing a long multi-line batch as an argv
+# element through `docker run` mangles it: the sidecar path came back with
+# "Incorrect syntax near '<mojibake>'", which decodes (byte-swapped UTF-16) to
+# EXECUTABLE_LOCATION=/opt/mssql-tools/bin/sqlcmd — the container's own
+# environment leaking into the batch. `docker exec` happened to survive it,
+# which is why only Azure SQL Edge failed. Reading from stdin sidesteps argv
+# entirely and behaves the same on both paths.
+sql_batch() {
+	case "$SQLCMD_MODE" in
+	in:*)
+		local path="${SQLCMD_MODE#in:}"
+		local extra=""
+		[[ "$path" == *tools18* ]] && extra="-C"
+		docker exec -i "$CONTAINER" "$path" -S localhost -U sa -P "$SA_PASS" $extra -i /dev/stdin
+		;;
+	sidecar)
+		docker run --rm -i --network "container:$CONTAINER" "$TOOLS_IMAGE" \
+			/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASS" -i /dev/stdin
+		;;
+	esac
+}
+
 # sql <args...> — run sqlcmd against the server under test.
 sql() {
 	case "$SQLCMD_MODE" in
@@ -150,16 +174,35 @@ wait_ready() {
 # Seed. Branches on UTF-8 collation availability: on 2017 there is none, and
 # asking for one is a hard error rather than something to skip past.
 #-----------------------------------------------------------------------------
-seed() {
-	local have_utf8="$1" utf8_col=""
-	[ "$have_utf8" = "yes" ] && utf8_col="v_u8 VARCHAR(400) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL,"
+SEED_ERROR=""
 
-	sql -Q "
+seed() {
+	local have_utf8="$1" utf8_col="" out
+	[ "$have_utf8" = "yes" ] && utf8_col="v_u8 VARCHAR(400) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL,"
+	SEED_ERROR=""
+
+	out=$(sql -Q "
 SET NOCOUNT ON;
 IF DB_ID('MatrixDB') IS NULL CREATE DATABASE MatrixDB;
-" >/dev/null 2>&1
+" 2>&1)
+	if echo "$out" | grep -qiE "^Msg [0-9]+|error"; then
+		SEED_ERROR="CREATE DATABASE: $(echo "$out" | grep -iE '^Msg|error' | head -1 | cut -c1-70)"
+		return 1
+	fi
 
-	sql -d MatrixDB -Q "
+	# CREATE DATABASE returns before the database is necessarily usable, and
+	# `-d MatrixDB` on the very next call then fails with "Cannot open
+	# database". That failure used to be swallowed, and the whole version
+	# reported as a row of "n/a" — indistinguishable from a deliberate skip.
+	local tries=0
+	until [ "$(sql1 "SELECT 1 FROM sys.databases WHERE name='MatrixDB' AND state_desc='ONLINE'")" = "1" ]; do
+		tries=$((tries + 1))
+		if [ $tries -gt 30 ]; then SEED_ERROR="MatrixDB never came ONLINE"; return 1; fi
+		sleep 2
+	done
+
+	out=$(sql_batch <<SQLEOF 2>&1
+USE MatrixDB;
 SET NOCOUNT ON;
 IF OBJECT_ID('dbo.Charsets') IS NOT NULL DROP TABLE dbo.Charsets;
 CREATE TABLE dbo.Charsets (
@@ -179,11 +222,34 @@ INSERT INTO dbo.Charsets (id, label, v_nvarchar, v_jp, v_1252) VALUES
  (3,'cjk',     REPLICATE(NCHAR(0x6F22),40),                REPLICATE(NCHAR(0x6F22),40), NULL),
  (4,'emoji',   REPLICATE(NCHAR(0xD83D)+NCHAR(0xDE00),40),  NULL,                NULL),
  (5,'latin1',  REPLICATE(NCHAR(0x00E9),40),                NULL,                REPLICATE(NCHAR(0x00E9),40));
-" >/dev/null 2>&1
+SQLEOF
+)
+	if echo "$out" | grep -qiE "^Msg [0-9]+"; then
+		SEED_ERROR="seed: $(echo "$out" | grep -iE '^Msg|^Incorrect|^Invalid|^The ' | head -2 | tr '\n' ' ' | cut -c1-140)"
+		return 1
+	fi
 
 	if [ "$have_utf8" = "yes" ]; then
-		sql -d MatrixDB -Q "SET NOCOUNT ON; UPDATE dbo.Charsets SET v_u8 = v_nvarchar;" >/dev/null 2>&1
+		out=$(sql -d MatrixDB -Q "SET NOCOUNT ON; UPDATE dbo.Charsets SET v_u8 = v_nvarchar;" 2>&1)
+		if echo "$out" | grep -qiE "^Msg [0-9]+"; then
+			SEED_ERROR="utf8 backfill: $(echo "$out" | grep -iE '^Msg|^Incorrect|^Invalid|^The ' | head -2 | tr '\n' ' ' | cut -c1-140)"
+			return 1
+		fi
 	fi
+
+	# Prove the fixture is actually there. Without this the round-trips below
+	# return "n/a" for a missing table, which looks like "not applicable to this
+	# version" rather than "the seed failed".
+	# USE emits "Changed database context to ...", which head -1 would take as
+	# the answer. Pass -d and keep only a bare number.
+	local n
+	n=$(sql -d MatrixDB -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.Charsets" 2>/dev/null \
+		| tr -d '\r' | grep -E '^[0-9]+$' | head -1)
+	if [ "$n" != "5" ]; then
+		SEED_ERROR="fixture has ${n:-0} rows, expected 5"
+		return 1
+	fi
+	return 0
 }
 
 #-----------------------------------------------------------------------------
@@ -289,7 +355,11 @@ run_version() {
 	echo "  server collation=$collation   UTF-8 collations=$utf8_colls"
 
 	local have_utf8="no"; [ "$utf8_colls" -gt 0 ] 2>/dev/null && have_utf8="yes"
-	seed "$have_utf8"
+	if ! seed "$have_utf8"; then
+		echo "  SEED FAILED: $SEED_ERROR"
+		RESULTS+=("$ver|$product|SEED_FAIL|$utf8_colls|-|-|-|-|-")
+		return
+	fi
 
 	local login; login=$(extension_login)
 	echo "  extension login: $login"
