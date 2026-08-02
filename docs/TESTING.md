@@ -12,7 +12,8 @@ This guide provides comprehensive instructions for testing the DuckDB MSSQL Exte
 6. [Test Data Reference](#test-data-reference)
 7. [Troubleshooting](#troubleshooting)
 8. [Kerberos Tests (spec 042)](#kerberos-tests-spec-042)
-9. [CI/CD Integration](#cicd-integration)
+9. [Version × Charset Matrix (local only)](#version--charset-matrix-local-only)
+10. [CI/CD Integration](#cicd-integration)
 
 ---
 
@@ -1239,6 +1240,83 @@ See [Kerberos.md](../Kerberos.md#wsl2-ubuntu-under-windows) for the full WSL2 se
 | Build OOM inside Docker (`cannot allocate memory`) | DuckDB compile needs ~4GB | The Dockerfile sets `CMAKE_BUILD_PARALLEL_LEVEL=2` to cap parallelism; if still failing, raise Docker Desktop's memory limit |
 
 See `test/kerberos/README.md` for the full layout and additional troubleshooting.
+
+---
+
+## Version × Charset Matrix (local only)
+
+`test/compat/mssql_version_matrix.sh` stands up one SQL Server container per
+version and exercises **the extension** — `build/release/duckdb`, not `sqlcmd` —
+against each.
+
+**This is not part of `make test` or CI, deliberately.** It pulls roughly 8 GB
+of images, and on Apple silicon four of the five run under amd64 emulation
+(only `azure-sql-edge` publishes a native `linux/arm64`). Budget minutes per
+version.
+
+### When to run it
+
+CI runs exactly one server version, so anything version-dependent is verified
+against 2022 and nowhere else. Run this before merging a change that touches:
+
+- **The LOGIN7 feature list or the login handshake.** A server that dislikes
+  what the client advertises rejects the login with 18456 — indistinguishable
+  from a wrong password. That has already shipped once: issue #225 found
+  `UTF8_SUPPORT` carrying a data byte, which SQL Server 2022 tolerates and
+  Azure SQL rejects.
+- **The string decode path or collation handling.** UTF-8 collations and the
+  `UTF8SUPPORT` feature both arrived in 2019; SQL Server 2017 has neither, and
+  that branch is unreachable from the `.test` suite with a single-version
+  container.
+- **Anything that reads `sys.` catalog views**, whose shape moves between
+  versions.
+
+### Running it
+
+```bash
+make release                                    # the script exercises this build
+
+# everything (2017, 2019, 2022, 2025, azure-sql-edge)
+test/compat/mssql_version_matrix.sh
+
+# a subset, on a chosen port, keeping the last container for hand-poking
+test/compat/mssql_version_matrix.sh --versions 2017,2022 --port 14333 --keep
+
+# machine-readable output, for diffing across runs
+test/compat/mssql_version_matrix.sh --json /tmp/matrix.json
+```
+
+The default port is **14333, not 1433** — a development machine usually already
+has something on the default port, and the script refuses to start if the port
+is occupied.
+
+### What it checks, per version
+
+| check | why |
+|---|---|
+| Extension login succeeds | catches a version rejecting our LOGIN7 feature list |
+| UTF-8 collation count | 0 on 2017, ~1553 on 2019+; drives what the rest can test |
+| Round-trip, 4 storage shapes | `VARCHAR`+UTF-8 collation (raw bytes), `NVARCHAR` (UTF-16 batch decode), `VARCHAR`+DBCS collation and `VARCHAR`+CP1252 (both server-side `CAST`) |
+| Wire bytes per row | ASCII / Cyrillic / CJK / astral, with `mssql_utf8_support` on and off |
+
+The four width classes matter because the UTF-8 wire form is only smaller for
+ASCII. At two bytes per character the two encodings tie, and for CJK UTF-8 is
+larger than the UTF-16 it replaces.
+
+The script degrades rather than failing when a server cannot support a check:
+2017 reports `n/a` for the UTF-8 cases and says why. A genuine failure is
+reported as `SEED_FAIL`, `LOGIN_FAIL`, `NO_SQLCMD`, `FAIL:` or `ERR:` and exits
+non-zero — a "skip" and a "broken" must never look alike.
+
+### Notes
+
+- `sqlcmd` is not in a fixed place: 2017/2019 ship `/opt/mssql-tools/bin` and
+  reject `-C`; 2022+ ship `/opt/mssql-tools18/bin` and require it; Azure SQL
+  Edge ships none, so the script drives it from a `mssql-tools` sidecar sharing
+  the container's network namespace. This is detected, not configured.
+- Readiness polls the **service**, never the port. A published port can accept
+  a TCP connection and still reset every byte, and SQL Server accepts
+  connections before recovery finishes.
 
 ---
 

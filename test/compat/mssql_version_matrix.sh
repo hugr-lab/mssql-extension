@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
 	--port)     PORT="$2";     shift 2 ;;
 	--keep)     KEEP=1;        shift   ;;
 	--json)     JSON_OUT="$2"; shift 2 ;;
-	-h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+	-h|--help)  sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -102,14 +102,33 @@ TOOLS_IMAGE="mcr.microsoft.com/mssql-tools:latest"
 SQLCMD_MODE=""   # "in:<path>" or "sidecar"
 
 detect_sqlcmd() {
-	local p
-	for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
-		if docker exec "$CONTAINER" test -x "$p" 2>/dev/null; then
-			SQLCMD_MODE="in:$p"
-			return 0
-		fi
+	local p tries=0
+	# Retry the probe: `docker run -d` returns before the container's filesystem
+	# is necessarily servable by `docker exec`, and a probe that runs too early
+	# finds neither path and silently falls back to the sidecar — for an image
+	# that does ship sqlcmd. That degradation is invisible in the output.
+	while [ $tries -lt 10 ]; do
+		for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
+			if docker exec "$CONTAINER" test -x "$p" 2>/dev/null; then
+				SQLCMD_MODE="in:$p"
+				return 0
+			fi
+		done
+		# Only keep waiting while the container is actually alive; a crashed
+		# container will never grow a sqlcmd.
+		[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ] || break
+		tries=$((tries + 1))
+		sleep 2
 	done
-	docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1 || docker pull -q "$TOOLS_IMAGE" >/dev/null 2>&1
+	# No in-container sqlcmd (azure-sql-edge). Fail loudly if the sidecar image
+	# cannot be obtained, rather than setting sidecar mode anyway and letting
+	# every later call fail silently until wait_ready burns its full deadline.
+	if ! docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1; then
+		if ! docker pull -q "$TOOLS_IMAGE" >/dev/null 2>&1; then
+			SQLCMD_MODE=""
+			return 1
+		fi
+	fi
 	SQLCMD_MODE="sidecar"
 }
 
@@ -274,11 +293,32 @@ extension_login() {
 	fi
 }
 
-# roundtrip <column> -> "pass" | "FAIL:<detail>" | "n/a"
-# Compares what the extension returns against the same value fetched as
-# NVARCHAR, which is the shape whose decode path is already well covered.
+# The values the seed inserted, expressed independently of the server.
+#
+# The NVARCHAR column is the REFERENCE the other three are compared against, so
+# it cannot be checked against itself: `v_nvarchar IS DISTINCT FROM v_nvarchar`
+# is false for every row, which made the reference path the one shape in the
+# matrix that could not fail — it printed "pass" unconditionally, including on a
+# build whose UTF-16 batch decode was broken. It is checked against literals
+# built on the DuckDB side instead.
+EXPECTED_CASE="CASE label \
+WHEN 'ascii'    THEN repeat('a', 40) \
+WHEN 'cyrillic' THEN repeat(chr(1076), 40) \
+WHEN 'cjk'      THEN repeat(chr(28450), 40) \
+WHEN 'emoji'    THEN repeat(chr(128512), 40) \
+WHEN 'latin1'   THEN repeat(chr(233), 40) END"
+
+# roundtrip <column> <pre-sql> [expected-expr] -> "pass" | "FAIL:<n>_mismatch" | "ERR:<detail>" | "n/a"
+#
+# `expected-expr` defaults to v_nvarchar (the reference). Pass $EXPECTED_CASE to
+# check the reference itself.
+#
+# "n/a" now means only "the column does not exist for this version". Anything
+# else that goes wrong returns ERR:, which the exit-code check treats as a
+# failure — a run that verified nothing must not exit 0 with a tidy table.
 roundtrip() {
-	local col="$1" pre="$2" out
+	local col="$1" pre="$2" expected="${3:-v_nvarchar}" out err rc
+	err=$(mktemp)
 	# -csv -noheader: the default box renderer draws with U+2502, not ASCII '|',
 	# so anything grepping for a pipe silently matches nothing and every result
 	# reads as "n/a" — which looks like a skip rather than a broken parser.
@@ -286,17 +326,37 @@ roundtrip() {
 $pre
 ATTACH '$(dsn)' AS m (TYPE mssql);
 SELECT count(*) FROM m.dbo.Charsets
-WHERE $col IS NOT NULL AND $col IS DISTINCT FROM v_nvarchar;" 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
-	if [ -z "$out" ]; then echo "n/a"; elif [ "$out" = "0" ]; then echo "pass"; else echo "FAIL:${out}_mismatch"; fi
+WHERE $col IS NOT NULL AND $col IS DISTINCT FROM ($expected);" 2>"$err" | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
+	rc=$?
+	if [ -n "$out" ]; then
+		rm -f "$err"
+		[ "$out" = "0" ] && echo "pass" || echo "FAIL:${out}_mismatch"
+		return
+	fi
+	local detail; detail=$(tr -d '\r' < "$err" | grep -iE "error" | head -1 | cut -c1-70)
+	rm -f "$err"
+	if echo "$detail" | grep -qiE "not found in FROM clause|Referenced column|does not have a column"; then
+		echo "n/a"   # column genuinely absent on this version
+	elif [ -n "$detail" ]; then
+		echo "ERR:${detail}"
+	else
+		echo "ERR:no_output_rc${rc}"
+	fi
 }
 
 # wire_bytes_per_row <label> <column> <feature> -> integer or "?"
 # Per ROW, not total: the D4 stream counters are known to report a single chunk
 # rather than the whole scan, so only a per-row figure is comparable.
 wire_bytes_per_row() {
-	local label="$1" col="$2" feat="$3" pre=""
+	local label="$1" col="$2" feat="$3" pre="" out
 	[ -n "$feat" ] && pre="SET mssql_utf8_support=$feat;"
-	MSSQL_DEBUG=2 "$DUCKDB_BIN" -c "
+	# Captured into a variable, NOT ending in `|| echo "?"`. With pipefail, a
+	# grep that matches nothing fails the whole pipeline *after* the python stage
+	# has already printed "?", so the `||` fired too and the function emitted TWO
+	# lines. That newline then rode into the `|`-separated RESULTS record, where
+	# `IFS='|' read` silently kept only the first line — truncating both the
+	# summary row and the JSON field. The python stage already owns the fallback.
+	out=$(MSSQL_DEBUG=2 "$DUCKDB_BIN" -c "
 SET threads=1; $pre
 ATTACH '$(dsn)' AS m (TYPE mssql);
 SELECT sum(length($col)) FROM m.dbo.Charsets WHERE label='$label';" 2>&1 \
@@ -308,13 +368,21 @@ for L in sys.stdin:
     m=re.search(r'rows=(\d+).*wire_in=(\d+)B',L)
     if m: rows+=int(m.group(1)); w+=int(m.group(2))
 print(round(w/rows,1) if rows else '?')
-" 2>/dev/null || echo "?"
+" 2>/dev/null)
+	# Belt and braces: collapse any stray newline so the RESULTS record stays
+	# single-line whatever happens upstream.
+	out=$(printf '%s' "$out" | tr -d '\n' | head -c 12)
+	echo "${out:-?}"
 }
 
 #-----------------------------------------------------------------------------
 run_version() {
 	local ver="$1" image
-	image="$(image_for "$ver")" || { echo "unknown version: $ver" >&2; return 1; }
+	if ! image="$(image_for "$ver")"; then
+		echo "unknown version: $ver (expected one of: 2017 2019 2022 2025 edge)" >&2
+		RESULTS+=("$ver|-|UNKNOWN_VERSION|-|-|-|-|-|-")
+		return 1
+	fi
 
 	echo
 	echo "==============================================================="
@@ -336,7 +404,11 @@ run_version() {
 		return
 	fi
 
-	detect_sqlcmd
+	if ! detect_sqlcmd; then
+		echo "  could not obtain a sqlcmd (no in-container binary, and $TOOLS_IMAGE would not pull)"
+		RESULTS+=("$ver|-|NO_SQLCMD|-|-|-|-|-|-")
+		return
+	fi
 	echo "  sqlcmd: $SQLCMD_MODE"
 	if ! wait_ready; then
 		echo "  server never became ready; last log lines:"
@@ -372,7 +444,7 @@ run_version() {
 	if has_utf8_setting; then pre_on="SET mssql_utf8_support=true;"; pre_off="SET mssql_utf8_support=false;"; fi
 
 	local rt_nv rt_jp rt_1252 rt_u8="n/a"
-	rt_nv=$(roundtrip v_nvarchar "$pre_on")
+	rt_nv=$(roundtrip v_nvarchar "$pre_on" "$EXPECTED_CASE")
 	rt_jp=$(roundtrip v_jp   "$pre_on")
 	rt_1252=$(roundtrip v_1252 "$pre_on")
 	[ "$have_utf8" = "yes" ] && rt_u8=$(roundtrip v_u8 "$pre_on")
@@ -412,6 +484,10 @@ IFS=',' read -r -a WANTED <<< "$VERSIONS"
 for v in "${WANTED[@]}"; do run_version "$v"; done
 
 echo
+if [ ${#RESULTS[@]} -eq 0 ]; then
+	echo "no versions ran — nothing to report" >&2
+	exit 1
+fi
 echo "==============================================================="
 echo "  SUMMARY"
 echo "==============================================================="
@@ -444,7 +520,12 @@ if [ -n "$JSON_OUT" ]; then
 	echo "wrote $JSON_OUT"
 fi
 
+# A run that verified nothing must not exit 0. ERR: is included deliberately:
+# it is the status that used to be reported as "n/a" and slip through.
 for r in "${RESULTS[@]}"; do
-	case "$r" in *"|FAILED|"*|*"|LOGIN_FAIL|"*|*FAIL:*) exit 1 ;; esac
+	case "$r" in
+	*"|FAILED|"*|*"|LOGIN_FAIL|"*|*"|SEED_FAIL|"*|*"|NO_SQLCMD|"*|*"|UNKNOWN_VERSION|"*|*FAIL:*|*ERR:*)
+		exit 1 ;;
+	esac
 done
 exit 0
