@@ -438,12 +438,17 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	DebugLog(1, "Executing INSERT BULK for BCP mode");
 
-	// Apply auto-TABLOCK for new tables (Issue #45)
-	// If creating a new table and user didn't explicitly set tablock, enable it for performance
-	if (config.is_new_table && !config.bcp_tablock_explicit) {
-		config.bcp_tablock = true;
-		DebugLog(1, "Auto-TABLOCK enabled for new table (no concurrent readers)");
-	}
+	// TABLOCK by the shape CTAS is creating (spec 057 step 1, replacing issue
+	// #45's "new tables" rule). CTAS always creates its target, so the shape is
+	// known without asking the server: heap unless table_options says otherwise.
+	const MSSQLIndexKind shape =
+		config.table_options.kind == MSSQLTableKind::COLUMNSTORE
+			? MSSQLIndexKind::CLUSTERED_COLUMNSTORE
+			: (config.table_options.kind == MSSQLTableKind::CLUSTERED ? MSSQLIndexKind::CLUSTERED
+																	  : MSSQLIndexKind::HEAP);
+	config.bcp_tablock = MSSQLResolveTablock(config.bcp_tablock_choice, shape);
+	DebugLog(1, "TABLOCK=%d (choice=%d, shape=%d)", config.bcp_tablock ? 1 : 0, (int)config.bcp_tablock_choice,
+			 (int)shape);
 
 	// Acquire a connection from the pool
 	auto &pool = catalog->GetConnectionPool();

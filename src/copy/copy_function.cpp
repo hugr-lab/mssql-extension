@@ -235,9 +235,11 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		} else if (loption == "flush_rows") {
 			bind_data->config.flush_rows = static_cast<idx_t>(BigIntValue::Get(option.second[0]));
 		} else if (loption == "tablock") {
-			bind_data->config.tablock = BooleanValue::Get(option.second[0]);
-			// Mark as explicitly set so auto-TABLOCK knows not to override
-			bind_data->config.tablock_explicit = true;
+			// A per-statement `tablock` option is by definition explicit, so it
+			// resolves to ON/OFF and never to AUTO — this is the one place the old
+			// `tablock_explicit` flag was set correctly.
+			bind_data->config.tablock_choice =
+				BooleanValue::Get(option.second[0]) ? MSSQLTablockChoice::ON : MSSQLTablockChoice::OFF;
 		} else if (loption == "truncate") {
 			bind_data->config.truncate = BooleanValue::Get(option.second[0]);
 		} else if (loption == "table_kind") {
@@ -465,12 +467,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
 
-		// Apply auto-TABLOCK for new tables (Issue #45)
-		// If creating a new table and user didn't explicitly set tablock, enable it for performance
-		if (bdata.config.is_new_table && !bdata.config.tablock_explicit) {
-			bdata.config.tablock = true;
-			CopyDebugLog(1, "BCPCopyInitGlobal: auto-TABLOCK enabled for new table (no concurrent readers)");
-		}
+		// TABLOCK by the target's shape (spec 057 step 1, replacing issue #45's
+		// "new tables" rule). ValidateTarget above set target_shape — from
+		// sys.indexes for an existing table, from what we just created otherwise.
+		bdata.config.tablock = MSSQLResolveTablock(bdata.config.tablock_choice, bdata.config.target_shape);
+		CopyDebugLog(1, "BCPCopyInitGlobal: TABLOCK=%d (choice=%d, target_shape=%d, new_table=%d)",
+					 bdata.config.tablock ? 1 : 0, (int)bdata.config.tablock_choice, (int)bdata.config.target_shape,
+					 bdata.config.is_new_table ? 1 : 0);
 
 		// Build and execute INSERT BULK statement
 		// This prepares the server to receive BulkLoad packets

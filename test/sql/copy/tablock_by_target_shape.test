@@ -1,0 +1,124 @@
+# name: test/sql/copy/tablock_by_target_shape.test
+# description: a load into each target shape works under the shape-driven TABLOCK policy (spec 057 step 1)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Spec 057 step 1 replaced issue #45's "TABLOCK for newly created tables" with a
+# decision taken from the target's physical shape: heap ON, clustered columnstore
+# ON, clustered rowstore OFF.
+#
+# TABLOCK is NOT observable from DuckDB — nothing here can assert which hint went
+# out, and pretending otherwise would make this file lie. The decision table is
+# pinned in test/cpp/test_index_kind.cpp, which needs no server.
+#
+# What this file is for is the other half: the policy now sends a DIFFERENT hint
+# than before for two of the three shapes, and a load that used to work must
+# still work and still land every row. The clustered-rowstore case is the one
+# that changed from ON to OFF, and the columnstore case only exists at all
+# because spec 060 made CTAS/COPY able to create one.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS tl (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+CREATE OR REPLACE TABLE tl_src AS
+SELECT i AS id, 'v' || i AS s, (i % 7) * 1.5 AS amt FROM range(3000) t(i);
+
+# -----------------------------------------------------------------------------
+# The setting is tri-state now, and 'auto' is the default. A BOOLEAN literal is
+# what the shipped tests write (SET mssql_copy_tablock = true), so the cast to
+# this option's VARCHAR has to keep working — that is asserted here rather than
+# assumed, because changing the option's type is exactly what could break it.
+# -----------------------------------------------------------------------------
+query I
+SELECT current_setting('mssql_copy_tablock');
+----
+auto
+
+statement ok
+SET mssql_copy_tablock = true;
+
+statement ok
+SET mssql_copy_tablock = false;
+
+statement ok
+SET mssql_copy_tablock = 'auto';
+
+# -----------------------------------------------------------------------------
+# Heap — TABLOCK stays ON, and this is the path that was silently NOT getting it
+# before, because the auto branch was dead code.
+# -----------------------------------------------------------------------------
+statement ok
+COPY tl_src TO 'tl.dbo.TablockHeap' (FORMAT bcp, CREATE_TABLE true, replace true);
+
+query III
+SELECT count(*), sum(id), sum(amt) FROM tl.dbo.TablockHeap;
+----
+3000	4498500	13491.0
+
+# -----------------------------------------------------------------------------
+# Clustered columnstore — TABLOCK ON. Reports index_id = 1 like a rowstore index
+# but takes the opposite branch, which is why the policy is typed on the index
+# KIND and not on a bool.
+# -----------------------------------------------------------------------------
+statement ok
+COPY tl_src TO 'tl.dbo.TablockColumnstore' (FORMAT bcp, CREATE_TABLE true, replace true, table_kind 'columnstore');
+
+query III
+SELECT count(*), sum(id), sum(amt) FROM tl.dbo.TablockColumnstore;
+----
+3000	4498500	13491.0
+
+# -----------------------------------------------------------------------------
+# Clustered rowstore — TABLOCK OFF. The behaviour change: the hint serialises
+# concurrent loaders against this shape, so 'auto' now withholds it. A clustered
+# index that is not a primary key is also invisible to PK discovery, which is why
+# it is created here through raw DDL rather than through the catalog.
+# -----------------------------------------------------------------------------
+# `amt` matches the SOURCE scale deliberately. Declaring it decimal(18,2) made
+# this file fail on something else entirely: a COPY into an existing column whose
+# scale differs from the source sends the mantissa unrescaled, so 1.5 lands as
+# 0.15. That is a real defect, it is not this file's subject, and it needs its own
+# test asserting the right answer rather than a fixture shaped around it.
+statement ok
+SELECT mssql_exec('tl', 'IF OBJECT_ID(''dbo.TablockClustered'') IS NOT NULL DROP TABLE dbo.TablockClustered;
+CREATE TABLE dbo.TablockClustered (id bigint NOT NULL, s nvarchar(50), amt decimal(21,1));
+CREATE CLUSTERED INDEX ix_tlc ON dbo.TablockClustered(id);');
+
+statement ok
+COPY tl_src TO 'tl.dbo.TablockClustered' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), sum(id), sum(amt) FROM tl.dbo.TablockClustered;
+----
+3000	4498500	13491.0
+
+# An explicit choice still wins over the shape — this is a load into the one
+# shape 'auto' would have withheld the hint from.
+statement ok
+SELECT mssql_exec('tl', 'TRUNCATE TABLE dbo.TablockClustered');
+
+statement ok
+COPY tl_src TO 'tl.dbo.TablockClustered' (FORMAT bcp, CREATE_TABLE false, tablock true);
+
+query II
+SELECT count(*), sum(id) FROM tl.dbo.TablockClustered;
+----
+3000	4498500
+
+statement ok
+SELECT mssql_exec('tl', 'DROP TABLE dbo.TablockHeap; DROP TABLE dbo.TablockColumnstore; DROP TABLE dbo.TablockClustered;');
+
+statement ok
+DETACH tl;

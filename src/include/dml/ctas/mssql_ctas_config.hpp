@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -78,16 +79,17 @@ struct CTASConfig {
 	// Applies to BCP mode only
 	idx_t bcp_flush_rows = 100000;
 
-	// From mssql_copy_tablock setting - use TABLOCK hint for BCP operations
-	// Provides 15-30% performance improvement but blocks concurrent reads
+	// Resolved by MSSQLResolveTablock at load time; read by the INSERT BULK
+	// builder. Not a user input on its own.
 	bool bcp_tablock = false;
 
-	// True if user explicitly set mssql_copy_tablock (vs using default)
-	// Used to determine if auto-TABLOCK should be applied for new tables
-	bool bcp_tablock_explicit = false;
+	// What the user asked for via mssql_copy_tablock. AUTO decides from the shape
+	// of the table CTAS is creating (table_options above), which is the peer of
+	// BCPCopyConfig::tablock_choice — see mssql_index_kind.hpp for why the old
+	// `bcp_tablock_explicit` bool could never be false.
+	MSSQLTablockChoice bcp_tablock_choice = MSSQLTablockChoice::AUTO;
 
 	// True if creating a brand-new table (table didn't exist or OR REPLACE dropped it)
-	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
 	bool is_new_table = false;
 
 	// Load configuration from client context

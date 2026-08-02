@@ -18,9 +18,10 @@ BCPCopyConfig LoadBCPCopyConfig(ClientContext &context) {
 	}
 
 	if (context.TryGetCurrentSetting("mssql_copy_tablock", val)) {
-		config.tablock = val.GetValue<bool>();
-		// Mark as explicitly set so auto-TABLOCK logic knows user preference
-		config.tablock_explicit = true;
+		// Tri-state. TryGetCurrentSetting succeeds for every registered option,
+		// default or not, so the VALUE has to carry the choice — the old code read
+		// the call's success as "the user set it" and was therefore always wrong.
+		config.tablock_choice = MSSQLParseTablockChoice(val.IsNull() ? string() : val.ToString());
 	}
 
 	if (context.TryGetCurrentSetting("mssql_utf8_collation", val)) {

@@ -341,14 +341,33 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 		"Rows before flushing to SQL Server during COPY (default: 100000, 0=no flush until end - high memory)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_FLUSH_ROWS), ValidateNonNegative, SetScope::GLOBAL);
 
-	// mssql_copy_tablock - Use TABLOCK hint for bulk load
-	// Enables table-level locking for better performance (15-30% faster)
-	// WARNING: Blocks other readers/writers during COPY operation
-	// Default changed to false in Spec 027 for safer multi-user behavior
-	config.AddExtensionOption(
-		"mssql_copy_tablock",
-		"Use TABLOCK hint for COPY/BCP operations (default: false, set true for 15-30% performance)",
-		LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	// mssql_copy_tablock — 'auto' | 'true' | 'false' (spec 057 step 1).
+	//
+	// Tri-state, and it has to be: the previous BOOLEAN could not express "the
+	// user did not choose". Both auto-TABLOCK sites read `tablock_explicit`,
+	// which was set from `TryGetCurrentSetting(...)` succeeding — and that
+	// succeeds unconditionally for an option with a registered default, so the
+	// flag was ALWAYS true and both auto branches were dead code from spec 030
+	// (issue #45) until now. INSERT BULK went out with no TABLOCK on every
+	// create-then-load, contradicting the documented behaviour.
+	//
+	// 'auto' decides from the target's shape, which is what the measurements
+	// support and "newness" never did:
+	//   heap                  -> ON  (4 concurrent loaders: 1.70 s vs 11.97 s;
+	//                                 BU locks are mutually compatible)
+	//   clustered columnstore -> ON  (reports index_id = 1 like a rowstore index
+	//                                 but wants the opposite answer)
+	//   clustered rowstore    -> OFF (TABLOCK serialises the loaders: 2.11 s/M
+	//                                 with, 1.20 s/M without)
+	// Magnitudes are from an emulated server and are upper bounds; the
+	// directions have mechanisms and hold.
+	//
+	// `SET mssql_copy_tablock = true` still works — DuckDB casts the boolean to
+	// this option's VARCHAR.
+	config.AddExtensionOption("mssql_copy_tablock",
+							  "TABLOCK hint for COPY/BCP: 'auto' (by target shape — heap and columnstore on, "
+							  "clustered rowstore off), 'true', or 'false'",
+							  LogicalType::VARCHAR, Value("auto"), nullptr, SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//
 	// VARCHAR Encoding Settings (Spec 026)
@@ -620,9 +639,9 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 	}
 
 	if (context.TryGetCurrentSetting("mssql_copy_tablock", val)) {
-		config.bcp_tablock = val.GetValue<bool>();
-		// Mark as explicitly set so auto-TABLOCK logic knows user preference
-		config.bcp_tablock_explicit = true;
+		// Tri-state — see BCPCopyConfig's peer in bcp_config.cpp. The success of
+		// this call says nothing about whether the user chose; the value does.
+		config.bcp_tablock_choice = MSSQLParseTablockChoice(val.IsNull() ? string() : val.ToString());
 	}
 
 	return config;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -52,14 +53,25 @@ struct BCPCopyConfig {
 	// - Allowing more parallel server-side processing
 	// WARNING: Blocks other readers/writers during COPY
 	// Default changed to false in Spec 027 for safer multi-user behavior
+	// Resolved at load time by MSSQLResolveTablock(tablock_choice, target_shape);
+	// read by the INSERT BULK builder. Not a user input on its own.
 	bool tablock = false;
 
-	// True if user explicitly set tablock option (vs using default from settings)
-	// Used to determine if auto-TABLOCK should be applied for new tables
-	bool tablock_explicit = false;
+	// What the user asked for: mssql_copy_tablock, or the per-statement `tablock`
+	// COPY option. AUTO means "decide from the target's shape" and is the default.
+	//
+	// This replaces a `tablock_explicit` bool that was ALWAYS true — it was set
+	// from TryGetCurrentSetting() succeeding, which it does unconditionally for an
+	// option carrying a registered default — so both auto-TABLOCK branches were
+	// dead from spec 030 (issue #45) until spec 057 step 1.
+	MSSQLTablockChoice tablock_choice = MSSQLTablockChoice::AUTO;
+
+	// The target's physical structure, which is what decides TABLOCK under AUTO.
+	// Taken from sys.indexes for an existing table (same round trip as the object
+	// check) and from what we are about to create otherwise.
+	MSSQLIndexKind target_shape = MSSQLIndexKind::HEAP;
 
 	// True if creating a brand-new table (table didn't exist or overwrite dropped it)
-	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
 	bool is_new_table = false;
 
 	// From mssql_utf8_collation — the collation to give a varchar column this COPY

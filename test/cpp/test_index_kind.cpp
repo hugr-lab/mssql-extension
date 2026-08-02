@@ -112,12 +112,82 @@ static void TestMalformedInputIsHeapAndDoesNotThrow() {
 	CheckMaps("1x", MSSQLIndexKind::CLUSTERED, "trailing junk is ignored by std::stoi");
 }
 
+//===----------------------------------------------------------------------===//
+// TABLOCK by target shape (spec 057 step 1)
+//
+// The decision table is here rather than in an integration test because TABLOCK
+// is not observable from DuckDB — the SQL suite can only show that all three
+// shapes load correctly, never which hint went out. This is the only place the
+// policy itself is pinned.
+//===----------------------------------------------------------------------===//
+
+static void CheckTablock(MSSQLTablockChoice choice, MSSQLIndexKind shape, bool expected, const char *why) {
+	const bool actual = MSSQLResolveTablock(choice, shape);
+	if (actual == expected) {
+		std::cout << "  ok: " << why << " -> " << (actual ? "TABLOCK" : "no TABLOCK") << "\n";
+	} else {
+		std::cerr << "  FAIL: " << why << " -> expected " << (expected ? "TABLOCK" : "no TABLOCK") << ", got "
+				  << (actual ? "TABLOCK" : "no TABLOCK") << "\n";
+		g_failures++;
+	}
+}
+
+static void TestTablockPolicy() {
+	std::cout << "\n-- TABLOCK decided by the target's shape --\n";
+	// Heap: concurrent bulk loaders take mutually compatible BU locks, so the hint
+	// is what lets them run together — 1.70 s vs 11.97 s at four sessions.
+	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::HEAP, true, "auto + heap");
+	// Clustered columnstore reports index_id = 1 like a rowstore index but wants
+	// the opposite answer, which is the whole reason this takes a kind not a bool.
+	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::CLUSTERED_COLUMNSTORE, true, "auto + clustered columnstore");
+	// Clustered rowstore: the same hint SERIALISES the loaders — 2.11 s/M with,
+	// 1.20 s/M without. Single-session is neutral, so shape alone can decide.
+	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::CLUSTERED, false, "auto + clustered rowstore");
+
+	std::cout << "\n-- an explicit choice always wins over the shape --\n";
+	CheckTablock(MSSQLTablockChoice::ON, MSSQLIndexKind::CLUSTERED, true, "explicit ON against a clustered index");
+	CheckTablock(MSSQLTablockChoice::OFF, MSSQLIndexKind::HEAP, false, "explicit OFF against a heap");
+	CheckTablock(MSSQLTablockChoice::ON, MSSQLIndexKind::HEAP, true, "explicit ON agreeing with the shape");
+	CheckTablock(MSSQLTablockChoice::OFF, MSSQLIndexKind::CLUSTERED, false, "explicit OFF agreeing with the shape");
+}
+
+static void CheckChoice(const char *raw, MSSQLTablockChoice expected, const char *why) {
+	const MSSQLTablockChoice actual = MSSQLParseTablockChoice(raw);
+	if (actual == expected) {
+		std::cout << "  ok: \"" << raw << "\" -> " << (int)actual << "  (" << why << ")\n";
+	} else {
+		std::cerr << "  FAIL: \"" << raw << "\" -> expected " << (int)expected << ", got " << (int)actual << "\n";
+		g_failures++;
+	}
+}
+
+static void TestTablockChoiceParsing() {
+	std::cout << "\n-- parsing mssql_copy_tablock --\n";
+	CheckChoice("auto", MSSQLTablockChoice::AUTO, "the default");
+	CheckChoice("true", MSSQLTablockChoice::ON, "spelled out");
+	CheckChoice("false", MSSQLTablockChoice::OFF, "spelled out");
+	// DuckDB casts `SET mssql_copy_tablock = true` (a BOOLEAN literal) to this
+	// option's VARCHAR, and the existing suite does exactly that — so the cast's
+	// output must parse. Verified against the shipped tests, not assumed.
+	CheckChoice("TRUE", MSSQLTablockChoice::ON, "what a BOOLEAN cast may produce");
+	CheckChoice("FALSE", MSSQLTablockChoice::OFF, "what a BOOLEAN cast may produce");
+	CheckChoice("1", MSSQLTablockChoice::ON, "numeric form");
+	CheckChoice("0", MSSQLTablockChoice::OFF, "numeric form");
+	// Anything unrecognised is AUTO: the value comes from a SET the user may have
+	// written by hand, and falling back to the measured policy beats guessing.
+	CheckChoice("", MSSQLTablockChoice::AUTO, "empty");
+	CheckChoice("yes", MSSQLTablockChoice::AUTO, "unrecognised — not silently ON");
+	CheckChoice("maybe", MSSQLTablockChoice::AUTO, "unrecognised");
+}
+
 int main() {
-	std::cout << "== MSSQLIndexKind unit tests (spec 049, #85) ==\n";
+	std::cout << "== MSSQLIndexKind unit tests (spec 049 #85, spec 057 step 1) ==\n";
 	TestEnumeratorsAreSysIndexesTypeValues();
 	TestKnownStructures();
 	TestUnknownStructuresDegradeToHeap();
 	TestMalformedInputIsHeapAndDoesNotThrow();
+	TestTablockPolicy();
+	TestTablockChoiceParsing();
 	if (g_failures == 0) {
 		std::cout << "\nAll MSSQLIndexKind tests passed.\n";
 		return 0;

@@ -414,24 +414,49 @@ static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarge
 // TargetResolver::ValidateTarget
 //===----------------------------------------------------------------------===//
 
+// The shape a table we are about to CREATE will have. Spec 060 lets CTAS/COPY
+// build a clustered columnstore or a clustered rowstore index instead of a heap,
+// and TABLOCK's answer differs across all three — so the created shape has to be
+// carried, not assumed to be a heap the way the issue-#45 policy did.
+static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
+	switch (options.kind) {
+	case MSSQLTableKind::COLUMNSTORE:
+		return MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
+	case MSSQLTableKind::CLUSTERED:
+		return MSSQLIndexKind::CLUSTERED;
+	default:
+		return MSSQLIndexKind::HEAP;
+	}
+}
+
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names) {
 	DebugLog(2, "ValidateTarget: checking %s", target.GetFullyQualifiedName().c_str());
 
-	// Build object check SQL
+	// Build object check SQL.
+	//
+	// The third column is the target's physical shape, and it rides on the check
+	// that already had to run — sys.indexes row index_id 0 (heap) or 1 (the
+	// clustered index, rowstore or columnstore), which is what decides TABLOCK
+	// under 'auto' (spec 057 step 1). No extra round trip, the same trick spec 049
+	// used for the catalog's index_kind.
 	string object_sql;
 	if (target.IsTempTable()) {
-		// Temp tables are in tempdb
+		// Temp tables are in tempdb, and so are their indexes.
 		object_sql = StringUtil::Format(
 			"SELECT OBJECT_ID('tempdb..%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('tempdb..%s'), 'IsView') AS is_view",
-			target.GetBracketedTable(), target.GetBracketedTable());
+			"OBJECTPROPERTY(OBJECT_ID('tempdb..%s'), 'IsView') AS is_view, "
+			"(SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
+			" WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1) AS index_type",
+			target.GetBracketedTable(), target.GetBracketedTable(), target.GetBracketedTable());
 	} else {
 		object_sql = StringUtil::Format(
 			"SELECT OBJECT_ID('%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('%s'), 'IsView') AS is_view",
-			target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
+			"OBJECTPROPERTY(OBJECT_ID('%s'), 'IsView') AS is_view, "
+			"(SELECT TOP 1 i.type FROM sys.indexes i "
+			" WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1) AS index_type",
+			target.GetFullyQualifiedName(), target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
 	}
 
 	DebugLog(3, "ValidateTarget SQL: %s", object_sql.c_str());
@@ -444,6 +469,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 	bool table_exists = false;
 	bool is_view = false;
+	MSSQLIndexKind existing_shape = MSSQLIndexKind::HEAP;
 
 	if (!result.rows.empty() && !result.rows[0].empty()) {
 		// Check if OBJECT_ID returned non-NULL
@@ -452,6 +478,11 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Check if it's a view
 			if (result.rows[0].size() > 1 && result.rows[0][1] == "1") {
 				is_view = true;
+			}
+			if (result.rows[0].size() > 2) {
+				// A NULL / unparseable type maps to HEAP, which is the conservative
+				// answer for the write path — see MSSQLIndexKindFromSysIndexesType.
+				existing_shape = MSSQLIndexKindFromSysIndexesType(result.rows[0][2]);
 			}
 		}
 	}
@@ -493,6 +524,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 						config.text_type_varchar);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
+			config.target_shape = ShapeOfCreatedTable(config.table_options);
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
@@ -517,6 +549,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 			// Appending to existing table, not a new table
 			config.is_new_table = false;
+			config.target_shape = existing_shape;
 		}
 	} else {
 		// Table doesn't exist
@@ -526,6 +559,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 						config.text_type_varchar);
 			// Newly created table
 			config.is_new_table = true;
+			config.target_shape = ShapeOfCreatedTable(config.table_options);
 		} else {
 			throw InvalidInputException(
 				"MSSQL COPY: Target table '%s' does not exist. "
