@@ -10,6 +10,7 @@
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -144,6 +145,59 @@ public:
 	//! transient pool timeout would become table corruption.
 	enum class Utf8Support : uint8_t { Unknown, Declined, Granted };
 	Utf8Support UTF8SupportState();
+
+	//! Spec 060: the collation to give varchar columns a statement is about to
+	//! create, or empty for "emit no COLLATE clause". Every path that creates a
+	//! table — CREATE TABLE, CTAS, COPY — must reach the same answer, so the rule
+	//! lives here rather than three times over: an empty mssql_utf8_collation is
+	//! the documented opt-out, a database default that is already UTF-8 (Fabric)
+	//! is inherited rather than overridden, and a server that declined
+	//! UTF8SUPPORT gets an error instead of a silently lossy column.
+	//! @param wants_varchar false short-circuits to empty — the overwhelmingly
+	//!        common case, where nothing asked for a single-byte column.
+	//! @param target_is_temp a #temp table lives in tempdb and inherits TEMPDB's
+	//!        collation, not the database's, so the "already UTF-8, inherit"
+	//!        shortcut does not hold for it.
+	string ResolveVarcharCollation(ClientContext &context, bool wants_varchar, bool target_is_temp = false);
+
+	//! Does this endpoint have no NVARCHAR at all? True on Fabric Data Warehouse,
+	//! which stores tables as Delta Parquet and has no UTF-16 type to map onto:
+	//! its own documentation says to use char/varchar instead, and `CREATE TABLE
+	//! (v nvarchar(50))` is refused with "not supported in this edition".
+	//! Verified against a live warehouse, not inferred from the docs.
+	bool RequiresSingleByteText() const;
+
+	//! Spec 060 / issue #225 (write side): the collation to name in the INSERT
+	//! BULK column list for a single-byte column, or empty for "keep it on the
+	//! UTF-16 wire". A DIFFERENT question from ResolveVarcharCollation, which
+	//! answers what goes in the DDL: there, empty means "inherit the database's",
+	//! which is right and cheap. On the wire nothing is inherited — the server
+	//! reads the payload by the collation in the statement text, so sending UTF-8
+	//! needs a UTF-8 name, and the database's own is the one to use when the DDL
+	//! did not need to say anything. Empty when the database is a code page,
+	//! which keeps such a target on the transcoding path where it belongs.
+	string WireVarcharCollation(const string &ddl_collation) const;
+
+	//! Spec 060: refuse a string type this server cannot store, before it reaches
+	//! the DDL. On Fabric that is any NVARCHAR annotation, and any collation
+	//! outside the two it supports — both UTF-8, and fixed when the warehouse was
+	//! created. Everywhere else this is a no-op.
+	void ValidateStringTargets(const vector<LogicalType> &types);
+
+	//! Spec 060: refuse table properties this server cannot apply. A Fabric
+	//! warehouse stores tables as Delta Parquet: it has no indexes of any kind
+	//! and no page compression, so table_kind, clustered_index and
+	//! data_compression all fail there — with server messages that name neither
+	//! the option the user wrote nor the reason. Elsewhere this is a no-op.
+	void ValidateTableOptions(const MSSQLTableOptions &options);
+
+	//! Spec 060 D5: accept `CREATE TABLE ... WITH (...)`. DuckDB parses the
+	//! clause into CreateTableInfo::options for every catalog and the base
+	//! implementation rejects it; SQL Server has real table properties to put
+	//! there — the table's shape and its compression. The option NAMES are
+	//! validated where they are applied, so an unsupported one is still an error
+	//! rather than a silently ignored request.
+	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

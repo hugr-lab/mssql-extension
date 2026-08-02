@@ -255,9 +255,29 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 
 	// mssql_ctas_text_type - Text column type for CTAS: NVARCHAR or VARCHAR
+	// Governs BOTH table-creating data paths — CTAS and COPY — so the two cannot
+	// disagree about what an unannotated DuckDB VARCHAR becomes (spec 060 D7).
+	// The name is historical: it predates COPY honouring it.
 	config.AddExtensionOption("mssql_ctas_text_type",
-							  "Text column type for CTAS: NVARCHAR (Unicode, default) or VARCHAR (collation-dependent)",
+							  "Type given to an unannotated VARCHAR column by CTAS and COPY: NVARCHAR (Unicode, "
+							  "default) or VARCHAR (single-byte, needs a UTF-8 collation)",
 							  LogicalType::VARCHAR, Value("NVARCHAR"), nullptr, SetScope::GLOBAL);
+
+	// mssql_default_string_length - length given to an unannotated VARCHAR column
+	// created by CTAS or COPY (spec 060 D9). 0 means MAX, which is what a plain
+	// VARCHAR has always meant, so nothing changes for anyone who sets nothing.
+	//
+	// It exists because nvarchar(max) is a poor default for a loaded table: it
+	// measured 4.1x slower to load than a sized target. A value states "no string
+	// in this data is longer than n" — SQL Server rejects anything longer, and
+	// the extension's own guard catches it before the batch is sent. Above the
+	// inline limit (4000 for NVARCHAR, 8000 for VARCHAR) the column stays MAX.
+	//
+	// Per-column control is a cast — MSSQL_NVARCHAR(n) / MSSQL_VARCHAR(n) — and
+	// beats this for anything but a uniform schema.
+	config.AddExtensionOption("mssql_default_string_length",
+							  "Length for an unannotated VARCHAR column created by CTAS/COPY (0 = MAX, the default)",
+							  LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
 
 	// mssql_utf8_collation - collation for VARCHAR targets (issue #225).
 	// Only consulted when mssql_ctas_text_type is VARCHAR and the server granted
@@ -274,6 +294,34 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "(default: Latin1_General_100_CI_AS_SC_UTF8; empty inherits the database default)",
 							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName,
 							  SetScope::GLOBAL);
+
+	// mssql_catalog_native_types - report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
+	// the string columns of attached tables instead of a bare VARCHAR (spec 060).
+	// On by default, because it is what lets a target inherit its source's
+	// declared lengths with no cast written by anyone: COPY (SELECT * FROM
+	// d.dbo.Src) TO 'd.dbo.Dst' reproduces Src's column types. The cost is that
+	// DESCRIBE and duckdb_columns() print the annotated name, so tooling that
+	// matches on the literal string "VARCHAR" sees something new — that is what
+	// this setting turns off. The values are ordinary DuckDB strings either way,
+	// and n constrains nothing on the DuckDB side.
+	//
+	// Read when a table entry is built, so a change applies to entries loaded
+	// afterwards; call mssql_invalidate_cache() to apply it to cached ones.
+	config.AddExtensionOption("mssql_catalog_native_types",
+							  "Report MSSQL_VARCHAR(n)/MSSQL_NVARCHAR(n) for attached string columns instead of "
+							  "VARCHAR (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
+	// mssql_default_table_kind - shape of a table CTAS/COPY creates (spec 060 D9).
+	// HEAP is SQL Server's own default and what the extension has always made.
+	// COLUMNSTORE creates a clustered columnstore index right after the table,
+	// which is where the large storage win lives for analytic loads; it is a
+	// separate DDL statement because a columnstore index cannot be declared
+	// inside CREATE TABLE. Per-statement control is the COPY table_kind option
+	// or CREATE TABLE ... WITH (table_kind = '...').
+	config.AddExtensionOption("mssql_default_table_kind",
+							  "Shape of a table created by CTAS/COPY: HEAP (default) or COLUMNSTORE",
+							  LogicalType::VARCHAR, Value("HEAP"), nullptr, SetScope::GLOBAL);
 
 	// mssql_ctas_use_bcp - Use BCP protocol for CTAS data transfer
 	// BCP is 2-10x faster than batched INSERT statements
@@ -533,6 +581,15 @@ CTASConfig LoadCTASConfig(ClientContext &context) {
 	// Load the UTF-8 collation for VARCHAR targets (issue #225)
 	if (context.TryGetCurrentSetting("mssql_utf8_collation", val)) {
 		config.utf8_collation = val.IsNull() ? string() : val.ToString();
+	}
+
+	// Spec 060 D9: shape of the table CTAS creates
+	config.table_options = MSSQLTableOptions::FromSettings(context);
+
+	// Spec 060 D9: default length for an unannotated VARCHAR column
+	if (context.TryGetCurrentSetting("mssql_default_string_length", val)) {
+		const int64_t raw = val.IsNull() ? 0 : val.GetValue<int64_t>();
+		config.default_string_length = raw <= 0 ? 0 : static_cast<int32_t>(std::min<int64_t>(raw, INT32_MAX));
 	}
 
 	// Inherit INSERT settings for batch insert phase (when use_bcp = false)

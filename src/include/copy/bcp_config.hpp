@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -32,6 +33,13 @@ struct BCPCopyConfig {
 	// Drop and recreate table if it exists
 	bool overwrite = false;
 
+	// Empty an EXISTING table before loading, keeping its definition — indexes,
+	// permissions, the columnstore index someone built on it. Separately named
+	// from `replace` on purpose: both destroy rows the statement does not name,
+	// but replace also discards the table's shape, and the two are not
+	// interchangeable for a target that was set up deliberately (spec 060 D7).
+	bool truncate = false;
+
 	// Rows before flushing to SQL Server (0 = flush only at end)
 	// This controls memory usage on SQL Server - data is buffered until flush
 	// Recommended: 100K-1M rows depending on row size
@@ -53,6 +61,37 @@ struct BCPCopyConfig {
 	// True if creating a brand-new table (table didn't exist or overwrite dropped it)
 	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
 	bool is_new_table = false;
+
+	// From mssql_utf8_collation — the collation to give a varchar column this COPY
+	// creates, when the column's own MSSQL_VARCHAR(n) annotation names none.
+	// Without it the column takes the database code page and SQL Server replaces
+	// everything outside it with '?' on insert, silently (issue #225). Empty is the
+	// documented way to inherit the database default, which is correct on Fabric.
+	string utf8_collation;
+
+	// The collation actually applied, resolved once per statement in
+	// ValidateTarget: empty unless some column asked for MSSQL_VARCHAR(n) without
+	// naming one, and the database default is not already UTF-8.
+	string varchar_collation;
+
+	// Collation to NAME in the INSERT BULK column list for a single-byte column,
+	// or empty to keep it on the UTF-16 wire. See CTASConfig for why this is not
+	// the same question as varchar_collation.
+	string wire_varchar_collation;
+
+	// From mssql_ctas_text_type — what an unannotated DuckDB VARCHAR becomes.
+	// The SAME setting drives CTAS, so the two table-creating paths cannot
+	// disagree about it (spec 060 D7).
+	bool text_type_varchar = false;
+
+	// From mssql_default_string_length, or the per-statement string_length option.
+	// 0 means MAX, which is what a plain VARCHAR has always meant.
+	int32_t default_string_length = 0;
+
+	// Shape of a table this COPY creates — mssql_default_table_kind, or the
+	// per-statement table_kind option (spec 060 D8). Ignored when the target
+	// already exists: COPY does not restructure someone else's table.
+	MSSQLTableOptions table_options;
 
 	// Check if data should be flushed to SQL Server
 	// Returns true when accumulated rows reach flush_rows threshold

@@ -13,6 +13,7 @@
 #include "codec/string_codec.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -414,6 +415,28 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 
 	case ExpressionClass::BOUND_BETWEEN:
 		return EncodeBetweenExpression(expr.Cast<BoundBetweenExpression>(), ctx);
+
+	case ExpressionClass::BOUND_CAST: {
+		// Spec 060: the catalog reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
+		// string columns, and DuckDB reaches a plain VARCHAR overload through the
+		// implicit no-op cast registered with those types. On the server there is
+		// nothing to cast — the column already IS that string — so encode straight
+		// through it. Without this arm the cast reads as an unsupported expression,
+		// the filter stops being pushed, and the whole column is fetched and
+		// filtered on the client instead.
+		//
+		// VARCHAR to VARCHAR only. A real conversion (INTEGER to VARCHAR) has
+		// formatting semantics SQL Server need not reproduce, and stays unpushed.
+		auto &cast = expr.Cast<BoundCastExpression>();
+		if (cast.return_type.id() == LogicalTypeId::VARCHAR && cast.child &&
+			cast.child->return_type.id() == LogicalTypeId::VARCHAR) {
+			return EncodeExpression(*cast.child, ctx);
+		}
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: cast %s -> %s not pushed",
+							   cast.child ? cast.child->return_type.ToString().c_str() : "?",
+							   cast.return_type.ToString().c_str());
+		return {"", false};
+	}
 
 	default:
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: unsupported expression class %d", (int)expr.GetExpressionClass());

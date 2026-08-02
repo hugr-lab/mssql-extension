@@ -1,12 +1,14 @@
 #include "copy/copy_function.hpp"
 
 #include "catalog/mssql_catalog.hpp"
+#include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_config.hpp"
 #include "copy/bcp_writer.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -72,6 +74,15 @@ static void BCPListCopyOptions(ClientContext &context, CopyOptionsInput &input) 
 	copy_options["flush_rows"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
 	// TABLOCK: Use table-level lock for better performance (default: false, from mssql_copy_tablock)
 	copy_options["tablock"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
+	// STRING_LENGTH: length for unannotated VARCHAR columns this COPY creates
+	// (default: 0 = MAX, from mssql_default_string_length). Spec 060 D8.
+	copy_options["string_length"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
+	// TABLE_KIND: HEAP (default) or COLUMNSTORE for a table this COPY creates,
+	// over mssql_default_table_kind. Spec 060 D8.
+	copy_options["table_kind"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
+	// TRUNCATE: empty an existing target before loading, keeping its definition
+	// (default: false). Spec 060 D7.
+	copy_options["truncate"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 }
 
 void RegisterMSSQLCopyFunctions(ExtensionLoader &loader) {
@@ -217,8 +228,42 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 			bind_data->config.tablock = BooleanValue::Get(option.second[0]);
 			// Mark as explicitly set so auto-TABLOCK knows not to override
 			bind_data->config.tablock_explicit = true;
+		} else if (loption == "truncate") {
+			bind_data->config.truncate = BooleanValue::Get(option.second[0]);
+		} else if (loption == "table_kind") {
+			bind_data->config.table_options.ApplyOption("table_kind", option.second[0].ToString());
+		} else if (loption == "string_length") {
+			// Spec 060 D8: per-statement override of mssql_default_string_length.
+			const int64_t raw = BigIntValue::Get(option.second[0]);
+			if (raw < 0) {
+				throw InvalidInputException("MSSQL COPY: string_length must be >= 0 (0 = MAX), got %lld",
+											(long long)raw);
+			}
+			bind_data->config.default_string_length =
+				raw == 0 ? 0 : static_cast<int32_t>(std::min<int64_t>(raw, INT32_MAX));
 		}
 		// Ignore unknown options (may be standard COPY options)
+	}
+
+	// Fabric Data Warehouse has no nvarchar type at all, so the setting cannot be
+	// honoured there and nvarchar(max) — the default everywhere else — is refused
+	// by the server. Verified against a live warehouse.
+	{
+		auto &target_catalog = Catalog::GetCatalog(context, bind_data->target.catalog_name).Cast<MSSQLCatalog>();
+		if (target_catalog.RequiresSingleByteText()) {
+			bind_data->config.text_type_varchar = true;
+		}
+	}
+
+	// Spec 060: stamp the session's default target type onto every unannotated
+	// VARCHAR here, once, so table creation, the INSERT BULK declaration and the
+	// encoder's length guard all read one annotation. A column that already
+	// states its own type — from a cast or carried from an attached source by the
+	// catalog — is left alone. The collation is filled in later by
+	// ValidateTarget, which is where a connection exists to ask the server.
+	for (auto &type : bind_data->source_types) {
+		type = mssql::codec::ApplyDefaultStringType(type, !bind_data->config.text_type_varchar,
+													bind_data->config.default_string_length, string());
 	}
 
 	CopyDebugLog(1, "BCPCopyBind: config flush_rows=%llu, create_table=%d, overwrite=%d, tablock=%d",
@@ -245,16 +290,6 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 
 	// Check write access
 	mssql_catalog.CheckWriteAccess("COPY TO");
-
-	// T042 (Bug 0.7): Check for Fabric endpoint - BCP/INSERT BULK is not supported
-	const auto &conn_info = mssql_catalog.GetConnectionInfo();
-	if (conn_info.is_fabric_endpoint) {
-		throw NotImplementedException(
-			"MSSQL COPY: Microsoft Fabric does not support INSERT BULK (BCP protocol). "
-			"Use CREATE TABLE AS SELECT (CTAS) instead, which auto-falls back to INSERT mode: "
-			"CREATE TABLE %s AS SELECT ... FROM source_table;",
-			bdata.target.GetFullyQualifiedName());
-	}
 
 	// Acquire a connection from the pool
 	// For BCP, we need an exclusive connection that will remain in Executing state
@@ -406,13 +441,17 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				}
 			} catch (...) {
 				// If we can't get target metadata (e.g., table was just created), use source types
-				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
+																		 bdata.config.wire_varchar_collation,
+																		 bdata.config.text_type_varchar);
 				CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 			}
 		} else {
 			// Table was replaced or created, use source types
-			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names);
+			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
+																	 bdata.config.wire_varchar_collation,
+																	 bdata.config.text_type_varchar);
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
 

@@ -174,8 +174,8 @@ void test_ctas_datetime() {
 	CTASConfig config;
 
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::DATE, config), "DATE");
-	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIME, config), "TIME(7)");
-	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIMESTAMP, config), "DATETIME2(7)");
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIME, config), "TIME(6)");
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIMESTAMP, config), "DATETIME2(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TIMESTAMP_TZ, config), "DATETIMEOFFSET(7)");
 
 	std::cout << "PASSED!" << std::endl;
@@ -198,11 +198,13 @@ void test_ctas_uuid() {
 // Test: CTAS Unsupported Types (FR-012)
 //==============================================================================
 void test_ctas_unsupported_hugeint() {
-	std::cout << "\n=== Test: CTAS Unsupported HUGEINT ===" << std::endl;
+	std::cout << "\n=== Test: CTAS HUGEINT ===" << std::endl;
 
 	CTASConfig config;
 
-	ASSERT_THROWS(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::HUGEINT, config), "HUGEINT");
+	// HUGEINT stopped being unsupported in spec 045 — it maps to the widest
+	// DECIMAL SQL Server has. This assertion said it threw, and never ran.
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::HUGEINT, config), "DECIMAL(38,0)");
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -212,7 +214,9 @@ void test_ctas_unsupported_interval() {
 
 	CTASConfig config;
 
-	ASSERT_THROWS(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::INTERVAL, config), "INTERVAL");
+	// Also no longer unsupported since spec 045 FR-026: an interval is stored as
+	// its canonical DuckDB text.
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::INTERVAL, config), "NVARCHAR(50)");
 
 	std::cout << "PASSED!" << std::endl;
 }

@@ -1,9 +1,11 @@
 #include "copy/target_resolver.hpp"
 
 #include "catalog/mssql_catalog.hpp"
+#include "codec/target_string_type.hpp"
 #include "copy/bcp_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -75,12 +77,45 @@ string BCPCopyTarget::GetBracketedTable() const {
 }
 
 //===----------------------------------------------------------------------===//
+// UTF-8 on the write wire (spec 060 / issue #225)
+//===----------------------------------------------------------------------===//
+
+//! Latin1_General_100_CI_AS_SC_UTF8, as the server itself sends it in
+//! COLMETADATA: LCID 0x0409, flags 0x4D (fIgnoreCase | fIgnoreWidth |
+//! fIgnoreKana | fUTF8), version 2, SortId 0. Read off the wire rather than
+//! derived from a table — COLLATIONPROPERTY's CollationID is a different
+//! namespace and Fabric closes the connection on it.
+//!
+//! A CONSTANT is correct here, and the existing code is the proof: every string
+//! column has always been declared SQL_Latin1_General_CP1_CI_AS whatever the
+//! target's own collation was, and loads into differently-collated columns work.
+//! The declared collation tells the server how to READ the bytes; it then
+//! converts into the column's own. Code page 65001 reads any UTF-8, so one
+//! constant covers every UTF-8 target.
+static const std::array<uint8_t, 5> UTF8_WIRE_COLLATION = {0x09, 0x04, 0xD0, 0x24, 0x00};
+
+//! Past this many bytes a varchar column has to be MAX, and travels as PLP.
+static constexpr int32_t MAX_INLINE_VARCHAR_BYTES = 8000;
+
+//! Does this target column hold UTF-8 bytes? Only a char type can, and only
+//! under a collation whose name ends in _UTF8 — the same test #225 uses on the
+//! read side, and the reason it is a name test is that Fabric refuses
+//! COLLATIONPROPERTY.
+static bool IsUtf8CharColumn(const string &type_name, const string &collation_name) {
+	const string lower = StringUtil::Lower(type_name);
+	if (lower != "varchar" && lower != "char") {
+		return false;
+	}
+	return StringUtil::EndsWith(StringUtil::Upper(collation_name), "_UTF8");
+}
+
+//===----------------------------------------------------------------------===//
 // BCPColumnMetadata Implementation
 //===----------------------------------------------------------------------===//
 
 bool BCPColumnMetadata::IsVariableLengthUSHORT() const {
-	// NVARCHARTYPE (0xE7) and BIGVARBINARYTYPE (0xA5) use USHORTLEN
-	return tds_type_token == 0xE7 || tds_type_token == 0xA5;
+	// NVARCHARTYPE (0xE7), BIGVARCHRTYPE (0xA7) and BIGVARBINARYTYPE (0xA5) use USHORTLEN
+	return tds_type_token == 0xE7 || tds_type_token == 0xA7 || tds_type_token == 0xA5;
 }
 
 bool BCPColumnMetadata::IsFixedLength() const {
@@ -136,6 +171,18 @@ string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
 			// max_length is in bytes, nvarchar is 2 bytes per character
 			return "nvarchar(" + std::to_string(max_length / 2) + ")";
 		}
+
+	case tds::TDS_TYPE_BIGVARCHAR: {
+		// A UTF-8 target: max_length is BYTES and the payload is UTF-8, so the
+		// number goes through unchanged rather than halved. The COLLATE clause
+		// is what makes the server read the payload as UTF-8 — see the note on
+		// BCPColumnMetadata::collation_name.
+		string decl = max_length == 0xFFFF ? "varchar(max)" : "varchar(" + std::to_string(max_length) + ")";
+		if (!collation_name.empty()) {
+			decl += " COLLATE " + collation_name;
+		}
+		return decl;
+	}
 
 	case tds::TDS_TYPE_BIGVARBINARY:
 		if (max_length == 0xFFFF) {
@@ -332,6 +379,38 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 }
 
 //===----------------------------------------------------------------------===//
+// ResolveVarcharCollation
+//===----------------------------------------------------------------------===//
+
+//! Issue #225 / spec 060: a varchar column round-trips non-ASCII only if its
+//! collation is a UTF-8 one. The rule lives on MSSQLCatalog so this path cannot
+//! drift from CREATE TABLE and CTAS; all this does is answer whether any column
+//! asked for a single-byte column without naming a collation itself. Resolved
+//! once per COPY, not per column.
+static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarget &target, const BCPCopyConfig &config,
+									  const vector<LogicalType> &source_types) {
+	// Two ways a single-byte column gets created here, and BOTH need a collation:
+	// a column that asked for MSSQL_VARCHAR(n) without naming one, and the
+	// session setting that turns EVERY unannotated VARCHAR into one. Missing the
+	// second is how 'Привет' reached a CP1252 database as '??????' through COPY
+	// while CTAS handled it correctly — issue #225's trap, one path at a time.
+	bool wants_varchar = config.text_type_varchar;
+	if (!wants_varchar) {
+		for (const auto &type : source_types) {
+			if (codec::NeedsVarcharCollation(type)) {
+				wants_varchar = true;
+				break;
+			}
+		}
+	}
+	if (!wants_varchar) {
+		return string();
+	}
+	auto &catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+	return catalog.ResolveVarcharCollation(context, true, target.IsTempTable());
+}
+
+//===----------------------------------------------------------------------===//
 // TargetResolver::ValidateTarget
 //===----------------------------------------------------------------------===//
 
@@ -386,6 +465,20 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// Track whether we're creating a new table for auto-TABLOCK (Issue #45)
 	config.is_new_table = false;
 
+	// Spec 060: refuse a string type this server cannot store before any DDL is
+	// generated, then resolve the collation once per statement, not per column.
+	{
+		auto &target_catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+		target_catalog.ValidateStringTargets(source_types);
+		target_catalog.ValidateTableOptions(config.table_options);
+	}
+	config.varchar_collation = ResolveVarcharCollation(context, target, config, source_types);
+	if (config.text_type_varchar || !config.varchar_collation.empty()) {
+		config.wire_varchar_collation = Catalog::GetCatalog(context, target.catalog_name)
+											.Cast<MSSQLCatalog>()
+											.WireVarcharCollation(config.varchar_collation);
+	}
+
 	if (table_exists) {
 		if (is_view) {
 			throw InvalidInputException("MSSQL COPY: Cannot COPY to a view. Target '%s' is a view.",
@@ -396,13 +489,32 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Drop and recreate
 			DebugLog(1, "ValidateTarget: REPLACE=true, dropping and recreating table");
 			DropTable(conn, target);
-			CreateTable(conn, target, source_types, source_names);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options,
+						config.text_type_varchar);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
 			ValidateExistingTableSchema(conn, target, source_types, source_names);
+
+			// Spec 060 D7: empty it first if asked, keeping its definition. On THIS
+			// connection, which is the one the load runs on: routing it elsewhere
+			// would let an aborted COPY leave the table both empty and unloaded,
+			// and inside a DuckDB transaction the load's own rows would not see
+			// the truncate.
+			if (config.truncate) {
+				const string truncate_sql = "TRUNCATE TABLE " + target.GetFullyQualifiedName();
+				DebugLog(1, "ValidateTarget: TRUNCATE=true, emptying %s", target.GetFullyQualifiedName().c_str());
+				auto truncate_result = MSSQLSimpleQuery::Execute(conn, truncate_sql);
+				if (!truncate_result.success) {
+					throw InvalidInputException(
+						"MSSQL COPY: Failed to truncate '%s': %s. TRUNCATE needs ALTER on the table and is refused "
+						"when a foreign key references it — use replace to recreate the table instead.",
+						target.GetFullyQualifiedName(), truncate_result.error_message);
+				}
+			}
+
 			// Appending to existing table, not a new table
 			config.is_new_table = false;
 		}
@@ -410,7 +522,8 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		// Table doesn't exist
 		if (config.create_table) {
 			DebugLog(1, "ValidateTarget: CREATE_TABLE=true, creating table");
-			CreateTable(conn, target, source_types, source_names);
+			CreateTable(conn, target, source_types, source_names, config.varchar_collation, config.table_options,
+						config.text_type_varchar);
 			// Newly created table
 			config.is_new_table = true;
 		} else {
@@ -427,7 +540,9 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 //===----------------------------------------------------------------------===//
 
 void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
-								 const vector<LogicalType> &source_types, const vector<string> &source_names) {
+								 const vector<LogicalType> &source_types, const vector<string> &source_names,
+								 const string &varchar_collation, const MSSQLTableOptions &table_options,
+								 bool single_byte_text) {
 	if (source_types.size() != source_names.size()) {
 		throw InvalidInputException("MSSQL COPY: Column types and names count mismatch");
 	}
@@ -439,10 +554,12 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 		if (i > 0) {
 			sql += ",\n";
 		}
-		sql += "  [" + source_names[i] + "] " + GetSQLServerTypeDeclaration(source_types[i]) + " NULL";
+		sql += "  [" + source_names[i] + "] " +
+			   GetSQLServerTypeDeclaration(source_types[i], varchar_collation, single_byte_text) + " NULL";
 	}
 
 	sql += "\n)";
+	sql += table_options.CreateTableSuffix();
 
 	DebugLog(2, "CreateTable SQL: %s", sql.c_str());
 
@@ -450,6 +567,20 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 	if (!result.success) {
 		throw InvalidInputException("MSSQL COPY: Failed to create table '%s': %s", target.GetFullyQualifiedName(),
 									result.error_message);
+	}
+
+	// Spec 060 D5: a clustered index of either kind is its own DDL statement. It
+	// goes in BEFORE the load on purpose — a clustered columnstore built after
+	// the rows are in place costs a full rebuild, and building it first is what
+	// lets the load write compressed rowgroups directly.
+	const string post_create = table_options.PostCreateStatement(target.schema_name, target.table_name);
+	if (!post_create.empty()) {
+		DebugLog(2, "CreateTable post-create SQL: %s", post_create.c_str());
+		auto index_result = MSSQLSimpleQuery::Execute(conn, post_create);
+		if (!index_result.success) {
+			throw InvalidInputException("MSSQL COPY: Failed to create index on '%s': %s",
+										target.GetFullyQualifiedName(), index_result.error_message);
+		}
 	}
 
 	DebugLog(1, "CreateTable: created %s with %llu columns", target.GetFullyQualifiedName().c_str(),
@@ -778,7 +909,8 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM tempdb.sys.columns c "
 			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
@@ -786,7 +918,8 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable "
+			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM sys.columns c "
 			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
@@ -820,6 +953,19 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		// Map SQL Server type to TDS type token
 		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
 		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision);
+
+		// Spec 060 / issue #225 (write side): a char column under a UTF-8
+		// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
+		// UTF-8 collation sends them as they are, instead of transcoding to
+		// UTF-16 here for the server to transcode back. max_length goes through
+		// unhalved because both sides now count bytes.
+		const string &collation_name = result.rows[i].size() > 6 ? result.rows[i][6] : string();
+		if (IsUtf8CharColumn(type_name, collation_name)) {
+			col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
+			col.max_length = max_length < 0 ? 0xFFFF : static_cast<uint16_t>(max_length);
+			col.collation = UTF8_WIRE_COLLATION;
+			col.collation_name = collation_name;
+		}
 
 		// Set a reasonable DuckDB type for encoding purposes
 		// This is used by BCPRowEncoder to know how to encode the data
@@ -914,7 +1060,9 @@ vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_
 //===----------------------------------------------------------------------===//
 
 vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<LogicalType> &source_types,
-																 const vector<string> &source_names) {
+																 const vector<string> &source_names,
+																 const string &varchar_collation,
+																 bool single_byte_text) {
 	vector<BCPColumnMetadata> columns;
 	columns.reserve(source_types.size());
 
@@ -927,6 +1075,36 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		// Map DuckDB type to TDS type
 		col.tds_type_token = GetTDSTypeToken(source_types[i]);
 		col.max_length = GetTDSMaxLength(source_types[i]);
+
+		// Spec 060 / issue #225 (write side): the same UTF-8 retarget the
+		// existing-table path does, for the paths that build metadata from
+		// DuckDB types instead — CTAS always, and COPY when it replaces the
+		// table. Without this CTAS declared nvarchar(50) on the wire for a
+		// column it had just created as varchar(50), so every value was
+		// transcoded to UTF-16 for the server to transcode back — the whole of
+		// the string path on Fabric, where nvarchar does not exist.
+		{
+			codec::TargetStringType spec;
+			const bool annotated_varchar = codec::TryGetTargetStringType(source_types[i], spec) && !spec.unicode;
+			const bool plain_varchar_target = single_byte_text && source_types[i].id() == LogicalTypeId::VARCHAR;
+			if (annotated_varchar || plain_varchar_target) {
+				// Empty means we cannot name a UTF-8 collation for this target, so
+				// the column stays on the transcoding path — which is the right
+				// answer for a code-page target, where sending UTF-8 bytes would
+				// be read in that code page and mangled.
+				const string &collation = spec.collation.empty() ? varchar_collation : spec.collation;
+				if (!collation.empty()) {
+					col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
+					// Both sides count bytes now, so the length is not doubled the
+					// way an nvarchar declaration doubles it. An unannotated column
+					// stated no length and is varchar(max) — the PLP sentinel.
+					const bool is_max = !annotated_varchar || spec.length > MAX_INLINE_VARCHAR_BYTES;
+					col.max_length = is_max ? 0xFFFF : static_cast<uint16_t>(spec.length);
+					col.collation = UTF8_WIRE_COLLATION;
+					col.collation_name = collation;
+				}
+			}
+		}
 
 		// Handle precision/scale for decimal types
 		if (source_types[i].id() == LogicalTypeId::DECIMAL) {
@@ -968,6 +1146,9 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		// declaring scale=0 for a TIMESTAMP_MS value drops every millisecond).
 		switch (source_types[i].id()) {
 		case LogicalTypeId::TIME:
+			col.scale = 6;		 // µs (DuckDB native)
+			col.max_length = 5;	 // time(6) alone — no date part, unlike DATETIME2
+			break;
 		case LogicalTypeId::TIMESTAMP:
 			col.scale = 6;		 // µs (DuckDB native)
 			col.max_length = 8;	 // 5 bytes time(6) + 3 bytes date
@@ -1004,7 +1185,18 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 // TargetResolver::GetSQLServerTypeDeclaration
 //===----------------------------------------------------------------------===//
 
-string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type) {
+string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation,
+												   bool single_byte_text) {
+	// Spec 060: an MSSQL_VARCHAR / MSSQL_NVARCHAR annotation states the target
+	// column's type, whether it came from an explicit cast or was carried here by
+	// the catalog from an attached source. The bound type is a plain DuckDB type
+	// with the size in extension info, so nothing downstream of here changes —
+	// only the DDL text.
+	codec::TargetStringType target_string;
+	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		return codec::FormatTargetStringDdl(target_string, varchar_collation);
+	}
+
 	switch (duckdb_type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return "bit";
@@ -1043,8 +1235,15 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 		return StringUtil::Format("decimal(%d,%d)", width, scale);
 	}
 
-	case LogicalTypeId::VARCHAR:
-		return "nvarchar(max)";
+	case LogicalTypeId::VARCHAR: {
+		if (!single_byte_text) {
+			return "nvarchar(max)";
+		}
+		// A single-byte target is only correct with a UTF-8 collation; an empty
+		// one means the database default already is one (Fabric), which is the
+		// case that matters most here since Fabric has no nvarchar at all.
+		return varchar_collation.empty() ? "varchar(max)" : "varchar(max) COLLATE " + varchar_collation;
+	}
 
 	case LogicalTypeId::BLOB:
 		return "varbinary(max)";
@@ -1149,6 +1348,23 @@ uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 //===----------------------------------------------------------------------===//
 
 uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
+	// Spec 060: without this the INSERT BULK declaration says nvarchar(max) for a
+	// column the same statement created as nvarchar(50), and the encoder's
+	// overflow guard — which reads this number — never fires at all. CTAS reaches
+	// this path for every column; COPY reaches it when replacing a table.
+	//
+	// Every char type travels as NVARCHAR, so the unit here is UTF-16 BYTES.
+	// MSSQL_VARCHAR(n) counts n bytes of UTF-8 in the target column, and n UTF-8
+	// bytes never hold more than n characters, so 2n is an upper bound on the wire
+	// — permissive, never rejecting a value the column would have accepted.
+	codec::TargetStringType target_string;
+	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		const int32_t wire_bytes = target_string.length * 2;
+		// Past 8000 bytes the inline NVARCHAR form is out of room and the value
+		// has to travel as PLP, exactly as an oversized existing column does.
+		return wire_bytes > 8000 ? 0xFFFF : static_cast<uint16_t>(wire_bytes);
+	}
+
 	switch (duckdb_type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return 1;

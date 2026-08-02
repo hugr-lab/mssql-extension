@@ -1,7 +1,10 @@
 #include "catalog/mssql_column_info.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 
 namespace duckdb {
 
@@ -55,6 +58,51 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown.
 	// Geometry/geography are "known" (we handle them via STAsBinary rewrite), not auto-CAST.
 	is_cast_required = !IsKnownSQLServerType(sql_type_name);
+}
+
+//===----------------------------------------------------------------------===//
+// Native type reporting (spec 060)
+//===----------------------------------------------------------------------===//
+
+LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
+	// Only a bounded character column has anything to state. A MAX column
+	// (max_length -1) is already what a plain VARCHAR means, text/ntext are MAX
+	// by nature, and a column the scan has to CAST — geometry, hierarchyid,
+	// sql_variant — does not arrive as the type the catalog names anyway.
+	if (duckdb_type.id() != LogicalTypeId::VARCHAR || max_length <= 0 || is_cast_required || is_geometry) {
+		return duckdb_type;
+	}
+
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+
+	mssql::codec::TargetStringType spec;
+	if (lower_type == "nvarchar" || lower_type == "nchar") {
+		// sys.columns reports these in bytes, two per UTF-16 code unit.
+		spec.unicode = true;
+		spec.length = max_length / 2;
+		if (spec.length < 1 || spec.length > mssql::codec::MAX_NVARCHAR_LENGTH) {
+			return duckdb_type;
+		}
+	} else if (lower_type == "varchar" || lower_type == "char") {
+		spec.unicode = false;
+		spec.length = max_length;
+		if (spec.length < 1 || spec.length > mssql::codec::MAX_VARCHAR_LENGTH) {
+			return duckdb_type;
+		}
+		// Carry the source's OWN collation, so a target created from this column
+		// is the column: same capacity for the same values. Inheriting the
+		// session's UTF-8 collation instead would silently change how many
+		// characters fit, since this length is in bytes either way.
+		if (mssql::codec::IsValidCollationName(collation_name)) {
+			spec.collation = collation_name;
+		}
+	} else {
+		return duckdb_type;
+	}
+
+	return mssql::codec::MakeTargetStringType(spec);
 }
 
 //===----------------------------------------------------------------------===//

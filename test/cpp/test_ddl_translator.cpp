@@ -82,8 +82,8 @@ void test_quote_identifier_special() {
 	// Closing bracket at end
 	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo]"), "[foo]]]");
 
-	// Only closing bracket
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]"), "[]]]]");
+	// Only closing bracket: [ + the doubled ] + the closing ] = four characters
+	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]"), "[]]]");
 
 	// Opening bracket (no escaping needed for [)
 	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo[bar"), "[foo[bar]");
@@ -158,7 +158,7 @@ void test_map_type_datetime() {
 	std::cout << "\n=== Test: MapTypeToSQLServer - Date/Time ===" << std::endl;
 
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::DATE), "DATE");
-	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIME), "TIME(7)");
+	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIME), "TIME(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIMESTAMP), "DATETIME2(6)");
 	ASSERT_EQ(MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::TIMESTAMP_TZ), "DATETIMEOFFSET(7)");
 

@@ -1,0 +1,296 @@
+# name: test/sql/catalog/table_options.test
+# description: table shape and default string length for created tables (spec 060)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS topt (TYPE mssql);
+
+# =============================================================================
+# Defaults first: with nothing set, a created table is a HEAP with nvarchar(max)
+# string columns, exactly as before spec 060. Everything below is opt-in.
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptDefault;
+
+statement ok
+CREATE TABLE topt.dbo.ToptDefault AS SELECT 1 AS a, 'x' AS b;
+
+query TTI
+SELECT type_desc, type_name, max_length FROM mssql_scan('topt', $$
+SELECT i.type_desc, t.name AS type_name, c.max_length
+FROM sys.indexes i
+JOIN sys.columns c ON c.object_id = i.object_id AND c.name = 'b'
+JOIN sys.types t ON t.user_type_id = c.user_type_id
+WHERE i.object_id = OBJECT_ID('dbo.ToptDefault')
+$$);
+----
+HEAP	nvarchar	-1
+
+# =============================================================================
+# CREATE TABLE ... WITH (...). DuckDB parses the clause for every catalog and
+# only the base Catalog::SupportsCreateTable rejects it, so MSSQLCatalog takes
+# it over. A clustered index of either kind is its own DDL statement — it cannot
+# be declared inside CREATE TABLE — and runs immediately after it.
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptCci;
+
+statement ok
+CREATE TABLE topt.dbo.ToptCci (a INTEGER, b MSSQL_NVARCHAR(50)) WITH (table_kind = 'columnstore');
+
+query TT
+SELECT name, type_desc FROM mssql_scan('topt', $$
+SELECT i.name, i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('dbo.ToptCci')
+$$);
+----
+CCI_ToptCci	CLUSTERED COLUMNSTORE
+
+# A clustered ROWSTORE index needs key columns, so naming them is what selects
+# it — writing table_kind as well would be a way to state two different things.
+# DATA_COMPRESSION rides inside the CREATE, which is what makes it apply during
+# a bulk load rather than after a later rebuild.
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptCix;
+
+statement ok
+CREATE TABLE topt.dbo.ToptCix (a INTEGER, b MSSQL_NVARCHAR(50))
+  WITH (clustered_index = 'a', data_compression = 'PAGE');
+
+query TTT
+SELECT name, type_desc, compression FROM mssql_scan('topt', $$
+SELECT i.name, i.type_desc, p.data_compression_desc AS compression
+FROM sys.indexes i JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID('dbo.ToptCix')
+$$);
+----
+CIX_ToptCix	CLUSTERED	PAGE
+
+# An option we do not support is an error naming it, not a silently ignored
+# request — a table that is not what the statement asked for is worse than a
+# rejected statement.
+statement error
+CREATE TABLE topt.dbo.ToptBad (a INTEGER) WITH (nonsense = 'x');
+----
+unknown table option 'nonsense'
+
+statement error
+CREATE TABLE topt.dbo.ToptBad (a INTEGER) WITH (table_kind = 'sideways');
+----
+unknown table_kind 'sideways'
+
+# =============================================================================
+# The same shape from the other two paths: a COPY option, and the session
+# default that CTAS reads (CTAS has no options syntax of its own).
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptCopyCci;
+
+statement ok
+COPY (SELECT 1 AS a, 'x' AS b) TO 'mssql://topt/dbo/ToptCopyCci' (FORMAT 'bcp', table_kind 'columnstore');
+
+query T
+SELECT type_desc FROM mssql_scan('topt', $$
+SELECT i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('dbo.ToptCopyCci')
+$$);
+----
+CLUSTERED COLUMNSTORE
+
+# The rows survive the index being created before the load.
+query I
+SELECT count(*) FROM topt.dbo.ToptCopyCci;
+----
+1
+
+statement ok
+SET mssql_default_table_kind = 'columnstore';
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptCtasCci;
+
+statement ok
+CREATE TABLE topt.dbo.ToptCtasCci AS SELECT 2 AS a, 'y' AS b;
+
+query T
+SELECT type_desc FROM mssql_scan('topt', $$
+SELECT i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('dbo.ToptCtasCci')
+$$);
+----
+CLUSTERED COLUMNSTORE
+
+statement ok
+SET mssql_default_table_kind = 'heap';
+
+# =============================================================================
+# Default string length. One setting governs BOTH table-creating paths, so CTAS
+# and COPY cannot disagree about what a plain DuckDB VARCHAR becomes; the COPY
+# option overrides it for one statement. An annotated column is never touched.
+# =============================================================================
+
+statement ok
+SET mssql_default_string_length = 64;
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptLenCtas;
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptLenCopy;
+
+statement ok
+CREATE TABLE topt.dbo.ToptLenCtas AS SELECT 'x' AS plain, 'y'::MSSQL_NVARCHAR(10) AS stated;
+
+statement ok
+COPY (SELECT 'x' AS plain, 'y'::MSSQL_NVARCHAR(10) AS stated)
+  TO 'mssql://topt/dbo/ToptLenCopy' (FORMAT 'bcp');
+
+# max_length is bytes: nvarchar(64) is 128, the stated nvarchar(10) is 20.
+query TTI
+SELECT tbl, col, max_length FROM mssql_scan('topt', $$
+SELECT o.name AS tbl, c.name AS col, c.max_length
+FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id
+WHERE o.name IN ('ToptLenCtas', 'ToptLenCopy') ORDER BY o.name, c.column_id
+$$);
+----
+ToptLenCopy	plain	128
+ToptLenCopy	stated	20
+ToptLenCtas	plain	128
+ToptLenCtas	stated	20
+
+# The bound is now real on the write path: our own error names the column, and
+# it fires before the batch is sent rather than arriving from the server.
+statement error
+CREATE TABLE topt.dbo.ToptLenFail AS SELECT repeat('x', 100) AS plain;
+----
+overflow
+
+statement ok
+SET mssql_default_string_length = 0;
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptLenOpt;
+
+statement ok
+COPY (SELECT 'x' AS plain) TO 'mssql://topt/dbo/ToptLenOpt' (FORMAT 'bcp', string_length 25);
+
+query I
+SELECT max_length FROM mssql_scan('topt', $$
+SELECT c.max_length FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.ToptLenOpt')
+$$);
+----
+50
+
+# =============================================================================
+# truncate empties an EXISTING target and keeps its definition. Separate from
+# replace on purpose: both destroy rows the statement does not name, but replace
+# also discards the table's shape — its indexes, its permissions — and the two
+# are not interchangeable for a target someone set up deliberately.
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptTrunc;
+
+statement ok
+COPY (SELECT 1 AS a) TO 'mssql://topt/dbo/ToptTrunc' (FORMAT 'bcp');
+
+statement ok
+COPY (SELECT 2 AS a) TO 'mssql://topt/dbo/ToptTrunc' (FORMAT 'bcp');
+
+query I
+SELECT count(*) FROM topt.dbo.ToptTrunc;
+----
+2
+
+statement ok
+COPY (SELECT 3 AS a) TO 'mssql://topt/dbo/ToptTrunc' (FORMAT 'bcp', truncate true);
+
+query II
+SELECT count(*), min(a) FROM topt.dbo.ToptTrunc;
+----
+1	3
+
+# =============================================================================
+# Temp tables. Their schema is empty — they live in tempdb under the SESSION —
+# so every qualified name built here has to drop the prefix rather than emit
+# "[].[#t]", which SQL Server rejects. That was a real bug in the clustered
+# index statement, caught only by pointing this at a temp target.
+#
+# Everything below runs inside ONE transaction, and has to. A temp table belongs
+# to the connection that created it; outside a transaction each statement takes
+# whatever connection the pool hands out, and the table is gone when that
+# connection goes back. A DuckDB transaction pins one connection for its whole
+# extent, which is what makes writing and reading the same #temp meaningful.
+# =============================================================================
+
+statement ok
+SET mssql_default_string_length = 32;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+COPY (SELECT 'Привет'::MSSQL_VARCHAR(30) AS stated, 'x' AS plain)
+  TO 'mssql://topt//#topt_tmp' (FORMAT 'bcp');
+
+# Non-ASCII round-trips, which is the assertion that matters: a varchar column
+# created without a UTF-8 collation would have returned '??????'.
+query TT
+SELECT stated, plain FROM mssql_scan('topt', 'SELECT stated, plain FROM #topt_tmp');
+----
+Привет	x
+
+statement ok
+COPY (SELECT 'Мир'::MSSQL_VARCHAR(30) AS stated, 'y' AS plain)
+  TO 'mssql://topt//#topt_tmp' (FORMAT 'bcp', truncate true);
+
+query TT
+SELECT stated, plain FROM mssql_scan('topt', 'SELECT stated, plain FROM #topt_tmp');
+----
+Мир	y
+
+statement ok
+COPY (SELECT 'x' AS a) TO 'mssql://topt//#topt_cci' (FORMAT 'bcp', table_kind 'columnstore');
+
+query TT
+SELECT ix, type_desc FROM mssql_scan('topt', $$
+SELECT i.name AS ix, i.type_desc FROM tempdb.sys.indexes i
+JOIN tempdb.sys.objects o ON o.object_id = i.object_id
+WHERE o.name LIKE '#topt\_cci%' ESCAPE '\'
+$$);
+----
+CCI_#topt_cci	CLUSTERED COLUMNSTORE
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_default_string_length = 0;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('topt', $$
+DROP TABLE IF EXISTS dbo.ToptDefault;
+DROP TABLE IF EXISTS dbo.ToptCci;
+DROP TABLE IF EXISTS dbo.ToptCix;
+DROP TABLE IF EXISTS dbo.ToptCopyCci;
+DROP TABLE IF EXISTS dbo.ToptCtasCci;
+DROP TABLE IF EXISTS dbo.ToptLenCtas;
+DROP TABLE IF EXISTS dbo.ToptLenCopy;
+DROP TABLE IF EXISTS dbo.ToptLenOpt;
+DROP TABLE IF EXISTS dbo.ToptLenFail;
+DROP TABLE IF EXISTS dbo.ToptTrunc;
+$$);
+
+statement ok
+DETACH topt;

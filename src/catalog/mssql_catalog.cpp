@@ -1,5 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
+#include "codec/target_string_type.hpp"
 
 #include "azure/azure_token.hpp"
 #include "catalog/mssql_bind_anchors.hpp"
@@ -550,11 +551,17 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	target.has_identity_column = false;
 	target.identity_column_index = 0;
 
+	// Spec 060: must match what the catalog told DuckDB about these columns —
+	// the binder resolved RETURNING against those types, and MSSQLPhysicalInsert
+	// references the parser's chunk straight into DuckDB's, which requires the
+	// types to be equal down to the extension info.
+	const bool native_types = MSSQLReportsNativeTypes(*this);
+
 	for (idx_t i = 0; i < mssql_columns.size(); i++) {
 		auto &col = mssql_columns[i];
 		MSSQLInsertColumn insert_col;
 		insert_col.name = col.name;
-		insert_col.duckdb_type = col.duckdb_type;
+		insert_col.duckdb_type = native_types ? col.NativeDuckDBType() : col.duckdb_type;
 		insert_col.mssql_type = col.sql_type_name;
 		insert_col.is_identity = false;	 // Will be detected below if needed
 		insert_col.is_nullable = col.is_nullable;
@@ -838,6 +845,150 @@ MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
 	pool.Release(conn);
 	utf8_support_acked_.store(acked ? 1 : 0, std::memory_order_relaxed);
 	return acked ? Utf8Support::Granted : Utf8Support::Declined;
+}
+
+string MSSQLCatalog::ResolveVarcharCollation(ClientContext &context, bool wants_varchar, bool target_is_temp) {
+	if (!wants_varchar) {
+		return string();
+	}
+
+	Value setting;
+	string requested;
+	if (context.TryGetCurrentSetting("mssql_utf8_collation", setting)) {
+		requested = setting.IsNull() ? string() : setting.ToString();
+	}
+	if (requested.empty()) {
+		// The documented way to ask for the pre-#225 behaviour deliberately.
+		return string();
+	}
+
+	// A database default that is already UTF-8 (Fabric) is the case where
+	// inheriting is right: imposing a Latin1 collation would also impose its
+	// case- and accent-sensitivity on every later comparison against the column.
+	//
+	// Except for a TEMP table, which does not inherit it. A #temp lives in
+	// tempdb and takes TEMPDB's collation — the server default, and typically
+	// not UTF-8 even when the database is. Verified on a UTF-8 database: a temp
+	// varchar column came back SQL_Latin1_General_CP1_CI_AS and 'Привет' landed
+	// as '??????'. Naming the database's own collation puts the temp column back
+	// in step with the permanent tables around it, and on Fabric — where every
+	// string column is a varchar, so this is the whole of it — that name is one
+	// of the two a warehouse accepts.
+	if (StringUtil::EndsWith(StringUtil::Upper(GetDatabaseCollation()), "_UTF8")) {
+		if (!target_is_temp) {
+			return string();
+		}
+		// The name reaches T-SQL as a bare identifier. It came from the server,
+		// but it is concatenated into DDL, so it is checked like any other.
+		return mssql::codec::IsValidCollationName(GetDatabaseCollation()) ? GetDatabaseCollation() : requested;
+	}
+
+	// Unknown is treated as granted, NOT as declined. Declined means the server
+	// has no UTF-8 collations at all and the DDL will fail with a clear message;
+	// unknown means only that no connection could be borrowed to ask. Reading
+	// either as "skip the collation" would turn a transient pool timeout into a
+	// silently lossy table.
+	if (UTF8SupportState() == Utf8Support::Declined) {
+		throw NotImplementedException(
+			"A VARCHAR column needs a UTF-8 collation, and this server did not grant the TDS UTF8SUPPORT feature "
+			"(SQL Server 2019 introduced both). The column would take the database's code page and lose every "
+			"character outside it on insert, silently. Use NVARCHAR instead, name a collation with "
+			"MSSQL_VARCHAR(n, 'collation'), or set mssql_utf8_collation='' to accept that loss deliberately.");
+	}
+	return requested;
+}
+
+bool MSSQLCatalog::RequiresSingleByteText() const {
+	return connection_info_ && connection_info_->is_fabric_endpoint;
+}
+
+string MSSQLCatalog::WireVarcharCollation(const string &ddl_collation) const {
+	if (!ddl_collation.empty()) {
+		return ddl_collation;
+	}
+	// The DDL said nothing because the database's own collation is already what
+	// the column wants. The wire has no such default, so name it.
+	const string &db_collation = GetDatabaseCollation();
+	if (StringUtil::EndsWith(StringUtil::Upper(db_collation), "_UTF8") &&
+		mssql::codec::IsValidCollationName(db_collation)) {
+		return db_collation;
+	}
+	return string();
+}
+
+void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
+	if (!RequiresSingleByteText()) {
+		return;
+	}
+
+	// Fabric Data Warehouse allows exactly these two, both UTF-8, and the choice
+	// is fixed when the warehouse is created. Anything else is rejected by the
+	// server with "...is not a valid collation", which is a worse place to find
+	// out than here.
+	static const char *const FABRIC_COLLATIONS[] = {"LATIN1_GENERAL_100_BIN2_UTF8",
+													"LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8"};
+
+	for (const auto &type : types) {
+		mssql::codec::TargetStringType spec;
+		if (!mssql::codec::TryGetTargetStringType(type, spec)) {
+			continue;
+		}
+		if (spec.unicode) {
+			throw NotImplementedException(
+				"MSSQL_NVARCHAR is not available on Microsoft Fabric: a warehouse stores tables as Delta Parquet and "
+				"has no UTF-16 type, so nvarchar columns cannot be created there. Use MSSQL_VARCHAR(n) — its "
+				"collation is UTF-8, so it holds the same characters, counting BYTES rather than UTF-16 units.");
+		}
+		if (spec.collation.empty()) {
+			continue;
+		}
+		const string upper = StringUtil::Upper(spec.collation);
+		bool supported = false;
+		for (const char *candidate : FABRIC_COLLATIONS) {
+			if (upper == candidate) {
+				supported = true;
+				break;
+			}
+		}
+		if (!supported) {
+			throw NotImplementedException(
+				"Collation '%s' is not available on Microsoft Fabric, which supports only "
+				"Latin1_General_100_BIN2_UTF8 and Latin1_General_100_CI_AS_KS_WS_SC_UTF8 — both UTF-8, and fixed when "
+				"the warehouse was created. Omit the collation to inherit the warehouse's own.",
+				spec.collation);
+		}
+	}
+}
+
+void MSSQLCatalog::ValidateTableOptions(const MSSQLTableOptions &options) {
+	if (!RequiresSingleByteText()) {
+		return;
+	}
+	// Verified against a live warehouse: table_kind and clustered_index both come
+	// back as "CREATE INDEX is not a supported statement type", data_compression
+	// as "The DATA COMPRESSION keyword is not supported in the CREATE TABLE
+	// statement". Delta Parquet has no indexes, and compresses itself.
+	if (options.kind != MSSQLTableKind::HEAP) {
+		throw NotImplementedException(
+			"Microsoft Fabric stores tables as Delta Parquet and supports no indexes, so table_kind and "
+			"clustered_index cannot be applied there. Omit them — a warehouse is already columnar.");
+	}
+	if (!options.data_compression.empty()) {
+		throw NotImplementedException(
+			"DATA_COMPRESSION is not available on Microsoft Fabric: a warehouse stores tables as Delta Parquet, "
+			"which carries its own compression. Omit the option.");
+	}
+}
+
+ErrorData MSSQLCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
+	auto &base = info.Base().Cast<CreateTableInfo>();
+	// PARTITIONED BY and SORTED BY stay rejected by the base implementation:
+	// SQL Server expresses both, but through partition schemes and index keys
+	// that this spec does not build. Only the WITH clause is claimed here.
+	if (base.partition_keys.empty() && base.sort_keys.empty()) {
+		return ErrorData();
+	}
+	return Catalog::SupportsCreateTable(info);
 }
 
 const MSSQLConnectionInfo &MSSQLCatalog::GetConnectionInfo() const {

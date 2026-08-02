@@ -431,7 +431,14 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
-	(void)in;
+	// The raw int64 in the vector is counted in the SOURCE type's unit; the wire
+	// form and its scale come from the target column. Those are two different
+	// types and only coincide when the column metadata was built from the source
+	// types — which is why CTAS was correct and COPY was not (issue #231). COPY
+	// re-reads the created table from sys.columns, where every datetime2 maps
+	// back to TIMESTAMP whatever its scale, so a TIMESTAMP_MS value was read as
+	// microseconds: 2024-01-15 arrived as 1970-01-20.
+	const LogicalTypeId source_id = in.GetType().id();
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::DATE:
 		tds::encoding::BCPRowEncoder::EncodeDate(buf, FormatValue<date_t>(fmt, row));
@@ -445,8 +452,8 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	case LogicalTypeId::TIMESTAMP_SEC: {
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, col.duckdb_type.id(), col.scale,
-								   time_value, date_value);
+		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
+								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 		return;
 	}
@@ -454,8 +461,8 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 		// DuckDB stores TIMESTAMP_TZ as UTC µs; offset 0 on the wire.
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, LogicalTypeId::TIMESTAMP_TZ, col.scale,
-								   time_value, date_value);
+		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
+								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
 		return;
 	}
@@ -492,7 +499,9 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	case LogicalTypeId::TIMESTAMP_SEC: {
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(TimestampValue::Get(value).value, col.duckdb_type.id(), col.scale, time_value,
+		// Same source-vs-target distinction as the fmt overload above (#231);
+		// here the source unit comes from the Value's own type.
+		ComputeDatetime2Components(TimestampValue::Get(value).value, value.type().id(), col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 		return;
@@ -500,7 +509,7 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	case LogicalTypeId::TIMESTAMP_TZ: {
 		uint64_t time_value;
 		uint32_t date_value;
-		ComputeDatetime2Components(TimestampValue::Get(value).value, LogicalTypeId::TIMESTAMP_TZ, col.scale, time_value,
+		ComputeDatetime2Components(TimestampValue::Get(value).value, value.type().id(), col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetimeOffsetRaw(buf, time_value, date_value, 0, col.scale);
 		return;
@@ -573,7 +582,7 @@ std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &
 	case LogicalTypeId::DATE:
 		return "DATE";
 	case LogicalTypeId::TIME:
-		return "TIME(7)";
+		return "TIME(6)";  // µs — DuckDB native, exact match (see DATETIME2 below)
 	case LogicalTypeId::TIMESTAMP:
 		return "DATETIME2(6)";	// μs — DuckDB native, exact match
 	case LogicalTypeId::TIMESTAMP_MS:

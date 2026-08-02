@@ -19,6 +19,20 @@ namespace duckdb {
 class MSSQLSchemaEntry;
 class MSSQLCatalog;
 
+//! Spec 060: does this catalog report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
+//! its string columns, or a bare VARCHAR? Read from the global setting rather
+//! than threaded through the metadata cache. Entries are cached, so a change
+//! applies to entries built afterwards — mssql_invalidate_cache() to apply it
+//! to the ones already loaded.
+//!
+//! Every place that hands DuckDB a type for a table column must agree with
+//! this, or the two disagree behind DuckDB's back: the binder resolves
+//! RETURNING against the ColumnDefinition types built here, so an INSERT whose
+//! physical operator declared the plain type would hand a VARCHAR chunk to a
+//! plan expecting MSSQL_NVARCHAR. That is why MSSQLCatalog::PlanInsert calls
+//! this too, and not only MakeTableInfo / GetScanFunction.
+bool MSSQLReportsNativeTypes(Catalog &catalog);
+
 //===----------------------------------------------------------------------===//
 // MSSQLTableEntry - DuckDB table entry for SQL Server table/view
 //

@@ -1,0 +1,133 @@
+# name: test/sql/copy/copy_varchar_collation.test
+# description: a varchar column COPY creates must be collated UTF-8, permanent or temp (spec 060 / issue #225)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The second attach below needs the parts, to reach a DIFFERENT database on the
+# same server than MSSQL_TESTDB_DSN names.
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+# =============================================================================
+# Two ways COPY ends up creating a single-byte column, and both used to lose
+# data. The failure is always the same shape: no COLLATE clause, so the column
+# takes whatever code page it inherits, and SQL Server replaces everything
+# outside that page with '?' ON INSERT — silently, because '?' is valid UTF-8.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cvc (TYPE mssql);
+
+# -----------------------------------------------------------------------------
+# 1. The session setting. CTAS honoured it and COPY did not: COPY only looked
+#    for an MSSQL_VARCHAR(n) annotation and missed the setting that turns every
+#    unannotated VARCHAR into a varchar column. TestDB is CP1252, so this is
+#    exactly the trap.
+# -----------------------------------------------------------------------------
+
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR';
+
+statement ok
+DROP TABLE IF EXISTS cvc.dbo.CvcSetting;
+
+statement ok
+COPY (SELECT 'Привет' AS b, '漢字' AS c) TO 'mssql://cvc/dbo/CvcSetting' (FORMAT 'bcp');
+
+query TT
+SELECT b, c FROM cvc.dbo.CvcSetting;
+----
+Привет	漢字
+
+query T
+SELECT collation_name FROM mssql_scan('cvc', $$
+SELECT DISTINCT c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.CvcSetting')
+$$);
+----
+Latin1_General_100_CI_AS_SC_UTF8
+
+# -----------------------------------------------------------------------------
+# 2. A #temp table on a database whose own collation is already UTF-8. The rule
+#    "the database default is UTF-8, so inherit and emit no COLLATE" is right
+#    for a permanent table and WRONG for a temp one: a #temp lives in tempdb and
+#    inherits TEMPDB's collation, which is the server default and not UTF-8.
+#
+#    This is the Fabric case — every string column on a warehouse is a varchar
+#    and the warehouse collation is UTF-8 — so it needs a UTF-8 database to
+#    reproduce, which this makes and drops.
+# -----------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('cvc', $$
+IF DB_ID('CvcUtf8Db') IS NULL CREATE DATABASE CvcUtf8Db COLLATE Latin1_General_100_CI_AS_SC_UTF8;
+$$);
+
+statement ok
+ATTACH 'Server=${MSSQL_TEST_HOST};Database=CvcUtf8Db;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}' AS cvc8 (TYPE mssql);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+COPY (SELECT 'Привет' AS b) TO 'mssql://cvc8//#cvc_tmp' (FORMAT 'bcp');
+
+query T
+SELECT b FROM mssql_scan('cvc8', 'SELECT b FROM #cvc_tmp');
+----
+Привет
+
+# The collation named is the DATABASE's own, not mssql_utf8_collation. That
+# matters on Fabric, which accepts only two collations and would refuse the
+# setting's default.
+query T
+SELECT coll FROM mssql_scan('cvc8', $$
+SELECT ISNULL(c.collation_name, 'none') AS coll
+FROM tempdb.sys.columns c WHERE c.object_id = OBJECT_ID('tempdb..#cvc_tmp')
+$$);
+----
+Latin1_General_100_CI_AS_SC_UTF8
+
+statement ok
+COMMIT;
+
+# A PERMANENT table on the same UTF-8 database still inherits, with no COLLATE
+# clause of its own — imposing one would also impose its case- and
+# accent-sensitivity on every later comparison.
+statement ok
+DROP TABLE IF EXISTS cvc8.dbo.CvcPerm;
+
+statement ok
+COPY (SELECT 'Привет' AS b) TO 'mssql://cvc8/dbo/CvcPerm' (FORMAT 'bcp');
+
+query T
+SELECT b FROM cvc8.dbo.CvcPerm;
+----
+Привет
+
+statement ok
+SET mssql_ctas_text_type = 'NVARCHAR';
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cvc', 'DROP TABLE IF EXISTS dbo.CvcSetting');
+
+statement ok
+DETACH cvc8;
+
+statement ok
+SELECT mssql_exec('cvc', 'DROP DATABASE IF EXISTS CvcUtf8Db');
+
+statement ok
+DETACH cvc;

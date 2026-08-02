@@ -353,55 +353,77 @@ Tokens are cached automatically:
 
 Microsoft Fabric Data Warehouses have some differences from Azure SQL Database:
 
-### BCP Protocol Not Supported
+### What a Warehouse Is, and What Follows
 
-Fabric doesn't support the TDS `INSERT BULK` command. The extension handles this automatically:
+A Fabric Data Warehouse stores its tables as Delta Parquet. Almost every
+difference below follows from that one fact, and the extension enforces them
+before generating any DDL rather than letting the server reject it.
 
 | Operation | Azure SQL | Microsoft Fabric |
 |-----------|-----------|------------------|
-| CTAS | BCP (fast) | INSERT fallback (auto) |
-| COPY TO | BCP (fast) | ❌ Not supported |
-| INSERT | Standard | Standard |
-| SELECT | Full support | Full support |
+| CTAS | BCP | BCP |
+| COPY TO | BCP | BCP |
+| INSERT / SELECT | Full | Full |
 
-**CTAS works on Fabric (auto-fallback):**
+**BCP works on Fabric.** Earlier releases forced CTAS onto an INSERT fallback
+and refused `COPY TO` outright; both are gone. Microsoft still labels bcp on
+Warehouse a preview, so if you hit a tenant where it is unavailable, the escape
+hatch is `SET mssql_ctas_use_bcp = false`.
 
-```sql
-CREATE TABLE fabric.dbo.new_table AS SELECT * FROM local_table;
-```
+### No NVARCHAR
 
-**COPY TO fails on Fabric:**
+There is no UTF-16 type in Parquet, so a warehouse has no `nvarchar` or `nchar`
+at all — `CREATE TABLE (v nvarchar(50))` is refused with *"not supported in this
+edition of SQL Server"*. Since `nvarchar(max)` is the extension's default for
+string columns everywhere else, CTAS and COPY force `VARCHAR` on a Fabric
+catalog whatever `mssql_ctas_text_type` says. Nothing is lost: a warehouse
+collation is UTF-8, so a `varchar` column holds every character an `nvarchar`
+would — counting bytes rather than UTF-16 units.
 
-```sql
-COPY (SELECT * FROM local_table) TO 'fabric.dbo.new_table' (FORMAT 'bcp');
--- Error: Microsoft Fabric does not support INSERT BULK (BCP protocol).
-```
+`MSSQL_NVARCHAR(n)` is refused with an error naming `MSSQL_VARCHAR(n)` as the
+alternative.
 
-### VARCHAR(MAX) / NVARCHAR(MAX) Not Supported
+`varchar(max)` **is** supported (16 MB), contrary to older guidance.
 
-Fabric doesn't support `VARCHAR(MAX)` or `NVARCHAR(MAX)` data types. When using CTAS with string columns, you may see:
+### Two collations, both UTF-8
 
-```
-Error: The data type 'nvarchar(max)' is not supported in this edition of SQL Server.
-```
+A warehouse accepts only `Latin1_General_100_BIN2_UTF8` (the default) and
+`Latin1_General_100_CI_AS_KS_WS_SC_UTF8`, and the choice is fixed when the
+warehouse is created. The extension emits no `COLLATE` clause for a permanent
+table — inheriting the warehouse's own is right — and refuses any other
+collation named in `MSSQL_VARCHAR(n, 'collation')` before the DDL is built.
 
-**Workarounds:**
+Because every string column on a warehouse is a UTF-8 `varchar`, BCP sends UTF-8
+bytes there rather than transcoding to UTF-16, which halves the wire for
+ASCII-ish data.
 
-1. **Cast to fixed-length strings** in your CTAS query:
-   ```sql
-   CREATE TABLE fabric.dbo.target AS
-   SELECT id, CAST(name AS VARCHAR(255)) AS name FROM source;
-   ```
+### No indexes, no page compression
 
-2. **Use Azure SQL Database** for tables with large text columns, then sync to Fabric
+`CREATE TABLE ... WITH (table_kind = ...)`, `clustered_index` and
+`data_compression` are all refused on a Fabric catalog: Delta Parquet has no
+indexes, and carries its own compression. A warehouse is already columnar.
 
-3. **Pre-create the table** in Fabric with appropriate VARCHAR(n) types, then INSERT
+### Types with no warehouse equivalent
+
+Beyond `nvarchar`/`nchar`: `datetimeoffset`, `datetime`, `smalldatetime`,
+`money`, `smallmoney`, `tinyint`, `text`, `ntext`, `image`, `xml`, `geometry`
+and `geography`. Note `datetimeoffset` in particular — the extension maps
+DuckDB's `TIMESTAMP WITH TIME ZONE` onto it, so such a column cannot be created
+on a warehouse.
+
+### Temp tables
+
+A `#temp` table works on a warehouse but **not** as a BCP target: the load fails
+inside Fabric with an I/O error against a parquet file. Load into a permanent
+table instead. Note also that a temp table lives in tempdb and does not inherit
+the warehouse's UTF-8 collation, so the extension names it explicitly on any
+temp target it creates.
 
 ### Performance Tips for Fabric
 
-1. Use CTAS instead of COPY TO
+1. Size your string columns — `MSSQL_VARCHAR(n)`, or `mssql_default_string_length`
 2. Break large loads into smaller batches
-3. Consider loading to Azure SQL first, then syncing to Fabric
+3. Keep `mssql_copy_tablock` in mind for large single-writer loads
 
 ---
 
@@ -413,7 +435,7 @@ Error: The data type 'nvarchar(max)' is not supported in this edition of SQL Ser
 |---------|-------------------|-------------|
 | Azure SQL Database | `name.database.windows.net` | ✅ Full |
 | Azure SQL Managed Instance | `name.public.xyz.database.windows.net,3342` | ✅ Full |
-| Microsoft Fabric DW | `xyz.datawarehouse.fabric.microsoft.com` | ❌ INSERT fallback |
+| Microsoft Fabric DW | `xyz.datawarehouse.fabric.microsoft.com` | ✅ Full (preview upstream) |
 | Azure Synapse Serverless | `name-ondemand.sql.azuresynapse.net` | ⚠️ Limited |
 
 ### Chain Priority

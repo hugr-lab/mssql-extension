@@ -376,6 +376,11 @@ classDiagram
 - **BCP encode contract (spec 054 W1/W2)**: production writes go through `BCPRowEncoder::EncodeChunk`, which builds one `UnifiedVectorFormat` per column per chunk, resolves each column's family encoder ONCE to a function pointer, precomputes the NULL wire kind (fixed / variable-USHORT / PLP), and emits the `0xD1` ROW token per row. Family `EncodeToBcp` overloads take the pre-built format (`vec, fmt, row, col, buffer`); shared accessors (`FormatValue` / `FormatIsNull`) and the per-row test shim (`EncodeToBcpViaFormat`) live in `codec/vector_format.hpp`. A new family or encode caller must implement/consume the fmt overload — the per-row `(Vector&, idx_t)` wrapper is a unit-test compatibility API only.
 - **TDS decode (spec 054 R1)**: `DecodeFromTds` writes straight into the output `Vector` slot (`StringVector::EmptyString` + valid-input UTF-16→UTF-8 conversion, no intermediate `std::string`); invalid UTF-16 (unpaired surrogates — legal UCS-2) falls back to the legacy decoder on the untrimmed payload with output-side CHAR/NCHAR space trim, preserving pre-054 semantics exactly.
 - TIMESTAMP_MS/NS/S/TZ round-trip through SQL Server `DATETIME2(3/7/0/7)` with the catalog and the codec reporting the same DuckDB type — closes the VIEW catalog-vs-runtime divergence (issue #89).
+- **Target string types (spec 060)**: `codec/target_string_type.{hpp,cpp}` carries a string column's *stated* SQL Server type — `{unicode, length, collation}` — on the `LogicalType` itself, as an alias (`MSSQL_VARCHAR` / `MSSQL_NVARCHAR`) plus `ExtensionTypeInfo`. Written by the type binder, by the catalog for attached columns, and by `ApplyDefaultStringType` for the session default. Read by everything that has to name a type: both DDL translators, the `INSERT BULK` column list, and the encoder's length bound.
+  - The physical type stays `VARCHAR`, so no codec, staging or BCP arm changes shape. What the annotation buys is that four sites read one answer instead of deciding separately — the failure it prevents is a feature that works on COPY and silently not on CTAS.
+  - **The bound is not a DuckDB constraint.** Nothing truncates or rejects on the DuckDB side; the length is enforced at the write boundary and by the server.
+  - **Two collations, not one.** The DDL collation may be empty, meaning "inherit the database's" — correct and cheap. The WIRE collation (`MSSQLCatalog::WireVarcharCollation`) may not: the server reads an `INSERT BULK` payload by the collation named in the statement text, and inherits nothing. A UTF-8 target with an empty DDL collation still needs its name on the wire, or the bytes are read in the database's code page.
+- **UTF-8 write path (spec 060 / issue #225)**: when the target column is a UTF-8 `varchar`/`char`, `BCPRowEncoder` resolves `codec::string::EncodeToBcpUtf8` for it — a separate entry point, not a branch, because the encoder is resolved once per column and the row loop must carry no test the column already answered. It declares `BIGVARCHAR` (0xA7) with the column's collation and copies the vector's bytes; every other char target keeps the UTF-16 transcode. Measured −51% client CPU and 35→19 wire bytes per 16-char value.
 
 ---
 
@@ -433,6 +438,7 @@ sequenceDiagram
 | 051 | `src/include/mssql_compat.hpp` — DuckDB API shims (header relocation, single-arg `BindScalarFunctionInput`) |
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
+| 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
 
 ## Where to read the code
 
@@ -443,3 +449,5 @@ sequenceDiagram
 - TDS connection: `src/include/tds/tds_connection.hpp`, `src/tds/tds_connection.cpp`
 - DuckDB API shims: `src/include/mssql_compat.hpp`
 - Codec dispatch: `src/codec/type_family.cpp`, `src/codec/literal_format.cpp`
+- Target string types: `src/include/codec/target_string_type.hpp`, `src/codec/target_string_type.cpp`
+- BCP column metadata (both builders): `src/copy/target_resolver.cpp`

@@ -49,6 +49,14 @@ struct MSSQLColumnInfo {
 	static bool IsUTF8Collation(const string &collation_name);
 
 	// Map SQL Server type to DuckDB LogicalType
+	//! Spec 060: the type to REPORT for this column — MSSQL_VARCHAR(n) /
+	//! MSSQL_NVARCHAR(n) where the column is a bounded character one, and plain
+	//! `duckdb_type` otherwise. Values are ordinary DuckDB strings either way;
+	//! the annotation exists so a target created from this column inherits its
+	//! declared type instead of becoming nvarchar(max). Gated by
+	//! mssql_catalog_native_types at the point the table entry is built.
+	LogicalType NativeDuckDBType() const;
+
 	static LogicalType MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length, uint8_t precision,
 												uint8_t scale);
 

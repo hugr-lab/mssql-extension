@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -41,6 +42,21 @@ struct CTASConfig {
 	// UTF-8 collation, as it is on Fabric: inheriting is cleaner than imposing
 	// a Latin1 one.
 	string varchar_collation;
+
+	// From mssql_default_string_length — length stamped onto an unannotated
+	// VARCHAR column this statement creates. 0 means MAX, which is what a plain
+	// VARCHAR has always meant, so an unset session behaves exactly as before.
+	int32_t default_string_length = 0;
+
+	// Collation to NAME in the INSERT BULK column list for a single-byte column,
+	// or empty to keep it on the UTF-16 wire. Not the same as varchar_collation:
+	// that one may be empty because the database's own collation is already
+	// right, and the wire inherits nothing.
+	string wire_varchar_collation;
+
+	// Shape of the table CTAS creates — mssql_default_table_kind (spec 060 D9).
+	// CTAS has no options syntax of its own, so the setting is the only dial.
+	MSSQLTableOptions table_options;
 
 	// From mssql_ctas_drop_on_failure setting
 	bool drop_on_failure = MSSQL_DEFAULT_CTAS_DROP_ON_FAILURE;

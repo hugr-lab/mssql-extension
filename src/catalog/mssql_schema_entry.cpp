@@ -2,6 +2,8 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "catalog/mssql_table_options.hpp"
+#include "codec/target_string_type.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
@@ -130,11 +132,53 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// Extract constraints (includes PRIMARY KEY, UNIQUE, etc.)
 	auto &constraints = base_info.constraints;
 
-	// Generate T-SQL for CREATE TABLE (with constraints)
-	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints);
+	// Spec 060: an MSSQL_VARCHAR(n) column needs a UTF-8 collation or SQL Server
+	// converts to the database code page on insert and drops everything outside
+	// it, silently (issue #225). Same rule as CTAS and COPY, resolved in one place
+	// on the catalog so the three cannot drift.
+	vector<LogicalType> column_types;
+	for (auto &column : columns.Logical()) {
+		column_types.push_back(column.GetType());
+	}
+	mssql_catalog.ValidateStringTargets(column_types);
+
+	bool wants_varchar = false;
+	for (auto &column : columns.Logical()) {
+		if (mssql::codec::NeedsVarcharCollation(column.GetType())) {
+			wants_varchar = true;
+			break;
+		}
+	}
+	const string varchar_collation = mssql_catalog.ResolveVarcharCollation(transaction.GetContext(), wants_varchar);
+
+	// Spec 060 D5: SQL Server table properties from CREATE TABLE ... WITH (...),
+	// over the session defaults. DATA_COMPRESSION rides inside the CREATE; a
+	// clustered index of either kind is its own statement and follows it.
+	MSSQLTableOptions table_options = MSSQLTableOptions::FromSettings(transaction.GetContext());
+	table_options.ApplyWithClause(base_info.options);
+	mssql_catalog.ValidateTableOptions(table_options);
+
+	// Generate T-SQL for CREATE TABLE (with constraints). The translator ends the
+	// statement with ');', so a table-option suffix has to go before that
+	// terminator rather than after it.
+	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints, varchar_collation);
+	const string suffix = table_options.CreateTableSuffix();
+	if (!suffix.empty()) {
+		const auto terminator = tsql.find_last_of(';');
+		if (terminator == string::npos) {
+			tsql += suffix;
+		} else {
+			tsql.insert(terminator, suffix);
+		}
+	}
 
 	// Execute DDL on SQL Server
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
+
+	const string post_create = table_options.PostCreateStatement(name, table_name);
+	if (!post_create.empty()) {
+		mssql_catalog.ExecuteDDL(transaction.GetContext(), post_create);
+	}
 
 	// Point invalidation: invalidate schema's table list and local table set
 	mssql_catalog.InvalidateSchemaTableSet(name);

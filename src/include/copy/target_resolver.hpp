@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <vector>
+#include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -107,6 +108,13 @@ struct BCPColumnMetadata {
 	// Collation bytes for character types (5 bytes)
 	std::array<uint8_t, 5> collation = {0x09, 0x04, 0xD0, 0x00, 0x34};	// Latin1_General_CI_AS default
 
+	// Collation NAME for the INSERT BULK column list, or empty. Not redundant
+	// with the bytes above: the server reads the incoming bytes according to the
+	// collation in the STATEMENT TEXT, not the one in COLMETADATA. Without it a
+	// varchar column takes the database default, and UTF-8 bytes arrive decoded
+	// as that code page — verified by watching 'Привет' land as 'ÐŸÑ€Ð¸Ð²ÐµÑ‚'.
+	string collation_name;
+
 	// Default constructor
 	BCPColumnMetadata() = default;
 
@@ -210,8 +218,12 @@ struct TargetResolver {
 	// @param target The target table
 	// @param source_types DuckDB types to map to SQL Server
 	// @param source_names Column names
+	// @param varchar_collation Collation for varchar columns with no collation of
+	//        their own; empty emits no COLLATE clause. Resolved by ValidateTarget.
 	static void CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &target,
-							const vector<LogicalType> &source_types, const vector<string> &source_names);
+							const vector<LogicalType> &source_types, const vector<string> &source_names,
+							const string &varchar_collation, const MSSQLTableOptions &table_options,
+							bool single_byte_text);
 
 	// Drop a table if it exists
 	// @param conn TDS connection for SQL execution
@@ -257,8 +269,14 @@ struct TargetResolver {
 	// @param source_types DuckDB logical types
 	// @param source_names Column names
 	// @return Vector of BCPColumnMetadata for COLMETADATA token generation
+	// @param varchar_collation collation for a column whose type states varchar
+	//        but names none itself; empty leaves the column on the UTF-16 wire
+	// @param varchar_collation collation for a column whose type states varchar
+	//        but names none itself; empty leaves such a column on the UTF-16 wire
 	static vector<BCPColumnMetadata> GenerateColumnMetadata(const vector<LogicalType> &source_types,
-															const vector<string> &source_names);
+															const vector<string> &source_names,
+															const string &varchar_collation = "",
+															bool single_byte_text = false);
 
 	//===----------------------------------------------------------------------===//
 	// Type Mapping
@@ -266,8 +284,14 @@ struct TargetResolver {
 
 	// Get SQL Server type declaration for CREATE TABLE
 	// @param duckdb_type DuckDB logical type
+	// @param varchar_collation Collation for an MSSQL_VARCHAR(n) column that names
+	//        none of its own; empty emits no COLLATE clause
 	// @return SQL Server type string (e.g., "int", "nvarchar(max)")
-	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type);
+	// @param single_byte_text emit varchar rather than nvarchar for an
+	//        unannotated VARCHAR — mssql_ctas_text_type='VARCHAR', or a Fabric
+	//        warehouse, which has no nvarchar type at all
+	static string GetSQLServerTypeDeclaration(const LogicalType &duckdb_type, const string &varchar_collation = "",
+											  bool single_byte_text = false);
 
 	// Map DuckDB type to TDS type token
 	// @param duckdb_type DuckDB logical type

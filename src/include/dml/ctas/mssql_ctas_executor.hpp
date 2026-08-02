@@ -54,6 +54,10 @@ struct CTASExecutionState {
 
 	// DDL state
 	string ddl_sql;
+
+	//! Spec 060: the clustered-index statement that follows CREATE TABLE, or
+	//! empty. It cannot ride inside the CREATE — SQL Server needs its own DDL.
+	string post_ddl_sql;
 	idx_t ddl_bytes = 0;
 	int64_t ddl_time_ms = 0;
 

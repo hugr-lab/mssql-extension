@@ -1,6 +1,7 @@
 #include "dml/ctas/mssql_ctas_planner.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/target_string_type.hpp"
 #include "dml/ctas/mssql_physical_ctas.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -41,35 +42,36 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	// code page and replaces anything outside it with '?' — no error, no warning,
 	// and nothing downstream can tell, because '?' is valid UTF-8.
 	//
-	// The database default already being UTF-8 (Fabric) is the one case where
-	// inheriting is right, and an empty mssql_utf8_collation is the documented
-	// way to ask for the old behaviour deliberately.
-	if (config.text_type == CTASTextType::VARCHAR && !config.utf8_collation.empty() &&
-		!StringUtil::EndsWith(StringUtil::Upper(catalog.GetDatabaseCollation()), "_UTF8")) {
-		// Unknown is treated as granted, NOT as declined. Declined means the
-		// server has no UTF-8 collations at all and the DDL below would fail
-		// with a clear message; unknown means only that no connection could be
-		// borrowed to ask. Reading either as "skip the collation" would turn a
-		// transient pool timeout into a silently lossy table.
-		const auto support = catalog.UTF8SupportState();
-		if (support == MSSQLCatalog::Utf8Support::Declined) {
-			throw NotImplementedException(
-				"CREATE TABLE AS with mssql_ctas_text_type='VARCHAR' needs a UTF-8 collation, and this server did not "
-				"grant the TDS UTF8SUPPORT feature (SQL Server 2019 introduced both). A VARCHAR column here would take "
-				"the database's code page and lose every character outside it on insert. Use the default "
-				"mssql_ctas_text_type='NVARCHAR', or set mssql_utf8_collation='' to accept that loss deliberately.");
-		}
-		config.varchar_collation = config.utf8_collation;
-		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s (UTF8SUPPORT %s)", config.varchar_collation.c_str(),
-							   support == MSSQLCatalog::Utf8Support::Granted ? "granted" : "not observed");
+	// Spec 060: an explicit MSSQL_VARCHAR(n) cast asks for exactly the same
+	// single-byte column that mssql_ctas_text_type='VARCHAR' asks for globally,
+	// so it needs the same collation. A column that named its own needs neither,
+	// and the rule itself lives on the catalog so CREATE TABLE, CTAS and COPY
+	// cannot drift apart on it.
+	// Fabric has no NVARCHAR at all, so the setting cannot be honoured there and
+	// nvarchar(max) — the default everywhere else — fails outright. Forcing
+	// VARCHAR is what makes CTAS work on a warehouse; its collation is UTF-8, so
+	// nothing is lost but the unit the length counts in.
+	if (catalog.RequiresSingleByteText()) {
+		config.text_type = CTASTextType::VARCHAR;
 	}
+	catalog.ValidateStringTargets(child_plan.types);
+	catalog.ValidateTableOptions(config.table_options);
 
-	// T042-T045 (Bug 0.7): Check for Fabric endpoint and disable BCP if detected
-	// Microsoft Fabric doesn't support INSERT BULK/BCP protocol
-	const auto &conn_info = catalog.GetConnectionInfo();
-	if (conn_info.is_fabric_endpoint && config.use_bcp) {
-		CTAS_PLANNER_DEBUG_LOG(1, "Fabric endpoint detected, disabling BCP mode (INSERT BULK not supported)");
-		config.use_bcp = false;
+	bool wants_varchar = config.text_type == CTASTextType::VARCHAR;
+	if (!wants_varchar) {
+		for (const auto &type : child_plan.types) {
+			if (codec::NeedsVarcharCollation(type)) {
+				wants_varchar = true;
+				break;
+			}
+		}
+	}
+	config.varchar_collation = catalog.ResolveVarcharCollation(context, wants_varchar);
+	if (wants_varchar) {
+		config.wire_varchar_collation = catalog.WireVarcharCollation(config.varchar_collation);
+	}
+	if (!config.varchar_collation.empty()) {
+		CTAS_PLANNER_DEBUG_LOG(1, "VARCHAR target: collating as %s", config.varchar_collation.c_str());
 	}
 
 	// Extract target table information
@@ -154,12 +156,18 @@ vector<CTASColumnDef> CTASPlanner::MapColumns(const LogicalCreateTable &op, Phys
 		// Column name
 		col_def.name = col.GetName();
 
-		// DuckDB type from child plan
-		col_def.duckdb_type = child_types[col_idx];
+		// DuckDB type from child plan. Spec 060: a plain VARCHAR picks up the
+		// session's default target type here, once, so the DDL text, the INSERT
+		// BULK declaration and the encoder's length guard all read the same
+		// annotation rather than each learning the policy separately. A column
+		// that states its own type is left alone.
+		col_def.duckdb_type =
+			codec::ApplyDefaultStringType(child_types[col_idx], config.text_type != CTASTextType::VARCHAR,
+										  config.default_string_length, config.varchar_collation);
 
 		// Map to SQL Server type using CTAS-specific mapper (FR-012, FR-013)
 		try {
-			col_def.mssql_type = MSSQLDDLTranslator::MapLogicalTypeToCTAS(child_types[col_idx], config);
+			col_def.mssql_type = MSSQLDDLTranslator::MapLogicalTypeToCTAS(col_def.duckdb_type, config);
 		} catch (NotImplementedException &e) {
 			// Enhance error message with column name (FR-012)
 			throw NotImplementedException("CTAS failed for column '%s': %s", col_def.name, e.what());

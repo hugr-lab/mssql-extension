@@ -75,6 +75,22 @@ void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target
 
 	// Generate DDL SQL
 	ddl_sql = MSSQLDDLTranslator::TranslateCreateTableFromSchema(target.schema_name, target.table_name, columns);
+	// Spec 060 D5/D9: DATA_COMPRESSION rides inside the CREATE; a clustered index
+	// of either kind is its own statement and runs after it, BEFORE the load, so
+	// a columnstore target takes compressed rowgroups directly instead of needing
+	// a rebuild afterwards.
+	{
+		const string suffix = config.table_options.CreateTableSuffix();
+		if (!suffix.empty()) {
+			const auto terminator = ddl_sql.find_last_of(';');
+			if (terminator == string::npos) {
+				ddl_sql += suffix;
+			} else {
+				ddl_sql.insert(terminator, suffix);
+			}
+		}
+	}
+	post_ddl_sql = config.table_options.PostCreateStatement(target.schema_name, target.table_name);
 	ddl_bytes = ddl_sql.size();
 
 	DebugLog(1, "Initialized CTAS for %s (DDL: %llu bytes, %llu columns)", target.GetQualifiedName().c_str(),
@@ -94,6 +110,10 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 	try {
 		// Execute CREATE TABLE using catalog's DDL execution method
 		catalog->ExecuteDDL(context, ddl_sql);
+		if (!post_ddl_sql.empty()) {
+			DebugLog(2, "Executing post-DDL: %s", post_ddl_sql.c_str());
+			catalog->ExecuteDDL(context, post_ddl_sql);
+		}
 
 		auto ddl_end = std::chrono::steady_clock::now();
 		ddl_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ddl_end - ddl_start).count();
@@ -409,7 +429,8 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 	}
 
 	// Use TargetResolver to generate proper BCP column metadata
-	bcp_columns = TargetResolver::GenerateColumnMetadata(source_types, source_names);
+	bcp_columns = TargetResolver::GenerateColumnMetadata(source_types, source_names, config.wire_varchar_collation,
+														 config.text_type == CTASTextType::VARCHAR);
 
 	DebugLog(2, "BCP columns initialized: %llu columns", (unsigned long long)bcp_columns.size());
 }
