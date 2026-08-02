@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -131,6 +131,20 @@ integration-test: release
 	fi
 	build/release/test/unittest "[integration]" --force-reload
 	build/release/test/unittest "[sql]" --force-reload
+
+# Run the SQL suite with the performance counters ON (spec 057 step 0b).
+#
+# Separate from integration-test on purpose. The counters are a code path of
+# their own — issue #233 was a crash that ONLY happened with them enabled, on a
+# column chunk the stager published as CONSTANT — and a suite that never turns
+# them on cannot catch that class again. Kept out of the default run because the
+# counters write a summary per stream to stderr, which is noise for everything
+# that is not measuring.
+counters-test: release
+	@echo "Running SQL suite with MSSQL_COUNTERS=1..."
+	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
+	@echo ""
+	MSSQL_COUNTERS=1 build/release/test/unittest "test/sql/*" --force-reload
 
 # Run all tests (unit + integration)
 test-all: release
@@ -745,6 +759,7 @@ help:
 	@echo "Custom targets:"
 	@echo "  make vcpkg-setup          - Bootstrap vcpkg (required for TLS support)"
 	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
+	@echo "  make counters-test        - Run the SQL suite with MSSQL_COUNTERS=1 (exercises the counter path)"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
 	@echo "  make test-simple-query    - Run C++ simple query test"

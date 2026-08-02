@@ -14,6 +14,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "mssql_counters.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_types.hpp"
@@ -57,6 +58,15 @@ using TimePoint = std::chrono::time_point<Clock>;
 static double ElapsedMs(TimePoint start) {
 	auto end = Clock::now();
 	return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+// Nanoseconds, deliberately. Spec 055 D0 found the read path accumulating
+// per-chunk intervals through duration_cast<microseconds>, which truncated every
+// short interval to zero and made the phase it measured report approximately
+// nothing. Accumulate ns; divide at print time.
+static uint64_t ElapsedNs(TimePoint start) {
+	auto end = Clock::now();
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 }
 
 //===----------------------------------------------------------------------===//
@@ -561,7 +571,8 @@ unique_ptr<LocalFunctionData> BCPCopyInitLocal(ExecutionContext &context, Functi
 
 void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
 				 LocalFunctionData &lstate, DataChunk &input) {
-	auto start_sink = Clock::now();
+	const bool counters = mssql::CountersEnabled();
+	auto start_sink = counters ? Clock::now() : TimePoint{};
 	auto &bdata = bind_data.Cast<MSSQLCopyBindData>();
 	auto &gdata = gstate.Cast<MSSQLCopyGlobalState>();
 
@@ -585,13 +596,13 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	try {
 		// Write directly to the BCPWriter (no local buffering to reduce memory)
 		// This is thread-safe because BCPWriter::WriteRows has its own mutex
-		auto start_write = Clock::now();
+		auto start_write = counters ? Clock::now() : TimePoint{};
 		idx_t rows_written = gdata.writer->WriteRows(input);
-		double write_ms = ElapsedMs(start_write);
+		const uint64_t encode_ns = counters ? ElapsedNs(start_write) : 0;
 		gdata.rows_sent.fetch_add(rows_written);
 
-		CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.2f ms, checking flush...",
-					 (unsigned long long)rows_written, write_ms);
+		CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.3f ms, checking flush...",
+					 (unsigned long long)rows_written, encode_ns / 1e6);
 
 		// Check for interrupt after encoding
 		if (context.client.IsInterrupted()) {
@@ -600,19 +611,19 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		}
 
 		// Check if we should flush to SQL Server
-		double flush_ms = 0;
+		uint64_t flush_ns = 0;
 		if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
 			CopyDebugLog(1, "BCPCopySink: triggering server flush (rows_in_batch=%llu, threshold=%llu)...",
 						 (unsigned long long)gdata.writer->GetRowsInCurrentBatch(),
 						 (unsigned long long)bdata.config.flush_rows);
-			auto start_flush = Clock::now();
+			auto start_flush = counters ? Clock::now() : TimePoint{};
 			std::lock_guard<std::mutex> lock(gdata.write_mutex);
 			// Double-check after acquiring lock
 			if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
 				FlushToServer(gdata, bdata);
 			}
-			flush_ms = ElapsedMs(start_flush);
-			CopyDebugLog(1, "BCPCopySink: server flush completed in %.2f ms", flush_ms);
+			flush_ns = counters ? ElapsedNs(start_flush) : 0;
+			CopyDebugLog(1, "BCPCopySink: server flush completed in %.2f ms", flush_ns / 1e6);
 		}
 
 		// Check for interrupt after flush
@@ -621,14 +632,15 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			throw InterruptException();
 		}
 
-		double total_ms = ElapsedMs(start_sink);
-		if (GetCopyDebugLevel() >= 1) {
-			double rows_per_sec = (total_ms > 0) ? (rows_written * 1000.0 / total_ms) : 0;
-			CopyDebugLog(
-				1,
-				"BCPCopySink: DONE - %llu rows in %.2f ms (write: %.2f, flush: %.2f) | %.0f rows/s | total sent: %llu",
-				(unsigned long long)rows_written, total_ms, write_ms, flush_ms, rows_per_sec,
-				(unsigned long long)gdata.rows_sent.load());
+		// Accumulate, do NOT log. This was a CopyDebugLog(1, "DONE ...") per chunk,
+		// and CopyDebugLog fflush'es: ~245 fprintf+fflush inside the timed path on
+		// a 500k-row load, inflating the client CPU it reported ~4x. The summary is
+		// printed once in BCPCopyFinalize instead.
+		if (counters) {
+			gdata.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
+			gdata.counter_sink_ns.fetch_add(ElapsedNs(start_sink), std::memory_order_relaxed);
+			gdata.counter_encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
+			gdata.counter_flush_ns.fetch_add(flush_ns, std::memory_order_relaxed);
 		}
 	} catch (std::exception &e) {
 		// Record the error for finalize to handle cleanup
@@ -714,6 +726,67 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 					LocalFunctionData &lstate) {
 	// No local buffering - nothing to flush
 	// All rows are written directly to BCPWriter in BCPCopySink
+}
+
+//===----------------------------------------------------------------------===//
+// PrintWriteCounters — the write path's close summary (spec 057 step 0b)
+//
+// The read path's peer is MSSQLResultStream::PrintDebugCounters. Printed once,
+// from the finalize the statement already runs, so nothing is logged from inside
+// a timed phase.
+//
+// What the split does and does not cover, stated because the numbers get quoted:
+//
+//   encode  BCPRowEncoder + accumulator append. This is the client CPU the
+//           columnar work (step 3) attacks.
+//   flush   a mid-statement batch boundary, END TO END: packet build, framing,
+//           send AND the server's confirmation. It is NOT server time alone —
+//           separating those needs a timer inside BCPWriter::FlushBatch, which
+//           step 4 adds when it has a reason to. Do not quote it as "waiting for
+//           the server".
+//   other   everything else in the sink; expected to be ~0, and a useful tripwire
+//           if it ever is not.
+//
+// The FINAL batch is confirmed in BCPCopyFinalize, after the sink has run for the
+// last time, so it is NOT in `flush` — with the default flush_rows that is one
+// whole batch sitting outside this summary.
+//===----------------------------------------------------------------------===//
+
+static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
+	if (!mssql::CountersEnabled()) {
+		return;
+	}
+	if (mssql::CountersConfoundedByLogging()) {
+		fprintf(stderr,
+				"[MSSQL COUNTERS] NOTE: MSSQL_DEBUG is set, and its logging runs inside the phases timed "
+				"below — these numbers include it. For timings use MSSQL_COUNTERS=1 with MSSQL_DEBUG unset.\n");
+	}
+
+	const uint64_t sink_ns = gdata.counter_sink_ns.load();
+	const uint64_t encode_ns = gdata.counter_encode_ns.load();
+	const uint64_t flush_ns = gdata.counter_flush_ns.load();
+	const uint64_t other_ns = sink_ns > encode_ns + flush_ns ? sink_ns - encode_ns - flush_ns : 0;
+	const idx_t chunks = gdata.counter_sink_calls.load();
+	const idx_t cols = gdata.columns.size();
+
+	fprintf(stderr,
+			"[MSSQL COUNTERS] copy close: rows=%llu cols=%llu chunks=%llu batches=%llu | sink=%lluus "
+			"(encode=%lluus flush=%lluus other=%lluus)\n",
+			(unsigned long long)rows, (unsigned long long)cols, (unsigned long long)chunks,
+			(unsigned long long)gdata.batches_flushed.load(), (unsigned long long)(sink_ns / 1000),
+			(unsigned long long)(encode_ns / 1000), (unsigned long long)(flush_ns / 1000),
+			(unsigned long long)(other_ns / 1000));
+
+	if (rows > 0) {
+		const double r = static_cast<double>(rows);
+		fprintf(stderr, "[MSSQL COUNTERS]   ns/row: sink=%.1f encode=%.1f flush=%.1f other=%.1f\n", sink_ns / r,
+				encode_ns / r, flush_ns / r, other_ns / r);
+		if (cols > 0) {
+			const double v = r * static_cast<double>(cols);
+			fprintf(stderr, "[MSSQL COUNTERS]   ns/value: sink=%.2f encode=%.2f other=%.2f\n", sink_ns / v,
+					encode_ns / v, other_ns / v);
+		}
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -874,6 +947,8 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	idx_t final_confirmed = gdata.rows_confirmed.load();
 	CopyDebugLog(1, "BCPCopyFinalize: COPY completed successfully, %llu rows transferred",
 				 (unsigned long long)final_confirmed);
+
+	PrintWriteCounters(gdata, final_confirmed);
 }
 
 //===----------------------------------------------------------------------===//

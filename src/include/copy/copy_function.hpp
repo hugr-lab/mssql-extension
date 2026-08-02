@@ -115,6 +115,20 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// Total rows expected (for progress reporting, 0 if unknown)
 	idx_t total_rows_expected = 0;
 
+	// Spec 057 step 0b: write-path phase counters, gated on MSSQL_COUNTERS.
+	//
+	// These replace a per-CHUNK `CopyDebugLog(1, "BCPCopySink: DONE ...")`, which
+	// fflush'ed stderr ~245 times inside the timed path on a 500k-row load and
+	// inflated the client CPU it was reporting roughly 4x (0.047 s -> 0.194 s).
+	// Accumulate here, print once at finalize — the shape the read path already
+	// uses. Atomic because the sink may run on several threads.
+	std::atomic<idx_t> counter_sink_calls{0};	 // chunks handed to the sink
+	std::atomic<uint64_t> counter_sink_ns{0};	 // wall inside BCPCopySink
+	std::atomic<uint64_t> counter_encode_ns{0};	 // of which: BCPWriter::WriteRows
+	std::atomic<uint64_t> counter_flush_ns{0};	 // of which: a batch boundary, END TO END —
+												 // build + send + the server's confirmation.
+												 // NOT server time alone; see PrintWriteCounters.
+
 	// INSERT BULK SQL (cached for re-execution on flush)
 	string insert_bulk_sql;
 

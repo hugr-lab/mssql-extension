@@ -1252,3 +1252,410 @@ What survives and what does not:
 
 The client-side microbenchmarks (§ "Columnar scatter measured", § "Wide rows")
 are unaffected — they never touch the server.
+
+---
+
+# Settled — what measurement has knocked down (2026-08-02)
+
+This document is long enough that its own refuted claims are easy to lose, and
+half of them are the sort that come back in six months as a fresh idea. Each row
+names what killed it, so the entry is checkable rather than remembered.
+
+## Refuted and closed
+
+### By this spec's own later measurements
+
+| claim | what killed it |
+| --- | --- |
+| Representation-aware encoding is the biggest remaining write-side win (§2, the premise this spec is named for) | twice: the encoder is 5% of wall (§"Reconnaissance"); and columnar scatter reaches 1.8-2.1 ns/value **without knowing** the input is const/dict, against 3.9-5.7 for the path that knows (§"Columnar scatter measured") |
+| The `nvarchar(max)` penalty is the storage engine | a server-side `INSERT ... WITH (TABLOCK) SELECT` of the same rows: 0.217 s into `NVARCHAR(40)` vs 0.207 s into `NVARCHAR(MAX)` — identical. The 2.7× lives entirely in the bulk-load path's PLP handling |
+| Keep MAX columns, declare a sized type in the BCP COLMETADATA | the server refuses: `Invalid column type from bcp client for colid 4`. Wire framing follows the column type; the column type is the only lever |
+| TABLOCK's win is minimal logging | recovery model makes no difference: FULL 0.783 / SIMPLE 0.785 without it, FULL 0.384 / SIMPLE 0.369 with |
+| Issue #45's policy — enable TABLOCK for newly created tables | newness is the wrong input. Right for a heap, wrong for a clustered-index target under parallel load (4 sessions: 2.11 s/M with, 1.20 s/M without). A new table is a heap only until an index is created on it |
+| Send fixed-width columns first, matching the server's physical row layout | two fixtures, including 44 columns at ~4 KB/row: consistently 2-3% *slower*. Even the 8060-byte maximum row is far inside L1, so intra-row scatter has nothing to cost |
+| `OPTIMIZE_FOR_SEQUENTIAL_KEY` helps a parallel clustered load | noise in both directions. Structural: the workers write disjoint ascending ranges, so there is no hot last page to relieve |
+| A branchless NULL scatter beats the branch | null50 5.5 -> 7.6, all-NULL constant 3.9 -> 7.3. **Do not retry.** It trades one well-predicted branch for an unconditional 8-byte write, a multiply that stops the loop vectorising, and a third pass |
+| Row-major sequential assembly is the cache-friendly shape | 1.14-1.29 ns/value at width vs 0.36-0.43 blocked. It makes the write pattern ideal and the read pattern terrible; the problem moves rather than disappears |
+| Streaming inside a batch stacks with parallel sessions | -20% at one session, noise at four. They are the same overlap |
+| A clustered-index target must fall back to a single stream | not supported by measurement: four concurrent sessions into a clustered index on a sequential key completed correctly and at the same speed |
+| "COPY loses the string length from Parquet", i.e. there is plumbing to fix | DuckDB drops the `VARCHAR(n)` modifier at `CREATE TABLE`, before any file is involved, and Parquet never carried one. There is no plumbing fix — the length can only come from the target, an MSSQL source catalog, an explicit cast, or a setting |
+
+### On the UTF-8 path
+
+| claim | what killed it |
+| --- | --- |
+| `COLLATIONPROPERTY` is the robust way to detect a UTF-8 / double-byte collation | Fabric does not support it and **closes the connection** rather than raising. In a shared metadata query that would have broken catalog loading on Fabric outright |
+| `CAST(x AS VARCHAR(m)) COLLATE <utf8>` | converts through the database's code page first: with a CP1252 database, Cyrillic, CJK and emoji all come back as `0x3F`. The `COLLATE` must sit on the source expression. Verified byte-for-byte |
+| The client's `UTF8_SUPPORT` request may carry a data byte | live Azure SQL rejects the login with 18456, indistinguishable from a wrong password. No local server reproduces it |
+| "Always cast unicode columns to UTF-8" | CJK loses 35%; the cast costs the same regardless of content, only the baseline varies |
+| `UTF8SUPPORT` is worth ~2× on the wire (how the PR #227 table reads) | @oluies, 2019/2022/2025/Edge, matching `DATALENGTH`: 0.51× ASCII, 1.00× Cyrillic, **1.49× worse** CJK, 1.00× astral. It is arithmetic — UTF-8 beats UTF-16 at one byte per character, ties at two, loses at three |
+
+### On the read path and the instrument
+
+| claim | what killed it |
+| --- | --- |
+| Exceptions are the cost on the parse path | table-driven EH is zero-cost on the non-throwing path. What cost was **out-of-line calls** — removing two per value measured -11.7% on bigint |
+| The auto-TABLOCK defect does not reproduce; the code path looks correct | it reproduces. `INSERT BULK` carries no `TABLOCK` on either COPY or CTAS when the table is created. Root cause: `TryGetCurrentSetting` succeeds unconditionally for a setting with a registered default, so `tablock_explicit` is always true and **both** auto-TABLOCK branches have been dead since spec 030 |
+| Issue #233 — "the counters report one 2048-row chunk of a multi-chunk scan" | the accumulation is correct (`rows=50000 chunks=25` on a varying fixture). The real defect is that `CountChunkForDebug` assumes a FLAT vector while spec 056 (#221) publishes a uniform chunk as CONSTANT, so **the query dies** with `INTERNAL Error: Operation requires a flat vector`. `rows=2048 chunks=0` is the destructor's partial dump during stack unwinding — a symptom, not a sampling bug |
+
+## Refuted, but the refutation has expired — re-open
+
+The distinction matters more than the list above, because these look settled and
+are not.
+
+- **"D5b is refuted: build + send is 7%, system time under 1%"** and **"the
+  encoder is 5% of wall"**. Both were taken against a baseline where the server
+  held 86% *because we created the target badly* — `nvarchar(max)`, no TABLOCK.
+  Once those are fixed the denominator collapses (1.68 s -> 0.37 s in this
+  document's own table) and the same milliseconds become ~12% and ~16%. The
+  syscall arithmetic in both the claim and its refutation is also stale: the
+  negotiated packet size has been 16384 since spec 055, not 4096, so a 10 MB
+  batch is ~640 sends, not ~2560. **Re-price at step 4 of the build order, not
+  before.**
+- **"Eight sessions are slower than four."** Withdrawn by this document: an
+  artefact of an emulated server on a laptop, not a property of SQL Server.
+- **Every server-side magnitude here.** Measured on amd64 under emulation on
+  Apple Silicon. Directions hold — each has a mechanism independent of CPU speed
+  — magnitudes do not. 7×, 2.8×, -37%, -11.8% are upper bounds biased toward the
+  server.
+
+## Withdrawn because the instrument was lying
+
+- **`parse=577 ns/row` vs `process=28 ns/row`.** Taken at `MSSQL_DEBUG=2`, where
+  an `fprintf` per token sits inside the function the parse timer wraps. The
+  numbers did not get noisy, they inverted.
+- **Every absolute wire-byte figure published so far** (85.8 -> 43.9 MB,
+  1 020 060 -> 540 030). Ratios survive — both sides sampled identically —
+  absolutes do not.
+- **Spec 058's T0d bound on the `Feed` copy** (~77 B/row -> ~8 ns/row) is derived
+  from `wire_in`, i.e. from an instrument that crashes outright on constant
+  columns. It must be re-derived before it can gate anything.
+
+## Never established — reasoning, marked as such
+
+Not refuted, but not evidence either, and not to be quoted as measured.
+
+- UTF-8 inflating against UTF-16 for double-byte East Asian code pages
+  (CP932/936/949/950 `varchar`). Flagged publicly by the author as reasoning.
+- The server-side transcode cost for a **sized** `varchar` under a UTF-8
+  collation. Only the pathological `varchar(max)` figure exists — ~10 s CPU and
+  11.9M logical reads per million rows — and it does not transfer.
+
+---
+
+# Measurement matrix (user, 2026-08-02)
+
+Two rules first, because both were learned by getting them wrong.
+
+**Every client-side delta is taken single-session.** Parallel sessions hide the
+client's work behind each other's server waits — that is exactly why streaming
+measures -20% at one session and noise at four. Measuring steps 3-6 with
+`PARALLEL N` on would make their wins vanish into the overlap and get them
+dropped for the wrong reason. Parallel is measured *on top*, last, as its own
+axis.
+
+**Interleaved same-session A/B, medians over >=3 pairs, order rotated**, with an
+untouched control family in every run. A control that moves invalidates the run.
+This is the protocol that has caught real bugs; it is not optional.
+
+## Base configuration
+
+Everything below is a one-axis sweep from this point unless a cross is named:
+4 columns (BIGINT, BIGINT, DECIMAL(18,2), NVARCHAR(40)), 500k rows, heap target
+with TABLOCK, autocommit, one session, all values valid, FLAT vectors, sized
+columns.
+
+## Axis A — type family, for every family we encode
+
+One column per cell, so ns/value is ns/row and the framing cost is not diluted.
+
+`BIT` · `TINYINT` · `SMALLINT` · `INT` · `BIGINT` · `HUGEINT` (#177) ·
+`FLOAT` · `DOUBLE` · `DECIMAL` at 9 / 18 / 38 digits (the three magnitude
+buckets) · `MONEY` · `SMALLMONEY` · `DATE` · `TIME(7)` · `DATETIME` ·
+`DATETIME2(0)` / `(3)` / `(7)` · `DATETIMEOFFSET` · `UNIQUEIDENTIFIER` ·
+`VARBINARY(n)` · `VARBINARY(MAX)` · `XML` · the string cells of axis B.
+
+The all-fixed-width fast path (step 3c) is only exercised when *no* column in the
+row is variable-width, so each fixed family also gets a 4-column all-fixed cell.
+
+## Axis B — string flavour on the target, crossed with input annotation
+
+This is the axis the read path already has and the write path does not. The
+cross is required, not decorative: the annotation decides the *framing* (2-byte
+prefix vs PLP), the collation decides the *encoding* (UTF-16 vs UTF-8 vs code
+page), and they are independent.
+
+**Annotated types and the UTF-8 wire form are already implemented — spec 060,
+end to end, and never measured.** Checked in the code before this matrix was
+written, because the first draft of it assumed the opposite:
+`TargetResolver::GenerateColumnMetadata` reads the annotation through
+`codec::TryGetTargetStringType`, retargets the column to `TDS_TYPE_BIGVARCHAR`
+(0xA7) with a UTF-8 collation, `GetTDSMaxLength` sizes the wire from the
+annotation (`2n`, PLP past 8000), `codec::string::EncodeVarcharUtf8` copies the
+UTF-8 bytes instead of converting, and COPY and CTAS reach it through the same
+builder. So this axis measures a shipped path, and its job is to find where that
+path does *not* fire — not to build it.
+
+| target column | wire form | client conversion |
+| --- | --- | --- |
+| `nvarchar(n)` | UTF-16LE, 2-byte prefix | UTF-8 -> UTF-16 encode |
+| `nvarchar(max)` | UTF-16LE, PLP | encode + PLP framing |
+| `varchar(n)`, `_UTF8` collation | **UTF-8, 2-byte prefix** (0xA7) | **none — bytes copied** |
+| `varchar(max)`, `_UTF8` collation | UTF-8, PLP | none |
+| `varchar(n)`, code page | UTF-16LE — deliberately: UTF-8 bytes read in that code page would be mangled | encode |
+
+Crossed with input annotation: plain `VARCHAR` (unannotated, sized by
+`mssql_default_string_length`) · `MSSQL_NVARCHAR(n)` · `MSSQL_VARCHAR(n)` ·
+`MSSQL_VARCHAR(n, 'collation')`.
+
+And crossed with content, because the UTF-8 branch's value is content-dependent
+and that is precisely what PR #227's review established: ASCII (1 B/char) ·
+Cyrillic (2) · CJK (3) · astral/emoji (4). Report wire bytes **and** client CPU
+separately — the wire-byte table alone does not settle the CJK case, since the
+UTF-8 target removes a conversion at both ends while adding 49% bytes.
+
+Content lengths: 4 / 16 / 40 / 256 / 4096 characters, plus the MAX/PLP cells.
+
+## Axis C — NULL density, crossed with representation
+
+These two interact: both decide the scatter loop's branch structure, which is the
+whole difference between 1.8 and 5.2 ns/value.
+
+NULL {0, 10, 50, 100}% × {FLAT unique, FLAT card-10, DICTIONARY 1/10/100,
+CONSTANT}. The all-NULL CONSTANT cell is the one the shipped path already wins
+(3.6 ns/value, one byte per row) and must not regress — it needs the early-out.
+
+## Axis D — row width
+
+1 / 4 / 16 / 44 columns. This is the blocking axis: a full per-column pass costs
+0.42 at 4 columns and 1.01 at 16, while blocked stays 0.36-0.43 flat. 44 columns
+matches the external-validation fixture.
+
+## Axis E — target shape, crossed with sessions
+
+The TABLOCK decision table, extended. {heap, clustered rowstore, clustered
+columnstore} × {TABLOCK on, off} × {1, 2, 4, 8 sessions}. The columnstore row
+also carries the `flush_rows` >= 102400 threshold (worth 12% on that target).
+
+## Axis F — transaction context
+
+Autocommit vs an explicit DuckDB transaction. The second forces degree 1, which
+is the configuration streaming exists for; it is the only place the streaming
+delta should still be visible after parallel lands.
+
+## What is reported per cell
+
+ns/value and ns/row · wire bytes · **allocations per chunk** (the arena is
+hooked; this is a stated goal, not a by-product) · client CPU vs wall ·
+encodes-per-chunk against rows-per-chunk (the D6 counter that proves the
+representation path did what it claims).
+
+## Cells that are deliberately NOT crossed
+
+Stated so the omission reads as a decision. NULL density against target shape
+(independent). Row width against string flavour (additive). Content script
+against representation (a CONSTANT column converts once whatever the script).
+
+---
+
+# Release comparison: v0.2.2 vs post-057
+
+Following the precedent set at the end of spec 054 (`bench(spec-054): pre-merge
+release comparison — v0.2.2 vs new build`), the series closes with a comparison
+against the last release rather than against the branch point, on both
+directions and at two volumes. The branch point measures the phase; the release
+measures what a user actually gets, which is the number that goes in the notes.
+
+Run at SF 1 and SF 10 equivalents, plus the 44-column external-validation
+fixture, plus the narrow 4-column base. Both a heap and a columnstore target, so
+the storage claim is covered too.
+
+---
+
+# Parallel write is mandatory (user, 2026-08-02)
+
+Promoted from "its own spec" into this one. Outside an explicit transaction the
+write should use N connections by default.
+
+What is already measured, and what it constrains:
+
+- **Heap: TABLOCK on.** Four sessions 1.70 s against 11.97 s without it — 7×,
+  because concurrent bulk loaders take mutually compatible BU locks.
+- **Clustered rowstore: TABLOCK off.** 1.20 s/M against 2.11 s/M with it — the
+  hint serialises the loaders. Two locks, two opposite behaviours; the rule needs
+  no conditionals beyond the target's index kind, which `MSSQLIndexKind`
+  (spec 049) now supplies.
+- **`ORDER` survives parallelism.** The server validates sort order per
+  bulk-load stream, not globally, so N sessions each sending a disjoint sorted
+  key range is legal and no session failed. Range-partitioning the input is
+  therefore the natural shape for a clustered-index target.
+- **Inside an explicit transaction the degree is forced to 1.** N connections
+  cannot share one SQL Server transaction. This is not an edge case for a
+  database extension, and it is the configuration streaming exists for.
+- **The degree is derived, not set.** Inputs: DuckDB's own thread count (more
+  streams than threads produces nothing), `mssql_connection_limit` (each stream
+  holds a connection for the duration and must not starve readers), and the
+  target's index kind. The saturation ceiling is unknown — the "eight is slower
+  than four" observation is a test-host artefact and must be re-taken on native
+  hardware before any default is chosen.
+- **A failure in one session must abort the rest.**
+
+## Revised build order
+
+One PR, sequential commits, each carrying its own delta against the previous.
+Wire output byte-identical to the shipped encoder is checked **per commit**, not
+once at the end — steps 1-2 change what the encoder is fed while step 3 changes
+the encoder, and a divergence found only at the end would not be localisable.
+
+| # | step | why here |
+| --- | --- | --- |
+| 0 | **Instrument**: `CountChunkForDebug` off the FLAT assumption; `MSSQL_COUNTERS` split from `MSSQL_DEBUG`; absolutes re-derived; a test pinning a uniform column with counters on | everything after is ranked by it, and today it crashes the query it measures |
+| 1 | **TABLOCK by target shape** (heap on / clustered rowstore off / columnstore on), replacing the dead `tablock_explicit` gate | free, and it resets the denominator — client work measured before this is measured against an inflated server wait |
+| 2 | **Target form**: `mssql_default_string_length` default; byte-based flush threshold; UTF-8 collation on created string targets | decides what the encoder is fed. Sized columns turn PLP framing into a 2-byte prefix and make `max_length` available as the step-3a buffer bound |
+| 3 | **Columnar transformation** — 3a bound from metadata + raw-pointer writes; 3b per-column kernel resolved once; 3c all-fixed-width direct scatter; 3d staging for variable width; 3e blocked assembly 64-128 rows; 3f NULLs from the validity mask; **3g truncation instead of a client-side throw** | mandatory. The UTF-8 wire form is NOT here — spec 060 shipped it; step 3 must carry it forward as a per-column kernel choice rather than rediscover it |
+| 4 | **Encode straight into wire frames**, headers reserved in place, one write per L2-sized buffer | kills three post-encode copies and the per-packet allocations. Same buffer decision as 3e, so it is decided once |
+| 5 | **Streaming inside a batch** | nearly free once 4 exists. Measured single-session, before parallel can mask it |
+| 6 | **Representation-aware, strings only** | what survives of D1-D3 after 3 |
+| 7 | **Parallel write** | last: the most invasive, and it hides every client-side delta above it |
+
+---
+
+# 3g — Truncate an over-long value, do not throw (user, 2026-08-02)
+
+## What ships today
+
+Both string guards **throw**, and they are the only thing standing between an
+over-long value and the server:
+
+- `codec::string::EncodeNVarcharFromUtf8` — `InvalidInputException` when the
+  UTF-16 byte length exceeds `col.max_length` (non-PLP only; FR-023 / issue #91);
+- `codec::string::EncodeVarcharUtf8` — the same against a UTF-8 byte bound.
+
+So the failure the user sees is ours, not error 2628, and it aborts the whole
+COPY on one bad row. The decision recorded earlier in this document — *overflow:
+truncate, do not error* — was never implemented.
+
+## The unit differs per regime, and getting it wrong is silent
+
+Measured earlier in this document; repeated here because the truncation kernel is
+where it becomes code:
+
+The declared unit is SQL Server's; the *kernel's* unit is bytes in every row of
+this table, because `BCPColumnMetadata::max_length` already holds a byte count.
+
+| target | declared unit | kernel bound | cut must not split |
+| --- | --- | --- | --- |
+| `NVARCHAR(n)` | n byte-pairs (UTF-16 code units) | `2n` bytes, always even | a surrogate pair — half a pair is an unpaired surrogate, the exact garbage class spec 055 spent a release removing from the read side |
+| `VARCHAR(n)`, `_UTF8` collation | n bytes | `n` bytes | a multi-byte UTF-8 sequence |
+| `VARCHAR(n)`, code page | n bytes of *that code page* | not computable client-side | see below |
+
+**The code-page case cannot be truncated correctly on the client.** Those columns
+travel as NVARCHAR (we send UTF-16, the server converts), so the client never
+knows how many code-page bytes a value will occupy — one character is 1 byte in
+CP1252 and 2 in CP932, and a character the page cannot represent becomes `?`,
+which is 1.
+
+**Settled (user, 2026-08-02): this regime keeps the server's error 2628.** The
+alternative — bounding conservatively at n/2 characters — is safe only in the
+sense that it never overflows; it truncates data that would have fitted, on a
+target that is already lossy by construction (a character outside the code page
+becomes `?` regardless). Silently cutting *more* than the column asked for
+compounds the loss instead of avoiding it. So a code-page target is the one place
+the load still aborts, loudly, with the server naming the row — which is strictly
+more information than a silent short value.
+
+## Requirements
+
+- **Cut on character boundaries.** Never mid-sequence, never between the halves
+  of a surrogate pair. A pair goes in whole or not at all.
+- **Drive it from the column's collation, not only its declared length.** The
+  collation id is already parsed into `ColumnMetadata::collation`.
+- **Count it, and report the count when the COPY finishes.** Truncation is data
+  loss whichever way it was asked for; losing values without saying so is a bad
+  trade even when it was chosen deliberately.
+- **Report where the bound came from**, because the three sources carry very
+  different blame and the user cannot tell them apart from the row alone:
+  1. an explicit cast (`col::MSSQL_NVARCHAR(20)`) — the user stated the bound,
+     truncating to it executes their instruction;
+  2. `mssql_default_string_length` — a global default they may never have
+     thought about, and the most dangerous of the three;
+  3. an existing target column — here SQL Server would have raised 2628, so
+     truncating converts a loud server error into silent loss.
+- **An escape hatch.** A setting to restore the throw, for the loads where
+  silently short data is worse than a failed batch. Default follows the
+  maintainer's call: truncate.
+
+## Where it lands in the columnar shape
+
+**Unconditional, branchless, fused into the assembly pass (user's call).**
+
+The earlier sketch here — compute the column's lengths, take a maximum, act only
+if it exceeds the bound — was wrong on its own terms: a maximum over per-value
+lengths is a per-value pass, a reduction instead of a branch but a pass all the
+same. And no cheaper detector exists: a column's *total* converted bytes cannot
+distinguish one over-long value among short ones from a uniform column of the
+same sum.
+
+**Moving truncation into a plan-level vectorised projection was considered and
+rejected, and the reason is not the one first offered.** It is not that it costs
+less per value — it costs exactly the same per value, in a separate operator,
+with an extra pass over the data to get there. One loop beats two, and the loop
+that has to exist anyway is the assembly pass. (The secondary objections stand
+and are worth recording: a plan-level cast only covers a bound that arrived *as*
+a cast, leaving the existing-column and `mssql_default_string_length` sources
+uncovered, and it would stop `MSSQL_NVARCHAR(n)` being the `ReinterpretCast`
+no-op that makes it free today.)
+
+So: **always truncate, never test whether truncation is needed.** The assembly
+pass already loads `len[r]` to copy the value; it copies `min(len[r], n)`
+instead. There is no cold path and no overflow branch.
+
+**The bound is in BYTES in both regimes, so there is one `min`, not two.** This
+mirrors how SQL Server declares the types — `varchar(n)` counts n bytes,
+`nvarchar(n)` counts n byte-pairs — and it is already what the code holds:
+`GetTDSMaxLength` stores `length * 2` for `MSSQL_NVARCHAR(n)`, and both shipped
+guards compare a byte count against `col.max_length`. Only the boundary
+correction differs, and both are branchless, which is what keeps "unconditional"
+from turning back into a branch:
+
+- **UTF-16 / `NVARCHAR(n)`** — the byte bound is `2n`, always even, so a byte
+  `min` can never split a code unit. Only a surrogate pair can be split, and that
+  is corrected by `len -= 2 * (last_unit >= 0xD800 && last_unit <= 0xDBFF)`.
+  Applying it to a value that was *not* truncated is a no-op for well-formed
+  UTF-16, since a valid string never ends in a lone high surrogate — so it needs
+  no guard either.
+- **UTF-8 / `VARCHAR(n)` `_UTF8`** — the byte bound is `n` and arbitrary, so the
+  `min` can land mid-sequence. Corrected by backing off over continuation bytes
+  (`0b10xxxxxx`), at most three, computed as arithmetic over the last four bytes
+  rather than as a loop.
+
+The one thing kept from the earlier requirement is the **count**, because it was
+a deliberate decision that losing values silently is a bad trade: `truncated +=
+(raw_len[r] > n)` is one branchless add in the same loop and needs no separate
+pass. If even that is unwanted it is a single line to remove — but then the COPY
+summary can no longer say anything happened.
+
+## Consequence: the shipped throws go away
+
+`EncodeNVarcharFromUtf8` and `EncodeVarcharUtf8` currently raise
+`InvalidInputException`, and that wording is asserted by existing tests with a
+"do not change" note. Unconditional truncation removes both raises from the
+default path; the tests move behind the escape-hatch setting, which is the only
+configuration that still throws.
+
+## Acceptance
+
+- Every regime in the table above round-trips: a value at exactly the bound is
+  stored whole, a value one unit over is stored truncated at a character
+  boundary, and re-reading it yields valid UTF-8 with no replacement characters
+  and no unpaired surrogates.
+- The emoji case is pinned explicitly: `NVARCHAR(20)` holds exactly 10 emoji
+  (10 surrogate pairs = 20 units); 11 emoji truncate to 10, never to 10.5.
+- The truncation count and the bound's source appear in the COPY summary.
+- With the escape hatch set, the shipped `InvalidInputException` wording is
+  unchanged — it is asserted in existing tests.
+- **No regression on the in-bound path.** This is the criterion that pins the
+  "unconditional" decision: a column whose values all fit must measure within 2%
+  of the same column encoded without the truncation kernel. If it does not, the
+  `min` and the boundary correction did not fuse the way this section claims and
+  the shape is wrong, not the threshold.
