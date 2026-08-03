@@ -276,14 +276,33 @@ inline bool IsNegative(int64_t v) {
 inline bool IsNegative(const hugeint_t &v) {
 	return v.upper < 0;
 }
-inline int32_t NegateMag(int32_t v) {
-	return -v;
+// Negate in UNSIGNED arithmetic, always.
+//
+// `-v` on the minimum of a signed type is undefined, and this kernel must be
+// TOTAL: the phase that transforms a column runs over every row including the
+// NULL slots, whose bytes are defined memory holding a meaningless value —
+// possibly INT64_MIN. A kernel that can trap on a value nobody will ever read is
+// a kernel that cannot be separated from the mask, which is the whole point of
+// the split. Unsigned wraparound is well defined for every input and produces
+// exactly the two's-complement magnitude we want.
+//
+// Correctness for real values is unchanged: a DECIMAL mantissa is bounded by
+// 10^p - 1, so the minimum is never a legitimate value and the wrap never
+// happens on data anyone reads.
+inline uint32_t NegateMag(int32_t v) {
+	return uint32_t(0) - static_cast<uint32_t>(v);
 }
-inline int64_t NegateMag(int64_t v) {
-	return -v;
+inline uint64_t NegateMag(int64_t v) {
+	return uint64_t(0) - static_cast<uint64_t>(v);
 }
 inline hugeint_t NegateMag(const hugeint_t &v) {
-	return Hugeint::Negate(v);
+	// Hugeint::Negate throws on int128 min; do it by hand so the kernel is total.
+	// Two's complement over the {lower, upper} pair, which IS the little-endian
+	// 128-bit value.
+	hugeint_t out;
+	out.lower = uint64_t(0) - v.lower;
+	out.upper = static_cast<int64_t>(~static_cast<uint64_t>(v.upper) + (v.lower == 0 ? 1u : 0u));
+	return out;
 }
 
 // One value: negate into sign-magnitude, then ONE store of MAG bytes.
@@ -309,7 +328,9 @@ inline void ScatterOne(uint8_t *out, const SRC &raw) {
 	using M = typename MagType<MAG>::type;
 	const M v = static_cast<M>(raw);
 	const bool neg = IsNegative(v);
-	const M mag = neg ? NegateMag(v) : v;
+	// Both arms produce the same width; the unsigned result reinterprets as the
+	// little-endian magnitude bytes the wire wants.
+	const auto mag = neg ? NegateMag(v) : static_cast<decltype(NegateMag(v))>(v);
 	out[0] = neg ? 0x00 : 0x01;
 	std::memcpy(out + 1, &mag, MAG);
 }

@@ -926,6 +926,91 @@ size_t WideColTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	return buf.size();
 }
 
+// THE ZERO-FILL TAX.
+//
+// The other variants reuse `buf`, so after the first iteration `resize` adds no
+// elements and costs nothing. Production does NOT: the accumulator grows chunk
+// by chunk, so every chunk's `resize(base + total)` VALUE-INITIALISES the new
+// tail — a full memset of the chunk's wire, immediately overwritten.
+//
+// This variant clears first, forcing the same zero-fill, so the delta against
+// colblk is the tax itself. Hypothesis: it is most of the 0.72 ns/value gap
+// between the blocked microbenchmark (0.39) and production (1.11).
+size_t WideColBlockedZeroFill(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block) {
+	buf.clear();
+	buf.resize(CHUNK_ROWS * w.stride);
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	uint8_t *const dst = buf.data();
+	for (idx_t r0 = 0; r0 < rows; r0 += block) {
+		const idx_t rend = duckdb::MinValue<idx_t>(r0 + block, rows);
+		for (idx_t r = r0; r < rend; ++r) {
+			dst[r * w.stride] = 0xD1;
+		}
+		size_t col_off = 1;
+		for (idx_t c = 0; c < ncols; ++c) {
+			const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+			for (idx_t r = r0; r < rend; ++r) {
+				uint8_t *p = dst + r * w.stride + col_off;
+				*p = 8;
+				memcpy(p + 1, &src[r], 8);
+			}
+			col_off += 9;
+		}
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
+// TEMPLATE FRAMING *INSIDE* A BLOCK.
+//
+// Framing-as-template was measured a loss at width (0.88 -> 0.95 at 44 columns)
+// and that measurement was taken WITHOUT blocking: the replication wrote 813 KB
+// that the payload pass immediately overwrote, i.e. it lost on memory traffic.
+// Per block the replication is 128 * stride and stays in L1, which removes
+// exactly the reason it lost. The two were never measured together.
+size_t WideColBlockedTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block) {
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	const size_t stride = w.stride;
+	buf.resize(rows * stride);
+	uint8_t *const dst = buf.data();
+
+	// One row of framing, built once for the whole chunk.
+	static duckdb::vector<uint8_t> tmpl;
+	tmpl.resize(stride);
+	tmpl[0] = 0xD1;
+	for (idx_t c = 0, off = 1; c < ncols; ++c, off += 9) {
+		tmpl[off] = 8;
+	}
+
+	for (idx_t r0 = 0; r0 < rows; r0 += block) {
+		const idx_t rend = duckdb::MinValue<idx_t>(r0 + block, rows);
+		const idx_t brows = rend - r0;
+		uint8_t *const bdst = dst + r0 * stride;
+		// Replicate the template across this block only — L1-resident.
+		memcpy(bdst, tmpl.data(), stride);
+		size_t done = 1;
+		while (done < brows) {
+			const size_t take = duckdb::MinValue<size_t>(done, brows - done);
+			memcpy(bdst + done * stride, bdst, take * stride);
+			done += take;
+		}
+		// Payload only: no length byte, no ROW token.
+		size_t col_off = 1;
+		for (idx_t c = 0; c < ncols; ++c) {
+			const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+			uint8_t *p = bdst + col_off + 1;
+			for (idx_t r = 0; r < brows; ++r) {
+				memcpy(p + r * stride, &src[r0 + r], 8);
+			}
+			col_off += 9;
+		}
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
 // WIDTH-SPECIALISED SCATTER.
 //
 // The production path holds the width in a runtime `uint8_t w` and calls
@@ -3058,7 +3143,15 @@ int main() {
 			variants.push_back({nm, [&, blk](duckdb::vector<uint8_t> &b) { return WideColBlocked(w, b, blk); }});
 		}
 		variants.push_back({"rowmajor", [&](duckdb::vector<uint8_t> &b) { return WideRowMajor(w, b); }});
+		variants.push_back(
+			{"zerofill64", [&](duckdb::vector<uint8_t> &b) { return WideColBlockedZeroFill(w, b, 64); }});
 		variants.push_back({"tmplframe", [&](duckdb::vector<uint8_t> &b) { return WideColTemplate(w, b); }});
+		for (idx_t blk : {(idx_t)64, (idx_t)128, (idx_t)256}) {
+			char *nm = new char[20];
+			std::snprintf(nm, 20, "tmplblk%llu", (unsigned long long)blk);
+			variants.push_back(
+				{nm, [&, blk](duckdb::vector<uint8_t> &b) { return WideColBlockedTemplate(w, b, blk); }});
+		}
 		variants.push_back({"typedw", [&](duckdb::vector<uint8_t> &b) { return WideColTypedWidth(w, b); }});
 		variants.push_back({"tmpl+typedw", [&](duckdb::vector<uint8_t> &b) { return WideColTemplateTyped(w, b); }});
 
