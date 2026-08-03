@@ -657,13 +657,26 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "bigint";
 
 	case LogicalTypeId::SMALLINT:
-		return target_lower == "smallint" || target_lower == "int" || target_lower == "bigint";
+		return target_lower == "smallint" || target_lower == "int" || target_lower == "bigint" ||
+			   target_lower == "tinyint";
 
 	case LogicalTypeId::INTEGER:
-		return target_lower == "int" || target_lower == "bigint";
+		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint" ||
+			   target_lower == "tinyint";
 
 	case LogicalTypeId::BIGINT:
+		// Issue #153. Narrowing is allowed because the encoder performs it with a
+		// range check and refuses the row that does not fit — the same answer SQL
+		// Server gives, arrived at before the batch is sent rather than by
+		// aborting it mid-stream. DuckDB defaults integer arithmetic to BIGINT, so
+		// refusing this made appending to an `int` column need REPLACE=true and a
+		// schema change the user did not want.
+		return target_lower == "bigint" || target_lower == "int" || target_lower == "smallint" ||
+			   target_lower == "tinyint";
+
 	case LogicalTypeId::UBIGINT:
+		// Stays exact: UBIGINT travels as DECIMAL(20,0) on the wire, not as an
+		// integer, so the narrowing arms above do not apply to it.
 		return target_lower == "bigint";
 
 	case LogicalTypeId::FLOAT:

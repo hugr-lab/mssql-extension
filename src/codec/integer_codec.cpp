@@ -111,6 +111,59 @@ void CheckUhugeintFitsDecimal38(const uhugeint_t &value, const std::string &col_
 	}
 }
 
+// Read the value at the width the SOURCE vector actually stores, widened to
+// hugeint so every integer physical type fits without a second dispatch.
+//
+// The encode switch below chooses the WIRE form from the target column, which is
+// right — but until spec 057 it also chose the READ width from the target, and
+// the source is under no obligation to match. `COPY (SELECT 1::INTEGER)` into a
+// `bigint` column asked for eight bytes from a four-byte array and died with
+// `INTERNAL Error: Expected unified vector format of type INT64, but found type
+// INT32`. Every widening the schema validator advertises (TINYINT -> int,
+// SMALLINT -> bigint, INTEGER -> bigint) failed that way, so the compatibility
+// table was documenting conversions the encoder could not perform (issue #153).
+hugeint_t ReadSourceInteger(Vector &in, const UnifiedVectorFormat &fmt, idx_t row) {
+	switch (in.GetType().InternalType()) {
+	case PhysicalType::BOOL:
+	case PhysicalType::INT8:
+		return hugeint_t(FormatValue<int8_t>(fmt, row));
+	case PhysicalType::UINT8:
+		return hugeint_t(FormatValue<uint8_t>(fmt, row));
+	case PhysicalType::INT16:
+		return hugeint_t(FormatValue<int16_t>(fmt, row));
+	case PhysicalType::UINT16:
+		return hugeint_t(FormatValue<uint16_t>(fmt, row));
+	case PhysicalType::INT32:
+		return hugeint_t(FormatValue<int32_t>(fmt, row));
+	case PhysicalType::UINT32:
+		return hugeint_t(FormatValue<uint32_t>(fmt, row));
+	case PhysicalType::INT64:
+		return hugeint_t(FormatValue<int64_t>(fmt, row));
+	case PhysicalType::UINT64:
+		// Two-argument form: a value above INT64_MAX must not become negative.
+		return hugeint_t(0, FormatValue<uint64_t>(fmt, row));
+	case PhysicalType::INT128:
+		return FormatValue<hugeint_t>(fmt, row);
+	default:
+		throw InternalException("codec::integer::EncodeToBcp: unexpected source PhysicalType for an integer column");
+	}
+}
+
+// Narrow to the target's width, refusing what will not fit.
+//
+// An error, not a wraparound: an integer that does not fit is a different number,
+// and SQL Server itself refuses the row. Contrast the string path, where the
+// column states a bound and truncating to it is the documented intent — nothing
+// about `bigint -> int` says the user wanted the low 32 bits.
+int64_t NarrowSourceInteger(const hugeint_t &value, int64_t min, int64_t max, const mssql::BCPColumnMetadata &col) {
+	if (Hugeint::GreaterThan(value, hugeint_t(max)) || Hugeint::GreaterThan(hugeint_t(min), value)) {
+		throw InvalidInputException(
+			"MSSQL: integer value %s in column \"%s\" is out of range for the target column (accepts %lld..%lld)",
+			Hugeint::ToString(value), col.name, (long long)min, (long long)max);
+	}
+	return Hugeint::Cast<int64_t>(value);
+}
+
 }  // namespace
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
@@ -145,30 +198,56 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
-	(void)in;
+	// The source's storage width, which the target is under no obligation to
+	// match (issue #153). Each arm below keeps its exact-match case byte-identical
+	// and only converts when the widths actually differ — so the common path pays
+	// one integer comparison, and step 3 resolves even that once per column.
+	const PhysicalType src = in.GetType().InternalType();
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::TINYINT:
-		AppendInt8Bcp(buf, FormatValue<int8_t>(fmt, row));
+		if (src == PhysicalType::INT8) {
+			AppendInt8Bcp(buf, FormatValue<int8_t>(fmt, row));
+			return;
+		}
+		// SQL Server tinyint is UNSIGNED 0..255, so that is the range a converted
+		// value must satisfy — not DuckDB TINYINT's -128..127. (The exact-match
+		// path above keeps the pre-existing signed behaviour; realigning that is a
+		// separate change with its own wire-compatibility question.)
+		AppendUInt8Bcp(buf, static_cast<uint8_t>(NarrowSourceInteger(ReadSourceInteger(in, fmt, row), 0, 255, col)));
 		return;
 	case LogicalTypeId::UTINYINT:
 		AppendUInt8Bcp(buf, FormatValue<uint8_t>(fmt, row));
 		return;
 	case LogicalTypeId::SMALLINT:
-		AppendInt16Bcp(buf, FormatValue<int16_t>(fmt, row));
+		if (src == PhysicalType::INT16) {
+			AppendInt16Bcp(buf, FormatValue<int16_t>(fmt, row));
+			return;
+		}
+		AppendInt16Bcp(
+			buf, static_cast<int16_t>(NarrowSourceInteger(ReadSourceInteger(in, fmt, row), INT16_MIN, INT16_MAX, col)));
 		return;
 	case LogicalTypeId::USMALLINT:
 		// USMALLINT (0-65535) widens to int32 to fit without overflow.
 		AppendInt32Bcp(buf, static_cast<int32_t>(FormatValue<uint16_t>(fmt, row)));
 		return;
 	case LogicalTypeId::INTEGER:
-		AppendInt32Bcp(buf, FormatValue<int32_t>(fmt, row));
+		if (src == PhysicalType::INT32) {
+			AppendInt32Bcp(buf, FormatValue<int32_t>(fmt, row));
+			return;
+		}
+		AppendInt32Bcp(
+			buf, static_cast<int32_t>(NarrowSourceInteger(ReadSourceInteger(in, fmt, row), INT32_MIN, INT32_MAX, col)));
 		return;
 	case LogicalTypeId::UINTEGER:
 		// UINTEGER (0-4B) widens to int64 to fit without overflow.
 		AppendInt64Bcp(buf, static_cast<int64_t>(FormatValue<uint32_t>(fmt, row)));
 		return;
 	case LogicalTypeId::BIGINT:
-		AppendInt64Bcp(buf, FormatValue<int64_t>(fmt, row));
+		if (src == PhysicalType::INT64) {
+			AppendInt64Bcp(buf, FormatValue<int64_t>(fmt, row));
+			return;
+		}
+		AppendInt64Bcp(buf, NarrowSourceInteger(ReadSourceInteger(in, fmt, row), INT64_MIN, INT64_MAX, col));
 		return;
 	case LogicalTypeId::UBIGINT: {
 		// UBIGINT (0-18e18) uses DECIMAL(20,0) on the wire — SQL Server BIGINT is signed.
