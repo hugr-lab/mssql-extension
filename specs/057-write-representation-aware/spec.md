@@ -1512,7 +1512,7 @@ the encoder, and a divergence found only at the end would not be localisable.
 | 0 | **Instrument**: `CountChunkForDebug` off the FLAT assumption; `MSSQL_COUNTERS` split from `MSSQL_DEBUG`; absolutes re-derived; a test pinning a uniform column with counters on | everything after is ranked by it, and today it crashes the query it measures |
 | 1 | **TABLOCK by target shape** (heap on / clustered rowstore off / columnstore on), replacing the dead `tablock_explicit` gate | free, and it resets the denominator — client work measured before this is measured against an inflated server wait |
 | 2 | **Target form**: `mssql_default_string_length` default; byte-based flush threshold; UTF-8 collation on created string targets | decides what the encoder is fed. Sized columns turn PLP framing into a 2-byte prefix and make `max_length` available as the step-3a buffer bound |
-| 3 | **Columnar transformation** — 3a bound from metadata + raw-pointer writes; 3b per-column kernel resolved once; 3c all-fixed-width direct scatter; 3d staging for variable width; 3e blocked assembly 64-128 rows; 3f NULLs from the validity mask; **3g truncation instead of a client-side throw** | mandatory. The UTF-8 wire form is NOT here — spec 060 shipped it; step 3 must carry it forward as a per-column kernel choice rather than rediscover it |
+| 3 | **Columnar transformation** — 3a bound from metadata + raw-pointer writes; 3b per-column kernel resolved once; 3c all-fixed-width direct scatter; 3d staging for variable width; 3e blocked assembly 64-128 rows; 3f NULLs from the validity mask; **3g truncation instead of a client-side throw** | mandatory. The UTF-8 wire form is NOT here — spec 060 shipped it; step 3 must carry it forward as a per-column kernel choice rather than rediscover it. **Status: 3a-3f landed for every family except conversions; 3g not built. See "Step 3 — what actually landed" at the end.** |
 | 4 | **Encode straight into wire frames**, headers reserved in place, one write per L2-sized buffer | kills three post-encode copies and the per-packet allocations. Same buffer decision as 3e, so it is decided once |
 | 5 | **Streaming inside a batch** | nearly free once 4 exists. Measured single-session, before parallel can mask it |
 | 6 | **Representation-aware, strings only** | what survives of D1-D3 after 3 |
@@ -2082,8 +2082,13 @@ built fits without change — its kernel is `scatter = nullptr` (memcpy) with th
 width from metadata, which is the degenerate case of the struct above.
 
 Strings stay last, as they are the only family where `wire_width` is 0 and the
-staging/blocked-assembly machinery is needed; everything above is a fixed stride
-and needs none of it.
+staging machinery is needed; everything above is a fixed stride and needs none of
+it.
+
+**Landed, and the ordering held** — see "Step 3 — what actually landed" at the
+end of this document for the measurements and for what a variable-width column
+turned out to imply: it breaks the constant-stride path for the WHOLE chunk, for
+a reason NULLs do not share.
 
 ---
 
@@ -2276,3 +2281,102 @@ only the kernel made them visible.
 Rounding costs nothing per value: the divisor's half and the day's tick count are
 column constants hoisted beside the scale factor, and the carry is one compare
 that is false for every value but the last tick of a day.
+
+---
+
+# Step 3 — what actually landed, and what is left (2026-08-03)
+
+**This section supersedes the reasoning above wherever they disagree.** The
+document is a working log kept in order, so several earlier conclusions were
+overturned by later measurement; each is marked where it stands, but this is the
+authoritative statement of the current code.
+
+## Measured, per family
+
+Production `encode` counters, best of 3, live server.
+
+| family | before | after | |
+| --- | --- | --- | --- |
+| direct copy (int / float / bool) | 9.2 ns/value | **1.05-1.16** | ~8x |
+| decimal | 16.9 | **3.75** | 4.5x |
+| DATE, datetime2 | 12.0 | **3.45** | 3.5x |
+| strings, sized | 14.5 | **8.1** | 1.8x |
+| PLP / MAX | — | — | 1.7x |
+| the NULL-bearing path | 6.5 | **2.9-4.0** | ~2x |
+| TIME, datetimeoffset, varbinary | — | on the columnar path | — |
+
+## What still takes the row path, and why
+
+Each is a decision, not an omission.
+
+- **Legacy `datetime` and `smalldatetime`** — `sys.columns` reports a width that
+  is not what we send. Correct on the row path; giving them a kernel means
+  changing COLMETADATA, which is a separate change with its own verification.
+- **Any source whose width or representation differs from the target's** — that
+  is a CONVERSION, and conversions are the next item below.
+- **`INTERVAL`, `XML`, `HUGEINT` into a decimal target** — the source is rendered
+  as text or otherwise reshaped before it is a payload.
+- **Invalid UTF-8** — the legacy per-value fallback reproduces pre-spec-043 bytes
+  exactly, and is not worth planning around.
+
+## Rules this step produced, which every future arm must satisfy
+
+1. **Check BOTH sides.** Keying an arm on the target alone was wrong three times:
+   legacy `datetime` (three formats share a token AND a `duckdb_type`), integer
+   conversions, and `INTERVAL` (a string wire form over an `interval_t` vector).
+2. **The metadata width must equal what the kernel writes.** Sizing reserves
+   before any value is touched, so a kernel emitting fewer bytes puts every later
+   column where the server is not looking. The row path never had this constraint
+   — it appends, so whatever it writes IS the layout.
+3. **Framing belongs to the plan, not the caller.** A caller adding "2 for the
+   prefix" got it wrong once; PLP would have been a second chance at the same
+   mistake with different numbers.
+4. **A narrowing conversion lands where the server would have put it.** Decimal
+   and temporal both round now; they disagreed before, in neighbouring files.
+5. **A kernel that runs over a whole column must be TOTAL** — no trap on the
+   garbage in a NULL slot. That is why negation is unsigned.
+
+## Hypotheses this step killed, with numbers
+
+Recorded so none is proposed again.
+
+| idea | verdict |
+| --- | --- |
+| width specialisation on its own | nothing: 0.88 -> 0.88 ns/value at 44 columns |
+| template framing (build one row's framing, replicate) | wins narrow, loses wide (0.88 -> 0.95); a wash once blocked |
+| row-major assembly inside a block (removes the cursor) | 1.6-2.7x WORSE at every width; a row touches one cache line per column and uses an eighth of each |
+| `resize`'s zero-fill is the production gap | real but 0.06-0.09 ns/value, ~12% of it |
+| blocking is unjustified in production | wrong — it was masked by the selection indirection, and is worth ~40% once that is gone |
+| NULL cost scales with density | no: the cliff is between 0% and 1%, flat after. It was a path switch, not a NULL cost |
+
+## The ceiling, and what it implies for the remaining steps
+
+The all-valid path at 1.05 ns/value moves 8 bytes of source and 9 of wire per
+value — **~15 GB/s on one thread, which is DRAM bandwidth**. The microbenchmark
+reaching 0.35 ns/value does so from L2 on a reused chunk. So further kernel work
+on fixed-width families is bounded by the bus, not by the code.
+
+That is the argument for the steps that are left: `PARALLEL N` (2.8x measured) is
+larger than anything remaining inside one thread.
+
+## Left in step 3
+
+- **Conversions as a resolved `ConvertArm`** — the #153 stopgap branches on the
+  source's `PhysicalType` inside every target arm, i.e. per value, for a pair
+  that is fixed per column. This is also where compatibility stops being a table
+  of type names and becomes `arm != Unsupported`, and where "compatible types
+  into an existing target" (int -> bigint, decimal, datetime) is answered
+  properly rather than by the current stopgap.
+- **Bulk string conversion** — one simdutf call per column instead of N. §3a puts
+  the remaining headroom at roughly 8.1 -> 6 ns/value, i.e. the smaller half of
+  that section's win; the larger half (pre-sizing) is already taken.
+- **3g truncation** — designed and specified, not built. The kernels are total
+  now, which was its precondition.
+
+## Steps not started
+
+4 (encode into wire frames), 5 (streaming inside a batch), 6 (representation-aware
+for strings), 7 (`PARALLEL N`). Step 4's justification was re-measured and stands:
+build+send is the same size as the encoder (~6% of wall each), and the two
+compose, because encoding into the frames is one pass instead of encode-then-copy
+-thrice.
