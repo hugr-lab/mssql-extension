@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -81,6 +82,14 @@ public:
 	// Sink Interface
 	//===----------------------------------------------------------------------===//
 
+	//! Spec 057 step 7: CTAS loads through the same INSERT BULK path COPY does,
+	//! and the bound there is SQL Server's ingest rate, which it parallelises
+	//! across SESSIONS. This was false — the default — so DuckDB drove the sink
+	//! from one thread and the mutex below was never contended.
+	bool ParallelSink() const override {
+		return true;
+	}
+
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
@@ -127,15 +136,58 @@ public:
 
 	// Mutex for thread-safe access
 	mutable std::mutex mutex;
+
+	//===------------------------------------------------------------------===//
+	// Parallel writers (spec 057 step 7, CTAS)
+	//===------------------------------------------------------------------===//
+
+	//! Upper bound on bulk-load sessions, the one opened by ExecuteBCPInsert
+	//! included. 1 disables the feature. Resolved once in GetGlobalSinkState.
+	idx_t parallel_writer_limit = 1;
+
+	//! Sessions handed out so far, that first one included.
+	std::atomic<idx_t> parallel_writers_used{1};
 };
 
 //===----------------------------------------------------------------------===//
-// MSSQLCTASLocalSinkState - Per-thread state (empty for CTAS)
+// MSSQLCTASLocalSinkState - Per-thread state
+//
+// A thread either owns a bulk-load session of its own — its own connection, its
+// own INSERT BULK, its own writer, no lock — or it has none and appends to the
+// global writer under the global mutex, which is what every thread did before.
 //===----------------------------------------------------------------------===//
 
 class MSSQLCTASLocalSinkState : public LocalSinkState {
 public:
 	MSSQLCTASLocalSinkState() = default;
+
+	//! Last-resort release. A throw from Sink skips Combine, so nothing else
+	//! would return this thread's connection: it would sit in Executing with a
+	//! bulk-load transaction open, holding locks on the table CTAS just created,
+	//! until the pool was torn down. Touches NO ClientContext — the pool handle
+	//! is captured on the thread that acquired the connection (issue #178).
+	~MSSQLCTASLocalSinkState();
+
+	//! This thread's own bulk-load connection, or null when it shares the global
+	//! writer (in a transaction, at the limit, or acquisition failed).
+	std::shared_ptr<tds::TdsConnection> connection;
+	unique_ptr<mssql::BCPWriter> writer;
+	weak_ptr<tds::ConnectionPool> pool_handle;
+
+	//! Rows this writer has sent since its last flush.
+	idx_t rows_in_batch = 0;
+
+	//! Rows this writer has encoded in total, folded into the global
+	//! rows_produced in Combine so the metrics line still adds up.
+	idx_t rows_written = 0;
+
+	//! Rows the server has confirmed to this writer, folded into the global
+	//! count in Combine.
+	idx_t rows_confirmed = 0;
+
+	//! Acquisition is tried ONCE, on the first chunk. Failure is not an error:
+	//! the thread falls back to the shared writer, which is always correct.
+	bool init_attempted = false;
 };
 
 }  // namespace duckdb

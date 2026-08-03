@@ -59,9 +59,10 @@ CTASExecutionState::~CTASExecutionState() {
 }
 
 void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
-	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError
-	// contract). CTAS never runs transaction-pinned.
-	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
+	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract).
+	// A pinned connection is dropped rather than released: the transaction owns
+	// it, and its ROLLBACK is what undoes the half-written load.
+	ReleaseBcpConnectionOnError(connection, pool_handle, transaction_pinned);
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
@@ -436,6 +437,24 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 	DebugLog(2, "BCP columns initialized: %llu columns", (unsigned long long)bcp_columns.size());
 }
 
+string CTASExecutionState::BuildInsertBulkSql() const {
+	// Format: INSERT BULK [schema].[table] (col1 type1, col2 type2, ...) [WITH (TABLOCK)]
+	string sql = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
+	for (idx_t i = 0; i < bcp_columns.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		// Column name must be bracketed for safety
+		sql += "[" + bcp_columns[i].name + "] ";
+		sql += bcp_columns[i].GetSQLServerTypeDeclaration();
+	}
+	sql += ")";
+	if (config.bcp_tablock) {
+		sql += " WITH (TABLOCK)";
+	}
+	return sql;
+}
+
 void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	DebugLog(1, "Executing INSERT BULK for BCP mode");
 
@@ -451,38 +470,25 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	DebugLog(1, "TABLOCK=%d (choice=%d, shape=%d)", config.bcp_tablock ? 1 : 0, (int)config.bcp_tablock_choice,
 			 (int)shape);
 
-	// Acquire a connection from the pool
-	auto &pool = catalog->GetConnectionPool();
-	connection = pool.Acquire();
+	// Through the provider, not straight from the pool — exactly as COPY does.
+	// Inside an explicit transaction this hands back the PINNED connection, so
+	// the bulk load runs in the transaction and its rows roll back with it.
+	// Acquiring from the pool here instead put the rows on a session the
+	// transaction did not own, and a CTAS survived its own ROLLBACK intact.
+	transaction_pinned = ConnectionProvider::IsInTransaction(context, *catalog);
+	connection = ConnectionProvider::GetConnection(context, *catalog);
 	if (!connection) {
 		throw IOException("CTAS BCP: Failed to acquire connection from pool");
 	}
 
 	try {
-		// Build INSERT BULK statement
-		// Format: INSERT BULK [schema].[table] (col1 type1, col2 type2, ...) [WITH (TABLOCK)]
-		string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
-
-		for (idx_t i = 0; i < bcp_columns.size(); i++) {
-			if (i > 0) {
-				insert_bulk += ", ";
-			}
-			// Column name must be bracketed for safety
-			insert_bulk += "[" + bcp_columns[i].name + "] ";
-			insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
-		}
-		insert_bulk += ")";
-
-		// Add TABLOCK hint if configured (may be auto-enabled for new tables)
-		if (config.bcp_tablock) {
-			insert_bulk += " WITH (TABLOCK)";
-			DebugLog(2, "BCP using TABLOCK hint");
-		}
-
-		DebugLog(2, "INSERT BULK: %s", insert_bulk.c_str());
+		// Built once here, after the TABLOCK decision above: every batch boundary
+		// and every parallel writer re-executes exactly this text.
+		insert_bulk_sql = BuildInsertBulkSql();
+		DebugLog(2, "INSERT BULK: %s", insert_bulk_sql.c_str());
 
 		// Execute INSERT BULK to put connection in BulkLoad mode
-		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
+		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk_sql);
 
 		// Verify connection is now in correct state for BCP
 		// After INSERT BULK, connection should be in BulkLoad mode
@@ -497,8 +503,8 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 		DebugLog(1, "BCP session started, ready to receive data");
 
 	} catch (std::exception &e) {
-		// Release connection on failure
-		pool.Release(std::move(connection));
+		// Release connection on failure — a no-op when the transaction owns it.
+		ConnectionProvider::ReleaseConnection(context, *catalog, connection);
 		connection = nullptr;
 		throw;
 	}
@@ -537,20 +543,7 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 			bcp_rows_in_batch = 0;
 
 			// Re-execute INSERT BULK for next batch
-			string insert_bulk = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
-			for (idx_t i = 0; i < bcp_columns.size(); i++) {
-				if (i > 0) {
-					insert_bulk += ", ";
-				}
-				insert_bulk += "[" + bcp_columns[i].name + "] ";
-				insert_bulk += bcp_columns[i].GetSQLServerTypeDeclaration();
-			}
-			insert_bulk += ")";
-			if (config.bcp_tablock) {
-				insert_bulk += " WITH (TABLOCK)";
-			}
-
-			auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk);
+			auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk_sql);
 			connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
 
 			// Write COLMETADATA for next batch
@@ -590,10 +583,10 @@ void CTASExecutionState::FlushBCP(ClientContext &context) {
 			DebugLog(1, "BCP completed with no additional rows");
 		}
 
-		// Release connection back to pool
+		// Release connection back to pool — a no-op when the transaction owns it,
+		// which is what keeps the pin alive for the statements after this one.
 		if (connection) {
-			auto &pool = catalog->GetConnectionPool();
-			pool.Release(std::move(connection));
+			ConnectionProvider::ReleaseConnection(context, *catalog, connection);
 			connection = nullptr;
 		}
 

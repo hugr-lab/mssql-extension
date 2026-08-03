@@ -875,9 +875,54 @@ SET mssql_ctas_drop_on_failure = true;
 - **BCP mode (default)**: Uses TDS BulkLoadBCP protocol for 2-10x faster data transfer
 - **Two-phase execution**: CREATE TABLE DDL, then data transfer via BCP or INSERT
 - **Streaming**: Large result sets are streamed without full buffering
-- **Non-atomic**: DDL commits immediately; data transfer respects transactions
+- **Not atomic, and not covered by a transaction**: see [What a failed load leaves behind](#what-a-failed-load-leaves-behind)
 - **Schema validation**: Target schema must exist before CTAS
 - **Legacy INSERT mode**: Set `mssql_ctas_use_bcp = false` to use batched INSERT statements
+
+### What a failed load leaves behind
+
+Neither CTAS nor COPY is atomic. If one fails part-way — a type that will not
+convert, a dropped connection, `Ctrl-C` — **what already reached SQL Server stays
+there.** Plan for that: check the row count before treating a load as done, and
+load into a staging table you can drop when the answer matters.
+
+The reason is the same for both: the bulk-load protocol commits each batch as it
+is sent. `mssql_copy_flush_rows` (102400 by default) is exactly that boundary, so
+a load of 1M rows that dies at row 700000 leaves six committed batches on the
+server, not zero.
+
+Wrapping the load in an explicit transaction bounds the damage:
+
+| | inside `BEGIN … COMMIT` | outside a transaction |
+|---|---|---|
+| `COPY TO` | rows roll back | partial rows remain; with `CREATE_TABLE true` the table remains too |
+| `CREATE TABLE AS` | rows roll back; **the empty table remains** | partial rows and the table remain |
+
+Both run their bulk load on the connection pinned to the transaction — one
+session, one `INSERT BULK`, parallel writers disabled (a second connection would
+sit outside the transaction, and its rows would not roll back with the rest).
+
+What a `ROLLBACK` does **not** undo is the `CREATE TABLE` itself: CTAS runs its
+DDL as its own statement before any row is sent, so an aborted CTAS leaves an
+empty table of the right shape behind. Drop it, or have the extension do it:
+
+```sql
+-- Drop a half-written table when the load fails (default: false)
+SET mssql_ctas_drop_on_failure = true;
+```
+
+That setting covers the failure the extension sees. It cannot cover a killed
+process or a lost connection — there, SQL Server rolls back the batch in flight
+and keeps the ones already committed, and the table stays.
+
+When the target already exists, `COPY` gives the stronger guarantee, because
+there is no DDL to leave behind:
+
+```sql
+BEGIN TRANSACTION;
+COPY src TO 'mssql.dbo.target' (FORMAT bcp, CREATE_TABLE false);
+COMMIT;   -- ROLLBACK instead leaves dbo.target exactly as it was
+```
 
 ## COPY TO (Bulk Load)
 

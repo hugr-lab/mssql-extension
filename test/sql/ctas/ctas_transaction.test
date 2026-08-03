@@ -47,6 +47,52 @@ SELECT * FROM mssql_tx.dbo.ctas_tx_commit;
 1	committed
 
 # =============================================================================
+# CTAS in Transaction - ROLLBACK
+#
+# The comment above has stated since spec 027 that a rollback leaves the table
+# empty, and `ctas_tx_rollback` was dropped in the setup for a case that was
+# never written. It did not hold: CTAS took its bulk-load connection straight
+# from the pool instead of the one pinned to the transaction, so its rows went
+# down a session the transaction did not own and a ROLLBACK left all of them in
+# place. Two sessions were visible on the server for a single CTAS.
+#
+# It now goes through ConnectionProvider, exactly as COPY does — one pinned
+# connection, one INSERT BULK — so the rows are inside the transaction. The
+# CREATE TABLE is not: it is its own statement, sent before any row, which is
+# why the table survives and the rows do not.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE mssql_tx.dbo.ctas_tx_rollback AS
+SELECT i AS id, 'rolled_' || i::VARCHAR AS name
+FROM generate_series(1, 500) t(i);
+
+statement ok
+ROLLBACK;
+
+# Every row is gone...
+query I
+SELECT COUNT(*) FROM mssql_tx.dbo.ctas_tx_rollback;
+----
+0
+
+# ...and the table is still there, which is what has to be cleaned up by hand
+# (or by mssql_ctas_drop_on_failure).
+query I
+SELECT COUNT(*) FROM mssql_scan('mssql_tx', 'SELECT 1 AS n FROM sys.objects WHERE name = ''ctas_tx_rollback''');
+----
+1
+
+# The pinned connection survives its own bulk load: the statement after the
+# rollback has to work on the same catalog, which it would not if the BCP stream
+# had left the connection mid-load or returned it to the pool.
+statement ok
+DROP TABLE mssql_tx.dbo.ctas_tx_rollback;
+
+# =============================================================================
 # CTAS in Transaction - Verify data in autocommit mode
 # =============================================================================
 

@@ -1,0 +1,165 @@
+# name: test/sql/ctas/ctas_parallel_writers.test
+# description: a CTAS driven from several threads must load every row exactly once (spec 057 step 7)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# CTAS declared `ParallelSink() = false` by inheriting the default, so DuckDB
+# drove its sink from ONE thread and the mutex in it was never contended. Turning
+# it on is the same change COPY took, and COPY's version of it lost 205376 of
+# 1000000 rows with the whole suite still green — the shared writer's append and
+# its batch flush were under two different locks.
+#
+# So this file is shaped for that failure, not for size:
+#
+#   * `mssql_copy_flush_rows` is set LOW, so the send-and-clear boundary — the
+#     window the race lives in — is crossed many times instead of once at the end;
+#   * both writer counts are exercised. `1` is the SHARED path, which is where the
+#     loss was and which reads like the safe one;
+#   * the check is a per-row SUM and a DISTINCT count, not just `count(*)`: a row
+#     written twice and a row lost cancel out in a count.
+#
+# CTAS also has something COPY does not — it CREATES the target, and each parallel
+# writer opens its own INSERT BULK against a table that did not exist a moment
+# ago. A writer that started before the DDL committed would fail, so the ordering
+# (DDL in GetGlobalSinkState, writers on first chunk) is part of what is asserted
+# here by the loads simply succeeding.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cpw (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# Small batches, so the send-and-clear boundary is crossed repeatedly.
+statement ok
+SET mssql_copy_flush_rows = 5000;
+
+statement ok
+CREATE OR REPLACE TABLE cpw_src AS
+SELECT i AS id, (i * 7)::BIGINT AS v, 'row_' || i AS s,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 1000)::INTEGER END AS n
+FROM range(200000) t(i);
+
+# -----------------------------------------------------------------------------
+# One writer: every thread shares the global writer under the mutex. This is the
+# configuration the row loss appeared in on the COPY path.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
+statement ok
+CREATE OR REPLACE TABLE cpw.dbo.CtasShared AS SELECT * FROM cpw_src;
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), count(n) FROM cpw.dbo.CtasShared;
+----
+200000	200000	19999900000	184615
+
+query I
+SELECT count(*) FROM (SELECT * FROM cpw_src EXCEPT ALL SELECT id, v, s, n FROM cpw.dbo.CtasShared);
+----
+0
+
+# -----------------------------------------------------------------------------
+# Four writers: each thread opens its own INSERT BULK on its own connection,
+# against the table this same statement just created.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+statement ok
+CREATE OR REPLACE TABLE cpw.dbo.CtasParallel AS SELECT * FROM cpw_src;
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), count(n) FROM cpw.dbo.CtasParallel;
+----
+200000	200000	19999900000	184615
+
+query I
+SELECT count(*) FROM (SELECT * FROM cpw_src EXCEPT ALL SELECT id, v, s, n FROM cpw.dbo.CtasParallel);
+----
+0
+
+# The row count CTAS REPORTS is summed across writers in Combine, not taken from
+# the one global writer — a parallel writer's rows are confirmed on its own
+# connection and would otherwise be missing from the answer while present in the
+# table.
+query I
+SELECT rows_written FROM (
+    SELECT count(*) AS rows_written FROM cpw.dbo.CtasParallel
+);
+----
+200000
+
+# -----------------------------------------------------------------------------
+# OR REPLACE with parallel writers: the DROP + CREATE runs before any writer
+# opens, so every writer must land in the NEW table, not in a leftover of the old
+# one. A stale session would show up as a row count above 200000.
+# -----------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE TABLE cpw.dbo.CtasParallel AS SELECT * FROM cpw_src WHERE id < 50000;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM cpw.dbo.CtasParallel;
+----
+50000	50000
+
+# -----------------------------------------------------------------------------
+# Inside an explicit transaction no extra writer may be opened: the load runs on
+# the connection pinned to the transaction, and a second one would sit outside it
+# — its rows would not roll back with the rest. The setting is ignored rather
+# than obeyed. ctas_transaction.test asserts the rollback itself.
+# -----------------------------------------------------------------------------
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE TABLE cpw.dbo.CtasTxn AS SELECT * FROM cpw_src;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM cpw.dbo.CtasTxn;
+----
+200000	200000
+
+# -----------------------------------------------------------------------------
+# An empty source still has to close every session it opened. A writer is only
+# started on a thread's first chunk, so nothing should open here at all — and the
+# statement must still complete rather than leave a connection in Executing.
+# -----------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE TABLE cpw.dbo.CtasEmpty AS SELECT * FROM cpw_src WHERE id < 0;
+
+query I
+SELECT count(*) FROM cpw.dbo.CtasEmpty;
+----
+0
+
+# The pool is usable afterwards, which it would not be if a bulk-load session had
+# been left open on a connection that went back into it.
+query I
+SELECT count(*) FROM cpw.dbo.CtasShared;
+----
+200000
+
+statement ok
+SET mssql_copy_parallel_writers = 0;
+
+statement ok
+SET mssql_copy_flush_rows = 102400;
+
+statement ok
+SELECT mssql_exec('cpw', 'DROP TABLE dbo.CtasShared; DROP TABLE dbo.CtasParallel; DROP TABLE dbo.CtasTxn; DROP TABLE dbo.CtasEmpty;');
+
+statement ok
+DETACH cpw;

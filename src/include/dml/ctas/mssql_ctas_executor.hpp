@@ -77,8 +77,25 @@ struct CTASExecutionState {
 	BCPCopyTarget bcp_target;
 	idx_t bcp_rows_in_batch = 0;  // Rows accumulated since last flush
 
+	//! The INSERT BULK text, built once in ExecuteBCPInsert. Every batch boundary
+	//! re-executes it, and each parallel writer opens its own session with it, so
+	//! it is state rather than something rebuilt at each site — it was assembled
+	//! from bcp_columns in two places before, which is two places to keep in step
+	//! with the TABLOCK decision that is resolved just above it.
+	string insert_bulk_sql;
+
 	// Connection (pinned for duration)
 	std::shared_ptr<tds::TdsConnection> connection;
+
+	//! True when `connection` is the one an explicit DuckDB transaction has
+	//! pinned, rather than one this CTAS took from the pool for itself.
+	//!
+	//! It decides two things that must agree: the bulk load runs INSIDE the
+	//! transaction, so ROLLBACK undoes its rows; and the connection is NOT
+	//! returned to the pool at the end, because the transaction still owns it.
+	//! Taking a pool connection here instead is what made a CTAS survive its own
+	//! ROLLBACK — the rows went down a session the transaction did not know about.
+	bool transaction_pinned = false;
 
 	// Weak handle to the catalog's pool so error/teardown paths can release the
 	// connection without touching the catalog pointer (issue #191 pattern from
@@ -133,6 +150,9 @@ struct CTASExecutionState {
 	// Initialize BCP writer and column metadata
 	// Called from ExecuteDDL when config.use_bcp = true
 	void InitializeBCP(ClientContext &context);
+
+	// Build the INSERT BULK text from bcp_target / bcp_columns / config.bcp_tablock
+	string BuildInsertBulkSql() const;
 
 	// Execute INSERT BULK command to start BCP session
 	void ExecuteBCPInsert(ClientContext &context);
