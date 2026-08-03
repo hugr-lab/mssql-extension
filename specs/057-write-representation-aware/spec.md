@@ -1731,3 +1731,134 @@ this stopgap does not:
   Integers refuse (a value that does not fit is a different number); strings
   truncate to the column's stated bound and count it. Those two are consistent
   with each other but the rule has never been written down as a rule.
+
+---
+
+# `flush_rows` is a server instruction, not a buffer size (user, 2026-08-03)
+
+The step-2 item was written as "a byte-based flush threshold, because 100 000
+rows means 10 MB on a narrow table and 400 MB on a wide one". That framing is
+wrong, or rather it answers a question that belongs to someone else: how much the
+client holds before sending is the **pipeline's** concern, and steps 4-5 remove
+it by encoding into wire frames and streaming them as they fill, so the batch
+size stops implying a buffer size at all.
+
+What `flush_rows` actually controls is the **boundary the server sees between
+DONE tokens**, and for a columnstore target that boundary has a physical
+threshold: SQL Server writes a bulk-load batch straight into a compressed
+rowgroup only when the batch carries **102 400 rows or more**. Below it, the rows
+go to the delta store and stay there until something rebuilds them.
+
+## Measured, and the mechanism is visible rather than inferred
+
+1M rows x 4 columns into a `table_kind = 'columnstore'` target, local SQL Server
+2022, everything else at defaults:
+
+| `flush_rows` | rowgroups afterwards | size on disk | wall |
+| --- | --- | --- | --- |
+| **100 000** (the shipped default) | `OPEN: groups=1 rows=1000000` | **53 MB** | 4.09 s |
+| **102 400** | `COMPRESSED: groups=9 rows=921600` + `OPEN: rows=78400` | **7 MB** | 3.22 s |
+
+`sys.column_store_row_groups.state_description` says it outright: at the default,
+**not one row is compressed**. All 1M sit in a single open delta-store rowgroup —
+a delta rowgroup only closes on its own at 1 048 576 rows, so a load of any
+smaller size simply never compresses.
+
+**7.6x on disk, from a 2400-row difference.** The -21% wall is the least
+interesting number here.
+
+## So this is a defect in spec 060's headline feature
+
+`mssql_default_table_kind = 'COLUMNSTORE'` exists to give the user the storage
+win — it is the lever behind the 56x the external-validation article reported.
+With the shipped `flush_rows` default it produces a columnstore table that is not
+compressed at all, and says nothing. The user asks for columnstore, gets the
+CREATE CLUSTERED COLUMNSTORE INDEX, and still stores 53 MB where 7 would do.
+
+## What to do (settled 2026-08-03, user)
+
+**One constant, one setting, one COPY parameter.** `MSSQL_DEFAULT_COPY_FLUSH_ROWS`
+becomes 102 400 — the threshold itself — and there is no columnstore special
+case, no second constant and no "was it set explicitly" flag.
+
+The alternative that was built first raised the boundary only for a
+CLUSTERED_COLUMNSTORE target, mirroring the TABLOCK policy. It worked, and it was
+rejected as more machinery than the problem deserves: batch size measured nearly
+flat on a heap (25k 0.93 s / 100k 0.78 s / 500k 0.75 s), so the extra 2400 rows
+buy nothing there and cost nothing either. A target-dependent default would be a
+rule to document, a branch to test and a surprise to debug, all to avoid a 2.4%
+change on the paths that do not care.
+
+Consequences worth stating:
+
+- A user who sets `flush_rows` lower gets exactly that, columnstore or not. The
+  regression test pins that case alongside the compressing one.
+- `ROWS_PER_BATCH` keeps describing the real boundary. It is a hint to the
+  optimizer rather than what decides rowgroup handling, but a hint that disagrees
+  with what is actually sent is worse than none.
+- **A byte-based cap is still wanted, for a different reason** — Fabric asks for
+  150 MB-1 GB batches, and a 4 KB-row table at 102 400 rows is already ~400 MB.
+  It is a cap on MEMORY, not the batch policy, and once steps 4-5 stream frames
+  as they fill it stops being urgent. Keep them separate: the row count answers
+  to the server, the byte count to the client.
+
+---
+
+# Sized string columns on a wide table — measured, and it corrects this document (2026-08-03)
+
+`mssql_default_string_length` stays at 0 (= MAX) for now; this section is the
+measurement behind that being a real choice rather than an oversight.
+
+500 000 rows x 44 columns (20 short string codes, 16 BIGINT, 4 DATETIME, 4 BIT),
+local SQL Server 2022, two interleaved passes, everything driven through the
+extension (`COPY ... (FORMAT bcp)`); the server-side state read back through
+`mssql_scan` over `sys.dm_db_partition_stats` and `sys.column_store_row_groups`.
+
+| target | `MAX` (today's default) | `string_length 200` | load ratio |
+| --- | --- | --- | --- |
+| heap | 14.09 / 14.49 s | **3.93 / 3.70 s** | **3.7x** |
+| clustered columnstore | 18.55 / 17.97 s | **8.91 / 9.39 s** | **2.0x** |
+
+| target | `MAX` size | `200` size |
+| --- | --- | --- |
+| heap | 278 MB | 278 MB |
+| clustered columnstore | **77 MB** | 85 MB |
+
+## Three findings, and the third retracts a claim made twice above
+
+1. **Load time is where sized columns pay, on both shapes.** 3.7x on a heap and
+   2.0x on a columnstore, consistent with the 2.7x / 4.1x measured earlier on
+   different fixtures. This is the argument for changing the default, and it is
+   a strong one.
+
+2. **Storage is NOT where they pay.** On a heap the two are identical to the
+   megabyte — `nvarchar(max)` holding short values is stored in-row, so the
+   pages are the same pages. Any expectation that sizing the column shrinks a
+   heap is unfounded.
+
+3. **`nvarchar(max)` does not block columnstore.** Both targets compressed the
+   same 409 600 rows, and the MAX variant was *smaller* — 77 MB against 85 MB.
+   Two sections of this document say otherwise ("`nvarchar(max)` is what blocks
+   it", § External validation; "not to create the target as `nvarchar(max)`,
+   which is what blocks columnstore", § Storage options). **Both are wrong** and
+   should be read as retracted. Columnstore has supported LOB/MAX columns since
+   SQL Server 2017; the restriction they describe belongs to 2016 and earlier.
+
+   What that changes: the article's 56x storage advantage came from the
+   columnstore alone, not from the column types, and the two findings are *not*
+   the same finding the way § External validation claimed. Sizing the columns and
+   choosing the target shape are independent levers — one buys load time, the
+   other buys storage.
+
+## Consequence for the default
+
+The case for a non-zero `mssql_default_string_length` is now narrower and better
+understood: it is worth 2-4x on load and nothing on storage. That is still a lot,
+but it no longer carries the "otherwise columnstore cannot compress" argument,
+which was the part that made it look forced.
+
+Against it, unchanged: a default length silently truncates values the user never
+declared a bound for, on data they may not have seen. The step-3g truncation
+kernel makes that loss cheap to detect and count, so revisit the default once it
+exists — the decision is easier to defend when the load can report how many
+values it cut.

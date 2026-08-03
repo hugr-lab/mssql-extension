@@ -2,6 +2,7 @@
 
 #include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
+#include "copy/bcp_config.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -77,7 +78,7 @@ struct CTASConfig {
 
 	// From mssql_copy_flush_rows setting - rows before flushing to SQL Server
 	// Applies to BCP mode only
-	idx_t bcp_flush_rows = 100000;
+	idx_t bcp_flush_rows = MSSQL_DEFAULT_COPY_FLUSH_ROWS;
 
 	// Resolved by MSSQLResolveTablock at load time; read by the INSERT BULK
 	// builder. Not a user input on its own.

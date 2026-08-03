@@ -338,7 +338,8 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// 0 = no intermediate flushes (WARNING: high memory usage for large datasets)
 	config.AddExtensionOption(
 		"mssql_copy_flush_rows",
-		"Rows before flushing to SQL Server during COPY (default: 100000, 0=no flush until end - high memory)",
+		"Rows per bulk-load batch sent to SQL Server (default: 102400 — SQL Server's threshold for writing "
+		"compressed columnstore rowgroups directly; 0 = one batch at the end, high memory)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_FLUSH_ROWS), ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_copy_tablock — 'auto' | 'true' | 'false' (spec 057 step 1).

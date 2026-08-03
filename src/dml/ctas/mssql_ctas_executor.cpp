@@ -2,6 +2,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "copy/bcp_config.hpp"
 #include "copy/bcp_writer.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"

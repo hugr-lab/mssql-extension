@@ -16,7 +16,27 @@ class ClientContext;
 // This controls memory usage on both DuckDB and SQL Server sides
 // 0 = no intermediate flushes (send all at end) - WARNING: high memory usage
 // Default 100K rows keeps buffer around 10-50MB depending on row size
-constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 100000;	 // 100K rows
+//! Rows per bulk-load batch — the boundary the SERVER sees between DONE tokens,
+//! not a client buffer size.
+//!
+//! 102 400 is SQL Server's own threshold: a batch at least this large is written
+//! straight into a COMPRESSED columnstore rowgroup, and anything smaller goes to
+//! the delta store and stays there until something rebuilds it. A delta rowgroup
+//! only closes on its own at 1 048 576 rows, so a smaller load never compresses
+//! at all.
+//!
+//! Measured (spec 057, 1M rows x 4 columns into a clustered columnstore): at the
+//! previous 100 000 default `sys.column_store_row_groups` reported a single OPEN
+//! group holding all 1M rows and 53 MB on disk; at 102 400, nine COMPRESSED
+//! groups and 7 MB. A 2400-row difference, 7.6x on disk — so
+//! `table_kind = 'columnstore'` silently did not compress, which is the entire
+//! reason a user asks for it.
+//!
+//! One constant rather than a columnstore special case: batch size measured
+//! nearly flat on a heap (25k 0.93 s / 100k 0.78 s / 500k 0.75 s), so the extra
+//! 2400 rows cost nothing there, and a target-dependent default would be a rule
+//! to explain for no gain. Set the option lower and the consequence is yours.
+constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 102400;
 
 namespace mssql {
 

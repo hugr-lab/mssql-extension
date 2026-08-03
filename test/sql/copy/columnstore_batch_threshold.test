@@ -1,0 +1,120 @@
+# name: test/sql/copy/columnstore_batch_threshold.test
+# description: a columnstore load must cross SQL Server's 102400-row rowgroup threshold (spec 057 step 2)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# SQL Server writes a bulk-load batch straight into a COMPRESSED columnstore
+# rowgroup only when the batch carries >= 102400 rows. Below that the rows go to
+# the delta store and stay there until something rebuilds them.
+#
+# The shipped flush_rows default was 100000 — 2400 rows short. So every
+# `table_kind = 'columnstore'` target the extension created was, measured on 1M
+# rows x 4 columns: one OPEN rowgroup holding all of them, and 53 MB on disk
+# against 7 MB once the threshold is crossed. The user asks for columnstore to
+# get the storage, and silently did not get it.
+#
+# The default is now the threshold itself — one constant, no columnstore special
+# case. Batch size measured nearly flat on a heap (25k 0.93 s / 100k 0.78 s /
+# 500k 0.75 s), so the extra 2400 rows cost nothing there.
+#
+# This is assertable rather than inferable: sys.column_store_row_groups reports
+# the state directly, so the test checks the mechanism and not a timing.
+#
+# 110000 rows is the smallest fixture that proves anything — it must exceed
+# 102400 so that at least one batch closes compressed, and the remainder then
+# lands in an OPEN group, which is correct and expected.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cs (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+CREATE OR REPLACE TABLE cs_src AS
+SELECT i AS id, (i % 97) AS k, 'v' || (i % 1000) AS s FROM range(110000) t(i);
+
+# -----------------------------------------------------------------------------
+# Defaults: the batch boundary IS the threshold, so rows compress.
+# -----------------------------------------------------------------------------
+statement ok
+COPY cs_src TO 'cs.dbo.CsThreshold' (FORMAT bcp, CREATE_TABLE true, replace true, table_kind 'columnstore');
+
+query I
+SELECT COUNT(*) FROM cs.dbo.CsThreshold;
+----
+110000
+
+query I
+SELECT COUNT(*) > 0 FROM mssql_scan('cs', '
+SELECT rg.total_rows FROM sys.column_store_row_groups rg
+JOIN sys.objects o ON o.object_id = rg.object_id
+WHERE o.name = ''CsThreshold'' AND rg.state_description = ''COMPRESSED''');
+----
+true
+
+# -----------------------------------------------------------------------------
+# A smaller flush_rows is obeyed exactly, even when the result is a columnstore
+# target that does not compress. Nothing overrides the value the user set — this
+# case is here to pin that, and to keep the threshold's effect attributable to
+# the batch boundary rather than to anything else the load does.
+# -----------------------------------------------------------------------------
+statement ok
+COPY cs_src TO 'cs.dbo.CsExplicit' (FORMAT bcp, CREATE_TABLE true, replace true, table_kind 'columnstore', flush_rows 50000);
+
+query I
+SELECT COUNT(*) FROM cs.dbo.CsExplicit;
+----
+110000
+
+query I
+SELECT COUNT(*) FROM mssql_scan('cs', '
+SELECT rg.total_rows FROM sys.column_store_row_groups rg
+JOIN sys.objects o ON o.object_id = rg.object_id
+WHERE o.name = ''CsExplicit'' AND rg.state_description = ''COMPRESSED''');
+----
+0
+
+# -----------------------------------------------------------------------------
+# CTAS reaches the same default through a different path — it has no
+# per-statement flush_rows option at all, so the setting is the only input.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_default_table_kind = 'COLUMNSTORE';
+
+statement ok
+CREATE OR REPLACE TABLE cs.dbo.CsCtas AS SELECT id, k, s FROM cs_src;
+
+query I
+SELECT COUNT(*) > 0 FROM mssql_scan('cs', '
+SELECT rg.total_rows FROM sys.column_store_row_groups rg
+JOIN sys.objects o ON o.object_id = rg.object_id
+WHERE o.name = ''CsCtas'' AND rg.state_description = ''COMPRESSED''');
+----
+true
+
+statement ok
+SET mssql_default_table_kind = 'HEAP';
+
+# A heap target must be untouched by any of this.
+statement ok
+COPY cs_src TO 'cs.dbo.CsHeap' (FORMAT bcp, CREATE_TABLE true, replace true);
+
+query I
+SELECT COUNT(*) FROM cs.dbo.CsHeap;
+----
+110000
+
+statement ok
+SELECT mssql_exec('cs', 'DROP TABLE dbo.CsThreshold; DROP TABLE dbo.CsExplicit; DROP TABLE dbo.CsCtas; DROP TABLE dbo.CsHeap;');
+
+statement ok
+DETACH cs;
