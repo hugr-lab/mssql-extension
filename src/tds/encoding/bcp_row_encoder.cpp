@@ -1,5 +1,6 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/write_column_ops.hpp"
@@ -249,6 +250,10 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 			mssql::codec::uuid::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
 													columns[c]);
 			break;
+		case mssql::codec::ScatterArm::Datetime:
+			mssql::codec::datetime::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+														columns[c]);
+			break;
 		// Width is a column constant too, so it belongs in the type rather than
 		// in a variable the loop re-reads.
 		case mssql::codec::ScatterArm::DirectCopy1:
@@ -332,8 +337,9 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 			CursorDirect<8>(dst, cursor, r0, rend, st.fmt);
 			break;
 		case mssql::codec::ScatterArm::Decimal:
-		case mssql::codec::ScatterArm::Guid: {
-			const bool is_dec = ops[c].arm == mssql::codec::ScatterArm::Decimal;
+		case mssql::codec::ScatterArm::Guid:
+		case mssql::codec::ScatterArm::Datetime: {
+			const auto arm = ops[c].arm;
 			for (idx_t r = r0; r < rend; r++) {
 				uint8_t *out = dst + cursor[r];
 				const idx_t idx = st.fmt.sel->get_index(r);
@@ -342,10 +348,12 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 					cursor[r] += 1;
 					continue;
 				}
-				if (is_dec) {
+				if (arm == mssql::codec::ScatterArm::Decimal) {
 					mssql::codec::decimal::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
-				} else {
+				} else if (arm == mssql::codec::ScatterArm::Guid) {
 					mssql::codec::uuid::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				} else {
+					mssql::codec::datetime::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
 				}
 				cursor[r] += 1 + w;
 			}

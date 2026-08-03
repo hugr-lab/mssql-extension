@@ -89,6 +89,46 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		ops.wire_width = target.max_length;
 		return ops;
 	}
+	switch (target.duckdb_type.id()) {
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_SEC: {
+		// The source must be the matching temporal storage: DATE is int32 days,
+		// the TIMESTAMP variants int64 ticks. Anything else is a conversion and
+		// goes the row path, which performs it.
+		const PhysicalType src = source.InternalType();
+		const bool date_ok = target.duckdb_type.id() == LogicalTypeId::DATE && src == PhysicalType::INT32 &&
+							 source.id() == LogicalTypeId::DATE && target.max_length == 3;
+		// The width the kernel WRITES must equal the width the chunk was sized
+		// from, or every later column in the row lands where the server is not
+		// looking. The row path never had this constraint because it appends —
+		// whatever it writes IS the layout. The scatter reserves first.
+		//
+		// This is not hypothetical: `datetime`, `datetime2` and `smalldatetime`
+		// all declare TDS_TYPE_DATETIME2 on the wire, but sys.columns reports
+		// max_length 8, 6/7/8 and 4 respectively. An old `datetime` column at
+		// scale 0 is sized 8 and would be written 6, desynchronising the stream
+		// with "premature end-of-message". Those targets keep the row path, which
+		// gets them right.
+		const uint32_t dt2_written =
+			static_cast<uint32_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale)) + 3;
+		const bool ts_ok = target.duckdb_type.id() != LogicalTypeId::DATE && src == PhysicalType::INT64 &&
+						   target.max_length == dt2_written;
+		if (date_ok || ts_ok) {
+			ops.arm = ScatterArm::Datetime;
+			ops.wire_width = target.max_length;
+			return ops;
+		}
+		ops.arm = ScatterArm::RowFallback;
+		ops.wire_width = target.max_length;
+		return ops;
+	}
+	default:
+		break;
+	}
+
 	if (target.duckdb_type.id() == LogicalTypeId::UUID) {
 		if (source.id() == LogicalTypeId::UUID && target.max_length == 16) {
 			ops.arm = ScatterArm::Guid;

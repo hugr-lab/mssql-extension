@@ -213,6 +213,126 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 }
 
 //===----------------------------------------------------------------------===//
+// Columnar scatter (spec 057 step 3)
+//
+// One call per COLUMN per block, with every column-invariant hoisted. What the
+// per-value path was paying for constants:
+//
+//   * `EncodeTime` computed its divisor with a LOOP — `for (i < 6 - scale)
+//     divisor *= 10` — up to six multiplies per value for a number fixed by the
+//     column's scale.
+//   * `GetTimeByteSize(scale)` ran per value.
+//   * `ComputeDatetime2Components` recomputed source_per_sec, source_per_day,
+//     target_per_sec and the scale DIRECTION per value, plus a division.
+//   * every byte of the payload went out through its own push_back.
+//
+// All of those are metadata. Here they are resolved once and the loop writes the
+// payload with two sized memcpys — the time field and the 3-byte date — whose
+// widths are template parameters.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
+void ScatterDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				int64_t per_day, int64_t factor, uint8_t total_size) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t raw = src[idx];
+		int64_t days;
+		int64_t sub;
+		if (raw >= 0) {
+			days = raw / per_day;
+			sub = raw % per_day;
+		} else {
+			days = (raw - per_day + 1) / per_day;
+			sub = raw - days * per_day;
+		}
+		const uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
+		const uint64_t time_value = UPSCALE ? static_cast<uint64_t>(sub * factor) : static_cast<uint64_t>(sub / factor);
+		out[0] = total_size;
+		std::memcpy(out + 1, &time_value, TIME_BYTES);
+		// Three bytes, not four: a uint32 memcpy would clobber the next column.
+		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
+	}
+}
+
+template <bool UPSCALE, int TIME_BYTES>
+void ScatterDt2Sel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				   int64_t per_day, int64_t factor, uint8_t total_size) {
+	if (fmt.sel->IsSet()) {
+		ScatterDt2<UPSCALE, TIME_BYTES, true>(dst, stride, row_begin, rows, fmt, per_day, factor, total_size);
+	} else {
+		ScatterDt2<UPSCALE, TIME_BYTES, false>(dst, stride, row_begin, rows, fmt, per_day, factor, total_size);
+	}
+}
+
+template <bool HAS_SEL>
+void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
+		out[0] = 3;
+		std::memcpy(out + 1, &days, 3);
+	}
+}
+
+}  // namespace
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+	if (col.duckdb_type.id() == LogicalTypeId::DATE) {
+		if (fmt.sel->IsSet()) {
+			ScatterDate<true>(dst, stride, row_begin, rows, fmt);
+		} else {
+			ScatterDate<false>(dst, stride, row_begin, rows, fmt);
+		}
+		return;
+	}
+
+	const int64_t source_per_sec = TicksPerSecondFor(in.GetType().id());
+	const int64_t per_day = source_per_sec * SECONDS_PER_DAY;
+	const int64_t target_per_sec = Pow10(col.scale);
+	const bool upscale = target_per_sec >= source_per_sec;
+	const int64_t factor = upscale ? target_per_sec / source_per_sec : source_per_sec / target_per_sec;
+	const uint8_t time_size = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+	const uint8_t total = static_cast<uint8_t>(time_size + 3);
+
+#define MSSQL_DT2_ARM(up, tb) ScatterDt2Sel<up, tb>(dst, stride, row_begin, rows, fmt, per_day, factor, total)
+	if (upscale) {
+		switch (time_size) {
+		case 3:
+			MSSQL_DT2_ARM(true, 3);
+			return;
+		case 4:
+			MSSQL_DT2_ARM(true, 4);
+			return;
+		default:
+			MSSQL_DT2_ARM(true, 5);
+			return;
+		}
+	}
+	switch (time_size) {
+	case 3:
+		MSSQL_DT2_ARM(false, 3);
+		return;
+	case 4:
+		MSSQL_DT2_ARM(false, 4);
+		return;
+	default:
+		MSSQL_DT2_ARM(false, 5);
+		return;
+	}
+#undef MSSQL_DT2_ARM
+}
+
+//===----------------------------------------------------------------------===//
 // DecodeFromTds
 //===----------------------------------------------------------------------===//
 

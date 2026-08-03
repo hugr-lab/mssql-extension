@@ -66,6 +66,9 @@ enum class ScatterArm : uint8_t {
 	//! Sign byte plus little-endian magnitude, width from the target's precision.
 	//! MONEY and SMALLMONEY map to DECIMAL and arrive here too.
 	Decimal,
+	//! DATE (3 bytes) and the DATETIME2 family (time 3/4/5 + date 3). TIME and
+	//! DATETIMEOFFSET are not here yet and take the row path.
+	Datetime,
 	//! The 16 wire bytes of a UNIQUEIDENTIFIER (mixed-endian by the spec, which
 	//! is why it is a kernel and not a copy).
 	Guid,
