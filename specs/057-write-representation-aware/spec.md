@@ -2451,6 +2451,55 @@ default (silent truncation risk), or size from source statistics — `stats()`
 gives an exact string length for a DuckDB table and nothing for Parquet
 (spec 060's sizing note).
 
+## Step 6 — CLOSED on measurement (2026-08-03)
+
+Representation-awareness means converting each DISTINCT value once instead of
+once per row. Four cases, and only one of them was still open:
+
+**Fixed-width families — already subsumed.** This spec's own prototype (see
+"Columnar scatter measured") reached 1.8-2.1 ns/value on constant and dictionary
+inputs *without knowing they were either*, against 3.9-5.7 for representation-aware
+encoding that did know. There is nothing left to save once the per-value work is
+two stores.
+
+**ASCII strings — already free.** The ASCII path added in step 3 makes an
+all-ASCII nvarchar column convert with no simdutf call at all: the UTF-16 length
+is twice the source length and the encoding is a widening loop. String encode
+halved.
+
+**Low-cardinality columns from a DuckDB table — invisible.** Probed: a column of
+100 distinct values scanned from a DuckDB table arrives **FLAT with no selection
+vector**. The dictionary structure would have to be DETECTED, which is exactly
+what closed spec 056 ("detection costs more than it saves").
+
+**Non-ASCII strings behind a DICTIONARY vector — the only remaining case, and it
+is real.** A join (`fact JOIN dim`) delivers `VectorType::DICTIONARY` with a
+selection vector, so it is free to identify. Measured on 1M rows x 4 columns,
+100 distinct values, minimum of three runs:
+
+| | nvarchar (converts per row) | UTF-8 target (no conversion) | difference |
+| --- | --- | --- | --- |
+| ASCII | 142.2 ms | 99.9 ms | 10.6 ns/value |
+| Cyrillic | 195.3 ms | 147.8 ms | **11.9 ns/value** |
+
+**Only the Cyrillic row isolates the conversion**, and the reason is worth
+recording because the first reading of this table was wrong: `nvarchar - utf8`
+measures the conversion AND the byte volume, and for ASCII the UTF-8 form is HALF
+the bytes. For Cyrillic both encodings are 2 bytes per character, so the volume
+is identical and the difference is conversion alone. (An earlier two-sample run
+of the same pair read 36.2 ns/value; three samples put it at 11.9. Two samples
+were not a measurement.)
+
+So the ceiling is **11.9 ns/value against a sink of 169 ns/value — 7%** on a
+table that is *nothing but* non-ASCII dictionary-backed strings. On the
+44-column fixture the applicable columns are two of forty-four and they arrive
+FLAT, so it applies to none of them.
+
+Closed. The case is identified rather than dismissed: if a star-schema load of
+non-ASCII dimensions is ever reported slow, the shape (`VectorType::DICTIONARY`
++ non-ASCII + string) is known and the implementation is "convert each child
+entry once into a scratch, then memcpy per row".
+
 ## Steps not started
 
-6 (representation-aware for strings), 7 (`PARALLEL N`).
+7 (`PARALLEL N`).
