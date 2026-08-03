@@ -1111,12 +1111,29 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 	// Convert microseconds to the appropriate scale
 	int64_t scaled_value;
 	if (scale <= 6) {
-		// Divide for scales 0-6
+		// ROUND, and saturate at the last tick of the day — not truncate.
+		//
+		// This truncated, while the columnar kernel rounds, so the same TIME value
+		// loaded as .123 or .124 depending on whether some OTHER column in the
+		// chunk happened to force the row path. Spec 057 taught datetime2 to round
+		// (rounding is what SQL Server does: CAST('12:34:56.600' AS time(0)) is
+		// 12:34:57) and this peer was missed.
+		//
+		// The saturation is the half a TIME cannot solve by carrying, having no
+		// date field: CAST('23:59:59.999999' AS time(0)) is 23:59:59 on the
+		// server, so rounding must stop at per_day - 1 rather than reach 86400.
 		int64_t divisor = 1;
 		for (int i = 0; i < 6 - scale; i++) {
 			divisor *= 10;
 		}
-		scaled_value = value.micros / divisor;
+		scaled_value = (value.micros + divisor / 2) / divisor;
+		int64_t per_day = Interval::SECS_PER_DAY;
+		for (int i = 0; i < scale; i++) {
+			per_day *= 10;
+		}
+		if (scaled_value >= per_day) {
+			scaled_value = per_day - 1;
+		}
 	} else {
 		// Multiply for scale 7 (100ns units)
 		scaled_value = value.micros * 10;

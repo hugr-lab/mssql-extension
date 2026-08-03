@@ -319,15 +319,24 @@ void ScatterDt2Sel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, con
 // TIME simply stops after the time field.
 template <int TIME_BYTES, bool UPSCALE, bool HAS_SEL>
 void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-				 int64_t factor, int64_t half) {
+				 int64_t factor, int64_t half, int64_t per_day) {
 	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
 		uint8_t *out = dst + r * stride;
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
 		const int64_t micros = src[idx];
-		const uint64_t ticks =
+		uint64_t ticks =
 			UPSCALE ? static_cast<uint64_t>(micros * factor) : static_cast<uint64_t>((micros + half) / factor);
+		// Rounding at the last tick of the day has nowhere to carry — a TIME has
+		// no date field, which is exactly why its datetime2 and datetimeoffset
+		// peers can carry and this cannot. SQL Server SATURATES rather than
+		// wrapping: CAST('23:59:59.999999' AS time(0)) is 23:59:59, not 24:00:00
+		// and not 00:00:00. Without this the kernel emitted 86400, which is
+		// outside the type's domain in either direction.
+		if (ticks >= static_cast<uint64_t>(per_day)) {
+			ticks = static_cast<uint64_t>(per_day) - 1;
+		}
 		out[0] = TIME_BYTES;
 		std::memcpy(out + 1, &ticks, TIME_BYTES);
 	}
@@ -435,37 +444,38 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		const bool up = target_per_sec >= 1000000;
 		const int64_t f = up ? target_per_sec / 1000000 : 1000000 / target_per_sec;
 		const int64_t h = up ? 0 : f / 2;
+		const int64_t per_day = target_per_sec * SECONDS_PER_DAY;
 		const uint8_t tb = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
 		const bool has_sel = fmt.sel->IsSet();
 		if (tb == 3) {
 			if (up && has_sel) {
-				ScatterTime<3, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<3, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<3, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<3, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<3, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<3, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<3, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<3, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			}
 		} else if (tb == 4) {
 			if (up && has_sel) {
-				ScatterTime<4, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<4, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<4, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<4, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<4, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<4, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<4, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<4, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			}
 		} else {
 			if (up && has_sel) {
-				ScatterTime<5, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<5, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<5, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<5, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<5, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<5, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
 			}
 		}
 		return;
