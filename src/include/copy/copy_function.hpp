@@ -125,9 +125,17 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	std::atomic<idx_t> counter_sink_calls{0};	 // chunks handed to the sink
 	std::atomic<uint64_t> counter_sink_ns{0};	 // wall inside BCPCopySink
 	std::atomic<uint64_t> counter_encode_ns{0};	 // of which: BCPWriter::WriteRows
-	std::atomic<uint64_t> counter_flush_ns{0};	 // of which: a batch boundary, END TO END —
-												 // build + send + the server's confirmation.
-												 // NOT server time alone; see PrintWriteCounters.
+	// Snapshotted from the BCPWriter before it is reset — the writer is destroyed
+	// in BCPCopyFinalize well before the summary prints, so reading it there gave
+	// zeroes. Decomposes counter_flush_ns into the half that is ours and the half
+	// that is the server's.
+	uint64_t counter_build_send_ns = 0;
+	uint64_t counter_server_wait_ns = 0;
+	idx_t counter_send_calls = 0;
+
+	std::atomic<uint64_t> counter_flush_ns{0};	// of which: a batch boundary, END TO END —
+												// build + send + the server's confirmation.
+												// NOT server time alone; see PrintWriteCounters.
 
 	// INSERT BULK SQL (cached for re-execution on flush)
 	string insert_bulk_sql;

@@ -1862,3 +1862,113 @@ declared a bound for, on data they may not have seen. The step-3g truncation
 kernel makes that loss cheap to detect and count, so revisit the default once it
 exists — the decision is easier to defend when the load can report how many
 values it cut.
+
+---
+
+# Step 1 gate — re-measured, and it does not say what this document predicted (2026-08-03)
+
+The gate on steps 1-2 was: re-take the write phase split once TABLOCK fires and
+the batch threshold is right, because "client work measured before this is
+measured against an inflated server wait". Taken now, on the repaired
+instrument (`MSSQL_COUNTERS=1`, `MSSQL_DEBUG` unset).
+
+500k rows x 4 columns (BIGINT, BIGINT, DECIMAL(18,2), VARCHAR), new heap target,
+interleaved, 3 pairs, order fixed within a pair. "pre" reproduces the old
+behaviour with explicit options (`tablock false, flush_rows 100000`) rather than
+by comparing against a number taken earlier — same binary, same fixture, same
+machine.
+
+| | pre (old behaviour) | post (new defaults) | sized target |
+| --- | --- | --- | --- |
+| wall, median | 1.99 s | 1.33 s | **0.61 s** |
+| `flush` (end to end) | 1408 ms | 897 ms | 334 ms |
+| `encode` | ~50 ms | ~39 ms | ~32 ms |
+| **encode as a share of wall** | **2.5%** | **3.0%** | **5.2%** |
+
+Steps 1-2 are worth **-33%** on the default path, and **3.3x** together with a
+sized target (1.99 -> 0.61 s). All three pairs moved in the same direction.
+
+## The prediction was wrong
+
+This document argued that after steps 1-2 the denominator would collapse and the
+encoder's 5% would become "~12%, and build+send ~16%". It did not. The encoder is
+**5.2% of wall on a fully well-formed target** — heap, TABLOCK on, sized columns
+— which is exactly what the original reconnaissance measured before any of this
+landed.
+
+The error was arithmetic on the wrong fixture: the 4.5x that the prediction
+leaned on (1.68 -> 0.37 s) was TABLOCK *and* sized types together on the
+44-column table. On this 4-column one TABLOCK alone is 1.5x, and the client's
+share is small enough that shrinking the server does not move it.
+
+**So the "re-open D5b, the refutation has expired" note earlier in this document
+is itself now retracted.** The refutation stands: build + send remains a small
+share. What has genuinely expired is only the syscall arithmetic in it — the
+negotiated packet size has been 16384 since spec 055, so a 10 MB batch is ~640
+sends, not ~2560.
+
+## What the gate does bound
+
+- **encode: ~5% of wall**, stable across pairs. Steps 3 and 6 target that.
+- **syscalls: under ~2% of wall.** `sys` measured 0.01 s of 0.51 s and was the
+  one stable CPU figure. That bounds the "one `send()` per packet" half of D5b
+  directly, and agrees with the reconnaissance's "system time under 1%".
+- **The packet-build share — measured, once the timer went in (below).**
+
+## Consequence for the plan
+
+**Pull step 4's timer forward.** Until a timer inside `BCPWriter::FlushBatch`
+separates build + send from the server's confirmation, steps 3 and 4 cannot be
+ranked against each other — and step 4 might be worth more than step 3, or
+nothing at all. It is a small change and it belongs with the instrument work,
+not with the redesign it is supposed to justify.
+
+**And be honest about what justifies steps 3-6 now.** Not wall-clock on this
+fixture: at 5%, a perfect encoder buys 5%. What survives is what the maintainer
+already gave as the reason (§ "Decision, 2026-07-30") — it is the only item here
+that is *ours*, unconditional, and taken away by nobody's DDL, where TABLOCK,
+sizing and PARALLEL are each conditional on the target. Plus two things this
+measurement cannot see: the allocation count, which is a stated goal in its own
+right, and the emulation bias, which inflates the server's share and therefore
+**understates** the client's everywhere in this document.
+
+## `flush` decomposed — build+send is the same size as the encoder
+
+The timer was pulled forward rather than left to step 4, because without it
+steps 3 and 4 could not be ranked. It is instrumented in the **primitives**
+(`SendBulkLoadPacket`, `Finalize`) rather than in `FlushBatch`: the final batch
+does not go through `FlushBatch` at all — `BCPCopyFinalize` calls
+`WriteDone` + `Finalize` directly — and at the default batch size that is a whole
+batch of server time. Counting where the work happens covers every caller by
+construction. (The instrumentation self-checks: `server_wait` comes out *larger*
+than `flush`, which is only possible because the final batch is now included.)
+
+Same sized-target fixture, 3 passes, medians:
+
+| phase | ns/row | ms | share of ~0.60 s wall |
+| --- | ---: | ---: | ---: |
+| `encode` | 75 | 37.7 | ~6% |
+| **`build_send`** | **75** | **37.6** | **~6%** |
+| `server_wait` | 720 | 360 | ~60% |
+
+**Build+send is not small — it is the same size as the encoder.** The
+reconnaissance's "build + send is 7%, so D5b is refuted" measured it as a share
+of a badly-defined target's wall; against a correct target the two client phases
+are equal, and together they are **~12.5% of wall**, not 5%.
+
+At ~25 MB of wire per run, 37.6 ms is roughly 665 MB/s — far below memcpy, which
+is what three passes over the data (accumulator -> `vector<TdsPacket>` ->
+`Serialize()`) plus a per-packet allocation would predict. So the number agrees
+with the mechanism D5b describes, even though the syscall half of that argument
+is bounded under 2% (`sys` = 0.01 s).
+
+### What this changes
+
+- **Steps 3 and 4 are worth about the same**, ~6% of wall each. Step 4 may be the
+  better trade: it removes three copies and a per-packet allocation outright,
+  where the encoder is already hoisted and dispatch-resolved (spec 054 W1/W2).
+- The two compose — encoding **into** the wire frames is one pass instead of
+  encode-then-copy-thrice, so doing 3 and 4 together is worth more than the sum,
+  which is what §D5b already argued from the buffer-shape side.
+- `other` stays ~60 us across 500k rows, so nothing is hiding in the sink outside
+  these two.

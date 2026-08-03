@@ -755,6 +755,16 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 // whole batch sitting outside this summary.
 //===----------------------------------------------------------------------===//
 
+// Must run before gdata.writer.reset(), which happens on every exit path.
+static void SnapshotWriterCounters(MSSQLCopyGlobalState &gdata) {
+	if (!gdata.writer) {
+		return;
+	}
+	gdata.counter_build_send_ns = gdata.writer->GetBuildSendNs();
+	gdata.counter_server_wait_ns = gdata.writer->GetServerWaitNs();
+	gdata.counter_send_calls = gdata.writer->GetSendCalls();
+}
+
 static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 	if (!mssql::CountersEnabled()) {
 		return;
@@ -765,6 +775,9 @@ static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 				"below — these numbers include it. For timings use MSSQL_COUNTERS=1 with MSSQL_DEBUG unset.\n");
 	}
 
+	const uint64_t build_send_ns = gdata.counter_build_send_ns;
+	const uint64_t server_wait_ns = gdata.counter_server_wait_ns;
+	const idx_t send_calls = gdata.counter_send_calls;
 	const uint64_t sink_ns = gdata.counter_sink_ns.load();
 	const uint64_t encode_ns = gdata.counter_encode_ns.load();
 	const uint64_t flush_ns = gdata.counter_flush_ns.load();
@@ -780,10 +793,21 @@ static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 			(unsigned long long)(encode_ns / 1000), (unsigned long long)(flush_ns / 1000),
 			(unsigned long long)(other_ns / 1000));
 
+	// The decomposition of `flush`, counted in the primitives so the FINAL batch —
+	// which BCPCopyFinalize sends through WriteDone + Finalize rather than through
+	// FlushBatch — is included. Without this split, build+send and the server's
+	// confirmation are one number and steps 3 and 4 cannot be ranked against each
+	// other (spec 057, step 1 gate).
+	fprintf(stderr, "[MSSQL COUNTERS]   wire: build_send=%lluus over %llu sends | server_wait=%lluus\n",
+			(unsigned long long)(build_send_ns / 1000), (unsigned long long)send_calls,
+			(unsigned long long)(server_wait_ns / 1000));
+
 	if (rows > 0) {
 		const double r = static_cast<double>(rows);
 		fprintf(stderr, "[MSSQL COUNTERS]   ns/row: sink=%.1f encode=%.1f flush=%.1f other=%.1f\n", sink_ns / r,
 				encode_ns / r, flush_ns / r, other_ns / r);
+		fprintf(stderr, "[MSSQL COUNTERS]   ns/row: build_send=%.1f server_wait=%.1f\n", build_send_ns / r,
+				server_wait_ns / r);
 		if (cols > 0) {
 			const double v = r * static_cast<double>(cols);
 			fprintf(stderr, "[MSSQL COUNTERS]   ns/value: sink=%.2f encode=%.2f other=%.2f\n", sink_ns / v,
@@ -839,6 +863,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		}
 
 		// Release the writer
+		SnapshotWriterCounters(gdata);
 		gdata.writer.reset();
 	};
 
@@ -917,6 +942,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	}
 
 	// Release the writer
+	SnapshotWriterCounters(gdata);
 	gdata.writer.reset();
 
 	// Note: BCPWriter::Finalize() already transitions connection back to Idle state

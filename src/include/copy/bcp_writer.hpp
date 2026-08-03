@@ -118,6 +118,17 @@ public:
 		return rows_in_batch_.load();
 	}
 
+	//! Phase counters (spec 057). Zero unless the timers ran; see the members.
+	uint64_t GetBuildSendNs() const {
+		return counter_build_send_ns_.load();
+	}
+	uint64_t GetServerWaitNs() const {
+		return counter_server_wait_ns_.load();
+	}
+	idx_t GetSendCalls() const {
+		return counter_send_calls_.load();
+	}
+
 	// Get current accumulator buffer size in bytes
 	size_t GetAccumulatorSize() const {
 		return accumulator_buffer_.size();
@@ -181,6 +192,21 @@ private:
 	std::atomic<idx_t> rows_sent_{0};	   // Total rows sent across all batches
 	std::atomic<idx_t> bytes_sent_{0};	   // Total bytes sent across all batches
 	std::atomic<idx_t> rows_in_batch_{0};  // Rows in current batch (resets on flush)
+
+	// Spec 057 step 1 gate: the two halves of what the COPY counters report as a
+	// single `flush`. Instrumented in the PRIMITIVES rather than in FlushBatch,
+	// because the final batch does not go through FlushBatch at all —
+	// BCPCopyFinalize calls WriteDone + Finalize directly, and at the default
+	// batch size that is a whole batch of server time. Counting where the work
+	// happens covers every caller by construction.
+	//
+	//   build_send  SendBulkLoadPacket: fragmenting the accumulator into TDS
+	//               packets, prepending headers, and the send() calls. This is
+	//               D5b's target and, until now, invisible.
+	//   server_wait Finalize: blocking until SQL Server confirms the batch.
+	std::atomic<uint64_t> counter_build_send_ns_{0};
+	std::atomic<uint64_t> counter_server_wait_ns_{0};
+	std::atomic<idx_t> counter_send_calls_{0};
 
 	// Packet ID counter for TDS protocol
 	uint8_t packet_id_ = 1;

@@ -59,6 +59,23 @@ static void BCPDebugLog(int level, const char *format, ...) {
 using Clock = std::chrono::high_resolution_clock;
 using TimePoint = std::chrono::time_point<Clock>;
 
+// Accumulate a phase into an atomic on scope exit, so an early return or a throw
+// cannot leave the counter short. Nanoseconds: spec 055 D0 caught microsecond
+// accumulation truncating short intervals to zero. One instance per batch, not
+// per value, so it is not on any hot path.
+namespace {
+struct ScopedNs {
+	std::atomic<uint64_t> &sink;
+	TimePoint start;
+	explicit ScopedNs(std::atomic<uint64_t> &sink_p) : sink(sink_p), start(Clock::now()) {}
+	~ScopedNs() {
+		sink.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()),
+			std::memory_order_relaxed);
+	}
+};
+}  // namespace
+
 static double ElapsedMs(TimePoint start) {
 	auto end = Clock::now();
 	return std::chrono::duration<double, std::milli>(end - start).count();
@@ -208,6 +225,9 @@ void BCPWriter::WriteDone(idx_t row_count) {
 }
 
 idx_t BCPWriter::Finalize() {
+	// Blocking on SQL Server's confirmation — the other half of `flush`, and the
+	// one no amount of client work can shrink.
+	ScopedNs phase(counter_server_wait_ns_);
 	// Read the server response after DONE token
 	// We expect a DONE token with the row count
 	auto start_total = Clock::now();
@@ -532,6 +552,10 @@ void BCPWriter::BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count) {
 //===----------------------------------------------------------------------===//
 
 void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) {
+	// Packet fragmentation, header prepending and the send() calls — the half of
+	// what the COPY summary reports as `flush` that is ours, and D5b's target.
+	ScopedNs phase(counter_build_send_ns_);
+	counter_send_calls_.fetch_add(1, std::memory_order_relaxed);
 	auto start_total = Clock::now();
 	BCPDebugLog(2, "SendBulkLoadPacket: buffer_size=%zu, is_last=%d, packet_id=%u", buffer.size(), is_last ? 1 : 0,
 				packet_id_);
