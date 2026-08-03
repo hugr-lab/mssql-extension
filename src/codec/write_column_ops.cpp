@@ -84,8 +84,17 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		ops.arm = ((string_target || binary_target) && string_source) ? ScatterArm::VarString : ScatterArm::RowFallback;
 		return ops;
 	}
+	if (ops.kind == WireKind::Plp) {
+		// nvarchar(max) / varchar(max) / varbinary(max). Same arm: the plan owns
+		// the framing difference, so nothing else here has to know about it.
+		const bool str_or_bin = target.tds_type_token == tds::TDS_TYPE_NVARCHAR ||
+								target.tds_type_token == tds::TDS_TYPE_BIGVARCHAR ||
+								target.tds_type_token == tds::TDS_TYPE_BIGVARBINARY;
+		const bool string_source = source.InternalType() == PhysicalType::VARCHAR;
+		ops.arm = (str_or_bin && string_source) ? ScatterArm::VarString : ScatterArm::RowFallback;
+		return ops;
+	}
 	if (ops.kind != WireKind::Fixed) {
-		// PLP/MAX still needs its framing planned; row path for now.
 		ops.arm = ScatterArm::RowFallback;
 		return ops;
 	}

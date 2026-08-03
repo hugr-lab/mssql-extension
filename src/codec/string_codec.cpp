@@ -485,27 +485,41 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		return false;  // XML and anything else: not planned yet
 	}
 
+	plan.plp = col.IsPLPType();
 	plan.lengths.resize(rows);
+	plan.wire.resize(rows);
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
 	for (idx_t r = 0; r < rows; r++) {
 		const idx_t idx = fmt.sel->get_index(row_begin + r);
 		if (!fmt.validity.RowIsValid(idx)) {
 			plan.lengths[r] = 0;
+			// PLP NULL is eight 0xFF bytes; the USHORT form is 0xFFFF.
+			plan.wire[r] = plan.plp ? 8 : 2;
 			continue;
 		}
 		const auto &sv = strings[idx];
+		uint32_t len;
 		if (plan.kind != VarKind::NVarchar) {
-			plan.lengths[r] = static_cast<uint32_t>(sv.GetSize());
-			continue;
+			len = static_cast<uint32_t>(sv.GetSize());
+		} else {
+			bool valid = false;
+			const size_t u16 = tds::encoding::Utf16LEByteLengthView(sv.GetData(), sv.GetSize(), valid);
+			if (!valid) {
+				// Invalid UTF-8 takes the legacy per-value fallback, which
+				// reproduces pre-spec-043 bytes exactly. Not worth planning around.
+				return false;
+			}
+			len = static_cast<uint32_t>(u16);
 		}
-		bool valid = false;
-		const size_t u16 = tds::encoding::Utf16LEByteLengthView(sv.GetData(), sv.GetSize(), valid);
-		if (!valid) {
-			// Invalid UTF-8 takes the legacy per-value fallback, which reproduces
-			// pre-spec-043 bytes exactly. Not worth planning around.
-			return false;
+		plan.lengths[r] = len;
+		if (!plan.plp) {
+			plan.wire[r] = 2 + len;
+		} else if (len == 0) {
+			// Empty PLP: header plus the zero terminator, no data chunk.
+			plan.wire[r] = 12;
+		} else {
+			plan.wire[r] = 16 + len;
 		}
-		plan.lengths[r] = static_cast<uint32_t>(u16);
 	}
 	return true;
 }
@@ -531,9 +545,8 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 		uint8_t *out = dst + cursor[r];
 		const idx_t idx = fmt.sel->get_index(r);
 		if (!fmt.validity.RowIsValid(idx)) {
-			out[0] = 0xFF;
-			out[1] = 0xFF;
-			cursor[r] += 2;
+			std::memset(out, 0xFF, plan.plp ? 8 : 2);
+			cursor[r] += plan.wire[r];
 			continue;
 		}
 		const uint32_t len = plan.lengths[r];
@@ -555,15 +568,29 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 					col.name, static_cast<size_t>(len), col.max_length);
 			}
 		}
-		out[0] = static_cast<uint8_t>(len & 0xFF);
-		out[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
 		const auto &sv = strings[idx];
-		if (convert) {
-			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), sv.GetSize(), out + 2);
+		uint8_t *payload;
+		if (!plan.plp) {
+			out[0] = static_cast<uint8_t>(len & 0xFF);
+			out[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
+			payload = out + 2;
 		} else {
-			std::memcpy(out + 2, sv.GetData(), len);
+			WritePlpHeader(out);
+			if (len == 0) {
+				WriteLe32(out + 8, 0);
+				cursor[r] += plan.wire[r];
+				continue;
+			}
+			WriteLe32(out + 8, len);
+			WriteLe32(out + 12 + len, 0);
+			payload = out + 12;
 		}
-		cursor[r] += 2 + len;
+		if (convert) {
+			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), sv.GetSize(), payload);
+		} else {
+			std::memcpy(payload, sv.GetData(), len);
+		}
+		cursor[r] += plan.wire[r];
 	}
 }
 

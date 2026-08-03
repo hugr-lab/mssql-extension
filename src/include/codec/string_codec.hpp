@@ -147,8 +147,21 @@ std::string EscapeSqlSingleQuotes(const std::string &str);
 enum class VarKind : uint8_t { NVarchar, Utf8Varchar, Binary };
 
 struct StringColumnPlan {
+	//! Payload bytes per row — UTF-16 for nvarchar, source bytes otherwise, 0 for
+	//! NULL.
 	duckdb::vector<uint32_t> lengths;
+	//! TOTAL bytes row r occupies on the wire for this column, framing included.
+	//!
+	//! The plan owns its own framing arithmetic rather than leaving the caller to
+	//! add "2 for the prefix": the caller got that wrong once already (one byte
+	//! instead of two), and the only symptom was the server reporting a premature
+	//! end-of-message, because every row was laid out a byte short. PLP would
+	//! have been a second chance to make the same mistake with different numbers.
+	duckdb::vector<uint32_t> wire;
 	VarKind kind = VarKind::NVarchar;
+	//! PLP framing (8-byte header, 4-byte chunk length, payload, 4-byte
+	//! terminator; 8 bytes of 0xFF for NULL) rather than a 2-byte prefix.
+	bool plp = false;
 };
 
 //! Write one block of a planned variable-length column at the cursor positions.

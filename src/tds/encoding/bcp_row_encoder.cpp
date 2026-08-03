@@ -440,12 +440,12 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		row_at.resize(row_count);
 		size_t base_row = 1;  // the 0xD1 token
 		for (idx_t c = 0; c < ncols; c++) {
-			// A variable column's prefix is TWO bytes (0xFFFF means NULL), not the
-			// one a fixed column's length byte takes; its payload is added per row
-			// below. Getting this wrong is invisible until the server reports
-			// "premature end-of-message", because the rows are simply laid out one
-			// byte short each and every later column lands off by that much.
-			base_row += ops[c].IsVariable() ? 2 : (1 + widths[c]);
+			// A variable column contributes NOTHING to the constant part: its plan
+			// carries the total wire bytes per row, framing included, and those
+			// are added below. Splitting framing between here and there is what
+			// produced a one-byte-short row the first time, visible only as the
+			// server reporting "premature end-of-message".
+			base_row += ops[c].IsVariable() ? 0 : (1 + widths[c]);
 		}
 		for (idx_t r = 0; r < row_count; r++) {
 			row_at[r] = base_row;
@@ -453,12 +453,10 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		for (idx_t c = 0; c < ncols; c++) {
 			auto &st = states[c];
 			if (ops[c].IsVariable()) {
-				// The 2-byte prefix is already in base_row; add each row's own
-				// payload. A NULL planned to length 0 and its prefix is 0xFFFF,
-				// so the same arithmetic covers it.
-				const auto &len = plans[c].lengths;
+				// Framing included — one number per row, whatever the wire form.
+				const auto &wire = plans[c].wire;
 				for (idx_t r = 0; r < row_count; r++) {
-					row_at[r] += len[r];
+					row_at[r] += wire[r];
 				}
 				continue;
 			}
