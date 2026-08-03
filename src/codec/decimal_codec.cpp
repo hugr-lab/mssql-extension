@@ -95,6 +95,76 @@ void CheckMantissaFitsPrecision(const hugeint_t &value, const mssql::BCPColumnMe
 	}
 }
 
+// The scale the SOURCE mantissa is expressed in. HUGEINT and any integer routed
+// into this family behave as DECIMAL(p, 0).
+int32_t SourceScale(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::DECIMAL) {
+		return static_cast<int32_t>(DecimalType::GetScale(type));
+	}
+	return 0;
+}
+
+// Move the point so the mantissa means the same number at the TARGET's scale.
+//
+// Without this the source mantissa went on the wire unchanged while COLMETADATA
+// declared the target column's scale, and SQL Server read it there: a
+// DECIMAL(21,1) value of 1.5 loaded into a `decimal(18,2)` column came back as
+// 0.15. No error, on either side — the mantissa 15 is perfectly valid at scale
+// 2, it just means something else. Only COPY into an EXISTING table could hit
+// it; CTAS and CREATE_TABLE derive the column from the source type, so the
+// scales agree by construction, which is why it survived this long.
+//
+// `shift` is a per-COLUMN constant — both scales are fixed for the whole chunk —
+// so the columnar encoder (step 3) resolves it once alongside the column's
+// kernel and this function stays a pure arithmetic step.
+hugeint_t RescaleMantissa(hugeint_t mantissa, int32_t shift, const mssql::BCPColumnMetadata &col) {
+	if (shift == 0) {
+		return mantissa;
+	}
+	if (shift > 0) {
+		// Widening the scale is exact: append zeros. Guard the multiply itself —
+		// CheckMantissaFitsPrecision runs afterwards and would catch an
+		// out-of-range result, but not an int128 that already wrapped.
+		if (shift > 38) {
+			throw InvalidInputException(
+				"MSSQL: DECIMAL column \"%s\" declares scale %d against a source of scale %d; the difference exceeds "
+				"DECIMAL's 38-digit range",
+				col.name, static_cast<int>(col.scale), static_cast<int>(col.scale) - shift);
+		}
+		const hugeint_t limit = Hugeint::POWERS_OF_TEN[38 - shift];
+		if (Hugeint::GreaterThan(mantissa, limit) || Hugeint::GreaterThan(Hugeint::Negate(limit), mantissa)) {
+			throw InvalidInputException(
+				"MSSQL: DECIMAL value (mantissa %s) in column \"%s\" does not fit DECIMAL(%d,%d) once rescaled from "
+				"scale %d",
+				Hugeint::ToString(mantissa), col.name, static_cast<int>(col.precision), static_cast<int>(col.scale),
+				static_cast<int>(col.scale) - shift);
+		}
+		return mantissa * Hugeint::POWERS_OF_TEN[shift];
+	}
+
+	// Narrowing: the column holds fewer decimals than the source. Round half away
+	// from zero, which is what SQL Server's own decimal-to-decimal conversion
+	// does — so the row lands exactly as it would had the user written the CAST.
+	// Erroring instead would reject data SQL Server accepts.
+	const int32_t down = -shift;
+	if (down > 38) {
+		return hugeint_t(0);
+	}
+	const hugeint_t divisor = Hugeint::POWERS_OF_TEN[down];
+	const hugeint_t quotient = mantissa / divisor;
+	const hugeint_t remainder = mantissa % divisor;
+	// |remainder| < divisor <= 10^38, so negating it cannot overflow (unlike the
+	// mantissa itself — see CheckMantissaFitsPrecision).
+	const hugeint_t abs_remainder =
+		Hugeint::GreaterThan(hugeint_t(0), remainder) ? Hugeint::Negate(remainder) : remainder;
+	// Powers of ten above 10^0 are even, so half is exact.
+	const hugeint_t half = divisor / 2;
+	if (!Hugeint::GreaterThan(half, abs_remainder)) {
+		return Hugeint::GreaterThan(hugeint_t(0), mantissa) ? quotient - 1 : quotient + 1;
+	}
+	return quotient;
+}
+
 }  // namespace
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
@@ -148,6 +218,9 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	hugeint_t value = WidenVectorToHugeint(in, fmt, row);
+	// Rescale BEFORE the precision check: the check is against the target column,
+	// and until this point the mantissa is still expressed at the source's scale.
+	value = RescaleMantissa(value, static_cast<int32_t>(col.scale) - SourceScale(in.GetType()), col);
 	CheckMantissaFitsPrecision(value, col);
 	tds::encoding::BCPRowEncoder::EncodeDecimal(buf, value, col.precision, col.scale);
 }
