@@ -24,6 +24,8 @@
 #include "tds/encoding/utf16.hpp"
 
 #include <cstring>
+#include <limits>
+#include <type_traits>
 
 namespace duckdb {
 namespace tds {
@@ -223,6 +225,235 @@ inline void ScatterDirect(uint8_t *dst, size_t stride, idx_t row_begin, idx_t ro
 	}
 }
 
+// An integer whose source width differs from the target's (issue #153).
+//
+// The pair is a COLUMN property, so both the read width and the write width are
+// template parameters and the loop carries no type test — that is the whole
+// difference from the row path, which re-dispatched on the source's PhysicalType
+// for every value even though the answer could not change within a column.
+//
+// Two facts keep the check off the widening path, which is the common one:
+//
+//   * a widening cannot fail, and `sizeof` is known at compile time, so the
+//     `if` below is folded away entirely for TINYINT -> int, INTEGER -> bigint
+//     and friends. Those become a sign-extending load and a store;
+//   * a narrowing needs the check, but not a BRANCH. `bad` is an OR reduction
+//     over the block, so the loop still vectorises; only after it does anything
+//     look at the result.
+//
+// Refusing rather than wrapping matches the row path and is the deliberate
+// choice: an integer that does not fit is a different number, and SQL Server
+// refuses the row itself. (Contrast the string path, where the column declares a
+// bound and truncating to it is the stated intent.)
+template <class SRC, class DST, bool HAS_SEL>
+inline bool ScatterConvTyped(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const SRC *src,
+							 const SelectionVector *sel) {
+	constexpr int W = sizeof(DST);
+	bool bad = false;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		*out = W;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const SRC v = src[idx];
+		const DST n = static_cast<DST>(v);
+		// Compile-time on both counts, so a widening and every float pair fold it
+		// away: a float narrowing loses precision by the column's own request and
+		// must not be refused, unlike an integer that becomes a different number.
+		if (std::is_integral<SRC>::value && sizeof(SRC) > sizeof(DST)) {
+			// Round-trip: exact iff the value survived the narrowing. Handles the
+			// unsigned target too — a negative into `tinyint` comes back positive.
+			bad |= (static_cast<SRC>(n) != v);
+		}
+		std::memcpy(out + 1, &n, W);
+	}
+	return !bad;
+}
+
+// Cold. The fast loop knows THAT a value did not fit, not which one, so name it
+// with a rescan — this runs only on the way to throwing.
+template <class SRC>
+void ThrowIntRange(const SRC *src, const SelectionVector *sel, idx_t row_begin, idx_t rows, int64_t lo, int64_t hi,
+				   const mssql::BCPColumnMetadata &col, const ValidityMask *mask) {
+	for (idx_t r = 0; r < rows; r++) {
+		const idx_t idx = sel ? sel->get_index(row_begin + r) : row_begin + r;
+		if (mask && !mask->RowIsValid(idx)) {
+			continue;
+		}
+		const int64_t v = static_cast<int64_t>(src[idx]);
+		if (v < lo || v > hi) {
+			throw InvalidInputException(
+				"MSSQL: integer value %lld in column \"%s\" is out of range for the target column (accepts %lld..%lld)",
+				(long long)v, col.name, (long long)lo, (long long)hi);
+		}
+	}
+	throw InternalException("BCPRowEncoder: integer range check disagreed with the rescan");
+}
+
+// SQL Server's `tinyint` is UNSIGNED 0..255 while DuckDB's TINYINT is signed, so
+// a CONVERTED value must satisfy the server's range — which is why width 1 binds
+// DST to uint8_t below. (An exact-width TINYINT source never reaches this arm; it
+// is a direct copy, and keeps the pre-existing signed passthrough.)
+//
+// The two-level switch is explicit rather than a generic lambda because this tree
+// is compiled as C++11 — see the ODR note in CLAUDE.md. It runs ONCE per column
+// per block, so its cost is not on the value path at all.
+template <class SRC, class DST>
+inline void ScatterConvT(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						 const mssql::BCPColumnMetadata &col) {
+	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
+	const bool has_sel = fmt.sel->IsSet();
+	const bool ok = has_sel ? ScatterConvTyped<SRC, DST, true>(dst, stride, row_begin, rows, src, fmt.sel)
+							: ScatterConvTyped<SRC, DST, false>(dst, stride, row_begin, rows, src, nullptr);
+	if (!ok) {
+		ThrowIntRange<SRC>(src, has_sel ? fmt.sel : nullptr, row_begin, rows, (int64_t)std::numeric_limits<DST>::min(),
+						   (int64_t)std::numeric_limits<DST>::max(), col, nullptr);
+	}
+}
+
+template <class DST>
+inline void ScatterConvDst(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						   const mssql::BCPColumnMetadata &col, uint8_t src_width) {
+	switch (src_width) {
+	case 1:
+		ScatterConvT<int8_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	case 2:
+		ScatterConvT<int16_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	case 4:
+		ScatterConvT<int32_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	default:
+		ScatterConvT<int64_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	}
+}
+
+inline void ScatterConv(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						const mssql::codec::WriteColumnOps &op, const mssql::BCPColumnMetadata &col) {
+	switch (op.wire_width) {
+	case 1:
+		ScatterConvDst<uint8_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	case 2:
+		ScatterConvDst<int16_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	case 4:
+		ScatterConvDst<int32_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	default:
+		ScatterConvDst<int64_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	}
+}
+
+// FLOAT <-> DOUBLE. Only two pairs exist, and neither can fail — the range check
+// inside ScatterConvTyped is compiled out for a non-integral source, so this
+// needs no error path at all.
+inline void ScatterConvFloat(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+							 const mssql::codec::WriteColumnOps &op) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (op.wire_width == 4) {
+		const double *src = reinterpret_cast<const double *>(fmt.data);
+		has_sel ? ScatterConvTyped<double, float, true>(dst, stride, row_begin, rows, src, fmt.sel)
+				: ScatterConvTyped<double, float, false>(dst, stride, row_begin, rows, src, nullptr);
+		return;
+	}
+	const float *src = reinterpret_cast<const float *>(fmt.data);
+	has_sel ? ScatterConvTyped<float, double, true>(dst, stride, row_begin, rows, src, fmt.sel)
+			: ScatterConvTyped<float, double, false>(dst, stride, row_begin, rows, src, nullptr);
+}
+
+// The NULL-bearing peer. Same compile-time pair, position from the cursor.
+template <class SRC, class DST, bool HAS_SEL>
+inline bool CursorConvTyped(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const SRC *src,
+							const SelectionVector *sel, const ValidityMask &mask) {
+	constexpr int W = sizeof(DST);
+	bool bad = false;
+	for (idx_t r = r0; r < rend; r++) {
+		uint8_t *out = dst + cursor[r];
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(r) : r;
+		if (!mask.RowIsValid(idx)) {
+			*out = 0x00;
+			cursor[r] += 1;
+			continue;
+		}
+		const SRC v = src[idx];
+		const DST n = static_cast<DST>(v);
+		if (std::is_integral<SRC>::value && sizeof(SRC) > sizeof(DST)) {
+			bad |= (static_cast<SRC>(n) != v);
+		}
+		*out = W;
+		std::memcpy(out + 1, &n, W);
+		cursor[r] += 1 + W;
+	}
+	return !bad;
+}
+
+template <class SRC, class DST>
+inline void CursorConvT(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+						const mssql::BCPColumnMetadata &col) {
+	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
+	const bool has_sel = fmt.sel->IsSet();
+	const bool ok = has_sel ? CursorConvTyped<SRC, DST, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+							: CursorConvTyped<SRC, DST, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+	if (!ok) {
+		ThrowIntRange<SRC>(src, has_sel ? fmt.sel : nullptr, r0, rend - r0, (int64_t)std::numeric_limits<DST>::min(),
+						   (int64_t)std::numeric_limits<DST>::max(), col, &fmt.validity);
+	}
+}
+
+template <class DST>
+inline void CursorConvDst(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+						  const mssql::BCPColumnMetadata &col, uint8_t src_width) {
+	switch (src_width) {
+	case 1:
+		CursorConvT<int8_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	case 2:
+		CursorConvT<int16_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	case 4:
+		CursorConvT<int32_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	default:
+		CursorConvT<int64_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	}
+}
+
+inline void CursorConv(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+					   const mssql::codec::WriteColumnOps &op, const mssql::BCPColumnMetadata &col) {
+	switch (op.wire_width) {
+	case 1:
+		CursorConvDst<uint8_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	case 2:
+		CursorConvDst<int16_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	case 4:
+		CursorConvDst<int32_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	default:
+		CursorConvDst<int64_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	}
+}
+
+inline void CursorConvFloat(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+							const mssql::codec::WriteColumnOps &op) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (op.wire_width == 4) {
+		const double *src = reinterpret_cast<const double *>(fmt.data);
+		has_sel ? CursorConvTyped<double, float, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+				: CursorConvTyped<double, float, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+		return;
+	}
+	const float *src = reinterpret_cast<const float *>(fmt.data);
+	has_sel ? CursorConvTyped<float, double, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+			: CursorConvTyped<float, double, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+}
+
 // One block of rows, all columns. Extracted so the blocked and whole-chunk cases
 // are the same code with a different block size.
 inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t rows, idx_t ncols,
@@ -268,6 +499,12 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 			break;
 		case mssql::codec::ScatterArm::DirectCopy8:
 			ScatterDirect<8>(bdst + col_off, stride, row_begin, rows, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::IntConvert:
+			ScatterConv(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c], columns[c]);
+			break;
+		case mssql::codec::ScatterArm::FloatConvert:
+			ScatterConvFloat(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c]);
 			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable scatter arm");
@@ -341,6 +578,12 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 			break;
 		case mssql::codec::ScatterArm::DirectCopy8:
 			CursorDirect<8>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::IntConvert:
+			CursorConv(dst, cursor, r0, rend, st.fmt, ops[c], columns[c]);
+			break;
+		case mssql::codec::ScatterArm::FloatConvert:
+			CursorConvFloat(dst, cursor, r0, rend, st.fmt, ops[c]);
 			break;
 		case mssql::codec::ScatterArm::Decimal:
 		case mssql::codec::ScatterArm::Guid:

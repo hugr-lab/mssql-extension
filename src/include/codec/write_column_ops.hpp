@@ -63,6 +63,16 @@ enum class ScatterArm : uint8_t {
 	DirectCopy2,
 	DirectCopy4,
 	DirectCopy8,
+	//! An integer whose SOURCE width differs from the target's: read at the
+	//! source's width, range-check against the target's, write at the target's.
+	//! This is issue #153 as a resolved arm — the pair is fixed for the whole
+	//! column, so nothing about it belongs in the per-value path.
+	IntConvert,
+	//! FLOAT <-> DOUBLE where the source's width differs from the target's. Its
+	//! own arm rather than IntConvert's because narrowing here is NOT an error:
+	//! losing precision is what the declared column asked for, so no value is
+	//! ever refused.
+	FloatConvert,
 	//! Sign byte plus little-endian magnitude, width from the target's precision.
 	//! MONEY and SMALLMONEY map to DECIMAL and arrive here too.
 	Decimal,
@@ -102,6 +112,10 @@ struct WriteColumnOps {
 	//! Payload bytes per value for a Fixed column; 0 when the width depends on
 	//! the value. Excludes the length prefix.
 	uint32_t wire_width = 0;
+
+	//! IntConvert / FloatConvert only: bytes the SOURCE stores per value. Zero
+	//! otherwise. Signedness comes from the source type, not from this.
+	uint8_t src_width = 0;
 
 	//! Does this column's width depend on the data? A single one of these makes
 	//! every row in the chunk a different length, so the constant-stride path is

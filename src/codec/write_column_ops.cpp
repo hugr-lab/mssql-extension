@@ -154,11 +154,16 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 							 target.max_length == tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale);
 		const bool dto_ok = target.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ && src == PhysicalType::INT64 &&
 							target.max_length == dt2_written + 2;
+		// A DATE source into a DATETIME2 target is an advertised conversion with a
+		// kernel of its own (ScatterDateAsDt2) — the time field is zero at every
+		// scale, so only the day number is computed.
+		const bool date_to_ts_ok = target.duckdb_type.id() == LogicalTypeId::TIMESTAMP && src == PhysicalType::INT32 &&
+								   source.id() == LogicalTypeId::DATE && target.max_length == dt2_written;
 		const bool ts_ok = target.duckdb_type.id() != LogicalTypeId::DATE &&
 						   target.duckdb_type.id() != LogicalTypeId::TIME &&
 						   target.duckdb_type.id() != LogicalTypeId::TIMESTAMP_TZ && src == PhysicalType::INT64 &&
 						   target.max_length == dt2_written;
-		if (date_ok || ts_ok || time_ok || dto_ok) {
+		if (date_ok || ts_ok || time_ok || dto_ok || date_to_ts_ok) {
 			ops.arm = ScatterArm::Datetime;
 			ops.wire_width = target.max_length;
 			return ops;
@@ -199,10 +204,38 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		return ops;
 	}
 
-	// The source has to already store exactly those bytes. A narrower or wider
-	// source is a CONVERSION — issue #153's territory — and until that becomes an
-	// arm of its own it goes through the row path, which performs it correctly.
-	if (GetTypeIdSize(source.InternalType()) != want) {
+	// A source that does not store exactly those bytes is a CONVERSION — issue
+	// #153's territory. It gets its own arm rather than the row path: the pair
+	// (source width, target width) is fixed for the column, so the widening or
+	// narrowing is resolved once here and the loop carries no type test.
+	//
+	// Integers and floats convert, each by its own arm — a float narrowing is a
+	// precision loss the column asked for, an integer narrowing that does not fit
+	// is a different number and is refused. BOOLEAN is one byte by definition, so
+	// a mismatch there means malformed metadata and keeps the row path.
+	const idx_t src_size = GetTypeIdSize(source.InternalType());
+	if (src_size != want) {
+		const bool int_target =
+			target.duckdb_type.id() == LogicalTypeId::TINYINT || target.duckdb_type.id() == LogicalTypeId::SMALLINT ||
+			target.duckdb_type.id() == LogicalTypeId::INTEGER || target.duckdb_type.id() == LogicalTypeId::BIGINT;
+		const PhysicalType sp = source.InternalType();
+		const bool int_source = sp == PhysicalType::INT8 || sp == PhysicalType::INT16 || sp == PhysicalType::INT32 ||
+								sp == PhysicalType::INT64;
+		if (int_target && int_source) {
+			ops.arm = ScatterArm::IntConvert;
+			ops.wire_width = want;
+			ops.src_width = static_cast<uint8_t>(src_size);
+			return ops;
+		}
+		const bool float_target =
+			target.duckdb_type.id() == LogicalTypeId::FLOAT || target.duckdb_type.id() == LogicalTypeId::DOUBLE;
+		const bool float_source = sp == PhysicalType::FLOAT || sp == PhysicalType::DOUBLE;
+		if (float_target && float_source) {
+			ops.arm = ScatterArm::FloatConvert;
+			ops.wire_width = want;
+			ops.src_width = static_cast<uint8_t>(src_size);
+			return ops;
+		}
 		ops.arm = ScatterArm::RowFallback;
 		ops.wire_width = want;
 		return ops;

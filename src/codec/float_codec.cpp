@@ -24,6 +24,7 @@
 #include "codec/float_codec.hpp"
 
 #include "codec/vector_format.hpp"
+#include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_compat.hpp"
 
@@ -109,19 +110,31 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// Other sizes silently skip (mirror legacy ConvertFloat — defensive only).
 }
 
-void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,
+// The wire form comes from the TARGET and the value from the SOURCE, which are
+// two different types whenever the target table already existed — this used to
+// ignore `col` entirely and write whatever width the source stored. Both pairs
+// IsTypeCompatible advertises were broken by it: a DOUBLE into `real` sent eight
+// bytes for a four-byte column and SQL Server aborted the batch with "Received an
+// invalid column length from the bcp client", and FLOAT into `float` sent four
+// for eight. Issue #153's shape in the float family.
+//
+// Narrowing DOUBLE -> real loses precision, and unlike the integer path that is
+// not an error: it is what CAST does on the server, and the column's declared
+// precision IS the request. Nothing here refuses a value.
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
-	switch (in.GetType().id()) {
-	case LogicalTypeId::FLOAT:
-		AppendFloatBcp(buf, FormatValue<float>(fmt, row));
-		break;
-	case LogicalTypeId::DOUBLE:
-		AppendDoubleBcp(buf, FormatValue<double>(fmt, row));
-		break;
-	default:
+	const LogicalTypeId source_id = in.GetType().id();
+	if (source_id != LogicalTypeId::FLOAT && source_id != LogicalTypeId::DOUBLE) {
 		throw InternalException("codec::float_family::EncodeToBcp: unexpected LogicalType '%s'",
 								in.GetType().ToString());
 	}
+	const double value = source_id == LogicalTypeId::FLOAT ? static_cast<double>(FormatValue<float>(fmt, row))
+														   : FormatValue<double>(fmt, row);
+	if (col.duckdb_type.id() == LogicalTypeId::FLOAT) {
+		AppendFloatBcp(buf, static_cast<float>(value));
+		return;
+	}
+	AppendDoubleBcp(buf, value);
 }
 
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

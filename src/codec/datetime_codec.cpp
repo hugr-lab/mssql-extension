@@ -392,6 +392,30 @@ void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const
 	}
 }
 
+// A DATE source into a DATETIME2 target — advertised by IsTypeCompatible and, in
+// the row path, previously read as a timestamp_t out of an int32 vector, which
+// aborted the COPY with `INTERNAL Error: Expected unified vector format of type
+// INT64, but found type INT32`. Issue #153's shape in the temporal family.
+//
+// It needs no scale arithmetic at all: a DATE is midnight, so the time field is
+// zero at every scale and only the day number is computed. Worth a kernel rather
+// than the row path because ONE unresolvable column drops the whole chunk off the
+// columnar path, so a single `date -> datetime2` column would have deoptimised
+// every other column in the table.
+template <int TIMESIZE, bool HAS_SEL>
+void ScatterDateAsDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
+		out[0] = TIMESIZE + 3;
+		std::memset(out + 1, 0, TIMESIZE);
+		std::memcpy(out + 1 + TIMESIZE, &days, 3);
+	}
+}
+
 }  // namespace
 
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
@@ -443,6 +467,24 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 			} else {
 				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h);
 			}
+		}
+		return;
+	}
+
+	if (in.GetType().id() == LogicalTypeId::DATE) {
+		// See ScatterDateAsDt2. Handled before TicksPerSecondFor, which has no
+		// answer for a DATE and would throw.
+		const uint8_t tsz = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+		const bool sel_set = fmt.sel->IsSet();
+		if (tsz == 3) {
+			sel_set ? ScatterDateAsDt2<3, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<3, false>(dst, stride, row_begin, rows, fmt);
+		} else if (tsz == 4) {
+			sel_set ? ScatterDateAsDt2<4, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<4, false>(dst, stride, row_begin, rows, fmt);
+		} else {
+			sel_set ? ScatterDateAsDt2<5, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<5, false>(dst, stride, row_begin, rows, fmt);
 		}
 		return;
 	}
@@ -775,6 +817,15 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	case LogicalTypeId::TIMESTAMP_SEC: {
 		uint64_t time_value;
 		uint32_t date_value;
+		if (source_id == LogicalTypeId::DATE) {
+			// A DATE is midnight of its day: no sub-day component to scale, and
+			// nothing for ComputeDatetime2Components to do (it would also throw,
+			// having no ticks-per-second for a DATE).
+			time_value = 0;
+			date_value = static_cast<uint32_t>(FormatValue<date_t>(fmt, row).days + DAYS_FROM_0001_TO_EPOCH);
+			tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
+			return;
+		}
 		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
