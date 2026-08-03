@@ -158,7 +158,27 @@ private:
 	//===----------------------------------------------------------------------===//
 
 	// Send buffer as BULK_LOAD packet
-	void SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last = false);
+	//! Frame `length` bytes at `data` into TDS packets and write them to the
+	//! socket, marking end-of-message only when `eom`.
+	//!
+	//! Replaces the BuildBulkLoadMultiPacket round trip, which materialised a
+	//! `vector<TdsPacket>` — one allocation and one copy of the payload per
+	//! frame, the whole batch duplicated in memory — and then copied each frame
+	//! AGAIN inside TdsSocket::SendPacket's Serialize(). Here one reusable frame
+	//! buffer is filled and written, so the batch is copied once and nothing is
+	//! allocated per frame.
+	void WriteFrames(const uint8_t *data, size_t length, bool eom);
+
+	//! Reused across every frame of every batch; sized at the negotiated packet
+	//! size on first use.
+	vector<uint8_t> frame_buffer_;
+
+	//! Push whole frames out of the accumulator, keeping only the tail that does
+	//! not fill one.
+	void DrainWholeFrames();
+
+	//! Chunks encoded since the last drain. Guarded by write_mutex_.
+	idx_t chunks_since_drain_ = 0;
 
 	// Write little-endian integers
 	static void WriteUInt8(vector<uint8_t> &buffer, uint8_t value);
@@ -200,7 +220,7 @@ private:
 	// batch size that is a whole batch of server time. Counting where the work
 	// happens covers every caller by construction.
 	//
-	//   build_send  SendBulkLoadPacket: fragmenting the accumulator into TDS
+	//   build_send  WriteFrames: fragmenting the accumulator into TDS
 	//               packets, prepending headers, and the send() calls. This is
 	//               D5b's target and, until now, invisible.
 	//   server_wait Finalize: blocking until SQL Server confirms the batch.
@@ -218,6 +238,23 @@ private:
 	// Used to send all data in a single message
 	// Note: Memory is released via swap trick in ResetForNextBatch()
 	vector<uint8_t> accumulator_buffer_;
+
+	//! Chunks to accumulate before whole frames are pushed to the socket.
+	//!
+	//! The batch used to be built in full before anything went out — 102400 rows
+	//! x 44 columns is ~63 MB, and the vector's capacity doubling made the peak
+	//! larger still — so the wire idled through the encode and the encoder wrote
+	//! far past any cache for the send to read back from DRAM. Measured on that
+	//! table, the writer's own footprint drops from ~180 MB to ~5 MB and the COPY
+	//! from 12.24 s to 10.07 s.
+	//!
+	//! Counted in CHUNKS rather than bytes because a byte threshold means
+	//! different things at different table widths: 256 KB is "drain every chunk"
+	//! for 44 columns and "drain every eighth" for three. A chunk count is the
+	//! same policy either way, and narrow tables still regulate themselves —
+	//! DrainWholeFrames emits only WHOLE frames, so a chunk pair that does not
+	//! fill one simply stays until it does.
+	static constexpr idx_t STREAM_BLOCK_CHUNKS = 2;
 
 	// D4 (spec 054): per-writer debug counters, active only at MSSQL_DEBUG>=2
 	// (latched at construction). Mutated under write_mutex_ in WriteRows —
