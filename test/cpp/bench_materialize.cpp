@@ -926,6 +926,45 @@ size_t WideColTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	return buf.size();
 }
 
+// ROW-MAJOR *INSIDE A BLOCK*.
+//
+// Row-major assembly was measured worse (1.14-1.29 vs 0.39 ns/value at width) and
+// dismissed — but that was over a whole 2048-row chunk, where walking every
+// column per row touches 44 * 2048 * 8 = 720 KB of sources and none of it stays
+// resident. Inside a 128-row block it is 45 KB: every column's slice is in L1 at
+// once, so the objection is about volume and blocking removes it.
+//
+// Why this matters far beyond a few percent: row-major needs NO CURSOR. Going
+// column-major over rows of variable length forces a per-row position array,
+// because column c's offset depends on which of columns 0..c-1 were NULL in that
+// row. Going row-major there is one moving pointer — write, advance by what was
+// written — so a NULL stops being a separate path and becomes a branch that
+// writes less. That is the entire 4.4x cliff between 0% and 1% NULLs.
+size_t WideRowBlocked(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block) {
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	buf.resize(rows * w.stride);
+	uint8_t *ptr = buf.data();
+	static duckdb::vector<const int64_t *> srcs;
+	srcs.resize(ncols);
+	for (idx_t c = 0; c < ncols; ++c) {
+		srcs[c] = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+	}
+	for (idx_t r0 = 0; r0 < rows; r0 += block) {
+		const idx_t rend = duckdb::MinValue<idx_t>(r0 + block, rows);
+		for (idx_t r = r0; r < rend; ++r) {
+			*ptr++ = 0xD1;
+			for (idx_t c = 0; c < ncols; ++c) {
+				*ptr++ = 8;
+				memcpy(ptr, &srcs[c][r], 8);
+				ptr += 8;
+			}
+		}
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
 // THE ZERO-FILL TAX.
 //
 // The other variants reuse `buf`, so after the first iteration `resize` adds no
@@ -3143,6 +3182,11 @@ int main() {
 			variants.push_back({nm, [&, blk](duckdb::vector<uint8_t> &b) { return WideColBlocked(w, b, blk); }});
 		}
 		variants.push_back({"rowmajor", [&](duckdb::vector<uint8_t> &b) { return WideRowMajor(w, b); }});
+		for (idx_t blk : {(idx_t)32, (idx_t)64, (idx_t)128, (idx_t)256}) {
+			char *nm = new char[20];
+			std::snprintf(nm, 20, "rowblk%llu", (unsigned long long)blk);
+			variants.push_back({nm, [&, blk](duckdb::vector<uint8_t> &b) { return WideRowBlocked(w, b, blk); }});
+		}
 		variants.push_back(
 			{"zerofill64", [&](duckdb::vector<uint8_t> &b) { return WideColBlockedZeroFill(w, b, 64); }});
 		variants.push_back({"tmplframe", [&](duckdb::vector<uint8_t> &b) { return WideColTemplate(w, b); }});

@@ -270,6 +270,93 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 	}
 }
 
+// One block of rows on the NULL-bearing path. Same four properties as
+// ScatterBlock — arm dispatched outside the row loop, width in the type,
+// selection test hoisted — with the position coming from the cursor instead of a
+// stride, and the cursor advanced by what was actually written.
+template <int W, bool HAS_SEL>
+inline void CursorDirectTyped(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const uint8_t *src,
+							  const SelectionVector *sel, const ValidityMask &mask) {
+	for (idx_t r = r0; r < rend; r++) {
+		uint8_t *out = dst + cursor[r];
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(r) : r;
+		if (!mask.RowIsValid(idx)) {
+			*out = 0x00;
+			cursor[r] += 1;
+			continue;
+		}
+		*out = W;
+		std::memcpy(out + 1, src + idx * W, W);
+		cursor[r] += 1 + W;
+	}
+}
+
+template <int W>
+inline void CursorDirect(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt) {
+	const uint8_t *src = reinterpret_cast<const uint8_t *>(fmt.data);
+	if (fmt.sel->IsSet()) {
+		CursorDirectTyped<W, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity);
+	} else {
+		CursorDirectTyped<W, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+	}
+}
+
+inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, idx_t ncols,
+							   const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
+							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint8_t> &widths) {
+	for (idx_t c = 0; c < ncols; c++) {
+		auto &st = states[c];
+		const uint8_t w = widths[c];
+		if (!st.vec) {
+			for (idx_t r = r0; r < rend; r++) {
+				dst[cursor[r]] = 0x00;
+				cursor[r] += 1;
+			}
+			continue;
+		}
+		// An all-valid column inside a NULL-bearing chunk still writes every
+		// payload — it just cannot use a stride, because OTHER columns moved the
+		// rows apart. Its inner loop carries no validity test at all.
+		const bool col_all_valid = st.fmt.validity.AllValid();
+		switch (ops[c].arm) {
+		case mssql::codec::ScatterArm::DirectCopy1:
+			CursorDirect<1>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy2:
+			CursorDirect<2>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy4:
+			CursorDirect<4>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy8:
+			CursorDirect<8>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::Decimal:
+		case mssql::codec::ScatterArm::Guid: {
+			const bool is_dec = ops[c].arm == mssql::codec::ScatterArm::Decimal;
+			for (idx_t r = r0; r < rend; r++) {
+				uint8_t *out = dst + cursor[r];
+				const idx_t idx = st.fmt.sel->get_index(r);
+				if (!col_all_valid && !st.fmt.validity.RowIsValid(idx)) {
+					*out = 0x00;
+					cursor[r] += 1;
+					continue;
+				}
+				if (is_dec) {
+					mssql::codec::decimal::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				} else {
+					mssql::codec::uuid::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				}
+				cursor[r] += 1 + w;
+			}
+			break;
+		}
+		default:
+			throw InternalException("BCPRowEncoder: unreachable cursor arm");
+		}
+	}
+}
+
 //! Encode the whole chunk as a columnar scatter. Returns false if any column
 //! lacks a scatter arm, having written nothing.
 bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vector<mssql::BCPColumnMetadata> &columns,
@@ -312,16 +399,49 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	if (all_valid) {
 		total = row_count * stride;
 	} else {
+		// Per COLUMN, not per row x column. The old shape ran `rows * ncols`
+		// iterations with a validity lookup and a branch in every one; this runs
+		// one pass per column that HAS a NULL, and a column with none contributes
+		// a constant that is folded into the base. Same answer, and the work is
+		// proportional to the number of nullable columns rather than to all of
+		// them.
 		row_at.resize(row_count);
+		size_t base_row = 1;  // the 0xD1 token
+		for (idx_t c = 0; c < ncols; c++) {
+			base_row += 1 + widths[c];
+		}
+		for (idx_t r = 0; r < row_count; r++) {
+			row_at[r] = base_row;
+		}
+		for (idx_t c = 0; c < ncols; c++) {
+			auto &st = states[c];
+			if (!st.vec) {
+				// Absent column: NULL on every row, so its payload never appears.
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= widths[c];
+				}
+				continue;
+			}
+			if (st.fmt.validity.AllValid()) {
+				continue;  // contributes its full width to every row already
+			}
+			const uint8_t w = widths[c];
+			if (st.fmt.sel->IsSet()) {
+				const auto *sel = st.fmt.sel;
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= st.fmt.validity.RowIsValid(sel->get_index_unsafe(r)) ? 0 : w;
+				}
+			} else {
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= st.fmt.validity.RowIsValid(r) ? 0 : w;
+				}
+			}
+		}
+		// Prefix-sum the per-row sizes into offsets, in place.
 		size_t acc = 0;
 		for (idx_t r = 0; r < row_count; r++) {
+			const size_t sz = row_at[r];
 			row_at[r] = acc;
-			size_t sz = 1;
-			for (idx_t c = 0; c < ncols; c++) {
-				const auto &st = states[c];
-				const bool valid = st.vec && st.fmt.validity.RowIsValid(st.fmt.sel->get_index(r));
-				sz += 1 + (valid ? widths[c] : 0);
-			}
 			acc += sz;
 		}
 		total = acc;
@@ -355,11 +475,23 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		return true;
 	}
 
-	// NULL-bearing: the row offsets are not a stride, so carry a per-column
-	// cursor. The branch per value is deliberate — the branchless form was
-	// measured WORSE (null50 5.5 -> 7.6 ns/value) because it trades a
-	// well-predicted branch for an unconditional write and a multiply that stops
-	// the loop vectorising. Do not retry it.
+	// NULL-bearing rows are not a constant stride, so a per-row cursor carries the
+	// position. That much is inherent: a NULL writes a 1-byte marker instead of
+	// 1+W, the wire is packed, and there is no formula for where row r starts.
+	//
+	// What is NOT inherent is that this path used to be slow. Measured across NULL
+	// density 0/1/10/30/50/70/90/100%, it cost 6.5-7.5 ns/value at EVERY non-zero
+	// density against 1.49 at zero — a 4.4x cliff at the first NULL and then flat.
+	// Density-shaped explanations are therefore all wrong (branch misprediction
+	// would peak at 50%; at 100% we write nine times fewer bytes and it still cost
+	// four times more). The cost was simply that this branch had received none of
+	// the four things the all-valid branch had: blocking, the width in the type,
+	// the selection test hoisted, and the arm dispatched outside the row loop.
+	//
+	// Going row-major instead would remove the cursor entirely, and was measured:
+	// even blocked it is 1.6-2.7x WORSE, because a row touches one cache line per
+	// column and uses an eighth of each. The cursor is the price of the right read
+	// order, and it is one L1 load/add/store per value.
 	for (idx_t r = 0; r < row_count; r++) {
 		dst[row_at[r]] = BCP_TOKEN_ROW;
 	}
@@ -367,33 +499,10 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	for (idx_t r = 0; r < row_count; r++) {
 		cursor[r] = row_at[r] + 1;
 	}
-	for (idx_t c = 0; c < ncols; c++) {
-		auto &st = states[c];
-		const uint8_t w = widths[c];
-		const auto arm = ops[c].arm;
-		const uint8_t *src = st.vec ? reinterpret_cast<const uint8_t *>(st.fmt.data) : nullptr;
-		for (idx_t r = 0; r < row_count; r++) {
-			uint8_t *out = dst + cursor[r];
-			const idx_t sidx = st.vec ? st.fmt.sel->get_index(r) : 0;
-			if (!st.vec || !st.fmt.validity.RowIsValid(sidx)) {
-				*out = 0x00;
-				cursor[r] += 1;
-				continue;
-			}
-			*out = w;
-			switch (arm) {
-			case mssql::codec::ScatterArm::Decimal:
-				mssql::codec::decimal::ScatterToBcp(out + 1, *st.vec, st.fmt, r, columns[c]);
-				break;
-			case mssql::codec::ScatterArm::Guid:
-				mssql::codec::uuid::ScatterToBcp(out + 1, *st.vec, st.fmt, r, columns[c]);
-				break;
-			default:
-				std::memcpy(out + 1, src + sidx * w, w);
-				break;
-			}
-			cursor[r] += 1 + w;
-		}
+	constexpr idx_t CURSOR_BLOCK_ROWS = 128;
+	for (idx_t r0 = 0; r0 < row_count; r0 += CURSOR_BLOCK_ROWS) {
+		const idx_t rend = MinValue<idx_t>(r0 + CURSOR_BLOCK_ROWS, row_count);
+		ScatterBlockCursor(dst, cursor.data(), r0, rend, ncols, columns, states, ops, widths);
 	}
 	return true;
 }
