@@ -473,11 +473,16 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		// UTF-8 target: the payload IS the source bytes, so the length is already
 		// in the string_t and nothing is converted. Spec 060 shipped this wire
 		// form; this is only its columnar sizing.
-		plan.utf8_passthrough = true;
-	} else if (col.tds_type_token != tds::TDS_TYPE_NVARCHAR) {
-		return false;  // binary/XML/other: not planned yet
+		plan.kind = VarKind::Utf8Varchar;
+	} else if (col.tds_type_token == tds::TDS_TYPE_BIGVARBINARY) {
+		// varbinary(n): the same framing, and not even a character set to think
+		// about. BCPRowEncoder::EncodeBinary has never bounded it client-side, so
+		// neither does this.
+		plan.kind = VarKind::Binary;
+	} else if (col.tds_type_token == tds::TDS_TYPE_NVARCHAR) {
+		plan.kind = VarKind::NVarchar;
 	} else {
-		plan.utf8_passthrough = false;
+		return false;  // XML and anything else: not planned yet
 	}
 
 	plan.lengths.resize(rows);
@@ -489,7 +494,7 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			continue;
 		}
 		const auto &sv = strings[idx];
-		if (plan.utf8_passthrough) {
+		if (plan.kind != VarKind::NVarchar) {
 			plan.lengths[r] = static_cast<uint32_t>(sv.GetSize());
 			continue;
 		}
@@ -521,7 +526,7 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
 					 const mssql::BCPColumnMetadata &col, const StringColumnPlan &plan) {
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
-	const bool passthrough = plan.utf8_passthrough;
+	const bool convert = plan.kind == VarKind::NVarchar;
 	for (idx_t r = r0; r < rend; r++) {
 		uint8_t *out = dst + cursor[r];
 		const idx_t idx = fmt.sel->get_index(r);
@@ -533,20 +538,30 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 		}
 		const uint32_t len = plan.lengths[r];
 		// FR-023 (issue #91): refuse before the batch is sent rather than letting
-		// the server abort it mid-stream. Wording is asserted by tests.
+		// the server abort it mid-stream. Each form's wording is asserted by
+		// tests, and binary has never been bounded here — keep all three exactly
+		// as the row path has them.
 		if (len > col.max_length) {
-			throw InvalidInputException(
-				"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
-				"but column max is %u code units (%u bytes)",
-				col.name, static_cast<size_t>(len) / 2, static_cast<size_t>(len), col.max_length / 2, col.max_length);
+			if (plan.kind == VarKind::NVarchar) {
+				throw InvalidInputException(
+					"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
+					"but column max is %u code units (%u bytes)",
+					col.name, static_cast<size_t>(len) / 2, static_cast<size_t>(len), col.max_length / 2,
+					col.max_length);
+			}
+			if (plan.kind == VarKind::Utf8Varchar) {
+				throw InvalidInputException(
+					"MSSQL: VARCHAR column '%s' overflow: value is %zu UTF-8 bytes but column max is %u bytes",
+					col.name, static_cast<size_t>(len), col.max_length);
+			}
 		}
 		out[0] = static_cast<uint8_t>(len & 0xFF);
 		out[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
 		const auto &sv = strings[idx];
-		if (passthrough) {
-			std::memcpy(out + 2, sv.GetData(), len);
-		} else {
+		if (convert) {
 			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), sv.GetSize(), out + 2);
+		} else {
+			std::memcpy(out + 2, sv.GetData(), len);
 		}
 		cursor[r] += 2 + len;
 	}

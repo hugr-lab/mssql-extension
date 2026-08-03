@@ -139,9 +139,16 @@ std::string EscapeSqlSingleQuotes(const std::string &str);
 //! `lengths[r]` is the PAYLOAD byte count row r will occupy on the wire — UTF-16
 //! bytes for an nvarchar target, source bytes for a UTF-8 one — with 0 for NULL.
 //! Framing (the 2-byte prefix, or PLP's header and terminator) is the caller's.
+//! Which of the three variable-length wire forms this column takes. They share
+//! the framing (2-byte LE length, 0xFFFF for NULL) and differ in whether the
+//! payload is converted and how an over-long value is refused — nvarchar and
+//! varchar each raise with their own wording, which tests assert, and binary has
+//! never checked at all.
+enum class VarKind : uint8_t { NVarchar, Utf8Varchar, Binary };
+
 struct StringColumnPlan {
 	duckdb::vector<uint32_t> lengths;
-	bool utf8_passthrough = false;
+	VarKind kind = VarKind::NVarchar;
 };
 
 //! Write one block of a planned variable-length column at the cursor positions.

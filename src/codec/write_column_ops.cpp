@@ -76,8 +76,12 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		// formats it first.
 		const bool string_target =
 			target.tds_type_token == tds::TDS_TYPE_NVARCHAR || target.tds_type_token == tds::TDS_TYPE_BIGVARCHAR;
+		// varbinary(n) shares the framing exactly and needs no conversion at all,
+		// so it rides the same arm. Its source is a BLOB, which DuckDB also stores
+		// as string_t.
+		const bool binary_target = target.tds_type_token == tds::TDS_TYPE_BIGVARBINARY;
 		const bool string_source = source.InternalType() == PhysicalType::VARCHAR;
-		ops.arm = (string_target && string_source) ? ScatterArm::VarString : ScatterArm::RowFallback;
+		ops.arm = ((string_target || binary_target) && string_source) ? ScatterArm::VarString : ScatterArm::RowFallback;
 		return ops;
 	}
 	if (ops.kind != WireKind::Fixed) {
@@ -109,7 +113,9 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_SEC: {
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP_TZ: {
 		// The source must be the matching temporal storage: DATE is int32 days,
 		// the TIMESTAMP variants int64 ticks. Anything else is a conversion and
 		// goes the row path, which performs it.
@@ -137,9 +143,18 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		// verification, for a narrow gain: tables still on the legacy type.
 		const uint32_t dt2_written =
 			static_cast<uint32_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale)) + 3;
-		const bool ts_ok = target.duckdb_type.id() != LogicalTypeId::DATE && src == PhysicalType::INT64 &&
+		// TIME has no date field, DATETIMEOFFSET adds a 2-byte offset, and both
+		// must satisfy the same width invariant as datetime2 above.
+		const bool time_ok = target.duckdb_type.id() == LogicalTypeId::TIME && src == PhysicalType::INT64 &&
+							 source.id() == LogicalTypeId::TIME &&
+							 target.max_length == tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale);
+		const bool dto_ok = target.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ && src == PhysicalType::INT64 &&
+							target.max_length == dt2_written + 2;
+		const bool ts_ok = target.duckdb_type.id() != LogicalTypeId::DATE &&
+						   target.duckdb_type.id() != LogicalTypeId::TIME &&
+						   target.duckdb_type.id() != LogicalTypeId::TIMESTAMP_TZ && src == PhysicalType::INT64 &&
 						   target.max_length == dt2_written;
-		if (date_ok || ts_ok) {
+		if (date_ok || ts_ok || time_ok || dto_ok) {
 			ops.arm = ScatterArm::Datetime;
 			ops.wire_width = target.max_length;
 			return ops;

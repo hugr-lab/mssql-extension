@@ -314,6 +314,71 @@ void ScatterDt2Sel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, con
 	}
 }
 
+// TIME(scale): the scaled tick count since midnight, no date field. DuckDB's
+// dtime_t is microseconds, so the same factor/half/direction logic applies —
+// TIME simply stops after the time field.
+template <int TIME_BYTES, bool UPSCALE, bool HAS_SEL>
+void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				 int64_t factor, int64_t half) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t micros = src[idx];
+		const uint64_t ticks =
+			UPSCALE ? static_cast<uint64_t>(micros * factor) : static_cast<uint64_t>((micros + half) / factor);
+		out[0] = TIME_BYTES;
+		std::memcpy(out + 1, &ticks, TIME_BYTES);
+	}
+}
+
+// DATETIMEOFFSET(scale): the datetime2 payload plus a 2-byte signed offset in
+// minutes. DuckDB stores TIMESTAMP_TZ as UTC microseconds and carries no
+// per-value zone, so the offset is always 0 — the same answer the row path
+// gives.
+//
+// Fabric Warehouse has no datetimeoffset type at all, so this arm simply never
+// resolves against such a target. That is a property of the catalog rather than
+// something to special-case here.
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
+void ScatterDtOffset(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+					 int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t raw = src[idx];
+		int64_t days;
+		int64_t sub;
+		if (raw >= 0) {
+			days = raw / per_day;
+			sub = raw % per_day;
+		} else {
+			days = (raw - per_day + 1) / per_day;
+			sub = raw - days * per_day;
+		}
+		uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
+		uint64_t time_value;
+		if (UPSCALE) {
+			time_value = static_cast<uint64_t>(sub * factor);
+		} else {
+			int64_t scaled = (sub + half) / factor;
+			if (scaled >= per_day_target) {
+				scaled = 0;
+				date_value += 1;
+			}
+			time_value = static_cast<uint64_t>(scaled);
+		}
+		out[0] = total_size;
+		std::memcpy(out + 1, &time_value, TIME_BYTES);
+		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
+		out[1 + TIME_BYTES + 3] = 0;
+		out[1 + TIME_BYTES + 4] = 0;
+	}
+}
+
 template <bool HAS_SEL>
 void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
 	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
@@ -340,6 +405,48 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		return;
 	}
 
+	if (col.duckdb_type.id() == LogicalTypeId::TIME) {
+		// dtime_t is microseconds; the target's scale decides the tick unit.
+		const int64_t target_per_sec = Pow10(col.scale);
+		const bool up = target_per_sec >= 1000000;
+		const int64_t f = up ? target_per_sec / 1000000 : 1000000 / target_per_sec;
+		const int64_t h = up ? 0 : f / 2;
+		const uint8_t tb = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+		const bool has_sel = fmt.sel->IsSet();
+		if (tb == 3) {
+			if (up && has_sel) {
+				ScatterTime<3, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (up) {
+				ScatterTime<3, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (has_sel) {
+				ScatterTime<3, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else {
+				ScatterTime<3, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+			}
+		} else if (tb == 4) {
+			if (up && has_sel) {
+				ScatterTime<4, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (up) {
+				ScatterTime<4, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (has_sel) {
+				ScatterTime<4, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else {
+				ScatterTime<4, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+			}
+		} else {
+			if (up && has_sel) {
+				ScatterTime<5, true, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (up) {
+				ScatterTime<5, true, false>(dst, stride, row_begin, rows, fmt, f, h);
+			} else if (has_sel) {
+				ScatterTime<5, false, true>(dst, stride, row_begin, rows, fmt, f, h);
+			} else {
+				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h);
+			}
+		}
+		return;
+	}
+
 	const int64_t source_per_sec = TicksPerSecondFor(in.GetType().id());
 	const int64_t per_day = source_per_sec * SECONDS_PER_DAY;
 	const int64_t target_per_sec = Pow10(col.scale);
@@ -349,6 +456,55 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 	const int64_t per_day_target = target_per_sec * SECONDS_PER_DAY;
 	const uint8_t time_size = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
 	const uint8_t total = static_cast<uint8_t>(time_size + 3);
+
+	if (col.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+		const uint8_t dto_total = static_cast<uint8_t>(time_size + 3 + 2);
+		const bool has_sel = fmt.sel->IsSet();
+		if (time_size == 3) {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		} else if (time_size == 4) {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		} else {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		}
+		return;
+	}
 
 #define MSSQL_DT2_ARM(up, tb) \
 	ScatterDt2Sel<up, tb>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target, total)
