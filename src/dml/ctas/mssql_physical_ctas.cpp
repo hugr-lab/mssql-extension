@@ -153,7 +153,7 @@ unique_ptr<LocalSinkState> MSSQLPhysicalCreateTableAs::GetLocalSinkState(Executi
 //! load: the thread falls back to the shared writer, which is the pre-parallel
 //! behaviour and always correct. A CTAS must not fail because it could not go
 //! faster.
-static void TryStartLocalWriter(ClientContext &context, MSSQLCatalog &catalog, MSSQLCTASGlobalSinkState &gstate,
+static void TryStartLocalWriter(MSSQLCatalog &catalog, MSSQLCTASGlobalSinkState &gstate,
 								MSSQLCTASLocalSinkState &lstate) {
 	if (gstate.parallel_writer_limit <= 1) {
 		return;
@@ -242,7 +242,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	if (!lstate.init_attempted) {
 		lstate.init_attempted = true;
-		TryStartLocalWriter(context.client, catalog_, gstate, lstate);
+		TryStartLocalWriter(catalog_, gstate, lstate);
 	}
 
 	// A thread with its own session writes without touching the global writer at

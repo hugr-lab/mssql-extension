@@ -131,6 +131,40 @@ statement ok
 SET mssql_default_table_kind = 'heap';
 
 # =============================================================================
+# The WITH clause on a CTAS, over the session default.
+#
+# Only MSSQLSchemaEntry::CreateTable — the plain CREATE TABLE path — called
+# ApplyWithClause, so `CREATE TABLE t WITH (...) AS SELECT ...` was parsed,
+# accepted, and dropped: the table came out a heap however it was written, and
+# `table_kind = 'sideways'` passed without a word while the same clause on a
+# plain CREATE TABLE errors. The two paths now read the same options in the same
+# order, so the pair below is what keeps them from drifting apart again.
+# =============================================================================
+
+statement ok
+DROP TABLE IF EXISTS topt.dbo.ToptCtasWith;
+
+statement ok
+CREATE TABLE topt.dbo.ToptCtasWith WITH (table_kind = 'columnstore') AS SELECT 3 AS a, 'z' AS b;
+
+query T
+SELECT type_desc FROM mssql_scan('topt', $$
+SELECT i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('dbo.ToptCtasWith')
+$$);
+----
+CLUSTERED COLUMNSTORE
+
+# An invalid value has to be rejected here for the same reason it is on a plain
+# CREATE TABLE: silently ignoring it is how the whole clause went missing.
+statement error
+CREATE OR REPLACE TABLE topt.dbo.ToptCtasBad WITH (table_kind = 'sideways') AS SELECT 1 AS a;
+----
+unknown table_kind 'sideways'
+
+statement ok
+DROP TABLE topt.dbo.ToptCtasWith;
+
+# =============================================================================
 # Default string length. One setting governs BOTH table-creating paths, so CTAS
 # and COPY cannot disagree about what a plain DuckDB VARCHAR becomes; the COPY
 # option overrides it for one statement. An annotated column is never touched.

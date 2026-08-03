@@ -55,6 +55,16 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 		config.text_type = CTASTextType::VARCHAR;
 	}
 	catalog.ValidateStringTargets(child_plan.types);
+
+	// Spec 060 D5: the WITH clause of THIS statement, over the session defaults —
+	// the same order MSSQLSchemaEntry::CreateTable applies for a plain CREATE
+	// TABLE. Only that path called ApplyWithClause, so
+	// `CREATE TABLE t WITH (table_kind = 'columnstore') AS SELECT ...` was
+	// accepted and then dropped on the floor: the table came out a heap, and even
+	// `table_kind = 'sideways'` passed without a word, while the same clause on a
+	// plain CREATE TABLE errors. Every option went the same way — clustered_index
+	// and data_compression too.
+	config.table_options.ApplyWithClause(op.info->Base().options);
 	catalog.ValidateTableOptions(config.table_options);
 
 	bool wants_varchar = config.text_type == CTASTextType::VARCHAR;
