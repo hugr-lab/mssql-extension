@@ -95,20 +95,32 @@ inline MSSQLTablockChoice MSSQLParseTablockChoice(const std::string &raw) {
 //!                                                             costs nothing
 //!
 //! Two locks, two opposite behaviours: concurrent bulk loaders on a heap take
-//! mutually compatible BU locks, so the hint lets them run together; against a
-//! clustered rowstore index the same hint serialises them. A clustered
-//! COLUMNSTORE reports index_id = 1 like a rowstore index but behaves like a
-//! heap here, which is why this takes the kind and not a bool.
+//! mutually compatible BU locks, so the hint lets them run together. Against any
+//! CLUSTERED index — rowstore or columnstore — the same hint serialises them.
 //!
-//! Single-session clustered load is neutral, so the degree of parallelism is
-//! deliberately NOT an input — the shape alone decides, and no conditional is
-//! needed.
+//! The columnstore half of this was measured wrong when the policy was written
+//! (spec 057 step 1 claimed a clustered COLUMNSTORE "behaves like a heap here")
+//! and step 7 disproved it, because only step 7 made the loads concurrent. With
+//! parallel writers against a clustered columnstore, 2M rows x 5 columns:
+//!
+//!     TABLOCK on   8.92 s   server pinned at ~99% CPU — exactly ONE core
+//!     TABLOCK off  5.23 s   server peaking at 305%    — three cores
+//!
+//! and the compression is IDENTICAL either way: 17 COMPRESSED rowgroups holding
+//! 1740800 rows in both. The claim that a bulk insert without a table lock leaves
+//! rows uncompressed until a rebuild does not hold for a load whose batches cross
+//! the 102400 threshold — the threshold is what decides that, not the lock.
+//!
+//! So the input is simply "is this a heap": a heap takes it, anything clustered
+//! does not. The degree of parallelism is deliberately NOT an input — a
+//! single-session clustered load is neutral, so the shape alone decides and no
+//! conditional is needed.
 //!
 //! This replaces the issue-#45 policy of enabling it for newly created tables.
 //! Newness is the wrong input: a fresh table is a heap only until an index is
 //! created on it, which is exactly what CTAS-then-index does.
 inline bool MSSQLTablockForShape(MSSQLIndexKind shape) {
-	return shape != MSSQLIndexKind::CLUSTERED;
+	return shape == MSSQLIndexKind::HEAP;
 }
 
 //! The whole decision: an explicit choice wins, otherwise the shape decides.
