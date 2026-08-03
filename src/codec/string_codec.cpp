@@ -34,6 +34,39 @@ namespace string {
 
 namespace {
 
+// Is every byte ASCII? Inlined deliberately: this replaces a simdutf
+// validate_utf8 call, and the whole point is that a CALL costs ~3.1 ns on a
+// short value while the byte test costs a fraction of that.
+//
+// Eight bytes at a time through a uint64 mask — the same trick simdutf uses at
+// its tail, minus the dispatch.
+inline bool IsAsciiRun(const char *data, size_t size) {
+	size_t i = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t w;
+		std::memcpy(&w, data + i, 8);
+		if (w & 0x8080808080808080ULL) {
+			return false;
+		}
+	}
+	for (; i < size; i++) {
+		if (static_cast<uint8_t>(data[i]) & 0x80) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// ASCII -> UTF-16LE: every byte becomes itself plus a zero high byte. Written as
+// a plain loop so it inlines and vectorises at the call site; simdutf does the
+// same work, but reaching it costs a call this does not make.
+inline void WidenAscii(const char *src, size_t size, uint8_t *out) {
+	for (size_t i = 0; i < size; i++) {
+		out[2 * i] = static_cast<uint8_t>(src[i]);
+		out[2 * i + 1] = 0;
+	}
+}
+
 // Largest prefix of a validated UTF-8 value whose UTF-16LE encoding fits in
 // `max_bytes`, returned as a source byte count with the UTF-16 size in
 // `out_utf16`.
@@ -609,6 +642,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 	// with no bound by definition — fail as an overflow.
 	const uint32_t bound = plan.plp ? 0xFFFFFFFFu : col.max_length;
 	bool over = false;
+	// A COLUMN property, so the scatter decides once which encoder to run rather
+	// than testing per value. A mixed column still skips the measuring call on
+	// its ASCII values here; only the scatter falls back wholesale.
+	bool ascii = true;
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
 	for (idx_t r = 0; r < rows; r++) {
 		const idx_t idx = fmt.sel->get_index(row_begin + r);
@@ -622,7 +659,18 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		uint32_t len;
 		if (plan.kind != VarKind::NVarchar) {
 			len = static_cast<uint32_t>(sv.GetSize());
+		} else if (ascii && IsAsciiRun(sv.GetData(), sv.GetSize())) {
+			// ASCII is valid UTF-8 by definition and encodes to exactly two bytes
+			// per character, so the length is KNOWN rather than measured and this
+			// value makes no simdutf call at all — not to validate, not to count.
+			//
+			// `ascii &&` short-circuits: once one value has settled the column's
+			// answer the test never runs again. Without it a fully non-ASCII
+			// column paid the scan on every value for a question already
+			// answered, measured at +10% there; with it, +2%.
+			len = static_cast<uint32_t>(sv.GetSize()) * 2;
 		} else {
+			ascii = false;
 			bool valid = false;
 			const size_t u16 = tds::encoding::Utf16LEByteLengthView(sv.GetData(), sv.GetSize(), valid);
 			if (!valid) {
@@ -646,6 +694,7 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			plan.wire[r] = 16 + len;
 		}
 	}
+	plan.all_ascii = ascii && plan.kind == VarKind::NVarchar;
 	if (over) {
 		ClampToBound(fmt, row_begin, rows, bound, plan, strings);
 	}
@@ -670,6 +719,8 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 	(void)col;	// the bound was applied during planning; nothing to check here
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
 	const bool convert = plan.kind == VarKind::NVarchar;
+	// Hoisted: one test per column, not per value.
+	const bool ascii_widen = plan.all_ascii;
 	for (idx_t r = r0; r < rend; r++) {
 		uint8_t *out = dst + cursor[r];
 		const idx_t idx = fmt.sel->get_index(r);
@@ -702,7 +753,9 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 			WriteLe32(out + 12 + len, 0);
 			payload = out + 12;
 		}
-		if (convert) {
+		if (ascii_widen) {
+			WidenAscii(sv.GetData(), len / 2, payload);
+		} else if (convert) {
 			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), src_bytes, payload);
 		} else {
 			std::memcpy(payload, sv.GetData(), len);

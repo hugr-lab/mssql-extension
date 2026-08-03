@@ -162,6 +162,14 @@ struct StringColumnPlan {
 	//! that fits converts its whole string_t, so nothing needs storing.
 	duckdb::vector<uint32_t> src_len;
 	VarKind kind = VarKind::NVarchar;
+	//! nvarchar only: every value in this block is pure ASCII.
+	//!
+	//! Then the UTF-16 length is exactly twice the source length and the encoding
+	//! is a widening copy, so the column needs NO simdutf call at all — which is
+	//! what this is for. Measured on 12-byte values, a simdutf call costs ~3.1 ns
+	//! of pure overhead and the path made THREE per value (validate, count,
+	//! convert) against ~3 ns of actual byte work.
+	bool all_ascii = false;
 	//! Did any value in this block exceed the column's declared bound? A COLUMN
 	//! property, so the scatter's test on it is perfectly predicted rather than a
 	//! per-value length comparison — and usually false, leaving src_len unbuilt.
