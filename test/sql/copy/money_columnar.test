@@ -1,0 +1,141 @@
+# name: test/sql/copy/money_columnar.test
+# description: money / smallmoney round-trip and reach the columnar encoder (spec 057 step 3)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# MONEY and SMALLMONEY go on the wire as DECIMALN, not as MONEYN: DuckDB has no
+# MONEY type, the codec's Money family is DECODE-ONLY, and the BCP target
+# resolver declares TDS_TYPE_DECIMAL for both. So what is sent is a decimal of
+# the column's precision — 9 bytes for money's 19, 9 for smallmoney's 10.
+#
+# `SQLServerTypeMaxLength` nonetheless answered 8 and 4 for them: the MONEY and
+# SMALLMONEY wire sizes, for a wire form nothing writes. The row-major encoder
+# never noticed, because it appends and whatever it writes IS the layout. The
+# columnar scatter reserves from that number BEFORE writing, so its width check
+# refused the column — and one unresolvable column drops the WHOLE chunk back to
+# row-major.
+#
+# The cost was therefore not paid by money columns but by every column beside
+# them. On a 44-column table, two money columns took the encode from 190 ms to
+# 394 ms — the other 42 columns lost their kernels because of these two.
+#
+# So the test that matters is not "money works" (it did) but "money does not
+# disable the table", which is what the mixed fixture below is for.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mn (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('mn', 'IF OBJECT_ID(''dbo.MoneyRt'') IS NOT NULL DROP TABLE dbo.MoneyRt;
+CREATE TABLE dbo.MoneyRt (id int, mny money, smny smallmoney, nl money)');
+
+# Both signs, zero, the 4 decimal places money actually stores, and NULLs — a
+# NULL money is a 1-byte marker whose column still has to reserve its width.
+statement ok
+CREATE OR REPLACE TABLE mn_src AS
+SELECT i AS id,
+       ((((i * 11) % 200000) - 100000) / 100.0)::DECIMAL(19,4) AS mny,
+       ((((i * 7) % 40000) - 20000) / 100.0)::DECIMAL(10,4)    AS smny,
+       CASE WHEN i % 3 = 0 THEN NULL ELSE (i / 10000.0)::DECIMAL(19,4) END AS nl
+FROM range(20000) t(i);
+
+statement ok
+COPY mn_src TO 'mn.dbo.MoneyRt' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM (
+    SELECT id, mny::DECIMAL(19,4) a, smny::DECIMAL(19,4) b, nl::DECIMAL(19,4) c FROM mn_src
+    EXCEPT ALL
+    SELECT id, mny::DECIMAL(19,4), smny::DECIMAL(19,4), nl::DECIMAL(19,4) FROM mn.dbo.MoneyRt
+);
+----
+0
+
+query II
+SELECT count(*), count(nl) FROM mn.dbo.MoneyRt;
+----
+20000	13333
+
+# Both signs are actually present — the arithmetic above is easy to get wrong in
+# a way that leaves the fixture one-sided, which would leave the sign byte of the
+# decimal encoding untested in one direction.
+query IIII
+SELECT min(mny) < 0, max(mny) > 0, min(smny) < 0, max(smny) > 0 FROM mn.dbo.MoneyRt;
+----
+1	1	1	1
+
+# The extremes of each type. money is +/-922337203685477.5807 and smallmoney is
+# +/-214748.3647; a value at the boundary exercises the widest magnitude the
+# 9-byte decimal has to carry.
+statement ok
+SELECT mssql_exec('mn', 'IF OBJECT_ID(''dbo.MoneyEdge'') IS NOT NULL DROP TABLE dbo.MoneyEdge;
+CREATE TABLE dbo.MoneyEdge (tag varchar(10), mny money, smny smallmoney)');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('max',  922337203685477.5807::DECIMAL(19,4),  214748.3647::DECIMAL(10,4)),
+    ('min', -922337203685477.5807::DECIMAL(19,4), -214748.3648::DECIMAL(10,4)),
+    ('zero', 0.0::DECIMAL(19,4),                   0.0::DECIMAL(10,4)),
+    ('cent', 0.0001::DECIMAL(19,4),               -0.0001::DECIMAL(10,4))
+) t(tag, mny, smny)) TO 'mn.dbo.MoneyEdge' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT tag, mny, smny FROM mn.dbo.MoneyEdge ORDER BY tag;
+----
+cent	0.0001	-0.0001
+max	922337203685477.5807	214748.3647
+min	-922337203685477.5807	-214748.3648
+zero	0.0000	0.0000
+
+# -----------------------------------------------------------------------------
+# The point of the fix: a money column must not cost its NEIGHBOURS their
+# kernels. Every column here resolves, so a mis-declared width on the money one
+# would drop all of them to the row path — which still round-trips, so the only
+# way this file can observe it is that the layout must stay exact with the money
+# column sitting BETWEEN two others.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('mn', 'IF OBJECT_ID(''dbo.MoneyMixed'') IS NOT NULL DROP TABLE dbo.MoneyMixed;
+CREATE TABLE dbo.MoneyMixed (
+  a bigint, mny money, b nvarchar(40), smny smallmoney, c datetime2(3), d decimal(18,6), e int
+)');
+
+statement ok
+CREATE OR REPLACE TABLE mn_mix AS
+SELECT (i * 31)::BIGINT AS a,
+       ((i % 50000) / 100.0)::DECIMAL(19,4) AS mny,
+       'v' || (i % 977) AS b,
+       ((i % 9000) / 100.0)::DECIMAL(10,4) AS smny,
+       (TIMESTAMP '2023-03-03 03:03:03.003' + INTERVAL (i % 7000) SECOND) AS c,
+       ((i % 999999) / 1000000.0)::DECIMAL(18,6) AS d,
+       (i % 100000)::INTEGER AS e
+FROM range(30000) t(i);
+
+statement ok
+COPY mn_mix TO 'mn.dbo.MoneyMixed' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM (
+    SELECT a, mny::DECIMAL(19,4) m, b, smny::DECIMAL(19,4) s, c::TIMESTAMP t, d::DECIMAL(18,6) dd, e FROM mn_mix
+    EXCEPT ALL
+    SELECT a, mny::DECIMAL(19,4), b, smny::DECIMAL(19,4), c::TIMESTAMP, d::DECIMAL(18,6), e FROM mn.dbo.MoneyMixed
+);
+----
+0
+
+statement ok
+SELECT mssql_exec('mn', 'DROP TABLE dbo.MoneyRt; DROP TABLE dbo.MoneyEdge; DROP TABLE dbo.MoneyMixed;');
+
+statement ok
+DETACH mn;

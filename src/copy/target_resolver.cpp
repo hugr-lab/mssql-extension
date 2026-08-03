@@ -882,8 +882,21 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 4;
 	} else if (type_lower == "float") {
 		return 8;
-	} else if (type_lower == "decimal" || type_lower == "numeric") {
-		// Calculate based on precision
+	} else if (type_lower == "decimal" || type_lower == "numeric" || type_lower == "money" ||
+			   type_lower == "smallmoney") {
+		// MONEY and SMALLMONEY are here on purpose. They go on the wire as
+		// DECIMALN — SQLServerTypeToTdsType declares TDS_TYPE_DECIMAL for them,
+		// and the encoder writes a decimal, because DuckDB has no MONEY type and
+		// the Money codec family is decode-only. So what is SENT is a decimal of
+		// this precision (9 bytes for money's 19, 9 for smallmoney's 10).
+		//
+		// This used to answer 8 and 4 — the MONEY and SMALLMONEY wire sizes, for
+		// a wire form nothing writes. The row path never noticed, because it
+		// appends and whatever it writes IS the layout; the columnar scatter
+		// reserves from this number first, so the width check refused the column
+		// and ONE money column dropped the WHOLE chunk back to row-major.
+		// Measured on a 44-column table: 394 ms against 190 ms for the same
+		// table without the two money columns.
 		if (precision <= 9) {
 			return 5;
 		} else if (precision <= 19) {
@@ -893,10 +906,6 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		} else {
 			return 17;
 		}
-	} else if (type_lower == "money") {
-		return 8;
-	} else if (type_lower == "smallmoney") {
-		return 4;
 	} else if (type_lower == "varchar" || type_lower == "char") {
 		// For (max), max_length is -1 in sys.columns
 		if (max_length == -1) {
