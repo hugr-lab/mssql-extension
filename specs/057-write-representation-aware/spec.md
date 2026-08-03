@@ -1972,3 +1972,115 @@ is bounded under 2% (`sys` = 0.01 s).
   which is what §D5b already argued from the buffer-shape side.
 - `other` stays ~60 us across 500k rows, so nothing is hiding in the sink outside
   these two.
+
+---
+
+# Kernel architecture — one declaration per (source, target), everything derived (user, 2026-08-03)
+
+Raised while adding the second family to the columnar scatter, and it stops that
+work until it is settled, because the obvious next step is the wrong one.
+
+## The trap being walked into
+
+The write path already keeps two things that must agree and have no mechanism
+forcing them to:
+
+- `IsTypeCompatible` in `target_resolver.cpp` — a table of type NAMES saying
+  which conversions are allowed;
+- the family encoders — what can actually be executed.
+
+They disagreed for two releases: every widening the table advertised
+(`TINYINT -> int`, `SMALLINT -> bigint`, `INTEGER -> bigint`) died in the encoder
+with `INTERNAL Error`, while `DECIMAL(21,1) -> decimal(18,2)` was waved through
+and silently moved the decimal point (issue #153).
+
+Adding a `ScatterFn` per family *alongside* the existing `EncodeFn` would make it
+**three** lists to keep in step. The next divergence would be a family that
+scatters correctly and appends wrongly, or vice versa, on a path no test
+distinguishes because both produce a plausible number.
+
+## The shape instead — mirror the read path (user, 2026-08-03)
+
+The read side already solved this in spec 055 and there is nothing to invent.
+`codec::staging::ResolveColumnOps(const tds::ColumnMetadata &, const LogicalType &)`
+returns a `ColumnOps` resolved **once per column** holding:
+
+- `AppendArm arm` — which per-value arm the row walk takes;
+- `FinalizeKernel kernel` — which batch kernel publishes the column;
+- `StagingKind kind` + `stride` — fixed width, or Var;
+- `direct_write` — the bypass when the wire bytes ARE the DuckDB representation;
+- `max_value_bytes` — the most bytes ONE value can occupy, so a chunk's worst
+  case is preallocable from metadata alone;
+- and `Unsupported` / `needs_value_fallback` as the escape hatches, so a
+  divergence degrades to the old path instead of writing wrong bytes.
+
+The write side takes the same shape, named to match so one reader can hold both:
+
+```
+struct WriteColumnOps {
+    ScatterArm  arm;              // DirectCopy1/2/4/8, Decimal, Date, Time,
+                                  // DateTime2, DateTimeOffset, Money, Guid, ...
+    ConvertArm  convert;          // None, WidenInt, NarrowInt, RescaleDecimal, ...
+    WireKind    kind;             // Fixed | VariableUShort | Plp
+    uint32_t    wire_width;       // bytes per value for Fixed; 0 for variable
+    uint32_t    max_value_bytes;  // provable worst case for a Var column
+};
+WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCPColumnMetadata &target);
+```
+
+**Enums, not function pointers** — this is the part worth copying deliberately.
+An arm selected by a small enum inside one loop can be inlined and vectorised; a
+`ScatterFn` called per value cannot be either, which would give back most of what
+the columnar shape just bought. The first sketch of this section proposed
+function pointers; the read path's choice is better and it is why.
+
+Three properties follow, and each closes a hole this spec already paid for:
+
+1. **The append form is DERIVED, not written.** For a fixed-width column,
+   appending is `resize(n + 1 + w); buf[n] = w; <arm writes at &buf[n+1]>`. One
+   implementation per family, so the row path and the columnar path cannot
+   diverge — they are the same bytes by construction, not by a test.
+
+2. **Compatibility IS resolvability.** `IsTypeCompatible` stops being a table of
+   type names and becomes `ResolveWriteColumnOps(...).arm != Unsupported`. A
+   conversion that cannot be executed cannot be advertised, which is exactly the
+   failure mode of #153, and the error can name what is missing instead of
+   saying "type mismatch" about a pair the encoder would have handled.
+
+3. **Conversion is a per-column constant.** Source scale vs target scale, source
+   width vs target width, source unit vs target unit — all fixed for the chunk.
+   The stopgap shipped for #153 branches on the source's `PhysicalType` inside
+   every target arm, i.e. per value; that becomes `convert` chosen once, and the
+   inner loop carries no type test at all.
+
+## What "automatically transformed on cast" has to mean
+
+The user's framing, and it is the right one: the set of conversions the extension
+performs implicitly should be exactly the set for which a kernel exists — no
+wider (that is #153) and no narrower (that is the `BIGINT -> int` refusal, which
+DuckDB's BIGINT-by-default arithmetic made a daily annoyance).
+
+Which leaves one policy question per kernel, and it needs writing down as a rule
+rather than decided family by family as it has been:
+
+| when the value does not fit | behaviour | why |
+| --- | --- | --- |
+| integer narrowing | **refuse** | a value that does not fit is a different number, and nothing in `bigint -> int` says the user wanted the low 32 bits |
+| decimal scale narrowing | **round**, half away from zero | matches what SQL Server's own CAST does, so the row lands as it would had the user written it |
+| string longer than the column | **truncate**, on a character boundary, and count it | the column states a bound; truncating to a stated bound is executing the declaration |
+| code-page target overflow | **refuse** (server's 2628) | the client cannot compute the code page's byte count |
+
+The pattern under it: **truncate when the target states a bound the user chose,
+refuse when it does not.** A `VARCHAR(20)` says twenty. An `int` does not say
+"the low 32 bits of whatever arrives".
+
+## Consequence for the build order
+
+Step 3's remaining kernels (DECIMAL, temporal, GUID, then strings) land on top of
+`ResolveKernel`, not beside the current `EncodeFn`. The direct-copy slice already
+built fits without change — its kernel is `scatter = nullptr` (memcpy) with the
+width from metadata, which is the degenerate case of the struct above.
+
+Strings stay last, as they are the only family where `wire_width` is 0 and the
+staging/blocked-assembly machinery is needed; everything above is a fixed stride
+and needs none of it.

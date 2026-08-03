@@ -1,5 +1,7 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/write_column_ops.hpp"
+
 #include "tds/tds_types.hpp"
 
 #include "codec/binary_codec.hpp"
@@ -164,6 +166,146 @@ void EncodeRowFromStates(vector<uint8_t> &buffer, idx_t row_idx, const vector<ms
 // Chunk- and Row-Level Encoding
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Columnar scatter for fixed-width, direct-copy columns (spec 057 step 3)
+//
+// The row loop below hoists per-column state (spec 054 W1+W2) but still appends
+// one value at a time through push_back, which costs a capacity check per byte —
+// measured at ~10 ns/value on the string path, more than the UTF-16 conversion
+// itself. This path removes it for the case where it is removable without any
+// conversion at all: every column fixed-width, and its wire bytes a plain
+// little-endian copy of what the vector already stores.
+//
+// The shape is: size the buffer from METADATA and the validity masks (never from
+// a value), resize once, then walk COLUMNS writing through a raw pointer. That
+// is the direction measured in test/cpp/bench_materialize.cpp — 8.14 -> 0.53
+// ns/value at one column, 7.83 -> 0.36 at 44 with blocking.
+//
+// Deliberately narrow for now. DECIMAL, temporal and GUID need transformation
+// kernels and variable-width families need staging; both are later commits, and
+// until they exist those chunks take the row loop unchanged.
+//
+// Little-endian is assumed, as it already is by the byte-wise appenders this
+// replaces and by DecodeFromTds's memcpy. Every platform this ships to is LE.
+//===----------------------------------------------------------------------===//
+
+//! Encode the whole chunk as a columnar scatter. Returns false if any column
+//! lacks a scatter arm, having written nothing.
+bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vector<mssql::BCPColumnMetadata> &columns,
+							vector<ColumnEncodeState> &states) {
+	const idx_t ncols = columns.size();
+	if (ncols == 0) {
+		return false;
+	}
+
+	vector<uint8_t> widths(ncols);
+	size_t stride = 1;	// the 0xD1 ROW token
+	bool all_valid = true;
+	for (idx_t c = 0; c < ncols; c++) {
+		// A missing source column is NULL every row: no payload, so it scatters
+		// for free. Everything else answers to ResolveWriteColumnOps, which is
+		// the single place that decides what this path can do.
+		if (!states[c].vec) {
+			widths[c] = 0;
+			stride += 1;
+			continue;
+		}
+		const auto ops = mssql::codec::ResolveWriteColumnOps(states[c].vec->GetType(), columns[c]);
+		if (!ops.CanScatter()) {
+			return false;
+		}
+		widths[c] = static_cast<uint8_t>(ops.wire_width);
+		stride += 1 + widths[c];
+		if (states[c].vec && !states[c].fmt.validity.AllValid()) {
+			all_valid = false;
+		}
+	}
+
+	// Sizing reads metadata and the masks only — never a value. A NULL keeps its
+	// 1-byte marker and drops its payload, so it can only make a row shorter.
+	const size_t base = buffer.size();
+	vector<size_t> row_at;
+	size_t total;
+	if (all_valid) {
+		total = row_count * stride;
+	} else {
+		row_at.resize(row_count);
+		size_t acc = 0;
+		for (idx_t r = 0; r < row_count; r++) {
+			row_at[r] = acc;
+			size_t sz = 1;
+			for (idx_t c = 0; c < ncols; c++) {
+				const auto &st = states[c];
+				const bool valid = st.vec && st.fmt.validity.RowIsValid(st.fmt.sel->get_index(r));
+				sz += 1 + (valid ? widths[c] : 0);
+			}
+			acc += sz;
+		}
+		total = acc;
+	}
+
+	buffer.resize(base + total);
+	uint8_t *const dst = buffer.data() + base;
+
+	if (all_valid) {
+		for (idx_t r = 0; r < row_count; r++) {
+			dst[r * stride] = BCP_TOKEN_ROW;
+		}
+		size_t col_off = 1;
+		for (idx_t c = 0; c < ncols; c++) {
+			const auto &st = states[c];
+			const uint8_t w = widths[c];
+			if (w == 0) {
+				for (idx_t r = 0; r < row_count; r++) {
+					dst[r * stride + col_off] = 0x00;  // missing column: NULL marker
+				}
+				col_off += 1;
+				continue;
+			}
+			const uint8_t *src = reinterpret_cast<const uint8_t *>(st.fmt.data);
+			const auto *sel = st.fmt.sel;
+			for (idx_t r = 0; r < row_count; r++) {
+				uint8_t *out = dst + r * stride + col_off;
+				*out = w;
+				std::memcpy(out + 1, src + sel->get_index(r) * w, w);
+			}
+			col_off += 1 + w;
+		}
+		return true;
+	}
+
+	// NULL-bearing: the row offsets are not a stride, so carry a per-column
+	// cursor. The branch per value is deliberate — the branchless form was
+	// measured WORSE (null50 5.5 -> 7.6 ns/value) because it trades a
+	// well-predicted branch for an unconditional write and a multiply that stops
+	// the loop vectorising. Do not retry it.
+	for (idx_t r = 0; r < row_count; r++) {
+		dst[row_at[r]] = BCP_TOKEN_ROW;
+	}
+	vector<size_t> cursor(row_count);
+	for (idx_t r = 0; r < row_count; r++) {
+		cursor[r] = row_at[r] + 1;
+	}
+	for (idx_t c = 0; c < ncols; c++) {
+		const auto &st = states[c];
+		const uint8_t w = widths[c];
+		const uint8_t *src = st.vec ? reinterpret_cast<const uint8_t *>(st.fmt.data) : nullptr;
+		for (idx_t r = 0; r < row_count; r++) {
+			uint8_t *out = dst + cursor[r];
+			const idx_t sidx = st.vec ? st.fmt.sel->get_index(r) : 0;
+			if (src && w != 0 && st.fmt.validity.RowIsValid(sidx)) {
+				*out = w;
+				std::memcpy(out + 1, src + sidx * w, w);
+				cursor[r] += 1 + w;
+			} else {
+				*out = 0x00;
+				cursor[r] += 1;
+			}
+		}
+	}
+	return true;
+}
+
 void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 								const vector<mssql::BCPColumnMetadata> &columns,
 								const vector<int32_t> *column_mapping) {
@@ -199,6 +341,9 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
+	if (TryEncodeChunkColumnar(buffer, row_count, columns, states)) {
+		return;
+	}
 	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
 		buffer.push_back(BCP_TOKEN_ROW);
 		EncodeRowFromStates(buffer, row_idx, columns, states);
