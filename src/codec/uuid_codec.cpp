@@ -100,16 +100,45 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 // Encode (DuckDB → TDS BCP)
 //===----------------------------------------------------------------------===//
 
-void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	// Format-based access (was FlatVector::GetData — wrong for dictionary/
 	// constant inputs; fixed as part of the W1 hoisting, spec 054).
 	(void)in;
-	auto uuid = FormatValue<hugeint_t>(fmt, row);
-	buf.push_back(GUID_LENGTH_PREFIX);
-	const size_t start = buf.size();
-	buf.resize(start + GUID_WIRE_SIZE);
-	EncodeHugeIntToWire(uuid, buf.data() + start);
+	const size_t at = buf.size();
+	buf.resize(at + 1 + GUID_WIRE_SIZE);
+	buf[at] = GUID_LENGTH_PREFIX;
+	ScatterToBcp(buf.data() + at + 1, in, fmt, row, col);
+}
+
+// One call per COLUMN — see decimal's peer and the read path's
+// DecodeChunkFromStaging. The shuffle is inlined here rather than called across
+// a translation-unit boundary per value.
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector & /*in*/,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/) {
+	const hugeint_t *src = reinterpret_cast<const hugeint_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	// Selection presence hoisted out of the loop — see decimal's peer.
+	if (sel->IsSet()) {
+		for (idx_t r = 0; r < rows; r++) {
+			uint8_t *out = dst + r * stride;
+			*out = GUID_LENGTH_PREFIX;
+			EncodeHugeIntToWire(src[sel->get_index_unsafe(row_begin + r)], out + 1);
+		}
+	} else {
+		for (idx_t r = 0; r < rows; r++) {
+			uint8_t *out = dst + r * stride;
+			*out = GUID_LENGTH_PREFIX;
+			EncodeHugeIntToWire(src[row_begin + r], out + 1);
+		}
+	}
+}
+
+// Write the 16 wire bytes at a pointer — the one implementation, from which the
+// appending form above is derived (spec 057 step 3).
+void ScatterToBcp(uint8_t *out, Vector & /*in*/, const UnifiedVectorFormat &fmt, idx_t row,
+				  const mssql::BCPColumnMetadata & /*col*/) {
+	EncodeHugeIntToWire(FormatValue<hugeint_t>(fmt, row), out);
 }
 
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {

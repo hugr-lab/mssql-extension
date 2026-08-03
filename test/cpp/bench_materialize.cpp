@@ -98,10 +98,10 @@ struct CellSpec {
 	std::string name;
 	size_t len_units = 16;	// UTF-16 code units per value
 	Script script = Script::Ascii;
-	int null_pct = 0;			   // % of NULL rows
-	size_t cardinality = 2048;	   // distinct values in the chunk
-	bool embedded_nul = false;	   // strategy-C gating case
-	bool lone_high_surr = false;   // strategy-B gating case (invalid UTF-16 tail)
+	int null_pct = 0;			  // % of NULL rows
+	size_t cardinality = 2048;	  // distinct values in the chunk
+	bool embedded_nul = false;	  // strategy-C gating case
+	bool lone_high_surr = false;  // strategy-B gating case (invalid UTF-16 tail)
 };
 
 void AppendUnit(std::vector<uint8_t> &buf, uint16_t unit) {
@@ -877,6 +877,123 @@ size_t WideColFull(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	return buf.size();
 }
 
+// TEMPLATE FRAMING (spec 057 step 3 design, 2026-08-03).
+//
+// For an all-valid fixed-width chunk every row's non-payload bytes are
+// IDENTICAL: the 0xD1 token and one length byte per column, all at fixed offsets
+// within the stride. So they are a template, not per-row work — build one row's
+// worth once, replicate it across the whole buffer by doubling, and the payload
+// pass then never touches a length byte.
+//
+// Two things this is meant to buy: the width stops being a per-value store, and
+// the payload store becomes a clean strided write of a known width with nothing
+// interleaved.
+size_t WideColTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf) {
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	const size_t stride = w.stride;
+	buf.resize(rows * stride);
+	uint8_t *const dst = buf.data();
+
+	// One row of framing, payload positions left undefined.
+	dst[0] = 0xD1;
+	{
+		size_t off = 1;
+		for (idx_t c = 0; c < ncols; ++c) {
+			dst[off] = 8;
+			off += 9;
+		}
+	}
+	// Replicate by doubling: log2(rows) memcpys instead of rows * (1 + ncols)
+	// single-byte stores.
+	size_t done = 1;
+	while (done < rows) {
+		const size_t take = duckdb::MinValue<size_t>(done, rows - done);
+		memcpy(dst + done * stride, dst, take * stride);
+		done += take;
+	}
+
+	size_t col_off = 1;
+	for (idx_t c = 0; c < ncols; ++c) {
+		const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		uint8_t *p = dst + col_off + 1;	 // straight to the payload
+		for (idx_t r = 0; r < rows; ++r) {
+			memcpy(p + r * stride, &src[r], 8);
+		}
+		col_off += 9;
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
+// WIDTH-SPECIALISED SCATTER.
+//
+// The production path holds the width in a runtime `uint8_t w` and calls
+// memcpy(dst, src, w), which no compiler can fold into a single store. The width
+// is a COLUMN constant and the arms already exist per width, so it belongs in
+// the type, not in a variable. This is the same loop as WideColFull with W as a
+// template parameter — the difference is only what the compiler can see.
+template <int W>
+inline void ScatterWidth(uint8_t *dst, size_t stride, size_t col_off, idx_t rows, const uint8_t *src) {
+	for (idx_t r = 0; r < rows; ++r) {
+		uint8_t *p = dst + r * stride + col_off;
+		*p = W;
+		memcpy(p + 1, src + r * W, W);
+	}
+}
+
+size_t WideColTypedWidth(WideFixture &w, duckdb::vector<uint8_t> &buf) {
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	buf.resize(rows * w.stride);
+	uint8_t *const dst = buf.data();
+	for (idx_t r = 0; r < rows; ++r) {
+		dst[r * w.stride] = 0xD1;
+	}
+	size_t col_off = 1;
+	for (idx_t c = 0; c < ncols; ++c) {
+		const uint8_t *src = reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]));
+		ScatterWidth<8>(dst, w.stride, col_off, rows, src);
+		col_off += 9;
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
+// Both together: template framing AND a width-specialised payload store.
+template <int W>
+inline void ScatterPayloadOnly(uint8_t *dst, size_t stride, idx_t rows, const uint8_t *src) {
+	for (idx_t r = 0; r < rows; ++r) {
+		memcpy(dst + r * stride, src + r * W, W);
+	}
+}
+
+size_t WideColTemplateTyped(WideFixture &w, duckdb::vector<uint8_t> &buf) {
+	const idx_t rows = CHUNK_ROWS;
+	const idx_t ncols = w.cols.size();
+	const size_t stride = w.stride;
+	buf.resize(rows * stride);
+	uint8_t *const dst = buf.data();
+	dst[0] = 0xD1;
+	for (idx_t c = 0, off = 1; c < ncols; ++c, off += 9) {
+		dst[off] = 8;
+	}
+	size_t done = 1;
+	while (done < rows) {
+		const size_t take = duckdb::MinValue<size_t>(done, rows - done);
+		memcpy(dst + done * stride, dst, take * stride);
+		done += take;
+	}
+	size_t col_off = 1;
+	for (idx_t c = 0; c < ncols; ++c) {
+		const uint8_t *src = reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]));
+		ScatterPayloadOnly<8>(dst + col_off + 1, stride, rows, src);
+		col_off += 9;
+	}
+	g_sink ^= buf.size();
+	return buf.size();
+}
+
 // Rows in blocks; within a block, all columns. The block's output slice stays
 // resident across the column walk.
 size_t WideColBlocked(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block) {
@@ -1296,8 +1413,7 @@ size_t EncodeChunkBulkUtf16Blocked(BcpFixture &f, duckdb::vector<uint8_t> &buf, 
 			gathered[g++] = '\0';
 		}
 
-		const size_t units =
-			g == 0 ? 0 : simdutf::convert_valid_utf8_to_utf16le(gathered.data(), g, converted.data());
+		const size_t units = g == 0 ? 0 : simdutf::convert_valid_utf8_to_utf16le(gathered.data(), g, converted.data());
 		const bool ascii = units == g;
 		const uint8_t *base = reinterpret_cast<const uint8_t *>(converted.data());
 
@@ -1401,7 +1517,7 @@ std::vector<BcpCellSpec> BuildBcpCells() {
 		K kind;
 		const char *prefix;
 	};
-	for (const KindRow &kr : {KindRow {K::Bigint, "bigint"}, KindRow {K::Varchar16, "nvarchar16"}}) {
+	for (const KindRow &kr : {KindRow{K::Bigint, "bigint"}, KindRow{K::Varchar16, "nvarchar16"}}) {
 		add(kr.kind, VecRep::FlatUnique, 2048, 0, std::string(kr.prefix) + "_flat_unique");
 		add(kr.kind, VecRep::FlatLowCard, 10, 0, std::string(kr.prefix) + "_flat_card10");
 		for (size_t card : {1, 10, 100}) {
@@ -1466,8 +1582,8 @@ std::string DecodeReplacingStandard(const uint8_t *data, size_t byte_length) {
 			const size_t written = simdutf::convert_valid_utf16le_to_utf8(src + pos, r.count, scratch.data());
 			out.append(scratch.data(), written);
 		}
-		out.append("\xEF\xBF\xBD", 3);  // U+FFFD
-		pos += r.count + 1;			   // skip the offending code unit
+		out.append("\xEF\xBF\xBD", 3);	// U+FFFD
+		pos += r.count + 1;				// skip the offending code unit
 	}
 	return out;
 }
@@ -1481,7 +1597,7 @@ struct StagedStrings {
 	size_t code_units = 0;
 	size_t delim_units = 0;
 	bool all_valid = true;
-	bool boundary_risky = false;   // some value ends in an unpaired high surrogate
+	bool boundary_risky = false;  // some value ends in an unpaired high surrogate
 	bool saw_embedded_nul = false;
 	bool all_ascii = false;
 };
@@ -1531,8 +1647,8 @@ StagedStrings StageColumn(const Fixture &f) {
 // Per-chunk scratch (the real implementation keeps these in the staging arena).
 struct BatchScratch {
 	std::vector<uint32_t> out_off, out_len;
-	std::vector<std::string> fb;	   // decoded fallback text for invalid values
-	std::vector<uint32_t> fb_epoch;	   // epoch stamp — avoids clearing per chunk
+	std::vector<std::string> fb;	 // decoded fallback text for invalid values
+	std::vector<uint32_t> fb_epoch;	 // epoch stamp — avoids clearing per chunk
 	uint32_t epoch = 0;
 };
 BatchScratch g_bs;
@@ -1643,10 +1759,9 @@ size_t FillChunkBatchB(const Fixture &f, const StagedStrings &s, DataChunk &chun
 size_t FillChunkBatchAscii(const Fixture &f, const StagedStrings &s, DataChunk &chunk) {
 	chunk.Reset();
 	auto &vec = chunk.data[0];
-	const size_t total =
-		s.code_units == 0
-			? 0
-			: simdutf::utf8_length_from_utf16le(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units);
+	const size_t total = s.code_units == 0 ? 0
+										   : simdutf::utf8_length_from_utf16le(
+												 reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units);
 	char *base = AllocOutput(vec, total);
 	if (s.code_units > 0) {
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
@@ -1757,8 +1872,8 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 	chunk.Reset();
 	auto &vec = chunk.data[0];
 	char *base = AllocOutput(vec, s.delim_units * 3);
-	const size_t written = simdutf::convert_valid_utf16le_to_utf8(
-		reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
+	const size_t written =
+		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
 	auto *slots = FlatVector::GetData<string_t>(vec);
 
 	if (written == s.delim_units) {
@@ -1843,8 +1958,8 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 	chunk.Reset();
 	auto &vec = chunk.data[0];
 	char *base = AllocOutput(vec, s.delim_units * 3);
-	const size_t written = simdutf::convert_valid_utf16le_to_utf8(
-		reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
+	const size_t written =
+		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
 	auto *slots = FlatVector::GetData<string_t>(vec);
 
 	if (written == s.delim_units) {
@@ -1895,8 +2010,8 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 	chunk.Reset();
 	auto &vec = chunk.data[0];
 	char *base = AllocOutput(vec, s.delim_units * 3);
-	const size_t written = simdutf::convert_valid_utf16le_to_utf8(
-		reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
+	const size_t written =
+		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
 	auto *slots = FlatVector::GetData<string_t>(vec);
 
 	if (written == s.delim_units) {
@@ -1946,10 +2061,10 @@ size_t FillChunkConvertOnlyPrealloc(const Fixture &f, const StagedStrings &s, Da
 	chunk.Reset();
 	auto &vec = chunk.data[0];
 	char *base = AllocOutput(vec, s.code_units * 3);
-	const size_t written =
-		s.code_units == 0 ? 0
-						  : simdutf::convert_valid_utf16le_to_utf8(
-								reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units, base);
+	const size_t written = s.code_units == 0
+							   ? 0
+							   : simdutf::convert_valid_utf16le_to_utf8(
+									 reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units, base);
 	chunk.SetCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
@@ -1962,10 +2077,9 @@ size_t FillChunkConvertOnly(const Fixture &f, const StagedStrings &s, DataChunk 
 	(void)f;
 	chunk.Reset();
 	auto &vec = chunk.data[0];
-	const size_t total =
-		s.code_units == 0
-			? 0
-			: simdutf::utf8_length_from_utf16le(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units);
+	const size_t total = s.code_units == 0 ? 0
+										   : simdutf::utf8_length_from_utf16le(
+												 reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units);
 	char *base = AllocOutput(vec, total);
 	if (s.code_units > 0) {
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
@@ -2154,8 +2268,8 @@ void FillWirePerValue(const WireImage &w, DataChunk &chunk, std::vector<std::vec
 struct RawColumn {
 	WireCol kind;
 	// StagedFixed / StagedVar
-	std::vector<uint8_t> raw;		   // fixed: row * stride; var: delimited payload
-	std::vector<uint32_t> off, len;	   // var only
+	std::vector<uint8_t> raw;		 // fixed: row * stride; var: delimited payload
+	std::vector<uint32_t> off, len;	 // var only
 	std::vector<uint64_t> validity;
 	uint32_t stride = 0;
 	// DirectFixed
@@ -2392,9 +2506,8 @@ size_t AnalyzeDictStrings(const Fixture &f, const StagedStrings &s, size_t cap) 
 				++uniques;
 				break;
 			}
-			if (slot_len[idx] == len &&
-				std::memcmp(s.payload.data() + slot_off[idx], p, len) == 0) {
-				break;  // hit, confirmed by full equality
+			if (slot_len[idx] == len && std::memcmp(s.payload.data() + slot_off[idx], p, len) == 0) {
+				break;	// hit, confirmed by full equality
 			}
 			idx = (idx + 1) & (TABLE - 1);
 		}
@@ -2568,25 +2681,25 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 	if (prec <= 4) {
 		auto *out = FlatVector::GetData<int16_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
-			const duckdb::hugeint_t v = fast ? ConvertDecimalFast(base + row * stride, stride)
-											 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(
-												   base + row * stride, stride);
+			const duckdb::hugeint_t v =
+				fast ? ConvertDecimalFast(base + row * stride, stride)
+					 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 			out[row] = static_cast<int16_t>(v.lower);
 		}
 	} else if (prec <= 9) {
 		auto *out = FlatVector::GetData<int32_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
-			const duckdb::hugeint_t v = fast ? ConvertDecimalFast(base + row * stride, stride)
-											 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(
-												   base + row * stride, stride);
+			const duckdb::hugeint_t v =
+				fast ? ConvertDecimalFast(base + row * stride, stride)
+					 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 			out[row] = static_cast<int32_t>(v.lower);
 		}
 	} else if (prec <= 18) {
 		auto *out = FlatVector::GetData<int64_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
-			const duckdb::hugeint_t v = fast ? ConvertDecimalFast(base + row * stride, stride)
-											 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(
-												   base + row * stride, stride);
+			const duckdb::hugeint_t v =
+				fast ? ConvertDecimalFast(base + row * stride, stride)
+					 : duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 			out[row] = static_cast<int64_t>(v.lower);
 		}
 	} else {
@@ -2605,8 +2718,9 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 
 int main() {
 	std::printf("[bench_materialize] spec 054 D1 — string-decode / fixed-decode / bcp-encode groups (current path)\n");
-	std::printf("group\tcell\tus_per_chunk_median\tus_p10\tus_p90\tns_per_value_median"
-				"\tutf16_in_bytes\tutf8_out_bytes\tcorrect\n");
+	std::printf(
+		"group\tcell\tus_per_chunk_median\tus_p10\tus_p90\tns_per_value_median"
+		"\tutf16_in_bytes\tutf8_out_bytes\tcorrect\n");
 
 	duckdb::tds::ColumnMetadata col;
 	col.name = "c";
@@ -2635,8 +2749,8 @@ int main() {
 		auto r = TimeCell([&]() { FillChunkCurrent(f, chunk, col); }, IterationsFor(f.utf16_bytes));
 
 		std::printf("string_decode_current\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t%zu\t%s\n", spec.name.c_str(),
-					r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value,
-					f.utf16_bytes, out_bytes, correct ? "PASS" : "FAIL");
+					r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value, f.utf16_bytes,
+					out_bytes, correct ? "PASS" : "FAIL");
 
 		// --- spec-055 batch prototypes over one staged column ---
 		StagedStrings staged = StageColumn(f);
@@ -2726,83 +2840,83 @@ int main() {
 
 	// --- spec-056 evaluation: what does DETECTING low cardinality cost? ---
 	for (size_t len : {4, 16}) {
-	for (size_t card : {1, 10, 100, 101, 2048}) {
-		CellSpec cs;
-		cs.cardinality = card;
-		cs.len_units = len;
-		cs.name = "len" + std::to_string(len) + "_card" + std::to_string(card);
-		Fixture f = BuildFixture(cs);
-		StagedStrings staged = StageColumn(f);
+		for (size_t card : {1, 10, 100, 101, 2048}) {
+			CellSpec cs;
+			cs.cardinality = card;
+			cs.len_units = len;
+			cs.name = "len" + std::to_string(len) + "_card" + std::to_string(card);
+			Fixture f = BuildFixture(cs);
+			StagedStrings staged = StageColumn(f);
 
-		auto rp = TimeCell([&]() { g_sink ^= AnalyzeDictStringsPrefix(f, staged, 100); }, 400);
-		std::printf("analyze_dict_string_prefix\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
-					rp.median_us_per_chunk, rp.p10_us_per_chunk, rp.p90_us_per_chunk, rp.median_ns_per_value,
-					f.utf16_bytes);
+			auto rp = TimeCell([&]() { g_sink ^= AnalyzeDictStringsPrefix(f, staged, 100); }, 400);
+			std::printf("analyze_dict_string_prefix\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
+						rp.median_us_per_chunk, rp.p10_us_per_chunk, rp.p90_us_per_chunk, rp.median_ns_per_value,
+						f.utf16_bytes);
 
-		auto rc = TimeCell([&]() { g_sink ^= AnalyzeConstantStrings(f, staged) ? 1u : 0u; }, 400);
-		std::printf("analyze_const_string\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
-					rc.median_us_per_chunk, rc.p10_us_per_chunk, rc.p90_us_per_chunk, rc.median_ns_per_value,
-					f.utf16_bytes);
+			auto rc = TimeCell([&]() { g_sink ^= AnalyzeConstantStrings(f, staged) ? 1u : 0u; }, 400);
+			std::printf("analyze_const_string\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
+						rc.median_us_per_chunk, rc.p10_us_per_chunk, rc.p90_us_per_chunk, rc.median_ns_per_value,
+						f.utf16_bytes);
 
-		auto rd = TimeCell([&]() { g_sink ^= AnalyzeDictStrings(f, staged, 100); }, 400);
-		std::printf("analyze_dict_string\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
-					rd.median_us_per_chunk, rd.p10_us_per_chunk, rd.p90_us_per_chunk, rd.median_ns_per_value,
-					f.utf16_bytes);
+			auto rd = TimeCell([&]() { g_sink ^= AnalyzeDictStrings(f, staged, 100); }, 400);
+			std::printf("analyze_dict_string\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\tPASS\n", cs.name.c_str(),
+						rd.median_us_per_chunk, rd.p10_us_per_chunk, rd.p90_us_per_chunk, rd.median_ns_per_value,
+						f.utf16_bytes);
 
-		std::vector<int64_t> ints = BuildIntColumn(card);
-		auto ri = TimeCell([&]() { g_sink ^= AnalyzeConstantInt(ints) ? 1u : 0u; }, 400);
-		std::printf("analyze_const_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
-					ri.median_us_per_chunk, ri.p10_us_per_chunk, ri.p90_us_per_chunk, ri.median_ns_per_value);
+			std::vector<int64_t> ints = BuildIntColumn(card);
+			auto ri = TimeCell([&]() { g_sink ^= AnalyzeConstantInt(ints) ? 1u : 0u; }, 400);
+			std::printf("analyze_const_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
+						ri.median_us_per_chunk, ri.p10_us_per_chunk, ri.p90_us_per_chunk, ri.median_ns_per_value);
 
-		auto rr = TimeCell(
-			[&]() {
-				int64_t lo, hi;
-				AnalyzeRangeInt(ints, lo, hi);
-				g_sink ^= static_cast<uint64_t>(hi - lo);
-			},
-			400);
-		std::printf("analyze_range_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
-					rr.median_us_per_chunk, rr.p10_us_per_chunk, rr.p90_us_per_chunk, rr.median_ns_per_value);
+			auto rr = TimeCell(
+				[&]() {
+					int64_t lo, hi;
+					AnalyzeRangeInt(ints, lo, hi);
+					g_sink ^= static_cast<uint64_t>(hi - lo);
+				},
+				400);
+			std::printf("analyze_range_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
+						rr.median_us_per_chunk, rr.p10_us_per_chunk, rr.p90_us_per_chunk, rr.median_ns_per_value);
 
-		auto rdi = TimeCell([&]() { g_sink ^= AnalyzeDictInt(ints, 100); }, 400);
-		std::printf("analyze_dict_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
-					rdi.median_us_per_chunk, rdi.p10_us_per_chunk, rdi.p90_us_per_chunk, rdi.median_ns_per_value);
-	}
+			auto rdi = TimeCell([&]() { g_sink ^= AnalyzeDictInt(ints, 100); }, 400);
+			std::printf("analyze_dict_int\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t-\t-\tPASS\n", cs.name.c_str(),
+						rdi.median_us_per_chunk, rdi.p10_us_per_chunk, rdi.p90_us_per_chunk, rdi.median_ns_per_value);
+		}
 	}
 
 	for (const auto &fc : BuildFixedCells()) {
 		try {
-		DataChunk chunk;
-		chunk.Initialize(duckdb::Allocator::DefaultAllocator(), {fc.type});
+			DataChunk chunk;
+			chunk.Initialize(duckdb::Allocator::DefaultAllocator(), {fc.type});
 
-		FillChunkFixed(fc, chunk);
-		bool correct = VerifyFixed(fc, chunk);
-		if (!correct) {
-			failures++;
-		}
-
-		auto r = TimeCell([&]() { FillChunkFixed(fc, chunk); }, 400);
-
-		std::printf("fixed_decode_current\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\t%s\n", fc.name.c_str(),
-					r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value, fc.in_bytes,
-					correct ? "PASS" : "FAIL");
-
-		// --- spec-055: staged batch loop, current kernel vs direct-assembly kernel ---
-		if (fc.col.type_id == duckdb::tds::TDS_TYPE_DECIMAL) {
-			StagedFixed sf = StageFixed(fc);
-			for (bool fast : {false, true}) {
-				FillChunkDecimalBatch(fc, sf, chunk, fast);
-				bool bcorrect = VerifyFixed(fc, chunk);
-				if (!bcorrect) {
-					failures++;
-				}
-				auto br = TimeCell([&]() { FillChunkDecimalBatch(fc, sf, chunk, fast); }, 400);
-				std::printf("%s\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\t%s\n",
-							fast ? "fixed_decode_batch_fastkernel" : "fixed_decode_batch_curkernel", fc.name.c_str(),
-							br.median_us_per_chunk, br.p10_us_per_chunk, br.p90_us_per_chunk, br.median_ns_per_value,
-							fc.in_bytes, bcorrect ? "PASS" : "FAIL");
+			FillChunkFixed(fc, chunk);
+			bool correct = VerifyFixed(fc, chunk);
+			if (!correct) {
+				failures++;
 			}
-		}
+
+			auto r = TimeCell([&]() { FillChunkFixed(fc, chunk); }, 400);
+
+			std::printf("fixed_decode_current\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\t%s\n", fc.name.c_str(),
+						r.median_us_per_chunk, r.p10_us_per_chunk, r.p90_us_per_chunk, r.median_ns_per_value,
+						fc.in_bytes, correct ? "PASS" : "FAIL");
+
+			// --- spec-055: staged batch loop, current kernel vs direct-assembly kernel ---
+			if (fc.col.type_id == duckdb::tds::TDS_TYPE_DECIMAL) {
+				StagedFixed sf = StageFixed(fc);
+				for (bool fast : {false, true}) {
+					FillChunkDecimalBatch(fc, sf, chunk, fast);
+					bool bcorrect = VerifyFixed(fc, chunk);
+					if (!bcorrect) {
+						failures++;
+					}
+					auto br = TimeCell([&]() { FillChunkDecimalBatch(fc, sf, chunk, fast); }, 400);
+					std::printf("%s\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%zu\t-\t%s\n",
+								fast ? "fixed_decode_batch_fastkernel" : "fixed_decode_batch_curkernel",
+								fc.name.c_str(), br.median_us_per_chunk, br.p10_us_per_chunk, br.p90_us_per_chunk,
+								br.median_ns_per_value, fc.in_bytes, bcorrect ? "PASS" : "FAIL");
+				}
+			}
 		} catch (std::exception &ex) {
 			std::fprintf(stderr, "cell %s threw: %s\n", fc.name.c_str(), ex.what());
 			failures++;
@@ -2861,8 +2975,8 @@ int main() {
 			// D5a columnar scatter: fixed-width families only (integer here).
 			if (bspec.kind == BcpCellSpec::Kind::Bigint) {
 				const size_t colw_bytes = EncodeChunkColumnarFixed(f, buf);
-				const bool colw_correct = hoisted_ref.size() == colw_bytes &&
-										  std::equal(hoisted_ref.begin(), hoisted_ref.end(), buf.begin());
+				const bool colw_correct =
+					hoisted_ref.size() == colw_bytes && std::equal(hoisted_ref.begin(), hoisted_ref.end(), buf.begin());
 				if (!colw_correct) {
 					failures++;
 				}
@@ -2944,6 +3058,9 @@ int main() {
 			variants.push_back({nm, [&, blk](duckdb::vector<uint8_t> &b) { return WideColBlocked(w, b, blk); }});
 		}
 		variants.push_back({"rowmajor", [&](duckdb::vector<uint8_t> &b) { return WideRowMajor(w, b); }});
+		variants.push_back({"tmplframe", [&](duckdb::vector<uint8_t> &b) { return WideColTemplate(w, b); }});
+		variants.push_back({"typedw", [&](duckdb::vector<uint8_t> &b) { return WideColTypedWidth(w, b); }});
+		variants.push_back({"tmpl+typedw", [&](duckdb::vector<uint8_t> &b) { return WideColTemplateTyped(w, b); }});
 
 		for (auto &v : variants) {
 			const size_t n = v.fn(buf);

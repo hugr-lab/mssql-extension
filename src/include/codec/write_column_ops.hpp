@@ -63,6 +63,12 @@ enum class ScatterArm : uint8_t {
 	DirectCopy2,
 	DirectCopy4,
 	DirectCopy8,
+	//! Sign byte plus little-endian magnitude, width from the target's precision.
+	//! MONEY and SMALLMONEY map to DECIMAL and arrive here too.
+	Decimal,
+	//! The 16 wire bytes of a UNIQUEIDENTIFIER (mixed-endian by the spec, which
+	//! is why it is a kernel and not a copy).
+	Guid,
 	//! Resolvable, but no columnar kernel yet — DECIMAL, temporal, GUID and the
 	//! string families still go through the row-major append path. Distinct from
 	//! Unsupported: this pair IS encodable, just not by a scatter, so it must not
@@ -90,7 +96,7 @@ struct WriteColumnOps {
 
 	//! Can this column take the columnar scatter?
 	bool CanScatter() const {
-		return arm == ScatterArm::NullOnly || (arm >= ScatterArm::DirectCopy1 && arm <= ScatterArm::DirectCopy8);
+		return arm != ScatterArm::Unsupported && arm != ScatterArm::RowFallback;
 	}
 };
 

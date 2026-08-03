@@ -9,6 +9,7 @@
 #include "codec/write_column_ops.hpp"
 
 #include "duckdb/common/types.hpp"
+#include "tds/encoding/bcp_row_encoder.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -70,10 +71,39 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		return ops;
 	}
 
+	// Fixed-width families that need a transformation rather than a copy. Each is
+	// still one width per column, so the stride model holds; only the arm differs.
+	if (target.duckdb_type.id() == LogicalTypeId::DECIMAL) {
+		// WidenVectorToHugeint accepts exactly these; anything else would read the
+		// wrong width out of the vector.
+		const PhysicalType src = source.InternalType();
+		const bool src_ok = src == PhysicalType::INT16 || src == PhysicalType::INT32 || src == PhysicalType::INT64 ||
+							src == PhysicalType::INT128;
+		const uint32_t width = tds::encoding::BCPRowEncoder::GetDecimalByteSize(target.precision);
+		if (src_ok && target.max_length == width) {
+			ops.arm = ScatterArm::Decimal;
+			ops.wire_width = width;
+			return ops;
+		}
+		ops.arm = ScatterArm::RowFallback;
+		ops.wire_width = target.max_length;
+		return ops;
+	}
+	if (target.duckdb_type.id() == LogicalTypeId::UUID) {
+		if (source.id() == LogicalTypeId::UUID && target.max_length == 16) {
+			ops.arm = ScatterArm::Guid;
+			ops.wire_width = 16;
+			return ops;
+		}
+		ops.arm = ScatterArm::RowFallback;
+		ops.wire_width = target.max_length;
+		return ops;
+	}
+
 	const uint32_t want = DirectCopyTargetWidth(target.duckdb_type);
 	if (want == 0) {
-		// DECIMAL, temporal and GUID are fixed width but need a transformation
-		// kernel, not a copy. They are resolvable and take the row path for now.
+		// Temporal families are fixed width but still need a kernel. Resolvable,
+		// row path for now.
 		ops.arm = ScatterArm::RowFallback;
 		ops.wire_width = target.max_length;
 		return ops;

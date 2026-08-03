@@ -2084,3 +2084,127 @@ width from metadata, which is the degenerate case of the struct above.
 Strings stay last, as they are the only family where `wire_width` is 0 and the
 staging/blocked-assembly machinery is needed; everything above is a fixed stride
 and needs none of it.
+
+---
+
+# Step 3 measured in production — and the width degradation does not reproduce (2026-08-03)
+
+## What landed
+
+Columnar scatter with the arm resolved once per column
+(`ResolveWriteColumnOps`), and batch kernels for the families that need a
+transformation rather than a copy.
+
+| fixture | row path | columnar | |
+| --- | --- | --- | --- |
+| 8 x BIGINT/INT/…, all valid | 73.3 ms (9.2 ns/value) | **24.7 ms (3.1)** | **3.0x** |
+| the same with NULLs | 64.2 ms | 58.2 ms | ~1.1x |
+| 4 DECIMAL + GUID + 3 BIGINT | 135 ms (16.9 ns/value) | **68.8 ms (8.6)** | **1.96x** |
+
+**A third of the decimal cost was an un-inlinable call.** The first version of
+the kernel was a per-value `ScatterToBcp` called from `bcp_row_encoder.cpp`
+across a translation-unit boundary: 102 ms. Turning it into one call per COLUMN,
+with the loop inside `decimal_codec.cpp` where it specialises on the source width
+and inlines the per-value step, took it to 68.8 ms — **1.48x for the same
+arithmetic**. Exactly the cost spec 058 identified ("what DID cost is out-of-line
+calls"), reintroduced by accident and then removed.
+
+## The width degradation does not reproduce
+
+The prototype measured a full per-column pass degrading with width — 0.42
+ns/value at 4 columns, 1.01 at 16 — and that measurement is the entire case for
+blocked assembly. In production it does not appear. BIGINT columns, 8M values in
+every cell, best of 3:
+
+| columns | rows | ns/value |
+| --- | --- | --- |
+| 1 | 8 000 000 | 3.00 |
+| 4 | 2 000 000 | 2.43 |
+| 16 | 500 000 | 2.24 |
+| 44 | 181 818 | **2.34** |
+
+Flat, and marginally *better* at width. The likely reason is cache size: a
+2048-row chunk of 44 BIGINT columns is ~813 KB of wire, which fits this machine's
+L2, so the per-column pass never leaves it. The prototype also measured a
+different shape — no length byte, no validity — so it is not a like-for-like.
+
+**This reading was wrong, and the prototype below overturns it.** The degradation
+is real; production simply cannot see it yet, because ~1.5-2 ns/value of
+per-value overhead sits on top and masks it. Left here with the correction rather
+than deleted, because the reasoning error is the instructive part: a flat
+production curve was read as "the effect does not exist" when it meant "something
+larger is in front of it".
+
+## What is still not the target shape
+
+The maintainer's formulation, and it is the right one: *data arrives in columns,
+so transform columns — with vectorisable instructions, not per value; every
+branch resolved before the hot path; and only then assemble the transformed
+columns into the wire in blocks.*
+
+Against that, what shipped is two-thirds there:
+
+- **one call per column** — yes;
+- **branches before the hot path** — yes: the arm, the width, the scale shift and
+  the source's storage type are all resolved before the loop;
+- **vectorisable transform** — **no.** The transform is fused with a STRIDED
+  store (`dst + r * stride`), so every value lands on its own cache line at
+  width and the loop cannot vectorise however well it is specialised.
+
+Separating them — transform the column into a contiguous staging array, then
+gather into the row-major wire — is what makes the transform vectorisable, and it
+is testable independently of blocking. For direct-copy families there is nothing
+to gain (there is no transform, only the store). For DECIMAL, temporal and the
+string families the transform is real work and this is where it would pay.
+
+---
+
+# Prototype: which shape actually wins (2026-08-03)
+
+Built in `test/cpp/bench_materialize.cpp` next to the existing wide-encode
+variants, so every cell is checked byte-identical against the shipped encoder by
+the harness itself. BIGINT columns, 2048-row chunks, median of 200, ns/value.
+
+| ncols | shipped | colfull | **colblk64** | tmplframe | typedw | tmpl+typedw |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.05 | 0.49 | 0.55 | **0.37** | 0.53 | 0.37 |
+| 4 | 1.95 | 0.40 | 0.40 | **0.35** | 0.38 | 0.35 |
+| 16 | 1.86 | 1.12 | **0.42** | 1.19 | 1.14 | 1.08 |
+| 44 | 1.68 | 0.88 | **0.38** | 0.95 | 0.88 | 0.87 |
+
+Two hypotheses died and one survived.
+
+**Width specialisation buys nothing.** The production scatter holds the width in
+a runtime `uint8_t` and calls `memcpy(dst, src, w)`; the theory was that this
+cannot fold into a single store. Templating the loop on W measured 0.49 -> 0.53
+at one column and 0.88 -> 0.88 at 44 — i.e. nothing. The compiler handles it. The
+cost is not there.
+
+**Template framing wins only when narrow.** Building one row's framing (the 0xD1
+token and every column's length byte, all at fixed offsets) and replicating it by
+doubling gives 0.49 -> 0.37 at one column, and 0.88 -> **0.95** at 44 — a loss.
+Obvious in hindsight: at width the replication writes 813 KB that the payload
+pass immediately overwrites, and that extra pass costs more than the length bytes
+it saves. Recorded so it is not re-proposed for wide tables.
+
+**Blocking is the win, and it is large.** 1.12 -> 0.42 at 16 columns, 0.88 ->
+0.38 at 44, and flat across every width tested. Block size is a plateau from 32
+to 256 with 64-128 the sweet spot, matching the earlier prototype.
+
+## Why production could not see it, and what that orders
+
+Production measures 2.24-3.00 ns/value where this microbenchmark's `colfull` is
+0.88-1.12 for the same shape. So **~1.5-2 ns/value of per-value overhead sits on
+top** — the microbenchmark walks `FlatVector::GetData<int64_t>(...)[r]` while the
+production scatter goes through `fmt.data` plus `sel->get_index(r)` per value.
+That indirection is what hides the difference between a good and a bad access
+pattern: when every value already costs a branch and a possible load, the cache
+behaviour of the store is not what dominates.
+
+**So the order is the reverse of what this document proposed an hour earlier.**
+Remove the per-value overhead first; blocking pays only once it is gone,
+otherwise its win drowns exactly as the degradation did. Whether a column has a
+selection vector at all is a COLUMN constant — the flat, no-selection case is the
+overwhelming majority and deserves a unit-stride loop the compiler can see
+through, which is the same rule as everything else here: every branch resolved
+before the hot path.
