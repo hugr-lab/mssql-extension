@@ -342,6 +342,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 		"compressed columnstore rowgroups directly; 0 = one batch at the end, high memory)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_FLUSH_ROWS), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_copy_parallel_writers — concurrent bulk-load connections per COPY
+	// (spec 057 step 7). 0 derives it from DuckDB's thread count, capped.
+	config.AddExtensionOption(
+		"mssql_copy_parallel_writers",
+		"Concurrent bulk-load connections a single COPY/CTAS may open (default: 0 = derive from DuckDB's "
+		"thread count, capped at 8). 1 disables parallel loading. Ignored inside an explicit transaction, "
+		"where the connection is pinned",
+		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_COPY_PARALLEL_WRITERS), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_copy_tablock — 'auto' | 'true' | 'false' (spec 057 step 1).
 	//
 	// Tri-state, and it has to be: the previous BOOLEAN could not express "the

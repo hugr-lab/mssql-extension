@@ -1,0 +1,146 @@
+# name: test/sql/copy/parallel_writers.test
+# description: a COPY run from several threads must load every row exactly once (spec 057 step 7)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Spec 057 step 7 made the COPY sink PARALLEL, so DuckDB may now call it from
+# several threads. That is the first time this path has ever been concurrent, and
+# turning it on lost rows immediately: **205376 of 1000000 arrived**, with no
+# error on either side. Nothing else in the suite noticed.
+#
+# The cause is worth stating because it is not "a missing lock" but two locks
+# that did not compose: the shared writer's append took BCPWriter's own internal
+# mutex, while the batch flush took the copy operator's. A flush could therefore
+# send and clear the accumulator while another thread was still appending to it,
+# and the appended rows went out with the buffer that had already been sent.
+#
+# So this file's job is to make silent row loss impossible to ship again, and the
+# fixture is shaped for the race rather than for size:
+#
+#   * `mssql_copy_flush_rows` is set LOW, so a batch boundary — the moment the
+#     accumulator is sent and cleared — happens many times during the load
+#     instead of once at the end. That is the window the race lives in;
+#   * both writer counts are exercised. `1` is the SHARED path, which is where
+#     the loss was, and is the case a reader would assume is the safe one;
+#   * the check is a per-row SUM and a DISTINCT count, not just `count(*)` — a
+#     row written twice and a row lost cancel out in a count.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS pw (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# Small batches, so the send-and-clear boundary is crossed repeatedly.
+statement ok
+SET mssql_copy_flush_rows = 5000;
+
+statement ok
+CREATE OR REPLACE TABLE pw_src AS
+SELECT i AS id, (i * 7)::BIGINT AS v, 'row_' || i AS s,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 1000)::INTEGER END AS n
+FROM range(200000) t(i);
+
+# -----------------------------------------------------------------------------
+# One writer: every thread shares the global writer. This is the configuration
+# the row loss appeared in.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
+statement ok
+SELECT mssql_exec('pw', 'IF OBJECT_ID(''dbo.PwShared'') IS NOT NULL DROP TABLE dbo.PwShared;
+CREATE TABLE dbo.PwShared (id int, v bigint, s nvarchar(40), n int)');
+
+statement ok
+COPY pw_src TO 'pw.dbo.PwShared' (FORMAT bcp, CREATE_TABLE false);
+
+# count, DISTINCT count and a checksum together: a duplicate plus a loss leaves
+# count(*) unchanged, and only the other two notice.
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), count(n) FROM pw.dbo.PwShared;
+----
+200000	200000	19999900000	184615
+
+query I
+SELECT count(*) FROM (SELECT * FROM pw_src EXCEPT ALL SELECT id, v, s, n FROM pw.dbo.PwShared);
+----
+0
+
+# -----------------------------------------------------------------------------
+# Four writers: each thread opens its own INSERT BULK on its own connection.
+# Concurrent bulk loads into a heap take mutually compatible BU locks, which is
+# what the TABLOCK `auto` policy turns the hint on for.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+statement ok
+SELECT mssql_exec('pw', 'IF OBJECT_ID(''dbo.PwParallel'') IS NOT NULL DROP TABLE dbo.PwParallel;
+CREATE TABLE dbo.PwParallel (id int, v bigint, s nvarchar(40), n int)');
+
+statement ok
+COPY pw_src TO 'pw.dbo.PwParallel' (FORMAT bcp, CREATE_TABLE false);
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), count(n) FROM pw.dbo.PwParallel;
+----
+200000	200000	19999900000	184615
+
+query I
+SELECT count(*) FROM (SELECT * FROM pw_src EXCEPT ALL SELECT id, v, s, n FROM pw.dbo.PwParallel);
+----
+0
+
+# Appending again must not disturb what is already there — the second load opens
+# a fresh set of sessions against a table that is no longer empty.
+statement ok
+COPY pw_src TO 'pw.dbo.PwParallel' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), count(DISTINCT id) FROM pw.dbo.PwParallel;
+----
+400000	200000
+
+# -----------------------------------------------------------------------------
+# Inside an explicit transaction the connection is PINNED, so no extra writer may
+# be opened: a second connection would be outside the transaction and its rows
+# would not roll back with the rest. The setting is ignored rather than obeyed.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('pw', 'IF OBJECT_ID(''dbo.PwTxn'') IS NOT NULL DROP TABLE dbo.PwTxn;
+CREATE TABLE dbo.PwTxn (id int, v bigint, s nvarchar(40), n int)');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+COPY pw_src TO 'pw.dbo.PwTxn' (FORMAT bcp, CREATE_TABLE false);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM pw.dbo.PwTxn;
+----
+200000	200000
+
+statement ok
+SET mssql_copy_parallel_writers = 0;
+
+statement ok
+SET mssql_copy_flush_rows = 102400;
+
+statement ok
+SELECT mssql_exec('pw', 'DROP TABLE dbo.PwShared; DROP TABLE dbo.PwParallel; DROP TABLE dbo.PwTxn;');
+
+statement ok
+DETACH pw;

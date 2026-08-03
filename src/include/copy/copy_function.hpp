@@ -146,6 +146,28 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// Error state
 	string error_message;
 	bool has_error = false;
+
+	//===------------------------------------------------------------------===//
+	// Parallel writers (spec 057 step 7)
+	//
+	// The bound on this path is SQL Server's INGEST rate: send() blocks because
+	// the receive window stays full while the server lays rows down, not because
+	// the client or the wire is slow. Nothing done on one connection moves that
+	// — the server parallelises across SESSIONS, so more of them is the lever.
+	//
+	// Each parallel writer is an independent INSERT BULK on its own pooled
+	// connection. Concurrent bulk loads into a heap take mutually compatible BU
+	// locks, which is exactly the case the TABLOCK `auto` policy turns the hint
+	// ON for (spec 057 step 1).
+	//===------------------------------------------------------------------===//
+
+	//! Upper bound on writers, including the global one. 1 disables the feature.
+	//! Resolved once in BCPCopyInitGlobal; zero inside a transaction, where the
+	//! connection is pinned to the DuckDB transaction and must not be multiplied.
+	idx_t parallel_writer_limit = 1;
+
+	//! Writers handed out so far, the global one included.
+	std::atomic<idx_t> parallel_writers_used{1};
 };
 
 //===----------------------------------------------------------------------===//
@@ -156,7 +178,27 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLCopyLocalState : public LocalFunctionData {
-	// No local buffering needed - writes go directly to BCPWriter
+	//! Last-resort release, mirroring MSSQLCopyGlobalState's contract: a throw
+	//! from the sink skips copy_to_combine, so nothing else would return this
+	//! thread's connection and it would sit in Executing with a bulk-load
+	//! transaction open, holding locks until the pool was torn down (issue #191).
+	//! Touches NO ClientContext — the release targets are captured on the thread
+	//! that acquired the connection.
+	~MSSQLCopyLocalState();
+
+	//! This thread's own bulk-load connection, or null when it shares the
+	//! global writer (in a transaction, at the limit, or acquisition failed).
+	std::shared_ptr<tds::TdsConnection> connection;
+	unique_ptr<mssql::BCPWriter> writer;
+	weak_ptr<tds::ConnectionPool> pool_handle;
+
+	//! Rows this writer has sent since its last flush.
+	idx_t rows_in_batch = 0;
+
+	//! Acquisition is tried ONCE, on the first chunk. A failure is not an error:
+	//! the thread falls back to the shared writer, which is the pre-parallel
+	//! behaviour and always correct.
+	bool init_attempted = false;
 };
 
 //===----------------------------------------------------------------------===//

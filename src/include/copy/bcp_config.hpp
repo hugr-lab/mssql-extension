@@ -38,6 +38,21 @@ class ClientContext;
 //! to explain for no gain. Set the option lower and the consequence is yours.
 constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 102400;
 
+//! Parallel bulk-load writers per COPY. 0 = derive from DuckDB's thread count.
+//!
+//! The bound this attacks is SQL Server's ingest rate, not the client and not
+//! the wire: `send()` blocks because the receive window stays full while the
+//! server lays rows down. Nothing done on one connection moves that — the server
+//! parallelises across SESSIONS, so more of them is the only lever.
+//!
+//! Capped independently of DuckDB's threads because each writer is a pooled
+//! connection holding an open bulk-load transaction; a 64-thread machine asking
+//! for 64 concurrent BU locks is a different decision from asking for 64
+//! threads, and `mssql_connection_limit` is a per-context ceiling shared with
+//! everything else.
+constexpr idx_t MSSQL_DEFAULT_COPY_PARALLEL_WRITERS = 0;
+constexpr idx_t MSSQL_MAX_COPY_PARALLEL_WRITERS = 8;
+
 namespace mssql {
 
 //===----------------------------------------------------------------------===//
