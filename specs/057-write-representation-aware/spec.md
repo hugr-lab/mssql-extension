@@ -2373,10 +2373,84 @@ larger than anything remaining inside one thread.
 - **3g truncation** — designed and specified, not built. The kernels are total
   now, which was its precondition.
 
+## Step 4 — done, and its stated justification was wrong
+
+Measured on 44 columns x 1M rows: **12.24 s -> 10.07 s wall, 506 MB -> 332 MB peak
+RSS**. The script's floor is 326 MB (DuckDB materialising the source), so the
+writer's own footprint went from ~180 MB to ~5 MB.
+
+The step was framed as removing copies and allocations. Those were real — a
+`TdsPacket` per frame with its payload copied in, the whole batch duplicated in a
+`vector<TdsPacket>`, then each frame copied AGAIN in `Serialize()` — but timing
+the halves separately priced them at **54 ms against 7865 ms of send()**, i.e.
+0.7%. They cost memory, not time.
+
+What pays is the half that was listed under step 5: not building the batch in
+full before anything goes out. Whole frames now leave as rows accumulate, with
+the threshold counted in CHUNKS (two) rather than bytes — a byte threshold means
+"drain every chunk" at 44 columns and "every eighth" at three, while a chunk
+count is the same policy at any width. Narrow tables regulate themselves because
+only WHOLE frames are emitted.
+
+Recorded because it cost time: the first streaming attempt read as 28% WORSE from
+the `sink` / `build_send` counters, and that reading was wrong — `DrainWholeFrames`
+runs inside the region the `encode` counter times, so the send merely MOVED
+counters. **Counter arithmetic is not a measurement when the change alters which
+counter the work lands in.** Wall clock and peak RSS settled it.
+
+## Step 5 — DROPPED (user, 2026-08-03)
+
+What remained of step 5 after step 4 absorbed the streaming was a real pipeline:
+a background sender thread so encoding overlaps the server wait. Dropped, for two
+reasons that compound:
+
+* it **gives memory back**. A sender thread needs double buffering, which undoes
+  the ~180 MB -> ~5 MB result that step 7 depends on;
+* it does not remove the block, only moves it. `send()` blocks because SQL
+  Server's receive window stays full — the bound is the server's ingest rate, not
+  the wire and not the client. Overlapping the encoder (4% of the phase) against
+  a wait that stays the same length buys ~4% at best.
+
+The thing that actually attacks that bound is more sessions, which is step 7.
+
+## Follow-up spec: `ORDER` on `INSERT BULK` for a clustered index
+
+`INSERT BULK` accepts an `ORDER (col [ASC|DESC], ...)` hint, which asserts that
+the rows arriving are ALREADY sorted by the target's clustered index key. SQL
+Server then loads them without sorting; without the hint it sorts every batch
+itself, whatever order they arrive in.
+
+The extension is in a position to make that assertion honestly and nobody else
+is: when a CTAS or a `COPY` is driven by a query carrying an `ORDER BY` that
+matches the clustered index key, the rows are already in key order by
+construction. Prototyped during this spec's experiments; not in scope here
+because it needs the ORDER-BY-to-index-key match resolved at bind time and a
+correctness story for the case where the match is only partial — asserting an
+order the data does not have makes SQL Server reject the batch.
+
+Interacts with `mssql_default_table_kind = 'COLUMNSTORE'` and with spec 061
+(collation-aware ORDER pushdown), which is where the key comparison semantics
+already have to be settled.
+
+## The largest lever measured on the write path is not in the writer
+
+2M rows, 7 columns, identical data, only the target's column types differing:
+
+| target | wall |
+|---|---|
+| unannotated VARCHAR -> `nvarchar(max)` | **11.18 s** |
+| `mssql_default_string_length = 100` | **2.09 s** |
+| annotated `MSSQL_NVARCHAR(40/60/20)` | **2.10 s** |
+
+**5.4x**, none of it in the encoder: `MAX` is the LOB path on the server.
+Annotated types and the setting reach the same place.
+
+The default is `mssql_default_string_length = 0`, i.e. **the extension creates the
+slowest of the three by default**. Open decision, not taken here: change the
+default (silent truncation risk), or size from source statistics — `stats()`
+gives an exact string length for a DuckDB table and nothing for Parquet
+(spec 060's sizing note).
+
 ## Steps not started
 
-4 (encode into wire frames), 5 (streaming inside a batch), 6 (representation-aware
-for strings), 7 (`PARALLEL N`). Step 4's justification was re-measured and stands:
-build+send is the same size as the encoder (~6% of wall each), and the two
-compose, because encoding into the frames is one pass instead of encode-then-copy
--thrice.
+6 (representation-aware for strings), 7 (`PARALLEL N`).
