@@ -137,9 +137,15 @@ static void TestTablockPolicy() {
 	// Heap: concurrent bulk loaders take mutually compatible BU locks, so the hint
 	// is what lets them run together — 1.70 s vs 11.97 s at four sessions.
 	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::HEAP, true, "auto + heap");
-	// Clustered columnstore reports index_id = 1 like a rowstore index but wants
-	// the opposite answer, which is the whole reason this takes a kind not a bool.
-	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::CLUSTERED_COLUMNSTORE, true, "auto + clustered columnstore");
+	// Clustered columnstore: OFF, and it took making the loads concurrent to find
+	// out. The hint SERIALISES them — measured on 2M rows, hint ON 8.92 s with the
+	// server pinned at ~99% CPU (exactly one core), hint OFF 5.23 s peaking at
+	// 305%, and identical compression either way (17 COMPRESSED rowgroups holding
+	// 1740800 rows in both). This assertion said `true` until spec 057 step 7,
+	// from a guess that a columnstore behaves like a heap; there was no way to
+	// evaluate it while only one session ever loaded.
+	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::CLUSTERED_COLUMNSTORE, false,
+				 "auto + clustered columnstore");
 	// Clustered rowstore: the same hint SERIALISES the loaders — 2.11 s/M with,
 	// 1.20 s/M without. Single-session is neutral, so shape alone can decide.
 	CheckTablock(MSSQLTablockChoice::AUTO, MSSQLIndexKind::CLUSTERED, false, "auto + clustered rowstore");

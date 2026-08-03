@@ -21,7 +21,7 @@ namespace duckdb {
 enum class MSSQLIndexKind : uint8_t {
 	HEAP = 0,					//!< no clustered index; bulk load wants TABLOCK
 	CLUSTERED = 1,				//!< clustered rowstore; TABLOCK serialises loaders
-	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; wants TABLOCK again
+	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; TABLOCK serialises it too
 };
 
 // The enumerators ARE sys.indexes.type. Renumbering them silently redefines what

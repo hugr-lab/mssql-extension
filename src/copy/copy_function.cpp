@@ -515,20 +515,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			insert_bulk += " WITH (ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows) + ")";
 		}
 
-		// RESEARCH HOOK (spec 057, not a supported interface): append extra
-		// INSERT BULK hints verbatim, e.g. MSSQL_BCP_EXTRA_HINTS='ORDER(id ASC)'.
-		// Exists to measure what the server does with hints we do not send yet;
-		// remove or replace with a real COPY option before this branch lands.
-		if (const char *extra = std::getenv("MSSQL_BCP_EXTRA_HINTS")) {
-			if (*extra) {
-				const auto with_pos = insert_bulk.rfind(" WITH (");
-				if (with_pos == string::npos) {
-					insert_bulk += " WITH (" + string(extra) + ")";
-				} else {
-					insert_bulk.insert(insert_bulk.size() - 1, ", " + string(extra));
-				}
-			}
-		}
+		// An MSSQL_BCP_EXTRA_HINTS env var used to splice arbitrary text into this
+		// WITH clause, to measure hints the extension does not send yet. It said of
+		// itself that it had to go before the branch landed, and it does: an
+		// environment variable that reaches a T-SQL statement verbatim is an
+		// injection surface for anything that can set one. The hint it existed to
+		// investigate — ORDER for a clustered target — needs a real COPY option and
+		// a guarantee that the rows really are sorted, which is its own spec.
 
 		CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
 
@@ -714,7 +707,8 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	}
 
 	// Check for errors
-	if (gdata.has_error) {
+	if (gdata.has_error.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
 		throw IOException("MSSQL COPY: Previous error occurred: %s", gdata.error_message);
 	}
 
@@ -827,8 +821,15 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	} catch (std::exception &e) {
 		// Record the error for finalize to handle cleanup
 		CopyDebugLog(1, "BCPCopySink: ERROR - %s", e.what());
-		gdata.has_error = true;
-		gdata.error_message = e.what();
+		{
+			// First failure wins: with N writers, one broken load fails them all,
+			// and the first message is the one that explains it.
+			std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
+			if (gdata.error_message.empty()) {
+				gdata.error_message = e.what();
+			}
+		}
+		gdata.has_error.store(true, std::memory_order_release);
 		throw;
 	}
 }
@@ -894,8 +895,15 @@ static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &
 					 flush_ms, insert_ms, reset_ms, rows_per_sec);
 
 	} catch (std::exception &e) {
-		gdata.has_error = true;
-		gdata.error_message = e.what();
+		{
+			// First failure wins: with N writers, one broken load fails them all,
+			// and the first message is the one that explains it.
+			std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
+			if (gdata.error_message.empty()) {
+				gdata.error_message = e.what();
+			}
+		}
+		gdata.has_error.store(true, std::memory_order_release);
 		throw;
 	}
 }
@@ -921,8 +929,15 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 		// Recorded rather than thrown from here: finalize owns the error path and
 		// the connection is released by the local state's destructor either way.
 		CopyDebugLog(1, "BCPCopyCombine: parallel writer failed to finish - %s", e.what());
-		gdata.has_error = true;
-		gdata.error_message = e.what();
+		{
+			// First failure wins: with N writers, one broken load fails them all,
+			// and the first message is the one that explains it.
+			std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
+			if (gdata.error_message.empty()) {
+				gdata.error_message = e.what();
+			}
+		}
+		gdata.has_error.store(true, std::memory_order_release);
 		throw;
 	}
 }
@@ -1063,8 +1078,10 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		gdata.writer.reset();
 	};
 
-	if (gdata.has_error) {
+	if (gdata.has_error.load(std::memory_order_acquire)) {
+		std::unique_lock<std::mutex> error_lock(gdata.error_mutex);
 		string error_msg = gdata.error_message;
+		error_lock.unlock();
 		cleanup_on_error(error_msg);
 
 		if (in_transaction) {

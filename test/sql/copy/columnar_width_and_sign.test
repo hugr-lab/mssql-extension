@@ -1,0 +1,126 @@
+# name: test/sql/copy/columnar_width_and_sign.test
+# description: two values the columnar path stored as a different number (spec 057 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Both of these loaded happily and stored the WRONG NUMBER. Neither the client
+# nor the server objected, and the row-major path got both right — so the only
+# way to see either was to compare what came back against what went in.
+#
+# They share a cause: the columnar path decides a column's kernel from WIDTHS,
+# and a width alone does not determine what a value means.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ws (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# -----------------------------------------------------------------------------
+# decimal(19): the magnitude is 8 wire bytes, and it is UNSIGNED, so it reaches
+# 10^19-1 — above INT64_MAX. The fast kernel picked its arithmetic type from the
+# target's byte size (MagType<8> = int64_t) while the source, a DECIMAL(19,s),
+# is physically INT128. The cast truncated and the sign bit landed in the
+# magnitude's top bit: 9223372036854775808 was stored as -9223372036854775808.
+#
+# 2^63 is the first value that shows it. Every smaller one round-trips, which is
+# why columnar_encode_all_families.test (precisions 4/9/18/28/38) and
+# money_columnar.test (whose extreme is exactly INT64_MAX) both missed it.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsDec19'') IS NOT NULL DROP TABLE dbo.WsDec19;
+CREATE TABLE dbo.WsDec19 (tag varchar(12), v decimal(19,0), w decimal(19,4))');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('two63',      9223372036854775808::DECIMAL(19,0),  922337203685477.5808::DECIMAL(19,4)),
+    ('two63neg',  -9223372036854775808::DECIMAL(19,0), -922337203685477.5808::DECIMAL(19,4)),
+    ('max19',      9999999999999999999::DECIMAL(19,0),  999999999999999.9999::DECIMAL(19,4)),
+    ('min19',     -9999999999999999999::DECIMAL(19,0), -999999999999999.9999::DECIMAL(19,4)),
+    ('below',      9223372036854775807::DECIMAL(19,0),  922337203685477.5807::DECIMAL(19,4)),
+    ('zero',                        0::DECIMAL(19,0),                  0::DECIMAL(19,4))
+) t(tag, v, w)) TO 'ws.dbo.WsDec19' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT tag, v, w FROM ws.dbo.WsDec19 ORDER BY tag;
+----
+below	9223372036854775807	922337203685477.5807
+max19	9999999999999999999	999999999999999.9999
+min19	-9999999999999999999	-999999999999999.9999
+two63	9223372036854775808	922337203685477.5808
+two63neg	-9223372036854775808	-922337203685477.5808
+zero	0	0.0000
+
+# The sign has to be right as a COMPARISON, not just as printed text — a flipped
+# magnitude bit reads back as a plausible number.
+query II
+SELECT count(*) FILTER (WHERE v > 0), count(*) FILTER (WHERE v < 0) FROM ws.dbo.WsDec19;
+----
+3	2
+
+# -----------------------------------------------------------------------------
+# UBIGINT -> bigint: eight bytes on both sides, so the resolver took the
+# direct-copy arm and memcpy'd the bytes across. 18446744073709551615 became -1.
+# The row path refuses the same value by range, and the two must agree.
+#
+# It has to be a REFUSAL rather than a conversion arm: that arm checks by
+# round-trip (`static_cast<SRC>(static_cast<DST>(v)) != v`), which every value of
+# a same-width unsigned/signed pair passes.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsUns'') IS NOT NULL DROP TABLE dbo.WsUns;
+CREATE TABLE dbo.WsUns (v bigint)');
+
+statement error
+COPY (SELECT 18446744073709551615::UBIGINT AS v) TO 'ws.dbo.WsUns' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+# Nothing was written by the refused statement.
+query I
+SELECT count(*) FROM ws.dbo.WsUns;
+----
+0
+
+# A value that DOES fit still goes through, so the guard rejects by value and not
+# by type — refusing every UBIGINT would be its own bug.
+statement ok
+COPY (SELECT 42::UBIGINT AS v UNION ALL SELECT 9223372036854775807::UBIGINT) TO 'ws.dbo.WsUns' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), max(v) FROM ws.dbo.WsUns;
+----
+2	9223372036854775807
+
+# The narrower unsigned sources are the same shape. UINTEGER -> int wrapped to a
+# negative, USMALLINT -> smallint likewise.
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsUns2'') IS NOT NULL DROP TABLE dbo.WsUns2;
+CREATE TABLE dbo.WsUns2 (a int, b smallint)');
+
+statement error
+COPY (SELECT 3000000000::UINTEGER AS a, 1::USMALLINT AS b) TO 'ws.dbo.WsUns2' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+statement ok
+COPY (SELECT 2000000000::UINTEGER AS a, 30000::USMALLINT AS b) TO 'ws.dbo.WsUns2' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT a, b FROM ws.dbo.WsUns2;
+----
+2000000000	30000
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsDec19; DROP TABLE dbo.WsUns; DROP TABLE dbo.WsUns2;');
+
+statement ok
+DETACH ws;

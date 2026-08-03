@@ -437,6 +437,19 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 			fast = src_width <= col.precision;
 		}
 	}
+	// ...and the magnitude type has to hold the SOURCE, not just satisfy the
+	// target's precision. Those are different questions, and conflating them
+	// flipped signs: decimal(19) is 9 wire bytes, so MagType<8> is `int64_t`,
+	// while the wire magnitude is UNSIGNED 8 bytes and reaches 10^19-1 — above
+	// INT64_MAX. A DECIMAL(19,s) source is physically INT128, `src_width <=
+	// precision` held, and the cast to int64_t truncated: 9223372036854775808
+	// arrived as -9223372036854775808. The general path does the arithmetic in
+	// hugeint_t and range-checks, so requiring the source to fit the magnitude
+	// type sends exactly the affected columns there and nothing else.
+	if (fast) {
+		const idx_t mag_bytes = static_cast<idx_t>(byte_size) - 1;
+		fast = GetTypeIdSize(src_type.InternalType()) <= mag_bytes;
+	}
 
 	switch (src_type.InternalType()) {
 	case PhysicalType::INT16:

@@ -241,6 +241,27 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		return ops;
 	}
 
+	// Equal width is NOT enough to copy the bytes across: signedness has to agree
+	// too. `UBIGINT -> bigint` is 8 bytes either side, so this took DirectCopy and
+	// memcpy'd 18446744073709551615 into a signed column as -1 — while the row
+	// path refuses the same value by range. UINTEGER -> int and USMALLINT ->
+	// smallint are the same shape, and IsTypeCompatible advertises all of them.
+	//
+	// Send them to the row path rather than to IntConvert: IntConvert's check is
+	// `static_cast<SRC>(static_cast<DST>(v)) != v`, a round-trip that a same-width
+	// unsigned/signed pair passes for every value, so it would catch nothing.
+	const PhysicalType src_phys = source.InternalType();
+	const bool unsigned_source = src_phys == PhysicalType::UINT8 || src_phys == PhysicalType::UINT16 ||
+								 src_phys == PhysicalType::UINT32 || src_phys == PhysicalType::UINT64;
+	const bool signed_int_target =
+		target.duckdb_type.id() == LogicalTypeId::TINYINT || target.duckdb_type.id() == LogicalTypeId::SMALLINT ||
+		target.duckdb_type.id() == LogicalTypeId::INTEGER || target.duckdb_type.id() == LogicalTypeId::BIGINT;
+	if (unsigned_source && signed_int_target) {
+		ops.arm = ScatterArm::RowFallback;
+		ops.wire_width = want;
+		return ops;
+	}
+
 	ops.arm = DirectCopyArm(want);
 	ops.wire_width = want;
 	return ops;

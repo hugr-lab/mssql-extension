@@ -71,6 +71,7 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 			if (table_existed) {
 				// Table exists - mark as skipped and return early
 				gstate->state.phase = mssql::CTASPhase::SKIPPED;
+				gstate->skipped = true;
 				gstate->state.LogMetrics();
 				return std::move(gstate);
 			}
@@ -230,8 +231,10 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 	auto &gstate = input.global_state.Cast<MSSQLCTASGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<MSSQLCTASLocalSinkState>();
 
-	// Skip if IF NOT EXISTS triggered skip (Issue #44)
-	if (gstate.state.phase == mssql::CTASPhase::SKIPPED) {
+	// Skip if IF NOT EXISTS triggered skip (Issue #44). Read from the flag fixed
+	// before the first chunk, never from `state.phase` — a failing thread writes
+	// that under the mutex this read does not hold.
+	if (gstate.skipped) {
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
@@ -277,10 +280,9 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 			// the normal shape of one broken load (the others' streams die with
 			// it), and each would otherwise issue its own DROP against a table the
 			// first one already removed.
-			bool cleanup_here = false;
+			const bool cleanup_here = !gstate.load_failed.exchange(true);
 			{
 				std::lock_guard<std::mutex> lock(gstate.mutex);
-				cleanup_here = gstate.state.phase != mssql::CTASPhase::FAILED;
 				gstate.state.phase = mssql::CTASPhase::FAILED;
 				gstate.state.error_message = "BCP phase failed";
 			}
@@ -311,10 +313,11 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		}
 	} catch (...) {
 		// Data transfer phase failed - attempt cleanup if configured
+		const bool cleanup_here = !gstate.load_failed.exchange(true);
 		gstate.state.phase = mssql::CTASPhase::FAILED;
 		gstate.state.error_message = gstate.state.config.use_bcp ? "BCP phase failed" : "Insert phase failed";
 
-		if (gstate.state.config.drop_on_failure) {
+		if (cleanup_here && gstate.state.config.drop_on_failure) {
 			gstate.state.AttemptCleanup(context.client);
 		}
 

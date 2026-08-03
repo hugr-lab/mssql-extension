@@ -143,9 +143,20 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// Write synchronization
 	std::mutex write_mutex;
 
-	// Error state
+	// Error state. Both fields became shared when the sink turned PARALLEL in
+	// spec 057 step 7.
+	//
+	//! Guards `error_message` ONLY. Separate from write_mutex because the failing
+	//! thread does not hold that one — a local writer never takes it, and a shared
+	//! writer's unique_lock is released by unwinding before the catch runs — so
+	//! the string was being assigned by several threads at once while others read
+	//! it to build their own exception. That is a double free, not a torn read.
+	std::mutex error_mutex;
 	string error_message;
-	bool has_error = false;
+
+	//! Read at the top of every Sink call on every thread, so it stays a plain
+	//! atomic load: the lock above is taken only on the error path.
+	std::atomic<bool> has_error{false};
 
 	//===------------------------------------------------------------------===//
 	// Parallel writers (spec 057 step 7)

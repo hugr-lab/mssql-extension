@@ -365,18 +365,24 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// support and "newness" never did:
 	//   heap                  -> ON  (4 concurrent loaders: 1.70 s vs 11.97 s;
 	//                                 BU locks are mutually compatible)
-	//   clustered columnstore -> ON  (reports index_id = 1 like a rowstore index
-	//                                 but wants the opposite answer)
-	//   clustered rowstore    -> OFF (TABLOCK serialises the loaders: 2.11 s/M
-	//                                 with, 1.20 s/M without)
+	//   anything clustered    -> OFF (TABLOCK serialises the loaders — rowstore
+	//                                 2.11 s/M with vs 1.20 s/M without;
+	//                                 columnstore 8.92 s vs 5.23 s on 2M rows,
+	//                                 the server pinned to ONE core with the hint
+	//                                 and spread over three without it, and the
+	//                                 compression identical either way)
 	// Magnitudes are from an emulated server and are upper bounds; the
 	// directions have mechanisms and hold.
+	//
+	// The columnstore half read ON until spec 057 step 7, on the guess that it
+	// behaves like a heap. Nothing could test that while only one session ever
+	// loaded; making the loads concurrent showed the opposite.
 	//
 	// `SET mssql_copy_tablock = true` still works — DuckDB casts the boolean to
 	// this option's VARCHAR.
 	config.AddExtensionOption("mssql_copy_tablock",
-							  "TABLOCK hint for COPY/BCP: 'auto' (by target shape — heap and columnstore on, "
-							  "clustered rowstore off), 'true', or 'false'",
+							  "TABLOCK hint for COPY/BCP: 'auto' (by target shape — heap on, anything "
+							  "clustered off), 'true', or 'false'",
 							  LogicalType::VARCHAR, Value("auto"), nullptr, SetScope::GLOBAL);
 
 	//===----------------------------------------------------------------------===//

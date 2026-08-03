@@ -147,6 +147,20 @@ public:
 
 	//! Sessions handed out so far, that first one included.
 	std::atomic<idx_t> parallel_writers_used{1};
+
+	//! IF NOT EXISTS found the table already there, so no row is to be sent.
+	//!
+	//! Decided in GetGlobalSinkState, before any Sink call, and never changed
+	//! after — which is the whole point of it being here rather than read off
+	//! `state.phase`. Sink checks this on every chunk on every thread, and phase
+	//! is written by a FAILING thread under `mutex`: reading it there unlocked
+	//! was a data race from the moment the sink became parallel.
+	bool skipped = false;
+
+	//! Set by the first thread whose load fails, so exactly one of them runs the
+	//! DROP that mssql_ctas_drop_on_failure asks for. Separate from `phase`
+	//! because it is the one piece of failure state read outside `mutex`.
+	std::atomic<bool> load_failed{false};
 };
 
 //===----------------------------------------------------------------------===//
