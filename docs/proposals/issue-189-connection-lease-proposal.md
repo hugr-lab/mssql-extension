@@ -11,7 +11,9 @@ Status: analysis complete, design settled, implementation proposed. Date: 2026-0
    transactions (serializing all use to one DuckDB connection), and COMMIT/ROLLBACK
    reset + unpin (D1–D4 in the code audit). All four failure modes fire
    deterministically against the shipped community binary (0.2.1 on DuckDB 1.5.4) via
-   the self-contained compose stack added at `docker/issue-189-repro/` (R1–R4 below).
+   the sidecar stack added at `docs/proposals/issue-189-repro/` (R1–R4 below). Two
+   baseline tests written against the fix's target API (currently red — D1–D3's absence
+   is exactly why) are also in place, ready to go green once the plan below ships.
 
 2. **The proposed fix (a user-controllable leased connection) is the right shape.**
    `ConnectionProvider` is already the single chokepoint for `mssql_exec` / `mssql_scan`
@@ -31,17 +33,18 @@ Status: analysis complete, design settled, implementation proposed. Date: 2026-0
 
 ## Reproduction attempts (all four failure modes reproduced)
 
-Environment: self-contained compose stack at `docker/issue-189-repro/` — SQL Server
-2022 (16.0.4262.2, linux/amd64 container) + a Python sidecar running DuckDB 1.5.4 with
-the **community `mssql` 0.2.1 binary** (what users actually run; a commented-out mount
-+ `MSSQL_EXTENSION_PATH` switches it to a local build). The sidecar populates
-`Repro189.dbo.Source` (1000 rows) and drives the scenarios; exit code 0 = all failure
-modes present. Verify with:
+Environment: `docs/proposals/issue-189-repro/` — a **sidecar only** compose file that
+joins the repo's existing SQL Server dev container (`docker/docker-compose.yml`,
+started via `make docker-up`; no second SQL Server provisioned) with a Python sidecar
+running DuckDB against the **community `mssql` binary** (what users actually run; a
+commented-out mount + `MSSQL_EXTENSION_PATH` switches it to a local Linux build). The
+sidecar populates `Repro189.dbo.Source` (1000 rows) and drives the scenarios; exit code
+0 = all failure modes present. Verify with (see the directory's README.md for details):
 
 ```bash
-cd docker/issue-189-repro
-docker compose run --build --rm repro
-docker compose down -v
+make docker-up
+docker compose -f docs/proposals/issue-189-repro/docker-compose.yml run --rm repro
+make docker-down
 ```
 
 | # | Scenario | Result |
@@ -62,10 +65,15 @@ Notes:
   before the `SET` runs (session default: infinite) — and hung until the extension's
   own 30s COLMETADATA timeout closed the connection. Blocking confirmed either way;
   the commit-release form is deterministic (and 10× faster per run).
-* Sidecar image note: the released 0.2.1 linux binary (pre-spec-053) still hard-links
-  `libgssapi_krb5.so.2`, which `python:3.12-slim` lacks — the sidecar Dockerfile
-  installs `libgssapi-krb5-2`. Incidental empirical confirmation of the issue #161 /
-  spec 053 premise.
+* Sidecar image note: the released linux binary (0.2.1, later reverified against 0.2.2
+  as the community index moved — both pre-spec-053) still hard-links
+  `libgssapi_krb5.so.2`, which `python:3.12-slim` lacks — the sidecar installs
+  `libgssapi-krb5-2` at container start. Incidental empirical confirmation of the
+  issue #161 / spec 053 premise.
+* Reproduced twice: once against a purpose-built standalone SQL Server container
+  (0.2.1 / DuckDB 1.5.4), and again after relocating the stack to reuse the repo's
+  standard dev container per review feedback (0.2.2 / DuckDB 1.5.5, community index
+  had moved on in the interim). All four results were identical both times.
 
 ## Code audit (main @ `2c1c4cf`)
 
@@ -215,6 +223,15 @@ is a follow-up — not worth changing the `mssql_pool_stats` schema here.
 `MSSQLConnectionLease` + catalog registry + `~MSSQLCatalog` hook. C++ unit tests
 (`test/cpp/`, no SQL Server): registry pruning, `Release()` idempotency, `Owns()`.
 
+A red skeleton already exists at `test/cpp/test_connection_lease.cpp`, covering the
+no-network subset of the contract (`IsHeld()`/`Release()`/`GetConnection()`/`Owns()` on
+a never-leased instance) — it does not compile today because
+`src/include/connection/mssql_connection_lease.hpp` doesn't exist. Making it compile
+and pass is Phase 1's exit criterion; extend it with registry-pruning cases once the
+catalog-side `RegisterLease`/`ReleaseAllLeases` land, and wire a `test-connection-lease`
+Makefile target then (not before — a listed source that can't compile would break
+`make test` for everyone in the meantime).
+
 ### Phase 2 — routing
 `allow_lease` parameter, lease-aware `ReleaseConnection`, `IsLeasedConnection` helper;
 call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
@@ -223,12 +240,18 @@ call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
 `mssql_lease` / `mssql_release` + registration alongside `RegisterMSSQLFunctions`.
 
 ### Phase 4 — integration tests (`test/sql/lease/`, requires `make docker-up`)
-1. `lease_basic.test` — SPID returned; `SELECT ... INTO ##t` via lease; second
-   sqllogictest connection (pooled) sees `##t`; `@@SPID` via lease stable across calls.
+1. `lease_basic.test` — **already written, red today** (fails at the first
+   `mssql_lease` call — function not registered). SPID returned; `SELECT ... INTO ##t`
+   via lease survives churn from unrelated pooled statements; `@@SPID` stable across
+   calls on the lease; double-lease errors; release drops the state (verified via a
+   baseline block proving the no-lease case fails the same way today, so the file
+   doubles as its own control). Making it pass is Phases 1–3's combined exit criterion.
 2. `lease_release_drops_state.test` — after release, churn the pool, verify `##t` gone
    via `tempdb.sys.tables` (retry loop — drop happens on the physical connection's
-   next reuse).
-3. `lease_errors.test` — double lease; release-none; unknown context; busy-stream error.
+   next reuse). (`lease_basic.test` already covers this at a smaller scale inline;
+   this file adds the retry-loop / multi-attempt version for extra confidence.)
+3. `lease_errors.test` — release-none; unknown context; busy-stream error. (Double-lease
+   is already covered by `lease_basic.test`.)
 4. `lease_transactions.test` — BEGIN/COMMIT around lease: txn `@@SPID` differs, lease
    SPID and `##t` survive commit.
 5. `lease_detach.test` — DETACH with held lease (no crash / assert in debug);
@@ -257,8 +280,22 @@ call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
 
 ## Artifacts from this investigation
 
-* Self-contained reproduction stack: `docker/issue-189-repro/` (compose file, sidecar
-  Dockerfile, `repro.py`). `docker compose run --build --rm repro` — exit 0 means the
-  limitation is present. Reusable as the fix's acceptance harness: mount a local build
-  via `MSSQL_EXTENSION_PATH` and extend `repro.py` with the lease-based happy path
-  (lease → create `##` tables → concurrent pooled readers → release → tables dropped).
+* Reproduction sidecar: `docs/proposals/issue-189-repro/` (`docker-compose.yml`,
+  `repro.py`, `README.md`). Joins the repo's existing SQL Server dev container
+  (`docker/docker-compose.yml`, `make docker-up`) rather than provisioning a second
+  one — nothing new to keep in sync. `docker compose -f
+  docs/proposals/issue-189-repro/docker-compose.yml run --rm repro` — exit 0 means the
+  limitation is present. Doubles as the fix's acceptance harness: mount a local Linux
+  build via `MSSQL_EXTENSION_PATH` and extend `repro.py` with the lease-based happy
+  path (lease → create `##` tables → survive pool churn → release → tables dropped).
+* Two red baseline tests, written against the fix's target API rather than today's
+  behavior (both fail right now — see Phase 1 / Phase 4 above for what "fixed" means
+  for each):
+  * `test/sql/lease/lease_basic.test` — SQL-level acceptance test; fails at the first
+    `mssql_lease` call today. Includes an inline baseline block (no lease) that
+    reproduces R1 in miniature, so the file self-documents the "before" state it's
+    fixing rather than just asserting an unexplained future API.
+  * `test/cpp/test_connection_lease.cpp` — C++ unit test; does not compile today
+    (`MSSQLConnectionLease` doesn't exist). Not wired into the Makefile yet
+    (deliberately — a non-compiling listed source would break `make test` for
+    everyone in the meantime).

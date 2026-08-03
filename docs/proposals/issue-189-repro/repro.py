@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Issue #189 reproduction — no connection lifetime a shared temp table can anchor to.
 
-Populates Repro189.dbo.Source (1000 rows), then exercises four failure modes:
+Runs against the repo's standard SQL Server dev container (docker/docker-compose.yml,
+service "sqlserver", container name mssql-dev — started via `make docker-up`). Creates
+its own database (Repro189) so it doesn't touch the container's TestDB fixtures, then
+exercises four failure modes:
 
   R1  ## global temp table created via mssql_exec is dropped as soon as the
       creating pooled connection is reused (RESET_CONNECTION on release).
@@ -12,6 +15,8 @@ Populates Repro189.dbo.Source (1000 rows), then exercises four failure modes:
       other pooled connections block until COMMIT/ROLLBACK.
 
 Exit code 0 = all four failure modes reproduced (the limitation is present).
+See README.md in this directory for how to run it, and
+docs/proposals/issue-189-connection-lease-proposal.md for the full analysis.
 """
 
 import os
@@ -21,7 +26,7 @@ import time
 
 import duckdb
 
-HOST = os.environ.get("MSSQL_HOST", "sqlserver")
+HOST = os.environ.get("MSSQL_HOST", "mssql-dev")
 PORT = os.environ.get("MSSQL_PORT", "1433")
 SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "TestPassword1")
 LOCAL_EXT = os.environ.get("MSSQL_EXTENSION_PATH", "")
@@ -88,6 +93,9 @@ def poll_gone(cur, table_name, attempts=10):
 
 def wait_and_init(con):
     # Spec 047 eager ATTACH validation makes ATTACH itself the readiness probe.
+    # The dev container's own healthcheck (make docker-up) should already have
+    # made this a fast path; the retry loop just absorbs the last bit of
+    # startup jitter.
     last_err = None
     for _ in range(60):
         try:
@@ -97,7 +105,7 @@ def wait_and_init(con):
             last_err = e
             time.sleep(2)
     else:
-        raise RuntimeError(f"SQL Server never became reachable: {last_err}")
+        raise RuntimeError(f"SQL Server never became reachable at {HOST}:{PORT}: {last_err}")
 
     def iexec(tsql):
         return con.execute(f"SELECT mssql_exec('init', '{q(tsql)}')").fetchall()[0][0]
