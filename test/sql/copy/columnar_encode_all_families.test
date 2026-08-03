@@ -1,0 +1,146 @@
+# name: test/sql/copy/columnar_encode_all_families.test
+# description: every family through the columnar BCP encoder, in one chunk, round-tripped exactly (spec 057 step 3)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Spec 057 step 3 replaced the row-major append encoder with a columnar scatter:
+# the chunk's wire is sized from metadata and the validity masks, then written
+# column by column through a raw pointer.
+#
+# Every family had to be taught separately, and every one of them was a chance to
+# get the framing wrong in a way ONLY the server notices — the symptom of a
+# mis-sized row is not a wrong value but "premature end-of-message", because the
+# next column lands where the server is not looking. That happened three times
+# during development (a one-byte prefix, a datetime width, an INTERVAL source),
+# and each time nothing client-side objected.
+#
+# So this file is one chunk containing every family at once, which is also the
+# condition that keeps the columnar path engaged: a single unresolvable column
+# drops the WHOLE chunk back to the row path and would make the rest of the file
+# pass without testing anything. The mixture is the test.
+#
+# What is deliberately covered beyond "one column per type":
+#   * NULLs at several densities, including an all-NULL and an all-valid column
+#     in the same chunk — the sizing pass treats those three cases differently;
+#   * a variable-length column, which makes every row a different length even
+#     with no NULLs at all, so the constant-stride path is unavailable;
+#   * PLP alongside sized strings, since their framing arithmetic differs;
+#   * an empty string, which is PLP's third size (header + terminator, no chunk);
+#   * embedded NUL bytes in binary, which any delimiter-based scheme would eat;
+#   * Cyrillic and CJK, so a UTF-16 length that is not twice the UTF-8 one is
+#     exercised;
+#   * every decimal precision bucket (4/9/18/28/38) and both signs;
+#   * temporal scales 0, 3 and 7, which are three different wire widths.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ce (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('ce', 'IF OBJECT_ID(''dbo.ColumnarAll'') IS NOT NULL DROP TABLE dbo.ColumnarAll;
+CREATE TABLE dbo.ColumnarAll (
+    i8 tinyint, i16 smallint, i32 int, i64 bigint,
+    f4 real, f8 float, bl bit, gu uniqueidentifier,
+    d4 decimal(4,2), d9 decimal(9,4), d18 decimal(18,6), d28 decimal(28,8), d38 decimal(38,10),
+    dt date, ts0 datetime2(0), ts3 datetime2(3), ts7 datetime2(7),
+    tm3 time(3), dto datetimeoffset(3),
+    sv nvarchar(80), bv varbinary(80), smax nvarchar(max), bmax varbinary(max),
+    n_few bigint, n_half nvarchar(50), n_all bigint, n_none bigint
+)');
+
+statement ok
+CREATE OR REPLACE TABLE ce_src AS
+SELECT
+    (i % 120)::TINYINT                                        AS i8,
+    ((i % 60000) - 30000)::SMALLINT                           AS i16,
+    ((i % 200000) - 100000)::INTEGER                          AS i32,
+    (i * 1000)::BIGINT                                        AS i64,
+    ((i % 1000) / 7.0)::FLOAT                                 AS f4,
+    ((i % 100000) / 3.0)::DOUBLE                              AS f8,
+    (i % 2 = 0)                                               AS bl,
+    uuid()                                                    AS gu,
+    (((i % 9999) / 100.0) - 50)::DECIMAL(4,2)                 AS d4,
+    (((i % 99999) / 10000.0) - 5)::DECIMAL(9,4)               AS d9,
+    (((i % 999999) / 1000000.0) - 0.5)::DECIMAL(18,6)         AS d18,
+    ((i % 999999) * -1.0)::DECIMAL(28,8)                      AS d28,
+    ((i % 999999) * 1.0)::DECIMAL(38,10)                      AS d38,
+    (DATE '1970-01-01' + INTERVAL (i % 30000) DAY)::DATE      AS dt,
+    (TIMESTAMP '1900-03-01 00:00:00' + INTERVAL (i % 900000) SECOND)     AS ts0,
+    (TIMESTAMP '2024-01-15 12:34:56.789' + INTERVAL (i % 90000) SECOND)  AS ts3,
+    (TIMESTAMP '2024-01-15 12:34:56.789012' + INTERVAL (i % 90000) SECOND) AS ts7,
+    (TIME '01:02:03.456' + INTERVAL (i % 1000) SECOND)::TIME  AS tm3,
+    (TIMESTAMP '2024-01-15 10:30:45.123' + INTERVAL (i % 9000) SECOND)::TIMESTAMPTZ AS dto,
+    CASE WHEN i % 3 = 0 THEN 'Привет ' || i
+         WHEN i % 3 = 1 THEN '漢字とかな' || i
+         ELSE 'ascii ' || i END                               AS sv,
+    encode(chr(0) || chr(1) || 'bin' || (i % 500))::BLOB      AS bv,
+    CASE WHEN i % 5 = 0 THEN '' ELSE 'max_' || repeat('m', i % 120) END AS smax,
+    encode('blob_' || repeat('b', i % 90))::BLOB              AS bmax,
+    CASE WHEN i % 97 = 0 THEN NULL ELSE i END                 AS n_few,
+    CASE WHEN i % 2 = 0 THEN NULL ELSE 'half_' || i END       AS n_half,
+    CAST(NULL AS BIGINT)                                      AS n_all,
+    (i * 7)::BIGINT                                           AS n_none
+FROM range(5000) t(i);
+
+statement ok
+COPY ce_src TO 'ce.dbo.ColumnarAll' (FORMAT bcp, CREATE_TABLE false);
+
+# Byte-for-byte on every column: any framing slip shows up here or as a server
+# error above, and nothing else in between.
+query I
+SELECT count(*) FROM (SELECT * FROM ce_src EXCEPT ALL SELECT * FROM ce.dbo.ColumnarAll);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM ce.dbo.ColumnarAll EXCEPT ALL SELECT * FROM ce_src);
+----
+0
+
+# The NULL shapes the sizing pass distinguishes, pinned by count rather than by
+# equality — an off-by-one in the mask handling can still round-trip the values
+# it did write.
+query IIII
+SELECT count(*), count(n_few), count(n_half), count(n_all) FROM ce.dbo.ColumnarAll;
+----
+5000	4948	2500	0
+
+# The all-valid column in a NULL-bearing chunk: it writes every payload but
+# cannot use a stride, which is its own code path.
+query I
+SELECT count(n_none) FROM ce.dbo.ColumnarAll;
+----
+5000
+
+# PLP's third size — header and terminator with no data chunk.
+query I
+SELECT count(*) FROM ce.dbo.ColumnarAll WHERE smax = '';
+----
+1000
+
+# A second pass into the same table: appending to an existing target re-reads the
+# column metadata from sys.columns rather than deriving it from the source types,
+# which is where the width invariant bites.
+statement ok
+COPY ce_src TO 'ce.dbo.ColumnarAll' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), count(n_few) FROM ce.dbo.ColumnarAll;
+----
+10000	9896
+
+statement ok
+SELECT mssql_exec('ce', 'DROP TABLE dbo.ColumnarAll');
+
+statement ok
+DETACH ce;

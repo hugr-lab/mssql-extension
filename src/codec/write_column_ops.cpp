@@ -136,20 +136,15 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		// looking. The row path never had this constraint because it appends —
 		// whatever it writes IS the layout. The scatter reserves first.
 		//
-		// This is not hypothetical: `datetime`, `datetime2` and `smalldatetime`
-		// all declare TDS_TYPE_DATETIME2 on the wire, but sys.columns reports
-		// max_length 8, 6/7/8 and 4 respectively. An old `datetime` column at
-		// scale 0 is sized 8 and would be written 6, desynchronising the stream
-		// with "premature end-of-message".
+		// `datetime`, `datetime2` and `smalldatetime` all declare
+		// TDS_TYPE_DATETIME2 on the wire and share a `duckdb_type`, so the width
+		// is the only thing that tells them apart — which is exactly why it is
+		// checked rather than assumed.
 		//
-		// **Legacy `datetime` and `smalldatetime` therefore keep the row path,
-		// deliberately.** They are correct there — the value still goes out in
-		// datetime2 form and the server converts, and the rounding and day-carry
-		// rules are shared, so only the speed differs. Giving them the kernel
-		// needs SQLServerTypeMaxLength to report what is actually SENT rather
-		// than the column's own storage size, which changes COLMETADATA — what
-		// the server is told — and so is a separate change with its own
-		// verification, for a narrow gain: tables still on the legacy type.
+		// SQLServerTypeMaxLength now reports what is actually SENT for all of
+		// them (it used to return a constant 8 for every datetime2, so only
+		// datetime2(7) ever matched), which is safe because COLMETADATA for this
+		// token carries the SCALE and no length at all.
 		const uint32_t dt2_written =
 			static_cast<uint32_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale)) + 3;
 		// TIME has no date field, DATETIMEOFFSET adds a 2-byte offset, and both

@@ -168,6 +168,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 |----------|-------------|
 | `MSSQL_DEBUG=1..3` | TDS protocol debug level (1=basic, 3=trace) |
 | `MSSQL_DML_DEBUG=1` | DML operation debugging (generated SQL, batch sizes, rowid values) |
+| `MSSQL_COUNTERS=1` | Per-stream and per-COPY performance counters **without** the logging that distorts them. Use this, not `MSSQL_DEBUG`, whenever a number is going to be quoted. `MSSQL_DEBUG>=1` still enables them for existing scripts, and says so next to the output — but its own logging runs inside the phases being timed: on read, level 2 `fprintf`s every token from inside the parse timer (`parse` measured 22 → 1133 ns/row and the socket wait collapsed, i.e. the numbers inverted); on write, the sink used to log per chunk and the logger flushes, inflating the client CPU it reported about 4×. `make counters-test` runs the SQL suite with them on, which is the only way the counter code path is exercised at all (issue #233 was a crash that lived there). |
 
 ## Extension Settings (SET in DuckDB)
 

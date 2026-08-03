@@ -1,5 +1,7 @@
 #include "copy/target_resolver.hpp"
 
+#include "tds/encoding/bcp_row_encoder.hpp"
+
 #include "catalog/mssql_catalog.hpp"
 #include "codec/target_string_type.hpp"
 #include "copy/bcp_config.hpp"
@@ -863,7 +865,7 @@ static uint8_t SQLServerTypeToTDSToken(const string &type_name) {
 // Helper: Get max_length for SQL Server type
 //===----------------------------------------------------------------------===//
 
-static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_length, uint8_t precision) {
+static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale) {
 	string type_lower = StringUtil::Lower(type_name);
 
 	if (type_lower == "bit") {
@@ -928,16 +930,30 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 16;
 	} else if (type_lower == "date") {
 		return 3;
-	} else if (type_lower == "time") {
-		return 5;
-	} else if (type_lower == "datetime2") {
-		return 8;
-	} else if (type_lower == "datetime") {
-		return 8;
-	} else if (type_lower == "smalldatetime") {
-		return 4;
-	} else if (type_lower == "datetimeoffset") {
-		return 10;
+	} else if (type_lower == "datetime2" || type_lower == "time" || type_lower == "datetimeoffset") {
+		// sys.columns already reports exactly what we send for these — 6/7/8 for
+		// datetime2(0/3/7), 3/4/5 for time, +2 for datetimeoffset — so take it
+		// instead of overriding it with a constant.
+		//
+		// It used to return 8 / 5 / 10 unconditionally, and nothing on the wire
+		// depended on that: COLMETADATA for DATETIME2N / TIMEN / DATETIMEOFFSETN
+		// carries the SCALE and no length at all (bcp_writer.cpp), and the row
+		// path appends, so whatever it writes is the layout either way.
+		//
+		// The columnar scatter is what made it matter: it reserves 1 + max_length
+		// per value BEFORE writing, so a claim of 8 for a datetime2(0) that emits
+		// 6 leaves every later column in the row two bytes past where the server
+		// reads. The width check added with the temporal kernel caught that and
+		// pushed those columns back to the row path — correct, but it meant only
+		// datetime2(7) (5 + 3 = 8, the single scale where the old constant
+		// happened to be right) ever reached the kernel.
+		return static_cast<uint16_t>(max_length);
+	} else if (type_lower == "datetime" || type_lower == "smalldatetime") {
+		// These two genuinely differ from what is sent: sys.columns reports their
+		// STORAGE size (8 and 4) while they go out in datetime2 form, i.e.
+		// GetTimeByteSize(scale) plus the 3-byte date — 7 and 6. Report what is
+		// sent, which is what the scatter reserves.
+		return static_cast<uint16_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(scale) + 3);
 	} else if (type_lower == "xml") {
 		return 0xFFFF;	// PLP indicator
 	}
@@ -999,7 +1015,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 
 		// Map SQL Server type to TDS type token
 		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
-		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision);
+		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision, col.scale);
 
 		// Spec 060 / issue #225 (write side): a char column under a UTF-8
 		// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
