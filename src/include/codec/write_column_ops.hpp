@@ -72,6 +72,12 @@ enum class ScatterArm : uint8_t {
 	//! The 16 wire bytes of a UNIQUEIDENTIFIER (mixed-endian by the spec, which
 	//! is why it is a kernel and not a copy).
 	Guid,
+	//! A variable-length string with a 2-byte length prefix — nvarchar(n), or a
+	//! varchar(n) whose UTF-8 bytes pass through unconverted. Its payload width
+	//! depends on the value, so a chunk containing one can never take the
+	//! constant-stride path; it is planned per column first (string::PlanColumn)
+	//! and then written with the cursor.
+	VarString,
 	//! Resolvable, but no columnar kernel yet — DECIMAL, temporal, GUID and the
 	//! string families still go through the row-major append path. Distinct from
 	//! Unsupported: this pair IS encodable, just not by a scatter, so it must not
@@ -96,6 +102,13 @@ struct WriteColumnOps {
 	//! Payload bytes per value for a Fixed column; 0 when the width depends on
 	//! the value. Excludes the length prefix.
 	uint32_t wire_width = 0;
+
+	//! Does this column's width depend on the data? A single one of these makes
+	//! every row in the chunk a different length, so the constant-stride path is
+	//! unavailable for ALL columns, NULLs or not.
+	bool IsVariable() const {
+		return arm == ScatterArm::VarString;
+	}
 
 	//! Can this column take the columnar scatter?
 	bool CanScatter() const {

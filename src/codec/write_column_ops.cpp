@@ -10,6 +10,7 @@
 
 #include "duckdb/common/types.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
+#include "tds/tds_types.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -64,9 +65,23 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 	ops.kind = target.IsPLPType() ? WireKind::Plp
 								  : (target.IsVariableLengthUSHORT() ? WireKind::VariableUShort : WireKind::Fixed);
 
+	if (ops.kind == WireKind::VariableUShort) {
+		// nvarchar(n) and the UTF-8 varchar(n) form. PLP/MAX is not planned yet.
+		//
+		// The SOURCE must actually be a string, not merely the target: spec 045
+		// FR-026 sends an INTERVAL as NVARCHAR, so the target is a string wire
+		// form over a vector that stores interval_t. Reading it as string_t trips
+		// "Expected unified vector format of type VARCHAR, but found type
+		// INTERVAL". Any such render-as-text source keeps the row path, which
+		// formats it first.
+		const bool string_target =
+			target.tds_type_token == tds::TDS_TYPE_NVARCHAR || target.tds_type_token == tds::TDS_TYPE_BIGVARCHAR;
+		const bool string_source = source.InternalType() == PhysicalType::VARCHAR;
+		ops.arm = (string_target && string_source) ? ScatterArm::VarString : ScatterArm::RowFallback;
+		return ops;
+	}
 	if (ops.kind != WireKind::Fixed) {
-		// Variable-width families need staging and blocked assembly, which is a
-		// later commit. Encodable, just not scatterable.
+		// PLP/MAX still needs its framing planned; row path for now.
 		ops.arm = ScatterArm::RowFallback;
 		return ops;
 	}

@@ -2,6 +2,7 @@
 
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
+#include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/write_column_ops.hpp"
 
@@ -308,10 +309,15 @@ inline void CursorDirect(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, con
 
 inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, idx_t ncols,
 							   const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
-							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint8_t> &widths) {
+							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint8_t> &widths,
+							   const vector<mssql::codec::string::StringColumnPlan> &plans) {
 	for (idx_t c = 0; c < ncols; c++) {
 		auto &st = states[c];
 		const uint8_t w = widths[c];
+		if (ops[c].IsVariable()) {
+			mssql::codec::string::ScatterVarBlock(dst, cursor, r0, rend, st.fmt, columns[c], plans[c]);
+			continue;
+		}
 		if (!st.vec) {
 			for (idx_t r = r0; r < rend; r++) {
 				dst[cursor[r]] = 0x00;
@@ -376,8 +382,12 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 
 	vector<mssql::codec::WriteColumnOps> ops(ncols);
 	vector<uint8_t> widths(ncols);
+	// Planned per variable column, so the wire can be sized before a byte is
+	// written. Indexed by column; empty for fixed-width ones.
+	vector<mssql::codec::string::StringColumnPlan> plans(ncols);
 	size_t stride = 1;	// the 0xD1 ROW token
 	bool all_valid = true;
+	bool has_variable = false;
 	for (idx_t c = 0; c < ncols; c++) {
 		// A missing source column is NULL every row: no payload, so it scatters
 		// for free. Everything else answers to ResolveWriteColumnOps, which is
@@ -392,6 +402,20 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		if (!ops[c].CanScatter()) {
 			return false;
 		}
+		if (ops[c].IsVariable()) {
+			// Measure it now: PlanColumn walks the column once and keeps the
+			// per-value payload length that the per-value encoder used to compute
+			// and throw away. A column it cannot plan (invalid UTF-8, an
+			// unhandled wire form) drops the whole chunk to the row path, which
+			// reproduces the legacy bytes exactly.
+			if (!mssql::codec::string::PlanColumn(*states[c].vec, states[c].fmt, 0, row_count, columns[c], plans[c])) {
+				return false;
+			}
+			has_variable = true;
+			widths[c] = 0;
+			stride += 2;  // the length prefix; the payload is per row
+			continue;
+		}
 		widths[c] = static_cast<uint8_t>(ops[c].wire_width);
 		stride += 1 + widths[c];
 		if (states[c].vec && !states[c].fmt.validity.AllValid()) {
@@ -404,7 +428,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	const size_t base = buffer.size();
 	vector<size_t> row_at;
 	size_t total;
-	if (all_valid) {
+	if (all_valid && !has_variable) {
 		total = row_count * stride;
 	} else {
 		// Per COLUMN, not per row x column. The old shape ran `rows * ncols`
@@ -416,13 +440,28 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		row_at.resize(row_count);
 		size_t base_row = 1;  // the 0xD1 token
 		for (idx_t c = 0; c < ncols; c++) {
-			base_row += 1 + widths[c];
+			// A variable column's prefix is TWO bytes (0xFFFF means NULL), not the
+			// one a fixed column's length byte takes; its payload is added per row
+			// below. Getting this wrong is invisible until the server reports
+			// "premature end-of-message", because the rows are simply laid out one
+			// byte short each and every later column lands off by that much.
+			base_row += ops[c].IsVariable() ? 2 : (1 + widths[c]);
 		}
 		for (idx_t r = 0; r < row_count; r++) {
 			row_at[r] = base_row;
 		}
 		for (idx_t c = 0; c < ncols; c++) {
 			auto &st = states[c];
+			if (ops[c].IsVariable()) {
+				// The 2-byte prefix is already in base_row; add each row's own
+				// payload. A NULL planned to length 0 and its prefix is 0xFFFF,
+				// so the same arithmetic covers it.
+				const auto &len = plans[c].lengths;
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] += len[r];
+				}
+				continue;
+			}
 			if (!st.vec) {
 				// Absent column: NULL on every row, so its payload never appears.
 				for (idx_t r = 0; r < row_count; r++) {
@@ -458,7 +497,10 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	buffer.resize(base + total);
 	uint8_t *const dst = buffer.data() + base;
 
-	if (all_valid) {
+	// One variable-width column makes every row a different length, so the
+	// constant-stride path is unavailable for EVERY column in the chunk — NULLs
+	// or not.
+	if (all_valid && !has_variable) {
 		// Rows in BLOCKS; within a block, walk the columns. A full per-column pass
 		// over a wide row touches a distinct cache line per store and then walks
 		// the same lines again for the next column: measured 0.40 ns/value at 4
@@ -510,7 +552,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	constexpr idx_t CURSOR_BLOCK_ROWS = 128;
 	for (idx_t r0 = 0; r0 < row_count; r0 += CURSOR_BLOCK_ROWS) {
 		const idx_t rend = MinValue<idx_t>(r0 + CURSOR_BLOCK_ROWS, row_count);
-		ScatterBlockCursor(dst, cursor.data(), r0, rend, ncols, columns, states, ops, widths);
+		ScatterBlockCursor(dst, cursor.data(), r0, rend, ncols, columns, states, ops, widths, plans);
 	}
 	return true;
 }

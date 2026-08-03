@@ -34,6 +34,20 @@ namespace string {
 
 namespace {
 
+//===--------------------------------------------------------------------===//
+// Batch decode from staging (spec 055 D5/T10) — see the header for the scheme
+// and its measurements.
+//===--------------------------------------------------------------------===//
+
+//! UTF-8 is at most 3 bytes per UTF-16 code unit: one BMP unit yields 1-3 bytes,
+//! and a surrogate pair yields 4 bytes from TWO units, i.e. 2 per unit. So 3x
+//! bounds every input — and 1.5x the wire bytes, since a unit is 2 bytes.
+//! The upper bound is 3, NOT 2: U+0800-U+FFFF, which is all of CJK, is three
+//! bytes per unit.
+inline idx_t Utf8UpperBound(idx_t units) {
+	return units * 3;
+}
+
 // Defer to the public EscapeSqlSingleQuotes API for in-module callers so
 // both this file and external callers (FilterEncoder LIKE emitter) share
 // one implementation.
@@ -148,20 +162,6 @@ void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql:
 	buf[start] = static_cast<uint8_t>(utf16_byte_len & 0xFF);
 	buf[start + 1] = static_cast<uint8_t>((utf16_byte_len >> 8) & 0xFF);
 	tds::encoding::Utf16LEEncodeValidDirect(utf8_data, utf8_len, buf.data() + start + 2);
-}
-
-//===--------------------------------------------------------------------===//
-// Batch decode from staging (spec 055 D5/T10) — see the header for the scheme
-// and its measurements.
-//===--------------------------------------------------------------------===//
-
-//! UTF-8 is at most 3 bytes per UTF-16 code unit: one BMP unit yields 1-3 bytes,
-//! and a surrogate pair yields 4 bytes from TWO units, i.e. 2 per unit. So 3x
-//! bounds every input — and 1.5x the wire bytes, since a unit is 2 bytes.
-//! The upper bound is 3, NOT 2: U+0800-U+FFFF, which is all of CJK, is three
-//! bytes per unit.
-inline idx_t Utf8UpperBound(idx_t units) {
-	return units * 3;
 }
 
 //! Average bytes one value's delimiter search covers before memchr's call
@@ -444,6 +444,113 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 }
 
 }  // namespace
+
+//===--------------------------------------------------------------------===//
+// Column plan for the columnar scatter (spec 057 step 3)
+//
+// A string column makes every row a different length, so it can never take the
+// constant-stride path — and until now it disabled the columnar path for the
+// WHOLE chunk, exactly as decimal did before it got a kernel. The plan below is
+// what lets the chunk stay columnar: it measures the column once, up front, so
+// the wire can be sized before a byte is written.
+//
+// It deliberately does NOT change the conversion strategy. Spec 057 §3a
+// decomposed that win and found the single-bulk-conversion scheme worth
+// 24.0 -> 16.8 ns/value, while 16.8 -> 6.6 came from pre-sizing the output and
+// filling it through a raw pointer — which is what the columnar path already
+// does. So this takes the larger, cheaper half first; the delimiter scheme (one
+// simdutf call per column) can follow on top and be measured against it.
+//
+// The per-value validate-and-count pass is not new work: EncodeNVarcharFromUtf8
+// already ran it before every value, then threw the answer away and ran a second
+// pass to convert. Here the answer is kept.
+//===--------------------------------------------------------------------===//
+
+bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx_t rows,
+				const mssql::BCPColumnMetadata &col, StringColumnPlan &plan) {
+	(void)in;
+	if (col.tds_type_token == tds::TDS_TYPE_BIGVARCHAR) {
+		// UTF-8 target: the payload IS the source bytes, so the length is already
+		// in the string_t and nothing is converted. Spec 060 shipped this wire
+		// form; this is only its columnar sizing.
+		plan.utf8_passthrough = true;
+	} else if (col.tds_type_token != tds::TDS_TYPE_NVARCHAR) {
+		return false;  // binary/XML/other: not planned yet
+	} else {
+		plan.utf8_passthrough = false;
+	}
+
+	plan.lengths.resize(rows);
+	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
+	for (idx_t r = 0; r < rows; r++) {
+		const idx_t idx = fmt.sel->get_index(row_begin + r);
+		if (!fmt.validity.RowIsValid(idx)) {
+			plan.lengths[r] = 0;
+			continue;
+		}
+		const auto &sv = strings[idx];
+		if (plan.utf8_passthrough) {
+			plan.lengths[r] = static_cast<uint32_t>(sv.GetSize());
+			continue;
+		}
+		bool valid = false;
+		const size_t u16 = tds::encoding::Utf16LEByteLengthView(sv.GetData(), sv.GetSize(), valid);
+		if (!valid) {
+			// Invalid UTF-8 takes the legacy per-value fallback, which reproduces
+			// pre-spec-043 bytes exactly. Not worth planning around.
+			return false;
+		}
+		plan.lengths[r] = static_cast<uint32_t>(u16);
+	}
+	return true;
+}
+
+// Write one block of a variable-length string column at the cursor.
+//
+// The wire form is a 2-byte little-endian payload length, 0xFFFF for NULL, then
+// the payload. Everything about it is already known: the length came from
+// PlanColumn, and the destination is pre-sized, so this writes through a raw
+// pointer with no capacity check and no length recomputation — which is the half
+// of the string win spec 057 §3a attributed to pre-sizing (16.8 -> 6.6 ns/value)
+// rather than to the conversion strategy.
+//
+// The conversion itself is still per value and still `EncodeValidDirect`: the
+// bytes were validated during planning, so this pass does not re-validate.
+// Collapsing the N conversion calls into one (the delimiter scheme) is the other
+// half and lands separately, measured against this.
+void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+					 const mssql::BCPColumnMetadata &col, const StringColumnPlan &plan) {
+	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
+	const bool passthrough = plan.utf8_passthrough;
+	for (idx_t r = r0; r < rend; r++) {
+		uint8_t *out = dst + cursor[r];
+		const idx_t idx = fmt.sel->get_index(r);
+		if (!fmt.validity.RowIsValid(idx)) {
+			out[0] = 0xFF;
+			out[1] = 0xFF;
+			cursor[r] += 2;
+			continue;
+		}
+		const uint32_t len = plan.lengths[r];
+		// FR-023 (issue #91): refuse before the batch is sent rather than letting
+		// the server abort it mid-stream. Wording is asserted by tests.
+		if (len > col.max_length) {
+			throw InvalidInputException(
+				"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
+				"but column max is %u code units (%u bytes)",
+				col.name, static_cast<size_t>(len) / 2, static_cast<size_t>(len), col.max_length / 2, col.max_length);
+		}
+		out[0] = static_cast<uint8_t>(len & 0xFF);
+		out[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
+		const auto &sv = strings[idx];
+		if (passthrough) {
+			std::memcpy(out + 2, sv.GetData(), len);
+		} else {
+			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), sv.GetSize(), out + 2);
+		}
+		cursor[r] += 2 + len;
+	}
+}
 
 size_t Utf16ByteLength(const std::string &utf8) {
 	return tds::encoding::Utf16LEByteLength(utf8);

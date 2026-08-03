@@ -134,6 +134,26 @@ size_t Utf16ByteLength(const std::string &utf8);
 // String-family text logic.
 std::string EscapeSqlSingleQuotes(const std::string &str);
 
+//! Per-column measurement for the columnar scatter (spec 057 step 3).
+//!
+//! `lengths[r]` is the PAYLOAD byte count row r will occupy on the wire — UTF-16
+//! bytes for an nvarchar target, source bytes for a UTF-8 one — with 0 for NULL.
+//! Framing (the 2-byte prefix, or PLP's header and terminator) is the caller's.
+struct StringColumnPlan {
+	duckdb::vector<uint32_t> lengths;
+	bool utf8_passthrough = false;
+};
+
+//! Write one block of a planned variable-length column at the cursor positions.
+void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+					 const mssql::BCPColumnMetadata &col, const StringColumnPlan &plan);
+
+//! Measure a column so the chunk's wire can be sized before anything is written.
+//! Returns false when the column cannot be planned — invalid UTF-8, or a wire
+//! form not handled yet — and the caller must fall back to the row path.
+bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx_t rows,
+				const mssql::BCPColumnMetadata &col, StringColumnPlan &plan);
+
 }  // namespace string
 }  // namespace codec
 }  // namespace mssql
