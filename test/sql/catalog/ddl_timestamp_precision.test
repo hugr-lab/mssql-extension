@@ -167,6 +167,12 @@ col_time	time	6
 # to TIMESTAMP whatever its scale, and the encoder used THAT type to read the
 # raw value's unit — so a TIMESTAMP_MS landed as 1970-01-20 and a TIMESTAMP_NS
 # was rejected by the server outright. The unit comes from the source vector now.
+# col_ns NARROWS here: the source is TIMESTAMP_NS '...123456789' (nine digits)
+# into datetime2(7), and a narrowing conversion now ROUNDS rather than
+# truncating — matching the server, which answers .1234568 for the same CAST
+# (verified). Truncation gave .1234567, so identical data loaded by COPY and by
+# INSERT ... CAST disagreed silently (spec 057). The CTAS block above is
+# unaffected: its source is already .1234567, so there is nothing to round.
 query TTTTT
 SELECT * FROM mssql_scan('db_tspre', '
     SELECT CONVERT(NVARCHAR(40), col_ms, 121) AS col_ms,
@@ -177,11 +183,18 @@ SELECT * FROM mssql_scan('db_tspre', '
     FROM dbo.ts_precision_copy
 ');
 ----
-2024-01-15 10:30:45.123	2024-01-15 10:30:45.1234567	2024-01-15 10:30:45	2024-01-15 10:30:45.123456	10:30:45.123456
+2024-01-15 10:30:45.123	2024-01-15 10:30:45.1234568	2024-01-15 10:30:45	2024-01-15 10:30:45.123456	10:30:45.123456
 
-# Deliberate narrowing: a source finer than the target truncates rather than
+# Deliberate narrowing: a source finer than the target is converted rather than
 # corrupting, which is what makes the fix general — the two precisions no longer
 # have to agree.
+#
+# It ROUNDS, and that is a change (spec 057). This block previously pinned
+# truncation, chosen because it does not corrupt — but rounding does not corrupt
+# either AND is what SQL Server itself does: for these two values it answers
+# .988 and 10:30:46, verified against the server. Truncating meant the same data
+# loaded by COPY and by INSERT ... CAST disagreed silently, and disagreed with
+# this extension's own decimal path, which already rounded when narrowing.
 statement ok
 SELECT mssql_exec('db_tspre', 'DROP TABLE IF EXISTS dbo.ts_narrow');
 
@@ -198,7 +211,7 @@ SELECT * FROM mssql_scan('db_tspre', '
     SELECT CONVERT(NVARCHAR(40), a, 121) AS a, CONVERT(NVARCHAR(40), b, 121) AS b FROM dbo.ts_narrow
 ');
 ----
-2024-01-15 10:30:45.987	2024-01-15 10:30:45
+2024-01-15 10:30:45.988	2024-01-15 10:30:46
 
 # -----------------------------------------------------------------------------
 # Cleanup

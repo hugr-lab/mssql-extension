@@ -2208,3 +2208,71 @@ selection vector at all is a COLUMN constant — the flat, no-selection case is 
 overwhelming majority and deserves a unit-stride loop the compiler can see
 through, which is the same rule as everything else here: every branch resolved
 before the hot path.
+
+---
+
+# Temporal: the kernel, the width invariant, and what legacy `datetime` does (2026-08-03)
+
+DATE and the DATETIME2 family take the columnar scatter: **96.3 -> 27.6 ms for 8M
+values, 12.0 -> 3.45 ns/value (3.5x)**. The same constants-per-value disease as
+decimal, with one extra: `EncodeTime` computed its scale divisor with a LOOP
+(`for (i < 6 - scale) divisor *= 10`), up to six multiplies for a number fixed by
+the column.
+
+## The width invariant — new, and it applies to every future arm
+
+**The scatter requires `wire_width` from metadata to equal what the kernel
+actually writes.** Sizing reserves `1 + max_length` per value before any value is
+touched, so a kernel that emits fewer bytes leaves every later column in the row
+where the server is not looking.
+
+The row path never had this constraint: it appends, so whatever it writes IS the
+layout. This was found by breaking it — the first temporal kernel desynchronised
+the stream on a legacy `datetime` target ("premature end-of-message"), because
+`datetime`, `datetime2` and `smalldatetime` share both the wire token
+(TDS_TYPE_DATETIME2) and `col.duckdb_type` (TIMESTAMP) and differ only in
+`max_length`: 8, 6/7/8 and 4. Keying the arm on the DuckDB type routed all three
+into a kernel that fits one.
+
+The resolver now checks the equality explicitly instead of assuming it.
+
+## Legacy `datetime` / `smalldatetime` stay on the row path — deliberately
+
+They are correct there. The value still goes out in datetime2 form and the server
+converts it; the rounding and day-carry rules below are shared by both paths, so
+only the speed differs.
+
+Giving them the kernel means making `SQLServerTypeMaxLength` report what is
+actually SENT rather than the column's own storage size. That changes
+COLMETADATA — what the server is told about the stream — so it is a separate
+change needing its own verification, and the gain is narrow: only tables still on
+the legacy type. Recorded here so the omission reads as a decision.
+
+## Narrowing rounds, and it carries into the date
+
+Found by asking what happens when the source precision differs from the target's,
+and checking against the server rather than assuming:
+
+| value -> target | SQL Server | before | after |
+| --- | --- | --- | --- |
+| `.1239999` -> datetime2(3) | `.124` | `.123` | `.124` |
+| `.1235` -> datetime2(3) | `.124` | `.123` | `.124` |
+| `.9999999` -> datetime2(0) | `12:00:01` | `12:00:00` | `12:00:01` |
+| `23:59:59.9999999` -> datetime2(3) | `2024-01-16 00:00:00.000` | `...15 23:59:59.999` | `2024-01-16 00:00:00.000` |
+
+**We truncated, the server rounds** — so the same data loaded by `COPY` and by
+`INSERT ... CAST` disagreed, silently, on anything with sub-second precision finer
+than the target. It also disagreed with this extension's own decimal path, which
+narrows by rounding for exactly this reason. One rule now: *a narrowing conversion
+lands where the server would have put it.*
+
+And the carry is real, not theoretical. The first fix asserted in a comment that
+rounding could not cross the day boundary; it can — `23:59:59.999999` into scale 3
+rounds to 86 400 000 ms, which is 24:00:00 and not a legal time, and the server
+rejects the row outright. SQL Server rolls the DATE instead, so the kernel does
+too. Both the pre-rounding truncation and the missing carry were pre-existing;
+only the kernel made them visible.
+
+Rounding costs nothing per value: the divisor's half and the day's tick count are
+column constants hoisted beside the scale factor, and the carry is one compare
+that is false for every value but the last tick of a day.

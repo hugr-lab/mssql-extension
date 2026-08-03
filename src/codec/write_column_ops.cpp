@@ -110,8 +110,16 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 		// all declare TDS_TYPE_DATETIME2 on the wire, but sys.columns reports
 		// max_length 8, 6/7/8 and 4 respectively. An old `datetime` column at
 		// scale 0 is sized 8 and would be written 6, desynchronising the stream
-		// with "premature end-of-message". Those targets keep the row path, which
-		// gets them right.
+		// with "premature end-of-message".
+		//
+		// **Legacy `datetime` and `smalldatetime` therefore keep the row path,
+		// deliberately.** They are correct there — the value still goes out in
+		// datetime2 form and the server converts, and the rounding and day-carry
+		// rules are shared, so only the speed differs. Giving them the kernel
+		// needs SQLServerTypeMaxLength to report what is actually SENT rather
+		// than the column's own storage size, which changes COLMETADATA — what
+		// the server is told — and so is a separate change with its own
+		// verification, for a narrow gain: tables still on the legacy type.
 		const uint32_t dt2_written =
 			static_cast<uint32_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(target.scale)) + 3;
 		const bool ts_ok = target.duckdb_type.id() != LogicalTypeId::DATE && src == PhysicalType::INT64 &&
