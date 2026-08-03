@@ -141,9 +141,9 @@ std::string EscapeSqlSingleQuotes(const std::string &str);
 //! Framing (the 2-byte prefix, or PLP's header and terminator) is the caller's.
 //! Which of the three variable-length wire forms this column takes. They share
 //! the framing (2-byte LE length, 0xFFFF for NULL) and differ in whether the
-//! payload is converted and how an over-long value is refused — nvarchar and
-//! varchar each raise with their own wording, which tests assert, and binary has
-//! never checked at all.
+//! payload is converted and in the UNIT the column's bound is stated in —
+//! nvarchar bounds UTF-16 code units, a UTF-8 varchar bounds bytes, and binary
+//! bounds bytes with no character boundary to respect.
 enum class VarKind : uint8_t { NVarchar, Utf8Varchar, Binary };
 
 struct StringColumnPlan {
@@ -158,7 +158,14 @@ struct StringColumnPlan {
 	//! end-of-message, because every row was laid out a byte short. PLP would
 	//! have been a second chance to make the same mistake with different numbers.
 	duckdb::vector<uint32_t> wire;
+	//! Source bytes to convert for row r. EMPTY unless `truncated` — a value
+	//! that fits converts its whole string_t, so nothing needs storing.
+	duckdb::vector<uint32_t> src_len;
 	VarKind kind = VarKind::NVarchar;
+	//! Did any value in this block exceed the column's declared bound? A COLUMN
+	//! property, so the scatter's test on it is perfectly predicted rather than a
+	//! per-value length comparison — and usually false, leaving src_len unbuilt.
+	bool truncated = false;
 	//! PLP framing (8-byte header, 4-byte chunk length, payload, 4-byte
 	//! terminator; 8 bytes of 0xFF for NULL) rather than a 2-byte prefix.
 	bool plp = false;

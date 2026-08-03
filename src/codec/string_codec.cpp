@@ -34,6 +34,63 @@ namespace string {
 
 namespace {
 
+// Largest prefix of a validated UTF-8 value whose UTF-16LE encoding fits in
+// `max_bytes`, returned as a source byte count with the UTF-16 size in
+// `out_utf16`.
+//
+// Truncation walks CODE POINTS, never bytes: cutting a UTF-8 sequence mid-way
+// produces invalid UTF-8, and cutting a UTF-16 surrogate pair in half produces a
+// lone surrogate that SQL Server stores and every later read reports as damaged.
+// So a character that does not fit whole is dropped whole, which is also what
+// SQL Server's own CONVERT does.
+//
+// Cold: reached only for values that actually exceed the bound.
+size_t Utf8PrefixForUtf16Limit(const char *data, size_t size, uint32_t max_bytes, uint32_t &out_utf16) {
+	size_t i = 0;
+	uint32_t used = 0;
+	while (i < size) {
+		const uint8_t lead = static_cast<uint8_t>(data[i]);
+		size_t cp_bytes;
+		uint32_t u16_bytes;
+		if (lead < 0x80) {
+			cp_bytes = 1;
+			u16_bytes = 2;
+		} else if (lead < 0xE0) {
+			cp_bytes = 2;
+			u16_bytes = 2;
+		} else if (lead < 0xF0) {
+			cp_bytes = 3;
+			u16_bytes = 2;
+		} else {
+			// Outside the BMP: a surrogate PAIR, four UTF-16 bytes, indivisible.
+			cp_bytes = 4;
+			u16_bytes = 4;
+		}
+		if (used + u16_bytes > max_bytes) {
+			break;
+		}
+		used += u16_bytes;
+		i += cp_bytes;
+	}
+	out_utf16 = used;
+	return i;
+}
+
+// The same for a UTF-8 target, where the column's bound is in BYTES (as SQL
+// Server states it for a UTF-8 collation) and the payload is the source itself.
+// Backs off to a code-point boundary rather than leaving a dangling sequence.
+size_t Utf8PrefixForByteLimit(const char *data, size_t size, uint32_t max_bytes) {
+	if (size <= max_bytes) {
+		return size;
+	}
+	size_t n = max_bytes;
+	// Continuation bytes are 10xxxxxx; step back off any partial sequence.
+	while (n > 0 && (static_cast<uint8_t>(data[n]) & 0xC0) == 0x80) {
+		n--;
+	}
+	return n;
+}
+
 //===--------------------------------------------------------------------===//
 // Batch decode from staging (spec 055 D5/T10) — see the header for the scheme
 // and its measurements.
@@ -119,16 +176,21 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col,
 							duckdb::vector<uint8_t> &buf) {
 	bool valid_utf8 = false;
-	const size_t utf16_byte_len = tds::encoding::Utf16LEByteLengthView(utf8_data, utf8_len, valid_utf8);
+	size_t utf16_byte_len = tds::encoding::Utf16LEByteLengthView(utf8_data, utf8_len, valid_utf8);
 
-	// FR-023 (issue #91) — pre-encode length check for non-PLP nvarchar(N).
-	// PLP columns are skipped (max_length sentinel 0xFFFF = nvarchar(max),
-	// no client-side cap). Error wording is tested — do not change.
+	// The column's declared bound, applied by TRUNCATION (spec 057 §3g) where
+	// issue #91 originally raised. A column that says nvarchar(20) has stated its
+	// bound and fitting the value to it is the intent — SQL Server's own CONVERT
+	// truncates, and refusing meant a load the server would have accepted failed
+	// at the client instead. The columnar path clamps during planning; this keeps
+	// the two producing the same bytes.
+	//
+	// PLP is exempt: max_length is the sentinel 0xFFFF there, not a length, and
+	// nvarchar(max) has no bound to apply.
 	if (!col.IsPLPType() && utf16_byte_len > col.max_length) {
-		throw InvalidInputException(
-			"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
-			"but column max is %u code units (%u bytes)",
-			col.name, utf16_byte_len / 2, utf16_byte_len, col.max_length / 2, col.max_length);
+		uint32_t clamped = 0;
+		utf8_len = Utf8PrefixForUtf16Limit(utf8_data, utf8_len, col.max_length, clamped);
+		utf16_byte_len = clamped;
 	}
 
 	if (!valid_utf8) {
@@ -466,6 +528,56 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 // pass to convert. Here the answer is kept.
 //===--------------------------------------------------------------------===//
 
+// Cold second pass: at least one value exceeded the column's declared bound, so
+// re-derive that column's lengths with every value clamped to it.
+//
+// TRUNCATION, not an error. The two are not the same judgement call: a column
+// that declares nvarchar(20) has stated its bound, and fitting the value to it
+// is the documented intent — SQL Server's own CONVERT truncates. Contrast the
+// integer path on the conversion arm, which refuses, because nothing about
+// `bigint -> int` says the user wanted the low 32 bits. Refusing here instead
+// meant a load that the server itself would have accepted failed at the client.
+//
+// Runs only when something actually overflowed, and fills src_len for EVERY row
+// so the scatter's truncating loop needs no per-value test of its own.
+static void ClampToBound(const UnifiedVectorFormat &fmt, idx_t row_begin, idx_t rows, uint32_t bound,
+						 StringColumnPlan &plan, const string_t *strings) {
+	plan.truncated = true;
+	plan.src_len.resize(rows);
+	for (idx_t r = 0; r < rows; r++) {
+		const idx_t idx = fmt.sel->get_index(row_begin + r);
+		if (!fmt.validity.RowIsValid(idx)) {
+			plan.src_len[r] = 0;
+			continue;
+		}
+		const auto &sv = strings[idx];
+		uint32_t len = plan.lengths[r];
+		uint32_t src = static_cast<uint32_t>(sv.GetSize());
+		if (len > bound) {
+			if (plan.kind == VarKind::NVarchar) {
+				src = static_cast<uint32_t>(Utf8PrefixForUtf16Limit(sv.GetData(), sv.GetSize(), bound, len));
+			} else if (plan.kind == VarKind::Utf8Varchar) {
+				src = static_cast<uint32_t>(Utf8PrefixForByteLimit(sv.GetData(), sv.GetSize(), bound));
+				len = src;
+			} else {
+				// Binary has no character boundary to respect and no client-side
+				// bound historically; clamping it is exact.
+				src = bound;
+				len = bound;
+			}
+			plan.lengths[r] = len;
+		}
+		plan.src_len[r] = src;
+		if (!plan.plp) {
+			plan.wire[r] = 2 + len;
+		} else if (len == 0) {
+			plan.wire[r] = 12;
+		} else {
+			plan.wire[r] = 16 + len;
+		}
+	}
+}
+
 bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx_t rows,
 				const mssql::BCPColumnMetadata &col, StringColumnPlan &plan) {
 	(void)in;
@@ -488,6 +600,15 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 	plan.plp = col.IsPLPType();
 	plan.lengths.resize(rows);
 	plan.wire.resize(rows);
+	plan.src_len.clear();
+	plan.truncated = false;
+	// The declared bound, or "none" for a MAX column — where max_length is the
+	// PLP SENTINEL 0xFFFF and not a length at all. The row path has always said
+	// so explicitly (`!col.IsPLPType() &&`); the columnar path lost that when it
+	// was written, which made a >65535-byte value into `nvarchar(max)` — a column
+	// with no bound by definition — fail as an overflow.
+	const uint32_t bound = plan.plp ? 0xFFFFFFFFu : col.max_length;
+	bool over = false;
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
 	for (idx_t r = 0; r < rows; r++) {
 		const idx_t idx = fmt.sel->get_index(row_begin + r);
@@ -512,6 +633,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			len = static_cast<uint32_t>(u16);
 		}
 		plan.lengths[r] = len;
+		// An OR reduction, not a branch: the loop stays vectorisable and only the
+		// accumulated answer is examined, once, after it. Same shape as the
+		// integer range check on the conversion arm.
+		over |= (len > bound);
 		if (!plan.plp) {
 			plan.wire[r] = 2 + len;
 		} else if (len == 0) {
@@ -520,6 +645,9 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		} else {
 			plan.wire[r] = 16 + len;
 		}
+	}
+	if (over) {
+		ClampToBound(fmt, row_begin, rows, bound, plan, strings);
 	}
 	return true;
 }
@@ -539,6 +667,7 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 // half and lands separately, measured against this.
 void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
 					 const mssql::BCPColumnMetadata &col, const StringColumnPlan &plan) {
+	(void)col;	// the bound was applied during planning; nothing to check here
 	const auto *strings = UnifiedVectorFormat::GetData<string_t>(fmt);
 	const bool convert = plan.kind == VarKind::NVarchar;
 	for (idx_t r = r0; r < rend; r++) {
@@ -550,25 +679,13 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 			continue;
 		}
 		const uint32_t len = plan.lengths[r];
-		// FR-023 (issue #91): refuse before the batch is sent rather than letting
-		// the server abort it mid-stream. Each form's wording is asserted by
-		// tests, and binary has never been bounded here — keep all three exactly
-		// as the row path has them.
-		if (len > col.max_length) {
-			if (plan.kind == VarKind::NVarchar) {
-				throw InvalidInputException(
-					"MSSQL: NVARCHAR column '%s' overflow: value is %zu UCS-2 code units (%zu UTF-16LE bytes) "
-					"but column max is %u code units (%u bytes)",
-					col.name, static_cast<size_t>(len) / 2, static_cast<size_t>(len), col.max_length / 2,
-					col.max_length);
-			}
-			if (plan.kind == VarKind::Utf8Varchar) {
-				throw InvalidInputException(
-					"MSSQL: VARCHAR column '%s' overflow: value is %zu UTF-8 bytes but column max is %u bytes",
-					col.name, static_cast<size_t>(len), col.max_length);
-			}
-		}
 		const auto &sv = strings[idx];
+		// How much of the source to convert. Fitting values convert whole; only a
+		// column where something overflowed carries per-row source lengths, and
+		// `truncated` is a COLUMN property, so this is a predictable test on a
+		// value the branch predictor sees settle immediately — no per-value bound
+		// comparison, and no throw, on the hot path at all.
+		const size_t src_bytes = plan.truncated ? plan.src_len[r] : sv.GetSize();
 		uint8_t *payload;
 		if (!plan.plp) {
 			out[0] = static_cast<uint8_t>(len & 0xFF);
@@ -586,7 +703,7 @@ void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const U
 			payload = out + 12;
 		}
 		if (convert) {
-			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), sv.GetSize(), payload);
+			tds::encoding::Utf16LEEncodeValidDirect(sv.GetData(), src_bytes, payload);
 		} else {
 			std::memcpy(payload, sv.GetData(), len);
 		}
@@ -692,10 +809,13 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // server-side truncation error (spec 060 § 3).
 void EncodeVarcharUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPColumnMetadata &col,
 					   duckdb::vector<uint8_t> &buf) {
+	// Truncated to the column's bound, in BYTES — which is the unit SQL Server
+	// states a UTF-8 varchar(n) in, and the reason this guard lives here rather
+	// than being shared with the nvarchar one. Backs off to a code-point boundary
+	// so the column never receives a dangling UTF-8 sequence. See the nvarchar
+	// path above for why this truncates instead of raising.
 	if (!col.IsPLPType() && utf8_len > col.max_length) {
-		throw InvalidInputException(
-			"MSSQL: VARCHAR column '%s' overflow: value is %zu UTF-8 bytes but column max is %u bytes", col.name,
-			utf8_len, col.max_length);
+		utf8_len = Utf8PrefixForByteLimit(utf8_data, utf8_len, col.max_length);
 	}
 
 	if (col.IsPLPType()) {

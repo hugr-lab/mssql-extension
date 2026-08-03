@@ -165,12 +165,24 @@ ToptLenCopy	stated	20
 ToptLenCtas	plain	128
 ToptLenCtas	stated	20
 
-# The bound is now real on the write path: our own error names the column, and
-# it fires before the batch is sent rather than arriving from the server.
-statement error
-CREATE TABLE topt.dbo.ToptLenFail AS SELECT repeat('x', 100) AS plain;
+# The bound is real on the write path: it is applied by the client before the
+# batch is sent rather than arriving as a server-side truncation error.
+#
+# Spec 057 §3g: a column that declares a length has STATED its bound, and fitting
+# the value to it is the intent — SQL Server's own CONVERT truncates. Raising
+# instead meant a load the server would have accepted failed at the client. (The
+# integer path still refuses, for the opposite reason: an integer that does not
+# fit is a different number, not a shortened one.)
+statement ok
+CREATE OR REPLACE TABLE topt.dbo.ToptLenFail AS SELECT repeat('x', 100) AS plain;
+
+query II
+SELECT length(plain), plain = repeat('x', 64) FROM topt.dbo.ToptLenFail;
 ----
-overflow
+64	true
+
+statement ok
+DROP TABLE topt.dbo.ToptLenFail;
 
 statement ok
 SET mssql_default_string_length = 0;

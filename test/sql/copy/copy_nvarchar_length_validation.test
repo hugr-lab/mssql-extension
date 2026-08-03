@@ -14,8 +14,12 @@
 #   (b) 8 ASCII + 4 emoji into nvarchar(20) — 16 UCS-2 code units (32 bytes),
 #       fits in 40-byte capacity; must succeed + round-trip.
 #   (c) 8 ASCII + 8 emoji into nvarchar(20) — 24 UCS-2 code units (48 bytes),
-#       exceeds 40-byte capacity; must fail with a String-family-emitted
-#       error naming the column.
+#       exceeds 40-byte capacity. Spec 057 §3g changed the answer here from an
+#       error to TRUNCATION: a column that declares nvarchar(20) has stated its
+#       bound, and fitting the value to it is the intent — SQL Server's own
+#       CONVERT truncates, so refusing meant a load the server would have
+#       accepted failed at the client. What the code-unit accounting is FOR is
+#       unchanged and is now what makes the cut land in the right place.
 #
 # Pre-spec-045 baseline (on `main`-at-kickoff): (a) and (b) succeed; (c)
 # fails with the opaque server-side "Received an invalid column length"
@@ -94,8 +98,15 @@ SELECT mssql_exec('db', 'DROP TABLE dbo.copy_nv_91_b');
 
 # ---------------------------------------------------------------------------
 # Scenario (c): 8 ASCII + 8 surrogate-pair emoji into nvarchar(20)
-#   24 UCS-2 code units / 48 bytes > 40-byte capacity → must throw a
-#   String-family error naming the 'payload' column.
+#   24 UCS-2 code units / 48 bytes > 40-byte capacity → truncated to exactly 20
+#   code units.
+#
+#   This is the scenario that shows why the bound is counted in code units. 20
+#   units is 8 ASCII + 6 emoji, because each emoji is a surrogate PAIR costing
+#   two — so the answer is 14 CHARACTERS, and the seventh emoji is dropped whole
+#   rather than cut in half. Counting characters instead would have let 12 emoji
+#   through; cutting at the byte would have left a lone surrogate, which SQL
+#   Server stores and every later read reports as damaged.
 # ---------------------------------------------------------------------------
 
 statement ok
@@ -107,19 +118,18 @@ SELECT mssql_refresh_cache('db');
 statement ok
 CREATE TABLE local_c AS SELECT 1 AS id, ('ABCDEFGH' || '😀😁😂😃😄😅😆😇')::VARCHAR AS payload;
 
-statement error
+statement ok
 COPY local_c TO 'mssql://db/dbo/copy_nv_91_c' (FORMAT 'bcp', CREATE_TABLE false);
-----
-payload
 
-# NOTE: No post-test cleanup for scenario (c). The codec validation throws
-# mid-BCP-stream, which leaves the per-test ATTACH-scoped pool with a
-# corrupted connection (the server still expects more BCP data; subsequent
-# commands on that connection fail with "Failed to receive TDS packet").
-# Cleaning up the dangling SQL Server table is handled by the pre-test
-# `IF OBJECT_ID(...) IS NOT NULL DROP TABLE` block at the file head, which
-# runs in a fresh DuckDB ATTACH for the next test invocation. Robust
-# in-flight BCP cancellation (ATTENTION token round-trip + state reset) is
-# tracked separately from spec 045 — it is a pre-existing limitation of
-# the COPY error path that becomes visible because Phase 5 introduces
-# client-side BCP validation for the first time.
+query III
+SELECT length(payload), payload = 'ABCDEFGH' || '😀😁😂😃😄😅', payload LIKE 'ABCDEFGH%'
+FROM db.dbo.copy_nv_91_c;
+----
+14	true	true
+
+# The note that used to sit here described why scenario (c) could not clean up
+# after itself: the validation threw mid-BCP-stream, leaving the connection with
+# the server still expecting data. Truncation removes that entirely — the load
+# now completes, so the table can simply be dropped.
+statement ok
+SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_nv_91_c');
