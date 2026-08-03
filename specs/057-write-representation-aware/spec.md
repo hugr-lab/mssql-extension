@@ -1659,3 +1659,75 @@ configuration that still throws.
   of the same column encoded without the truncation kernel. If it does not, the
   `min` and the boundary correction did not fuse the way this section claims and
   the shape is wrong, not the threshold.
+
+---
+
+# BCP wire type compatibility — the current fix is a stopgap (user, 2026-08-02)
+
+Issue [#153](https://github.com/hugr-lab/mssql-extension/issues/153) asked whether
+COPY into an existing table should allow compatible numeric coercion. The
+question turned out to rest on a false premise, and the answer shipped here is
+deliberately a stopgap. Both halves need recording, because step 3 has to redo it.
+
+## What was actually wrong
+
+`IsTypeCompatible` advertised a widening-only policy. The widenings did not work:
+
+| conversion | validator | runtime, before |
+| --- | --- | --- |
+| `INTEGER -> bigint` | allowed | `INTERNAL Error: Expected unified vector format of type INT64, but found type INT32` |
+| `TINYINT -> int` | allowed | `INTERNAL Error: ... INT32 ... INT8` |
+| `SMALLINT -> bigint` | allowed | `INTERNAL Error: ... INT64 ... INT16` |
+| `BIGINT -> int` | rejected | never reached |
+| `DECIMAL(21,1) -> decimal(18,2)` | allowed | silently 10x wrong |
+
+`integer::EncodeToBcp` switched on `col.duckdb_type` — the TARGET's type — to
+choose the read width, then read the SOURCE vector's memory at that width. So
+only an exact match ever worked, the compatibility table turned a clean "type
+mismatch" into an `INTERNAL Error`, and the one narrowing it refused was the one
+case that could have been done safely. The decimal path had no width question at
+all and was simply wrong.
+
+So the choice in the issue — "keep strict" vs "allow coercions" — was never the
+real choice: the shipped behaviour was neither.
+
+## What shipped now, and why it is a stopgap
+
+The encoder reads the source at its own width and range-checks against the
+target's, so every widening works and narrowing is refused **by value** rather
+than by type. The validator was widened to match what the encoder can do.
+
+The shape is wrong on this project's own terms: each target arm carries a branch
+on the source's `PhysicalType`, i.e. a per-value test of something that is
+constant for the whole chunk. It is a crutch that buys correctness now, at the
+cost of a comparison per value on the exact-match path.
+
+## What step 3 must do instead
+
+**Resolve the conversion once per column, as a kernel.** The pair
+(source `PhysicalType`, target wire type) is fixed at COLMETADATA time, so it
+selects one function — exactly like `ResolveColumnOps` on the read side — and the
+inner loop carries no dispatch, no branch and no per-value type test. The
+exact-match case then costs literally nothing rather than one comparison.
+
+And with that in place, **revisit the compatibility question properly**, which
+this stopgap does not:
+
+- The policy currently lives in two places that must agree by hand —
+  `IsTypeCompatible` (a table of type NAMES) and the encoder (what it can
+  actually execute). They disagreed for two releases and nothing detected it.
+  The compatibility answer should be *derived from* the set of resolvable
+  kernels, so an unimplementable conversion cannot be advertised.
+- The same question is open for the families this stopgap did not touch: float
+  to/from decimal, decimal to integer, temporal precision changes
+  (`datetime2(7)` source into a `datetime2(3)` column), and string to non-string.
+  Each is either a kernel or an honest refusal; today most are neither.
+- `tinyint` deserves settling while the kernels are being written: SQL Server's
+  is UNSIGNED 0..255 and the extension maps it to DuckDB's signed `TINYINT`, so
+  an exact-match source of -1 currently goes out as 0xFF and the server stores
+  255. The stopgap left that path byte-identical on purpose — changing it is a
+  wire-compatibility decision, not a refactor.
+- Whether a refused value should abort the statement or be reported per row.
+  Integers refuse (a value that does not fit is a different number); strings
+  truncate to the column's stated bound and count it. Those two are consistent
+  with each other but the rule has never been written down as a rule.
