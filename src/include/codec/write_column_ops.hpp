@@ -76,8 +76,12 @@ enum class ScatterArm : uint8_t {
 	//! Sign byte plus little-endian magnitude, width from the target's precision.
 	//! MONEY and SMALLMONEY map to DECIMAL and arrive here too.
 	Decimal,
-	//! DATE (3 bytes) and the DATETIME2 family (time 3/4/5 + date 3). TIME and
-	//! DATETIMEOFFSET are not here yet and take the row path.
+	//! Every temporal target: DATE (3 bytes), the DATETIME2 family (time 3/4/5 +
+	//! date 3), TIME (3/4/5, no date field), DATETIMEOFFSET (datetime2 + a 2-byte
+	//! offset), and a DATE source widened into a DATETIME2 target. `datetime`,
+	//! `datetime2` and `smalldatetime` share one wire type and one duckdb_type,
+	//! so the WIDTH is the only thing separating them — which is why every case
+	//! below checks `max_length` rather than assuming it.
 	Datetime,
 	//! The 16 wire bytes of a UNIQUEIDENTIFIER (mixed-endian by the spec, which
 	//! is why it is a kernel and not a copy).
@@ -88,10 +92,20 @@ enum class ScatterArm : uint8_t {
 	//! constant-stride path; it is planned per column first (string::PlanColumn)
 	//! and then written with the cursor.
 	VarString,
-	//! Resolvable, but no columnar kernel yet — DECIMAL, temporal, GUID and the
-	//! string families still go through the row-major append path. Distinct from
-	//! Unsupported: this pair IS encodable, just not by a scatter, so it must not
-	//! be read as an incompatibility.
+	//! Resolvable, but not by a scatter. Distinct from Unsupported: this pair IS
+	//! encodable, just not columnar, so it must not be read as an
+	//! incompatibility.
+	//!
+	//! Every family now has a kernel, so what lands here is a specific PAIR, not
+	//! a family: a source rendered as text (INTERVAL into NVARCHAR), a HUGEINT or
+	//! UBIGINT column (both travel as DECIMAL but are not routed to the decimal
+	//! arm), a width that disagrees with what COLMETADATA declared, and the two
+	//! deliberate refusals — an unsigned source into a signed target, and a
+	//! signed one-byte source into SQL Server's unsigned `tinyint`, both of which
+	//! the row path range-checks and refuses by VALUE.
+	//!
+	//! Cost worth knowing before adding to this list: ONE column resolving here
+	//! sends the WHOLE chunk row-major, every other column with it.
 	RowFallback,
 };
 

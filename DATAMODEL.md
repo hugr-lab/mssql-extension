@@ -587,7 +587,7 @@ Two lifetime rules that are easy to get wrong:
 - Codec dispatch: `src/codec/type_family.cpp`, `src/codec/literal_format.cpp`
 - Target string types: `src/include/codec/target_string_type.hpp`, `src/codec/target_string_type.cpp`
 - BCP column metadata (both builders): `src/copy/target_resolver.cpp`
-- Write-path column resolution (the `ScatterArm` table): `src/codec/write_column_ops.cpp`
+- Write-path column resolution (the `ScatterArm` table): `src/codec/write_column_ops.cpp` — and [`docs/columnar-encode-core.md`](docs/columnar-encode-core.md), a reader's guide to the six files that make up the encode core, with the invariants that have actually broken
 - Row-major encoder (the fallback both paths must agree with): `src/tds/encoding/bcp_row_encoder.cpp`
 - BCP framing and the streaming drain: `src/copy/bcp_writer.cpp`
 - CTAS sink and its parallel writers: `src/dml/ctas/mssql_physical_ctas.cpp`, `src/dml/ctas/mssql_ctas_executor.cpp`
