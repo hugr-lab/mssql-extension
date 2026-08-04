@@ -702,8 +702,21 @@ that already exists uses that table's types, and `STRING_LENGTH` / `TABLE_KIND`
 are ignored — COPY does not restructure someone else's table.
 
 The bound is **informational on the DuckDB side**. The value is an ordinary
-DuckDB string, and nothing truncates it there; the length is enforced when the
-data is written, with an error naming the column, and by SQL Server.
+DuckDB string and nothing shortens it there; the bound applies when the data is
+written, and an over-long value is **truncated to fit**, not rejected. That is
+what SQL Server's own `CONVERT` does, and refusing a load the server would have
+accepted is worse than matching it.
+
+The cut respects character boundaries, which a byte count alone does not: a
+UTF-8 sequence is never split, and neither is a UTF-16 surrogate pair — half of
+one is a lone surrogate that the server stores and every later read reports as
+damaged. A character that does not fit whole is dropped whole. The unit is SQL
+Server's own: `nvarchar(n)` bounds **code units** (a non-BMP character costs
+two), a UTF-8 `varchar(n)` bounds **bytes**.
+
+Numbers are the opposite case and still error: a `BIGINT` that does not fit an
+`int` is a different number, and nothing about the target type says the low 32
+bits were wanted.
 
 A `MSSQL_VARCHAR` column is given a UTF-8 collation (`mssql_utf8_collation`), or
 the one you name in the second argument. Without a UTF-8 collation a single-byte
@@ -745,7 +758,7 @@ loaded.
 | `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_CI_AS_SC_UTF8` | Collation for created `varchar` columns; empty inherits the database default |
 
 `mssql_default_string_length` says "no string in this data is longer than n".
-Anything longer fails with an error naming the column, before the batch is sent.
+Anything longer is truncated to `n` on a character boundary, as described above.
 Above SQL Server's inline limit (4000 for `nvarchar`, 8000 for `varchar`) the
 column stays MAX. A cast beats this for anything but a uniform schema.
 
@@ -1030,8 +1043,22 @@ COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `mssql_copy_flush_rows` | BIGINT | 100000 | Rows before flushing to SQL Server (0 = flush at end only) |
-| `mssql_copy_tablock` | BOOLEAN | false | Use TABLOCK hint for 15-30% better performance (blocks concurrent access) |
+| `mssql_copy_flush_rows` | BIGINT | 102400 | Rows per batch — the boundary the **server** sees, not a client buffer. 102400 is SQL Server's own threshold for writing a batch straight into a compressed columnstore rowgroup; below it every row goes to the delta store, so a smaller value defeats `table_kind = 'columnstore'` entirely |
+| `mssql_copy_tablock` | VARCHAR | `auto` | `auto` \| `true` \| `false`. `auto` decides from the target's shape: **on** for a heap, **off** for anything clustered — see below |
+| `mssql_copy_parallel_writers` | BIGINT | 0 | Concurrent bulk-load connections one COPY or CTAS may open. `0` derives it from DuckDB's thread count, capped at 8; `1` disables parallel loading |
+
+`mssql_copy_flush_rows` was 100000 and `mssql_copy_tablock` was a `BOOLEAN`
+defaulting to `false`; both changed in spec 057, and the reasons are measurements
+rather than taste:
+
+* at 100000 rows a columnstore load produced **one OPEN rowgroup and 53 MB**; at
+  102400, **nine COMPRESSED rowgroups and 7 MB** (1M rows). The extra 2400 rows
+  cost nothing on a heap, where batch size measured nearly flat;
+* TABLOCK helps a heap, where concurrent loaders take mutually compatible BU
+  locks, and **serialises** everything clustered. On 2M rows into a clustered
+  columnstore: hint on 8.92 s with the server pinned at one core, hint off
+  5.23 s across three, and **identical compression either way**. What decides
+  whether rows land compressed is `mssql_copy_flush_rows`, not the lock.
 
 ### COPY TO Options
 
@@ -1733,19 +1760,22 @@ SET mssql_connection_cache = false;
 For loading large datasets into SQL Server, use COPY TO with BCP protocol:
 
 ```sql
--- Fastest: TABLOCK + large flush threshold
-SET mssql_copy_tablock = true;  -- 15-30% faster, but blocks concurrent access
-SET mssql_copy_flush_rows = 500000;  -- Fewer flushes = better throughput
-
 COPY large_dataset TO 'mssql://db/dbo/target' (FORMAT 'bcp');
 ```
 
-| Scenario | Recommended Settings | Notes |
-|----------|---------------------|-------|
-| Single-user batch load | `TABLOCK=true`, `FLUSH_ROWS=500000` | Maximum throughput |
-| Multi-user environment | `TABLOCK=false` (default) | Allows concurrent access |
-| Memory-constrained | `FLUSH_ROWS=50000` | Lower memory on both sides |
-| Maximum reliability | `FLUSH_ROWS=100000` (default) | Balanced throughput/memory |
+**The defaults are the tuned values.** This section used to recommend
+`TABLOCK = true` and `FLUSH_ROWS = 500000`; spec 057 measured both against a
+live server and both are wrong more often than not.
+
+| Setting | Leave it alone unless | Why |
+|---------|----------------------|-----|
+| `mssql_copy_tablock` | you know the target is a heap AND nothing else loads into it | `auto` already turns it on for a heap. Forcing it on for anything **clustered** serialises the load: 2M rows into a clustered columnstore took 8.92 s with the hint against 5.23 s without, one core busy instead of three, and compressed identically either way |
+| `mssql_copy_flush_rows` | you are memory-constrained on the server | Lowering it below **102400** stops a columnstore target from compressing at all — every row lands in the delta store, which only closes on its own at 1048576. Raising it does not help: the value is a server-side batch boundary, not a client buffer, and throughput measured flat above the threshold |
+| `mssql_copy_parallel_writers` | you must not open more than one session | The bound on this path is SQL Server's ingest rate, and it parallelises across sessions. 44 columns x 1M rows: 10.55 s at one writer, **3.24 s at four**, 3.51 s at eight — it plateaus past four, which is why the derived value is capped |
+
+Inside an explicit transaction COPY uses one writer regardless: the connection is
+pinned, and a second would sit outside the transaction. CTAS is not affected —
+it loads outside the transaction by design.
 
 ### Connection Pool Tuning
 
@@ -1768,8 +1798,13 @@ SET mssql_connection_cache = false;  -- Disable pooling for isolation
 |--------|----------|----------|
 | Single INSERT | ~1K | Small single-row operations |
 | Batched INSERT | ~50K | INSERT with RETURNING clause |
-| COPY TO (BCP) | ~300K | Bulk loading without RETURNING |
-| COPY TO + TABLOCK | ~400K | Single-user bulk loading |
+| COPY TO / CTAS (BCP) | ~300K | Bulk loading without RETURNING |
+
+The big lever above that is `mssql_copy_parallel_writers`, not TABLOCK: the
+bound is SQL Server's ingest rate and it parallelises across sessions, measured
+at 3.3x from one writer to four. TABLOCK is worth nothing extra on the default
+path — `auto` already applies it where it helps — and costs about 1.7x where it
+does not (see the tuning table above).
 
 ```sql
 -- For bulk loads without RETURNING, always prefer COPY
