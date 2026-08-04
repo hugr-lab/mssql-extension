@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind counters-test help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -314,6 +314,27 @@ test-index-kind:
 	@echo ""
 	@echo "Running MSSQLIndexKind unit test..."
 	build/test/test_index_kind
+
+# Spec 063 D1: MSSQLResolveLoadPolicy — who supplies a bulk-load writer's
+# connection, and how many writers there may be.
+#
+# Pure in-memory, nothing to link: copy/load_policy.hpp is a self-contained
+# header of plain types for exactly this reason. Every case it decides is one
+# where being wrong is SILENT (a writer handed the pinned connection, a second
+# writer whose rows do not roll back, a second writer against a session-scoped
+# `#temp` target), so an end-to-end test would see a load that succeeded.
+LOAD_POLICY_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+LOAD_POLICY_TEST_INCLUDES := -I src/include
+
+test-load-policy:
+	@echo "Building load-policy unit test (spec 063 D1)..."
+	@mkdir -p build/test
+	$(CXX) $(LOAD_POLICY_TEST_FLAGS) $(LOAD_POLICY_TEST_INCLUDES) \
+	    test/cpp/test_load_policy.cpp \
+	    -o build/test/test_load_policy
+	@echo ""
+	@echo "Running load-policy unit test..."
+	build/test/test_load_policy
 
 # ---------------------------------------------------------------------------
 # Standalone C++ unit tests (no Catch, no SQL Server, own main()).

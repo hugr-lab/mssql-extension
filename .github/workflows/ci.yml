@@ -137,6 +137,20 @@ jobs:
             test/cpp/test_index_kind.cpp -o /tmp/test_index_kind
           /tmp/test_index_kind
 
+      # Spec 063 D1: who supplies a bulk-load writer's connection and how many
+      # writers there may be. Every case it decides fails SILENTLY when wrong —
+      # a writer given the pinned connection interleaves ROW tokens into someone
+      # else's bulk load; a second writer inside a transaction lands rows that do
+      # not roll back; a second writer against a `#temp` target writes to whatever
+      # same-named table that pooled session holds. An end-to-end test sees a load
+      # that succeeded, so the policy is asserted directly.
+      # Self-contained header: no submodule checkout, nothing to link.
+      - name: Build + run load-policy unit test (spec 063)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_load_policy.cpp -o /tmp/test_load_policy
+          /tmp/test_load_policy
+
   # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)

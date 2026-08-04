@@ -115,16 +115,14 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
 				configured = pw.GetValue<int64_t>();
 			}
-			idx_t limit;
-			if (configured > 0) {
-				limit = static_cast<idx_t>(configured);
-			} else {
-				// Derived, then capped: a writer is a pooled connection holding an
-				// open bulk load, which is a different resource from a CPU thread.
-				const idx_t threads = static_cast<idx_t>(context.db->NumberOfThreads());
-				limit = MinValue<idx_t>(threads, MSSQL_MAX_COPY_PARALLEL_WRITERS);
-			}
-			gstate->parallel_writer_limit = MaxValue<idx_t>(limit, 1);
+			// The same resolver COPY uses (spec 063 D1). CTAS answers OwnsTarget,
+			// which is what the paragraph above says in one word: it created the
+			// table, so the undo is dropping it and a transaction does not cap the
+			// writers.
+			const auto policy = MSSQLResolveLoadPolicy(
+				gstate->state.bcp_target.is_temp_table, ConnectionProvider::IsInTransaction(context, catalog_),
+				MSSQLLoadTransactionRole::OwnsTarget, configured, static_cast<uint64_t>(context.db->NumberOfThreads()));
+			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 		}
 
 	} catch (...) {

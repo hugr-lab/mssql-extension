@@ -543,31 +543,29 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		gstate->writer =
 			make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns, gstate->column_mapping);
 
-		// How many bulk-load sessions this COPY may open (spec 057 step 7).
+		// How many bulk-load sessions this COPY may open, and on whose connection
+		// (spec 057 step 7; resolved by one shared function since spec 063 D1,
+		// because COPY derived this inline and CTAS derived it again, differently).
 		//
-		// Zero extra inside a transaction: the connection is pinned to the DuckDB
-		// transaction, so a second one would be outside it and its rows would not
-		// roll back with the rest — a correctness question, not a tuning one.
-		gstate->parallel_writer_limit = 1;
-		if (!gstate->transaction_pinned) {
+		// COPY answers JoinsTransaction: it may be loading into a table that
+		// existed before the statement, whose rows nothing else can undo, so
+		// inside a transaction the transaction has to own the load — and a second
+		// writer would sit outside it and not roll back with the rest. A
+		// correctness question, not a tuning one.
+		{
 			Value pw;
 			int64_t configured = 0;
 			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
 				configured = pw.GetValue<int64_t>();
 			}
-			idx_t limit;
-			if (configured > 0) {
-				limit = static_cast<idx_t>(configured);
-			} else {
-				// Derived, then capped: a writer is a pooled connection holding an
-				// open bulk load, which is a different resource from a CPU thread.
-				const idx_t threads = static_cast<idx_t>(context.db->NumberOfThreads());
-				limit = MinValue<idx_t>(threads, MSSQL_MAX_COPY_PARALLEL_WRITERS);
-			}
-			gstate->parallel_writer_limit = MaxValue<idx_t>(limit, 1);
+			const auto policy = MSSQLResolveLoadPolicy(bdata.target.is_temp_table, gstate->transaction_pinned,
+													   MSSQLLoadTransactionRole::JoinsTransaction, configured,
+													   static_cast<uint64_t>(context.db->NumberOfThreads()));
+			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 		}
-		CopyDebugLog(1, "BCPCopyInitGlobal: parallel_writer_limit=%llu (pinned=%d)",
-					 (unsigned long long)gstate->parallel_writer_limit, gstate->transaction_pinned ? 1 : 0);
+		CopyDebugLog(1, "BCPCopyInitGlobal: parallel_writer_limit=%llu (pinned=%d, session_temp=%d)",
+					 (unsigned long long)gstate->parallel_writer_limit, gstate->transaction_pinned ? 1 : 0,
+					 bdata.target.is_temp_table ? 1 : 0);
 
 		// Send COLMETADATA token to start the BCP stream
 		gstate->writer->WriteColmetadata();
@@ -623,7 +621,14 @@ static void TryStartLocalWriter(ClientContext &context, MSSQLCopyBindData &bdata
 	try {
 		auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-		conn = ConnectionProvider::GetConnection(context, mssql_catalog);
+		// The POOL, never ConnectionProvider (spec 063 D3). The provider returns
+		// the transaction's PINNED connection, and two writers on one connection
+		// interleave their ROW tokens into a single bulk load. That never happened
+		// because MSSQLResolveLoadPolicy caps a pinned load at one writer, so this
+		// function returns at its `<= 1` guard first — but that made the safety a
+		// consequence of a limit resolved 75 lines away rather than of what this
+		// line asks for. Acquire what a parallel writer is allowed to have.
+		conn = mssql_catalog.GetConnectionPool().Acquire();
 		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
 			throw IOException("no idle connection available for a parallel writer");
 		}
