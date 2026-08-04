@@ -33,8 +33,7 @@ grant. The lease design remains the recommended fix for that population.
 
 Environment: `docs/proposals/issue-189-repro/` — a sidecar-only compose file that joins
 the repo's existing SQL Server dev container (no second server provisioned) with a
-Python sidecar running DuckDB against the community `mssql` binary. Verify with (see
-the directory's README.md for details):
+Python sidecar running DuckDB against the community `mssql` binary.
 
 ```bash
 make docker-up
@@ -52,9 +51,7 @@ make docker-down
 The drop in R1/R3 is not time-based — it fires exactly when the creating physical
 connection is next reused, confirming the `RESET_CONNECTION` mechanism rather than any
 server-side expiry. Reproduced twice, against two different SQL Server/DuckDB/extension
-version combinations, with identical results both times. Additional notes (an earlier
-R4 variant's `LOCK_TIMEOUT` investigation, a sidecar build-environment finding) are in
-`issue-189-detail.local.md`.
+version combinations, with identical results both times.
 
 ## Code audit (main @ `2c1c4cf`)
 
@@ -68,9 +65,7 @@ absence of any user-controllable exemption**.
 release (mssql_connection_provider.cpp:224-232), and `~MSSQLResultStream` does the same
 on stream teardown (mssql_result_stream.cpp:92). The reset rides the next SQL_BATCH
 header, dropping the session's temp tables, `##` globals included — standard
-ADO.NET/JDBC-style pool hygiene, but with no opt-out. Reproduced as R1. (Independent
-corroboration, and a ruled-out `RESET_CONNECTION_SKIP_TRAN` alternative: see local
-detail file.)
+ADO.NET/JDBC-style pool hygiene, but with no opt-out. Reproduced as R1.
 
 ### D2. No pinning outside explicit transactions — `#` tables cannot span autocommit statements
 
@@ -123,11 +118,6 @@ considered and rejected: it needs no new scalar functions, but pushes correctnes
 operator discipline (idle-cleanup eviction order isn't identity-aware; a shared pool
 leaks `SET`/isolation-level state across unrelated queries) rather than guaranteeing it
 by construction the way an explicit lease does.
-
-Full investigation detail — exact error text and code paths for both forms, the
-minimal-grant chase (schema ownership, the SQL-Server-restart durability finding), and
-the idle-cleanup eviction mechanics — is kept in
-`issue-189-detail.local.md` (untracked, same directory) rather than repeated here.
 
 ## Design
 
@@ -220,6 +210,7 @@ dedicated `leased_count` column is a follow-up.
 ## Implementation plan
 
 ### Phase 1 — core (self-contained, unit-testable)
+
 `MSSQLConnectionLease` + catalog registry + `~MSSQLCatalog` hook. C++ unit tests
 (`test/cpp/`, no SQL Server): registry pruning, `Release()` idempotency, `Owns()`.
 
@@ -229,6 +220,7 @@ extend with registry-pruning cases once the catalog side lands, and wire a Makef
 target then (not before, so an uncompilable listed source doesn't break `make test`).
 
 ### Phase 2 — routing
+
 `allow_lease` parameter, lease-aware `ReleaseConnection`, `IsLeasedConnection` helper;
 call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
 
