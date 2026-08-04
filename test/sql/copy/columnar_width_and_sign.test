@@ -170,6 +170,80 @@ SELECT count(*) FROM (
 statement ok
 SELECT mssql_exec('ws', 'DROP TABLE dbo.WsTinySrc; DROP TABLE dbo.WsTinyDst;');
 
+# -----------------------------------------------------------------------------
+# The other direction of the same fact: a SIGNED source into that unsigned
+# column. `-1::TINYINT` was stored on the server as 255 — silently, on BOTH
+# encode paths, so there was no divergence to notice — because the row encoder
+# had an exact-width fast path that skipped its own range check and the columnar
+# resolver copied the byte. It was left that way on purpose, marked as a
+# "wire-compatibility question", but there was no compatibility to keep: the
+# catalog reads the column back as UTINYINT, so writing -1 and reading it never
+# returned -1 either.
+#
+# It is now the same rule every other integer pair follows — a value that does
+# not fit is a different number — and the refusal is by VALUE, so a signed
+# column holding only 0..127 still loads.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinySigned'') IS NOT NULL DROP TABLE dbo.WsTinySigned;
+CREATE TABLE dbo.WsTinySigned (v tinyint)');
+
+statement error
+COPY (SELECT (-1)::TINYINT AS v) TO 'ws.dbo.WsTinySigned' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+query I
+SELECT count(*) FROM ws.dbo.WsTinySigned;
+----
+0
+
+# The row path has to give the same answer, so the outcome does not depend on
+# whether some other column dropped the chunk out of the kernels.
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinyRow'') IS NOT NULL DROP TABLE dbo.WsTinyRow;
+CREATE TABLE dbo.WsTinyRow (v tinyint, h decimal(38,0))');
+
+statement error
+COPY (SELECT (-1)::TINYINT AS v, 1::HUGEINT AS h) TO 'ws.dbo.WsTinyRow' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+# In range, both paths, still loads.
+statement ok
+COPY (SELECT 0::TINYINT AS v UNION ALL SELECT 127::TINYINT) TO 'ws.dbo.WsTinySigned' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), min(v), max(v) FROM ws.dbo.WsTinySigned;
+----
+2	0	127
+
+# -----------------------------------------------------------------------------
+# And a table CREATED from a signed TINYINT no longer gets a column that cannot
+# hold it. SQL Server has no signed one-byte integer, so the DDL widens to
+# smallint — the same rule USMALLINT (-> int) and UINTEGER (-> bigint) already
+# followed, and the reason a negative survives here without any refusal at all.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinyDdl'') IS NOT NULL DROP TABLE dbo.WsTinyDdl');
+
+statement ok
+CREATE TABLE ws.dbo.WsTinyDdl AS SELECT (-128)::TINYINT AS lo, 127::TINYINT AS hi;
+
+query I
+SELECT DATA_TYPE FROM mssql_scan('ws', 'SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = ''WsTinyDdl'' AND COLUMN_NAME = ''lo''');
+----
+smallint
+
+query II
+SELECT lo, hi FROM ws.dbo.WsTinyDdl;
+----
+-128	127
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsTinySigned; DROP TABLE dbo.WsTinyRow; DROP TABLE dbo.WsTinyDdl;');
+
 statement ok
 SELECT mssql_exec('ws', 'DROP TABLE dbo.WsDec19; DROP TABLE dbo.WsUns; DROP TABLE dbo.WsUns2;');
 

@@ -204,20 +204,27 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	// one integer comparison, and step 3 resolves even that once per column.
 	const PhysicalType src = in.GetType().InternalType();
 	switch (col.duckdb_type.id()) {
-	case LogicalTypeId::TINYINT:
-		if (src == PhysicalType::INT8) {
-			AppendInt8Bcp(buf, FormatValue<int8_t>(fmt, row));
+	case LogicalTypeId::UTINYINT:
+		// SQL Server's `tinyint`: one byte, UNSIGNED 0..255. A UINT8 source is
+		// exactly that and skips the check because every value of it fits.
+		if (src == PhysicalType::UINT8) {
+			AppendUInt8Bcp(buf, FormatValue<uint8_t>(fmt, row));
 			return;
 		}
-		// SQL Server tinyint is UNSIGNED 0..255, so that is the range a converted
-		// value must satisfy — not DuckDB TINYINT's -128..127. (The exact-match
-		// path above keeps the pre-existing signed behaviour; realigning that is a
-		// separate change with its own wire-compatibility question.)
+		// Anything else must satisfy 0..255 — notably a SIGNED int8, whose byte
+		// used to be copied straight through: -1 landed on the server as 255, with
+		// no error and no warning, just a different number. It was left that way
+		// deliberately as a "wire-compatibility question", but there was no
+		// compatibility to keep — the catalog reads the column back as UTINYINT, so
+		// the round trip never returned -1 either. Same principle as
+		// `bigint -> int`: a value that does not fit is a different number.
 		AppendUInt8Bcp(buf, static_cast<uint8_t>(NarrowSourceInteger(ReadSourceInteger(in, fmt, row), 0, 255, col)));
 		return;
-	case LogicalTypeId::UTINYINT:
-		AppendUInt8Bcp(buf, FormatValue<uint8_t>(fmt, row));
-		return;
+	case LogicalTypeId::TINYINT:
+		// A SIGNED TINYINT source travels as a smallint, because SQL Server has no
+		// signed one-byte integer to put it in — the same widening USMALLINT and
+		// UINTEGER already do. Its source is int8, never int16, so it always takes
+		// the conversion arm below and always fits.
 	case LogicalTypeId::SMALLINT:
 		if (src == PhysicalType::INT16) {
 			AppendInt16Bcp(buf, FormatValue<int16_t>(fmt, row));
@@ -284,9 +291,12 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	switch (col.duckdb_type.id()) {
 	case LogicalTypeId::TINYINT:
-		AppendInt8Bcp(buf, value.GetValue<int8_t>());
+		// Widened to smallint, as in the Vector overload above.
+		AppendInt16Bcp(buf, value.GetValue<int16_t>());
 		return;
 	case LogicalTypeId::UTINYINT:
+		// GetValue<uint8_t> throws on a negative rather than wrapping it, which is
+		// the answer the range check gives there.
 		AppendUInt8Bcp(buf, value.GetValue<uint8_t>());
 		return;
 	case LogicalTypeId::SMALLINT:
@@ -372,10 +382,16 @@ std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &
 	(void)cfg;
 	(void)ctx;	// Output is byte-identical in CreateTable and CtasCreateTable (FR-025 / FR-028).
 	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
-		// UTINYINT (0-255) fits in SQL Server TINYINT (also 0-255).
+		// UTINYINT (0-255) fits SQL Server TINYINT exactly (also 0-255).
 		return "TINYINT";
+	case LogicalTypeId::TINYINT:
+		// Signed TINYINT (-128..127) does NOT fit, because SQL Server's tinyint is
+		// UNSIGNED — it is the only unsigned integer the server has. Creating a
+		// tinyint here and copying the byte stored -1 as 255, silently. So it
+		// widens, exactly as USMALLINT widens to INT and UINTEGER to BIGINT for
+		// the same reason in the other direction.
+		return "SMALLINT";
 	case LogicalTypeId::SMALLINT:
 		return "SMALLINT";
 	case LogicalTypeId::USMALLINT:

@@ -1045,7 +1045,12 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		if (type_lower == "bit") {
 			col.duckdb_type = LogicalType::BOOLEAN;
 		} else if (type_lower == "tinyint") {
-			col.duckdb_type = LogicalType::TINYINT;
+			// UTINYINT, not TINYINT: SQL Server's tinyint is UNSIGNED 0..255, and
+			// this is the type the CATALOG reports for such a column too. The two
+			// names mean different wire forms here — UTINYINT is the server's one
+			// unsigned byte, TINYINT is a signed DuckDB source that travels as a
+			// smallint — so a column that is genuinely the former must say so.
+			col.duckdb_type = LogicalType::UTINYINT;
 		} else if (type_lower == "smallint") {
 			col.duckdb_type = LogicalType::SMALLINT;
 		} else if (type_lower == "int") {
@@ -1273,9 +1278,14 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	case LogicalTypeId::BOOLEAN:
 		return "bit";
 
-	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
-		return "tinyint";
+		return "tinyint";  // UTINYINT (0-255) fits tinyint exactly
+
+	case LogicalTypeId::TINYINT:
+		// Signed TINYINT (-128..127) does NOT fit: SQL Server's tinyint is
+		// UNSIGNED 0..255. Creating one and copying the byte stored -1 as 255.
+		// Same widening rule USMALLINT and UINTEGER already follow below.
+		return "smallint";
 
 	case LogicalTypeId::SMALLINT:
 		return "smallint";
@@ -1441,9 +1451,11 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	case LogicalTypeId::BOOLEAN:
 		return 1;
 
-	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
 		return 1;
+
+	case LogicalTypeId::TINYINT:
+		return 2;  // signed TINYINT maps to smallint (2 bytes)
 
 	case LogicalTypeId::SMALLINT:
 		return 2;

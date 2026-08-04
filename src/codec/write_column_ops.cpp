@@ -21,15 +21,17 @@ namespace {
 //! The payload width a direct copy would need for this target type, or 0 if the
 //! type is not a direct-copy candidate at all.
 //!
-//! SQL Server's tinyint is UNSIGNED 0..255 while DuckDB's TINYINT is signed; the
-//! byte that goes on the wire is the same byte either way, so a copy is exact
-//! and this file does not change that. Realigning the signedness is a
-//! wire-compatibility decision and is tracked separately.
+//! TINYINT is listed for its WIDTH only. SQL Server's tinyint is UNSIGNED
+//! 0..255, so whether a one-byte copy is exact depends on the source: it is for
+//! UTINYINT and it is not for a signed TINYINT, whose negatives are the top half
+//! of the target's range. ResolveWriteColumnOps sorts that out below; this
+//! function answers "how wide", not "is it safe".
 uint32_t DirectCopyTargetWidth(const LogicalType &target_type) {
 	switch (target_type.id()) {
 	case LogicalTypeId::BOOLEAN:
-	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::UTINYINT:
 		return 1;
+	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:
 		return 2;
 	case LogicalTypeId::INTEGER:
@@ -270,6 +272,23 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 								   target.duckdb_type.id() == LogicalTypeId::INTEGER ||
 								   target.duckdb_type.id() == LogicalTypeId::BIGINT;
 	if (unsigned_source && signed_int_target) {
+		ops.arm = ScatterArm::RowFallback;
+		ops.wire_width = want;
+		return ops;
+	}
+
+	// The mirror image, and the reason the byte widths agreeing is not enough on
+	// its own: a SIGNED one-byte source into SQL Server's UNSIGNED `tinyint`.
+	// Copying the byte put -1 on the server as 255 — silently, on both paths,
+	// because the row encoder had an exact-width fast path that skipped its own
+	// range check.
+	//
+	// It goes the row path rather than being refused here, so the refusal is by
+	// VALUE and not by type: a TINYINT column holding only 0..127 loads exactly
+	// as before, and only a negative errors. That matters because the columnar
+	// resolver decides per column, before any data — refusing here would reject
+	// loads that are entirely in range.
+	if (src_phys == PhysicalType::INT8 && target.duckdb_type.id() == LogicalTypeId::UTINYINT) {
 		ops.arm = ScatterArm::RowFallback;
 		ops.wire_width = want;
 		return ops;
