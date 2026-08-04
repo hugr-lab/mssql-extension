@@ -13,8 +13,7 @@ grant. The lease design remains the recommended fix for that population.
    releases flag `RESET_CONNECTION` (drops `#`/`##` tables on next reuse), pinning
    exists only inside explicit transactions (serializes all use to one DuckDB
    connection), and COMMIT/ROLLBACK reset + unpin (D1–D4 below). All four failure modes
-   reproduce deterministically against the shipped community binary (R1–R4 below). Two
-   red baseline tests are in place, ready to go green once the plan ships.
+   reproduce deterministically against the shipped community binary (R1–R4 below).
 
 2. **A user-controllable leased connection is the right shape for the fix.**
    `ConnectionProvider` is already the chokepoint for `mssql_exec`/`mssql_scan`
@@ -31,15 +30,8 @@ grant. The lease design remains the recommended fix for that population.
 
 ## Reproduction attempts (all four failure modes reproduced)
 
-Environment: `docs/proposals/issue-189-repro/` — a sidecar-only compose file that joins
-the repo's existing SQL Server dev container (no second server provisioned) with a
-Python sidecar running DuckDB against the community `mssql` binary.
-
-```bash
-make docker-up
-docker compose -f docs/proposals/issue-189-repro/docker-compose.yml run --rm repro
-make docker-down
-```
+Reproduced locally against a live SQL Server instance, using the community `mssql`
+binary:
 
 | # | Scenario | Result |
 |---|---|---|
@@ -214,33 +206,33 @@ dedicated `leased_count` column is a follow-up.
 `MSSQLConnectionLease` + catalog registry + `~MSSQLCatalog` hook. C++ unit tests
 (`test/cpp/`, no SQL Server): registry pruning, `Release()` idempotency, `Owns()`.
 
-A red skeleton exists at `test/cpp/test_connection_lease.cpp` (doesn't compile yet —
-the header doesn't exist). Making it compile and pass is this phase's exit criterion;
-extend with registry-pruning cases once the catalog side lands, and wire a Makefile
-target then (not before, so an uncompilable listed source doesn't break `make test`).
-
 ### Phase 2 — routing
 
 `allow_lease` parameter, lease-aware `ReleaseConnection`, `IsLeasedConnection` helper;
 call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
 
 ### Phase 3 — scalar functions
+
 `mssql_lease` / `mssql_release` + registration alongside `RegisterMSSQLFunctions`.
 
-### Phase 4 — integration tests (`test/sql/lease/`, requires `make docker-up`)
+### Phase 4 — integration tests (requires `make docker-up`)
 
-1. `lease_basic.test` — already written, red today (fails at the first `mssql_lease`
-   call). SPID returned; `##t` via lease survives pool churn; `@@SPID` stable while
-   held; double-lease errors; release drops the state. Making it pass is Phases 1–3's
-   combined exit criterion.
-2. `lease_release_drops_state.test` — retry-loop version of the release-drops-state
-   check, for extra confidence beyond `lease_basic.test`'s inline version.
-3. `lease_errors.test` — release-none; unknown context; busy-stream error.
-4. `lease_transactions.test` — BEGIN/COMMIT around a lease: distinct SPIDs, lease
-   state survives commit.
-5. `lease_detach.test` — DETACH with held lease; re-ATTACH + re-lease.
-6. `lease_multi_catalog.test` — two ATTACHes, independent leases.
-7. `lease_pool_stats.test` — pinned count 0 → 1 → 0.
+Needs SQL-Server-backed test coverage for:
+
+1. The lease/release round trip — SPID returned; `##t` created via the lease survives
+   churn from unrelated pooled statements; `@@SPID` stable across calls while held;
+   double-lease errors; release drops the session state.
+2. Release-then-churn — after release, repeated pool activity should show the `##`
+   table gone (a retry loop may be needed, since the drop happens on the physical
+   connection's next reuse rather than immediately).
+3. Error cases — release with none held; unknown context; busy-stream error.
+4. Transaction interaction — BEGIN/COMMIT around a held lease: distinct SPIDs for the
+   transaction vs. the lease, lease state and the `##` table survive commit.
+5. DETACH safety — DETACH with a held lease should not crash or assert in debug;
+   re-ATTACH + re-lease should work cleanly afterward.
+6. Multi-catalog isolation — two ATTACHes should get independent leases.
+7. Pool stats — the pinned count in `mssql_pool_stats` should go 0 → 1 → 0 across
+   lease and release.
 
 ### Phase 5 — docs & finish
 * README: "Leased connections / shared temp tables" section with the issue's motivating
@@ -259,12 +251,3 @@ call-site updates in `mssql_exec` / `MSSQLQueryExecutor`; stream flag rename.
 * Keep-alive pings for long-held leases (client idle cleanup only touches idle pool
   connections, so a held lease is never culled; SQL Server does not kill idle sessions
   by default).
-
-## Artifacts from this investigation
-
-* Reproduction sidecar: `docs/proposals/issue-189-repro/` — see "Reproduction
-  attempts" above. Doubles as the fix's acceptance harness: mount a local build and
-  extend `repro.py` with the lease-based happy path.
-* Two red baseline tests (see Phase 1 / Phase 4 above): `test/sql/lease/lease_basic.test`
-  and `test/cpp/test_connection_lease.cpp` — both written against the fix's target API;
-  neither passes/compiles yet.
