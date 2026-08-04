@@ -454,11 +454,21 @@ inline void CursorConvFloat(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, 
 			: CursorConvTyped<float, double, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
 }
 
-// One block of rows, all columns. Extracted so the blocked and whole-chunk cases
-// are the same code with a different block size.
+// One block of rows, all columns.
+//
+// PRECONDITION: only callable when the chunk has NO variable-length column.
+// `col_off += 1 + widths[c]` below must track the planner's
+// `stride += 1 + widths[c]`, and the planner adds `stride += 2` for a variable
+// column while setting its `widths[c] = 0` — so with one present the two walks
+// diverge and this one runs past the row. The guard is `all_valid &&
+// !has_variable` at the call site, three hundred lines from the arithmetic it
+// protects, which is why it is written down here as well.
+//
+// Extracted so the blocked and whole-chunk cases are the same code with a
+// different block size.
 inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t rows, idx_t ncols,
 						 const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
-						 const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint8_t> &widths) {
+						 const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint32_t> &widths) {
 	size_t col_off = 1;
 	for (idx_t c = 0; c < ncols; c++) {
 		auto &st = states[c];
@@ -546,11 +556,11 @@ inline void CursorDirect(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, con
 
 inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, idx_t ncols,
 							   const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
-							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint8_t> &widths,
+							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint32_t> &widths,
 							   const vector<mssql::codec::string::StringColumnPlan> &plans) {
 	for (idx_t c = 0; c < ncols; c++) {
 		auto &st = states[c];
-		const uint8_t w = widths[c];
+		const uint32_t w = widths[c];
 		if (ops[c].IsVariable()) {
 			mssql::codec::string::ScatterVarBlock(dst, cursor, r0, rend, st.fmt, columns[c], plans[c]);
 			continue;
@@ -624,7 +634,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	}
 
 	vector<mssql::codec::WriteColumnOps> ops(ncols);
-	vector<uint8_t> widths(ncols);
+	vector<uint32_t> widths(ncols);
 	// Planned per variable column, so the wire can be sized before a byte is
 	// written. Indexed by column; empty for fixed-width ones.
 	vector<mssql::codec::string::StringColumnPlan> plans(ncols);
@@ -659,7 +669,16 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			stride += 2;  // the length prefix; the payload is per row
 			continue;
 		}
-		widths[c] = static_cast<uint8_t>(ops[c].wire_width);
+		// uint32_t, matching wire_width, so this cannot narrow. It was a uint8_t
+		// cast, safe only by coincidence of the current arm set — every fixed arm
+		// today is <= 17 bytes, and the several `wire_width = target.max_length`
+		// assignments that could exceed 255 all land on arms CanScatter() already
+		// rejected. Add one strided fixed-width arm for binary(n)/char(n) — a
+		// natural next step, and max_length is already assigned in those branches
+		// — and the cast truncates silently, stride comes out short, and the
+		// kernel writes the full width into it. Widening costs nothing: widths is
+		// indexed per column, not per value.
+		widths[c] = ops[c].wire_width;
 		stride += 1 + widths[c];
 		if (states[c].vec && !states[c].fmt.validity.AllValid()) {
 			all_valid = false;
@@ -713,7 +732,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			if (st.fmt.validity.AllValid()) {
 				continue;  // contributes its full width to every row already
 			}
-			const uint8_t w = widths[c];
+			const uint32_t w = widths[c];
 			if (st.fmt.sel->IsSet()) {
 				const auto *sel = st.fmt.sel;
 				for (idx_t r = 0; r < row_count; r++) {

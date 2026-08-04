@@ -926,8 +926,11 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 	try {
 		FinishLocalWriter(context.client, bdata, gdata, ldata);
 	} catch (std::exception &e) {
-		// Recorded rather than thrown from here: finalize owns the error path and
-		// the connection is released by the local state's destructor either way.
+		// Recorded AND rethrown, which the two halves need for different reasons:
+		// the record is what makes first-failure-wins work across N writers, and
+		// the rethrow is what actually fails the statement — Combine is the last
+		// place this thread can. The connection is released by the local state's
+		// destructor on either path (the #191 contract).
 		CopyDebugLog(1, "BCPCopyCombine: parallel writer failed to finish - %s", e.what());
 		{
 			// First failure wins: with N writers, one broken load fails them all,
