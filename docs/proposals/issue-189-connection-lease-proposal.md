@@ -2,6 +2,12 @@
 
 Status: analysis complete, design settled, implementation proposed. Date: 2026-07-16. Main @ `2c1c4cf`.
 
+Updated 2026-08-04 with an evaluation of an alternative fix (see "Alternative
+(tempdb-qualified table)" section) — empirically tested, and found to leave a real user
+population (no path to ANY write grant, e.g. regulated environments) still unserved.
+The lease design in this document remains the recommended fix for that population; see
+that section for the full reasoning before treating this as settled.
+
 ## TL;DR
 
 1. **The reported problem is genuine — every claim verified against the code AND
@@ -24,7 +30,7 @@ Status: analysis complete, design settled, implementation proposed. Date: 2026-0
    `mssql_open` handle API contradicts its deprecation (and the handles are not
    catalog-scoped).
 
-3. **Three open design points settled** (maintainer-confirmed): lease routing covers
+3. **Three open design points settled**: lease routing covers
    **`mssql_exec` + `mssql_scan` only**; **explicit transactions win** and the lease
    survives COMMIT/ROLLBACK untouched; **`mssql_lease(ctx) → BIGINT` (SPID), strict
    error on double-lease; `mssql_release(ctx) → BOOLEAN`** (false when none held). One
@@ -101,7 +107,8 @@ Connection pinning exists only in the explicit-transaction branch of
 statements each acquire an arbitrary pool connection (and D1's reset fires between
 them). A `#` table created by one `mssql_exec` is gone for the next statement. Inside
 a transaction it works — but then all use is confined to one DuckDB connection,
-serialized on one TDS connection, defeating the reporter's concurrent-worker design.
+serialized on one TDS connection, defeating any concurrent-worker design that depends
+on shared visibility.
 Reproduced as R2.
 
 ### D3. COMMIT/ROLLBACK reset + unpin — a transaction cannot anchor temp state beyond its own lifetime, and blocks everyone else while it lives
@@ -120,6 +127,50 @@ discriminator. Extending it would contradict its deprecation; confirmed dead end
 Safety margin already in place (relevant to the fix): `TdsConnection` guards state
 transitions with a CAS (tds_connection.cpp:884, :994), so a second operation on a busy
 leased connection fails with an error rather than corrupting the TDS stream.
+
+Independent corroboration of D1: same-SPID proof that the reset is what
+kills the table, not a different physical connection serving the retry
+(`SELECT @@SPID, 'x' INTO ##g` then `SELECT @@SPID, OBJECT_ID('tempdb..##g')` — SPID
+identical, `OBJECT_ID` NULL). Also tried `RESET_CONNECTION_SKIP_TRAN`
+(0x10, the TDS header's other reset variant — `tds_types.hpp:32`) as a possible
+selective reset; both `##` and `#` were dropped identically. No variant of the existing
+reset mechanism preserves temp-table state — closes off the one nearby alternative this
+document hadn't tried.
+
+## Alternative (tempdb-qualified table): evaluated, insufficient for read-only-only users
+
+An alternative routes around session-scoped temp tables entirely: write to an ordinary,
+persistently-named table in `tempdb` instead of a `#`/`##` table, since an ordinary
+table has no session affinity and is unaffected by `RESET_CONNECTION`. Two forms — a
+COPY-target enhancement (a database segment added to `TargetResolver`'s target string)
+and an ATTACH-as-second-catalog workaround (works today, no code change) — turn out to
+be the same underlying mechanism. **Both require the identical `CREATE TABLE`
+permission in the target database**, confirmed empirically against a genuinely
+read-only login: both fail with SQL Server error 262, `CREATE TABLE permission
+denied`.
+
+That's a *different* permission from the one that lets `#`/`##` temp table creation
+work — SQL Server does not gate temp-table creation through the ordinary per-database
+`CREATE TABLE` check at all. "Can create temp tables" does not imply "can create
+ordinary tables in `tempdb`."
+
+For users who can get a `tempdb`-scoped grant, this is simpler than the lease design
+and worth building. **For users with no possible path to any write grant** (e.g.
+regulated environments), it's a hard dead end regardless of scope — the lease design
+needs zero additional SQL Server permissions and remains the correct fix for that
+population. The two approaches are complementary, not competing.
+
+A lighter-weight "disable connection reset for one dedicated pool" setting was also
+considered and rejected: it needs no new scalar functions, but pushes correctness onto
+operator discipline (idle-cleanup eviction order isn't identity-aware; a shared pool
+leaks `SET`/isolation-level state across unrelated queries) rather than guaranteeing it
+by construction the way an explicit lease does.
+
+Full investigation detail — exact error text and code paths for both forms, the
+minimal-grant chase (schema ownership, the SQL-Server-restart durability finding), and
+the idle-cleanup eviction mechanics — is kept in
+`issue-189-tempdb-alternative-detail.local.md` (untracked, same directory) rather than
+repeated here.
 
 ## Design
 
@@ -159,6 +210,14 @@ The design reuses two reviewed patterns:
 
 Re-ATTACH under the same alias reuses the (released) state object; `Lease()` just
 stores the new catalog's pool handle — no stale-pointer hazard.
+
+Verified invariant (relevant to how a lease survives idle cleanup): `ConnectionPool`'s
+cleanup thread (`CleanupThreadFunc`, tds_connection_pool.cpp:334-376) only ever walks
+`idle_connections_`; `Acquire()` removes a connection from that structure for the
+duration it's checked out. A held lease is therefore invisible to idle-timeout eviction
+by construction — not because of any lease-specific code, but because "leased" is, from
+the pool's point of view, indistinguishable from "a query is currently using this
+connection." No interaction with `mssql_idle_timeout`/`mssql_min_connections` needed.
 
 ### Catalog lease registry (DETACH safety)
 
