@@ -38,6 +38,15 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS cpw (TYPE mssql);
 statement ok
 SET mssql_exec_invalidate_cache = true;
 
+# A writer is claimed by a THREAD, on its first chunk. So the writer count below
+# is a ceiling, not a floor: without enough DuckDB threads to drive the sink
+# concurrently, `mssql_copy_parallel_writers = 4` still yields one writer and
+# this whole file passes while testing the serial path twice. Pinning the thread
+# count is what makes the two sections actually differ — a one-core CI runner
+# would otherwise report green on a path it never took.
+statement ok
+SET threads = 4;
+
 # Small batches, so the send-and-clear boundary is crossed repeatedly.
 statement ok
 SET mssql_copy_flush_rows = 5000;

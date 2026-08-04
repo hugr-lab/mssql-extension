@@ -260,17 +260,34 @@ SELECT count(*) FROM (
 ----
 0
 
-# FLOAT -> float(53) is exact; DOUBLE -> real is not, so it is compared at the
-# precision `real` actually carries.
+# FLOAT -> float(53) widens, so it must match to the bit.
 query I
 SELECT count(*) FROM (SELECT f_to_d::DOUBLE FROM cv_misc EXCEPT ALL SELECT f_to_d::DOUBLE FROM cv.dbo.ConvMisc);
 ----
 0
 
+# DOUBLE -> real NARROWS, and what it must equal is exactly what DuckDB's own
+# `::FLOAT` produces — `real` is IEEE 754 single precision on both sides, so
+# there is no tolerance to pick and no reason to accept "close enough".
+#
+# This replaces `WHERE abs(d_to_f::DOUBLE - (d_to_f::DOUBLE)) > 0.001`, which
+# subtracted a column from itself: both operands came from the SAME row of the
+# SAME table, so it was 0 for any encoder, correct or not. The join to the
+# source is what makes it a comparison at all.
 query I
-SELECT count(*) FROM cv.dbo.ConvMisc WHERE abs(d_to_f::DOUBLE - (d_to_f::DOUBLE)) > 0.001;
+SELECT count(*) FROM cv_misc s JOIN cv.dbo.ConvMisc t ON s.s_wide = t.s_wide
+WHERE t.d_to_f::DOUBLE <> s.d_to_f::FLOAT::DOUBLE;
 ----
 0
+
+# ...and the narrowing is real rather than a no-op that the check above would
+# also pass: most of these values cannot be held by a `real`. Without this line a
+# source that happened to be representable would make the assertion vacuous.
+query I
+SELECT count(*) > 1000 FROM cv_misc s JOIN cv.dbo.ConvMisc t ON s.s_wide = t.s_wide
+WHERE t.d_to_f::DOUBLE <> s.d_to_f;
+----
+true
 
 # -----------------------------------------------------------------------------
 # What the table refuses must still be refused. The point of resolving the
