@@ -71,6 +71,12 @@ Two of these are worth merging for a reason beyond tidiness:
   new family here" the obvious move. Today a new family gets tested by whoever
   remembers the pattern exists.
 
+  Merging them also puts the **lever** in one place, which matters more than the
+  tidiness: three of these used a fixture that did not force the row path at all
+  and compared the columnar path with itself (fixed in `b6c21d3`). One file means
+  one thing to re-verify when the resolver changes — and the columnar-gaps PR
+  changes it.
+
 ### What not to merge, and the cost of merging
 
 - **A merged file stops at its first failure**, so later sections do not run. A
@@ -86,10 +92,13 @@ Two of these are worth merging for a reason beyond tidiness:
 
 ### Worth fixing at the same time
 
-- Four COPY files gate on `MSSQL_TEST_SERVER` and had never run until this
-  branch exported it. **Audit every `require-env` in the suite** for others that
-  nothing sets — the same class as issue #192, and a green suite reporting
-  "skipped" is indistinguishable from a green suite that ran.
+- ~~Audit every `require-env`~~ — **done on spec 057.** It found
+  `MSSQL_TEST_CONNECTION_STRING` hiding four more files (both auto-TABLOCK tests
+  among them), and then @oluies found the widest instance: `make integration-test`
+  filtered on `[integration]`/`[sql]`, which match only the 8 top-level files,
+  while `"[mssql]"` matches NOTHING and exits 0. All three fixed. The lesson to
+  carry: **a filter that matches nothing is indistinguishable from a suite that
+  passed** — check the case count, not the exit code.
 - The suite creates and drops its tables by hand in every file. A shared setup
   fragment would cut round trips, but only where it does not make a file's
   preconditions invisible.

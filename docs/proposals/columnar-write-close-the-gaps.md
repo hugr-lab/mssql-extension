@@ -82,22 +82,31 @@ is also what `write_column_ops.hpp` already claims.
 
 Requires byte-equality tests between the two paths per family — the existing
 `time_rounding_both_paths.test` / `smalldatetime_write.test` /
-`string_bound_truncation.test` are the pattern.
+`string_bound_truncation.test` are the pattern, and the writer-merge PR folds
+them into one file with a section per family. Note their lever: a signed
+`TINYINT` into `tinyint`. If this PR ever makes that pair columnar, every one of
+those tests goes vacuous and silently keeps passing.
 
 ### 3. Shrink what reaches row-major at all
 
 Two ordinary column types send the WHOLE table row-major today, and both already
 travel as DECIMAL on the wire where a kernel exists:
 
-- **HUGEINT** — this is the cheap one. Its source is physically INT128, which
-  `ResolveWriteColumnOps` already accepts for the decimal arm, and
-  `GenerateColumnMetadata` sets `max_length = 17`, which equals
-  `GetDecimalByteSize(38)`. The only thing blocking it is that the dispatch gate
-  is `target.duckdb_type.id() == LogicalTypeId::DECIMAL` and a HUGEINT column's
-  `duckdb_type` is HUGEINT. Worth doing first: `SUM()` over integers returns
-  HUGEINT, so aggregate-then-load is a common shape, and today one such column
-  takes the whole table row-major. (It is also why HUGEINT is the standard trick
-  for forcing the row path in tests — those will need another lever.)
+- **HUGEINT — but only with GENERATED metadata**, which is the correction that
+  came out of @oluies' review. Loading into an **existing** `decimal(38,0)` it
+  ALREADY resolves to `ScatterArm::Decimal`: the catalog reports the column as
+  DECIMAL, INT128 is in the accepted source set, and `max_length` equals
+  `GetDecimalByteSize(38)`. What is still row-major is CTAS / `REPLACE`, where
+  `GenerateColumnMetadata` keeps `duckdb_type = HUGEINT` so
+  `DirectCopyTargetWidth` returns 0. Worth doing — `SUM()` over integers returns
+  HUGEINT, so aggregate-then-create is a common shape — but the win is narrower
+  than first written.
+
+  Consequence already dealt with (`b6c21d3`): four tests used HUGEINT into an
+  existing `decimal(38,0)` believing it forced the row path. It did not, and they
+  compared the columnar path with itself. The lever is now a signed `TINYINT`
+  into SQL Server's unsigned `tinyint`. **Verify any new both-paths test by
+  instrumenting the path choice, not by assuming the fixture works.**
 - **UBIGINT** — needs an inconsistency resolved first. `GenerateColumnMetadata`
   sets `precision = 20, max_length = 9`, but `GetDecimalByteSize(20)` is **13**,
   so the resolver's `target.max_length == width` check cannot pass. Verified
@@ -108,9 +117,18 @@ travel as DECIMAL on the wire where a kernel exists:
   sources only.
 
 Everything else on the `RowFallback` list is a deliberate refusal (unsigned into
-a signed target, signed into `tinyint`) or a genuine conversion the row path
-performs (a non-string source rendered as text, e.g. INTERVAL as NVARCHAR).
-Those are the "hard cases" the cursor and row paths should be reserved for.
+a signed target, signed into `tinyint`) or a conversion the row path is supposed
+to perform. Those are the "hard cases" the cursor and row paths should be
+reserved for.
+
+**Except one, which does not work at all: `INTERVAL` into an `nvarchar` target
+raises an INTERNAL Error.** `write_column_ops.cpp` says such a render-as-text
+source "keeps the row path, which formats it first"; it does not —
+`string::EncodeToBcp` reads the vector as VARCHAR and throws *"Expected unified
+vector format of type VARCHAR, but found type INTERVAL"*. Pre-existing, nothing
+covers it, and it is the one RowFallback case that is a bug rather than a
+decision. Fix it here, since this is the PR that reasons about what reaches the
+row path.
 
 ## Not in scope, and it comes first
 
