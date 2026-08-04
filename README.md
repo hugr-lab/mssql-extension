@@ -573,9 +573,12 @@ All statements within a transaction execute on the same SQL Server connection. I
 - **Isolation level**: SQL Server default (READ COMMITTED). Use `mssql_exec()` to change if needed
 - **Connection reset**: After commit/rollback, the connection's session state is reset via TDS RESET_CONNECTION flag before pool reuse
 - **One connection, one job**: because a transaction pins a single connection, it
-  cannot stream a result set and receive a bulk load at once — a `COPY` or CTAS
-  that reads from the same catalog it writes to fails inside an explicit
-  transaction. See [Reading and writing the same catalog in one transaction](#reading-and-writing-the-same-catalog-in-one-transaction)
+  cannot stream a result set and receive a bulk load at once — a `COPY` that
+  reads from the same catalog it writes to fails inside an explicit transaction.
+  See [Reading and writing the same catalog in one transaction](#reading-and-writing-the-same-catalog-in-one-transaction)
+- **CTAS is outside the transaction**: it creates its table with autocommitting
+  DDL and loads on connections of its own, so `ROLLBACK` undoes neither. See
+  [CTAS is not part of the transaction](#ctas-is-not-part-of-the-transaction)
 
 ### Multi-Statement SQL Batches
 
@@ -1105,20 +1108,41 @@ COMMIT;
 separate pooled connections. Two different catalogs (two ATTACHes) are also
 fine, each having its own pool: only same-catalog read-and-write collides.
 
-**CTAS has the same limitation, and leaves more behind.**
-`BEGIN; CREATE TABLE sqlserver.dbo.Dst AS SELECT * FROM sqlserver.dbo.Src;`
-fails with the same error, but its `CREATE TABLE` already ran — on a pool
-connection, where it autocommitted — so an **empty `Dst` is left on the server**
-that `ROLLBACK` does not remove and DuckDB's catalog cache does not show. Drop
-it explicitly, and call `mssql_invalidate_cache()` before creating it again:
+**CTAS is not subject to this**, because it does not use the transaction's
+connection at all — see below.
+
+#### CTAS is not part of the transaction
+
+A `CREATE TABLE ... AS SELECT` into SQL Server runs entirely outside any
+explicit DuckDB transaction: its `CREATE TABLE` is DDL that autocommits, and its
+rows are loaded on connections of their own, taken from the pool. So a
+`ROLLBACK` undoes neither:
+
+```sql
+BEGIN;
+CREATE TABLE sqlserver.dbo.Dst AS SELECT * FROM sqlserver.dbo.Src;
+ROLLBACK;
+-- Dst exists, with every row in it.
+```
+
+This is deliberate. Putting the load on the transaction's pinned connection is
+the only way to make `ROLLBACK` discard the rows, and it costs more than it
+buys: one connection cannot stream a result set and receive a bulk load at the
+same time, so the statement above — reading from the same catalog it writes to —
+could not run at all, and no CTAS inside a transaction could use more than one
+writer. The table itself survived a rollback either way, since the `CREATE` had
+already autocommitted; the choice was only ever between an empty table and a
+full one.
+
+Undoing a table the statement itself created means dropping it, which is
+complete and needs no shared transaction. That is what
+`mssql_ctas_drop_on_failure` does when the load fails partway. Drop it by hand
+otherwise:
 
 ```sql
 SELECT mssql_exec('sqlserver', 'DROP TABLE dbo.Dst');
-SELECT mssql_invalidate_cache('sqlserver');
+SELECT mssql_invalidate_cache('sqlserver');   -- the catalog cache does not see it go
 ```
-
-Outside a transaction the same CTAS is fine — read and load take separate
-connections, and the load runs several of them in parallel.
 
 ### Performance Characteristics
 

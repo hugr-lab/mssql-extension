@@ -103,13 +103,13 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 		// Only the BCP path: the INSERT path has no session to multiply, and it
 		// batches through one executor.
 		//
-		// Zero extra inside a transaction. CTAS takes its connection straight from
-		// the pool rather than through the pinned one, so a second connection is no
-		// more outside the transaction than the first is — but this is not the place
-		// to widen that: one session that does not roll back with the statement is
-		// already a question, and N of them is the same question multiplied.
-		if (gstate->state.config.use_bcp && gstate->state.bcp_writer &&
-			!ConnectionProvider::IsInTransaction(context, catalog_)) {
+		// An explicit transaction no longer caps this at one. It used to, because
+		// the first writer was the transaction's own pinned connection and a second
+		// one would have sat outside it. Now none of them is pinned — the load is
+		// deliberately outside the transaction either way (see ExecuteBCPInsert) —
+		// so writer number two is in exactly the same position as writer number
+		// one, and there is nothing left for the cap to protect.
+		if (gstate->state.config.use_bcp && gstate->state.bcp_writer) {
 			Value pw;
 			int64_t configured = 0;
 			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
@@ -243,6 +243,18 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
+	// Another writer has already failed. Whether that ends this one too is the
+	// drop_on_failure question and not a separate setting: if the table is about
+	// to be dropped, every row still in flight is wasted work AND holds a session
+	// open against the table the DROP has to lock. If it is NOT going to be
+	// dropped, `false` means "keep what landed" — and a thread that still has rows
+	// to send is landing more of exactly what the user asked to keep.
+	if (gstate.state.config.drop_on_failure && gstate.load_failed.load(std::memory_order_acquire)) {
+		throw IOException(
+			"CTAS aborted: another parallel bulk-load writer failed and "
+			"mssql_ctas_drop_on_failure is set, so the table is being dropped");
+	}
+
 	if (!lstate.init_attempted) {
 		lstate.init_attempted = true;
 		TryStartLocalWriter(catalog_, gstate, lstate);
@@ -271,15 +283,20 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 				lstate.writer->WriteColmetadata();
 			}
 		} catch (...) {
-			// This thread's stream died mid-bulk-load. Mark the statement failed
-			// under the global lock, then let ~MSSQLCTASLocalSinkState close and
-			// release this connection — Combine will not run after a throw.
-			//
-			// The DROP that mssql_ctas_drop_on_failure asks for is done by the
-			// FIRST thread to fail and by no other: with N writers, N failures are
-			// the normal shape of one broken load (the others' streams die with
-			// it), and each would otherwise issue its own DROP against a table the
-			// first one already removed.
+			// Close this thread's own stream FIRST, before anything below can issue
+			// a DROP. The connection is sitting mid-bulk-load on the very table the
+			// DROP has to take a schema lock on, so leaving it open until
+			// ~MSSQLCTASLocalSinkState runs would have the cleanup block on this
+			// same thread's work.
+			lstate.writer.reset();
+			mssql::ReleaseBcpConnectionOnError(lstate.connection, lstate.pool_handle,
+											   /*transaction_pinned=*/false);
+
+			// Mark the statement failed. The DROP that mssql_ctas_drop_on_failure
+			// asks for is done by the FIRST thread to fail and by no other: with N
+			// writers, N failures are the normal shape of one broken load (the
+			// others' streams die with it), and each would otherwise issue its own
+			// DROP against a table the first one already removed.
 			const bool cleanup_here = !gstate.load_failed.exchange(true);
 			{
 				std::lock_guard<std::mutex> lock(gstate.mutex);
@@ -288,7 +305,9 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 			}
 			if (cleanup_here && gstate.state.config.drop_on_failure) {
 				// Not under the lock: this takes its own connection and talks to
-				// the server, and the other writers are unwinding meanwhile.
+				// the server, and the other writers are unwinding meanwhile. They
+				// bail out at the top of Sink rather than finishing their batches,
+				// which is what keeps this DROP from waiting on them.
 				gstate.state.AttemptCleanup(context.client);
 			}
 			throw;

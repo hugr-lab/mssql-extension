@@ -60,9 +60,9 @@ CTASExecutionState::~CTASExecutionState() {
 
 void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
 	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract).
-	// A pinned connection is dropped rather than released: the transaction owns
-	// it, and its ROLLBACK is what undoes the half-written load.
-	ReleaseBcpConnectionOnError(connection, pool_handle, transaction_pinned);
+	// Always a pool connection here — CTAS never loads on the pinned one — so it
+	// is always returned rather than dropped.
+	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
@@ -470,13 +470,25 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	DebugLog(1, "TABLOCK=%d (choice=%d, shape=%d)", config.bcp_tablock ? 1 : 0, (int)config.bcp_tablock_choice,
 			 (int)shape);
 
-	// Through the provider, not straight from the pool — exactly as COPY does.
-	// Inside an explicit transaction this hands back the PINNED connection, so
-	// the bulk load runs in the transaction and its rows roll back with it.
-	// Acquiring from the pool here instead put the rows on a session the
-	// transaction did not own, and a CTAS survived its own ROLLBACK intact.
-	transaction_pinned = ConnectionProvider::IsInTransaction(context, *catalog);
-	connection = ConnectionProvider::GetConnection(context, *catalog);
+	// Straight from the pool, NOT through ConnectionProvider: CTAS never loads on
+	// the connection an explicit transaction has pinned.
+	//
+	// It did, briefly, so that ROLLBACK would undo the rows. That bought less than
+	// it cost. One connection cannot stream a result set and receive a bulk load
+	// at the same time, so `BEGIN; CREATE TABLE t AS SELECT * FROM <same catalog>`
+	// collided with itself and failed outright — and every CTAS in a transaction
+	// was held to a single writer, because a second session would have been
+	// outside the transaction anyway.
+	//
+	// What the pin bought was half a guarantee in any case: the CREATE TABLE is
+	// DDL, sent on a pool connection, and autocommits. A rollback therefore left
+	// an empty table behind rather than nothing at all.
+	//
+	// The undo for a table this statement CREATED is dropping it, which is
+	// complete — it did not exist before the statement — and needs no shared
+	// transaction. That is what mssql_ctas_drop_on_failure does.
+	auto &pool = catalog->GetConnectionPool();
+	connection = pool.Acquire();
 	if (!connection) {
 		throw IOException("CTAS BCP: Failed to acquire connection from pool");
 	}
@@ -503,8 +515,7 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 		DebugLog(1, "BCP session started, ready to receive data");
 
 	} catch (std::exception &e) {
-		// Release connection on failure — a no-op when the transaction owns it.
-		ConnectionProvider::ReleaseConnection(context, *catalog, connection);
+		pool.Release(connection);
 		connection = nullptr;
 		throw;
 	}
@@ -583,10 +594,10 @@ void CTASExecutionState::FlushBCP(ClientContext &context) {
 			DebugLog(1, "BCP completed with no additional rows");
 		}
 
-		// Release connection back to pool — a no-op when the transaction owns it,
-		// which is what keeps the pin alive for the statements after this one.
+		// Back to the pool. Never the pinned connection, so this is a real release
+		// and not the provider's no-op.
 		if (connection) {
-			ConnectionProvider::ReleaseConnection(context, *catalog, connection);
+			catalog->GetConnectionPool().Release(connection);
 			connection = nullptr;
 		}
 

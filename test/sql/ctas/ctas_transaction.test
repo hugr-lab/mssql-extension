@@ -27,8 +27,9 @@ DROP TABLE IF EXISTS mssql_tx.dbo.ctas_tx_rollback;
 # CTAS in Transaction - COMMIT
 # =============================================================================
 
-# Note: DDL (CREATE TABLE) auto-commits in SQL Server, but INSERT data
-# respects the transaction. After rollback, table exists but is empty.
+# Note: a CTAS does not participate in the DuckDB transaction at all — neither
+# its CREATE TABLE nor its rows. COMMIT is therefore uneventful; the ROLLBACK
+# case below is where that shows.
 
 statement ok
 BEGIN;
@@ -47,19 +48,29 @@ SELECT * FROM mssql_tx.dbo.ctas_tx_commit;
 1	committed
 
 # =============================================================================
-# CTAS in Transaction - ROLLBACK
+# CTAS in Transaction - ROLLBACK does NOT undo it
 #
-# The comment above has stated since spec 027 that a rollback leaves the table
-# empty, and `ctas_tx_rollback` was dropped in the setup for a case that was
-# never written. It did not hold: CTAS took its bulk-load connection straight
-# from the pool instead of the one pinned to the transaction, so its rows went
-# down a session the transaction did not own and a ROLLBACK left all of them in
-# place. Two sessions were visible on the server for a single CTAS.
+# A CTAS is not part of the DuckDB transaction, and this asserts that on purpose
+# rather than tolerating it.
 #
-# It now goes through ConnectionProvider, exactly as COPY does — one pinned
-# connection, one INSERT BULK — so the rows are inside the transaction. The
-# CREATE TABLE is not: it is its own statement, sent before any row, which is
-# why the table survives and the rows do not.
+# The history is worth keeping, because both of the obvious answers were tried.
+# Originally CTAS took its bulk-load connection from the pool, so its rows went
+# down a session the transaction did not own and survived a ROLLBACK — while the
+# comment above claimed the opposite. It was then routed through
+# ConnectionProvider onto the pinned connection, which did make the rows roll
+# back. That is the version this file used to assert, and it was worse:
+#
+#   * one connection cannot stream a result set and receive a bulk load at the
+#     same time, so `CREATE TABLE t AS SELECT * FROM <the same catalog>` inside a
+#     transaction failed outright, having deadlocked against itself;
+#   * every CTAS in a transaction was capped at ONE bulk-load writer, since a
+#     second would have been outside the transaction anyway.
+#
+# And the guarantee it bought was only ever half of one: CREATE TABLE is DDL sent
+# on a pool connection and autocommits, so a rollback left an EMPTY TABLE behind
+# rather than nothing at all. Undoing a table this statement created means
+# dropping it, which is complete and needs no shared transaction — that is what
+# mssql_ctas_drop_on_failure is for.
 # =============================================================================
 
 statement ok
@@ -73,24 +84,75 @@ FROM generate_series(1, 500) t(i);
 statement ok
 ROLLBACK;
 
-# Every row is gone...
+# The table is there and so is every row. Half of this — the table surviving —
+# was always true; the rows surviving is what the pin used to hide.
 query I
 SELECT COUNT(*) FROM mssql_tx.dbo.ctas_tx_rollback;
 ----
-0
+500
 
-# ...and the table is still there, which is what has to be cleaned up by hand
-# (or by mssql_ctas_drop_on_failure).
 query I
 SELECT COUNT(*) FROM mssql_scan('mssql_tx', 'SELECT 1 AS n FROM sys.objects WHERE name = ''ctas_tx_rollback''');
 ----
 1
 
-# The pinned connection survives its own bulk load: the statement after the
-# rollback has to work on the same catalog, which it would not if the BCP stream
-# had left the connection mid-load or returned it to the pool.
+# The catalog still works after all of it: the load's connections went back to
+# the pool, and the transaction's own pinned connection was never touched by the
+# bulk load, so it is still usable for the statement that follows.
 statement ok
 DROP TABLE mssql_tx.dbo.ctas_tx_rollback;
+
+# =============================================================================
+# CTAS reading from the SAME catalog it writes to, inside a transaction
+#
+# This is the case the pinned version could not do at all — it failed with
+# `Cannot execute: connection not in Idle state (current: Executing)`, because
+# the sink put the pinned connection into bulk-load mode and the scan then tried
+# to send its SELECT down the same one. It also left an empty table behind,
+# since the CREATE had already autocommitted.
+#
+# The scan keeps the pinned connection; the load takes its own.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('mssql_tx', 'IF OBJECT_ID(''dbo.ctas_tx_src'') IS NOT NULL DROP TABLE dbo.ctas_tx_src;
+CREATE TABLE dbo.ctas_tx_src (id int, name nvarchar(20));
+INSERT INTO dbo.ctas_tx_src VALUES (1, ''a''), (2, ''b''), (3, ''c'')');
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE mssql_tx.dbo.ctas_tx_self AS SELECT id, name FROM mssql_tx.dbo.ctas_tx_src;
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM mssql_tx.dbo.ctas_tx_self ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# The pinned connection is still the transaction's own afterwards, which a load
+# that had hijacked it would not leave behind.
+statement ok
+BEGIN;
+
+query I
+SELECT COUNT(*) FROM mssql_tx.dbo.ctas_tx_src;
+----
+3
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE mssql_tx.dbo.ctas_tx_self;
+
+statement ok
+DROP TABLE mssql_tx.dbo.ctas_tx_src;
 
 # =============================================================================
 # CTAS in Transaction - Verify data in autocommit mode
