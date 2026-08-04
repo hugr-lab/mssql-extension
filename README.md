@@ -572,6 +572,10 @@ All statements within a transaction execute on the same SQL Server connection. I
 - **Explicit transactions**: `BEGIN` pins a connection; all subsequent operations reuse it until `COMMIT` or `ROLLBACK`
 - **Isolation level**: SQL Server default (READ COMMITTED). Use `mssql_exec()` to change if needed
 - **Connection reset**: After commit/rollback, the connection's session state is reset via TDS RESET_CONNECTION flag before pool reuse
+- **One connection, one job**: because a transaction pins a single connection, it
+  cannot stream a result set and receive a bulk load at once — a `COPY` or CTAS
+  that reads from the same catalog it writes to fails inside an explicit
+  transaction. See [Reading and writing the same catalog in one transaction](#reading-and-writing-the-same-catalog-in-one-transaction)
 
 ### Multi-Statement SQL Batches
 
@@ -1067,8 +1071,54 @@ CREATE TABLE result AS SELECT * FROM mssql_scan('sqlserver', 'SELECT * FROM #bat
 COMMIT;
 ```
 
-The same applies to `##global` temp tables for the load itself, though those
-survive for other sessions to read.
+`##global` temp tables need the same transaction, and are **not** a way around
+it. A global temp table lives only as long as the session that created it, and
+the pool's reset ends that session — so a `##` table created by one pooled
+statement is already gone by the next one, on the same connection. Use a
+transaction for those too.
+
+#### Reading and writing the same catalog in one transaction
+
+A DuckDB transaction pins **one** SQL Server connection, and that connection
+cannot stream a result set and receive a bulk load at the same time. So a COPY
+whose source reads from the same attached catalog it writes to fails inside an
+explicit transaction:
+
+```sql
+BEGIN TRANSACTION;
+COPY (SELECT id FROM sqlserver.dbo.Src) TO 'sqlserver.dbo.Dst' (FORMAT 'bcp', CREATE_TABLE false);
+-- IO Error: Failed to execute SQL batch: Cannot execute: connection not in
+-- Idle state (current: Executing)
+```
+
+It fails cleanly: no rows are written, and the catalog is fully usable after
+`ROLLBACK`. Either read into a local table first —
+
+```sql
+CREATE TABLE staging AS SELECT id FROM sqlserver.dbo.Src;   -- outside, or before the load
+BEGIN TRANSACTION;
+COPY staging TO 'sqlserver.dbo.Dst' (FORMAT 'bcp', CREATE_TABLE false);
+COMMIT;
+```
+
+— or drop the explicit transaction, which lets the read and the load take
+separate pooled connections. Two different catalogs (two ATTACHes) are also
+fine, each having its own pool: only same-catalog read-and-write collides.
+
+**CTAS has the same limitation, and leaves more behind.**
+`BEGIN; CREATE TABLE sqlserver.dbo.Dst AS SELECT * FROM sqlserver.dbo.Src;`
+fails with the same error, but its `CREATE TABLE` already ran — on a pool
+connection, where it autocommitted — so an **empty `Dst` is left on the server**
+that `ROLLBACK` does not remove and DuckDB's catalog cache does not show. Drop
+it explicitly, and call `mssql_invalidate_cache()` before creating it again:
+
+```sql
+SELECT mssql_exec('sqlserver', 'DROP TABLE dbo.Dst');
+SELECT mssql_invalidate_cache('sqlserver');
+```
+
+Outside a transaction the same CTAS is fine — read and load take separate
+connections, and the load runs several of them in parallel.
 
 ### Performance Characteristics
 
