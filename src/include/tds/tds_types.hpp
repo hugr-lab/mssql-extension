@@ -232,6 +232,19 @@ constexpr size_t DEFAULT_CONNECTION_LIMIT = 64;
 constexpr size_t DEFAULT_MIN_CONNECTIONS = 0;
 constexpr bool DEFAULT_CONNECTION_CACHE = true;
 
+//! Reset a pooled connection's SESSION before it is handed to the next user
+//! (the TDS RESET_CONNECTION bit, i.e. what sp_reset_connection does).
+//!
+//! On by default because a pool is shared: without it a `SET` option, an
+//! isolation level, a session variable, a cursor, a `#temp` table or an open
+//! transaction left by one statement is inherited by the next, unrelated one.
+//!
+//! Off is a deliberate handover of that state to the user, and the reason it
+//! exists is issue #189 — a global `##temp` table lives only as long as the
+//! session that created it, so the reset destroys it between statements and
+//! there is no selective form of the bit to ask for instead.
+constexpr bool DEFAULT_RESET_CONNECTION = true;
+
 // Long-idle threshold for tiered validation (seconds)
 constexpr int LONG_IDLE_THRESHOLD = 60;
 

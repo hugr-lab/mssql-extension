@@ -72,6 +72,15 @@ public:
 	//! @param catalog The MSSQL catalog
 	//! @return true if SQL Server transaction is active on pinned connection
 	static bool IsSqlServerTransactionActive(ClientContext &context, MSSQLCatalog &catalog);
+
+	//! `mssql_reset_connection` — should a connection returned to the pool have
+	//! its SESSION reset before the next user sees it (issue #189)?
+	//!
+	//! Read on the CLIENT thread and carried to wherever the release happens.
+	//! MSSQLResultStream's destructor is a release path and may run on a worker
+	//! thread, where touching the ClientContext is a data race (issue #178) — so
+	//! the answer travels with the stream exactly as `transaction_pinned` does.
+	static bool ShouldResetOnRelease(ClientContext &context);
 };
 
 namespace mssql {

@@ -60,6 +60,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_connection_cache", "Enable connection pooling and reuse", LogicalType::BOOLEAN,
 							  Value::BOOLEAN(tds::DEFAULT_CONNECTION_CACHE), nullptr, SetScope::GLOBAL);
 
+	// mssql_reset_connection - reset a pooled connection's SESSION before reuse
+	// (issue #189). See DEFAULT_RESET_CONNECTION for what `false` takes on: this
+	// is "I own this session's state", not "keep my temp tables".
+	config.AddExtensionOption("mssql_reset_connection",
+							  "Reset session state (temp tables, SET options, open transactions) when a connection "
+							  "returns to the pool; false hands that state to the user",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(tds::DEFAULT_RESET_CONNECTION), nullptr,
+							  SetScope::GLOBAL);
+
 	// mssql_connection_timeout - TCP connection timeout in seconds
 	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
 							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);

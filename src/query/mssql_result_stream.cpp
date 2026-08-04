@@ -40,11 +40,12 @@ namespace duckdb {
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
 									 const string &context_name, weak_ptr<tds::ConnectionPool> pool_handle,
-									 bool transaction_pinned, int query_timeout_seconds)
+									 bool transaction_pinned, int query_timeout_seconds, bool reset_on_release)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
 	  pool_handle_(std::move(pool_handle)),
 	  transaction_pinned_(transaction_pinned),
+	  reset_on_release_(reset_on_release),
 	  sql_(sql),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
@@ -109,7 +110,13 @@ MSSQLResultStream::~MSSQLResultStream() {
 				// reuse — same as ConnectionProvider's autocommit release
 				// (the reset is a header bit on the next SQL_BATCH, not an
 				// extra round trip).
-				connection_->SetNeedsReset(true);
+				//
+				// `mssql_reset_connection = false` skips it (issue #189), and
+				// THIS is the path that decides whether a `##temp` table survives:
+				// every mssql_scan and every table scan returns its connection
+				// here, so leaving it unconditional made the setting look
+				// implemented while changing nothing a user could observe.
+				connection_->SetNeedsReset(reset_on_release_);
 				pool->Release(std::move(connection_));
 			} catch (...) {
 				// Release failed — drop the connection.

@@ -1,0 +1,142 @@
+# name: test/sql/integration/reset_connection.test
+# description: mssql_reset_connection decides whether a pooled connection's session survives (issue #189)
+# group: [mssql]
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# A pooled connection is reset before reuse — the TDS RESET_CONNECTION bit, what
+# sp_reset_connection does — so a `##global` temp table dies between statements
+# even though `##` is supposed to outlive the batch that created it. It is the
+# SESSION that owns it, and the reset ends the session.
+#
+# Issue #189 asks for that to be optional. There is no selective form of the bit
+# to ask for instead: it is one bit with two variants, and building with
+# RESET_CONNECTION_SKIP_TRAN drops `##g` and a local `#loc` identically.
+#
+# What this file has to prove is that the setting changes BEHAVIOUR. Testing that
+# it parses would pass against a setting nothing reads — which is exactly how
+# `mssql_copy_tablock`'s original "enable for newly created tables" rule shipped
+# broken: it tested a flag that was set unconditionally.
+#
+# The trap in testing it: `##g` is visible from EVERY session, so a second
+# statement landing on a different pooled connection would still see it, and the
+# "reset is off" case would pass without the setting doing anything. So the pool
+# is pinned to ONE connection and @@SPID is asserted equal across statements —
+# if the session were not reused, the experiment is void rather than passing.
+# =============================================================================
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rc (TYPE mssql);
+
+# -----------------------------------------------------------------------------
+# The lever: one connection, reused. Everything below depends on it.
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE TABLE spids AS SELECT (SELECT spid FROM mssql_scan('rc', 'SELECT @@SPID AS spid')) AS first;
+
+query I
+SELECT (SELECT spid FROM mssql_scan('rc', 'SELECT @@SPID AS spid')) = first FROM spids;
+----
+true
+
+# =============================================================================
+# Default (true): the session is reset, so the global temp table is gone.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('rc', 'IF OBJECT_ID(''tempdb..##rc_on'') IS NOT NULL DROP TABLE ##rc_on; SELECT 1 AS x INTO ##rc_on');
+
+# Same connection as the statement that created it (asserted above), and the
+# table is still gone — that is the reset, not a different session.
+query I
+SELECT n IS NULL FROM mssql_scan('rc', 'SELECT OBJECT_ID(''tempdb..##rc_on'') AS n');
+----
+true
+
+# =============================================================================
+# false: the session survives, and so does the table.
+# =============================================================================
+
+statement ok
+SET mssql_reset_connection = false;
+
+statement ok
+SELECT mssql_exec('rc', 'IF OBJECT_ID(''tempdb..##rc_off'') IS NOT NULL DROP TABLE ##rc_off; SELECT 42 AS x INTO ##rc_off');
+
+query I
+SELECT n IS NOT NULL FROM mssql_scan('rc', 'SELECT OBJECT_ID(''tempdb..##rc_off'') AS n');
+----
+true
+
+# Readable, not merely present — a table object that exists but lost its rows
+# would be a different bug wearing the same answer.
+query I
+SELECT x FROM mssql_scan('rc', 'SELECT x FROM ##rc_off');
+----
+42
+
+# A local `#temp` survives too, which is the part that makes the writer policy
+# load-bearing: with the reset off, a stale same-named `#temp` can now outlive
+# the statement that made it, so a parallel writer must never open a second
+# session against such a target (spec 063 D1).
+statement ok
+SELECT mssql_exec('rc', 'SELECT 7 AS y INTO #rc_local');
+
+query I
+SELECT y FROM mssql_scan('rc', 'SELECT y FROM #rc_local');
+----
+7
+
+# -----------------------------------------------------------------------------
+# COMMIT is a release path too, and it obeys the same rule. A setting that held
+# in autocommit but not after COMMIT would have the user watching temp objects
+# survive one way and vanish the other, with nothing to read that explains it.
+# -----------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('rc', 'IF OBJECT_ID(''tempdb..##rc_txn'') IS NOT NULL DROP TABLE ##rc_txn; SELECT 5 AS x INTO ##rc_txn');
+
+statement ok
+COMMIT;
+
+query I
+SELECT x FROM mssql_scan('rc', 'SELECT x FROM ##rc_txn');
+----
+5
+
+# =============================================================================
+# Back on: the same statement sequence loses the table again. Without this the
+# file would prove only that `false` works, not that the setting is what decides.
+# =============================================================================
+
+statement ok
+SET mssql_reset_connection = true;
+
+statement ok
+SELECT mssql_exec('rc', 'IF OBJECT_ID(''tempdb..##rc_back'') IS NOT NULL DROP TABLE ##rc_back; SELECT 1 AS x INTO ##rc_back');
+
+query I
+SELECT n IS NULL FROM mssql_scan('rc', 'SELECT OBJECT_ID(''tempdb..##rc_back'') AS n');
+----
+true
+
+# The `false`-era tables outlived their creating statements, so they are this
+# file's litter to clear — the reset is no longer doing it.
+statement ok
+SELECT mssql_exec('rc', 'IF OBJECT_ID(''tempdb..##rc_off'') IS NOT NULL DROP TABLE ##rc_off; IF OBJECT_ID(''tempdb..##rc_on'') IS NOT NULL DROP TABLE ##rc_on; IF OBJECT_ID(''tempdb..##rc_back'') IS NOT NULL DROP TABLE ##rc_back');
+
+statement ok
+DETACH rc;

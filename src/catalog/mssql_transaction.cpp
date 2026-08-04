@@ -1,6 +1,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include <cstring>
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "tds/tds_connection.hpp"
@@ -78,6 +79,7 @@ MSSQLTransaction::MSSQLTransaction(TransactionManager &manager, ClientContext &c
 	: Transaction(manager, context),
 	  catalog_(catalog),
 	  pinned_connection_(nullptr),
+	  reset_on_release_(ConnectionProvider::ShouldResetOnRelease(context)),
 	  sql_server_transaction_active_(false),
 	  savepoint_counter_(0) {}
 
@@ -253,9 +255,19 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
 
-		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header
-		MSSQL_TXN_LOG("CommitTransaction: Flagging connection for reset");
-		pinned_conn->SetNeedsReset(true);
+		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
+		//
+		// Honours `mssql_reset_connection` like every other release path
+		// (issue #189). A setting that meant "I own this session's state"
+		// everywhere EXCEPT after COMMIT would leave a user watching their
+		// temp objects survive in autocommit and vanish here, with nothing
+		// to read that explains it. The transaction itself is already
+		// resolved at this point — Commit ran, and the descriptor is
+		// cleared above — so what the reset drops here is session state,
+		// which is exactly what the setting is about.
+		const bool reset_on_release = mssql_txn.ShouldResetOnRelease();
+		MSSQL_TXN_LOG("CommitTransaction: reset=%d", reset_on_release ? 1 : 0);
+		pinned_conn->SetNeedsReset(reset_on_release);
 
 		// Return connection to pool
 		MSSQL_TXN_LOG("CommitTransaction: Returning connection to pool");
@@ -304,9 +316,19 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
 
-		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header
-		MSSQL_TXN_LOG("RollbackTransaction: Flagging connection for reset");
-		pinned_conn->SetNeedsReset(true);
+		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
+		//
+		// Honours `mssql_reset_connection` like every other release path
+		// (issue #189). A setting that meant "I own this session's state"
+		// everywhere EXCEPT after COMMIT would leave a user watching their
+		// temp objects survive in autocommit and vanish here, with nothing
+		// to read that explains it. The transaction itself is already
+		// resolved at this point — Rollback ran, and the descriptor is
+		// cleared above — so what the reset drops here is session state,
+		// which is exactly what the setting is about.
+		const bool reset_on_release = mssql_txn.ShouldResetOnRelease();
+		MSSQL_TXN_LOG("RollbackTransaction: reset=%d", reset_on_release ? 1 : 0);
+		pinned_conn->SetNeedsReset(reset_on_release);
 
 		// Return connection to pool
 		MSSQL_TXN_LOG("RollbackTransaction: Returning connection to pool");

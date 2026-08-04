@@ -75,6 +75,18 @@ bool ConnectionProvider::IsInTransaction(ClientContext &context, MSSQLCatalog &c
 }
 
 //===----------------------------------------------------------------------===//
+// ConnectionProvider::ShouldResetOnRelease
+//===----------------------------------------------------------------------===//
+
+bool ConnectionProvider::ShouldResetOnRelease(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_reset_connection", val)) {
+		return val.GetValue<bool>();
+	}
+	return tds::DEFAULT_RESET_CONNECTION;
+}
+
+//===----------------------------------------------------------------------===//
 // ConnectionProvider::IsSqlServerTransactionActive
 //===----------------------------------------------------------------------===//
 
@@ -225,8 +237,18 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 		// Not in a transaction OR in autocommit mode - flag for reset and return to pool
 		// The RESET_CONNECTION flag will be set on the TDS header of the next SQL_BATCH,
 		// which is how ADO.NET/JDBC drivers reset session state (temp tables, variables, SET options)
-		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, flagging connection for reset");
-		conn->SetNeedsReset(true);
+		//
+		// `mssql_reset_connection = false` skips it (issue #189). The bit has no
+		// selective form — one bit, two variants, and RESET_CONNECTION_SKIP_TRAN
+		// drops `##g` and `#loc` alike — so keeping a global temp table alive
+		// across statements means not sending it at all, and the session state it
+		// would have cleared becomes the user's to manage.
+		//
+		// Read per release rather than cached: SET must take effect on the next
+		// statement, and this is once per statement, not per row.
+		const bool reset_on_release = ShouldResetOnRelease(context);
+		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, reset=%d", reset_on_release ? 1 : 0);
+		conn->SetNeedsReset(reset_on_release);
 		auto &pool = catalog.GetConnectionPool();
 		pool.Release(conn);
 		return;
@@ -270,6 +292,21 @@ void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection
 
 	if (auto pool = pool_handle.lock()) {
 		try {
+			// The ONE reset site that does not consult `mssql_reset_connection`,
+			// stated here rather than left to be discovered.
+			//
+			// Mostly it cannot matter: this runs after a bulk load failed, and the
+			// branch above has just Closed the connection unless it was already
+			// Idle — closing ends the session, so any `##temp` it held is gone
+			// whatever this flag says. The flag only decides anything in the Idle
+			// sub-case, and there resetting is the defensible answer for a failure
+			// path.
+			//
+			// It also has no ClientContext to ask, by design (issue #178): this is
+			// reached from destructors that may run on a worker thread. Honouring
+			// the setting would mean carrying it through four separate BCP state
+			// structs — which spec 063 D2 is about to collapse into one, so the
+			// flag belongs there once rather than here four times.
 			connection->SetNeedsReset(true);
 			pool->Release(std::move(connection));
 		} catch (...) {
