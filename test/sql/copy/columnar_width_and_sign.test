@@ -119,6 +119,57 @@ SELECT a, b FROM ws.dbo.WsUns2;
 ----
 2000000000	30000
 
+# -----------------------------------------------------------------------------
+# UTINYINT -> tinyint is the pair that must NOT be refused, and it is the reason
+# the guard above names three target types rather than four.
+#
+# SQL Server's `tinyint` is the one UNSIGNED integer it has (0..255), so a
+# UTINYINT source is an exact match — the same byte, not a reinterpretation.
+# Sweeping it into the same refusal as UBIGINT -> bigint was over-broad and cost
+# far more than it protected: the catalog maps SQL Server `tinyint` to UTINYINT,
+# so ONE such column in an mssql -> mssql load pushed the ENTIRE chunk down the
+# row-major path, every other column with it.
+#
+# The full 0..255 range is loaded because the two ends are where a signed
+# reinterpretation would show: 128..255 would come back negative, or be refused.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinySrc'') IS NOT NULL DROP TABLE dbo.WsTinySrc;
+IF OBJECT_ID(''dbo.WsTinyDst'') IS NOT NULL DROP TABLE dbo.WsTinyDst;
+CREATE TABLE dbo.WsTinySrc (id int, tb tinyint, other bigint);
+CREATE TABLE dbo.WsTinyDst (id int, tb tinyint, other bigint);
+INSERT INTO dbo.WsTinySrc SELECT TOP 256 n - 1, n - 1, (n - 1) * 7
+  FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) n FROM sys.all_objects) x');
+
+# The catalog reports the source column as UTINYINT, which is what makes this the
+# mssql -> mssql shape rather than a DuckDB-literal one.
+query I
+SELECT column_type FROM (DESCRIBE SELECT tb FROM ws.dbo.WsTinySrc);
+----
+UTINYINT
+
+statement ok
+COPY (SELECT id, tb, other FROM ws.dbo.WsTinySrc) TO 'ws.dbo.WsTinyDst' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), min(tb), max(tb) FROM ws.dbo.WsTinyDst;
+----
+256	0	255
+
+# Value for value, including the neighbouring columns — a chunk that changed
+# layout would break those first.
+query I
+SELECT count(*) FROM (
+    SELECT id, tb, other FROM ws.dbo.WsTinySrc
+    EXCEPT ALL
+    SELECT id, tb, other FROM ws.dbo.WsTinyDst
+);
+----
+0
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsTinySrc; DROP TABLE dbo.WsTinyDst;');
+
 statement ok
 SELECT mssql_exec('ws', 'DROP TABLE dbo.WsDec19; DROP TABLE dbo.WsUns; DROP TABLE dbo.WsUns2;');
 

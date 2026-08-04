@@ -253,9 +253,22 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 	const PhysicalType src_phys = source.InternalType();
 	const bool unsigned_source = src_phys == PhysicalType::UINT8 || src_phys == PhysicalType::UINT16 ||
 								 src_phys == PhysicalType::UINT32 || src_phys == PhysicalType::UINT64;
-	const bool signed_int_target =
-		target.duckdb_type.id() == LogicalTypeId::TINYINT || target.duckdb_type.id() == LogicalTypeId::SMALLINT ||
-		target.duckdb_type.id() == LogicalTypeId::INTEGER || target.duckdb_type.id() == LogicalTypeId::BIGINT;
+	// TINYINT is deliberately NOT in this list. SQL Server's `tinyint` is the one
+	// UNSIGNED integer it has — 0..255 — and a target column of that type is
+	// carried here as LogicalTypeId::TINYINT only because that is the 1-byte
+	// stand-in. A UTINYINT source is therefore an exact match, not a
+	// reinterpretation, and refusing it costs far more than the guard protects:
+	// the catalog maps SQL Server `tinyint` to UTINYINT, so ONE such column in an
+	// mssql -> mssql load sent the ENTIRE chunk row-major.
+	//
+	// The pairs that stay refused are the ones where the unsigned source really
+	// can exceed a SIGNED target: USMALLINT -> smallint, UINTEGER -> int,
+	// UBIGINT -> bigint. Those cannot be caught by the conversion arm's
+	// round-trip test, since every value of a same-width unsigned/signed pair
+	// passes it.
+	const bool signed_int_target = target.duckdb_type.id() == LogicalTypeId::SMALLINT ||
+								   target.duckdb_type.id() == LogicalTypeId::INTEGER ||
+								   target.duckdb_type.id() == LogicalTypeId::BIGINT;
 	if (unsigned_source && signed_int_target) {
 		ops.arm = ScatterArm::RowFallback;
 		ops.wire_width = want;
