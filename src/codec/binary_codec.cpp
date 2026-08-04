@@ -134,6 +134,27 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	}
 }
 
+//! Cut a BLOB to the column's declared bound, the way the columnar path's
+//! ClampToBound does for VarKind::Binary.
+//!
+//! It did not, and the two paths disagreed: a varbinary(3) column took the first
+//! 3 bytes when every column in the chunk resolved to a kernel, and the whole
+//! value when some unrelated column dropped the chunk to row-major — where the
+//! server then rejected the batch for an over-long value. Same statement, same
+//! data, outcome decided by a neighbour.
+//!
+//! Binary has no character boundary to respect, so unlike the string bounds this
+//! cut is exact. A PLP column has no bound at all — `max_length` there is the
+//! 0xFFFF sentinel, not a length — which is why this is only reached on the
+//! non-PLP arm.
+static string_t ClampBlobToBound(const string_t &blob, const mssql::BCPColumnMetadata &col) {
+	const uint32_t bound = col.max_length;
+	if (bound == 0 || blob.GetSize() <= bound) {
+		return blob;
+	}
+	return string_t(blob.GetData(), bound);
+}
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf) {
 	// Format-based access (was FlatVector::GetData — wrong for dictionary/
@@ -143,7 +164,7 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	if (col.IsPLPType()) {
 		tds::encoding::BCPRowEncoder::EncodeBinaryPLP(buf, blob);
 	} else {
-		tds::encoding::BCPRowEncoder::EncodeBinary(buf, blob);
+		tds::encoding::BCPRowEncoder::EncodeBinary(buf, ClampBlobToBound(blob, col));
 	}
 }
 
@@ -156,7 +177,7 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 	if (col.IsPLPType()) {
 		tds::encoding::BCPRowEncoder::EncodeBinaryPLP(buf, blob);
 	} else {
-		tds::encoding::BCPRowEncoder::EncodeBinary(buf, blob);
+		tds::encoding::BCPRowEncoder::EncodeBinary(buf, ClampBlobToBound(blob, col));
 	}
 }
 

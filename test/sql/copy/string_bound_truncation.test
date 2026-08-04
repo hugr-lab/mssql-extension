@@ -192,6 +192,52 @@ SELECT count(*) FROM tr.dbo.TruncMixed WHERE s LIKE 'short%' AND length(s) <> 6;
 ----
 0
 
+# -----------------------------------------------------------------------------
+# The ROW path has to cut at the same place.
+#
+# It did not: `ClampToBound` bounded VarKind::Binary and `EncodeBinary` never
+# had a bound at all. So a varbinary(3) column took 3 bytes when every column in
+# the chunk resolved to a kernel, and the whole value when some unrelated column
+# dropped the chunk to row-major — where the server rejected the batch. Same
+# statement, same data, outcome decided by a neighbour.
+#
+# The decimal(38,0) column is what forces the second load down the row path: its
+# HUGEINT source has no scatter arm, so the whole chunk falls back.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncBinRow'') IS NOT NULL DROP TABLE dbo.TruncBinRow;
+CREATE TABLE dbo.TruncBinRow (tag nvarchar(10), bn varbinary(3), h decimal(38,0))');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('long',  encode('abcdefghij')::BLOB, 1::HUGEINT),
+    ('exact', encode('abc')::BLOB,        2::HUGEINT),
+    ('short', encode('a')::BLOB,          3::HUGEINT),
+    ('empty', encode('')::BLOB,           4::HUGEINT)
+) t(tag, bn, h)) TO 'tr.dbo.TruncBinRow' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT tag, bn FROM tr.dbo.TruncBinRow ORDER BY tag;
+----
+empty	(empty)
+exact	abc
+long	abc
+short	a
+
+# And it agrees with the columnar answer for the same bound and the same value —
+# TruncBound's `ascii` row is the same varbinary(3) cut, taken by kernels.
+query I
+SELECT count(*) FROM (
+    SELECT bn FROM tr.dbo.TruncBinRow WHERE tag = 'long'
+    EXCEPT ALL
+    SELECT bn FROM tr.dbo.TruncBound WHERE tag = 'ascii'
+);
+----
+0
+
+statement ok
+SELECT mssql_exec('tr', 'DROP TABLE dbo.TruncBinRow;');
+
 statement ok
 SELECT mssql_exec('tr', 'DROP TABLE dbo.TruncBound; DROP TABLE dbo.TruncMax; DROP TABLE dbo.TruncMixed;');
 
