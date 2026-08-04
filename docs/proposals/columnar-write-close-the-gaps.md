@@ -112,8 +112,13 @@ a signed target, signed into `tinyint`) or a genuine conversion the row path
 performs (a non-string source rendered as text, e.g. INTERVAL as NVARCHAR).
 Those are the "hard cases" the cursor and row paths should be reserved for.
 
-## Not in scope
+## Not in scope, and it comes first
 
-Deduplicating the parallel-writer machinery between COPY and CTAS. It has
-drifted, and it should be merged, but it buys no measured speed and reads as a
-different kind of change — its own PR, reviewed as a refactor.
+Deduplicating the parallel-writer machinery between COPY and CTAS, plus the test
+consolidation that goes with it:
+[merge-writer-machinery-and-tests](merge-writer-machinery-and-tests.md).
+
+That PR lands **before** this one. It touches the two sinks while this touches
+the kernels, so doing it first means the work here modifies one writer
+implementation rather than keeping two in step — and one both-paths byte-equality
+test file rather than three.
