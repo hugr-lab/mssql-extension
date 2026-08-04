@@ -95,6 +95,11 @@ MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_
 # TestDB connection strings for catalog tests
 MSSQL_TESTDB_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=TestDB;User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
 MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/TestDB
+# Four COPY tests gate on MSSQL_TEST_SERVER, which nothing has ever set — not
+# this Makefile and not CI — so copy_connection_leak, copy_type_mismatch,
+# copy_empty_schema and copy_existing_temp have been skipping silently since they
+# were written. Same shape as issue #192, one env var lower down.
+MSSQL_TEST_SERVER = $(MSSQL_TESTDB_DSN)
 
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
@@ -106,6 +111,7 @@ export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
 export MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_URI
+export MSSQL_TEST_SERVER
 # NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default. Export it manually to
 # run TLS-specific tests (requires SQL Server with TLS enabled).
 # export MSSQL_TEST_DSN_TLS
