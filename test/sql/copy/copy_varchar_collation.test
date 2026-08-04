@@ -13,6 +13,8 @@ require-env MSSQL_TESTDB_DSN
 # same server than MSSQL_TESTDB_DSN names.
 require-env MSSQL_TEST_HOST
 
+require-env MSSQL_TEST_PORT
+
 require-env MSSQL_TEST_USER
 
 require-env MSSQL_TEST_PASS
@@ -72,7 +74,7 @@ IF DB_ID('CvcUtf8Db') IS NULL CREATE DATABASE CvcUtf8Db COLLATE Latin1_General_1
 $$);
 
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST};Database=CvcUtf8Db;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}' AS cvc8 (TYPE mssql);
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=CvcUtf8Db;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}' AS cvc8 (TYPE mssql);
 
 statement ok
 BEGIN TRANSACTION;
