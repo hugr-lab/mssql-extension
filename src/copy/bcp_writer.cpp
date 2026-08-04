@@ -92,11 +92,25 @@ BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vect
 	  columns_(std::move(columns)),
 	  column_mapping_(std::move(column_mapping)),
 	  counters_enabled_(GetBCPDebugLevel() >= 2) {
-	// Pre-allocate buffer to reduce reallocation overhead
-	// Estimate: 100 bytes per column per row, reserve for 10K rows
-	// This will grow as needed but reduces initial reallocations
-	size_t estimated_row_size = columns_.size() * 100;
-	accumulator_buffer_.reserve(estimated_row_size * 10000);  // ~1MB initial
+	// Pre-allocate enough to hold what the buffer ACTUALLY holds, which since the
+	// streaming change is STREAM_BLOCK_CHUNKS chunks and not a batch: WriteRows
+	// drains whole frames once that many have accumulated.
+	//
+	// It used to reserve `columns * 100 * 10000` and call it "~1MB initial",
+	// which is only true at one column. At 44 it is 44 MB — committed before a
+	// single row is encoded, and now multiplied by every parallel writer.
+	//
+	// 32 bytes per column is an average rather than a bound, so the vector may
+	// still grow; that is deliberate. Growth is amortised, capacity is retained
+	// across batches by ResetForNextBatch, and reaching the true size by doubling
+	// costs a handful of copies once per load — against pre-committing memory
+	// per writer for a width the data may never have.
+	const size_t est_row_size = columns_.size() * 32;
+	const size_t est_buffer = est_row_size * STANDARD_VECTOR_SIZE * STREAM_BLOCK_CHUNKS;
+	// The cap is what stops a very wide table from re-creating the old problem
+	// across N writers. Past it, growth finds the real size.
+	static constexpr size_t MAX_INITIAL_RESERVE = 8u * 1024 * 1024;
+	accumulator_buffer_.reserve(MinValue<size_t>(est_buffer, MAX_INITIAL_RESERVE));
 
 	// D4 (spec 054): every row encodes every target column, so per-family
 	// value counts are rows × per-family column counts — precompute the
