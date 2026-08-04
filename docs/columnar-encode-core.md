@@ -45,7 +45,7 @@ Decided per chunk in `TryEncodeChunkColumnar` (`bcp_row_encoder.cpp`):
 |---|---|---|
 | **strided** — `ScatterBlock` | every column fixed-width **and** no NULLs anywhere | one kernel call per column per block |
 | **cursor** — `CursorBlock` | any variable-length column **or** any NULL in a fixed-width column | one call per column for direct-copy/convert arms; **one call per VALUE** for decimal/uuid/datetime |
-| **row-major** — `EncodeRow` | any column resolves to `RowFallback` | no kernels at all, for any column |
+| **row-major** — `EncodeRow` | any column resolves to `RowFallback`, **or** `string::PlanColumn` fails on a variable column (`bcp_row_encoder.cpp:655`) | no kernels at all, for any column |
 
 The literal condition is `if (all_valid && !has_variable)`. Two consequences
 that surprise people:
@@ -70,16 +70,26 @@ that surprise people:
 | `Decimal` | sign byte + little-endian magnitude, width from the target's precision. MONEY/SMALLMONEY arrive here |
 | `Datetime` | every temporal target: DATE, the DATETIME2 family, TIME, DATETIMEOFFSET, and DATE widened into DATETIME2 |
 | `Guid` | the 16 bytes of a UNIQUEIDENTIFIER, mixed-endian per the spec |
-| `VarString` | 2-byte-length string or binary. Payload width is per value, so a chunk with one can never be strided |
-| `RowFallback` | encodable, but not by a scatter |
-| `Unsupported` | no kernel for this pair — **this is the compatibility answer** |
+| `VarString` | string or binary of any framing — the 2-byte-length form **and** `nvarchar(max)`/`varchar(max)`/`varbinary(max)` under PLP's 8-byte framing, which resolve to the same arm because the plan owns the difference. Payload width is per value, so a chunk with one can never be strided |
+| `RowFallback` | encodable, but not by a scatter: a source rendered as text, a HUGEINT/UBIGINT column with generated metadata, a family mismatch (non-int storage into DECIMAL, TIMESTAMP into DATE, non-UUID into `uniqueidentifier`), a width disagreeing with COLMETADATA, and the two deliberate refusals |
+| `Unsupported` | no kernel for this pair — the compatibility answer this design is *aiming* at; see below |
 
-That last row is the design's main structural idea. Compatibility used to be a
-separate table of type *names* (`IsTypeCompatible`), and it disagreed with what
-the encoders could actually execute: every widening the table advertised died in
+That last row is the design's main structural idea, and it is **not implemented
+yet** — the header is careful to say compatibility is "meant to become"
+`arm != Unsupported`, and this guide should be equally careful.
+
+Where it actually stands: `IsTypeCompatible` (a table of type *names*,
+`target_resolver.cpp:648`) is still the gate, called at `:787`. And
+`ResolveWriteColumnOps` can never return `Unsupported` today — the only producer
+is `DirectCopyArm`'s `default:` (`write_column_ops.cpp:59`), reachable only for a
+width outside {1,2,4,8}, which the caller has already excluded. Every other exit
+assigns a concrete arm.
+
+The motivation is real regardless: the names table disagreed with what the
+encoders could execute for two releases — every widening it advertised died in
 the encoder, while a decimal scale mismatch was waved through and silently moved
-the decimal point (issue #153). Making compatibility mean `arm != Unsupported`
-is what stops a conversion being advertised that cannot be performed.
+the decimal point (issue #153). Collapsing the two is what would stop an
+unexecutable conversion being advertised.
 
 ## The invariants to be suspicious of
 
@@ -104,6 +114,13 @@ A reviewer's checklist, in the order these have actually broken:
    guaranteed by structure. `TIME` rounded on one and truncated on the other;
    `varbinary(n)` was bounded on one and not the other. Both were invisible until
    a test loaded the same values down both paths.
+
+   And the tests that do it need their **lever** checked, not just their
+   assertions: four of them used a fixture believed to force the row path that
+   in fact resolved columnar, so they compared the columnar path with itself and
+   passed for the wrong reason. If you add one, instrument the path choice once
+   and confirm the row-major branch is actually taken. An assertion that cannot
+   fail is worse than no assertion, because it is counted.
 4. **Conservatism is not free.** Refusing a pair sends the whole chunk
    row-major. `UTINYINT` was swept into an unsigned-source refusal that was right
    for the wider types, and because the catalog maps SQL Server `tinyint` to
@@ -131,6 +148,25 @@ A reviewer's checklist, in the order these have actually broken:
   at +0.23 s CPU per 16M values against a `bigint` control that costs nothing.
   Design for closing it — the kernels need no NULL branch at all — is in
   [`proposals/columnar-write-close-the-gaps.md`](proposals/columnar-write-close-the-gaps.md).
-- **`HUGEINT` and `UBIGINT` columns take the whole table row-major**, though both
-  travel as DECIMAL on the wire where a kernel already exists. `SUM()` over
-  integers returns HUGEINT, so this is an ordinary shape, not a corner.
+- **`UBIGINT` columns take the whole table row-major**, though they travel as
+  DECIMAL on the wire where a kernel already exists — its `UINT64` source is not
+  in the decimal arm's accepted set. `HUGEINT` is row-major only when the
+  metadata is GENERATED (CTAS, or COPY with `REPLACE`), where `duckdb_type` is
+  the source type and `DirectCopyTargetWidth` returns 0. Loading into an
+  **existing** `decimal(38,0)` it resolves to `ScatterArm::Decimal`: the catalog
+  reports the column as DECIMAL, `INT128` is in the accepted set, and
+  `max_length` already equals `GetDecimalByteSize(38)`.
+
+  That distinction is not academic — it invalidated four tests. They used a
+  `decimal(38,0)` column fed `1::HUGEINT` **into an existing table** to force the
+  row path, so they resolved columnar and compared the columnar path with itself.
+  Verified by instrumenting the path choice. The working lever is a signed
+  `TINYINT` source into a SQL Server `tinyint`, which is unsigned and therefore
+  cannot be a byte copy.
+
+- **`INTERVAL` into an `nvarchar` target raises an INTERNAL Error.** The
+  resolver's comment says such a "render-as-text" source keeps the row path,
+  "which formats it first" — it does not: `string::EncodeToBcp` reads the
+  INTERVAL vector as VARCHAR and throws `Expected unified vector format of type
+  VARCHAR, but found type INTERVAL`. Reproducible on this branch; nothing tests
+  it. Needs its own issue.

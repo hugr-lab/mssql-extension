@@ -201,20 +201,29 @@ SELECT count(*) FROM tr.dbo.TruncMixed WHERE s LIKE 'short%' AND length(s) <> 6;
 # dropped the chunk to row-major — where the server rejected the batch. Same
 # statement, same data, outcome decided by a neighbour.
 #
-# The decimal(38,0) column is what forces the second load down the row path: its
-# HUGEINT source has no scatter arm, so the whole chunk falls back.
+# The `tinyint` column is what forces the ROW path. SQL Server's tinyint is
+# UNSIGNED, so a signed TINYINT source cannot be a byte copy — the resolver sends
+# it to the row encoder, which range-checks and refuses a negative. 0..127 loads
+# normally and takes the whole chunk with it.
+#
+# It used to be a `decimal(38,0)` fed a HUGEINT, on the belief that HUGEINT has
+# no scatter arm. It does when the TARGET ALREADY EXISTS: the catalog reports the
+# column as DECIMAL(38,0), INT128 is in the decimal arm's accepted sources, and
+# the width already matches — so that fixture resolved COLUMNAR and this file
+# compared the columnar path with itself. Verified by instrumenting the path
+# choice; the lever below prints ROW-MAJOR where the old one printed COLUMNAR.
 # -----------------------------------------------------------------------------
 statement ok
 SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncBinRow'') IS NOT NULL DROP TABLE dbo.TruncBinRow;
-CREATE TABLE dbo.TruncBinRow (tag nvarchar(10), bn varbinary(3), h decimal(38,0))');
+CREATE TABLE dbo.TruncBinRow (tag nvarchar(10), bn varbinary(3), rp tinyint)');
 
 statement ok
 COPY (SELECT * FROM (VALUES
-    ('long',  encode('abcdefghij')::BLOB, 1::HUGEINT),
-    ('exact', encode('abc')::BLOB,        2::HUGEINT),
-    ('short', encode('a')::BLOB,          3::HUGEINT),
-    ('empty', encode('')::BLOB,           4::HUGEINT)
-) t(tag, bn, h)) TO 'tr.dbo.TruncBinRow' (FORMAT bcp, CREATE_TABLE false);
+    ('long',  encode('abcdefghij')::BLOB, 0::TINYINT),
+    ('exact', encode('abc')::BLOB,        1::TINYINT),
+    ('short', encode('a')::BLOB,          2::TINYINT),
+    ('empty', encode('')::BLOB,           3::TINYINT)
+) t(tag, bn, rp)) TO 'tr.dbo.TruncBinRow' (FORMAT bcp, CREATE_TABLE false);
 
 query II
 SELECT tag, bn FROM tr.dbo.TruncBinRow ORDER BY tag;
