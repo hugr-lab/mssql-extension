@@ -80,6 +80,12 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
+//! Scatter a whole COLUMN at a constant row stride — one call per column, the
+//! peer of decimal's. DATE and the DATETIME2 family only; TIME and
+//! DATETIMEOFFSET still take the row path.
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col);
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);

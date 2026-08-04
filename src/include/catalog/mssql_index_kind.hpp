@@ -21,7 +21,7 @@ namespace duckdb {
 enum class MSSQLIndexKind : uint8_t {
 	HEAP = 0,					//!< no clustered index; bulk load wants TABLOCK
 	CLUSTERED = 1,				//!< clustered rowstore; TABLOCK serialises loaders
-	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; wants TABLOCK again
+	CLUSTERED_COLUMNSTORE = 5,	//!< clustered columnstore; TABLOCK serialises it too
 };
 
 // The enumerators ARE sys.indexes.type. Renumbering them silently redefines what
@@ -54,6 +54,84 @@ inline MSSQLIndexKind MSSQLIndexKindFromSysIndexesType(const std::string &raw) {
 		return MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
 	default:
 		return MSSQLIndexKind::HEAP;
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// TABLOCK, decided by the target's shape (spec 057 step 1)
+//
+// Lives here, next to the enum, because the decision IS the enum plus one line —
+// and because it then unit-tests with -I src/include and nothing else, the same
+// property test/cpp/test_index_kind.cpp already relies on.
+//===----------------------------------------------------------------------===//
+
+//! What mssql_copy_tablock says. Tri-state so that "the user did not choose" is
+//! representable — the previous BOOLEAN could not express it, which is why both
+//! auto-TABLOCK branches were dead code (see the setting's registration).
+enum class MSSQLTablockChoice : uint8_t { AUTO, ON, OFF };
+
+//! Parse the setting / COPY option. Anything unrecognised is AUTO: this value
+//! reaches us from a SET the user may have written by hand, and defaulting to
+//! the measured-correct policy beats guessing ON or OFF.
+inline MSSQLTablockChoice MSSQLParseTablockChoice(const std::string &raw) {
+	if (raw == "true" || raw == "TRUE" || raw == "True" || raw == "1" || raw == "on" || raw == "ON") {
+		return MSSQLTablockChoice::ON;
+	}
+	if (raw == "false" || raw == "FALSE" || raw == "False" || raw == "0" || raw == "off" || raw == "OFF") {
+		return MSSQLTablockChoice::OFF;
+	}
+	return MSSQLTablockChoice::AUTO;
+}
+
+//! Should a bulk load into a target of this shape take a table lock?
+//!
+//! Measured (spec 057, "Revised TABLOCK policy"; emulated server, so the
+//! magnitudes are upper bounds and the directions are what hold):
+//!
+//!   heap, 4 sessions        1.70 s with, 11.97 s without   -> ON
+//!   heap, 1 session         11.37 s with, 14.42 s without  -> ON
+//!   clustered rowstore, 4   2.11 s/M with, 1.20 s/M without-> OFF
+//!   clustered rowstore, 1   2.185 s vs 2.166 s             -> neutral, so OFF
+//!                                                             costs nothing
+//!
+//! Two locks, two opposite behaviours: concurrent bulk loaders on a heap take
+//! mutually compatible BU locks, so the hint lets them run together. Against any
+//! CLUSTERED index — rowstore or columnstore — the same hint serialises them.
+//!
+//! The columnstore half of this was measured wrong when the policy was written
+//! (spec 057 step 1 claimed a clustered COLUMNSTORE "behaves like a heap here")
+//! and step 7 disproved it, because only step 7 made the loads concurrent. With
+//! parallel writers against a clustered columnstore, 2M rows x 5 columns:
+//!
+//!     TABLOCK on   8.92 s   server pinned at ~99% CPU — exactly ONE core
+//!     TABLOCK off  5.23 s   server peaking at 305%    — three cores
+//!
+//! and the compression is IDENTICAL either way: 17 COMPRESSED rowgroups holding
+//! 1740800 rows in both. The claim that a bulk insert without a table lock leaves
+//! rows uncompressed until a rebuild does not hold for a load whose batches cross
+//! the 102400 threshold — the threshold is what decides that, not the lock.
+//!
+//! So the input is simply "is this a heap": a heap takes it, anything clustered
+//! does not. The degree of parallelism is deliberately NOT an input — a
+//! single-session clustered load is neutral, so the shape alone decides and no
+//! conditional is needed.
+//!
+//! This replaces the issue-#45 policy of enabling it for newly created tables.
+//! Newness is the wrong input: a fresh table is a heap only until an index is
+//! created on it, which is exactly what CTAS-then-index does.
+inline bool MSSQLTablockForShape(MSSQLIndexKind shape) {
+	return shape == MSSQLIndexKind::HEAP;
+}
+
+//! The whole decision: an explicit choice wins, otherwise the shape decides.
+inline bool MSSQLResolveTablock(MSSQLTablockChoice choice, MSSQLIndexKind shape) {
+	switch (choice) {
+	case MSSQLTablockChoice::ON:
+		return true;
+	case MSSQLTablockChoice::OFF:
+		return false;
+	default:
+		return MSSQLTablockForShape(shape);
 	}
 }
 

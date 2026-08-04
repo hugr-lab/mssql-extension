@@ -77,7 +77,17 @@ struct CTASExecutionState {
 	BCPCopyTarget bcp_target;
 	idx_t bcp_rows_in_batch = 0;  // Rows accumulated since last flush
 
-	// Connection (pinned for duration)
+	//! The INSERT BULK text, built once in ExecuteBCPInsert. Every batch boundary
+	//! re-executes it, and each parallel writer opens its own session with it, so
+	//! it is state rather than something rebuilt at each site — it was assembled
+	//! from bcp_columns in two places before, which is two places to keep in step
+	//! with the TABLOCK decision that is resolved just above it.
+	string insert_bulk_sql;
+
+	//! The first bulk-load connection, taken from the pool and returned to it.
+	//!
+	//! Never the connection an explicit DuckDB transaction has pinned — see
+	//! ExecuteBCPInsert for why CTAS deliberately loads outside the transaction.
 	std::shared_ptr<tds::TdsConnection> connection;
 
 	// Weak handle to the catalog's pool so error/teardown paths can release the
@@ -91,6 +101,17 @@ struct CTASExecutionState {
 	// Error tracking
 	string error_message;
 	string cleanup_error;
+
+	//! The CREATE TABLE has run and succeeded, so there is something for
+	//! mssql_ctas_drop_on_failure to drop. `phase` cannot answer this: a CREATE
+	//! that itself failed also leaves phase == FAILED, and dropping then means a
+	//! round trip that can only report "no such table".
+	bool table_created = false;
+
+	//! A cleanup DROP has already been issued. The failing Sink thread runs one
+	//! as early as it can, and the destructor covers the aborts that never reach
+	//! a Sink at all; without this the two would both fire on the same table.
+	bool cleanup_attempted = false;
 
 	// Timing
 	std::chrono::steady_clock::time_point start_time;
@@ -134,6 +155,9 @@ struct CTASExecutionState {
 	// Called from ExecuteDDL when config.use_bcp = true
 	void InitializeBCP(ClientContext &context);
 
+	// Build the INSERT BULK text from bcp_target / bcp_columns / config.bcp_tablock
+	string BuildInsertBulkSql() const;
+
 	// Execute INSERT BULK command to start BCP session
 	void ExecuteBCPInsert(ClientContext &context);
 
@@ -147,6 +171,11 @@ struct CTASExecutionState {
 
 	// Attempt cleanup DROP TABLE on failure
 	void AttemptCleanup(ClientContext &context);
+
+	//! The same DROP without a ClientContext, so it is callable from a destructor
+	//! and from a worker thread (issue #178). Goes through `pool_handle` rather
+	//! than `catalog`, which may already be gone.
+	void AttemptCleanupNoContext() noexcept;
 
 	// Invalidate catalog cache after successful DDL
 	void InvalidateCache();

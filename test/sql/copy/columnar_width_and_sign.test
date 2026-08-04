@@ -1,0 +1,251 @@
+# name: test/sql/copy/columnar_width_and_sign.test
+# description: two values the columnar path stored as a different number (spec 057 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Both of these loaded happily and stored the WRONG NUMBER. Neither the client
+# nor the server objected, and the row-major path got both right — so the only
+# way to see either was to compare what came back against what went in.
+#
+# They share a cause: the columnar path decides a column's kernel from WIDTHS,
+# and a width alone does not determine what a value means.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ws (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# -----------------------------------------------------------------------------
+# decimal(19): the magnitude is 8 wire bytes, and it is UNSIGNED, so it reaches
+# 10^19-1 — above INT64_MAX. The fast kernel picked its arithmetic type from the
+# target's byte size (MagType<8> = int64_t) while the source, a DECIMAL(19,s),
+# is physically INT128. The cast truncated and the sign bit landed in the
+# magnitude's top bit: 9223372036854775808 was stored as -9223372036854775808.
+#
+# 2^63 is the first value that shows it. Every smaller one round-trips, which is
+# why columnar_encode_all_families.test (precisions 4/9/18/28/38) and
+# money_columnar.test (whose extreme is exactly INT64_MAX) both missed it.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsDec19'') IS NOT NULL DROP TABLE dbo.WsDec19;
+CREATE TABLE dbo.WsDec19 (tag varchar(12), v decimal(19,0), w decimal(19,4))');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('two63',      9223372036854775808::DECIMAL(19,0),  922337203685477.5808::DECIMAL(19,4)),
+    ('two63neg',  -9223372036854775808::DECIMAL(19,0), -922337203685477.5808::DECIMAL(19,4)),
+    ('max19',      9999999999999999999::DECIMAL(19,0),  999999999999999.9999::DECIMAL(19,4)),
+    ('min19',     -9999999999999999999::DECIMAL(19,0), -999999999999999.9999::DECIMAL(19,4)),
+    ('below',      9223372036854775807::DECIMAL(19,0),  922337203685477.5807::DECIMAL(19,4)),
+    ('zero',                        0::DECIMAL(19,0),                  0::DECIMAL(19,4))
+) t(tag, v, w)) TO 'ws.dbo.WsDec19' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT tag, v, w FROM ws.dbo.WsDec19 ORDER BY tag;
+----
+below	9223372036854775807	922337203685477.5807
+max19	9999999999999999999	999999999999999.9999
+min19	-9999999999999999999	-999999999999999.9999
+two63	9223372036854775808	922337203685477.5808
+two63neg	-9223372036854775808	-922337203685477.5808
+zero	0	0.0000
+
+# The sign has to be right as a COMPARISON, not just as printed text — a flipped
+# magnitude bit reads back as a plausible number.
+query II
+SELECT count(*) FILTER (WHERE v > 0), count(*) FILTER (WHERE v < 0) FROM ws.dbo.WsDec19;
+----
+3	2
+
+# -----------------------------------------------------------------------------
+# UBIGINT -> bigint: eight bytes on both sides, so the resolver took the
+# direct-copy arm and memcpy'd the bytes across. 18446744073709551615 became -1.
+# The row path refuses the same value by range, and the two must agree.
+#
+# It has to be a REFUSAL rather than a conversion arm: that arm checks by
+# round-trip (`static_cast<SRC>(static_cast<DST>(v)) != v`), which every value of
+# a same-width unsigned/signed pair passes.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsUns'') IS NOT NULL DROP TABLE dbo.WsUns;
+CREATE TABLE dbo.WsUns (v bigint)');
+
+statement error
+COPY (SELECT 18446744073709551615::UBIGINT AS v) TO 'ws.dbo.WsUns' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+# Nothing was written by the refused statement.
+query I
+SELECT count(*) FROM ws.dbo.WsUns;
+----
+0
+
+# A value that DOES fit still goes through, so the guard rejects by value and not
+# by type — refusing every UBIGINT would be its own bug.
+statement ok
+COPY (SELECT 42::UBIGINT AS v UNION ALL SELECT 9223372036854775807::UBIGINT) TO 'ws.dbo.WsUns' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), max(v) FROM ws.dbo.WsUns;
+----
+2	9223372036854775807
+
+# The narrower unsigned sources are the same shape. UINTEGER -> int wrapped to a
+# negative, USMALLINT -> smallint likewise.
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsUns2'') IS NOT NULL DROP TABLE dbo.WsUns2;
+CREATE TABLE dbo.WsUns2 (a int, b smallint)');
+
+statement error
+COPY (SELECT 3000000000::UINTEGER AS a, 1::USMALLINT AS b) TO 'ws.dbo.WsUns2' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+statement ok
+COPY (SELECT 2000000000::UINTEGER AS a, 30000::USMALLINT AS b) TO 'ws.dbo.WsUns2' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT a, b FROM ws.dbo.WsUns2;
+----
+2000000000	30000
+
+# -----------------------------------------------------------------------------
+# UTINYINT -> tinyint is the pair that must NOT be refused, and it is the reason
+# the guard above names three target types rather than four.
+#
+# SQL Server's `tinyint` is the one UNSIGNED integer it has (0..255), so a
+# UTINYINT source is an exact match — the same byte, not a reinterpretation.
+# Sweeping it into the same refusal as UBIGINT -> bigint was over-broad and cost
+# far more than it protected: the catalog maps SQL Server `tinyint` to UTINYINT,
+# so ONE such column in an mssql -> mssql load pushed the ENTIRE chunk down the
+# row-major path, every other column with it.
+#
+# The full 0..255 range is loaded because the two ends are where a signed
+# reinterpretation would show: 128..255 would come back negative, or be refused.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinySrc'') IS NOT NULL DROP TABLE dbo.WsTinySrc;
+IF OBJECT_ID(''dbo.WsTinyDst'') IS NOT NULL DROP TABLE dbo.WsTinyDst;
+CREATE TABLE dbo.WsTinySrc (id int, tb tinyint, other bigint);
+CREATE TABLE dbo.WsTinyDst (id int, tb tinyint, other bigint);
+INSERT INTO dbo.WsTinySrc SELECT TOP 256 n - 1, n - 1, (n - 1) * 7
+  FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) n FROM sys.all_objects) x');
+
+# The catalog reports the source column as UTINYINT, which is what makes this the
+# mssql -> mssql shape rather than a DuckDB-literal one.
+query I
+SELECT column_type FROM (DESCRIBE SELECT tb FROM ws.dbo.WsTinySrc);
+----
+UTINYINT
+
+statement ok
+COPY (SELECT id, tb, other FROM ws.dbo.WsTinySrc) TO 'ws.dbo.WsTinyDst' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), min(tb), max(tb) FROM ws.dbo.WsTinyDst;
+----
+256	0	255
+
+# Value for value, including the neighbouring columns — a chunk that changed
+# layout would break those first.
+query I
+SELECT count(*) FROM (
+    SELECT id, tb, other FROM ws.dbo.WsTinySrc
+    EXCEPT ALL
+    SELECT id, tb, other FROM ws.dbo.WsTinyDst
+);
+----
+0
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsTinySrc; DROP TABLE dbo.WsTinyDst;');
+
+# -----------------------------------------------------------------------------
+# The other direction of the same fact: a SIGNED source into that unsigned
+# column. `-1::TINYINT` was stored on the server as 255 — silently, on BOTH
+# encode paths, so there was no divergence to notice — because the row encoder
+# had an exact-width fast path that skipped its own range check and the columnar
+# resolver copied the byte. It was left that way on purpose, marked as a
+# "wire-compatibility question", but there was no compatibility to keep: the
+# catalog reads the column back as UTINYINT, so writing -1 and reading it never
+# returned -1 either.
+#
+# It is now the same rule every other integer pair follows — a value that does
+# not fit is a different number — and the refusal is by VALUE, so a signed
+# column holding only 0..127 still loads.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinySigned'') IS NOT NULL DROP TABLE dbo.WsTinySigned;
+CREATE TABLE dbo.WsTinySigned (v tinyint)');
+
+statement error
+COPY (SELECT (-1)::TINYINT AS v) TO 'ws.dbo.WsTinySigned' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+query I
+SELECT count(*) FROM ws.dbo.WsTinySigned;
+----
+0
+
+# The row path has to give the same answer, so the outcome does not depend on
+# whether some other column dropped the chunk out of the kernels.
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinyRow'') IS NOT NULL DROP TABLE dbo.WsTinyRow;
+CREATE TABLE dbo.WsTinyRow (v tinyint, h decimal(38,0))');
+
+statement error
+COPY (SELECT (-1)::TINYINT AS v, 1::HUGEINT AS h) TO 'ws.dbo.WsTinyRow' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+# In range, both paths, still loads.
+statement ok
+COPY (SELECT 0::TINYINT AS v UNION ALL SELECT 127::TINYINT) TO 'ws.dbo.WsTinySigned' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), min(v), max(v) FROM ws.dbo.WsTinySigned;
+----
+2	0	127
+
+# -----------------------------------------------------------------------------
+# And a table CREATED from a signed TINYINT no longer gets a column that cannot
+# hold it. SQL Server has no signed one-byte integer, so the DDL widens to
+# smallint — the same rule USMALLINT (-> int) and UINTEGER (-> bigint) already
+# followed, and the reason a negative survives here without any refusal at all.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ws', 'IF OBJECT_ID(''dbo.WsTinyDdl'') IS NOT NULL DROP TABLE dbo.WsTinyDdl');
+
+statement ok
+CREATE TABLE ws.dbo.WsTinyDdl AS SELECT (-128)::TINYINT AS lo, 127::TINYINT AS hi;
+
+query I
+SELECT DATA_TYPE FROM mssql_scan('ws', 'SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = ''WsTinyDdl'' AND COLUMN_NAME = ''lo''');
+----
+smallint
+
+query II
+SELECT lo, hi FROM ws.dbo.WsTinyDdl;
+----
+-128	127
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsTinySigned; DROP TABLE dbo.WsTinyRow; DROP TABLE dbo.WsTinyDdl;');
+
+statement ok
+SELECT mssql_exec('ws', 'DROP TABLE dbo.WsDec19; DROP TABLE dbo.WsUns; DROP TABLE dbo.WsUns2;');
+
+statement ok
+DETACH ws;

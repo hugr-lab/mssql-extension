@@ -53,21 +53,49 @@ SELECT mssql_exec('db', 'IF OBJECT_ID(''dbo.int_target'', ''U'') IS NOT NULL DRO
 statement ok
 SELECT mssql_exec('db', 'CREATE TABLE dbo.int_target (id INT)');
 
-# BIGINT into an INT column is a NARROWING conversion and must be refused, not silently
-# truncated: IsTypeCompatible (src/copy/target_resolver.cpp) is deliberately widening-only, so
-# BIGINT is compatible with `bigint` alone.
+# BIGINT into an INT column now SUCCEEDS, range-checked per row (issue #153, spec 057).
 #
-# This originally read "COPY should succeed (BIGINT to INT is compatible)" and expected
-# `statement ok`. It never could — the check and this test landed in the same commit (3c8ac8e,
-# spec 025) and contradicted each other from the start; CI never ran the .test files so nothing
-# caught it (issue #192). Note DuckDB's range()/COUNT()/integer literals are all BIGINT, so
-# reaching an INT target needs an explicit cast (see below).
-statement error
+# History, because this block has said the opposite twice. It first read "COPY should succeed"
+# and expected `statement ok`; the check and this test landed in the same commit (3c8ac8e, spec
+# 025) contradicting each other, and CI did not run .test files so nothing caught it (#192). It
+# was then changed to `statement error` with the rationale that IsTypeCompatible is
+# "deliberately widening-only".
+#
+# That rationale did not survive measurement. The widening-only policy it described never
+# worked: TINYINT -> int, SMALLINT -> bigint and INTEGER -> bigint were all ACCEPTED by the
+# validator and then died in the encoder with
+#
+#   INTERNAL Error: Expected unified vector format of type INT64, but found type INT32
+#
+# because EncodeToBcp picked the read width from the TARGET column while reading the SOURCE
+# vector's memory. So the table advertised conversions the encoder could not perform, and the
+# only thing "strict" achieved for narrowing was to reject the one case it could have done
+# safely. Meanwhile DECIMAL(21,1) -> decimal(18,2) was waved through and silently moved the
+# decimal point.
+#
+# With the encoder reading the source's own width and range-checking the target's, narrowing is
+# safe: a value that does not fit raises before the batch is sent, naming the column and the
+# accepted range, instead of wrapping or letting SQL Server abort the stream mid-load. And it
+# removes real friction — DuckDB's range(), COUNT() and integer literals are all BIGINT, so
+# every append to an `int` column previously needed an explicit cast.
+statement ok
 COPY bigint_source TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
-----
-type mismatch
 
-# Casting the source to INTEGER is the supported route, and it must work.
+query II
+SELECT COUNT(*), SUM(id) FROM db.dbo.int_target;
+----
+5	10
+
+statement ok
+SELECT mssql_exec('db', 'TRUNCATE TABLE dbo.int_target');
+
+# A value that does not fit is refused client-side, by value and not by type.
+statement error
+COPY (SELECT 2147483648::BIGINT AS id) TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
+----
+out of range for the target column
+
+# An explicit cast remains the supported route and must keep working.
 statement ok
 COPY (SELECT id::INTEGER AS id FROM bigint_source) TO 'db.dbo.int_target' (FORMAT 'bcp', CREATE_TABLE false);
 

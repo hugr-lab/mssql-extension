@@ -59,6 +59,23 @@ static void BCPDebugLog(int level, const char *format, ...) {
 using Clock = std::chrono::high_resolution_clock;
 using TimePoint = std::chrono::time_point<Clock>;
 
+// Accumulate a phase into an atomic on scope exit, so an early return or a throw
+// cannot leave the counter short. Nanoseconds: spec 055 D0 caught microsecond
+// accumulation truncating short intervals to zero. One instance per batch, not
+// per value, so it is not on any hot path.
+namespace {
+struct ScopedNs {
+	std::atomic<uint64_t> &sink;
+	TimePoint start;
+	explicit ScopedNs(std::atomic<uint64_t> &sink_p) : sink(sink_p), start(Clock::now()) {}
+	~ScopedNs() {
+		sink.fetch_add(
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()),
+			std::memory_order_relaxed);
+	}
+};
+}  // namespace
+
 static double ElapsedMs(TimePoint start) {
 	auto end = Clock::now();
 	return std::chrono::duration<double, std::milli>(end - start).count();
@@ -75,11 +92,25 @@ BCPWriter::BCPWriter(tds::TdsConnection &conn, const BCPCopyTarget &target, vect
 	  columns_(std::move(columns)),
 	  column_mapping_(std::move(column_mapping)),
 	  counters_enabled_(GetBCPDebugLevel() >= 2) {
-	// Pre-allocate buffer to reduce reallocation overhead
-	// Estimate: 100 bytes per column per row, reserve for 10K rows
-	// This will grow as needed but reduces initial reallocations
-	size_t estimated_row_size = columns_.size() * 100;
-	accumulator_buffer_.reserve(estimated_row_size * 10000);  // ~1MB initial
+	// Pre-allocate enough to hold what the buffer ACTUALLY holds, which since the
+	// streaming change is STREAM_BLOCK_CHUNKS chunks and not a batch: WriteRows
+	// drains whole frames once that many have accumulated.
+	//
+	// It used to reserve `columns * 100 * 10000` and call it "~1MB initial",
+	// which is only true at one column. At 44 it is 44 MB — committed before a
+	// single row is encoded, and now multiplied by every parallel writer.
+	//
+	// 32 bytes per column is an average rather than a bound, so the vector may
+	// still grow; that is deliberate. Growth is amortised, capacity is retained
+	// across batches by ResetForNextBatch, and reaching the true size by doubling
+	// costs a handful of copies once per load — against pre-committing memory
+	// per writer for a width the data may never have.
+	const size_t est_row_size = columns_.size() * 32;
+	const size_t est_buffer = est_row_size * STANDARD_VECTOR_SIZE * STREAM_BLOCK_CHUNKS;
+	// The cap is what stops a very wide table from re-creating the old problem
+	// across N writers. Past it, growth finds the real size.
+	static constexpr size_t MAX_INITIAL_RESERVE = 8u * 1024 * 1024;
+	accumulator_buffer_.reserve(MinValue<size_t>(est_buffer, MAX_INITIAL_RESERVE));
 
 	// D4 (spec 054): every row encodes every target column, so per-family
 	// value counts are rows × per-family column counts — precompute the
@@ -167,6 +198,12 @@ idx_t BCPWriter::WriteRows(DataChunk &chunk) {
 	double encode_ms = ElapsedMs(start_encode);
 
 	size_t bytes_added = accumulator_buffer_.size() - buffer_start;
+	// Push what is already framable rather than holding the whole batch. Still
+	// under write_mutex_, so frames leave in the order they were encoded.
+	if (++chunks_since_drain_ >= STREAM_BLOCK_CHUNKS) {
+		chunks_since_drain_ = 0;
+		DrainWholeFrames();
+	}
 	rows_sent_.fetch_add(rows_written);
 	rows_in_batch_.fetch_add(rows_written);
 
@@ -204,10 +241,13 @@ void BCPWriter::WriteDone(idx_t row_count) {
 
 	// Send the complete accumulated buffer (COLMETADATA + ROWs + DONE) as a single BULK_LOAD message
 	// This sends all data in one packet with EOM flag
-	SendBulkLoadPacket(accumulator_buffer_, true);
+	WriteFrames(accumulator_buffer_.data(), accumulator_buffer_.size(), true);
 }
 
 idx_t BCPWriter::Finalize() {
+	// Blocking on SQL Server's confirmation — the other half of `flush`, and the
+	// one no amount of client work can shrink.
+	ScopedNs phase(counter_server_wait_ns_);
 	// Read the server response after DONE token
 	// We expect a DONE token with the row count
 	auto start_total = Clock::now();
@@ -363,7 +403,7 @@ idx_t BCPWriter::FlushBatch(idx_t row_count) {
 	// Send the complete accumulated buffer
 	auto start_send = Clock::now();
 	BCPDebugLog(1, "FlushBatch: sending %zu bytes to server...", accumulator_buffer_.size());
-	SendBulkLoadPacket(accumulator_buffer_, true);
+	WriteFrames(accumulator_buffer_.data(), accumulator_buffer_.size(), true);
 	double send_ms = ElapsedMs(start_send);
 	BCPDebugLog(1, "FlushBatch: send complete in %.2f ms (%.1f MB/s)", send_ms,
 				(send_ms > 0) ? (accumulator_buffer_.size() / 1024.0 / 1024.0 * 1000.0 / send_ms) : 0);
@@ -390,6 +430,7 @@ void BCPWriter::ResetForNextBatch() {
 	// Clear buffer but KEEP capacity for reuse (reduces memory fragmentation)
 	// The buffer will be reused for the next batch without reallocation
 	accumulator_buffer_.clear();
+	chunks_since_drain_ = 0;
 
 	// Reset COLMETADATA state so it can be sent again
 	colmetadata_sent_ = false;
@@ -531,101 +572,72 @@ void BCPWriter::BuildDoneToken(vector<uint8_t> &buffer, idx_t row_count) {
 // Wire Helpers
 //===----------------------------------------------------------------------===//
 
-void BCPWriter::SendBulkLoadPacket(const vector<uint8_t> &buffer, bool is_last) {
-	auto start_total = Clock::now();
-	BCPDebugLog(2, "SendBulkLoadPacket: buffer_size=%zu, is_last=%d, packet_id=%u", buffer.size(), is_last ? 1 : 0,
-				packet_id_);
+void BCPWriter::DrainWholeFrames() {
+	const size_t max_payload = conn_.GetNegotiatedPacketSize() - tds::TDS_HEADER_SIZE;
+	// Whole frames only. The tail that does not fill one stays behind rather than
+	// going out short: the batch is one TDS message either way, and a short frame
+	// per block would multiply the send count for nothing.
+	const size_t sendable = (accumulator_buffer_.size() / max_payload) * max_payload;
+	if (sendable == 0) {
+		return;
+	}
+	WriteFrames(accumulator_buffer_.data(), sendable, false);
+	// The remainder is shorter than one frame, so this moves at most max_payload
+	// bytes.
+	accumulator_buffer_.erase(accumulator_buffer_.begin(),
+							  accumulator_buffer_.begin() + static_cast<std::ptrdiff_t>(sendable));
+}
 
-	// Get the socket
+void BCPWriter::WriteFrames(const uint8_t *data, size_t length, bool eom) {
+	ScopedNs phase(counter_build_send_ns_);
+	counter_send_calls_.fetch_add(1, std::memory_order_relaxed);
+
 	auto socket = conn_.GetSocket();
 	if (!socket) {
 		throw IOException("MSSQL: Connection socket is null");
 	}
 
-	// Debug: dump first 64 bytes of payload
-	if (GetBCPDebugLevel() >= 3 && !buffer.empty()) {
-		std::string hex;
-		size_t dump_len = std::min(buffer.size(), (size_t)64);
-		for (size_t i = 0; i < dump_len; i++) {
-			char buf[4];
-			snprintf(buf, sizeof(buf), "%02X ", buffer[i]);
-			hex += buf;
-		}
-		BCPDebugLog(3, "SendBulkLoadPacket: first %zu bytes: %s", dump_len, hex.c_str());
+	const uint32_t packet_size = conn_.GetNegotiatedPacketSize();
+	const size_t max_payload = packet_size - tds::TDS_HEADER_SIZE;
+	if (frame_buffer_.size() != packet_size) {
+		frame_buffer_.resize(packet_size);
 	}
 
-	// Use TDS protocol layer to build properly fragmented packets
-	auto start_build = Clock::now();
-	uint32_t packet_size = conn_.GetNegotiatedPacketSize();
-	std::vector<tds::TdsPacket> packets = tds::TdsProtocol::BuildBulkLoadMultiPacket(buffer, packet_size);
-	double build_ms = ElapsedMs(start_build);
+	size_t offset = 0;
+	// An empty payload still has to produce the end-of-message frame, or the
+	// server keeps waiting for a message that was already complete.
+	while (offset < length || (length == 0 && eom)) {
+		const size_t chunk = std::min(max_payload, length - offset);
+		const bool last = eom && (offset + chunk >= length);
+		const uint16_t total = static_cast<uint16_t>(tds::TDS_HEADER_SIZE + chunk);
 
-	BCPDebugLog(1, "SendBulkLoadPacket: built %zu packets in %.2f ms (packet_size=%u)", packets.size(), build_ms,
-				packet_size);
+		// The 8-byte TDS header, written in place ahead of the payload: type,
+		// status, big-endian length, SPID, packet id, window.
+		uint8_t *f = frame_buffer_.data();
+		f[0] = static_cast<uint8_t>(tds::PacketType::BULK_LOAD);
+		f[1] = last ? 0x01 : 0x00;
+		f[2] = static_cast<uint8_t>((total >> 8) & 0xFF);
+		f[3] = static_cast<uint8_t>(total & 0xFF);
+		f[4] = 0;
+		f[5] = 0;
+		f[6] = packet_id_++;
+		f[7] = 0;
+		std::memcpy(f + tds::TDS_HEADER_SIZE, data + offset, chunk);
 
-	// Send all packets with incrementing packet IDs
-	auto start_send = Clock::now();
-	size_t bytes_sent_so_far = 0;
-	double slowest_packet_ms = 0;
-	size_t slowest_packet_idx = 0;
-
-	for (size_t i = 0; i < packets.size(); i++) {
-		auto &packet = packets[i];
-		packet.SetPacketId(packet_id_++);
-
-		// Debug: dump the TDS packet header
-		if (GetBCPDebugLevel() >= 2) {
-			BCPDebugLog(2,
-						"SendBulkLoadPacket: sending packet %zu/%zu, type=0x%02X, status=0x%02X, length=%u, "
-						"payload=%zu, eom=%d, pkt_id=%u",
-						i + 1, packets.size(), static_cast<unsigned>(packet.GetType()),
-						static_cast<unsigned>(packet.GetStatus()), packet.GetLength(), packet.GetPayload().size(),
-						packet.IsEndOfMessage(), packet.GetPacketId());
-		}
-
-		if (GetBCPDebugLevel() >= 3) {
-			auto serialized = packet.Serialize();
-			BCPDebugLog(3, "SendBulkLoadPacket: TDS header (8 bytes): %02X %02X %02X %02X %02X %02X %02X %02X",
-						serialized[0], serialized[1], serialized[2], serialized[3], serialized[4], serialized[5],
-						serialized[6], serialized[7]);
-		}
-
-		// Send the packet with timing
-		auto start_pkt = Clock::now();
-		if (!socket->SendPacket(packet)) {
-			// T009: Close connection before throwing to prevent corrupted pool state
+		if (!socket->Send(f, total)) {
+			// Close before throwing: a half-written message leaves the connection
+			// unusable, and returning it to the pool would hand the corruption to
+			// the next caller (T009).
 			conn_.Close();
-			throw IOException("MSSQL: Failed to send BULK_LOAD packet %zu/%zu: %s", i + 1, packets.size(),
+			throw IOException("MSSQL: Failed to send BULK_LOAD frame at offset %zu/%zu: %s", offset, length,
 							  socket->GetLastError().c_str());
 		}
-		double pkt_ms = ElapsedMs(start_pkt);
-		if (pkt_ms > slowest_packet_ms) {
-			slowest_packet_ms = pkt_ms;
-			slowest_packet_idx = i;
-		}
-
-		// Update bytes sent counter
-		bytes_sent_.fetch_add(packet.GetPayload().size() + tds::TDS_HEADER_SIZE);
-		bytes_sent_so_far += packet.GetPayload().size() + tds::TDS_HEADER_SIZE;
-
-		// Progress every 1000 packets or at the end
-		if ((i + 1) % 1000 == 0 || i + 1 == packets.size()) {
-			double elapsed = ElapsedMs(start_send);
-			double mb_per_sec = (elapsed > 0) ? (bytes_sent_so_far / 1024.0 / 1024.0 * 1000.0 / elapsed) : 0;
-			BCPDebugLog(1, "SendBulkLoadPacket: sent %zu/%zu packets (%zu KB) in %.2f ms | %.1f MB/s", i + 1,
-						packets.size(), bytes_sent_so_far / 1024, elapsed, mb_per_sec);
+		bytes_sent_.fetch_add(total);
+		offset += chunk;
+		if (chunk == 0) {
+			break;
 		}
 	}
-
-	double send_ms = ElapsedMs(start_send);
-	double total_ms = ElapsedMs(start_total);
-	double mb_per_sec = (send_ms > 0) ? (bytes_sent_so_far / 1024.0 / 1024.0 * 1000.0 / send_ms) : 0;
-
-	BCPDebugLog(1,
-				"SendBulkLoadPacket: DONE - %zu packets, %zu KB in %.2f ms (build: %.2f, send: %.2f) | %.1f MB/s | "
-				"slowest pkt[%zu]: %.2f ms",
-				packets.size(), bytes_sent_so_far / 1024, total_ms, build_ms, send_ms, mb_per_sec, slowest_packet_idx,
-				slowest_packet_ms);
 }
 
 void BCPWriter::WriteUInt8(vector<uint8_t> &buffer, uint8_t value) {

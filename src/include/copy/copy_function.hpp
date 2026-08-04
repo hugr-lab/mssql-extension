@@ -115,15 +115,70 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// Total rows expected (for progress reporting, 0 if unknown)
 	idx_t total_rows_expected = 0;
 
+	// Spec 057 step 0b: write-path phase counters, gated on MSSQL_COUNTERS.
+	//
+	// These replace a per-CHUNK `CopyDebugLog(1, "BCPCopySink: DONE ...")`, which
+	// fflush'ed stderr ~245 times inside the timed path on a 500k-row load and
+	// inflated the client CPU it was reporting roughly 4x (0.047 s -> 0.194 s).
+	// Accumulate here, print once at finalize — the shape the read path already
+	// uses. Atomic because the sink may run on several threads.
+	std::atomic<idx_t> counter_sink_calls{0};	 // chunks handed to the sink
+	std::atomic<uint64_t> counter_sink_ns{0};	 // wall inside BCPCopySink
+	std::atomic<uint64_t> counter_encode_ns{0};	 // of which: BCPWriter::WriteRows
+	// Snapshotted from the BCPWriter before it is reset — the writer is destroyed
+	// in BCPCopyFinalize well before the summary prints, so reading it there gave
+	// zeroes. Decomposes counter_flush_ns into the half that is ours and the half
+	// that is the server's.
+	uint64_t counter_build_send_ns = 0;
+	uint64_t counter_server_wait_ns = 0;
+	idx_t counter_send_calls = 0;
+
+	std::atomic<uint64_t> counter_flush_ns{0};	// of which: a batch boundary, END TO END —
+												// build + send + the server's confirmation.
+												// NOT server time alone; see PrintWriteCounters.
+
 	// INSERT BULK SQL (cached for re-execution on flush)
 	string insert_bulk_sql;
 
 	// Write synchronization
 	std::mutex write_mutex;
 
-	// Error state
+	// Error state. Both fields became shared when the sink turned PARALLEL in
+	// spec 057 step 7.
+	//
+	//! Guards `error_message` ONLY. Separate from write_mutex because the failing
+	//! thread does not hold that one — a local writer never takes it, and a shared
+	//! writer's unique_lock is released by unwinding before the catch runs — so
+	//! the string was being assigned by several threads at once while others read
+	//! it to build their own exception. That is a double free, not a torn read.
+	std::mutex error_mutex;
 	string error_message;
-	bool has_error = false;
+
+	//! Read at the top of every Sink call on every thread, so it stays a plain
+	//! atomic load: the lock above is taken only on the error path.
+	std::atomic<bool> has_error{false};
+
+	//===------------------------------------------------------------------===//
+	// Parallel writers (spec 057 step 7)
+	//
+	// The bound on this path is SQL Server's INGEST rate: send() blocks because
+	// the receive window stays full while the server lays rows down, not because
+	// the client or the wire is slow. Nothing done on one connection moves that
+	// — the server parallelises across SESSIONS, so more of them is the lever.
+	//
+	// Each parallel writer is an independent INSERT BULK on its own pooled
+	// connection. Concurrent bulk loads into a heap take mutually compatible BU
+	// locks, which is exactly the case the TABLOCK `auto` policy turns the hint
+	// ON for (spec 057 step 1).
+	//===------------------------------------------------------------------===//
+
+	//! Upper bound on writers, including the global one. 1 disables the feature.
+	//! Resolved once in BCPCopyInitGlobal; zero inside a transaction, where the
+	//! connection is pinned to the DuckDB transaction and must not be multiplied.
+	idx_t parallel_writer_limit = 1;
+
+	//! Writers handed out so far, the global one included.
+	std::atomic<idx_t> parallel_writers_used{1};
 };
 
 //===----------------------------------------------------------------------===//
@@ -134,7 +189,27 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLCopyLocalState : public LocalFunctionData {
-	// No local buffering needed - writes go directly to BCPWriter
+	//! Last-resort release, mirroring MSSQLCopyGlobalState's contract: a throw
+	//! from the sink skips copy_to_combine, so nothing else would return this
+	//! thread's connection and it would sit in Executing with a bulk-load
+	//! transaction open, holding locks until the pool was torn down (issue #191).
+	//! Touches NO ClientContext — the release targets are captured on the thread
+	//! that acquired the connection.
+	~MSSQLCopyLocalState();
+
+	//! This thread's own bulk-load connection, or null when it shares the
+	//! global writer (in a transaction, at the limit, or acquisition failed).
+	std::shared_ptr<tds::TdsConnection> connection;
+	unique_ptr<mssql::BCPWriter> writer;
+	weak_ptr<tds::ConnectionPool> pool_handle;
+
+	//! Rows this writer has sent since its last flush.
+	idx_t rows_in_batch = 0;
+
+	//! Acquisition is tried ONCE, on the first chunk. A failure is not an error:
+	//! the thread falls back to the shared writer, which is the pre-parallel
+	//! behaviour and always correct.
+	bool init_attempted = false;
 };
 
 //===----------------------------------------------------------------------===//

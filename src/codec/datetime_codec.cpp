@@ -206,10 +206,385 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 	if (target_per_sec >= source_per_sec) {
 		// Upscale (e.g. TIMESTAMP_MS → DATETIME2(7)) — exact.
 		time_value = static_cast<uint64_t>(sub_day_ticks * (target_per_sec / source_per_sec));
-	} else {
-		// Downscale (e.g. TIMESTAMP_NS → DATETIME2(3)) — integer truncation.
-		time_value = static_cast<uint64_t>(sub_day_ticks / (source_per_sec / target_per_sec));
+		return;
 	}
+	// Downscale (e.g. TIMESTAMP_NS → DATETIME2(3)): ROUND, do not truncate.
+	//
+	// SQL Server's own conversion rounds — CAST('12:00:00.1239999' AS
+	// datetime2(3)) is .124, and CAST('12:00:00.9999999' AS datetime2(0)) is
+	// 12:00:01, crossing the second. Truncating gave .123 and 12:00:00, so the
+	// same data loaded by COPY and by INSERT ... CAST disagreed, silently, on
+	// anything with sub-second precision finer than the target.
+	//
+	// It also disagreed with this extension's own decimal path, which narrows by
+	// rounding for exactly this reason. One rule now: a narrowing conversion
+	// lands where the server would have put it.
+	//
+	// `sub_day_ticks` is non-negative (it is the remainder within a day), so a
+	// plain +half is correct and no sign handling is needed.
+	//
+	// Rounding CAN carry past the end of the day: 23:59:59.999999 into scale 3
+	// rounds to 86 400 000 ms, which is 24:00:00 and not a legal time — the
+	// server rejects the row outright ("returned invalid data for column"). SQL
+	// Server rolls the DATE instead: CAST('2024-01-15 23:59:59.9999999' AS
+	// datetime2(3)) is 2024-01-16 00:00:00.000, verified against the server. So
+	// carry into the date rather than emitting an out-of-range time.
+	const int64_t divisor = source_per_sec / target_per_sec;
+	int64_t scaled = (sub_day_ticks + divisor / 2) / divisor;
+	const int64_t target_per_day = target_per_sec * SECONDS_PER_DAY;
+	if (scaled >= target_per_day) {
+		scaled = 0;
+		date_value += 1;
+	}
+	time_value = static_cast<uint64_t>(scaled);
+}
+
+//===----------------------------------------------------------------------===//
+// Columnar scatter (spec 057 step 3)
+//
+// One call per COLUMN per block, with every column-invariant hoisted. What the
+// per-value path was paying for constants:
+//
+//   * `EncodeTime` computed its divisor with a LOOP — `for (i < 6 - scale)
+//     divisor *= 10` — up to six multiplies per value for a number fixed by the
+//     column's scale.
+//   * `GetTimeByteSize(scale)` ran per value.
+//   * `ComputeDatetime2Components` recomputed source_per_sec, source_per_day,
+//     target_per_sec and the scale DIRECTION per value, plus a division.
+//   * every byte of the payload went out through its own push_back.
+//
+// All of those are metadata. Here they are resolved once and the loop writes the
+// payload with two sized memcpys — the time field and the 3-byte date — whose
+// widths are template parameters.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
+void ScatterDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t raw = src[idx];
+		int64_t days;
+		int64_t sub;
+		if (raw >= 0) {
+			days = raw / per_day;
+			sub = raw % per_day;
+		} else {
+			days = (raw - per_day + 1) / per_day;
+			sub = raw - days * per_day;
+		}
+		uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
+		// Narrowing ROUNDS, matching SQL Server, and a round that reaches the end
+		// of the day carries into the date — see ComputeDatetime2Components for
+		// both, verified against the server. `half` and `per_day_target` are
+		// column constants hoisted by the caller, so this costs nothing per value
+		// beyond one compare that is false for every value but the last tick.
+		uint64_t time_value;
+		if (UPSCALE) {
+			time_value = static_cast<uint64_t>(sub * factor);
+		} else {
+			int64_t scaled = (sub + half) / factor;
+			if (scaled >= per_day_target) {
+				scaled = 0;
+				date_value += 1;
+			}
+			time_value = static_cast<uint64_t>(scaled);
+		}
+		out[0] = total_size;
+		std::memcpy(out + 1, &time_value, TIME_BYTES);
+		// Three bytes, not four: a uint32 memcpy would clobber the next column.
+		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
+	}
+}
+
+template <bool UPSCALE, int TIME_BYTES>
+void ScatterDt2Sel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				   int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
+	if (fmt.sel->IsSet()) {
+		ScatterDt2<UPSCALE, TIME_BYTES, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											  total_size);
+	} else {
+		ScatterDt2<UPSCALE, TIME_BYTES, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   total_size);
+	}
+}
+
+// TIME(scale): the scaled tick count since midnight, no date field. DuckDB's
+// dtime_t is microseconds, so the same factor/half/direction logic applies —
+// TIME simply stops after the time field.
+template <int TIME_BYTES, bool UPSCALE, bool HAS_SEL>
+void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+				 int64_t factor, int64_t half, int64_t per_day) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t micros = src[idx];
+		uint64_t ticks =
+			UPSCALE ? static_cast<uint64_t>(micros * factor) : static_cast<uint64_t>((micros + half) / factor);
+		// Rounding at the last tick of the day has nowhere to carry — a TIME has
+		// no date field, which is exactly why its datetime2 and datetimeoffset
+		// peers can carry and this cannot. SQL Server SATURATES rather than
+		// wrapping: CAST('23:59:59.999999' AS time(0)) is 23:59:59, not 24:00:00
+		// and not 00:00:00. Without this the kernel emitted 86400, which is
+		// outside the type's domain in either direction.
+		if (ticks >= static_cast<uint64_t>(per_day)) {
+			ticks = static_cast<uint64_t>(per_day) - 1;
+		}
+		out[0] = TIME_BYTES;
+		std::memcpy(out + 1, &ticks, TIME_BYTES);
+	}
+}
+
+// DATETIMEOFFSET(scale): the datetime2 payload plus a 2-byte signed offset in
+// minutes. DuckDB stores TIMESTAMP_TZ as UTC microseconds and carries no
+// per-value zone, so the offset is always 0 — the same answer the row path
+// gives.
+//
+// Fabric Warehouse has no datetimeoffset type at all, so this arm simply never
+// resolves against such a target. That is a property of the catalog rather than
+// something to special-case here.
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
+void ScatterDtOffset(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+					 int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
+	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const int64_t raw = src[idx];
+		int64_t days;
+		int64_t sub;
+		if (raw >= 0) {
+			days = raw / per_day;
+			sub = raw % per_day;
+		} else {
+			days = (raw - per_day + 1) / per_day;
+			sub = raw - days * per_day;
+		}
+		uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
+		uint64_t time_value;
+		if (UPSCALE) {
+			time_value = static_cast<uint64_t>(sub * factor);
+		} else {
+			int64_t scaled = (sub + half) / factor;
+			if (scaled >= per_day_target) {
+				scaled = 0;
+				date_value += 1;
+			}
+			time_value = static_cast<uint64_t>(scaled);
+		}
+		out[0] = total_size;
+		std::memcpy(out + 1, &time_value, TIME_BYTES);
+		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
+		out[1 + TIME_BYTES + 3] = 0;
+		out[1 + TIME_BYTES + 4] = 0;
+	}
+}
+
+template <bool HAS_SEL>
+void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
+		out[0] = 3;
+		std::memcpy(out + 1, &days, 3);
+	}
+}
+
+// A DATE source into a DATETIME2 target — advertised by IsTypeCompatible and, in
+// the row path, previously read as a timestamp_t out of an int32 vector, which
+// aborted the COPY with `INTERNAL Error: Expected unified vector format of type
+// INT64, but found type INT32`. Issue #153's shape in the temporal family.
+//
+// It needs no scale arithmetic at all: a DATE is midnight, so the time field is
+// zero at every scale and only the day number is computed. Worth a kernel rather
+// than the row path because ONE unresolvable column drops the whole chunk off the
+// columnar path, so a single `date -> datetime2` column would have deoptimised
+// every other column in the table.
+template <int TIMESIZE, bool HAS_SEL>
+void ScatterDateAsDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
+	const SelectionVector *sel = fmt.sel;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
+		out[0] = TIMESIZE + 3;
+		std::memset(out + 1, 0, TIMESIZE);
+		std::memcpy(out + 1 + TIMESIZE, &days, 3);
+	}
+}
+
+}  // namespace
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+	if (col.duckdb_type.id() == LogicalTypeId::DATE) {
+		if (fmt.sel->IsSet()) {
+			ScatterDate<true>(dst, stride, row_begin, rows, fmt);
+		} else {
+			ScatterDate<false>(dst, stride, row_begin, rows, fmt);
+		}
+		return;
+	}
+
+	if (col.duckdb_type.id() == LogicalTypeId::TIME) {
+		// dtime_t is microseconds; the target's scale decides the tick unit.
+		const int64_t target_per_sec = Pow10(col.scale);
+		const bool up = target_per_sec >= 1000000;
+		const int64_t f = up ? target_per_sec / 1000000 : 1000000 / target_per_sec;
+		const int64_t h = up ? 0 : f / 2;
+		const int64_t per_day = target_per_sec * SECONDS_PER_DAY;
+		const uint8_t tb = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+		const bool has_sel = fmt.sel->IsSet();
+		if (tb == 3) {
+			if (up && has_sel) {
+				ScatterTime<3, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (up) {
+				ScatterTime<3, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (has_sel) {
+				ScatterTime<3, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else {
+				ScatterTime<3, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			}
+		} else if (tb == 4) {
+			if (up && has_sel) {
+				ScatterTime<4, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (up) {
+				ScatterTime<4, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (has_sel) {
+				ScatterTime<4, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else {
+				ScatterTime<4, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			}
+		} else {
+			if (up && has_sel) {
+				ScatterTime<5, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (up) {
+				ScatterTime<5, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else if (has_sel) {
+				ScatterTime<5, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			} else {
+				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+			}
+		}
+		return;
+	}
+
+	if (in.GetType().id() == LogicalTypeId::DATE) {
+		// See ScatterDateAsDt2. Handled before TicksPerSecondFor, which has no
+		// answer for a DATE and would throw.
+		const uint8_t tsz = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+		const bool sel_set = fmt.sel->IsSet();
+		if (tsz == 3) {
+			sel_set ? ScatterDateAsDt2<3, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<3, false>(dst, stride, row_begin, rows, fmt);
+		} else if (tsz == 4) {
+			sel_set ? ScatterDateAsDt2<4, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<4, false>(dst, stride, row_begin, rows, fmt);
+		} else {
+			sel_set ? ScatterDateAsDt2<5, true>(dst, stride, row_begin, rows, fmt)
+					: ScatterDateAsDt2<5, false>(dst, stride, row_begin, rows, fmt);
+		}
+		return;
+	}
+
+	const int64_t source_per_sec = TicksPerSecondFor(in.GetType().id());
+	const int64_t per_day = source_per_sec * SECONDS_PER_DAY;
+	const int64_t target_per_sec = Pow10(col.scale);
+	const bool upscale = target_per_sec >= source_per_sec;
+	const int64_t factor = upscale ? target_per_sec / source_per_sec : source_per_sec / target_per_sec;
+	const int64_t half = upscale ? 0 : factor / 2;
+	const int64_t per_day_target = target_per_sec * SECONDS_PER_DAY;
+	const uint8_t time_size = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
+	const uint8_t total = static_cast<uint8_t>(time_size + 3);
+
+	if (col.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+		const uint8_t dto_total = static_cast<uint8_t>(time_size + 3 + 2);
+		const bool has_sel = fmt.sel->IsSet();
+		if (time_size == 3) {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		} else if (time_size == 4) {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		} else {
+			if (upscale && has_sel) {
+				ScatterDtOffset<true, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
+											   dto_total);
+			} else if (upscale) {
+				ScatterDtOffset<true, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else if (has_sel) {
+				ScatterDtOffset<false, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												per_day_target, dto_total);
+			} else {
+				ScatterDtOffset<false, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+												 per_day_target, dto_total);
+			}
+		}
+		return;
+	}
+
+#define MSSQL_DT2_ARM(up, tb) \
+	ScatterDt2Sel<up, tb>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target, total)
+	if (upscale) {
+		switch (time_size) {
+		case 3:
+			MSSQL_DT2_ARM(true, 3);
+			return;
+		case 4:
+			MSSQL_DT2_ARM(true, 4);
+			return;
+		default:
+			MSSQL_DT2_ARM(true, 5);
+			return;
+		}
+	}
+	switch (time_size) {
+	case 3:
+		MSSQL_DT2_ARM(false, 3);
+		return;
+	case 4:
+		MSSQL_DT2_ARM(false, 4);
+		return;
+	default:
+		MSSQL_DT2_ARM(false, 5);
+		return;
+	}
+#undef MSSQL_DT2_ARM
 }
 
 //===----------------------------------------------------------------------===//
@@ -452,6 +827,15 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	case LogicalTypeId::TIMESTAMP_SEC: {
 		uint64_t time_value;
 		uint32_t date_value;
+		if (source_id == LogicalTypeId::DATE) {
+			// A DATE is midnight of its day: no sub-day component to scale, and
+			// nothing for ComputeDatetime2Components to do (it would also throw,
+			// having no ticks-per-second for a DATE).
+			time_value = 0;
+			date_value = static_cast<uint32_t>(FormatValue<date_t>(fmt, row).days + DAYS_FROM_0001_TO_EPOCH);
+			tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
+			return;
+		}
 		ComputeDatetime2Components(FormatValue<timestamp_t>(fmt, row).value, source_id, col.scale, time_value,
 								   date_value);
 		tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);

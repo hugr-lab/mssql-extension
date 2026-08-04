@@ -10,6 +10,18 @@ require-env MSSQL_TEST_SERVER
 statement ok
 ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
 
+# This file counts connections, so it has to pin the number a COPY is allowed to
+# open. Spec 057 step 7 let a successful COPY take one bulk-load session per
+# worker thread, and the counts below — written when there was exactly one —
+# started reporting 2 created where they expect 1 on any machine with more than
+# one thread. That is the feature working, not a leak: `active_connections` stays
+# 0 either way, which is what this file is actually about.
+#
+# One writer restores the shape these assertions describe. Parallel writers have
+# their own coverage in parallel_writers.test.
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
 # Create test data
 statement ok
 CREATE TABLE test_data AS SELECT i AS id, 'row' || i::VARCHAR AS name FROM range(10) t(i);

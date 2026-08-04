@@ -1,5 +1,7 @@
 #include "copy/target_resolver.hpp"
 
+#include "tds/encoding/bcp_row_encoder.hpp"
+
 #include "catalog/mssql_catalog.hpp"
 #include "codec/target_string_type.hpp"
 #include "copy/bcp_config.hpp"
@@ -414,24 +416,49 @@ static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarge
 // TargetResolver::ValidateTarget
 //===----------------------------------------------------------------------===//
 
+// The shape a table we are about to CREATE will have. Spec 060 lets CTAS/COPY
+// build a clustered columnstore or a clustered rowstore index instead of a heap,
+// and TABLOCK's answer differs across all three — so the created shape has to be
+// carried, not assumed to be a heap the way the issue-#45 policy did.
+static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
+	switch (options.kind) {
+	case MSSQLTableKind::COLUMNSTORE:
+		return MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
+	case MSSQLTableKind::CLUSTERED:
+		return MSSQLIndexKind::CLUSTERED;
+	default:
+		return MSSQLIndexKind::HEAP;
+	}
+}
+
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names) {
 	DebugLog(2, "ValidateTarget: checking %s", target.GetFullyQualifiedName().c_str());
 
-	// Build object check SQL
+	// Build object check SQL.
+	//
+	// The third column is the target's physical shape, and it rides on the check
+	// that already had to run — sys.indexes row index_id 0 (heap) or 1 (the
+	// clustered index, rowstore or columnstore), which is what decides TABLOCK
+	// under 'auto' (spec 057 step 1). No extra round trip, the same trick spec 049
+	// used for the catalog's index_kind.
 	string object_sql;
 	if (target.IsTempTable()) {
-		// Temp tables are in tempdb
+		// Temp tables are in tempdb, and so are their indexes.
 		object_sql = StringUtil::Format(
 			"SELECT OBJECT_ID('tempdb..%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('tempdb..%s'), 'IsView') AS is_view",
-			target.GetBracketedTable(), target.GetBracketedTable());
+			"OBJECTPROPERTY(OBJECT_ID('tempdb..%s'), 'IsView') AS is_view, "
+			"(SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
+			" WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1) AS index_type",
+			target.GetBracketedTable(), target.GetBracketedTable(), target.GetBracketedTable());
 	} else {
 		object_sql = StringUtil::Format(
 			"SELECT OBJECT_ID('%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('%s'), 'IsView') AS is_view",
-			target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
+			"OBJECTPROPERTY(OBJECT_ID('%s'), 'IsView') AS is_view, "
+			"(SELECT TOP 1 i.type FROM sys.indexes i "
+			" WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1) AS index_type",
+			target.GetFullyQualifiedName(), target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
 	}
 
 	DebugLog(3, "ValidateTarget SQL: %s", object_sql.c_str());
@@ -444,6 +471,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 	bool table_exists = false;
 	bool is_view = false;
+	MSSQLIndexKind existing_shape = MSSQLIndexKind::HEAP;
 
 	if (!result.rows.empty() && !result.rows[0].empty()) {
 		// Check if OBJECT_ID returned non-NULL
@@ -452,6 +480,11 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			// Check if it's a view
 			if (result.rows[0].size() > 1 && result.rows[0][1] == "1") {
 				is_view = true;
+			}
+			if (result.rows[0].size() > 2) {
+				// A NULL / unparseable type maps to HEAP, which is the conservative
+				// answer for the write path — see MSSQLIndexKindFromSysIndexesType.
+				existing_shape = MSSQLIndexKindFromSysIndexesType(result.rows[0][2]);
 			}
 		}
 	}
@@ -493,6 +526,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 						config.text_type_varchar);
 			// After drop+create, this is effectively a new table
 			config.is_new_table = true;
+			config.target_shape = ShapeOfCreatedTable(config.table_options);
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
@@ -517,6 +551,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 
 			// Appending to existing table, not a new table
 			config.is_new_table = false;
+			config.target_shape = existing_shape;
 		}
 	} else {
 		// Table doesn't exist
@@ -526,6 +561,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 						config.text_type_varchar);
 			// Newly created table
 			config.is_new_table = true;
+			config.target_shape = ShapeOfCreatedTable(config.table_options);
 		} else {
 			throw InvalidInputException(
 				"MSSQL COPY: Target table '%s' does not exist. "
@@ -623,13 +659,26 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "bigint";
 
 	case LogicalTypeId::SMALLINT:
-		return target_lower == "smallint" || target_lower == "int" || target_lower == "bigint";
+		return target_lower == "smallint" || target_lower == "int" || target_lower == "bigint" ||
+			   target_lower == "tinyint";
 
 	case LogicalTypeId::INTEGER:
-		return target_lower == "int" || target_lower == "bigint";
+		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint" ||
+			   target_lower == "tinyint";
 
 	case LogicalTypeId::BIGINT:
+		// Issue #153. Narrowing is allowed because the encoder performs it with a
+		// range check and refuses the row that does not fit — the same answer SQL
+		// Server gives, arrived at before the batch is sent rather than by
+		// aborting it mid-stream. DuckDB defaults integer arithmetic to BIGINT, so
+		// refusing this made appending to an `int` column need REPLACE=true and a
+		// schema change the user did not want.
+		return target_lower == "bigint" || target_lower == "int" || target_lower == "smallint" ||
+			   target_lower == "tinyint";
+
 	case LogicalTypeId::UBIGINT:
+		// Stays exact: UBIGINT travels as DECIMAL(20,0) on the wire, not as an
+		// integer, so the narrowing arms above do not apply to it.
 		return target_lower == "bigint";
 
 	case LogicalTypeId::FLOAT:
@@ -816,7 +865,7 @@ static uint8_t SQLServerTypeToTDSToken(const string &type_name) {
 // Helper: Get max_length for SQL Server type
 //===----------------------------------------------------------------------===//
 
-static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_length, uint8_t precision) {
+static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale) {
 	string type_lower = StringUtil::Lower(type_name);
 
 	if (type_lower == "bit") {
@@ -833,8 +882,21 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 4;
 	} else if (type_lower == "float") {
 		return 8;
-	} else if (type_lower == "decimal" || type_lower == "numeric") {
-		// Calculate based on precision
+	} else if (type_lower == "decimal" || type_lower == "numeric" || type_lower == "money" ||
+			   type_lower == "smallmoney") {
+		// MONEY and SMALLMONEY are here on purpose. They go on the wire as
+		// DECIMALN — SQLServerTypeToTdsType declares TDS_TYPE_DECIMAL for them,
+		// and the encoder writes a decimal, because DuckDB has no MONEY type and
+		// the Money codec family is decode-only. So what is SENT is a decimal of
+		// this precision (9 bytes for money's 19, 9 for smallmoney's 10).
+		//
+		// This used to answer 8 and 4 — the MONEY and SMALLMONEY wire sizes, for
+		// a wire form nothing writes. The row path never noticed, because it
+		// appends and whatever it writes IS the layout; the columnar scatter
+		// reserves from this number first, so the width check refused the column
+		// and ONE money column dropped the WHOLE chunk back to row-major.
+		// Measured on a 44-column table: 394 ms against 190 ms for the same
+		// table without the two money columns.
 		if (precision <= 9) {
 			return 5;
 		} else if (precision <= 19) {
@@ -844,10 +906,6 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		} else {
 			return 17;
 		}
-	} else if (type_lower == "money") {
-		return 8;
-	} else if (type_lower == "smallmoney") {
-		return 4;
 	} else if (type_lower == "varchar" || type_lower == "char") {
 		// For (max), max_length is -1 in sys.columns
 		if (max_length == -1) {
@@ -881,16 +939,30 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 		return 16;
 	} else if (type_lower == "date") {
 		return 3;
-	} else if (type_lower == "time") {
-		return 5;
-	} else if (type_lower == "datetime2") {
-		return 8;
-	} else if (type_lower == "datetime") {
-		return 8;
-	} else if (type_lower == "smalldatetime") {
-		return 4;
-	} else if (type_lower == "datetimeoffset") {
-		return 10;
+	} else if (type_lower == "datetime2" || type_lower == "time" || type_lower == "datetimeoffset") {
+		// sys.columns already reports exactly what we send for these — 6/7/8 for
+		// datetime2(0/3/7), 3/4/5 for time, +2 for datetimeoffset — so take it
+		// instead of overriding it with a constant.
+		//
+		// It used to return 8 / 5 / 10 unconditionally, and nothing on the wire
+		// depended on that: COLMETADATA for DATETIME2N / TIMEN / DATETIMEOFFSETN
+		// carries the SCALE and no length at all (bcp_writer.cpp), and the row
+		// path appends, so whatever it writes is the layout either way.
+		//
+		// The columnar scatter is what made it matter: it reserves 1 + max_length
+		// per value BEFORE writing, so a claim of 8 for a datetime2(0) that emits
+		// 6 leaves every later column in the row two bytes past where the server
+		// reads. The width check added with the temporal kernel caught that and
+		// pushed those columns back to the row path — correct, but it meant only
+		// datetime2(7) (5 + 3 = 8, the single scale where the old constant
+		// happened to be right) ever reached the kernel.
+		return static_cast<uint16_t>(max_length);
+	} else if (type_lower == "datetime" || type_lower == "smalldatetime") {
+		// These two genuinely differ from what is sent: sys.columns reports their
+		// STORAGE size (8 and 4) while they go out in datetime2 form, i.e.
+		// GetTimeByteSize(scale) plus the 3-byte date — 7 and 6. Report what is
+		// sent, which is what the scatter reserves.
+		return static_cast<uint16_t>(tds::encoding::BCPRowEncoder::GetTimeByteSize(scale) + 3);
 	} else if (type_lower == "xml") {
 		return 0xFFFF;	// PLP indicator
 	}
@@ -952,7 +1024,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 
 		// Map SQL Server type to TDS type token
 		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
-		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision);
+		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision, col.scale);
 
 		// Spec 060 / issue #225 (write side): a char column under a UTF-8
 		// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
@@ -973,7 +1045,12 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		if (type_lower == "bit") {
 			col.duckdb_type = LogicalType::BOOLEAN;
 		} else if (type_lower == "tinyint") {
-			col.duckdb_type = LogicalType::TINYINT;
+			// UTINYINT, not TINYINT: SQL Server's tinyint is UNSIGNED 0..255, and
+			// this is the type the CATALOG reports for such a column too. The two
+			// names mean different wire forms here — UTINYINT is the server's one
+			// unsigned byte, TINYINT is a signed DuckDB source that travels as a
+			// smallint — so a column that is genuinely the former must say so.
+			col.duckdb_type = LogicalType::UTINYINT;
 		} else if (type_lower == "smallint") {
 			col.duckdb_type = LogicalType::SMALLINT;
 		} else if (type_lower == "int") {
@@ -1201,9 +1278,14 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	case LogicalTypeId::BOOLEAN:
 		return "bit";
 
-	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
-		return "tinyint";
+		return "tinyint";  // UTINYINT (0-255) fits tinyint exactly
+
+	case LogicalTypeId::TINYINT:
+		// Signed TINYINT (-128..127) does NOT fit: SQL Server's tinyint is
+		// UNSIGNED 0..255. Creating one and copying the byte stored -1 as 255.
+		// Same widening rule USMALLINT and UINTEGER already follow below.
+		return "smallint";
 
 	case LogicalTypeId::SMALLINT:
 		return "smallint";
@@ -1369,9 +1451,11 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	case LogicalTypeId::BOOLEAN:
 		return 1;
 
-	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::UTINYINT:
 		return 1;
+
+	case LogicalTypeId::TINYINT:
+		return 2;  // signed TINYINT maps to smallint (2 bytes)
 
 	case LogicalTypeId::SMALLINT:
 		return 2;

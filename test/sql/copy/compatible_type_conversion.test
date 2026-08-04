@@ -1,0 +1,307 @@
+# name: test/sql/copy/compatible_type_conversion.test
+# description: COPY into an EXISTING table whose column types differ from the source's (issue #153, spec 057 step 3)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# When COPY creates the table, source and target types agree by construction.
+# Appending to a table that ALREADY EXISTS is the case where they do not, and it
+# is the common one: DuckDB computes integer arithmetic in BIGINT, so `SELECT
+# SUM(x)` into an `int` column is a conversion whether anyone asked for one.
+#
+# That case was broken in both directions at once (issue #153):
+#
+#   * every WIDENING the compatibility table advertised — TINYINT -> int,
+#     SMALLINT -> bigint, INTEGER -> bigint — died in the encoder with
+#     `INTERNAL Error: Expected unified vector format of type INT64, but found
+#     type INT32`, because the encode switch took the READ width from the target
+#     and the source is under no obligation to match;
+#   * NARROWING was refused by the validator, so appending to an `int` column
+#     needed REPLACE=true and a schema change the user did not ask for.
+#
+# The table and the encoder disagreed, and only the table was documentation. So
+# this file asserts the two of them against each other: everything
+# IsTypeCompatible advertises must round-trip, and what cannot fit must be
+# refused with an error rather than wrapped into a different number.
+#
+# Silent wraparound is the failure this guards. `2200000000::BIGINT` into an
+# `int` column is -2094967296 if the high bytes are simply dropped, and nothing
+# downstream would ever say so.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cv (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# -----------------------------------------------------------------------------
+# Every advertised integer pair, in ONE table so they share a chunk — a single
+# unresolvable column would drop the whole chunk to the row path and let the
+# columnar kernels pass untested.
+#
+# Both directions of every width, including the pairs that skip two widths
+# (TINYINT -> bigint, BIGINT -> tinyint), since the conversion is resolved from
+# the width pair and 1->8 is not 4->8.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('cv', 'IF OBJECT_ID(''dbo.ConvInt'') IS NOT NULL DROP TABLE dbo.ConvInt;
+CREATE TABLE dbo.ConvInt (
+    w_i8_i16 smallint, w_i8_i32 int, w_i8_i64 bigint,
+    w_i16_i32 int, w_i16_i64 bigint, w_i32_i64 bigint,
+    n_i64_i32 int, n_i64_i16 smallint, n_i64_i8 tinyint,
+    n_i32_i16 smallint, n_i32_i8 tinyint, n_i16_i8 tinyint,
+    keep_i32 int, nl_i64_i32 int
+)');
+
+# Values chosen to sit inside the NARROWEST target each column feeds, so the
+# round-trip is exact — the range check is exercised separately below.
+# nl_i64_i32 carries NULLs, which puts a converting column on the cursor path
+# (the one that cannot use a stride) rather than the strided one.
+statement ok
+CREATE OR REPLACE TABLE cv_src AS
+SELECT
+    (i % 100)::TINYINT   AS w_i8_i16,
+    (i % 100)::TINYINT   AS w_i8_i32,
+    (i % 100)::TINYINT   AS w_i8_i64,
+    (i % 30000)::SMALLINT AS w_i16_i32,
+    (i % 30000)::SMALLINT AS w_i16_i64,
+    (i * 1000)::INTEGER  AS w_i32_i64,
+    (i * 7)::BIGINT      AS n_i64_i32,
+    ((i % 60000) - 30000)::BIGINT AS n_i64_i16,
+    (i % 256)::BIGINT    AS n_i64_i8,
+    ((i % 60000) - 30000)::INTEGER AS n_i32_i16,
+    (i % 256)::INTEGER   AS n_i32_i8,
+    (i % 256)::SMALLINT  AS n_i16_i8,
+    (i * 3)::INTEGER     AS keep_i32,
+    CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 11)::BIGINT END AS nl_i64_i32
+FROM range(5000) t(i);
+
+statement ok
+COPY cv_src TO 'cv.dbo.ConvInt' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM cv.dbo.ConvInt;
+----
+5000
+
+# Byte-for-byte against the source, with the source cast to what the target
+# stores. A wraparound or a dropped high byte fails here; so does a value
+# written at the wrong width, because it would misalign every later column and
+# the server would have rejected the batch outright.
+query I
+SELECT count(*) FROM (
+    SELECT w_i8_i16::BIGINT a, w_i8_i32::BIGINT b, w_i8_i64::BIGINT c,
+           w_i16_i32::BIGINT d, w_i16_i64::BIGINT e, w_i32_i64::BIGINT f,
+           n_i64_i32::BIGINT g, n_i64_i16::BIGINT h, n_i64_i8::BIGINT i,
+           n_i32_i16::BIGINT j, n_i32_i8::BIGINT k, n_i16_i8::BIGINT l,
+           keep_i32::BIGINT m, nl_i64_i32::BIGINT n
+    FROM cv_src
+    EXCEPT ALL
+    SELECT w_i8_i16::BIGINT, w_i8_i32::BIGINT, w_i8_i64::BIGINT,
+           w_i16_i32::BIGINT, w_i16_i64::BIGINT, w_i32_i64::BIGINT,
+           n_i64_i32::BIGINT, n_i64_i16::BIGINT, n_i64_i8::BIGINT,
+           n_i32_i16::BIGINT, n_i32_i8::BIGINT, n_i16_i8::BIGINT,
+           keep_i32::BIGINT, nl_i64_i32::BIGINT
+    FROM cv.dbo.ConvInt
+);
+----
+0
+
+query I
+SELECT count(nl_i64_i32) FROM cv.dbo.ConvInt;
+----
+4285
+
+# -----------------------------------------------------------------------------
+# Out of range is an ERROR, not a wraparound.
+#
+# An integer that does not fit is a different number, and SQL Server refuses the
+# row itself — this just arrives at the same answer before the batch is sent
+# rather than by aborting it mid-stream. Contrast the string path, where the
+# column declares a bound and truncating to it is the documented intent: nothing
+# about `bigint -> int` says the user wanted the low 32 bits.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('cv', 'IF OBJECT_ID(''dbo.ConvRange'') IS NOT NULL DROP TABLE dbo.ConvRange;
+CREATE TABLE dbo.ConvRange (v int)');
+
+statement error
+COPY (SELECT 2200000000::BIGINT AS v) TO 'cv.dbo.ConvRange' (FORMAT bcp, CREATE_TABLE false);
+----
+is out of range for the target column
+
+# The offender is named, not just the fact that one exists — the fast loop only
+# learns THAT a value did not fit, so the message comes from a rescan.
+statement error
+COPY (SELECT * FROM (VALUES (1::BIGINT), (2200000000::BIGINT), (3::BIGINT)) t(v)) TO 'cv.dbo.ConvRange' (FORMAT bcp, CREATE_TABLE false);
+----
+2200000000
+
+# Negative below INT32_MIN, the other end of the same check.
+statement error
+COPY (SELECT -2200000000::BIGINT AS v) TO 'cv.dbo.ConvRange' (FORMAT bcp, CREATE_TABLE false);
+----
+is out of range for the target column
+
+# SQL Server's `tinyint` is UNSIGNED 0..255 while DuckDB's TINYINT is signed, so
+# a CONVERTED value must satisfy the SERVER's range. -1 fits a DuckDB TINYINT
+# and must still be refused here; 255 does not fit one and must be accepted.
+statement ok
+SELECT mssql_exec('cv', 'IF OBJECT_ID(''dbo.ConvTiny'') IS NOT NULL DROP TABLE dbo.ConvTiny;
+CREATE TABLE dbo.ConvTiny (v tinyint)');
+
+statement error
+COPY (SELECT -1::INTEGER AS v) TO 'cv.dbo.ConvTiny' (FORMAT bcp, CREATE_TABLE false);
+----
+is out of range for the target column
+
+statement ok
+COPY (SELECT 255::INTEGER AS v) TO 'cv.dbo.ConvTiny' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT v::INTEGER FROM cv.dbo.ConvTiny;
+----
+255
+
+statement error
+COPY (SELECT 256::INTEGER AS v) TO 'cv.dbo.ConvTiny' (FORMAT bcp, CREATE_TABLE false);
+----
+is out of range for the target column
+
+# A refused batch must leave the connection usable rather than checked out with
+# an INSERT BULK transaction still open (issue #191) — so the next COPY works.
+statement ok
+COPY (SELECT 7::INTEGER AS v) TO 'cv.dbo.ConvTiny' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM cv.dbo.ConvTiny;
+----
+2
+
+# The range check must survive the NULL path too, where the value's position
+# comes from a cursor rather than a stride — a different loop with the same
+# guarantee.
+statement ok
+SELECT mssql_exec('cv', 'IF OBJECT_ID(''dbo.ConvRangeNull'') IS NOT NULL DROP TABLE dbo.ConvRangeNull;
+CREATE TABLE dbo.ConvRangeNull (v int, s nvarchar(20))');
+
+statement error
+COPY (SELECT * FROM (VALUES (1::BIGINT, 'a'), (NULL::BIGINT, 'b'), (2200000000::BIGINT, 'c')) t(v, s)) TO 'cv.dbo.ConvRangeNull' (FORMAT bcp, CREATE_TABLE false);
+----
+is out of range for the target column
+
+# A NULL in a converting column is a NULL, never a range failure — the check
+# must not read the payload of a row that has none.
+statement ok
+COPY (SELECT * FROM (VALUES (1::BIGINT, 'a'), (NULL::BIGINT, 'b')) t(v, s)) TO 'cv.dbo.ConvRangeNull' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), count(v) FROM cv.dbo.ConvRangeNull;
+----
+2	1
+
+# -----------------------------------------------------------------------------
+# The other families that convert into an existing target. Each is a different
+# mechanism — decimal rescales the mantissa, DATE gains a time field, FLOAT
+# changes representation — and all of them are reached only when the target
+# already exists.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('cv', 'IF OBJECT_ID(''dbo.ConvMisc'') IS NOT NULL DROP TABLE dbo.ConvMisc;
+CREATE TABLE dbo.ConvMisc (
+    dec_up decimal(18,6), dec_down decimal(9,2),
+    dt_to_ts datetime2(3), ts_to_dt datetime,
+    f_to_d float, d_to_f real,
+    s_wide nvarchar(100), b_wide varbinary(100)
+)');
+
+statement ok
+CREATE OR REPLACE TABLE cv_misc AS
+SELECT
+    (i / 100.0)::DECIMAL(9,2)                              AS dec_up,
+    (i / 1000000.0)::DECIMAL(18,6)                         AS dec_down,
+    (DATE '2020-01-01' + INTERVAL (i % 500) DAY)::DATE     AS dt_to_ts,
+    (TIMESTAMP '2021-06-01 08:00:00' + INTERVAL (i % 900) SECOND) AS ts_to_dt,
+    ((i % 977) / 7.0)::FLOAT                               AS f_to_d,
+    ((i % 977) / 7.0)::DOUBLE                              AS d_to_f,
+    'v' || i                                               AS s_wide,
+    encode('b' || i)::BLOB                                 AS b_wide
+FROM range(2000) t(i);
+
+statement ok
+COPY cv_misc TO 'cv.dbo.ConvMisc' (FORMAT bcp, CREATE_TABLE false);
+
+# Widening a decimal is exact; the columns that only widen must match to the bit.
+query I
+SELECT count(*) FROM (
+    SELECT dec_up::DECIMAL(18,6) a, dt_to_ts::TIMESTAMP b, ts_to_dt::TIMESTAMP c, s_wide d, b_wide e FROM cv_misc
+    EXCEPT ALL
+    SELECT dec_up::DECIMAL(18,6), dt_to_ts::TIMESTAMP, ts_to_dt::TIMESTAMP, s_wide, b_wide FROM cv.dbo.ConvMisc
+);
+----
+0
+
+# decimal(18,6) -> decimal(9,2) drops digits by design; it must ROUND rather
+# than truncate, and must not move the decimal point (which is what issue #153's
+# other half did — a scale mismatch was waved through unrescaled).
+query I
+SELECT count(*) FROM (
+    SELECT round(dec_down, 2)::DECIMAL(9,2) FROM cv_misc
+    EXCEPT ALL
+    SELECT dec_down::DECIMAL(9,2) FROM cv.dbo.ConvMisc
+);
+----
+0
+
+# FLOAT -> float(53) widens, so it must match to the bit.
+query I
+SELECT count(*) FROM (SELECT f_to_d::DOUBLE FROM cv_misc EXCEPT ALL SELECT f_to_d::DOUBLE FROM cv.dbo.ConvMisc);
+----
+0
+
+# DOUBLE -> real NARROWS, and what it must equal is exactly what DuckDB's own
+# `::FLOAT` produces — `real` is IEEE 754 single precision on both sides, so
+# there is no tolerance to pick and no reason to accept "close enough".
+#
+# This replaces `WHERE abs(d_to_f::DOUBLE - (d_to_f::DOUBLE)) > 0.001`, which
+# subtracted a column from itself: both operands came from the SAME row of the
+# SAME table, so it was 0 for any encoder, correct or not. The join to the
+# source is what makes it a comparison at all.
+query I
+SELECT count(*) FROM cv_misc s JOIN cv.dbo.ConvMisc t ON s.s_wide = t.s_wide
+WHERE t.d_to_f::DOUBLE <> s.d_to_f::FLOAT::DOUBLE;
+----
+0
+
+# ...and the narrowing is real rather than a no-op that the check above would
+# also pass: most of these values cannot be held by a `real`. Without this line a
+# source that happened to be representable would make the assertion vacuous.
+query I
+SELECT count(*) > 1000 FROM cv_misc s JOIN cv.dbo.ConvMisc t ON s.s_wide = t.s_wide
+WHERE t.d_to_f::DOUBLE <> s.d_to_f;
+----
+true
+
+# -----------------------------------------------------------------------------
+# What the table refuses must still be refused. The point of resolving the
+# conversion per column is that compatibility and executability stay one answer,
+# so a pair with no kernel must fail at the validator with a usable message and
+# not somewhere inside the encoder.
+# -----------------------------------------------------------------------------
+statement error
+COPY (SELECT 'not a number' AS dec_up) TO 'cv.dbo.ConvMisc' (FORMAT bcp, CREATE_TABLE false);
+----
+type mismatch
+
+statement ok
+SELECT mssql_exec('cv', 'DROP TABLE dbo.ConvInt; DROP TABLE dbo.ConvRange; DROP TABLE dbo.ConvTiny; DROP TABLE dbo.ConvRangeNull; DROP TABLE dbo.ConvMisc;');
+
+statement ok
+DETACH cv;

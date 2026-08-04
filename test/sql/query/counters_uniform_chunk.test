@@ -1,0 +1,91 @@
+# name: test/sql/query/counters_uniform_chunk.test
+# description: the debug counters must survive a CONSTANT-published column chunk (issue #233)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#   MSSQL_COUNTERS   - counters must be ON, or this file tests nothing
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_COUNTERS
+
+# =============================================================================
+# Issue #233. The stager publishes a column-chunk whose 2048 values are all equal
+# as a CONSTANT vector (spec 056, #221). CountChunkForDebug read it through
+# FlatVector::GetData / FlatVector::Validity, which assert a flat vector, so the
+# counter KILLED the query it was measuring:
+#
+#   INTERNAL Error: Operation requires a flat vector but a non-flat vector was
+#   encountered
+#
+# It reproduced on any scan of a repeated value with MSSQL_DEBUG>=2 — the level
+# the documentation names for debugging — and the partial `rows=2048 chunks=0`
+# dump reported in the issue is this crash seen from the destructor during stack
+# unwinding, not a sampling bug.
+#
+# The fixture has to exceed STANDARD_VECTOR_SIZE and hold ONE repeated value:
+# fewer rows is a single chunk, and varied values are published FLAT and never
+# reach the broken path. 5000 rows is two full chunks plus a remainder, so the
+# constant path runs more than once and the tail is exercised too.
+#
+# `require-env MSSQL_COUNTERS` is not decoration: with the counters off, every
+# assertion here passes against the broken code.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ctr_db (TYPE mssql);
+
+statement ok
+CREATE OR REPLACE TABLE ctr_db.dbo.CounterUniform AS
+SELECT i AS id, 'same' AS s_uniform, 'v' || i AS s_varied
+FROM range(5000) t(i);
+
+# The regression: a uniform string column, read whole. This is the statement that
+# raised INTERNAL Error before the fix.
+query I
+SELECT count(*) FROM ctr_db.dbo.CounterUniform WHERE s_uniform = 'same';
+----
+5000
+
+# ... and its value survives, which the crash never let anyone check.
+query II
+SELECT sum(length(s_uniform)), count(DISTINCT s_uniform) FROM ctr_db.dbo.CounterUniform;
+----
+20000	1
+
+# A uniform column projected alone — no other column to force the chunk flat.
+query I
+SELECT DISTINCT s_uniform FROM ctr_db.dbo.CounterUniform;
+----
+same
+
+# The varied column is the control: it took the FLAT path all along, so it must
+# read identically. A change here means the fix moved something it should not
+# have.
+query II
+SELECT sum(length(s_varied)), count(DISTINCT s_varied) FROM ctr_db.dbo.CounterUniform;
+----
+23890	5000
+
+# A uniform NULL column: all-null chunks are published constant too, and the
+# validity read is the other half of what FlatVector asserted.
+statement ok
+CREATE OR REPLACE TABLE ctr_db.dbo.CounterAllNull AS
+SELECT i AS id, CAST(NULL AS VARCHAR) AS s_null FROM range(5000) t(i);
+
+query II
+SELECT count(*), count(s_null) FROM ctr_db.dbo.CounterAllNull;
+----
+5000	0
+
+statement ok
+DROP TABLE ctr_db.dbo.CounterUniform;
+
+statement ok
+DROP TABLE ctr_db.dbo.CounterAllNull;
+
+statement ok
+DETACH ctr_db;

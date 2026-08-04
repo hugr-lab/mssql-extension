@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "mssql_counters.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_packet.hpp"
@@ -48,8 +49,12 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
 	  rows_read_(0),
-	  counters_enabled_(GetDebugLevel() >= 2),
-	  timing_enabled_(GetDebugLevel() >= 1) {
+	  // MSSQL_COUNTERS, not MSSQL_DEBUG — see mssql_counters.hpp for the two
+	  // measurements that forced the split. MSSQL_DEBUG>=1 still enables them so
+	  // existing scripts keep working, but every phase number taken that way is
+	  // measuring the logging as well as the work.
+	  counters_enabled_(mssql::CountersEnabled()),
+	  timing_enabled_(mssql::CountersEnabled()) {
 	// Convert timeout from seconds to milliseconds
 	// 0 = no timeout (use INT_MAX for effectively infinite wait)
 	// Otherwise, multiply by 1000 to convert to milliseconds
@@ -553,11 +558,28 @@ void MSSQLResultStream::CountChunkForDebug(DataChunk &chunk, idx_t row_count) {
 			counters_.plp_values += values;
 		}
 		if (family == string_family && target->GetType().InternalType() == PhysicalType::VARCHAR) {
-			const string_t *strings = FlatVector::GetData<string_t>(*target);
-			const auto &mask = FlatVector::Validity(*target);
+			// UnifiedVectorFormat, NOT FlatVector: the stager publishes a uniform
+			// column-chunk as a CONSTANT vector (spec 056, #221), and
+			// FlatVector::GetData / FlatVector::Validity assert a flat one. This
+			// counter therefore KILLED the query it was measuring — every scan of a
+			// column whose 2048-row chunk held one repeated value died with
+			// `INTERNAL Error: Operation requires a flat vector`, at MSSQL_DEBUG=2,
+			// the level the docs name for debugging. The partial `rows=2048
+			// chunks=0` dump that issue #233 reports is this crash seen from the
+			// destructor during unwinding, not a sampling bug.
+			//
+			// The count stays LOGICAL — one entry per row, so `str_out / rows`
+			// remains an average value size and stays comparable with wire_in. For
+			// a CONSTANT vector that is not the number of bytes converted (one
+			// value was), which is a representation question and belongs to a
+			// representation counter, not to this one.
+			UnifiedVectorFormat format;
+			target->ToUnifiedFormat(row_count, format);
+			const string_t *strings = UnifiedVectorFormat::GetData<string_t>(format);
 			for (idx_t row = 0; row < row_count; row++) {
-				if (mask.RowIsValid(row)) {
-					counters_.string_bytes_out += strings[row].GetSize();
+				const idx_t idx = format.sel->get_index(row);
+				if (format.validity.RowIsValid(idx)) {
+					counters_.string_bytes_out += strings[idx].GetSize();
 				}
 			}
 		}
@@ -600,6 +622,15 @@ void MSSQLResultStream::CountRowForDebug(DataChunk &chunk, idx_t row_idx, idx_t 
 }
 
 void MSSQLResultStream::PrintDebugCounters() {
+	if (mssql::CountersConfoundedByLogging()) {
+		// Say it where the numbers are read, not only in a comment. Level 1 already
+		// logs a line per chunk from inside the timed fill; level 2 adds one per
+		// token from inside the timed parse. Either way the phase split below is
+		// measuring stderr as well as the work.
+		fprintf(stderr,
+				"[MSSQL COUNTERS] NOTE: MSSQL_DEBUG is set, and its logging runs inside the phases timed "
+				"below — these numbers include it. For timings use MSSQL_COUNTERS=1 with MSSQL_DEBUG unset.\n");
+	}
 	fprintf(stderr,
 			"[MSSQL COUNTERS] stream close: rows=%llu chunks=%llu nulls=%llu wire_in=%lluB str_out=%lluB "
 			"plp=%llu utf16_fallback=%llu fill=%lluus (parse=%lluus read=%lluus process=%lluus)\n",

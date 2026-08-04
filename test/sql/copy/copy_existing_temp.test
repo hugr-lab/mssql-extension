@@ -61,13 +61,17 @@ SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_int');
 ----
 10
 
-# The other half of the same rule: a BIGINT source into that INT column is a narrowing
-# conversion and must be refused, not silently truncated. This is what the original Test 2
-# expected to succeed.
-statement error
+# A BIGINT source into that INT column now succeeds, range-checked per value (issue #153,
+# spec 057) — which is what the original Test 2 expected all along. Narrowing is refused by
+# VALUE, not by type: see copy_type_mismatch.test for the history and for the out-of-range
+# case, and note the rows here are 0..9 and fit an INT trivially.
+statement ok
 COPY local_test TO 'mssql://db/#temp_int' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT COUNT(*) FROM mssql_scan('db', 'SELECT * FROM #temp_int');
 ----
-type mismatch
+20
 
 statement ok
 ROLLBACK;

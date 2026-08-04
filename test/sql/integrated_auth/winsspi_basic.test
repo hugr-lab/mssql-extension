@@ -10,6 +10,8 @@ require-env MSSQL_WINSSPI_TEST
 
 require-env MSSQL_TEST_HOST
 
+require-env MSSQL_TEST_PORT
+
 require-env MSSQL_TEST_DB
 
 #
@@ -17,7 +19,7 @@ require-env MSSQL_TEST_DB
 #         Resolves to authenticator=winsspi on Windows.
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST};Database=${MSSQL_TEST_DB};Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS wsspi (TYPE mssql);
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS wsspi (TYPE mssql);
 
 #
 # Test 2: Basic SELECT through the catalog.
@@ -42,7 +44,7 @@ DETACH wsspi;
 # Test 4: ATTACH via explicit authenticator=winsspi (go-mssqldb form).
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST};Database=${MSSQL_TEST_DB};authenticator=winsspi;Encrypt=yes;TrustServerCertificate=yes' AS wsspi2 (TYPE mssql);
+ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};authenticator=winsspi;Encrypt=yes;TrustServerCertificate=yes' AS wsspi2 (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('wsspi2', 'SELECT @@VERSION AS v');

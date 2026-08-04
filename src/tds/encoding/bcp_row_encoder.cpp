@@ -1,5 +1,11 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 
+#include "codec/datetime_codec.hpp"
+#include "codec/decimal_codec.hpp"
+#include "codec/string_codec.hpp"
+#include "codec/uuid_codec.hpp"
+#include "codec/write_column_ops.hpp"
+
 #include "tds/tds_types.hpp"
 
 #include "codec/binary_codec.hpp"
@@ -18,6 +24,8 @@
 #include "tds/encoding/utf16.hpp"
 
 #include <cstring>
+#include <limits>
+#include <type_traits>
 
 namespace duckdb {
 namespace tds {
@@ -164,6 +172,651 @@ void EncodeRowFromStates(vector<uint8_t> &buffer, idx_t row_idx, const vector<ms
 // Chunk- and Row-Level Encoding
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Columnar scatter for fixed-width, direct-copy columns (spec 057 step 3)
+//
+// The row loop below hoists per-column state (spec 054 W1+W2) but still appends
+// one value at a time through push_back, which costs a capacity check per byte —
+// measured at ~10 ns/value on the string path, more than the UTF-16 conversion
+// itself. This path removes it for the case where it is removable without any
+// conversion at all: every column fixed-width, and its wire bytes a plain
+// little-endian copy of what the vector already stores.
+//
+// The shape is: size the buffer from METADATA and the validity masks (never from
+// a value), resize once, then walk COLUMNS writing through a raw pointer. That
+// is the direction measured in test/cpp/bench_materialize.cpp — 8.14 -> 0.53
+// ns/value at one column, 7.83 -> 0.36 at 44 with blocking.
+//
+// Deliberately narrow for now. DECIMAL, temporal and GUID need transformation
+// kernels and variable-width families need staging; both are later commits, and
+// until they exist those chunks take the row loop unchanged.
+//
+// Little-endian is assumed, as it already is by the byte-wise appenders this
+// replaces and by DecodeFromTds's memcpy. Every platform this ships to is LE.
+//===----------------------------------------------------------------------===//
+
+// Whether a column has a selection vector is a COLUMN constant, and it decides
+// whether the source walk is unit-stride. Left as `sel->get_index(r)` inside the
+// loop it is a branch plus a possible load per value, and — worse — the compiler
+// can no longer see the access as affine, so nothing downstream vectorises.
+//
+// Measured: the microbenchmark walking FlatVector data directly reached 0.88-1.12
+// ns/value on the same shape where production measured 2.24-3.00. That gap is
+// this indirection, and it was large enough to hide the cache effect blocking is
+// meant to fix (spec 057, prototype 2026-08-03).
+template <int W, bool HAS_SEL>
+inline void ScatterDirectTyped(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const uint8_t *src,
+							   const SelectionVector *sel) {
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		*out = W;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		std::memcpy(out + 1, src + idx * W, W);
+	}
+}
+
+template <int W>
+inline void ScatterDirect(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+	const uint8_t *src = reinterpret_cast<const uint8_t *>(fmt.data);
+	if (fmt.sel->IsSet()) {
+		ScatterDirectTyped<W, true>(dst, stride, row_begin, rows, src, fmt.sel);
+	} else {
+		ScatterDirectTyped<W, false>(dst, stride, row_begin, rows, src, nullptr);
+	}
+}
+
+// An integer whose source width differs from the target's (issue #153).
+//
+// The pair is a COLUMN property, so both the read width and the write width are
+// template parameters and the loop carries no type test — that is the whole
+// difference from the row path, which re-dispatched on the source's PhysicalType
+// for every value even though the answer could not change within a column.
+//
+// Two facts keep the check off the widening path, which is the common one:
+//
+//   * a widening cannot fail, and `sizeof` is known at compile time, so the
+//     `if` below is folded away entirely for TINYINT -> int, INTEGER -> bigint
+//     and friends. Those become a sign-extending load and a store;
+//   * a narrowing needs the check, but not a BRANCH. `bad` is an OR reduction
+//     over the block, so the loop still vectorises; only after it does anything
+//     look at the result.
+//
+// Refusing rather than wrapping matches the row path and is the deliberate
+// choice: an integer that does not fit is a different number, and SQL Server
+// refuses the row itself. (Contrast the string path, where the column declares a
+// bound and truncating to it is the stated intent.)
+template <class SRC, class DST, bool HAS_SEL>
+inline bool ScatterConvTyped(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const SRC *src,
+							 const SelectionVector *sel) {
+	constexpr int W = sizeof(DST);
+	bool bad = false;
+	for (idx_t r = 0; r < rows; r++) {
+		uint8_t *out = dst + r * stride;
+		*out = W;
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		const SRC v = src[idx];
+		const DST n = static_cast<DST>(v);
+		// Compile-time on both counts, so a widening and every float pair fold it
+		// away: a float narrowing loses precision by the column's own request and
+		// must not be refused, unlike an integer that becomes a different number.
+		if (std::is_integral<SRC>::value && sizeof(SRC) > sizeof(DST)) {
+			// Round-trip: exact iff the value survived the narrowing. Handles the
+			// unsigned target too — a negative into `tinyint` comes back positive.
+			bad |= (static_cast<SRC>(n) != v);
+		}
+		std::memcpy(out + 1, &n, W);
+	}
+	return !bad;
+}
+
+// Cold. The fast loop knows THAT a value did not fit, not which one, so name it
+// with a rescan — this runs only on the way to throwing.
+template <class SRC>
+void ThrowIntRange(const SRC *src, const SelectionVector *sel, idx_t row_begin, idx_t rows, int64_t lo, int64_t hi,
+				   const mssql::BCPColumnMetadata &col, const ValidityMask *mask) {
+	for (idx_t r = 0; r < rows; r++) {
+		const idx_t idx = sel ? sel->get_index(row_begin + r) : row_begin + r;
+		if (mask && !mask->RowIsValid(idx)) {
+			continue;
+		}
+		const int64_t v = static_cast<int64_t>(src[idx]);
+		if (v < lo || v > hi) {
+			throw InvalidInputException(
+				"MSSQL: integer value %lld in column \"%s\" is out of range for the target column (accepts %lld..%lld)",
+				(long long)v, col.name, (long long)lo, (long long)hi);
+		}
+	}
+	throw InternalException("BCPRowEncoder: integer range check disagreed with the rescan");
+}
+
+// SQL Server's `tinyint` is UNSIGNED 0..255 while DuckDB's TINYINT is signed, so
+// a CONVERTED value must satisfy the server's range — which is why width 1 binds
+// DST to uint8_t below. (An exact-width TINYINT source never reaches this arm; it
+// is a direct copy, and keeps the pre-existing signed passthrough.)
+//
+// The two-level switch is explicit rather than a generic lambda because this tree
+// is compiled as C++11 — see the ODR note in CLAUDE.md. It runs ONCE per column
+// per block, so its cost is not on the value path at all.
+template <class SRC, class DST>
+inline void ScatterConvT(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						 const mssql::BCPColumnMetadata &col) {
+	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
+	const bool has_sel = fmt.sel->IsSet();
+	const bool ok = has_sel ? ScatterConvTyped<SRC, DST, true>(dst, stride, row_begin, rows, src, fmt.sel)
+							: ScatterConvTyped<SRC, DST, false>(dst, stride, row_begin, rows, src, nullptr);
+	if (!ok) {
+		ThrowIntRange<SRC>(src, has_sel ? fmt.sel : nullptr, row_begin, rows, (int64_t)std::numeric_limits<DST>::min(),
+						   (int64_t)std::numeric_limits<DST>::max(), col, nullptr);
+	}
+}
+
+template <class DST>
+inline void ScatterConvDst(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						   const mssql::BCPColumnMetadata &col, uint8_t src_width) {
+	switch (src_width) {
+	case 1:
+		ScatterConvT<int8_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	case 2:
+		ScatterConvT<int16_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	case 4:
+		ScatterConvT<int32_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	default:
+		ScatterConvT<int64_t, DST>(dst, stride, row_begin, rows, fmt, col);
+		return;
+	}
+}
+
+inline void ScatterConv(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+						const mssql::codec::WriteColumnOps &op, const mssql::BCPColumnMetadata &col) {
+	switch (op.wire_width) {
+	case 1:
+		ScatterConvDst<uint8_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	case 2:
+		ScatterConvDst<int16_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	case 4:
+		ScatterConvDst<int32_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	default:
+		ScatterConvDst<int64_t>(dst, stride, row_begin, rows, fmt, col, op.src_width);
+		return;
+	}
+}
+
+// FLOAT <-> DOUBLE. Only two pairs exist, and neither can fail — the range check
+// inside ScatterConvTyped is compiled out for a non-integral source, so this
+// needs no error path at all.
+inline void ScatterConvFloat(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+							 const mssql::codec::WriteColumnOps &op) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (op.wire_width == 4) {
+		const double *src = reinterpret_cast<const double *>(fmt.data);
+		has_sel ? ScatterConvTyped<double, float, true>(dst, stride, row_begin, rows, src, fmt.sel)
+				: ScatterConvTyped<double, float, false>(dst, stride, row_begin, rows, src, nullptr);
+		return;
+	}
+	const float *src = reinterpret_cast<const float *>(fmt.data);
+	has_sel ? ScatterConvTyped<float, double, true>(dst, stride, row_begin, rows, src, fmt.sel)
+			: ScatterConvTyped<float, double, false>(dst, stride, row_begin, rows, src, nullptr);
+}
+
+// The NULL-bearing peer. Same compile-time pair, position from the cursor.
+template <class SRC, class DST, bool HAS_SEL>
+inline bool CursorConvTyped(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const SRC *src,
+							const SelectionVector *sel, const ValidityMask &mask) {
+	constexpr int W = sizeof(DST);
+	bool bad = false;
+	for (idx_t r = r0; r < rend; r++) {
+		uint8_t *out = dst + cursor[r];
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(r) : r;
+		if (!mask.RowIsValid(idx)) {
+			*out = 0x00;
+			cursor[r] += 1;
+			continue;
+		}
+		const SRC v = src[idx];
+		const DST n = static_cast<DST>(v);
+		if (std::is_integral<SRC>::value && sizeof(SRC) > sizeof(DST)) {
+			bad |= (static_cast<SRC>(n) != v);
+		}
+		*out = W;
+		std::memcpy(out + 1, &n, W);
+		cursor[r] += 1 + W;
+	}
+	return !bad;
+}
+
+template <class SRC, class DST>
+inline void CursorConvT(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+						const mssql::BCPColumnMetadata &col) {
+	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
+	const bool has_sel = fmt.sel->IsSet();
+	const bool ok = has_sel ? CursorConvTyped<SRC, DST, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+							: CursorConvTyped<SRC, DST, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+	if (!ok) {
+		ThrowIntRange<SRC>(src, has_sel ? fmt.sel : nullptr, r0, rend - r0, (int64_t)std::numeric_limits<DST>::min(),
+						   (int64_t)std::numeric_limits<DST>::max(), col, &fmt.validity);
+	}
+}
+
+template <class DST>
+inline void CursorConvDst(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+						  const mssql::BCPColumnMetadata &col, uint8_t src_width) {
+	switch (src_width) {
+	case 1:
+		CursorConvT<int8_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	case 2:
+		CursorConvT<int16_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	case 4:
+		CursorConvT<int32_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	default:
+		CursorConvT<int64_t, DST>(dst, cursor, r0, rend, fmt, col);
+		return;
+	}
+}
+
+inline void CursorConv(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+					   const mssql::codec::WriteColumnOps &op, const mssql::BCPColumnMetadata &col) {
+	switch (op.wire_width) {
+	case 1:
+		CursorConvDst<uint8_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	case 2:
+		CursorConvDst<int16_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	case 4:
+		CursorConvDst<int32_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	default:
+		CursorConvDst<int64_t>(dst, cursor, r0, rend, fmt, col, op.src_width);
+		return;
+	}
+}
+
+inline void CursorConvFloat(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+							const mssql::codec::WriteColumnOps &op) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (op.wire_width == 4) {
+		const double *src = reinterpret_cast<const double *>(fmt.data);
+		has_sel ? CursorConvTyped<double, float, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+				: CursorConvTyped<double, float, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+		return;
+	}
+	const float *src = reinterpret_cast<const float *>(fmt.data);
+	has_sel ? CursorConvTyped<float, double, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity)
+			: CursorConvTyped<float, double, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+}
+
+// One block of rows, all columns.
+//
+// PRECONDITION: only callable when the chunk has NO variable-length column.
+// `col_off += 1 + widths[c]` below must track the planner's
+// `stride += 1 + widths[c]`, and the planner adds `stride += 2` for a variable
+// column while setting its `widths[c] = 0` — so with one present the two walks
+// diverge and this one runs past the row. The guard is `all_valid &&
+// !has_variable` at the call site, three hundred lines from the arithmetic it
+// protects, which is why it is written down here as well.
+//
+// Extracted so the blocked and whole-chunk cases are the same code with a
+// different block size.
+inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t rows, idx_t ncols,
+						 const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
+						 const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint32_t> &widths) {
+	size_t col_off = 1;
+	for (idx_t c = 0; c < ncols; c++) {
+		auto &st = states[c];
+		// Dispatch OUTSIDE the row loop: each arm owns its own loop, so the inner
+		// body carries no switch and stays vectorisable.
+		switch (ops[c].arm) {
+		case mssql::codec::ScatterArm::NullOnly:
+			for (idx_t r = 0; r < rows; r++) {
+				bdst[r * stride + col_off] = 0x00;
+			}
+			break;
+		case mssql::codec::ScatterArm::Decimal:
+			// One call per column per block. The loop lives in decimal_codec.cpp
+			// where it specialises on the source width and inlines the per-value
+			// step; a per-value call across a TU boundary would be un-inlinable,
+			// which is the cost spec 058 identified as the one that measures.
+			mssql::codec::decimal::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+													   columns[c]);
+			break;
+		case mssql::codec::ScatterArm::Guid:
+			mssql::codec::uuid::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+													columns[c]);
+			break;
+		case mssql::codec::ScatterArm::Datetime:
+			mssql::codec::datetime::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+														columns[c]);
+			break;
+		// Width is a column constant too, so it belongs in the type rather than
+		// in a variable the loop re-reads.
+		case mssql::codec::ScatterArm::DirectCopy1:
+			ScatterDirect<1>(bdst + col_off, stride, row_begin, rows, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy2:
+			ScatterDirect<2>(bdst + col_off, stride, row_begin, rows, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy4:
+			ScatterDirect<4>(bdst + col_off, stride, row_begin, rows, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy8:
+			ScatterDirect<8>(bdst + col_off, stride, row_begin, rows, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::IntConvert:
+			ScatterConv(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c], columns[c]);
+			break;
+		case mssql::codec::ScatterArm::FloatConvert:
+			ScatterConvFloat(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c]);
+			break;
+		default:
+			throw InternalException("BCPRowEncoder: unreachable scatter arm");
+		}
+		col_off += 1 + widths[c];
+	}
+}
+
+// One block of rows on the NULL-bearing path. Same four properties as
+// ScatterBlock — arm dispatched outside the row loop, width in the type,
+// selection test hoisted — with the position coming from the cursor instead of a
+// stride, and the cursor advanced by what was actually written.
+template <int W, bool HAS_SEL>
+inline void CursorDirectTyped(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const uint8_t *src,
+							  const SelectionVector *sel, const ValidityMask &mask) {
+	for (idx_t r = r0; r < rend; r++) {
+		uint8_t *out = dst + cursor[r];
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(r) : r;
+		if (!mask.RowIsValid(idx)) {
+			*out = 0x00;
+			cursor[r] += 1;
+			continue;
+		}
+		*out = W;
+		std::memcpy(out + 1, src + idx * W, W);
+		cursor[r] += 1 + W;
+	}
+}
+
+template <int W>
+inline void CursorDirect(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt) {
+	const uint8_t *src = reinterpret_cast<const uint8_t *>(fmt.data);
+	if (fmt.sel->IsSet()) {
+		CursorDirectTyped<W, true>(dst, cursor, r0, rend, src, fmt.sel, fmt.validity);
+	} else {
+		CursorDirectTyped<W, false>(dst, cursor, r0, rend, src, nullptr, fmt.validity);
+	}
+}
+
+inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, idx_t ncols,
+							   const vector<mssql::BCPColumnMetadata> &columns, vector<ColumnEncodeState> &states,
+							   const vector<mssql::codec::WriteColumnOps> &ops, const vector<uint32_t> &widths,
+							   const vector<mssql::codec::string::StringColumnPlan> &plans) {
+	for (idx_t c = 0; c < ncols; c++) {
+		auto &st = states[c];
+		const uint32_t w = widths[c];
+		if (ops[c].IsVariable()) {
+			mssql::codec::string::ScatterVarBlock(dst, cursor, r0, rend, st.fmt, columns[c], plans[c]);
+			continue;
+		}
+		if (!st.vec) {
+			for (idx_t r = r0; r < rend; r++) {
+				dst[cursor[r]] = 0x00;
+				cursor[r] += 1;
+			}
+			continue;
+		}
+		// An all-valid column inside a NULL-bearing chunk still writes every
+		// payload — it just cannot use a stride, because OTHER columns moved the
+		// rows apart. Its inner loop carries no validity test at all.
+		const bool col_all_valid = st.fmt.validity.AllValid();
+		switch (ops[c].arm) {
+		case mssql::codec::ScatterArm::DirectCopy1:
+			CursorDirect<1>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy2:
+			CursorDirect<2>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy4:
+			CursorDirect<4>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::DirectCopy8:
+			CursorDirect<8>(dst, cursor, r0, rend, st.fmt);
+			break;
+		case mssql::codec::ScatterArm::IntConvert:
+			CursorConv(dst, cursor, r0, rend, st.fmt, ops[c], columns[c]);
+			break;
+		case mssql::codec::ScatterArm::FloatConvert:
+			CursorConvFloat(dst, cursor, r0, rend, st.fmt, ops[c]);
+			break;
+		case mssql::codec::ScatterArm::Decimal:
+		case mssql::codec::ScatterArm::Guid:
+		case mssql::codec::ScatterArm::Datetime: {
+			const auto arm = ops[c].arm;
+			for (idx_t r = r0; r < rend; r++) {
+				uint8_t *out = dst + cursor[r];
+				const idx_t idx = st.fmt.sel->get_index(r);
+				if (!col_all_valid && !st.fmt.validity.RowIsValid(idx)) {
+					*out = 0x00;
+					cursor[r] += 1;
+					continue;
+				}
+				if (arm == mssql::codec::ScatterArm::Decimal) {
+					mssql::codec::decimal::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				} else if (arm == mssql::codec::ScatterArm::Guid) {
+					mssql::codec::uuid::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				} else {
+					mssql::codec::datetime::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
+				}
+				cursor[r] += 1 + w;
+			}
+			break;
+		}
+		default:
+			throw InternalException("BCPRowEncoder: unreachable cursor arm");
+		}
+	}
+}
+
+//! Encode the whole chunk as a columnar scatter. Returns false if any column
+//! lacks a scatter arm, having written nothing.
+bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vector<mssql::BCPColumnMetadata> &columns,
+							vector<ColumnEncodeState> &states) {
+	const idx_t ncols = columns.size();
+	if (ncols == 0) {
+		return false;
+	}
+
+	vector<mssql::codec::WriteColumnOps> ops(ncols);
+	vector<uint32_t> widths(ncols);
+	// Planned per variable column, so the wire can be sized before a byte is
+	// written. Indexed by column; empty for fixed-width ones.
+	vector<mssql::codec::string::StringColumnPlan> plans(ncols);
+	size_t stride = 1;	// the 0xD1 ROW token
+	bool all_valid = true;
+	bool has_variable = false;
+	for (idx_t c = 0; c < ncols; c++) {
+		// A missing source column is NULL every row: no payload, so it scatters
+		// for free. Everything else answers to ResolveWriteColumnOps, which is
+		// the single place that decides what this path can do.
+		if (!states[c].vec) {
+			ops[c].arm = mssql::codec::ScatterArm::NullOnly;
+			widths[c] = 0;
+			stride += 1;
+			continue;
+		}
+		ops[c] = mssql::codec::ResolveWriteColumnOps(states[c].vec->GetType(), columns[c]);
+		if (!ops[c].CanScatter()) {
+			return false;
+		}
+		if (ops[c].IsVariable()) {
+			// Measure it now: PlanColumn walks the column once and keeps the
+			// per-value payload length that the per-value encoder used to compute
+			// and throw away. A column it cannot plan (invalid UTF-8, an
+			// unhandled wire form) drops the whole chunk to the row path, which
+			// reproduces the legacy bytes exactly.
+			if (!mssql::codec::string::PlanColumn(*states[c].vec, states[c].fmt, 0, row_count, columns[c], plans[c])) {
+				return false;
+			}
+			has_variable = true;
+			widths[c] = 0;
+			stride += 2;  // the length prefix; the payload is per row
+			continue;
+		}
+		// uint32_t, matching wire_width, so this cannot narrow. It was a uint8_t
+		// cast, safe only by coincidence of the current arm set — every fixed arm
+		// today is <= 17 bytes, and the several `wire_width = target.max_length`
+		// assignments that could exceed 255 all land on arms CanScatter() already
+		// rejected. Add one strided fixed-width arm for binary(n)/char(n) — a
+		// natural next step, and max_length is already assigned in those branches
+		// — and the cast truncates silently, stride comes out short, and the
+		// kernel writes the full width into it. Widening costs nothing: widths is
+		// indexed per column, not per value.
+		widths[c] = ops[c].wire_width;
+		stride += 1 + widths[c];
+		if (states[c].vec && !states[c].fmt.validity.AllValid()) {
+			all_valid = false;
+		}
+	}
+
+	// Sizing reads metadata and the masks only — never a value. A NULL keeps its
+	// 1-byte marker and drops its payload, so it can only make a row shorter.
+	const size_t base = buffer.size();
+	vector<size_t> row_at;
+	size_t total;
+	if (all_valid && !has_variable) {
+		total = row_count * stride;
+	} else {
+		// Per COLUMN, not per row x column. The old shape ran `rows * ncols`
+		// iterations with a validity lookup and a branch in every one; this runs
+		// one pass per column that HAS a NULL, and a column with none contributes
+		// a constant that is folded into the base. Same answer, and the work is
+		// proportional to the number of nullable columns rather than to all of
+		// them.
+		row_at.resize(row_count);
+		size_t base_row = 1;  // the 0xD1 token
+		for (idx_t c = 0; c < ncols; c++) {
+			// A variable column contributes NOTHING to the constant part: its plan
+			// carries the total wire bytes per row, framing included, and those
+			// are added below. Splitting framing between here and there is what
+			// produced a one-byte-short row the first time, visible only as the
+			// server reporting "premature end-of-message".
+			base_row += ops[c].IsVariable() ? 0 : (1 + widths[c]);
+		}
+		for (idx_t r = 0; r < row_count; r++) {
+			row_at[r] = base_row;
+		}
+		for (idx_t c = 0; c < ncols; c++) {
+			auto &st = states[c];
+			if (ops[c].IsVariable()) {
+				// Framing included — one number per row, whatever the wire form.
+				const auto &wire = plans[c].wire;
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] += wire[r];
+				}
+				continue;
+			}
+			if (!st.vec) {
+				// Absent column: NULL on every row, so its payload never appears.
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= widths[c];
+				}
+				continue;
+			}
+			if (st.fmt.validity.AllValid()) {
+				continue;  // contributes its full width to every row already
+			}
+			const uint32_t w = widths[c];
+			if (st.fmt.sel->IsSet()) {
+				const auto *sel = st.fmt.sel;
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= st.fmt.validity.RowIsValid(sel->get_index_unsafe(r)) ? 0 : w;
+				}
+			} else {
+				for (idx_t r = 0; r < row_count; r++) {
+					row_at[r] -= st.fmt.validity.RowIsValid(r) ? 0 : w;
+				}
+			}
+		}
+		// Prefix-sum the per-row sizes into offsets, in place.
+		size_t acc = 0;
+		for (idx_t r = 0; r < row_count; r++) {
+			const size_t sz = row_at[r];
+			row_at[r] = acc;
+			acc += sz;
+		}
+		total = acc;
+	}
+
+	buffer.resize(base + total);
+	uint8_t *const dst = buffer.data() + base;
+
+	// One variable-width column makes every row a different length, so the
+	// constant-stride path is unavailable for EVERY column in the chunk — NULLs
+	// or not.
+	if (all_valid && !has_variable) {
+		// Rows in BLOCKS; within a block, walk the columns. A full per-column pass
+		// over a wide row touches a distinct cache line per store and then walks
+		// the same lines again for the next column: measured 0.40 ns/value at 4
+		// columns but 1.12 at 16 and 0.88 at 44, while blocked stays 0.38-0.42
+		// flat across every width (spec 057 prototype, 2026-08-03). The block's
+		// slice of the wire and the columns' sources stay resident together.
+		//
+		// Block size is a plateau from 32 to 256; 128 sits in the middle of it.
+		// Row-major assembly was measured WORSE (1.14-1.29 at width) — it makes
+		// the write pattern ideal and the read pattern terrible, so the cache
+		// problem moves rather than disappearing. Do not retry it.
+		constexpr idx_t SCATTER_BLOCK_ROWS = 128;
+		for (idx_t r0 = 0; r0 < row_count; r0 += SCATTER_BLOCK_ROWS) {
+			const idx_t rend = MinValue<idx_t>(r0 + SCATTER_BLOCK_ROWS, row_count);
+			const idx_t block_rows = rend - r0;
+			uint8_t *const bdst = dst + r0 * stride;
+			for (idx_t r = 0; r < block_rows; r++) {
+				bdst[r * stride] = BCP_TOKEN_ROW;
+			}
+			ScatterBlock(bdst, stride, r0, block_rows, ncols, columns, states, ops, widths);
+		}
+		return true;
+	}
+
+	// NULL-bearing rows are not a constant stride, so a per-row cursor carries the
+	// position. That much is inherent: a NULL writes a 1-byte marker instead of
+	// 1+W, the wire is packed, and there is no formula for where row r starts.
+	//
+	// What is NOT inherent is that this path used to be slow. Measured across NULL
+	// density 0/1/10/30/50/70/90/100%, it cost 6.5-7.5 ns/value at EVERY non-zero
+	// density against 1.49 at zero — a 4.4x cliff at the first NULL and then flat.
+	// Density-shaped explanations are therefore all wrong (branch misprediction
+	// would peak at 50%; at 100% we write nine times fewer bytes and it still cost
+	// four times more). The cost was simply that this branch had received none of
+	// the four things the all-valid branch had: blocking, the width in the type,
+	// the selection test hoisted, and the arm dispatched outside the row loop.
+	//
+	// Going row-major instead would remove the cursor entirely, and was measured:
+	// even blocked it is 1.6-2.7x WORSE, because a row touches one cache line per
+	// column and uses an eighth of each. The cursor is the price of the right read
+	// order, and it is one L1 load/add/store per value.
+	for (idx_t r = 0; r < row_count; r++) {
+		dst[row_at[r]] = BCP_TOKEN_ROW;
+	}
+	vector<size_t> cursor(row_count);
+	for (idx_t r = 0; r < row_count; r++) {
+		cursor[r] = row_at[r] + 1;
+	}
+	constexpr idx_t CURSOR_BLOCK_ROWS = 128;
+	for (idx_t r0 = 0; r0 < row_count; r0 += CURSOR_BLOCK_ROWS) {
+		const idx_t rend = MinValue<idx_t>(r0 + CURSOR_BLOCK_ROWS, row_count);
+		ScatterBlockCursor(dst, cursor.data(), r0, rend, ncols, columns, states, ops, widths, plans);
+	}
+	return true;
+}
+
 void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 								const vector<mssql::BCPColumnMetadata> &columns,
 								const vector<int32_t> *column_mapping) {
@@ -199,6 +852,9 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
+	if (TryEncodeChunkColumnar(buffer, row_count, columns, states)) {
+		return;
+	}
 	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
 		buffer.push_back(BCP_TOKEN_ROW);
 		EncodeRowFromStates(buffer, row_idx, columns, states);
@@ -474,12 +1130,29 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 	// Convert microseconds to the appropriate scale
 	int64_t scaled_value;
 	if (scale <= 6) {
-		// Divide for scales 0-6
+		// ROUND, and saturate at the last tick of the day — not truncate.
+		//
+		// This truncated, while the columnar kernel rounds, so the same TIME value
+		// loaded as .123 or .124 depending on whether some OTHER column in the
+		// chunk happened to force the row path. Spec 057 taught datetime2 to round
+		// (rounding is what SQL Server does: CAST('12:34:56.600' AS time(0)) is
+		// 12:34:57) and this peer was missed.
+		//
+		// The saturation is the half a TIME cannot solve by carrying, having no
+		// date field: CAST('23:59:59.999999' AS time(0)) is 23:59:59 on the
+		// server, so rounding must stop at per_day - 1 rather than reach 86400.
 		int64_t divisor = 1;
 		for (int i = 0; i < 6 - scale; i++) {
 			divisor *= 10;
 		}
-		scaled_value = value.micros / divisor;
+		scaled_value = (value.micros + divisor / 2) / divisor;
+		int64_t per_day = Interval::SECS_PER_DAY;
+		for (int i = 0; i < scale; i++) {
+			per_day *= 10;
+		}
+		if (scaled_value >= per_day) {
+			scaled_value = per_day - 1;
+		}
 	} else {
 		// Multiply for scale 7 (100ns units)
 		scaled_value = value.micros * 10;

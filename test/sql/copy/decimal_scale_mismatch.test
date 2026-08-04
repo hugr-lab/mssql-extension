@@ -1,0 +1,113 @@
+# name: test/sql/copy/decimal_scale_mismatch.test
+# description: COPY into an existing decimal column rescales the mantissa instead of moving the point
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# The mantissa a DuckDB DECIMAL vector holds is expressed at the SOURCE type's
+# scale; BCP COLMETADATA declares the TARGET column's. Until spec 057 nothing
+# reconciled the two, so the mantissa went out unchanged and SQL Server read it
+# at the target's scale — 1.5 into a decimal(18,2) column arrived as 0.15. Valid
+# data on both sides, no error anywhere, and simply the wrong number.
+#
+# Only COPY into an EXISTING table could reach it: CTAS and CREATE_TABLE derive
+# the column from the source type, so the scales agree by construction. That is
+# why it survived, and why every case here uses a hand-declared target.
+#
+# Narrowing rounds half AWAY FROM ZERO, which is what SQL Server's own
+# decimal-to-decimal conversion does — verified against the server rather than
+# assumed, so a row lands exactly as it would had the user written the CAST.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ds (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('ds', 'IF OBJECT_ID(''dbo.ScaleWiden'') IS NOT NULL DROP TABLE dbo.ScaleWiden;
+CREATE TABLE dbo.ScaleWiden (a decimal(18,2), b decimal(18,4), c decimal(28,6));');
+
+# Widening the scale is exact — the mantissa gains zeros, no value changes.
+statement ok
+CREATE OR REPLACE TABLE src_widen AS
+SELECT 1.5::DECIMAL(21,1) AS a, 3.5::DECIMAL(21,1) AS b, (-12.75)::DECIMAL(21,2) AS c;
+
+statement ok
+COPY src_widen TO 'ds.dbo.ScaleWiden' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT a, b, c FROM ds.dbo.ScaleWiden;
+----
+1.50	3.5000	-12.750000
+
+# -----------------------------------------------------------------------------
+# Narrowing. Every expectation below is what SQL Server returns for the same
+# CAST — checked on a live server, including the exact halves and both signs.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ds', 'IF OBJECT_ID(''dbo.ScaleNarrow'') IS NOT NULL DROP TABLE dbo.ScaleNarrow;
+CREATE TABLE dbo.ScaleNarrow (a decimal(18,0), b decimal(18,0), c decimal(18,0), d decimal(18,0), e decimal(18,0), f decimal(18,1));');
+
+statement ok
+CREATE OR REPLACE TABLE src_narrow AS
+SELECT 2.55::DECIMAL(20,2) AS a, (-2.55)::DECIMAL(20,2) AS b,
+       2.5::DECIMAL(20,1) AS c, (-2.5)::DECIMAL(20,1) AS d,
+       2.4::DECIMAL(20,1) AS e, (-1.25)::DECIMAL(20,2) AS f;
+
+statement ok
+COPY src_narrow TO 'ds.dbo.ScaleNarrow' (FORMAT bcp, CREATE_TABLE false);
+
+query IIIIII
+SELECT a, b, c, d, e, f FROM ds.dbo.ScaleNarrow;
+----
+3	-3	3	-3	2	-1.3
+
+# -----------------------------------------------------------------------------
+# Equal scales must be untouched — this is the overwhelmingly common case and
+# the one a rescale could regress.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ds', 'IF OBJECT_ID(''dbo.ScaleSame'') IS NOT NULL DROP TABLE dbo.ScaleSame;
+CREATE TABLE dbo.ScaleSame (v decimal(18,3));');
+
+statement ok
+CREATE OR REPLACE TABLE src_same AS
+SELECT v::DECIMAL(18,3) AS v FROM (VALUES (1.234), (-9.876), (0.001), (0.000)) t(v);
+
+statement ok
+COPY src_same TO 'ds.dbo.ScaleSame' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), sum(v) FROM ds.dbo.ScaleSame;
+----
+4	-8.641
+
+# -----------------------------------------------------------------------------
+# A value that cannot fit the target once rescaled must be refused client-side,
+# not sent for the server to abort the batch on mid-stream.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('ds', 'IF OBJECT_ID(''dbo.ScaleOverflow'') IS NOT NULL DROP TABLE dbo.ScaleOverflow;
+CREATE TABLE dbo.ScaleOverflow (v decimal(5,4));');
+
+statement ok
+CREATE OR REPLACE TABLE src_overflow AS SELECT 12345.6::DECIMAL(20,1) AS v;
+
+statement error
+COPY src_overflow TO 'ds.dbo.ScaleOverflow' (FORMAT bcp, CREATE_TABLE false);
+----
+DECIMAL
+
+statement ok
+SELECT mssql_exec('ds', 'DROP TABLE dbo.ScaleWiden; DROP TABLE dbo.ScaleNarrow; DROP TABLE dbo.ScaleSame; DROP TABLE dbo.ScaleOverflow;');
+
+statement ok
+DETACH ds;

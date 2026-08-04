@@ -57,6 +57,20 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).
+//! Scatter a whole COLUMN at a constant row stride — one call per column, the
+//! write-side peer of the read path's DecodeChunkFromStaging. `dst` points at
+//! row 0's LENGTH byte; each row's value lands `stride` bytes after the last.
+//! Only for all-valid columns: a NULL changes the row's width, which is what
+//! makes the stride constant in the first place.
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col);
+
+//! Write the PAYLOAD (no length prefix) at a pointer. Spec 057 step 3: the
+//! appending overload below is derived from this, so the row path and the
+//! columnar scatter share one implementation.
+void ScatterToBcp(uint8_t *out, Vector &in, const UnifiedVectorFormat &fmt, idx_t row,
+				  const mssql::BCPColumnMetadata &col);
+
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
 				 duckdb::vector<uint8_t> &buf);
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);

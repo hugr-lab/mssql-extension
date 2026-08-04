@@ -2,6 +2,8 @@
 
 How the extension is structured inside the process. Five layers, each owned by the one above it, with the DuckDB `DatabaseInstance` at the top and a TCP socket at the bottom.
 
+Layers 1–5 describe **reading**. The write path (`COPY … TO`, `CREATE TABLE … AS SELECT`) reuses layers 1, 2 and 5 but owns connections and threads differently enough to need [its own section](#the-write-path-spec-057) — read that before changing anything in it, because the read-path picture is actively misleading about connection ownership there.
+
 ## Primer (user perspective)
 
 Each `ATTACH '…' AS db (TYPE mssql)` creates exactly one `MSSQLCatalog` inside DuckDB. That catalog owns **everything** related to that connection: its own connection pool, its own metadata cache, its own statistics, its own per-catalog result-stream registry. Two ATTACHes against the same DSN under different aliases get fully independent state — there is no process-wide singleton. `DETACH` runs `~MSSQLCatalog` deterministically via RAII and tears the whole stack down.
@@ -38,10 +40,20 @@ flowchart TD
         tls[TlsTdsContext]
         auth["AuthenticationStrategy /<br/>IAuthenticator"]
     end
+    subgraph LW["Write path (spec 057) — see its own section"]
+        sinks["COPY / CTAS sinks<br/>ParallelSink, N writers"]
+        ops["ResolveWriteColumnOps<br/>one ScatterArm per column"]
+        bcp["BCPWriter<br/>frames + streaming drain"]
+    end
     L3 --> L4
     L3 --> L2
     L3 --> L5
     L2 --> L1
+    sinks --> ops
+    ops --> bcp
+    ops -.reuses.-> codec
+    sinks -.one pooled connection<br/>per writer.-> pool
+    bcp --> conn
     cat --- pool
     cat --- meta
     cat --- stats
@@ -428,6 +440,129 @@ sequenceDiagram
 
 ---
 
+## The write path (spec 057)
+
+Everything above describes reading. The write path — `COPY … TO`, `CREATE TABLE … AS SELECT`
+— reuses layers 1, 2 and 5 but owns connections and threads differently enough that
+the read-path picture is actively misleading about it.
+
+Both operators are DuckDB **sinks with `ParallelSink() == true`**, so DuckDB drives
+them from every worker thread at once.
+
+### Who owns which connection
+
+This is the part that has changed most, and the two operators deliberately differ:
+
+| | connection for the DDL | connection(s) for the rows | inside an explicit transaction |
+|---|---|---|---|
+| `COPY … TO` | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
+| CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers |
+
+CTAS is outside the transaction on purpose. One connection cannot stream a result
+set and receive a bulk load at the same time, so pinning it made
+`BEGIN; CREATE TABLE t AS SELECT * FROM <the same catalog>` fail against itself, and
+capped every in-transaction CTAS at one writer. The undo for a table the statement
+CREATED is dropping it, which is complete and needs no shared transaction — that is
+what `mssql_ctas_drop_on_failure` does. The consequence, which is asserted rather
+than tolerated: `ROLLBACK` undoes neither a CTAS's table nor its rows.
+
+### Writers
+
+```mermaid
+flowchart TD
+    subgraph GS["GlobalSinkState (one per statement)"]
+        ddl["DDL phase<br/>CREATE TABLE — pool conn, autocommits"]
+        gw["global BCPWriter<br/>+ its own connection + INSERT BULK"]
+        lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8"]
+        failed["load_failed (atomic)"]
+    end
+    subgraph T1["worker thread 1"]
+        lw1["local BCPWriter<br/>own conn, own INSERT BULK"]
+    end
+    subgraph T2["worker thread 2"]
+        lw2["local BCPWriter<br/>own conn, own INSERT BULK"]
+    end
+    subgraph T3["worker thread N"]
+        shared["no slot left →<br/>shares the global writer<br/>under gstate.mutex"]
+    end
+    ddl --> gw
+    lim -.claimed once per thread<br/>on its first chunk.-> lw1
+    lim -.-> lw2
+    lim -.exhausted.-> shared
+    lw1 --> srv[(SQL Server)]
+    lw2 --> srv
+    gw --> srv
+    shared --> gw
+```
+
+A writer is claimed by a **thread**, on its first chunk — not allocated up front —
+because `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text
+and resolved columns are only settled by the DDL phase. Failing to get one is **not**
+an error: the thread falls back to the shared writer, which is always correct. A load
+must not fail because it could not go faster.
+
+The writer count is therefore a **ceiling, not a floor**. With one DuckDB thread
+driving the sink, `mssql_copy_parallel_writers = 8` still yields one writer — which is
+why the parallel tests pin `SET threads`.
+
+### Encoding: one resolution per column, one decision per chunk
+
+`codec::ResolveWriteColumnOps(source, target)` maps each column to a `ScatterArm`
+once, from the pair of types — never per value. The arms are the columnar kernels
+(`DirectCopy1/2/4/8`, `IntConvert`, `FloatConvert`, `Decimal`, `Datetime`, `Guid`,
+`VarString`) plus `RowFallback`.
+
+**If any one column resolves to `RowFallback`, the whole chunk goes row-major** —
+every other column with it. That is the single fact to keep in mind when touching
+this layer: a column type nobody thought about does not cost its own column, it costs
+the table. It is why `UTINYINT` mattered (SQL Server `tinyint` reaches the catalog as
+UTINYINT, so one such column sent whole tables row-major) and why a HUGEINT column is
+the standard way a test forces the row path.
+
+The two paths must produce **identical bytes**. They are separate implementations, so
+that is a claim tests have to hold up rather than something the structure guarantees —
+`time_rounding_both_paths.test`, `smalldatetime_write.test` and
+`string_bound_truncation.test` each load the same values down both and require them to
+agree.
+
+### Failure and cleanup
+
+```mermaid
+sequenceDiagram
+    participant T as failing writer thread
+    participant G as GlobalSinkState
+    participant O as other writers
+    participant S as SQL Server
+
+    T->>T: close own stream, release own connection FIRST
+    Note over T: the DROP below takes a schema lock on<br/>the table this connection is still loading into
+    T->>G: load_failed.exchange(true)
+    alt first to fail AND mssql_ctas_drop_on_failure
+        T->>S: SET LOCK_TIMEOUT 5000; DROP TABLE …
+    end
+    O->>G: read load_failed at the top of Sink
+    alt drop_on_failure = true
+        O->>O: give up — rows in flight are wasted work<br/>holding a session against the table being dropped
+    else false (default)
+        O->>O: keep going — "keep what landed"
+    end
+```
+
+Two lifetime rules that are easy to get wrong:
+
+- a connection abandoned **mid-bulk-load is destroyed, not pooled**. Closing the
+  socket is what rolls the `INSERT BULK` back server-side and drops its locks, so
+  reusing it would leave a half-written load committed. This is why `connections_created`
+  climbs by the writer count after each failed load while `active_connections` stays 0 —
+  churn by design, not a leak;
+- a CTAS killed from **outside** the sink (a cast in the `SELECT`, a read error, a
+  cancelled query) never reaches either catch block, so the cleanup also hangs off
+  `~CTASExecutionState`. It runs without a `ClientContext` — through `pool_handle`,
+  not `catalog`, which may already be gone (issue #178) — guarded by `table_created`
+  and `cleanup_attempted`.
+
+---
+
 ## Per-spec map
 
 | Spec | What it added at the data-model level |
@@ -439,6 +574,7 @@ sequenceDiagram
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 | 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
+| 057 | The write path above. `codec::ResolveWriteColumnOps` resolves a `ScatterArm` per column so the encode loop carries no type test, and one `RowFallback` takes the whole chunk row-major. Both sinks become `ParallelSink`, with writers claimed per thread on first chunk against a `parallel_writer_limit`. CTAS stops using the transaction's pinned connection entirely — its DDL and its rows both go to pool connections, so `ROLLBACK` undoes neither and the compensation is `mssql_ctas_drop_on_failure`'s DROP, wired to `~CTASExecutionState` as well as to the sink's catch blocks. `LogicalTypeId::UTINYINT` becomes the resolved type of a SQL Server `tinyint` column (one unsigned byte), leaving `TINYINT` to mean a signed source that travels as a smallint |
 
 ## Where to read the code
 
@@ -451,3 +587,8 @@ sequenceDiagram
 - Codec dispatch: `src/codec/type_family.cpp`, `src/codec/literal_format.cpp`
 - Target string types: `src/include/codec/target_string_type.hpp`, `src/codec/target_string_type.cpp`
 - BCP column metadata (both builders): `src/copy/target_resolver.cpp`
+- Write-path column resolution (the `ScatterArm` table): `src/codec/write_column_ops.cpp` — and [`docs/columnar-encode-core.md`](docs/columnar-encode-core.md), a reader's guide to the six files that make up the encode core, with the invariants that have actually broken
+- Row-major encoder (the fallback both paths must agree with): `src/tds/encoding/bcp_row_encoder.cpp`
+- BCP framing and the streaming drain: `src/copy/bcp_writer.cpp`
+- CTAS sink and its parallel writers: `src/dml/ctas/mssql_physical_ctas.cpp`, `src/dml/ctas/mssql_ctas_executor.cpp`
+- COPY sink and its parallel writers: `src/copy/copy_function.cpp`

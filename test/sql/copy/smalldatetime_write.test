@@ -1,0 +1,133 @@
+# name: test/sql/copy/smalldatetime_write.test
+# description: smalldatetime rounds to the minute, on both encode paths (spec 057 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# `smalldatetime` had NO write coverage at all, while spec 057 newly qualified
+# it for the columnar kernel. It is the awkward member of the datetime family:
+#
+#   * four bytes, not eight — two for days since 1900-01-01, two for minutes
+#     since midnight — and `datetime`, `datetime2` and `smalldatetime` all
+#     declare the same TDS type on the wire, so the WIDTH is the only thing
+#     telling the resolver them apart. A kernel that wrote eight bytes into a
+#     four-byte slot would put every later column of the row where the server is
+#     not looking;
+#   * its resolution is a MINUTE, and SQL Server ROUNDS to it rather than
+#     truncating. Truncating is the plausible wrong answer, and it is invisible
+#     unless a value sits past the half-minute.
+#
+# So the same values are loaded twice — once so every column resolves to a
+# kernel, once with a column that drops the chunk to row-major — and the two
+# must agree with each other AND with what the server's own CAST produces.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sd (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('sd', 'IF OBJECT_ID(''dbo.SdCol'') IS NOT NULL DROP TABLE dbo.SdCol;
+IF OBJECT_ID(''dbo.SdRow'') IS NOT NULL DROP TABLE dbo.SdRow;
+CREATE TABLE dbo.SdCol (tag varchar(10), v smalldatetime, d datetime);
+CREATE TABLE dbo.SdRow (tag varchar(10), v smalldatetime, d datetime, rp tinyint)');
+
+statement ok
+CREATE OR REPLACE TABLE sd_src AS
+SELECT * FROM (VALUES
+    ('lo',    TIMESTAMP '1900-01-01 00:00:00'),
+    ('hi',    TIMESTAMP '2079-06-06 23:59:00'),
+    ('up',    TIMESTAMP '2020-03-04 10:20:30'),
+    ('down',  TIMESTAMP '2020-03-04 10:20:29'),
+    ('exact', TIMESTAMP '2020-03-04 10:20:00'),
+    ('frac',  TIMESTAMP '2020-03-04 10:20:59.999'),
+    ('midn',  TIMESTAMP '2001-12-31 23:59:00')
+) t(tag, v);
+
+# The `datetime` column alongside is what makes the width question real: two
+# columns of the same family and the same DuckDB type, sharing one wire type and
+# differing only in bytes written.
+statement ok
+COPY (SELECT tag, v, v AS d FROM sd_src) TO 'sd.dbo.SdCol' (FORMAT bcp, CREATE_TABLE false);
+
+# The `tinyint` column is what forces the ROW path. SQL Server's tinyint is
+# UNSIGNED, so a signed TINYINT source cannot be a byte copy — the resolver sends
+# it to the row encoder, which range-checks and refuses a negative. 0..127 loads
+# normally and takes the whole chunk with it.
+#
+# It used to be a `decimal(38,0)` fed a HUGEINT, on the belief that HUGEINT has
+# no scatter arm. It does when the TARGET ALREADY EXISTS: the catalog reports the
+# column as DECIMAL(38,0), INT128 is in the decimal arm's accepted sources, and
+# the width already matches — so that fixture resolved COLUMNAR and this file
+# compared the columnar path with itself. Verified by instrumenting the path
+# choice; the lever below prints ROW-MAJOR where the old one printed COLUMNAR.
+statement ok
+COPY (SELECT tag, v, v AS d, 0::TINYINT AS rp FROM sd_src) TO 'sd.dbo.SdRow' (FORMAT bcp, CREATE_TABLE false);
+
+# The two paths agree, value for value.
+query I
+SELECT count(*) FROM (
+    SELECT tag, v, d FROM sd.dbo.SdCol
+    EXCEPT ALL
+    SELECT tag, v, d FROM sd.dbo.SdRow
+);
+----
+0
+
+# Rounding to the minute, not truncation: :30 goes up and :29 does not. This is
+# the assertion a truncating encoder fails and every other check here passes.
+query II
+SELECT tag, v FROM sd.dbo.SdCol WHERE tag IN ('up', 'down', 'frac', 'exact') ORDER BY tag;
+----
+down	2020-03-04 10:20:00
+exact	2020-03-04 10:20:00
+frac	2020-03-04 10:21:00
+up	2020-03-04 10:21:00
+
+# ...and it is the server's own answer, not merely a plausible one. CAST on the
+# server side is the reference; a literal expectation could be wrong in the test
+# and in the encoder at once.
+query I
+SELECT count(*) FROM mssql_scan('sd', $$
+SELECT c.tag FROM dbo.SdCol c
+JOIN (VALUES
+    ('lo',   '1900-01-01 00:00:00'),    ('hi',    '2079-06-06 23:59:00'),
+    ('up',   '2020-03-04 10:20:30'),    ('down',  '2020-03-04 10:20:29'),
+    ('exact','2020-03-04 10:20:00'),    ('frac',  '2020-03-04 10:20:59.997'),
+    ('midn', '2001-12-31 23:59:00')
+) AS src(tag, txt) ON src.tag = c.tag
+WHERE c.v <> CAST(src.txt AS smalldatetime)
+$$);
+----
+0
+
+# Both ends of the type's range survive. smalldatetime starts at 1900-01-01 and
+# ends at 2079-06-06, so these are the values a day- or minute-count off by one
+# would push outside it.
+query II
+SELECT tag, v FROM sd.dbo.SdCol WHERE tag IN ('lo', 'hi') ORDER BY tag;
+----
+hi	2079-06-06 23:59:00
+lo	1900-01-01 00:00:00
+
+# The eight-byte neighbour keeps its sub-minute precision, which is what says the
+# four-byte width was applied to the right column and not to the whole family.
+query II
+SELECT tag, d FROM sd.dbo.SdCol WHERE tag IN ('down', 'frac') ORDER BY tag;
+----
+down	2020-03-04 10:20:29
+frac	2020-03-04 10:21:00
+
+statement ok
+SELECT mssql_exec('sd', 'DROP TABLE dbo.SdCol; DROP TABLE dbo.SdRow;');
+
+statement ok
+DETACH sd;

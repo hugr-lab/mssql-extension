@@ -134,6 +134,61 @@ size_t Utf16ByteLength(const std::string &utf8);
 // String-family text logic.
 std::string EscapeSqlSingleQuotes(const std::string &str);
 
+//! Per-column measurement for the columnar scatter (spec 057 step 3).
+//!
+//! `lengths[r]` is the PAYLOAD byte count row r will occupy on the wire — UTF-16
+//! bytes for an nvarchar target, source bytes for a UTF-8 one — with 0 for NULL.
+//! Framing (the 2-byte prefix, or PLP's header and terminator) is the caller's.
+//! Which of the three variable-length wire forms this column takes. They share
+//! the framing (2-byte LE length, 0xFFFF for NULL) and differ in whether the
+//! payload is converted and in the UNIT the column's bound is stated in —
+//! nvarchar bounds UTF-16 code units, a UTF-8 varchar bounds bytes, and binary
+//! bounds bytes with no character boundary to respect.
+enum class VarKind : uint8_t { NVarchar, Utf8Varchar, Binary };
+
+struct StringColumnPlan {
+	//! Payload bytes per row — UTF-16 for nvarchar, source bytes otherwise, 0 for
+	//! NULL.
+	duckdb::vector<uint32_t> lengths;
+	//! TOTAL bytes row r occupies on the wire for this column, framing included.
+	//!
+	//! The plan owns its own framing arithmetic rather than leaving the caller to
+	//! add "2 for the prefix": the caller got that wrong once already (one byte
+	//! instead of two), and the only symptom was the server reporting a premature
+	//! end-of-message, because every row was laid out a byte short. PLP would
+	//! have been a second chance to make the same mistake with different numbers.
+	duckdb::vector<uint32_t> wire;
+	//! Source bytes to convert for row r. EMPTY unless `truncated` — a value
+	//! that fits converts its whole string_t, so nothing needs storing.
+	duckdb::vector<uint32_t> src_len;
+	VarKind kind = VarKind::NVarchar;
+	//! nvarchar only: every value in this block is pure ASCII.
+	//!
+	//! Then the UTF-16 length is exactly twice the source length and the encoding
+	//! is a widening copy, so the column needs NO simdutf call at all — which is
+	//! what this is for. Measured on 12-byte values, a simdutf call costs ~3.1 ns
+	//! of pure overhead and the path made THREE per value (validate, count,
+	//! convert) against ~3 ns of actual byte work.
+	bool all_ascii = false;
+	//! Did any value in this block exceed the column's declared bound? A COLUMN
+	//! property, so the scatter's test on it is perfectly predicted rather than a
+	//! per-value length comparison — and usually false, leaving src_len unbuilt.
+	bool truncated = false;
+	//! PLP framing (8-byte header, 4-byte chunk length, payload, 4-byte
+	//! terminator; 8 bytes of 0xFF for NULL) rather than a 2-byte prefix.
+	bool plp = false;
+};
+
+//! Write one block of a planned variable-length column at the cursor positions.
+void ScatterVarBlock(uint8_t *dst, size_t *cursor, idx_t r0, idx_t rend, const UnifiedVectorFormat &fmt,
+					 const mssql::BCPColumnMetadata &col, const StringColumnPlan &plan);
+
+//! Measure a column so the chunk's wire can be sized before anything is written.
+//! Returns false when the column cannot be planned — invalid UTF-8, or a wire
+//! form not handled yet — and the caller must fall back to the row path.
+bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx_t rows,
+				const mssql::BCPColumnMetadata &col, StringColumnPlan &plan);
+
 }  // namespace string
 }  // namespace codec
 }  // namespace mssql

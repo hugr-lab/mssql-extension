@@ -1,0 +1,254 @@
+# name: test/sql/copy/string_bound_truncation.test
+# description: an over-long string is truncated to the column's declared bound, on a character boundary (spec 057 step 3g)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# A value longer than its target column used to raise. It now TRUNCATES.
+#
+# The two directions are a deliberate pair, not an inconsistency:
+#
+#   * a column that declares nvarchar(20) has STATED its bound, and fitting the
+#     value to it is the documented intent — SQL Server's own CONVERT truncates.
+#     Raising meant a load the server itself would have accepted failed at the
+#     client instead;
+#   * an integer that does not fit is a DIFFERENT NUMBER, so the conversion arm
+#     refuses it. Nothing about `bigint -> int` says the user wanted the low 32
+#     bits. (See compatible_type_conversion.test.)
+#
+# What makes truncation a correctness problem rather than a `memcpy` is where it
+# is allowed to cut. Two boundaries must hold, and neither is visible in the
+# byte count alone:
+#
+#   * a UTF-8 sequence cut mid-way is invalid UTF-8;
+#   * a UTF-16 SURROGATE PAIR cut in half is a lone surrogate — SQL Server stores
+#     it and every later read reports damage, with nothing at load time saying so.
+#
+# So a character that does not fit whole is dropped whole, which is why the
+# expectations below are not simply "n characters".
+#
+# The units differ per type and are SQL Server's, not ours: nvarchar(n) bounds
+# CODE UNITS (a non-BMP character costs two), while a UTF-8 varchar(n) bounds
+# BYTES.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS tr (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncBound'') IS NOT NULL DROP TABLE dbo.TruncBound;
+CREATE TABLE dbo.TruncBound (
+    tag nvarchar(10),
+    nv nvarchar(5),
+    vc varchar(5) COLLATE Latin1_General_100_CI_AS_SC_UTF8,
+    bn varbinary(3)
+)');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('ascii', 'abcdefghij',      'abcdefghij',  encode('abcdefghij')::BLOB),
+    ('cyr',   'Привет мир',       'Привет',      encode('xyz')::BLOB),
+    ('cjk',   '漢字とかな漢字',      '漢字とかな',    encode('ab')::BLOB),
+    ('emoji', '👍👍👍👍',          '👍👍',         encode('')::BLOB),
+    ('mixed', 'ab👍cd',           'ab👍',        encode('q')::BLOB),
+    ('surr',  'a👍b👍c👍',         'a👍b👍',      encode('w')::BLOB),
+    ('fits',  'abc',              'abc',         encode('ab')::BLOB)
+) t(tag, nv, vc, bn)) TO 'tr.dbo.TruncBound' (FORMAT bcp, CREATE_TABLE false);
+
+# nvarchar(5) bounds CODE UNITS:
+#   ascii/cyr/cjk — 5 characters, each one code unit;
+#   emoji         — each 👍 is a surrogate PAIR, so two code units: 2 fit, and
+#                   the third is dropped WHOLE rather than leaving half of it;
+#   mixed         — a, b, the pair, c = exactly 5 code units, so nothing is lost
+#                   even though it is only 4 characters;
+#   surr          — the case that DISTINGUISHES a correct cut from a byte-wise
+#                   one. a(1) + pair(2) + b(1) = 4 code units, and the next pair
+#                   needs 2 more than remain, so it is dropped and the answer is
+#                   3 characters. Counting a non-BMP character as one code unit
+#                   instead lets it through and cuts the pair in half, yielding
+#                   `a👍b` plus a LONE SURROGATE — 4 code units, which the server
+#                   accepts and every later read reports as damaged. Four
+#                   identical emoji do NOT catch that: the wrong arithmetic still
+#                   happens to stop on a pair boundary there.
+query IIII
+SELECT tag, nv, length(nv), nv IS NOT NULL FROM tr.dbo.TruncBound ORDER BY tag;
+----
+ascii	abcde	5	true
+cjk	漢字とかな	5	true
+cyr	Приве	5	true
+emoji	👍👍	2	true
+fits	abc	3	true
+mixed	ab👍c	4	true
+surr	a👍b	3	true
+
+# varchar(5) with a UTF-8 collation bounds BYTES, so a multi-byte character that
+# would straddle the bound is dropped whole:
+#   cyr   — 2 characters = 4 bytes; a third would be 6;
+#   cjk   — 1 character  = 3 bytes; a second would be 6;
+#   emoji — 1 pair       = 4 bytes; a second would be 8;
+#   mixed — 'ab' = 2 bytes, then the 4-byte emoji does not fit.
+query III
+SELECT tag, vc, strlen(vc::VARCHAR) FROM tr.dbo.TruncBound ORDER BY tag;
+----
+ascii	abcde	5
+cjk	漢	3
+cyr	Пр	4
+emoji	👍	4
+fits	abc	3
+mixed	ab	2
+surr	a👍	5
+
+# varbinary has no character boundary to respect, so the cut is exact.
+query II
+SELECT tag, bn FROM tr.dbo.TruncBound WHERE tag IN ('ascii', 'fits') ORDER BY tag;
+----
+ascii	abc
+fits	ab
+
+# -----------------------------------------------------------------------------
+# A MAX column has NO bound to apply — its `max_length` is the PLP sentinel
+# 0xFFFF, not a length.
+#
+# The columnar string path lost that distinction and compared against the
+# sentinel, so a value over 65535 bytes into `nvarchar(max)` — a column that is
+# unbounded by definition — failed as an overflow. The row path never had the
+# bug; it says `!col.IsPLPType()` explicitly.
+#
+# 200000 characters is chosen to sit well past 0xFFFF in BOTH units, since the
+# nvarchar bound is counted in UTF-16 bytes.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncMax'') IS NOT NULL DROP TABLE dbo.TruncMax;
+CREATE TABLE dbo.TruncMax (v nvarchar(max), u varchar(max) COLLATE Latin1_General_100_CI_AS_SC_UTF8, b varbinary(max))');
+
+statement ok
+COPY (SELECT repeat('x', 200000) AS v, repeat('y', 200000) AS u, encode(repeat('z', 200000))::BLOB AS b)
+    TO 'tr.dbo.TruncMax' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT length(v), length(u), octet_length(b) FROM tr.dbo.TruncMax;
+----
+200000	200000	200000
+
+# Non-ASCII past the sentinel too: the UTF-16 length is twice the character
+# count, so this is 400000 bytes against a 65535 "bound" that must not apply.
+statement ok
+COPY (SELECT repeat('ю', 200000) AS v, repeat('y', 10) AS u, encode('z')::BLOB AS b)
+    TO 'tr.dbo.TruncMax' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT length(v) FROM tr.dbo.TruncMax ORDER BY length(u) LIMIT 1;
+----
+200000
+
+# -----------------------------------------------------------------------------
+# The truncating path must not disturb the values around it. A chunk where only
+# SOME rows overflow re-derives the whole column's layout, so a row that fits has
+# to come through untouched — and the row that follows an over-long one is where
+# a mis-sized wire would show up first.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncMixed'') IS NOT NULL DROP TABLE dbo.TruncMixed;
+CREATE TABLE dbo.TruncMixed (id int, s nvarchar(10), other bigint)');
+
+statement ok
+CREATE OR REPLACE TABLE tr_src AS
+SELECT i AS id,
+       CASE WHEN i % 3 = 0 THEN repeat('L', 50)
+            WHEN i % 3 = 1 THEN NULL
+            ELSE 'short' || (i % 7) END AS s,
+       (i * 13)::BIGINT AS other
+FROM range(3000) t(i);
+
+statement ok
+COPY tr_src TO 'tr.dbo.TruncMixed' (FORMAT bcp, CREATE_TABLE false);
+
+# Every neighbouring column survives intact, which a mis-sized row would break
+# long before the string itself looked wrong.
+query I
+SELECT count(*) FROM (
+    SELECT id, other FROM tr_src EXCEPT ALL SELECT id, other FROM tr.dbo.TruncMixed
+);
+----
+0
+
+# The short values are untouched; only the over-long ones are cut, to exactly 10.
+query III
+SELECT count(*), count(s), count(*) FILTER (WHERE s = repeat('L', 10)) FROM tr.dbo.TruncMixed;
+----
+3000	2000	1000
+
+query I
+SELECT count(*) FROM tr.dbo.TruncMixed WHERE s LIKE 'short%' AND length(s) <> 6;
+----
+0
+
+# -----------------------------------------------------------------------------
+# The ROW path has to cut at the same place.
+#
+# It did not: `ClampToBound` bounded VarKind::Binary and `EncodeBinary` never
+# had a bound at all. So a varbinary(3) column took 3 bytes when every column in
+# the chunk resolved to a kernel, and the whole value when some unrelated column
+# dropped the chunk to row-major — where the server rejected the batch. Same
+# statement, same data, outcome decided by a neighbour.
+#
+# The `tinyint` column is what forces the ROW path. SQL Server's tinyint is
+# UNSIGNED, so a signed TINYINT source cannot be a byte copy — the resolver sends
+# it to the row encoder, which range-checks and refuses a negative. 0..127 loads
+# normally and takes the whole chunk with it.
+#
+# It used to be a `decimal(38,0)` fed a HUGEINT, on the belief that HUGEINT has
+# no scatter arm. It does when the TARGET ALREADY EXISTS: the catalog reports the
+# column as DECIMAL(38,0), INT128 is in the decimal arm's accepted sources, and
+# the width already matches — so that fixture resolved COLUMNAR and this file
+# compared the columnar path with itself. Verified by instrumenting the path
+# choice; the lever below prints ROW-MAJOR where the old one printed COLUMNAR.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('tr', 'IF OBJECT_ID(''dbo.TruncBinRow'') IS NOT NULL DROP TABLE dbo.TruncBinRow;
+CREATE TABLE dbo.TruncBinRow (tag nvarchar(10), bn varbinary(3), rp tinyint)');
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    ('long',  encode('abcdefghij')::BLOB, 0::TINYINT),
+    ('exact', encode('abc')::BLOB,        1::TINYINT),
+    ('short', encode('a')::BLOB,          2::TINYINT),
+    ('empty', encode('')::BLOB,           3::TINYINT)
+) t(tag, bn, rp)) TO 'tr.dbo.TruncBinRow' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT tag, bn FROM tr.dbo.TruncBinRow ORDER BY tag;
+----
+empty	(empty)
+exact	abc
+long	abc
+short	a
+
+# And it agrees with the columnar answer for the same bound and the same value —
+# TruncBound's `ascii` row is the same varbinary(3) cut, taken by kernels.
+query I
+SELECT count(*) FROM (
+    SELECT bn FROM tr.dbo.TruncBinRow WHERE tag = 'long'
+    EXCEPT ALL
+    SELECT bn FROM tr.dbo.TruncBound WHERE tag = 'ascii'
+);
+----
+0
+
+statement ok
+SELECT mssql_exec('tr', 'DROP TABLE dbo.TruncBinRow;');
+
+statement ok
+SELECT mssql_exec('tr', 'DROP TABLE dbo.TruncBound; DROP TABLE dbo.TruncMax; DROP TABLE dbo.TruncMixed;');
+
+statement ok
+DETACH tr;

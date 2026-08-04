@@ -93,6 +93,15 @@ public:
 	// Decimal type (DECIMALNTYPE 0x6A)
 	// Wire format: [length:1] [sign:1] [mantissa:4/8/12/16 LE]
 	// sign: 0x00=negative, 0x01=non-negative
+	// Wire widths, public because a column's PAYLOAD width is its contract with
+	// COLMETADATA — the columnar scatter sizes the whole chunk from it before a
+	// single value is touched (spec 057 step 3), so it cannot be private to the
+	// appending encoder.
+	//   time     scale 0-2: 3 bytes, 3-4: 4, 5-7: 5
+	//   decimal  precision 1-9: 5, 10-19: 9, 20-28: 13, 29-38: 17
+	static uint8_t GetTimeByteSize(uint8_t scale);
+	static uint8_t GetDecimalByteSize(uint8_t precision);
+
 	static void EncodeDecimal(vector<uint8_t> &buffer, const hugeint_t &value, uint8_t precision, uint8_t scale);
 
 	// Binary data (BIGVARBINARYTYPE 0xA5) - standard USHORT length prefix
@@ -178,13 +187,7 @@ private:
 	// Convert string to UTF-16LE bytes
 	static vector<uint8_t> StringToUTF16LE(const string_t &str);
 
-	// Get time byte size based on scale
-	// scale 0-2: 3 bytes, scale 3-4: 4 bytes, scale 5-7: 5 bytes
-	static uint8_t GetTimeByteSize(uint8_t scale);
-
-	// Get decimal byte size based on precision
-	// precision 1-9: 5, 10-19: 9, 20-28: 13, 29-38: 17
-	static uint8_t GetDecimalByteSize(uint8_t precision);
+	// Convert DuckDB timestamp to TDS datetime2 components
 
 	// Convert DuckDB timestamp to TDS datetime2 components
 	static void TimestampToDatetime2Components(timestamp_t ts, uint8_t scale, uint64_t &time_value,

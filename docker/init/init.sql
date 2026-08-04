@@ -17,11 +17,19 @@ GO
 -- =============================================================================
 -- master.dbo.test — seed for catalog_discovery.test
 --
--- That test attaches MSSQL_TEST_DSN, which defaults to Database=master (see the
--- Makefile), and expects `dbo.test` to exist there: "we use master.dbo.test for
--- testing". Everything else in this script lives in TestDB, so nothing created
--- this table and the test could never pass. It went unnoticed because CI never
--- ran the .test files (issue #192).
+-- That test attaches MSSQL_TEST_DSN and expects `dbo.test` to exist in whatever
+-- database the DSN names: "we use master.dbo.test for testing". Everything else
+-- in this script lives in TestDB, so nothing created this table and the test
+-- could never pass against master. It went unnoticed because CI never ran the
+-- .test files (issue #192).
+--
+-- Which database that is depends on MSSQL_TEST_DB, and BOTH values are live:
+-- `Makefile` declares `?= master`, while `-include .env` (line 82) lets a local
+-- .env set TestDB, which is what the checked-in setup does. So this seed and the
+-- TestDB one near the end of the file must stay IDENTICAL — when they disagreed
+-- on the column type (nvarchar here, varchar there), catalog_discovery asserted
+-- MSSQL_NVARCHAR(50) and got MSSQL_VARCHAR(50), and the failure read as a
+-- catalog bug rather than as two fixtures for one test.
 --
 -- The test rewrites rows 98/99 and restores id=1 to 'A' as it goes, so it only
 -- needs a stable (1,'A'), (2,'B'), (3,'C') starting point.
@@ -265,7 +273,15 @@ SELECT
     col_char, col_varchar, col_nchar, col_nvarchar,
     col_binary, col_varbinary,
     DATEADD(day, id, col_date), col_time, col_time_scale,
-    DATEADD(day, id, col_datetime), DATEADD(day, id, col_datetime2), col_datetime2_scale,
+    DATEADD(day, id, col_datetime),
+    -- NOT a bare DATEADD: one seed row holds 9999-12-31 23:59:59.9999999, the
+    -- datetime2 MAXIMUM, and adding a day to it raises Msg 517 and aborts the
+    -- whole INSERT ... SELECT. dbo.AllDataTypes ended up with 3 rows instead of
+    -- 6, silently, for anyone who ran the suite — and a short fixture reads as a
+    -- code defect long before anyone suspects the seed. The boundary row is
+    -- worth keeping, so it keeps its value instead of being shifted.
+    CASE WHEN col_datetime2 < '9999-12-01' THEN DATEADD(day, id, col_datetime2) ELSE col_datetime2 END,
+    col_datetime2_scale,
     col_smalldatetime,
     DATEADD(day, id, col_datetimeoffset), col_datetimeoffset_scale
 FROM dbo.AllDataTypes WHERE id <= 3;
@@ -786,13 +802,21 @@ GO
 -- Create dbo.test table in TestDB for catalog_discovery tests
 -- =============================================================================
 -- Note: All test tables are in TestDB. Set MSSQL_TEST_DB=TestDB in .env
+--
+-- `name` is NVARCHAR here to match the master.dbo.test seed at the top of this
+-- file EXACTLY. catalog_discovery.test runs against whichever of the two
+-- MSSQL_TEST_DB names, and asserts the column's reported type — spec 060 reports
+-- a bounded character column as MSSQL_NVARCHAR(n) or MSSQL_VARCHAR(n) according
+-- to what the column actually is, so two seeds differing in type make the same
+-- assertion pass in one database and fail in the other. It was VARCHAR(50) here
+-- against NVARCHAR(50) there, which is exactly what that looked like.
 
 IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE dbo.test;
 GO
 
 CREATE TABLE dbo.test (
     id INT NOT NULL PRIMARY KEY,
-    name VARCHAR(50) NOT NULL
+    name NVARCHAR(50) NOT NULL
 );
 GO
 

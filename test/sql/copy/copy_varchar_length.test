@@ -38,12 +38,18 @@ SELECT id, s, rtrim(c), ns FROM db.dbo.copy_varchar_len_test ORDER BY id;
 1	aaaaaa	bbbbbb	cccccc
 2	1234567890	abcdefghij	klmnopqrst
 
-# A value that genuinely exceeds VARCHAR(10) must still be rejected (by the
-# server, not by the halved client-side wire declaration).
-statement error
+# A value that exceeds VARCHAR(10) is truncated to it (spec 057 §3g) rather than
+# rejected. What this case is really pinning is that the bound applied is the
+# column's REAL one: the client declares the wire length halved for a varchar
+# target, and truncating to that instead would cut at 5.
+statement ok
 COPY (SELECT 3 AS id, '12345678901' AS s, 'x' AS c, 'x' AS ns)
 TO 'mssql://db/dbo/copy_varchar_len_test' (FORMAT 'bcp', CREATE_TABLE false);
+
+query IT
+SELECT id, s FROM db.dbo.copy_varchar_len_test WHERE id = 3;
 ----
+3	1234567890
 
 # varchar(n) with n > 4000 exceeds the 8000-byte inline NVARCHAR wire limit
 # and must fall back to PLP (nvarchar(max)) transmission.

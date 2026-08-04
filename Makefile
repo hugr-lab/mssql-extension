@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -95,6 +95,16 @@ MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_
 # TestDB connection strings for catalog tests
 MSSQL_TESTDB_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=TestDB;User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
 MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/TestDB
+# Four COPY tests gate on MSSQL_TEST_SERVER, which nothing has ever set — not
+# this Makefile and not CI — so copy_connection_leak, copy_type_mismatch,
+# copy_empty_schema and copy_existing_temp have been skipping silently since they
+# were written. Same shape as issue #192, one env var lower down.
+MSSQL_TEST_SERVER = $(MSSQL_TESTDB_DSN)
+# And the same again: MSSQL_TEST_CONNECTION_STRING gates copy_auto_tablock,
+# ctas_auto_tablock, ctas_if_not_exists and ddl_if_not_exists, and nothing has
+# ever set it either. Two of those cover auto-TABLOCK — the behaviour spec 057
+# rewrote — so the tests for that change had never executed once.
+MSSQL_TEST_CONNECTION_STRING = $(MSSQL_TESTDB_DSN)
 
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
@@ -106,6 +116,8 @@ export MSSQL_TEST_DSN
 export MSSQL_TEST_URI
 export MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_URI
+export MSSQL_TEST_SERVER
+export MSSQL_TEST_CONNECTION_STRING
 # NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default. Export it manually to
 # run TLS-specific tests (requires SQL Server with TLS enabled).
 # export MSSQL_TEST_DSN_TLS
@@ -129,8 +141,31 @@ integration-test: release
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "WARNING: SQL Server container not detected. Run 'make docker-up' first."; \
 	fi
-	build/release/test/unittest "[integration]" --force-reload
-	build/release/test/unittest "[sql]" --force-reload
+	@# The path glob, not the group tags. `[integration]` and `[sql]` match only
+	@# the 8 files at the TOP level of test/sql — the 164 in subdirectories are
+	@# tagged `[mssql]`, and `"[mssql]"` matches NOTHING: sqllogictest registers a
+	@# subdirectory file under its path, so the tag never becomes a Catch tag. It
+	@# exits 0 having run zero tests, which is why nobody noticed.
+	@#
+	@# So every `.test` file written since the suite grew subdirectories has been
+	@# invisible to this target and to CI. Third instance of the same class on this
+	@# branch, and the widest: MSSQL_TEST_SERVER hid 4 files,
+	@# MSSQL_TEST_CONNECTION_STRING hides 4 more, this hid 164.
+	build/release/test/unittest "test/sql/*" --force-reload
+
+# Run the SQL suite with the performance counters ON (spec 057 step 0b).
+#
+# Separate from integration-test on purpose. The counters are a code path of
+# their own — issue #233 was a crash that ONLY happened with them enabled, on a
+# column chunk the stager published as CONSTANT — and a suite that never turns
+# them on cannot catch that class again. Kept out of the default run because the
+# counters write a summary per stream to stderr, which is noise for everything
+# that is not measuring.
+counters-test: release
+	@echo "Running SQL suite with MSSQL_COUNTERS=1..."
+	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
+	@echo ""
+	MSSQL_COUNTERS=1 build/release/test/unittest "test/sql/*" --force-reload
 
 # Run all tests (unit + integration)
 test-all: release
@@ -745,6 +780,7 @@ help:
 	@echo "Custom targets:"
 	@echo "  make vcpkg-setup          - Bootstrap vcpkg (required for TLS support)"
 	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
+	@echo "  make counters-test        - Run the SQL suite with MSSQL_COUNTERS=1 (exercises the counter path)"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
 	@echo "  make test-simple-query    - Run C++ simple query test"

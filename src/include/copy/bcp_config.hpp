@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -15,7 +16,42 @@ class ClientContext;
 // This controls memory usage on both DuckDB and SQL Server sides
 // 0 = no intermediate flushes (send all at end) - WARNING: high memory usage
 // Default 100K rows keeps buffer around 10-50MB depending on row size
-constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 100000;	 // 100K rows
+//! Rows per bulk-load batch — the boundary the SERVER sees between DONE tokens,
+//! not a client buffer size.
+//!
+//! 102 400 is SQL Server's own threshold: a batch at least this large is written
+//! straight into a COMPRESSED columnstore rowgroup, and anything smaller goes to
+//! the delta store and stays there until something rebuilds it. A delta rowgroup
+//! only closes on its own at 1 048 576 rows, so a smaller load never compresses
+//! at all.
+//!
+//! Measured (spec 057, 1M rows x 4 columns into a clustered columnstore): at the
+//! previous 100 000 default `sys.column_store_row_groups` reported a single OPEN
+//! group holding all 1M rows and 53 MB on disk; at 102 400, nine COMPRESSED
+//! groups and 7 MB. A 2400-row difference, 7.6x on disk — so
+//! `table_kind = 'columnstore'` silently did not compress, which is the entire
+//! reason a user asks for it.
+//!
+//! One constant rather than a columnstore special case: batch size measured
+//! nearly flat on a heap (25k 0.93 s / 100k 0.78 s / 500k 0.75 s), so the extra
+//! 2400 rows cost nothing there, and a target-dependent default would be a rule
+//! to explain for no gain. Set the option lower and the consequence is yours.
+constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 102400;
+
+//! Parallel bulk-load writers per COPY. 0 = derive from DuckDB's thread count.
+//!
+//! The bound this attacks is SQL Server's ingest rate, not the client and not
+//! the wire: `send()` blocks because the receive window stays full while the
+//! server lays rows down. Nothing done on one connection moves that — the server
+//! parallelises across SESSIONS, so more of them is the only lever.
+//!
+//! Capped independently of DuckDB's threads because each writer is a pooled
+//! connection holding an open bulk-load transaction; a 64-thread machine asking
+//! for 64 concurrent BU locks is a different decision from asking for 64
+//! threads, and `mssql_connection_limit` is a per-context ceiling shared with
+//! everything else.
+constexpr idx_t MSSQL_DEFAULT_COPY_PARALLEL_WRITERS = 0;
+constexpr idx_t MSSQL_MAX_COPY_PARALLEL_WRITERS = 8;
 
 namespace mssql {
 
@@ -52,14 +88,25 @@ struct BCPCopyConfig {
 	// - Allowing more parallel server-side processing
 	// WARNING: Blocks other readers/writers during COPY
 	// Default changed to false in Spec 027 for safer multi-user behavior
+	// Resolved at load time by MSSQLResolveTablock(tablock_choice, target_shape);
+	// read by the INSERT BULK builder. Not a user input on its own.
 	bool tablock = false;
 
-	// True if user explicitly set tablock option (vs using default from settings)
-	// Used to determine if auto-TABLOCK should be applied for new tables
-	bool tablock_explicit = false;
+	// What the user asked for: mssql_copy_tablock, or the per-statement `tablock`
+	// COPY option. AUTO means "decide from the target's shape" and is the default.
+	//
+	// This replaces a `tablock_explicit` bool that was ALWAYS true — it was set
+	// from TryGetCurrentSetting() succeeding, which it does unconditionally for an
+	// option carrying a registered default — so both auto-TABLOCK branches were
+	// dead from spec 030 (issue #45) until spec 057 step 1.
+	MSSQLTablockChoice tablock_choice = MSSQLTablockChoice::AUTO;
+
+	// The target's physical structure, which is what decides TABLOCK under AUTO.
+	// Taken from sys.indexes for an existing table (same round trip as the object
+	// check) and from what we are about to create otherwise.
+	MSSQLIndexKind target_shape = MSSQLIndexKind::HEAP;
 
 	// True if creating a brand-new table (table didn't exist or overwrite dropped it)
-	// Used for auto-TABLOCK: new tables have no concurrent readers, so TABLOCK is safe
 	bool is_new_table = false;
 
 	// From mssql_utf8_collation — the collation to give a varchar column this COPY

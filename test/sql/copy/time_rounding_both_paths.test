@@ -1,0 +1,120 @@
+# name: test/sql/copy/time_rounding_both_paths.test
+# description: TIME narrows the same way on both encode paths, and saturates at the end of the day (spec 057 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# `write_column_ops.hpp` claims the row-major path and the columnar path "cannot
+# produce different bytes — not because a test says so, but because there is one
+# implementation". For TIME that was false: the kernel ROUNDED and the row
+# encoder TRUNCATED, so the same value loaded as .789 or .790 depending on
+# whether some OTHER column in the chunk forced the fallback. Spec 057 taught
+# datetime2 to round and missed its TIME peer.
+#
+# Rounding is the correct half — the server does it: CAST('12:34:56.600' AS
+# time(0)) is 12:34:57. What TIME cannot do is CARRY, having no date field, and
+# the kernel had no bound at all: 23:59:59.999999 into time(0) produced 86400,
+# outside the type's domain in either direction. The server saturates instead
+# (23:59:59), and both paths now do.
+#
+# So this file loads the SAME values twice — once so the chunk resolves entirely
+# to kernels, once with a column that drops it to row-major — and requires the
+# two to agree AND to match what the server's own CAST produces. Asserting one
+# path against a literal would not have caught the divergence, because both
+# answers are plausible times.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS tm (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('tm', 'IF OBJECT_ID(''dbo.TmCol'') IS NOT NULL DROP TABLE dbo.TmCol;
+IF OBJECT_ID(''dbo.TmRow'') IS NOT NULL DROP TABLE dbo.TmRow;
+CREATE TABLE dbo.TmCol (tag varchar(10), t0 time(0), t2 time(2), t3 time(3));
+CREATE TABLE dbo.TmRow (tag varchar(10), t0 time(0), t2 time(2), t3 time(3), rp tinyint)');
+
+statement ok
+CREATE OR REPLACE TABLE tm_src AS
+SELECT * FROM (VALUES
+    ('eod',   TIME '23:59:59.999999', TIME '23:59:59.999999', TIME '23:59:59.999999'),
+    ('eod2',  TIME '23:59:59.995000', TIME '23:59:59.999000', TIME '23:59:59.999500'),
+    ('up',    TIME '12:34:56.600000', TIME '12:34:56.567000', TIME '12:34:56.789600'),
+    ('down',  TIME '12:34:56.400000', TIME '12:34:56.564000', TIME '12:34:56.789400'),
+    ('half',  TIME '12:34:56.500000', TIME '12:34:56.565000', TIME '12:34:56.789500'),
+    ('exact', TIME '01:02:03.000000', TIME '01:02:03.120000', TIME '01:02:03.456000'),
+    ('zero',  TIME '00:00:00.000000', TIME '00:00:00.000000', TIME '00:00:00.000000')
+) t(tag, t0, t2, t3);
+
+# Only temporal and a bounded string, so every column resolves to a kernel.
+statement ok
+COPY tm_src TO 'tm.dbo.TmCol' (FORMAT bcp, CREATE_TABLE false);
+
+# The `tinyint` column is what forces the ROW path. SQL Server's tinyint is
+# UNSIGNED, so a signed TINYINT source cannot be a byte copy — the resolver sends
+# it to the row encoder, which range-checks and refuses a negative. 0..127 loads
+# normally and takes the whole chunk with it.
+#
+# It used to be a `decimal(38,0)` fed a HUGEINT, on the belief that HUGEINT has
+# no scatter arm. It does when the TARGET ALREADY EXISTS: the catalog reports the
+# column as DECIMAL(38,0), INT128 is in the decimal arm's accepted sources, and
+# the width already matches — so that fixture resolved COLUMNAR and this file
+# compared the columnar path with itself. Verified by instrumenting the path
+# choice; the lever below prints ROW-MAJOR where the old one printed COLUMNAR.
+statement ok
+COPY (SELECT *, 0::TINYINT AS rp FROM tm_src) TO 'tm.dbo.TmRow' (FORMAT bcp, CREATE_TABLE false);
+
+# The two paths agree, value for value.
+query I
+SELECT count(*) FROM (
+    SELECT tag, t0, t2, t3 FROM tm.dbo.TmCol
+    EXCEPT ALL
+    SELECT tag, t0, t2, t3 FROM tm.dbo.TmRow
+);
+----
+0
+
+# ...and agree with what SQL Server itself produces for the same narrowing, which
+# is the part a literal expectation could get wrong in both places at once.
+query I
+SELECT count(*) FROM mssql_scan('tm', $$
+SELECT c.tag FROM dbo.TmCol c
+JOIN (VALUES
+    ('eod',   '23:59:59.999999'), ('eod2', '23:59:59.999500'),
+    ('up',    '12:34:56.789600'), ('down', '12:34:56.789400'),
+    ('half',  '12:34:56.789500'), ('exact','01:02:03.456000'),
+    ('zero',  '00:00:00.000000')
+) AS src(tag, t3_text) ON src.tag = c.tag
+WHERE c.t3 <> CAST(src.t3_text AS time(3))
+$$);
+----
+0
+
+# The end-of-day cases are the ones the missing bound produced 86400 for. They
+# must be the LAST tick of the day, never a wrap to midnight.
+query III
+SELECT tag, t0, t3 FROM tm.dbo.TmCol WHERE tag IN ('eod', 'eod2') ORDER BY tag;
+----
+eod	23:59:59	23:59:59.999
+eod2	23:59:59	23:59:59.999
+
+# Rounding, not truncation — `up` moves to the next second and `down` does not.
+query III
+SELECT tag, t0, t3 FROM tm.dbo.TmCol WHERE tag IN ('up', 'down') ORDER BY tag;
+----
+down	12:34:56	12:34:56.789
+up	12:34:57	12:34:56.79
+
+statement ok
+SELECT mssql_exec('tm', 'DROP TABLE dbo.TmCol; DROP TABLE dbo.TmRow;');
+
+statement ok
+DETACH tm;
