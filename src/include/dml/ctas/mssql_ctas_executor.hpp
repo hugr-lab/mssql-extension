@@ -102,6 +102,17 @@ struct CTASExecutionState {
 	string error_message;
 	string cleanup_error;
 
+	//! The CREATE TABLE has run and succeeded, so there is something for
+	//! mssql_ctas_drop_on_failure to drop. `phase` cannot answer this: a CREATE
+	//! that itself failed also leaves phase == FAILED, and dropping then means a
+	//! round trip that can only report "no such table".
+	bool table_created = false;
+
+	//! A cleanup DROP has already been issued. The failing Sink thread runs one
+	//! as early as it can, and the destructor covers the aborts that never reach
+	//! a Sink at all; without this the two would both fire on the same table.
+	bool cleanup_attempted = false;
+
 	// Timing
 	std::chrono::steady_clock::time_point start_time;
 
@@ -160,6 +171,11 @@ struct CTASExecutionState {
 
 	// Attempt cleanup DROP TABLE on failure
 	void AttemptCleanup(ClientContext &context);
+
+	//! The same DROP without a ClientContext, so it is callable from a destructor
+	//! and from a worker thread (issue #178). Goes through `pool_handle` rather
+	//! than `catalog`, which may already be gone.
+	void AttemptCleanupNoContext() noexcept;
 
 	// Invalidate catalog cache after successful DDL
 	void InvalidateCache();

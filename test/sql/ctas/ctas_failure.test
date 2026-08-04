@@ -81,6 +81,77 @@ SELECT 1 AS id;
 not found
 
 # =============================================================================
+# mssql_ctas_drop_on_failure when the error comes from the SOURCE
+#
+# The setting was wired to two catch blocks, in Sink and in Finalize, and both
+# require the SINK to be what failed. An error raised anywhere else in the plan —
+# a cast in the SELECT, a read error on the source, a cancelled query — aborts
+# the pipeline without either one running, so the table stayed on the server with
+# whatever rows had landed and the setting silently did nothing. That is also the
+# commonest way for a CTAS to fail, the source being the larger half of the
+# statement.
+#
+# The row count is large enough that the load is well under way before the cast
+# blows up, so the cases below are "a table with rows in it", not "a table that
+# was never written to".
+# =============================================================================
+
+statement ok
+CREATE OR REPLACE TABLE ctas_src AS SELECT i AS a, 'x' || i::VARCHAR AS b FROM range(300000) t(i);
+
+statement ok
+SET mssql_ctas_drop_on_failure = true;
+
+statement error
+CREATE TABLE mssql_fail.dbo.ctas_dropme AS
+SELECT a, b, (1 / (a - 250000))::INT AS boom FROM ctas_src;
+----
+out of range
+
+query I
+SELECT COUNT(*) FROM mssql_scan('mssql_fail', 'SELECT 1 AS n FROM sys.tables WHERE name = ''ctas_dropme''');
+----
+0
+
+# `false` is the default and has to keep what landed — dropping there would
+# discard rows the user was never promised would be removed.
+statement ok
+SET mssql_ctas_drop_on_failure = false;
+
+statement error
+CREATE TABLE mssql_fail.dbo.ctas_keepme AS
+SELECT a, b, (1 / (a - 250000))::INT AS boom FROM ctas_src;
+----
+out of range
+
+query I
+SELECT COUNT(*) FROM mssql_scan('mssql_fail', 'SELECT 1 AS n FROM sys.tables WHERE name = ''ctas_keepme''');
+----
+1
+
+statement ok
+SELECT mssql_exec('mssql_fail', 'DROP TABLE dbo.ctas_keepme');
+
+# A CTAS that SUCCEEDS with the setting on keeps its table — the drop is bound to
+# the failure, not to the setting being enabled.
+statement ok
+SET mssql_ctas_drop_on_failure = true;
+
+statement ok
+CREATE TABLE mssql_fail.dbo.ctas_survives AS SELECT a, b FROM ctas_src;
+
+query I
+SELECT COUNT(*) FROM mssql_fail.dbo.ctas_survives;
+----
+300000
+
+statement ok
+DROP TABLE mssql_fail.dbo.ctas_survives;
+
+statement ok
+SET mssql_ctas_drop_on_failure = false;
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 

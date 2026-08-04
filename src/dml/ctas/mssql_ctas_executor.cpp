@@ -56,6 +56,22 @@ CTASExecutionState::~CTASExecutionState() {
 	// error). Fires only when the sink died without reaching those. Touch no
 	// ClientContext here (issue #178): can run on a worker thread.
 	ReleaseBCPConnectionOnError();
+
+	// The only place a CTAS killed from OUTSIDE the sink can be cleaned up.
+	//
+	// AttemptCleanup used to hang off two catch blocks, in Sink and in Finalize,
+	// and both of them require the sink itself to be the thing that failed. An
+	// error raised anywhere else in the pipeline — a cast in the SELECT, a read
+	// error on the source, a cancelled query — aborts the plan without either one
+	// running, and mssql_ctas_drop_on_failure silently did nothing. That is the
+	// commonest way for a CTAS to fail, since the source is usually the larger
+	// half of the statement.
+	//
+	// The connection above is released first, so the DROP is not waiting on this
+	// state's own bulk-load session.
+	if (config.drop_on_failure && phase != CTASPhase::COMPLETE && phase != CTASPhase::SKIPPED) {
+		AttemptCleanupNoContext();
+	}
 }
 
 void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
@@ -122,6 +138,9 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 
 		DebugLog(1, "DDL completed in %lld ms", ddl_time_ms);
 
+		// From here on there is a table on the server that this statement made,
+		// and that mssql_ctas_drop_on_failure is entitled to remove.
+		table_created = true;
 		phase = CTASPhase::DDL_DONE;
 
 		// Branch based on use_bcp setting (Spec 027)
@@ -295,21 +314,63 @@ void CTASExecutionState::FlushInserts(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 
 void CTASExecutionState::AttemptCleanup(ClientContext &context) {
-	if (phase == CTASPhase::PENDING || phase == CTASPhase::DDL_EXECUTING) {
-		// Table was never created, nothing to clean up
+	// One implementation, and it is the context-free one: the DROP needs a
+	// connection and a table name, never anything off the ClientContext.
+	// MSSQLCatalog::ExecuteDDL does not read its own `context` parameter either.
+	AttemptCleanupNoContext();
+}
+
+void CTASExecutionState::AttemptCleanupNoContext() noexcept {
+	if (!table_created || cleanup_attempted) {
+		return;
+	}
+	cleanup_attempted = true;
+
+	auto pool = pool_handle.lock();
+	if (!pool) {
+		// The catalog is being torn down and took its pool with it. Nothing can
+		// be sent, and a DETACH is not the moment to start reporting about it.
 		return;
 	}
 
 	DebugLog(1, "Attempting cleanup DROP TABLE due to failure");
 
-	string drop_sql = MSSQLDDLTranslator::TranslateDropTable(target.schema_name, target.table_name);
+	// LOCK_TIMEOUT because this DROP is issued while the load that failed may
+	// still be unwinding: the other writers hold bulk-load sessions against this
+	// exact table, and their schema locks outlive the throw by however long
+	// teardown takes. Without a bound the DROP waits on them indefinitely, which
+	// on a failed statement means the process appears to hang. Five seconds is
+	// long enough for an ordinary unwind and short enough not to look like one.
+	const string drop_sql =
+		"SET LOCK_TIMEOUT 5000; " + MSSQLDDLTranslator::TranslateDropTable(target.schema_name, target.table_name);
 
+	std::shared_ptr<tds::TdsConnection> conn;
 	try {
-		catalog->ExecuteDDL(context, drop_sql);
-		DebugLog(1, "Cleanup DROP TABLE succeeded");
+		conn = pool->Acquire();
+		if (!conn) {
+			cleanup_error = "no connection available for cleanup DROP";
+			return;
+		}
+		auto result = MSSQLSimpleQuery::Execute(*conn, drop_sql);
+		if (result.success) {
+			DebugLog(1, "Cleanup DROP TABLE succeeded");
+		} else {
+			cleanup_error = result.error_message;
+			DebugLog(1, "Cleanup DROP TABLE failed: %s", cleanup_error.c_str());
+		}
 	} catch (std::exception &e) {
 		cleanup_error = e.what();
 		DebugLog(1, "Cleanup DROP TABLE failed: %s", cleanup_error.c_str());
+	} catch (...) {
+		cleanup_error = "unknown error during cleanup DROP";
+	}
+	if (conn) {
+		try {
+			pool->Release(conn);
+		} catch (...) {
+			// The handle is dropped either way; a pool that cannot take it back
+			// has bigger problems than this statement's cleanup.
+		}
 	}
 }
 
