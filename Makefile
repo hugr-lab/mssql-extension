@@ -100,6 +100,11 @@ MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HO
 # copy_empty_schema and copy_existing_temp have been skipping silently since they
 # were written. Same shape as issue #192, one env var lower down.
 MSSQL_TEST_SERVER = $(MSSQL_TESTDB_DSN)
+# And the same again: MSSQL_TEST_CONNECTION_STRING gates copy_auto_tablock,
+# ctas_auto_tablock, ctas_if_not_exists and ddl_if_not_exists, and nothing has
+# ever set it either. Two of those cover auto-TABLOCK — the behaviour spec 057
+# rewrote — so the tests for that change had never executed once.
+MSSQL_TEST_CONNECTION_STRING = $(MSSQL_TESTDB_DSN)
 
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
@@ -112,6 +117,7 @@ export MSSQL_TEST_URI
 export MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_URI
 export MSSQL_TEST_SERVER
+export MSSQL_TEST_CONNECTION_STRING
 # NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default. Export it manually to
 # run TLS-specific tests (requires SQL Server with TLS enabled).
 # export MSSQL_TEST_DSN_TLS
@@ -135,8 +141,17 @@ integration-test: release
 	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
 		echo "WARNING: SQL Server container not detected. Run 'make docker-up' first."; \
 	fi
-	build/release/test/unittest "[integration]" --force-reload
-	build/release/test/unittest "[sql]" --force-reload
+	@# The path glob, not the group tags. `[integration]` and `[sql]` match only
+	@# the 8 files at the TOP level of test/sql — the 164 in subdirectories are
+	@# tagged `[mssql]`, and `"[mssql]"` matches NOTHING: sqllogictest registers a
+	@# subdirectory file under its path, so the tag never becomes a Catch tag. It
+	@# exits 0 having run zero tests, which is why nobody noticed.
+	@#
+	@# So every `.test` file written since the suite grew subdirectories has been
+	@# invisible to this target and to CI. Third instance of the same class on this
+	@# branch, and the widest: MSSQL_TEST_SERVER hid 4 files,
+	@# MSSQL_TEST_CONNECTION_STRING hides 4 more, this hid 164.
+	build/release/test/unittest "test/sql/*" --force-reload
 
 # Run the SQL suite with the performance counters ON (spec 057 step 0b).
 #

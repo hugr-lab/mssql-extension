@@ -273,7 +273,15 @@ SELECT
     col_char, col_varchar, col_nchar, col_nvarchar,
     col_binary, col_varbinary,
     DATEADD(day, id, col_date), col_time, col_time_scale,
-    DATEADD(day, id, col_datetime), DATEADD(day, id, col_datetime2), col_datetime2_scale,
+    DATEADD(day, id, col_datetime),
+    -- NOT a bare DATEADD: one seed row holds 9999-12-31 23:59:59.9999999, the
+    -- datetime2 MAXIMUM, and adding a day to it raises Msg 517 and aborts the
+    -- whole INSERT ... SELECT. dbo.AllDataTypes ended up with 3 rows instead of
+    -- 6, silently, for anyone who ran the suite — and a short fixture reads as a
+    -- code defect long before anyone suspects the seed. The boundary row is
+    -- worth keeping, so it keeps its value instead of being shifted.
+    CASE WHEN col_datetime2 < '9999-12-01' THEN DATEADD(day, id, col_datetime2) ELSE col_datetime2 END,
+    col_datetime2_scale,
     col_smalldatetime,
     DATEADD(day, id, col_datetimeoffset), col_datetimeoffset_scale
 FROM dbo.AllDataTypes WHERE id <= 3;

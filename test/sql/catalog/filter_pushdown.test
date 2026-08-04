@@ -254,12 +254,21 @@ SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_date = '2024-06
 1	2147483647
 
 # Test 27: Filter on DATE column with less than
-# id=1 has 2024-06-15, id=2 has 1900-01-01
+#
+# id=1 is 2024-06-15, id=2 is 1900-01-01, and id=5 is 1900-01-03 — the second
+# INSERT's shift of id=2 by two days.
+#
+# id=5 is new to this expectation, and its absence was a FIXTURE bug that had
+# been baked in here: init.sql's "add more rows" INSERT ... SELECT died on
+# Msg 517, because one seed row holds the datetime2 MAXIMUM and DATEADD over it
+# overflows. dbo.AllDataTypes had 3 rows where the seed always intended 6, so
+# this assertion was written against half a table.
 query II
 SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_date < '2024-06-16' ORDER BY id;
 ----
 1	2147483647
 2	-2147483648
+5	-2147483648
 
 # =============================================================================
 # TIMESTAMP (DATETIME/DATETIME2) Filter Tests
@@ -273,26 +282,40 @@ SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime >= '20
 1	2147483647
 
 # Test 29: Filter on TIMESTAMP (DATETIME2) column with greater than
-# id=1: 2024-06-15, id=2: 0001-01-01, id=3: 9999-12-31
+#
+# id=1: 2024-06-15, id=2: 0001-01-01, id=3: 9999-12-31, and the second INSERT's
+# shifted copies id=4 and id=6. id=6 is id=3's row, which keeps 9999-12-31
+# unshifted — adding a day to the datetime2 maximum is what used to abort the
+# whole seed (see Test 27).
+#
+# The comparison happens on the SERVER, so 9999-12-31 participates normally here
+# even though reading it back into a DuckDB TIMESTAMP_NS yields NULL — that
+# domain ends around 2262 (issue #168).
 query II
 SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime2 > '2024-06-15 00:00:00' ORDER BY id;
 ----
 1	2147483647
 3	0
+4	2147483647
+6	0
 
 # Test 30: Filter on TIMESTAMP column with less than
-# Should return id=2 (1900-01-01 00:00:00)
+# id=2 is 1900-01-01 and id=5 is its two-day shift from the second INSERT.
 query II
 SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime < '1901-01-01 00:00:00' ORDER BY id;
 ----
 2	-2147483648
+5	-2147483648
 
 # Test 31: Filter on TIMESTAMP column with range (year 2024)
+# id=4 is id=1 shifted by a day; id=6 is id=3 shifted by three days, which lands
+# in 2025 and is therefore outside this range.
 query II
 SELECT id, col_int FROM testdb_filter.dbo.AllDataTypes WHERE col_datetime >= '2024-01-01 00:00:00' AND col_datetime < '2025-01-01 00:00:00' ORDER BY id;
 ----
 1	2147483647
 3	0
+4	2147483647
 
 # Test 32: Combined DATE and TIMESTAMP filter
 query II
