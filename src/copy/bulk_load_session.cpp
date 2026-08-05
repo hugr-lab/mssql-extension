@@ -20,6 +20,44 @@ uint64_t ElapsedNs(TimePoint start) {
 
 }  // namespace
 
+string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMetadata> &columns, bool tablock,
+						  idx_t rows_per_batch) {
+	// A temp table is named by its bare name: `#t` lives in tempdb, and
+	// `[dbo].[#t]` sends the server looking in the current database.
+	string sql = "INSERT BULK ";
+	sql += target.IsTempTable() ? target.GetBracketedTable() : target.GetFullyQualifiedName();
+	sql += " (";
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			sql += ", ";
+		}
+		sql += "[" + columns[i].name + "] ";
+		// The column's own declaration: exact TDS type info for an existing
+		// table, generated types for one this statement is creating.
+		sql += columns[i].GetSQLServerTypeDeclaration();
+	}
+	sql += ")";
+
+	// TABLOCK: a table-level lock instead of row locks, which also enables
+	// minimal logging. ROWS_PER_BATCH: tells the server the batch size up front
+	// so it can size the load rather than discover it.
+	//
+	// An MSSQL_BCP_EXTRA_HINTS env var used to splice arbitrary text into this
+	// WITH clause, to measure hints the extension does not send yet. It is gone:
+	// an environment variable reaching a T-SQL statement verbatim is an injection
+	// surface for anything that can set one. The hint it existed to investigate —
+	// ORDER for a clustered target — needs a real option and a guarantee that the
+	// rows really are sorted, which is its own spec.
+	if (tablock && rows_per_batch > 0) {
+		sql += " WITH (TABLOCK, ROWS_PER_BATCH = " + std::to_string(rows_per_batch) + ")";
+	} else if (tablock) {
+		sql += " WITH (TABLOCK)";
+	} else if (rows_per_batch > 0) {
+		sql += " WITH (ROWS_PER_BATCH = " + std::to_string(rows_per_batch) + ")";
+	}
+	return sql;
+}
+
 BulkLoadSession::~BulkLoadSession() noexcept {
 	// The writer goes first: it holds a reference to the connection, and the
 	// release protocol closes the socket underneath it.

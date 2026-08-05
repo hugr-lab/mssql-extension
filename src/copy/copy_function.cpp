@@ -476,48 +476,10 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 					 bdata.config.tablock ? 1 : 0, (int)bdata.config.tablock_choice, (int)bdata.config.target_shape,
 					 bdata.config.is_new_table ? 1 : 0);
 
-		// Build and execute INSERT BULK statement
-		// This prepares the server to receive BulkLoad packets
-		// For temp tables, use just the table name (not schema-qualified)
-		string target_name;
-		if (bdata.target.IsTempTable()) {
-			target_name = bdata.target.GetBracketedTable();
-		} else {
-			target_name = bdata.target.GetFullyQualifiedName();
-		}
-		string insert_bulk = "INSERT BULK " + target_name + " (";
-		for (idx_t i = 0; i < gstate->columns.size(); i++) {
-			if (i > 0) {
-				insert_bulk += ", ";
-			}
-			insert_bulk += "[" + gstate->columns[i].name + "] ";
-			// Use the column's method to get accurate type declaration for INSERT BULK
-			// This handles both existing tables (uses actual TDS type info) and new tables
-			insert_bulk += gstate->columns[i].GetSQLServerTypeDeclaration();
-		}
-		insert_bulk += ")";
-
-		// Add bulk load hints for performance
-		// TABLOCK: Table-level lock instead of row locks (15-30% faster, enables minimal logging)
-		// ROWS_PER_BATCH: Helps SQL Server optimize batch processing
-		if (bdata.config.tablock) {
-			insert_bulk += " WITH (TABLOCK";
-			if (bdata.config.flush_rows > 0) {
-				insert_bulk += ", ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows);
-			}
-			insert_bulk += ")";
-		} else if (bdata.config.flush_rows > 0) {
-			insert_bulk += " WITH (ROWS_PER_BATCH = " + std::to_string(bdata.config.flush_rows) + ")";
-		}
-
-		// An MSSQL_BCP_EXTRA_HINTS env var used to splice arbitrary text into this
-		// WITH clause, to measure hints the extension does not send yet. It said of
-		// itself that it had to go before the branch landed, and it does: an
-		// environment variable that reaches a T-SQL statement verbatim is an
-		// injection surface for anything that can set one. The hint it existed to
-		// investigate — ORDER for a clustered target — needs a real COPY option and
-		// a guarantee that the rows really are sorted, which is its own spec.
-
+		// Build and execute INSERT BULK statement — one builder for every consumer
+		// (spec 063 D4), which is what stops CTAS silently omitting ROWS_PER_BATCH.
+		const string insert_bulk =
+			BuildInsertBulkSql(bdata.target, gstate->columns, bdata.config.tablock, bdata.config.flush_rows);
 		CopyDebugLog(2, "BCPCopyInitGlobal: INSERT BULK SQL: %s", insert_bulk.c_str());
 
 		// Cache the INSERT BULK SQL for re-execution on batch flush

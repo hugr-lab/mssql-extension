@@ -137,8 +137,13 @@ void TestFormatDdlTypeNameExpectedShapes() {
 	std::cout << "Test: FormatDdlTypeName returns SQL Server-canonical type names\n";
 
 	duckdb::mssql::CTASConfig cfg;
+	// Signed TINYINT widens to SMALLINT, deliberately (spec 057): SQL Server's
+	// `tinyint` is its ONLY unsigned integer (0..255) while DuckDB's TINYINT is
+	// signed (-128..127), so the narrow mapping silently turned -1 into 255 on
+	// the wire. UTINYINT is the type that actually matches `tinyint`, and the two
+	// lines below are what says the pair is not symmetric.
 	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::TINYINT, cfg, DdlContext::CreateTable),
-			 std::string("TINYINT"));
+			 std::string("SMALLINT"));
 	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::UTINYINT, cfg, DdlContext::CreateTable),
 			 std::string("TINYINT"));
 	CHECK_EQ(duckdb::mssql::codec::integer::FormatDdlTypeName(LogicalType::SMALLINT, cfg, DdlContext::CtasCreateTable),

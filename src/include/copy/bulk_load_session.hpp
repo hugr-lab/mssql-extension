@@ -89,6 +89,27 @@ struct BulkLoadSessionParams {
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 };
 
+//! Build the `INSERT BULK` statement that opens a bulk load.
+//!
+//! One builder for every consumer, which is what closes the drift it was written
+//! to close: CTAS emitted only `WITH (TABLOCK)` and never `ROWS_PER_BATCH`, so
+//! the server was told the batch size for a COPY and left to guess it for a
+//! CTAS. Two builders is how that happens; one cannot.
+//!
+//! @param target        resolved target — a temp table is named WITHOUT its
+//!                      schema, because `#name` lives in tempdb and qualifying
+//!                      it makes the server look in the wrong place
+//! @param columns       column list, bracketed, with each column's own SQL
+//!                      Server type declaration (exact for an existing table,
+//!                      generated for one being created)
+//! @param tablock       resolved TABLOCK decision — the POLICY belongs to the
+//!                      caller (MSSQLResolveTablock reads the target's shape);
+//!                      this only renders it
+//! @param rows_per_batch `flush_rows`, told to the server up front so it can
+//!                      size the load. 0 omits the hint.
+string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMetadata> &columns, bool tablock,
+						  idx_t rows_per_batch);
+
 //! A bulk-load session owned by ONE thread. Not thread-safe and not meant to be:
 //! a thread either owns one of these or shares the operator's global writer.
 class BulkLoadSession {

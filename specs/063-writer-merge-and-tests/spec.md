@@ -389,6 +389,30 @@ or a workflow, or is on an explicit opt-in list (`MSSQL_COUNTERS`, `AZURE_*`,
 **A filter that matches nothing is indistinguishable from a suite that passed.**
 Assert the case count, not the exit code.
 
+**A fourth instance turned up while building D4, and its root cause is
+different — which changes what this deliverable can achieve.** `make test-cpp`
+builds 13 standalone C++ tests, and three of them had been failing on `main`:
+`test_ddl_translator`, `test_ctas_type_mapping` and `test_integer_codec` all
+still expected signed `TINYINT` to map to `tinyint`, which spec 057 deliberately
+widened to `smallint` (SQL Server's `tinyint` is unsigned 0..255; the narrow
+mapping turned -1 into 255 on the wire). Fixed here.
+
+They went stale inside ONE spec, and the Makefile comment directly above them
+says why it keeps happening — those files "existed in test/cpp/ for a long time
+WITHOUT being built by anything... A test nobody runs is documentation that looks
+like a guarantee." Spec 057 wired them into the Makefile. It did not wire them
+into CI.
+
+And it could not: **no CI job builds the extension on a pull request at all**
+(`ci.yml:161` — the build job is `workflow_dispatch`/`schedule` only), which is
+issue #212. `make test-cpp` links against the built archive, so a gate for it is
+blocked behind that. So D7 splits:
+
+- the `require-env` gate for `test/sql/` — doable here, catches instances of the
+  first three's shape;
+- a gate for the standalone C++ tests — needs #212 first. Record the dependency
+  rather than pretending the deliverable covers it.
+
 ### D8 — consolidate the parallel-writer tests
 
 `parallel_writers` and `ctas_parallel_writers` are near-identical and will test

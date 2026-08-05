@@ -76,7 +76,11 @@ void test_ctas_integers() {
 
 	// Signed integers
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::BOOLEAN, config), "BIT");
-	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TINYINT, config), "TINYINT");
+	// Signed TINYINT widens to SMALLINT, deliberately (spec 057): SQL Server's
+	// `tinyint` is its ONLY unsigned integer (0..255) while DuckDB's TINYINT is
+	// signed (-128..127), so the narrow mapping silently turned -1 into 255 on
+	// the wire. UTINYINT is the type that actually matches `tinyint`.
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::TINYINT, config), "SMALLINT");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::SMALLINT, config), "SMALLINT");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::INTEGER, config), "INT");
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::BIGINT, config), "BIGINT");

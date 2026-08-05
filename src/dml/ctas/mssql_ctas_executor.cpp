@@ -4,6 +4,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_config.hpp"
 #include "copy/bcp_writer.hpp"
+#include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
@@ -500,21 +501,10 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 }
 
 string CTASExecutionState::BuildInsertBulkSql() const {
-	// Format: INSERT BULK [schema].[table] (col1 type1, col2 type2, ...) [WITH (TABLOCK)]
-	string sql = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
-	for (idx_t i = 0; i < bcp_columns.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		// Column name must be bracketed for safety
-		sql += "[" + bcp_columns[i].name + "] ";
-		sql += bcp_columns[i].GetSQLServerTypeDeclaration();
-	}
-	sql += ")";
-	if (config.bcp_tablock) {
-		sql += " WITH (TABLOCK)";
-	}
-	return sql;
+	// The shared builder (spec 063 D4). CTAS used to have its own, which emitted
+	// only `WITH (TABLOCK)` — so the server was told the batch size for a COPY and
+	// left to guess it for a CTAS, for no reason anyone chose.
+	return mssql::BuildInsertBulkSql(bcp_target, bcp_columns, config.bcp_tablock, config.bcp_flush_rows);
 }
 
 void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {

@@ -353,6 +353,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ddl_translator.cpp \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_catalog_filter.cpp \
+    test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/codec/test_binary_codec.cpp \
     test/cpp/codec/test_boolean_codec.cpp \
     test/cpp/codec/test_datetime_codec.cpp \
