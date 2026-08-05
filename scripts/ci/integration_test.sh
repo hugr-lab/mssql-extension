@@ -190,12 +190,30 @@ done < /tmp/mssql_our_files.txt
 owned=$(wc -l < /tmp/mssql_our_files.txt | tr -d ' ')
 selected=$(grep -c . /tmp/mssql_selected.txt || true)
 echo "Suite: $owned .test files in the repo, $selected registered in the runner"
-if [ "$selected" -lt "$MIN_TEST_CASES" ]; then
+
+# EVERY file this repository owns must be registered — not merely "enough of
+# them". A floor alone would pass with 160 of 172 registered, and the 12 missing
+# would be exactly as invisible as the 172 were before #212. Adding a .test file
+# needs no change here (the list is computed by `find` on every run); a file that
+# the BUILD failed to pick up is what this catches.
+if [ "$selected" -ne "$owned" ]; then
     echo "" >&2
-    echo "=== Only $selected of $owned .test files are registered in $UNITTEST_BIN ===" >&2
-    echo "    The build did not register this extension's tests, so nothing would run." >&2
+    echo "=== $selected of $owned .test files are registered in $UNITTEST_BIN ===" >&2
+    echo "    Files the runner does not know about, so they would not run:" >&2
+    while read -r f; do
+        grep -qF "$f" /tmp/mssql_all_tests.txt || echo "      $f" >&2
+    done < /tmp/mssql_our_files.txt
     echo "    A few names the runner DOES know, for comparison:" >&2
     head -4 /tmp/mssql_all_tests.txt | sed 's/^/      /' >&2
+    exit 1
+fi
+
+# And a floor besides, for the case where the repo itself has lost its tests.
+if [ "$owned" -lt "$MIN_TEST_CASES" ]; then
+    echo "" >&2
+    echo "=== the repo has only $owned .test files, expected at least $MIN_TEST_CASES ===" >&2
+    echo "    If files were deliberately removed, lower MSSQL_MIN_TEST_CASES in the" >&2
+    echo "    same commit. Otherwise the checkout is not what it should be." >&2
     exit 1
 fi
 
