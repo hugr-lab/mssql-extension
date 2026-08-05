@@ -106,6 +106,13 @@ MSSQL_TEST_SERVER = $(MSSQL_TESTDB_DSN)
 # rewrote — so the tests for that change had never executed once.
 MSSQL_TEST_CONNECTION_STRING = $(MSSQL_TESTDB_DSN)
 
+# Floor on the number of sqllogictest cases `integration-test` must actually run.
+# Not a target to grow — a tripwire. The suite has been reported green while
+# running 0 files (a tag that matched nothing) and while running 8 of 172 (the
+# wrong filter), both exiting 0. Lower it deliberately, in the commit that
+# removes files, or not at all.
+MSSQL_MIN_TEST_CASES ?= 150
+
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
 export MSSQL_TEST_PORT
@@ -151,7 +158,21 @@ integration-test: release
 	@# invisible to this target and to CI. Third instance of the same class on this
 	@# branch, and the widest: MSSQL_TEST_SERVER hid 4 files,
 	@# MSSQL_TEST_CONNECTION_STRING hides 4 more, this hid 164.
-	build/release/test/unittest "test/sql/*" --force-reload
+	@# ...and the exit code alone would not have caught any of it. A filter that
+	@# matches nothing is indistinguishable from a suite that passed, so the count
+	@# is asserted, not the status (spec 063 D7).
+	@set -o pipefail; build/release/test/unittest "test/sql/*" --force-reload 2>&1 | tee /tmp/mssql_integration.out
+	@cases=$$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration.out | tail -1 | grep -oE '^[0-9]+'); \
+	if [ -z "$$cases" ]; then \
+		echo "integration-test: could not read a case count from the output — the suite did not report" >&2; exit 1; \
+	fi; \
+	if [ "$$cases" -lt $(MSSQL_MIN_TEST_CASES) ]; then \
+		echo "integration-test: only $$cases cases ran, expected at least $(MSSQL_MIN_TEST_CASES)." >&2; \
+		echo "  A filter that matches nothing exits 0. If files were deliberately removed," >&2; \
+		echo "  lower MSSQL_MIN_TEST_CASES in the Makefile in the same commit." >&2; \
+		exit 1; \
+	fi; \
+	echo "integration-test: $$cases cases ran (floor $(MSSQL_MIN_TEST_CASES))"
 
 # Run the SQL suite with the performance counters ON (spec 057 step 0b).
 #
