@@ -5,6 +5,7 @@
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/write_column_ops.hpp"
+#include "mssql_counters.hpp"
 
 #include "tds/tds_types.hpp"
 
@@ -653,6 +654,13 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		}
 		ops[c] = mssql::codec::ResolveWriteColumnOps(states[c].vec->GetType(), columns[c]);
 		if (!ops[c].CanScatter()) {
+			if (mssql::CountersEnabled()) {
+				auto &pc = mssql::GetEncodePathCounters();
+				pc.chunks_row_major.fetch_add(1, std::memory_order_relaxed);
+				pc.fallback_unsupported_pair.fetch_add(1, std::memory_order_relaxed);
+				pc.last_fallback_column.store(c, std::memory_order_relaxed);
+				pc.last_fallback_arm.store(static_cast<uint64_t>(ops[c].arm), std::memory_order_relaxed);
+			}
 			return false;
 		}
 		if (ops[c].IsVariable()) {
@@ -662,6 +670,12 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			// unhandled wire form) drops the whole chunk to the row path, which
 			// reproduces the legacy bytes exactly.
 			if (!mssql::codec::string::PlanColumn(*states[c].vec, states[c].fmt, 0, row_count, columns[c], plans[c])) {
+				if (mssql::CountersEnabled()) {
+					auto &pc = mssql::GetEncodePathCounters();
+					pc.chunks_row_major.fetch_add(1, std::memory_order_relaxed);
+					pc.fallback_string_plan.fetch_add(1, std::memory_order_relaxed);
+					pc.last_fallback_column.store(c, std::memory_order_relaxed);
+				}
 				return false;
 			}
 			has_variable = true;
@@ -760,6 +774,14 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	// One variable-width column makes every row a different length, so the
 	// constant-stride path is unavailable for EVERY column in the chunk — NULLs
 	// or not.
+	if (mssql::CountersEnabled()) {
+		auto &pc = mssql::GetEncodePathCounters();
+		if (all_valid && !has_variable) {
+			pc.chunks_strided.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			pc.chunks_cursor.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	if (all_valid && !has_variable) {
 		// Rows in BLOCKS; within a block, walk the columns. A full per-column pass
 		// over a wide row touches a distinct cache line per store and then walks

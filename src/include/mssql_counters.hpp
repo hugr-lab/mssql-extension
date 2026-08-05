@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 
 namespace duckdb {
@@ -53,6 +55,52 @@ inline bool CountersConfoundedByLogging() {
 		return debug && std::atoi(debug) >= 1;
 	}();
 	return confounded;
+}
+
+//===----------------------------------------------------------------------===//
+// Encode-path attribution (spec 064 reconnaissance)
+//
+// The write path has three shapes and picks one PER CHUNK, and nothing reported
+// which. That makes the central question of the columnar work unanswerable from
+// the outside: "what fraction of this table's chunks fell off the fast path, and
+// which column pushed them?" Every number in the spec-057 series was a total,
+// and a total cannot distinguish a slow kernel from a chunk that never reached
+// one.
+//
+// Process-wide rather than per-statement on purpose: this is reconnaissance, the
+// benchmark runs one load per process, and threading it through four state
+// structs to answer a question about a resolver would be a lot of machinery for
+// a measurement. Relaxed ordering — these are counts, never a decision.
+//===----------------------------------------------------------------------===//
+
+struct EncodePathCounters {
+	//! Every column fixed-width and no NULLs: one kernel call per column per
+	//! block, constant stride. The fast path.
+	std::atomic<uint64_t> chunks_strided{0};
+	//! A variable-length column, or a NULL in a fixed-width one. Kernel calls for
+	//! the direct-copy and convert arms; ONE CALL PER VALUE for decimal, uuid and
+	//! datetime.
+	std::atomic<uint64_t> chunks_cursor{0};
+	//! Some column resolved to RowFallback, or a string column could not be
+	//! planned: no kernels at all, for ANY column in the chunk.
+	std::atomic<uint64_t> chunks_row_major{0};
+
+	//! Why the row path was taken, counted separately because the two have
+	//! different fixes: an unsupported (source, target) PAIR is resolver work,
+	//! an unplannable string column is codec work.
+	std::atomic<uint64_t> fallback_unsupported_pair{0};
+	std::atomic<uint64_t> fallback_string_plan{0};
+
+	//! The column index that most recently forced the row path, and the arm it
+	//! resolved to. Last-writer-wins: enough to name a culprit in a benchmark,
+	//! not enough to attribute a mixed workload.
+	std::atomic<uint64_t> last_fallback_column{0};
+	std::atomic<uint64_t> last_fallback_arm{0};
+};
+
+inline EncodePathCounters &GetEncodePathCounters() {
+	static EncodePathCounters counters;
+	return counters;
 }
 
 }  // namespace mssql

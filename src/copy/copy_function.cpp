@@ -901,6 +901,28 @@ static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 					encode_ns / v, other_ns / v);
 		}
 	}
+	// Encode-path attribution (spec 064). The three shapes are picked PER CHUNK
+	// and nothing used to report which, so "did this table reach the fast path?"
+	// could not be answered from outside the process.
+	{
+		auto &pc = mssql::GetEncodePathCounters();
+		const uint64_t st = pc.chunks_strided.load(std::memory_order_relaxed);
+		const uint64_t cu = pc.chunks_cursor.load(std::memory_order_relaxed);
+		const uint64_t rm = pc.chunks_row_major.load(std::memory_order_relaxed);
+		if (st + cu + rm > 0) {
+			fprintf(stderr, "[MSSQL COUNTERS]   encode path (chunks): strided=%llu cursor=%llu row_major=%llu\n",
+					(unsigned long long)st, (unsigned long long)cu, (unsigned long long)rm);
+			if (rm > 0) {
+				fprintf(stderr,
+						"[MSSQL COUNTERS]   row-major cause: unsupported_pair=%llu string_plan=%llu "
+						"(last: column %llu, arm %llu)\n",
+						(unsigned long long)pc.fallback_unsupported_pair.load(std::memory_order_relaxed),
+						(unsigned long long)pc.fallback_string_plan.load(std::memory_order_relaxed),
+						(unsigned long long)pc.last_fallback_column.load(std::memory_order_relaxed),
+						(unsigned long long)pc.last_fallback_arm.load(std::memory_order_relaxed));
+			}
+		}
+	}
 }
 
 //===----------------------------------------------------------------------===//
