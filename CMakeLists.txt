@@ -221,6 +221,7 @@ set(EXTENSION_SOURCES
     src/copy/bcp_config.cpp
     src/copy/target_resolver.cpp
     src/copy/bcp_writer.cpp
+    src/copy/bulk_load_session.cpp
     src/copy/copy_function.cpp
     # Azure AD authentication layer
     src/azure/azure_http.cpp

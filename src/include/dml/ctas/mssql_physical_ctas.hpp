@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include "copy/bulk_load_session.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_executor.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
@@ -175,21 +176,11 @@ class MSSQLCTASLocalSinkState : public LocalSinkState {
 public:
 	MSSQLCTASLocalSinkState() = default;
 
-	//! Last-resort release. A throw from Sink skips Combine, so nothing else
-	//! would return this thread's connection: it would sit in Executing with a
-	//! bulk-load transaction open, holding locks on the table CTAS just created,
-	//! until the pool was torn down. Touches NO ClientContext — the pool handle
-	//! is captured on the thread that acquired the connection (issue #178).
-	~MSSQLCTASLocalSinkState();
-
-	//! This thread's own bulk-load connection, or null when it shares the global
-	//! writer (in a transaction, at the limit, or acquisition failed).
-	std::shared_ptr<tds::TdsConnection> connection;
-	unique_ptr<mssql::BCPWriter> writer;
-	weak_ptr<tds::ConnectionPool> pool_handle;
-
-	//! Rows this writer has sent since its last flush.
-	idx_t rows_in_batch = 0;
+	//! This thread's own bulk-load session, or unopened when it shares the global
+	//! writer (at the limit, or acquisition failed). Owns the connection, the
+	//! writer, the batch bookkeeping and the last-resort release — see
+	//! copy/bulk_load_session.hpp; COPY holds the same type.
+	mssql::BulkLoadSession session;
 
 	//! Rows this writer has encoded in total, folded into the global
 	//! rows_produced in Combine so the metrics line still adds up.

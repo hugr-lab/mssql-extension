@@ -118,12 +118,6 @@ void RegisterMSSQLCopyFunctions(ExtensionLoader &loader) {
 	CopyDebugLog(1, "Registered 'bcp' COPY function");
 }
 
-MSSQLCopyLocalState::~MSSQLCopyLocalState() {
-	// See the header: covers the sink-throw path, where copy_to_combine never
-	// runs. Same contract as the global state's — no ClientContext here.
-	mssql::ReleaseBcpConnectionOnError(connection, pool_handle, false);
-}
-
 //===----------------------------------------------------------------------===//
 // MSSQLCopyGlobalState destructor - last-resort connection release (issue #191)
 //===----------------------------------------------------------------------===//
@@ -592,105 +586,6 @@ unique_ptr<LocalFunctionData> BCPCopyInitLocal(ExecutionContext &context, Functi
 }
 
 //===----------------------------------------------------------------------===//
-// Parallel writers (spec 057 step 7)
-//===----------------------------------------------------------------------===//
-
-//! Give this thread its own bulk-load session, or leave it sharing the global
-//! one. Tried once, on the thread's first chunk, because copy_to_initialize_local
-//! does not receive the global state and everything needed — the INSERT BULK
-//! text, the resolved columns, the mapping — is resolved there.
-//!
-//! Failure is NOT an error. A pool at its limit, a server refusing another bulk
-//! load, anything: the thread falls back to the shared writer, which is the
-//! pre-parallel behaviour and always correct. A COPY must not fail because it
-//! could not go faster.
-static void TryStartLocalWriter(ClientContext &context, MSSQLCopyBindData &bdata, MSSQLCopyGlobalState &gdata,
-								MSSQLCopyLocalState &ldata) {
-	if (gdata.parallel_writer_limit <= 1) {
-		return;
-	}
-	// Claim a slot before doing any work, so N threads racing here cannot
-	// collectively exceed the limit.
-	const idx_t slot = gdata.parallel_writers_used.fetch_add(1);
-	if (slot >= gdata.parallel_writer_limit) {
-		gdata.parallel_writers_used.fetch_sub(1);
-		return;
-	}
-
-	std::shared_ptr<tds::TdsConnection> conn;
-	try {
-		auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
-		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-		// The POOL, never ConnectionProvider (spec 063 D3). The provider returns
-		// the transaction's PINNED connection, and two writers on one connection
-		// interleave their ROW tokens into a single bulk load. That never happened
-		// because MSSQLResolveLoadPolicy caps a pinned load at one writer, so this
-		// function returns at its `<= 1` guard first — but that made the safety a
-		// consequence of a limit resolved 75 lines away rather than of what this
-		// line asks for. Acquire what a parallel writer is allowed to have.
-		conn = mssql_catalog.GetConnectionPool().Acquire();
-		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
-			throw IOException("no idle connection available for a parallel writer");
-		}
-		auto result = MSSQLSimpleQuery::Execute(*conn, gdata.insert_bulk_sql);
-		if (!result.success) {
-			throw IOException("INSERT BULK failed on the parallel connection: %s", result.error_message);
-		}
-		if (!conn->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-			throw IOException("could not transition the parallel connection to Executing");
-		}
-		ldata.pool_handle = mssql_catalog.GetConnectionPoolHandle();
-		ldata.connection = conn;
-		ldata.writer = make_uniq<BCPWriter>(*ldata.connection, bdata.target, gdata.columns, gdata.column_mapping);
-		// The stream opens with COLMETADATA; without it the server has no schema
-		// for the ROW tokens that follow.
-		ldata.writer->WriteColmetadata();
-		CopyDebugLog(1, "TryStartLocalWriter: writer %llu of %llu started", (unsigned long long)(slot + 1),
-					 (unsigned long long)gdata.parallel_writer_limit);
-	} catch (std::exception &e) {
-		CopyDebugLog(1, "TryStartLocalWriter: falling back to the shared writer (%s)", e.what());
-		if (conn) {
-			try {
-				auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
-				catalog.Cast<MSSQLCatalog>().GetConnectionPool().Release(conn);
-			} catch (...) {
-				// Nothing left to do — the handle is dropped either way.
-			}
-		}
-		ldata.connection.reset();
-		ldata.writer.reset();
-		gdata.parallel_writers_used.fetch_sub(1);
-	}
-}
-
-//! Close this thread's own bulk-load session: DONE for whatever is unflushed,
-//! then the server's confirmation, then the connection goes back to the pool.
-static void FinishLocalWriter(ClientContext &context, MSSQLCopyBindData &bdata, MSSQLCopyGlobalState &gdata,
-							  MSSQLCopyLocalState &ldata) {
-	if (!ldata.writer) {
-		return;
-	}
-	// Always send DONE, even for zero rows: INSERT BULK left the connection in
-	// Executing, and only DONE closes the stream so it can be pooled again.
-	ldata.writer->WriteDone(ldata.rows_in_batch);
-	const idx_t confirmed = ldata.writer->Finalize();
-	gdata.rows_confirmed.fetch_add(confirmed);
-	if (ldata.rows_in_batch > 0) {
-		gdata.batches_flushed.fetch_add(1);
-	}
-	ldata.rows_in_batch = 0;
-	ldata.writer.reset();
-
-	auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
-	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-	if (ldata.connection) {
-		ldata.connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-		mssql_catalog.GetConnectionPool().Release(ldata.connection);
-		ldata.connection.reset();
-	}
-}
-
-//===----------------------------------------------------------------------===//
 // BCPCopySink - Accumulate rows and flush batches
 //===----------------------------------------------------------------------===//
 
@@ -722,48 +617,45 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	auto &ldata = lstate.Cast<MSSQLCopyLocalState>();
 	if (!ldata.init_attempted) {
 		ldata.init_attempted = true;
-		TryStartLocalWriter(context.client, bdata, gdata, ldata);
+		auto &catalog = Catalog::GetCatalog(context.client, bdata.catalog_name);
+		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		BulkLoadSessionParams params;
+		// The POOL, never ConnectionProvider: inside a transaction the provider
+		// returns the PINNED connection, and two writers on one connection
+		// interleave their ROW tokens into a single bulk load. The policy already
+		// caps a pinned load at one writer, but this is what makes it structural.
+		params.pool = &mssql_catalog.GetConnectionPool();
+		params.pool_handle = mssql_catalog.GetConnectionPoolHandle();
+		params.insert_bulk_sql = &gdata.insert_bulk_sql;
+		params.target = &bdata.target;
+		params.columns = &gdata.columns;
+		params.column_mapping = &gdata.column_mapping;
+		params.flush_rows = bdata.config.flush_rows;
+		params.collect_timings = counters;
+		if (params.pool && ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit)) {
+			CopyDebugLog(1, "BCPCopySink: parallel writer started (limit=%llu)",
+						 (unsigned long long)gdata.parallel_writer_limit);
+		} else {
+			CopyDebugLog(1, "BCPCopySink: sharing the global writer");
+		}
 	}
 
 	try {
 		// A thread with its own session writes without touching the shared writer
 		// at all — no mutex, no shared accumulator. Threads that did not get one
 		// share the global writer exactly as before.
-		if (ldata.writer) {
-			auto start_write = counters ? Clock::now() : TimePoint{};
-			const idx_t rows_written = ldata.writer->WriteRows(input);
-			const uint64_t encode_ns_local = counters ? ElapsedNs(start_write) : 0;
-			ldata.rows_in_batch += rows_written;
-			gdata.rows_sent.fetch_add(rows_written);
-
-			uint64_t flush_ns_local = 0;
-			if (bdata.config.ShouldFlushToServer(ldata.rows_in_batch)) {
-				auto start_flush = counters ? Clock::now() : TimePoint{};
-				const idx_t confirmed = ldata.writer->FlushBatch(ldata.rows_in_batch);
-				gdata.rows_confirmed.fetch_add(confirmed);
+		if (ldata.session.IsOwned()) {
+			const auto written = ldata.session.Write(input);
+			gdata.rows_sent.fetch_add(written.rows_written);
+			if (written.flushed) {
+				gdata.rows_confirmed.fetch_add(written.rows_confirmed);
 				gdata.batches_flushed.fetch_add(1);
-				ldata.rows_in_batch = 0;
-				// FlushBatch closed the stream; the next batch needs its own
-				// INSERT BULK, same as the shared path does in FlushToServer.
-				auto result = MSSQLSimpleQuery::Execute(*ldata.connection, gdata.insert_bulk_sql);
-				if (!result.success) {
-					throw InvalidInputException(
-						"MSSQL COPY: Failed to re-execute INSERT BULK on a parallel "
-						"connection: %s",
-						result.error_message);
-				}
-				if (!ldata.connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-					throw IOException("MSSQL COPY: Failed to transition a parallel connection to Executing");
-				}
-				ldata.writer->ResetForNextBatch();
-				ldata.writer->WriteColmetadata();
-				flush_ns_local = counters ? ElapsedNs(start_flush) : 0;
 			}
 			if (counters) {
 				gdata.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
 				gdata.counter_sink_ns.fetch_add(ElapsedNs(start_sink), std::memory_order_relaxed);
-				gdata.counter_encode_ns.fetch_add(encode_ns_local, std::memory_order_relaxed);
-				gdata.counter_flush_ns.fetch_add(flush_ns_local, std::memory_order_relaxed);
+				gdata.counter_encode_ns.fetch_add(written.encode_ns, std::memory_order_relaxed);
+				gdata.counter_flush_ns.fetch_add(written.flush_ns, std::memory_order_relaxed);
 			}
 			if (context.client.IsInterrupted()) {
 				throw InterruptException();
@@ -925,11 +817,17 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 	auto &bdata = bind_data.Cast<MSSQLCopyBindData>();
 	auto &gdata = gstate.Cast<MSSQLCopyGlobalState>();
 	auto &ldata = lstate.Cast<MSSQLCopyLocalState>();
-	if (!ldata.writer) {
+	if (!ldata.session.IsOwned()) {
 		return;
 	}
 	try {
-		FinishLocalWriter(context.client, bdata, gdata, ldata);
+		const idx_t batches = ldata.session.BatchesFlushed();
+		const idx_t confirmed = ldata.session.Finish();
+		gdata.rows_confirmed.fetch_add(confirmed);
+		// The final batch, which Finish() closed with DONE rather than FlushBatch.
+		if (ldata.session.BatchesFlushed() > batches) {
+			gdata.batches_flushed.fetch_add(1);
+		}
 	} catch (std::exception &e) {
 		// Recorded AND rethrown, which the two halves need for different reasons:
 		// the record is what makes first-failure-wins work across N writers, and
