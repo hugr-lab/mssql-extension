@@ -165,12 +165,38 @@ cd "$REPO_ROOT"
 # The runner reports `require-env` misses as skips, never failures, so a missing variable would
 # quietly reduce the suite to a no-op. The skip list is printed at the end of its output; the
 # expected skips are the optional environments (Azure, Kerberos, TLS, Windows SSPI).
-if "$UNITTEST_BIN" "test/sql/*"; then
+# A filter that matches nothing exits 0. That is not a hypothetical here: this
+# job has been reporting PASSED while running ZERO tests (issue #212 — "test/sql/*
+# selects zero files"), verified on the last scheduled runs of main as well as on
+# this one. The exit code cannot tell the difference, so the COUNT is checked.
+#
+# The Makefile's integration-test target grew the same floor (spec 063 D7), and
+# that was not enough: CI does not call it, it calls this script. A gate on one of
+# two entry points is a gate on neither.
+MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
+set -o pipefail
+"$UNITTEST_BIN" "test/sql/*" 2>&1 | tee /tmp/mssql_integration_ci.out
+status=$?
+
+cases=$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration_ci.out | tail -1 | grep -oE '^[0-9]+' || true)
+if [ -z "$cases" ]; then
+    cases=0
+fi
+
+if [ "$status" -ne 0 ]; then
     echo ""
-    echo "=== Integration Test PASSED ==="
-    exit 0
-else
-    echo ""
-    echo "=== Integration Test FAILED ==="
+    echo "=== Integration Test FAILED ($cases cases ran) ==="
     exit 1
 fi
+
+if [ "$cases" -lt "$MIN_TEST_CASES" ]; then
+    echo ""
+    echo "=== Integration Test ran $cases cases, expected at least $MIN_TEST_CASES ===" >&2
+    echo "    The runner exited 0 having selected (almost) nothing — see issue #212." >&2
+    echo "    A green job here means the suite RAN, not merely that it did not fail." >&2
+    exit 1
+fi
+
+echo ""
+echo "=== Integration Test PASSED ($cases cases) ==="
+exit 0
