@@ -357,6 +357,20 @@ void ScatterFast(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat
 
 // The general path: a scale shift and/or a range check are needed, so the value
 // goes through hugeint. Still one call per column, still no dispatch in the loop.
+// hugeint_t has no uint64 constructor, and hugeint_t(int64) would fold values
+// above INT64_MAX negative — the exact bug the unsigned/signed refusals exist
+// for. One overload, zero cost for the signed sources.
+static inline hugeint_t ToHuge(uint64_t v) {
+	hugeint_t h;
+	h.lower = v;
+	h.upper = 0;
+	return h;
+}
+template <class SRC>
+static inline hugeint_t ToHuge(const SRC &v) {
+	return hugeint_t(v);
+}
+
 template <class SRC, class POS, bool HAS_SEL, bool HAS_NULLS>
 void ScatterGeneral(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, int32_t shift,
 					uint8_t byte_size, const mssql::BCPColumnMetadata &col) {
@@ -371,7 +385,7 @@ void ScatterGeneral(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFor
 			continue;
 		}
 		*out = byte_size;
-		hugeint_t value = RescaleMantissa(hugeint_t(src[idx]), shift, col);
+		hugeint_t value = RescaleMantissa(ToHuge(src[idx]), shift, col);
 		CheckMantissaFitsPrecision(value, col);
 		const bool neg = value.upper < 0;
 		const hugeint_t mag = neg ? Hugeint::Negate(value) : value;
@@ -487,6 +501,12 @@ static void ScatterChunkPos(POS pos, idx_t row_begin, idx_t rows, Vector &in, co
 	case PhysicalType::INT128:
 		fast ? ScatterFastByMag<hugeint_t, POS>(pos, row_begin, rows, fmt, byte_size, all_valid)
 			 : ScatterGeneralSel<hugeint_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
+		return;
+	case PhysicalType::UINT64:
+		// Never "fast": fast requires a DECIMAL source whose own precision bounds
+		// it. General widens through ToHuge and range-checks — vacuously for
+		// decimal(20,0), whose ceiling exceeds uint64's.
+		ScatterGeneralSel<uint64_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
 		return;
 	default:
 		throw InternalException("codec::decimal::ScatterChunk: unexpected source PhysicalType");

@@ -687,8 +687,15 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 	case LogicalTypeId::DOUBLE:
 		return target_lower == "float" || target_lower == "real";
 
+	case LogicalTypeId::USMALLINT:
+		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint";
+
+	case LogicalTypeId::UINTEGER:
+		return target_lower == "bigint" || target_lower == "int";
+
 	case LogicalTypeId::DECIMAL:
 	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
 		return target_lower == "decimal" || target_lower == "numeric" || target_lower == "money" ||
 			   target_lower == "smallmoney";
 
@@ -719,8 +726,12 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 		return target_lower == "datetimeoffset";
 
 	default:
-		// For unknown types, allow if types look similar
-		return true;
+		// An unknown source type is REFUSED, not waved through. `return true`
+		// here was how INTERVAL reached an encoder that throws an INTERNAL Error
+		// (issue #238), and how nested types were "allowed" with no evidence
+		// anyone had tried. The refusal is at bind time with the pair named;
+		// the fix on the user's side is an explicit cast.
+		return false;
 	}
 }
 
@@ -1205,7 +1216,11 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		if (source_types[i].id() == LogicalTypeId::UBIGINT) {
 			col.precision = 20;
 			col.scale = 0;
-			col.max_length = 9;	 // DECIMAL(20,0) needs 9 bytes
+			// 13, not 9: GetDecimalByteSize(20) is 13 (sign + 12 magnitude
+			// bytes), and EncodeDecimal has always WRITTEN 13 for precision 20 —
+			// the 9 here disagreed with every byte on the wire, which is what
+			// kept the resolver's width check from ever matching (spec 064 D4).
+			col.max_length = 13;
 		}
 
 		// Handle HUGEINT as DECIMAL(38,0) — #177 (SUM() aggregates return HUGEINT).
