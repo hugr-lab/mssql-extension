@@ -413,15 +413,44 @@ blocked behind that. So D7 splits:
 - a gate for the standalone C++ tests — needs #212 first. Record the dependency
   rather than pretending the deliverable covers it.
 
-### D8 — consolidate the parallel-writer tests
+### D8 — the parallel-writer tests: decided NOT to merge
 
-`parallel_writers` and `ctas_parallel_writers` are near-identical and will test
-one implementation after D2. Each needs its own `SET threads`, so the merge keeps
-that per-section or does not happen — decide once the code is one.
+The decision this deliverable deferred to "once the code is one" is: **leave them
+as two files.** Reading them after D2:
 
-Add the case §4 describes and nothing covers: a COPY into a `#temp` target with
-`threads > 1` opens **exactly one** bulk-load session, rather than N-1 failures
-and a fallback.
+- what is duplicated is the PROSE — the paragraph about the lost 205376 rows, the
+  thread-pinning note — not the assertions;
+- what differs is real. CTAS **creates** its target, so each writer opens an
+  `INSERT BULK` against a table that did not exist a moment ago, and the ordering
+  (DDL in `GetGlobalSinkState`, writers on first chunk) is asserted by those loads
+  simply succeeding. COPY loads into a table that already existed;
+- and §B.3 of `research.md` already says not to merge across `copy/` and `ctas/`
+  by subject, because the directory split is how the suite is filtered when only
+  one operator changed. That rule was written before this deliverable and holds.
+
+**What they were missing is the D6 problem, not duplication.** Both said, in a
+comment, that the writer count is "a ceiling, not a floor" — and asserted
+nothing. So a one-core runner, or any change that stopped a slot being claimed,
+would have both files testing the serial path twice and reporting green.
+
+Half of that is now asserted: after the serial section,
+`mssql_pool_stats(...).connections_created` must be exactly **1**, which proves
+`mssql_copy_parallel_writers = 1` really disables the feature. Verified to bite —
+changing the setting to 4 fails the assertion.
+
+The other half **could not be asserted, and the file says so instead of
+pretending.** The obvious check — `connections_created > 1` after the parallel
+section — is useless: the count is 2 even on a single thread, because the
+operator opens the global writer's connection in its global state and the one
+sink thread then claims a session of its own on top of it. Measured at
+threads=1 → 2 and threads=4 → 3, so the only thing separating them is a
+scheduling-dependent number that would flake. Making it verifiable needs a signal
+the extension does not expose to SQL: the counters know (`writers=N/M`, D5) but
+they go to stderr.
+
+Still open, and not covered by anything: a COPY into a `#temp` target with
+`threads > 1` opening **exactly one** bulk-load session (§4). It needs the same
+missing signal.
 
 ### D9 — merge PR #232, with two corrections it has now outlived
 
