@@ -98,88 +98,45 @@ and nothing tells them the other three exist.
 That reframes a deliverable: the biggest available write-path win needs no
 kernel work at all.
 
-### D0 — revisit the default text type  *(before any kernel work)*
+### D0 — the default text type: no change, and the reasoning was already in the code
 
-`mssql_ctas_text_type` defaults to `NVARCHAR`, which costs 3.2x against
-`varchar(n)` + UTF-8 on ASCII-ish data. Changing a default is a compatibility
-decision, not a performance one, so this deliverable was the analysis.
+`varchar(n)` + UTF-8 measured 3.2x today's `nvarchar(max)` default, so: should the
+default change? **No, and most of what looked like a question is already answered
+in the source.**
 
-**Done. One blocking finding, and one that was withdrawn — the withdrawal
-matters, because it was the first answer.**
+- **We do not impose a collation on a UTF-8 database.**
+  `MSSQLCatalog::ResolveVarcharCollation` returns empty when the database's own
+  collation ends in `_UTF8`, so the column INHERITS it. On Fabric that is
+  `Latin1_General_100_BIN2_UTF8` and we leave it alone. The `Latin1_General_100_CI_AS_SC_UTF8`
+  default is only the name used when the database is NOT UTF-8 and something has
+  to be named — and CI_AS is chosen over BIN2 there deliberately, because the
+  collation governs every later comparison and BIN2 would silently make the
+  column case- and accent-sensitive.
+- **A `#temp` target is the documented exception**: it lives in tempdb and takes
+  tempdb's collation, not the database's, so there the name IS emitted. Verified
+  in the code comment by 'Привет' arriving as '??????' without it.
+- **A server without UTF8SUPPORT needs no new work**: `varchar_collation` is only
+  ever set when the server granted it.
 
-**Withdrawn: there is no truncation risk in the default.** I first measured ten
-Cyrillic characters into `varchar(10)` UTF-8 being rejected where `nvarchar(10)`
-took them, and called it a capacity loss. That compares two explicit
-ANNOTATIONS, not old default against new. The default today is `nvarchar(max)`
-and the alternative is `varchar(max)` UTF-8 — max to max, no capacity to lose.
-DuckDB's own VARCHAR has no declared length at all, and `MSSQL_VARCHAR(n)` means
-n bytes on both sides, so nothing is being reinterpreted.
+What remains is the one thing that is genuinely a decision rather than a
+mechanism: **a UTF-8 column conflicts with non-UTF-8 ones.** Measured:
 
-Where bytes-vs-characters does bite is narrower and conditional: with
-`mssql_default_string_length` set (default 0 = MAX), an unannotated column becomes
-`varchar(n)` — n BYTES — where `nvarchar(n)` would have been n characters. Worth
-a documentation line, not a blocker.
-
-**Confirmed, then narrowed — and the narrowing is the useful part.** The first
-control showed a UTF-8-collated column conflicting with what the database has:
-
-| join, in a database collated `SQL_Latin1_General_CP1_CI_AS` | result |
+| join, database collated `SQL_Latin1_General_CP1_CI_AS` | result |
 |---|---|
-| `nvarchar` (today's default) × `varchar` CP1 | **works** |
-| `varchar` CP1 × `varchar` CP1 | works |
+| `nvarchar` (today's default) × `varchar` CP1 | works |
 | `nvarchar` × `varchar` **UTF-8** | **error 468** |
 | `varchar` UTF-8 × `varchar` CP1 | **error 468** |
 
-    SQL Server error 468: Cannot resolve the collation conflict between
-    "Latin1_General_100_CI_AS_SC_UTF8" and "SQL_Latin1_General_CP1_CI_AS"
-    in the equal to operation.
-
-**But the conflict is not a property of UTF-8. It is a property of MIXING.**
-The same experiment inside a database created `COLLATE
-Latin1_General_100_CI_AS_SC_UTF8`:
-
-| join, in a UTF-8 database | result |
+| join, database collated `Latin1_General_100_CI_AS_SC_UTF8` | result |
 |---|---|
-| `varchar` inheriting the default × `varchar` stating the same collation | **works** |
-| `varchar` UTF-8 × **`nvarchar`** | **works** |
+| `varchar` inheriting × `varchar` stating the same | works |
+| `varchar` UTF-8 × `nvarchar` | works |
 
-No conflict at all, including against `nvarchar`. The blocker is precisely
-*imposing a collation the database does not already use.*
-
-**And the extension already gets this right.** `WireVarcharCollation` returns the
-database's OWN collation when it ends in `_UTF8`, and `varchar_collation` stays
-empty so the DDL emits no `COLLATE` clause and the column inherits. That is the
-Fabric path, conflict-free by construction.
-
-The hypothesis that prompted this probe — point `mssql_utf8_collation` at a UTF-8
-form of the database's own collation — **does not work for the common case**, and
-the reason is worth recording: the test database is
-`SQL_Latin1_General_CP1_CI_AS`, and `SQL_Latin1_General_CP1_CI_AS_UTF8` does not
-exist. Legacy `SQL_` collations have no UTF-8 forms; only the Windows ones do.
-There is nothing to point it at.
-
-**Conclusion: keep the default, and state when the fast path is safe.** It is not
-an option to reach for blindly — it is a property of the TARGET DATABASE:
-
-- database default already UTF-8 (Fabric, or one created that way):
-  `mssql_ctas_text_type = VARCHAR` is conflict-free and worth 3.2x, and the
-  extension inherits rather than imposing, so nothing else is needed;
-- database default not UTF-8: a UTF-8 column conflicts with every existing string
-  column, and the honest advice is to create the target database with a UTF-8
-  collation — not to set our option and hope;
-- document both, beside the four-way measurement.
-
-A server without UTF-8 support needs no new work: the extension asks, and only
-attaches the collation when the answer is yes. `CTASConfig::varchar_collation` is
-"only ever set when the server granted UTF8SUPPORT", because without it a VARCHAR
-column takes the database's code page and everything outside that page is
-replaced by `?` ON INSERT — silently (issue #225). `WireVarcharCollation` then
-falls back to the database's OWN collation when that already ends in `_UTF8`,
-which is what makes Fabric work without imposing a Latin1 one.
-
-What remains genuinely unverified is the end-to-end behaviour on 2017, which has
-no UTF-8 collations at all. #232's version matrix is exactly that probe, and it
-is now merged.
+So the conflict is about MIXING collations, not about UTF-8, and it is a property
+of the target database rather than of our settings. **Decision: keep
+`NVARCHAR` as the default; document that `mssql_ctas_text_type = VARCHAR` is
+worth 3.2x and is conflict-free exactly when the target database is itself
+collated UTF-8.** No code change.
 
 ## 2. The question this spec has to answer twice
 
