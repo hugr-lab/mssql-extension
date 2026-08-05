@@ -77,9 +77,9 @@ struct EncodePathCounters {
 	//! Every column fixed-width and no NULLs: one kernel call per column per
 	//! block, constant stride. The fast path.
 	std::atomic<uint64_t> chunks_strided{0};
-	//! A variable-length column, or a NULL in a fixed-width one. Kernel calls for
-	//! the direct-copy and convert arms; ONE CALL PER VALUE for decimal, uuid and
-	//! datetime.
+	//! A variable-length column, or a NULL in a fixed-width one. One kernel call
+	//! per column per block for every arm — decimal, uuid and datetime included
+	//! since spec 064 D1 (this counter was born measuring their per-value era).
 	std::atomic<uint64_t> chunks_cursor{0};
 	//! Some column resolved to RowFallback, or a string column could not be
 	//! planned: no kernels at all, for ANY column in the chunk.

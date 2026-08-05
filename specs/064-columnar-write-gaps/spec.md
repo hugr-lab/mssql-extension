@@ -161,11 +161,27 @@ questions, and the code answers them in three unrelated places:
 structural half of this spec; making 3 never surprise anyone is the correctness
 half.
 
-## 3. Type compatibility map — what exists today
+> **Closure note.** The correctness half shipped, in two steps. D5 first made
+> the unknown-pair failure a bind-time refusal; review then moved it to FIRST
+> DATA, because bind cannot tell a `NULL AS col` source from real data (DuckDB
+> types a bare NULL as INTEGER before the extension sees it) and filling a
+> column with NULLs is a pair-independent, legitimate thing to do. The rule
+> now: an incompatible matched pair is admitted for the all-NULL case, the
+> encoder verifies the mask per chunk, and a value raises the same
+> type-mismatch error with the pair named — before any of that chunk is
+> encoded. The structural half — collapsing 1 into 2 — did NOT ship in this
+> branch and is recorded as deferred in
+> `docs/proposals/columnar-write-close-the-gaps.md`: it needs the resolver to
+> build `WriteColumnOps` at bind time, which it cannot until the source Vector
+> types are known there.
 
-Extracted from `IsTypeCompatible`, not from documentation. **"Vectorised?" is the
-column this spec is about**, and it is filled in from `ResolveWriteColumnOps`
-plus the measurements in §1; every cell marked *(unverified)* still needs a probe.
+## 3. Type compatibility map — as of RECONNAISSANCE
+
+Extracted from `IsTypeCompatible`, not from documentation, **before any change
+on this branch** — several ❌/⚠️ cells below are exactly what D1/D4/D5 then
+fixed; the postscript after the map says where each landed. **"Vectorised?" is
+the column this spec is about**, filled in from `ResolveWriteColumnOps` plus
+the measurements in §1; every cell marked *(unverified)* still needs a probe.
 
 | DuckDB source | SQL Server targets allowed | wire form | vectorised today |
 |---|---|---|---|
@@ -186,6 +202,44 @@ plus the measurements in §1; every cell marked *(unverified)* still needs a pro
 | `TIMESTAMP_TZ` | `datetimeoffset` | datetime2 + 2-byte offset | ✅ Datetime arm, same caveat |
 | `INTERVAL` | *(falls to `default: return true`)* | rendered as text | ❌ **INTERNAL Error — issue #238.** The resolver says the row path "formats it first"; it does not |
 | `LIST` / `STRUCT` / `MAP` | *(falls to `default: return true`)* | — | ❓ unverified — `IsTypeCompatible` says yes to everything it does not know |
+
+**Where the branch left each cell** (the map above is the before-picture):
+
+- `UBIGINT` → ✅ Decimal arm, both metadata sources — D4 fixed the generated
+  `max_length` (9 → 13, and the duplicate in `GetTDSMaxLength`) and admitted
+  `UINT64` sources. The review's added test then showed the existing-target
+  half was DEAD: `IsTypeCompatible` still allowed `bigint` only, so the column
+  CTAS itself creates from a UBIGINT source was unappendable. Allowed targets
+  grew to the decimal family, and the row path's widening gained the UINT64
+  arm the mixed-chunk fallback needs.
+- `HUGEINT` → ✅ Decimal arm with generated metadata too (same D4 gate).
+- `DECIMAL` / `UUID` / `DATE` / `TIME` / `TIMESTAMP*` — the "per VALUE on the
+  cursor path" caveat is gone: D1 gave the kernels a position policy and the
+  cursor path calls them once per column per block.
+- `INTERVAL`, `LIST`/`STRUCT`/`MAP`, and everything else unknown → refusal
+  naming the pair (D5, closes #238's error shape and #153) — raised at FIRST
+  DATA rather than at bind, because any pair whose source column is entirely
+  NULL is legitimate: `NULL AS col` reaches bind already typed, so the
+  distinction only exists once the mask is visible. The all-NULL case routes
+  through the missing-column NullOnly machinery (`null_only_columns.test`
+  pins all three marker kinds on all three encode paths).
+- Fixing that exposed a PRE-EXISTING columnar bug: the NullOnly arm wrote the
+  one-byte 0x00 marker for every column kind, but a USHORT-length NULL is
+  FF FF and a PLP NULL is eight 0xFF — an absent nvarchar/varbinary column
+  corrupted the row framing whenever the chunk stayed columnar. Hidden until
+  now because such chunks usually carried a real variable column too and went
+  row-major, where the row path's marker writer always knew the kinds.
+- `VARCHAR` → `xml` verified working end to end (the map row always allowed
+  it; `xml_copy_bcp.test` pins it, Unicode included). GEOMETRY as a SQL Server
+  `geometry` target — as opposed to WKB into varbinary, which works — is a
+  separate PR.
+- `GEOMETRY` → ✅ VarString into `varbinary`/`binary`/`image` — review-caught:
+  the payload is standard WKB (verified byte-identical to `ST_AsWKB`), the pair
+  worked for years through `default: return true`, and D5's refusal would have
+  regressed it. Explicit case added.
+- `UHUGEINT` → refused at bind, deliberately: the decimal widening has no
+  UINT128 arm, so advertising the pair (as an early D5 draft did) reintroduces
+  the INTERNAL error D5 exists to remove. Support is a close-the-gaps item.
 
 **Two structural problems this map makes visible**, both worth more than any
 individual cell:

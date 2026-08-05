@@ -131,6 +131,32 @@ void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
 	}
 }
 
+// The wire form of NULL depends on the column's LENGTH KIND, not on anything
+// per value: PLP eight 0xFF, USHORT-length FF FF, byte-length one 0x00. The
+// columnar NullOnly arm wrote the byte-length form for every kind — wrong for
+// an absent nvarchar/varbinary column, and hidden until spec 064's all-NULL
+// pass made string-typed NullOnly columns routine (before that, a chunk with
+// such a column usually had a real variable column too and went row-major,
+// where EncodeNullOfKind above did it right).
+inline uint32_t NullMarkerSize(NullWireKind kind) {
+	return kind == NullWireKind::Plp ? 8 : (kind == NullWireKind::VariableUShort ? 2 : 1);
+}
+
+inline void WriteNullMarker(uint8_t *out, NullWireKind kind) {
+	switch (kind) {
+	case NullWireKind::Plp:
+		std::memset(out, 0xFF, 8);
+		return;
+	case NullWireKind::VariableUShort:
+		out[0] = 0xFF;
+		out[1] = 0xFF;
+		return;
+	case NullWireKind::Fixed:
+		out[0] = 0x00;
+		return;
+	}
+}
+
 // Build the hoisted per-column state. `format_count` is the row count the
 // UnifiedVectorFormat is computed for (chunk size for EncodeChunk; row+1 for
 // the per-row EncodeRow compatibility path).
@@ -150,6 +176,25 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 		}
 		state.vec = &chunk.data[source_idx];
 		state.vec->ToUnifiedFormat(format_count, state.fmt);
+		if (col.null_only_source) {
+			// Bind admitted this pair for the all-NULL case only (a constant
+			// NULL source arrives typed, indistinguishable from data there).
+			// Entirely NULL → the missing-column NullOnly machinery writes the
+			// markers on every path; a value is the type-mismatch error, raised
+			// here before any of this chunk is encoded. Cost: nothing for
+			// unmarked columns, a mask walk for marked ones.
+			for (idx_t r = 0; r < format_count; r++) {
+				if (state.fmt.validity.RowIsValid(state.fmt.sel->get_index(r))) {
+					throw InvalidInputException(
+						"MSSQL COPY: Column '%s' type mismatch: the target column cannot take %s values — "
+						"only an entirely-NULL source column is accepted for this pair. "
+						"Use an explicit cast, or REPLACE=true to recreate the table.",
+						col.name, chunk.data[source_idx].GetType().ToString());
+				}
+			}
+			state.vec = nullptr;
+			continue;
+		}
 		state.encode = ResolveEncoder(col);
 	}
 }
@@ -478,7 +523,7 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 		switch (ops[c].arm) {
 		case mssql::codec::ScatterArm::NullOnly:
 			for (idx_t r = 0; r < rows; r++) {
-				bdst[r * stride + col_off] = 0x00;
+				WriteNullMarker(bdst + r * stride + col_off, st.null_kind);
 			}
 			break;
 		case mssql::codec::ScatterArm::Decimal:
@@ -561,15 +606,15 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 							   const vector<mssql::codec::string::StringColumnPlan> &plans) {
 	for (idx_t c = 0; c < ncols; c++) {
 		auto &st = states[c];
-		const uint32_t w = widths[c];
 		if (ops[c].IsVariable()) {
 			mssql::codec::string::ScatterVarBlock(dst, cursor, r0, rend, st.fmt, columns[c], plans[c]);
 			continue;
 		}
 		if (!st.vec) {
+			const uint32_t marker = 1 + widths[c];
 			for (idx_t r = r0; r < rend; r++) {
-				dst[cursor[r]] = 0x00;
-				cursor[r] += 1;
+				WriteNullMarker(dst + cursor[r], st.null_kind);
+				cursor[r] += marker;
 			}
 			continue;
 		}
@@ -642,10 +687,14 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		// A missing source column is NULL every row: no payload, so it scatters
 		// for free. Everything else answers to ResolveWriteColumnOps, which is
 		// the single place that decides what this path can do.
+		//
+		// widths[c] holds MARKER SIZE − 1, so the uniform `1 + widths[c]`
+		// arithmetic (stride, col_off, cursor base) sizes the marker without a
+		// NullOnly special case anywhere downstream.
 		if (!states[c].vec) {
 			ops[c].arm = mssql::codec::ScatterArm::NullOnly;
-			widths[c] = 0;
-			stride += 1;
+			widths[c] = NullMarkerSize(states[c].null_kind) - 1;
+			stride += 1 + widths[c];
 			continue;
 		}
 		ops[c] = mssql::codec::ResolveWriteColumnOps(states[c].vec->GetType(), columns[c]);
@@ -671,6 +720,11 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 					pc.chunks_row_major.fetch_add(1, std::memory_order_relaxed);
 					pc.fallback_string_plan.fetch_add(1, std::memory_order_relaxed);
 					pc.last_fallback_column.store(c, std::memory_order_relaxed);
+					// Without this store the "(last: column X, arm Y)" print pairs
+					// this column with whatever arm an EARLIER unsupported-pair
+					// event left behind — misattributing the culprit in exactly
+					// the reconnaissance these counters were built for.
+					pc.last_fallback_arm.store(static_cast<uint64_t>(ops[c].arm), std::memory_order_relaxed);
 				}
 				return false;
 			}
@@ -733,10 +787,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 				continue;
 			}
 			if (!st.vec) {
-				// Absent column: NULL on every row, so its payload never appears.
-				for (idx_t r = 0; r < row_count; r++) {
-					row_at[r] -= widths[c];
-				}
+				// Absent column: the NULL marker (1 + widths[c] bytes, see the
+				// NullOnly branch above) appears on EVERY row and is already in
+				// base_row. Nothing varies, nothing to subtract.
 				continue;
 			}
 			if (st.fmt.validity.AllValid()) {

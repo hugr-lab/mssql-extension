@@ -290,14 +290,17 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 
 	// mssql_utf8_collation - collation for VARCHAR targets (issue #225).
 	// Only consulted when mssql_ctas_text_type is VARCHAR and the server granted
-	// UTF8SUPPORT at login. The default is the UTF-8 sibling of the usual
-	// Latin1 defaults; override it when the database's own collation is not
-	// Latin1-based, since this collation is stored in the schema and governs
-	// every later comparison against the column. Empty means "add no COLLATE
-	// clause", which lets the column inherit the database default — right when
-	// that default is already UTF-8, and the way back to the pre-#225 behaviour
-	// otherwise. The name is not validated here: SQL Server rejects an unknown
-	// collation by name, which is a clearer error than anything this could say.
+	// UTF8SUPPORT at login. The default is BIN2 — binary comparison, no
+	// linguistic rules, so case- and accent-SENSITIVE — because that is what
+	// Fabric Warehouse defaults to, and a binary collation has no locale to be
+	// wrong about (spec 064 D0). Users who want linguistic matching set a CI_AS
+	// UTF-8 collation here or per column via MSSQL_VARCHAR(n, 'collation'); the
+	// collation is stored in the schema and governs every later comparison
+	// against the column. Empty means "add no COLLATE clause", which lets the
+	// column inherit the database default — right when that default is already
+	// UTF-8, and the way back to the pre-#225 behaviour otherwise. The name is
+	// not validated here: SQL Server rejects an unknown collation by name, which
+	// is a clearer error than anything this could say.
 	config.AddExtensionOption(
 		"mssql_utf8_collation",
 		"Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "

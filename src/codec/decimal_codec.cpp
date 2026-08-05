@@ -68,6 +68,17 @@ hugeint_t WidenVectorToHugeint(Vector &vec, const UnifiedVectorFormat &fmt, idx_
 		return hugeint_t(FormatValue<int64_t>(fmt, row_idx));
 	case PhysicalType::INT128:
 		return FormatValue<hugeint_t>(fmt, row_idx);
+	case PhysicalType::UINT64: {
+		// UBIGINT into a decimal-family target (spec 064): a mixed chunk that
+		// row-falls-back reaches this widening for the SAME column the columnar
+		// arm handles — without this arm, one unplannable string beside a
+		// UBIGINT column turned into an INTERNAL error. upper = 0 by hand: the
+		// int64 constructor would fold values above INT64_MAX negative.
+		hugeint_t widened;
+		widened.lower = FormatValue<uint64_t>(fmt, row_idx);
+		widened.upper = 0;
+		return widened;
+	}
 	default:
 		throw InternalException("codec::decimal::EncodeToBcp: unexpected PhysicalType for DECIMAL");
 	}

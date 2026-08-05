@@ -37,7 +37,13 @@ require-env MSSQL_TESTDB_DSN
 #   * Cyrillic and CJK, so a UTF-16 length that is not twice the UTF-8 one is
 #     exercised;
 #   * every decimal precision bucket (4/9/18/28/38) and both signs;
-#   * temporal scales 0, 3 and 7, which are three different wire widths.
+#   * temporal scales 0, 3 and 7, which are three different wire widths;
+#   * NULLs INSIDE the fixed-width transform families — decimal, datetime and
+#     uuid — not only beside them: since spec 064 D1 the NULL marker for these
+#     is written by the batch kernel itself, and a chunk whose only NULLs sat in
+#     integer/string columns would leave that prologue untested;
+#   * a UBIGINT source above INT64_MAX into decimal(20,0), the pair whose
+#     metadata width disagreed with the encoder until spec 064 D4.
 # =============================================================================
 
 statement ok
@@ -48,6 +54,7 @@ SET mssql_exec_invalidate_cache = true;
 
 statement ok
 SELECT mssql_exec('ce', 'IF OBJECT_ID(''dbo.ColumnarAll'') IS NOT NULL DROP TABLE dbo.ColumnarAll;
+IF OBJECT_ID(''dbo.ColumnarGen'') IS NOT NULL DROP TABLE dbo.ColumnarGen;
 CREATE TABLE dbo.ColumnarAll (
     i8 tinyint, i16 smallint, i32 int, i64 bigint,
     f4 real, f8 float, bl bit, gu uniqueidentifier,
@@ -55,7 +62,10 @@ CREATE TABLE dbo.ColumnarAll (
     dt date, ts0 datetime2(0), ts3 datetime2(3), ts7 datetime2(7),
     tm3 time(3), dto datetimeoffset(3),
     sv nvarchar(80), bv varbinary(80), smax nvarchar(max), bmax varbinary(max),
-    n_few bigint, n_half nvarchar(50), n_all bigint, n_none bigint
+    n_few bigint, n_half nvarchar(50), n_all bigint, n_none bigint,
+    nu_d9 decimal(9,4), nu_d38 decimal(38,10), nu_ts7 datetime2(7),
+    nu_dt date, nu_tm time(3), nu_gu uniqueidentifier,
+    u64 decimal(20,0)
 )');
 
 statement ok
@@ -89,7 +99,14 @@ SELECT
     CASE WHEN i % 97 = 0 THEN NULL ELSE i END                 AS n_few,
     CASE WHEN i % 2 = 0 THEN NULL ELSE 'half_' || i END       AS n_half,
     CAST(NULL AS BIGINT)                                      AS n_all,
-    (i * 7)::BIGINT                                           AS n_none
+    (i * 7)::BIGINT                                           AS n_none,
+    CASE WHEN i % 7 = 0 THEN NULL ELSE (((i % 99999) / 10000.0) - 5)::DECIMAL(9,4) END AS nu_d9,
+    CASE WHEN i % 11 = 0 THEN NULL ELSE ((i % 999999) * 1.0)::DECIMAL(38,10) END AS nu_d38,
+    CASE WHEN i % 13 = 0 THEN NULL ELSE TIMESTAMP '2024-01-15 12:34:56.789012' + INTERVAL (i % 90000) SECOND END AS nu_ts7,
+    CASE WHEN i % 17 = 0 THEN NULL ELSE (DATE '1970-01-01' + INTERVAL (i % 30000) DAY)::DATE END AS nu_dt,
+    CASE WHEN i % 19 = 0 THEN NULL ELSE (TIME '01:02:03.456' + INTERVAL (i % 1000) SECOND)::TIME END AS nu_tm,
+    CASE WHEN i % 23 = 0 THEN NULL ELSE uuid() END            AS nu_gu,
+    (18446744073709551615::UBIGINT - i::UBIGINT)              AS u64
 FROM range(5000) t(i);
 
 statement ok
@@ -114,6 +131,15 @@ query IIII
 SELECT count(*), count(n_few), count(n_half), count(n_all) FROM ce.dbo.ColumnarAll;
 ----
 5000	4948	2500	0
+
+# The same pin for the families whose NULL marker is written INSIDE the batch
+# kernel (spec 064 D1) — decimal, datetime and uuid. EXCEPT ALL above proves the
+# values; this proves no marker was dropped or doubled per family.
+query IIIIII
+SELECT count(nu_d9), count(nu_d38), count(nu_ts7), count(nu_dt), count(nu_tm), count(nu_gu)
+FROM ce.dbo.ColumnarAll;
+----
+4285	4545	4615	4705	4736	4782
 
 # The all-valid column in a NULL-bearing chunk: it writes every payload but
 # cannot use a stride, which is its own code path.
@@ -141,6 +167,47 @@ SELECT count(*), count(n_few) FROM ce.dbo.ColumnarAll;
 
 statement ok
 SELECT mssql_exec('ce', 'DROP TABLE dbo.ColumnarAll');
+
+# =============================================================================
+# Spec 064 D4 — generated metadata. CREATE_TABLE derives the target from the
+# source types and keeps duckdb_type = UBIGINT / HUGEINT beside precision 20/38.
+# Before D4 the generated UBIGINT width said 9 where the encoder writes 13, the
+# width check refused the arm, and that ONE column sent the whole table
+# row-major. The values straddle INT64_MAX on purpose: the uint64 widening that
+# keeps upper = 0 is the part a signed constructor would fold negative.
+# =============================================================================
+
+statement ok
+CREATE OR REPLACE TABLE ce_gen AS
+SELECT (18446744073709551615::UBIGINT - i::UBIGINT) AS u64,
+       ((CASE WHEN i % 2 = 0 THEN 1 ELSE -1 END)::HUGEINT
+        * (99999999999999999999999999999999999999::HUGEINT - i::HUGEINT)) AS h128
+FROM range(2048) t(i);
+
+statement ok
+COPY ce_gen TO 'ce.dbo.ColumnarGen' (FORMAT bcp);
+
+# Explicit casts on the source side: DuckDB's common type for HUGEINT vs
+# DECIMAL(38,0) would be lossy (precision 39 does not exist), and a lossy
+# comparison passes for the wrong reason.
+query I
+SELECT count(*) FROM (
+  SELECT u64::DECIMAL(20,0) AS u64, h128::DECIMAL(38,0) AS h128 FROM ce_gen
+  EXCEPT ALL
+  SELECT u64, h128 FROM ce.dbo.ColumnarGen);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT u64, h128 FROM ce.dbo.ColumnarGen
+  EXCEPT ALL
+  SELECT u64::DECIMAL(20,0), h128::DECIMAL(38,0) FROM ce_gen);
+----
+0
+
+statement ok
+SELECT mssql_exec('ce', 'DROP TABLE dbo.ColumnarGen');
 
 statement ok
 DETACH ce;

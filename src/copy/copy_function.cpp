@@ -395,6 +395,18 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 
+				// Columns whose pair bind admitted for the all-NULL case only
+				// (constant `NULL AS col` sources — see BCPCopyConfig): mark the
+				// target metadata so PrepareColumnStates verifies the mask per
+				// chunk and routes them through the NullOnly path.
+				for (const auto &nn : bdata.config.null_only_columns) {
+					for (auto &col : gstate->columns) {
+						if (StringUtil::Lower(col.name) == nn) {
+							col.null_only_source = true;
+						}
+					}
+				}
+
 				// Build column mapping from source to target
 				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
 

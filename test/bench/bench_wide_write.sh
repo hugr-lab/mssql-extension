@@ -5,7 +5,14 @@
 # The spec-057 numbers were all on narrow, uniform tables, which is the shape
 # that flatters the columnar path: one family, one decision. A real load is wide
 # and mixed, and the path is chosen PER CHUNK for the whole chunk — so one
-# awkward column decides for the other forty. This measures that.
+# awkward column decides for the other nineteen. This measures that.
+#
+# The fixture is 20 columns, one per family the encoder has an arm for
+# (integers, unsigned, bool, float/double, three decimal buckets, date, time,
+# timestamp, timestamptz, uuid, three strings, blob, and the NULL carrier).
+# Deliberately absent: pairs the encoder REFUSES (a signed TINYINT into
+# `tinyint`, spec 057) — a refused column would poison every cell the same way
+# and measure nothing.
 #
 # Three axes, because each moves a different lever:
 #
@@ -19,18 +26,21 @@
 # phases it times. Wall clock comes from `.timer on`, and the phase totals it
 # prints are SUMMED ACROSS THREADS — they rise with thread count while wall time
 # falls, which is not a slowdown.
-set -uo pipefail
-cd /Users/vgribanov/projects/hugr-lab/mssql-extension
+set -euo pipefail
+cd "$(dirname "$0")/../.."
 
 set -a; . ./.env; set +a
 DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
 ROWS=${ROWS:-500000}
 OUT=${OUT:-/tmp/bench_wide.log}
 
-# 26 columns across every family the encoder has an arm for, plus the two that
-# do not (HUGEINT with generated metadata, and a signed TINYINT into `tinyint`).
-# `nn` is the NULL carrier: switched on and off to move the strided/cursor line
-# without changing anything else.
+# The SQL file carries the DSN (password included): mktemp gives it 0600 and the
+# trap removes it however the run ends — a fixed /tmp path outlived the run and
+# was world-readable, which is how a bench script leaks credentials.
+SQLFILE=$(mktemp "${TMPDIR:-/tmp}/bench_wide.XXXXXX.sql")
+CELLLOG=$(mktemp "${TMPDIR:-/tmp}/bench_wide.XXXXXX.cell")
+trap 'rm -f "$SQLFILE" "$CELLLOG"' EXIT
+
 gen_source() {
 	local nulls="$1"
 	local nn_expr="0::INTEGER"
@@ -83,14 +93,26 @@ for nulls in nonulls nulls; do
 				echo "SET mssql_copy_parallel_writers = 0;"
 				echo "ATTACH '${DSN}' AS db (TYPE mssql);"
 				gen_source "$nulls"
-				echo "SELECT CASE WHEN count(*) = ${ROWS} THEN 'FIXTURE OK' ELSE 'FIXTURE BROKEN' END AS f FROM wide_src;"
+				echo "SELECT CASE WHEN count(*) = ${ROWS} AND count(c_uuid) = ${ROWS} THEN 'FIXTURE OK' ELSE 'FIXTURE BROKEN' END AS f FROM wide_src;"
 				echo "SELECT mssql_exec('db','IF OBJECT_ID(''dbo.WideBench'') IS NOT NULL DROP TABLE dbo.WideBench');"
 				echo "SELECT '### CELL ${cell}' AS marker;"
 				echo "CREATE TABLE db.dbo.WideBench AS SELECT $(projection "$ann") FROM wide_src;"
 				echo "SELECT mssql_exec('db','DROP TABLE dbo.WideBench');"
-			} > /tmp/bench_wide.sql
+			} > "$SQLFILE"
 			echo "=== $cell ===" >> "$OUT"
-			MSSQL_COUNTERS=1 ./build/release/duckdb < /tmp/bench_wide.sql >> "$OUT" 2>&1
+			# A cell that errors, or whose fixture check did not print FIXTURE OK,
+			# aborts the whole run BY NAME — an 8-cell matrix that produced zero
+			# numbers must not exit 0 (the `[mssql]`-filter lesson).
+			if ! MSSQL_COUNTERS=1 ./build/release/duckdb < "$SQLFILE" > "$CELLLOG" 2>&1; then
+				cat "$CELLLOG" >> "$OUT"
+				echo "CELL FAILED: $cell (see $OUT)" >&2
+				exit 1
+			fi
+			cat "$CELLLOG" >> "$OUT"
+			if ! grep -q 'FIXTURE OK' "$CELLLOG" || grep -q 'Error' "$CELLLOG"; then
+				echo "CELL INVALID (fixture or error): $cell (see $OUT)" >&2
+				exit 1
+			fi
 		done
 	done
 done

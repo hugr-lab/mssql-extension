@@ -115,6 +115,13 @@ struct BCPColumnMetadata {
 	// as that code page — verified by watching 'Привет' land as 'ÐŸÑ€Ð¸Ð²ÐµÑ‚'.
 	string collation_name;
 
+	// The matched source column's type is incompatible with this target column,
+	// and bind admitted the pair for the all-NULL case only (a constant NULL
+	// source arrives typed — see BCPCopyConfig::null_only_columns). The encoder
+	// verifies the mask per chunk and routes the column through the
+	// missing-column NullOnly path; a value in it is the type-mismatch error.
+	bool null_only_source = false;
+
 	// Default constructor
 	BCPColumnMetadata() = default;
 
@@ -230,14 +237,18 @@ struct TargetResolver {
 	// @param target The target table to drop
 	static void DropTable(tds::TdsConnection &conn, const BCPCopyTarget &target);
 
-	// Validate that existing table schema is compatible with source
+	// Validate that existing table schema is compatible with source.
+	// An incompatible matched pair is not a bind error: it is recorded in
+	// config.null_only_columns and admitted for the all-NULL case — the encoder
+	// raises the type-mismatch error the moment the column carries a value.
 	// @param conn TDS connection for SQL execution
 	// @param target The target table
+	// @param config receives null_only_columns
 	// @param source_types DuckDB types from the source query
 	// @param source_names Column names from the source query
-	// @throws InvalidInputException if schema is incompatible
+	// @throws InvalidInputException when no source column matches the target
 	static void ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
-											const vector<LogicalType> &source_types,
+											BCPCopyConfig &config, const vector<LogicalType> &source_types,
 											const vector<string> &source_names);
 
 	// Get column metadata for an existing table
