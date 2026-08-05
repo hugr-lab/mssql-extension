@@ -149,7 +149,38 @@ classDiagram
 - One pool **per `MSSQLCatalog`** (no process-wide singleton — that was spec 047's headline fix). Lifetime is bounded by catalog lifetime.
 - Background `cleanup_thread_` reaps idle connections past `idle_timeout`. It parks on its **own** `cleanup_cv_` (notified only by `Shutdown()`, so DETACH doesn't wait out a blind 1-second sleep); `available_cv_` is reserved for `Acquire()` waiters — the invariant is that `Release()`'s `notify_one` always reaches a thread blocked on pool exhaustion, never the cleanup thread (spec 054 review).
 - DuckDB's quiescence contract requires every connection be released before `~MSSQLCatalog` runs; the pool's `Shutdown()` emits a warning + assertion if `active_connections_` is non-empty at teardown.
-- COPY/CTAS bulk loads that die mid-BCP-stream must not return the connection as-is (the server still awaits bulk data). Both paths share one release protocol — `mssql::ReleaseBcpConnectionOnError` (`src/connection/mssql_connection_provider.cpp`): close if mid-stream, then `SetNeedsReset` + `Release` through the catalog's `weak_ptr` pool handle (a failed `lock()` = catalog torn down → drop). Worker-thread safe (issue #178); called from `~MSSQLCopyGlobalState` (issue #191) and `CTASExecutionState::ReleaseBCPConnectionOnError`.
+- COPY/CTAS bulk loads that die mid-BCP-stream must not return the connection as-is (the server still awaits bulk data). Both paths share one release protocol — `mssql::ReleaseBcpConnectionOnError` (`src/connection/mssql_connection_provider.cpp`): close if mid-stream, then `SetNeedsReset` + `Release` through the catalog's `weak_ptr` pool handle (a failed `lock()` = catalog torn down → drop). Worker-thread safe (issue #178); called from `~MSSQLCopyGlobalState` (issue #191), `CTASExecutionState::ReleaseBCPConnectionOnError` and `BulkLoadSession`.
+
+### Session reset, and who decides it (issue #189)
+
+A connection going back to the pool is flagged for **session reset** — the TDS
+`RESET_CONNECTION` header bit, what `sp_reset_connection` does. That is why a
+`##global` temp table does not survive between statements: it lives exactly as
+long as the session that created it, and the reset ends that session on the same
+physical connection (`@@SPID` unchanged).
+
+There is no selective form to ask for instead — one bit, two variants, and
+`RESET_CONNECTION_SKIP_TRAN` drops `##g` and a local `#loc` identically. So
+`mssql_reset_connection = false` turns it off wholesale, and what the user takes
+on is not "temp tables" but **all** session state: `SET` options, isolation level,
+session variables, `CONTEXT_INFO`, cursors — and an open transaction that then
+keeps its locks until that connection is used again.
+
+Four release paths honour it, and each learns the answer on the CLIENT thread
+because none of them can ask a `ClientContext` where they run:
+
+| path | how it knows |
+|---|---|
+| autocommit release (`ConnectionProvider::ReleaseConnection` — what `mssql_exec` uses) | read per release, so `SET` applies to the next statement |
+| result-stream close (**every** `mssql_scan` and table scan) | captured at construction (issue #178: the destructor may be on a worker thread) |
+| COMMIT / ROLLBACK | captured at BEGIN — `TransactionManager::RollbackTransaction` receives no `ClientContext`, and a rule holding on COMMIT but not ROLLBACK would be worse than either answer |
+| `ReleaseBcpConnectionOnError` | passed in by the caller; the parameter has **no default**, so a new caller cannot silently skip the question |
+
+The prerequisite is on the write side: with the reset off, a `#temp` COPY outside
+a transaction becomes meaningful and therefore unpinned, and without the target
+predicate above it would open N writers against N pooled sessions — some holding
+a **stale same-named** temp table, whose writes succeed against the wrong one
+silently.
 
 ---
 
@@ -458,6 +489,25 @@ This is the part that has changed most, and the two operators deliberately diffe
 | `COPY … TO` | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
 | CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers |
 
+Since spec 063 that answer comes from ONE function rather than from each operator
+deriving it: `MSSQLResolveLoadPolicy` (`copy/load_policy.hpp`) reduces the whole
+question to a single predicate about the TARGET —
+
+> can a session other than the one driving the statement see it, and may its rows
+> land outside the current transaction?
+
+A `#local` temp table answers no to the first (it lives only in its creating
+session, so **one writer** whatever the thread count); a target in a transaction
+whose rows must roll back answers no to the second; CTAS's own new table answers
+yes to both. `##global` is visible across sessions and keeps its N writers, which
+is why the flag the policy reads is the LOCAL temp one and not
+`BCPCopyTarget::IsTempTable()`, which merges the two.
+
+The one input that differs per operator is stated as a property of the STATEMENT
+— `MSSQLLoadTransactionRole::JoinsTransaction` for COPY, `OwnsTarget` for CTAS —
+so a future consumer (INSERT via BCP, the `#temp` staging table UPDATE/DELETE
+will fill) answers the same question rather than adding a branch.
+
 CTAS is outside the transaction on purpose. One connection cannot stream a result
 set and receive a bulk load at the same time, so pinning it made
 `BEGIN; CREATE TABLE t AS SELECT * FROM <the same catalog>` fail against itself, and
@@ -477,10 +527,10 @@ flowchart TD
         failed["load_failed (atomic)"]
     end
     subgraph T1["worker thread 1"]
-        lw1["local BCPWriter<br/>own conn, own INSERT BULK"]
+        lw1["BulkLoadSession<br/>own conn, own INSERT BULK"]
     end
     subgraph T2["worker thread 2"]
-        lw2["local BCPWriter<br/>own conn, own INSERT BULK"]
+        lw2["BulkLoadSession<br/>own conn, own INSERT BULK"]
     end
     subgraph T3["worker thread N"]
         shared["no slot left →<br/>shares the global writer<br/>under gstate.mutex"]
@@ -495,6 +545,13 @@ flowchart TD
     shared --> gw
 ```
 
+`mssql::BulkLoadSession` (`copy/bulk_load_session.hpp`) is that per-thread writer,
+and there is ONE of it: COPY and CTAS grew separate copies in the same week and had
+diverged nine ways within it — `ROWS_PER_BATCH` sent by one and not the other, no
+interrupt check and no counters on the CTAS side at all. It owns the connection,
+the writer, the batch bookkeeping and the mid-bulk-load release protocol; who may
+open one, and how many, is the policy above and is handed to it.
+
 A writer is claimed by a **thread**, on its first chunk — not allocated up front —
 because `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text
 and resolved columns are only settled by the DDL phase. Failing to get one is **not**
@@ -504,6 +561,13 @@ must not fail because it could not go faster.
 The writer count is therefore a **ceiling, not a floor**. With one DuckDB thread
 driving the sink, `mssql_copy_parallel_writers = 8` still yields one writer — which is
 why the parallel tests pin `SET threads`.
+
+That ceiling is only half-checkable from SQL. The tests assert that
+`mssql_copy_parallel_writers = 1` really disables the feature (exactly one pooled
+connection created) but cannot assert that the parallel section ran concurrently:
+`connections_created` is 2 even single-threaded, because the operator opens the
+global writer's connection and the one sink thread then claims a session on top of
+it. `MSSQL_COUNTERS=1` reports the truth as `writers=N/M`, but only to stderr.
 
 ### Encoding: one resolution per column, one decision per chunk
 

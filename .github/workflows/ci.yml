@@ -73,6 +73,15 @@ jobs:
           sudo apt-get install -y clang-format-14
           find src -name '*.cpp' -o -name '*.hpp' | xargs clang-format-14 --dry-run --Werror
 
+      # Spec 063 D7. A sqllogictest file whose require-env variable is unset does
+      # not fail — it SKIPS, and the run reports success. Spec 057 found that
+      # class three times in one spec (MSSQL_TEST_SERVER hid 4 files,
+      # MSSQL_TEST_CONNECTION_STRING 4 more including both auto-TABLOCK tests,
+      # and a filter matching nothing hid 164). This is what makes the fourth a
+      # build failure instead of a green run. No build needed — it reads files.
+      - name: Every require-env variable is actually set
+        run: scripts/ci/check_require_env.sh
+
   # ============================================================================
   # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.
   # Runs on every push/PR (unlike the heavy build job, which is manual).
@@ -137,6 +146,20 @@ jobs:
             test/cpp/test_index_kind.cpp -o /tmp/test_index_kind
           /tmp/test_index_kind
 
+      # Spec 063 D1: who supplies a bulk-load writer's connection and how many
+      # writers there may be. Every case it decides fails SILENTLY when wrong —
+      # a writer given the pinned connection interleaves ROW tokens into someone
+      # else's bulk load; a second writer inside a transaction lands rows that do
+      # not roll back; a second writer against a `#temp` target writes to whatever
+      # same-named table that pooled session holds. An end-to-end test sees a load
+      # that succeeded, so the policy is asserted directly.
+      # Self-contained header: no submodule checkout, nothing to link.
+      - name: Build + run load-policy unit test (spec 063)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_load_policy.cpp -o /tmp/test_load_policy
+          /tmp/test_load_policy
+
   # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)
@@ -144,7 +167,13 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
+    # Also on a merge to `main` (issue #212 gap 1). A pull request never compiled
+    # the extension, so a C++ regression could reach main behind green checks —
+    # three times in one week when that issue was filed. Building on the merge
+    # catches it on main rather than at the next release, and costs nothing on
+    # the PRs themselves: the `push` trigger is `branches: [main]` and the
+    # workflow's `paths-ignore` keeps docs-only merges free.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
     strategy:
       fail-fast: false
       matrix:
@@ -501,7 +530,11 @@ jobs:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
+    # Follows the build on a merge to `main`: an extension that COMPILES can still
+    # fail to LOAD (symbol visibility, a missing runtime dependency), and that is
+    # the class this job exists for. One extra minute on top of a build that is
+    # already running.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
     strategy:
       fail-fast: false
       matrix:
@@ -558,7 +591,11 @@ jobs:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' }}
+    # On a merge to `main` as well: the suite went from weekly to per-merge, which
+    # is what makes a SQL regression visible while the change is still fresh.
+    # Only worth having because the selection is fixed — this job used to report
+    # PASSED having run zero files (#212 gap 2).
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' || github.event_name == 'push' }}
 
     services:
       sqlserver:

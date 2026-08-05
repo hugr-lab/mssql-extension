@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include "copy/bulk_load_session.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_executor.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
@@ -161,6 +162,23 @@ public:
 	//! DROP that mssql_ctas_drop_on_failure asks for. Separate from `phase`
 	//! because it is the one piece of failure state read outside `mutex`.
 	std::atomic<bool> load_failed{false};
+
+	//===------------------------------------------------------------------===//
+	// MSSQL_COUNTERS (spec 063 D5)
+	//
+	// CTAS reported NOTHING: `counter_*` appeared zero times in this operator
+	// against twenty in the COPY sink, so `MSSQL_COUNTERS=1` measured one of the
+	// two write paths and a CTAS could not be compared with a COPY at all.
+	//
+	// Totals cover both routes — a thread with its own session reports through
+	// BulkLoadWriteResult, one sharing the global writer through
+	// CTASExecutionState's own phase counters.
+	//===------------------------------------------------------------------===//
+
+	std::atomic<idx_t> counter_sink_calls{0};
+	std::atomic<uint64_t> counter_sink_ns{0};
+	std::atomic<uint64_t> counter_encode_ns{0};
+	std::atomic<uint64_t> counter_flush_ns{0};
 };
 
 //===----------------------------------------------------------------------===//
@@ -175,21 +193,11 @@ class MSSQLCTASLocalSinkState : public LocalSinkState {
 public:
 	MSSQLCTASLocalSinkState() = default;
 
-	//! Last-resort release. A throw from Sink skips Combine, so nothing else
-	//! would return this thread's connection: it would sit in Executing with a
-	//! bulk-load transaction open, holding locks on the table CTAS just created,
-	//! until the pool was torn down. Touches NO ClientContext — the pool handle
-	//! is captured on the thread that acquired the connection (issue #178).
-	~MSSQLCTASLocalSinkState();
-
-	//! This thread's own bulk-load connection, or null when it shares the global
-	//! writer (in a transaction, at the limit, or acquisition failed).
-	std::shared_ptr<tds::TdsConnection> connection;
-	unique_ptr<mssql::BCPWriter> writer;
-	weak_ptr<tds::ConnectionPool> pool_handle;
-
-	//! Rows this writer has sent since its last flush.
-	idx_t rows_in_batch = 0;
+	//! This thread's own bulk-load session, or unopened when it shares the global
+	//! writer (at the limit, or acquisition failed). Owns the connection, the
+	//! writer, the batch bookkeeping and the last-resort release — see
+	//! copy/bulk_load_session.hpp; COPY holds the same type.
+	mssql::BulkLoadSession session;
 
 	//! Rows this writer has encoded in total, folded into the global
 	//! rows_produced in Combine so the metrics line still adds up.

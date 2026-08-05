@@ -4,10 +4,12 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_config.hpp"
 #include "copy/bcp_writer.hpp"
+#include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "mssql_counters.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
@@ -78,13 +80,14 @@ void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
 	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract).
 	// Always a pool connection here — CTAS never loads on the pinned one — so it
 	// is always returned rather than dropped.
-	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
+	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false, reset_on_release);
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
-									CTASConfig config_p) {
+									CTASConfig config_p, bool reset_on_release_p) {
 	catalog = &catalog_ref;
 	pool_handle = catalog_ref.GetConnectionPoolHandle();
+	reset_on_release = reset_on_release_p;
 	target = std::move(target_p);
 	columns = std::move(columns_p);
 	config = std::move(config_p);
@@ -499,21 +502,10 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 }
 
 string CTASExecutionState::BuildInsertBulkSql() const {
-	// Format: INSERT BULK [schema].[table] (col1 type1, col2 type2, ...) [WITH (TABLOCK)]
-	string sql = "INSERT BULK " + bcp_target.GetFullyQualifiedName() + " (";
-	for (idx_t i = 0; i < bcp_columns.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		// Column name must be bracketed for safety
-		sql += "[" + bcp_columns[i].name + "] ";
-		sql += bcp_columns[i].GetSQLServerTypeDeclaration();
-	}
-	sql += ")";
-	if (config.bcp_tablock) {
-		sql += " WITH (TABLOCK)";
-	}
-	return sql;
+	// The shared builder (spec 063 D4). CTAS used to have its own, which emitted
+	// only `WITH (TABLOCK)` — so the server was told the batch size for a COPY and
+	// left to guess it for a CTAS, for no reason anyone chose.
+	return mssql::BuildInsertBulkSql(bcp_target, bcp_columns, config.bcp_tablock, config.bcp_flush_rows);
 }
 
 void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
@@ -595,11 +587,19 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk_rows,
 			 (unsigned long long)bcp_rows_in_batch);
 
+	const bool counters = mssql::CountersEnabled();
 	try {
 		// Write rows to BCP writer
+		auto encode_start = std::chrono::steady_clock::now();
 		idx_t written = bcp_writer->WriteRows(chunk);
+		if (counters) {
+			counter_encode_ns += static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - encode_start)
+					.count());
+		}
 		bcp_rows_in_batch += written;
 		rows_produced += written;
+		auto flush_start = std::chrono::steady_clock::now();
 
 		// Check if we need to flush the batch
 		if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
@@ -620,6 +620,12 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 
 			// Write COLMETADATA for next batch
 			bcp_writer->WriteColmetadata();
+
+			if (counters) {
+				counter_flush_ns += static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flush_start)
+						.count());
+			}
 		}
 	} catch (...) {
 		// Row encode or batch flush failed mid-BCP-stream (e.g. the #177

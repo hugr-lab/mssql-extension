@@ -7,6 +7,7 @@
 #include <vector>
 #include "copy/bcp_config.hpp"
 #include "copy/bcp_writer.hpp"
+#include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -95,6 +96,10 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	//                        MSSQLTransaction owns the pin.
 	weak_ptr<tds::ConnectionPool> pool_handle;
 	bool transaction_pinned = false;
+
+	//! `mssql_reset_connection`, resolved in BCPCopyInitGlobal on the client
+	//! thread — the destructor below has no ClientContext (issue #178).
+	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 
 	// BCP packet writer (thread-safe)
 	unique_ptr<mssql::BCPWriter> writer;
@@ -189,22 +194,12 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLCopyLocalState : public LocalFunctionData {
-	//! Last-resort release, mirroring MSSQLCopyGlobalState's contract: a throw
-	//! from the sink skips copy_to_combine, so nothing else would return this
-	//! thread's connection and it would sit in Executing with a bulk-load
-	//! transaction open, holding locks until the pool was torn down (issue #191).
-	//! Touches NO ClientContext — the release targets are captured on the thread
-	//! that acquired the connection.
-	~MSSQLCopyLocalState();
-
-	//! This thread's own bulk-load connection, or null when it shares the
-	//! global writer (in a transaction, at the limit, or acquisition failed).
-	std::shared_ptr<tds::TdsConnection> connection;
-	unique_ptr<mssql::BCPWriter> writer;
-	weak_ptr<tds::ConnectionPool> pool_handle;
-
-	//! Rows this writer has sent since its last flush.
-	idx_t rows_in_batch = 0;
+	//! This thread's own bulk-load session, or unopened when it shares the global
+	//! writer (in a transaction, at the limit, or acquisition failed). Owns the
+	//! connection, the writer, the batch bookkeeping and the last-resort release
+	//! that issue #191 is about — see copy/bulk_load_session.hpp; CTAS holds the
+	//! same type.
+	mssql::BulkLoadSession session;
 
 	//! Acquisition is tried ONCE, on the first chunk. A failure is not an error:
 	//! the thread falls back to the shared writer, which is the pre-parallel

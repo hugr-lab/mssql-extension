@@ -49,9 +49,12 @@ public:
 	//                        DuckDB transaction; the destructor then just drops
 	//                        its reference (the MSSQLTransaction owns the pin).
 	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
+	// reset_on_release: `mssql_reset_connection`, resolved on the client thread
+	//                   for the same reason transaction_pinned is (issue #178).
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
 					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
-					  bool transaction_pinned = false, int query_timeout_seconds = 30);
+					  bool transaction_pinned = false, int query_timeout_seconds = 30,
+					  bool reset_on_release = tds::DEFAULT_RESET_CONNECTION);
 	~MSSQLResultStream();
 
 	// Non-copyable, non-movable (manages connection)
@@ -168,6 +171,11 @@ private:
 	// race vs TransactionContext::Commit) nor a raw catalog pointer.
 	weak_ptr<tds::ConnectionPool> pool_handle_;
 	bool transaction_pinned_;
+	//! `mssql_reset_connection` (issue #189). Captured here, not read in the
+	//! destructor: this is a release path, and it is THE release path for every
+	//! `mssql_scan` and table scan — the one that decides whether a `##temp`
+	//! table created by one statement is still there for the next.
+	bool reset_on_release_;
 
 	// Query
 	string sql_;

@@ -2,6 +2,7 @@
 
 #include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
+#include "copy/load_policy.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -50,8 +51,11 @@ constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 102400;
 //! for 64 concurrent BU locks is a different decision from asking for 64
 //! threads, and `mssql_connection_limit` is a per-context ceiling shared with
 //! everything else.
+//!
+//! The cap itself — MSSQL_MAX_COPY_PARALLEL_WRITERS — lives in
+//! copy/load_policy.hpp with the function that applies it, so the policy header
+//! stays self-contained and unit-testable. Included above; still visible here.
 constexpr idx_t MSSQL_DEFAULT_COPY_PARALLEL_WRITERS = 0;
-constexpr idx_t MSSQL_MAX_COPY_PARALLEL_WRITERS = 8;
 
 namespace mssql {
 

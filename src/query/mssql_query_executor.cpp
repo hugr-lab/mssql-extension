@@ -87,9 +87,10 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	// must not touch the ClientContext (TSan: MetaTransaction::Get raced
 	// TransactionContext::Commit).
 	const bool transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+	const bool reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 	auto result_stream =
 		make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, mssql_catalog.GetConnectionPoolHandle(),
-									 transaction_pinned, query_timeout);
+									 transaction_pinned, query_timeout, reset_on_release);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)
 	// If Initialize() throws, result_stream destructor will release connection back to pool

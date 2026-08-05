@@ -345,8 +345,15 @@ WHERE $col IS NOT NULL AND $col IS DISTINCT FROM ($expected);" 2>"$err" | tr -d 
 }
 
 # wire_bytes_per_row <label> <column> <feature> -> integer or "?"
-# Per ROW, not total: the D4 stream counters are known to report a single chunk
-# rather than the whole scan, so only a per-row figure is comparable.
+#
+# Per ROW rather than a total, which is the right comparison across versions
+# whatever the counters do — but the reason once written here was wrong. The
+# stream counters were believed to report a single chunk instead of the whole
+# scan (#233). They do not: that was a CRASH, not a sampling bug. Reading a
+# column-chunk published as a CONSTANT vector through FlatVector::GetData
+# asserted, so any scan of a repeated value died at MSSQL_DEBUG>=2 and the
+# `rows=2048 chunks=0` dump was the destructor printing during unwinding. Fixed
+# in #234; the counters report complete totals.
 wire_bytes_per_row() {
 	local label="$1" col="$2" feat="$3" pre="" out
 	[ -n "$feat" ] && pre="SET mssql_utf8_support=$feat;"
@@ -356,7 +363,12 @@ wire_bytes_per_row() {
 	# lines. That newline then rode into the `|`-separated RESULTS record, where
 	# `IFS='|' read` silently kept only the first line — truncating both the
 	# summary row and the JSON field. The python stage already owns the fallback.
-	out=$(MSSQL_DEBUG=2 "$DUCKDB_BIN" -c "
+	# MSSQL_COUNTERS=1, not MSSQL_DEBUG=2. Since spec 057 that is the flag for
+	# anything that will be quoted: MSSQL_DEBUG logs from INSIDE the phases it
+	# times. It matters less for a byte count than for a duration, but
+	# MSSQL_DEBUG>=2 is also the level that used to crash here (#233), which is
+	# very likely how this script's author met that bug.
+	out=$(MSSQL_COUNTERS=1 "$DUCKDB_BIN" -c "
 SET threads=1; $pre
 ATTACH '$(dsn)' AS m (TYPE mssql);
 SELECT sum(length($col)) FROM m.dbo.Charsets WHERE label='$label';" 2>&1 \

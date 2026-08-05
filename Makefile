@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind counters-test help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -106,6 +106,13 @@ MSSQL_TEST_SERVER = $(MSSQL_TESTDB_DSN)
 # rewrote — so the tests for that change had never executed once.
 MSSQL_TEST_CONNECTION_STRING = $(MSSQL_TESTDB_DSN)
 
+# Floor on the number of sqllogictest cases `integration-test` must actually run.
+# Not a target to grow — a tripwire. The suite has been reported green while
+# running 0 files (a tag that matched nothing) and while running 8 of 172 (the
+# wrong filter), both exiting 0. Lower it deliberately, in the commit that
+# removes files, or not at all.
+MSSQL_MIN_TEST_CASES ?= 150
+
 # Export all test environment variables for subprocesses
 export MSSQL_TEST_HOST
 export MSSQL_TEST_PORT
@@ -151,7 +158,21 @@ integration-test: release
 	@# invisible to this target and to CI. Third instance of the same class on this
 	@# branch, and the widest: MSSQL_TEST_SERVER hid 4 files,
 	@# MSSQL_TEST_CONNECTION_STRING hides 4 more, this hid 164.
-	build/release/test/unittest "test/sql/*" --force-reload
+	@# ...and the exit code alone would not have caught any of it. A filter that
+	@# matches nothing is indistinguishable from a suite that passed, so the count
+	@# is asserted, not the status (spec 063 D7).
+	@set -o pipefail; build/release/test/unittest "test/sql/*" --force-reload 2>&1 | tee /tmp/mssql_integration.out
+	@cases=$$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration.out | tail -1 | grep -oE '^[0-9]+'); \
+	if [ -z "$$cases" ]; then \
+		echo "integration-test: could not read a case count from the output — the suite did not report" >&2; exit 1; \
+	fi; \
+	if [ "$$cases" -lt $(MSSQL_MIN_TEST_CASES) ]; then \
+		echo "integration-test: only $$cases cases ran, expected at least $(MSSQL_MIN_TEST_CASES)." >&2; \
+		echo "  A filter that matches nothing exits 0. If files were deliberately removed," >&2; \
+		echo "  lower MSSQL_MIN_TEST_CASES in the Makefile in the same commit." >&2; \
+		exit 1; \
+	fi; \
+	echo "integration-test: $$cases cases ran (floor $(MSSQL_MIN_TEST_CASES))"
 
 # Run the SQL suite with the performance counters ON (spec 057 step 0b).
 #
@@ -315,6 +336,27 @@ test-index-kind:
 	@echo "Running MSSQLIndexKind unit test..."
 	build/test/test_index_kind
 
+# Spec 063 D1: MSSQLResolveLoadPolicy — who supplies a bulk-load writer's
+# connection, and how many writers there may be.
+#
+# Pure in-memory, nothing to link: copy/load_policy.hpp is a self-contained
+# header of plain types for exactly this reason. Every case it decides is one
+# where being wrong is SILENT (a writer handed the pinned connection, a second
+# writer whose rows do not roll back, a second writer against a session-scoped
+# `#temp` target), so an end-to-end test would see a load that succeeded.
+LOAD_POLICY_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
+LOAD_POLICY_TEST_INCLUDES := -I src/include
+
+test-load-policy:
+	@echo "Building load-policy unit test (spec 063 D1)..."
+	@mkdir -p build/test
+	$(CXX) $(LOAD_POLICY_TEST_FLAGS) $(LOAD_POLICY_TEST_INCLUDES) \
+	    test/cpp/test_load_policy.cpp \
+	    -o build/test/test_load_policy
+	@echo ""
+	@echo "Running load-policy unit test..."
+	build/test/test_load_policy
+
 # ---------------------------------------------------------------------------
 # Standalone C++ unit tests (no Catch, no SQL Server, own main()).
 #
@@ -332,6 +374,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ddl_translator.cpp \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_catalog_filter.cpp \
+    test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/codec/test_binary_codec.cpp \
     test/cpp/codec/test_boolean_codec.cpp \
     test/cpp/codec/test_datetime_codec.cpp \

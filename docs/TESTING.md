@@ -1273,6 +1273,20 @@ against 2022 and nowhere else. Run this before merging a change that touches:
 
 ### Running it
 
+**Needs bash 4 or newer.** macOS still ships bash **3.2** as `/bin/bash`, and it
+cannot PARSE this script — it dies with `syntax error near unexpected token ';;'`
+pointing at the last line of the file, before executing anything. Verified: bash
+3.2 fails, bash 5 parses cleanly. A version guard inside the script would not
+help, because the failure happens at parse time.
+
+On macOS, either install a current bash (`brew install bash`, which puts it ahead
+of `/bin/bash` in `PATH`) or run the script through a container:
+
+```bash
+docker run --rm -v "$PWD:/w" -v /var/run/docker.sock:/var/run/docker.sock \
+  -w /w bash:5 bash test/compat/mssql_version_matrix.sh --versions 2022
+```
+
 ```bash
 make release                                    # the script exercises this build
 

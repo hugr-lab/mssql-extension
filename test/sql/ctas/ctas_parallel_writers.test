@@ -77,6 +77,15 @@ SELECT count(*) FROM (SELECT * FROM cpw_src EXCEPT ALL SELECT id, v, s, n FROM c
 ----
 0
 
+# `mssql_copy_parallel_writers = 1` really does disable the feature, asserted
+# rather than assumed: the load runs on the ONE connection the operator opens in
+# its global state, and no thread claims a session of its own. If the setting
+# stopped being honoured this would read 2.
+query I
+SELECT connections_created FROM mssql_pool_stats('cpw');
+----
+1
+
 # -----------------------------------------------------------------------------
 # Four writers: each thread opens its own INSERT BULK on its own connection,
 # against the table this same statement just created.
@@ -96,6 +105,19 @@ query I
 SELECT count(*) FROM (SELECT * FROM cpw_src EXCEPT ALL SELECT id, v, s, n FROM cpw.dbo.CtasParallel);
 ----
 0
+
+# What is NOT asserted here, stated so it is not assumed: that the parallel
+# section actually ran CONCURRENTLY. The obvious candidate was
+# `connections_created > 1` after it — and it is useless, because the count is 2
+# even on a single thread: the operator opens the global writer's connection in
+# its global state, and the one sink thread then claims a session of its own on
+# top of it. Measured at threads=1 -> 2 and threads=4 -> 3, so the only thing
+# separating them is a scheduling-dependent number that would flake.
+#
+# So the concurrency of this section rests on `SET threads` above, and the row
+# checks below are what would catch a race if one appeared. Making it verifiable
+# needs a signal the extension does not expose to SQL — the counters know
+# (`writers=N/M`, spec 063 D5) but they go to stderr.
 
 # The row count CTAS REPORTS is summed across writers in Combine, not taken from
 # the one global writer — a parallel writer's rows are confirmed on its own

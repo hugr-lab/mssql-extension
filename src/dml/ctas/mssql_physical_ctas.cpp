@@ -2,21 +2,14 @@
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_config.hpp"
+#include "mssql_counters.hpp"
+
+#include <cstdio>
+#include <cstdlib>
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
 
 namespace duckdb {
-
-//===----------------------------------------------------------------------===//
-// MSSQLCTASLocalSinkState
-//===----------------------------------------------------------------------===//
-
-MSSQLCTASLocalSinkState::~MSSQLCTASLocalSinkState() {
-	// The writer goes first: it holds a reference to the connection, and the
-	// release protocol closes the socket underneath it.
-	writer.reset();
-	mssql::ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
-}
 
 //===----------------------------------------------------------------------===//
 // MSSQLCTASGlobalSinkState
@@ -26,7 +19,7 @@ MSSQLCTASGlobalSinkState::MSSQLCTASGlobalSinkState(ClientContext &context, MSSQL
 												   const mssql::CTASTarget &target,
 												   const vector<mssql::CTASColumnDef> &columns,
 												   const mssql::CTASConfig &config) {
-	state.Initialize(catalog, target, columns, config);
+	state.Initialize(catalog, target, columns, config, ConnectionProvider::ShouldResetOnRelease(context));
 }
 
 //===----------------------------------------------------------------------===//
@@ -115,16 +108,14 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
 				configured = pw.GetValue<int64_t>();
 			}
-			idx_t limit;
-			if (configured > 0) {
-				limit = static_cast<idx_t>(configured);
-			} else {
-				// Derived, then capped: a writer is a pooled connection holding an
-				// open bulk load, which is a different resource from a CPU thread.
-				const idx_t threads = static_cast<idx_t>(context.db->NumberOfThreads());
-				limit = MinValue<idx_t>(threads, MSSQL_MAX_COPY_PARALLEL_WRITERS);
-			}
-			gstate->parallel_writer_limit = MaxValue<idx_t>(limit, 1);
+			// The same resolver COPY uses (spec 063 D1). CTAS answers OwnsTarget,
+			// which is what the paragraph above says in one word: it created the
+			// table, so the undo is dropping it and a transaction does not cap the
+			// writers.
+			const auto policy = MSSQLResolveLoadPolicy(
+				gstate->state.bcp_target.is_temp_table, ConnectionProvider::IsInTransaction(context, catalog_),
+				MSSQLLoadTransactionRole::OwnsTarget, configured, static_cast<uint64_t>(context.db->NumberOfThreads()));
+			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 		}
 
 	} catch (...) {
@@ -142,94 +133,76 @@ unique_ptr<LocalSinkState> MSSQLPhysicalCreateTableAs::GetLocalSinkState(Executi
 }
 
 //===----------------------------------------------------------------------===//
-// Parallel writers (spec 057 step 7)
-//===----------------------------------------------------------------------===//
-
-//! Give this thread its own bulk-load session, or leave it sharing the global
-//! one. Tried once, on the thread's first chunk — GetLocalSinkState does not see
-//! the global state, and everything needed (the INSERT BULK text, the resolved
-//! columns) is settled there by the DDL phase.
-//!
-//! Failure is NOT an error. A pool at its limit, a server refusing another bulk
-//! load: the thread falls back to the shared writer, which is the pre-parallel
-//! behaviour and always correct. A CTAS must not fail because it could not go
-//! faster.
-static void TryStartLocalWriter(MSSQLCatalog &catalog, MSSQLCTASGlobalSinkState &gstate,
-								MSSQLCTASLocalSinkState &lstate) {
-	if (gstate.parallel_writer_limit <= 1) {
-		return;
-	}
-	// Claim a slot before doing any work, so N threads racing here cannot
-	// collectively exceed the limit.
-	const idx_t slot = gstate.parallel_writers_used.fetch_add(1);
-	if (slot >= gstate.parallel_writer_limit) {
-		gstate.parallel_writers_used.fetch_sub(1);
-		return;
-	}
-
-	std::shared_ptr<tds::TdsConnection> conn;
-	try {
-		auto &pool = catalog.GetConnectionPool();
-		conn = pool.Acquire();
-		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
-			throw IOException("no idle connection available for a parallel writer");
-		}
-		auto result = MSSQLSimpleQuery::Execute(*conn, gstate.state.insert_bulk_sql);
-		if (!result.success) {
-			throw IOException("INSERT BULK failed on the parallel connection: %s", result.error_message);
-		}
-		if (!conn->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-			throw IOException("could not transition the parallel connection to Executing");
-		}
-		lstate.pool_handle = catalog.GetConnectionPoolHandle();
-		lstate.connection = conn;
-		lstate.writer =
-			make_uniq<mssql::BCPWriter>(*lstate.connection, gstate.state.bcp_target, gstate.state.bcp_columns);
-		// The stream opens with COLMETADATA; without it the server has no schema
-		// for the ROW tokens that follow.
-		lstate.writer->WriteColmetadata();
-	} catch (std::exception &) {
-		if (conn) {
-			try {
-				catalog.GetConnectionPool().Release(conn);
-			} catch (...) {
-				// Nothing left to do — the handle is dropped either way.
-			}
-		}
-		lstate.connection.reset();
-		lstate.writer.reset();
-		gstate.parallel_writers_used.fetch_sub(1);
-	}
-}
-
-//! Close this thread's own bulk-load session: DONE for whatever is unflushed,
-//! then the server's confirmation, then the connection goes back to the pool.
-static void FinishLocalWriter(MSSQLCatalog &catalog, MSSQLCTASLocalSinkState &lstate) {
-	if (!lstate.writer) {
-		return;
-	}
-	// Always send DONE, even for zero rows: INSERT BULK left the connection in
-	// Executing, and only DONE closes the stream so it can be pooled again.
-	lstate.writer->WriteDone(lstate.rows_in_batch);
-	lstate.rows_confirmed += lstate.writer->Finalize();
-	lstate.rows_in_batch = 0;
-	lstate.writer.reset();
-
-	if (lstate.connection) {
-		lstate.connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-		catalog.GetConnectionPool().Release(lstate.connection);
-		lstate.connection.reset();
-	}
-}
-
-//===----------------------------------------------------------------------===//
 // Sink Implementation
 //===----------------------------------------------------------------------===//
+
+// House debug pattern (see CLAUDE.md): a static level read from MSSQL_DEBUG.
+// Added because "did this CTAS go parallel?" was unanswerable without timing it
+// — COPY logged the slot and CTAS was silent (spec 063 D5).
+static int GetCtasSinkDebugLevel() {
+	static const int level = []() {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
+#define CTAS_SINK_LOG(fmt, ...)                                       \
+	do {                                                              \
+		if (GetCtasSinkDebugLevel() >= 1) {                           \
+			fprintf(stderr, "[MSSQL CTAS] " fmt "\n", ##__VA_ARGS__); \
+		}                                                             \
+	} while (0)
+
+static uint64_t ElapsedNsSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+//! The CTAS peer of PrintWriteCounters in copy_function.cpp — same field names
+//! and the same units, so a CTAS and a COPY of the same data can be compared
+//! line for line. That was impossible before: CTAS reported nothing at all.
+static void PrintCtasCounters(MSSQLCTASGlobalSinkState &gstate) {
+	if (!mssql::CountersEnabled()) {
+		return;
+	}
+	if (mssql::CountersConfoundedByLogging()) {
+		fprintf(stderr,
+				"[MSSQL COUNTERS] NOTE: MSSQL_DEBUG is set, and its logging runs inside the phases timed "
+				"below — these numbers include it. For timings use MSSQL_COUNTERS=1 with MSSQL_DEBUG unset.\n");
+	}
+	const uint64_t sink_ns = gstate.counter_sink_ns.load();
+	const uint64_t encode_ns = gstate.counter_encode_ns.load();
+	const uint64_t flush_ns = gstate.counter_flush_ns.load();
+	const uint64_t other_ns = sink_ns > encode_ns + flush_ns ? sink_ns - encode_ns - flush_ns : 0;
+	const idx_t rows = gstate.state.rows_produced;
+	const idx_t chunks = gstate.counter_sink_calls.load();
+
+	// The phase totals below are SUMMED ACROSS THREADS, not wall clock: with
+	// N writers they can exceed the elapsed time of the statement, and a
+	// rise from 1 to N threads does NOT mean it got slower. Said in the
+	// output too, because these numbers get quoted.
+	fprintf(stderr, "[MSSQL COUNTERS]   (phase totals are summed across threads, not wall clock)\n");
+	fprintf(stderr,
+			"[MSSQL COUNTERS] ctas close: rows=%llu cols=%llu chunks=%llu writers=%llu/%llu | sink=%lluus "
+			"(encode=%lluus flush=%lluus other=%lluus)\n",
+			(unsigned long long)rows, (unsigned long long)gstate.state.bcp_columns.size(), (unsigned long long)chunks,
+			(unsigned long long)gstate.parallel_writers_used.load(), (unsigned long long)gstate.parallel_writer_limit,
+			(unsigned long long)(sink_ns / 1000), (unsigned long long)(encode_ns / 1000),
+			(unsigned long long)(flush_ns / 1000), (unsigned long long)(other_ns / 1000));
+	if (rows > 0) {
+		const double r = static_cast<double>(rows);
+		fprintf(stderr, "[MSSQL COUNTERS]   ns/row: sink=%.1f encode=%.1f flush=%.1f other=%.1f\n", sink_ns / r,
+				encode_ns / r, flush_ns / r, other_ns / r);
+	}
+}
 
 SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataChunk &chunk,
 												OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLCTASGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<MSSQLCTASLocalSinkState>();
+	const bool counters = mssql::CountersEnabled();
+	const auto sink_start = std::chrono::steady_clock::now();
 
 	// Skip if IF NOT EXISTS triggered skip (Issue #44). Read from the flag fixed
 	// before the first chunk, never from `state.phase` — a failing thread writes
@@ -241,6 +214,14 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 	// Skip empty chunks
 	if (chunk.size() == 0) {
 		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	// Ctrl+C. CTAS had no interrupt check at all — `IsInterrupted` appeared zero
+	// times in this file against five in the COPY sink — so a cancelled CTAS ran
+	// to completion at the server while the client had stopped caring, holding a
+	// bulk load open on a table nobody was going to keep (spec 063 D5).
+	if (context.client.IsInterrupted()) {
+		throw InterruptException();
 	}
 
 	// Another writer has already failed. Whether that ends this one too is the
@@ -257,30 +238,35 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	if (!lstate.init_attempted) {
 		lstate.init_attempted = true;
-		TryStartLocalWriter(catalog_, gstate, lstate);
+		mssql::BulkLoadSessionParams params;
+		params.pool = &catalog_.GetConnectionPool();
+		params.pool_handle = catalog_.GetConnectionPoolHandle();
+		params.insert_bulk_sql = &gstate.state.insert_bulk_sql;
+		params.target = &gstate.state.bcp_target;
+		params.columns = &gstate.state.bcp_columns;
+		params.flush_rows = gstate.state.config.bcp_flush_rows;
+		params.reset_on_release = gstate.state.reset_on_release;
+		params.collect_timings = counters;
+		if (lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit)) {
+			CTAS_SINK_LOG("parallel writer started (limit=%llu)", (unsigned long long)gstate.parallel_writer_limit);
+		} else {
+			CTAS_SINK_LOG("sharing the global writer (limit=%llu)", (unsigned long long)gstate.parallel_writer_limit);
+		}
 	}
 
 	// A thread with its own session writes without touching the global writer at
 	// all — no mutex, no shared accumulator. Its batch boundary re-opens its own
 	// INSERT BULK, exactly as the global one does.
-	if (lstate.writer) {
+	if (lstate.session.IsOwned()) {
 		try {
-			const idx_t written = lstate.writer->WriteRows(chunk);
-			lstate.rows_in_batch += written;
-			lstate.rows_written += written;
-			if (gstate.state.config.bcp_flush_rows > 0 && lstate.rows_in_batch >= gstate.state.config.bcp_flush_rows) {
-				lstate.rows_confirmed += lstate.writer->FlushBatch(lstate.rows_in_batch);
-				lstate.rows_in_batch = 0;
-				auto result = MSSQLSimpleQuery::Execute(*lstate.connection, gstate.state.insert_bulk_sql);
-				if (!result.success) {
-					throw IOException("CTAS BCP: Failed to re-execute INSERT BULK on a parallel connection: %s",
-									  result.error_message);
-				}
-				if (!lstate.connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-					throw IOException("CTAS BCP: Failed to transition a parallel connection to Executing");
-				}
-				lstate.writer->ResetForNextBatch();
-				lstate.writer->WriteColmetadata();
+			const auto written = lstate.session.Write(chunk);
+			lstate.rows_written += written.rows_written;
+			lstate.rows_confirmed += written.rows_confirmed;
+			if (counters) {
+				gstate.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
+				gstate.counter_sink_ns.fetch_add(ElapsedNsSince(sink_start), std::memory_order_relaxed);
+				gstate.counter_encode_ns.fetch_add(written.encode_ns, std::memory_order_relaxed);
+				gstate.counter_flush_ns.fetch_add(written.flush_ns, std::memory_order_relaxed);
 			}
 		} catch (...) {
 			// Close this thread's own stream FIRST, before anything below can issue
@@ -288,9 +274,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 			// DROP has to take a schema lock on, so leaving it open until
 			// ~MSSQLCTASLocalSinkState runs would have the cleanup block on this
 			// same thread's work.
-			lstate.writer.reset();
-			mssql::ReleaseBcpConnectionOnError(lstate.connection, lstate.pool_handle,
-											   /*transaction_pinned=*/false);
+			lstate.session.Abandon();
 
 			// Mark the statement failed. The DROP that mssql_ctas_drop_on_failure
 			// asks for is done by the FIRST thread to fail and by no other: with N
@@ -323,7 +307,17 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 	try {
 		if (gstate.state.config.use_bcp && gstate.state.bcp_writer) {
 			// BCP mode: delegate to AddChunkBCP
+			const uint64_t encode_before = gstate.state.counter_encode_ns;
+			const uint64_t flush_before = gstate.state.counter_flush_ns;
 			gstate.state.AddChunkBCP(context.client, chunk);
+			if (counters) {
+				gstate.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
+				gstate.counter_sink_ns.fetch_add(ElapsedNsSince(sink_start), std::memory_order_relaxed);
+				gstate.counter_encode_ns.fetch_add(gstate.state.counter_encode_ns - encode_before,
+												   std::memory_order_relaxed);
+				gstate.counter_flush_ns.fetch_add(gstate.state.counter_flush_ns - flush_before,
+												  std::memory_order_relaxed);
+			}
 		} else if (gstate.state.insert_executor) {
 			// Legacy INSERT mode
 			gstate.state.rows_produced += chunk.size();
@@ -354,11 +348,11 @@ SinkCombineResultType MSSQLPhysicalCreateTableAs::Combine(ExecutionContext &cont
 
 	// A thread that never got a session of its own has nothing to close; its rows
 	// went out through the global writer and Finalize accounts for them.
-	if (!lstate.writer && lstate.rows_written == 0) {
+	if (!lstate.session.IsOwned() && lstate.rows_written == 0) {
 		return SinkCombineResultType::FINISHED;
 	}
 
-	FinishLocalWriter(catalog_, lstate);
+	lstate.rows_confirmed += lstate.session.Finish();
 
 	std::lock_guard<std::mutex> lock(gstate.mutex);
 	gstate.state.rows_produced += lstate.rows_written;
@@ -392,6 +386,7 @@ SinkFinalizeType MSSQLPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event 
 
 		// Log success metrics
 		gstate.state.LogMetrics();
+		PrintCtasCounters(gstate);
 
 	} catch (...) {
 		// Finalize failed - attempt cleanup if configured

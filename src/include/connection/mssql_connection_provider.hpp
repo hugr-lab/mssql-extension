@@ -72,6 +72,15 @@ public:
 	//! @param catalog The MSSQL catalog
 	//! @return true if SQL Server transaction is active on pinned connection
 	static bool IsSqlServerTransactionActive(ClientContext &context, MSSQLCatalog &catalog);
+
+	//! `mssql_reset_connection` — should a connection returned to the pool have
+	//! its SESSION reset before the next user sees it (issue #189)?
+	//!
+	//! Read on the CLIENT thread and carried to wherever the release happens.
+	//! MSSQLResultStream's destructor is a release path and may run on a worker
+	//! thread, where touching the ClientContext is a data race (issue #178) — so
+	//! the answer travels with the stream exactly as `transaction_pinned` does.
+	static bool ShouldResetOnRelease(ClientContext &context);
 };
 
 namespace mssql {
@@ -90,9 +99,18 @@ namespace mssql {
 //!        (catalog torn down) drops the connection instead
 //! @param transaction_pinned true if an MSSQLTransaction owns the pin — the
 //!        reference is dropped without a pool Release
+//! @param reset_on_release `mssql_reset_connection` as resolved on the CLIENT
+//!        thread. Deliberately has NO default: this was the one reset site the
+//!        setting did not reach, and a defaulted parameter is exactly how it
+//!        would come to be half-honoured again. Every caller states its answer.
+//!
+//!        Mostly it decides nothing here — the branch below Closes the
+//!        connection unless it was already Idle, and closing ends the session
+//!        whatever the flag says — but "every release path" is the setting's
+//!        contract, so the Idle sub-case obeys it too.
 void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
-								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
-								 bool transaction_pinned) noexcept;
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle, bool transaction_pinned,
+								 bool reset_on_release) noexcept;
 
 }  // namespace mssql
 

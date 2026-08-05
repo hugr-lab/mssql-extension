@@ -30,6 +30,16 @@ public:
 
 	static MSSQLTransaction &Get(ClientContext &context, Catalog &catalog);
 
+	//! `mssql_reset_connection` as it stood when this transaction began
+	//! (issue #189). Captured rather than read at COMMIT/ROLLBACK because
+	//! TransactionManager::RollbackTransaction receives NO ClientContext — and a
+	//! rule that held on COMMIT but not on ROLLBACK would be worse than either
+	//! answer alone. Reading it at BEGIN is also the semantics one would choose:
+	//! the transaction behaves as it was configured when it started.
+	bool ShouldResetOnRelease() const {
+		return reset_on_release_;
+	}
+
 	//===--------------------------------------------------------------------===//
 	// Transaction support (Spec 001-mssql-transactions)
 	//===--------------------------------------------------------------------===//
@@ -73,6 +83,9 @@ private:
 	//! Pinned SQL Server connection for this transaction
 	//! nullptr when not in transaction or autocommit mode
 	std::shared_ptr<tds::TdsConnection> pinned_connection_;
+
+	//! See ShouldResetOnRelease().
+	bool reset_on_release_;
 
 	//! Mutex for serializing concurrent operations on pinned connection
 	mutable mutex connection_mutex_;

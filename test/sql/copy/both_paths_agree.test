@@ -1,0 +1,332 @@
+# name: test/sql/copy/both_paths_agree.test
+# description: the row-major and columnar encode paths produce identical bytes — one experiment, one lever (spec 063 D6)
+# group: [mssql]
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# THE EXPERIMENT
+#
+# `write_column_ops.hpp` claims the row-major and columnar paths "cannot produce
+# different bytes — not because a test says so, but because there is one
+# implementation". That is true for the direct-copy and convert arms. It is NOT
+# true for decimal, uuid, datetime and string, where the row encoder has its own
+# code — and every divergence found so far lived there:
+#
+#   * TIME: the kernel ROUNDED, the row encoder TRUNCATED, and the kernel had no
+#     end-of-day bound at all (23:59:59.999999 into time(0) produced 86400);
+#   * varbinary(n): the bound was applied by the kernel and not by the row path,
+#     so the server rejected the batch — or did not — depending on a NEIGHBOURING
+#     column;
+#   * smalldatetime: four bytes where its family uses eight, and rounding to the
+#     minute rather than truncation.
+#
+# In each case the SAME statement with the SAME data gave a different answer
+# because of some other column in the chunk. So each section below loads one set
+# of values TWICE — once so every column resolves to a kernel, once with a column
+# that drops the whole chunk to row-major — and requires the two to agree, and
+# where the answer is a narrowing, to agree with what the server's own CAST
+# produces. Asserting one path against a literal would not catch a divergence:
+# both answers are plausible.
+#
+# THE LEVER, and why it is section 0
+#
+# All of this rests on the second load actually taking the row path. Three of
+# these tests once used a `decimal(38,0)` fed `1::HUGEINT`, believing HUGEINT had
+# no scatter arm. Against an EXISTING table it has one — the catalog reports
+# DECIMAL(38,0), INT128 is in the decimal arm's accepted sources, and the width
+# already matches — so the fixture resolved COLUMNAR and those files compared the
+# columnar path with itself, passing for the wrong reason for a release.
+#
+# The lever now is a signed `TINYINT` into SQL Server's `tinyint`, which is
+# UNSIGNED — so the pair cannot be a byte copy and the resolver sends the column
+# to the row encoder. Section 0 PROVES that, rather than assuming it, and it must
+# stay the first thing this file does: if it ever stops holding, every comparison
+# below is the columnar path against itself and they all still pass.
+#
+# What would break it: making signed TINYINT -> tinyint columnar. That is a
+# reasonable thing for the columnar-gaps work to want. If it happens, this file
+# needs a new lever, not a deleted section 0.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS bp (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# =============================================================================
+# Section 0 — THE LEVER
+#
+# A signed TINYINT source into `tinyint` is refused BY VALUE, which only the row
+# encoder does: it range-checks each value. A columnar byte copy would store -1
+# as 255 and raise nothing — silently, which is how this shipped before spec 057.
+# So the error below is the proof that the fixtures in every section are taking
+# the path they claim.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BpLever'') IS NOT NULL DROP TABLE dbo.BpLever;
+CREATE TABLE dbo.BpLever (v tinyint)');
+
+statement error
+COPY (SELECT (-1)::TINYINT AS v) TO 'bp.dbo.BpLever' (FORMAT bcp, CREATE_TABLE false);
+----
+out of range
+
+# Nothing landed. A row-major refusal rejects the batch; it does not write 255
+# and carry on.
+query I
+SELECT count(*) FROM bp.dbo.BpLever;
+----
+0
+
+# ...and 0..127 loads normally through the same path, which is what makes it
+# usable as a lever in the sections below.
+statement ok
+COPY (SELECT (7)::TINYINT AS v) TO 'bp.dbo.BpLever' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT v FROM bp.dbo.BpLever;
+----
+7
+
+statement ok
+SELECT mssql_exec('bp', 'DROP TABLE dbo.BpLever');
+
+# =============================================================================
+# Section 1 — TIME
+#
+# Rounding is the correct half, because the server does it: CAST('12:34:56.600'
+# AS time(0)) is 12:34:57. What TIME cannot do is CARRY, having no date field, so
+# the end of the day has to SATURATE rather than wrap to midnight.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BpTimeCol'') IS NOT NULL DROP TABLE dbo.BpTimeCol;
+IF OBJECT_ID(''dbo.BpTimeRow'') IS NOT NULL DROP TABLE dbo.BpTimeRow;
+CREATE TABLE dbo.BpTimeCol (tag varchar(10), t0 time(0), t2 time(2), t3 time(3));
+CREATE TABLE dbo.BpTimeRow (tag varchar(10), t0 time(0), t2 time(2), t3 time(3), rp tinyint)');
+
+statement ok
+CREATE OR REPLACE TABLE bp_time_src AS
+SELECT * FROM (VALUES
+    ('eod',   TIME '23:59:59.999999', TIME '23:59:59.999999', TIME '23:59:59.999999'),
+    ('eod2',  TIME '23:59:59.995000', TIME '23:59:59.999000', TIME '23:59:59.999500'),
+    ('up',    TIME '12:34:56.600000', TIME '12:34:56.567000', TIME '12:34:56.789600'),
+    ('down',  TIME '12:34:56.400000', TIME '12:34:56.564000', TIME '12:34:56.789400'),
+    ('half',  TIME '12:34:56.500000', TIME '12:34:56.565000', TIME '12:34:56.789500'),
+    ('exact', TIME '01:02:03.000000', TIME '01:02:03.120000', TIME '01:02:03.456000'),
+    ('zero',  TIME '00:00:00.000000', TIME '00:00:00.000000', TIME '00:00:00.000000')
+) t(tag, t0, t2, t3);
+
+# Temporal and a bounded string only, so every column resolves to a kernel.
+statement ok
+COPY bp_time_src TO 'bp.dbo.BpTimeCol' (FORMAT bcp, CREATE_TABLE false);
+
+# The lever column drops the whole chunk to row-major.
+statement ok
+COPY (SELECT *, 0::TINYINT AS rp FROM bp_time_src) TO 'bp.dbo.BpTimeRow' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM (
+    SELECT tag, t0, t2, t3 FROM bp.dbo.BpTimeCol
+    EXCEPT ALL
+    SELECT tag, t0, t2, t3 FROM bp.dbo.BpTimeRow
+);
+----
+0
+
+# ...and both agree with the server's own narrowing, which is the part a literal
+# expectation could get wrong in the test and in the encoder at once.
+query I
+SELECT count(*) FROM mssql_scan('bp', $$
+SELECT c.tag FROM dbo.BpTimeCol c
+JOIN (VALUES
+    ('eod',   '23:59:59.999999'), ('eod2', '23:59:59.999500'),
+    ('up',    '12:34:56.789600'), ('down', '12:34:56.789400'),
+    ('half',  '12:34:56.789500'), ('exact','01:02:03.456000'),
+    ('zero',  '00:00:00.000000')
+) AS src(tag, t3_text) ON src.tag = c.tag
+WHERE c.t3 <> CAST(src.t3_text AS time(3))
+$$);
+----
+0
+
+# The end-of-day cases are the ones the missing bound produced 86400 for: the
+# last tick of the day, never a wrap to midnight.
+query III
+SELECT tag, t0, t3 FROM bp.dbo.BpTimeCol WHERE tag IN ('eod', 'eod2') ORDER BY tag;
+----
+eod	23:59:59	23:59:59.999
+eod2	23:59:59	23:59:59.999
+
+# Rounding, not truncation — `up` moves to the next second and `down` does not.
+query III
+SELECT tag, t0, t3 FROM bp.dbo.BpTimeCol WHERE tag IN ('up', 'down') ORDER BY tag;
+----
+down	12:34:56	12:34:56.789
+up	12:34:57	12:34:56.79
+
+statement ok
+SELECT mssql_exec('bp', 'DROP TABLE dbo.BpTimeCol; DROP TABLE dbo.BpTimeRow;');
+
+# =============================================================================
+# Section 2 — smalldatetime
+#
+# The awkward member of the datetime family, and it had no write coverage at all
+# while spec 057 newly qualified it for the kernel:
+#
+#   * FOUR bytes, not eight — two for days since 1900-01-01, two for minutes —
+#     and `datetime`, `datetime2` and `smalldatetime` all declare the same TDS
+#     type, so the WIDTH is the only thing telling the resolver them apart. A
+#     kernel writing eight bytes into a four-byte slot puts every later column of
+#     the row where the server is not looking;
+#   * its resolution is a MINUTE and SQL Server ROUNDS to it. Truncating is the
+#     plausible wrong answer, invisible unless a value sits past the half-minute.
+#
+# The `datetime` column alongside is what makes the width question real: same
+# family, same DuckDB type, same wire type, differing only in bytes written.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BpSdCol'') IS NOT NULL DROP TABLE dbo.BpSdCol;
+IF OBJECT_ID(''dbo.BpSdRow'') IS NOT NULL DROP TABLE dbo.BpSdRow;
+CREATE TABLE dbo.BpSdCol (tag varchar(10), v smalldatetime, d datetime);
+CREATE TABLE dbo.BpSdRow (tag varchar(10), v smalldatetime, d datetime, rp tinyint)');
+
+statement ok
+CREATE OR REPLACE TABLE bp_sd_src AS
+SELECT * FROM (VALUES
+    ('lo',    TIMESTAMP '1900-01-01 00:00:00'),
+    ('hi',    TIMESTAMP '2079-06-06 23:59:00'),
+    ('up',    TIMESTAMP '2020-03-04 10:20:30'),
+    ('down',  TIMESTAMP '2020-03-04 10:20:29'),
+    ('exact', TIMESTAMP '2020-03-04 10:20:00'),
+    ('frac',  TIMESTAMP '2020-03-04 10:20:59.999'),
+    ('midn',  TIMESTAMP '2001-12-31 23:59:00')
+) t(tag, v);
+
+statement ok
+COPY (SELECT tag, v, v AS d FROM bp_sd_src) TO 'bp.dbo.BpSdCol' (FORMAT bcp, CREATE_TABLE false);
+
+statement ok
+COPY (SELECT tag, v, v AS d, 0::TINYINT AS rp FROM bp_sd_src) TO 'bp.dbo.BpSdRow' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM (
+    SELECT tag, v, d FROM bp.dbo.BpSdCol
+    EXCEPT ALL
+    SELECT tag, v, d FROM bp.dbo.BpSdRow
+);
+----
+0
+
+# Rounding to the minute, not truncation: :30 goes up and :29 does not. This is
+# the assertion a truncating encoder fails and every other check here passes.
+query II
+SELECT tag, v FROM bp.dbo.BpSdCol WHERE tag IN ('up', 'down', 'frac', 'exact') ORDER BY tag;
+----
+down	2020-03-04 10:20:00
+exact	2020-03-04 10:20:00
+frac	2020-03-04 10:21:00
+up	2020-03-04 10:21:00
+
+# ...and it is the server's own answer, not merely a plausible one.
+query I
+SELECT count(*) FROM mssql_scan('bp', $$
+SELECT c.tag FROM dbo.BpSdCol c
+JOIN (VALUES
+    ('lo',   '1900-01-01 00:00:00'),    ('hi',    '2079-06-06 23:59:00'),
+    ('up',   '2020-03-04 10:20:30'),    ('down',  '2020-03-04 10:20:29'),
+    ('exact','2020-03-04 10:20:00'),    ('frac',  '2020-03-04 10:20:59.997'),
+    ('midn', '2001-12-31 23:59:00')
+) AS src(tag, txt) ON src.tag = c.tag
+WHERE c.v <> CAST(src.txt AS smalldatetime)
+$$);
+----
+0
+
+# Both ends of the type's range survive: smalldatetime starts at 1900-01-01 and
+# ends at 2079-06-06, so these are what a day- or minute-count off by one would
+# push outside it.
+query II
+SELECT tag, v FROM bp.dbo.BpSdCol WHERE tag IN ('lo', 'hi') ORDER BY tag;
+----
+hi	2079-06-06 23:59:00
+lo	1900-01-01 00:00:00
+
+# The eight-byte neighbour keeps its sub-minute precision, which is what says the
+# four-byte width was applied to the right column and not to the whole family.
+query II
+SELECT tag, d FROM bp.dbo.BpSdCol WHERE tag IN ('down', 'frac') ORDER BY tag;
+----
+down	2020-03-04 10:20:29
+frac	2020-03-04 10:21:00
+
+statement ok
+SELECT mssql_exec('bp', 'DROP TABLE dbo.BpSdCol; DROP TABLE dbo.BpSdRow;');
+
+# =============================================================================
+# Section 3 — varbinary(n)
+#
+# `ClampToBound` bounded VarKind::Binary and `EncodeBinary` had no bound at all,
+# so a varbinary(3) column took 3 bytes when every column resolved to a kernel
+# and the WHOLE value when some unrelated column dropped the chunk to row-major —
+# where the server rejected the batch. Same statement, same data, outcome decided
+# by a neighbour.
+#
+# The truncation SEMANTICS (character boundaries, MAX columns, mixed widths) are
+# string_bound_truncation.test's subject. What is here is only the agreement.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BpBinCol'') IS NOT NULL DROP TABLE dbo.BpBinCol;
+IF OBJECT_ID(''dbo.BpBinRow'') IS NOT NULL DROP TABLE dbo.BpBinRow;
+CREATE TABLE dbo.BpBinCol (tag nvarchar(10), bn varbinary(3));
+CREATE TABLE dbo.BpBinRow (tag nvarchar(10), bn varbinary(3), rp tinyint)');
+
+statement ok
+CREATE OR REPLACE TABLE bp_bin_src AS
+SELECT * FROM (VALUES
+    ('long',  encode('abcdefghij')::BLOB),
+    ('exact', encode('abc')::BLOB),
+    ('short', encode('a')::BLOB),
+    ('empty', encode('')::BLOB)
+) t(tag, bn);
+
+statement ok
+COPY bp_bin_src TO 'bp.dbo.BpBinCol' (FORMAT bcp, CREATE_TABLE false);
+
+statement ok
+COPY (SELECT *, 0::TINYINT AS rp FROM bp_bin_src) TO 'bp.dbo.BpBinRow' (FORMAT bcp, CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM (
+    SELECT tag, bn FROM bp.dbo.BpBinCol
+    EXCEPT ALL
+    SELECT tag, bn FROM bp.dbo.BpBinRow
+);
+----
+0
+
+# The bound is applied, and to the same place — an over-long value is cut to the
+# declared 3 bytes rather than rejected or stored whole.
+query II
+SELECT tag, bn FROM bp.dbo.BpBinRow ORDER BY tag;
+----
+empty	(empty)
+exact	abc
+long	abc
+short	a
+
+statement ok
+SELECT mssql_exec('bp', 'DROP TABLE dbo.BpBinCol; DROP TABLE dbo.BpBinRow;');
+
+statement ok
+DETACH bp;

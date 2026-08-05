@@ -165,12 +165,81 @@ cd "$REPO_ROOT"
 # The runner reports `require-env` misses as skips, never failures, so a missing variable would
 # quietly reduce the suite to a no-op. The skip list is printed at the end of its output; the
 # expected skips are the optional environments (Azure, Kerberos, TLS, Windows SSPI).
-if "$UNITTEST_BIN" "test/sql/*"; then
-    echo ""
-    echo "=== Integration Test PASSED ==="
-    exit 0
-else
-    echo ""
-    echo "=== Integration Test FAILED ==="
+# Select the suite by NAME, not by a path-shaped glob.
+#
+# `test/sql/*` selected zero files here for months while the job reported PASSED
+# (issue #212). The runner's test list is COMPILED IN at build time — a binary in
+# an empty directory still lists all 173 — so what the glob has to match is the
+# name the BUILD registered, and that prefix is not the same in CI as it is
+# locally. A glob is the wrong instrument for that: `*test/sql/*` "fixes" it by
+# also selecting DuckDB's own suite (344 instead of 172), which would look like a
+# much better fix than it is.
+#
+# So the list is built from the files this repository actually owns, matched
+# against what the binary registered by SUFFIX, and passed with --input-file.
+# Whatever prefix the build used, our files are found or the script says so.
+MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
+
+"$UNITTEST_BIN" --list-tests > /tmp/mssql_all_tests.txt 2>/dev/null || true
+find test/sql -name '*.test' | sort > /tmp/mssql_our_files.txt
+: > /tmp/mssql_selected.txt
+while read -r f; do
+    grep -F -m1 "$f" /tmp/mssql_all_tests.txt | cut -f1 >> /tmp/mssql_selected.txt || true
+done < /tmp/mssql_our_files.txt
+
+owned=$(wc -l < /tmp/mssql_our_files.txt | tr -d ' ')
+selected=$(grep -c . /tmp/mssql_selected.txt || true)
+echo "Suite: $owned .test files in the repo, $selected registered in the runner"
+
+# EVERY file this repository owns must be registered — not merely "enough of
+# them". A floor alone would pass with 160 of 172 registered, and the 12 missing
+# would be exactly as invisible as the 172 were before #212. Adding a .test file
+# needs no change here (the list is computed by `find` on every run); a file that
+# the BUILD failed to pick up is what this catches.
+if [ "$selected" -ne "$owned" ]; then
+    echo "" >&2
+    echo "=== $selected of $owned .test files are registered in $UNITTEST_BIN ===" >&2
+    echo "    Files the runner does not know about, so they would not run:" >&2
+    while read -r f; do
+        grep -qF "$f" /tmp/mssql_all_tests.txt || echo "      $f" >&2
+    done < /tmp/mssql_our_files.txt
+    echo "    A few names the runner DOES know, for comparison:" >&2
+    head -4 /tmp/mssql_all_tests.txt | sed 's/^/      /' >&2
     exit 1
 fi
+
+# And a floor besides, for the case where the repo itself has lost its tests.
+if [ "$owned" -lt "$MIN_TEST_CASES" ]; then
+    echo "" >&2
+    echo "=== the repo has only $owned .test files, expected at least $MIN_TEST_CASES ===" >&2
+    echo "    If files were deliberately removed, lower MSSQL_MIN_TEST_CASES in the" >&2
+    echo "    same commit. Otherwise the checkout is not what it should be." >&2
+    exit 1
+fi
+
+set -o pipefail
+"$UNITTEST_BIN" -f /tmp/mssql_selected.txt 2>&1 | tee /tmp/mssql_integration_ci.out
+status=$?
+
+cases=$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration_ci.out | tail -1 | grep -oE '^[0-9]+' || true)
+if [ -z "$cases" ]; then
+    cases=0
+fi
+
+if [ "$status" -ne 0 ]; then
+    echo ""
+    echo "=== Integration Test FAILED ($cases cases ran) ==="
+    exit 1
+fi
+
+if [ "$cases" -lt "$MIN_TEST_CASES" ]; then
+    echo ""
+    echo "=== Integration Test ran $cases cases, expected at least $MIN_TEST_CASES ===" >&2
+    echo "    The runner exited 0 having selected (almost) nothing — see issue #212." >&2
+    echo "    A green job here means the suite RAN, not merely that it did not fail." >&2
+    exit 1
+fi
+
+echo ""
+echo "=== Integration Test PASSED ($cases cases) ==="
+exit 0

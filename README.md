@@ -1693,6 +1693,7 @@ Queries involving unsupported types will raise an error.
 | -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
 | `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
+| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](#owning-the-session-mssql_reset_connection)) |
 | `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |
@@ -1790,6 +1791,63 @@ SET mssql_idle_timeout = 600;     -- Keep connections longer (default: 300s)
 
 -- Debugging connection issues
 SET mssql_connection_cache = false;  -- Disable pooling for isolation
+```
+
+### Owning the session: `mssql_reset_connection`
+
+Connections are pooled, and by default a connection returning to the pool is
+flagged for a **session reset** before the next statement uses it — the TDS
+`RESET_CONNECTION` bit, which is what `sp_reset_connection` does and what
+ADO.NET and JDBC drivers do for the same reason.
+
+That is why a temp table does not survive between statements:
+
+```sql
+SELECT mssql_exec('db', 'SELECT 1 AS x INTO ##staging');
+SELECT * FROM mssql_scan('db', 'SELECT * FROM ##staging');
+-- Invalid object name '##staging'
+```
+
+A `##global` table lives exactly as long as the session that created it, and the
+reset ends that session. It is the same physical connection — `@@SPID` is
+unchanged — but a new session on it.
+
+There is no way to keep temp tables while still clearing everything else: the
+reset is a single bit in the TDS packet header with two variants, and the other
+one (`RESET_CONNECTION_SKIP_TRAN`) drops `##global` and local `#temp` tables just
+the same; it differs only in how it treats transaction state.
+
+So the choice is all or nothing:
+
+```sql
+SET mssql_reset_connection = false;
+
+SELECT mssql_exec('db', 'SELECT 1 AS x INTO ##staging');
+SELECT * FROM mssql_scan('db', 'SELECT * FROM ##staging');  -- 1
+SELECT mssql_exec('db', 'DROP TABLE ##staging');            -- yours to clean up
+```
+
+**What you are taking on.** `false` does not mean "keep my temp tables". It means
+**you own the session state** of every pooled connection, and the reset was
+clearing more than temp objects:
+
+- `SET` options (`ANSI_NULLS`, `DATEFIRST`, `ARITHABORT`, …) and the isolation
+  level set by one statement are inherited by the next, unrelated one;
+- session variables, `CONTEXT_INFO`, and open cursors persist;
+- **an open transaction stays open**, and keeps its locks, until that connection
+  is used again — the reset is what would have rolled it back.
+
+Use it when you deliberately want a staging table to outlive the statement that
+created it, prefer `##global` over `#local` (a `#` table is reachable only from
+the session that made it, and a pool gives no guarantee about which connection
+you get next), and drop what you create.
+
+An alternative that needs no setting, if you have `CREATE TABLE` permission on
+the database: attach a second catalog and use an ordinary table.
+
+```sql
+ATTACH 'Server=...;Database=tempdb;...' AS stg (TYPE mssql);
+CREATE TABLE stg.dbo.staging AS SELECT * FROM local_data;
 ```
 
 ### INSERT vs COPY Performance

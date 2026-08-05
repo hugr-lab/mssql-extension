@@ -75,6 +75,18 @@ bool ConnectionProvider::IsInTransaction(ClientContext &context, MSSQLCatalog &c
 }
 
 //===----------------------------------------------------------------------===//
+// ConnectionProvider::ShouldResetOnRelease
+//===----------------------------------------------------------------------===//
+
+bool ConnectionProvider::ShouldResetOnRelease(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_reset_connection", val)) {
+		return val.GetValue<bool>();
+	}
+	return tds::DEFAULT_RESET_CONNECTION;
+}
+
+//===----------------------------------------------------------------------===//
 // ConnectionProvider::IsSqlServerTransactionActive
 //===----------------------------------------------------------------------===//
 
@@ -225,8 +237,18 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 		// Not in a transaction OR in autocommit mode - flag for reset and return to pool
 		// The RESET_CONNECTION flag will be set on the TDS header of the next SQL_BATCH,
 		// which is how ADO.NET/JDBC drivers reset session state (temp tables, variables, SET options)
-		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, flagging connection for reset");
-		conn->SetNeedsReset(true);
+		//
+		// `mssql_reset_connection = false` skips it (issue #189). The bit has no
+		// selective form — one bit, two variants, and RESET_CONNECTION_SKIP_TRAN
+		// drops `##g` and `#loc` alike — so keeping a global temp table alive
+		// across statements means not sending it at all, and the session state it
+		// would have cleared becomes the user's to manage.
+		//
+		// Read per release rather than cached: SET must take effect on the next
+		// statement, and this is once per statement, not per row.
+		const bool reset_on_release = ShouldResetOnRelease(context);
+		MSSQL_CONN_LOG("ReleaseConnection: Autocommit mode, reset=%d", reset_on_release ? 1 : 0);
+		conn->SetNeedsReset(reset_on_release);
 		auto &pool = catalog.GetConnectionPool();
 		pool.Release(conn);
 		return;
@@ -245,8 +267,8 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 namespace mssql {
 
 void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
-								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
-								 bool transaction_pinned) noexcept {
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle, bool transaction_pinned,
+								 bool reset_on_release) noexcept {
 	if (!connection) {
 		return;
 	}
@@ -270,7 +292,10 @@ void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection
 
 	if (auto pool = pool_handle.lock()) {
 		try {
-			connection->SetNeedsReset(true);
+			// The answer comes from the caller, which captured it on the client
+			// thread: there is no ClientContext to ask here by design (issue #178
+			// — this runs from destructors that may be on a worker thread).
+			connection->SetNeedsReset(reset_on_release);
 			pool->Release(std::move(connection));
 		} catch (...) {
 			// Release failed — drop it; the shared_ptr destructor closes the socket.

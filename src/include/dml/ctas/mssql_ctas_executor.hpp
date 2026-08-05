@@ -95,6 +95,18 @@ struct CTASExecutionState {
 	// MSSQLCopyGlobalState; a failed lock() means the catalog is torn down).
 	weak_ptr<tds::ConnectionPool> pool_handle;
 
+	//! `mssql_reset_connection`, resolved on the client thread and carried for the
+	//! same reason `pool_handle` is: the release paths below run without a
+	//! ClientContext, some of them from a destructor on a worker thread (#178).
+	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
+
+	//! MSSQL_COUNTERS phase totals for the SHARED writer path (AddChunkBCP).
+	//! A thread with its own session reports through BulkLoadWriteResult instead;
+	//! both land in the same global totals. Plain integers — every write here is
+	//! under the global sink mutex.
+	uint64_t counter_encode_ns = 0;
+	uint64_t counter_flush_ns = 0;
+
 	// Catalog reference for cache invalidation
 	MSSQLCatalog *catalog = nullptr;
 
@@ -130,7 +142,7 @@ struct CTASExecutionState {
 
 	// Initialize for execution
 	void Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
-					CTASConfig config_p);
+					CTASConfig config_p, bool reset_on_release_p);
 
 	// Execute CREATE TABLE DDL phase
 	void ExecuteDDL(ClientContext &context);
