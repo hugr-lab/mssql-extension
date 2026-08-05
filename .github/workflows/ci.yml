@@ -530,12 +530,10 @@ jobs:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
-    # Also on a merge to `main` (issue #212 gap 1). A pull request never compiled
-    # the extension, so a C++ regression could reach main behind green checks —
-    # three times in one week when that issue was filed. Building on the merge
-    # catches it on main rather than at the next release, and costs nothing on
-    # the PRs themselves: the `push` trigger is `branches: [main]` and the
-    # workflow's `paths-ignore` keeps docs-only merges free.
+    # Follows the build on a merge to `main`: an extension that COMPILES can still
+    # fail to LOAD (symbol visibility, a missing runtime dependency), and that is
+    # the class this job exists for. One extra minute on top of a build that is
+    # already running.
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
     strategy:
       fail-fast: false
