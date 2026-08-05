@@ -120,11 +120,10 @@ Where bytes-vs-characters does bite is narrower and conditional: with
 `varchar(n)` — n BYTES — where `nvarchar(n)` would have been n characters. Worth
 a documentation line, not a blocker.
 
-**Confirmed: a UTF-8-collated column cannot be compared with the collations
-already in the database.** This one was measured properly only after the control
-was demanded, and the control is what makes it stand:
+**Confirmed, then narrowed — and the narrowing is the useful part.** The first
+control showed a UTF-8-collated column conflicting with what the database has:
 
-| join | result |
+| join, in a database collated `SQL_Latin1_General_CP1_CI_AS` | result |
 |---|---|
 | `nvarchar` (today's default) × `varchar` CP1 | **works** |
 | `varchar` CP1 × `varchar` CP1 | works |
@@ -135,24 +134,40 @@ was demanded, and the control is what makes it stand:
     "Latin1_General_100_CI_AS_SC_UTF8" and "SQL_Latin1_General_CP1_CI_AS"
     in the equal to operation.
 
-So the difference is real and it is introduced by the switch: what we create
-today joins against both kinds of existing column, and a UTF-8 column joins
-against neither. Every predicate against an existing table would need an explicit
-`COLLATE`. That is not slower, it is broken.
+**But the conflict is not a property of UTF-8. It is a property of MIXING.**
+The same experiment inside a database created `COLLATE
+Latin1_General_100_CI_AS_SC_UTF8`:
 
-**Conclusion: keep the default, make the alternative findable.** The 3.2x is real
-and stays opt-in:
+| join, in a UTF-8 database | result |
+|---|---|
+| `varchar` inheriting the default × `varchar` stating the same collation | **works** |
+| `varchar` UTF-8 × **`nvarchar`** | **works** |
 
-- document the four-way measurement where someone investigating slow writes will
-  find it, with the collation conflict stated beside it;
-- make `mssql_ctas_text_type = VARCHAR` the documented answer to "my data is
-  ASCII and the load is slow", with its one condition — the loaded table must not
-  be joined to columns in another collation;
-- `mssql_utf8_collation` already exists to match the database's own collation
-  instead of `Latin1_General_100_...`, which is the escape hatch when the target
-  database is not Latin1-based. Setting it to a UTF-8 form of the database's OWN
-  collation would avoid the conflict entirely — **untested, and the obvious next
-  probe if this is ever revisited.**
+No conflict at all, including against `nvarchar`. The blocker is precisely
+*imposing a collation the database does not already use.*
+
+**And the extension already gets this right.** `WireVarcharCollation` returns the
+database's OWN collation when it ends in `_UTF8`, and `varchar_collation` stays
+empty so the DDL emits no `COLLATE` clause and the column inherits. That is the
+Fabric path, conflict-free by construction.
+
+The hypothesis that prompted this probe — point `mssql_utf8_collation` at a UTF-8
+form of the database's own collation — **does not work for the common case**, and
+the reason is worth recording: the test database is
+`SQL_Latin1_General_CP1_CI_AS`, and `SQL_Latin1_General_CP1_CI_AS_UTF8` does not
+exist. Legacy `SQL_` collations have no UTF-8 forms; only the Windows ones do.
+There is nothing to point it at.
+
+**Conclusion: keep the default, and state when the fast path is safe.** It is not
+an option to reach for blindly — it is a property of the TARGET DATABASE:
+
+- database default already UTF-8 (Fabric, or one created that way):
+  `mssql_ctas_text_type = VARCHAR` is conflict-free and worth 3.2x, and the
+  extension inherits rather than imposing, so nothing else is needed;
+- database default not UTF-8: a UTF-8 column conflicts with every existing string
+  column, and the honest advice is to create the target database with a UTF-8
+  collation — not to set our option and hope;
+- document both, beside the four-way measurement.
 
 A server without UTF-8 support needs no new work: the extension asks, and only
 attaches the collation when the answer is yes. `CTASConfig::varchar_collation` is
