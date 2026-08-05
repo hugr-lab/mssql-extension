@@ -226,6 +226,46 @@ denominators). D1's case is real but must be taken in evidence-ordered steps:
 Wall-clock expectation stays zero on server-bound reads; the win is client
 CPU, which is the currency this series has always traded in.
 
+## T0f — D1-alt SHIPPED and the residual measured (2026-08-05)
+
+D1-alt implemented: `SkipForm`/`SkipDesc` in `tds_column_metadata.hpp`,
+resolved once per COLMETADATA by the parser, `SkipByForm` fast walk in
+`SkipRow`/`SkipNBCRow`; PLP, TEXT/NTEXT/IMAGE and unknown types stay on the
+legacy `SkipValue`/`SkipValueNBC`, which remain the single implementation of
+the hard forms. Byte-identical by construction and by `diff_check.sh` 13/13;
+full suite green.
+
+**A/B, alt vs base** (6 pairs, medians, negative = alt faster):
+
+| fixture | delta ns/value | pairs where alt slower |
+| --- | ---: | ---: |
+| 1×bigint | 0.00 | 3/6 (tie) |
+| 4×mixed | **−1.16** | 0/6 |
+| 15×wide | **−0.78** | 1/6 |
+
+**Residual, alt vs alt-doing-the-fast-walk-twice** (6 pairs):
+
+| fixture | residual ns/value | wins |
+| --- | ---: | ---: |
+| 1×bigint | **+1.97** (≡ ns/row) | 6/6 |
+| 4×mixed | +0.16 | 3/6 |
+| 15×wide | +0.16 | 5/6 |
+
+Reading: on MIXED shapes the type_id switch was the cost — alt removed
+~55% of the walk, and the per-VALUE residual is ≈0.16 ns, essentially done.
+On a single-column table the switch was perfectly predicted and alt buys
+nothing; the stubborn ~2 ns there is a per-ROW constant (the call,
+`RowReader` construction, loop setup) — which is also exactly what the
+residual decomposes to: **~2 ns/row fixed + ~0.16 ns/value**.
+
+**Full D1's remaining prize is therefore a per-row constant**: ~13% of client
+CPU on a 1-column read, ~4% at 4 columns, ~2% at 15. Against that stand the
+consumed-bytes contract change and the mandatory staged-walk clamp (T0e).
+**Deferred**: the 2 ns/row now belongs to the same bucket as the other fixed
+per-row costs T0b exposed (~17 ns/row parse-fixed + loop mechanics), and if
+that bucket is ever attacked it should be attacked whole — removing the walk
+alone buys the narrow-table case only.
+
 ## 4. D1 — skip the skip (the main item)
 
 ### What the second walk actually costs

@@ -71,5 +71,29 @@ private:
 	static bool ParseColumnName(const uint8_t *data, size_t length, size_t &offset, std::string &name);
 };
 
+// Spec 058 D1-alt. The skip walk's job per value is tiny — read a length
+// prefix, bounds-check, advance — but SkipValue selects it with a ~30-case
+// switch on type_id PER VALUE. The wire has only four framing shapes, and
+// which one a column uses is fixed at COLMETADATA, so the parser resolves each
+// column to a form ONCE and the walk dispatches on a 2-bit form from a
+// contiguous array instead. Measured before the change: the whole walk is
+// 1.7–2.1 ns/value, ~13% of the entire client-side read of a cheap type
+// (spec 058 §3a/T0e).
+//
+// SLOW keeps the legacy SkipValue/SkipValueNBC as the one implementation of
+// the hard forms: PLP chunk lists, the TEXT/NTEXT/IMAGE text-pointer form and
+// its MAX_LOB guard, and unknown types. Lives here (not in RowReader) so the
+// parser can hold the resolved array without a header cycle — RowData lives in
+// the parser's header, which RowReader needs.
+enum class SkipForm : uint8_t { FIXED = 0, PREFIX1 = 1, PREFIX2 = 2, SLOW = 3 };
+
+struct SkipDesc {
+	SkipForm form;
+	uint8_t width;	// FIXED: payload bytes; other forms: unused
+};
+
+//! Defined in tds_row_reader.cpp beside the switch it mirrors.
+SkipDesc ResolveSkipForm(const ColumnMetadata &col);
+
 }  // namespace tds
 }  // namespace duckdb

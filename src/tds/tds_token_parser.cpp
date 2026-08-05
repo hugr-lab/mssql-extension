@@ -39,6 +39,7 @@ void TokenParser::Reset() {
 	buffer_.clear();
 	buffer_pos_ = 0;
 	columns_.clear();
+	skip_descs_.clear();
 	current_row_.Clear();
 	current_error_ = TdsError();
 	current_info_ = TdsInfo();
@@ -265,6 +266,12 @@ bool TokenParser::ParseColMetadata() {
 	}
 
 	TDS_PARSER_DEBUG(1, "ParseColMetadata: parsed %zu columns, consumed %zu bytes", columns_.size(), bytes_consumed);
+	// Spec 058 D1-alt: resolve each column's skip form once, here, so the
+	// per-row walks dispatch on a 2-bit form instead of a type_id switch.
+	skip_descs_.resize(columns_.size());
+	for (size_t i = 0; i < columns_.size(); i++) {
+		skip_descs_[i] = ResolveSkipForm(columns_[i]);
+	}
 	ConsumeBytes(1 + bytes_consumed);  // token type + parsed data
 	state_ = ParserState::ParsingRow;
 	return true;
@@ -283,6 +290,7 @@ bool TokenParser::ParseRow() {
 	}
 
 	RowReader reader(columns_);
+	reader.SetSkipDescriptors(skip_descs_.data());
 	const uint8_t *data = Current() + 1;  // Skip token type
 	size_t length = Available() - 1;
 	size_t bytes_consumed = 0;
@@ -340,6 +348,7 @@ bool TokenParser::ParseNBCRow() {
 	}
 
 	RowReader reader(columns_);
+	reader.SetSkipDescriptors(skip_descs_.data());
 	const uint8_t *data = Current() + 1;  // Skip token type
 	size_t length = Available() - 1;
 	size_t bytes_consumed = 0;
