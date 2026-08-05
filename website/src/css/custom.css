@@ -1,0 +1,82 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ */
+
+/* You can override the default Infima variables here. */
+:root {
+  --ifm-font-family-base: 'Quicksand', system-ui, -apple-system, sans-serif;
+  --ifm-color-primary: #1c7d78;
+  --ifm-color-primary-dark: #19716c;
+  --ifm-color-primary-darker: #186a66;
+  --ifm-color-primary-darkest: #145854;
+  --ifm-color-primary-light: #1d837e;
+  --ifm-color-primary-lighter: #1f8a84;
+  --ifm-color-primary-lightest: #20908a;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --ifm-navbar-height: 80px;
+  --ifm-navbar-background-color: rgba(255, 255, 255, 0.5);
+}
+
+.navbar__logo {
+  height: 64px;
+  width: auto;
+}
+
+.navbar__logo img {
+  height: 64px;
+  width: auto;
+}
+
+.navbar__link {
+  font-size: 1.3rem;
+  color: #20908a;
+  font-weight: 600;
+}
+
+.navbar__title {
+  font-family: 'Quicksand';
+  font-size: 1.3rem;
+  color: #20908a;
+  font-weight: 600;
+}
+
+.button {
+  border-radius: 22px;
+  font-family: 'Quicksand';
+}
+
+.highlighted {
+  color: #21807a;
+  font-family: 'Quicksand';
+}
+
+@media screen and (max-width: 996px) {
+  :root {
+    --ifm-navbar-background-color: rgba(255, 255, 255, 0.9);
+  }
+}
+
+/* Hide default Docusaurus navbar on homepage (custom HeroNavbar used instead) */
+.navbar:has(~ .homepage) {
+  display: none !important;
+}
+
+
+/*
+/* For readability concerns, you should choose a lighter palette in dark mode. 
+[data-theme='dark'] {
+  --ifm-color-primary: #00bfbc;
+  --ifm-color-primary-dark: #00aca9;
+  --ifm-color-primary-darker: #00a2a0;
+  --ifm-color-primary-darkest: #008f8d;
+  --ifm-color-primary-light: #00d2cf;
+  --ifm-color-primary-lighter: #00dcd8;
+  --ifm-color-primary-lightest: #00f8f4;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+*/
+
+

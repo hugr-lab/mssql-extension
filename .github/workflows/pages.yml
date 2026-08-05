@@ -1,19 +1,21 @@
-name: Deploy metrics page
+name: Deploy docs + metrics page
 
-# Publishes web/ (the DuckDB-Wasm interactive download-metrics chart) to GitHub
-# Pages, together with the static SVG the README embeds. Requires Settings ->
-# Pages -> "Build and deployment" Source set to "GitHub Actions". Served at
-# https://<owner>.github.io/<repo>/.
+# Publishes to GitHub Pages (https://hugr-lab.github.io/mssql-extension/):
+#   /                       Docusaurus documentation site (website/)
+#   /metrics/               the DuckDB-Wasm interactive download-metrics chart (web/)
+#   /download-metrics.svg   static chart the README embeds — PATH IS STABLE, the
+#                           README hotlinks it; move it and the README image dies
 #
-# The weekly schedule is why the SVG is rendered here rather than committed. It
-# used to be refreshed by a job that wrote docs/assets/download-metrics.svg and
-# pushed to `main` — a protected branch, so every Monday it failed with "GH006:
-# Protected branch update failed ... Changes must be made through a pull
-# request". Publishing the image to Pages keeps the chart current with no
-# commit, no weekly pull request to approve, and no token that can write to
-# main: this workflow holds `contents: read`.
+# The DOCS are built from the LATEST RELEASE TAG, not from main: the site is
+# the documentation of what users can install, and main runs ahead of it
+# between releases (maintainer decision, 2026-08-05). Bootstrap fallback: while
+# the latest tag predates website/'s existence, build from main instead.
+# The SVG is rendered fresh on every run (weekly schedule) — that part keeps
+# the pre-docs behavior: no commit, no PR, `contents: read` only.
 
 on:
+  release:
+    types: [published]
   schedule:
     - cron: "17 6 * * 1" # Mondays 06:17 UTC (the weekly archive refreshes daily ~04:00Z)
   push:
@@ -41,6 +43,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags needed to resolve the docs ref
+
+      - name: Resolve the docs source ref
+        id: docsref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            REF="${{ github.event.release.tag_name }}"
+          else
+            REF=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+          fi
+          # Bootstrap: a tag from before the docs site existed has no website/.
+          if [ -z "$REF" ] || ! git ls-tree -r --name-only "$REF" | grep -q '^website/package.json$'; then
+            echo "docs ref '$REF' has no website/ — building docs from main"
+            REF="${{ github.sha }}"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Building docs from: $REF"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
 
       - uses: actions/setup-python@v7
         with:
@@ -62,13 +90,22 @@ jobs:
           "$HOME/.local/bin/duckdb" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build the site — web/ plus a freshly rendered chart
+      - name: Build the docs site from the resolved ref
+        run: |
+          git worktree add /tmp/docs-src "${{ steps.docsref.outputs.ref }}"
+          cd /tmp/docs-src/website
+          npm ci
+          npx docusaurus build
+          mkdir -p "$GITHUB_WORKSPACE/_site"
+          cp -r build/. "$GITHUB_WORKSPACE/_site/"
+
+      - name: Add the metrics chart and the fresh SVG
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          mkdir -p _site
-          cp -r web/. _site/
+          mkdir -p _site/metrics
+          cp -r web/. _site/metrics/
           # --svg-only renders the chart and touches nothing else. The README
           # points at this URL, so the image carries the freshness.
           python3 scripts/update_download_metrics.py --svg-only _site/download-metrics.svg
