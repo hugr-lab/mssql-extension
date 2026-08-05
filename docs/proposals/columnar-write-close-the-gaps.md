@@ -80,12 +80,18 @@ position policy (`StridePos{stride}` / `CursorPos{cursor}`) so both entry points
 instantiate the same body in the same TU and keep inlining. One implementation
 is also what `write_column_ops.hpp` already claims.
 
-Requires byte-equality tests between the two paths per family — the existing
-`time_rounding_both_paths.test` / `smalldatetime_write.test` /
-`string_bound_truncation.test` are the pattern, and the writer-merge PR folds
-them into one file with a section per family. Note their lever: a signed
-`TINYINT` into `tinyint`. If this PR ever makes that pair columnar, every one of
-those tests goes vacuous and silently keeps passing.
+Requires byte-equality tests between the two paths per family. **That merge has
+happened**: `test/sql/copy/both_paths_agree.test` is now the single file, with a
+section per family and one lever — add the new family as a section there.
+
+Its **section 0 asserts the lever** rather than describing it: `-1::TINYINT` into
+`tinyint` must raise an out-of-range error, which only the row encoder produces.
+Verified to bite — disabling the INT8 -> UTINYINT fallback in the resolver fails
+that assertion on assertion 4, before any section can pass for the wrong reason.
+
+**So if this PR makes signed `TINYINT` -> `tinyint` columnar, that file fails
+loudly instead of going vacuous.** When it does, the answer is a NEW lever, not a
+deleted section 0. Nothing else in the suite currently forces the row path.
 
 ### 3. Shrink what reaches row-major at all
 
@@ -130,13 +136,59 @@ covers it, and it is the one RowFallback case that is a bug rather than a
 decision. Fix it here, since this is the PR that reasons about what reaches the
 row path.
 
+## Carried over from spec 063 (the writer merge), which is now done
+
+Three things that spec could not close, each of which this one is better placed
+to:
+
+### A signal for "how many writers actually ran"
+
+Spec 063 tried to assert concurrency from SQL and could not. The available
+signal — `mssql_pool_stats(...).connections_created` — does not discriminate: the
+count is 2 even single-threaded, because the operator opens the global writer's
+connection in its global state and the one sink thread then claims a session of
+its own on top of it. Measured threads=1 → 2, threads=4 → 3, so only a
+scheduling-dependent number separates them and an assertion on it would flake.
+
+The counters DO know (`writers=N/M`, added in D5) but they go to stderr. Two
+tests therefore state in prose what they cannot check, and one acceptance
+criterion went unmet:
+
+- `parallel_writers.test` / `ctas_parallel_writers.test` assert that
+  `mssql_copy_parallel_writers = 1` really disables the feature (exactly one
+  connection created) and say plainly that the parallel section's concurrency is
+  NOT verified;
+- **unverified: a COPY into a `#temp` target with `threads > 1` opens exactly one
+  bulk-load session.** That is the case `MSSQLResolveLoadPolicy` was written for,
+  and with `mssql_reset_connection = false` it is the difference between wasted
+  round trips and rows landing in a stale same-named table silently.
+
+A table function exposing the last statement's writer count — or any
+SQL-reachable form of the counters — would close all three at once.
+
+### `INTERVAL` into `nvarchar` is issue #238
+
+Filed while spec 063 was open. Still the one `RowFallback` entry that is a bug
+rather than a decision, and still uncovered.
+
+### The version-matrix script cannot run on macOS
+
+`test/compat/mssql_version_matrix.sh` (merged as #232) fails to PARSE under
+bash 3.2, which is stock macOS `/bin/bash`; bash 5 parses it cleanly. Documented
+in `docs/TESTING.md` with two workarounds, but not fixed — the offending
+construct was not located, and every bisection attempt cut into the SQL heredoc
+and unbalanced its quotes, so each intermediate answer was an artifact of the
+method. Whoever next touches that script should find it properly.
+
 ## Not in scope, and it comes first
 
 Deduplicating the parallel-writer machinery between COPY and CTAS, plus the test
 consolidation that goes with it:
 [merge-writer-machinery-and-tests](merge-writer-machinery-and-tests.md).
 
-That PR lands **before** this one. It touches the two sinks while this touches
-the kernels, so doing it first means the work here modifies one writer
-implementation rather than keeping two in step — and one both-paths byte-equality
-test file rather than three.
+**That work is done** — spec 063, branch `spec/063-writer-merge`. COPY and CTAS
+now share `mssql::BulkLoadSession` and one `INSERT BULK` builder, so this PR
+modifies ONE writer implementation, and the both-paths tests are one file rather
+than three. Measured after it: CTAS and COPY differ by 0.0–2.6% in every cell of
+a 2x2 matrix (1 vs 4 threads, annotated vs unannotated types) against a
+run-to-run spread of up to 9%.

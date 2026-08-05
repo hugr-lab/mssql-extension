@@ -181,8 +181,15 @@ private:
 
 	std::shared_ptr<tds::TdsConnection> connection_;
 	unique_ptr<BCPWriter> writer_;
+	//! The ONE release mechanism. There was briefly a raw `tds::ConnectionPool *`
+	//! beside this, used by Finish() while the destructor used the handle — two
+	//! ways to return a connection in one class, which is how they come to
+	//! disagree. Finish() runs inside the statement so a raw pointer was safe
+	//! there; the point is that nothing now has to know that.
 	weak_ptr<tds::ConnectionPool> pool_handle_;
-	tds::ConnectionPool *pool_ = nullptr;
+	//! Owned by the operator's GLOBAL state, which DuckDB destroys after every
+	//! local state — so this outlives the session that dereferences it on every
+	//! batch boundary.
 	const string *insert_bulk_sql_ = nullptr;
 	idx_t flush_rows_ = 0;
 	bool collect_timings_ = false;

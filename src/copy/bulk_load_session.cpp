@@ -92,7 +92,6 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		}
 
 		pool_handle_ = params.pool_handle;
-		pool_ = params.pool;
 		insert_bulk_sql_ = params.insert_bulk_sql;
 		flush_rows_ = params.flush_rows;
 		collect_timings_ = params.collect_timings;
@@ -170,8 +169,8 @@ idx_t BulkLoadSession::Finish() {
 
 	if (connection_) {
 		connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-		if (pool_) {
-			pool_->Release(connection_);
+		if (auto pool = pool_handle_.lock()) {
+			pool->Release(connection_);
 		}
 		connection_.reset();
 	}
