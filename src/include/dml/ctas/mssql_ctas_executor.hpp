@@ -100,6 +100,13 @@ struct CTASExecutionState {
 	//! ClientContext, some of them from a destructor on a worker thread (#178).
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 
+	//! MSSQL_COUNTERS phase totals for the SHARED writer path (AddChunkBCP).
+	//! A thread with its own session reports through BulkLoadWriteResult instead;
+	//! both land in the same global totals. Plain integers — every write here is
+	//! under the global sink mutex.
+	uint64_t counter_encode_ns = 0;
+	uint64_t counter_flush_ns = 0;
+
 	// Catalog reference for cache invalidation
 	MSSQLCatalog *catalog = nullptr;
 

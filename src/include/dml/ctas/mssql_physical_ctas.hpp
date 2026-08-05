@@ -162,6 +162,23 @@ public:
 	//! DROP that mssql_ctas_drop_on_failure asks for. Separate from `phase`
 	//! because it is the one piece of failure state read outside `mutex`.
 	std::atomic<bool> load_failed{false};
+
+	//===------------------------------------------------------------------===//
+	// MSSQL_COUNTERS (spec 063 D5)
+	//
+	// CTAS reported NOTHING: `counter_*` appeared zero times in this operator
+	// against twenty in the COPY sink, so `MSSQL_COUNTERS=1` measured one of the
+	// two write paths and a CTAS could not be compared with a COPY at all.
+	//
+	// Totals cover both routes — a thread with its own session reports through
+	// BulkLoadWriteResult, one sharing the global writer through
+	// CTASExecutionState's own phase counters.
+	//===------------------------------------------------------------------===//
+
+	std::atomic<idx_t> counter_sink_calls{0};
+	std::atomic<uint64_t> counter_sink_ns{0};
+	std::atomic<uint64_t> counter_encode_ns{0};
+	std::atomic<uint64_t> counter_flush_ns{0};
 };
 
 //===----------------------------------------------------------------------===//

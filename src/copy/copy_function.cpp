@@ -866,11 +866,17 @@ static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 	const idx_t chunks = gdata.counter_sink_calls.load();
 	const idx_t cols = gdata.columns.size();
 
+	// The phase totals below are SUMMED ACROSS THREADS, not wall clock: with
+	// N writers they can exceed the elapsed time of the statement, and a
+	// rise from 1 to N threads does NOT mean it got slower. Said in the
+	// output too, because these numbers get quoted.
+	fprintf(stderr, "[MSSQL COUNTERS]   (phase totals are summed across threads, not wall clock)\n");
 	fprintf(stderr,
-			"[MSSQL COUNTERS] copy close: rows=%llu cols=%llu chunks=%llu batches=%llu | sink=%lluus "
-			"(encode=%lluus flush=%lluus other=%lluus)\n",
+			"[MSSQL COUNTERS] copy close: rows=%llu cols=%llu chunks=%llu batches=%llu writers=%llu/%llu | "
+			"sink=%lluus (encode=%lluus flush=%lluus other=%lluus)\n",
 			(unsigned long long)rows, (unsigned long long)cols, (unsigned long long)chunks,
-			(unsigned long long)gdata.batches_flushed.load(), (unsigned long long)(sink_ns / 1000),
+			(unsigned long long)gdata.batches_flushed.load(), (unsigned long long)gdata.parallel_writers_used.load(),
+			(unsigned long long)gdata.parallel_writer_limit, (unsigned long long)(sink_ns / 1000),
 			(unsigned long long)(encode_ns / 1000), (unsigned long long)(flush_ns / 1000),
 			(unsigned long long)(other_ns / 1000));
 

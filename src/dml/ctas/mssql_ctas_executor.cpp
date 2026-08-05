@@ -9,6 +9,7 @@
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "mssql_counters.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
@@ -586,11 +587,19 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk_rows,
 			 (unsigned long long)bcp_rows_in_batch);
 
+	const bool counters = mssql::CountersEnabled();
 	try {
 		// Write rows to BCP writer
+		auto encode_start = std::chrono::steady_clock::now();
 		idx_t written = bcp_writer->WriteRows(chunk);
+		if (counters) {
+			counter_encode_ns += static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - encode_start)
+					.count());
+		}
 		bcp_rows_in_batch += written;
 		rows_produced += written;
+		auto flush_start = std::chrono::steady_clock::now();
 
 		// Check if we need to flush the batch
 		if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
@@ -611,6 +620,12 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 
 			// Write COLMETADATA for next batch
 			bcp_writer->WriteColmetadata();
+
+			if (counters) {
+				counter_flush_ns += static_cast<uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flush_start)
+						.count());
+			}
 		}
 	} catch (...) {
 		// Row encode or batch flush failed mid-BCP-stream (e.g. the #177
