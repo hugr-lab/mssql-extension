@@ -102,16 +102,69 @@ kernel work at all.
 
 `mssql_ctas_text_type` defaults to `NVARCHAR`, which costs 3.2x against
 `varchar(n)` + UTF-8 on ASCII-ish data. Changing a default is a compatibility
-decision, not a performance one, so this deliverable is the ANALYSIS:
+decision, not a performance one, so this deliverable was the analysis.
 
-- what breaks when a column becomes `varchar` + UTF-8 instead of `nvarchar`?
-  Collation-sensitive comparisons and sorts against existing columns, index key
-  sizes (UTF-8 is variable-width, so a 40-char key is up to 160 bytes), and any
-  consumer that expects `nvarchar` from `sys.columns`;
-- what a server WITHOUT UTF-8 collations does (2017 and earlier) — the fallback
-  must stay `nvarchar`, and #232's matrix is the tool that answers it;
-- whether the honest move is a new default, a warning, or documentation. All
-  three are acceptable outcomes; shipping the measurement and no decision is not.
+**Done. One blocking finding, and one that was withdrawn — the withdrawal
+matters, because it was the first answer.**
+
+**Withdrawn: there is no truncation risk in the default.** I first measured ten
+Cyrillic characters into `varchar(10)` UTF-8 being rejected where `nvarchar(10)`
+took them, and called it a capacity loss. That compares two explicit
+ANNOTATIONS, not old default against new. The default today is `nvarchar(max)`
+and the alternative is `varchar(max)` UTF-8 — max to max, no capacity to lose.
+DuckDB's own VARCHAR has no declared length at all, and `MSSQL_VARCHAR(n)` means
+n bytes on both sides, so nothing is being reinterpreted.
+
+Where bytes-vs-characters does bite is narrower and conditional: with
+`mssql_default_string_length` set (default 0 = MAX), an unannotated column becomes
+`varchar(n)` — n BYTES — where `nvarchar(n)` would have been n characters. Worth
+a documentation line, not a blocker.
+
+**Confirmed: a UTF-8-collated column cannot be compared with the collations
+already in the database.** This one was measured properly only after the control
+was demanded, and the control is what makes it stand:
+
+| join | result |
+|---|---|
+| `nvarchar` (today's default) × `varchar` CP1 | **works** |
+| `varchar` CP1 × `varchar` CP1 | works |
+| `nvarchar` × `varchar` **UTF-8** | **error 468** |
+| `varchar` UTF-8 × `varchar` CP1 | **error 468** |
+
+    SQL Server error 468: Cannot resolve the collation conflict between
+    "Latin1_General_100_CI_AS_SC_UTF8" and "SQL_Latin1_General_CP1_CI_AS"
+    in the equal to operation.
+
+So the difference is real and it is introduced by the switch: what we create
+today joins against both kinds of existing column, and a UTF-8 column joins
+against neither. Every predicate against an existing table would need an explicit
+`COLLATE`. That is not slower, it is broken.
+
+**Conclusion: keep the default, make the alternative findable.** The 3.2x is real
+and stays opt-in:
+
+- document the four-way measurement where someone investigating slow writes will
+  find it, with the collation conflict stated beside it;
+- make `mssql_ctas_text_type = VARCHAR` the documented answer to "my data is
+  ASCII and the load is slow", with its one condition — the loaded table must not
+  be joined to columns in another collation;
+- `mssql_utf8_collation` already exists to match the database's own collation
+  instead of `Latin1_General_100_...`, which is the escape hatch when the target
+  database is not Latin1-based. Setting it to a UTF-8 form of the database's OWN
+  collation would avoid the conflict entirely — **untested, and the obvious next
+  probe if this is ever revisited.**
+
+A server without UTF-8 support needs no new work: the extension asks, and only
+attaches the collation when the answer is yes. `CTASConfig::varchar_collation` is
+"only ever set when the server granted UTF8SUPPORT", because without it a VARCHAR
+column takes the database's code page and everything outside that page is
+replaced by `?` ON INSERT — silently (issue #225). `WireVarcharCollation` then
+falls back to the database's OWN collation when that already ends in `_UTF8`,
+which is what makes Fabric work without imposing a Latin1 one.
+
+What remains genuinely unverified is the end-to-end behaviour on 2017, which has
+no UTF-8 collations at all. #232's version matrix is exactly that probe, and it
+is now merged.
 
 ## 2. The question this spec has to answer twice
 
