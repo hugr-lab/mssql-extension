@@ -254,3 +254,47 @@ Key reference files: `duckdb/src/execution/physical_plan/plan_update.cpp`,
 `postgres_insert.cpp:428-446` (MaterializePostgresScans),
 `src/include/copy/load_policy.hpp`, `specs/062-insert-via-bcp/spec.md`,
 `specs/061-collation-aware-order-pushdown/spec.md`.
+
+---
+
+## 7. SEMANTIC CONTRACT DIRECTIVE (maintainer decision, 2026-08-05)
+
+Settled during the join/agg reconnaissance, and it reframes the string-key
+question:
+
+**Default = NATIVE server semantics.** A user who attached a SQL Server
+database expects the results SQL Server would give — comparisons follow the
+column's collation and T-SQL's padding rule. This is already the shipped
+contract: pushed WHERE filters are removed from the plan and never
+re-checked, so `WHERE name = 'abc'` has matched `'ABC'` under CI collations
+since spec 026. Pushed GROUP BY / JOIN keys follow the same rule — bare
+column references, index seeks intact, which is the entire point of pushing.
+
+**Strictness is an OPT-IN, not a gate.** The measured varbinary trick
+(`GROUP BY CAST(s AS varbinary)` — byte-exact, defeats padding AND collation,
+verified live 2026-08-05) becomes the implementation of an explicit marker —
+an annotation in the spirit of spec 060's extension types
+(`col::MSSQL_VARCHAR_STRICT` or a collation-annotated variant), NOT the
+default. It costs index seeks, which for JOIN relocation defeats the purpose;
+for pushed-down aggregation over a full scan it merely trades seek for scan
+(hash aggregate scans anyway), so strict-mode GROUP BY remains usable.
+
+**Consequences to carry into the specs:**
+- The BIN2 predicate machinery (spec 061 D1) stops being a correctness GATE
+  and becomes strict-mode's cheap path (BIN2 keys need no varbinary cast —
+  modulo the padding caveat below).
+- Spec 061's own default deserves re-examination under this frame: it was
+  written with "DuckDB semantics are the contract" and ships `off`; the
+  directive implies native-semantics ORDER BY pushdown could default ON,
+  with `strict` as the opt-in. One coherent knob across ORDER/GROUP/JOIN
+  (e.g. `mssql_pushdown_semantics = native | strict`) beats three.
+- NEW FINDING feeding 061: T-SQL pads trailing spaces in comparisons EVEN
+  under `_BIN2` (verified: `'a' = 'a '` TRUE, GROUP BY merges them, only
+  LIKE does not pad). 061's "BIN2 is code-point-stable" claim holds for
+  ordering of pad-equal values only up to tie-order; for columns that can
+  carry trailing spaces the strict path needs the varbinary form even on
+  BIN2 columns.
+- Numeric aggregate wrappers stay mandatory regardless of the directive
+  (they fix VALUES, not comparison semantics): `SUM(int)` must ship as
+  `SUM(CAST(x AS bigint))` (8115 overflow verified), `AVG(int)` as
+  `AVG(CAST(x AS float))` (integer truncation verified: 1 vs 1.5).
