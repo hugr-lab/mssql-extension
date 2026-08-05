@@ -596,9 +596,19 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 		case mssql::codec::ScatterArm::FloatConvert:
 			CursorConvFloat(dst, cursor, r0, rend, st.fmt, ops[c]);
 			break;
-		case mssql::codec::ScatterArm::Decimal:
 		case mssql::codec::ScatterArm::Guid:
+			// One call per COLUMN (spec 064 D1). This used to loop here and call
+			// the strided kernel with `rows = 1` per value — 2048 un-inlinable
+			// calls across a TU boundary, for no reason in the data: the width is
+			// fixed and the offsets were already in `cursor`. The kernel now takes
+			// the cursor itself and handles NULLs, because on this path a NULL is
+			// what makes the rows differ in length.
+			mssql::codec::uuid::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
+												   col_all_valid);
+			break;
+		case mssql::codec::ScatterArm::Decimal:
 		case mssql::codec::ScatterArm::Datetime: {
+			// Still per value; their cursor entry points are the next step of D1.
 			const auto arm = ops[c].arm;
 			for (idx_t r = r0; r < rend; r++) {
 				uint8_t *out = dst + cursor[r];
@@ -610,8 +620,6 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 				}
 				if (arm == mssql::codec::ScatterArm::Decimal) {
 					mssql::codec::decimal::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
-				} else if (arm == mssql::codec::ScatterArm::Guid) {
-					mssql::codec::uuid::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
 				} else {
 					mssql::codec::datetime::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
 				}
