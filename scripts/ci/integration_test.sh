@@ -165,17 +165,42 @@ cd "$REPO_ROOT"
 # The runner reports `require-env` misses as skips, never failures, so a missing variable would
 # quietly reduce the suite to a no-op. The skip list is printed at the end of its output; the
 # expected skips are the optional environments (Azure, Kerberos, TLS, Windows SSPI).
-# A filter that matches nothing exits 0. That is not a hypothetical here: this
-# job has been reporting PASSED while running ZERO tests (issue #212 — "test/sql/*
-# selects zero files"), verified on the last scheduled runs of main as well as on
-# this one. The exit code cannot tell the difference, so the COUNT is checked.
+# Select the suite by NAME, not by a path-shaped glob.
 #
-# The Makefile's integration-test target grew the same floor (spec 063 D7), and
-# that was not enough: CI does not call it, it calls this script. A gate on one of
-# two entry points is a gate on neither.
+# `test/sql/*` selected zero files here for months while the job reported PASSED
+# (issue #212). The runner's test list is COMPILED IN at build time — a binary in
+# an empty directory still lists all 173 — so what the glob has to match is the
+# name the BUILD registered, and that prefix is not the same in CI as it is
+# locally. A glob is the wrong instrument for that: `*test/sql/*` "fixes" it by
+# also selecting DuckDB's own suite (344 instead of 172), which would look like a
+# much better fix than it is.
+#
+# So the list is built from the files this repository actually owns, matched
+# against what the binary registered by SUFFIX, and passed with --input-file.
+# Whatever prefix the build used, our files are found or the script says so.
 MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
+
+"$UNITTEST_BIN" --list-tests > /tmp/mssql_all_tests.txt 2>/dev/null || true
+find test/sql -name '*.test' | sort > /tmp/mssql_our_files.txt
+: > /tmp/mssql_selected.txt
+while read -r f; do
+    grep -F -m1 "$f" /tmp/mssql_all_tests.txt | cut -f1 >> /tmp/mssql_selected.txt || true
+done < /tmp/mssql_our_files.txt
+
+owned=$(wc -l < /tmp/mssql_our_files.txt | tr -d ' ')
+selected=$(grep -c . /tmp/mssql_selected.txt || true)
+echo "Suite: $owned .test files in the repo, $selected registered in the runner"
+if [ "$selected" -lt "$MIN_TEST_CASES" ]; then
+    echo "" >&2
+    echo "=== Only $selected of $owned .test files are registered in $UNITTEST_BIN ===" >&2
+    echo "    The build did not register this extension's tests, so nothing would run." >&2
+    echo "    A few names the runner DOES know, for comparison:" >&2
+    head -4 /tmp/mssql_all_tests.txt | sed 's/^/      /' >&2
+    exit 1
+fi
+
 set -o pipefail
-"$UNITTEST_BIN" "test/sql/*" 2>&1 | tee /tmp/mssql_integration_ci.out
+"$UNITTEST_BIN" -f /tmp/mssql_selected.txt 2>&1 | tee /tmp/mssql_integration_ci.out
 status=$?
 
 cases=$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration_ci.out | tail -1 | grep -oE '^[0-9]+' || true)
