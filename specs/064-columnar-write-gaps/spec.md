@@ -242,6 +242,20 @@ So:
   that measures. The fallback the spec named — "accept the cursor and make D1
   complete" — is the outcome.
 
+Re-measured across NULL DENSITY after D4/D5 (same fixture, three variants
+interleaved, 4 reps): no NULLs (strided) 230 ms median, 0.1% NULLs (cursor) 245,
+33% NULLs (cursor) 255 — every pairwise comparison a 2:2 tie against run spread
+of up to 80%. Density does not measure: a NULL row writes no payload, only its
+0x00 marker, which roughly refunds the cursor bookkeeping. A column that is
+nullable but holds no NULLs is not a separate case — the path is chosen from the
+ACTUAL mask (`AllValid()`), not from declared nullability, so it takes strided
+by construction.
+
+The stated goal — offsets known, NULLs written where the mask says, directly
+into the wire buffer — is the shipped design after D1: the kernels write 0x00
+straight into the frame, offsets come from the masks without reading a value,
+and payloads are written for valid rows only.
+
 Acceptance criterion 1 is satisfied by its second branch: the strided count for
 string-bearing cells stays 0, with this measurement as the reason.
 
