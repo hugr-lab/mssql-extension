@@ -167,7 +167,13 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
+    # Also on a merge to `main` (issue #212 gap 1). A pull request never compiled
+    # the extension, so a C++ regression could reach main behind green checks —
+    # three times in one week when that issue was filed. Building on the merge
+    # catches it on main rather than at the next release, and costs nothing on
+    # the PRs themselves: the `push` trigger is `branches: [main]` and the
+    # workflow's `paths-ignore` keeps docs-only merges free.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
     strategy:
       fail-fast: false
       matrix:
@@ -524,7 +530,13 @@ jobs:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
     needs: build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' }}
+    # Also on a merge to `main` (issue #212 gap 1). A pull request never compiled
+    # the extension, so a C++ regression could reach main behind green checks —
+    # three times in one week when that issue was filed. Building on the merge
+    # catches it on main rather than at the next release, and costs nothing on
+    # the PRs themselves: the `push` trigger is `branches: [main]` and the
+    # workflow's `paths-ignore` keeps docs-only merges free.
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
     strategy:
       fail-fast: false
       matrix:
@@ -581,7 +593,11 @@ jobs:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' }}
+    # On a merge to `main` as well: the suite went from weekly to per-merge, which
+    # is what makes a SQL regression visible while the change is still fresh.
+    # Only worth having because the selection is fixed — this job used to report
+    # PASSED having run zero files (#212 gap 2).
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' || github.event_name == 'push' }}
 
     services:
       sqlserver:
