@@ -98,45 +98,51 @@ and nothing tells them the other three exist.
 That reframes a deliverable: the biggest available write-path win needs no
 kernel work at all.
 
-### D0 — the default text type: no change, and the reasoning was already in the code
+### D0 — the default text type, and the collation it names
 
-`varchar(n)` + UTF-8 measured 3.2x today's `nvarchar(max)` default, so: should the
-default change? **No, and most of what looked like a question is already answered
-in the source.**
+`varchar(n)` + UTF-8 measured 3.2x today's `nvarchar(max)` default (§1a). Two
+separate questions came out of it.
 
-- **We do not impose a collation on a UTF-8 database.**
-  `MSSQLCatalog::ResolveVarcharCollation` returns empty when the database's own
-  collation ends in `_UTF8`, so the column INHERITS it. On Fabric that is
-  `Latin1_General_100_BIN2_UTF8` and we leave it alone. The `Latin1_General_100_CI_AS_SC_UTF8`
-  default is only the name used when the database is NOT UTF-8 and something has
-  to be named — and CI_AS is chosen over BIN2 there deliberately, because the
-  collation governs every later comparison and BIN2 would silently make the
-  column case- and accent-sensitive.
-- **A `#temp` target is the documented exception**: it lives in tempdb and takes
-  tempdb's collation, not the database's, so there the name IS emitted. Verified
-  in the code comment by 'Привет' arriving as '??????' without it.
-- **A server without UTF8SUPPORT needs no new work**: `varchar_collation` is only
-  ever set when the server granted it.
+**Should NVARCHAR stop being the default? No.** A UTF-8-collated column cannot be
+compared with a non-UTF-8 one — measured, `nvarchar` × `varchar` UTF-8 gives SQL
+Server error 468 — so switching would break joins against existing tables in any
+database that is not itself collated UTF-8. Inside a UTF-8 database there is no
+conflict at all, including against `nvarchar`. So the 3.2x is available and
+conflict-free exactly when the TARGET DATABASE is collated UTF-8; that belongs in
+the documentation, not in a changed default.
 
-What remains is the one thing that is genuinely a decision rather than a
-mechanism: **a UTF-8 column conflicts with non-UTF-8 ones.** Measured:
+**Which collation should we name when we do name one? BIN2** (decided by the
+user, 2026-08-05). `MSSQL_DEFAULT_UTF8_COLLATION` becomes
+`Latin1_General_100_BIN2_UTF8`, matching what Fabric Warehouse uses as its own
+default. Binary comparison: no linguistic rules, no case- or accent-folding, no
+locale table — the fastest answer for comparison and sort.
 
-| join, database collated `SQL_Latin1_General_CP1_CI_AS` | result |
-|---|---|
-| `nvarchar` (today's default) × `varchar` CP1 | works |
-| `nvarchar` × `varchar` **UTF-8** | **error 468** |
-| `varchar` UTF-8 × `varchar` CP1 | **error 468** |
+The cost is stated rather than hidden: BIN2 is case- and accent-SENSITIVE, so
+`WHERE name = 'abc'` stops matching `'ABC'` on a column created this way. That is
+why it is a default and not a rule — a column needing different semantics says so
+per column.
 
-| join, database collated `Latin1_General_100_CI_AS_SC_UTF8` | result |
-|---|---|
-| `varchar` inheriting × `varchar` stating the same | works |
-| `varchar` UTF-8 × `nvarchar` | works |
+**And it removes a reason the old code had to work around the old default.**
+Fabric accepts exactly two collations (`LATIN1_GENERAL_100_BIN2_UTF8`,
+`LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8`). The previous default was neither, so
+naming it on Fabric would have been refused. BIN2 is one of them.
 
-So the conflict is about MIXING collations, not about UTF-8, and it is a property
-of the target database rather than of our settings. **Decision: keep
-`NVARCHAR` as the default; document that `mssql_ctas_text_type = VARCHAR` is
-worth 3.2x and is conflict-free exactly when the target database is itself
-collated UTF-8.** No code change.
+### The resolution order, which was already correct
+
+A VARCHAR column's collation comes from, in order:
+
+1. **the type annotation** — `MSSQL_VARCHAR(n, 'collation')`. Verified to
+   outrank everything: `FormatTargetStringDdl` uses `spec.collation` when it is
+   set and only then falls back;
+2. **`mssql_utf8_collation`**, the setting;
+3. **the database** — by emitting no `COLLATE` clause so the column inherits.
+
+I briefly rewrote `ResolveVarcharCollation` to make the setting beat the database
+unconditionally, on the grounds that "the setting should win". That was wrong and
+the user caught it: on a UTF-8 database, imposing the setting's collation creates
+a column in a DIFFERENT collation from everything around it, which is the error
+468 measured above. Inheriting is the only conflict-free answer there, and the
+existing code already did it. Reverted.
 
 ## 2. The question this spec has to answer twice
 

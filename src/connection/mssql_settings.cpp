@@ -298,11 +298,11 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// that default is already UTF-8, and the way back to the pre-#225 behaviour
 	// otherwise. The name is not validated here: SQL Server rejects an unknown
 	// collation by name, which is a clearer error than anything this could say.
-	config.AddExtensionOption("mssql_utf8_collation",
-							  "Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "
-							  "(default: Latin1_General_100_CI_AS_SC_UTF8; empty inherits the database default)",
-							  LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName,
-							  SetScope::GLOBAL);
+	config.AddExtensionOption(
+		"mssql_utf8_collation",
+		"Collation given to VARCHAR columns created by CTAS when the server supports UTF-8 "
+		"(default: Latin1_General_100_BIN2_UTF8, matching Fabric; empty inherits the database default)",
+		LogicalType::VARCHAR, Value(mssql::MSSQL_DEFAULT_UTF8_COLLATION), ValidateCollationName, SetScope::GLOBAL);
 
 	// mssql_catalog_native_types - report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
 	// the string columns of attached tables instead of a bare VARCHAR (spec 060).
