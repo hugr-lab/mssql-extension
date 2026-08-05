@@ -63,7 +63,7 @@ Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 
 **Solutions:**
 
-- Check the [Type Mapping](#type-mapping) section for supported types
+- Check the [Type Mapping](/reading/types/) section for supported types
 - Cast unsupported columns to supported types in your query
 - Exclude unsupported columns from SELECT
 
@@ -114,7 +114,6 @@ VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`)
 |---------|------|---------|-------------|
 | `mssql_convert_varchar_max` | BOOLEAN | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries |
 
-When `mssql_convert_varchar_max = true` (default), VARCHAR(MAX) columns with non-UTF8 collations are converted to NVARCHAR(MAX), enabling proper UTF-8 handling for extended ASCII characters. This may halve the effective buffer capacity (from ~4096 to ~2048 characters) due to NVARCHAR's 2-byte encoding.
 
 To preserve the full buffer capacity at the cost of potential encoding errors with extended ASCII:
 
@@ -134,7 +133,6 @@ FROM mssql_scan('db', 'SELECT name FROM dbo.customers');
 FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.customers');
 ```
 
-2. **VARCHAR(MAX) buffer limits**: SQL Server has TDS buffer limits (~4096 bytes) for MAX types. When converted to NVARCHAR(MAX), the effective character count is halved since NVARCHAR uses 2 bytes per character. Use `SET mssql_convert_varchar_max = false` if you need maximum buffer capacity with ASCII-only data.
 
 ### Unicode Transcoding (simdutf)
 
@@ -155,7 +153,7 @@ The codec validates the input first and falls back to a slower scalar implementa
 
 ### Known Issues
 
-- Queries with unsupported types (UDT, SQL_VARIANT, etc.) will fail
+- Catalog scans auto-CAST server-specific types (`SQL_VARIANT`, `hierarchyid`, CLR UDTs) to `NVARCHAR(MAX)`, so three-part-name queries succeed; raw `mssql_scan()` needs an explicit CAST for such columns
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close

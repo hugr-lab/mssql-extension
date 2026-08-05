@@ -6,6 +6,12 @@ slug: /
 
 # DuckDB MSSQL Extension
 
+[![GitHub stars](https://img.shields.io/github/stars/hugr-lab/mssql-extension?style=social)](https://github.com/hugr-lab/mssql-extension)
+[![GitHub release](https://img.shields.io/github/v/release/hugr-lab/mssql-extension)](https://github.com/hugr-lab/mssql-extension/releases)
+[![DuckDB Community Extension](https://img.shields.io/badge/DuckDB-community%20extension-fff100)](https://duckdb.org/community_extensions/extensions/mssql.html)
+[![License](https://img.shields.io/github/license/hugr-lab/mssql-extension)](https://github.com/hugr-lab/mssql-extension/blob/main/LICENSE)
+
+
 Connect DuckDB to Microsoft SQL Server, Azure SQL and Microsoft Fabric over a
 **native TDS 7.4 implementation** — no ODBC, no JDBC, no FreeTDS. Attach a
 database and it becomes a DuckDB catalog: stream reads with filter and ORDER BY
@@ -21,6 +27,12 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 ```
 
 → **[Getting Started](/getting-started/)** · **[Settings Reference](/reference/settings/)** · **[Download metrics](https://hugr-lab.github.io/mssql-extension/metrics/)**
+
+## Community Extension Downloads
+
+[![Weekly downloads of the mssql DuckDB community extension](https://hugr-lab.github.io/mssql-extension/download-metrics.svg)](https://duckdb.org/community_extensions/download_metrics)
+
+📊 **[Interactive chart](https://hugr-lab.github.io/mssql-extension/metrics/)** — queried live in your browser with DuckDB-Wasm. Regenerated weekly; counts are a Cloudflare estimate of `INSTALL mssql FROM community` events across DuckDB versions and platforms.
 
 ## Features
 
@@ -55,48 +67,32 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 
 ## Roadmap
 
-The following features are planned for future releases:
+**Current release: v0.2.3** — the performance series. Reads stage column-major
+with batch decode (−14…−47% per family), writes encode column-major over
+parallel bulk-load sessions (up to 6.6×), UTF-8 end to end, declared string
+types for table creation. Details in the
+[release notes](https://github.com/hugr-lab/mssql-extension/releases).
 
-| Feature | Description | Status |
+**v0.3.0 — DML pushdown and federation** (reconnaissance complete, specs in
+progress):
+
+| Feature | What it does | Status |
 |---------|-------------|--------|
-| **Row Identity** | `rowid` pseudo-column mapping to primary keys | ✅ Implemented |
-| **UPDATE/DELETE** | DML support with PK-based row identification, batched execution | ✅ Implemented |
-| **Transactions** | BEGIN/COMMIT/ROLLBACK with connection pinning | ✅ Implemented |
-| **Multi-Statement Batches** | Temp table workflows via `mssql_scan()` with session reset | ✅ Implemented |
-| **CTAS** | CREATE TABLE AS SELECT with two-phase execution (DDL + INSERT) | ✅ Implemented |
-| **BCP/COPY** | High-throughput bulk insert via TDS BCP protocol (10M+ rows) | ✅ Implemented |
-| **Integrated Auth** | Kerberos on POSIX (kinit / keytab / raw); SSPI on Windows | ✅ Implemented |
-| **Custom Application Name** | LOGIN7 `program_name` from connection string / URI / secret / ATTACH option | ✅ Implemented |
-| **ATTACH credential validation** | Fail-fast on wrong password / unreachable host (`lazy_validation true` to opt out) | ✅ Implemented |
-| **BCP throughput** | LOGIN7 32 KB packet size, single-connection encoder/sender pipelining, column-batch encoding, parallel multi-connection BCP for heap targets | Planned |
-| **CTAS quality** | Bounded `NVARCHAR(N)` text defaults, `PAGE` compression, primary-key propagation, per-query overrides via COPY options | Planned |
-| **TRUNCATE optimization** | Auto-detect `DELETE FROM t` without `WHERE` and emit `TRUNCATE TABLE` when safe (no triggers/FK/CCI) | Planned |
-| **COPY TO TRUNCATE mode** | Atomic replace via TRUNCATE + BCP (distinct from current `OVERWRITE` = DROP+CREATE) | Planned |
+| **Direct UPDATE/DELETE** | When the whole `WHERE` pushes down, emit one `UPDATE/DELETE ... WHERE` statement — no scan, no rowid round trip. Also lifts the primary-key requirement for pushable statements (#140) | Spec drafted |
+| **INSERT over BCP** | `INSERT INTO ... SELECT` switches from batched VALUES text to the bulk-load protocol (2–10×) | Spec drafted |
+| **UPDATE/DELETE via staging** | Affected rows bulk-load into a session `#temp`, one server-side `UPDATE ... JOIN #stage` replaces per-batch VALUES joins | Spec drafted |
+| **MERGE INTO + upsert** | `MERGE INTO` planning (DuckDB lowers `INSERT ... ON CONFLICT` to MERGE, so both arrive together); full T-SQL MERGE pushdown for same-catalog sources | Recon complete |
+| **Same-catalog read-then-write in transactions** | Materialize the extension's own scans before a bulk-load sink starts (the duckdb-postgres pattern), removing a documented limitation (#239) | Recon complete |
+| **JOIN / aggregate pushdown** | Semi-join reduction (always-safe), shipping small local tables to the server via BCP for server-side joins, and pushed GROUP BY / aggregates with exact type mapping | Recon complete |
+| **ORDER BY pushdown by default** | Collation-aware safety predicate; native server semantics as the default contract | Spec drafted |
 
 ### Under consideration
 
-Items being designed; surface and implementation strategy not committed yet.
-
 | Topic | What we're thinking about |
 |-------|----------------------------|
-| **Direct DML pushdown** | Skip the `rowid` round trip on UPDATE/DELETE when the entire `WHERE` filter is pushable — emit a single `UPDATE target SET ... WHERE <pushdown>` / `DELETE FROM target WHERE <pushdown>` statement instead. |
-| **MERGE INTO** | Native SQL Server `MERGE` push-down. Pipelined BCP upload of the USING source to a session `#tmp`, then emit `MERGE INTO target USING #tmp WITH (HOLDLOCK)`. RETURNING via `OUTPUT $action`. |
-| **VARIANT fallback for unsupported types** | UDT / `SQL_VARIANT` / legacy `IMAGE` / `TEXT` / `NTEXT` columns mapped to DuckDB `VARIANT` instead of raising. Opt-in via a setting. |
-
-### Feature Details
-
-**Row Identity**: Tables with primary keys expose a virtual `rowid` column. Scalar PKs map to their native type; composite PKs map to DuckDB STRUCT. This enables UPDATE/DELETE support.
-
-**UPDATE/DELETE**: Supports `UPDATE ... SET ... WHERE` and `DELETE FROM ... WHERE` through DuckDB catalog integration. Uses `rowid` for row identification. Batched execution for large operations. Note: RETURNING clause is not supported for UPDATE/DELETE (only for INSERT).
-
-**Transactions**: DML transactions with connection pinning. Each explicit transaction pins a single TDS connection for the transaction's duration, using SQL Server's 8-byte transaction descriptor in ALL_HEADERS. Connections are flagged for session reset (RESET_CONNECTION) on pool return.
-
-**Multi-Statement Batches**: `mssql_scan()` supports batches where intermediate statements (DML/DDL) don't return result sets. Only one result-producing statement per batch is allowed. Session state (temp tables, variables) is reset via TDS RESET_CONNECTION flag when connections return to the pool.
-
-**CTAS**: `CREATE TABLE mssql.schema.table AS SELECT ...` with two-phase execution: CREATE TABLE DDL followed by batched INSERT. Supports CREATE OR REPLACE, configurable text type (NVARCHAR/VARCHAR), and streaming for large result sets. Type mapping from DuckDB to SQL Server with clear errors for unsupported types.
-
-**BCP/COPY**: Binary bulk copy protocol for maximum throughput. Streaming execution with bounded memory. No RETURNING support (use regular INSERT for that).
-
+| **VARIANT fallback** | UDT / `SQL_VARIANT` columns as DuckDB `VARIANT` instead of today's `NVARCHAR(MAX)` auto-CAST text form. Opt-in via a setting. |
+| **TRUNCATE optimization** | Auto-detect `DELETE FROM t` without `WHERE` and emit `TRUNCATE TABLE` when safe (no triggers/FK/CCI). |
+| **DuckLake metadata backend** | SQL Server as a DuckLake catalog store (#129). |
 
 ## Support MSSQL Extension
 

@@ -5,6 +5,14 @@ sidebar_position: 6
 
 # Performance Tuning
 
+**Where v0.2.3 stands.** Reads stage column-major and batch-decode
+(−14…−47% client CPU per type family vs v0.2.2); writes encode column-major
+across parallel bulk-load sessions (up to 6.6×); the default TDS packet size
+is 16 384 (`mssql_tds_packet_size`, −28% CPU / −43% wall on read vs the old
+4096). For per-phase numbers on your own workload, run with `MSSQL_COUNTERS=1`
+— per-stream and per-COPY counters, including encode-path attribution, with
+no logging inside the timed phases.
+
 ### Bulk Data Loading
 
 For loading large datasets into SQL Server, use COPY TO with BCP protocol:
@@ -104,8 +112,8 @@ CREATE TABLE stg.dbo.staging AS SELECT * FROM local_data;
 | Method | Rows/sec | Best For |
 |--------|----------|----------|
 | Single INSERT | ~1K | Small single-row operations |
-| Batched INSERT | ~50K | INSERT with RETURNING clause |
-| COPY TO / CTAS (BCP) | ~300K | Bulk loading without RETURNING |
+| Batched INSERT | ~50–100K | INSERT with RETURNING clause |
+| COPY TO / CTAS (BCP) | 1M+ (parallel writers) | Bulk loading without RETURNING |
 
 The big lever above that is `mssql_copy_parallel_writers`, not TABLOCK: the
 bound is SQL Server's ingest rate and it parallelises across sessions, measured
@@ -138,7 +146,7 @@ JOIN local_lookup USING (id);
 
 | Setting | Impact | Recommendation |
 |---------|--------|----------------|
-| `mssql_copy_flush_rows` | SQL Server buffer memory | Increase for throughput, decrease for memory |
+| `mssql_copy_flush_rows` | Server-side batch boundary | Leave at 102 400 — measured flat on heaps; lowering it silently defeats columnstore compression |
 | `mssql_insert_batch_size` | DuckDB batch memory | Keep at 1000 (SQL Server limit) |
 | `mssql_dml_batch_size` | UPDATE/DELETE memory | Decrease for wide tables |
 

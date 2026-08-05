@@ -27,10 +27,10 @@ All statements within a transaction execute on the same SQL Server connection. I
 - **One connection, one job**: because a transaction pins a single connection, it
   cannot stream a result set and receive a bulk load at once — a `COPY` that
   reads from the same catalog it writes to fails inside an explicit transaction.
-  See [Reading and writing the same catalog in one transaction](#reading-and-writing-the-same-catalog-in-one-transaction)
+  See [Reading and writing the same catalog in one transaction](/writing/copy/#reading-and-writing-the-same-catalog-in-one-transaction)
 - **CTAS is outside the transaction**: it creates its table with autocommitting
   DDL and loads on connections of its own, so `ROLLBACK` undoes neither. See
-  [CTAS is not part of the transaction](#ctas-is-not-part-of-the-transaction)
+  [CTAS is not part of the transaction](/writing/copy/#ctas-is-not-part-of-the-transaction)
 
 ### Multi-Statement SQL Batches
 

@@ -44,7 +44,7 @@ git submodule update --init --recursive
 
 ```bash
 # Set DuckDB version (required by Community CI)
-DUCKDB_GIT_VERSION=v1.4.3 make set_duckdb_version
+DUCKDB_GIT_VERSION=v1.5.5 make set_duckdb_version
 
 # Build release
 make release

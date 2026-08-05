@@ -45,7 +45,10 @@ sidebar_position: 3
 | `TIME`              | `TIME`          | Up to 100ns precision        |
 | `DATETIME`          | `TIMESTAMP`     | 3.33ms precision             |
 | `SMALLDATETIME`     | `TIMESTAMP`     | 1 minute precision           |
-| `DATETIME2`         | `TIMESTAMP`     | Up to 100ns precision        |
+| `DATETIME2(0)`      | `TIMESTAMP_S`   | Scale-precise mapping (spec 045) |
+| `DATETIME2(1-3)`    | `TIMESTAMP_MS`  | |
+| `DATETIME2(4-6)`    | `TIMESTAMP`     | Microseconds |
+| `DATETIME2(7)`      | `TIMESTAMP_NS`  | Round-trips losslessly |
 | `DATETIMEOFFSET`    | `TIMESTAMP_TZ`  | Timezone-aware               |
 
 ### Special Types
@@ -61,15 +64,32 @@ sidebar_position: 3
 - **CTAS**: Supported via BCP protocol
 - **INSERT/UPDATE via SQL literals**: Supported for small values (up to 4096 bytes). Larger XML values error with a recommendation to use COPY TO with BCP protocol
 
-### Unsupported Types
+### Legacy LOB Types
 
-The following SQL Server types are not currently supported:
+`TEXT`, `NTEXT` and `IMAGE` columns **are readable**: `TEXT`/`NTEXT` arrive as
+`VARCHAR`, `IMAGE` as `BLOB`. Both the catalog scan and raw `mssql_scan()`
+decode the legacy LOB wire forms natively (issue #197).
 
-- `UDT` (User-Defined Types)
-- `SQL_VARIANT`
-- `IMAGE` (deprecated)
-- `TEXT` (deprecated)
-- `NTEXT` (deprecated)
+### Spatial Types
 
-Queries involving unsupported types will raise an error.
+`geometry` and `geography` columns map to DuckDB `GEOMETRY`: the scan rewrites
+them to WKB (`.STAsBinary()`), so they compose with the DuckDB `spatial`
+extension. On the write side, a GEOMETRY source column lands in a
+`varbinary`/`binary`/`image` target as standard WKB.
+
+### Other Server-Specific Types
+
+`SQL_VARIANT`, `hierarchyid` and CLR UDT columns are auto-CAST to
+`NVARCHAR(MAX)` by the catalog scan, so three-part-name queries return their
+text form. Raw `mssql_scan()` queries that select such columns without a CAST
+will fail — add an explicit `CAST(col AS NVARCHAR(MAX))` in the T-SQL.
+
+### Catalog-Reported String Types
+
+With `mssql_catalog_native_types = true` (the default, spec 060), bounded
+string columns of attached tables report as `MSSQL_VARCHAR(n)` /
+`MSSQL_NVARCHAR(n)` in `DESCRIBE` and `duckdb_columns()` rather than bare
+`VARCHAR` — this is what lets a target created from an MSSQL source inherit
+declared lengths and collations with no explicit casts. Set the option to
+`false` to restore plain `VARCHAR` reporting.
 

@@ -49,7 +49,7 @@ by CTAS and by `COPY TO` when it creates the target.
 | `USMALLINT`, `INTEGER` | `INT` |
 | `UINTEGER`, `BIGINT` | `BIGINT` |
 | `UBIGINT` | `DECIMAL(20,0)` |
-| `HUGEINT`, `UHUGEINT` | `DECIMAL(38,0)` |
+| `HUGEINT` | `DECIMAL(38,0)` |
 | `FLOAT` | `REAL` |
 | `DOUBLE` | `FLOAT` |
 | `DECIMAL(p,s)` | `DECIMAL(p,s)` (p clamped to 38) |
@@ -57,28 +57,34 @@ by CTAS and by `COPY TO` when it creates the target.
 | `BLOB` | `VARBINARY(MAX)` |
 | `UUID` | `UNIQUEIDENTIFIER` |
 | `DATE` | `DATE` |
-| `TIME` | `TIME(7)` |
+| `TIME` | `TIME(6)` — µs, both CTAS and COPY agree |
 | `TIMESTAMP` | `DATETIME2(6)` — µs, DuckDB's own precision |
 | `TIMESTAMP_MS` | `DATETIME2(3)` |
 | `TIMESTAMP_NS` | `DATETIME2(7)` — 100 ns, lossy by 2 digits |
 | `TIMESTAMP_S` | `DATETIME2(0)` |
 | `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET(7)` |
-| `INTERVAL` | `NVARCHAR(50)` — canonical DuckDB interval text |
 
-**Unsupported types** (will error with a clear message):
+
+**Unsupported types** (refused with a clear message naming the pair):
 
 - `LIST`, `STRUCT`, `MAP`, `ARRAY`, `UNION`, `ENUM` — no SQL Server equivalent
+- `INTERVAL` — no direct equivalent on the bulk-load path; cast explicitly
+  (`::VARCHAR`) or set `mssql_ctas_use_bcp = false` for the legacy text path
+- `UHUGEINT` — exceeds what the decimal wire encoding accepts from an unsigned
+  128-bit source; cast to `HUGEINT` or `DECIMAL(38,0)` explicitly
+
+Two softenings apply everywhere on the write path: a source column that is
+**entirely NULL** is accepted into any target column (`SELECT ..., NULL AS c`
+is the ordinary way to fill an unmatched column), and the refusal for a
+genuinely incompatible pair is raised the moment the column carries a value —
+before any of that batch is sent.
 
 The `VARCHAR` row is the only one you can change, and it is the one worth
 changing: `nvarchar(max)` is an off-row LOB and measured 4.1× slower to load
 than a sized column. See
-[Target Column Types and Table Shape](#target-column-types-and-table-shape) for
+[Target Column Types and Table Shape](/writing/table-options/) for
 `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`, `mssql_default_string_length` and
 `mssql_ctas_text_type`.
-
-> **Note**: `COPY TO`'s auto-create currently emits `time(6)` where CTAS emits
-> `TIME(7)` for a DuckDB `TIME`. Both are lossless — DuckDB's `TIME` is
-> microseconds — but the two paths disagree.
 
 ### CTAS Settings
 
@@ -89,7 +95,7 @@ than a sized column. See
 | `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if data transfer phase fails |
 
 Column lengths and the table's shape come from
-[Target Column Types and Table Shape](#target-column-types-and-table-shape) —
+[Target Column Types and Table Shape](/writing/table-options/) —
 cast a column to `MSSQL_NVARCHAR(n)` in the SELECT list to size it, since CTAS
 has no options syntax of its own.
 
@@ -129,16 +135,20 @@ Wrapping the load in an explicit transaction bounds the damage:
 
 | | inside `BEGIN … COMMIT` | outside a transaction |
 |---|---|---|
-| `COPY TO` | rows roll back | partial rows remain; with `CREATE_TABLE true` the table remains too |
-| `CREATE TABLE AS` | rows roll back; **the empty table remains** | partial rows and the table remain |
+| `COPY TO` | rows roll back (load runs on the pinned connection, parallel writers disabled) | partial rows remain; with `CREATE_TABLE true` the table remains too |
+| `CREATE TABLE AS` | **nothing rolls back** — see below | partial rows and the table remain on failure |
 
-Both run their bulk load on the connection pinned to the transaction — one
-session, one `INSERT BULK`, parallel writers disabled (a second connection would
-sit outside the transaction, and its rows would not roll back with the rest).
+`COPY TO` joins the transaction: its bulk load runs on the pinned connection —
+one session, one `INSERT BULK` (a second connection would sit outside the
+transaction and its rows would not roll back with the rest).
 
-What a `ROLLBACK` does **not** undo is the `CREATE TABLE` itself: CTAS runs its
-DDL as its own statement before any row is sent, so an aborted CTAS leaves an
-empty table of the right shape behind. Drop it, or have the extension do it:
+**CTAS does not join the transaction.** Its DDL is auto-committed T-SQL, so
+the created table could never roll back — and loading the rows inside the
+transaction while the table exists outside it would tear the statement in
+half. CTAS therefore runs entirely on pool connections, DDL and load both,
+even when issued inside `BEGIN … COMMIT` — which also means CTAS keeps its
+parallel writers in a transaction. A failed CTAS leaves an empty (or
+partially loaded) table behind; drop it, or have the extension do it:
 
 ```sql
 -- Drop a half-written table when the load fails (default: false)

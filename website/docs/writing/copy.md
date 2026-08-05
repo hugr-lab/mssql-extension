@@ -46,28 +46,6 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
   TO 'sqlserver.dbo.million_rows' (FORMAT 'bcp');
 ```
 
-### COPY TO Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `CREATE_TABLE` | BOOLEAN | true | Auto-create target table if it doesn't exist |
-| `REPLACE` | BOOLEAN | false | Drop and recreate table (replaces existing data) |
-| `FLUSH_ROWS` | BIGINT | 100000 | Rows before flushing to SQL Server (overrides setting) |
-| `TABLOCK` | BOOLEAN | false | Use TABLOCK hint for faster bulk load (overrides setting) |
-
-```sql
--- Auto-create table (default: true)
-COPY data TO 'mssql://sqlserver/dbo/new_table' (FORMAT 'bcp', CREATE_TABLE true);
-
--- Replace existing table (drop and recreate)
-COPY data TO 'mssql://sqlserver/dbo/existing_table' (FORMAT 'bcp', REPLACE true);
-
--- Control flush frequency (rows before committing to SQL Server)
-COPY data TO 'sqlserver.dbo.table' (FORMAT 'bcp', FLUSH_ROWS 500000);
-
--- Disable TABLOCK hint (allows concurrent access, slower)
-COPY data TO 'sqlserver.dbo.table' (FORMAT 'bcp', TABLOCK false);
-```
 
 ### Temporary Tables
 
@@ -92,7 +70,11 @@ COPY data TO 'mssql://sqlserver//#temp_table' (FORMAT 'bcp');  -- URL with empty
 COPY data TO 'sqlserver..#temp_table' (FORMAT 'bcp');          -- Catalog with empty schema
 COMMIT;
 
--- Global temp table (visible to all sessions)
+-- Global temp table (visible to all sessions) — ONLY meaningful with the
+-- session reset disabled or inside a transaction: with the default
+-- mssql_reset_connection = true, the pool reset ends the creating session
+-- right after the statement and the ##table dies with it (issue #189)
+SET mssql_reset_connection = false;
 COPY data TO 'mssql://sqlserver/##global_temp' (FORMAT 'bcp');
 ```
 
@@ -234,8 +216,8 @@ SELECT mssql_invalidate_cache('sqlserver');   -- the catalog cache does not see 
 
 - **Protocol**: Uses TDS BulkLoadBCP (packet type 0x07) for maximum throughput
 - **Streaming**: Bounded memory usage regardless of dataset size
-- **Throughput**: ~300K rows/s for simple rows, ~10K rows/s for wide rows (500+ chars × 10 columns)
-- **TABLOCK**: Enables table-level locking and minimal logging for faster inserts
+- **Throughput**: 1M+ rows/s on simple rows; a 44-column × 1M-row load measured 3.24 s with 4 parallel writers (10.55 s single-writer) — the write path encodes column-major and fans out across bulk-load sessions (`mssql_copy_parallel_writers`)
+- **TABLOCK**: decided from the target's shape by default (`mssql_copy_tablock = auto`): ON for heaps (concurrent BU locks compose), OFF for anything clustered — against a clustered index the hint *serialises* parallel loaders (measured 8.9 s vs 5.2 s on a 2M-row columnstore load)
 - **UTF-8 targets**: a `varchar` column under a UTF-8 collation receives UTF-8 bytes as they are, rather than being transcoded to UTF-16 for the server to transcode back. Measured at half the wire bytes for ASCII-ish data (35 → 19 bytes for a 16-character value) and −51% client CPU on long strings. An `nvarchar` target is unaffected. This is the whole of the string path on Microsoft Fabric, where every string column is a UTF-8 `varchar`
 
 ### COPY TO Behavior

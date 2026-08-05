@@ -7,13 +7,13 @@ sidebar_position: 2
 
 ### mssql_version()
 
-Returns the extension version string (e.g. `0.2.0`).
+Returns the extension version string (e.g. `0.2.3`).
 
 **Signature:** `mssql_version() -> VARCHAR`
 
 ```sql
 SELECT mssql_version();
--- Returns: '0.2.0'
+-- Returns: '0.2.3'
 ```
 
 ### mssql_scan()
@@ -182,3 +182,14 @@ SELECT mssql_preload_catalog('sqlserver', 'dbo');
 
 The function loads metadata per-schema to avoid SQL Server tempdb sort spills on large databases. Statistics (approximate row counts) are also pre-populated to avoid per-table DMV queries.
 
+### Authentication Test Functions
+
+Connectivity diagnostics that exercise the auth path without a full query.
+Details on the auth pages: [Azure AD](/connection/azure/), [Kerberos / SSPI](/connection/kerberos/).
+
+| Function | Description |
+|---|---|
+| `mssql_azure_auth_test(secret [, tenant])` | Test Azure AD token acquisition |
+| `mssql_kerberos_auth_test(host [, port])` | POSIX Kerberos: returns OK + SPN / principal / token size, or the verbatim GSSAPI error |
+| `mssql_kerberos_auth_test_secret(secret_name)` | Same, reading keytab / SPN override from an MSSQL secret |
+| `mssql_winsspi_auth_test(host [, port])` | Windows SSPI peer; `mssql_winsspi_auth_test_spn(spn)` takes an explicit SPN |

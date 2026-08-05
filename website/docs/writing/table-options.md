@@ -164,7 +164,7 @@ loaded.
 | `mssql_default_string_length` | BIGINT | `0` | Length for an unannotated `VARCHAR` column (0 = MAX) |
 | `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of a created table: `HEAP` or `COLUMNSTORE` |
 | `mssql_catalog_native_types` | BOOLEAN | `true` | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for attached string columns |
-| `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_CI_AS_SC_UTF8` | Collation for created `varchar` columns; empty inherits the database default |
+| `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_BIN2_UTF8` | Collation for created `varchar` columns; empty inherits the database default. BIN2 matches Microsoft Fabric's own default (one of the two collations Fabric accepts) and compares binary — **case- and accent-sensitive**, so `WHERE name = 'abc'` does not match `'ABC'` on such a column. Want linguistic matching? Set a CI collation here or per column via `MSSQL_VARCHAR(n, 'collation')` |
 
 `mssql_default_string_length` says "no string in this data is longer than n".
 Anything longer is truncated to `n` on a character boundary, as described above.

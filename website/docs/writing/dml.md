@@ -86,15 +86,15 @@ WHERE id = 42;
 Large updates are automatically batched:
 
 ```sql
--- Set batch size (default: 1000)
-SET mssql_update_batch_size = 500;
+-- Set batch size (default: 500)
+SET mssql_dml_batch_size = 500;
 ```
 
 ### Limitations
 
 - **RETURNING clause is not supported** for UPDATE operations
 - Tables must have a primary key (uses rowid for row identification)
-- Updates are executed as batched DELETE + INSERT internally for composite PKs
+- Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the primary key (scalar or composite)
 
 ## DELETE
 
@@ -125,8 +125,8 @@ WHERE order_id IN (SELECT id FROM sqlserver.dbo.orders WHERE status = 'cancelled
 Large deletes are automatically batched:
 
 ```sql
--- Set batch size (default: 1000)
-SET mssql_delete_batch_size = 500;
+-- Set batch size (default: 500)
+SET mssql_dml_batch_size = 500;
 ```
 
 ### Limitations

@@ -278,3 +278,17 @@ In addition to options propagated from the secret / connection string, the follo
 | `lazy_validation`   | BOOLEAN | Skip the eager ATTACH-time credential check (default `false`)                |
 | `application_name`  | VARCHAR | Override LOGIN7 `program_name` for this ATTACH (also accepts `applicationname`) |
 
+### Named Instances
+
+`Server=host\instance` resolves the instance's dynamic TCP port through the
+SQL Server Browser (UDP 1434) at ATTACH time:
+
+```sql
+ATTACH 'Server=myhost\SQLEXPRESS;Database=mydb;User Id=sa;Password=...' AS db (TYPE mssql);
+```
+
+In environments that strip outbound UDP 1434, set
+`mssql_named_instance_resolution = false` — a named instance then errors
+instead of silently trying port 1433 — and connect with an explicit
+`Server=host,port`. The Browser query timeout is
+`mssql_browser_timeout_seconds` (default 3 s, one retry).

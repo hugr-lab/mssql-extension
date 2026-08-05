@@ -24,23 +24,31 @@ SELECT id, name FROM sqlserver.dbo.customers WHERE status = 'active';
 
 Supported filter operations for pushdown:
 
-- Equality: `column = value`
-- Comparisons: `>`, `<`, `>=`, `<=`, `<>`
+- Equality and comparisons: `=`, `>`, `<`, `>=`, `<=`, `<>`
 - IN clause: `column IN (val1, val2, ...)`
 - NULL checks: `IS NULL`, `IS NOT NULL`
-- Conjunctions: `AND`, `OR`
+- Conjunctions: `AND`, `OR`; `CASE`, `BETWEEN`
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
-- Datetime functions: `year(date_col) = 2024`, `month(date_col) = 6`, `day(date_col) = 15`
+- **Mapped functions** inside predicates:
+  - strings: `lower`, `upper`, `length`/`len`, `trim`, `ltrim`, `rtrim`
+  - dates: `year`, `month`, `day`, `hour`, `minute`, `second`, `date_diff`,
+    `date_add`, `date_part`
+  - arithmetic: `+ - * / %`, negation
+  - substring matching: `prefix`/`suffix`/`contains` and their
+    case-insensitive variants translate to `LIKE` (constant patterns) —
+    including leading-wildcard forms
+- Rowid equality (expands to the primary-key columns)
 
-**Not pushed down** (applied locally by DuckDB):
+**Not pushed down** (applied locally by DuckDB): unmapped functions —
+`list_contains()`, `regexp_matches()`, and anything else without a T-SQL
+mapping. An expression the encoder cannot translate stays in DuckDB; results
+are unchanged either way.
 
-- LIKE patterns with leading wildcards: `LIKE '%pattern'`, `LIKE '%pattern%'`
-- ILIKE (case-insensitive LIKE)
-- Most function expressions: `lower(name) = 'test'`, `length(col) > 5`
-- DuckDB-specific functions: `list_contains()`, `regexp_matches()`
-
-Note: `LIKE 'prefix%'` patterns are optimized by DuckDB into range comparisons which ARE pushed down.
+> Pushed string predicates follow the **server's comparison semantics**: on a
+> case-insensitive collation, `WHERE name = 'abc'` matches `'ABC'` — exactly
+> what the same query returns in SSMS. See the collation notes under
+> [Target Column Types](/writing/table-options/).
 
 ### ORDER BY Pushdown (Experimental)
 

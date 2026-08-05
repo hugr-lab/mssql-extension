@@ -341,7 +341,7 @@ CREATE SECRET kerb_raw (
 );
 
 -- All Kerberos secret fields:
---   authenticator               -- 'krb5' (or 'winsspi' on Windows, pending)
+--   authenticator               -- 'krb5' (or 'winsspi' on Windows)
 --   krb5_configfile             -- /etc/krb5.conf override (Linux only)
 --   krb5_keytabfile             -- selects keytab mode
 --   krb5_credcachefile          -- ccache path override (Linux only)
