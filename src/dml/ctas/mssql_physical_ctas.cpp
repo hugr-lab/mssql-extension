@@ -15,7 +15,7 @@ MSSQLCTASGlobalSinkState::MSSQLCTASGlobalSinkState(ClientContext &context, MSSQL
 												   const mssql::CTASTarget &target,
 												   const vector<mssql::CTASColumnDef> &columns,
 												   const mssql::CTASConfig &config) {
-	state.Initialize(catalog, target, columns, config);
+	state.Initialize(catalog, target, columns, config, ConnectionProvider::ShouldResetOnRelease(context));
 }
 
 //===----------------------------------------------------------------------===//
@@ -170,6 +170,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		params.target = &gstate.state.bcp_target;
 		params.columns = &gstate.state.bcp_columns;
 		params.flush_rows = gstate.state.config.bcp_flush_rows;
+		params.reset_on_release = gstate.state.reset_on_release;
 		lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit);
 	}
 

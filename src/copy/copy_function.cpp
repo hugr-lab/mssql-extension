@@ -129,7 +129,7 @@ MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
 	//
 	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract) — worker-thread
 	// safe per issue #178 / PR #179.
-	mssql::ReleaseBcpConnectionOnError(connection, pool_handle, transaction_pinned);
+	mssql::ReleaseBcpConnectionOnError(connection, pool_handle, transaction_pinned, reset_on_release);
 }
 
 namespace mssql {
@@ -317,6 +317,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	// helper below nor BCPCopyFinalize runs (issue #191).
 	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	gstate->transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+	gstate->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 
 	// Helper to release connection on error
 	auto release_connection_on_error = [&]() {
@@ -632,6 +633,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		params.column_mapping = &gdata.column_mapping;
 		params.flush_rows = bdata.config.flush_rows;
 		params.collect_timings = counters;
+		params.reset_on_release = gdata.reset_on_release;
 		if (params.pool && ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit)) {
 			CopyDebugLog(1, "BCPCopySink: parallel writer started (limit=%llu)",
 						 (unsigned long long)gdata.parallel_writer_limit);

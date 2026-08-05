@@ -97,6 +97,10 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	weak_ptr<tds::ConnectionPool> pool_handle;
 	bool transaction_pinned = false;
 
+	//! `mssql_reset_connection`, resolved in BCPCopyInitGlobal on the client
+	//! thread — the destructor below has no ClientContext (issue #178).
+	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
+
 	// BCP packet writer (thread-safe)
 	unique_ptr<mssql::BCPWriter> writer;
 

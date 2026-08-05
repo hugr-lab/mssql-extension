@@ -78,13 +78,14 @@ void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
 	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract).
 	// Always a pool connection here — CTAS never loads on the pinned one — so it
 	// is always returned rather than dropped.
-	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false);
+	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false, reset_on_release);
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
-									CTASConfig config_p) {
+									CTASConfig config_p, bool reset_on_release_p) {
 	catalog = &catalog_ref;
 	pool_handle = catalog_ref.GetConnectionPoolHandle();
+	reset_on_release = reset_on_release_p;
 	target = std::move(target_p);
 	columns = std::move(columns_p);
 	config = std::move(config_p);

@@ -320,17 +320,21 @@ at release time, where the context is available either way.
 
 ### D2 — one bulk-load session type
 
-Carries the last unhonoured reset site with it. `ReleaseBcpConnectionOnError` is
-the one place that still flags a reset unconditionally, because it has no
-`ClientContext` by design (issue #178 — it runs from destructors on worker
-threads) and honouring `mssql_reset_connection` there would mean threading the
-flag through four separate BCP state structs. This deliverable makes it one
-struct; the flag joins `pool_handle` and `transaction_pinned` in it then.
+Carried the last unhonoured reset site with it, as its own commit.
+`ReleaseBcpConnectionOnError` was the one place that flagged a reset
+unconditionally — no `ClientContext` by design (issue #178: it runs from
+destructors on worker threads), and honouring the setting meant threading the
+answer through four BCP state structs. With one struct there are three carriers
+instead: the session, COPY's global state, CTAS's execution state.
 
-Mostly it does not matter today — the function Closes the connection unless it
-was already Idle, and closing ends the session regardless of the flag — but the
-setting's contract says every release path, so the exception is written down in
-the code and here rather than left to be found.
+Its `reset_on_release` parameter has **no default**, which is the point rather
+than a detail: a defaulted one is exactly how the setting came to be
+half-honoured in the first place, and the compiler now makes every caller state
+an answer.
+
+Mostly it decides nothing — the function Closes the connection unless it was
+already Idle, and closing ends the session regardless of the flag — so the value
+is the contract holding everywhere, not an observable behaviour change.
 
 
 Owns the connection, the `BCPWriter`, the pool handle, `rows_in_batch`,

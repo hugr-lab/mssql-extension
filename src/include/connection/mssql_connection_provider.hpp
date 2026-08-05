@@ -99,9 +99,18 @@ namespace mssql {
 //!        (catalog torn down) drops the connection instead
 //! @param transaction_pinned true if an MSSQLTransaction owns the pin — the
 //!        reference is dropped without a pool Release
+//! @param reset_on_release `mssql_reset_connection` as resolved on the CLIENT
+//!        thread. Deliberately has NO default: this was the one reset site the
+//!        setting did not reach, and a defaulted parameter is exactly how it
+//!        would come to be half-honoured again. Every caller states its answer.
+//!
+//!        Mostly it decides nothing here — the branch below Closes the
+//!        connection unless it was already Idle, and closing ends the session
+//!        whatever the flag says — but "every release path" is the setting's
+//!        contract, so the Idle sub-case obeys it too.
 void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
-								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
-								 bool transaction_pinned) noexcept;
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle, bool transaction_pinned,
+								 bool reset_on_release) noexcept;
 
 }  // namespace mssql
 

@@ -267,8 +267,8 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 namespace mssql {
 
 void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection,
-								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle,
-								 bool transaction_pinned) noexcept {
+								 const duckdb::weak_ptr<tds::ConnectionPool> &pool_handle, bool transaction_pinned,
+								 bool reset_on_release) noexcept {
 	if (!connection) {
 		return;
 	}
@@ -292,22 +292,10 @@ void ReleaseBcpConnectionOnError(std::shared_ptr<tds::TdsConnection> &connection
 
 	if (auto pool = pool_handle.lock()) {
 		try {
-			// The ONE reset site that does not consult `mssql_reset_connection`,
-			// stated here rather than left to be discovered.
-			//
-			// Mostly it cannot matter: this runs after a bulk load failed, and the
-			// branch above has just Closed the connection unless it was already
-			// Idle — closing ends the session, so any `##temp` it held is gone
-			// whatever this flag says. The flag only decides anything in the Idle
-			// sub-case, and there resetting is the defensible answer for a failure
-			// path.
-			//
-			// It also has no ClientContext to ask, by design (issue #178): this is
-			// reached from destructors that may run on a worker thread. Honouring
-			// the setting would mean carrying it through four separate BCP state
-			// structs — which spec 063 D2 is about to collapse into one, so the
-			// flag belongs there once rather than here four times.
-			connection->SetNeedsReset(true);
+			// The answer comes from the caller, which captured it on the client
+			// thread: there is no ClientContext to ask here by design (issue #178
+			// — this runs from destructors that may be on a worker thread).
+			connection->SetNeedsReset(reset_on_release);
 			pool->Release(std::move(connection));
 		} catch (...) {
 			// Release failed — drop it; the shared_ptr destructor closes the socket.

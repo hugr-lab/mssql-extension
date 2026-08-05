@@ -39,6 +39,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
+#include "tds/tds_types.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -82,6 +83,10 @@ struct BulkLoadSessionParams {
 	idx_t flush_rows = 0;
 	//! Fill BulkLoadWriteResult's timings.
 	bool collect_timings = false;
+	//! `mssql_reset_connection`, resolved on the client thread. Carried because
+	//! the release happens in a destructor that may run on a worker thread, where
+	//! there is no ClientContext to ask (issue #178).
+	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 };
 
 //! A bulk-load session owned by ONE thread. Not thread-safe and not meant to be:
@@ -160,6 +165,7 @@ private:
 	const string *insert_bulk_sql_ = nullptr;
 	idx_t flush_rows_ = 0;
 	bool collect_timings_ = false;
+	bool reset_on_release_ = tds::DEFAULT_RESET_CONNECTION;
 
 	idx_t rows_in_batch_ = 0;
 	idx_t batches_flushed_ = 0;

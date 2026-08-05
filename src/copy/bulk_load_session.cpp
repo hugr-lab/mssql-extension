@@ -24,7 +24,7 @@ BulkLoadSession::~BulkLoadSession() noexcept {
 	// The writer goes first: it holds a reference to the connection, and the
 	// release protocol closes the socket underneath it.
 	writer_.reset();
-	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false);
+	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
 }
 
 bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers) {
@@ -58,6 +58,7 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		insert_bulk_sql_ = params.insert_bulk_sql;
 		flush_rows_ = params.flush_rows;
 		collect_timings_ = params.collect_timings;
+		reset_on_release_ = params.reset_on_release;
 		connection_ = conn;
 		writer_ = make_uniq<BCPWriter>(*connection_, *params.target, *params.columns,
 									   params.column_mapping ? *params.column_mapping : vector<int32_t>());
@@ -145,7 +146,7 @@ void BulkLoadSession::Abandon() noexcept {
 	// lock on. Leaving it open until the destructor runs would have that DROP
 	// block on this same thread's work.
 	writer_.reset();
-	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false);
+	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
 	rows_in_batch_ = 0;
 }
 
