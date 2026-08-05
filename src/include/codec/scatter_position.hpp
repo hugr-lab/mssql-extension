@@ -48,8 +48,7 @@ struct StridePos {
 	}
 	//! No-op: the next row's position is implied by the stride, so nothing has
 	//! to be recorded.
-	inline void Advance(idx_t, size_t) const {
-	}
+	inline void Advance(idx_t, size_t) const {}
 };
 
 //! Rows at positions held in a per-row cursor: the layout when the chunk has a

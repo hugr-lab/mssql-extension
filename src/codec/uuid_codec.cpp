@@ -161,12 +161,12 @@ static inline void ScatterDispatch(POS pos, idx_t row_begin, idx_t rows, const U
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector & /*in*/,
 						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/) {
 	// Strided implies all-valid: a NULL would have made the rows differ in length.
-	ScatterDispatch(StridePos {dst, stride}, row_begin, rows, fmt, /*all_valid=*/true);
+	ScatterDispatch(StridePos{dst, stride}, row_begin, rows, fmt, /*all_valid=*/true);
 }
 
 void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector & /*in*/,
 						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/, bool all_valid) {
-	ScatterDispatch(CursorPos {dst, cursor, row_begin}, row_begin, rows, fmt, all_valid);
+	ScatterDispatch(CursorPos{dst, cursor, row_begin}, row_begin, rows, fmt, all_valid);
 }
 
 // Write the 16 wire bytes at a pointer — the one implementation, from which the
