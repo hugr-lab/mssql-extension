@@ -215,39 +215,39 @@ Measured cost of the current shape (spec 057, 2M rows × 8 columns): decimal
 0.163 s → 0.396 s CPU when the cursor path is forced, against a `bigint` control
 that costs nothing because its arm is inlined in the same TU.
 
-### D2 — NULLs stop disqualifying the strided path
+### D2 / D3 — CLOSED by measurement: after D1 the cursor path costs the same as strided
 
-The kernels do not need to know about NULLs: a NULL row's length prefix is `0x00`
-and the cursor advances by 1 rather than `1 + W`, so a payload written for a NULL
-row is overwritten before the frame is sent. Removing the validity test from the
-inner loop lets `all_valid` stop mattering.
+Both deliverables existed to move chunks from the cursor layout onto the strided
+one. Measured after D1 (2026-08-05, same build, same 8 x decimal(18,4) x 2M
+fixture, the ONLY difference being a NULL every 1000th row that flips the layout,
+interleaved, 4 reps):
 
-**Worth less than the proposal implies** — §1 shows the NULL axis moving nothing,
-because `has_variable` had already forced the cursor. It becomes valuable only
-*after* D3, and the tail case (a NULL in the last column of the last row must not
-write past the buffer) is an out-of-bounds write rather than a wrong value, so it
-needs its own test.
+    strided medians 416 ms encode, cursor 413 ms — equal within noise,
+    pairwise 3:1 for the CURSOR.
 
-### D3 — strided for chunks that contain strings
+The whole strided-vs-cursor gap was the per-value call overhead, and D1 already
+recovered it (decimal −42%, datetime −23%, 5/5 pairs each). What remains between
+the layouts — the cursor array reads and the sizing pass — does not measure.
 
-The prize §1 uncovered, and the one not in the predecessor proposal at all. A
-variable-length column disqualifies a constant stride **for the whole chunk**,
-including its fixed-width columns. Options to evaluate, none yet measured:
+So:
 
-- **a BOUNDED string has a known maximum width**, so it can take a constant
-  stride by reserving `n` bytes per row and letting the length prefix say how
-  many are used. That trades wire bytes for a constant stride — attractive
-  exactly when the column is narrow and nearly full, which is what an annotated
-  `varchar(20)` usually is, and useless for `varchar(max)`. It also composes with
-  §1a: a UTF-8 target's payload is the source bytes, so the reserved width is the
-  declared byte length rather than a transcode estimate;
-- encode the fixed-width columns strided into their own region and interleave;
-- two-pass: plan every column (strings already are), then a per-column pass with
-  a per-row offset table — the cursor without the per-value dispatch;
-- accept the cursor and make D1 complete, which is the cheap version.
+- **D2 (NULLs onto strided)**: nothing left to recover. Its literal mechanism —
+  kernels write payload unconditionally, the garbage is overwritten — is also
+  UNSOUND on the cursor layout as proposed: passes are column-major, so the last
+  column's garbage for a NULL row lands in the NEXT row's already-written bytes,
+  not in a later pass's path. Recorded so nobody builds it.
+- **D3 (stride for string-bearing chunks, incl. reserving a bounded string's
+  declared width)**: the fixed-width columns such a chunk contains now encode at
+  strided cost already. Reserving width would spend wire bytes to buy nothing
+  that measures. The fallback the spec named — "accept the cursor and make D1
+  complete" — is the outcome.
 
-The last is the fallback and is already D1. This deliverable exists to ask
-whether the first two beat it, with a measurement rather than an opinion.
+Acceptance criterion 1 is satisfied by its second branch: the strided count for
+string-bearing cells stays 0, with this measurement as the reason.
+
+Host noise on this machine is brutal — identical work measured 266–745 ms across
+reps — so only interleaved pairwise comparison decided anything here; medians of
+interleaved runs are quoted, absolutes are not portable.
 
 ### D4 — shrink what reaches row-major
 
