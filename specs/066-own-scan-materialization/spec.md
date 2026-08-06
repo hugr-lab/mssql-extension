@@ -124,6 +124,15 @@ applied two ways, and BOTH exist:
   Batch size is its own knob (staging batches are statement granularity;
   `mssql_copy_flush_rows` remains the wire batch INSIDE each BCP stream) —
   default in the ~100k range, decided by measurement in the staging spec.
+- **Pipelined incremental (the autocommit shape of the above; maintainer
+  refinement)** — the roles separate onto their own connections: the SCAN
+  streams on A, a DATA connection B fills `##stage` tables, a DML
+  connection C runs the JOIN batches — ping-pong two stages so load(N+1)
+  overlaps update(N). Wall time tends to max(scan, load, mutate) instead of
+  their sum. Costs 2–3 pool connections: degrade gracefully to the serial
+  single-connection loop when the pool cannot grant them. In a transaction
+  the DML leg is pinned to A, so the overlap is scan∥load with DML batches
+  after the drain — smaller but still real.
 - **Single-statement (transaction mode; autocommit opt-in)** — stage
   everything, mutate once. In an explicit transaction this is the natural
   shape (atomicity comes from the transaction; the pinned connection does
