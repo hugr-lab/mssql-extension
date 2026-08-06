@@ -1,17 +1,17 @@
 # Spec 058 — Read framing: one pass over the wire
 
-**Status: T0 EXECUTED 2026-08-05 — D1 is WORTH TAKING, in evidence-ordered
-steps; everything else closed.** Results in §3a/T0e below. The short version:
-of the three candidates whose SUM was the case for this spec, two (the Feed
-copy and CompactBuffer) measured at noise level and are closed. `SkipRow`
-measured 1.7–2.1 ns/value — first read as 7.6–11.9% of client CPU and
-"straddling the abandon threshold", then corrected to **~13%, above the
-threshold**, once the instrument's own 50 ns/row was measured out of the
-denominator (T0e: the honest client cost of a 1×bigint read is 15–16 ns/row
-TOTAL). Plan: D1-alt (per-column skip descriptor, cheap, keeps validation) →
-re-measure the residual → full D1 only if the residual justifies a parser-
-contract change plus the mandatory staged-walk prefix clamp T0e identified.
-Wall clock on server-bound reads will not move; the win is client CPU.
+**Status: EXECUTED AND CLOSED 2026-08-05 — D1-alt SHIPPED (§T0f), full D1
+DEFERRED, everything else closed at noise.** The arc: the Feed copy and
+CompactBuffer measured unresolvable (§3a) and are closed. `SkipRow` measured
+1.4–2.1 ns/value — first read as 7.6–11.9% of client CPU ("straddling the
+abandon threshold"), then corrected upward once the instrument's own
+50 ns/row was measured out of the denominator (§T0e: the honest client cost
+of a 1×bigint read is 15–16 ns/row TOTAL, putting the single-column share
+at ~11%). D1-alt (per-column skip descriptor, keeps all validation) then
+shipped with −1.16/−0.78 ns/value on mixed fixtures; the measured residual
+left full D1 a per-row-constant prize on narrow tables only, deferred with
+the reasoning in §T0f. Wall clock on server-bound reads does not move; the
+win is client CPU.
 
 **Original header:** design draft. Nothing here is scheduled until T0 below
 produces numbers.
@@ -138,7 +138,14 @@ is not worth doing and should be closed rather than scaled down.
 
 ## 3a. T0 RESULTS (2026-08-05, macOS ARM64, live Docker SQL Server)
 
-Method: `test/bench/bench_058_t0.sh` (this branch). Three NOT-NULL fixtures —
+Method: `test/bench/bench_058_t0.sh` (this branch) for the phase split and
+the two-binary A/B mode. The 2x VARIANT BINARIES are temporary one-hunk
+patches described in each finding below — applied, built, staged to /tmp,
+reverted; deliberately NOT committed (they change hot-path behavior), so
+reproducing T0c/T0f means re-applying them from the descriptions. The T0e
+instrument-cost numbers came from two one-off methods recorded there
+(process CPU via `time`, per-query `.timer on` user time), not from this
+script. Three NOT-NULL fixtures —
 1×bigint (2M rows), 4×(bigint,int,decimal(18,4),nvarchar(16)) (1M),
 15×mixed-family (500k) — drained by `SELECT min(...)` of every column, 8
 iterations per process. Marginal costs by the established 2x trick: a variant
@@ -204,8 +211,9 @@ the T0c shares:
    `min()` plumbing. The T0c shares used whole-process CPU (~22.6 ns/row),
    which still carried ATTACH/warmup residue the startup control missed.
 
-**Corrected share: SkipRow's measured 1.7–2.1 ns/value is ~13% of true client
-read CPU on cheap types — ABOVE the 10% threshold, not below it.**
+**Corrected share: SkipRow's measured 1.72 ns/value on the 1×bigint fixture
+is ~11% of the true 15–16 ns/row client cost — ABOVE the 10% threshold, not
+below it** (the whole-process denominator had put the same number at 7.6%).
 
 **Amended verdict.** D2 and CompactBuffer stay closed (noise, both
 denominators). D1's case is real but must be taken in evidence-ordered steps:
@@ -252,16 +260,21 @@ full suite green.
 | 15×wide | +0.16 | 5/6 |
 
 Reading: on MIXED shapes the type_id switch was the cost — alt removed
-~55% of the walk, and the per-VALUE residual is ≈0.16 ns, essentially done.
-On a single-column table the switch was perfectly predicted and alt buys
-nothing; the stubborn ~2 ns there is a per-ROW constant (the call,
-`RowReader` construction, loop setup) — which is also exactly what the
-residual decomposes to: **~2 ns/row fixed + ~0.16 ns/value**.
+~55% of the walk, and the remaining walk is unresolvable there: +0.16
+ns/value at 3/6 and 5/6 wins sits at the harness's noise floor. (A naive
+"F ns/row + m ns/value" model does NOT fit all three cells at once — the
+equal wide-fixture residuals would force F = 0 against the 1-col 1.97 — so
+no decomposition is claimed beyond this reading.) What IS solid: the
+1-column residual of **+1.97 ns/row at 6/6** — a per-ROW constant (the
+call, `RowReader` construction, loop setup) that alt cannot touch and full
+D1 would remove.
 
-**Full D1's remaining prize is therefore a per-row constant**: ~13% of client
-CPU on a 1-column read, ~4% at 4 columns, ~2% at 15. Against that stand the
-consumed-bytes contract change and the mandatory staged-walk clamp (T0e).
-**Deferred**: the 2 ns/row now belongs to the same bucket as the other fixed
+**Full D1's remaining prize is therefore that per-row constant**: ~12–13%
+of client CPU on a single-column read (1.97 over §T0e's 15–16 ns/row),
+amortizing away with width — the wide-fixture residuals are already
+indistinguishable from noise. Against that stand the consumed-bytes
+contract change and the mandatory staged-walk clamp (T0e).
+**Deferred**: the 2 ns/row belongs to the same bucket as the other fixed
 per-row costs T0b exposed (~17 ns/row parse-fixed + loop mechanics), and if
 that bucket is ever attacked it should be attacked whole — removing the walk
 alone buys the narrow-table case only.

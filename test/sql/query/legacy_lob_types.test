@@ -41,6 +41,13 @@ SELECT mssql_exec('lob', 'INSERT INTO dbo.LegacyLob VALUES
     REPLICATE(CAST(''t'' AS varchar(max)), 9000),
     CAST(REPLICATE(CAST(''ab'' AS varchar(max)), 5000) AS varbinary(max)))');
 
+# Wire-form coverage note: NTEXT (0x63) and IMAGE (0x22) are pinned on their
+# LEGACY wire forms below. TEXT is asserted readable but travels as PLP — the
+# catalog scan CASTs it to NVARCHAR(MAX) server-side unconditionally (its
+# code-page decode without the cast is issue #224's territory), so the 0x23
+# reader arm is exercised only by raw mssql_scan with no CAST, deliberately
+# not pinned here.
+
 # The catalog scan: values, NULLs and lengths — a framing slip in the
 # text-pointer form shows up as a dead connection, not a wrong value, so the
 # lengths are the assertion that the large row actually crossed the wire.

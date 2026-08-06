@@ -55,6 +55,8 @@ CREATE TABLE dbo.b58_15col (
   c15 nvarchar(16) NOT NULL)');
 SQL
 		echo "SELECT CASE WHEN (SELECT count(*) FROM db.dbo.b58_1col) = 2000000 THEN 'F1 OK' ELSE 'F1 LOAD' END;"
+		echo "SELECT CASE WHEN (SELECT count(*) FROM db.dbo.b58_4col) = 1000000 THEN 'F2 OK' ELSE 'F1 LOAD' END;"
+		echo "SELECT CASE WHEN (SELECT count(*) FROM db.dbo.b58_15col) = 500000 THEN 'F3 OK' ELSE 'F1 LOAD' END;"
 	} > "$SQLFILE"
 	local probe
 	probe=$("$1" < "$SQLFILE" 2>&1) || { echo "fixture probe failed:"; echo "$probe" | grep -i error; exit 1; }
@@ -95,20 +97,30 @@ run_read() { # <binary> <table> <select> <counters:0|1>
 		attach_sql
 		for _ in $(seq 1 "$ITERS"); do echo "${sel};"; done
 	} > "$SQLFILE"
-	local t
+	# Exit status is tested EXPLICITLY: an earlier form echoed STEPFAIL inside
+	# the timed block, but bash prints the TIMEFORMAT line AFTER it, so
+	# `tail -n1` always captured the timing and a crashed variant binary flowed
+	# near-zero CPU into the medians as a phantom improvement (review finding).
+	local out rc
 	if [ "$want_counters" = "1" ]; then
-		t=$( { time { MSSQL_COUNTERS=1 "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE" || echo STEPFAIL; } ; } 2>&1 | tail -n1 )
+		out=$( { time { MSSQL_COUNTERS=1 "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ); rc=$?
 	else
-		t=$( { time { "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE" || echo STEPFAIL; } ; } 2>&1 | tail -n1 )
+		out=$( { time { "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ); rc=$?
 	fi
-	case "$t" in *STEPFAIL*) echo FAIL;; *) echo "$t";; esac
+	if [ "$rc" -ne 0 ]; then echo FAIL; else echo "$out" | tail -n1; fi
 }
 
-startup_cpu() { # <binary>
+startup_cpu() { # <binary> — median of 3 (a single sample biased every
+	# subtracted number AND every win identically; review finding). The first
+	# run also absorbs macOS first-exec overhead before the samples we keep.
 	echo "$(attach_sql) SELECT 1;" > "$SQLFILE"
-	local t
-	t=$( { time { "$1" < "$SQLFILE" >/dev/null 2>&1 || true; } ; } 2>&1 | tail -n1 )
-	echo "$t" | awk '{printf "%.3f", $1 + $2}'
+	"$1" < "$SQLFILE" >/dev/null 2>&1 || true
+	local t vals=""
+	for _ in 1 2 3; do
+		t=$( { time { "$1" < "$SQLFILE" >/dev/null 2>&1 || true; } ; } 2>&1 | tail -n1 )
+		vals="$vals$(echo "$t" | awk '{printf "%.3f\n", $1 + $2}')"$'\n'
+	done
+	printf '%s' "$vals" | grep -v '^$' | median
 }
 
 FIX_TBL=(b58_1col b58_4col b58_15col)
