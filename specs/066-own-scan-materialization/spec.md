@@ -109,11 +109,31 @@ yes, and it falls out of the connection rules):
 | explicit transaction (same catalog) | client `ColumnDataCollection` — a second connection's rows would not roll back, and the pinned connection cannot stream + bulk-load at once, so the scan must drain first; the CDC spills via DuckDB's buffer manager | full result, spillable | INSERT: BCP straight into the target on the pinned connection (INSERT BULK *is* the one statement — no stage needed). UPDATE/DELETE: BCP into `#stage` on the pinned connection, then ONE `... JOIN #stage` |
 | small results (either mode) | CDC — below a threshold the stage round-trip is not worth it (the spec-062 D1 decision-function shape) | small | direct statement / VALUES join as today |
 
+**Application modes** (maintainer refinement, 2026-08-06): the stage can be
+applied two ways, and BOTH exist:
+
+- **Incremental (autocommit default)** — the user's pattern: `CREATE #stage`
+  once, then loop { BCP ~N rows → `UPDATE/DELETE ... JOIN #stage` →
+  `TRUNCATE TABLE #stage` }. This is today's VALUES-join batching with a
+  ~200× larger, index-joinable batch and bulk delivery instead of literal
+  SQL — and it PRESERVES today's semantics exactly, warts included:
+  incremental application on failure, and the READ COMMITTED ambiguity of
+  mutating `t` while its scan still streams (identical to today's mid-scan
+  flushing — inherited, not introduced). Bounded tempdb, short statements
+  (no lock escalation, small log transactions), progress on failure.
+  Batch size is its own knob (staging batches are statement granularity;
+  `mssql_copy_flush_rows` remains the wire batch INSIDE each BCP stream) —
+  default in the ~100k range, decided by measurement in the staging spec.
+- **Single-statement (transaction mode; autocommit opt-in)** — stage
+  everything, mutate once. In an explicit transaction this is the natural
+  shape (atomicity comes from the transaction; the pinned connection does
+  minimal work); in autocommit it is the opt-in for users who want
+  one-statement point-in-time semantics over incremental progress.
+
 Notes:
-- "Batches" come free: a `#stage` fill is ONE continuous `INSERT BULK`
-  stream whose server-visible batch boundaries are `mssql_copy_flush_rows`
-  (102 400) — dozens of DONE-delimited batches for millions of rows, not
-  thousands of statements.
+- "Batches" come free at the wire level either way: a `#stage` fill is a
+  continuous `INSERT BULK` stream whose server-visible batch boundaries are
+  `mssql_copy_flush_rows` (102 400).
 - The single-writer-on-a-GIVEN-connection seam (research.md §1.3) is the
   prerequisite for every `#stage` cell above — one more consumer for it.
 - The final `UPDATE ... JOIN #stage` over millions of rows is one server
