@@ -143,9 +143,10 @@ sudo nano /etc/krb5.conf
 kinit alice@CORP.EXAMPLE.COM
 klist
 
-# 4. Use the extension (built or downloaded as a Linux .duckdb_extension)
-duckdb --unsigned -c "
-  LOAD '/path/to/mssql.duckdb_extension';
+# 4. Use the extension
+duckdb -c "
+  INSTALL mssql FROM community;
+  LOAD mssql;
   ATTACH 'Server=sqlhost.corp.example.com;Database=YourDB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes' AS p (TYPE mssql);
   SELECT TOP 5 name FROM p.sys.tables;
 "
@@ -724,8 +725,9 @@ or credential issue via `mssql_winsspi_auth_test` than via a failing
 sqllogictest:
 
 ```powershell
-duckdb.exe --unsigned -c "
-  LOAD 'C:\duckdb\ext\mssql.duckdb_extension';
+duckdb.exe -c "
+  INSTALL mssql FROM community;
+  LOAD mssql;
   SELECT mssql_winsspi_auth_test('sqlhost.corp.example.com');
 "
 ```
@@ -798,7 +800,7 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
 | `KRB5_TRACE` is not set in production | MIT Kerberos writes ticket-acquisition trace (principal names, key versions, ticket flags) to the path in `KRB5_TRACE`. Useful for debugging, dangerous if forgotten. | `env \| grep KRB5_TRACE` — should be empty |
 | `MSSQL_DEBUG` is unset (or `0`) in production | Our extension logs auth flow timing, SPN, host, and pool factory errors to stderr at level 1–3. Sizes and metadata only (no token contents — verified by audit), but reveals operational signal. | `env \| grep MSSQL_DEBUG` — should be empty |
 | Coredumps disabled for the DuckDB process | If the process crashes, the coredump contains in-memory cleartext tokens, ccache contents, and TGS session keys. | `ulimit -c 0` before launching DuckDB, or `prlimit --core=0 -p <pid>` on a running process. For systemd-managed services: `LimitCORE=0` in the unit file. |
-| Connection strings with passwords don't reach shell history | `duckdb -c "ATTACH '...;Password=...' ..."` writes the password to `~/.bash_history` and exposes it in `ps auxw` to other users for the duration of the process. | Use `CREATE SECRET` + `ATTACH '' AS db (TYPE mssql, SECRET <name>)` instead, or wrap the ATTACH in a heredoc (`duckdb --unsigned <<'EOF'\n…\nEOF`). For Kerberos this is moot — `Trusted_Connection=yes` carries no secret. |
+| Connection strings with passwords don't reach shell history | `duckdb -c "ATTACH '...;Password=...' ..."` writes the password to `~/.bash_history` and exposes it in `ps auxw` to other users for the duration of the process. | Use `CREATE SECRET` + `ATTACH '' AS db (TYPE mssql, SECRET <name>)` instead, or wrap the ATTACH in a heredoc (`duckdb <<'EOF'\n…\nEOF`). For Kerberos this is moot — `Trusted_Connection=yes` carries no secret. |
 | `duckdb_secrets()` does not expose the password | The `password` field is registered as a redacted secret key in DuckDB's SecretManager and shows as `***` instead of the cleartext. | `SELECT name, secret_string FROM duckdb_secrets() WHERE type='mssql';` |
 
 ### See Also
