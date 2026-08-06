@@ -207,9 +207,9 @@ precedent and insertion point) — not scoped here.
 |---|------|----------|-----------|--------|
 | 0 | release v0.2.3 | version bump, release notes 054→064, final report R of the SIMD series | #241 merged | — |
 | 1 | **066 — own-scan materialization** (#239) | plan-walk + scan drain + COPY coverage; catalog-scoped and transaction-gated. PROMOTED to first (2026-08-06, maintainer call): it fixes the latent same-catalog `INSERT ... SELECT`-in-transaction collision that exists TODAY, and it retires the defer-to-Finalize machinery every later DML spec would otherwise have to work around — doing DML first would touch that code twice | nothing | **#239** |
-| 2 | **065 — direct UPDATE/DELETE** (spec.md drafted) | 3-arg Plan hooks, fully-pushed predicate, SET translation, childless executor, conditional #140 guard, token-loop consolidation | simpler on top of 1 | **#140** |
+| 2 | **065 — direct UPDATE/DELETE** (spec.md drafted) | 3-arg Plan hooks, fully-pushed predicate, SET translation, childless executor, conditional #140 guard (interim — 067 removes the requirement entirely), token-loop consolidation | simpler on top of 1 | #140 (pushable statements) |
 | 3 | **062 — INSERT via BCP** (existing draft) | + the shared held-connection bulk session (the seam from §1.3); its open D3 is already answered by 063's infrastructure | 063 (done) | — |
-| 4 | **UPDATE/DELETE staging** | columnar buffering, stage lifecycle (unique names, explicit DROP), `UPDATE/DELETE ... JOIN #stage`, decision function vs VALUES join | 062's seam, 1 | — |
+| 4 | **067 — UPDATE/DELETE staged JOIN** (spec.md drafted) | the match-key ladder (PK → unique index → all-columns NULL-safe) retires rowid as a REQUIREMENT — keyless tables update correctly (value-match ≡ predicate-match for deterministic statements); delivery via 066 D5 (##stage, pipelined/incremental/single modes) | 062's seam, 1 | **#140 fully** |
 | 5 | **MERGE phase 1** | `PlanMergeInto` composition over existing sinks; upsert unlock | 2 (cleaner sinks) | MERGE + ON CONFLICT |
 | 6 | **MERGE pushdown** | same-catalog source → one T-SQL MERGE; staged source via seam; clause folding; 8672/HOLDLOCK contract | 1, 4, 5 | — |
 | 7 | **061 + JOIN/agg** | ORDER BY safe-pushdown; then the reduction ladder (see join-agg-pushdown.md) | — | — |
