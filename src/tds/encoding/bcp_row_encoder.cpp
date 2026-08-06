@@ -5,6 +5,7 @@
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/write_column_ops.hpp"
+#include "mssql_counters.hpp"
 
 #include "tds/tds_types.hpp"
 
@@ -130,6 +131,32 @@ void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
 	}
 }
 
+// The wire form of NULL depends on the column's LENGTH KIND, not on anything
+// per value: PLP eight 0xFF, USHORT-length FF FF, byte-length one 0x00. The
+// columnar NullOnly arm wrote the byte-length form for every kind — wrong for
+// an absent nvarchar/varbinary column, and hidden until spec 064's all-NULL
+// pass made string-typed NullOnly columns routine (before that, a chunk with
+// such a column usually had a real variable column too and went row-major,
+// where EncodeNullOfKind above did it right).
+inline uint32_t NullMarkerSize(NullWireKind kind) {
+	return kind == NullWireKind::Plp ? 8 : (kind == NullWireKind::VariableUShort ? 2 : 1);
+}
+
+inline void WriteNullMarker(uint8_t *out, NullWireKind kind) {
+	switch (kind) {
+	case NullWireKind::Plp:
+		std::memset(out, 0xFF, 8);
+		return;
+	case NullWireKind::VariableUShort:
+		out[0] = 0xFF;
+		out[1] = 0xFF;
+		return;
+	case NullWireKind::Fixed:
+		out[0] = 0x00;
+		return;
+	}
+}
+
 // Build the hoisted per-column state. `format_count` is the row count the
 // UnifiedVectorFormat is computed for (chunk size for EncodeChunk; row+1 for
 // the per-row EncodeRow compatibility path).
@@ -149,6 +176,25 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 		}
 		state.vec = &chunk.data[source_idx];
 		state.vec->ToUnifiedFormat(format_count, state.fmt);
+		if (col.null_only_source) {
+			// Bind admitted this pair for the all-NULL case only (a constant
+			// NULL source arrives typed, indistinguishable from data there).
+			// Entirely NULL → the missing-column NullOnly machinery writes the
+			// markers on every path; a value is the type-mismatch error, raised
+			// here before any of this chunk is encoded. Cost: nothing for
+			// unmarked columns, a mask walk for marked ones.
+			for (idx_t r = 0; r < format_count; r++) {
+				if (state.fmt.validity.RowIsValid(state.fmt.sel->get_index(r))) {
+					throw InvalidInputException(
+						"MSSQL COPY: Column '%s' type mismatch: the target column cannot take %s values — "
+						"only an entirely-NULL source column is accepted for this pair. "
+						"Use an explicit cast, or REPLACE=true to recreate the table.",
+						col.name, chunk.data[source_idx].GetType().ToString());
+				}
+			}
+			state.vec = nullptr;
+			continue;
+		}
 		state.encode = ResolveEncoder(col);
 	}
 }
@@ -477,7 +523,7 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 		switch (ops[c].arm) {
 		case mssql::codec::ScatterArm::NullOnly:
 			for (idx_t r = 0; r < rows; r++) {
-				bdst[r * stride + col_off] = 0x00;
+				WriteNullMarker(bdst + r * stride + col_off, st.null_kind);
 			}
 			break;
 		case mssql::codec::ScatterArm::Decimal:
@@ -560,15 +606,15 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 							   const vector<mssql::codec::string::StringColumnPlan> &plans) {
 	for (idx_t c = 0; c < ncols; c++) {
 		auto &st = states[c];
-		const uint32_t w = widths[c];
 		if (ops[c].IsVariable()) {
 			mssql::codec::string::ScatterVarBlock(dst, cursor, r0, rend, st.fmt, columns[c], plans[c]);
 			continue;
 		}
 		if (!st.vec) {
+			const uint32_t marker = 1 + widths[c];
 			for (idx_t r = r0; r < rend; r++) {
-				dst[cursor[r]] = 0x00;
-				cursor[r] += 1;
+				WriteNullMarker(dst + cursor[r], st.null_kind);
+				cursor[r] += marker;
 			}
 			continue;
 		}
@@ -595,29 +641,25 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 		case mssql::codec::ScatterArm::FloatConvert:
 			CursorConvFloat(dst, cursor, r0, rend, st.fmt, ops[c]);
 			break;
-		case mssql::codec::ScatterArm::Decimal:
 		case mssql::codec::ScatterArm::Guid:
-		case mssql::codec::ScatterArm::Datetime: {
-			const auto arm = ops[c].arm;
-			for (idx_t r = r0; r < rend; r++) {
-				uint8_t *out = dst + cursor[r];
-				const idx_t idx = st.fmt.sel->get_index(r);
-				if (!col_all_valid && !st.fmt.validity.RowIsValid(idx)) {
-					*out = 0x00;
-					cursor[r] += 1;
-					continue;
-				}
-				if (arm == mssql::codec::ScatterArm::Decimal) {
-					mssql::codec::decimal::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
-				} else if (arm == mssql::codec::ScatterArm::Guid) {
-					mssql::codec::uuid::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
-				} else {
-					mssql::codec::datetime::ScatterChunkStrided(out, 0, r, 1, *st.vec, st.fmt, columns[c]);
-				}
-				cursor[r] += 1 + w;
-			}
+			// One call per COLUMN (spec 064 D1). These three used to loop here and
+			// call the strided kernel with `rows = 1` per value — 2048 un-inlinable
+			// calls across a TU boundary, for no reason in the data: the widths are
+			// fixed and the offsets were already in `cursor`. The signature was the
+			// whole reason. The kernels now take the cursor themselves and handle
+			// NULLs, because on this path a NULL is what makes rows differ in
+			// length.
+			mssql::codec::uuid::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
+												   col_all_valid);
 			break;
-		}
+		case mssql::codec::ScatterArm::Decimal:
+			mssql::codec::decimal::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
+													  col_all_valid);
+			break;
+		case mssql::codec::ScatterArm::Datetime:
+			mssql::codec::datetime::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
+													   col_all_valid);
+			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable cursor arm");
 		}
@@ -645,14 +687,25 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		// A missing source column is NULL every row: no payload, so it scatters
 		// for free. Everything else answers to ResolveWriteColumnOps, which is
 		// the single place that decides what this path can do.
+		//
+		// widths[c] holds MARKER SIZE − 1, so the uniform `1 + widths[c]`
+		// arithmetic (stride, col_off, cursor base) sizes the marker without a
+		// NullOnly special case anywhere downstream.
 		if (!states[c].vec) {
 			ops[c].arm = mssql::codec::ScatterArm::NullOnly;
-			widths[c] = 0;
-			stride += 1;
+			widths[c] = NullMarkerSize(states[c].null_kind) - 1;
+			stride += 1 + widths[c];
 			continue;
 		}
 		ops[c] = mssql::codec::ResolveWriteColumnOps(states[c].vec->GetType(), columns[c]);
 		if (!ops[c].CanScatter()) {
+			if (mssql::CountersEnabled()) {
+				auto &pc = mssql::GetEncodePathCounters();
+				pc.chunks_row_major.fetch_add(1, std::memory_order_relaxed);
+				pc.fallback_unsupported_pair.fetch_add(1, std::memory_order_relaxed);
+				pc.last_fallback_column.store(c, std::memory_order_relaxed);
+				pc.last_fallback_arm.store(static_cast<uint64_t>(ops[c].arm), std::memory_order_relaxed);
+			}
 			return false;
 		}
 		if (ops[c].IsVariable()) {
@@ -662,6 +715,17 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			// unhandled wire form) drops the whole chunk to the row path, which
 			// reproduces the legacy bytes exactly.
 			if (!mssql::codec::string::PlanColumn(*states[c].vec, states[c].fmt, 0, row_count, columns[c], plans[c])) {
+				if (mssql::CountersEnabled()) {
+					auto &pc = mssql::GetEncodePathCounters();
+					pc.chunks_row_major.fetch_add(1, std::memory_order_relaxed);
+					pc.fallback_string_plan.fetch_add(1, std::memory_order_relaxed);
+					pc.last_fallback_column.store(c, std::memory_order_relaxed);
+					// Without this store the "(last: column X, arm Y)" print pairs
+					// this column with whatever arm an EARLIER unsupported-pair
+					// event left behind — misattributing the culprit in exactly
+					// the reconnaissance these counters were built for.
+					pc.last_fallback_arm.store(static_cast<uint64_t>(ops[c].arm), std::memory_order_relaxed);
+				}
 				return false;
 			}
 			has_variable = true;
@@ -723,10 +787,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 				continue;
 			}
 			if (!st.vec) {
-				// Absent column: NULL on every row, so its payload never appears.
-				for (idx_t r = 0; r < row_count; r++) {
-					row_at[r] -= widths[c];
-				}
+				// Absent column: the NULL marker (1 + widths[c] bytes, see the
+				// NullOnly branch above) appears on EVERY row and is already in
+				// base_row. Nothing varies, nothing to subtract.
 				continue;
 			}
 			if (st.fmt.validity.AllValid()) {
@@ -760,6 +823,14 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 	// One variable-width column makes every row a different length, so the
 	// constant-stride path is unavailable for EVERY column in the chunk — NULLs
 	// or not.
+	if (mssql::CountersEnabled()) {
+		auto &pc = mssql::GetEncodePathCounters();
+		if (all_valid && !has_variable) {
+			pc.chunks_strided.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			pc.chunks_cursor.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	if (all_valid && !has_variable) {
 		// Rows in BLOCKS; within a block, walk the columns. A full per-column pass
 		// over a wide row touches a distinct cache line per store and then walks

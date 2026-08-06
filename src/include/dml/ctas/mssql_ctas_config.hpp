@@ -18,11 +18,26 @@ constexpr bool MSSQL_DEFAULT_CTAS_DROP_ON_FAILURE = false;
 constexpr const char *MSSQL_DEFAULT_CTAS_TEXT_TYPE = "NVARCHAR";
 
 // Collation given to a VARCHAR target when the server granted UTF8SUPPORT.
-// CI_AS rather than BIN2: this collation is stored in the schema and governs
-// every comparison against the column afterwards, so it has to match what a
-// user gets from the usual database defaults, not silently make the column
-// case- and accent-sensitive.
-constexpr const char *MSSQL_DEFAULT_UTF8_COLLATION = "Latin1_General_100_CI_AS_SC_UTF8";
+//
+// BIN2, matching what Microsoft Fabric Warehouse uses as ITS default. A binary
+// collation compares byte by byte: no linguistic rules, no case- or
+// accent-folding, and no locale table to consult — which is both the fastest
+// answer for comparison and sort, and the one a data-loading target most often
+// wants.
+//
+// The cost is stated rather than hidden: BIN2 IS case- and accent-sensitive, so
+// `WHERE name = 'abc'` stops matching 'ABC' on a column created this way, where
+// a CI_AS collation would have matched. That is a real behaviour difference from
+// the usual database defaults, and it is why this is a DEFAULT and not a rule —
+// a column that needs different semantics states them per column:
+//
+//     x::MSSQL_VARCHAR(40, 'Latin1_General_100_CI_AS_SC_UTF8')
+//
+// and `mssql_utf8_collation` moves it globally. Neither is consulted when the
+// database's own collation is already UTF-8: there the column INHERITS, which is
+// the Fabric path and is conflict-free by construction (see
+// MSSQLCatalog::ResolveVarcharCollation).
+constexpr const char *MSSQL_DEFAULT_UTF8_COLLATION = "Latin1_General_100_BIN2_UTF8";
 
 // Text type policy for CTAS DDL generation
 enum class CTASTextType { NVARCHAR, VARCHAR };

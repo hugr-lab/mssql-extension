@@ -65,6 +65,12 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
 						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col);
 
+//! The same scatter positioned by a per-row CURSOR — one call per column on the
+//! layout a chunk takes when any column is variable-width or carries a NULL.
+//! Handles NULLs itself (0x00 length byte, 1-byte advance). Spec 064 D1.
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector &in,
+						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col, bool all_valid);
+
 //! Write the PAYLOAD (no length prefix) at a pointer. Spec 057 step 3: the
 //! appending overload below is derived from this, so the row path and the
 //! columnar scatter share one implementation.

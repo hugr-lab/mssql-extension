@@ -26,6 +26,8 @@
 
 #include "codec/uuid_codec.hpp"
 
+#include "codec/scatter_position.hpp"
+
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -114,24 +116,57 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 // One call per COLUMN — see decimal's peer and the read path's
 // DecodeChunkFromStaging. The shuffle is inlined here rather than called across
 // a translation-unit boundary per value.
-void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector & /*in*/,
-						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/) {
+// One implementation, two positionings (spec 064 D1). POS is StridePos or
+// CursorPos; both are empty-ish structs whose members inline, so the strided
+// instantiation compiles to what it always did.
+//
+// HAS_NULLS is a template parameter rather than a runtime flag so the all-valid
+// instantiation — every strided caller, and a NULL-free column inside a cursor
+// chunk — carries no validity test in the loop at all.
+template <class POS, bool HAS_SEL, bool HAS_NULLS>
+static inline void ScatterImpl(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
 	const hugeint_t *src = reinterpret_cast<const hugeint_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
-	// Selection presence hoisted out of the loop — see decimal's peer.
-	if (sel->IsSet()) {
-		for (idx_t r = 0; r < rows; r++) {
-			uint8_t *out = dst + r * stride;
-			*out = GUID_LENGTH_PREFIX;
-			EncodeHugeIntToWire(src[sel->get_index_unsafe(row_begin + r)], out + 1);
+	for (idx_t r = 0; r < rows; r++) {
+		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		uint8_t *out = pos.At(r);
+		if (HAS_NULLS && !fmt.validity.RowIsValid(idx)) {
+			// A NULL is a zero length byte and no payload — so the row is SHORTER
+			// by the width, which is the whole reason a NULL-bearing chunk cannot
+			// use a constant stride.
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
 		}
-	} else {
-		for (idx_t r = 0; r < rows; r++) {
-			uint8_t *out = dst + r * stride;
-			*out = GUID_LENGTH_PREFIX;
-			EncodeHugeIntToWire(src[row_begin + r], out + 1);
-		}
+		*out = GUID_LENGTH_PREFIX;
+		EncodeHugeIntToWire(src[idx], out + 1);
+		pos.Advance(r, 1 + GUID_LENGTH_PREFIX);
 	}
+}
+
+template <class POS>
+static inline void ScatterDispatch(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+								   bool all_valid) {
+	const bool has_sel = fmt.sel->IsSet();
+	// Selection presence and validity hoisted out of the loop — see decimal's peer.
+	if (all_valid) {
+		has_sel ? ScatterImpl<POS, true, false>(pos, row_begin, rows, fmt)
+				: ScatterImpl<POS, false, false>(pos, row_begin, rows, fmt);
+	} else {
+		has_sel ? ScatterImpl<POS, true, true>(pos, row_begin, rows, fmt)
+				: ScatterImpl<POS, false, true>(pos, row_begin, rows, fmt);
+	}
+}
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector & /*in*/,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/) {
+	// Strided implies all-valid: a NULL would have made the rows differ in length.
+	ScatterDispatch(StridePos{dst, stride}, row_begin, rows, fmt, /*all_valid=*/true);
+}
+
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector & /*in*/,
+						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata & /*col*/, bool all_valid) {
+	ScatterDispatch(CursorPos{dst, cursor, row_begin}, row_begin, rows, fmt, all_valid);
 }
 
 // Write the 16 wire bytes at a pointer — the one implementation, from which the

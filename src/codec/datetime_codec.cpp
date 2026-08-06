@@ -52,6 +52,8 @@
 
 #include "codec/datetime_codec.hpp"
 
+#include "codec/scatter_position.hpp"
+
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
@@ -260,14 +262,19 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 
 namespace {
 
-template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
-void ScatterDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-				int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL, class POS>
+void ScatterDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, int64_t per_day,
+				int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
 	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (!all_valid && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
 		const int64_t raw = src[idx];
 		int64_t days;
 		int64_t sub;
@@ -299,32 +306,38 @@ void ScatterDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const 
 		std::memcpy(out + 1, &time_value, TIME_BYTES);
 		// Three bytes, not four: a uint32 memcpy would clobber the next column.
 		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
+		pos.Advance(r, 1 + static_cast<size_t>(total_size));
 	}
 }
 
-template <bool UPSCALE, int TIME_BYTES>
-void ScatterDt2Sel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+template <bool UPSCALE, int TIME_BYTES, class POS>
+void ScatterDt2Sel(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
 				   int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
 	if (fmt.sel->IsSet()) {
-		ScatterDt2<UPSCALE, TIME_BYTES, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
-											  total_size);
+		ScatterDt2<UPSCALE, TIME_BYTES, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
+											  per_day_target, total_size);
 	} else {
-		ScatterDt2<UPSCALE, TIME_BYTES, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
-											   total_size);
+		ScatterDt2<UPSCALE, TIME_BYTES, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
+											   per_day_target, total_size);
 	}
 }
 
 // TIME(scale): the scaled tick count since midnight, no date field. DuckDB's
 // dtime_t is microseconds, so the same factor/half/direction logic applies —
 // TIME simply stops after the time field.
-template <int TIME_BYTES, bool UPSCALE, bool HAS_SEL>
-void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-				 int64_t factor, int64_t half, int64_t per_day) {
+template <int TIME_BYTES, bool UPSCALE, bool HAS_SEL, class POS>
+void ScatterTime(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, int64_t factor,
+				 int64_t half, int64_t per_day) {
 	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (!all_valid && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
 		const int64_t micros = src[idx];
 		uint64_t ticks =
 			UPSCALE ? static_cast<uint64_t>(micros * factor) : static_cast<uint64_t>((micros + half) / factor);
@@ -339,6 +352,7 @@ void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const
 		}
 		out[0] = TIME_BYTES;
 		std::memcpy(out + 1, &ticks, TIME_BYTES);
+		pos.Advance(r, 1 + TIME_BYTES);
 	}
 }
 
@@ -350,14 +364,19 @@ void ScatterTime(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const
 // Fabric Warehouse has no datetimeoffset type at all, so this arm simply never
 // resolves against such a target. That is a property of the catalog rather than
 // something to special-case here.
-template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL>
-void ScatterDtOffset(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
+template <bool UPSCALE, int TIME_BYTES, bool HAS_SEL, class POS>
+void ScatterDtOffset(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
 					 int64_t per_day, int64_t factor, int64_t half, int64_t per_day_target, uint8_t total_size) {
 	const int64_t *src = reinterpret_cast<const int64_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (!all_valid && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
 		const int64_t raw = src[idx];
 		int64_t days;
 		int64_t sub;
@@ -385,19 +404,26 @@ void ScatterDtOffset(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, c
 		std::memcpy(out + 1 + TIME_BYTES, &date_value, 3);
 		out[1 + TIME_BYTES + 3] = 0;
 		out[1 + TIME_BYTES + 4] = 0;
+		pos.Advance(r, 1 + static_cast<size_t>(total_size));
 	}
 }
 
-template <bool HAS_SEL>
-void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+template <bool HAS_SEL, class POS>
+void ScatterDate(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
 	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (!all_valid && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
 		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
 		out[0] = 3;
 		std::memcpy(out + 1, &days, 3);
+		pos.Advance(r, 4);
 	}
 }
 
@@ -411,29 +437,36 @@ void ScatterDate(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const
 // than the row path because ONE unresolvable column drops the whole chunk off the
 // columnar path, so a single `date -> datetime2` column would have deoptimised
 // every other column in the table.
-template <int TIMESIZE, bool HAS_SEL>
-void ScatterDateAsDt2(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
+template <int TIMESIZE, bool HAS_SEL, class POS>
+void ScatterDateAsDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt) {
 	const int32_t *src = reinterpret_cast<const int32_t *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (!all_valid && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
 		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
 		out[0] = TIMESIZE + 3;
 		std::memset(out + 1, 0, TIMESIZE);
 		std::memcpy(out + 1 + TIMESIZE, &days, 3);
+		pos.Advance(r, 1 + TIMESIZE + 3);
 	}
 }
 
 }  // namespace
 
-void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
-						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+template <class POS>
+static void ScatterChunkPos(POS pos, bool all_valid, idx_t row_begin, idx_t rows, Vector &in,
+							const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
 	if (col.duckdb_type.id() == LogicalTypeId::DATE) {
 		if (fmt.sel->IsSet()) {
-			ScatterDate<true>(dst, stride, row_begin, rows, fmt);
+			ScatterDate<true>(pos, all_valid, row_begin, rows, fmt);
 		} else {
-			ScatterDate<false>(dst, stride, row_begin, rows, fmt);
+			ScatterDate<false>(pos, all_valid, row_begin, rows, fmt);
 		}
 		return;
 	}
@@ -449,33 +482,33 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		const bool has_sel = fmt.sel->IsSet();
 		if (tb == 3) {
 			if (up && has_sel) {
-				ScatterTime<3, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<3, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<3, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<3, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<3, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<3, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<3, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<3, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			}
 		} else if (tb == 4) {
 			if (up && has_sel) {
-				ScatterTime<4, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<4, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<4, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<4, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<4, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<4, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<4, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<4, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			}
 		} else {
 			if (up && has_sel) {
-				ScatterTime<5, true, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<5, true, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (up) {
-				ScatterTime<5, true, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<5, true, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else if (has_sel) {
-				ScatterTime<5, false, true>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<5, false, true>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			} else {
-				ScatterTime<5, false, false>(dst, stride, row_begin, rows, fmt, f, h, per_day);
+				ScatterTime<5, false, false>(pos, all_valid, row_begin, rows, fmt, f, h, per_day);
 			}
 		}
 		return;
@@ -487,14 +520,14 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		const uint8_t tsz = tds::encoding::BCPRowEncoder::GetTimeByteSize(col.scale);
 		const bool sel_set = fmt.sel->IsSet();
 		if (tsz == 3) {
-			sel_set ? ScatterDateAsDt2<3, true>(dst, stride, row_begin, rows, fmt)
-					: ScatterDateAsDt2<3, false>(dst, stride, row_begin, rows, fmt);
+			sel_set ? ScatterDateAsDt2<3, true>(pos, all_valid, row_begin, rows, fmt)
+					: ScatterDateAsDt2<3, false>(pos, all_valid, row_begin, rows, fmt);
 		} else if (tsz == 4) {
-			sel_set ? ScatterDateAsDt2<4, true>(dst, stride, row_begin, rows, fmt)
-					: ScatterDateAsDt2<4, false>(dst, stride, row_begin, rows, fmt);
+			sel_set ? ScatterDateAsDt2<4, true>(pos, all_valid, row_begin, rows, fmt)
+					: ScatterDateAsDt2<4, false>(pos, all_valid, row_begin, rows, fmt);
 		} else {
-			sel_set ? ScatterDateAsDt2<5, true>(dst, stride, row_begin, rows, fmt)
-					: ScatterDateAsDt2<5, false>(dst, stride, row_begin, rows, fmt);
+			sel_set ? ScatterDateAsDt2<5, true>(pos, all_valid, row_begin, rows, fmt)
+					: ScatterDateAsDt2<5, false>(pos, all_valid, row_begin, rows, fmt);
 		}
 		return;
 	}
@@ -514,44 +547,44 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		const bool has_sel = fmt.sel->IsSet();
 		if (time_size == 3) {
 			if (upscale && has_sel) {
-				ScatterDtOffset<true, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
-											   dto_total);
+				ScatterDtOffset<true, 3, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
+											   per_day_target, dto_total);
 			} else if (upscale) {
-				ScatterDtOffset<true, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<true, 3, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else if (has_sel) {
-				ScatterDtOffset<false, 3, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 3, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else {
-				ScatterDtOffset<false, 3, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 3, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												 per_day_target, dto_total);
 			}
 		} else if (time_size == 4) {
 			if (upscale && has_sel) {
-				ScatterDtOffset<true, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
-											   dto_total);
+				ScatterDtOffset<true, 4, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
+											   per_day_target, dto_total);
 			} else if (upscale) {
-				ScatterDtOffset<true, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<true, 4, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else if (has_sel) {
-				ScatterDtOffset<false, 4, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 4, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else {
-				ScatterDtOffset<false, 4, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 4, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												 per_day_target, dto_total);
 			}
 		} else {
 			if (upscale && has_sel) {
-				ScatterDtOffset<true, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target,
-											   dto_total);
+				ScatterDtOffset<true, 5, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
+											   per_day_target, dto_total);
 			} else if (upscale) {
-				ScatterDtOffset<true, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<true, 5, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else if (has_sel) {
-				ScatterDtOffset<false, 5, true>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 5, true>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												per_day_target, dto_total);
 			} else {
-				ScatterDtOffset<false, 5, false>(dst, stride, row_begin, rows, fmt, per_day, factor, half,
+				ScatterDtOffset<false, 5, false>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half,
 												 per_day_target, dto_total);
 			}
 		}
@@ -559,7 +592,7 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 	}
 
 #define MSSQL_DT2_ARM(up, tb) \
-	ScatterDt2Sel<up, tb>(dst, stride, row_begin, rows, fmt, per_day, factor, half, per_day_target, total)
+	ScatterDt2Sel<up, tb>(pos, all_valid, row_begin, rows, fmt, per_day, factor, half, per_day_target, total)
 	if (upscale) {
 		switch (time_size) {
 		case 3:
@@ -585,6 +618,17 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 		return;
 	}
 #undef MSSQL_DT2_ARM
+}
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+	// Strided implies all-valid: a NULL would have made the rows differ in length.
+	ScatterChunkPos(StridePos{dst, stride}, /*all_valid=*/true, row_begin, rows, in, fmt, col);
+}
+
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector &in,
+						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col, bool all_valid) {
+	ScatterChunkPos(CursorPos{dst, cursor, row_begin}, all_valid, row_begin, rows, in, fmt, col);
 }
 
 //===----------------------------------------------------------------------===//

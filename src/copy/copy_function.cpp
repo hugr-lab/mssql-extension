@@ -395,6 +395,18 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 
+				// Columns whose pair bind admitted for the all-NULL case only
+				// (constant `NULL AS col` sources — see BCPCopyConfig): mark the
+				// target metadata so PrepareColumnStates verifies the mask per
+				// chunk and routes them through the NullOnly path.
+				for (const auto &nn : bdata.config.null_only_columns) {
+					for (auto &col : gstate->columns) {
+						if (StringUtil::Lower(col.name) == nn) {
+							col.null_only_source = true;
+						}
+					}
+				}
+
 				// Build column mapping from source to target
 				gstate->column_mapping = TargetResolver::BuildColumnMapping(bdata.source_names, gstate->columns);
 
@@ -899,6 +911,28 @@ static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
 			const double v = r * static_cast<double>(cols);
 			fprintf(stderr, "[MSSQL COUNTERS]   ns/value: sink=%.2f encode=%.2f other=%.2f\n", sink_ns / v,
 					encode_ns / v, other_ns / v);
+		}
+	}
+	// Encode-path attribution (spec 064). The three shapes are picked PER CHUNK
+	// and nothing used to report which, so "did this table reach the fast path?"
+	// could not be answered from outside the process.
+	{
+		auto &pc = mssql::GetEncodePathCounters();
+		const uint64_t st = pc.chunks_strided.load(std::memory_order_relaxed);
+		const uint64_t cu = pc.chunks_cursor.load(std::memory_order_relaxed);
+		const uint64_t rm = pc.chunks_row_major.load(std::memory_order_relaxed);
+		if (st + cu + rm > 0) {
+			fprintf(stderr, "[MSSQL COUNTERS]   encode path (chunks): strided=%llu cursor=%llu row_major=%llu\n",
+					(unsigned long long)st, (unsigned long long)cu, (unsigned long long)rm);
+			if (rm > 0) {
+				fprintf(stderr,
+						"[MSSQL COUNTERS]   row-major cause: unsupported_pair=%llu string_plan=%llu "
+						"(last: column %llu, arm %llu)\n",
+						(unsigned long long)pc.fallback_unsupported_pair.load(std::memory_order_relaxed),
+						(unsigned long long)pc.fallback_string_plan.load(std::memory_order_relaxed),
+						(unsigned long long)pc.last_fallback_column.load(std::memory_order_relaxed),
+						(unsigned long long)pc.last_fallback_arm.load(std::memory_order_relaxed));
+			}
 		}
 	}
 }

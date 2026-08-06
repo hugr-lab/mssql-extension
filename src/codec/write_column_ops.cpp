@@ -103,12 +103,16 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 
 	// Fixed-width families that need a transformation rather than a copy. Each is
 	// still one width per column, so the stride model holds; only the arm differs.
-	if (target.duckdb_type.id() == LogicalTypeId::DECIMAL) {
-		// WidenVectorToHugeint accepts exactly these; anything else would read the
-		// wrong width out of the vector.
+	if (target.duckdb_type.id() == LogicalTypeId::DECIMAL || target.duckdb_type.id() == LogicalTypeId::UBIGINT ||
+		target.duckdb_type.id() == LogicalTypeId::HUGEINT) {
+		// UBIGINT and HUGEINT belong here because they TRAVEL as DECIMAL —
+		// generated metadata keeps the source's duckdb_type (precision 20/38 set
+		// beside it), and gating on DECIMAL alone sent both whole-table row-major
+		// (spec 064 D4). The kernel takes UINT64 via an explicit widening; a
+		// uint64's maximum is below 10^20-1, so the range check never fires.
 		const PhysicalType src = source.InternalType();
 		const bool src_ok = src == PhysicalType::INT16 || src == PhysicalType::INT32 || src == PhysicalType::INT64 ||
-							src == PhysicalType::INT128;
+							src == PhysicalType::INT128 || src == PhysicalType::UINT64;
 		const uint32_t width = tds::encoding::BCPRowEncoder::GetDecimalByteSize(target.precision);
 		if (src_ok && target.max_length == width) {
 			ops.arm = ScatterArm::Decimal;
