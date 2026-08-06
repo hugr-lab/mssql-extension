@@ -103,11 +103,29 @@ the server is the better buffer (maintainer question, 2026-08-06: "if there
 are millions of rows — fill a temp table in batches and mutate once?" —
 yes, and it falls out of the connection rules):
 
+The vehicle splits by OPERATION CLASS (maintainer boundary, 2026-08-06):
+what a mutation stages is AUXILIARY data (rowids + SET values) and the
+mutation itself only exists as a statement — staging is inherent; what a
+load ships IS the payload, and `INSERT BULK` lands it in the target
+directly — routing it through a stage would push the full volume through
+the server TWICE. Client-side spill is cheaper than a server-side double
+write.
+
+**Load class — INSERT (spec 062) / COPY / CTAS: always direct `INSERT BULK`
+into the target.** When the gate demands materialization (transaction +
+same catalog, or self-reference), the source drains into a client
+`ColumnDataCollection` (spillable via DuckDB's buffer manager), then the
+bulk load runs single-pass into the target — on the pinned connection in a
+transaction (INSERT/COPY; CTAS stays on pool connections as today), on pool
+connections otherwise.
+
+**Mutation class — UPDATE / DELETE (and the MERGE source later): staged.**
+
 | case | vehicle | client memory | final mutation |
 |---|---|---|---|
-| autocommit, self-reference | **stream scan (conn A) → BCP into `#stage` (conn B)** — no client accumulation; reading `t` and writing `#stage` cannot conflict, so Halloween is excluded constructively | O(chunk) | ONE `INSERT INTO t SELECT FROM #stage` (or `UPDATE/DELETE ... JOIN #stage`) |
-| explicit transaction (same catalog) | **stream scan (pinned A) → BCP into `##stage_<uuid>` (pool conn B)** — the no-second-connection rule bound TARGET rows (they would not roll back); a GLOBAL temp is scratch, its rows never need to roll back, and it is visible to the pinned connection for the final statement (maintainer insight, 2026-08-06). UUID name solves the global-namespace collisions; B is held until the mutation completes; reset-on-release is the error-path safety net (creator session ends → `##` evaporates). Fallback to client CDC when the pool cannot grant a second connection, below the small-result threshold, or via an opt-out (a `##` table is briefly server-visible to any session — the one real cost) | O(chunk) | ONE statement on the pinned connection, inside the transaction: `INSERT INTO t SELECT FROM ##stage` / `UPDATE/DELETE ... JOIN ##stage`, then DROP + release B |
-| small results (either mode) | CDC — below a threshold the stage round-trip is not worth it (the spec-062 D1 decision-function shape) | small | direct statement / VALUES join as today |
+| autocommit | stream the rowid scan (conn A) → BCP into `##stage_<uuid>` (conn B) | O(chunk) | `UPDATE/DELETE ... JOIN ##stage`, per the application modes below |
+| explicit transaction | stream scan (pinned A) → BCP into `##stage_<uuid>` (pool conn B) — the no-second-connection rule bound TARGET rows; a global temp is scratch, its rows never roll back, and it IS visible to the pinned connection. UUID answers namespace collisions; B held until the mutation completes; reset-on-release is the error-path cleanup. Fallback to client CDC when the pool cannot grant B, below the small-result threshold, or via opt-out (a `##` table is briefly server-visible to any session) | O(chunk) | ONE (or batched) statement on pinned A, inside the transaction, then DROP + release B |
+| small results (either mode) | client CDC / today's VALUES join — below a threshold the stage round-trip is not worth it (the spec-062 D1 decision-function shape) | small | VALUES join as today |
 
 **Application modes** (maintainer refinement, 2026-08-06): the stage can be
 applied two ways, and BOTH exist:
