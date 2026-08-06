@@ -96,6 +96,35 @@ memory the UPDATE/DELETE defer path already spends today, now in a
 instead of `vector<vector<Value>>`. Document the equivalence; no new limit
 setting in v1 (the collection spills; the Value buffers never did).
 
+### D5 — the materialization VEHICLE: client collection vs server #stage
+
+Where the drained rows LIVE depends on what is legal, and for large results
+the server is the better buffer (maintainer question, 2026-08-06: "if there
+are millions of rows — fill a temp table in batches and mutate once?" —
+yes, and it falls out of the connection rules):
+
+| case | vehicle | client memory | final mutation |
+|---|---|---|---|
+| autocommit, self-reference | **stream scan (conn A) → BCP into `#stage` (conn B)** — no client accumulation; reading `t` and writing `#stage` cannot conflict, so Halloween is excluded constructively | O(chunk) | ONE `INSERT INTO t SELECT FROM #stage` (or `UPDATE/DELETE ... JOIN #stage`) |
+| explicit transaction (same catalog) | client `ColumnDataCollection` — a second connection's rows would not roll back, and the pinned connection cannot stream + bulk-load at once, so the scan must drain first; the CDC spills via DuckDB's buffer manager | full result, spillable | INSERT: BCP straight into the target on the pinned connection (INSERT BULK *is* the one statement — no stage needed). UPDATE/DELETE: BCP into `#stage` on the pinned connection, then ONE `... JOIN #stage` |
+| small results (either mode) | CDC — below a threshold the stage round-trip is not worth it (the spec-062 D1 decision-function shape) | small | direct statement / VALUES join as today |
+
+Notes:
+- "Batches" come free: a `#stage` fill is ONE continuous `INSERT BULK`
+  stream whose server-visible batch boundaries are `mssql_copy_flush_rows`
+  (102 400) — dozens of DONE-delimited batches for millions of rows, not
+  thousands of statements.
+- The single-writer-on-a-GIVEN-connection seam (research.md §1.3) is the
+  prerequisite for every `#stage` cell above — one more consumer for it.
+- The final `UPDATE ... JOIN #stage` over millions of rows is one server
+  statement and one log transaction; if transaction-log pressure ever
+  demands chunked mutation, `TOP (N)`-loop batching of the JOIN is the
+  server-side lever — recorded as an open question, not v1.
+- v1 SCOPE of this spec stays the mechanism + CDC vehicle; the `#stage`
+  vehicle lands with the staging/062 specs that build the seam — but the
+  gate and the vehicle table are decided HERE so those specs implement
+  against a settled design.
+
 ## 3. Tasks
 
 - **T0** — probe `CopyFunction::plan`: minimal prototype that reproduces the
