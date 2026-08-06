@@ -436,6 +436,33 @@ jobs:
             echo "::endgroup::"
           done
 
+          # PR #245: dictionary/constant vectors through the BCP encoder,
+          # constructed explicitly. The SQL twin (vector_encodings_bcp.test)
+          # relies on the parquet reader / storage layer CHOOSING dictionary
+          # encoding and would keep passing if they stopped; this one cannot go
+          # vacuous. Needs Vector/DataChunk plus the encoder's full dependency
+          # cone (BCPColumnMetadata methods live in target_resolver.cpp, which
+          # pulls catalog/connection/TLS), so it links the just-built static
+          # archives exactly like `make test-cpp` does.
+          echo "::group::test_vector_encodings (dictionary/constant vectors -> BCP encoder)"
+          if [ "$(uname -s)" = "Darwin" ]; then
+            PLATLIBS="-framework GSS -framework CoreFoundation -framework Security"
+          else
+            PLATLIBS="-ldl -lrt"
+          fi
+          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include -I duckdb/src/include -I "$PREFIX/include" \
+            test/cpp/test_vector_encodings.cpp \
+            build/release/extension/mssql/libmssql_extension.a \
+            build/release/src/libduckdb_static.a \
+            $(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
+            build/release/src/libduckdb_static.a \
+            "$PREFIX/lib/libssl.a" "$PREFIX/lib/libcrypto.a" "$PREFIX/lib/libsimdutf.a" \
+            $PLATLIBS \
+            -o build/test/test_vector_encodings
+          ./build/test/test_vector_encodings
+          echo "::endgroup::"
+
           # spec 055: the staging structures. `make test-column-staging` existed
           # from the day they landed but nothing invoked it, so the whole staged
           # read path's unit test ran only on developer machines.
