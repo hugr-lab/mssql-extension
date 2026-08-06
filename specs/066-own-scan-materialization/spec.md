@@ -106,7 +106,7 @@ yes, and it falls out of the connection rules):
 | case | vehicle | client memory | final mutation |
 |---|---|---|---|
 | autocommit, self-reference | **stream scan (conn A) → BCP into `#stage` (conn B)** — no client accumulation; reading `t` and writing `#stage` cannot conflict, so Halloween is excluded constructively | O(chunk) | ONE `INSERT INTO t SELECT FROM #stage` (or `UPDATE/DELETE ... JOIN #stage`) |
-| explicit transaction (same catalog) | client `ColumnDataCollection` — a second connection's rows would not roll back, and the pinned connection cannot stream + bulk-load at once, so the scan must drain first; the CDC spills via DuckDB's buffer manager | full result, spillable | INSERT: BCP straight into the target on the pinned connection (INSERT BULK *is* the one statement — no stage needed). UPDATE/DELETE: BCP into `#stage` on the pinned connection, then ONE `... JOIN #stage` |
+| explicit transaction (same catalog) | **stream scan (pinned A) → BCP into `##stage_<uuid>` (pool conn B)** — the no-second-connection rule bound TARGET rows (they would not roll back); a GLOBAL temp is scratch, its rows never need to roll back, and it is visible to the pinned connection for the final statement (maintainer insight, 2026-08-06). UUID name solves the global-namespace collisions; B is held until the mutation completes; reset-on-release is the error-path safety net (creator session ends → `##` evaporates). Fallback to client CDC when the pool cannot grant a second connection, below the small-result threshold, or via an opt-out (a `##` table is briefly server-visible to any session — the one real cost) | O(chunk) | ONE statement on the pinned connection, inside the transaction: `INSERT INTO t SELECT FROM ##stage` / `UPDATE/DELETE ... JOIN ##stage`, then DROP + release B |
 | small results (either mode) | CDC — below a threshold the stage round-trip is not worth it (the spec-062 D1 decision-function shape) | small | direct statement / VALUES join as today |
 
 **Application modes** (maintainer refinement, 2026-08-06): the stage can be
@@ -135,7 +135,15 @@ Notes:
   continuous `INSERT BULK` stream whose server-visible batch boundaries are
   `mssql_copy_flush_rows` (102 400).
 - The single-writer-on-a-GIVEN-connection seam (research.md §1.3) is the
-  prerequisite for every `#stage` cell above — one more consumer for it.
+  prerequisite for every stage cell above — one more consumer for it.
+- With `##stage`, the DEFER MACHINERY RETIRES EVERYWHERE — the transaction
+  case streams too. Client CDC survives only as the fallback (pool
+  exhaustion / small results / opt-out), which flips D4's memory story:
+  bounded is the norm, spillable-full-result the exception.
+- The spec-063-era objection to `##` ("collides across concurrent merges
+  and is dropped by reset") was about `##` as a load TARGET; for scratch
+  staging the UUID name answers the first and the reset-drop is exactly the
+  wanted failure-mode cleanup.
 - The final `UPDATE ... JOIN #stage` over millions of rows is one server
   statement and one log transaction; if transaction-log pressure ever
   demands chunked mutation, `TOP (N)`-loop batching of the JOIN is the
