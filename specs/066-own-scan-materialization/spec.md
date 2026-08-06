@@ -45,14 +45,27 @@ we can gate it (see D2) so autocommit keeps streaming.
   `context_name` equals the sink's catalog, sets the flag. (Improvement over
   the reference, which flags every postgres scan regardless of catalog.)
 
-### D2 — the gate: only where the conflict is real
+### D2 — the gate: only where a conflict is real (two of them exist)
 
-The walk runs ONLY when the sink's `ClientContext` is inside an explicit
-transaction (`!IsAutoCommit() && IsInTransaction` — the same test the DML
-executors use today). Autocommit plans are untouched: source scans keep
-streaming on pool connections, zero new buffering. This answers the cost
-question issue #239 itself raises — postgres pays always, we pay only in
-transactions.
+A scan is flagged when EITHER holds:
+
+1. **Connection conflict**: the sink's `ClientContext` is inside an explicit
+   transaction (`!IsAutoCommit() && IsInTransaction` — the DML executors'
+   test) AND the scan's catalog is the sink's catalog. One pinned
+   connection cannot stream and take the sink's traffic at once.
+2. **Self-reference (Halloween)**: the scan reads the SAME TABLE the sink
+   writes — in ANY commit mode. In autocommit the scan streams on session A
+   while the sink mutates the table from session B; under READ COMMITTED
+   the streaming SELECT can observe the sink's own writes (re-read moved
+   rows, or feed an INSERT its own output). This is the hazard that makes
+   duckdb-postgres materialize unconditionally; we name it and gate on it
+   instead. It also covers today's autocommit UPDATE/DELETE mid-scan batch
+   flushing against the scanned table.
+
+Everything else in autocommit is untouched: source scans keep streaming on
+pool connections, zero new buffering. This answers the cost question issue
+#239 itself raises — postgres pays always, we pay only where one of the two
+conflicts is provable at plan time.
 
 ### D3 — call sites
 
@@ -98,8 +111,12 @@ setting in v1 (the collection spills; the Value buffers never did).
      else keeps the documented error;
   3. transaction UPDATE with `defer_execution_ = false` — works and
      round-trips (proves the retirement property for 065);
-  4. autocommit: counters/plan assert NO materialization happened
-     (the gate's bite test);
+  4. autocommit, DIFFERENT tables: counters/plan assert NO materialization
+     happened (gate bite test #1);
+  4a. autocommit, SELF-reference (`INSERT INTO t SELECT FROM t WHERE ...`):
+     materialization DOES happen, and the insert is not fed its own output
+     (row count exactly the pre-statement match count — the Halloween
+     test);
   5. rollback: materialized-source INSERT rolls back atomically;
   6. same-alias-different-catalog: two ATTACHes of one server — scan of
      alias A feeding a sink into alias B must NOT materialize (context_name
