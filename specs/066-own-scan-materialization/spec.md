@@ -1,0 +1,117 @@
+# Spec 066 — Materialize own-catalog scans before a sink (#239)
+
+**Status:** Draft (step 1 of the v0.3.0 order — promoted ahead of the DML
+rework, 2026-08-06)
+**Reference:** duckdb-postgres `MaterializePostgresScans`
+(`src/storage/postgres_insert.cpp:428-446`) + our recon
+(`specs/065-dml-pushdown-recon/research.md` §3.3)
+**Closes:** #239; also fixes the latent same-catalog
+`INSERT ... SELECT`-in-transaction collision found in the recon
+
+---
+
+## 1. The problem, precisely
+
+Inside an explicit transaction every statement runs on the ONE pinned
+connection, and that connection cannot stream a result set and take other
+traffic at once (spec 057). So any plan where a sink WRITES to the catalog
+while its source READS the same catalog collides:
+
+| shape | today |
+|---|---|
+| `INSERT INTO ms.t SELECT ... FROM ms.u` in a transaction | **latent collision** — INSERT has no defer guard (recon §2); the sink executes mid-scan on the connection the scan is streaming on |
+| `COPY (SELECT ... FROM ms.u) TO 'ms.dbo.t'` in a transaction | documented limitation (README): user must restructure |
+| `UPDATE/DELETE ms.t ... ` in a transaction | works, via the defer machinery: every row buffered as Values until Finalize — unbounded memory, code duplicated per executor |
+| Any of the above in AUTOCOMMIT | fine — the scan streams on its own pooled connection |
+
+duckdb-postgres solves this in the planner: before the sink starts, scans of
+its own catalog are drained into a `ColumnDataCollection`, so the connection
+is free by the time the sink needs it. It pays that price UNCONDITIONALLY;
+we can gate it (see D2) so autocommit keeps streaming.
+
+## 2. Decisions
+
+### D1 — the mechanism (mirrors the reference, adapted)
+
+- `MSSQLCatalogScanBindData` gains `requires_materialization` (+ the
+  serialize/deserialize fields — the common-subplan rule).
+- When set, `TableScanInitGlobal` drains the entire result into a
+  `ColumnDataCollection` before returning; execution serves chunks from the
+  collection and the scan's connection is released at drain end (reset per
+  the normal release path). `MaxThreads` returns 1 while materializing.
+- A plan-walk helper `MaterializeOwnScans(PhysicalOperator &root, const
+  string &catalog_name)` recurses `op.children`, and for every
+  `PhysicalTableScan` whose function is ours AND whose bind data's
+  `context_name` equals the sink's catalog, sets the flag. (Improvement over
+  the reference, which flags every postgres scan regardless of catalog.)
+
+### D2 — the gate: only where the conflict is real
+
+The walk runs ONLY when the sink's `ClientContext` is inside an explicit
+transaction (`!IsAutoCommit() && IsInTransaction` — the same test the DML
+executors use today). Autocommit plans are untouched: source scans keep
+streaming on pool connections, zero new buffering. This answers the cost
+question issue #239 itself raises — postgres pays always, we pay only in
+transactions.
+
+### D3 — call sites
+
+- `MSSQLCatalog::PlanInsert` — fixes the latent collision.
+- `MSSQLCatalog::PlanCreateTableAs` — CTAS reads transactionally on the
+  pinned connection while loading via pool; drained-first is also the shape
+  MERGE will need.
+- `MSSQLCatalog::PlanUpdate` / `PlanDelete` (4-arg, existing) — makes the
+  child's rowid stream drain before Sink ever runs, which is what lets the
+  DEFER MACHINERY RETIRE: with the scan guaranteed complete, the executors
+  can flush batches during Sink in transactions exactly as they do in
+  autocommit. Retiring the buffers themselves is left to spec 065/staging
+  (this spec only guarantees the property), EXCEPT the guard: `defer_execution_`
+  can flip to `false` once materialization is in — covered by a test here,
+  removed there.
+- **COPY**: `CopyFunction::plan` (`copy_to_plan_t`, bind-time whole-plan
+  hook — `duckdb/src/planner/binder/statement/bind_copy.cpp:90-92`) is the
+  only reach COPY gives us. Phase decision: implement it here if the hook's
+  cost (owning the COPY plan shape) proves small; otherwise document COPY as
+  the one remaining restructure case and finish it in a follow-up. The
+  investigation task T0 below decides.
+
+### D4 — memory honesty
+
+Materialization buffers the full source result client-side — the SAME
+memory the UPDATE/DELETE defer path already spends today, now in a
+`ColumnDataCollection` (columnar, spillable by DuckDB's own buffer manager)
+instead of `vector<vector<Value>>`. Document the equivalence; no new limit
+setting in v1 (the collection spills; the Value buffers never did).
+
+## 3. Tasks
+
+- **T0** — probe `CopyFunction::plan`: minimal prototype that reproduces the
+  default COPY plan + the walk; measure blast radius (what else the default
+  plan builder does that we would now own). Decides D3's COPY phase.
+- T1 — bind-data flag + drain in InitGlobal + serialize; unit-level test
+  with a large result (spill path exercised).
+- T2 — the walk + gate; wire into PlanInsert/PlanCTAS/PlanUpdate/PlanDelete.
+- T3 — tests:
+  1. transaction `INSERT INTO ms.t SELECT FROM ms.u` — works (today's
+     latent collision becomes the headline test);
+  2. transaction `COPY (SELECT FROM ms.u) TO ms.t` — works if T0 lands COPY,
+     else keeps the documented error;
+  3. transaction UPDATE with `defer_execution_ = false` — works and
+     round-trips (proves the retirement property for 065);
+  4. autocommit: counters/plan assert NO materialization happened
+     (the gate's bite test);
+  5. rollback: materialized-source INSERT rolls back atomically;
+  6. same-alias-different-catalog: two ATTACHes of one server — scan of
+     alias A feeding a sink into alias B must NOT materialize (context_name
+     inequality — the gate's second bite test).
+- T4 — README/docs: the "reading and writing the same catalog in one
+  transaction" limitation text updated (removed or narrowed to COPY per T0).
+
+## 4. Acceptance
+
+1. The three transaction shapes (INSERT-SELECT, UPDATE, CTAS source) run
+   green with sources in the same catalog; #239 closes.
+2. Autocommit plans show zero behavior/perf change (interleaved A/B on the
+   read bench — within noise).
+3. Full suite green; serialize/deserialize covered (common-subplan test
+   pattern from #211).

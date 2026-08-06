@@ -206,20 +206,21 @@ precedent and insertion point) — not scoped here.
 | # | Spec | Contents | Depends on | Closes |
 |---|------|----------|-----------|--------|
 | 0 | release v0.2.3 | version bump, release notes 054→064, final report R of the SIMD series | #241 merged | — |
-| 1 | **065 — direct UPDATE/DELETE** | 3-arg Plan hooks, fully-pushed predicate, SET translation (+CAST→CONVERT), childless executor, conditional #140 guard, token-loop consolidation, retire dead `mssql_dml_use_prepared` | nothing | **#140** |
-| 2 | **062 — INSERT via BCP** (existing draft) | + the shared held-connection bulk session (the seam from §1.3); its open D3 is already answered by 063's infrastructure | 063 (done) | — |
-| 3 | **066 — UPDATE/DELETE staging** | columnar buffering, stage lifecycle (unique names, explicit DROP), `UPDATE/DELETE ... JOIN #stage`, decision function vs VALUES join | 062's seam | — |
-| 4 | **067 — #239 materialization** | plan-walk + scan drain + `CopyFunction::plan` for COPY; catalog-scoped and transaction-gated | nothing (unlocks 5) | **#239** |
-| 5 | **068 — MERGE phase 1** | `PlanMergeInto` composition over existing sinks; upsert unlock | 1 (cleaner sinks) | MERGE + ON CONFLICT |
-| 6 | **069 — MERGE pushdown** | same-catalog source → one T-SQL MERGE; staged source via seam; clause folding; 8672/HOLDLOCK contract | 3, 4, 5 | — |
-| 7 | **061 + JOIN/agg recon** | ORDER BY safe-pushdown; then JOIN/aggregate investigation | — | — |
+| 1 | **066 — own-scan materialization** (#239) | plan-walk + scan drain + COPY coverage; catalog-scoped and transaction-gated. PROMOTED to first (2026-08-06, maintainer call): it fixes the latent same-catalog `INSERT ... SELECT`-in-transaction collision that exists TODAY, and it retires the defer-to-Finalize machinery every later DML spec would otherwise have to work around — doing DML first would touch that code twice | nothing | **#239** |
+| 2 | **065 — direct UPDATE/DELETE** (spec.md drafted) | 3-arg Plan hooks, fully-pushed predicate, SET translation, childless executor, conditional #140 guard, token-loop consolidation | simpler on top of 1 | **#140** |
+| 3 | **062 — INSERT via BCP** (existing draft) | + the shared held-connection bulk session (the seam from §1.3); its open D3 is already answered by 063's infrastructure | 063 (done) | — |
+| 4 | **UPDATE/DELETE staging** | columnar buffering, stage lifecycle (unique names, explicit DROP), `UPDATE/DELETE ... JOIN #stage`, decision function vs VALUES join | 062's seam, 1 | — |
+| 5 | **MERGE phase 1** | `PlanMergeInto` composition over existing sinks; upsert unlock | 2 (cleaner sinks) | MERGE + ON CONFLICT |
+| 6 | **MERGE pushdown** | same-catalog source → one T-SQL MERGE; staged source via seam; clause folding; 8672/HOLDLOCK contract | 1, 4, 5 | — |
+| 7 | **061 + JOIN/agg** | ORDER BY safe-pushdown; then the reduction ladder (see join-agg-pushdown.md) | — | — |
 
-Rationale for the order: (1) the direct path is standalone, fixes the
-loudest issue (#140), and delivers the most dramatic user-visible win
-(a filtered UPDATE of 1M rows today: scan 1M rowids + ship 1M value tuples;
-after: one statement). (2)+(3) share the seam — 062 builds it, 066 consumes
-it. (4) is planner-only, isolated, and gates (6). MERGE lands in two
-reviewable steps.
+Rationale for the order: (1) materialization first — it is planner-only,
+fixes a bug reachable today, and simplifies everything after it (the
+UPDATE/DELETE defer machinery and the staging spec's transaction shape both
+collapse once the source scan is guaranteed drained before the sink runs).
+(2) the direct path then lands on the simplified base and fixes the loudest
+issue (#140). (3)+(4) share the seam — 062 builds it, staging consumes it.
+MERGE lands in two reviewable steps.
 
 ## 5. Risks and contracts to settle in the specs
 
