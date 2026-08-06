@@ -17,8 +17,10 @@ every number below is the midpoint of two runs unless marked otherwise
   read parquet through the identical DuckDB core.
 - **Baseline**: stock DuckDB CLI v1.5.5 (`d8cdaa33fd`) + `INSTALL mssql FROM
   community` = **0.2.2**. **Candidate**: locally built CLI at the same DuckDB
-  SHA with the 058-tip extension statically linked (= what ships as 0.2.3).
-  Same core SHA ⇒ the comparison isolates the extension.
+  SHA with the 058-tip extension statically linked — everything in 0.2.3
+  *except* the spec-064 cursor-path optimization, which merged after the
+  branch: the numbers are therefore conservative for the release. Same core
+  SHA ⇒ the comparison isolates the extension.
 - **Timing**: `.timer on` wall clock, `MSSQL_COUNTERS` off, fresh process per
   run, interleaved old/new with order rotated between rounds. Client-side CPU
   cost measured separately with `/usr/bin/time -l` (instructions retired,
@@ -210,3 +212,8 @@ the client-CPU column is the one that scales.
   consistency (instructions, cycles, user, packet counts) is the evidence.
 - `mssql_version()` prints 0.2.2 on both binaries (the bump lands in the
   release train); binaries were distinguished by path throughout the logs.
+- The candidate predates the spec-064 merge, so its varchar variants stamped
+  the pre-064 `mssql_utf8_collation` default (CI_AS) on created columns;
+  0.2.3 stamps `Latin1_General_100_BIN2_UTF8`. This changes zero bytes on the
+  wire or on disk — collation governs comparison, not encoding — so F2/F3
+  timings and sizes are unaffected.
