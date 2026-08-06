@@ -97,3 +97,18 @@ Run `make help` to see all available targets:
 | `docker-down`        | Stop SQL Server test container                       |
 | `docker-status`      | Check SQL Server container status                    |
 
+## Releasing Documentation
+
+The docs site is versioned with Docusaurus. At each extension release, before
+tagging:
+
+```bash
+cd website
+npm run docusaurus docs:version <X.Y.Z>   # e.g. 0.2.3
+```
+
+and commit the generated `versioned_docs/` + `versioned_sidebars/` snapshot.
+The released version then serves at the site root (the default), while the
+live `website/docs/` tree publishes as **Next** under `/next/` with an
+"unreleased" banner — documentation for the coming release is always
+reachable from the version dropdown, but never the landing default.

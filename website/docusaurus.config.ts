@@ -36,6 +36,14 @@ const config: Config = {
           sidebarPath: './sidebars.ts',
           // Docs ARE the site: /mssql-extension/<page>/
           routeBasePath: '/',
+          // VERSIONING CONTRACT: at each release, run
+          //   npm run docusaurus docs:version <X.Y.Z>
+          // in website/ and commit the snapshot. Docusaurus then serves the
+          // latest RELEASED version at the root (the default) and the live
+          // docs/ tree as "Next" under /next/ with an "unreleased" banner —
+          // so in-progress docs for the coming release are reachable but
+          // never the landing default. Until the first snapshot exists,
+          // current docs serve at the root with no dropdown entry to switch.
           editUrl: 'https://github.com/hugr-lab/mssql-extension/tree/main/website/',
           showLastUpdateTime: true,
         },
@@ -71,6 +79,10 @@ const config: Config = {
           sidebarId: 'docsSidebar',
           position: 'left',
           label: 'Docs',
+        },
+        {
+          type: 'docsVersionDropdown',
+          position: 'right',
         },
         {
           href: 'https://hugr-lab.github.io/mssql-extension/metrics/',

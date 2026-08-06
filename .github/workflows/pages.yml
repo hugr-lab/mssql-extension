@@ -6,10 +6,13 @@ name: Deploy docs + metrics page
 #   /download-metrics.svg   static chart the README embeds — PATH IS STABLE, the
 #                           README hotlinks it; move it and the README image dies
 #
-# The DOCS are built from the LATEST RELEASE TAG, not from main: the site is
-# the documentation of what users can install, and main runs ahead of it
-# between releases (maintainer decision, 2026-08-05). Bootstrap fallback: while
-# the latest tag predates website/'s existence, build from main instead.
+# The docs build from MAIN, and Docusaurus VERSIONING keeps released content
+# authoritative: at each release `docs:version <X.Y.Z>` snapshots the docs
+# into versioned_docs/, which serves at the ROOT as the default; the live
+# docs/ tree publishes as "Next" under /next/ with an unreleased banner. So a
+# main push only ever changes /next/ until the next release snapshot — docs
+# for the coming release stay reachable but never become the default
+# (maintainer decision, 2026-08-06; supersedes the build-from-tag scheme).
 # The SVG is rendered fresh on every run (weekly schedule) — that part keeps
 # the pre-docs behavior: no commit, no PR, `contents: read` only.
 
@@ -22,6 +25,7 @@ on:
     branches: [main]
     paths:
       - "web/**"
+      - "website/**"
       - "scripts/update_download_metrics.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -43,26 +47,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # tags needed to resolve the docs ref
-
-      - name: Resolve the docs source ref
-        id: docsref
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            REF="${{ github.event.release.tag_name }}"
-          else
-            REF=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
-          fi
-          # Bootstrap: a tag from before the docs site existed has no website/.
-          if [ -z "$REF" ] || ! git ls-tree -r --name-only "$REF" | grep -q '^website/package.json$'; then
-            echo "docs ref '$REF' has no website/ — building docs from main"
-            REF="${{ github.sha }}"
-          fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Building docs from: $REF"
 
       - uses: actions/setup-node@v6
         with:
@@ -90,10 +74,9 @@ jobs:
           "$HOME/.local/bin/duckdb" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build the docs site from the resolved ref
+      - name: Build the docs site
         run: |
-          git worktree add /tmp/docs-src "${{ steps.docsref.outputs.ref }}"
-          cd /tmp/docs-src/website
+          cd website
           npm ci
           npx docusaurus build
           mkdir -p "$GITHUB_WORKSPACE/_site"
