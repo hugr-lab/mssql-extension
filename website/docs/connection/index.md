@@ -5,6 +5,61 @@ sidebar_position: 1
 
 # Connection Configuration
 
+There are three ways to tell `ATTACH` where and how to connect, and they
+compose:
+
+1. **ADO.NET connection string** — the familiar `Server=...;Database=...` form
+2. **URI** — `mssql://user:pass@host:port/db?...`
+3. **DuckDB secret** — credentials stored once, referenced by name
+
+Values are resolved with a fixed precedence: **ATTACH options override
+connection-string / URI values, which override secret values.** So a secret
+can carry the credentials while an individual `ATTACH` overrides, say, the
+filters or the application name.
+
+### Using Connection Strings (ADO.NET style)
+
+```sql
+-- The basics: host, port, database, SQL authentication, TLS on
+ATTACH 'Server=localhost,1433;Database=AdventureWorks;User Id=sa;Password=...;Encrypt=yes'
+    AS mssql (TYPE mssql);
+
+-- Named instance: the port is resolved through SQL Server Browser (UDP 1434)
+ATTACH 'Server=myhost\SQLEXPRESS;Database=mydb;User Id=app;Password=...'
+    AS db (TYPE mssql);
+
+-- Integrated authentication (Kerberos on POSIX, SSPI on Windows)
+ATTACH 'Server=sql.corp.example.com;Database=Sales;Trusted_Connection=yes'
+    AS sales (TYPE mssql);
+
+-- Identify the client to the server (visible in sys.dm_exec_sessions)
+ATTACH 'Server=host;Database=db;User Id=u;Password=p;Application Name=nightly-etl'
+    AS etl (TYPE mssql);
+```
+
+`Server=host` defaults the port to 1433; `Server=host,port` sets it
+explicitly. Keys are case-insensitive and accept the usual ADO.NET aliases
+(full table below).
+
+### Using URIs
+
+```sql
+ATTACH 'mssql://user:password@host:1433/database?encrypt=true'
+    AS db (TYPE mssql);
+```
+
+Structure: `mssql://[user[:password]@]host[:port]/database[?param=value&...]`.
+User and password are URL-decoded, so special characters go in %-encoded.
+Recognized query parameters:
+
+| Parameter | Values | Description |
+|---|---|---|
+| `encrypt` | `true`/`false` | TLS (default: true) |
+| `trustservercertificate` | `true`/`false` | Accept a self-signed server certificate |
+| `catalog` | `true`/`false` | Catalog integration (default: true) |
+| `schema_filter` / `table_filter` | regex | Limit visible schemas / tables |
+| `applicationname` | string | LOGIN7 `program_name` (spaceless form in URIs) |
+
 ### Using Secrets
 
 Create a secret to store connection credentials securely:
@@ -36,7 +91,7 @@ CREATE SECRET secret_name (
 | `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
 | `azure_secret`  | VARCHAR | No     | Name of an Azure secret (DuckDB Azure extension) for Azure AD auth — see [AZURE.md](/connection/azure/) |
 | `access_token`  | VARCHAR | No     | Pre-acquired Azure AD JWT (hidden in `duckdb_secrets()`) — see [AZURE.md](/connection/azure/) |
-| `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows; pending) — Kerberos / SSPI integrated auth, see [Kerberos.md](/connection/kerberos/) |
+| `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows SSPI) — Kerberos / SSPI integrated auth, see [Kerberos.md](/connection/kerberos/) |
 | `krb5_configfile`    | VARCHAR | No | Per-secret `/etc/krb5.conf` override (Linux only) |
 | `krb5_keytabfile`    | VARCHAR | No | Path to a keytab — selects keytab credential mode (Linux only) |
 | `krb5_credcachefile` | VARCHAR | No | ccache path override (Linux only) |
@@ -50,16 +105,7 @@ Attach using the secret:
 ATTACH '' AS context_name (TYPE mssql, SECRET secret_name);
 ```
 
-### Using Connection Strings
-
-#### ADO.NET Format
-
-```sql
-ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
-    AS context_name (TYPE mssql);
-```
-
-#### Key Aliases (case-insensitive)
+### Connection String Key Aliases (case-insensitive)
 
 | Key                         | Aliases                              |
 | --------------------------- | ------------------------------------ |
@@ -77,15 +123,6 @@ ATTACH 'Server=host,port;Database=db;User Id=user;Password=pass;Encrypt=yes'
 | `krb5-realm`                | `krb5_realm` (AD realm, UPPERCASE) |
 | `service_principal_name`    | `service-principal-name`, `serviceprincipalname` (SPN override) |
 | `Application Name`          | `ApplicationName`, `App Name`, `application_name` (LOGIN7 `program_name`; visible as `APP_NAME()`. URI query form: `applicationname`. Empty → `"DuckDB MSSQL Extension"`. Clamped to 128 UTF-16 code units.) |
-
-#### URI Format
-
-```sql
-ATTACH 'mssql://user:password@host:port/database?encrypt=true'
-    AS context_name (TYPE mssql);
-```
-
-URI format supports URL-encoded components for special characters in credentials.
 
 ### Integrated Authentication (Kerberos / SSPI)
 
