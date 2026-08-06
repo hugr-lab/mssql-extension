@@ -185,7 +185,6 @@ bool MSSQLResultStream::Initialize() {
 					}
 				}
 
-				row_reader_ = make_uniq<tds::RowReader>(parsed_columns);
 				state_ = MSSQLResultStreamState::Streaming;
 				return true;
 			}
