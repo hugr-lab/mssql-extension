@@ -46,7 +46,6 @@ COPY (SELECT i AS id, 'row_' || i AS name FROM range(1000000) t(i))
   TO 'sqlserver.dbo.million_rows' (FORMAT 'bcp');
 ```
 
-
 ### Temporary Tables
 
 Temp tables are prefixed with `#` (local) or `##` (global). They require a transaction context to remain accessible.
