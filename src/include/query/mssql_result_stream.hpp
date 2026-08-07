@@ -8,7 +8,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_connection.hpp"
-#include "tds/tds_row_reader.hpp"
 #include "tds/tds_token_parser.hpp"
 
 namespace duckdb {
@@ -184,9 +183,8 @@ private:
 	MSSQLResultStreamState state_;
 	std::atomic<bool> is_cancelled_;
 
-	// Parser and reader
+	// Parser
 	tds::TokenParser parser_;
-	unique_ptr<tds::RowReader> row_reader_;
 
 	// Column info (set after COLMETADATA)
 	vector<LogicalType> column_types_;

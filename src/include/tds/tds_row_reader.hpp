@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <vector>
 #include "tds_column_metadata.hpp"
@@ -47,7 +48,34 @@ public:
 	size_t SkipValueNBC(const uint8_t *data, size_t length, size_t col_idx);
 	size_t ReadValueNBC(const uint8_t *data, size_t length, size_t col_idx, std::vector<uint8_t> &value, bool &is_null);
 
+	// Spec 058 D1-alt: hand this reader the per-column skip forms the parser
+	// resolved at COLMETADATA (see SkipForm in tds_column_metadata.hpp). The
+	// skip walks then dispatch on the 2-bit form instead of the per-value
+	// type_id switch; SLOW columns keep the legacy path. NBC uses the SAME
+	// forms — non-NULL values keep their normal framing, and NULL columns
+	// carry no bytes so the walk never reaches the descriptor.
+	//! `descs` must outlive this reader and hold one entry per column, in
+	//! column order (the parser owns it, recomputed per COLMETADATA).
+	//!
+	//! The count is taken rather than inferred: the walks index this array up to
+	//! `columns_.size()`, and the mismatch that would break that is CALLER-side
+	//! — a descriptor vector sized from a stale column list. Nothing in the
+	//! parser could detect it, and an out-of-bounds read inside the TDS walk is
+	//! the one class of bug this file exists to avoid. Debug-only, so the
+	//! release path is unchanged.
+	void SetSkipDescriptors(const SkipDesc *descs, size_t count) {
+		// assert(), not D_ASSERT: this layer carries no DuckDB headers by design
+		// — the fuzz harnesses compile tds_row_reader.cpp standalone without
+		// libduckdb, and including duckdb/common/assert.hpp here would break
+		// that build.
+		assert(descs == nullptr || count == columns_.size());
+		(void)count;
+		skip_descs_ = descs;
+	}
+
 private:
+	const SkipDesc *skip_descs_ = nullptr;
+
 	// Type-specific readers
 	size_t ReadFixedType(const uint8_t *data, size_t length, uint8_t type_id, std::vector<uint8_t> &value);
 

@@ -268,6 +268,10 @@ private:
 
 	// Parsed data
 	std::vector<ColumnMetadata> columns_;
+	// Spec 058 D1-alt: per-column skip forms, resolved once per COLMETADATA and
+	// handed to every RowReader so the skip walk dispatches on a 2-bit form
+	// instead of a ~30-case type_id switch per value.
+	std::vector<SkipDesc> skip_descs_;
 	RowData current_row_;
 	TdsError current_error_;
 	TdsInfo current_info_;
