@@ -103,9 +103,13 @@ run_read() { # <binary> <table> <select> <counters:0|1>
 	# near-zero CPU into the medians as a phantom improvement (review finding).
 	local out rc
 	if [ "$want_counters" = "1" ]; then
-		out=$( { time { MSSQL_COUNTERS=1 "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ); rc=$?
+		# `|| rc=$?` NOT `; rc=$?`: under `set -e` (line 18) a bare assignment
+		# from a failing command substitution aborts the script before the next
+		# statement runs, so the explicit check below was itself unreachable —
+		# the operator got a silent abort instead of the FAIL path's diagnosis.
+		rc=0; out=$( { time { MSSQL_COUNTERS=1 "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ) || rc=$?
 	else
-		out=$( { time { "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ); rc=$?
+		rc=0; out=$( { time { "$bin" < "$SQLFILE" >/dev/null 2>"$ERRFILE"; } ; } 2>&1 ) || rc=$?
 	fi
 	if [ "$rc" -ne 0 ]; then echo FAIL; else echo "$out" | tail -n1; fi
 }
@@ -139,7 +143,10 @@ phases)
 	for f in 0 1 2; do
 		run_read "$bin" "${FIX_TBL[$f]}" "${FIX_SEL[$f]}" 1 > /dev/null
 		echo "--- ${FIX_TBL[$f]} (${FIX_ROWS[$f]} rows x ${FIX_COLS[$f]} cols) ---" | tee -a "$OUT"
-		grep 'ns/row' "$ERRFILE" | tee -a "$OUT"
+		# `|| true`: a binary that produced no counter line is a real outcome,
+		# not a reason to abort the campaign — pipefail would make the empty
+		# grep kill the run mid-matrix.
+		grep 'ns/row' "$ERRFILE" | tee -a "$OUT" || true
 	done
 	;;
 ab)
@@ -154,7 +161,7 @@ ab)
 			if [ $((p % 2)) -eq 1 ]; then order="base var"; else order="var base"; fi
 			for who in $order; do
 				if [ "$who" = base ]; then t=$(run_read "$base" "${FIX_TBL[$f]}" "${FIX_SEL[$f]}" 0); else t=$(run_read "$variant" "${FIX_TBL[$f]}" "${FIX_SEL[$f]}" 0); fi
-				[ "$t" = "FAIL" ] && { echo "RUN FAILED ($who, ${FIX_TBL[$f]})"; grep -i error "$ERRFILE" | head -3; exit 1; }
+				[ "$t" = "FAIL" ] && { echo "RUN FAILED ($who, ${FIX_TBL[$f]})"; grep -i error "$ERRFILE" | head -3 || true; exit 1; }
 				cpu=$(echo "$t" | awk -v s="$([ "$who" = base ] && echo "$su_base" || echo "$su_var")" '{printf "%.3f", $1 + $2 - s}')
 				if [ "$who" = base ]; then base_cpus="$base_cpus$cpu"$'\n'; b_last="$cpu"; else var_cpus="$var_cpus$cpu"$'\n'; v_last="$cpu"; fi
 			done

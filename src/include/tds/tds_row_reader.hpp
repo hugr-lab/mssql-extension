@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <vector>
 #include "tds_column_metadata.hpp"
@@ -55,7 +56,20 @@ public:
 	// carry no bytes so the walk never reaches the descriptor.
 	//! `descs` must outlive this reader and hold one entry per column, in
 	//! column order (the parser owns it, recomputed per COLMETADATA).
-	void SetSkipDescriptors(const SkipDesc *descs) {
+	//!
+	//! The count is taken rather than inferred: the walks index this array up to
+	//! `columns_.size()`, and the mismatch that would break that is CALLER-side
+	//! — a descriptor vector sized from a stale column list. Nothing in the
+	//! parser could detect it, and an out-of-bounds read inside the TDS walk is
+	//! the one class of bug this file exists to avoid. Debug-only, so the
+	//! release path is unchanged.
+	void SetSkipDescriptors(const SkipDesc *descs, size_t count) {
+		// assert(), not D_ASSERT: this layer carries no DuckDB headers by design
+		// — the fuzz harnesses compile tds_row_reader.cpp standalone without
+		// libduckdb, and including duckdb/common/assert.hpp here would break
+		// that build.
+		assert(descs == nullptr || count == columns_.size());
+		(void)count;
 		skip_descs_ = descs;
 	}
 
