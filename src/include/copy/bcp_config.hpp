@@ -113,6 +113,16 @@ struct BCPCopyConfig {
 	// True if creating a brand-new table (table didn't exist or overwrite dropped it)
 	bool is_new_table = false;
 
+	// Lowercased names of matched columns whose (source, target) pair
+	// IsTypeCompatible refused. NOT an error at bind: a constant `NULL AS col`
+	// in the source SELECT — the ordinary way to fill an unmatched column —
+	// reaches bind as INTEGER (DuckDB types a bare NULL before the extension
+	// sees it), indistinguishable from real integer data. So the pair is
+	// admitted for the all-NULL case only, and the encoder checks the mask per
+	// chunk: entirely NULL → the column takes the missing-column NullOnly path;
+	// any value → the same type-mismatch error, at first chunk (spec 064).
+	vector<string> null_only_columns;
+
 	// From mssql_utf8_collation — the collation to give a varchar column this COPY
 	// creates, when the column's own MSSQL_VARCHAR(n) annotation names none.
 	// Without it the column takes the database code page and SQL Server replaces

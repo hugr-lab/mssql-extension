@@ -50,12 +50,16 @@ SELECT b, c FROM cvc.dbo.CvcSetting;
 ----
 Привет	漢字
 
+# BIN2, which is `mssql_utf8_collation`'s default: it is what Fabric Warehouse
+# uses as ITS default, and binary comparison is the fastest answer for a loading
+# target. The cost is that the column is case- and accent-SENSITIVE — a column
+# that needs otherwise says so per column, MSSQL_VARCHAR(n, 'collation').
 query T
 SELECT collation_name FROM mssql_scan('cvc', $$
 SELECT DISTINCT c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.CvcSetting')
 $$);
 ----
-Latin1_General_100_CI_AS_SC_UTF8
+Latin1_General_100_BIN2_UTF8
 
 # -----------------------------------------------------------------------------
 # 2. A #temp table on a database whose own collation is already UTF-8. The rule

@@ -69,8 +69,9 @@ VARCHAR
 # =============================================================================
 # mssql_utf8_collation picks which UTF-8 collation is asked for. It matters
 # because the collation is stored in the schema and governs every later
-# comparison against the column, so a Latin1 default is wrong for a database
-# that is not Latin1-based.
+# comparison against the column. The shipped default is BIN2 — binary, no
+# linguistic rules (spec 064 D0) — so anyone who wants case-insensitive or
+# locale-aware matching overrides it, as this section does.
 # =============================================================================
 
 statement ok
@@ -89,8 +90,11 @@ SELECT s FROM ctas_col.dbo.CtasVarcharCyrillic ORDER BY s;
 Привет мир
 漢字とかな
 
+# Back to the SHIPPED default, whatever it is — a literal here would freeze the
+# pre-064 default and silently hand any later varchar assertion in this file a
+# collation that is no longer what ships.
 statement ok
-SET mssql_utf8_collation = 'Latin1_General_100_CI_AS_SC_UTF8';
+RESET mssql_utf8_collation;
 
 # The name lands in generated DDL as a bare identifier — COLLATE takes no
 # quoting in T-SQL — so anything that is not a collation name is rejected at SET

@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -274,6 +274,27 @@ test-login7-encoding: debug
 # LOGIN7 response parser tests (issue #164 State byte + #183 length clamps +
 # fuzz-found FEDAUTHINFO/ENVCHANGE OOB fixes). Same TDS-only source set as
 # test-login7-encoding; mirrors what .github/workflows/ci.yml compiles.
+# Spec 058 D1-alt: the fast skip walk must consume exactly what the legacy
+# per-value walk consumes, for every TDS type. Two switches in one file with
+# nothing holding them together — a width edited in ResolveSkipForm but not in
+# SkipValue misframes every row after that column and no other test notices.
+# TDS-only: no libduckdb.
+test-skip-form-equivalence: debug
+	@echo "Building SkipForm equivalence unit test (spec 058 D1-alt)..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
+	    test/cpp/test_skip_form_equivalence.cpp \
+	    src/tds/tds_row_reader.cpp src/tds/tds_column_metadata.cpp \
+	    src/tds/tds_types.cpp src/tds/tds_token_parser.cpp src/tds/encoding/utf16.cpp \
+	    $(LOGIN7_TEST_LIBS) \
+	    -o build/test/test_skip_form_equivalence
+	@echo ""
+	build/test/test_skip_form_equivalence
+
 test-login-error-state: debug
 	@echo "Building LOGIN7 response-parser unit test..."
 	@mkdir -p build/test

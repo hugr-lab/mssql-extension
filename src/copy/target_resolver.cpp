@@ -530,7 +530,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
-			ValidateExistingTableSchema(conn, target, source_types, source_names);
+			ValidateExistingTableSchema(conn, target, config, source_types, source_names);
 
 			// Spec 060 D7: empty it first if asked, keeping its definition. On THIS
 			// connection, which is the one the load runs on: routing it elsewhere
@@ -677,9 +677,17 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "tinyint";
 
 	case LogicalTypeId::UBIGINT:
-		// Stays exact: UBIGINT travels as DECIMAL(20,0) on the wire, not as an
-		// integer, so the narrowing arms above do not apply to it.
-		return target_lower == "bigint";
+		// UBIGINT travels as DECIMAL(20,0) on the wire, so the decimal family
+		// takes it natively — refusing `decimal` here made the column CTAS
+		// itself creates from a UBIGINT source unappendable, and left D4's
+		// UINT64 columnar arm dead code for existing targets (caught by the
+		// spec 064 review's added test, not by the review itself). The integer
+		// narrowing arms above still do not apply: the wire form is not an
+		// integer. A value too big for the target's precision is refused per
+		// value by the #177 mantissa guard, the same answer BIGINT narrowing
+		// gives.
+		return target_lower == "bigint" || target_lower == "decimal" || target_lower == "numeric" ||
+			   target_lower == "money" || target_lower == "smallmoney";
 
 	case LogicalTypeId::FLOAT:
 		return target_lower == "real" || target_lower == "float";
@@ -687,8 +695,18 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 	case LogicalTypeId::DOUBLE:
 		return target_lower == "float" || target_lower == "real";
 
+	case LogicalTypeId::USMALLINT:
+		return target_lower == "int" || target_lower == "bigint" || target_lower == "smallint";
+
+	case LogicalTypeId::UINTEGER:
+		return target_lower == "bigint" || target_lower == "int";
+
 	case LogicalTypeId::DECIMAL:
 	case LogicalTypeId::HUGEINT:
+		// UHUGEINT is deliberately NOT here: advertising it would pass bind and
+		// then die in the decimal encoder, whose widening has no UINT128 arm —
+		// exactly the INTERNAL-error shape this default:false exists to remove.
+		// The user-side fix is an explicit cast to HUGEINT or DECIMAL.
 		return target_lower == "decimal" || target_lower == "numeric" || target_lower == "money" ||
 			   target_lower == "smallmoney";
 
@@ -697,6 +715,13 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml";
 
 	case LogicalTypeId::BLOB:
+		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
+
+	case LogicalTypeId::GEOMETRY:
+		// A GEOMETRY vector's payload is standard WKB (verified byte-identical to
+		// ST_AsWKB output), and it landed in varbinary through the VarString arm
+		// long before this switch had a default. Refusing it here was a spec 064
+		// review-caught regression, not a cleanup.
 		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
 
 	case LogicalTypeId::UUID:
@@ -719,8 +744,12 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 		return target_lower == "datetimeoffset";
 
 	default:
-		// For unknown types, allow if types look similar
-		return true;
+		// An unknown source type is REFUSED, not waved through. `return true`
+		// here was how INTERVAL reached an encoder that throws an INTERNAL Error
+		// (issue #238), and how nested types were "allowed" with no evidence
+		// anyone had tried. The refusal is at bind time with the pair named;
+		// the fix on the user's side is an explicit cast.
+		return false;
 	}
 }
 
@@ -729,7 +758,7 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 //===----------------------------------------------------------------------===//
 
 void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
-												 const vector<LogicalType> &source_types,
+												 BCPCopyConfig &config, const vector<LogicalType> &source_types,
 												 const vector<string> &source_names) {
 	// Query the target table's column information
 	string column_sql;
@@ -783,13 +812,18 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		matched_columns++;
 		const string &target_type_name = it->second.first;
 
-		// Check type compatibility
+		// An incompatible pair is NOT a bind error: a constant `NULL AS col` in
+		// the source — the ordinary way to fill a column — reaches bind already
+		// typed (DuckDB gives a bare NULL a concrete type first), so it cannot
+		// be told apart from real data here. The pair is admitted for the
+		// all-NULL case only; the encoder checks the mask per chunk and raises
+		// the same type-mismatch error the moment a value shows up.
 		bool compatible = IsTypeCompatible(source_types[i], target_type_name);
 		if (!compatible) {
-			throw InvalidInputException(
-				"MSSQL COPY: Column '%s' type mismatch: target expects %s, source provides %s. "
-				"Use REPLACE=true to recreate the table with the new schema.",
-				source_names[i], StringUtil::Upper(target_type_name), source_types[i].ToString());
+			DebugLog(2, "ValidateExistingTableSchema: column '%s' pair (%s -> %s) admitted for all-NULL only",
+					 source_names[i].c_str(), source_types[i].ToString().c_str(), target_type_name.c_str());
+			config.null_only_columns.push_back(source_name_lower);
+			continue;
 		}
 
 		DebugLog(3, "ValidateExistingTableSchema: column '%s' compatible (source: %s, target: %s)",
@@ -1205,7 +1239,11 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		if (source_types[i].id() == LogicalTypeId::UBIGINT) {
 			col.precision = 20;
 			col.scale = 0;
-			col.max_length = 9;	 // DECIMAL(20,0) needs 9 bytes
+			// 13, not 9: GetDecimalByteSize(20) is 13 (sign + 12 magnitude
+			// bytes), and EncodeDecimal has always WRITTEN 13 for precision 20 —
+			// the 9 here disagreed with every byte on the wire, which is what
+			// kept the resolver's width check from ever matching (spec 064 D4).
+			col.max_length = 13;
 		}
 
 		// Handle HUGEINT as DECIMAL(38,0) — #177 (SUM() aggregates return HUGEINT).
@@ -1473,7 +1511,10 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 		return 8;
 
 	case LogicalTypeId::UBIGINT:
-		return 9;  // DECIMAL(20,0) - precision 20 needs 9 bytes storage
+		// DECIMAL(20,0): sign byte + 12 magnitude bytes (precision 20 is in the
+		// 20-28 storage bucket). 9 was the same wrong answer GenerateColumnMetadata
+		// carried until spec 064 D4 — kept in agreement with GetDecimalByteSize(20).
+		return 13;
 
 	case LogicalTypeId::FLOAT:
 		return 4;

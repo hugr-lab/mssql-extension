@@ -73,17 +73,23 @@ SELECT total_connections, idle_connections, active_connections, connections_crea
 ----
 1	1	0	1
 
-# Try COPY with type mismatch (VARCHAR to INT) - should fail during sink
+# COPY with type mismatch (VARCHAR to INT). Until spec 064 this errored at BIND
+# — the pair check ran before the sink existed, so this block never tested what
+# its title says. The pair is now admitted for the all-NULL case and the data
+# check fires on the FIRST CHUNK, genuinely inside the sink, with INSERT BULK
+# already open on the connection.
 statement error
 COPY varchar_data TO 'db.dbo.int_table' (FORMAT 'bcp', CREATE_TABLE false);
 ----
 type mismatch
 
-# Verify connection was released (not leaked)
+# NOT leaked (active = 0) — and not pooled either: a connection abandoned
+# mid-INSERT BULK is dirty, and the error path destroys it rather than hand the
+# next statement a broken stream. total = 0 IS the correct release here.
 query IIII
 SELECT total_connections, idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-1	1	0	1
+0	0	0	1
 
 # Cleanup
 statement ok
@@ -96,11 +102,12 @@ SELECT mssql_exec('db', 'DROP TABLE dbo.int_table');
 # This is harder to test directly - finalize errors typically occur during
 # network issues. We test that normal completion releases connections.
 
-# Get current pool stats
+# Get current pool stats. connections_created is 2: T013 destroyed its dirty
+# connection, so the cleanup mssql_exec above opened a fresh one.
 query III
 SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-1	0	1
+1	0	2
 
 # Run a successful COPY
 statement ok
@@ -110,7 +117,7 @@ COPY test_data TO 'db.dbo.test_finalize' (FORMAT 'bcp', REPLACE true);
 query III
 SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-1	0	1
+1	0	2
 
 # Cleanup
 statement ok
@@ -124,7 +131,7 @@ DROP TABLE IF EXISTS db.dbo.test_finalize;
 query III
 SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-1	0	1
+1	0	2
 
 # Run 10 failing COPY operations
 loop i 0 10
@@ -137,11 +144,12 @@ does not exist
 
 endloop
 
-# Verify no connections leaked after all failures
+# Verify no connections leaked after all failures — these fail at bind (the
+# table check), on a clean pooled connection, so nothing is created or lost.
 query III
 SELECT idle_connections, active_connections, connections_created FROM mssql_pool_stats('db');
 ----
-1	0	1
+1	0	2
 
 # Cleanup
 statement ok

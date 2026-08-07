@@ -31,6 +31,8 @@
 
 #include "codec/decimal_codec.hpp"
 
+#include "codec/scatter_position.hpp"
+
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
@@ -66,6 +68,17 @@ hugeint_t WidenVectorToHugeint(Vector &vec, const UnifiedVectorFormat &fmt, idx_
 		return hugeint_t(FormatValue<int64_t>(fmt, row_idx));
 	case PhysicalType::INT128:
 		return FormatValue<hugeint_t>(fmt, row_idx);
+	case PhysicalType::UINT64: {
+		// UBIGINT into a decimal-family target (spec 064): a mixed chunk that
+		// row-falls-back reaches this widening for the SAME column the columnar
+		// arm handles — without this arm, one unplannable string beside a
+		// UBIGINT column turned into an INTERNAL error. upper = 0 by hand: the
+		// int64 constructor would fold values above INT64_MAX negative.
+		hugeint_t widened;
+		widened.lower = FormatValue<uint64_t>(fmt, row_idx);
+		widened.upper = 0;
+		return widened;
+	}
 	default:
 		throw InternalException("codec::decimal::EncodeToBcp: unexpected PhysicalType for DECIMAL");
 	}
@@ -335,75 +348,106 @@ inline void ScatterOne(uint8_t *out, const SRC &raw) {
 	std::memcpy(out + 1, &mag, MAG);
 }
 
-template <class SRC, int MAG, bool HAS_SEL>
-void ScatterFast(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-				 uint8_t byte_size) {
+template <class SRC, int MAG, class POS, bool HAS_SEL, bool HAS_NULLS>
+void ScatterFast(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, uint8_t byte_size) {
 	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
-		*out = byte_size;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
+		if (HAS_NULLS && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
+		*out = byte_size;
 		ScatterOne<SRC, MAG>(out + 1, src[idx]);
+		pos.Advance(r, 1 + static_cast<size_t>(byte_size));
 	}
 }
 
 // The general path: a scale shift and/or a range check are needed, so the value
 // goes through hugeint. Still one call per column, still no dispatch in the loop.
-template <class SRC, bool HAS_SEL>
-void ScatterGeneral(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-					int32_t shift, uint8_t byte_size, const mssql::BCPColumnMetadata &col) {
+// hugeint_t has no uint64 constructor, and hugeint_t(int64) would fold values
+// above INT64_MAX negative — the exact bug the unsigned/signed refusals exist
+// for. One overload, zero cost for the signed sources.
+static inline hugeint_t ToHuge(uint64_t v) {
+	hugeint_t h;
+	h.lower = v;
+	h.upper = 0;
+	return h;
+}
+template <class SRC>
+static inline hugeint_t ToHuge(const SRC &v) {
+	return hugeint_t(v);
+}
+
+template <class SRC, class POS, bool HAS_SEL, bool HAS_NULLS>
+void ScatterGeneral(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, int32_t shift,
+					uint8_t byte_size, const mssql::BCPColumnMetadata &col) {
 	const SRC *src = reinterpret_cast<const SRC *>(fmt.data);
 	const SelectionVector *sel = fmt.sel;
 	for (idx_t r = 0; r < rows; r++) {
-		uint8_t *out = dst + r * stride;
-		*out = byte_size;
+		uint8_t *out = pos.At(r);
 		const idx_t idx = HAS_SEL ? sel->get_index_unsafe(row_begin + r) : row_begin + r;
-		hugeint_t value = RescaleMantissa(hugeint_t(src[idx]), shift, col);
+		if (HAS_NULLS && !fmt.validity.RowIsValid(idx)) {
+			*out = 0x00;
+			pos.Advance(r, 1);
+			continue;
+		}
+		*out = byte_size;
+		hugeint_t value = RescaleMantissa(ToHuge(src[idx]), shift, col);
 		CheckMantissaFitsPrecision(value, col);
 		const bool neg = value.upper < 0;
 		const hugeint_t mag = neg ? Hugeint::Negate(value) : value;
 		out[1] = neg ? 0x00 : 0x01;
 		std::memcpy(out + 2, &mag, byte_size - 1);
+		pos.Advance(r, 1 + static_cast<size_t>(byte_size));
 	}
 }
 
-template <class SRC, int MAG>
-void ScatterFastSel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-					uint8_t byte_size) {
-	if (fmt.sel->IsSet()) {
-		ScatterFast<SRC, MAG, true>(dst, stride, row_begin, rows, fmt, byte_size);
+template <class SRC, int MAG, class POS>
+void ScatterFastSel(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, uint8_t byte_size,
+					bool all_valid) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (all_valid) {
+		has_sel ? ScatterFast<SRC, MAG, POS, true, false>(pos, row_begin, rows, fmt, byte_size)
+				: ScatterFast<SRC, MAG, POS, false, false>(pos, row_begin, rows, fmt, byte_size);
 	} else {
-		ScatterFast<SRC, MAG, false>(dst, stride, row_begin, rows, fmt, byte_size);
+		has_sel ? ScatterFast<SRC, MAG, POS, true, true>(pos, row_begin, rows, fmt, byte_size)
+				: ScatterFast<SRC, MAG, POS, false, true>(pos, row_begin, rows, fmt, byte_size);
 	}
 }
 
-template <class SRC>
-void ScatterFastByMag(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-					  uint8_t byte_size) {
+template <class SRC, class POS>
+void ScatterFastByMag(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, uint8_t byte_size,
+					  bool all_valid) {
 	switch (byte_size) {
 	case 5:
-		ScatterFastSel<SRC, 4>(dst, stride, row_begin, rows, fmt, byte_size);
+		ScatterFastSel<SRC, 4, POS>(pos, row_begin, rows, fmt, byte_size, all_valid);
 		return;
 	case 9:
-		ScatterFastSel<SRC, 8>(dst, stride, row_begin, rows, fmt, byte_size);
+		ScatterFastSel<SRC, 8, POS>(pos, row_begin, rows, fmt, byte_size, all_valid);
 		return;
 	case 13:
-		ScatterFastSel<SRC, 12>(dst, stride, row_begin, rows, fmt, byte_size);
+		ScatterFastSel<SRC, 12, POS>(pos, row_begin, rows, fmt, byte_size, all_valid);
 		return;
 	default:
-		ScatterFastSel<SRC, 16>(dst, stride, row_begin, rows, fmt, byte_size);
+		ScatterFastSel<SRC, 16, POS>(pos, row_begin, rows, fmt, byte_size, all_valid);
 		return;
 	}
 }
 
-template <class SRC>
-void ScatterGeneralSel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt,
-					   int32_t shift, uint8_t byte_size, const mssql::BCPColumnMetadata &col) {
-	if (fmt.sel->IsSet()) {
-		ScatterGeneral<SRC, true>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+template <class SRC, class POS>
+void ScatterGeneralSel(POS pos, idx_t row_begin, idx_t rows, const UnifiedVectorFormat &fmt, int32_t shift,
+					   uint8_t byte_size, const mssql::BCPColumnMetadata &col, bool all_valid) {
+	const bool has_sel = fmt.sel->IsSet();
+	if (all_valid) {
+		has_sel ? ScatterGeneral<SRC, POS, true, false>(pos, row_begin, rows, fmt, shift, byte_size, col)
+				: ScatterGeneral<SRC, POS, false, false>(pos, row_begin, rows, fmt, shift, byte_size, col);
 	} else {
-		ScatterGeneral<SRC, false>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+		has_sel ? ScatterGeneral<SRC, POS, true, true>(pos, row_begin, rows, fmt, shift, byte_size, col)
+				: ScatterGeneral<SRC, POS, false, true>(pos, row_begin, rows, fmt, shift, byte_size, col);
 	}
 }
 
@@ -415,8 +459,9 @@ void ScatterGeneralSel(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows,
 // the loop body carries no dispatch, and the loop lives in this translation unit
 // where it can be specialised and inlined. The previous shape called a
 // per-value function across a TU boundary, which no compiler can inline.
-void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
-						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+template <class POS>
+static void ScatterChunkPos(POS pos, idx_t row_begin, idx_t rows, Vector &in, const UnifiedVectorFormat &fmt,
+							const mssql::BCPColumnMetadata &col, bool all_valid) {
 	const uint8_t byte_size = tds::encoding::BCPRowEncoder::GetDecimalByteSize(col.precision);
 	const LogicalType &src_type = in.GetType();
 	const int32_t shift = static_cast<int32_t>(col.scale) - SourceScale(src_type);
@@ -453,24 +498,41 @@ void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t row
 
 	switch (src_type.InternalType()) {
 	case PhysicalType::INT16:
-		fast ? ScatterFastByMag<int16_t>(dst, stride, row_begin, rows, fmt, byte_size)
-			 : ScatterGeneralSel<int16_t>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+		fast ? ScatterFastByMag<int16_t, POS>(pos, row_begin, rows, fmt, byte_size, all_valid)
+			 : ScatterGeneralSel<int16_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
 		return;
 	case PhysicalType::INT32:
-		fast ? ScatterFastByMag<int32_t>(dst, stride, row_begin, rows, fmt, byte_size)
-			 : ScatterGeneralSel<int32_t>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+		fast ? ScatterFastByMag<int32_t, POS>(pos, row_begin, rows, fmt, byte_size, all_valid)
+			 : ScatterGeneralSel<int32_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
 		return;
 	case PhysicalType::INT64:
-		fast ? ScatterFastByMag<int64_t>(dst, stride, row_begin, rows, fmt, byte_size)
-			 : ScatterGeneralSel<int64_t>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+		fast ? ScatterFastByMag<int64_t, POS>(pos, row_begin, rows, fmt, byte_size, all_valid)
+			 : ScatterGeneralSel<int64_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
 		return;
 	case PhysicalType::INT128:
-		fast ? ScatterFastByMag<hugeint_t>(dst, stride, row_begin, rows, fmt, byte_size)
-			 : ScatterGeneralSel<hugeint_t>(dst, stride, row_begin, rows, fmt, shift, byte_size, col);
+		fast ? ScatterFastByMag<hugeint_t, POS>(pos, row_begin, rows, fmt, byte_size, all_valid)
+			 : ScatterGeneralSel<hugeint_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
+		return;
+	case PhysicalType::UINT64:
+		// Never "fast": fast requires a DECIMAL source whose own precision bounds
+		// it. General widens through ToHuge and range-checks — vacuously for
+		// decimal(20,0), whose ceiling exceeds uint64's.
+		ScatterGeneralSel<uint64_t, POS>(pos, row_begin, rows, fmt, shift, byte_size, col, all_valid);
 		return;
 	default:
-		throw InternalException("codec::decimal::ScatterChunkStrided: unexpected source PhysicalType");
+		throw InternalException("codec::decimal::ScatterChunk: unexpected source PhysicalType");
 	}
+}
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
+						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
+	// Strided implies all-valid: a NULL would have made the rows differ in length.
+	ScatterChunkPos(StridePos{dst, stride}, row_begin, rows, in, fmt, col, /*all_valid=*/true);
+}
+
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector &in,
+						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col, bool all_valid) {
+	ScatterChunkPos(CursorPos{dst, cursor, row_begin}, row_begin, rows, in, fmt, col, all_valid);
 }
 
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,

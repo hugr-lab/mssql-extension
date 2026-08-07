@@ -1,0 +1,66 @@
+# name: test/sql/copy/geometry_wkb.test
+# description: GEOMETRY into varbinary lands as standard WKB (spec 064 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require spatial
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# A GEOMETRY vector's payload is standard WKB, and it has always reached a
+# varbinary target through the VarString arm — until spec 064 D5's
+# default-refusal in IsTypeCompatible cut it off by accident (caught in review:
+# the stored bytes were verified identical to ST_AsWKB output). This file pins
+# both halves: the pair is accepted at bind, and what lands is the WKB that
+# ST_AsWKB would have produced — so a future "unknown type" cleanup that
+# forgets GEOMETRY fails here at bind time, loudly.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS geo (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('geo', 'IF OBJECT_ID(''dbo.GeoWkb'') IS NOT NULL DROP TABLE dbo.GeoWkb;
+CREATE TABLE dbo.GeoWkb (id int, g varbinary(max))');
+
+# A mix of geometry kinds, so the payload is not one fixed length.
+statement ok
+CREATE OR REPLACE TABLE geo_src AS
+SELECT i AS id,
+       CASE WHEN i % 3 = 0 THEN ST_Point(i * 1.5, -i * 0.25)
+            WHEN i % 3 = 1 THEN ST_GeomFromText('LINESTRING(0 0, ' || i || ' ' || i || ')')
+            ELSE ST_GeomFromText('POLYGON((0 0, ' || i || ' 0, ' || i || ' ' || i || ', 0 0))')
+       END AS g
+FROM range(1, 100) t(i);
+
+statement ok
+COPY geo_src TO 'geo.dbo.GeoWkb' (FORMAT bcp, CREATE_TABLE false);
+
+# Byte-for-byte: what is stored equals the explicit WKB conversion of the same
+# geometry. If GEOMETRY's internal layout ever stops being WKB, this is the
+# assertion that says so before a user's varbinary column fills with it.
+query I
+SELECT count(*)
+FROM geo_src s JOIN geo.dbo.GeoWkb t ON s.id = t.id
+WHERE t.g IS DISTINCT FROM ST_AsWKB(s.g)::BLOB;
+----
+0
+
+query I
+SELECT count(*) FROM geo.dbo.GeoWkb;
+----
+99
+
+statement ok
+SELECT mssql_exec('geo', 'DROP TABLE dbo.GeoWkb');
+
+statement ok
+DETACH geo;

@@ -1,5 +1,25 @@
 # Closing the gaps in the columnar write path
 
+> **Status: largely EXECUTED — and partly REFUTED — by spec 064**
+> (`specs/064-columnar-write-gaps/spec.md`, PR #241). The per-value cursor
+> calls described below are gone (D1: position-policy kernels, one call per
+> column per block); UBIGINT/HUGEINT go columnar (D4); unknown pairs are
+> refused at bind (D5). The NULL-axis premise below was measured and did not
+> survive: after D1 the cursor path costs what strided costs at every NULL
+> density, so the "one NULL taxes the chunk" framing is no longer true. What
+> remains OPEN from this document and the 064 review:
+>
+> - collapsing `IsTypeCompatible` into `arm != Unsupported` (the resolver
+>   would need source Vector types at bind time);
+> - UHUGEINT → decimal support (the decimal widening has no UINT128 arm;
+>   the pair is currently refused at bind);
+> - a SQL-reachable signal for writers/encode-path counters (spec 063
+>   acceptance criterion 5);
+> - the bash-3.2 parse failure in `test/compat/mssql_version_matrix.sh`
+>   (construct never located; documented in `docs/TESTING.md`).
+>
+> Read the rest as the historical map that motivated 064, not as current state.
+
 Follow-up to spec 057, scoped as its own PR. **Goal: everything that can be a
 per-column kernel call becomes one, and the row-major path is reached only by
 genuinely unsupported type pairs.**

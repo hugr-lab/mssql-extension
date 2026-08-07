@@ -1,0 +1,111 @@
+# name: test/sql/copy/null_only_columns.test
+# description: an incompatible pair is accepted when the source column is entirely NULL (spec 064)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# `SELECT ..., NULL AS col` is the ordinary way to fill a target column the
+# source does not have — and by the time the extension binds, DuckDB has given
+# that NULL a concrete type (INTEGER), indistinguishable from real data. So an
+# incompatible (source, target) pair is NOT refused at bind: it is admitted for
+# the all-NULL case, and the encoder checks the mask per chunk — entirely NULL
+# routes the column through the missing-column NullOnly machinery, a value
+# raises the type-mismatch error with the pair named.
+#
+# The NULL marker on the wire is a property of the target's LENGTH KIND, which
+# is why the targets below are chosen: int/decimal/datetime2 take a one-byte
+# 0x00, nvarchar(100) takes FF FF, varchar(max)/nvarchar(max) take PLP's eight
+# 0xFF. The columnar NullOnly arm wrote the one-byte form for every kind until
+# this feature made string-typed NullOnly columns routine and the server
+# noticed ("Received an invalid column length from the bcp client").
+#
+# Three shapes on purpose, because the marker is written by three code paths:
+#   * strided — no variable column, no NULL in a REAL column;
+#   * cursor  — a real variable-length column alongside;
+#   * row-major — a signed TINYINT forces RowFallback for the whole chunk.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS no (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('no', 'IF OBJECT_ID(''dbo.NullOnlyT'') IS NOT NULL DROP TABLE dbo.NullOnlyT;
+CREATE TABLE dbo.NullOnlyT (
+    id int, n_fixed decimal(9,2), n_dt datetime2(3),
+    n_ushort nvarchar(100), n_plp nvarchar(max)
+)');
+
+# Strided: every real column fixed-width and valid, so the NULL markers are laid
+# down by ScatterBlock at a constant stride — one wrong marker size here shifts
+# every later column of the row.
+statement ok
+COPY (SELECT i AS id, NULL AS n_fixed, NULL AS n_dt, NULL AS n_ushort, NULL AS n_plp
+      FROM range(1, 2001) t(i))
+TO 'no.dbo.NullOnlyT' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), count(n_fixed) + count(n_dt) + count(n_ushort) + count(n_plp) FROM no.dbo.NullOnlyT;
+----
+2000	0
+
+# Cursor: a real string column makes every row a different length, so the same
+# markers are written through the per-row cursor instead.
+statement ok
+COPY (SELECT i AS id, 'txt' || i AS n_ushort, NULL AS n_fixed, NULL AS n_dt, NULL AS n_plp
+      FROM range(1, 1001) t(i))
+TO 'no.dbo.NullOnlyT' (FORMAT bcp, CREATE_TABLE false);
+
+query III
+SELECT count(*), count(n_ushort), count(n_fixed) + count(n_dt) + count(n_plp)
+FROM no.dbo.NullOnlyT;
+----
+3000	1000	0
+
+# A value in an admitted-for-NULL column: the type-mismatch error, at first
+# chunk, before any of the chunk is encoded. This is the assertion that keeps
+# the feature from becoming silent data loss.
+statement error
+COPY (SELECT i AS id, CASE WHEN i = 500 THEN 42 ELSE NULL END AS n_dt FROM range(1, 1001) t(i))
+TO 'no.dbo.NullOnlyT' (FORMAT bcp, CREATE_TABLE false);
+----
+type mismatch
+
+# Nothing from the failed statement landed.
+query I
+SELECT count(*) FROM no.dbo.NullOnlyT;
+----
+3000
+
+statement ok
+SELECT mssql_exec('no', 'DROP TABLE dbo.NullOnlyT');
+
+# Row-major: the signed-TINYINT-into-tinyint pair resolves RowFallback (the
+# range check is per value), sending the WHOLE chunk through EncodeRow — whose
+# NULL writer always knew the three kinds. The pin is that both halves agree.
+statement ok
+SELECT mssql_exec('no', 'IF OBJECT_ID(''dbo.NullOnlyRow'') IS NOT NULL DROP TABLE dbo.NullOnlyRow;
+CREATE TABLE dbo.NullOnlyRow (id tinyint, n_ushort nvarchar(50), n_plp varbinary(max))');
+
+statement ok
+COPY (SELECT (i % 100)::TINYINT AS id, NULL AS n_ushort, NULL AS n_plp FROM range(1, 501) t(i))
+TO 'no.dbo.NullOnlyRow' (FORMAT bcp, CREATE_TABLE false);
+
+query II
+SELECT count(*), count(n_ushort) + count(n_plp) FROM no.dbo.NullOnlyRow;
+----
+500	0
+
+statement ok
+SELECT mssql_exec('no', 'DROP TABLE dbo.NullOnlyRow');
+
+statement ok
+DETACH no;

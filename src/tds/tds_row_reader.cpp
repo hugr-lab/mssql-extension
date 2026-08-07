@@ -20,6 +20,82 @@ constexpr uint32_t MAX_LOB_VALUE_BYTES = 2147483647u;
 
 RowReader::RowReader(const std::vector<ColumnMetadata> &columns) : columns_(columns) {}
 
+// Spec 058 D1-alt: one value of the fast walk. Byte-identical semantics to the
+// corresponding SkipValue arms — same prefix reads, same bounds tests, 0 still
+// means "need more data" — only the per-value type_id switch is gone. Shared by
+// the ROW and NBC walks because the wire forms are identical for both.
+static inline size_t SkipByForm(const uint8_t *data, size_t length, SkipDesc desc) {
+	switch (desc.form) {
+	case SkipForm::FIXED:
+		return length >= desc.width ? desc.width : 0;
+	case SkipForm::PREFIX1: {
+		if (length < 1) {
+			return 0;
+		}
+		const size_t data_length = data[0];
+		return length >= 1 + data_length ? 1 + data_length : 0;
+	}
+	case SkipForm::PREFIX2: {
+		if (length < 2) {
+			return 0;
+		}
+		const uint16_t data_length = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+		if (data_length == 0xFFFF) {
+			return 2;  // NULL
+		}
+		return length >= 2 + static_cast<size_t>(data_length) ? 2 + data_length : 0;
+	}
+	default:
+		return 0;  // SLOW is handled by the caller; unreachable here
+	}
+}
+
+SkipDesc ResolveSkipForm(const ColumnMetadata &col) {
+	switch (col.type_id) {
+	case TDS_TYPE_TINYINT:
+	case TDS_TYPE_BIT:
+		return {SkipForm::FIXED, 1};
+	case TDS_TYPE_SMALLINT:
+		return {SkipForm::FIXED, 2};
+	case TDS_TYPE_INT:
+	case TDS_TYPE_REAL:
+	case TDS_TYPE_SMALLMONEY:
+	case TDS_TYPE_SMALLDATETIME:
+		return {SkipForm::FIXED, 4};
+	case TDS_TYPE_BIGINT:
+	case TDS_TYPE_FLOAT:
+	case TDS_TYPE_MONEY:
+	case TDS_TYPE_DATETIME:
+		return {SkipForm::FIXED, 8};
+	case TDS_TYPE_INTN:
+	case TDS_TYPE_BITN:
+	case TDS_TYPE_FLOATN:
+	case TDS_TYPE_MONEYN:
+	case TDS_TYPE_DATETIMEN:
+	case TDS_TYPE_DECIMAL:
+	case TDS_TYPE_NUMERIC:
+	case TDS_TYPE_DATE:
+	case TDS_TYPE_TIME:
+	case TDS_TYPE_DATETIME2:
+	case TDS_TYPE_DATETIMEOFFSET:
+	case TDS_TYPE_UNIQUEIDENTIFIER:
+		return {SkipForm::PREFIX1, 0};
+	case TDS_TYPE_BIGCHAR:
+	case TDS_TYPE_BIGVARCHAR:
+	case TDS_TYPE_NCHAR:
+	case TDS_TYPE_NVARCHAR:
+	case TDS_TYPE_BIGBINARY:
+	case TDS_TYPE_BIGVARBINARY:
+		// PLP (MAX) framing is a chunk list, not a prefix — legacy code owns it.
+		return col.IsPLPType() ? SkipDesc{SkipForm::SLOW, 0} : SkipDesc{SkipForm::PREFIX2, 0};
+	default:
+		// XML (always PLP), TEXT/NTEXT/IMAGE (text-pointer form + MAX_LOB
+		// guard), and anything unknown: the legacy switch stays the one
+		// implementation of the hard forms.
+		return {SkipForm::SLOW, 0};
+	}
+}
+
 bool RowReader::ReadRow(const uint8_t *data, size_t length, size_t &bytes_consumed, RowData &row) {
 	// Use Prepare to allocate/clear efficiently (preserves capacity)
 	row.Prepare(columns_.size());
@@ -47,6 +123,24 @@ bool RowReader::ReadRow(const uint8_t *data, size_t length, size_t &bytes_consum
 bool RowReader::SkipRow(const uint8_t *data, size_t length, size_t &bytes_consumed) {
 	// Fast path: just calculate byte size without copying data
 	size_t offset = 0;
+
+	if (skip_descs_ != nullptr) {
+		for (size_t col_idx = 0; col_idx < columns_.size(); col_idx++) {
+			const SkipDesc desc = skip_descs_[col_idx];
+			size_t consumed;
+			if (desc.form == SkipForm::SLOW) {
+				consumed = SkipValue(data + offset, length - offset, col_idx);
+			} else {
+				consumed = SkipByForm(data + offset, length - offset, desc);
+			}
+			if (consumed == 0) {
+				return false;  // Need more data
+			}
+			offset += consumed;
+		}
+		bytes_consumed = offset;
+		return true;
+	}
 
 	for (size_t col_idx = 0; col_idx < columns_.size(); col_idx++) {
 		size_t consumed = SkipValue(data + offset, length - offset, col_idx);
@@ -125,7 +219,12 @@ bool RowReader::SkipNBCRow(const uint8_t *data, size_t length, size_t &bytes_con
 			continue;  // No data for NULL column
 		}
 
-		size_t consumed = SkipValueNBC(data + offset, length - offset, col_idx);
+		size_t consumed;
+		if (skip_descs_ != nullptr && skip_descs_[col_idx].form != SkipForm::SLOW) {
+			consumed = SkipByForm(data + offset, length - offset, skip_descs_[col_idx]);
+		} else {
+			consumed = SkipValueNBC(data + offset, length - offset, col_idx);
+		}
 		if (consumed == 0) {
 			return false;
 		}
