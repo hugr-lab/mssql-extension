@@ -290,7 +290,7 @@ bool TokenParser::ParseRow() {
 	}
 
 	RowReader reader(columns_);
-	reader.SetSkipDescriptors(skip_descs_.data());
+	reader.SetSkipDescriptors(skip_descs_.data(), skip_descs_.size());
 	const uint8_t *data = Current() + 1;  // Skip token type
 	size_t length = Available() - 1;
 	size_t bytes_consumed = 0;
@@ -348,7 +348,7 @@ bool TokenParser::ParseNBCRow() {
 	}
 
 	RowReader reader(columns_);
-	reader.SetSkipDescriptors(skip_descs_.data());
+	reader.SetSkipDescriptors(skip_descs_.data(), skip_descs_.size());
 	const uint8_t *data = Current() + 1;  // Skip token type
 	size_t length = Available() - 1;
 	size_t bytes_consumed = 0;

@@ -6,9 +6,24 @@
 // trusts the server's declared types and lengths, so this is where length
 // arithmetic / type confusion bugs live.
 //
-// The input bytes are a raw token stream (the payload after the 8-byte TDS packet
-// header — exactly what TdsConnection feeds the parser from packet.GetPayload()).
-// We drive the same TryParseNext() loop the connection does.
+// INPUT LAYOUT — [mode byte][token stream]
+//
+//   byte 0    `% 3` selects the parser mode: 0 normal ReadRow, 1 raw-row,
+//             2 skip-drain. Consumed, NOT passed to the parser.
+//   byte 1..  a raw token stream: the payload after the 8-byte TDS packet
+//             header, exactly what TdsConnection feeds the parser from
+//             packet.GetPayload(). We drive the same TryParseNext() loop the
+//             connection does.
+//
+// A corpus file is therefore NOT a bare token stream. Every seed under
+// fuzz/corpus/tds_tokens/ carries a leading 0x00 so it replays in normal mode,
+// which is what each was recorded under. Prepend that byte when adding a new
+// one — without it the first token byte is eaten as the mode selector and the
+// seed silently exercises a different mode on a truncated stream. That is not
+// hypothetical: the mode byte was introduced without re-baselining, and all
+// eight seeds — including the #185 FEDAUTHINFO PoC and the #184 ERROR
+// heap-overflow guards — stopped testing what they were committed for, with a
+// green CI throughout.
 //
 // std::exception on malformed input is benign; only a sanitizer report / signal
 // is a real bug. We never catch(...).
