@@ -256,8 +256,16 @@ jobs:
 
       - name: Setup vcpkg
         run: |
+          # Pinned to vcpkg.json's builtin-baseline: an unpinned master clone
+          # rides vcpkg's scripts ahead of the pinned ports, and the first
+          # cold-cache port build breaks when those scripts outgrow the
+          # runner's CMake (v0.2.3 release: z_vcpkg_spdx.cmake started using
+          # string(JSON ... STRING_ENCODE), CMake >= 4.1, and arm64-linux —
+          # the one platform without a warm openssl archive — failed).
           if [ ! -d "vcpkg" ]; then
             git clone https://github.com/microsoft/vcpkg.git
+            BASELINE=$(grep -o '"builtin-baseline": *"[a-f0-9]*"' vcpkg.json | grep -oE '[a-f0-9]{40}')
+            git -C vcpkg checkout "$BASELINE"
             ./vcpkg/bootstrap-vcpkg.sh
           fi
 

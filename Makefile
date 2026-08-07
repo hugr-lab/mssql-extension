@@ -44,6 +44,8 @@ vcpkg-setup:
 			rm -rf $(VCPKG_DIR); \
 			git clone https://github.com/microsoft/vcpkg.git $(VCPKG_DIR); \
 		fi; \
+		baseline=$$(grep -o '"builtin-baseline": *"[a-f0-9]*"' $(PROJ_DIR)vcpkg.json | grep -oE '[a-f0-9]{40}'); \
+		git -C $(VCPKG_DIR) checkout "$$baseline"; \
 		$(VCPKG_DIR)/bootstrap-vcpkg.sh; \
 	fi
 
