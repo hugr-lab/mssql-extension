@@ -1,0 +1,51 @@
+{
+  "docsSidebar": [
+    "index",
+    "getting-started",
+    {
+      "type": "category",
+      "label": "Connections & Auth",
+      "link": {
+        "type": "doc",
+        "id": "connection/index"
+      },
+      "items": [
+        "connection/azure",
+        "connection/kerberos"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Reading Data",
+      "items": [
+        "reading/catalog",
+        "reading/queries",
+        "reading/types"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Writing Data",
+      "items": [
+        "writing/copy",
+        "writing/ctas",
+        "writing/table-options",
+        "writing/dml",
+        "writing/ddl",
+        "writing/transactions"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Reference",
+      "items": [
+        "reference/settings",
+        "reference/functions",
+        "reference/troubleshooting"
+      ]
+    },
+    "performance",
+    "articles",
+    "development"
+  ]
+}
