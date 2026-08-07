@@ -322,18 +322,41 @@ roundtrip() {
 	# -csv -noheader: the default box renderer draws with U+2502, not ASCII '|',
 	# so anything grepping for a pipe silently matches nothing and every result
 	# reads as "n/a" — which looks like a skip rather than a broken parser.
+	# TWO numbers, not one: the mismatch count alone cannot tell "every row
+	# agreed" from "there were no rows to compare". The `IS NOT NULL` guard means
+	# a column with zero non-NULL rows counts 0 mismatches and would report pass
+	# while comparing nothing — the same vacuous-pass shape as the self-compare
+	# tautology this function was already fixed for once.
 	out=$("$DUCKDB_BIN" -csv -noheader -c "
 $pre
 ATTACH '$(dsn)' AS m (TYPE mssql);
-SELECT count(*) FROM m.dbo.Charsets
-WHERE $col IS NOT NULL AND $col IS DISTINCT FROM ($expected);" 2>"$err" | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
+SELECT count(*) FILTER (WHERE $col IS DISTINCT FROM ($expected)) || ':' || count(*)
+FROM m.dbo.Charsets WHERE $col IS NOT NULL;" 2>"$err" | tr -d '\r' | grep -E '^[0-9]+:[0-9]+$' | head -1)
 	rc=$?
 	if [ -n "$out" ]; then
 		rm -f "$err"
-		[ "$out" = "0" ] && echo "pass" || echo "FAIL:${out}_mismatch"
+		# ':' not ',' as the separator: -csv QUOTES any value containing a comma,
+		# so `0,2` arrives as `"0,2"` and no bare-numeric regex matches it. Third
+		# time an output-format detail has silently defeated this parser (see the
+		# U+2502 note above), hence the deliberately unquotable separator.
+		local bad="${out%%:*}" compared="${out##*:}"
+		if [ "$compared" = "0" ]; then
+			# Nothing to compare. Reported distinctly so it can never be read as
+			# evidence the column round-trips.
+			echo "empty"
+		elif [ "$bad" = "0" ]; then
+			echo "pass:${compared}"
+		else
+			echo "FAIL:${bad}_of_${compared}"
+		fi
 		return
 	fi
-	local detail; detail=$(tr -d '\r' < "$err" | grep -iE "error" | head -1 | cut -c1-70)
+	# Strip the characters that break the two consumers downstream: `"` makes
+	# --json emit invalid JSON (DuckDB says `Referenced column "v_u8" not found`),
+	# and `|` shifts every later field of the `IFS='|' read` that builds the
+	# summary row. Both were reachable from any real error.
+	local detail
+	detail=$(tr -d '\r' < "$err" | grep -iE "error" | head -1 | tr -d '"\\|' | tr -s ' ' | cut -c1-70)
 	rm -f "$err"
 	if echo "$detail" | grep -qiE "not found in FROM clause|Referenced column|does not have a column"; then
 		echo "n/a"   # column genuinely absent on this version
@@ -503,10 +526,10 @@ fi
 echo "==============================================================="
 echo "  SUMMARY"
 echo "==============================================================="
-printf "%-6s %-14s %-10s %-6s %-9s %-9s %-9s %-9s\n" ver product status u8col nvarchar dbcs cp1252 utf8col
+printf "%-6s %-14s %-10s %-6s %-12s %-12s %-12s %-12s\n" ver product status u8col nvarchar dbcs cp1252 utf8col
 for r in "${RESULTS[@]}"; do
 	IFS='|' read -r ver prod st u8 nv jp l1 u8c _wire <<< "$r"
-	printf "%-6s %-14s %-10s %-6s %-9s %-9s %-9s %-9s\n" "$ver" "$prod" "$st" "$u8" "$nv" "$jp" "$l1" "$u8c"
+	printf "%-6s %-14s %-10s %-6s %-12s %-12s %-12s %-12s\n" "$ver" "$prod" "$st" "$u8" "$nv" "$jp" "$l1" "$u8c"
 done
 echo
 for r in "${RESULTS[@]}"; do
@@ -536,7 +559,7 @@ fi
 # it is the status that used to be reported as "n/a" and slip through.
 for r in "${RESULTS[@]}"; do
 	case "$r" in
-	*"|FAILED|"*|*"|LOGIN_FAIL|"*|*"|SEED_FAIL|"*|*"|NO_SQLCMD|"*|*"|UNKNOWN_VERSION|"*|*FAIL:*|*ERR:*)
+	*"|FAILED|"*|*"|LOGIN_FAIL|"*|*"|SEED_FAIL|"*|*"|NO_SQLCMD|"*|*"|UNKNOWN_VERSION|"*|*FAIL:*|*ERR:*|*"|empty"*|*"|empty|"*)
 		exit 1 ;;
 	esac
 done
