@@ -5,7 +5,8 @@ set -u
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 REPO="${MSSQL_BENCH_REPO:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)}"
 SIZES="${SIZES:-$SCRATCH/sizes.csv}"
-DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
+PASS_SQL="${MSSQL_TEST_PASS//\'/\'\'}"
+DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${PASS_SQL}"
 
 case "$1" in
   drop)

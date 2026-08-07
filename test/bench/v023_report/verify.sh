@@ -9,7 +9,8 @@ SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 FIXTURE="${F38_FIXTURE:-$SCRATCH/f38_fixture.parquet}"
 REPO="${MSSQL_BENCH_REPO:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)}"
 BIN="${MSSQL_BENCH_CANDIDATE:-$REPO/build/release/duckdb}"
-DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
+PASS_SQL="${MSSQL_TEST_PASS//\'/\'\'}"
+DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${PASS_SQL}"
 VARIANT="$1"
 
 COLS=(i8 i16 i32 i64 cv_i64_i32 cv_i32_i16 cv_i16_i8 cv_i8_i64 f4 f8 cv_f8_f4 bl \

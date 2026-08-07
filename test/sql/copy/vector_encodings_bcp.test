@@ -91,6 +91,17 @@ SELECT count(*) FROM (
 ----
 0
 
+# The reverse direction too: server-minus-source alone proves only a SUBSET —
+# silently dropped rows (a chunk lost at a batch boundary) would pass it.
+query I
+SELECT count(*) FROM (
+  SELECT i, s_dict, s_dict_u, b_dict, s_const, n_all, bl, d9 FROM ve_src
+  EXCEPT ALL
+  SELECT i, s_dict::VARCHAR, s_dict_u::VARCHAR, b_dict, s_const::VARCHAR, n_all, bl, d9 FROM ve_db.dbo.VecEnc
+)
+----
+0
+
 # --- constant-vector-only chunk stream ---
 
 statement ok

@@ -20,7 +20,7 @@ r() { "$R/run_variant.sh" "$1" "$2" full "$3"; }
 
 case "$1" in
   B)
-    for n in 2 4 8; do w $NEW w-plain-$n r1 new-w-plain-$n; done
+    for n in 1 2 4 8; do w $NEW w-plain-$n r1 new-w-plain-$n; done
     w $NEW w-maxlen  r1 new-w-maxlen
     w $NEW w-nv      r1 new-w-nv
     w $NEW w-vc-cp   r1 new-w-vc-cp
@@ -28,7 +28,7 @@ case "$1" in
     w $NEW w-cci     r1 new-w-cci
     w $NEW w-cci-vc  r1 new-w-cci-vc
     # old ctas from parquet would hit F0 (segfault) — the old/new CTAS pair is
-    # measured from the generated source in block G instead.
+    # measured from the generated source via gen_run.sh (see README), not here.
     w $NEW  ctas     r1 new-ctas
     "$R/wb_util.sh" drop
     ;;

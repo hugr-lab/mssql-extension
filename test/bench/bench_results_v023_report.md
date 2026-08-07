@@ -3,8 +3,9 @@
 Phase-R closing report for `docs/proposals/simd-chunk-materialization-design.md`:
 what actually changes for a user upgrading community `mssql` 0.2.2 → 0.2.3,
 measured end-to-end on one wide real-shape table. Two full interleaved rounds;
-every number below is the midpoint of two runs unless marked otherwise
-(round-to-round spread was ±1–8%).
+every number below is the arithmetic mean of the two rounds' raw values in
+`v023_report/results_r1r2.csv`, rounded to one decimal (round-to-round spread
+was ±1–8%).
 
 ## Methodology
 
@@ -62,7 +63,7 @@ NVARCHAR(MAX) on both sides:
 
 | operation | 0.2.2 | candidate @1 writer | speedup |
 | --- | --- | --- | --- |
-| COPY | 933.2 s | 696.6 s | **1.34×** |
+| COPY | 933.1 s | 696.6 s | **1.34×** |
 | CTAS | 942.7 s | 699.4 s | **1.35×** |
 
 Both ends are bounded by the (Rosetta) server's single-session ingest — this
@@ -75,10 +76,10 @@ Plain COPY from parquet, heap, NVARCHAR(MAX):
 
 | writers | wall (s) | scaling |
 | --- | --- | --- |
-| 1 | 676.9 | 1.00 |
+| 1 | 676.8 | 1.00 |
 | 2 | 396.1 | 1.71× |
-| 4 | 230.0 | 2.94× |
-| 8 | 149.9 | **4.52×** |
+| 4 | 229.9 | 2.94× |
+| 8 | 149.8 | **4.52×** |
 
 Unlike the 15-column spec-057 bench (plateau at 4), the 44-column table keeps
 scaling to 8. `mssql_copy_parallel_writers = 0` (default) derives 8 on this
@@ -92,8 +93,8 @@ box, so **the out-of-the-box upgrade on this statement is ≈ 6.0×**
 
 | variant | target string type | wall (s) | table size (MB) |
 | --- | --- | --- | --- |
-| plain @4 | NVARCHAR(MAX), PLP wire | 230.0 | 23,103 |
-| `mssql_default_string_length=200` | NVARCHAR(200) inline | **93.7** | 23,104 |
+| plain @4 | NVARCHAR(MAX), PLP wire | 229.9 | 23,103 |
+| `mssql_default_string_length=200` | NVARCHAR(200) inline | **93.6** | 23,104 |
 | annotated `MSSQL_NVARCHAR(200)` | NVARCHAR(200) inline | 93.5 | 23,103 |
 | annotated `MSSQL_VARCHAR(200)`, DB code page¹ | VARCHAR(200) CP1252 | 92.5 | 18,092 |
 | annotated `MSSQL_VARCHAR(200)`, UTF-8 collation | VARCHAR(200) UTF-8 | 92.2 | **17,812** |
@@ -103,7 +104,7 @@ this variant; UTF-8 varchar takes all nine.
 
 The headline is the **PLP tax**: giving the nine MAX-typed string columns a
 length — same data, same bytes on disk — takes **2.45×** off the load
-(230 → 94 s), one `SET` away. Each MAX value pays 8+4 bytes of PLP framing and
+(229.9 → 93.6 s), one `SET` away. Each MAX value pays 8+4 bytes of PLP framing and
 the server's LOB write path. VARCHAR then halves string bytes on the wire and
 takes −23% off the table size; wall stays ~92-94 s because at 4 writers the
 bound is no longer bytes. Against the 0.2.2 baseline the sized-string load is
@@ -113,8 +114,8 @@ bound is no longer bytes. Against the 0.2.2 baseline the sized-string load is
 
 | variant | wall (s) | table size (MB) | rowgroups |
 | --- | --- | --- | --- |
-| heap, plain | 230.0 | 23,103 | — |
-| columnstore, plain | 301.8 | **5,166** | 369 COMPRESSED / 1 OPEN |
+| heap, plain | 229.9 | 23,103 | — |
+| columnstore, plain | 301.7 | **5,166** | 369 COMPRESSED / 1 OPEN |
 | columnstore, varchar-utf8 | 187.3 | 5,694 | 351 COMPRESSED / 2 OPEN |
 
 4.5× smaller on disk; `mssql_copy_flush_rows = 102400` lands rows compressed
@@ -133,13 +134,13 @@ wider-but-more-uniform encoding.
 | candidate, defaults | parquet | **152.7** |
 
 CTAS inherits the whole write path: like-for-like it mirrors F1 (1.35×), and
-at defaults it matches plain@8 (149.9) — **≈ 6× out of the box**.
+at defaults it matches plain@8 (149.8) — **≈ 6× out of the box**.
 
 ### F5–F7. Read
 
 | shape | 0.2.2 (s) | candidate (s) | wall speedup |
 | --- | --- | --- | --- |
-| grouped aggregation, 5 cols (GROUP BY i8) | 36.6 | 29.9 | 1.22× |
+| grouped aggregation, 5 cols (GROUP BY i8) | 36.5 | 29.9 | 1.22× |
 | full drain, 8 cols (min over each) | 46.0 | 36.3 | 1.27× |
 | SQL Server → parquet, all 44 cols | 175.8 | 125.3 | **1.40×** |
 

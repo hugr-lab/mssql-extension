@@ -6,13 +6,18 @@ set -u
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 RESULTS="${RESULTS:-$SCRATCH/results.csv}"
 BIN="$1"; KIND="$2"; ROWS="$3"; TAG="$4"
-DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
+PASS_SQL="${MSSQL_TEST_PASS//\'/\'\'}"
+DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${PASS_SQL}"
 
 GEN_SQL="$(cat "$SCRATCH/gen_source.sql")"
 if [ "$ROWS" != "full" ]; then GEN_SQL="${GEN_SQL/range(38000000)/range($ROWS)}"; fi
 
-LOAD_LINE=""
-if [[ "$BIN" == *stock* ]]; then LOAD_LINE="LOAD mssql;"; fi
+# Probe, not path substring: a static build resolves mssql_version() without LOAD.
+if "$BIN" -c "SELECT mssql_version();" >/dev/null 2>&1; then
+  LOAD_LINE=""
+else
+  LOAD_LINE="LOAD mssql;"
+fi
 
 case "$KIND" in
   w)    STMT="COPY ($GEN_SQL) TO 'db.dbo.WB' (FORMAT bcp, CREATE_TABLE true, REPLACE true);";;
@@ -33,7 +38,7 @@ EOF
 rc=$?
 rt_line=$(grep 'Run Time' "$LOG" | tail -1)
 n_rt=$(grep -c 'Run Time' "$LOG")
-min_rt=3; [ -n "$LOAD_LINE" ] && min_rt=3 || min_rt=2
+if [ -n "$LOAD_LINE" ]; then min_rt=3; else min_rt=2; fi
 if [ $rc -ne 0 ] || [ "$n_rt" -lt "$min_rt" ]; then
   echo "FAIL $TAG gen-$KIND $BIN rc=$rc rt_lines=$n_rt — see $LOG" >&2
   tail -5 "$LOG" >&2
