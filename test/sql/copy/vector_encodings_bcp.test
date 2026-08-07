@@ -1,0 +1,120 @@
+# name: test/sql/copy/vector_encodings_bcp.test
+# description: dictionary and constant vectors through COPY TO mssql, content-verified
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require parquet
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# The BCP encoder must accept every vector class DuckDB can hand a sink, not
+# just flat ones. This is not hypothetical: v0.2.2's row encoder indexed
+# vectors as if they were flat, and the first real columnar source at scale —
+# a parquet read, or a scan of DuckDB's own storage, both of which emit
+# DICTIONARY vectors — made EncodeBinaryPLP dereference string CONTENT bytes
+# as a string_t pointer and segfault (found 2026-08-06 while benchmarking the
+# v0.2.3 report; fixed structurally by the spec-057 unified-format encode).
+#
+# There is no SQL-visible assertion "this vector was dictionary-encoded", so
+# the test constructs sources that are dictionary-encoded by construction:
+#   * a parquet file with low-cardinality string/blob columns — the parquet
+#     writer dictionary-encodes them, the reader emits dictionary vectors;
+#   * a native DuckDB table with the same repetitive columns — storage
+#     compression emits dictionary vectors on scan;
+#   * literal projections and an all-NULL column — constant vectors.
+# The assertion is content round-trip (EXCEPT ALL in both directions), not
+# just survival.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ve_db (TYPE mssql);
+
+statement ok
+CREATE TABLE ve_src AS
+SELECT i,
+       'name_' || (i % 7)                    AS s_dict,
+       'Кириллица_' || (i % 5)               AS s_dict_u,
+       encode('blob_payload_' || (i % 11))   AS b_dict,
+       'const_tail'                          AS s_const,
+       NULL::BIGINT                          AS n_all,
+       (i % 3 = 0)                           AS bl,
+       ((i % 9700) / 100.0)::DECIMAL(9,4)    AS d9
+FROM range(400000) t(i);
+
+statement ok
+COPY ve_src TO '__TEST_DIR__/ve_dict.parquet';
+
+# --- parquet source: dictionary vectors from the parquet reader ---
+
+statement ok
+COPY (FROM read_parquet('__TEST_DIR__/ve_dict.parquet')) TO 've_db.dbo.VecEnc' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
+
+query I
+SELECT count(*) FROM ve_db.dbo.VecEnc
+----
+400000
+
+query I
+SELECT count(*) FROM (
+  SELECT i, s_dict::VARCHAR, s_dict_u::VARCHAR, b_dict, s_const::VARCHAR, n_all, bl, d9 FROM ve_db.dbo.VecEnc
+  EXCEPT ALL
+  SELECT i, s_dict, s_dict_u, b_dict, s_const, n_all, bl, d9 FROM ve_src
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT i, s_dict, s_dict_u, b_dict, s_const, n_all, bl, d9 FROM ve_src
+  EXCEPT ALL
+  SELECT i, s_dict::VARCHAR, s_dict_u::VARCHAR, b_dict, s_const::VARCHAR, n_all, bl, d9 FROM ve_db.dbo.VecEnc
+)
+----
+0
+
+# --- native-table source: dictionary vectors from DuckDB storage compression ---
+
+statement ok
+COPY ve_src TO 've_db.dbo.VecEnc' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
+
+query I
+SELECT count(*) FROM (
+  SELECT i, s_dict::VARCHAR, s_dict_u::VARCHAR, b_dict, s_const::VARCHAR, n_all, bl, d9 FROM ve_db.dbo.VecEnc
+  EXCEPT ALL
+  SELECT i, s_dict, s_dict_u, b_dict, s_const, n_all, bl, d9 FROM ve_src
+)
+----
+0
+
+# The reverse direction too: server-minus-source alone proves only a SUBSET —
+# silently dropped rows (a chunk lost at a batch boundary) would pass it.
+query I
+SELECT count(*) FROM (
+  SELECT i, s_dict, s_dict_u, b_dict, s_const, n_all, bl, d9 FROM ve_src
+  EXCEPT ALL
+  SELECT i, s_dict::VARCHAR, s_dict_u::VARCHAR, b_dict, s_const::VARCHAR, n_all, bl, d9 FROM ve_db.dbo.VecEnc
+)
+----
+0
+
+# --- constant-vector-only chunk stream ---
+
+statement ok
+COPY (SELECT 'always_same' AS a, NULL::INTEGER AS b, 42::BIGINT AS c FROM range(150000))
+TO 've_db.dbo.VecEncC' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
+
+query III
+SELECT count(*), count(DISTINCT a), count(b) FROM ve_db.dbo.VecEncC
+----
+150000	1	0
+
+statement ok
+SELECT mssql_exec('ve_db', 'DROP TABLE IF EXISTS dbo.VecEnc, dbo.VecEncC;');
+
+statement ok
+DETACH ve_db;

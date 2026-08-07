@@ -1,0 +1,114 @@
+=== old gen-w 4M ===
+      103.37 real        10.37 user         1.41 sys
+           263176192  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               20046  page reclaims
+                1042  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+              793914  messages sent
+                 214  messages received
+                   0  signals received
+                1648  voluntary context switches
+                6400  involuntary context switches
+        204902651299  instructions retired
+         40778904450  cycles elapsed
+           231162672  peak memory footprint
+=== new gen-w 4M @1 ===
+       72.75 real         7.24 user         0.70 sys
+            39108608  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                2429  page reclaims
+                 174  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+              200613  messages sent
+                 212  messages received
+                   0  signals received
+                1578  voluntary context switches
+                4112  involuntary context switches
+         73169334379  instructions retired
+         17572106922  cycles elapsed
+            14631368  peak memory footprint
+=== old r-cols ===
+       50.17 real        60.39 user         6.36 sys
+            38895616  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                2531  page reclaims
+                 999  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  45  messages sent
+             2177496  messages received
+                   0  signals received
+              745258  voluntary context switches
+               70509  involuntary context switches
+       1420794803808  instructions retired
+        247778764522  cycles elapsed
+            10535488  peak memory footprint
+=== new r-cols ===
+       35.14 real         3.78 user         4.23 sys
+            32391168  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                1533  page reclaims
+                1227  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  43  messages sent
+              876499  messages received
+                   0  signals received
+              517331  voluntary context switches
+               19154  involuntary context switches
+         87361913842  instructions retired
+         29216377542  cycles elapsed
+             9568736  peak memory footprint
+=== old r-parquet ===
+      174.51 real        76.35 user        24.69 sys
+           396640256  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               44196  page reclaims
+                1003  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  45  messages sent
+            12061052  messages received
+                   0  signals received
+             2866151  voluntary context switches
+              173799  involuntary context switches
+       1398085610101  instructions retired
+        367758069370  cycles elapsed
+           300827464  peak memory footprint
+=== new r-parquet ===
+      124.88 real        37.18 user        19.66 sys
+           380452864  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               42257  page reclaims
+                1236  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  43  messages sent
+             5620590  messages received
+                   0  signals received
+             2677515  voluntary context switches
+              188779  involuntary context switches
+        719592323331  instructions retired
+        210844182520  cycles elapsed
+           285819552  peak memory footprint

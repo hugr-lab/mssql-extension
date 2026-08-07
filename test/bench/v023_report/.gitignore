@@ -1,0 +1,7 @@
+logs/
+results.csv
+sizes.csv
+sig_*.txt
+r_export_out.parquet
+nohup_*.log
+driver.log
