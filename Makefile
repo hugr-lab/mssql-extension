@@ -276,6 +276,22 @@ test-login7-encoding: debug
 # LOGIN7 response parser tests (issue #164 State byte + #183 length clamps +
 # fuzz-found FEDAUTHINFO/ENVCHANGE OOB fixes). Same TDS-only source set as
 # test-login7-encoding; mirrors what .github/workflows/ci.yml compiles.
+test-login-error-state: debug
+	@echo "Building LOGIN7 response-parser unit test..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
+	    test/cpp/test_login_error_state.cpp \
+	    $(LOGIN7_TEST_SOURCES) \
+	    $(LOGIN7_TEST_LIBS) \
+	    -o build/test/test_login_error_state
+	@echo ""
+	@echo "Running LOGIN7 response-parser unit test..."
+	build/test/test_login_error_state
+
 # Spec 058 D1-alt: the fast skip walk must consume exactly what the legacy
 # per-value walk consumes, for every TDS type. Two switches in one file with
 # nothing holding them together — a width edited in ResolveSkipForm but not in
@@ -296,22 +312,6 @@ test-skip-form-equivalence: debug
 	    -o build/test/test_skip_form_equivalence
 	@echo ""
 	build/test/test_skip_form_equivalence
-
-test-login-error-state: debug
-	@echo "Building LOGIN7 response-parser unit test..."
-	@mkdir -p build/test
-	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
-		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
-		exit 1; \
-	fi
-	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
-	    test/cpp/test_login_error_state.cpp \
-	    $(LOGIN7_TEST_SOURCES) \
-	    $(LOGIN7_TEST_LIBS) \
-	    -o build/test/test_login_error_state
-	@echo ""
-	@echo "Running LOGIN7 response-parser unit test..."
-	build/test/test_login_error_state
 
 # Spec 053 (#161): lazy GSSAPI/krb5 runtime loader unit test.
 # Pure in-memory — does NOT need SQL Server or a KDC. On Linux it links only
