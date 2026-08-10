@@ -44,4 +44,10 @@ jobs:
           # On PRs: scan from the base ref to HEAD (only new commits).
           # On push to main / schedule: scan the entire repo history. The
           # action handles the base/head args based on the event.
-          extra_args: --only-verified
+          #
+          # lob detector excluded: its pattern matches C++ test function
+          # names like test_serialize_string_unicode_characters (letters and
+          # underscores, not an API key shape) and its verifier confirms
+          # them, so the full-history scan fails on blobs we can't amend.
+          # We don't use Lob (lob.com print/mail API).
+          extra_args: --only-verified --exclude-detectors=lob
