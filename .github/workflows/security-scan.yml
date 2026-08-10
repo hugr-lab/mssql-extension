@@ -16,6 +16,10 @@ on:
   pull_request:
   schedule:
     - cron: '17 5 * * 1'
+  # Manual runs: a failed scheduled run can only be re-run with the workflow
+  # definition from the commit it originally ran against, so a fix to this
+  # file never turns an old run green — dispatch a fresh one instead.
+  workflow_dispatch:
 
 permissions:
   contents: read
