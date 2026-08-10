@@ -53,6 +53,13 @@ void Fail(const std::string &what, const std::string &detail) {
 	failures++;
 }
 
+//! `"0x" + std::to_string(0xE7)` prints 0x231. Format the byte properly so a
+//! failure names the type it actually saw.
+std::string HexByte(uint8_t v) {
+	static const char *d = "0123456789ABCDEF";
+	return std::string("0x") + d[(v >> 4) & 0xF] + d[v & 0xF];
+}
+
 const char *FormName(SkipForm f) {
 	switch (f) {
 	case SkipForm::FIXED:
@@ -268,7 +275,7 @@ void TestPlpStaysSlow() {
 	for (uint8_t t : plp_types) {
 		const SkipDesc d = ResolveSkipForm(MakeCol(t, 0xFFFF));
 		if (d.form != SkipForm::SLOW) {
-			Fail("PLP type 0x" + std::to_string(t), std::string("resolved ") + FormName(d.form) + ", expected SLOW");
+			Fail("PLP type " + HexByte(t), std::string("resolved ") + FormName(d.form) + ", expected SLOW");
 		}
 	}
 	const SkipDesc x = ResolveSkipForm(MakeCol(tds::TDS_TYPE_XML, 0));
@@ -290,6 +297,156 @@ void TestUnknownDegradesToSlow() {
 	}
 }
 
+
+//===----------------------------------------------------------------------===//
+// [4] Multi-column rows
+//
+// Everything above uses a ONE-column row, which localises a width divergence
+// but leaves three things unexercised — and they are exactly the ones the
+// per-column design introduces:
+//
+//   * `skip_descs_[col_idx]` indexed with more than one entry. The
+//     `SetSkipDescriptors(descs, count)` assert added alongside this test
+//     guards a descriptor/column transposition, and with one column it can
+//     never fire.
+//   * a SLOW column sandwiched between fast ones, where `SkipRow` threads the
+//     offset from `SkipByForm` into the `SkipValue` fallback and back.
+//   * an NBC row with a NULL bit actually set — the bitmap above is always
+//     0x00, so the "a NULL column carries no bytes" accounting is untested.
+//
+// A transposition or an NBC bitmap miscount passes [1] cleanly. These do not.
+//===----------------------------------------------------------------------===//
+
+struct MultiCase {
+	std::string label;
+	std::vector<ColumnMetadata> cols;
+	std::vector<std::vector<uint8_t>> wires;  // one per column, ROW framing
+	int null_col = -1;                        // NBC only: which column's bit is set
+};
+
+void CheckMulti(const MultiCase &m, bool nbc) {
+	const std::string what = m.label + (nbc ? " [NBC]" : " [ROW]");
+	if (m.cols.size() != m.wires.size()) {
+		Fail(what, "fixture: column and wire counts differ");
+		return;
+	}
+
+	// An NBC row omits a NULL column's bytes entirely; a ROW row carries every
+	// column, so null_col is ignored there.
+	std::vector<uint8_t> body;
+	for (size_t i = 0; i < m.cols.size(); i++) {
+		if (nbc && static_cast<int>(i) == m.null_col) {
+			continue;
+		}
+		body.insert(body.end(), m.wires[i].begin(), m.wires[i].end());
+	}
+
+	std::vector<uint8_t> row;
+	size_t bitmap_bytes = 0;
+	if (nbc) {
+		bitmap_bytes = (m.cols.size() + 7) / 8;
+		row.assign(bitmap_bytes, 0x00);
+		if (m.null_col >= 0) {
+			row[m.null_col >> 3] |= static_cast<uint8_t>(1u << (m.null_col & 7));
+		}
+	}
+	row.insert(row.end(), body.begin(), body.end());
+
+	// Legacy: no descriptors, so every column takes the per-value arm.
+	RowReader legacy(m.cols);
+	size_t legacy_consumed = 0;
+	const bool legacy_ok = nbc ? legacy.SkipNBCRow(row.data(), row.size(), legacy_consumed)
+							   : legacy.SkipRow(row.data(), row.size(), legacy_consumed);
+	if (!legacy_ok || legacy_consumed != row.size()) {
+		Fail(what, "fixture is malformed: legacy walk consumed " + std::to_string(legacy_consumed) + " of " +
+					   std::to_string(row.size()));
+		return;
+	}
+
+	// Fast: the descriptors the parser would have resolved, one per column.
+	std::vector<SkipDesc> descs;
+	descs.reserve(m.cols.size());
+	for (const auto &c : m.cols) {
+		descs.push_back(ResolveSkipForm(c));
+	}
+	RowReader fast(m.cols);
+	fast.SetSkipDescriptors(descs.data(), descs.size());
+	size_t fast_consumed = 0;
+	const bool fast_ok = nbc ? fast.SkipNBCRow(row.data(), row.size(), fast_consumed)
+							 : fast.SkipRow(row.data(), row.size(), fast_consumed);
+	if (!fast_ok) {
+		Fail(what, "fast walk did not complete the row");
+		return;
+	}
+	if (fast_consumed != legacy_consumed) {
+		std::string forms;
+		for (const auto &d : descs) {
+			forms += std::string(forms.empty() ? "" : ",") + FormName(d.form);
+		}
+		Fail(what, "fast consumed " + std::to_string(fast_consumed) + ", legacy " +
+					   std::to_string(legacy_consumed) + " (forms=" + forms + ")");
+	}
+}
+
+void TestMultiColumn() {
+	std::cout << "[4] multi-column rows: descriptor indexing, SLOW in the middle, NBC NULL bit..." << std::endl;
+
+	const ColumnMetadata c_int = MakeCol(tds::TDS_TYPE_INT, 4);                 // FIXED
+	const ColumnMetadata c_intn = MakeCol(tds::TDS_TYPE_INTN, 4);              // PREFIX1
+	const ColumnMetadata c_nvar = MakeCol(tds::TDS_TYPE_NVARCHAR, 40);         // PREFIX2
+	const ColumnMetadata c_plp = MakeCol(tds::TDS_TYPE_NVARCHAR, 0xFFFF);      // SLOW
+	const ColumnMetadata c_guid = MakeCol(tds::TDS_TYPE_UNIQUEIDENTIFIER, 16); // PREFIX1
+
+	std::vector<MultiCase> cases;
+
+	// Every form together, so a descriptor/column transposition shifts a width.
+	cases.push_back({"INT|INTN|NVARCHAR",
+					 {c_int, c_intn, c_nvar},
+					 {Bytes(4), P1(Bytes(4)), P2(Bytes(8))}});
+
+	// A SLOW column between two fast ones: SkipRow must hand off to the legacy
+	// arm and pick the offset back up.
+	cases.push_back({"INT|PLP(SLOW)|NVARCHAR",
+					 {c_int, c_plp, c_nvar},
+					 {Bytes(4), Plp(Bytes(6)), P2(Bytes(4))}});
+
+	// Deliberately asymmetric widths: a transposition of columns 0 and 2 would
+	// keep the total identical if the widths matched, so they must not.
+	cases.push_back({"GUID|INT|NVARCHAR",
+					 {c_guid, c_int, c_nvar},
+					 {P1(Bytes(16)), Bytes(4), P2(Bytes(2))}});
+
+	// Wider than one bitmap byte, so NBC bit addressing past byte 0 is covered.
+	{
+		MultiCase wide;
+		wide.label = "9 columns, NULL in the second bitmap byte";
+		for (int i = 0; i < 9; i++) {
+			wide.cols.push_back(c_int);
+			wide.wires.push_back(Bytes(4));
+		}
+		wide.null_col = 8;
+		cases.push_back(wide);
+	}
+
+	for (const MultiCase &m : cases) {
+		CheckMulti(m, /*nbc=*/false);
+		CheckMulti(m, /*nbc=*/true);
+	}
+
+	// The same shapes again with a NULL bit set on the MIDDLE column, which is
+	// the case that exercises "a NULL column consumes no bytes" while columns
+	// on both sides still do.
+	for (MultiCase m : cases) {
+		if (m.cols.size() < 3) {
+			continue;
+		}
+		m.label += " (middle NULL)";
+		m.null_col = 1;
+		CheckMulti(m, /*nbc=*/true);
+	}
+	std::cout << "    " << cases.size() << " shapes x ROW/NBC, plus middle-NULL variants" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +458,7 @@ int main() {
 		TestEveryType();
 		TestPlpStaysSlow();
 		TestUnknownDegradesToSlow();
+		TestMultiColumn();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

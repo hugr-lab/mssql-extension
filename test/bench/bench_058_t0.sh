@@ -141,11 +141,20 @@ phases)
 	setup_fixtures "$bin"
 	echo "[b058] T0b phase split, binary=$bin, iters=$ITERS" | tee "$OUT"
 	for f in 0 1 2; do
-		run_read "$bin" "${FIX_TBL[$f]}" "${FIX_SEL[$f]}" 1 > /dev/null
+		# Capture rather than discard: `> /dev/null` threw the FAIL marker away,
+		# so a crashed binary produced an empty counters section that reads as
+		# "emitted no counters" rather than "died". The `ab` branch has always
+		# checked this; this one did not, and adding `|| true` to the grep below
+		# made the silence quieter still.
+		t=$(run_read "$bin" "${FIX_TBL[$f]}" "${FIX_SEL[$f]}" 1)
 		echo "--- ${FIX_TBL[$f]} (${FIX_ROWS[$f]} rows x ${FIX_COLS[$f]} cols) ---" | tee -a "$OUT"
-		# `|| true`: a binary that produced no counter line is a real outcome,
-		# not a reason to abort the campaign — pipefail would make the empty
-		# grep kill the run mid-matrix.
+		if [ "$t" = "FAIL" ]; then
+			echo "RUN FAILED (phases, ${FIX_TBL[$f]})" | tee -a "$OUT"
+			grep -i error "$ERRFILE" | head -3 || true
+			exit 1
+		fi
+		# `|| true` stays, but now only covers the genuinely-empty grep: a binary
+		# that ran fine and emitted no counter line.
 		grep 'ns/row' "$ERRFILE" | tee -a "$OUT" || true
 	done
 	;;
