@@ -179,6 +179,10 @@ bool TdsConnection::Authenticate(const std::string &username, const std::string 
 		return DoLogin7(username, password, database, app_name);
 	});
 	if (!ok) {
+		// The login failed, so this connection is not "in" any database. Leaving
+		// the attempted name behind would weaken GetDatabase() from "the database
+		// this connection is logged into" to "the last one tried".
+		database_.clear();
 		return false;
 	}
 
@@ -439,6 +443,10 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 		return DoLogin7WithFedAuth(database, fedauth_token, app_name);
 	});
 	if (!ok) {
+		// The login failed, so this connection is not "in" any database. Leaving
+		// the attempted name behind would weaken GetDatabase() from "the database
+		// this connection is logged into" to "the last one tried".
+		database_.clear();
 		return false;
 	}
 
@@ -924,6 +932,10 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 		return LoginAttemptOutcome::Failure;
 	});
 	if (!ok) {
+		// The login failed, so this connection is not "in" any database. Leaving
+		// the attempted name behind would weaken GetDatabase() from "the database
+		// this connection is logged into" to "the last one tried".
+		database_.clear();
 		return false;
 	}
 
@@ -948,14 +960,18 @@ LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const s
 	// routed named instance received the wrong ServerName. On a first attempt
 	// the driver sets tds_server_name_ = host_, leaving a non-routed login
 	// byte-identical to the pre-068 packet.
-	const std::string &server_name = tds_server_name_.empty() ? host_ : tds_server_name_;
+	//
+	// tds_server_name_ is passed RAW: an empty one means "mirror host", and
+	// that rule lives in BuildLogin7 alone. Re-applying it here as well would
+	// put the same fallback in two places, free to disagree the moment a caller
+	// passes a `host` that is not host_.
 	// Request our configured frame size. The server answers with
 	// min(requested, its own maximum) via the PACKETSIZE ENVCHANGE — it never
 	// raises the value on its own, so asking for the 4096 default (as this did
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
 	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
-											   requested_packet_size_, request_utf8_support_, server_name);
+											   requested_packet_size_, request_utf8_support_, tds_server_name_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

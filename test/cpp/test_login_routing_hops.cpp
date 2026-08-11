@@ -157,16 +157,24 @@ void AppendRoutingEnvChange(std::vector<uint8_t> &buf, const std::string &server
 // portion is 94 bytes and the (offset, length) pairs start at byte 36 in field
 // order HostName, UserName, Password, AppName, ServerName -- so ibServerName is
 // at 52 and cchServerName (in UTF-16 code units, not bytes) at 54. Offsets are
-// relative to the start of the LOGIN7 payload. Returns "" if anything is out of
-// range, which fails the assertion rather than silently passing.
+// relative to the start of the LOGIN7 payload.
+//
+// Anomalies return a DISTINGUISHABLE sentinel rather than "". This helper exists
+// to make the ServerName fix non-revertible, so when a CHECK on its result
+// fails, the message has to say whether the harness misread the packet or the
+// code under test sent the wrong name -- collapsing both into "" would read as
+// a production regression when it might be a bug in this file.
 std::string ExtractLogin7ServerName(const std::vector<uint8_t> &payload) {
-	if (payload.size() < 56) {
-		return "";
+	if (payload.size() < 94) {	// [MS-TDS] 2.2.6.4 fixed portion is 94 bytes
+		return "<short-payload>";
 	}
 	const uint16_t ib = static_cast<uint16_t>(payload[52] | (payload[53] << 8));
 	const uint16_t cch = static_cast<uint16_t>(payload[54] | (payload[55] << 8));
+	if (ib < 94) {	// variable data cannot start inside the fixed portion
+		return "<offset-in-header>";
+	}
 	if (static_cast<size_t>(ib) + static_cast<size_t>(cch) * 2 > payload.size()) {
-		return "";
+		return "<oob-offset>";
 	}
 	std::string out;
 	for (uint16_t i = 0; i < cch; i++) {
@@ -628,6 +636,33 @@ void TestHopLimitAborts() {
 	std::cout << "  [ok] hop limit aborts after 5 hops, naming count + last target" << std::endl;
 }
 
+// The per-attempt reset covers the FIRST attempt too, not just hops 2..N.
+// Close() resets state_ but leaves next_packet_id_ where the last login left
+// it, so a reused connection would open its second PRELOGIN at 3. Nothing else
+// in the suite discriminates that: TestPerHopPacketIdReset only exercises the
+// hop, so deleting `next_packet_id_ = 1` from the first-attempt reset leaves it
+// green.
+void TestReusedConnectionRestartsPacketSequence() {
+	FakeTdsServer server([](int) { return LoginAckStream(); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+	conn.Close();
+
+	// Same object, second login: PRELOGIN must be packet id 1 again.
+	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	const std::vector<int> ids = server.FirstPacketIds();
+	CHECK(ids.size() == 2);
+	CHECK(ids[0] == 1);
+	CHECK(ids[1] == 1);	 // without the reset this is 3 (PRELOGIN 1, LOGIN7 2)
+	conn.Close();
+	server.Stop();
+	std::cout << "  [ok] a reused connection restarts its packet sequence at 1" << std::endl;
+}
+
 // The routed target in its full Fabric shape: "host\INSTANCE:port". Three
 // separate rules meet here, and with a bare "127.0.0.1" target none of them are
 // exercised — which is how the whole suite stayed green with the ServerName fix
@@ -660,6 +695,8 @@ void TestRoutedTargetWithInstanceAndPortSuffix() {
 	CHECK(conn.GetState() == ConnectionState::Idle);
 	CHECK(conn.GetPort() == target_port);  // rule 1: suffix beat the ENVCHANGE port
 	CHECK(conn.GetHost() == "127.0.0.1");  // rule 2: instance stripped for TCP
+	// Exactly one attempt against each: no retry, no second pass at the gateway.
+	CHECK(gateway.ConnectionCount() == 1);
 	CHECK(target.ConnectionCount() == 1);
 
 	// rule 3: the routed server's LOGIN7 carried the instance form...
@@ -777,6 +814,7 @@ int main() {
 	TestSqlAuthSingleHopWithLoginAck();
 	TestRouteWithoutLoginAckFollowsHop();
 	TestPerHopPacketIdReset();
+	TestReusedConnectionRestartsPacketSequence();
 	TestRoutedTargetWithInstanceAndPortSuffix();
 	TestHopLimitAborts();
 	TestIntegratedAuthFactoryRebuiltPerHop();

@@ -171,21 +171,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SIMDUTF_VER=$(python3 -c "import json;print([o['version'] for o in json.load(open('vcpkg.json'))['overrides'] if o['name']=='simdutf'][0])")
-          # Update this hash when the vcpkg.json override moves; the mismatch
-          # message below is the reminder.
-          EXPECTED_VER=6.1.1
-          EXPECTED_SHA=28f4b565330d25801f160c97970ef06f6b861202286e9a3fef35b0d7320bbf3f
+          # shellcheck source=scripts/ci/simdutf_pin.env
+          . scripts/ci/simdutf_pin.env
+          # `next(..., '')` rather than `[0]`: vcpkg.json's own comments
+          # contemplate dropping the override once the baseline catches up, and
+          # an IndexError traceback is not the guidance a maintainer needs.
+          SIMDUTF_VER=$(python3 -c "import json;print(next((o['version'] for o in json.load(open('vcpkg.json'))['overrides'] if o['name']=='simdutf'), ''))")
+          if [ -z "$SIMDUTF_VER" ]; then
+            echo "::error::vcpkg.json no longer overrides simdutf, so the routing test cannot tell which version the extension links. Either restore the override or pin the version directly in scripts/ci/simdutf_pin.env and drop this check."
+            exit 1
+          fi
+          if [ "$SIMDUTF_VER" != "$SIMDUTF_EXPECTED_VER" ]; then
+            echo "::error::vcpkg.json now pins simdutf $SIMDUTF_VER but scripts/ci/simdutf_pin.env records $SIMDUTF_EXPECTED_VER. Download the new asset, record its SHA-256, and update that file."
+            exit 1
+          fi
           echo "vcpkg.json pins simdutf $SIMDUTF_VER"
           mkdir -p /tmp/simdutf
           curl -sSL --fail --retry 3 -o /tmp/simdutf/singleheader.zip \
             "https://github.com/simdutf/simdutf/releases/download/v${SIMDUTF_VER}/singleheader.zip"
-          if [ "$SIMDUTF_VER" = "$EXPECTED_VER" ]; then
-            echo "$EXPECTED_SHA  /tmp/simdutf/singleheader.zip" | shasum -a 256 -c -
-          else
-            echo "::error::vcpkg.json now pins simdutf $SIMDUTF_VER, but the checksum recorded in ci.yml is for $EXPECTED_VER. Record the new asset's SHA-256 and update EXPECTED_VER/EXPECTED_SHA."
-            exit 1
-          fi
+          echo "$SIMDUTF_EXPECTED_SHA  /tmp/simdutf/singleheader.zip" | shasum -a 256 -c -
           unzip -o -q /tmp/simdutf/singleheader.zip -d /tmp/simdutf
           test -f /tmp/simdutf/simdutf.cpp && test -f /tmp/simdutf/simdutf.h
 
@@ -908,12 +912,30 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # Same pin file the Linux/macOS leg reads, so the two cannot drift.
+          $pin = Get-Content scripts/ci/simdutf_pin.env `
+                 | Where-Object { $_ -notmatch '^\s*#' -and $_ -match '=' } `
+                 | ConvertFrom-StringData
+          $expectedVer = $pin.SIMDUTF_EXPECTED_VER
+          $expectedSha = $pin.SIMDUTF_EXPECTED_SHA
           $ver = (Get-Content vcpkg.json | ConvertFrom-Json).overrides `
                  | Where-Object { $_.name -eq "simdutf" } | Select-Object -ExpandProperty version
+          if (-not $ver) {
+            throw "vcpkg.json no longer overrides simdutf; see scripts/ci/simdutf_pin.env"
+          }
+          if ($ver -ne $expectedVer) {
+            throw "vcpkg.json pins simdutf $ver but scripts/ci/simdutf_pin.env records $expectedVer. Record the new asset's SHA-256 in that file."
+          }
           Write-Host "vcpkg.json pins simdutf $ver"
           New-Item -ItemType Directory -Force -Path simdutf_sh | Out-Null
           Invoke-WebRequest -Uri "https://github.com/simdutf/simdutf/releases/download/v$ver/singleheader.zip" `
             -OutFile simdutf_sh/singleheader.zip
+          # ~100k lines of C++ get compiled into the test binary below; verify
+          # the bytes before trusting them, exactly as the POSIX leg does.
+          $actualSha = (Get-FileHash simdutf_sh/singleheader.zip -Algorithm SHA256).Hash
+          if ($actualSha -ne $expectedSha.ToUpper()) {
+            throw "simdutf singleheader.zip SHA-256 mismatch: got $actualSha, expected $($expectedSha.ToUpper())"
+          }
           Expand-Archive -Force -Path simdutf_sh/singleheader.zip -DestinationPath simdutf_sh
           $prefix = "build/release/vcpkg_installed/x64-windows-static-release"
           cl /std:c++17 /EHsc /nologo /MT /D_WINSOCK_DEPRECATED_NO_WARNINGS `
