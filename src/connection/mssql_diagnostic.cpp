@@ -141,6 +141,11 @@ void MSSQLOpenFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 			throw IOException("Failed to connect to %s:%d: %s", host, port, conn->GetLastError());
 		}
 
+		// Spec 068: no change needed here -- Authenticate() now follows a
+		// login-time ROUTING redirect internally, so this deprecated diagnostic
+		// path reaches an Azure MI / Redirect-policy endpoint for free. The
+		// handle ends up bound to the routed server, which is the one that can
+		// actually answer queries.
 		if (!conn->Authenticate(user, password, database)) {
 			throw InvalidInputException("Login failed: %s", conn->GetLastError());
 		}

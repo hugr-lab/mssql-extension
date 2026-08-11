@@ -154,24 +154,31 @@ bool TdsConnection::Authenticate(const std::string &username, const std::string 
 		return false;
 	}
 
-	// Step 1: PRELOGIN handshake (negotiates encryption)
-	if (!DoPrelogin(use_encrypt)) {
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
+	// Initialize the LOGIN7 ServerName to the host we dialled; a routing hop
+	// replaces it with the routed "hostname\instance" form.
+	tds_server_name_ = host_;
+
+	// Spec 068: SQL auth follows ROUTING like every other path. Azure SQL with
+	// the Redirect connection policy (the DEFAULT for traffic originating
+	// inside Azure), Azure SQL Managed Instance, and on-prem AlwaysOn
+	// read-intent routing all answer LOGIN7 with an ENVCHANGE 20. Before this,
+	// such an answer either failed as "Authentication failed" (no LOGINACK) or
+	// -- worse, because it was silent -- "succeeded" against a gateway that had
+	// just told us to go elsewhere.
+	const bool ok = RunWithRoutingHops([&]() -> LoginAttemptOutcome {
+		// Step 1: PRELOGIN handshake (negotiates encryption)
+		if (!DoPrelogin(use_encrypt)) {
+			return LoginAttemptOutcome::Failure;
+		}
+		// Step 2: LOGIN7 authentication
+		// Note: If TLS was enabled during PRELOGIN, all subsequent traffic is encrypted
+		return DoLogin7(username, password, database, app_name);
+	});
+	if (!ok) {
 		return false;
 	}
 
-	// Step 2: LOGIN7 authentication
-	// Note: If TLS was enabled during PRELOGIN, all subsequent traffic is encrypted
-	if (!DoLogin7(username, password, database, app_name)) {
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
-	}
-
-	// Success - transition to Idle
 	database_ = database;
-	state_.store(ConnectionState::Idle);
 	UpdateLastUsed();
 	return true;
 }
@@ -237,6 +244,161 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 }
 
 //===----------------------------------------------------------------------===//
+// Login-time routing -- spec 068
+//
+// ENVCHANGE type 20 tells the client "this session is not usable, log in over
+// there instead". It arrives during login, before the connection is ever Idle,
+// so no query or ATTENTION interaction exists here. The loop below was
+// originally inline in AuthenticateWithFedAuth, where it was built and proven
+// against the Azure SQL / Fabric gateways; spec 068 lifted it out so SQL auth
+// and integrated auth get the same behaviour instead of two different wrong
+// ones.
+//===----------------------------------------------------------------------===//
+
+void TdsConnection::NormalizeRoutedTarget(const std::string &routed_server, uint16_t routed_port, std::string &out_host,
+										  uint16_t &out_port) {
+	// Format from Azure Fabric: "hostname.pbidedicated.windows.net\INSTANCE-NAME:port".
+	// We need (1) the bare hostname for DNS resolution, (2) the port from after
+	// the instance name if present, else the ROUTING ENVCHANGE port.
+	std::string next_server = routed_server;
+	uint16_t next_port = routed_port;
+
+	MSSQL_CONN_DEBUG_LOG(2, "NormalizeRoutedTarget: parsing routed server '%s', envchange_port=%d", next_server.c_str(),
+						 next_port);
+
+	// A trailing ":digits" is a port suffix and wins over the ENVCHANGE port.
+	// Scanning the decoded UTF-8 for ':' and '\\' is safe: every continuation
+	// byte of a multi-byte sequence is >= 0x80, so neither can appear inside one.
+	size_t last_colon = next_server.rfind(':');
+	if (last_colon != std::string::npos) {
+		std::string port_str = next_server.substr(last_colon + 1);
+		bool is_port = !port_str.empty();
+		for (char c : port_str) {
+			if (!std::isdigit(static_cast<unsigned char>(c))) {
+				is_port = false;
+				break;
+			}
+		}
+		if (is_port) {
+			try {
+				int parsed_port = std::stoi(port_str);
+				if (parsed_port > 0 && parsed_port <= 65535) {
+					next_port = static_cast<uint16_t>(parsed_port);
+					next_server = next_server.substr(0, last_colon);
+					MSSQL_CONN_DEBUG_LOG(2, "NormalizeRoutedTarget: extracted port %d from server string", next_port);
+				}
+			} catch (...) {
+				// Ignore parse errors -- keep the ENVCHANGE port.
+			}
+		}
+	}
+
+	// Server name (with instance, without port) for the LOGIN7 ServerName field.
+	// Per [MS-TDS] and go-mssqldb: ServerName is "hostname\instance", no port.
+	tds_server_name_ = next_server;
+
+	// Strip the instance name for DNS/TCP. We do not consult the SQL Browser on
+	// a hop (see the header comment); the routed target carries its own port.
+	size_t backslash_pos = next_server.find('\\');
+	if (backslash_pos != std::string::npos) {
+		MSSQL_CONN_DEBUG_LOG(2, "NormalizeRoutedTarget: stripping instance name, keeping hostname '%s'",
+							 next_server.substr(0, backslash_pos).c_str());
+		next_server = next_server.substr(0, backslash_pos);
+	}
+
+	MSSQL_CONN_DEBUG_LOG(1, "NormalizeRoutedTarget: final routed target: %s:%d (tds_name=%s)", next_server.c_str(),
+						 next_port, tds_server_name_.c_str());
+
+	out_host = next_server;
+	out_port = next_port;
+}
+
+bool TdsConnection::RunWithRoutingHops(const std::function<LoginAttemptOutcome()> &attempt) {
+	// Azure SQL / Fabric may route through several layers of gateway
+	// infrastructure. Each hop is a full reconnect + PRELOGIN + LOGIN7.
+	constexpr int MAX_ROUTING_HOPS = 5;
+	int routing_hop = 0;
+
+	while (routing_hop <= MAX_ROUTING_HOPS) {
+		MSSQL_CONN_DEBUG_LOG(1, "RunWithRoutingHops: authentication attempt %d on %s:%d", routing_hop + 1,
+							 host_.c_str(), port_);
+
+		// Per-attempt state. Cleared BEFORE the first attempt too, so a reused
+		// TdsConnection cannot inherit a stale route from an earlier login.
+		// next_packet_id_/tls_enabled_ are already correct on the first pass
+		// (fresh socket); resetting them is what makes hops 2..N correct.
+		has_routing_ = false;
+		routed_server_.clear();
+		routed_port_ = 0;
+
+		const LoginAttemptOutcome outcome = attempt();
+
+		if (outcome == LoginAttemptOutcome::Success) {
+			state_.store(ConnectionState::Idle);
+			MSSQL_CONN_DEBUG_LOG(1, "RunWithRoutingHops: login successful after %d routing hop(s)", routing_hop);
+			return true;
+		}
+
+		if (outcome == LoginAttemptOutcome::Failure) {
+			// last_error_ was set by the attempt.
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+
+		// Route. The session on this socket is dead either way -- whether or
+		// not a LOGINACK came with it.
+		routing_hop++;
+		MSSQL_CONN_DEBUG_LOG(1, "RunWithRoutingHops: routing hop %d -> %s:%d", routing_hop, routed_server_.c_str(),
+							 routed_port_);
+
+		if (routing_hop > MAX_ROUTING_HOPS) {
+			last_error_ = "Too many routing hops (" + std::to_string(routing_hop) +
+						  ") - aborting; last routed target " + "was " + routed_server_ + ":" +
+						  std::to_string(routed_port_);
+			state_.store(ConnectionState::Disconnected);
+			socket_->Close();
+			return false;
+		}
+
+		std::string next_server;
+		uint16_t next_port = 0;
+		NormalizeRoutedTarget(routed_server_, routed_port_, next_server, next_port);
+
+		// Close the current connection and reset everything that is per-socket.
+		// Note we call socket_->Connect() rather than TdsConnection::Connect():
+		// the latter demands the Disconnected state, and the state machine must
+		// stay in Authenticating across a hop.
+		socket_->Close();
+		next_packet_id_ = 1;
+		tls_enabled_ = false;
+		fedauth_echo_ = false;
+
+		// host_ is the stripped hostname for TCP/DNS and for TLS SNI (per
+		// go-mssqldb, SNI follows the routed host, not the original gateway);
+		// tds_server_name_ carries the full name for LOGIN7.
+		host_ = next_server;
+		port_ = next_port;
+
+		if (!socket_->Connect(next_server, next_port, DEFAULT_CONNECTION_TIMEOUT)) {
+			last_error_ = "Failed to connect to routed server " + next_server + ":" + std::to_string(next_port) + ": " +
+						  socket_->GetLastError();
+			state_.store(ConnectionState::Disconnected);
+			return false;
+		}
+
+		MSSQL_CONN_DEBUG_LOG(1, "RunWithRoutingHops: connected to routed server %s:%d", next_server.c_str(), next_port);
+		// Loop continues with a fresh handshake on the new server.
+	}
+
+	// Unreachable: the hop-limit check above returns first.
+	last_error_ = "Routing hop loop exited unexpectedly";
+	state_.store(ConnectionState::Disconnected);
+	socket_->Close();
+	return false;
+}
+
+//===----------------------------------------------------------------------===//
 // Azure AD FEDAUTH Authentication (T018/T020)
 //===----------------------------------------------------------------------===//
 
@@ -254,139 +416,26 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 	// Initialize TDS server name to host - may be updated if routing includes instance name
 	tds_server_name_ = host_;
 
-	// Azure SQL/Fabric may require multiple routing hops through gateway infrastructure
-	// Each hop requires full PRELOGIN + LOGIN7 handshake
-	constexpr int MAX_ROUTING_HOPS = 5;
-	int routing_hop = 0;
-
-	while (routing_hop <= MAX_ROUTING_HOPS) {
-		MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: authentication attempt %d on %s:%d", routing_hop + 1,
-							 host_.c_str(), port_);
-
+	// The hop loop that used to live inline here is now RunWithRoutingHops
+	// (spec 068 D2) -- same behaviour, shared with the other two auth paths.
+	// Per go-mssqldb: after routing, TLS SNI follows the NEW routed hostname,
+	// not the original gateway. The driver has already retargeted host_ by the
+	// time this lambda runs, and DoPreloginWithFedAuth defaults its SNI to host_.
+	const bool ok = RunWithRoutingHops([&]() -> LoginAttemptOutcome {
 		// Step 1: PRELOGIN handshake with FEDAUTHREQUIRED
-		// Per go-mssqldb: after routing, use the NEW routed hostname for TLS SNI (not the original gateway)
-		// The host_ is already updated to the routed server in the loop below
 		if (!DoPreloginWithFedAuth(use_encrypt, "" /* use host_ for TLS SNI */)) {
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
+			return LoginAttemptOutcome::Failure;
 		}
-
 		// Step 2: LOGIN7 with FEDAUTH feature extension
-		if (!DoLogin7WithFedAuth(database, fedauth_token, app_name)) {
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
-		}
-
-		// Step 3: Check if server requested routing (Azure SQL/Fabric gateway redirection)
-		if (!has_routing_) {
-			// No more routing - authentication complete
-			break;
-		}
-
-		// Handle routing to next server
-		routing_hop++;
-		MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: routing hop %d -> %s:%d", routing_hop, routed_server_.c_str(),
-							 routed_port_);
-
-		if (routing_hop > MAX_ROUTING_HOPS) {
-			last_error_ = "Too many routing hops (" + std::to_string(routing_hop) + ") - aborting";
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
-		}
-
-		// Close current connection
-		socket_->Close();
-
-		// Reset state for new connection
-		// Parse routed server - may contain instance name and/or port suffix
-		// Format from Azure Fabric: "hostname.pbidedicated.windows.net\INSTANCE-NAME:port"
-		// We need:
-		// 1. Just the hostname part for DNS resolution
-		// 2. The port from after instance name (if present), otherwise use ROUTING ENVCHANGE port
-		std::string next_server = routed_server_;
-		uint16_t next_port = routed_port_;
-
-		MSSQL_CONN_DEBUG_LOG(2, "AuthenticateWithFedAuth: parsing routed server '%s', envchange_port=%d",
-							 next_server.c_str(), next_port);
-
-		// First, check for port suffix in the full string (after instance name)
-		// Format: hostname\instance:port - the :port is at the very end
-		size_t last_colon = next_server.rfind(':');
-		if (last_colon != std::string::npos) {
-			// Check if this looks like a port (all digits after colon)
-			std::string port_str = next_server.substr(last_colon + 1);
-			bool is_port = !port_str.empty();
-			for (char c : port_str) {
-				if (!std::isdigit(static_cast<unsigned char>(c))) {
-					is_port = false;
-					break;
-				}
-			}
-			if (is_port) {
-				try {
-					int parsed_port = std::stoi(port_str);
-					if (parsed_port > 0 && parsed_port <= 65535) {
-						next_port = static_cast<uint16_t>(parsed_port);
-						next_server = next_server.substr(0, last_colon);
-						MSSQL_CONN_DEBUG_LOG(2, "AuthenticateWithFedAuth: extracted port %d from server string",
-											 next_port);
-					}
-				} catch (...) {
-					// Ignore parse errors
-				}
-			}
-		}
-
-		// Store server name (with instance, without port) for LOGIN7 ServerName field
-		// Per TDS spec and go-mssqldb: ServerName should be "hostname\instance" but NOT include port
-		tds_server_name_ = next_server;
-
-		// Now strip instance name (after backslash) - we don't use SQL Browser service
-		// Keep hostname only for DNS resolution
-		size_t backslash_pos = next_server.find('\\');
-		if (backslash_pos != std::string::npos) {
-			MSSQL_CONN_DEBUG_LOG(2, "AuthenticateWithFedAuth: stripping instance name, keeping hostname '%s'",
-								 next_server.substr(0, backslash_pos).c_str());
-			next_server = next_server.substr(0, backslash_pos);
-		}
-
-		MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: final routed target: %s:%d (tds_name=%s)",
-							 next_server.c_str(), next_port, tds_server_name_.c_str());
-
-		has_routing_ = false;
-		routed_server_.clear();
-		routed_port_ = 0;
-		next_packet_id_ = 1;
-		tls_enabled_ = false;
-		fedauth_echo_ = false;
-
-		// Update connection target
-		// host_ is stripped hostname for TCP/DNS, tds_server_name_ is full name for LOGIN7
-		host_ = next_server;
-		port_ = next_port;
-
-		// Connect to routed server
-		if (!socket_->Connect(next_server, next_port, DEFAULT_CONNECTION_TIMEOUT)) {
-			last_error_ = "Failed to connect to routed server " + next_server + ":" + std::to_string(next_port) + ": " +
-						  socket_->GetLastError();
-			state_.store(ConnectionState::Disconnected);
-			return false;
-		}
-
-		MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: connected to routed server %s:%d", next_server.c_str(),
-							 next_port);
-		// Loop continues with PRELOGIN + LOGIN7 on new server
+		return DoLogin7WithFedAuth(database, fedauth_token, app_name);
+	});
+	if (!ok) {
+		return false;
 	}
 
-	// Success - transition to Idle
 	database_ = database;
-	state_.store(ConnectionState::Idle);
 	UpdateLastUsed();
-	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: Azure AD authentication successful after %d routing hop(s)",
-						 routing_hop);
+	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: Azure AD authentication successful");
 	return true;
 }
 
@@ -465,8 +514,9 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 	return true;
 }
 
-bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
-										const std::string &app_name) {
+LoginAttemptOutcome TdsConnection::DoLogin7WithFedAuth(const std::string &database,
+													   const std::vector<uint8_t> &fedauth_token,
+													   const std::string &app_name) {
 	// Get local hostname for LOGIN7 HostName field (per go-mssqldb: HostName = client workstation)
 	std::string client_hostname = GetClientHostname();
 	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
@@ -506,7 +556,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 
 	if (!socket_->SendPacket(login)) {
 		last_error_ = "Failed to send LOGIN7: " + socket_->GetLastError();
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: LOGIN7 with ADAL sent, waiting for FEDAUTHINFO response...");
@@ -516,7 +566,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
 		last_error_ = "Failed to receive LOGIN7 response: " + socket_->GetLastError();
 		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ReceiveMessage failed: %s", last_error_.c_str());
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: received %zu bytes response", response.size());
@@ -582,7 +632,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 			if (!socket_->SendPacket(token_packets[i])) {
 				last_error_ =
 					"Failed to send FEDAUTH_TOKEN packet " + std::to_string(i) + ": " + socket_->GetLastError();
-				return false;
+				return LoginAttemptOutcome::Failure;
 			}
 		}
 
@@ -593,7 +643,7 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 		if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
 			last_error_ = "Failed to receive LOGINACK after FEDAUTH_TOKEN: " + socket_->GetLastError();
 			MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ReceiveMessage after token failed: %s", last_error_.c_str());
-			return false;
+			return LoginAttemptOutcome::Failure;
 		}
 
 		MSSQL_CONN_DEBUG_LOG(2, "DoLogin7WithFedAuth: received %zu bytes final response", response.size());
@@ -614,6 +664,20 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 		NoteFeatureAcks(login_response);
 	}
 
+	// Routing is checked BEFORE success (spec 068 D1). A gateway may answer the
+	// token with ROUTING + DONE and no LOGINACK -- legal per [MS-TDS], and the
+	// session on this socket is unusable either way. Reading `success` first (as
+	// this did until spec 068) turned that answer into "Azure AD authentication
+	// failed" and the hop loop never saw the redirect.
+	if (login_response.has_routing) {
+		has_routing_ = true;
+		routed_server_ = login_response.routed_server;
+		routed_port_ = login_response.routed_port;
+		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ROUTING requested to %s:%d (loginack=%d)", routed_server_.c_str(),
+							 routed_port_, login_response.success ? 1 : 0);
+		return LoginAttemptOutcome::Route;
+	}
+
 	// Check for success
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
@@ -622,26 +686,17 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 		} else {
 			last_error_ = "Azure AD authentication failed: " + login_response.error_message;
 		}
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	spid_ = login_response.spid;
 	negotiated_packet_size_ = login_response.negotiated_packet_size;
 	ApplyNegotiatedFraming();
 
-	// Check for routing (Azure SQL/Fabric gateway redirection)
-	if (login_response.has_routing) {
-		has_routing_ = true;
-		routed_server_ = login_response.routed_server;
-		routed_port_ = login_response.routed_port;
-		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ROUTING requested to %s:%d", routed_server_.c_str(),
-							 routed_port_);
-	}
-
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: Azure AD login successful, spid=%d, packet_size=%d", spid_,
 						 negotiated_packet_size_);
 
-	return true;
+	return LoginAttemptOutcome::Success;
 }
 
 //===----------------------------------------------------------------------===//
@@ -658,10 +713,16 @@ bool TdsConnection::DoLogin7WithFedAuth(const std::string &database, const std::
 // Phase 2 wires the loop and validates the LOGIN7 builder + 0xED parser.
 // Phase 3/4 provides the concrete Krb5Authenticator / WinSspiAuthenticator
 // implementations. Without one, this returns a clear error per FR-012.
+//
+// Spec 068 D3: the authenticator arrives as a FACTORY, not an instance. The
+// credential is bound to the target's SPN, so a routing hop must obtain a
+// service ticket for the ROUTED host -- reusing the gateway's blob would fail
+// validation on the new server. The factory is called once per attempt; a
+// non-routed login therefore behaves exactly as before (one fresh authenticator
+// per connection, spec 042 semantics preserved).
 //===----------------------------------------------------------------------===//
-bool TdsConnection::AuthenticateIntegrated(const std::string &database,
-										   std::shared_ptr<tds::IAuthenticator> authenticator, bool use_encrypt,
-										   const std::string &app_name, size_t login7_max_packet) {
+bool TdsConnection::AuthenticateIntegrated(const std::string &database, AuthenticatorFactory authenticator_factory,
+										   bool use_encrypt, const std::string &app_name, size_t login7_max_packet) {
 	// Validate the (DuckDB-setting-sourced) fragmentation boundary. 0 or an
 	// out-of-range value falls back to the 4096 pre-negotiation default; small
 	// in-range values are the TEST hook to force the multi-packet path. The
@@ -673,190 +734,226 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database,
 		last_error_ = "Cannot authenticate: not in Authenticating state";
 		return false;
 	}
-	if (!authenticator) {
-		last_error_ =
-			"MSSQL Error: This build of the mssql extension was compiled without Kerberos / SSPI support. "
-			"Rebuild with -DENABLE_KRB5=ON or use SQL authentication.";
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
-	}
 
-	// Step 1: PRELOGIN (encryption only; integrated auth does NOT set FEDAUTHREQUIRED)
-	if (!DoPrelogin(use_encrypt)) {
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
-	}
+	// Initialize the LOGIN7 ServerName to the host we dialled; a routing hop
+	// replaces it with the routed "hostname\instance" form.
+	tds_server_name_ = host_;
 
-	// Step 2: Initial SPNEGO blob from the authenticator.
-	std::vector<uint8_t> initial_blob;
-	try {
-		initial_blob = authenticator->InitialBytes();
-	} catch (const std::exception &e) {
-		// Authenticator already prefixes with "MSSQL Kerberos auth failed:";
-		// just propagate verbatim to avoid double-prefixing.
-		last_error_ = e.what();
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
-	}
-	if (initial_blob.empty()) {
-		last_error_ = "MSSQL Kerberos auth failed: authenticator returned empty initial SPNEGO blob";
-		state_.store(ConnectionState::Disconnected);
-		socket_->Close();
-		return false;
-	}
-
-	// Step 3: LOGIN7 with SSPI field populated. The HostName field is the
-	// CLIENT workstation name (per [MS-TDS] 2.2.6.4 -- surfaces in
-	// sys.dm_exec_sessions.host_name, sp_who, audit logs); the ServerName
-	// field is the destination. Passing host_ (the destination) into both
-	// positions makes DBA tooling see every connection as if the server were
-	// connecting to itself. spec 042 ultrareview bug_029.
-	const std::string client_hostname = GetClientHostname();
-	MSSQL_CONN_DEBUG_LOG(1,
-						 "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
-						 initial_blob.size(), client_hostname.c_str(), database.c_str());
-	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
-	// preserves the prior extension default.
-	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
-	TdsPacket login =
-		TdsProtocol::BuildLogin7WithSSPI(client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database,
-										 initial_blob, login7_app_name, requested_packet_size_, request_utf8_support_);
-
-	// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
-	// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
-	// packet-size negotiation completes, so it MUST be fragmented to the default
-	// packet size with EOM on the last packet only -- otherwise SQL Server
-	// TCP-resets the connection while we read the response. issue #138.
-	std::vector<TdsPacket> login_packets = TdsProtocol::SplitIntoPackets(login, login7_fragment_size);
-	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: LOGIN7 payload=%zu bytes -> %zu TDS packet(s) (max_packet=%zu)",
-						 login.GetPayload().size(), login_packets.size(), login7_fragment_size);
-	for (size_t i = 0; i < login_packets.size(); i++) {
-		TdsPacket &pkt = login_packets[i];
-		pkt.SetPacketId(next_packet_id_++);
-		if (!socket_->SendPacket(pkt)) {
-			last_error_ = "Failed to send LOGIN7 (integrated) packet " + std::to_string(i + 1) + "/" +
-						  std::to_string(login_packets.size()) + ": " + socket_->GetLastError();
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
+	bool first_attempt = true;
+	const bool ok = RunWithRoutingHops([&]() -> LoginAttemptOutcome {
+		// Step 0: a fresh authenticator for THIS target. On a hop the SPN
+		// follows the routed host (an explicit service_principal_name= override
+		// is honoured verbatim by the strategy factory, so it survives hops).
+		std::shared_ptr<IAuthenticator> authenticator;
+		if (authenticator_factory) {
+			authenticator = authenticator_factory(host_, port_);
 		}
-	}
-
-	// Step 4: Continuation loop on 0xED SSPI tokens.
-	constexpr int MAX_SSPI_ROUNDS = 8;	// SPNEGO with cross-realm trust typically 2-3 rounds
-	for (int round = 0; round < MAX_SSPI_ROUNDS; round++) {
-		std::vector<uint8_t> response;
-		if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
-			last_error_ = "Failed to receive LOGIN7 response (integrated): " + socket_->GetLastError();
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
-		}
-
-		LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
-		NoteFeatureAcks(login_response);
-		if (login_response.success) {
-			spid_ = login_response.spid;
-			negotiated_packet_size_ = login_response.negotiated_packet_size;
-			ApplyNegotiatedFraming();
-			MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: success after %d round(s), spid=%d, packet_size=%d",
-								 round + 1, spid_, negotiated_packet_size_);
-			database_ = database;
-			state_.store(ConnectionState::Idle);
-			UpdateLastUsed();
-			authenticator->Free();
-			return true;
-		}
-
-		if (!login_response.has_sspi_token) {
-			// No continuation requested and no LOGINACK -- server rejected the auth.
-			if (login_response.error_number > 0) {
-				last_error_ = "MSSQL Kerberos auth rejected by server (error " +
-							  std::to_string(login_response.error_number) + "): " + login_response.error_message;
-			} else if (!login_response.error_message.empty()) {
-				last_error_ = "MSSQL Kerberos auth rejected: " + login_response.error_message;
+		if (!authenticator) {
+			if (first_attempt) {
+				last_error_ =
+					"MSSQL Error: This build of the mssql extension was compiled without Kerberos / SSPI support. "
+					"Rebuild with -DENABLE_KRB5=ON or use SQL authentication.";
 			} else {
-				last_error_ = "MSSQL Kerberos auth rejected by server (no SSPI token, no LOGINACK)";
+				// A hop-specific failure: the ticket for the routed host could
+				// not be obtained. Name the target so a field report is
+				// diagnosable in one round (the default SPN derivation is
+				// MSSQLSvc/<host>:<port>; an explicit service_principal_name=
+				// overrides it).
+				last_error_ = "MSSQL Kerberos auth failed: could not build an authenticator for routed server " +
+							  host_ + ":" + std::to_string(port_) + " (expected SPN MSSQLSvc/" + host_ + ":" +
+							  std::to_string(port_) + " unless service_principal_name= overrides it)";
 			}
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
+			return LoginAttemptOutcome::Failure;
+		}
+		first_attempt = false;
+
+		// Step 1: PRELOGIN (encryption only; integrated auth does NOT set FEDAUTHREQUIRED)
+		if (!DoPrelogin(use_encrypt)) {
+			return LoginAttemptOutcome::Failure;
 		}
 
-		// Continue the SPNEGO negotiation.
-		std::vector<uint8_t> next_blob;
+		// Step 2: Initial SPNEGO blob from the authenticator.
+		std::vector<uint8_t> initial_blob;
 		try {
-			next_blob = authenticator->NextBytes(login_response.sspi_token);
+			initial_blob = authenticator->InitialBytes();
 		} catch (const std::exception &e) {
-			// Authenticator already prefixes; just propagate verbatim.
+			// Authenticator already prefixes with "MSSQL Kerberos auth failed:";
+			// just propagate verbatim to avoid double-prefixing.
 			last_error_ = e.what();
-			state_.store(ConnectionState::Disconnected);
-			socket_->Close();
-			return false;
+			return LoginAttemptOutcome::Failure;
+		}
+		if (initial_blob.empty()) {
+			last_error_ = "MSSQL Kerberos auth failed: authenticator returned empty initial SPNEGO blob";
+			return LoginAttemptOutcome::Failure;
 		}
 
-		if (next_blob.empty()) {
-			// SPNEGO complete on our side but server hasn't sent LOGINACK yet --
-			// just read the next message in the next loop iteration.
-			MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- authenticator complete, awaiting LOGINACK",
-								 round + 1);
-			continue;
-		}
+		// Step 3: LOGIN7 with SSPI field populated. The HostName field is the
+		// CLIENT workstation name (per [MS-TDS] 2.2.6.4 -- surfaces in
+		// sys.dm_exec_sessions.host_name, sp_who, audit logs); the ServerName
+		// field is the destination. Passing host_ (the destination) into both
+		// positions makes DBA tooling see every connection as if the server were
+		// connecting to itself. spec 042 ultrareview bug_029.
+		const std::string client_hostname = GetClientHostname();
+		MSSQL_CONN_DEBUG_LOG(
+			1, "AuthenticateIntegrated: sending LOGIN7 with SSPI blob (%zu bytes), client_host='%s', db='%s'",
+			initial_blob.size(), client_hostname.c_str(), database.c_str());
+		// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
+		// preserves the prior extension default.
+		const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
+		TdsPacket login = TdsProtocol::BuildLogin7WithSSPI(
+			client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database, initial_blob,
+			login7_app_name, requested_packet_size_, request_utf8_support_);
 
-		MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- sending continuation blob (%zu bytes)", round + 1,
-							 next_blob.size());
-		// Continuation tokens are usually small, but fragment defensively to the
-		// same boundary as the initial LOGIN7 for the same reason (#138).
-		TdsPacket sspi_msg = TdsProtocol::BuildSSPIMessage(next_blob);
-		std::vector<TdsPacket> sspi_packets = TdsProtocol::SplitIntoPackets(sspi_msg, login7_fragment_size);
-		for (size_t i = 0; i < sspi_packets.size(); i++) {
-			TdsPacket &pkt = sspi_packets[i];
+		// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
+		// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
+		// packet-size negotiation completes, so it MUST be fragmented to the default
+		// packet size with EOM on the last packet only -- otherwise SQL Server
+		// TCP-resets the connection while we read the response. issue #138.
+		std::vector<TdsPacket> login_packets = TdsProtocol::SplitIntoPackets(login, login7_fragment_size);
+		MSSQL_CONN_DEBUG_LOG(1,
+							 "AuthenticateIntegrated: LOGIN7 payload=%zu bytes -> %zu TDS packet(s) (max_packet=%zu)",
+							 login.GetPayload().size(), login_packets.size(), login7_fragment_size);
+		for (size_t i = 0; i < login_packets.size(); i++) {
+			TdsPacket &pkt = login_packets[i];
 			pkt.SetPacketId(next_packet_id_++);
 			if (!socket_->SendPacket(pkt)) {
-				last_error_ = "Failed to send SSPI continuation packet " + std::to_string(i + 1) + "/" +
-							  std::to_string(sspi_packets.size()) + ": " + socket_->GetLastError();
-				state_.store(ConnectionState::Disconnected);
-				socket_->Close();
-				return false;
+				last_error_ = "Failed to send LOGIN7 (integrated) packet " + std::to_string(i + 1) + "/" +
+							  std::to_string(login_packets.size()) + ": " + socket_->GetLastError();
+				return LoginAttemptOutcome::Failure;
 			}
 		}
+
+		// Step 4: Continuation loop on 0xED SSPI tokens.
+		constexpr int MAX_SSPI_ROUNDS = 8;	// SPNEGO with cross-realm trust typically 2-3 rounds
+		for (int round = 0; round < MAX_SSPI_ROUNDS; round++) {
+			std::vector<uint8_t> response;
+			if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+				last_error_ = "Failed to receive LOGIN7 response (integrated): " + socket_->GetLastError();
+				return LoginAttemptOutcome::Failure;
+			}
+
+			LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
+			NoteFeatureAcks(login_response);
+
+			// Routing outranks BOTH the success branch and the no-SSPI-token
+			// rejection below (spec 068 D1). A routed answer can arrive at any
+			// round, and one without an SSPI token would otherwise be reported
+			// as "auth rejected by server (no SSPI token, no LOGINACK)".
+			if (login_response.has_routing) {
+				has_routing_ = true;
+				routed_server_ = login_response.routed_server;
+				routed_port_ = login_response.routed_port;
+				MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: ROUTING requested to %s:%d (loginack=%d)",
+									 routed_server_.c_str(), routed_port_, login_response.success ? 1 : 0);
+				// Release this hop's GSSAPI/SSPI context before the next hop
+				// builds its own -- otherwise every hop leaks one.
+				authenticator->Free();
+				return LoginAttemptOutcome::Route;
+			}
+
+			if (login_response.success) {
+				spid_ = login_response.spid;
+				negotiated_packet_size_ = login_response.negotiated_packet_size;
+				ApplyNegotiatedFraming();
+				MSSQL_CONN_DEBUG_LOG(1, "AuthenticateIntegrated: success after %d round(s), spid=%d, packet_size=%d",
+									 round + 1, spid_, negotiated_packet_size_);
+				authenticator->Free();
+				return LoginAttemptOutcome::Success;
+			}
+
+			if (!login_response.has_sspi_token) {
+				// No continuation requested and no LOGINACK -- server rejected the auth.
+				if (login_response.error_number > 0) {
+					last_error_ = "MSSQL Kerberos auth rejected by server (error " +
+								  std::to_string(login_response.error_number) + "): " + login_response.error_message;
+				} else if (!login_response.error_message.empty()) {
+					last_error_ = "MSSQL Kerberos auth rejected: " + login_response.error_message;
+				} else {
+					last_error_ = "MSSQL Kerberos auth rejected by server (no SSPI token, no LOGINACK)";
+				}
+				return LoginAttemptOutcome::Failure;
+			}
+
+			// Continue the SPNEGO negotiation.
+			std::vector<uint8_t> next_blob;
+			try {
+				next_blob = authenticator->NextBytes(login_response.sspi_token);
+			} catch (const std::exception &e) {
+				// Authenticator already prefixes; just propagate verbatim.
+				last_error_ = e.what();
+				return LoginAttemptOutcome::Failure;
+			}
+
+			if (next_blob.empty()) {
+				// SPNEGO complete on our side but server hasn't sent LOGINACK yet --
+				// just read the next message in the next loop iteration.
+				MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- authenticator complete, awaiting LOGINACK",
+									 round + 1);
+				continue;
+			}
+
+			MSSQL_CONN_DEBUG_LOG(2, "AuthenticateIntegrated: round %d -- sending continuation blob (%zu bytes)",
+								 round + 1, next_blob.size());
+			// Continuation tokens are usually small, but fragment defensively to the
+			// same boundary as the initial LOGIN7 for the same reason (#138).
+			TdsPacket sspi_msg = TdsProtocol::BuildSSPIMessage(next_blob);
+			std::vector<TdsPacket> sspi_packets = TdsProtocol::SplitIntoPackets(sspi_msg, login7_fragment_size);
+			for (size_t i = 0; i < sspi_packets.size(); i++) {
+				TdsPacket &pkt = sspi_packets[i];
+				pkt.SetPacketId(next_packet_id_++);
+				if (!socket_->SendPacket(pkt)) {
+					last_error_ = "Failed to send SSPI continuation packet " + std::to_string(i + 1) + "/" +
+								  std::to_string(sspi_packets.size()) + ": " + socket_->GetLastError();
+					return LoginAttemptOutcome::Failure;
+				}
+			}
+		}
+
+		last_error_ = "MSSQL Kerberos auth failed: SPNEGO did not converge in " + std::to_string(MAX_SSPI_ROUNDS) +
+					  " rounds (possible cross-realm misconfiguration)";
+		return LoginAttemptOutcome::Failure;
+	});
+	if (!ok) {
+		return false;
 	}
 
-	last_error_ = "MSSQL Kerberos auth failed: SPNEGO did not converge in " + std::to_string(MAX_SSPI_ROUNDS) +
-				  " rounds (possible cross-realm misconfiguration)";
-	state_.store(ConnectionState::Disconnected);
-	socket_->Close();
-	return false;
+	database_ = database;
+	UpdateLastUsed();
+	return true;
 }
 
-bool TdsConnection::DoLogin7(const std::string &username, const std::string &password, const std::string &database,
-							 const std::string &app_name) {
+LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const std::string &password,
+											const std::string &database, const std::string &app_name) {
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: starting authentication for user='%s', db='%s'", username.c_str(),
 						 database.c_str());
 	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
 	// preserves the prior extension default.
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
+	// ServerName: tds_server_name_ when set, which is what a routing hop leaves
+	// behind -- "hostname\instance", the form [MS-TDS] wants in this field.
+	// host_ is the instance-STRIPPED name used for DNS/TCP, so passing it here
+	// (as this did before spec 068) sends the wrong ServerName after a hop to a
+	// named instance. On a first attempt the driver sets tds_server_name_ =
+	// host_, so a non-routed login is byte-identical to the pre-068 packet.
+	const std::string &server_name = tds_server_name_.empty() ? host_ : tds_server_name_;
 	// Request our configured frame size. The server answers with
 	// min(requested, its own maximum) via the PACKETSIZE ENVCHANGE — it never
 	// raises the value on its own, so asking for the 4096 default (as this did
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
-	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
+	TdsPacket login = TdsProtocol::BuildLogin7(server_name, username, password, database, login7_app_name,
 											   requested_packet_size_, request_utf8_support_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {
 		last_error_ = "Failed to send LOGIN7: " + socket_->GetLastError();
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	std::vector<uint8_t> response;
 	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
 		last_error_ = "Failed to receive LOGIN7 response: " + socket_->GetLastError();
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	// Debug dump of the login response, mirroring DoLogin7WithFedAuth. The
@@ -875,6 +972,22 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
 	NoteFeatureAcks(login_response);
+
+	// Routing outranks success (spec 068 D1). Azure SQL under the Redirect
+	// connection policy, Azure SQL Managed Instance and AlwaysOn read-intent
+	// routing all answer a SQL-auth LOGIN7 with ENVCHANGE 20 -- with or without
+	// a LOGINACK beside it. Before spec 068 this code never read the routing
+	// fields at all: the with-LOGINACK shape "succeeded" against the gateway,
+	// silently, and the without-LOGINACK shape failed as a login error.
+	if (login_response.has_routing) {
+		has_routing_ = true;
+		routed_server_ = login_response.routed_server;
+		routed_port_ = login_response.routed_port;
+		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: ROUTING requested to %s:%d (loginack=%d)", routed_server_.c_str(),
+							 routed_port_, login_response.success ? 1 : 0);
+		return LoginAttemptOutcome::Route;
+	}
+
 	if (!login_response.success) {
 		if (login_response.error_number > 0) {
 			// Include the ERROR-token State byte: for 18456 it is the only field
@@ -885,7 +998,7 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 		} else {
 			last_error_ = "Authentication failed: " + login_response.error_message;
 		}
-		return false;
+		return LoginAttemptOutcome::Failure;
 	}
 
 	spid_ = login_response.spid;
@@ -895,7 +1008,7 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 	MSSQL_CONN_DEBUG_LOG(1, "DoLogin7: authentication successful, spid=%d, packet_size=%d", spid_,
 						 negotiated_packet_size_);
 
-	return true;
+	return LoginAttemptOutcome::Success;
 }
 
 void TdsConnection::ApplyNegotiatedFraming() {

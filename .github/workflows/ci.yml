@@ -146,6 +146,46 @@ jobs:
             test/cpp/test_index_kind.cpp -o /tmp/test_index_kind
           /tmp/test_index_kind
 
+      # Spec 068: login-time routing (ENVCHANGE 20) is followed on every auth
+      # path. Drives a real TdsConnection against a loopback fake TDS server on
+      # 127.0.0.1 -- no SQL Server, no Azure, no AD. It lives in THIS job rather
+      # than the build job's "Run C++ unit tests" step on purpose: that job is
+      # dispatch/schedule-gated, and a routing regression must fail the PR that
+      # causes it. tds_connection.cpp reaches nothing outside the TDS layer, so
+      # the only externals are simdutf (via encoding/utf16.cpp) and OpenSSL
+      # (via tds_socket.hpp -> the TLS TUs; the test itself runs unencrypted).
+      - name: Install simdutf (spec 068 routing test)
+        run: |
+          if [ "${{ matrix.os.id }}" = "macos" ]; then
+            brew install simdutf
+          else
+            sudo apt-get update
+            sudo apt-get install -y libsimdutf-dev libssl-dev
+          fi
+
+      - name: Build + run login routing hop-driver test (spec 068)
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os.id }}" = "macos" ]; then
+            SIMDUTF_PREFIX="$(brew --prefix simdutf)"
+            OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+            EXTRA_INC="-I $SIMDUTF_PREFIX/include -I $OPENSSL_PREFIX/include"
+            EXTRA_LIB="-L $SIMDUTF_PREFIX/lib -L $OPENSSL_PREFIX/lib"
+          else
+            EXTRA_INC=""
+            EXTRA_LIB=""
+          fi
+          c++ -std=c++17 -pthread -Wno-deprecated-declarations \
+            -I src/include $EXTRA_INC \
+            test/cpp/test_login_routing_hops.cpp \
+            src/tds/tds_connection.cpp src/tds/tds_socket.cpp \
+            src/tds/tls/tds_tls_context.cpp src/tds/tls/tds_tls_impl.cpp \
+            src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp \
+            src/tds/encoding/utf16.cpp \
+            $EXTRA_LIB -lsimdutf -lssl -lcrypto \
+            -o /tmp/test_login_routing_hops
+          /tmp/test_login_routing_hops
+
       # Spec 063 D1: who supplies a bulk-load writer's connection and how many
       # writers there may be. Every case it decides fails SILENTLY when wrong —
       # a writer given the pinned connection interleaves ROW tokens into someone

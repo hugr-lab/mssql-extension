@@ -175,23 +175,37 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
 				return nullptr;
 			}
-			std::shared_ptr<tds::AuthenticationStrategy> strategy;
-			try {
-				strategy = tds::AuthStrategyFactory::Create(info_copy);
-			} catch (const std::exception &e) {
-				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
-				return nullptr;
-			}
-			if (!strategy) {
-				fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
-				return nullptr;
-			}
-			auto authenticator = strategy->GetAuthenticator();
-			if (!authenticator) {
-				fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
-				return nullptr;
-			}
-			if (!conn->AuthenticateIntegrated(info_copy.database, authenticator, info_copy.use_encrypt, app_name,
+			// Spec 068 D3: a factory, not an instance. It is called once per
+			// login attempt, so a routing hop gets a ticket for the ROUTED
+			// host's SPN instead of a retry of the gateway's. The first call
+			// receives this connection's original host/port, which is what the
+			// pre-068 code built the authenticator from — so a non-routed login
+			// is unchanged. `DeriveSpn` reads info.host/info.port, and honours
+			// an explicit service_principal_name verbatim, so the override
+			// survives hops with no extra handling here.
+			auto auth_factory = [info_copy](const std::string &host,
+											uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
+				MSSQLConnectionInfo hop_info = info_copy;
+				hop_info.host = host;
+				hop_info.port = port;
+				std::shared_ptr<tds::AuthenticationStrategy> strategy;
+				try {
+					strategy = tds::AuthStrategyFactory::Create(hop_info);
+				} catch (const std::exception &e) {
+					fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
+					return nullptr;
+				}
+				if (!strategy) {
+					fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
+					return nullptr;
+				}
+				auto authenticator = strategy->GetAuthenticator();
+				if (!authenticator) {
+					fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
+				}
+				return authenticator;
+			};
+			if (!conn->AuthenticateIntegrated(info_copy.database, auth_factory, info_copy.use_encrypt, app_name,
 											  info_copy.login7_max_packet)) {
 				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
 				return nullptr;

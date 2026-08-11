@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include "tds/auth/iauthenticator.hpp"
@@ -12,6 +13,45 @@
 
 namespace duckdb {
 namespace tds {
+
+// Outcome of ONE login attempt against ONE target (spec 068 D1).
+//
+// The contract, in one rule: a login helper that sees ROUTING in the response
+// returns `Route`, whatever the response said about success. [MS-TDS] is
+// explicit that a routed session is not usable, so a routed answer that ALSO
+// carried a LOGINACK is still a redirect, not a success -- and a routed answer
+// with no LOGINACK is still a redirect, not a failure. Before spec 068 we got
+// one of each wrong: the FEDAUTH path returned early on `!success` and never
+// looked at the routing fields, while SQL auth never looked at them at all and
+// kept talking to a gateway that had told it to leave.
+//
+// A plain bool cannot express this -- it would force the driver to read
+// `has_routing_` as a side channel off a `false` return, which is the exact
+// arrangement that produced the bug. Hence three states.
+enum class LoginAttemptOutcome : uint8_t {
+	Success,  // LOGINACK received, no ROUTING -- the session on this socket is usable
+	Route,	  // ROUTING received (with OR without LOGINACK) -- hop to routed_server_/routed_port_
+	Failure	  // neither -- last_error_ has been set by the attempt
+};
+
+// Builds an authenticator for ONE login attempt against ONE target (spec 068 D3).
+//
+// Integrated auth binds its credential to the target's SPN, so a routing hop
+// cannot reuse the gateway's authenticator: it needs a service ticket for the
+// ROUTED host. The caller therefore hands over a factory rather than an
+// instance, and the hop driver calls it again per hop.
+//
+// `host` is the TCP/DNS host of the current hop -- instance-stripped, no port
+// suffix -- because that is what an AD SPN is registered against
+// ("MSSQLSvc/<fqdn>:<port>"). Never pass the LOGIN7 ServerName form
+// ("host\instance"), which is not a valid SPN component.
+//
+// Returning nullptr fails the login: on the first call with the existing
+// "compiled without Kerberos / SSPI support" message, on a hop with a message
+// naming the routed host. The factory must not throw -- it runs inside the TDS
+// layer, which is exception-free by contract -- and must capture by value only,
+// since pool refills run on worker threads (issues #178/#179).
+using AuthenticatorFactory = std::function<std::shared_ptr<IAuthenticator>(const std::string &host, uint16_t port)>;
 
 // Represents a single TDS connection to SQL Server
 // Implements connection state machine per FR-009
@@ -60,10 +100,15 @@ public:
 	// drives the multi-round continuation loop via 0xED tokens.
 	// Parameters:
 	//   database     - initial database to connect to
-	//   authenticator - IAuthenticator implementation (Krb5Authenticator on POSIX,
-	//                   WinSspiAuthenticator on Windows). The Phase 2 scaffold
-	//                   errors out unless a real implementation is supplied; the
-	//                   real implementations land in Phase 3 / 4.
+	//   authenticator_factory - builds an IAuthenticator for a given (host, port)
+	//                   (Krb5Authenticator on POSIX, WinSspiAuthenticator on
+	//                   Windows). A FACTORY rather than an instance because a
+	//                   routing hop needs a service ticket for the routed host's
+	//                   SPN, not a retry of the gateway's (spec 068 D3); it is
+	//                   called once per login attempt. Returning nullptr on the
+	//                   first call reproduces the pre-068 "no authenticator"
+	//                   error. There is deliberately NO shared_ptr overload: it
+	//                   would silently reuse the gateway's ticket on a hop.
 	//   use_encrypt  - if true, enables TLS encryption (typical for production)
 	//   app_name     - spec 047 FR-014; see SQL-auth Authenticate above.
 	//   login7_max_packet - TDS packet size to fragment the LOGIN7 / SSPI sends
@@ -74,7 +119,7 @@ public:
 	//                   smaller values are a TEST hook to force the multi-packet
 	//                   path. A plain size_t keeps the TDS layer DuckDB-free; the
 	//                   value originates from the mssql_login7_max_packet setting.
-	bool AuthenticateIntegrated(const std::string &database, std::shared_ptr<tds::IAuthenticator> authenticator,
+	bool AuthenticateIntegrated(const std::string &database, AuthenticatorFactory authenticator_factory,
 								bool use_encrypt = true, const std::string &app_name = "",
 								size_t login7_max_packet = 0);
 
@@ -288,16 +333,46 @@ private:
 	// Original gateway hostname for TLS SNI after routing (Azure Fabric session tracking)
 	std::string original_sni_hostname_;
 
+	// Login-time routing driver (spec 068 D2). Runs `attempt` against the
+	// current target and follows ROUTING up to MAX_ROUTING_HOPS times, with a
+	// full reconnect + handshake per hop.
+	//
+	// Pre:  state_ == Authenticating, socket_ connected, host_/port_ set.
+	// Post: true  -> state_ == Idle, socket_ connected to the final target;
+	//       false -> state_ == Disconnected, socket_ closed, last_error_ set.
+	//
+	// Guarantees to `attempt`: host_/port_/tds_server_name_ are already
+	// retargeted for this hop, the per-hop state is already reset, and the
+	// socket is connected and un-TLS'd (the attempt does its own PRELOGIN).
+	// Obligations on `attempt`: set last_error_ when returning Failure, and
+	// NEVER touch state_ or close the socket -- the driver owns both, because a
+	// hop has to close and reopen the socket while the state machine stays in
+	// Authenticating.
+	bool RunWithRoutingHops(const std::function<LoginAttemptOutcome()> &attempt);
+
+	// Split a ROUTING ENVCHANGE target into what TCP needs and what LOGIN7
+	// needs, and set tds_server_name_ as a side effect.
+	//
+	// Azure Fabric sends "hostname.pbidedicated.windows.net\INSTANCE:port": a
+	// trailing ":port" (digits only) wins over the ENVCHANGE port, the
+	// "hostname\instance" form (port stripped) is what LOGIN7's ServerName
+	// field wants, and everything from the backslash on is stripped for
+	// DNS/TCP. The SQL Browser is deliberately NOT consulted on a hop -- every
+	// observed gateway supplies the port, and inventing UDP traffic mid-login
+	// is how timeouts happen.
+	void NormalizeRoutedTarget(const std::string &routed_server, uint16_t routed_port, std::string &out_host,
+							   uint16_t &out_port);
+
 	// Internal helpers
 	bool DoPrelogin(bool use_encrypt);
-	bool DoLogin7(const std::string &username, const std::string &password, const std::string &database,
-				  const std::string &app_name);
+	LoginAttemptOutcome DoLogin7(const std::string &username, const std::string &password, const std::string &database,
+								 const std::string &app_name);
 
 	// Azure AD FEDAUTH helpers (T018/T020)
 	// Optional sni_hostname overrides default for TLS SNI (for Azure routing)
 	bool DoPreloginWithFedAuth(bool use_encrypt, const std::string &sni_hostname = "");
-	bool DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
-							 const std::string &app_name);
+	LoginAttemptOutcome DoLogin7WithFedAuth(const std::string &database, const std::vector<uint8_t> &fedauth_token,
+											const std::string &app_name);
 };
 
 }  // namespace tds

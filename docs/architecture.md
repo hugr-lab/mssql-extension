@@ -458,6 +458,26 @@ Standard library types (`std::vector`, `std::runtime_error`) only.
 | `Krb5Authenticator` | `krb5_authenticator.cpp` | POSIX (Linux + macOS), via system GSSAPI | Phase 3 shipped |
 | `WinSspiAuthenticator` | `winsspi_authenticator.cpp` | Windows, via `secur32.dll` Negotiate package | Phase 4 pending |
 
+### Login-time routing (spec 068)
+
+Routing is a property of the **connection**, not of an authentication method.
+`TdsConnection::RunWithRoutingHops` owns the hop loop and every state transition
+in it; the three `Authenticate*` entry points are thin wrappers that supply a
+per-attempt callback (their PRELOGIN flavour + their LOGIN7 flavour). A callback
+reports `LoginAttemptOutcome::{Success, Route, Failure}` — three states rather
+than a bool, because a routed answer *without* a LOGINACK is neither a success
+nor a failure, and expressing it as "false plus a side flag" is what produced
+the original bug.
+
+| Path | Wrapper | Notes |
+|---|---|---|
+| SQL auth | `Authenticate` | — |
+| Azure AD | `AuthenticateWithFedAuth` | the loop originally lived here |
+| Kerberos / SSPI | `AuthenticateIntegrated` | takes an `AuthenticatorFactory`, so each hop gets a ticket for the routed host's SPN |
+
+Protocol details, the hop budget and the normalization rules are in
+[tds-protocol.md](tds-protocol.md#routing-envchange-type-20).
+
 ### Configuration Structs
 
 **PreloginOptions**:

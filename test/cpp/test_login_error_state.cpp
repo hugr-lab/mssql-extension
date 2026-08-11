@@ -140,6 +140,28 @@ void AppendLoginAckToken(std::vector<uint8_t> &buf) {
 	buf.insert(buf.end(), body.begin(), body.end());
 }
 
+// ROUTING ENVCHANGE (type 20 / 0x14) per [MS-TDS] 2.2.7.13. Layout inside the
+// ENVCHANGE token: Type(1) NewValueLen(2, LE) Protocol(1, 0=TCP)
+// Port(2, LE) AltServerLen(2, LE, in CHARACTERS) AltServer(UTF-16LE)
+// OldValue(2, always 0). Spec 068.
+void AppendRoutingEnvChange(std::vector<uint8_t> &buf, const std::string &server, uint16_t port) {
+	std::vector<uint8_t> routing;
+	routing.push_back(0x00);									 // Protocol: TCP
+	AppendU16LE(routing, port);									 // ProtocolProperty: port
+	AppendU16LE(routing, static_cast<uint16_t>(server.size()));	 // AltServer length in chars
+	AppendUtf16LE(routing, server);
+
+	std::vector<uint8_t> body;
+	body.push_back(20);										   // ENVCHANGE type 20 = ROUTING
+	AppendU16LE(body, static_cast<uint16_t>(routing.size()));  // NewValue length
+	body.insert(body.end(), routing.begin(), routing.end());
+	AppendU16LE(body, 0);  // OldValue length = 0
+
+	buf.push_back(static_cast<uint8_t>(TokenType::ENVCHANGE));
+	AppendU16LE(buf, static_cast<uint16_t>(body.size()));
+	buf.insert(buf.end(), body.begin(), body.end());
+}
+
 //===----------------------------------------------------------------------===//
 // Tests
 //===----------------------------------------------------------------------===//
@@ -465,6 +487,89 @@ void TestTruncatedDoneDoesNotOverread() {
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// Spec 068 -- login-time routing (ENVCHANGE 20)
+//
+// The parser half of the contract: `has_routing` must be reported independently
+// of `success`, because the connection layer now treats routing as outranking
+// both. The two shapes below are the two the connection layer used to get
+// wrong in opposite directions.
+//===----------------------------------------------------------------------===//
+
+// Shape 1 -- ROUTING alongside a LOGINACK. This is what the Azure gateways we
+// have actually met send. The parser must report BOTH; the connection layer
+// then hops rather than transacting against the gateway.
+void TestRoutingWithLoginAck() {
+	std::vector<uint8_t> stream;
+	AppendLoginAckToken(stream);
+	AppendRoutingEnvChange(stream, "routed.database.windows.net", 11003);
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0000, 0x0000, 0);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);	  // LOGINACK was there...
+	CHECK(resp.has_routing == true);  // ...and so was the redirect
+	CHECK(resp.routed_server == "routed.database.windows.net");
+	CHECK(resp.routed_port == 11003);
+	std::cout << "  [ok] ROUTING + LOGINACK reports both success and has_routing (spec 068 D1)" << std::endl;
+}
+
+// Shape 2 -- ROUTING with NO LOGINACK: legal per [MS-TDS], and the shape that
+// used to die as "authentication failed" on the FEDAUTH path because the
+// !success return came before the routing capture (spec 068 Gap 1).
+void TestRoutingWithoutLoginAck() {
+	std::vector<uint8_t> stream;
+	AppendRoutingEnvChange(stream, "routed.database.windows.net", 11003);
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0000, 0x0000, 0);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == false);	  // no LOGINACK on this socket...
+	CHECK(resp.has_routing == true);  // ...but the redirect is still there
+	CHECK(resp.routed_server == "routed.database.windows.net");
+	CHECK(resp.routed_port == 11003);
+	CHECK(resp.error_number == 0);	// and it is NOT an error
+	std::cout << "  [ok] ROUTING without LOGINACK still reports has_routing (spec 068 Gap 1)" << std::endl;
+}
+
+// The routed target may carry an instance name and a port suffix -- Fabric
+// sends "hostname\INSTANCE:port". The parser hands the string over verbatim;
+// splitting it is NormalizeRoutedTarget's job. Pins that the UTF-16LE decode
+// keeps the backslash and the colon intact.
+void TestRoutedTargetWithInstanceAndPortSurvivesDecode() {
+	std::vector<uint8_t> stream;
+	AppendRoutingEnvChange(stream, "host.pbidedicated.windows.net\\INST01:1433", 1433);
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0000, 0x0000, 0);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.has_routing == true);
+	CHECK(resp.routed_server == "host.pbidedicated.windows.net\\INST01:1433");
+	std::cout << "  [ok] routed target keeps instance + port suffix through the UTF-16 decode" << std::endl;
+}
+
+// Composition with PR #254: a Synapse-style DONEINPROC run ahead of the real
+// tokens. #254 fixed the 12-byte TDS 7.2+ DONE body size; if that regressed,
+// the walk would desync and never reach the ROUTING behind it. This is the
+// shape a routing Synapse Serverless endpoint would send.
+void TestRoutingBehindDoneInProcRun() {
+	std::vector<uint8_t> stream;
+	for (int i = 0; i < 3; i++) {
+		AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0001 /* DONE_MORE */, 0x00E6, 0);
+	}
+	AppendLoginAckToken(stream);
+	AppendRoutingEnvChange(stream, "routed.sql.azuresynapse.net", 1433);
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0000, 0x0000, 0);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);
+	CHECK(resp.has_routing == true);
+	CHECK(resp.routed_server == "routed.sql.azuresynapse.net");
+	CHECK(resp.routed_port == 1433);
+	std::cout << "  [ok] ROUTING behind a DONEINPROC run still parsed (composition with #254)" << std::endl;
+}
+
 int main() {
 	std::cout << "test_login_error_state (issue #164: capture 18456 State byte)" << std::endl;
 
@@ -484,6 +589,10 @@ int main() {
 	TestPlainDoneBeforeLoginAck();
 	TestDoneExactlyAtBufferEnd();
 	TestTruncatedDoneDoesNotOverread();
+	TestRoutingWithLoginAck();
+	TestRoutingWithoutLoginAck();
+	TestRoutedTargetWithInstanceAndPortSurvivesDecode();
+	TestRoutingBehindDoneInProcRun();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

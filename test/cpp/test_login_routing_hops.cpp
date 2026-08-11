@@ -1,0 +1,684 @@
+// test/cpp/test_login_routing_hops.cpp
+// Unit tests for login-time routing (ENVCHANGE type 20) -- spec 068.
+//
+// These tests do NOT require a running SQL Server, an Azure subscription or an
+// Active Directory. They stand up a loopback fake TDS server on 127.0.0.1 that
+// speaks exactly three things -- a PRELOGIN response, a LOGIN7 response, and
+// nothing else -- and drive a REAL TdsConnection against it.
+//
+// What they pin (spec 068):
+//   D1: ROUTING outranks success. A routed answer is a hop whether or not a
+//       LOGINACK came with it. Before 068 the FEDAUTH path failed the
+//       no-LOGINACK shape as "authentication failed", and SQL auth silently
+//       "succeeded" against a gateway that had told it to leave.
+//   D2: one hop driver behind all three auth paths, with MAX_ROUTING_HOPS=5,
+//       a full handshake per hop, and a per-hop packet-id reset.
+//   D3: integrated auth takes an authenticator FACTORY, so a hop obtains a
+//       ticket for the routed host's SPN rather than retrying the gateway's.
+//
+// The fake server runs unencrypted (use_encrypt=false), so no TLS keys and no
+// OpenSSL handshake are involved -- OpenSSL is linked only because
+// tds_socket.hpp pulls the TLS context in.
+//
+// Build + run via the Makefile (matches the CI source set exactly):
+//   make test-login-routing-hops
+//
+// Or compile manually (macOS/brew example):
+//   c++ -std=c++17 -pthread -I src/include \
+//       -I/opt/homebrew/opt/simdutf/include -I/opt/homebrew/opt/openssl@3/include \
+//       test/cpp/test_login_routing_hops.cpp \
+//       src/tds/tds_connection.cpp src/tds/tds_socket.cpp \
+//       src/tds/tls/tds_tls_context.cpp src/tds/tls/tds_tls_impl.cpp \
+//       src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp \
+//       src/tds/encoding/utf16.cpp \
+//       -L/opt/homebrew/opt/simdutf/lib -L/opt/homebrew/opt/openssl@3/lib \
+//       -lsimdutf -lssl -lcrypto -o build/test/test_login_routing_hops
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using socket_t = SOCKET;
+#define CLOSE_SOCKET closesocket
+#define INVALID_SOCK INVALID_SOCKET
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using socket_t = int;
+#define CLOSE_SOCKET ::close
+#define INVALID_SOCK (-1)
+#endif
+
+#include "tds/tds_connection.hpp"
+#include "tds/tds_protocol.hpp"
+#include "tds/tds_types.hpp"
+
+using namespace duckdb;
+using namespace duckdb::tds;
+
+namespace {
+
+int g_checks = 0;
+
+#define CHECK(cond)                                                                                             \
+	do {                                                                                                        \
+		g_checks++;                                                                                             \
+		if (!(cond)) {                                                                                          \
+			std::cerr << "ASSERT FAILED: " << #cond << " (" << __FILE__ << ":" << __LINE__ << ")" << std::endl; \
+			std::exit(1);                                                                                       \
+		}                                                                                                       \
+	} while (0)
+
+//===----------------------------------------------------------------------===//
+// Token builders (same wire shapes as test_login_error_state.cpp)
+//===----------------------------------------------------------------------===//
+
+void AppendU16LE(std::vector<uint8_t> &buf, uint16_t v) {
+	buf.push_back(static_cast<uint8_t>(v & 0xFF));
+	buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+
+void AppendU32LE(std::vector<uint8_t> &buf, uint32_t v) {
+	for (int i = 0; i < 4; i++) {
+		buf.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+	}
+}
+
+void AppendU64LE(std::vector<uint8_t> &buf, uint64_t v) {
+	for (int i = 0; i < 8; i++) {
+		buf.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+	}
+}
+
+void AppendUtf16LE(std::vector<uint8_t> &buf, const std::string &s) {
+	for (char c : s) {
+		buf.push_back(static_cast<uint8_t>(c));
+		buf.push_back(0x00);
+	}
+}
+
+// Minimal successful LOGINACK (interface + TDS 7.4 + empty progname + progver).
+void AppendLoginAck(std::vector<uint8_t> &buf) {
+	std::vector<uint8_t> body;
+	body.push_back(0x01);
+	AppendU32LE(body, 0x74000004);
+	body.push_back(0x00);
+	AppendU32LE(body, 0x00000000);
+	buf.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
+	AppendU16LE(buf, static_cast<uint16_t>(body.size()));
+	buf.insert(buf.end(), body.begin(), body.end());
+}
+
+// Final DONE in the TDS 7.2+ layout: Status(2) CurCmd(2) RowCount(8).
+void AppendDone(std::vector<uint8_t> &buf) {
+	buf.push_back(static_cast<uint8_t>(TokenType::DONE));
+	AppendU16LE(buf, 0x0000);
+	AppendU16LE(buf, 0x0000);
+	AppendU64LE(buf, 0);
+}
+
+// ROUTING ENVCHANGE (type 20) per [MS-TDS] 2.2.7.13.
+void AppendRoutingEnvChange(std::vector<uint8_t> &buf, const std::string &server, uint16_t port) {
+	std::vector<uint8_t> routing;
+	routing.push_back(0x00);  // Protocol: TCP
+	AppendU16LE(routing, port);
+	AppendU16LE(routing, static_cast<uint16_t>(server.size()));	 // length in CHARACTERS
+	AppendUtf16LE(routing, server);
+
+	std::vector<uint8_t> body;
+	body.push_back(20);	 // ENVCHANGE type 20 = ROUTING
+	AppendU16LE(body, static_cast<uint16_t>(routing.size()));
+	body.insert(body.end(), routing.begin(), routing.end());
+	AppendU16LE(body, 0);  // OldValue length
+
+	buf.push_back(static_cast<uint8_t>(TokenType::ENVCHANGE));
+	AppendU16LE(buf, static_cast<uint16_t>(body.size()));
+	buf.insert(buf.end(), body.begin(), body.end());
+}
+
+//===----------------------------------------------------------------------===//
+// Loopback fake TDS server
+//
+// Binds 127.0.0.1:0 (kernel-assigned port, read back with getsockname) so
+// nothing collides with a developer's SQL Server or a parallel CI job. One
+// thread accepts connections in a loop and answers PRELOGIN + LOGIN7 with
+// caller-supplied bytes. Accept and recv both poll with a timeout, so a wiring
+// bug fails the test in seconds instead of hanging the job.
+//===----------------------------------------------------------------------===//
+
+constexpr int POLL_TIMEOUT_MS = 5000;
+
+class FakeTdsServer {
+public:
+	// `login_response` is the token stream sent in answer to LOGIN7. It is a
+	// callback so a scenario can vary its answer per connection (e.g. route on
+	// the first, accept on the second).
+	using LoginResponder = std::function<std::vector<uint8_t>(int connection_index)>;
+
+	explicit FakeTdsServer(LoginResponder responder) : responder_(std::move(responder)) {
+		listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+		if (listen_fd_ == INVALID_SOCK) {
+			std::cerr << "fake server: socket() failed" << std::endl;
+			std::exit(1);
+		}
+		int reuse = 1;
+		::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
+
+		sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+		addr.sin_port = 0;	// kernel picks
+		if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+			std::cerr << "fake server: bind() failed" << std::endl;
+			std::exit(1);
+		}
+		if (::listen(listen_fd_, 8) != 0) {
+			std::cerr << "fake server: listen() failed" << std::endl;
+			std::exit(1);
+		}
+		socklen_t len = sizeof(addr);
+		if (::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+			std::cerr << "fake server: getsockname() failed" << std::endl;
+			std::exit(1);
+		}
+		port_ = ntohs(addr.sin_port);
+
+		thread_ = std::thread([this]() { Serve(); });
+	}
+
+	~FakeTdsServer() {
+		Stop();
+	}
+
+	void Stop() {
+		if (stopped_) {
+			return;
+		}
+		stopped_ = true;
+		running_ = false;
+		if (thread_.joinable()) {
+			thread_.join();
+		}
+		if (listen_fd_ != INVALID_SOCK) {
+			CLOSE_SOCKET(listen_fd_);
+			listen_fd_ = INVALID_SOCK;
+		}
+	}
+
+	uint16_t GetPort() const {
+		return port_;
+	}
+	int ConnectionCount() const {
+		return connections_.load();
+	}
+	// Packet id of the FIRST packet of the FIRST message on each connection.
+	// A hop must reset the sequence, so every connection must see 1.
+	const std::vector<int> &FirstPacketIds() const {
+		return first_packet_ids_;
+	}
+
+private:
+	void Serve() {
+		while (running_) {
+			socket_t client = AcceptWithTimeout();
+			if (client == INVALID_SOCK) {
+				continue;
+			}
+			const int index = connections_.fetch_add(1);
+			HandleConnection(client, index);
+			CLOSE_SOCKET(client);
+		}
+	}
+
+	socket_t AcceptWithTimeout() {
+#if defined(_WIN32)
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(listen_fd_, &readfds);
+		timeval tv = {0, 200 * 1000};
+		int rc = ::select(0, &readfds, nullptr, nullptr, &tv);
+		if (rc <= 0) {
+			return INVALID_SOCK;
+		}
+#else
+		pollfd pfd = {};
+		pfd.fd = listen_fd_;
+		pfd.events = POLLIN;
+		int rc = ::poll(&pfd, 1, 200);
+		if (rc <= 0) {
+			return INVALID_SOCK;
+		}
+#endif
+		return ::accept(listen_fd_, nullptr, nullptr);
+	}
+
+	// Read one complete TDS message (packets until the EOM status bit).
+	// Returns false on timeout / peer close. Records the first packet's id.
+	bool ReadMessage(socket_t fd, bool record_first_id) {
+		bool eom = false;
+		bool first = true;
+		while (!eom) {
+			uint8_t header[8];
+			if (!ReadExactly(fd, header, sizeof(header))) {
+				return false;
+			}
+			if (first && record_first_id) {
+				first_packet_ids_.push_back(static_cast<int>(header[6]));
+				first = false;
+			}
+			const uint16_t length = (static_cast<uint16_t>(header[2]) << 8) | header[3];
+			if (length < 8) {
+				return false;
+			}
+			std::vector<uint8_t> payload(length - 8);
+			if (!payload.empty() && !ReadExactly(fd, payload.data(), payload.size())) {
+				return false;
+			}
+			eom = (header[1] & 0x01) != 0;
+		}
+		return true;
+	}
+
+	static bool ReadExactly(socket_t fd, uint8_t *buf, size_t n) {
+		size_t got = 0;
+		while (got < n) {
+#if defined(_WIN32)
+			fd_set readfds;
+			FD_ZERO(&readfds);
+			FD_SET(fd, &readfds);
+			timeval tv = {POLL_TIMEOUT_MS / 1000, 0};
+			if (::select(0, &readfds, nullptr, nullptr, &tv) <= 0) {
+				return false;
+			}
+			int rc = ::recv(fd, reinterpret_cast<char *>(buf + got), static_cast<int>(n - got), 0);
+#else
+			pollfd pfd = {};
+			pfd.fd = fd;
+			pfd.events = POLLIN;
+			if (::poll(&pfd, 1, POLL_TIMEOUT_MS) <= 0) {
+				return false;
+			}
+			ssize_t rc = ::recv(fd, buf + got, n - got, 0);
+#endif
+			if (rc <= 0) {
+				return false;
+			}
+			got += static_cast<size_t>(rc);
+		}
+		return true;
+	}
+
+	static bool SendAll(socket_t fd, const std::vector<uint8_t> &data) {
+		size_t sent = 0;
+		while (sent < data.size()) {
+#if defined(_WIN32)
+			int rc =
+				::send(fd, reinterpret_cast<const char *>(data.data() + sent), static_cast<int>(data.size() - sent), 0);
+#else
+			ssize_t rc = ::send(fd, data.data() + sent, data.size() - sent, 0);
+#endif
+			if (rc <= 0) {
+				return false;
+			}
+			sent += static_cast<size_t>(rc);
+		}
+		return true;
+	}
+
+	// Wrap a payload in one TDS TABULAR_RESULT packet with EOM set.
+	static std::vector<uint8_t> Frame(const std::vector<uint8_t> &payload) {
+		std::vector<uint8_t> out;
+		const uint16_t length = static_cast<uint16_t>(payload.size() + 8);
+		out.push_back(static_cast<uint8_t>(PacketType::TABULAR_RESULT));
+		out.push_back(0x01);  // EOM
+		out.push_back(static_cast<uint8_t>((length >> 8) & 0xFF));
+		out.push_back(static_cast<uint8_t>(length & 0xFF));
+		out.push_back(0x00);  // SPID hi
+		out.push_back(0x00);  // SPID lo
+		out.push_back(0x01);  // packet id
+		out.push_back(0x00);  // window
+		out.insert(out.end(), payload.begin(), payload.end());
+		return out;
+	}
+
+	// PRELOGIN response advertising VERSION + ENCRYPT_NOT_SUP. The client runs
+	// with use_encrypt=false, which accepts anything except ENCRYPT_REQ.
+	static std::vector<uint8_t> BuildPreloginResponse() {
+		// Option headers: VERSION(0), ENCRYPTION(1), TERMINATOR(0xFF).
+		// Offsets are big-endian and relative to the start of the payload.
+		const uint16_t header_size = 5 + 5 + 1;
+		std::vector<uint8_t> out;
+		out.push_back(0x00);  // VERSION
+		out.push_back(static_cast<uint8_t>((header_size >> 8) & 0xFF));
+		out.push_back(static_cast<uint8_t>(header_size & 0xFF));
+		out.push_back(0x00);
+		out.push_back(0x06);  // len 6
+		out.push_back(0x01);  // ENCRYPTION
+		out.push_back(static_cast<uint8_t>(((header_size + 6) >> 8) & 0xFF));
+		out.push_back(static_cast<uint8_t>((header_size + 6) & 0xFF));
+		out.push_back(0x00);
+		out.push_back(0x01);  // len 1
+		out.push_back(0xFF);  // TERMINATOR
+		// VERSION data: 16.0.1000 build, 0 sub-build
+		out.push_back(16);
+		out.push_back(0);
+		out.push_back(0x03);
+		out.push_back(0xE8);
+		out.push_back(0);
+		out.push_back(0);
+		// ENCRYPTION data
+		out.push_back(static_cast<uint8_t>(EncryptionOption::ENCRYPT_NOT_SUP));
+		return out;
+	}
+
+	void HandleConnection(socket_t client, int index) {
+		// 1. PRELOGIN
+		if (!ReadMessage(client, /*record_first_id=*/true)) {
+			return;
+		}
+		if (!SendAll(client, Frame(BuildPreloginResponse()))) {
+			return;
+		}
+		// 2. LOGIN7 -> one answer, then we are done with this connection. The
+		//    integrated scenarios need no SPNEGO round trip: StubAuthenticator
+		//    completes on InitialBytes(), so the server's single answer is the
+		//    LOGINACK (or the ROUTING) the client is waiting for.
+		if (!ReadMessage(client, /*record_first_id=*/false)) {
+			return;
+		}
+		std::vector<uint8_t> answer = responder_(index);
+		if (answer.empty()) {
+			return;
+		}
+		SendAll(client, Frame(answer));
+	}
+
+	LoginResponder responder_;
+	socket_t listen_fd_ = INVALID_SOCK;
+	uint16_t port_ = 0;
+	std::thread thread_;
+	std::atomic<bool> running_{true};
+	bool stopped_ = false;
+	std::atomic<int> connections_{0};
+	std::vector<int> first_packet_ids_;
+};
+
+// Response streams the scenarios reuse.
+std::vector<uint8_t> LoginAckStream() {
+	std::vector<uint8_t> s;
+	AppendLoginAck(s);
+	AppendDone(s);
+	return s;
+}
+
+std::vector<uint8_t> RouteWithLoginAckStream(uint16_t port) {
+	std::vector<uint8_t> s;
+	AppendLoginAck(s);
+	AppendRoutingEnvChange(s, "127.0.0.1", port);
+	AppendDone(s);
+	return s;
+}
+
+std::vector<uint8_t> RouteWithoutLoginAckStream(uint16_t port) {
+	std::vector<uint8_t> s;
+	AppendRoutingEnvChange(s, "127.0.0.1", port);
+	AppendDone(s);
+	return s;
+}
+
+//===----------------------------------------------------------------------===//
+// A stub authenticator: records its lifecycle so the integrated-path tests can
+// assert the factory was re-invoked per hop and the previous context freed.
+//===----------------------------------------------------------------------===//
+
+struct AuthTrace {
+	std::vector<std::pair<std::string, uint16_t>> factory_calls;
+	int frees = 0;
+	int frees_before_second_build = -1;
+};
+
+class StubAuthenticator : public IAuthenticator {
+public:
+	explicit StubAuthenticator(AuthTrace *trace) : trace_(trace) {}
+	std::vector<uint8_t> InitialBytes() override {
+		return {0x60, 0x01, 0x02, 0x03};  // non-empty SPNEGO-shaped blob
+	}
+	std::vector<uint8_t> NextBytes(const std::vector<uint8_t> &) override {
+		return {};	// negotiation complete on our side
+	}
+	void Free() override {
+		trace_->frees++;
+	}
+
+private:
+	AuthTrace *trace_;
+};
+
+//===----------------------------------------------------------------------===//
+// Scenarios
+//===----------------------------------------------------------------------===//
+
+// Baseline: no ROUTING anywhere. Proves the hop driver did not change the
+// zero-hop path when AuthenticateWithFedAuth's loop was extracted into it.
+void TestZeroHopLoginUnchanged() {
+	FakeTdsServer server([](int) { return LoginAckStream(); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	CHECK(conn.GetState() == ConnectionState::Idle);
+	CHECK(conn.GetPort() == server.GetPort());
+	CHECK(server.ConnectionCount() == 1);
+	CHECK(server.FirstPacketIds().size() == 1);
+	CHECK(server.FirstPacketIds()[0] == 1);
+	conn.Close();
+	server.Stop();
+	std::cout << "  [ok] zero-hop login unchanged by the hop driver" << std::endl;
+}
+
+// D1 + Gap 2: SQL auth follows a ROUTING that arrives WITH a LOGINACK.
+// Before spec 068 this "succeeded" against the gateway -- silently.
+void TestSqlAuthSingleHopWithLoginAck() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+	FakeTdsServer gateway([target_port](int) { return RouteWithLoginAckStream(target_port); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	CHECK(conn.GetState() == ConnectionState::Idle);
+	CHECK(conn.GetPort() == target_port);  // we ended up on the ROUTED server
+	CHECK(conn.GetHost() == "127.0.0.1");
+	CHECK(gateway.ConnectionCount() == 1);
+	CHECK(target.ConnectionCount() == 1);
+	conn.Close();
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] SQL auth follows ROUTING + LOGINACK to the routed server (spec 068 Gap 2)" << std::endl;
+}
+
+// D1 + Gap 1: the routed answer carries NO LOGINACK. This is the shape that
+// used to abort the login as an authentication failure.
+void TestRouteWithoutLoginAckFollowsHop() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+	FakeTdsServer gateway([target_port](int) { return RouteWithoutLoginAckStream(target_port); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	CHECK(conn.GetState() == ConnectionState::Idle);
+	CHECK(conn.GetPort() == target_port);
+	conn.Close();
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] ROUTING without LOGINACK follows the hop instead of failing (spec 068 Gap 1)" << std::endl;
+}
+
+// The per-hop packet-id reset: every new socket must start its sequence at 1.
+// A carried-over id makes SQL Server drop the connection mid-login.
+void TestPerHopPacketIdReset() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+	FakeTdsServer gateway([target_port](int) { return RouteWithLoginAckStream(target_port); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	CHECK(target.FirstPacketIds().size() == 1);
+	CHECK(target.FirstPacketIds()[0] == 1);	 // the HOP's first packet, not 3 or 4
+	conn.Close();
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] packet id resets to 1 on the routed connection" << std::endl;
+}
+
+// A server that routes to itself must be stopped by MAX_ROUTING_HOPS, and the
+// error must name both the count and the last routed target so a field report
+// is diagnosable in one round.
+void TestHopLimitAborts() {
+	// The responder reads self_port by reference: it is filled in right after
+	// construction, before the first connection can possibly arrive.
+	uint16_t self_port = 0;
+	FakeTdsServer server([&self_port](int) { return RouteWithLoginAckStream(self_port); });
+	self_port = server.GetPort();
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false) == false);
+
+	CHECK(conn.GetState() == ConnectionState::Disconnected);
+	const std::string err = conn.GetLastError();
+	CHECK(err.find("Too many routing hops") != std::string::npos);
+	CHECK(err.find("127.0.0.1") != std::string::npos);	// last routed target named
+	// 1 initial login + MAX_ROUTING_HOPS(5) hops = 6 connections, then abort.
+	CHECK(server.ConnectionCount() == 6);
+	server.Stop();
+	std::cout << "  [ok] hop limit aborts after 5 hops, naming count + last target" << std::endl;
+}
+
+// D3: the integrated path takes a FACTORY, and a hop re-invokes it with the
+// ROUTED host/port -- that is what makes the Kerberos/SSPI ticket match the
+// routed server's SPN instead of the gateway's.
+void TestIntegratedAuthFactoryRebuiltPerHop() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+	FakeTdsServer gateway([target_port](int) { return RouteWithLoginAckStream(target_port); });
+
+	AuthTrace trace;
+	auto factory = [&trace](const std::string &host, uint16_t port) -> std::shared_ptr<IAuthenticator> {
+		if (trace.factory_calls.size() == 1) {
+			// About to build the SECOND authenticator: how many Free()s so far?
+			trace.frees_before_second_build = trace.frees;
+		}
+		trace.factory_calls.emplace_back(host, port);
+		return std::make_shared<StubAuthenticator>(&trace);
+	};
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.AuthenticateIntegrated("TestDB", factory, /*use_encrypt=*/false));
+
+	CHECK(conn.GetState() == ConnectionState::Idle);
+	CHECK(trace.factory_calls.size() == 2);						// gateway, then routed server
+	CHECK(trace.factory_calls[0].second == gateway.GetPort());	// first attempt: the gateway
+	CHECK(trace.factory_calls[1].second == target_port);		// hop: the ROUTED target
+	CHECK(trace.factory_calls[1].first == "127.0.0.1");
+	// The gateway's context must be released before the hop's is built,
+	// otherwise every hop leaks a GSSAPI/SSPI context.
+	CHECK(trace.frees_before_second_build == 1);
+	conn.Close();
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] integrated auth rebuilds the authenticator for the routed host, freeing the old one"
+			  << std::endl;
+}
+
+// A factory that cannot produce a ticket for the ROUTED host must fail with an
+// error naming that host -- the spec's mitigation for shipping the SPN-over-hop
+// design without a live AD + routing environment to verify it against.
+void TestIntegratedAuthFactoryNullOnHopNamesRoutedHost() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+	FakeTdsServer gateway([target_port](int) { return RouteWithLoginAckStream(target_port); });
+
+	AuthTrace trace;
+	auto factory = [&trace](const std::string &host, uint16_t port) -> std::shared_ptr<IAuthenticator> {
+		trace.factory_calls.emplace_back(host, port);
+		if (trace.factory_calls.size() == 1) {
+			return std::make_shared<StubAuthenticator>(&trace);
+		}
+		return nullptr;	 // no ticket for the routed host
+	};
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.AuthenticateIntegrated("TestDB", factory, /*use_encrypt=*/false) == false);
+
+	const std::string err = conn.GetLastError();
+	CHECK(err.find("routed server") != std::string::npos);
+	CHECK(err.find(std::to_string(target_port)) != std::string::npos);
+	// Must NOT be the "compiled without Kerberos support" message -- that one
+	// belongs to a first-attempt nullptr only.
+	CHECK(err.find("compiled without") == std::string::npos);
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] a hop with no obtainable ticket names the routed host in the error" << std::endl;
+}
+
+// A first-attempt nullptr keeps the pre-068 wording, which users have in their
+// notes and issue reports.
+void TestIntegratedAuthNullFactoryFirstAttemptKeepsWording() {
+	FakeTdsServer server([](int) { return LoginAckStream(); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
+	auto factory = [](const std::string &, uint16_t) -> std::shared_ptr<IAuthenticator> { return nullptr; };
+	CHECK(conn.AuthenticateIntegrated("TestDB", factory, /*use_encrypt=*/false) == false);
+
+	CHECK(conn.GetLastError().find("compiled without Kerberos / SSPI support") != std::string::npos);
+	CHECK(conn.GetState() == ConnectionState::Disconnected);
+	server.Stop();
+	std::cout << "  [ok] first-attempt null factory keeps the pre-068 error wording" << std::endl;
+}
+
+}  // namespace
+
+int main() {
+#if defined(_WIN32)
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+	std::cout << "test_login_routing_hops (spec 068: ENVCHANGE 20 on every auth path)" << std::endl;
+
+	TestZeroHopLoginUnchanged();
+	TestSqlAuthSingleHopWithLoginAck();
+	TestRouteWithoutLoginAckFollowsHop();
+	TestPerHopPacketIdReset();
+	TestHopLimitAborts();
+	TestIntegratedAuthFactoryRebuiltPerHop();
+	TestIntegratedAuthFactoryNullOnHopNamesRoutedHost();
+	TestIntegratedAuthNullFactoryFirstAttemptKeepsWording();
+
+	std::cout << "All " << g_checks << " checks passed." << std::endl;
+	return 0;
+}
