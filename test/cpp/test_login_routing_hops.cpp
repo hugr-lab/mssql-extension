@@ -724,6 +724,44 @@ void TestRoutedTargetWithInstanceAndPortSuffix() {
 			  << std::endl;
 }
 
+// A routed target that cannot be reached. The gateway's answer is perfectly
+// well-formed; the hop just fails to connect -- a stale AlwaysOn routing list,
+// a firewalled replica, a gateway naming an address the client cannot see.
+// Before this, RunWithRoutingHops's reconnect-failure branch and its error
+// string were the only paths in the driver with no coverage at all.
+//
+// The unreachable port is a listener's own port after it has been stopped, so
+// the connection is REFUSED immediately. A black-holed address (the
+// 10.255.255.x trick Microsoft's mssql-rs failover tests use) would exercise
+// the timeout instead, but DEFAULT_CONNECTION_TIMEOUT is compiled in at 30s
+// here, which is not a unit test.
+void TestUnreachableRoutedTargetFails() {
+	uint16_t dead_port = 0;
+	{
+		FakeTdsServer doomed([](int) { return LoginAckStream(); });
+		dead_port = doomed.GetPort();
+		doomed.Stop();	// nothing listens there now
+	}
+	FakeTdsServer gateway([dead_port](int) { return RouteWithLoginAckStream(dead_port); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false) == false);
+
+	CHECK(conn.GetState() == ConnectionState::Disconnected);
+	CHECK(conn.GetDatabase().empty());
+	const std::string err = conn.GetLastError();
+	// The message must name the target that could not be reached -- "connection
+	// failed" without the routed address sends the reader back to the gateway,
+	// which was working fine.
+	CHECK(err.find("Failed to connect to routed server") != std::string::npos);
+	CHECK(err.find(std::to_string(dead_port)) != std::string::npos);
+	CHECK(gateway.ConnectionCount() == 1);
+
+	gateway.Stop();
+	std::cout << "  [ok] an unreachable routed target fails with the routed address named" << std::endl;
+}
+
 // D3: the integrated path takes a FACTORY, and a hop re-invokes it with the
 // ROUTED host/port -- that is what makes the Kerberos/SSPI ticket match the
 // routed server's SPN instead of the gateway's.
@@ -824,6 +862,7 @@ int main() {
 	TestPerHopPacketIdReset();
 	TestReusedConnectionRestartsPacketSequence();
 	TestRoutedTargetWithInstanceAndPortSuffix();
+	TestUnreachableRoutedTargetFails();
 	TestHopLimitAborts();
 	TestIntegratedAuthFactoryRebuiltPerHop();
 	TestIntegratedAuthFactoryNullOnHopNamesRoutedHost();
