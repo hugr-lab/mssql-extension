@@ -103,13 +103,41 @@ std::vector<uint8_t> BuildErrorToken(uint32_t number, uint8_t state, uint8_t err
 	return token;
 }
 
-// Append a minimal DONE token (0xFD) with the ERROR status bit set. 8 bytes of
-// payload follow the token type (Status 2 + CurCmd 2 + RowCount 4).
+void AppendU64LE(std::vector<uint8_t> &buf, uint64_t v) {
+	for (int i = 0; i < 8; i++) {
+		buf.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+	}
+}
+
+// Append a DONE-family token in the TDS 7.2+ layout ([MS-TDS] 2.2.7.9):
+// Status(2) + CurCmd(2) + DoneRowCount(8). The 8-byte row count is what every
+// server we log in to sends (we negotiate 7.4); the pre-7.2 4-byte form this
+// helper used to emit masked the parser skipping 8 bytes instead of 12 --
+// harmless only because DONE was always the last token in these fixtures.
+void AppendDoneFamilyToken(std::vector<uint8_t> &buf, TokenType type, uint16_t status, uint16_t cur_cmd,
+						   uint64_t row_count) {
+	buf.push_back(static_cast<uint8_t>(type));
+	AppendU16LE(buf, status);
+	AppendU16LE(buf, cur_cmd);
+	AppendU64LE(buf, row_count);
+}
+
+// Final DONE (0xFD) with the ERROR status bit set.
 void AppendDoneToken(std::vector<uint8_t> &buf) {
-	buf.push_back(static_cast<uint8_t>(TokenType::DONE));
-	AppendU16LE(buf, 0x0002);  // DONE_ERROR
-	AppendU16LE(buf, 0x0000);  // CurCmd
-	AppendU32LE(buf, 0x0000);  // RowCount
+	AppendDoneFamilyToken(buf, TokenType::DONE, 0x0002 /* DONE_ERROR */, 0x0000, 0);
+}
+
+// Minimal successful LOGINACK token (type + len + interface + tdsver +
+// progname-len + progver), shared by the fixtures that need a success path.
+void AppendLoginAckToken(std::vector<uint8_t> &buf) {
+	std::vector<uint8_t> body;
+	body.push_back(0x01);			// Interface
+	AppendU32LE(body, 0x74000004);	// TDS 7.4 version
+	body.push_back(0x00);			// ProgName length (0 chars)
+	AppendU32LE(body, 0x00000000);	// ProgVersion
+	buf.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
+	AppendU16LE(buf, static_cast<uint16_t>(body.size()));
+	buf.insert(buf.end(), body.begin(), body.end());
 }
 
 //===----------------------------------------------------------------------===//
@@ -161,18 +189,8 @@ void TestState4060CannotOpenDatabase() {
 // Regression: a successful LOGINACK response must leave error_state at its 0
 // default (no ERROR token present).
 void TestSuccessLeavesStateZero() {
-	// Minimal LOGINACK token: type + len + interface(1) + tdsver(4) +
-	// prognamelen(1) + progname + progver(4).
-	std::vector<uint8_t> body;
-	body.push_back(0x01);			// Interface
-	AppendU32LE(body, 0x74000004);	// TDS 7.4 version (value is not asserted here)
-	body.push_back(0x00);			// ProgName length (0 chars)
-	AppendU32LE(body, 0x00000000);	// ProgVersion
-
 	std::vector<uint8_t> stream;
-	stream.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
-	AppendU16LE(stream, static_cast<uint16_t>(body.size()));
-	stream.insert(stream.end(), body.begin(), body.end());
+	AppendLoginAckToken(stream);
 	AppendDoneToken(stream);
 
 	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
@@ -307,15 +325,7 @@ void TestEnvChangeZeroLenMidStreamContinues() {
 // re-breaks the skip for the success flow, which the ERROR-path test wouldn't catch.
 void TestEnvChangeZeroLenBeforeLoginAckSucceeds() {
 	std::vector<uint8_t> stream = {static_cast<uint8_t>(TokenType::ENVCHANGE), 0x00, 0x00};	 // empty ENVCHANGE
-
-	std::vector<uint8_t> body;
-	body.push_back(0x01);			// Interface
-	AppendU32LE(body, 0x74000004);	// TDS 7.4 version
-	body.push_back(0x00);			// ProgName length (0 chars)
-	AppendU32LE(body, 0x00000000);	// ProgVersion
-	stream.push_back(static_cast<uint8_t>(TokenType::LOGINACK));
-	AppendU16LE(stream, static_cast<uint16_t>(body.size()));
-	stream.insert(stream.end(), body.begin(), body.end());
+	AppendLoginAckToken(stream);
 	AppendDoneToken(stream);
 
 	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
@@ -323,6 +333,54 @@ void TestEnvChangeZeroLenBeforeLoginAckSucceeds() {
 	CHECK(resp.success == true);  // LOGINACK after the empty ENVCHANGE still reached
 	CHECK(resp.error_number == 0);
 	std::cout << "  [ok] empty ENVCHANGE mid-stream skipped, following LOGINACK still succeeds" << std::endl;
+}
+
+// Regression for issues #88 / #164 (Azure Synapse Serverless): the login
+// response there does NOT lead with LOGINACK -- the gateway runs internal
+// procs during login and fronts it with a run of DONEINPROC tokens (confirmed
+// by an MSSQL_DEBUG=2 hex dump: `ff 11 00 c1 00 01 00 00 00 00 00 00 00 ...`,
+// 13 bytes per token, DONE_MORE|DONE_COUNT). The parser used to skip the
+// pre-7.2 DONE size (8 bytes instead of 12), desyncing 4 bytes per token and
+// never reaching the LOGINACK -> "No LOGINACK token in response" on every
+// auth path. Replays that exact token pattern and requires the login to
+// succeed.
+void TestSynapseDoneInProcRunBeforeLoginAck() {
+	std::vector<uint8_t> stream;
+	// The observed pattern: rowcount 1, 1, 0 with DONE_MORE|DONE_COUNT (0x11),
+	// then a bare DONE_MORE (0x01) separator -- twice, for a healthy run.
+	for (int round = 0; round < 2; round++) {
+		AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0011, 0x00C1, 1);
+		AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0011, 0x00C1, 1);
+		AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0011, 0x00C1, 0);
+		AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0001, 0x00C0, 0);
+	}
+	AppendLoginAckToken(stream);
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0000, 0x0000, 0);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);  // LOGINACK behind the DONEINPROC run is reached
+	CHECK(resp.error_state == 0);
+	std::cout << "  [ok] LOGINACK behind a Synapse-style DONEINPROC run is parsed (issues #88/#164)" << std::endl;
+}
+
+// Sibling on the failure path: a login ERROR behind the same DONEINPROC run
+// must surface as that error, not as the parser losing its place. Before the
+// fix a desynced parse swallowed the ERROR too, so a bad password on Synapse
+// reported "No LOGINACK token in response" instead of 18456.
+void TestSynapseDoneInProcRunBeforeError() {
+	std::vector<uint8_t> stream;
+	AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0011, 0x00C1, 1);
+	AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0001, 0x00C0, 0);
+	auto err = BuildErrorToken(18456, 8, 14, "Login failed for user 'app_user'.");
+	stream.insert(stream.end(), err.begin(), err.end());
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == false);
+	CHECK(resp.error_number == 18456);	// the real error, not a lost parse
+	CHECK(resp.error_state == 8);
+	std::cout << "  [ok] ERROR behind a DONEINPROC run still surfaces (issues #88/#164)" << std::endl;
 }
 
 }  // namespace
@@ -340,6 +398,8 @@ int main() {
 	TestEnvChangeZeroLenNoOverread();
 	TestEnvChangeZeroLenMidStreamContinues();
 	TestEnvChangeZeroLenBeforeLoginAckSucceeds();
+	TestSynapseDoneInProcRunBeforeLoginAck();
+	TestSynapseDoneInProcRunBeforeError();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;
