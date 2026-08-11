@@ -154,35 +154,39 @@ jobs:
       # causes it. tds_connection.cpp reaches nothing outside the TDS layer, so
       # the only externals are simdutf (via encoding/utf16.cpp) and OpenSSL
       # (via tds_socket.hpp -> the TLS TUs; the test itself runs unencrypted).
-      - name: Install simdutf (spec 068 routing test)
+      # simdutf comes from the upstream single-file amalgamation rather than a
+      # distro package: Ubuntu 24.04 (noble) has no libsimdutf-dev, and pinning
+      # the tag to vcpkg.json's `simdutf` override means this test decodes
+      # UTF-16 with the same version the shipped extension links. No package
+      # manager, no vcpkg, no version drift.
+      - name: Fetch simdutf amalgamation (spec 068 routing test)
         run: |
-          if [ "${{ matrix.os.id }}" = "macos" ]; then
-            brew install simdutf
-          else
-            sudo apt-get update
-            sudo apt-get install -y libsimdutf-dev libssl-dev
-          fi
+          set -euo pipefail
+          mkdir -p /tmp/simdutf
+          curl -sSL --retry 3 -o /tmp/simdutf/singleheader.zip \
+            https://github.com/simdutf/simdutf/releases/download/v6.1.1/singleheader.zip
+          unzip -o -q /tmp/simdutf/singleheader.zip -d /tmp/simdutf
+          test -f /tmp/simdutf/simdutf.cpp && test -f /tmp/simdutf/simdutf.h
 
       - name: Build + run login routing hop-driver test (spec 068)
         run: |
           set -euo pipefail
           if [ "${{ matrix.os.id }}" = "macos" ]; then
-            SIMDUTF_PREFIX="$(brew --prefix simdutf)"
             OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-            EXTRA_INC="-I $SIMDUTF_PREFIX/include -I $OPENSSL_PREFIX/include"
-            EXTRA_LIB="-L $SIMDUTF_PREFIX/lib -L $OPENSSL_PREFIX/lib"
+            EXTRA_INC="-I $OPENSSL_PREFIX/include"
+            EXTRA_LIB="-L $OPENSSL_PREFIX/lib"
           else
             EXTRA_INC=""
             EXTRA_LIB=""
           fi
           c++ -std=c++17 -pthread -Wno-deprecated-declarations \
-            -I src/include $EXTRA_INC \
+            -I src/include -I /tmp/simdutf $EXTRA_INC \
             test/cpp/test_login_routing_hops.cpp \
             src/tds/tds_connection.cpp src/tds/tds_socket.cpp \
             src/tds/tls/tds_tls_context.cpp src/tds/tls/tds_tls_impl.cpp \
             src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp \
-            src/tds/encoding/utf16.cpp \
-            $EXTRA_LIB -lsimdutf -lssl -lcrypto \
+            src/tds/encoding/utf16.cpp /tmp/simdutf/simdutf.cpp \
+            $EXTRA_LIB -lssl -lcrypto \
             -o /tmp/test_login_routing_hops
           /tmp/test_login_routing_hops
 
