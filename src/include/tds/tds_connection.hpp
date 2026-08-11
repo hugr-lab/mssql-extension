@@ -300,6 +300,12 @@ private:
 	// TLS state
 	bool tls_enabled_;
 
+	// Connect timeout the caller supplied to Connect(), remembered so a routing
+	// hop reconnects on the SAME budget (spec 068). Without this a user who
+	// sets mssql_connection_timeout=5 and gets routed to an unreachable replica
+	// waits the compiled-in default per hop instead of the 5 they asked for.
+	int connect_timeout_seconds_ = DEFAULT_CONNECTION_TIMEOUT;
+
 	// Frame size we ask for in LOGIN7 (spec 055). Defaults to the pre-055
 	// behaviour so anything that does not call SetRequestedPacketSize is
 	// unchanged.

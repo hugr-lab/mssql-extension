@@ -134,6 +134,7 @@ bool TdsConnection::Connect(const std::string &host, uint16_t port, int timeout_
 
 	host_ = host;
 	port_ = port;
+	connect_timeout_seconds_ = timeout_seconds;
 	last_error_.clear();
 
 	if (!socket_->Connect(host, port, timeout_seconds)) {
@@ -391,7 +392,9 @@ bool TdsConnection::RunWithRoutingHops(const std::function<LoginAttemptOutcome()
 		host_ = next_server;
 		port_ = next_port;
 
-		if (!socket_->Connect(next_server, next_port, DEFAULT_CONNECTION_TIMEOUT)) {
+		// The caller's timeout, not the compiled-in default: a hop is part of the
+		// same connection attempt and must not silently cost more than asked.
+		if (!socket_->Connect(next_server, next_port, connect_timeout_seconds_)) {
 			last_error_ = "Failed to connect to routed server " + next_server + ":" + std::to_string(next_port) + ": " +
 						  socket_->GetLastError();
 			state_.store(ConnectionState::Disconnected);
@@ -1124,10 +1127,16 @@ void TdsConnection::Close() {
 	state_.store(ConnectionState::Disconnected);
 	spid_ = 0;
 	// This connection is no longer logged in anywhere, so it is no longer "in"
-	// a database either -- same reason spid_ is zeroed here. Without this the
-	// invariant that state_ == Disconnected implies an empty GetDatabase()
-	// would hold after an aborted login and not after a normal close, and a
-	// half-enforced invariant is the kind a later caller reads the wrong way.
+	// a database either -- same reason spid_ is zeroed here.
+	//
+	// Scope, precisely: database_ is cleared on the DELIBERATE teardown (here)
+	// and on the failed-login paths. It is NOT a class-wide invariant that
+	// state_ == Disconnected implies an empty GetDatabase(): Ping, SendAttention,
+	// WaitForAttentionAck, ExecuteBatch and ReceiveData all store Disconnected
+	// directly, and the early return above means a connection that died
+	// mid-query still reports its last database. Making that invariant real
+	// would mean funnelling every one of those through a MarkDisconnected()
+	// helper -- worth doing, but it is not this change's business.
 	database_.clear();
 }
 

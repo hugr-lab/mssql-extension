@@ -35,6 +35,7 @@
 //       -lsimdutf -lssl -lcrypto -o build/test/test_login_routing_hops
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -484,10 +485,10 @@ std::vector<uint8_t> LoginAckStream() {
 	return s;
 }
 
-std::vector<uint8_t> RouteWithLoginAckStream(uint16_t port) {
+std::vector<uint8_t> RouteWithLoginAckStream(uint16_t port, const std::string &host = "127.0.0.1") {
 	std::vector<uint8_t> s;
 	AppendLoginAck(s);
-	AppendRoutingEnvChange(s, "127.0.0.1", port);
+	AppendRoutingEnvChange(s, host, port);
 	AppendDone(s);
 	return s;
 }
@@ -736,13 +737,26 @@ void TestRoutedTargetWithInstanceAndPortSuffix() {
 // the timeout instead, but DEFAULT_CONNECTION_TIMEOUT is compiled in at 30s
 // here, which is not a unit test.
 void TestUnreachableRoutedTargetFails() {
+	// Take a listener's port and stop it, so the port is genuinely closed and
+	// the connect is REFUSED immediately.
+	//
+	// The tempting alternative -- keep a socket bound but never listen(), so the
+	// port cannot be reassigned -- is wrong on macOS: measured here, connecting
+	// to a bound-but-unlistening 127.0.0.1 port does NOT get an RST, the SYN is
+	// dropped and connect() sits for ~7.8s. That is a Linux behaviour, not a
+	// portable one. So the port is freed, and the premise the test rests on
+	// ("nothing is listening there") is enforced by assertion instead: if the
+	// kernel handed the gateway that same port, the gateway would route to
+	// itself and this would fail with the hop-limit message, pointing at the
+	// wrong code.
 	uint16_t dead_port = 0;
 	{
 		FakeTdsServer doomed([](int) { return LoginAckStream(); });
 		dead_port = doomed.GetPort();
-		doomed.Stop();	// nothing listens there now
+		doomed.Stop();
 	}
 	FakeTdsServer gateway([dead_port](int) { return RouteWithLoginAckStream(dead_port); });
+	CHECK(gateway.GetPort() != dead_port);	// the premise, enforced
 
 	TdsConnection conn;
 	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
@@ -760,6 +774,34 @@ void TestUnreachableRoutedTargetFails() {
 
 	gateway.Stop();
 	std::cout << "  [ok] an unreachable routed target fails with the routed address named" << std::endl;
+}
+
+// The caller's connect timeout must apply to the HOP, not just the first dial.
+// Connect() used to take timeout_seconds, use it once and forget it, so a hop
+// always reconnected on the compiled-in 30s default -- a user asking for 5s and
+// routed to a black-holed replica waited 30s per hop, up to five times.
+//
+// 192.0.2.1 is TEST-NET-1 (RFC 5737): reserved for documentation, so it is
+// never a real host. What the network does with it varies -- a SYN that gets
+// dropped exercises the timeout, an ICMP unreachable comes back immediately --
+// so this asserts a generous upper bound rather than a precise duration. It
+// discriminates the fix wherever packets are dropped (30s -> ~2s) and merely
+// passes cheaply where they are rejected outright.
+void TestHopHonoursCallerConnectTimeout() {
+	FakeTdsServer gateway([](int) { return RouteWithLoginAckStream(1433, "192.0.2.1"); });
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), /*timeout_seconds=*/2));
+	const auto started = std::chrono::steady_clock::now();
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false) == false);
+	const auto elapsed = std::chrono::steady_clock::now() - started;
+
+	CHECK(conn.GetLastError().find("Failed to connect to routed server") != std::string::npos);
+	const auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+	CHECK(secs < 15);  // the old behaviour would sit here for DEFAULT_CONNECTION_TIMEOUT
+	gateway.Stop();
+	std::cout << "  [ok] a hop reconnects on the caller's timeout, not the compiled-in default (" << secs << "s)"
+			  << std::endl;
 }
 
 // D3: the integrated path takes a FACTORY, and a hop re-invokes it with the
@@ -863,6 +905,7 @@ int main() {
 	TestReusedConnectionRestartsPacketSequence();
 	TestRoutedTargetWithInstanceAndPortSuffix();
 	TestUnreachableRoutedTargetFails();
+	TestHopHonoursCallerConnectTimeout();
 	TestHopLimitAborts();
 	TestIntegratedAuthFactoryRebuiltPerHop();
 	TestIntegratedAuthFactoryNullOnHopNamesRoutedHost();
