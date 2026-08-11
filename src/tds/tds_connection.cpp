@@ -859,6 +859,20 @@ bool TdsConnection::DoLogin7(const std::string &username, const std::string &pas
 		return false;
 	}
 
+	// Debug dump of the login response, mirroring DoLogin7WithFedAuth. The
+	// fedauth-path dump is what cracked the Synapse DONEINPROC-before-LOGINACK
+	// case (issues #88/#164); SQL-auth failures had no byte-level view at all.
+	MSSQL_CONN_DEBUG_LOG(2, "DoLogin7: received %zu bytes response", response.size());
+	if (GetMssqlDebugLevel() >= 2) {
+		std::string hex_dump;
+		for (size_t i = 0; i < std::min<size_t>(150, response.size()); i++) {
+			char buf[4];
+			snprintf(buf, sizeof(buf), "%02x ", response[i]);
+			hex_dump += buf;
+		}
+		MSSQL_CONN_DEBUG_LOG(2, "DoLogin7: response bytes (first 150): %s", hex_dump.c_str());
+	}
+
 	LoginResponse login_response = TdsProtocol::ParseLoginResponse(response);
 	NoteFeatureAcks(login_response);
 	if (!login_response.success) {
