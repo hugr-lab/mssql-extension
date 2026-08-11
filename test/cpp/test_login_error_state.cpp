@@ -383,6 +383,86 @@ void TestSynapseDoneInProcRunBeforeError() {
 	std::cout << "  [ok] ERROR behind a DONEINPROC run still surfaces (issues #88/#164)" << std::endl;
 }
 
+// The quiet casualty of the same desync, and the one that fails no test and
+// raises no error: a PACKETSIZE ENVCHANGE sitting BEHIND a DONE. DoLogin7 feeds
+// LoginResponse::negotiated_packet_size into ApplyNegotiatedFraming, so losing
+// it pins every packet on the connection at the 4096 default -- spec 055's
+// measured -28% client CPU / -43% wall simply does not happen, silently. The
+// login still succeeds, which is exactly why nothing would have caught it.
+void TestPacketSizeEnvChangeAfterDone() {
+	std::vector<uint8_t> stream;
+	AppendDoneFamilyToken(stream, TokenType::DONEINPROC, 0x0011, 0x00C1, 1);
+
+	// ENVCHANGE type 4 (PACKETSIZE), new value "16384" as UTF-16LE digits.
+	const std::string new_size = "16384";
+	std::vector<uint8_t> env;
+	env.push_back(0x04);								   // type = PACKETSIZE
+	env.push_back(static_cast<uint8_t>(new_size.size()));  // NewValueLen (chars)
+	AppendUtf16LE(env, new_size);						   // NewValue
+	env.push_back(0x00);								   // OldValueLen
+	stream.push_back(static_cast<uint8_t>(TokenType::ENVCHANGE));
+	AppendU16LE(stream, static_cast<uint16_t>(env.size()));
+	stream.insert(stream.end(), env.begin(), env.end());
+
+	AppendLoginAckToken(stream);
+	AppendDoneToken(stream);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);
+	CHECK(resp.negotiated_packet_size == 16384);
+	std::cout << "  [ok] PACKETSIZE ENVCHANGE behind a DONE still negotiated" << std::endl;
+}
+
+// Plain DONE (0xFD) ahead of the LOGINACK. The Synapse capture is all
+// DONEINPROC/DONEPROC, so the third member of the branch is covered only by
+// assumption; pin it.
+void TestPlainDoneBeforeLoginAck() {
+	std::vector<uint8_t> stream;
+	AppendDoneFamilyToken(stream, TokenType::DONE, 0x0001, 0x0000, 7);
+	AppendLoginAckToken(stream);
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);
+	std::cout << "  [ok] plain DONE (0xFD) before LOGINACK does not desync" << std::endl;
+}
+
+// Exact boundary: a DONE whose 12 payload bytes end precisely at `end`. The
+// guard is `ptr + 12 <= end`, and the other half of getting that right is
+// ACCEPTING a well-formed trailing DONE -- an off-by-one here would reject the
+// commonest token in every login response, so hold both directions.
+void TestDoneExactlyAtBufferEnd() {
+	std::vector<uint8_t> stream;
+	AppendLoginAckToken(stream);
+	const size_t before_done = stream.size();
+	AppendDoneToken(stream);
+	CHECK(stream.size() == before_done + 13);  // 1 type + 12 payload
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == true);
+	std::cout << "  [ok] DONE ending exactly at buffer end accepted" << std::endl;
+}
+
+// ...and the rejecting direction: a DONE with only 9 payload bytes -- enough for
+// the OLD 8-byte skip, four short of the real 12 -- must break out rather than
+// walk past `end`. Without a case here the bounds check is only ever exercised
+// on well-formed input.
+void TestTruncatedDoneDoesNotOverread() {
+	std::vector<uint8_t> stream;
+	stream.push_back(static_cast<uint8_t>(TokenType::DONEINPROC));
+	for (int i = 0; i < 9; i++) {
+		stream.push_back(0x00);
+	}
+
+	LoginResponse resp = TdsProtocol::ParseLoginResponse(stream);
+
+	CHECK(resp.success == false);
+	CHECK(resp.error_message == "No LOGINACK token in response");
+	std::cout << "  [ok] truncated DONE breaks cleanly, no over-read" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -400,6 +480,10 @@ int main() {
 	TestEnvChangeZeroLenBeforeLoginAckSucceeds();
 	TestSynapseDoneInProcRunBeforeLoginAck();
 	TestSynapseDoneInProcRunBeforeError();
+	TestPacketSizeEnvChangeAfterDone();
+	TestPlainDoneBeforeLoginAck();
+	TestDoneExactlyAtBufferEnd();
+	TestTruncatedDoneDoesNotOverread();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;
