@@ -157,6 +157,10 @@ bool TdsConnection::Authenticate(const std::string &username, const std::string 
 	// Initialize the LOGIN7 ServerName to the host we dialled; a routing hop
 	// replaces it with the routed "hostname\instance" form.
 	tds_server_name_ = host_;
+	// Set before the driver runs, so the successful attempt publishes
+	// state_ == Idle with database_ already correct -- the driver stores Idle
+	// itself, and other threads observe the connection through that atomic.
+	database_ = database;
 
 	// Spec 068: SQL auth follows ROUTING like every other path. Azure SQL with
 	// the Redirect connection policy (the DEFAULT for traffic originating
@@ -178,7 +182,6 @@ bool TdsConnection::Authenticate(const std::string &username, const std::string 
 		return false;
 	}
 
-	database_ = database;
 	UpdateLastUsed();
 	return true;
 }
@@ -323,13 +326,20 @@ bool TdsConnection::RunWithRoutingHops(const std::function<LoginAttemptOutcome()
 		MSSQL_CONN_DEBUG_LOG(1, "RunWithRoutingHops: authentication attempt %d on %s:%d", routing_hop + 1,
 							 host_.c_str(), port_);
 
-		// Per-attempt state. Cleared BEFORE the first attempt too, so a reused
-		// TdsConnection cannot inherit a stale route from an earlier login.
-		// next_packet_id_/tls_enabled_ are already correct on the first pass
-		// (fresh socket); resetting them is what makes hops 2..N correct.
+		// Per-attempt state, cleared before EVERY attempt including the first.
+		// Hops 2..N obviously need it. The first attempt needs it too: Close()
+		// resets state_ but not next_packet_id_, so a reused TdsConnection
+		// (Close -> Connect -> Authenticate) would otherwise open its LOGIN7
+		// with a stale sequence id, and would inherit a stale route from the
+		// previous login. tls_enabled_/fedauth_echo_ are self-correcting (both
+		// PRELOGIN flavours assign them unconditionally) but are reset here
+		// anyway, so the whole per-attempt set lives in one place.
 		has_routing_ = false;
 		routed_server_.clear();
 		routed_port_ = 0;
+		next_packet_id_ = 1;
+		tls_enabled_ = false;
+		fedauth_echo_ = false;
 
 		const LoginAttemptOutcome outcome = attempt();
 
@@ -370,9 +380,6 @@ bool TdsConnection::RunWithRoutingHops(const std::function<LoginAttemptOutcome()
 		// the latter demands the Disconnected state, and the state machine must
 		// stay in Authenticating across a hop.
 		socket_->Close();
-		next_packet_id_ = 1;
-		tls_enabled_ = false;
-		fedauth_echo_ = false;
 
 		// host_ is the stripped hostname for TCP/DNS and for TLS SNI (per
 		// go-mssqldb, SNI follows the routed host, not the original gateway);
@@ -415,6 +422,8 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 
 	// Initialize TDS server name to host - may be updated if routing includes instance name
 	tds_server_name_ = host_;
+	// See Authenticate(): set before the driver publishes state_ == Idle.
+	database_ = database;
 
 	// The hop loop that used to live inline here is now RunWithRoutingHops
 	// (spec 068 D2) -- same behaviour, shared with the other two auth paths.
@@ -433,7 +442,6 @@ bool TdsConnection::AuthenticateWithFedAuth(const std::string &database, const s
 		return false;
 	}
 
-	database_ = database;
 	UpdateLastUsed();
 	MSSQL_CONN_DEBUG_LOG(1, "AuthenticateWithFedAuth: Azure AD authentication successful");
 	return true;
@@ -738,6 +746,8 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 	// Initialize the LOGIN7 ServerName to the host we dialled; a routing hop
 	// replaces it with the routed "hostname\instance" form.
 	tds_server_name_ = host_;
+	// See Authenticate(): set before the driver publishes state_ == Idle.
+	database_ = database;
 
 	bool first_attempt = true;
 	const bool ok = RunWithRoutingHops([&]() -> LoginAttemptOutcome {
@@ -917,7 +927,6 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 		return false;
 	}
 
-	database_ = database;
 	UpdateLastUsed();
 	return true;
 }
