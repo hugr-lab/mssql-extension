@@ -652,7 +652,11 @@ void TestReusedConnectionRestartsPacketSequence() {
 	TdsConnection conn;
 	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
 	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+	CHECK(conn.GetDatabase() == "TestDB");
 	conn.Close();
+	// The other exit from "logged in": a normal close must leave the accessor
+	// empty too, not just an aborted login.
+	CHECK(conn.GetDatabase().empty());
 
 	// Same object, second login: PRELOGIN must be packet id 1 again.
 	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));

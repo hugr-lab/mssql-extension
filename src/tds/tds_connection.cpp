@@ -1123,6 +1123,12 @@ void TdsConnection::Close() {
 
 	state_.store(ConnectionState::Disconnected);
 	spid_ = 0;
+	// This connection is no longer logged in anywhere, so it is no longer "in"
+	// a database either -- same reason spid_ is zeroed here. Without this the
+	// invariant that state_ == Disconnected implies an empty GetDatabase()
+	// would hold after an aborted login and not after a normal close, and a
+	// half-enforced invariant is the kind a later caller reads the wrong way.
+	database_.clear();
 }
 
 bool TdsConnection::SendAttention() {
