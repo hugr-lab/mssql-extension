@@ -13,6 +13,11 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-adminpw}"
 USER_PRINCIPAL="${USER_PRINCIPAL:-testuser}"
 USER_PASSWORD="${USER_PASSWORD:-testpass}"
 SERVICE_PRINCIPAL="${SERVICE_PRINCIPAL:-MSSQLSvc/sql.example.com:1433}"
+# Issue #261: the routing gateway's own SPN. The client must be able to get a
+# ticket for the gateway BEFORE it can send a LOGIN7 there and be redirected --
+# that first ticket request is half of what the hop test proves. No keytab is
+# exported for it: the gateway never validates the blob, it only redirects.
+GATEWAY_PRINCIPAL="${GATEWAY_PRINCIPAL:-MSSQLSvc/gateway.example.com:1433}"
 KEYTAB_OUT="${KEYTAB_OUT:-/export/mssql.keytab}"
 
 mkdir -p /var/log /var/lib/krb5kdc /export
@@ -38,6 +43,15 @@ if [[ ! -f /var/lib/krb5kdc/principal ]]; then
     # clients using the principal-name form land on the port-suffixed variant.
     # Registering both makes the test KDC robust against both client paths.
     # spec 042 ultrareview bug_015.
+    if [[ -n "${GATEWAY_PRINCIPAL}" ]]; then
+        echo "[init-kdc] creating routing-gateway principal ${GATEWAY_PRINCIPAL}@${REALM} (issue #261)"
+        kadmin.local -q "addprinc -randkey ${GATEWAY_PRINCIPAL}@${REALM}"
+        GATEWAY_PRINCIPAL_HOSTBASED="${GATEWAY_PRINCIPAL%:*}"
+        if [[ "${GATEWAY_PRINCIPAL_HOSTBASED}" != "${GATEWAY_PRINCIPAL}" ]]; then
+            kadmin.local -q "addprinc -randkey ${GATEWAY_PRINCIPAL_HOSTBASED}@${REALM}"
+        fi
+    fi
+
     SERVICE_PRINCIPAL_HOSTBASED="${SERVICE_PRINCIPAL%:*}"  # strip ":1433"
     if [[ "${SERVICE_PRINCIPAL_HOSTBASED}" != "${SERVICE_PRINCIPAL}" ]]; then
         echo "[init-kdc] also creating hostbased variant ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}"

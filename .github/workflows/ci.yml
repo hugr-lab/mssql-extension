@@ -908,6 +908,27 @@ jobs:
       # package location; here the prefix is already built above.
       # Consequence: Windows coverage of this test is dispatch-gated, unlike
       # Linux/macOS which run it on every PR.
+      # Issue #260: the SSPI path had no automated coverage at all -- its only
+      # test assumes a domain-joined host and is therefore never run. Acquiring
+      # a Negotiate credential and producing the first SPNEGO token needs the
+      # local logon session, not a domain and not a SQL Server, so it runs here
+      # on a bare runner. secur32 is the SSPI library; the rest is the TDS layer
+      # the authenticator sits in.
+      - name: Build + run Windows SSPI context test (issue #260)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $prefix = "build/release/vcpkg_installed/x64-windows-static-release"
+          cl /std:c++17 /EHsc /nologo /MT /DMSSQL_ENABLE_SSPI=1 `
+            /I src/include /I "$prefix/include" `
+            test/cpp/test_winsspi_context.cpp `
+            src/tds/auth/winsspi_authenticator.cpp `
+            /Fe:test_winsspi_context.exe `
+            /link secur32.lib
+          if ($LASTEXITCODE -ne 0) { throw "compile failed" }
+          ./test_winsspi_context.exe
+          if ($LASTEXITCODE -ne 0) { throw "test failed" }
+
       - name: Build + run login routing hop-driver test (spec 068)
         shell: pwsh
         run: |

@@ -352,6 +352,8 @@ bool TdsConnection::RunWithRoutingHops(const std::function<LoginAttemptOutcome()
 		has_routing_ = false;
 		routed_server_.clear();
 		routed_port_ = 0;
+		last_error_number_ = 0;
+		last_error_state_ = 0;
 		next_packet_id_ = 1;
 		tls_enabled_ = false;
 		fedauth_echo_ = false;
@@ -709,6 +711,8 @@ LoginAttemptOutcome TdsConnection::DoLogin7WithFedAuth(const std::string &databa
 
 	// Check for success
 	if (!login_response.success) {
+		last_error_number_ = login_response.error_number;
+		last_error_state_ = login_response.error_state;
 		if (login_response.error_number > 0) {
 			last_error_ = "Azure AD authentication failed (error " + std::to_string(login_response.error_number) +
 						  "): " + login_response.error_message;
@@ -894,6 +898,8 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 
 			if (!login_response.has_sspi_token) {
 				// No continuation requested and no LOGINACK -- server rejected the auth.
+				last_error_number_ = login_response.error_number;
+				last_error_state_ = login_response.error_state;
 				if (login_response.error_number > 0) {
 					last_error_ = "MSSQL Kerberos auth rejected by server (error " +
 								  std::to_string(login_response.error_number) + "): " + login_response.error_message;
@@ -1031,6 +1037,8 @@ LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const s
 	}
 
 	if (!login_response.success) {
+		last_error_number_ = login_response.error_number;
+		last_error_state_ = login_response.error_state;
 		if (login_response.error_number > 0) {
 			// Include the ERROR-token State byte: for 18456 it is the only field
 			// that distinguishes a bad password from an inaccessible default/initial

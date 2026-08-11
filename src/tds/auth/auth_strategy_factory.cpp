@@ -20,7 +20,21 @@
 #include "tds/auth/winsspi_authenticator.hpp"
 #endif
 
+#include <cstring>
 #include <string>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
 namespace duckdb {
 namespace tds {
@@ -64,11 +78,58 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 		return spn;
 	}
 	// No override: build the canonical "MSSQLSvc/<fqdn>:<port>" form so the
-	// SPN matches what SQL Server registers in AD by default.
-	return std::string("MSSQLSvc/") + info.host + ":" + std::to_string(info.port);
+	// SPN matches what SQL Server registers in AD by default. An IP literal is
+	// reverse-resolved first -- AD registers names, not addresses (issue #259).
+	const std::string spn_host = ResolveHostForSpn(info.host);
+	if (spn_host.empty()) {
+		throw InvalidInputException(
+			"Cannot derive a Kerberos SPN from the IP address '%s': Active Directory registers SQL Server SPNs "
+			"against the host's FQDN, and no reverse DNS record was found for it. Connect by name, add a PTR "
+			"record, or pass the SPN explicitly: service_principal_name=MSSQLSvc/<fqdn>:%d",
+			info.host, info.port);
+	}
+	return std::string("MSSQLSvc/") + spn_host + ":" + std::to_string(info.port);
 }
 
 }  // namespace
+
+std::string ResolveHostForSpn(const std::string &host) {
+	if (host.empty()) {
+		return host;
+	}
+
+	// Only IP literals need resolving. A name is already what AD registers
+	// against, and looking it up would risk turning a working SPN into a
+	// different one (a CNAME resolving to some other canonical name).
+	sockaddr_in v4 = {};
+	sockaddr_in6 v6 = {};
+	const sockaddr *addr = nullptr;
+	socklen_t addr_len = 0;
+	if (inet_pton(AF_INET, host.c_str(), &v4.sin_addr) == 1) {
+		v4.sin_family = AF_INET;
+		addr = reinterpret_cast<const sockaddr *>(&v4);
+		addr_len = sizeof(v4);
+	} else if (inet_pton(AF_INET6, host.c_str(), &v6.sin6_addr) == 1) {
+		v6.sin6_family = AF_INET6;
+		addr = reinterpret_cast<const sockaddr *>(&v6);
+		addr_len = sizeof(v6);
+	} else {
+		return host;  // already a name
+	}
+
+	char fqdn[NI_MAXHOST] = {0};
+	// NI_NAMEREQD: fail rather than hand back the numeric form, which is what
+	// getnameinfo does by default and would silently reproduce the bug.
+	if (getnameinfo(addr, addr_len, fqdn, sizeof(fqdn), nullptr, 0, NI_NAMEREQD) != 0) {
+		return std::string();  // caller reports this; see the header
+	}
+	std::string resolved(fqdn);
+	// A trailing dot is legal in DNS and not wanted in an SPN.
+	if (!resolved.empty() && resolved.back() == '.') {
+		resolved.pop_back();
+	}
+	return resolved;
+}
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {
 	// Spec 047 FR-014 / T065: single resolution point for LOGIN7 program_name.

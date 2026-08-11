@@ -14,6 +14,8 @@
 #include "tds/auth/manual_token_strategy.hpp"
 #include "tds/auth/sql_auth_strategy.hpp"
 
+#include <string>
+
 namespace duckdb {
 
 // Forward declarations
@@ -25,6 +27,22 @@ namespace tds {
 //===----------------------------------------------------------------------===//
 // AuthStrategyFactory - Creates appropriate auth strategy based on connection
 //===----------------------------------------------------------------------===//
+
+// Reverse-resolve a host for SPN construction (issue #259).
+//
+// Active Directory registers SQL Server SPNs against the FQDN, so a connection
+// made by IP -- Server=10.1.2.3,1433 -- yields "MSSQLSvc/10.1.2.3:1433", which
+// can never match and fails with a KDC "server not found in Kerberos database"
+// that says nothing about the address form being the problem.
+//
+// Returns the FQDN when `host` is an IP literal that reverse-resolves. Returns
+// `host` unchanged when it is already a name (the overwhelmingly common case,
+// and no lookup is performed). Returns an empty string when `host` is an IP
+// literal that does NOT reverse-resolve, which the caller turns into an error
+// naming the fix, because silently building an unmatched SPN is worse.
+//
+// Separately declared so it can be unit tested without a KDC.
+std::string ResolveHostForSpn(const std::string &host);
 
 class AuthStrategyFactory {
 public:

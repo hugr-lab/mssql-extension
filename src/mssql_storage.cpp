@@ -1002,19 +1002,64 @@ void MSSQLConnectionInfo::ResolveNamedInstance(ClientContext &context) {
 // Connection Validation
 //===----------------------------------------------------------------------===//
 
-// Translate TDS error message to user-friendly message
-static string TranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
-									   const string &database) {
+// Translate TDS error message to user-friendly message.
+//
+// `server_error` / `server_state` are the SERVER's own ERROR-token fields, or 0
+// when the failure produced no ERROR token. When a number is present it decides
+// the classification; the string heuristics below only run for failures that
+// never reached a login (socket, TLS, DNS).
+//
+// Issue #262: the string arms must never be allowed to classify a login
+// failure. Every login failure this extension produces begins "Authentication
+// failed (error N, state S): ...", so a `find("authentication")` test matches
+// our OWN wrapper rather than the server's message, and collapsed every cause
+// -- including Azure 40613, a serverless database resuming -- into "check
+// username and password". The server's number and text are always appended now,
+// so no diagnosis is lost on the way to the user.
+string TranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
+								const string &database, uint32_t server_error, uint8_t server_state) {
 	string lower_error = StringUtil::Lower(error);
 
-	// Authentication failures
-	if (lower_error.find("login failed") != string::npos || lower_error.find("authentication") != string::npos ||
-		lower_error.find("18456") != string::npos) {
-		return StringUtil::Format("Authentication failed for user '%s' - check username and password", user);
+	// Server-classified failures. These take precedence over every heuristic
+	// below, because here we know what the server actually said.
+	if (server_error > 0) {
+		switch (server_error) {
+		case 40613:	 // Azure SQL: "Database ... is not currently available"
+		case 40197:	 // Azure SQL: error processing the request, reconfiguration
+		case 40501:	 // Azure SQL: service is busy
+		case 49918:	 // Azure SQL: cannot process request, not enough resources
+			return StringUtil::Format(
+				"Database '%s' on %s:%d is not available yet (server error %d) - a serverless database may be "
+				"resuming, or the service is being reconfigured; retry shortly. Server said: %s",
+				database, host, port, server_error, error);
+		case 18456:	 // Login failed. State is the only field that says WHY (issue #164).
+			return StringUtil::Format(
+				"Authentication failed for user '%s' (server error 18456, state %d) - state 8 is a wrong password, "
+				"state 38/40 an inaccessible initial database, state 1 an unspecified cause the server logs but "
+				"does not disclose. Server said: %s",
+				user, server_state, error);
+		case 4060:	// Cannot open database requested by the login
+			return StringUtil::Format(
+				"Cannot access database '%s' - check database name and permissions (server "
+				"error 4060). Server said: %s",
+				database, error);
+		default:
+			return StringUtil::Format("Login to %s:%d failed with server error %d (state %d): %s", host, port,
+									  server_error, server_state, error);
+		}
+	}
+
+	// A login rejection that carried no usable error number. Matches the
+	// SERVER's phrase ("Login failed for user ...") and deliberately NOT the
+	// word "authentication", which appears in our own wrapper for every login
+	// failure and is what made this arm swallow everything (issue #262).
+	if (lower_error.find("login failed") != string::npos) {
+		return StringUtil::Format("Authentication failed for user '%s' - check username and password. Server said: %s",
+								  user, error);
 	}
 
 	// Database access failures
-	if (lower_error.find("cannot open database") != string::npos || lower_error.find("4060") != string::npos) {
+	if (lower_error.find("cannot open database") != string::npos) {
 		return StringUtil::Format("Cannot access database '%s' - check database name and permissions", database);
 	}
 
@@ -1242,7 +1287,8 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database,
+													 conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
 								translated.c_str());
 		conn.Close();
