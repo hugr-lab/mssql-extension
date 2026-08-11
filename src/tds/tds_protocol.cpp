@@ -780,9 +780,15 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 		} else if (token_type == static_cast<uint8_t>(TokenType::DONE) ||
 				   token_type == static_cast<uint8_t>(TokenType::DONEPROC) ||
 				   token_type == static_cast<uint8_t>(TokenType::DONEINPROC)) {
-			// DONE token: skip 8 bytes (status + curcmd + rowcount)
-			if (ptr + 8 <= end) {
-				ptr += 8;
+			// DONE token: Status(2) + CurCmd(2) + DoneRowCount(8) -- the row count
+			// is 8 bytes in TDS 7.2+ ([MS-TDS] 2.2.7.9), and we always log in as
+			// 7.4. Skipping the pre-7.2 size (4-byte count, 8 total) desynced the
+			// parse by 4 bytes per token; harmless when DONE is the final token
+			// (regular SQL Server sends LOGINACK first), fatal on Synapse
+			// Serverless, which runs internal procs during login and fronts the
+			// LOGINACK with a run of DONEINPROC tokens (issues #88, #164).
+			if (ptr + 12 <= end) {
+				ptr += 12;
 			} else {
 				break;
 			}
@@ -1306,13 +1312,15 @@ bool TdsProtocol::ParseDoneForAttentionAck(const std::vector<uint8_t> &data) {
 
 		if (token == static_cast<uint8_t>(TokenType::DONE) || token == static_cast<uint8_t>(TokenType::DONEPROC) ||
 			token == static_cast<uint8_t>(TokenType::DONEINPROC)) {
-			if (ptr + 8 <= end) {
+			// Status(2) + CurCmd(2) + DoneRowCount(8): 12 bytes in TDS 7.2+
+			// (same layout note as ParseLoginResponse).
+			if (ptr + 12 <= end) {
 				// Status (2 bytes, LE)
 				uint16_t status = ptr[0] | (static_cast<uint16_t>(ptr[1]) << 8);
 				if (status & static_cast<uint16_t>(DoneStatus::DONE_ATTN)) {
 					return true;
 				}
-				ptr += 8;
+				ptr += 12;
 			} else {
 				break;
 			}
