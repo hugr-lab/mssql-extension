@@ -1016,8 +1016,8 @@ void MSSQLConnectionInfo::ResolveNamedInstance(ClientContext &context) {
 // -- including Azure 40613, a serverless database resuming -- into "check
 // username and password". The server's number and text are always appended now,
 // so no diagnosis is lost on the way to the user.
-string TranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
-								const string &database, uint32_t server_error, uint8_t server_state) {
+string MSSQLTranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
+									 const string &database, uint32_t server_error, uint8_t server_state) {
 	string lower_error = StringUtil::Lower(error);
 
 	// Server-classified failures. These take precedence over every heuristic
@@ -1155,7 +1155,12 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
 	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt,
 									  ResolveAppName(info))) {
-		string error = conn.GetLastError();
+		// Classified, not raw: the Azure-AD path is the one most likely to meet
+		// 40613 on a paused serverless database, which is the case issue #262
+		// was filed about.
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
@@ -1222,7 +1227,9 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
 	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt, ResolveAppName(info))) {
-		string error = conn.GetLastError();
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
@@ -1276,7 +1283,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s", error.c_str(),
 								translated.c_str());
 		throw IOException("MSSQL connection validation failed: %s", translated);
@@ -1287,8 +1294,8 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database,
-													 conn.GetLastErrorNumber(), conn.GetLastErrorState());
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database,
+														  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
 								translated.c_str());
 		conn.Close();
@@ -1304,7 +1311,8 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 		try {
 			if (!conn.ExecuteBatch("SELECT 1")) {
 				string error = conn.GetLastError();
-				string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+				string translated =
+					MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED - raw: %s, translated: %s",
 										error.c_str(), translated.c_str());
 				conn.Close();
@@ -1323,7 +1331,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query succeeded");
 		} catch (const std::exception &e) {
 			string error = e.what();
-			string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+			string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED with exception - %s",
 									error.c_str());
 			conn.Close();
@@ -1357,7 +1365,7 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 	conn.SetRequestUtf8Support(info.utf8_support);
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, "", info.database);
 		throw IOException("MSSQL connection validation failed: %s", translated);
 	}
 
@@ -1400,7 +1408,9 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 		// `strategy_error` is the GSSAPI/SSPI cause, which the callable could
 		// not throw across the TDS layer. Reporting only the cause would drop
 		// the routed host; reporting only the driver would drop the reason.
-		string error = conn.GetLastError();
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		if (!strategy_error.empty()) {
 			error += " (" + strategy_error + ")";
 		}

@@ -21,6 +21,8 @@
 #endif
 
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
 
 #if defined(_WIN32)
@@ -77,18 +79,9 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 		// Hostbased form (@) -- pass through unchanged.
 		return spn;
 	}
-	// No override: build the canonical "MSSQLSvc/<fqdn>:<port>" form so the
-	// SPN matches what SQL Server registers in AD by default. An IP literal is
-	// reverse-resolved first -- AD registers names, not addresses (issue #259).
-	const std::string spn_host = ResolveHostForSpn(info.host);
-	if (spn_host.empty()) {
-		throw InvalidInputException(
-			"Cannot derive a Kerberos SPN from the IP address '%s': Active Directory registers SQL Server SPNs "
-			"against the host's FQDN, and no reverse DNS record was found for it. Connect by name, add a PTR "
-			"record, or pass the SPN explicitly: service_principal_name=MSSQLSvc/<fqdn>:%d",
-			info.host, info.port);
-	}
-	return std::string("MSSQLSvc/") + spn_host + ":" + std::to_string(info.port);
+	// No override: the canonical "MSSQLSvc/<fqdn>:<port>" form, shared with the
+	// diagnostic functions so they cannot disagree about it (issue #259).
+	return DeriveDefaultSpn(info.host, info.port);
 }
 
 }  // namespace
@@ -96,6 +89,23 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 std::string ResolveHostForSpn(const std::string &host) {
 	if (host.empty()) {
 		return host;
+	}
+
+	// Memoized because this sits on the pool-refill path: a fresh strategy is
+	// built per login attempt and again per routing hop, and getnameinfo is a
+	// blocking resolver call. The negative results are the ones that matter --
+	// an IP with no PTR record costs the full resolver timeout every time, and
+	// the answer is always the same. A host's PTR record changing mid-process
+	// therefore needs a restart to be picked up, which is the right trade for a
+	// value that is fixed for the life of an ATTACH.
+	static std::mutex cache_mutex;
+	static std::map<std::string, std::string> cache;
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		auto it = cache.find(host);
+		if (it != cache.end()) {
+			return it->second;
+		}
 	}
 
 	// Only IP literals need resolving. A name is already what AD registers
@@ -114,13 +124,17 @@ std::string ResolveHostForSpn(const std::string &host) {
 		addr = reinterpret_cast<const sockaddr *>(&v6);
 		addr_len = sizeof(v6);
 	} else {
-		return host;  // already a name
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		cache[host] = host;	 // already a name; no lookup was performed
+		return host;
 	}
 
 	char fqdn[NI_MAXHOST] = {0};
 	// NI_NAMEREQD: fail rather than hand back the numeric form, which is what
 	// getnameinfo does by default and would silently reproduce the bug.
 	if (getnameinfo(addr, addr_len, fqdn, sizeof(fqdn), nullptr, 0, NI_NAMEREQD) != 0) {
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		cache[host] = std::string();
 		return std::string();  // caller reports this; see the header
 	}
 	std::string resolved(fqdn);
@@ -128,7 +142,26 @@ std::string ResolveHostForSpn(const std::string &host) {
 	if (!resolved.empty() && resolved.back() == '.') {
 		resolved.pop_back();
 	}
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		cache[host] = resolved;
+	}
 	return resolved;
+}
+
+std::string DeriveDefaultSpn(const std::string &host, uint16_t port) {
+	const std::string spn_host = ResolveHostForSpn(host);
+	if (spn_host.empty()) {
+		if (host.empty()) {
+			throw InvalidInputException("Cannot derive a Kerberos SPN: no host was supplied.");
+		}
+		throw InvalidInputException(
+			"Cannot derive a Kerberos SPN from the IP address '%s': Active Directory registers SQL Server SPNs "
+			"against the host's FQDN, and no reverse DNS record was found for it. Connect by name, add a PTR "
+			"record, or pass the SPN explicitly: service_principal_name=MSSQLSvc/<fqdn>:%d",
+			host, port);
+	}
+	return std::string("MSSQLSvc/") + spn_host + ":" + std::to_string(port);
 }
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {

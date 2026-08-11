@@ -87,9 +87,13 @@ services:
       start_period: 30s
 
   # Issue #261 / spec 068: answers any login with a ROUTING redirect to `sql`,
-  # so the stack can exercise a Kerberos hop. Plaintext (ENCRYPT_NOT_SUP), so
-  # the hop test connects with Encrypt=no; the real login on the routed server
-  # is unaffected and still negotiates TLS as the other tests do.
+  # so the stack can exercise a Kerberos hop. The gateway is plaintext
+  # (ENCRYPT_NOT_SUP), so the hop test connects with Encrypt=no -- and that
+  # setting PROPAGATES across the hop: the routed login to sql.example.com is
+  # plaintext too, because the hop reuses the same connection info and changes
+  # only host and port. That diverges from step 4, which uses
+  # Encrypt=yes;TrustServerCertificate=yes; worth knowing before debugging a
+  # step-6 failure as though it were a TLS problem.
   gateway:
     build: ./gateway
     container_name: mssql-kerb-gateway

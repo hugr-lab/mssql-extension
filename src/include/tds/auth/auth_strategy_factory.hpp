@@ -14,6 +14,7 @@
 #include "tds/auth/manual_token_strategy.hpp"
 #include "tds/auth/sql_auth_strategy.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace duckdb {
@@ -43,6 +44,17 @@ namespace tds {
 //
 // Separately declared so it can be unit tested without a KDC.
 std::string ResolveHostForSpn(const std::string &host);
+
+// The canonical default SPN, "MSSQLSvc/<fqdn>:<port>", with `host` run through
+// ResolveHostForSpn first. Throws when `host` is an IP literal with no PTR
+// record, because a silently-unmatchable SPN is worse than a clear refusal.
+//
+// Shared deliberately: mssql_kerberos_auth_test / mssql_winsspi_auth_test are
+// the tools users are pointed at when a Kerberos login fails, and each used to
+// carry its own copy of this formatting. A diagnostic that reports a different
+// SPN than the connection would actually request sends the reader in the wrong
+// direction -- exactly the situation issue #259 is about.
+std::string DeriveDefaultSpn(const std::string &host, uint16_t port);
 
 class AuthStrategyFactory {
 public:

@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/krb5_test_function.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -109,12 +110,12 @@ static std::string RunKrb5Test(tds::Krb5Config config) {
 }
 
 //===----------------------------------------------------------------------===//
-// DeriveDefaultSpn - same logic as auth_strategy_factory.cpp's DeriveSpn
-// for the (host, port) form. Kept local here to avoid a circular include.
+// SPN derivation comes from auth_strategy_factory.hpp (tds::DeriveDefaultSpn),
+// NOT from a local copy. This function exists to tell a user why a Kerberos
+// login is failing; reporting an SPN the connection path would not actually
+// request is worse than reporting nothing. Issue #259 made them diverge for IP
+// literals -- the real path reverse-resolves, the local copy did not.
 //===----------------------------------------------------------------------===//
-static std::string DeriveDefaultSpn(const std::string &host, uint16_t port) {
-	return "MSSQLSvc/" + host + ":" + std::to_string(port);
-}
 
 //===----------------------------------------------------------------------===//
 // Krb5TestHost - mssql_kerberos_auth_test(host VARCHAR) -> VARCHAR
@@ -124,7 +125,7 @@ static void Krb5TestHost(DataChunk &args, ExpressionState & /*state*/, Vector &r
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
 		tds::Krb5Config cfg;
-		cfg.spn = DeriveDefaultSpn(h, 1433);
+		cfg.spn = tds::DeriveDefaultSpn(h, 1433);
 		return StringVector::AddString(result, RunKrb5Test(std::move(cfg)));
 	});
 }
@@ -139,7 +140,7 @@ static void Krb5TestHostPort(DataChunk &args, ExpressionState & /*state*/, Vecto
 		host_vec, port_vec, result, args.size(), [&](string_t host, int32_t port) {
 			std::string h = host.GetString();
 			tds::Krb5Config cfg;
-			cfg.spn = DeriveDefaultSpn(h, static_cast<uint16_t>(port));
+			cfg.spn = tds::DeriveDefaultSpn(h, static_cast<uint16_t>(port));
 			return StringVector::AddString(result, RunKrb5Test(std::move(cfg)));
 		});
 }
@@ -183,7 +184,7 @@ static void Krb5TestSecret(DataChunk &args, ExpressionState &state, Vector &resu
 				cfg.spn = spn;
 			}
 		} else {
-			cfg.spn = DeriveDefaultSpn(info->host, info->port);
+			cfg.spn = tds::DeriveDefaultSpn(info->host, info->port);
 		}
 		cfg.configfile = info->krb5_configfile;
 		cfg.keytabfile = info->krb5_keytabfile;

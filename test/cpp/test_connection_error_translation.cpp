@@ -46,8 +46,8 @@ void TestResumingAzureDatabaseIsNotACredentialProblem() {
 	const string raw =
 		"Authentication failed (error 40613, state 1): Database 'sales' on server "
 		"'x.database.windows.net' is not currently available. Please retry the connection later.";
-	const string out = TranslateConnectionError(raw, "x.database.windows.net", 1433, "azure_sql_admin", "sales",
-												/*server_error=*/40613, /*server_state=*/1);
+	const string out = MSSQLTranslateConnectionError(raw, "x.database.windows.net", 1433, "azure_sql_admin", "sales",
+													 /*server_error=*/40613, /*server_state=*/1);
 
 	CHECK(!Contains(out, "check username and password"));  // the whole point
 	CHECK(Contains(out, "not available yet"));
@@ -61,9 +61,9 @@ void TestResumingAzureDatabaseIsNotACredentialProblem() {
 // 40197 / 40501 / 49918 are the same family: transient Azure conditions.
 void TestOtherTransientAzureErrorsAreRetryable() {
 	for (uint32_t code : {40197u, 40501u, 49918u}) {
-		const string out =
-			TranslateConnectionError("Authentication failed (error " + std::to_string(code) + ", state 1): transient",
-									 "h", 1433, "u", "db", code, 1);
+		const string out = MSSQLTranslateConnectionError(
+			"Authentication failed (error " + std::to_string(code) + ", state 1): transient", "h", 1433, "u", "db",
+			code, 1);
 		CHECK(!Contains(out, "check username and password"));
 		CHECK(Contains(out, "retry"));
 	}
@@ -74,7 +74,7 @@ void TestOtherTransientAzureErrorsAreRetryable() {
 // user -- that is the whole point of issue #164, and the old code threw it away.
 void TestLoginFailedKeepsStateByte() {
 	const string raw = "Authentication failed (error 18456, state 40): Login failed for user 'app_user'.";
-	const string out = TranslateConnectionError(raw, "sql1", 1433, "app_user", "reporting", 18456, 40);
+	const string out = MSSQLTranslateConnectionError(raw, "sql1", 1433, "app_user", "reporting", 18456, 40);
 
 	CHECK(Contains(out, "app_user"));
 	CHECK(Contains(out, "18456"));
@@ -87,10 +87,10 @@ void TestLoginFailedKeepsStateByte() {
 // A wrong password is state 8 -- same number, different cause, and the message
 // must not read identically to the state-40 case above.
 void TestWrongPasswordAndInaccessibleDatabaseDiffer() {
-	const string a = TranslateConnectionError("Authentication failed (error 18456, state 8): Login failed.", "s", 1433,
-											  "u", "db", 18456, 8);
-	const string b = TranslateConnectionError("Authentication failed (error 18456, state 40): Login failed.", "s", 1433,
-											  "u", "db", 18456, 40);
+	const string a = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 8): Login failed.", "s",
+												   1433, "u", "db", 18456, 8);
+	const string b = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 40): Login failed.", "s",
+												   1433, "u", "db", 18456, 40);
 	CHECK(a != b);
 	CHECK(Contains(a, "state 8"));
 	CHECK(Contains(b, "state 40"));
@@ -99,8 +99,8 @@ void TestWrongPasswordAndInaccessibleDatabaseDiffer() {
 
 // 4060 is a database-access failure, not a credential one.
 void TestCannotOpenDatabase() {
-	const string out = TranslateConnectionError("Authentication failed (error 4060, state 1): Cannot open database",
-												"s", 1433, "u", "missing_db", 4060, 1);
+	const string out = MSSQLTranslateConnectionError(
+		"Authentication failed (error 4060, state 1): Cannot open database", "s", 1433, "u", "missing_db", 4060, 1);
 	CHECK(Contains(out, "missing_db"));
 	CHECK(Contains(out, "check database name and permissions"));
 	CHECK(!Contains(out, "check username and password"));
@@ -110,8 +110,8 @@ void TestCannotOpenDatabase() {
 // An unrecognised server error must still surface its number, state and text
 // rather than being flattened into a guess.
 void TestUnknownServerErrorSurfacesVerbatim() {
-	const string out = TranslateConnectionError("Authentication failed (error 12345, state 7): something specific", "s",
-												1433, "u", "db", 12345, 7);
+	const string out = MSSQLTranslateConnectionError("Authentication failed (error 12345, state 7): something specific",
+													 "s", 1433, "u", "db", 12345, 7);
 	CHECK(Contains(out, "12345"));
 	CHECK(Contains(out, "7"));
 	CHECK(Contains(out, "something specific"));
@@ -122,13 +122,13 @@ void TestUnknownServerErrorSurfacesVerbatim() {
 // Failures that never reached a login carry no number, and the string
 // heuristics still have to work.
 void TestNonLoginFailuresStillClassified() {
-	const string refused = TranslateConnectionError("connect: connection refused", "s", 1433, "u", "db");
+	const string refused = MSSQLTranslateConnectionError("connect: connection refused", "s", 1433, "u", "db");
 	CHECK(Contains(refused, "Connection refused"));
 
-	const string tls = TranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
+	const string tls = MSSQLTranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
 	CHECK(Contains(tls, "TLS handshake failed"));
 
-	const string timeout = TranslateConnectionError("connect timed out", "s", 1433, "u", "db");
+	const string timeout = MSSQLTranslateConnectionError("connect timed out", "s", 1433, "u", "db");
 	CHECK(Contains(timeout, "timed out"));
 	std::cout << "  [ok] socket / TLS / timeout failures still classified without a server number" << std::endl;
 }
@@ -137,13 +137,13 @@ void TestNonLoginFailuresStillClassified() {
 // should still give the credential hint -- but the word "authentication" alone
 // must never trigger it, since our own wrapper always contains it.
 void TestServerPhraseWithoutNumber() {
-	const string out = TranslateConnectionError("Login failed for user 'sa'.", "s", 1433, "sa", "db");
+	const string out = MSSQLTranslateConnectionError("Login failed for user 'sa'.", "s", 1433, "sa", "db");
 	CHECK(Contains(out, "check username and password"));
 
 	// This is the shape that used to swallow everything: our wrapper's word,
 	// no server number. It must NOT be called a credential problem.
 	const string wrapper_only =
-		TranslateConnectionError("Azure AD authentication failed: token audience rejected", "s", 1433, "u", "db");
+		MSSQLTranslateConnectionError("Azure AD authentication failed: token audience rejected", "s", 1433, "u", "db");
 	CHECK(!Contains(wrapper_only, "check username and password"));
 	CHECK(Contains(wrapper_only, "token audience rejected"));
 	std::cout << "  [ok] the server's phrase hints at credentials; our own wrapper's word does not" << std::endl;
