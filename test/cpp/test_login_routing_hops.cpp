@@ -731,11 +731,11 @@ void TestRoutedTargetWithInstanceAndPortSuffix() {
 // Before this, RunWithRoutingHops's reconnect-failure branch and its error
 // string were the only paths in the driver with no coverage at all.
 //
-// The unreachable port is a listener's own port after it has been stopped, so
-// the connection is REFUSED immediately. A black-holed address (the
-// 10.255.255.x trick Microsoft's mssql-rs failover tests use) would exercise
-// the timeout instead, but DEFAULT_CONNECTION_TIMEOUT is compiled in at 30s
-// here, which is not a unit test.
+// This is the REFUSAL branch: the unreachable port is a listener's own, after
+// it has been stopped. The TIMEOUT branch is the next test down
+// (TestHopHonoursCallerConnectTimeout), which became a viable unit test once
+// the hop started honouring the caller's timeout rather than the compiled-in
+// 30s default.
 void TestUnreachableRoutedTargetFails() {
 	// Take a listener's port and stop it, so the port is genuinely closed and
 	// the connect is REFUSED immediately.

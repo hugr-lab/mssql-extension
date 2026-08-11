@@ -81,6 +81,14 @@ TdsConnection::~TdsConnection() noexcept {
 	}
 }
 
+// NOTE: these move operations carry most, but not all, of the object. Several
+// members predating spec 068 -- requested_packet_size_, request_utf8_support_,
+// needs_reset_, fedauth_echo_, tds_server_name_ -- are not carried, and that is
+// an omission rather than a decision. Nothing moves a TdsConnection today (the
+// pool holds shared_ptr and the stack-local ones in mssql_storage.cpp are never
+// moved), which is why it has stayed harmless. connect_timeout_seconds_ IS
+// carried: it is a policy the caller asked for, and dropping it would silently
+// restore the compiled-in default for any later hop.
 TdsConnection::TdsConnection(TdsConnection &&other) noexcept
 	: socket_(std::move(other.socket_)),
 	  state_(other.state_.load()),
@@ -93,6 +101,7 @@ TdsConnection::TdsConnection(TdsConnection &&other) noexcept
 	  last_error_(std::move(other.last_error_)),
 	  tls_enabled_(other.tls_enabled_),
 	  next_packet_id_(other.next_packet_id_),
+	  connect_timeout_seconds_(other.connect_timeout_seconds_),
 	  negotiated_packet_size_(other.negotiated_packet_size_) {
 	other.state_.store(ConnectionState::Disconnected);
 	other.spid_ = 0;
@@ -114,6 +123,7 @@ TdsConnection &TdsConnection::operator=(TdsConnection &&other) noexcept {
 		last_error_ = std::move(other.last_error_);
 		tls_enabled_ = other.tls_enabled_;
 		next_packet_id_ = other.next_packet_id_;
+		connect_timeout_seconds_ = other.connect_timeout_seconds_;
 		negotiated_packet_size_ = other.negotiated_packet_size_;
 
 		other.state_.store(ConnectionState::Disconnected);
