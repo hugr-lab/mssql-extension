@@ -913,9 +913,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           # Same pin file the Linux/macOS leg reads, so the two cannot drift.
-          $pin = Get-Content scripts/ci/simdutf_pin.env `
-                 | Where-Object { $_ -notmatch '^\s*#' -and $_ -match '=' } `
-                 | ConvertFrom-StringData
+          # -Raw matters: without it Get-Content emits one string PER LINE and
+          # ConvertFrom-StringData runs per input, returning an array of
+          # single-entry hashtables that only behaves like one hashtable through
+          # member-access enumeration. ConvertFrom-StringData already skips '#'
+          # comment lines, so no pre-filter is needed.
+          $pin = Get-Content -Raw scripts/ci/simdutf_pin.env | ConvertFrom-StringData
           $expectedVer = $pin.SIMDUTF_EXPECTED_VER
           $expectedSha = $pin.SIMDUTF_EXPECTED_SHA
           $ver = (Get-Content vcpkg.json | ConvertFrom-Json).overrides `

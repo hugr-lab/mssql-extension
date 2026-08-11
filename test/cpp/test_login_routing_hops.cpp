@@ -542,6 +542,7 @@ void TestZeroHopLoginUnchanged() {
 
 	CHECK(conn.GetState() == ConnectionState::Idle);
 	CHECK(conn.GetPort() == server.GetPort());
+	CHECK(conn.GetDatabase() == "TestDB");	// logged in -> the accessor names the database
 	CHECK(server.ConnectionCount() == 1);
 	CHECK(server.FirstPacketIds().size() == 1);
 	CHECK(server.FirstPacketIds()[0] == 1);
@@ -627,6 +628,9 @@ void TestHopLimitAborts() {
 	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false) == false);
 
 	CHECK(conn.GetState() == ConnectionState::Disconnected);
+	// ...and the connection is not "in" any database: GetDatabase() means the
+	// database this connection is logged INTO, not the last one attempted.
+	CHECK(conn.GetDatabase().empty());
 	const std::string err = conn.GetLastError();
 	CHECK(err.find("Too many routing hops") != std::string::npos);
 	CHECK(err.find("127.0.0.1") != std::string::npos);	// last routed target named
