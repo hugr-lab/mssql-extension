@@ -36,9 +36,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -151,6 +153,31 @@ void AppendRoutingEnvChange(std::vector<uint8_t> &buf, const std::string &server
 	buf.insert(buf.end(), body.begin(), body.end());
 }
 
+// Pull the ServerName out of a LOGIN7 payload. [MS-TDS] 2.2.6.4: the fixed
+// portion is 94 bytes and the (offset, length) pairs start at byte 36 in field
+// order HostName, UserName, Password, AppName, ServerName -- so ibServerName is
+// at 52 and cchServerName (in UTF-16 code units, not bytes) at 54. Offsets are
+// relative to the start of the LOGIN7 payload. Returns "" if anything is out of
+// range, which fails the assertion rather than silently passing.
+std::string ExtractLogin7ServerName(const std::vector<uint8_t> &payload) {
+	if (payload.size() < 56) {
+		return "";
+	}
+	const uint16_t ib = static_cast<uint16_t>(payload[52] | (payload[53] << 8));
+	const uint16_t cch = static_cast<uint16_t>(payload[54] | (payload[55] << 8));
+	if (static_cast<size_t>(ib) + static_cast<size_t>(cch) * 2 > payload.size()) {
+		return "";
+	}
+	std::string out;
+	for (uint16_t i = 0; i < cch; i++) {
+		const uint16_t unit = static_cast<uint16_t>(payload[ib + i * 2] | (payload[ib + i * 2 + 1] << 8));
+		// Every fixture here is ASCII-range; anything else would be a bug in
+		// the test, not in the code under test.
+		out.push_back(static_cast<char>(unit & 0xFF));
+	}
+	return out;
+}
+
 //===----------------------------------------------------------------------===//
 // Loopback fake TDS server
 //
@@ -228,8 +255,19 @@ public:
 	}
 	// Packet id of the FIRST packet of the FIRST message on each connection.
 	// A hop must reset the sequence, so every connection must see 1.
-	const std::vector<int> &FirstPacketIds() const {
+	// Returns a COPY under the lock: the server thread appends to the vector
+	// and could reallocate under a returned reference.
+	std::vector<int> FirstPacketIds() const {
+		std::lock_guard<std::mutex> guard(mutex_);
 		return first_packet_ids_;
+	}
+
+	// The LOGIN7 ServerName field ([MS-TDS] 2.2.6.4) captured per connection,
+	// decoded from UTF-16LE. This is what pins the routed-target handling: on a
+	// hop it must be the "hostname\instance" form, not the DNS name.
+	std::vector<std::string> ServerNames() const {
+		std::lock_guard<std::mutex> guard(mutex_);
+		return server_names_;
 	}
 
 private:
@@ -268,8 +306,9 @@ private:
 	}
 
 	// Read one complete TDS message (packets until the EOM status bit).
-	// Returns false on timeout / peer close. Records the first packet's id.
-	bool ReadMessage(socket_t fd, bool record_first_id) {
+	// Returns false on timeout / peer close. Records the first packet's id, and
+	// appends the reassembled payload to `payload_out` when given.
+	bool ReadMessage(socket_t fd, bool record_first_id, std::vector<uint8_t> *payload_out = nullptr) {
 		bool eom = false;
 		bool first = true;
 		while (!eom) {
@@ -278,6 +317,7 @@ private:
 				return false;
 			}
 			if (first && record_first_id) {
+				std::lock_guard<std::mutex> guard(mutex_);
 				first_packet_ids_.push_back(static_cast<int>(header[6]));
 				first = false;
 			}
@@ -288,6 +328,9 @@ private:
 			std::vector<uint8_t> payload(length - 8);
 			if (!payload.empty() && !ReadExactly(fd, payload.data(), payload.size())) {
 				return false;
+			}
+			if (payload_out) {
+				payload_out->insert(payload_out->end(), payload.begin(), payload.end());
 			}
 			eom = (header[1] & 0x01) != 0;
 		}
@@ -398,8 +441,13 @@ private:
 		//    integrated scenarios need no SPNEGO round trip: StubAuthenticator
 		//    completes on InitialBytes(), so the server's single answer is the
 		//    LOGINACK (or the ROUTING) the client is waiting for.
-		if (!ReadMessage(client, /*record_first_id=*/false)) {
+		std::vector<uint8_t> login_payload;
+		if (!ReadMessage(client, /*record_first_id=*/false, &login_payload)) {
 			return;
+		}
+		{
+			std::lock_guard<std::mutex> guard(mutex_);
+			server_names_.push_back(ExtractLogin7ServerName(login_payload));
 		}
 		std::vector<uint8_t> answer = responder_(index);
 		if (answer.empty()) {
@@ -409,6 +457,7 @@ private:
 	}
 
 	LoginResponder responder_;
+	mutable std::mutex mutex_;	// guards first_packet_ids_ / server_names_
 	socket_t listen_fd_ = INVALID_SOCK;
 	uint16_t port_ = 0;
 	std::thread thread_;
@@ -416,6 +465,7 @@ private:
 	bool stopped_ = false;
 	std::atomic<int> connections_{0};
 	std::vector<int> first_packet_ids_;
+	std::vector<std::string> server_names_;
 };
 
 // Response streams the scenarios reuse.
@@ -556,11 +606,13 @@ void TestPerHopPacketIdReset() {
 // error must name both the count and the last routed target so a field report
 // is diagnosable in one round.
 void TestHopLimitAborts() {
-	// The responder reads self_port by reference: it is filled in right after
-	// construction, before the first connection can possibly arrive.
-	uint16_t self_port = 0;
-	FakeTdsServer server([&self_port](int) { return RouteWithLoginAckStream(self_port); });
-	self_port = server.GetPort();
+	// The responder reads self_port from the server thread while the main
+	// thread writes it right after construction; atomic because "the socket
+	// round-trip orders it in practice" is not something the memory model
+	// promises, and TSAN would rightly complain.
+	std::atomic<uint16_t> self_port{0};
+	FakeTdsServer server([&self_port](int) { return RouteWithLoginAckStream(self_port.load()); });
+	self_port.store(server.GetPort());
 
 	TdsConnection conn;
 	CHECK(conn.Connect("127.0.0.1", server.GetPort(), 5));
@@ -574,6 +626,57 @@ void TestHopLimitAborts() {
 	CHECK(server.ConnectionCount() == 6);
 	server.Stop();
 	std::cout << "  [ok] hop limit aborts after 5 hops, naming count + last target" << std::endl;
+}
+
+// The routed target in its full Fabric shape: "host\INSTANCE:port". Three
+// separate rules meet here, and with a bare "127.0.0.1" target none of them are
+// exercised — which is how the whole suite stayed green with the ServerName fix
+// reverted:
+//   1. the trailing ":port" beats the ENVCHANGE port field (deliberately wrong
+//      below, so taking the ENVCHANGE value connects to the wrong place);
+//   2. "\INSTANCE" is stripped for DNS/TCP;
+//   3. "\INSTANCE" is KEPT for the LOGIN7 ServerName field, which is the
+//      spec-068 R7 fix — before it, DoLogin7 sent host_ and the routed named
+//      instance received the instance-stripped name.
+void TestRoutedTargetWithInstanceAndPortSuffix() {
+	FakeTdsServer target([](int) { return LoginAckStream(); });
+	const uint16_t target_port = target.GetPort();
+
+	// ENVCHANGE port is 9 (discard protocol) — if the suffix does not win, the
+	// hop connects there and the login fails.
+	const std::string routed = "127.0.0.1\\INST01:" + std::to_string(target_port);
+	FakeTdsServer gateway([routed](int) {
+		std::vector<uint8_t> s;
+		AppendLoginAck(s);
+		AppendRoutingEnvChange(s, routed, 9);
+		AppendDone(s);
+		return s;
+	});
+
+	TdsConnection conn;
+	CHECK(conn.Connect("127.0.0.1", gateway.GetPort(), 5));
+	CHECK(conn.Authenticate("sa", "pw", "TestDB", /*use_encrypt=*/false));
+
+	CHECK(conn.GetState() == ConnectionState::Idle);
+	CHECK(conn.GetPort() == target_port);  // rule 1: suffix beat the ENVCHANGE port
+	CHECK(conn.GetHost() == "127.0.0.1");  // rule 2: instance stripped for TCP
+	CHECK(target.ConnectionCount() == 1);
+
+	// rule 3: the routed server's LOGIN7 carried the instance form...
+	const std::vector<std::string> routed_names = target.ServerNames();
+	CHECK(routed_names.size() == 1);
+	CHECK(routed_names[0] == "127.0.0.1\\INST01");
+	// ...while the gateway's first LOGIN7 carried the plain dialled host, so
+	// this pins the hop specifically and not just "ServerName is ever set".
+	const std::vector<std::string> gw_names = gateway.ServerNames();
+	CHECK(gw_names.size() == 1);
+	CHECK(gw_names[0] == "127.0.0.1");
+
+	conn.Close();
+	gateway.Stop();
+	target.Stop();
+	std::cout << "  [ok] routed host\\instance:port — suffix wins, instance stripped for TCP, kept in ServerName"
+			  << std::endl;
 }
 
 // D3: the integrated path takes a FACTORY, and a hop re-invokes it with the
@@ -674,6 +777,7 @@ int main() {
 	TestSqlAuthSingleHopWithLoginAck();
 	TestRouteWithoutLoginAckFollowsHop();
 	TestPerHopPacketIdReset();
+	TestRoutedTargetWithInstanceAndPortSuffix();
 	TestHopLimitAborts();
 	TestIntegratedAuthFactoryRebuiltPerHop();
 	TestIntegratedAuthFactoryNullOnHopNamesRoutedHost();

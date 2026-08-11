@@ -103,11 +103,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Kerberos dev headers (Linux)
+      # libssl-dev is for the spec 068 routing test below, which links
+      # -lssl -lcrypto (tds_socket.hpp pulls in the TLS context). It rides along
+      # with this step because this one already runs apt-get update, and
+      # depending on the runner image happening to carry OpenSSL headers is the
+      # kind of assumption that breaks quietly on an image bump.
+      - name: Install Kerberos + OpenSSL dev headers (Linux)
         if: matrix.os.id == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libkrb5-dev binutils pkg-config
+          sudo apt-get install -y libkrb5-dev binutils pkg-config libssl-dev
 
       - name: Build + run gssapi_runtime loader unit test (spec 053)
         run: |
@@ -155,16 +160,32 @@ jobs:
       # the only externals are simdutf (via encoding/utf16.cpp) and OpenSSL
       # (via tds_socket.hpp -> the TLS TUs; the test itself runs unencrypted).
       # simdutf comes from the upstream single-file amalgamation rather than a
-      # distro package: Ubuntu 24.04 (noble) has no libsimdutf-dev, and pinning
-      # the tag to vcpkg.json's `simdutf` override means this test decodes
-      # UTF-16 with the same version the shipped extension links. No package
-      # manager, no vcpkg, no version drift.
+      # distro package: Ubuntu 24.04 (noble) has no libsimdutf-dev (the repo's
+      # own test/kerberos/test-client/Dockerfile says so and builds from source
+      # for the same reason), and brew/apt would ship 8.x while the extension
+      # links what vcpkg.json pins. The version is READ FROM vcpkg.json rather
+      # than hardcoded, so bumping the override cannot silently leave this test
+      # on the old codec; the checksum is pinned alongside it, so such a bump
+      # fails here loudly and visibly instead of pulling unreviewed bytes.
       - name: Fetch simdutf amalgamation (spec 068 routing test)
+        shell: bash
         run: |
           set -euo pipefail
+          SIMDUTF_VER=$(python3 -c "import json;print([o['version'] for o in json.load(open('vcpkg.json'))['overrides'] if o['name']=='simdutf'][0])")
+          # Update this hash when the vcpkg.json override moves; the mismatch
+          # message below is the reminder.
+          EXPECTED_VER=6.1.1
+          EXPECTED_SHA=28f4b565330d25801f160c97970ef06f6b861202286e9a3fef35b0d7320bbf3f
+          echo "vcpkg.json pins simdutf $SIMDUTF_VER"
           mkdir -p /tmp/simdutf
-          curl -sSL --retry 3 -o /tmp/simdutf/singleheader.zip \
-            https://github.com/simdutf/simdutf/releases/download/v6.1.1/singleheader.zip
+          curl -sSL --fail --retry 3 -o /tmp/simdutf/singleheader.zip \
+            "https://github.com/simdutf/simdutf/releases/download/v${SIMDUTF_VER}/singleheader.zip"
+          if [ "$SIMDUTF_VER" = "$EXPECTED_VER" ]; then
+            echo "$EXPECTED_SHA  /tmp/simdutf/singleheader.zip" | shasum -a 256 -c -
+          else
+            echo "::error::vcpkg.json now pins simdutf $SIMDUTF_VER, but the checksum recorded in ci.yml is for $EXPECTED_VER. Record the new asset's SHA-256 and update EXPECTED_VER/EXPECTED_SHA."
+            exit 1
+          fi
           unzip -o -q /tmp/simdutf/singleheader.zip -d /tmp/simdutf
           test -f /tmp/simdutf/simdutf.cpp && test -f /tmp/simdutf/simdutf.h
 
@@ -873,6 +894,40 @@ jobs:
             ../../duckdb
           cmake --build . --config Release
           Pop-Location
+
+      # Spec 068: the routing hop-driver test is a standalone compile (it is not
+      # part of the CMake target set), and its fake TDS server is the only
+      # Winsock code in the tree outside TdsSocket -- listen/accept/select/recv
+      # behind #ifdef _WIN32, which nothing else would ever compile. It rides on
+      # THIS job rather than the ungated cpp-unit-tests one because that job has
+      # no vcpkg, and OpenSSL on a Windows runner would mean guessing at a
+      # package location; here the prefix is already built above.
+      # Consequence: Windows coverage of this test is dispatch-gated, unlike
+      # Linux/macOS which run it on every PR.
+      - name: Build + run login routing hop-driver test (spec 068)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = (Get-Content vcpkg.json | ConvertFrom-Json).overrides `
+                 | Where-Object { $_.name -eq "simdutf" } | Select-Object -ExpandProperty version
+          Write-Host "vcpkg.json pins simdutf $ver"
+          New-Item -ItemType Directory -Force -Path simdutf_sh | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/simdutf/simdutf/releases/download/v$ver/singleheader.zip" `
+            -OutFile simdutf_sh/singleheader.zip
+          Expand-Archive -Force -Path simdutf_sh/singleheader.zip -DestinationPath simdutf_sh
+          $prefix = "build/release/vcpkg_installed/x64-windows-static-release"
+          cl /std:c++17 /EHsc /nologo /MT /D_WINSOCK_DEPRECATED_NO_WARNINGS `
+            /I src/include /I simdutf_sh /I "$prefix/include" `
+            test/cpp/test_login_routing_hops.cpp `
+            src/tds/tds_connection.cpp src/tds/tds_socket.cpp `
+            src/tds/tls/tds_tls_context.cpp src/tds/tls/tds_tls_impl.cpp `
+            src/tds/tds_packet.cpp src/tds/tds_protocol.cpp src/tds/tds_types.cpp `
+            src/tds/encoding/utf16.cpp simdutf_sh/simdutf.cpp `
+            /Fe:test_login_routing_hops.exe `
+            /link /LIBPATH:"$prefix/lib" libssl.lib libcrypto.lib ws2_32.lib crypt32.lib user32.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "compile failed" }
+          ./test_login_routing_hops.exe
+          if ($LASTEXITCODE -ne 0) { throw "test failed" }
 
       # See the linux/macos build job for why the binary cache needs pruning.
       - name: Prune stale vcpkg binary archives

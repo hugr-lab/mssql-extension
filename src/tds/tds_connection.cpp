@@ -938,20 +938,24 @@ LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const s
 	// Spec 047 FR-014: LOGIN7 program_name from caller (already clamped). Empty
 	// preserves the prior extension default.
 	const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
-	// ServerName: tds_server_name_ when set, which is what a routing hop leaves
-	// behind -- "hostname\instance", the form [MS-TDS] wants in this field.
-	// host_ is the instance-STRIPPED name used for DNS/TCP, so passing it here
-	// (as this did before spec 068) sends the wrong ServerName after a hop to a
-	// named instance. On a first attempt the driver sets tds_server_name_ =
-	// host_, so a non-routed login is byte-identical to the pre-068 packet.
+	// ServerName goes in as its own argument rather than by overwriting `host`:
+	// BuildLogin7 mirrors its first argument into BOTH HostName and ServerName,
+	// so passing the routed "hostname\instance" form as `host` would have moved
+	// HostName too -- a different field with a different meaning ([MS-TDS]
+	// 2.2.6.4: client workstation, not destination). A routing hop leaves the
+	// instance form in tds_server_name_ while host_ holds the instance-STRIPPED
+	// name used for DNS/TCP; before spec 068 only host_ existed here, so a
+	// routed named instance received the wrong ServerName. On a first attempt
+	// the driver sets tds_server_name_ = host_, leaving a non-routed login
+	// byte-identical to the pre-068 packet.
 	const std::string &server_name = tds_server_name_.empty() ? host_ : tds_server_name_;
 	// Request our configured frame size. The server answers with
 	// min(requested, its own maximum) via the PACKETSIZE ENVCHANGE — it never
 	// raises the value on its own, so asking for the 4096 default (as this did
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
-	TdsPacket login = TdsProtocol::BuildLogin7(server_name, username, password, database, login7_app_name,
-											   requested_packet_size_, request_utf8_support_);
+	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
+											   requested_packet_size_, request_utf8_support_, server_name);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

@@ -1347,7 +1347,17 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 
 	if (!conn.AuthenticateIntegrated(info.database, auth_factory, info.use_encrypt, ResolveAppName(info),
 									 info.login7_max_packet)) {
-		string error = strategy_error.empty() ? conn.GetLastError() : strategy_error;
+		// Keep BOTH messages. The connection's own error is the one that says
+		// WHICH target failed -- after a routing hop it names the routed server
+		// and the SPN that would have been requested, which `Kerberos.md`
+		// documents as the one-round field diagnosis for the SPN-over-hop path.
+		// `strategy_error` is the GSSAPI/SSPI cause, which the callable could
+		// not throw across the TDS layer. Reporting only the cause would drop
+		// the routed host; reporting only the driver would drop the reason.
+		string error = conn.GetLastError();
+		if (!strategy_error.empty()) {
+			error += " (" + strategy_error + ")";
+		}
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
 	}

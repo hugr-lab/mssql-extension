@@ -229,7 +229,7 @@ static void AppendUtf8SupportFeature(TdsPacket &packet) {
 
 TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								   const std::string &database, const std::string &app_name, uint32_t packet_size,
-								   bool request_utf8_support) {
+								   bool request_utf8_support, const std::string &server_name) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 fixed header is 94 bytes; variable-length strings follow.
@@ -244,7 +244,14 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	Login7VarField field_username = EncodeLogin7VarField("UserName", username, var_offset);
 	Login7VarField field_password = EncodeLogin7VarField("Password", password, var_offset, /*obfuscate_password=*/true);
 	Login7VarField field_appname = EncodeLogin7VarField("AppName", app_name, var_offset);
-	Login7VarField field_servername = EncodeLogin7VarField("ServerName", host, var_offset);	 // ServerName mirrors host
+	// ServerName mirrors host unless the caller supplies one explicitly, which
+	// is what a routing hop does: the routed target keeps "\\instance" here but
+	// is stripped for DNS/TCP, so host and ServerName stop being the same
+	// string (spec 068). HostName above is deliberately left alone -- it is a
+	// separate field with a separate meaning and changing it is not this
+	// change's business.
+	Login7VarField field_servername =
+		EncodeLogin7VarField("ServerName", server_name.empty() ? host : server_name, var_offset);
 
 	// Unused / extension / CltIntName / Language all have length 0 and share
 	// the current cumulative offset (per MS-TDS §2.2.6.4 zero-length fields

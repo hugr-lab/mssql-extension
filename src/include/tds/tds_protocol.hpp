@@ -92,9 +92,16 @@ public:
 	//     of transcoding them to UTF-16 (0xE7), which halves the wire bytes for ASCII-heavy
 	//     data and lets the client copy them straight into the vector. A server that does not
 	//     support it omits the acknowledgement and keeps sending UTF-16, so asking is safe.
+	// `server_name` fills the LOGIN7 ServerName field ([MS-TDS] 2.2.6.4) when it
+	// differs from `host`, which happens after a login-time routing hop: the
+	// routed target is "hostname\instance" for ServerName but the bare hostname
+	// for DNS/TCP (spec 068). Empty keeps the historical behaviour of mirroring
+	// `host` into both HostName and ServerName, so every existing caller is
+	// unaffected.
 	static TdsPacket BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								 const std::string &database, const std::string &app_name = "DuckDB MSSQL Extension",
-								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE, bool request_utf8_support = true);
+								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE, bool request_utf8_support = true,
+								 const std::string &server_name = "");
 
 	// Parse LOGIN7 response (LOGINACK token and potential errors)
 	static LoginResponse ParseLoginResponse(const std::vector<uint8_t> &data);
