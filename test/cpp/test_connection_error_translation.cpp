@@ -149,6 +149,62 @@ void TestServerPhraseWithoutNumber() {
 	std::cout << "  [ok] the server's phrase hints at credentials; our own wrapper's word does not" << std::endl;
 }
 
+// The heuristic branches (no server error number) used to return a canned
+// sentence and DISCARD the original text. These are the three messages
+// AuthenticateWithFedAuth actually sets, and the reason it mattered: two of
+// them describe a failure BEFORE any handshake, so "TLS handshake failed" was
+// not merely lossy but wrong.
+//
+// Note the shape of the old assertion this replaces: checking for "TLS
+// handshake failed" passed both before and after the fix, because the canned
+// string contained it. These assert on the part that was being thrown away.
+void TestPreHandshakeAzureFailuresKeepTheirText() {
+	const string not_sup = MSSQLTranslateConnectionError(
+		"TLS required for Azure AD but server does not support encryption", "az.database.windows.net", 1433, "", "db");
+	CHECK(Contains(not_sup, "does not support encryption"));
+
+	const string declined = MSSQLTranslateConnectionError("TLS required for Azure AD but server declined encryption",
+														  "az.database.windows.net", 1433, "", "db");
+	CHECK(Contains(declined, "declined encryption"));
+
+	// A real handshake failure must keep the OpenSSL reason, which is the only
+	// part that says what to change.
+	const string handshake = MSSQLTranslateConnectionError("TLS handshake failed: sslv3 alert handshake failure",
+														   "az.database.windows.net", 1433, "", "db");
+	CHECK(Contains(handshake, "sslv3 alert handshake failure"));
+
+	std::cout << "  [ok] pre-handshake and handshake failures keep the server/OpenSSL text" << std::endl;
+}
+
+// Every other heuristic branch had the same defect.
+void TestOtherHeuristicBranchesKeepTheirText() {
+	CHECK(Contains(MSSQLTranslateConnectionError("connect: connection refused", "s", 1433, "u", "db"),
+				   "connection refused"));
+	CHECK(Contains(MSSQLTranslateConnectionError("cannot resolve host: no such host", "nope", 1433, "u", "db"),
+				   "no such host"));
+	CHECK(Contains(MSSQLTranslateConnectionError("connect timed out after 30s", "s", 1433, "u", "db"), "after 30s"));
+	CHECK(Contains(MSSQLTranslateConnectionError("certificate verify failed: self signed", "s", 1433, "u", "db"),
+				   "self signed"));
+	std::cout << "  [ok] refused / DNS / timeout / certificate branches keep the original text" << std::endl;
+}
+
+// On the token-authenticated paths the identity comes from the token, so
+// info.user is empty and "for user ''" is less informative than nothing.
+void TestEmptyUserOmitsTheClause() {
+	const string out = MSSQLTranslateConnectionError(
+		"Authentication failed (error 18456, state 1): Login failed for user '<token-identified principal>'.",
+		"az.database.windows.net", 1433, /*user=*/"", "db", 18456, 1);
+
+	CHECK(!Contains(out, "for user ''"));
+	CHECK(Contains(out, "state 1"));					 // the byte still surfaces
+	CHECK(Contains(out, "token-identified principal"));	 // and the server's own text
+	// A named user still gets the clause.
+	const string named = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 8): Login failed.",
+													   "s", 1433, "app_user", "db", 18456, 8);
+	CHECK(Contains(named, "for user 'app_user'"));
+	std::cout << "  [ok] the \"for user\" clause is omitted when the identity came from a token" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -162,6 +218,9 @@ int main() {
 	TestUnknownServerErrorSurfacesVerbatim();
 	TestNonLoginFailuresStillClassified();
 	TestServerPhraseWithoutNumber();
+	TestPreHandshakeAzureFailuresKeepTheirText();
+	TestOtherHeuristicBranchesKeepTheirText();
+	TestEmptyUserOmitsTheClause();
 
 	std::cout << "All " << g_checks << " checks passed." << std::endl;
 	return 0;

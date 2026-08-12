@@ -94,9 +94,11 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 // address be treated as a name, which is the unmatchable SPN issue #259 is
 // about. So this path initialises Winsock itself.
 static std::once_flag spn_winsock_once;
+static bool spn_winsock_ready = false;
 static void EnsureWinsockForResolution() {
 	WSADATA wsa_data;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0) {
+		spn_winsock_ready = true;
 		atexit([]() { WSACleanup(); });
 	}
 }
@@ -108,6 +110,12 @@ std::string ResolveHostForSpn(const std::string &host) {
 	}
 #if defined(_WIN32)
 	std::call_once(spn_winsock_once, EnsureWinsockForResolution);
+	if (!spn_winsock_ready) {
+		// Without Winsock we cannot even tell an address from a name, so answer
+		// "unresolvable" rather than guess. Not cached: WSAStartup failing is a
+		// property of the process at this instant, not of the host.
+		return std::string();
+	}
 #endif
 
 	// Memoized because this sits on the pool-refill path: a fresh strategy is
@@ -144,6 +152,17 @@ std::string ResolveHostForSpn(const std::string &host) {
 		addr = reinterpret_cast<const sockaddr *>(&v6);
 		addr_len = sizeof(v6);
 	} else {
+		// Not parseable as an address -- normally that means it IS a name. But
+		// inet_pton can also fail because Winsock never came up, and treating
+		// an IP literal as a name is exactly the unmatchable-SPN bug this path
+		// exists to prevent (issue #259). So: a string made only of hex digits,
+		// dots and colons cannot be a hostname, and is refused rather than
+		// cached as one.
+		const bool looks_like_address =
+			!host.empty() && host.find_first_not_of("0123456789abcdefABCDEF.:") == std::string::npos;
+		if (looks_like_address) {
+			return std::string();  // caller reports it; never cached
+		}
 		std::lock_guard<std::mutex> guard(cache_mutex);
 		cache[host] = host;	 // already a name; no lookup was performed
 		return host;
@@ -160,12 +179,29 @@ std::string ResolveHostForSpn(const std::string &host) {
 		// exists for -- and caching it would keep failing every later ATTACH
 		// and every routing hop until the process restarts, long after DNS
 		// recovered. EAI_FAIL and anything else get the same treatment: retry.
-#if defined(EAI_NONAME)
-		if (rc == EAI_NONAME) {
+#if defined(_WIN32)
+		// getnameinfo on Windows documents only "nonzero on failure"; the code
+		// comes from WSAGetLastError. WSANO_DATA is "the name exists but has no
+		// record of this type", which for a PTR query is as definitive as
+		// WSAHOST_NOT_FOUND -- classifying only the latter would mean never
+		// caching a negative on Windows, and paying the full resolver timeout
+		// on every pool refill and every routing hop. Silent, and merely slow.
+		const int wsa_err = WSAGetLastError();
+		const bool definitive = (wsa_err == WSAHOST_NOT_FOUND || wsa_err == WSANO_DATA);
+#elif defined(EAI_NONAME)
+		// EAI_NODATA is deprecated/absent on some libcs, hence the guard.
+#if defined(EAI_NODATA)
+		const bool definitive = (rc == EAI_NONAME || rc == EAI_NODATA);
+#else
+		const bool definitive = (rc == EAI_NONAME);
+#endif
+#else
+		const bool definitive = false;
+#endif
+		if (definitive) {
 			std::lock_guard<std::mutex> guard(cache_mutex);
 			cache[host] = std::string();
 		}
-#endif
 		return std::string();  // caller reports this; see the header
 	}
 	std::string resolved(fqdn);
@@ -193,6 +229,16 @@ std::string DeriveDefaultSpn(const std::string &host, uint16_t port) {
 			host, port);
 	}
 	return std::string("MSSQLSvc/") + spn_host + ":" + std::to_string(port);
+}
+
+bool TryDeriveDefaultSpn(const std::string &host, uint16_t port, std::string &spn, std::string &error) {
+	try {
+		spn = DeriveDefaultSpn(host, port);
+		return true;
+	} catch (const std::exception &e) {
+		error = e.what();
+		return false;
+	}
 }
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {

@@ -56,6 +56,12 @@ std::string ResolveHostForSpn(const std::string &host);
 // direction -- exactly the situation issue #259 is about.
 std::string DeriveDefaultSpn(const std::string &host, uint16_t port);
 
+// Non-throwing form for the diagnostic functions, whose contract is to RETURN a
+// status string rather than abort the query -- an unresolvable IP is exactly
+// what a user runs them to diagnose. Returns false and fills `error` with the
+// explanation; the caller decides how to prefix it.
+bool TryDeriveDefaultSpn(const std::string &host, uint16_t port, std::string &spn, std::string &error);
+
 class AuthStrategyFactory {
 public:
 	// Create strategy from connection info

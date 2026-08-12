@@ -125,13 +125,9 @@ static void Krb5TestHost(DataChunk &args, ExpressionState & /*state*/, Vector &r
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
 		tds::Krb5Config cfg;
-		try {
-			cfg.spn = tds::DeriveDefaultSpn(h, 1433);
-		} catch (const std::exception &e) {
-			// These functions report; they do not throw. An unresolvable IP is
-			// precisely what a user runs this to diagnose (issue #259), so the
-			// explanation has to come back as the result string.
-			return StringVector::AddString(result, std::string(e.what()));
+		std::string spn_error;
+		if (!tds::TryDeriveDefaultSpn(h, 1433, cfg.spn, spn_error)) {
+			return StringVector::AddString(result, std::string("MSSQL Kerberos auth test: ") + spn_error);
 		}
 		return StringVector::AddString(result, RunKrb5Test(std::move(cfg)));
 	});
@@ -147,13 +143,9 @@ static void Krb5TestHostPort(DataChunk &args, ExpressionState & /*state*/, Vecto
 		host_vec, port_vec, result, args.size(), [&](string_t host, int32_t port) {
 			std::string h = host.GetString();
 			tds::Krb5Config cfg;
-			try {
-				cfg.spn = tds::DeriveDefaultSpn(h, static_cast<uint16_t>(port));
-			} catch (const std::exception &e) {
-				// These functions report; they do not throw. An unresolvable IP is
-				// precisely what a user runs this to diagnose (issue #259), so the
-				// explanation has to come back as the result string.
-				return StringVector::AddString(result, std::string(e.what()));
+			std::string spn_error;
+			if (!tds::TryDeriveDefaultSpn(h, static_cast<uint16_t>(port), cfg.spn, spn_error)) {
+				return StringVector::AddString(result, std::string("MSSQL Kerberos auth test: ") + spn_error);
 			}
 			return StringVector::AddString(result, RunKrb5Test(std::move(cfg)));
 		});
@@ -198,13 +190,9 @@ static void Krb5TestSecret(DataChunk &args, ExpressionState &state, Vector &resu
 				cfg.spn = spn;
 			}
 		} else {
-			try {
-				cfg.spn = tds::DeriveDefaultSpn(info->host, info->port);
-			} catch (const std::exception &e) {
-				// These functions report; they do not throw. An unresolvable IP is
-				// precisely what a user runs this to diagnose (issue #259), so the
-				// explanation has to come back as the result string.
-				return StringVector::AddString(result, std::string(e.what()));
+			std::string spn_error;
+			if (!tds::TryDeriveDefaultSpn(info->host, info->port, cfg.spn, spn_error)) {
+				return StringVector::AddString(result, std::string("MSSQL Kerberos auth test: ") + spn_error);
 			}
 		}
 		cfg.configfile = info->krb5_configfile;
