@@ -95,14 +95,17 @@ void TestWrongPasswordAndInaccessibleDatabaseDiffer() {
 	// "state 8" and "state 38/40" both occur in the branch's own static
 	// explanation, so asserting on them cannot fail even if server_state were
 	// dropped from the format. Assert on states the static text never names.
-	const string c = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 5): x", "s", 1433, "u",
-												   "db", 18456, 5);
-	const string d = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 11): x", "s", 1433, "u",
-												   "db", 18456, 11);
+	// The raw error deliberately does NOT mention a state: the 18456 branch
+	// echoes the raw text back ("Server said: %s"), so an assertion on a state
+	// that appears in the input is satisfied by the echo alone and cannot fail
+	// however the format string changes. Same trap as asserting on the branch's
+	// static explanation, one layer along.
+	const string c = MSSQLTranslateConnectionError("Login failed for user 'u'.", "s", 1433, "u", "db", 18456, 5);
+	const string d = MSSQLTranslateConnectionError("Login failed for user 'u'.", "s", 1433, "u", "db", 18456, 11);
 	CHECK(Contains(c, "state 5"));
 	CHECK(Contains(d, "state 11"));
 	CHECK(c != d);
-	std::cout << "  [ok] state 8 and state 40 produce different messages" << std::endl;
+	std::cout << "  [ok] the State byte reaches the message and distinguishes causes" << std::endl;
 }
 
 // 4060 is a database-access failure, not a credential one.
@@ -193,18 +196,27 @@ void TestOtherHeuristicBranchesKeepTheirText() {
 	CHECK(Contains(MSSQLTranslateConnectionError("connect timed out after 30s", "s", 1433, "u", "db"), "after 30s"));
 	CHECK(Contains(MSSQLTranslateConnectionError("certificate verify failed: self signed", "s", 1433, "u", "db"),
 				   "self signed"));
+
+	// The ENCRYPT_REQ arm. Its text carries no tls/ssl/handshake substring, so
+	// it correctly misses the TLS branch above and lands in its own -- which
+	// used to name neither the server nor the cause. With several ATTACHes in
+	// flight, "server requires encryption" without a host is unactionable.
+	const string enc = MSSQLTranslateConnectionError("Server requires encryption (ENCRYPT_REQ) but use_encrypt=false",
+													 "sql1", 1433, "u", "db");
+	CHECK(Contains(enc, "sql1:1433"));
+	CHECK(Contains(enc, "ENCRYPT_REQ"));
+	CHECK(Contains(enc, "use_encrypt=true"));  // the actionable half
 	std::cout << "  [ok] refused / DNS / timeout / certificate branches keep the original text" << std::endl;
 }
 
 // On the token-authenticated paths the identity comes from the token, so
 // info.user is empty and "for user ''" is less informative than nothing.
 void TestEmptyUserOmitsTheClause() {
-	const string out = MSSQLTranslateConnectionError(
-		"Authentication failed (error 18456, state 1): Login failed for user '<token-identified principal>'.",
-		"az.database.windows.net", 1433, /*user=*/"", "db", 18456, 1);
+	const string out = MSSQLTranslateConnectionError("Login failed for user '<token-identified principal>'.",
+													 "az.database.windows.net", 1433, /*user=*/"", "db", 18456, 5);
 
 	CHECK(!Contains(out, "for user ''"));
-	CHECK(Contains(out, "state 1"));					 // the byte still surfaces
+	CHECK(Contains(out, "state 5"));					 // the byte still surfaces
 	CHECK(Contains(out, "token-identified principal"));	 // and the server's own text
 	// A named user still gets the clause.
 	const string named = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 8): Login failed.",
