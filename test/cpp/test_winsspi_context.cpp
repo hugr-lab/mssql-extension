@@ -19,7 +19,10 @@
 // On non-Windows this compiles to a no-op so the file can live in the normal
 // test set without a platform fence around every build recipe.
 //
-// Build + run (Windows): part of the MSVC build job in .github/workflows/ci.yml.
+// Build + run: the `windows-sspi-test` job in .github/workflows/ci.yml, which
+// is UNGATED -- it runs on every PR. That is the property worth having: the
+// dispatch-gated Windows build job would only run it when somebody ticks a box,
+// which is barely better than the never-set env var this replaces.
 
 #include <iostream>
 #include <string>

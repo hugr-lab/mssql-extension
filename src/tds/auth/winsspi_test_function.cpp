@@ -130,7 +130,14 @@ static void WinSspiTestHost(DataChunk &args, ExpressionState & /*state*/, Vector
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
 		tds::WinSspiConfig cfg;
-		cfg.spn = tds::DeriveDefaultSpn(h, 1433);
+		try {
+			cfg.spn = tds::DeriveDefaultSpn(h, 1433);
+		} catch (const std::exception &e) {
+			// These functions report; they do not throw. An unresolvable IP is
+			// precisely what a user runs this to diagnose (issue #259), so the
+			// explanation has to come back as the result string.
+			return StringVector::AddString(result, std::string(e.what()));
+		}
 		return StringVector::AddString(result, RunWinSspiTest(std::move(cfg)));
 	});
 }
@@ -145,7 +152,14 @@ static void WinSspiTestHostPort(DataChunk &args, ExpressionState & /*state*/, Ve
 		host_vec, port_vec, result, args.size(), [&](string_t host, int32_t port) {
 			std::string h = host.GetString();
 			tds::WinSspiConfig cfg;
-			cfg.spn = tds::DeriveDefaultSpn(h, static_cast<uint16_t>(port));
+			try {
+				cfg.spn = tds::DeriveDefaultSpn(h, static_cast<uint16_t>(port));
+			} catch (const std::exception &e) {
+				// These functions report; they do not throw. An unresolvable IP is
+				// precisely what a user runs this to diagnose (issue #259), so the
+				// explanation has to come back as the result string.
+				return StringVector::AddString(result, std::string(e.what()));
+			}
 			return StringVector::AddString(result, RunWinSspiTest(std::move(cfg)));
 		});
 }

@@ -1033,11 +1033,14 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 				"resuming, or the service is being reconfigured; retry shortly. Server said: %s",
 				database, host, port, server_error, error);
 		case 18456:	 // Login failed. State is the only field that says WHY (issue #164).
+			// `user` is empty on the token-authenticated paths, where the identity
+			// comes from the token rather than a User Id -- naming user '' there
+			// is less informative than the server's own text.
 			return StringUtil::Format(
-				"Authentication failed for user '%s' (server error 18456, state %d) - state 8 is a wrong password, "
-				"state 38/40 an inaccessible initial database, state 1 an unspecified cause the server logs but "
-				"does not disclose. Server said: %s",
-				user, server_state, error);
+				"Authentication failed%s (server error 18456, state %d) - state 8 is a wrong "
+				"password, state 38/40 an inaccessible initial database, state 1 an unspecified "
+				"cause the server logs but does not disclose. Server said: %s",
+				user.empty() ? "" : StringUtil::Format(" for user '%s'", user), server_state, error);
 		case 4060:	// Cannot open database requested by the login
 			return StringUtil::Format(
 				"Cannot access database '%s' - check database name and permissions (server "
@@ -1054,19 +1057,21 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 	// word "authentication", which appears in our own wrapper for every login
 	// failure and is what made this arm swallow everything (issue #262).
 	if (lower_error.find("login failed") != string::npos) {
-		return StringUtil::Format("Authentication failed for user '%s' - check username and password. Server said: %s",
-								  user, error);
+		return StringUtil::Format("Authentication failed%s - check username and password. Server said: %s",
+								  user.empty() ? "" : StringUtil::Format(" for user '%s'", user), error);
 	}
 
 	// Database access failures
 	if (lower_error.find("cannot open database") != string::npos) {
-		return StringUtil::Format("Cannot access database '%s' - check database name and permissions", database);
+		return StringUtil::Format("Cannot access database '%s' - check database name and permissions. Details: %s",
+								  database, error);
 	}
 
 	// TLS failures
 	if (lower_error.find("tls") != string::npos || lower_error.find("ssl") != string::npos ||
 		lower_error.find("handshake") != string::npos) {
-		return StringUtil::Format("TLS handshake failed to %s:%d - check TLS configuration", host, port);
+		return StringUtil::Format("TLS negotiation failed to %s:%d - check TLS configuration. Details: %s", host, port,
+								  error);
 	}
 
 	// Server requires encryption but client disabled it
@@ -1079,27 +1084,30 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 
 	// Certificate validation failures
 	if (lower_error.find("certificate") != string::npos || lower_error.find("cert") != string::npos) {
-		return StringUtil::Format("TLS certificate validation failed - server certificate not trusted");
+		return StringUtil::Format(
+			"TLS certificate validation failed to %s:%d - server certificate not trusted. "
+			"Details: %s",
+			host, port, error);
 	}
 
 	// Connection refused
 	if (lower_error.find("connection refused") != string::npos || lower_error.find("econnrefused") != string::npos) {
 		return StringUtil::Format(
-			"Connection refused to %s:%d - check if SQL Server is running and accepting "
-			"connections",
-			host, port);
+			"Connection refused to %s:%d - check if SQL Server is running and accepting connections. Details: %s", host,
+			port, error);
 	}
 
 	// DNS/hostname resolution
 	if (lower_error.find("resolve") != string::npos || lower_error.find("host") != string::npos ||
 		lower_error.find("enoent") != string::npos || lower_error.find("name or service not known") != string::npos) {
-		return StringUtil::Format("Cannot resolve hostname '%s' - check server name", host);
+		return StringUtil::Format("Cannot resolve hostname '%s' - check server name. Details: %s", host, error);
 	}
 
 	// Timeout
 	if (lower_error.find("timeout") != string::npos || lower_error.find("timed out") != string::npos) {
-		return StringUtil::Format("Connection timed out to %s:%d - check network connectivity and firewall settings",
-								  host, port);
+		return StringUtil::Format(
+			"Connection timed out to %s:%d - check network connectivity and firewall settings. Details: %s", host, port,
+			error);
 	}
 
 	// Generic connection error
@@ -1161,7 +1169,8 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 		string error =
 			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
 										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - raw: %s, translated: %s",
+								conn.GetLastError().c_str(), error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
 	}
@@ -1230,7 +1239,8 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 		string error =
 			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
 										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - raw: %s, translated: %s",
+								conn.GetLastError().c_str(), error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
 	}

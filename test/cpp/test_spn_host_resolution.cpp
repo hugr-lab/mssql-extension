@@ -52,10 +52,11 @@ void TestHostnamePassesThroughUnchanged() {
 void TestIPv4LiteralIsReverseResolved() {
 	const std::string resolved = ResolveHostForSpn("127.0.0.1");
 	CHECK(!resolved.empty());
-	CHECK(resolved != "127.0.0.1");	 // the whole point: no longer an address
-	CHECK(resolved.find('.') == std::string::npos || resolved.find("localhost") != std::string::npos ||
-		  !resolved.empty());		// whatever the box calls loopback
-	CHECK(resolved.back() != '.');	// trailing DNS dot stripped
+	CHECK(resolved != "127.0.0.1");					 // the whole point: no longer an address
+	CHECK(resolved.find('/') == std::string::npos);	 // characters that would be
+	CHECK(resolved.find(':') == std::string::npos);	 // invalid inside the derived
+	CHECK(resolved.find('@') == std::string::npos);	 // "MSSQLSvc/<host>:<port>" SPN
+	CHECK(resolved.back() != '.');					 // trailing DNS dot stripped
 	std::cout << "  [ok] 127.0.0.1 reverse-resolves to '" << resolved << "' instead of staying an address" << std::endl;
 }
 

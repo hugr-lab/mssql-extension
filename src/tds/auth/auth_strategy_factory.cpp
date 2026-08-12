@@ -86,18 +86,38 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 
 }  // namespace
 
+#if defined(_WIN32)
+// inet_pton and getnameinfo are Winsock calls and need WSAStartup first.
+// TdsSocket does that inside Connect(), which has NOT run when
+// mssql_winsspi_auth_test() is the first thing a process does -- resolution
+// would then fail with WSANOTINITIALISED, or inet_pton would fail and the
+// address be treated as a name, which is the unmatchable SPN issue #259 is
+// about. So this path initialises Winsock itself.
+static std::once_flag spn_winsock_once;
+static void EnsureWinsockForResolution() {
+	WSADATA wsa_data;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0) {
+		atexit([]() { WSACleanup(); });
+	}
+}
+#endif
+
 std::string ResolveHostForSpn(const std::string &host) {
 	if (host.empty()) {
 		return host;
 	}
+#if defined(_WIN32)
+	std::call_once(spn_winsock_once, EnsureWinsockForResolution);
+#endif
 
 	// Memoized because this sits on the pool-refill path: a fresh strategy is
 	// built per login attempt and again per routing hop, and getnameinfo is a
-	// blocking resolver call. The negative results are the ones that matter --
-	// an IP with no PTR record costs the full resolver timeout every time, and
-	// the answer is always the same. A host's PTR record changing mid-process
-	// therefore needs a restart to be picked up, which is the right trade for a
-	// value that is fixed for the life of an ATTACH.
+	// blocking resolver call. Only DEFINITIVE answers are cached: a successful
+	// resolution, a name that needed no lookup, and EAI_NONAME ("this address
+	// has no PTR record"). A transient failure is retried, because a resolver
+	// that is down says nothing about the host. A PTR record changing
+	// mid-process needs a restart to be picked up, which is the right trade for
+	// a value fixed for the life of an ATTACH.
 	static std::mutex cache_mutex;
 	static std::map<std::string, std::string> cache;
 	{
@@ -132,9 +152,20 @@ std::string ResolveHostForSpn(const std::string &host) {
 	char fqdn[NI_MAXHOST] = {0};
 	// NI_NAMEREQD: fail rather than hand back the numeric form, which is what
 	// getnameinfo does by default and would silently reproduce the bug.
-	if (getnameinfo(addr, addr_len, fqdn, sizeof(fqdn), nullptr, 0, NI_NAMEREQD) != 0) {
-		std::lock_guard<std::mutex> guard(cache_mutex);
-		cache[host] = std::string();
+	const int rc = getnameinfo(addr, addr_len, fqdn, sizeof(fqdn), nullptr, 0, NI_NAMEREQD);
+	if (rc != 0) {
+		// Cache ONLY a definitive "this address has no name". EAI_AGAIN is a
+		// resolver that is unreachable or timing out -- routine while a
+		// container stack is coming up, which is the situation lazy_validation
+		// exists for -- and caching it would keep failing every later ATTACH
+		// and every routing hop until the process restarts, long after DNS
+		// recovered. EAI_FAIL and anything else get the same treatment: retry.
+#if defined(EAI_NONAME)
+		if (rc == EAI_NONAME) {
+			std::lock_guard<std::mutex> guard(cache_mutex);
+			cache[host] = std::string();
+		}
+#endif
 		return std::string();  // caller reports this; see the header
 	}
 	std::string resolved(fqdn);
