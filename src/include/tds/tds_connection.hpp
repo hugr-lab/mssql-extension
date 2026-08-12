@@ -49,8 +49,13 @@ enum class LoginAttemptOutcome : uint8_t {
 // Returning nullptr fails the login: on the first call with the existing
 // "compiled without Kerberos / SSPI support" message, on a hop with a message
 // naming the routed host. The factory must not throw -- it runs inside the TDS
-// layer, which is exception-free by contract -- and must capture by value only,
-// since pool refills run on worker threads (issues #178/#179).
+// layer, which is exception-free by contract.
+//
+// On captures: a factory that outlives the call -- the pool's, which is stored
+// and re-run on every refill from a worker thread -- must capture by VALUE
+// (issues #178/#179). A factory built and consumed within a single synchronous
+// call, as the ATTACH-validation path does, may capture by reference; that is
+// how it reports a construction error the callable itself cannot throw.
 using AuthenticatorFactory = std::function<std::shared_ptr<IAuthenticator>(const std::string &host, uint16_t port)>;
 
 // Represents a single TDS connection to SQL Server
@@ -362,9 +367,6 @@ private:
 	// TDS ServerName for LOGIN7 - may differ from host_ when routing includes instance name
 	// Format: "hostname" or "hostname\instance" (instance name is for TDS protocol, not DNS)
 	std::string tds_server_name_;
-
-	// Original gateway hostname for TLS SNI after routing (Azure Fabric session tracking)
-	std::string original_sni_hostname_;
 
 	// Login-time routing driver (spec 068 D2). Runs `attempt` against the
 	// current target and follows ROUTING up to MAX_ROUTING_HOPS times, with a

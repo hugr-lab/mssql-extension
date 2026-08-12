@@ -1387,6 +1387,12 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 	// construction errors are captured here and re-thrown after the call
 	// returns — `strategy_error` holds the message the callable could not raise.
 	string strategy_error;
+	// By reference, deliberately, and the exception to the by-value rule in
+	// AuthenticatorFactory's docs: this factory is built and consumed inside
+	// this one synchronous call, and `strategy_error` is how a construction
+	// failure gets back out -- the callable cannot throw across the TDS layer.
+	// The pool's factory (mssql_catalog.cpp) captures by value, because it is
+	// stored and re-run on worker threads.
 	auto auth_factory = [&info, &strategy_error](const std::string &host,
 												 uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
 		MSSQLConnectionInfo hop_info = info;
