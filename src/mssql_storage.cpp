@@ -1078,8 +1078,9 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 	if (lower_error.find("encrypt_req") != string::npos ||
 		(lower_error.find("encryption") != string::npos && lower_error.find("require") != string::npos)) {
 		return StringUtil::Format(
-			"Server requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
-			"Set use_encrypt=true or Encrypt=yes in connection string.");
+			"Server %s:%d requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
+			"Set use_encrypt=true or Encrypt=yes in connection string. Details: %s",
+			host, port, error);
 	}
 
 	// Certificate validation failures

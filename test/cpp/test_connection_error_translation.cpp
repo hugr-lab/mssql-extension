@@ -92,8 +92,16 @@ void TestWrongPasswordAndInaccessibleDatabaseDiffer() {
 	const string b = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 40): Login failed.", "s",
 												   1433, "u", "db", 18456, 40);
 	CHECK(a != b);
-	CHECK(Contains(a, "state 8"));
-	CHECK(Contains(b, "state 40"));
+	// "state 8" and "state 38/40" both occur in the branch's own static
+	// explanation, so asserting on them cannot fail even if server_state were
+	// dropped from the format. Assert on states the static text never names.
+	const string c = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 5): x", "s", 1433, "u",
+												   "db", 18456, 5);
+	const string d = MSSQLTranslateConnectionError("Authentication failed (error 18456, state 11): x", "s", 1433, "u",
+												   "db", 18456, 11);
+	CHECK(Contains(c, "state 5"));
+	CHECK(Contains(d, "state 11"));
+	CHECK(c != d);
 	std::cout << "  [ok] state 8 and state 40 produce different messages" << std::endl;
 }
 

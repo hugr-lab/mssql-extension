@@ -47,6 +47,22 @@ void TestHostnamePassesThroughUnchanged() {
 	std::cout << "  [ok] a hostname passes through unchanged, unresolved" << std::endl;
 }
 
+// Short single-label hostnames -- the NetBIOS-style names a Windows shop
+// actually uses, and the deployment integrated auth exists for.
+//
+// These are here because a "does this look like an address?" heuristic was
+// briefly added to this function that refused any host made only of hex
+// digits, dots and colons. db01, dc01, ad01 and cafe all match that, so
+// ATTACH 'Server=db01;Trusted_Connection=yes' failed with "Cannot derive a
+// Kerberos SPN from the IP address 'db01'" -- wrong about the input and the
+// cause. Nothing else in the suite used a hex-only name, so nothing caught it.
+void TestShortHexLookingHostnamesArePassedThrough() {
+	for (const char *name : {"db01", "dc01", "ad01", "cafe", "abe", "db", "feed", "0"}) {
+		CHECK(ResolveHostForSpn(name) == name);
+	}
+	std::cout << "  [ok] short hex-looking hostnames (db01, dc01, ad01, ...) pass through as names" << std::endl;
+}
+
 // The reported case: an IPv4 literal must be turned into a name. 127.0.0.1
 // resolves from the local hosts database on every platform CI runs on.
 void TestIPv4LiteralIsReverseResolved() {
@@ -98,6 +114,7 @@ int main() {
 	std::cout << "test_spn_host_resolution (issue #259)" << std::endl;
 
 	TestHostnamePassesThroughUnchanged();
+	TestShortHexLookingHostnamesArePassedThrough();
 	TestIPv4LiteralIsReverseResolved();
 	TestUnresolvableIPReturnsEmpty();
 	TestIPv6LiteralIsRecognised();

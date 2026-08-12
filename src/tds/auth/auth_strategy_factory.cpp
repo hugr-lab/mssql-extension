@@ -111,10 +111,16 @@ std::string ResolveHostForSpn(const std::string &host) {
 #if defined(_WIN32)
 	std::call_once(spn_winsock_once, EnsureWinsockForResolution);
 	if (!spn_winsock_ready) {
-		// Without Winsock we cannot even tell an address from a name, so answer
-		// "unresolvable" rather than guess. Not cached: WSAStartup failing is a
-		// property of the process at this instant, not of the host.
-		return std::string();
+		// Without Winsock we cannot tell an address from a name. Returning
+		// empty would make DeriveDefaultSpn report every host -- including
+		// plain hostnames -- as "an IP address with no reverse DNS record",
+		// which is wrong about the input AND the cause. Pass the host through
+		// instead: a name then behaves exactly as it always has, and an IP gets
+		// the pre-issue-#259 SPN, which is no worse than before and academic
+		// anyway, since nothing can open a socket in this state either. Not
+		// cached -- WSAStartup failing is a property of the process right now,
+		// not of the host.
+		return host;
 	}
 #endif
 
@@ -152,19 +158,17 @@ std::string ResolveHostForSpn(const std::string &host) {
 		addr = reinterpret_cast<const sockaddr *>(&v6);
 		addr_len = sizeof(v6);
 	} else {
-		// Not parseable as an address -- normally that means it IS a name. But
-		// inet_pton can also fail because Winsock never came up, and treating
-		// an IP literal as a name is exactly the unmatchable-SPN bug this path
-		// exists to prevent (issue #259). So: a string made only of hex digits,
-		// dots and colons cannot be a hostname, and is refused rather than
-		// cached as one.
-		const bool looks_like_address =
-			!host.empty() && host.find_first_not_of("0123456789abcdefABCDEF.:") == std::string::npos;
-		if (looks_like_address) {
-			return std::string();  // caller reports it; never cached
-		}
+		// Not parseable as an address, so it is a name.
+		//
+		// There is deliberately NO "does this look like an address anyway"
+		// heuristic here. One was tried, refusing any host made only of hex
+		// digits, dots and colons -- which is every short hostname a Windows
+		// shop uses: db01, dc01, ad01 all match, and integrated auth against
+		// them broke outright. The case it guarded against (inet_pton failing
+		// because Winsock never started) is already handled by the readiness
+		// gate at the top of this function, which returns before we get here.
 		std::lock_guard<std::mutex> guard(cache_mutex);
-		cache[host] = host;	 // already a name; no lookup was performed
+		cache[host] = host;	 // no lookup was performed
 		return host;
 	}
 
