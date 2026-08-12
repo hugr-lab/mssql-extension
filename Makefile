@@ -292,6 +292,34 @@ test-login-error-state: debug
 	@echo "Running LOGIN7 response-parser unit test..."
 	build/test/test_login_error_state
 
+# Spec 068: login-time routing (ENVCHANGE 20) hop driver. Drives a REAL
+# TdsConnection against a loopback fake TDS server -- no SQL Server, no Azure,
+# and no libduckdb: tds_connection.cpp reaches nothing outside the TDS layer,
+# so the link set is the LOGIN7 one plus the socket + TLS TUs and OpenSSL.
+# (The TLS TUs come in via tds_socket.hpp; the test itself runs use_encrypt=false.)
+ROUTING_TEST_SOURCES := \
+    src/tds/tds_connection.cpp \
+    src/tds/tds_socket.cpp \
+    src/tds/tls/tds_tls_context.cpp \
+    src/tds/tls/tds_tls_impl.cpp \
+    $(LOGIN7_TEST_SOURCES)
+
+test-login-routing-hops: debug
+	@echo "Building login routing hop-driver unit test (spec 068)..."
+	@mkdir -p build/test
+	@if [ -z "$(LOGIN7_TEST_VCPKG_TRIPLET)" ]; then \
+		echo "ERROR: $(LOGIN7_TEST_VCPKG_INSTALLED) has no triplet subdir; run 'make debug' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
+	    test/cpp/test_login_routing_hops.cpp \
+	    $(ROUTING_TEST_SOURCES) \
+	    $(LOGIN7_TEST_LIBS) -lssl -lcrypto \
+	    -o build/test/test_login_routing_hops
+	@echo ""
+	@echo "Running login routing hop-driver unit test..."
+	build/test/test_login_routing_hops
+
 # Spec 058 D1-alt: the fast skip walk must consume exactly what the legacy
 # per-value walk consumes, for every TDS type. Two switches in one file with
 # nothing holding them together — a width edited in ResolveSkipForm but not in

@@ -293,6 +293,42 @@ ATTACH 'Server=sql-internal.local,1433;Database=db;Trusted_Connection=yes;servic
 Accepts either the canonical Kerberos principal form (`MSSQLSvc/host:port`) or
 the hostbased-service form (`MSSQLSvc@host`).
 
+### SPNs when the server redirects you (login routing)
+
+Some endpoints answer a login by telling the client to log in somewhere else
+(TDS ENVCHANGE type 20 — Azure SQL Managed Instance, Azure SQL under the
+Redirect connection policy, on-prem AlwaysOn read-only routing). A Kerberos or
+SSPI ticket is bound to the **target's** SPN, so the gateway's ticket cannot be
+replayed on the routed server.
+
+The extension therefore acquires a **fresh ticket per hop**:
+
+- **No override set** — the SPN is re-derived for the routed host as
+  `MSSQLSvc/<routed-host>:<routed-port>`. This is normally what you want, and it
+  requires that the routed host's SPN is registered in AD. On Azure SQL MI the
+  routed name is inside the `*.database.windows.net` zone.
+- **`service_principal_name=` set** — your value is used **verbatim on every
+  hop**, gateway and routed server alike. You pinned it; the extension does not
+  second-guess it. If the routed server needs a different SPN than the gateway,
+  do not pin one.
+
+If a hop cannot obtain a ticket, the error names the routed host and the SPN
+that would have been requested, e.g.:
+
+```
+MSSQL Kerberos auth failed: could not build an authenticator for routed server
+sql-node-3.corp.example.com:1433 (expected SPN MSSQLSvc/sql-node-3.corp.example.com:1433
+unless service_principal_name= overrides it)
+```
+
+That is the first thing to check with `setspn -L` (or the `kvno` recipe above)
+when integrated auth works against a gateway but fails right after a redirect.
+
+> This path is exercised in unit tests against a loopback fake server, but no
+> environment with **both** Active Directory and a routing front-end exists in
+> the project's test surface. Field reports are welcome — the error above is
+> designed to make one diagnosable in a single round.
+
 ## Using MSSQL Secrets
 
 Use a secret when you want to:

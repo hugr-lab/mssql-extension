@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Login-time routing is now followed on every authentication path**
+  (spec 068). A server can answer LOGIN7 with a ROUTING ENVCHANGE (type 20)
+  meaning "log in over there instead" — Azure SQL Managed Instance, Azure SQL
+  under the **Redirect** connection policy (the default for clients connecting
+  from inside Azure), Fabric/Synapse gateways, and on-prem AlwaysOn read-only
+  routing all do it. Only the Azure AD path honoured it; SQL authentication and
+  integrated (Kerberos/SSPI) authentication did not.
+  - **SQL auth**: a routed login used to fail as `Authentication failed` when
+    the redirect arrived without a LOGINACK, and — worse, because it was silent
+    — appear to *succeed* when a LOGINACK came with it, leaving the session
+    bound to a gateway that had just told the client to leave. Both now follow
+    the hop.
+  - **Azure AD**: a redirect with no LOGINACK (legal per [MS-TDS]) died as
+    `Azure AD authentication failed` because the success check ran before the
+    routing fields were read. Behaviour against gateways that send LOGINACK is
+    unchanged.
+  - **Integrated auth**: hops now acquire a service ticket for the **routed**
+    host's SPN instead of replaying the gateway's, which could not validate. An
+    explicit `service_principal_name=` is still used verbatim on every hop. See
+    `Kerberos.md`.
+  - The hop budget (5) and the routed-target parsing (`host\instance:port`,
+    no SQL Browser lookup on a hop) are unchanged; exceeding the budget now
+    names the last routed target in the error.
+
+  **Behaviour change**: SQL authentication against an endpoint that answers with
+  ROUTING *and* a LOGINACK now redirects instead of transacting against the
+  gateway. That is the correct behaviour per [MS-TDS] — a routed session is not
+  usable — but it is a visible change for anyone who was unknowingly relying on
+  the old one.
+
+  **Internal API change**: `TdsConnection::AuthenticateIntegrated` takes an
+  `AuthenticatorFactory` (`(host, port) -> IAuthenticator`) instead of a
+  pre-built authenticator. Affects embedders calling the TDS layer directly.
+
 - **dbt segfault with `threads >= 2`** (spec 052, closes
   [#126](https://github.com/hugr-lab/mssql-extension/issues/126)).
   Catalog entries (`MSSQLTableEntry`, `MSSQLSchemaEntry`) switched from

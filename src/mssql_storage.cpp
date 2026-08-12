@@ -1315,29 +1315,55 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 		throw IOException("MSSQL connection validation failed: %s", translated);
 	}
 
-	// Build the strategy; this triggers Krb5Authenticator construction (which
-	// validates the keytab/realm/etc. early).
-	std::shared_ptr<tds::AuthenticationStrategy> strategy;
-	try {
-		strategy = tds::AuthStrategyFactory::Create(info);
-	} catch (const std::exception &e) {
-		conn.Close();
-		throw InvalidInputException("MSSQL connection validation failed: %s", e.what());
-	}
-	if (!strategy) {
-		conn.Close();
-		throw InvalidInputException("MSSQL connection validation failed: failed to construct integrated-auth strategy");
-	}
-	auto authenticator = strategy->GetAuthenticator();
-	if (!authenticator) {
-		conn.Close();
-		throw InvalidInputException(
-			"MSSQL connection validation failed: integrated-auth strategy did not provide an authenticator");
-	}
+	// Build the strategy per login attempt; this triggers Krb5Authenticator
+	// construction (which validates the keytab/realm/etc. early). Spec 068 D3:
+	// a factory rather than an instance, so a routing hop obtains a ticket for
+	// the routed host's SPN. The factory cannot throw across the TDS layer, so
+	// construction errors are captured here and re-thrown after the call
+	// returns — `strategy_error` holds the message the callable could not raise.
+	string strategy_error;
+	// By reference, deliberately, and the exception to the by-value rule in
+	// AuthenticatorFactory's docs: this factory is built and consumed inside
+	// this one synchronous call, and `strategy_error` is how a construction
+	// failure gets back out -- the callable cannot throw across the TDS layer.
+	// The pool's factory (mssql_catalog.cpp) captures by value, because it is
+	// stored and re-run on worker threads.
+	auto auth_factory = [&info, &strategy_error](const std::string &host,
+												 uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
+		MSSQLConnectionInfo hop_info = info;
+		hop_info.host = host;
+		hop_info.port = port;
+		std::shared_ptr<tds::AuthenticationStrategy> strategy;
+		try {
+			strategy = tds::AuthStrategyFactory::Create(hop_info);
+		} catch (const std::exception &e) {
+			strategy_error = e.what();
+			return nullptr;
+		}
+		if (!strategy) {
+			strategy_error = "failed to construct integrated-auth strategy";
+			return nullptr;
+		}
+		auto authenticator = strategy->GetAuthenticator();
+		if (!authenticator) {
+			strategy_error = "integrated-auth strategy did not provide an authenticator";
+		}
+		return authenticator;
+	};
 
-	if (!conn.AuthenticateIntegrated(info.database, authenticator, info.use_encrypt, ResolveAppName(info),
+	if (!conn.AuthenticateIntegrated(info.database, auth_factory, info.use_encrypt, ResolveAppName(info),
 									 info.login7_max_packet)) {
+		// Keep BOTH messages. The connection's own error is the one that says
+		// WHICH target failed -- after a routing hop it names the routed server
+		// and the SPN that would have been requested, which `Kerberos.md`
+		// documents as the one-round field diagnosis for the SPN-over-hop path.
+		// `strategy_error` is the GSSAPI/SSPI cause, which the callable could
+		// not throw across the TDS layer. Reporting only the cause would drop
+		// the routed host; reporting only the driver would drop the reason.
 		string error = conn.GetLastError();
+		if (!strategy_error.empty()) {
+			error += " (" + strategy_error + ")";
+		}
 		conn.Close();
 		throw InvalidInputException("MSSQL connection validation failed: %s", error);
 	}

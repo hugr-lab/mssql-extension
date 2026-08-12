@@ -219,9 +219,11 @@ Packet 1: type=0x08, status=0x00, len=4096, payload=4088 bytes
 Packet 2: type=0x08, status=0x01, len=110,  payload=102 bytes (remaining)
 ```
 
-### Routing (Azure SQL Gateway)
+### Routing (ENVCHANGE type 20)
 
-Azure SQL Database may redirect connections via ENVCHANGE type 20 (0x14):
+Login-time routing is **not Azure-specific**, and since spec 068 it is not
+FEDAUTH-specific either. A server redirects the client with ENVCHANGE type 20
+(0x14) in the LOGIN7 response:
 
 ```
 ENVCHANGE Type 20 (Routing):
@@ -232,11 +234,47 @@ ENVCHANGE Type 20 (Routing):
   N bytes: server name (UTF-16LE)
 ```
 
-When routing occurs:
-1. Close current connection
-2. Connect to new server:port
-3. Repeat PRELOGIN/TLS/LOGIN7/FEDAUTH flow
-4. Up to 5 routing hops allowed
+Who sends it: Azure SQL Database under the **Redirect** connection policy (the
+default for clients connecting from inside Azure), Azure SQL Managed Instance,
+Microsoft Fabric / Synapse gateways, and on-prem AlwaysOn **read-only routing**
+for read-intent sessions.
+
+**The contract — routing outranks success.** If the response carries ROUTING,
+the outcome on that socket is *hop*, whether or not a LOGINACK came with it.
+[MS-TDS] is explicit that a routed session is not usable, so treating
+route-with-LOGINACK as success (keep talking to the gateway) and
+route-without-LOGINACK as failure are both wrong. Before spec 068 the extension
+did one of each, depending on the auth path.
+
+Which paths follow it:
+
+| Auth path | Follows ROUTING |
+|---|---|
+| SQL authentication (`Authenticate`) | yes |
+| Azure AD / FEDAUTH (`AuthenticateWithFedAuth`) | yes |
+| Integrated Kerberos / SSPI (`AuthenticateIntegrated`) | yes |
+
+All three go through one driver, `TdsConnection::RunWithRoutingHops`
+(`src/tds/tds_connection.cpp`), which per hop:
+
+1. closes the current socket;
+2. normalizes the routed target — a trailing `:port` beats the ENVCHANGE port,
+   `hostname\instance` (port stripped) becomes the LOGIN7 ServerName, and the
+   instance suffix is stripped for DNS/TCP. **The SQL Browser is not consulted
+   on a hop**: every observed gateway supplies the port, and adding UDP traffic
+   mid-login is how timeouts happen;
+3. resets the per-hop state — packet id back to 1, TLS off, FEDAUTH echo off,
+   routing fields cleared;
+4. reconnects (TLS SNI follows the *routed* hostname, not the original gateway)
+   and repeats the full PRELOGIN + LOGIN7 handshake.
+
+Up to `MAX_ROUTING_HOPS` = 5 hops. Exceeding it aborts with an error naming both
+the hop count and the last routed target.
+
+Integrated auth additionally rebuilds its authenticator per hop, via the
+`AuthenticatorFactory` callable its caller supplies — a Kerberos/SSPI ticket is
+bound to the target's SPN, so the gateway's ticket will not validate on the
+routed host. See `Kerberos.md`.
 
 ### Endpoint Type Detection
 

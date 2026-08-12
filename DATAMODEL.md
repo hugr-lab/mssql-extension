@@ -118,6 +118,45 @@ classDiagram
 - Auth strategies cover SQL auth, FEDAUTH (Azure AD), Kerberos (POSIX), and Windows SSPI. `IAuthenticator` is the SPNEGO continuation interface for integrated auth (spec 042).
 - All destructors in this layer are `noexcept` (spec 047 T046k) — the teardown chain has no place to swallow errors except via `MSSQL_POOL_DEBUG_LOG`.
 
+### Login is a loop, not a step (spec 068)
+
+A login is not one handshake against one host. Any of these endpoints may answer
+LOGIN7 with a ROUTING ENVCHANGE (type 20) meaning "not here, log in over there":
+Azure SQL Managed Instance, Azure SQL under the Redirect connection policy
+(the default from inside Azure), Fabric/Synapse gateways, on-prem AlwaysOn
+read-only routing. So the connection's login step is:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Authenticating: Connect()
+    Authenticating --> Attempt: PRELOGIN + LOGIN7
+    Attempt --> Idle: Success (LOGINACK, no ROUTING)
+    Attempt --> Authenticating: Route (close, retarget, reconnect) — max 5
+    Attempt --> Disconnected: Failure (neither)
+    Attempt --> Disconnected: hop limit / reconnect failed
+```
+
+Invariants that make this safe, all owned by `TdsConnection::RunWithRoutingHops`
+and none by the callbacks:
+
+- **ROUTING outranks LOGINACK.** A routed response is a hop even when a LOGINACK
+  came with it — [MS-TDS] says a routed session is unusable. The per-attempt
+  callback therefore returns `LoginAttemptOutcome::{Success, Route, Failure}`; a
+  bool cannot express the routed-without-LOGINACK case, and mis-expressing it is
+  the bug spec 068 fixed.
+- **The state machine stays in `Authenticating` across a hop.** The loop calls
+  `socket_->Connect()`, not `TdsConnection::Connect()`, and no callback touches
+  `state_` or closes the socket.
+- **Per-hop reset**: packet id → 1, TLS off, FEDAUTH echo off, routing fields
+  cleared (also *before* the first attempt, so a reused connection cannot
+  inherit a stale route). `tds_server_name_` is deliberately kept — it is the
+  hop's output, and carries the `hostname\instance` form into LOGIN7.
+- **Bounded**: 5 hops, then an error naming the count and the last routed target.
+- **Credential per target**: `AuthenticateIntegrated` takes an
+  `AuthenticatorFactory` rather than an authenticator, because a Kerberos/SSPI
+  ticket is bound to the target's SPN; each hop builds a new one for the routed
+  host and frees the previous context first.
+
 ---
 
 ## Layer 2 — Connection pool (spec 047)
