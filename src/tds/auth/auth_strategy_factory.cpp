@@ -7,6 +7,31 @@
 // Spec 031: Connection & FEDAUTH Refactoring - US7
 //===----------------------------------------------------------------------===//
 
+// Winsock MUST be included before anything that can reach <windows.h>.
+//
+// windows.h pulls in <winsock.h> -- Winsock 1.1 -- unless WIN32_LEAN_AND_MEAN
+// is already defined, and tds/auth/winsspi_authenticator.hpp (included below
+// whenever MSSQL_ENABLE_SSPI is set, i.e. every Windows build) includes
+// windows.h without it. A <winsock2.h> arriving afterwards then redefines
+// sockaddr, fd_set, timeval, WSAData and a dozen more -- around 40 C2011s,
+// which is exactly how this file first broke the MSVC build.
+//
+// Including winsock2.h first also defines _WINSOCKAPI_, so the later
+// windows.h skips winsock.h entirely. Same ordering tds_socket.cpp uses.
+// Fenced because clang-format's SortIncludes would happily undo it.
+// clang-format off
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+// clang-format on
+
 #include "tds/auth/auth_strategy_factory.hpp"
 #include "azure/azure_token.hpp"
 #include "mssql_storage.hpp"
@@ -25,13 +50,7 @@
 #include <mutex>
 #include <string>
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
