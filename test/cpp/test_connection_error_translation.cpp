@@ -43,9 +43,10 @@ bool Contains(const string &haystack, const string &needle) {
 // failed (error ...)" prefix, which is exactly why the old substring test
 // misfired. Classification must come from the number.
 void TestResumingAzureDatabaseIsNotACredentialProblem() {
-	const string raw =
-		"Authentication failed (error 40613, state 1): Database 'sales' on server "
-		"'x.database.windows.net' is not currently available. Please retry the connection later.";
+	// Raw carrying neither the number nor the database name: this arm echoes the
+	// raw after "Server said: ", so a raw containing them satisfies the
+	// assertions below even with the interpolations deleted.
+	const string raw = "Database is not currently available. Please retry the connection later.";
 	const string out = MSSQLTranslateConnectionError(raw, "x.database.windows.net", 1433, "azure_sql_admin", "sales",
 													 /*server_error=*/40613, /*server_state=*/1);
 
@@ -73,7 +74,8 @@ void TestOtherTransientAzureErrorsAreRetryable() {
 // 18456 IS a credential-family failure, and the State byte must survive to the
 // user -- that is the whole point of issue #164, and the old code threw it away.
 void TestLoginFailedKeepsStateByte() {
-	const string raw = "Authentication failed (error 18456, state 40): Login failed for user 'app_user'.";
+	// Same trap: no number in the raw, so "18456" can only come from the format.
+	const string raw = "Login failed for user 'app_user'.";
 	const string out = MSSQLTranslateConnectionError(raw, "sql1", 1433, "app_user", "reporting", 18456, 40);
 
 	CHECK(Contains(out, "app_user"));
@@ -215,6 +217,10 @@ void TestOtherHeuristicBranchesKeepTheirText() {
 	// of it is satisfied by the static text alone. Only the "Details: " marker
 	// followed by the echo proves the raw error survived.
 	CHECK(Contains(enc, "Details: Server requires encryption"));
+	// Disjoint from the above: the raw says use_encrypt=FALSE, so this needle
+	// comes only from the branch's remediation clause -- it catches that clause
+	// being deleted, which the join assertion does not.
+	CHECK(Contains(enc, "Set use_encrypt=true"));
 	std::cout << "  [ok] refused / DNS / timeout / certificate / ENCRYPT_REQ branches keep the original text"
 			  << std::endl;
 }
