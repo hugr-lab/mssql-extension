@@ -121,10 +121,12 @@ void TestCannotOpenDatabase() {
 // An unrecognised server error must still surface its number, state and text
 // rather than being flattened into a guess.
 void TestUnknownServerErrorSurfacesVerbatim() {
-	const string out = MSSQLTranslateConnectionError("Authentication failed (error 12345, state 7): something specific",
-													 "s", 1433, "u", "db", 12345, 7);
+	// Raw text carrying neither the number nor the state: the default arm
+	// echoes the raw verbatim, so feeding it "error 12345 ... state 7" would
+	// satisfy these checks even with server_error/server_state dropped.
+	const string out = MSSQLTranslateConnectionError("something specific", "s", 1433, "u", "db", 12345, 7);
 	CHECK(Contains(out, "12345"));
-	CHECK(Contains(out, "7"));
+	CHECK(Contains(out, "state 7"));
 	CHECK(Contains(out, "something specific"));
 	CHECK(!Contains(out, "check username and password"));
 	std::cout << "  [ok] an unknown server error keeps its number, state and text" << std::endl;
@@ -137,10 +139,14 @@ void TestNonLoginFailuresStillClassified() {
 	CHECK(Contains(refused, "Connection refused"));
 
 	const string tls = MSSQLTranslateConnectionError("TLS handshake failed: bad record", "s", 1433, "u", "db");
-	CHECK(Contains(tls, "TLS handshake failed"));
+	// "TLS negotiation failed" is this branch's own wording -- the raw input says
+	// "handshake", so asserting on that would pass from the echo alone even if
+	// classification fell through to the generic arm.
+	CHECK(Contains(tls, "TLS negotiation failed"));
 
 	const string timeout = MSSQLTranslateConnectionError("connect timed out", "s", 1433, "u", "db");
-	CHECK(Contains(timeout, "timed out"));
+	// Same: "timed out" is in the raw. This fragment is only in the branch.
+	CHECK(Contains(timeout, "check network connectivity"));
 	std::cout << "  [ok] socket / TLS / timeout failures still classified without a server number" << std::endl;
 }
 
@@ -203,10 +209,14 @@ void TestOtherHeuristicBranchesKeepTheirText() {
 	// flight, "server requires encryption" without a host is unactionable.
 	const string enc = MSSQLTranslateConnectionError("Server requires encryption (ENCRYPT_REQ) but use_encrypt=false",
 													 "sql1", 1433, "u", "db");
-	CHECK(Contains(enc, "sql1:1433"));
-	CHECK(Contains(enc, "ENCRYPT_REQ"));
-	CHECK(Contains(enc, "use_encrypt=true"));  // the actionable half
-	std::cout << "  [ok] refused / DNS / timeout / certificate branches keep the original text" << std::endl;
+	CHECK(Contains(enc, "sql1:1433"));	// which server
+	// Assert on the JOIN, not on either side of it: the raw producer string is
+	// word-for-word a subset of this branch's own sentence, so every fragment
+	// of it is satisfied by the static text alone. Only the "Details: " marker
+	// followed by the echo proves the raw error survived.
+	CHECK(Contains(enc, "Details: Server requires encryption"));
+	std::cout << "  [ok] refused / DNS / timeout / certificate / ENCRYPT_REQ branches keep the original text"
+			  << std::endl;
 }
 
 // On the token-authenticated paths the identity comes from the token, so
