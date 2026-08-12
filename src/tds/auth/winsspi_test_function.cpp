@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/winsspi_test_function.hpp"
+#include "tds/auth/auth_strategy_factory.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
@@ -114,11 +115,12 @@ static std::string RunWinSspiTest(tds::WinSspiConfig config) {
 }
 
 //===----------------------------------------------------------------------===//
-// DeriveDefaultSpn - canonical "MSSQLSvc/<host>:<port>" form
+// SPN derivation comes from auth_strategy_factory.hpp (tds::DeriveDefaultSpn),
+// NOT from a local copy. This function exists to tell a user why a Kerberos
+// login is failing; reporting an SPN the connection path would not actually
+// request is worse than reporting nothing. Issue #259 made them diverge for IP
+// literals -- the real path reverse-resolves, the local copy did not.
 //===----------------------------------------------------------------------===//
-static std::string DeriveDefaultSpn(const std::string &host, uint16_t port) {
-	return "MSSQLSvc/" + host + ":" + std::to_string(port);
-}
 
 //===----------------------------------------------------------------------===//
 // WinSspiTestHost - mssql_winsspi_auth_test(host VARCHAR) -> VARCHAR
@@ -128,7 +130,10 @@ static void WinSspiTestHost(DataChunk &args, ExpressionState & /*state*/, Vector
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
 		tds::WinSspiConfig cfg;
-		cfg.spn = DeriveDefaultSpn(h, 1433);
+		std::string spn_error;
+		if (!tds::TryDeriveDefaultSpn(h, 1433, cfg.spn, spn_error)) {
+			return StringVector::AddString(result, std::string("MSSQL SSPI auth test: ") + spn_error);
+		}
 		return StringVector::AddString(result, RunWinSspiTest(std::move(cfg)));
 	});
 }
@@ -143,7 +148,10 @@ static void WinSspiTestHostPort(DataChunk &args, ExpressionState & /*state*/, Ve
 		host_vec, port_vec, result, args.size(), [&](string_t host, int32_t port) {
 			std::string h = host.GetString();
 			tds::WinSspiConfig cfg;
-			cfg.spn = DeriveDefaultSpn(h, static_cast<uint16_t>(port));
+			std::string spn_error;
+			if (!tds::TryDeriveDefaultSpn(h, static_cast<uint16_t>(port), cfg.spn, spn_error)) {
+				return StringVector::AddString(result, std::string("MSSQL SSPI auth test: ") + spn_error);
+			}
 			return StringVector::AddString(result, RunWinSspiTest(std::move(cfg)));
 		});
 }

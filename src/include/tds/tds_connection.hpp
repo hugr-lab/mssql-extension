@@ -182,6 +182,23 @@ public:
 	const std::string &GetLastError() const {
 		return last_error_;
 	}
+
+	// The SERVER's own error number and state from the last failed login, or 0
+	// when the failure had no ERROR token (a socket error, a TLS failure).
+	//
+	// These exist because the alternative -- deciding what went wrong by
+	// pattern-matching the formatted message -- reads our own wrapper text
+	// rather than the server's, and every login failure begins "Authentication
+	// failed", so everything looked like a bad password (issue #262). The
+	// number is also what distinguishes retryable conditions (Azure 40613, a
+	// serverless database resuming) from a credential problem, and the state is
+	// what separates the several distinct causes of 18456 (issue #164).
+	uint32_t GetLastErrorNumber() const {
+		return last_error_number_;
+	}
+	uint8_t GetLastErrorState() const {
+		return last_error_state_;
+	}
 	bool IsTlsEnabled() const {
 		return tls_enabled_;
 	}
@@ -298,6 +315,8 @@ private:
 
 	// Error tracking
 	std::string last_error_;
+	uint32_t last_error_number_ = 0;
+	uint8_t last_error_state_ = 0;
 
 	// Packet sequencing
 	uint8_t next_packet_id_;

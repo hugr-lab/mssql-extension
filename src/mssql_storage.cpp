@@ -1002,59 +1002,113 @@ void MSSQLConnectionInfo::ResolveNamedInstance(ClientContext &context) {
 // Connection Validation
 //===----------------------------------------------------------------------===//
 
-// Translate TDS error message to user-friendly message
-static string TranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
-									   const string &database) {
+// Translate TDS error message to user-friendly message.
+//
+// `server_error` / `server_state` are the SERVER's own ERROR-token fields, or 0
+// when the failure produced no ERROR token. When a number is present it decides
+// the classification; the string heuristics below only run for failures that
+// never reached a login (socket, TLS, DNS).
+//
+// Issue #262: the string arms must never be allowed to classify a login
+// failure. Every login failure this extension produces begins "Authentication
+// failed (error N, state S): ...", so a `find("authentication")` test matches
+// our OWN wrapper rather than the server's message, and collapsed every cause
+// -- including Azure 40613, a serverless database resuming -- into "check
+// username and password". The server's number and text are always appended now,
+// so no diagnosis is lost on the way to the user.
+string MSSQLTranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
+									 const string &database, uint32_t server_error, uint8_t server_state) {
 	string lower_error = StringUtil::Lower(error);
 
-	// Authentication failures
-	if (lower_error.find("login failed") != string::npos || lower_error.find("authentication") != string::npos ||
-		lower_error.find("18456") != string::npos) {
-		return StringUtil::Format("Authentication failed for user '%s' - check username and password", user);
+	// Server-classified failures. These take precedence over every heuristic
+	// below, because here we know what the server actually said.
+	if (server_error > 0) {
+		switch (server_error) {
+		case 40613:	 // Azure SQL: "Database ... is not currently available"
+		case 40197:	 // Azure SQL: error processing the request, reconfiguration
+		case 40501:	 // Azure SQL: service is busy
+		case 49918:	 // Azure SQL: cannot process request, not enough resources
+			return StringUtil::Format(
+				"Database '%s' on %s:%d is not available yet (server error %d) - a serverless database may be "
+				"resuming, or the service is being reconfigured; retry shortly. Server said: %s",
+				database, host, port, server_error, error);
+		case 18456:	 // Login failed. State is the only field that says WHY (issue #164).
+			// `user` is empty on the token-authenticated paths, where the identity
+			// comes from the token rather than a User Id -- naming user '' there
+			// is less informative than the server's own text.
+			return StringUtil::Format(
+				"Authentication failed%s (server error 18456, state %d) - state 8 is a wrong "
+				"password, state 38/40 an inaccessible initial database, state 1 an unspecified "
+				"cause the server logs but does not disclose. Server said: %s",
+				user.empty() ? "" : StringUtil::Format(" for user '%s'", user), server_state, error);
+		case 4060:	// Cannot open database requested by the login
+			return StringUtil::Format(
+				"Cannot access database '%s' - check database name and permissions (server "
+				"error 4060). Server said: %s",
+				database, error);
+		default:
+			return StringUtil::Format("Login to %s:%d failed with server error %d (state %d): %s", host, port,
+									  server_error, server_state, error);
+		}
+	}
+
+	// A login rejection that carried no usable error number. Matches the
+	// SERVER's phrase ("Login failed for user ...") and deliberately NOT the
+	// word "authentication", which appears in our own wrapper for every login
+	// failure and is what made this arm swallow everything (issue #262).
+	if (lower_error.find("login failed") != string::npos) {
+		return StringUtil::Format("Authentication failed%s - check username and password. Server said: %s",
+								  user.empty() ? "" : StringUtil::Format(" for user '%s'", user), error);
 	}
 
 	// Database access failures
-	if (lower_error.find("cannot open database") != string::npos || lower_error.find("4060") != string::npos) {
-		return StringUtil::Format("Cannot access database '%s' - check database name and permissions", database);
+	if (lower_error.find("cannot open database") != string::npos) {
+		return StringUtil::Format("Cannot access database '%s' - check database name and permissions. Details: %s",
+								  database, error);
 	}
 
 	// TLS failures
 	if (lower_error.find("tls") != string::npos || lower_error.find("ssl") != string::npos ||
 		lower_error.find("handshake") != string::npos) {
-		return StringUtil::Format("TLS handshake failed to %s:%d - check TLS configuration", host, port);
+		return StringUtil::Format("TLS negotiation failed to %s:%d - check TLS configuration. Details: %s", host, port,
+								  error);
 	}
 
 	// Server requires encryption but client disabled it
 	if (lower_error.find("encrypt_req") != string::npos ||
 		(lower_error.find("encryption") != string::npos && lower_error.find("require") != string::npos)) {
 		return StringUtil::Format(
-			"Server requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
-			"Set use_encrypt=true or Encrypt=yes in connection string.");
+			"Server %s:%d requires encryption (ENCRYPT_REQ) but use_encrypt=false. "
+			"Set use_encrypt=true or Encrypt=yes in connection string. Details: %s",
+			host, port, error);
 	}
 
 	// Certificate validation failures
 	if (lower_error.find("certificate") != string::npos || lower_error.find("cert") != string::npos) {
-		return StringUtil::Format("TLS certificate validation failed - server certificate not trusted");
+		return StringUtil::Format(
+			"TLS certificate validation failed to %s:%d - server certificate not trusted. "
+			"Details: %s",
+			host, port, error);
 	}
 
 	// Connection refused
 	if (lower_error.find("connection refused") != string::npos || lower_error.find("econnrefused") != string::npos) {
 		return StringUtil::Format(
-			"Connection refused to %s:%d - check if SQL Server is running and accepting "
-			"connections",
-			host, port);
+			"Connection refused to %s:%d - check if SQL Server is running and accepting connections. Details: %s", host,
+			port, error);
 	}
 
 	// DNS/hostname resolution
 	if (lower_error.find("resolve") != string::npos || lower_error.find("host") != string::npos ||
 		lower_error.find("enoent") != string::npos || lower_error.find("name or service not known") != string::npos) {
-		return StringUtil::Format("Cannot resolve hostname '%s' - check server name", host);
+		return StringUtil::Format("Cannot resolve hostname '%s' - check server name. Details: %s", host, error);
 	}
 
 	// Timeout
 	if (lower_error.find("timeout") != string::npos || lower_error.find("timed out") != string::npos) {
-		return StringUtil::Format("Connection timed out to %s:%d - check network connectivity and firewall settings",
-								  host, port);
+		return StringUtil::Format(
+			"Connection timed out to %s:%d - check network connectivity and firewall settings. Details: %s", host, port,
+			error);
 	}
 
 	// Generic connection error
@@ -1110,8 +1164,14 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
 	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt,
 									  ResolveAppName(info))) {
-		string error = conn.GetLastError();
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - %s", error.c_str());
+		// Classified, not raw: the Azure-AD path is the one most likely to meet
+		// 40613 on a paused serverless database, which is the case issue #262
+		// was filed about.
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - raw: %s, translated: %s",
+								conn.GetLastError().c_str(), error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
 	}
@@ -1177,8 +1237,11 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
 	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt, ResolveAppName(info))) {
-		string error = conn.GetLastError();
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - %s", error.c_str());
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
+		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - raw: %s, translated: %s",
+								conn.GetLastError().c_str(), error.c_str());
 		conn.Close();
 		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
 	}
@@ -1231,7 +1294,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s", error.c_str(),
 								translated.c_str());
 		throw IOException("MSSQL connection validation failed: %s", translated);
@@ -1242,7 +1305,8 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
 	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database,
+														  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
 								translated.c_str());
 		conn.Close();
@@ -1258,7 +1322,8 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 		try {
 			if (!conn.ExecuteBatch("SELECT 1")) {
 				string error = conn.GetLastError();
-				string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+				string translated =
+					MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED - raw: %s, translated: %s",
 										error.c_str(), translated.c_str());
 				conn.Close();
@@ -1277,7 +1342,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query succeeded");
 		} catch (const std::exception &e) {
 			string error = e.what();
-			string translated = TranslateConnectionError(error, info.host, info.port, info.user, info.database);
+			string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED with exception - %s",
 									error.c_str());
 			conn.Close();
@@ -1311,7 +1376,7 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 	conn.SetRequestUtf8Support(info.utf8_support);
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
-		string translated = TranslateConnectionError(error, info.host, info.port, "", info.database);
+		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, "", info.database);
 		throw IOException("MSSQL connection validation failed: %s", translated);
 	}
 
@@ -1360,7 +1425,9 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 		// `strategy_error` is the GSSAPI/SSPI cause, which the callable could
 		// not throw across the TDS layer. Reporting only the cause would drop
 		// the routed host; reporting only the driver would drop the reason.
-		string error = conn.GetLastError();
+		string error =
+			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
+										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
 		if (!strategy_error.empty()) {
 			error += " (" + strategy_error + ")";
 		}

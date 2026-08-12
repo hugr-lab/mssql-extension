@@ -27,6 +27,8 @@ PRINCIPAL="${PRINCIPAL:-testuser@EXAMPLE.COM}"
 PASSWORD="${PASSWORD:-testpass}"
 SQL_HOST="${SQL_HOST:-sql.example.com}"
 SQL_PORT="${SQL_PORT:-1433}"
+GATEWAY_HOST="${GATEWAY_HOST:-gateway.example.com}"
+GATEWAY_PORT="${GATEWAY_PORT:-1433}"
 
 echo "[run-tests] step 0: extension sanity check"
 if [[ ! -f "${EXT}" ]]; then
@@ -107,5 +109,59 @@ if echo "${negative}" | grep -q "^OK:"; then
     echo "[run-tests] ERROR: auth_test reported OK with no ccache -- this should have failed." >&2
     exit 4
 fi
+
+# --------------------------------------------------------------------------
+# step 6: a Kerberos login that is ROUTED (issue #261, spec 068 D3).
+#
+# The design under test: when a server answers LOGIN7 with ENVCHANGE 20, the
+# client must acquire a FRESH service ticket for the ROUTED host's SPN. The
+# gateway's ticket is bound to the gateway's SPN and cannot validate anywhere
+# else. Unit tests cover the mechanics with a stub authenticator; what they
+# cannot cover is whether a real KDC issues that second ticket, which is the
+# part spec 068 shipped as its acknowledged risk.
+#
+# The gateway container answers every login with ROUTING -> sql.example.com. So
+# a single ATTACH against the gateway should make the client:
+#   1. ask the KDC for MSSQLSvc/gateway.example.com:1433, send LOGIN7 there;
+#   2. receive ROUTING, reconnect to sql.example.com;
+#   3. ask the KDC for MSSQLSvc/sql.example.com:1433 -- a DIFFERENT ticket;
+#   4. send a second LOGIN7 there.
+#
+# The assertion is on the ticket cache, not on the final login: as in step 4,
+# SQL Server on Linux cannot map the AD principal without SSSD/realmd, so the
+# login itself is expected to be rejected. Two service tickets in the ccache is
+# the proof, and it is exactly what would NOT appear if the hop reused the
+# gateway's authenticator.
+echo "[run-tests] step 6: routed Kerberos login (issue #261)"
+kdestroy 2>/dev/null || true
+echo -n "${PASSWORD}" | kinit "${PRINCIPAL}"
+
+cat > /tmp/route.sql <<EOF
+LOAD '${EXT}';
+ATTACH 'Server=${GATEWAY_HOST},${GATEWAY_PORT};Database=TestDB;Trusted_Connection=yes;Encrypt=no' AS kroute (TYPE mssql);
+DETACH kroute;
+EOF
+set +e
+route_out=$(MSSQL_DEBUG=1 duckdb --unsigned -f /tmp/route.sql 2>&1)
+set -e
+echo "${route_out}"
+
+if ! echo "${route_out}" | grep -q "ROUTING requested to ${SQL_HOST}"; then
+    echo "[run-tests] ERROR: the gateway's ROUTING was not followed -- no hop logged" >&2
+    exit 5
+fi
+
+tickets=$(klist)
+echo "${tickets}"
+if ! echo "${tickets}" | grep -q "MSSQLSvc/${GATEWAY_HOST}"; then
+    echo "[run-tests] ERROR: no service ticket for the gateway -- the first login never asked the KDC" >&2
+    exit 5
+fi
+if ! echo "${tickets}" | grep -q "MSSQLSvc/${SQL_HOST}"; then
+    echo "[run-tests] ERROR: no service ticket for the ROUTED host. The hop reused the gateway's" >&2
+    echo "[run-tests]        credential instead of acquiring one for ${SQL_HOST} -- spec 068 D3 is wrong." >&2
+    exit 5
+fi
+echo "[run-tests] step 6: OK -- the hop acquired a separate ticket for ${SQL_HOST} (spec 068 D3 verified)"
 
 echo "[run-tests] all integration steps completed"

@@ -7,6 +7,31 @@
 // Spec 031: Connection & FEDAUTH Refactoring - US7
 //===----------------------------------------------------------------------===//
 
+// Winsock MUST be included before anything that can reach <windows.h>.
+//
+// windows.h pulls in <winsock.h> -- Winsock 1.1 -- unless WIN32_LEAN_AND_MEAN
+// is already defined, and tds/auth/winsspi_authenticator.hpp (included below
+// whenever MSSQL_ENABLE_SSPI is set, i.e. every Windows build) includes
+// windows.h without it. A <winsock2.h> arriving afterwards then redefines
+// sockaddr, fd_set, timeval, WSAData and a dozen more -- around 40 C2011s,
+// which is exactly how this file first broke the MSVC build.
+//
+// Including winsock2.h first also defines _WINSOCKAPI_, so the later
+// windows.h skips winsock.h entirely. Same ordering tds_socket.cpp uses.
+// Fenced because clang-format's SortIncludes would happily undo it.
+// clang-format off
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+// clang-format on
+
 #include "tds/auth/auth_strategy_factory.hpp"
 #include "azure/azure_token.hpp"
 #include "mssql_storage.hpp"
@@ -20,7 +45,17 @@
 #include "tds/auth/winsspi_authenticator.hpp"
 #endif
 
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
 namespace duckdb {
 namespace tds {
@@ -63,12 +98,171 @@ static std::string DeriveSpn(const MSSQLConnectionInfo &info) {
 		// Hostbased form (@) -- pass through unchanged.
 		return spn;
 	}
-	// No override: build the canonical "MSSQLSvc/<fqdn>:<port>" form so the
-	// SPN matches what SQL Server registers in AD by default.
-	return std::string("MSSQLSvc/") + info.host + ":" + std::to_string(info.port);
+	// No override: the canonical "MSSQLSvc/<fqdn>:<port>" form, shared with the
+	// diagnostic functions so they cannot disagree about it (issue #259).
+	return DeriveDefaultSpn(info.host, info.port);
 }
 
 }  // namespace
+
+#if defined(_WIN32)
+// inet_pton and getnameinfo are Winsock calls and need WSAStartup first.
+// TdsSocket does that inside Connect(), which has NOT run when
+// mssql_winsspi_auth_test() is the first thing a process does -- resolution
+// would then fail with WSANOTINITIALISED, or inet_pton would fail and the
+// address be treated as a name, which is the unmatchable SPN issue #259 is
+// about. So this path initialises Winsock itself.
+static std::once_flag spn_winsock_once;
+static bool spn_winsock_ready = false;
+static void EnsureWinsockForResolution() {
+	WSADATA wsa_data;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0) {
+		spn_winsock_ready = true;
+		atexit([]() { WSACleanup(); });
+	}
+}
+#endif
+
+std::string ResolveHostForSpn(const std::string &host) {
+	if (host.empty()) {
+		return host;
+	}
+#if defined(_WIN32)
+	std::call_once(spn_winsock_once, EnsureWinsockForResolution);
+	if (!spn_winsock_ready) {
+		// Without Winsock we cannot tell an address from a name. Returning
+		// empty would make DeriveDefaultSpn report every host -- including
+		// plain hostnames -- as "an IP address with no reverse DNS record",
+		// which is wrong about the input AND the cause. Pass the host through
+		// instead: a name then behaves exactly as it always has, and an IP gets
+		// the pre-issue-#259 SPN, which is no worse than before and academic
+		// anyway, since nothing can open a socket in this state either. Not
+		// cached -- WSAStartup failing is a property of the process right now,
+		// not of the host.
+		return host;
+	}
+#endif
+
+	// Memoized because this sits on the pool-refill path: a fresh strategy is
+	// built per login attempt and again per routing hop, and getnameinfo is a
+	// blocking resolver call. Only DEFINITIVE answers are cached: a successful
+	// resolution, a name that needed no lookup, and EAI_NONAME ("this address
+	// has no PTR record"). A transient failure is retried, because a resolver
+	// that is down says nothing about the host. A PTR record changing
+	// mid-process needs a restart to be picked up, which is the right trade for
+	// a value fixed for the life of an ATTACH.
+	static std::mutex cache_mutex;
+	static std::map<std::string, std::string> cache;
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		auto it = cache.find(host);
+		if (it != cache.end()) {
+			return it->second;
+		}
+	}
+
+	// Only IP literals need resolving. A name is already what AD registers
+	// against, and looking it up would risk turning a working SPN into a
+	// different one (a CNAME resolving to some other canonical name).
+	sockaddr_in v4 = {};
+	sockaddr_in6 v6 = {};
+	const sockaddr *addr = nullptr;
+	socklen_t addr_len = 0;
+	if (inet_pton(AF_INET, host.c_str(), &v4.sin_addr) == 1) {
+		v4.sin_family = AF_INET;
+		addr = reinterpret_cast<const sockaddr *>(&v4);
+		addr_len = sizeof(v4);
+	} else if (inet_pton(AF_INET6, host.c_str(), &v6.sin6_addr) == 1) {
+		v6.sin6_family = AF_INET6;
+		addr = reinterpret_cast<const sockaddr *>(&v6);
+		addr_len = sizeof(v6);
+	} else {
+		// Not parseable as an address, so it is a name.
+		//
+		// There is deliberately NO "does this look like an address anyway"
+		// heuristic here. One was tried, refusing any host made only of hex
+		// digits, dots and colons -- which is every short hostname a Windows
+		// shop uses: db01, dc01, ad01 all match, and integrated auth against
+		// them broke outright. The case it guarded against (inet_pton failing
+		// because Winsock never started) is already handled by the readiness
+		// gate at the top of this function, which returns before we get here.
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		cache[host] = host;	 // no lookup was performed
+		return host;
+	}
+
+	char fqdn[NI_MAXHOST] = {0};
+	// NI_NAMEREQD: fail rather than hand back the numeric form, which is what
+	// getnameinfo does by default and would silently reproduce the bug.
+	const int rc = getnameinfo(addr, addr_len, fqdn, sizeof(fqdn), nullptr, 0, NI_NAMEREQD);
+	if (rc != 0) {
+		// Cache ONLY a definitive "this address has no name". EAI_AGAIN is a
+		// resolver that is unreachable or timing out -- routine while a
+		// container stack is coming up, which is the situation lazy_validation
+		// exists for -- and caching it would keep failing every later ATTACH
+		// and every routing hop until the process restarts, long after DNS
+		// recovered. EAI_FAIL and anything else get the same treatment: retry.
+#if defined(_WIN32)
+		// getnameinfo on Windows documents only "nonzero on failure"; the code
+		// comes from WSAGetLastError. WSANO_DATA is "the name exists but has no
+		// record of this type", which for a PTR query is as definitive as
+		// WSAHOST_NOT_FOUND -- classifying only the latter would mean never
+		// caching a negative on Windows, and paying the full resolver timeout
+		// on every pool refill and every routing hop. Silent, and merely slow.
+		const int wsa_err = WSAGetLastError();
+		const bool definitive = (wsa_err == WSAHOST_NOT_FOUND || wsa_err == WSANO_DATA);
+#elif defined(EAI_NONAME)
+		// EAI_NODATA is deprecated/absent on some libcs, hence the guard.
+#if defined(EAI_NODATA)
+		const bool definitive = (rc == EAI_NONAME || rc == EAI_NODATA);
+#else
+		const bool definitive = (rc == EAI_NONAME);
+#endif
+#else
+		const bool definitive = false;
+#endif
+		if (definitive) {
+			std::lock_guard<std::mutex> guard(cache_mutex);
+			cache[host] = std::string();
+		}
+		return std::string();  // caller reports this; see the header
+	}
+	std::string resolved(fqdn);
+	// A trailing dot is legal in DNS and not wanted in an SPN.
+	if (!resolved.empty() && resolved.back() == '.') {
+		resolved.pop_back();
+	}
+	{
+		std::lock_guard<std::mutex> guard(cache_mutex);
+		cache[host] = resolved;
+	}
+	return resolved;
+}
+
+std::string DeriveDefaultSpn(const std::string &host, uint16_t port) {
+	const std::string spn_host = ResolveHostForSpn(host);
+	if (spn_host.empty()) {
+		if (host.empty()) {
+			throw InvalidInputException("Cannot derive a Kerberos SPN: no host was supplied.");
+		}
+		throw InvalidInputException(
+			"Cannot derive a Kerberos SPN from the IP address '%s': Active Directory registers SQL Server SPNs "
+			"against the host's FQDN, and no reverse DNS record was found for it. Connect by name, add a PTR "
+			"record, or pass the SPN explicitly: service_principal_name=MSSQLSvc/<fqdn>:%d",
+			host, port);
+	}
+	return std::string("MSSQLSvc/") + spn_host + ":" + std::to_string(port);
+}
+
+bool TryDeriveDefaultSpn(const std::string &host, uint16_t port, std::string &spn, std::string &error) {
+	try {
+		spn = DeriveDefaultSpn(host, port);
+		return true;
+	} catch (const std::exception &e) {
+		error = e.what();
+		return false;
+	}
+}
 
 AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info, ClientContext *context) {
 	// Spec 047 FR-014 / T065: single resolution point for LOGIN7 program_name.

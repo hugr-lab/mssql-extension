@@ -235,6 +235,20 @@ struct MSSQLConnectionInfo {
 // manual token / integrated) goes through the same logic. A future
 // change to the default string only touches the impl.
 //===----------------------------------------------------------------------===//
+// Turn a connection/login failure into something a user can act on.
+//
+// `server_error` / `server_state` are the SERVER's ERROR-token fields (0 when
+// the failure never reached a login). When a number is present it classifies
+// the failure; otherwise a few string heuristics cover socket/TLS/DNS errors.
+// MSSQL-prefixed per CLAUDE.md's namespace rule: an exported free function in
+// the shared `duckdb` namespace needs the prefix, and this name is generic
+// enough to collide.
+//
+// Declared here rather than kept static so the classification can be unit
+// tested -- issue #262 was a misclassification that no test could have caught.
+string MSSQLTranslateConnectionError(const string &error, const string &host, uint16_t port, const string &user,
+									 const string &database, uint32_t server_error = 0, uint8_t server_state = 0);
+
 string ResolveAppName(const MSSQLConnectionInfo &info);
 
 //===----------------------------------------------------------------------===//

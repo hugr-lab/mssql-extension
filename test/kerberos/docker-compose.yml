@@ -4,6 +4,7 @@
 #
 #   kdc         MIT Kerberos KDC, realm EXAMPLE.COM
 #   sql         SQL Server 2022, joined-equivalent via a service keytab
+#   gateway     TDS server that answers every login with ROUTING -> sql (#261)
 #   test-client Ubuntu + krb5-user + the built mssql.duckdb_extension
 #
 # Usage (from this directory):
@@ -85,6 +86,32 @@ services:
       retries: 40
       start_period: 30s
 
+  # Issue #261 / spec 068: answers any login with a ROUTING redirect to `sql`,
+  # so the stack can exercise a Kerberos hop. The gateway is plaintext
+  # (ENCRYPT_NOT_SUP), so the hop test connects with Encrypt=no -- and that
+  # setting PROPAGATES across the hop: the routed login to sql.example.com is
+  # plaintext too, because the hop reuses the same connection info and changes
+  # only host and port. That diverges from step 4, which uses
+  # Encrypt=yes;TrustServerCertificate=yes; worth knowing before debugging a
+  # step-6 failure as though it were a TLS problem.
+  gateway:
+    build: ./gateway
+    container_name: mssql-kerb-gateway
+    hostname: gateway.example.com
+    networks:
+      kerb_net:
+        aliases:
+          - gateway.example.com
+    environment:
+      ROUTE_TO_HOST: sql.example.com
+      ROUTE_TO_PORT: "1433"
+      LISTEN_PORT: "1433"
+    expose:
+      - "1433/tcp"
+    depends_on:
+      sql:
+        condition: service_healthy
+
   test-client:
     # CI pre-builds this tag with buildx + GHA cache, then `docker compose up`
     # (no --build) reuses it. Local users keep the original behaviour because
@@ -106,6 +133,8 @@ services:
     depends_on:
       sql:
         condition: service_healthy
+      gateway:
+        condition: service_started
     # Keep alive so the user can `docker compose exec` into it.
     command: ["sleep", "infinity"]
 

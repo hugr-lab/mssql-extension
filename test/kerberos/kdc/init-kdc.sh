@@ -13,9 +13,36 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-adminpw}"
 USER_PRINCIPAL="${USER_PRINCIPAL:-testuser}"
 USER_PASSWORD="${USER_PASSWORD:-testpass}"
 SERVICE_PRINCIPAL="${SERVICE_PRINCIPAL:-MSSQLSvc/sql.example.com:1433}"
+# Issue #261: the routing gateway's own SPN. The client must be able to get a
+# ticket for the gateway BEFORE it can send a LOGIN7 there and be redirected --
+# that first ticket request is half of what the hop test proves. No keytab is
+# exported for it: the gateway never validates the blob, it only redirects.
+GATEWAY_PRINCIPAL="${GATEWAY_PRINCIPAL:-MSSQLSvc/gateway.example.com:1433}"
 KEYTAB_OUT="${KEYTAB_OUT:-/export/mssql.keytab}"
 
 mkdir -p /var/log /var/lib/krb5kdc /export
+
+# Issue #261: the routing gateway's SPN. Idempotent and called from BOTH the
+# fresh-realm and existing-realm branches -- a stack brought up before this
+# commit and restarted without `down -v` keeps its KDC database, and a missing
+# gateway principal there makes the hop test fail with "the first login never
+# asked the KDC", which points at the client when the cause is the KDC.
+ensure_gateway_principal() {
+    [[ -n "${GATEWAY_PRINCIPAL}" ]] || return 0
+    local p
+    for p in "${GATEWAY_PRINCIPAL}" "${GATEWAY_PRINCIPAL%:*}"; do
+        [[ -n "${p}" ]] || continue
+        if kadmin.local -q "getprinc ${p}@${REALM}" 2>/dev/null | grep -q "Principal:"; then
+            echo "[init-kdc] gateway principal ${p}@${REALM} already present"
+        else
+            echo "[init-kdc] creating routing-gateway principal ${p}@${REALM} (issue #261)"
+            kadmin.local -q "addprinc -randkey ${p}@${REALM}"
+        fi
+        # The port-less hostbased variant equals the principal when there is no
+        # ":port" suffix; don't create it twice.
+        [[ "${GATEWAY_PRINCIPAL%:*}" != "${GATEWAY_PRINCIPAL}" ]] || break
+    done
+}
 
 if [[ ! -f /var/lib/krb5kdc/principal ]]; then
     echo "[init-kdc] creating realm ${REALM}"
@@ -53,6 +80,8 @@ if [[ ! -f /var/lib/krb5kdc/principal ]]; then
         kadmin.local -q "ktadd -k ${KEYTAB_OUT} ${SERVICE_PRINCIPAL_HOSTBASED}@${REALM}"
     fi
     chmod 644 "${KEYTAB_OUT}"
+
+    ensure_gateway_principal
 else
     echo "[init-kdc] realm already exists at /var/lib/krb5kdc; skipping create"
     # Re-export keytab in case the keytabs volume was wiped between runs but
@@ -66,6 +95,9 @@ else
         fi
         chmod 644 "${KEYTAB_OUT}"
     fi
+
+    # A KDC database created before issue #261 has no gateway principal.
+    ensure_gateway_principal
 fi
 
 echo "[init-kdc] starting krb5kdc and kadmind"

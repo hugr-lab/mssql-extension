@@ -230,6 +230,48 @@ jobs:
           /tmp/test_load_policy
 
   # ============================================================================
+  # Windows SSPI Unit Test - ungated, like cpp-unit-tests above.
+  #
+  # Issue #260: WinSspiAuthenticator had no automated coverage. Its only test
+  # assumes a domain-joined host and sits on the never-set allowlist in
+  # check_require_env.sh, and the Windows BUILD jobs are dispatch-gated -- so
+  # putting it there would trade a test nobody runs for a test that runs when
+  # somebody ticks a box.
+  #
+  # It belongs in its own job rather than as a windows entry in the
+  # cpp-unit-tests matrix because five of that job's steps are POSIX-only
+  # (pkg-config, readelf, shasum, `c++`) and would each need an `if:` guard.
+  #
+  # No vcpkg needed: winsspi_authenticator.cpp includes only its own header and
+  # the Windows SDK. Acquiring a Negotiate credential and producing the first
+  # token uses the local logon session -- no domain, no SQL Server, no network.
+  # ============================================================================
+  windows-sspi-test:
+    name: Windows SSPI Unit Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Visual Studio Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build + run Windows SSPI context test (issue #260)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cl /std:c++17 /EHsc /nologo /MT /DMSSQL_ENABLE_SSPI=1 `
+            /I src/include `
+            test/cpp/test_winsspi_context.cpp `
+            src/tds/auth/winsspi_authenticator.cpp `
+            /Fe:test_winsspi_context.exe `
+            /link secur32.lib
+          if ($LASTEXITCODE -ne 0) { throw "compile failed" }
+          ./test_winsspi_context.exe
+          if ($LASTEXITCODE -ne 0) { throw "test failed" }
+
+  # ============================================================================
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)
   # ============================================================================

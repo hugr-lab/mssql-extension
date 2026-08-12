@@ -66,3 +66,7 @@ docs/assets/download-metrics.svg
 website/node_modules/
 website/build/
 website/.docusaurus/
+
+# Python bytecode (e.g. test/kerberos/gateway helpers imported locally)
+__pycache__/
+*.pyc
