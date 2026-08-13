@@ -24,20 +24,14 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive';
 ----
 1
 
-# Test: Create Azure secret with interactive chain and specific tenant
-statement ok
-CREATE OR REPLACE SECRET test_azure_interactive_tenant (
-    TYPE azure,
-    PROVIDER credential_chain,
-    CHAIN 'interactive',
-    TENANT_ID 'common'
-);
-
-# Verify secret was created
-query I
-SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive_tenant';
-----
-1
+# A TENANT_ID variant of the secret used to sit here. It asserted parameters
+# of the azure extension's own CREATE SECRET -- upstream surface, none of our
+# code -- and had never actually executed anyway (`require azure` was
+# unsatisfiable in every local and CI environment until 2026-08-13, when the
+# whole file first ran). Removed rather than updated: pinning a third-party
+# parameter list buys no coverage of this extension and breaks on upstream
+# changes. The secret creation above stays as a sanity check of the
+# precondition the device-code flow relies on.
 
 # Note: Testing mssql_azure_auth_test with interactive secrets would require
 # actual user interaction. In CI environments, this would hang waiting for input.
@@ -50,6 +44,3 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive_tenan
 # Clean up
 statement ok
 DROP SECRET IF EXISTS test_azure_interactive;
-
-statement ok
-DROP SECRET IF EXISTS test_azure_interactive_tenant;

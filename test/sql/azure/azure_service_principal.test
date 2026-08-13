@@ -48,9 +48,14 @@ CREATE OR REPLACE SECRET azure_sql_secret (
 statement ok
 ATTACH '' AS azuredb (TYPE mssql, SECRET azure_sql_secret);
 
-# Basic connectivity test - SELECT 1
+# Basic connectivity test - SELECT 1. mssql_scan takes the attached context
+# NAME as a string. The `azuredb.mssql_scan(azuredb, ...)` form this line
+# carried since it was written (WIP commit b8677ef) NEVER worked -- the
+# extension has never registered table functions inside attached catalogs --
+# and never ran either: `require azure` was unsatisfiable in every local and
+# CI environment until 2026-08-13, so the whole file was dead weight.
 query I
-SELECT 1 FROM azuredb.mssql_scan(azuredb, 'SELECT 1 AS value');
+SELECT value FROM mssql_scan('azuredb', 'SELECT 1 AS value');
 ----
 1
 
