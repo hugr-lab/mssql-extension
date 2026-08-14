@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: azure-test test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -127,16 +127,20 @@ export MSSQL_TESTDB_DSN
 export MSSQL_TESTDB_URI
 export MSSQL_TEST_SERVER
 export MSSQL_TEST_CONNECTION_STRING
-# NOTE: MSSQL_TEST_DSN_TLS is NOT exported by default. Export it manually to
-# run TLS-specific tests (requires SQL Server with TLS enabled).
-# export MSSQL_TEST_DSN_TLS
+# MSSQL_TEST_DSN_TLS was assigned above but deliberately NOT exported, so the
+# four TLS files (tls_connection, tls_queries, tls_parallel, tls_multipacket)
+# skipped on every run — and scripts/ci/check_require_env.sh accepted the bare
+# assignment as proof they did not. SQL Server 2022 has TLS on by default with a
+# self-signed certificate (see the header of tls_connection.test), which is the
+# server `make docker-up` starts, so there is nothing left to opt into.
+export MSSQL_TEST_DSN_TLS
 
-# Integration tests - requires SQL Server running
-# NOTE: TLS tests are skipped unless MSSQL_TEST_DSN_TLS is exported.
+# Integration tests - requires SQL Server running.
+# Local Docker lane only: nothing here talks to a cloud database. The Azure
+# files live behind their own env gates and `make azure-test`.
 integration-test: release
 	@echo "Running integration tests..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
-	@echo "NOTE: TLS tests skipped unless MSSQL_TEST_DSN_TLS is exported"
 	@echo ""
 	@echo "Test environment:"
 	@echo "  MSSQL_TEST_HOST=$(MSSQL_TEST_HOST)"
@@ -175,6 +179,81 @@ integration-test: release
 		exit 1; \
 	fi; \
 	echo "integration-test: $$cases cases ran (floor $(MSSQL_MIN_TEST_CASES))"
+
+#===----------------------------------------------------------------------===#
+# Azure / Fabric lane
+#
+# Kept out of integration-test on purpose: those files talk to a cloud database
+# with real credentials, and azure_lazy_loading.test CREATEs and DROPs tables in
+# `dbo` while it runs. integration-test describes itself as the local Docker
+# lane, so it must not reach them — the extra AZURE_SQL_DDL_OK gate on that file
+# is what keeps a developer who exported AZURE_SQL_TEST_DSN (as docs/TESTING.md
+# tells them to) from getting silent DDL against their Azure database out of a
+# target whose banner says "SQL Server must be running".
+#
+# `require azure` is the other half. The runner can only satisfy it by
+# INSTALLing from LOCAL_EXTENSION_REPO with --autoloading, and nothing ever
+# provisioned it that way, so every file in the group skipped and the run exited
+# 0 — which is how two lines of never-executed WIP survived in the group for
+# months. The isolated HOME matters too: an azure extension already installed in
+# ~/.duckdb from another origin makes the runner's INSTALL fail on the origin
+# conflict, which also surfaces as a silent skip.
+#
+# Only NON-EMPTY variables are passed through. Exporting an empty AZURE_APP_ID
+# would satisfy `require-env` and turn a skip into a live OAuth2 rejection —
+# which is exactly what .env.example's placeholder values used to do.
+#===----------------------------------------------------------------------===#
+AZURE_EXT_REPO ?= $(CURDIR)/build/release/repository
+AZURE_TEST_HOME ?= $(CURDIR)/build/release/azure-test-home
+# Floor, same tripwire as MSSQL_MIN_TEST_CASES: a group where every file skips
+# still reports "N test cases ... PASSED" and exits 0. Assertions cannot be
+# faked that way. The first real run of this group was 168 assertions.
+AZURE_MIN_ASSERTIONS ?= 100
+
+AZURE_ENV_VARS := AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
+                  AZURE_SQL_DB_HOST AZURE_SQL_DB \
+                  AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+                  AZURE_ACCESS_TOKEN AZURE_SQL_TEST_DSN AZURE_SQL_DDL_OK \
+                  AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN
+AZURE_ENV := $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)='$($(v))'))
+
+azure-test: release
+	@echo "Running Azure / Fabric tests..."
+	@echo "NOTE: needs real Azure credentials in .env (see .env.example) and the"
+	@echo "      azure extension installed locally: duckdb -c 'INSTALL azure;'"
+	@echo "Variables supplied: $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)))"
+	@echo ""
+	@set -e; \
+	repo_dir=$$(ls -d $(AZURE_EXT_REPO)/v*/*/ 2>/dev/null | head -1); \
+	if [ -z "$$repo_dir" ]; then \
+		echo "azure-test: no local extension repository under $(AZURE_EXT_REPO)." >&2; \
+		echo "  Run 'make release' first." >&2; exit 1; \
+	fi; \
+	rel=$${repo_dir#$(AZURE_EXT_REPO)/}; \
+	src="$$HOME/.duckdb/extensions/$${rel%/}/azure.duckdb_extension"; \
+	if [ ! -f "$$src" ]; then \
+		echo "azure-test: $$src not found." >&2; \
+		echo "  Install the azure extension for this DuckDB version first:" >&2; \
+		echo "    ./build/release/duckdb -c \"INSTALL azure;\"" >&2; \
+		exit 1; \
+	fi; \
+	cp "$$src" "$$repo_dir"; \
+	rm -rf "$(AZURE_TEST_HOME)"; mkdir -p "$(AZURE_TEST_HOME)"; \
+	set -o pipefail; \
+	env HOME="$(AZURE_TEST_HOME)" LOCAL_EXTENSION_REPO="$(AZURE_EXT_REPO)" $(AZURE_ENV) \
+		build/release/test/unittest "[azure],[fabric]" --autoloading available --force-reload \
+		2>&1 | tee /tmp/mssql_azure.out
+	@asserts=$$(grep -oE '[0-9]+ assertions?' /tmp/mssql_azure.out | tail -1 | grep -oE '^[0-9]+'); \
+	if [ -z "$$asserts" ]; then \
+		echo "azure-test: could not read an assertion count — the suite did not report" >&2; exit 1; \
+	fi; \
+	if [ "$$asserts" -lt $(AZURE_MIN_ASSERTIONS) ]; then \
+		echo "azure-test: only $$asserts assertions ran, expected at least $(AZURE_MIN_ASSERTIONS)." >&2; \
+		echo "  A group where every file skips still exits 0. Check that 'require azure'" >&2; \
+		echo "  resolved and that the AZURE_* variables above are actually set." >&2; \
+		exit 1; \
+	fi; \
+	echo "azure-test: $$asserts assertions ran (floor $(AZURE_MIN_ASSERTIONS))"
 
 # Run the SQL suite with the performance counters ON (spec 057 step 0b).
 #
@@ -877,6 +956,7 @@ help:
 	@echo "Custom targets:"
 	@echo "  make vcpkg-setup          - Bootstrap vcpkg (required for TLS support)"
 	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
+	@echo "  make azure-test           - Run Azure/Fabric tests (requires cloud credentials + azure ext)"
 	@echo "  make counters-test        - Run the SQL suite with MSSQL_COUNTERS=1 (exercises the counter path)"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"

@@ -149,6 +149,25 @@ ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
 --         and enter the code ABCD1234 to authenticate.
 ```
 
+**Choosing the tenant.** With no tenant the device-code flow signs in against
+the multi-tenant `/common/` endpoint, which is what you want for a personal
+account and wrong for a single-tenant organization. `TENANT_ID` does **not**
+work on the azure secret — duckdb-azure rejects it on
+`provider='credential_chain'` — so pass it on the MSSQL side, either as the
+`azure_tenant_id` ATTACH option or as the secret field of the same name. The
+ATTACH option wins over the secret.
+
+```sql
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'azure_interactive',
+    AZURE_TENANT_ID 'contoso.onmicrosoft.com'
+);
+```
+
+The tenant is part of the token cache key, so two ATTACHes of the same secret
+against different tenants do not share a token.
+
 **Example Session:**
 
 ```text

@@ -28,9 +28,13 @@ std::vector<uint8_t> EncodeFedAuthToken(const std::string &token_utf8) {
 	return tds::encoding::Utf16LEEncode(token_utf8);
 }
 
-FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azure_secret_name) {
-	// Acquire token using Phase 1 infrastructure
-	auto token_result = AcquireToken(context, azure_secret_name);
+FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azure_secret_name,
+								  const std::string &tenant_id_override) {
+	// Acquire token using Phase 1 infrastructure. The tenant override is what
+	// makes an interactive / device-code ATTACH usable in a single-tenant org:
+	// without it AcquireToken keeps the secret's tenant, and the device-code
+	// path then defaults to "common".
+	auto token_result = AcquireToken(context, azure_secret_name, tenant_id_override);
 
 	if (!token_result.success) {
 		throw ConnectionException("Azure AD authentication failed: %s", token_result.error_message);

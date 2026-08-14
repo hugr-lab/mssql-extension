@@ -29,12 +29,38 @@ CREATE SECRET my_interactive_azure (
     CHAIN 'interactive'
 );
 
--- Option B: Using specific tenant (for organizational accounts)
+-- Option B: Using a specific tenant (for organizational accounts).
+--
+-- NOT on the azure secret: duckdb-azure rejects TENANT_ID on
+-- provider='credential_chain' with
+--   Binder Error: Unknown parameter 'tenant_id' ... provider 'credential_chain'
+-- This file recommended exactly that until 2026-08-14. The tenant goes on the
+-- MSSQL secret instead, where this extension reads it (azure_tenant_id ->
+-- MSSQLConnectionInfo::azure_tenant_id -> AcquireToken). Without it the device
+-- code flow authenticates against /common/.
 CREATE SECRET my_interactive_azure (
     TYPE azure,
     PROVIDER credential_chain,
-    CHAIN 'interactive',
-    TENANT_ID 'your-tenant-id-here'
+    CHAIN 'interactive'
+);
+
+CREATE SECRET my_db (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    DATABASE 'mydb',
+    AZURE_SECRET 'my_interactive_azure',
+    AZURE_TENANT_ID 'your-tenant-id-here'
+);
+```
+
+The `azure_tenant_id` ATTACH option does the same thing and overrides the
+secret:
+
+```sql
+ATTACH 'Server=myserver.database.windows.net;Database=mydb' AS db (
+    TYPE mssql,
+    AZURE_SECRET 'my_interactive_azure',
+    AZURE_TENANT_ID 'your-tenant-id-here'
 );
 ```
 

@@ -16,6 +16,12 @@ require mssql
 
 require-env MSSQL_TEST_DSN_TLS
 
+# The plaintext DSN, used by the TLS-vs-non-TLS comparison at the bottom of this
+# file. It gated inline down there until 2026-08-14, which is the wrong shape: a
+# failing `require` aborts and marks the WHOLE file skipped, so an unset
+# MSSQL_TEST_DSN would have discarded every assertion above it as well.
+require-env MSSQL_TEST_DSN
+
 # ============================================================================
 # Test: Basic TLS Connection
 # Verifies that a TLS connection can be established and used for queries
@@ -130,8 +136,8 @@ DROP SECRET tls_test_secret;
 # ============================================================================
 # Test: TLS vs Non-TLS Connection Comparison (if both work)
 # Both should return same results for same queries
+# (MSSQL_TEST_DSN is gated at the top of this file, with the other gates.)
 # ============================================================================
-require-env MSSQL_TEST_DSN
 
 statement ok
 ATTACH '${MSSQL_TEST_DSN}' AS plain_db (TYPE mssql);

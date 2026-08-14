@@ -1210,22 +1210,56 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/lib
           AZURE_SQL_TEST_DSN: ${{ secrets.AZURE_SQL_TEST_DSN }}
+          # azure_lazy_loading.test CREATEs/ALTERs/DROPs tables in `dbo`. The DSN
+          # alone does not authorise that; this is the explicit second gate.
+          AZURE_SQL_DDL_OK: "1"
           AZURE_APP_ID: ${{ secrets.AZURE_APP_ID }}
           AZURE_DIRECTORY_ID: ${{ secrets.AZURE_DIRECTORY_ID }}
           AZURE_APP_SECRET: ${{ secrets.AZURE_APP_SECRET }}
           AZURE_SQL_DB_HOST: ${{ secrets.AZURE_SQL_DB_HOST }}
           AZURE_SQL_DB: ${{ secrets.AZURE_SQL_DB }}
+          # Fabric. The job has been titled "Azure SQL Database and Fabric tests"
+          # since it was written while selecting only `[azure]` — and Catch tags
+          # come from the parent DIRECTORY, so test/sql/fabric/fabric_types.test
+          # is tagged `[fabric]` and was never selected. These three are what it
+          # gates on, and nothing ever set them either, so Fabric had never been
+          # exercised in any lane.
+          AZURE_WH_HOST: ${{ secrets.AZURE_WH_HOST }}
+          AZURE_WH_NAME: ${{ secrets.AZURE_WH_NAME }}
+          AZURE_WH_TOKEN: ${{ secrets.AZURE_WH_TOKEN }}
+          # A group where every file skips still prints "N test cases ... PASSED"
+          # and exits 0 — which is how this job reported success for months while
+          # running zero assertions. Same tripwire as MSSQL_MIN_TEST_CASES.
+          AZURE_MIN_ASSERTIONS: "100"
         run: |
+          set -euo pipefail
           echo "============================================"
           echo "Running Azure Tests with unittest"
           echo "============================================"
-          echo "AZURE_APP_ID is set: $([ -n \"$AZURE_APP_ID\" ] && echo 'yes' || echo 'no')"
-          echo "AZURE_DIRECTORY_ID is set: $([ -n \"$AZURE_DIRECTORY_ID\" ] && echo 'yes' || echo 'no')"
-          echo "AZURE_APP_SECRET is set: $([ -n \"$AZURE_APP_SECRET\" ] && echo 'yes' || echo 'no')"
+          for v in AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
+                   AZURE_SQL_DB_HOST AZURE_SQL_DB AZURE_SQL_TEST_DSN \
+                   AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN; do
+            eval "val=\${$v:-}"
+            echo "$v is set: $([ -n \"$val\" ] && echo 'yes' || echo 'no')"
+          done
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           echo "============================================"
 
-          # Run Azure test group
-          ./test/unittest "[azure]" --force-reload
+          # `require azure` is only satisfiable when the runner may install the
+          # azure extension; without --autoloading every file behind that gate
+          # SKIPS and the run exits 0. Both `[azure]` and `[fabric]` are
+          # selected — the tag is the directory name.
+          ./test/unittest "[azure],[fabric]" --autoloading available --force-reload 2>&1 | tee azure-tests.out
 
-          echo "Azure tests completed!"
+          asserts=$(grep -oE '[0-9]+ assertions?' azure-tests.out | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ -z "$asserts" ]; then
+            echo "azure-test: could not read an assertion count — the suite did not report" >&2
+            exit 1
+          fi
+          if [ "$asserts" -lt "$AZURE_MIN_ASSERTIONS" ]; then
+            echo "azure-test: only $asserts assertions ran, expected at least $AZURE_MIN_ASSERTIONS." >&2
+            echo "  Every file skipping still exits 0. Check that 'require azure' resolved" >&2
+            echo "  and that the AZURE_* secrets above are actually populated." >&2
+            exit 1
+          fi
+          echo "Azure tests completed! ($asserts assertions, floor $AZURE_MIN_ASSERTIONS)"

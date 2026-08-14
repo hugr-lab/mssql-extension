@@ -137,9 +137,13 @@ Tests require these environment variables (automatically set by `make integratio
 | `MSSQL_TEST_URI` | (computed) | URI connection string for master |
 | `MSSQL_TESTDB_DSN` | (computed) | ADO.NET connection string for TestDB |
 | `MSSQL_TESTDB_URI` | (computed) | URI connection string for TestDB |
-| `MSSQL_TEST_DSN_TLS` | (not exported) | TLS URI string (export manually for TLS tests) |
+| `MSSQL_TEST_DSN_TLS` | (computed) | TLS URI string. Exported since 2026-08-14 — it was assigned but never exported before, so the four `tls_*.test` files skipped on every run |
 
 **Azure AD Test Environment Variables:**
+
+Supplied by `make azure-test` from `.env`, which passes through only the ones
+that are **non-empty** — an exported-but-empty variable satisfies `require-env`
+and turns a clean skip into a live credential rejection.
 
 | Variable | Description |
 |----------|-------------|
@@ -147,8 +151,12 @@ Tests require these environment variables (automatically set by `make integratio
 | `AZURE_DIRECTORY_ID` | Azure AD tenant (directory) ID |
 | `AZURE_APP_SECRET` | Azure AD client secret for service principal tests |
 | `AZURE_SQL_TEST_DSN` | Connection string to Azure SQL Database (for azure_lazy_loading.test) |
+| `AZURE_SQL_DDL_OK` | Second, explicit gate on `azure_lazy_loading.test`, which CREATEs/ALTERs/DROPs tables in `dbo` on the database that DSN points at. Set it only when you are content for that to happen |
 | `AZURE_SQL_DB_HOST` | Azure SQL server hostname (e.g., myserver.database.windows.net) |
 | `AZURE_SQL_DB` | Azure SQL database name |
+| `AZURE_WH_HOST` | Microsoft Fabric warehouse endpoint (`test/sql/fabric/`) |
+| `AZURE_WH_NAME` | Fabric warehouse name |
+| `AZURE_WH_TOKEN` | Bearer token for the Fabric warehouse (`az account get-access-token --resource https://database.windows.net/`) |
 
 **Azure SDK Standard Environment Variables (Spec 032):**
 
@@ -313,14 +321,18 @@ test/
 │   │   ├── xml_nbc.test            # XML with NBC (Null Bitmap Compression) row format
 │   │   ├── xml_copy_bcp.test       # XML COPY TO via BCP protocol (BCP remaps XML to NVARCHAR(MAX))
 │   │   └── xml_dml_error.test      # DML guard: INSERT/UPDATE reject XML with error
-│   ├── azure/                      # Azure AD authentication tests
+│   ├── azure/                      # Azure AD authentication tests (tag [azure])
 │   │   ├── azure_access_token.test # ACCESS_TOKEN option tests (Spec 032)
-│   │   ├── azure_auth_test_function.test # mssql_azure_auth_test() function tests
-│   │   ├── azure_device_code.test  # Device code flow tests (interactive)
+│   │   ├── azure_auth_test_function.test # mssql_azure_auth_test() error paths (no credentials)
+│   │   ├── azure_auth_test_function_with_credentials.test # ...against a real service principal
+│   │   ├── azure_device_code.test  # Interactive/device-code config + azure_tenant_id override
 │   │   ├── azure_env_provider.test # credential_chain 'env' provider tests (Spec 032)
-│   │   ├── azure_lazy_loading.test # Lazy catalog loading with Azure SQL (requires AZURE_SQL_TEST_DSN)
-│   │   ├── azure_secret_validation.test # Azure secret validation tests
-│   │   └── azure_service_principal.test # Service principal authentication tests
+│   │   ├── azure_lazy_loading.test # Lazy catalog loading (AZURE_SQL_TEST_DSN + AZURE_SQL_DDL_OK: destructive)
+│   │   ├── azure_secret_validation.test # MSSQL secret validation (no credentials needed)
+│   │   ├── azure_secret_validation_with_credentials.test # ...with a real azure secret
+│   │   └── azure_service_principal.test # Service principal FEDAUTH: scan + catalog + pool
+│   ├── fabric/                     # Microsoft Fabric warehouse tests (tag [fabric])
+│   │   └── fabric_types.test       # Fabric type mapping (requires AZURE_WH_*)
 │   ├── catalog_discovery.test      # Catalog discovery tests
 │   ├── mssql_attach.test           # ATTACH/DETACH tests
 │   ├── mssql_exec.test             # mssql_exec() function tests
@@ -396,17 +408,33 @@ DETACH testdb;
 
 ### Test Groups
 
-| Group | Description | Requires SQL Server |
+> **The `# group:` header does not select anything.** For a file in a
+> subdirectory of `test/sql`, sqllogictest derives the Catch tag from the
+> **parent directory name** — `test/sql/azure/x.test` is `[azure]`,
+> `test/sql/fabric/x.test` is `[fabric]` — and the `# group:` line is inert.
+> All eight files at the *top* level of `test/sql` carry `# group: [mssql]`
+> while `[sql]` is what actually selects them, and no directory is named
+> `mssql`, so `"[mssql]"` matches nothing at all and exits 0. That mismatch is
+> what let `make integration-test` report a passing suite while running 8 of
+> 172 files (and, earlier, 0 of 172). `integration-test` now filters on the
+> **path glob** `test/sql/*` for exactly this reason, with a case-count floor
+> as a tripwire.
+>
+> Practical consequence: moving a file to another directory changes which job
+> runs it, whatever its `# group:` header says. Keep the header consistent for
+> readability, but never rely on it.
+
+| Tag (= directory) | Description | Requires SQL Server |
 |-------|-------------|---------------------|
-| `[sql]` | General SQL tests | Yes |
+| `[sql]` | General SQL tests (top level of `test/sql`) | Yes |
 | `[integration]` | Integration tests | Yes |
-| `[mssql]` | MSSQL-specific tests (catalog, DML, transactions) | Yes |
 | `[dml]` | DML operations (INSERT/UPDATE/DELETE) | Yes |
 | `[transaction]` | Transaction management tests | Yes |
 | `[copy]` | COPY TO MSSQL (BulkLoadBCP) tests | Yes |
 | `[ctas]` | CREATE TABLE AS SELECT tests | Yes |
 | `[xml]` | XML data type tests | Yes |
-| `[azure]` | Azure AD authentication tests | No (requires Azure credentials) |
+| `[azure]` | Azure AD authentication tests (`make azure-test`) | No (requires Azure credentials) |
+| `[fabric]` | Microsoft Fabric warehouse tests (`make azure-test`) | No (requires a Fabric warehouse + token) |
 
 ---
 
@@ -918,9 +946,15 @@ DROP SECRET azure_sp;
 **Azure AD Test Best Practices:**
 
 1. **Use `require-env AZURE_APP_ID`** - Tests are skipped when Azure credentials not configured
-2. **Test token acquisition only** - `mssql_azure_auth_test()` validates tokens without SQL Server
-3. **Keep tests in `test/sql/azure/`** - Separate from integration tests that require SQL Server
-4. **Group as `[azure]`** - Allows running Azure tests independently
+2. **Put every gate at the TOP of the file** - a `require` that fails aborts the file and marks it
+   skipped *including the assertions above it*. If half a file needs credentials and half does not,
+   split it in two (`*_with_credentials.test`). `scripts/ci/check_require_env.sh` enforces this.
+3. **Test token acquisition only** - `mssql_azure_auth_test()` validates tokens without SQL Server
+4. **Keep tests in `test/sql/azure/`** - the directory *is* the `[azure]` tag; see the note under
+   [Test Groups](#test-groups) — the `# group:` header selects nothing
+5. **Run them with `make azure-test`** - it provisions the azure extension into the local extension
+   repository (without which `require azure` is unsatisfiable and every file skips silently), passes
+   only the non-empty `AZURE_*` variables, and fails if fewer than `AZURE_MIN_ASSERTIONS` ran
 
 **Azure AD Authentication Methods:**
 
@@ -929,8 +963,24 @@ DROP SECRET azure_sp;
 | Service Principal | `azure` | `provider='service_principal'`, `tenant_id`, `client_id`, `client_secret` |
 | Environment | `azure` | `provider='credential_chain'`, `chain='env'` (uses AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET env vars) |
 | Azure CLI | `azure` | `provider='credential_chain'`, `chain='cli'` |
-| Interactive | `azure` | `provider='credential_chain'`, `chain='interactive'`, `tenant_id` |
+| Interactive | `azure` | `provider='credential_chain'`, `chain='interactive'` — **not** `tenant_id`, see below |
 | Manual Token | `mssql` or ATTACH | `ACCESS_TOKEN='<jwt>'` option (Spec 032) |
+
+> **Tenant for interactive auth.** `TENANT_ID` is *not* accepted on
+> `provider='credential_chain'` — current duckdb-azure answers
+> `Binder Error: Unknown parameter 'tenant_id'`. This table advertised it until
+> 2026-08-14. The tenant belongs on **our** side instead: `azure_tenant_id` on the
+> MSSQL secret, or the `azure_tenant_id` ATTACH option, which overrides it.
+> Without one of those, the device-code flow authenticates against the `/common/`
+> endpoint, which is wrong for a single-tenant organization.
+>
+> ```sql
+> CREATE SECRET db_secret (
+>     TYPE mssql, HOST 'myserver.database.windows.net', DATABASE 'mydb',
+>     AZURE_SECRET 'azure_interactive',
+>     AZURE_TENANT_ID 'contoso.onmicrosoft.com'
+> );
+> ```
 
 **Azure AD Test Scenarios:**
 

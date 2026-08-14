@@ -8,8 +8,8 @@
 # - AZURE_CLIENT_SECRET: Service principal client secret
 #
 # And Azure SQL connection info:
-# - AZURE_SQL_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
-# - AZURE_SQL_DATABASE: Database name
+# - AZURE_SQL_DB_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
+# - AZURE_SQL_DB: Database name
 #
 # These are the same environment variables used by Azure SDK (DefaultAzureCredential)
 # Set them before running:
@@ -22,9 +22,9 @@ require mssql
 require azure
 
 # Skip if Azure SQL connection info not provided
-require-env AZURE_SQL_HOST
+require-env AZURE_SQL_DB_HOST
 
-require-env AZURE_SQL_DATABASE
+require-env AZURE_SQL_DB
 
 # Skip if Azure env vars not set
 require-env AZURE_TENANT_ID
@@ -47,20 +47,20 @@ CREATE OR REPLACE SECRET azure_env_secret (
 
 # ATTACH using the env-based Azure secret
 statement ok
-ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS env_db (
+ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS env_db (
     TYPE mssql,
     AZURE_SECRET 'azure_env_secret'
 );
 
 # Basic connectivity test
 query I
-SELECT 1 FROM mssql_scan('env_db', 'SELECT 1 AS value');
+SELECT value FROM mssql_scan('env_db', 'SELECT 1 AS value');
 ----
 1
 
 # Verify pool stats
 query I
-SELECT COUNT(*) >= 0 FROM mssql_pool_stats('env_db');
+SELECT connections_created >= 1 FROM mssql_pool_stats('env_db');
 ----
 true
 
@@ -83,7 +83,7 @@ CREATE OR REPLACE SECRET azure_env_cli_secret (
 );
 
 statement ok
-ATTACH 'Server=${AZURE_SQL_HOST};Database=${AZURE_SQL_DATABASE}' AS env_cli_db (
+ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS env_cli_db (
     TYPE mssql,
     AZURE_SECRET 'azure_env_cli_secret'
 );
