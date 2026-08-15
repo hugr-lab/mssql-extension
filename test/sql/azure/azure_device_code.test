@@ -49,9 +49,14 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive';
 # which meant every interactive ATTACH went to the /common/ endpoint
 # (AZURE_DEFAULT_TENANT in azure_device_code.cpp) with no way to say otherwise
 # in a single-tenant org. This is the replacement assertion, on our surface
-# rather than the azure extension's: the parameter is accepted and persisted,
-# and mssql_storage.cpp reads it back into MSSQLConnectionInfo::azure_tenant_id
-# on the ATTACH path.
+# rather than the azure extension's.
+#
+# Scope, honestly: this only shows the parameter is accepted and persisted, and
+# mssql_secret.cpp stored it long before anything read it -- so this assertion
+# passes just as well with the new plumbing ripped out. The one that actually
+# discriminates lives in azure_secret_validation_with_credentials.test, where a
+# valid azure secret plus a deliberately unresolvable tenant proves the override
+# reached AcquireToken. It needs credentials; this one does not.
 # ---------------------------------------------------------------------------
 
 statement ok

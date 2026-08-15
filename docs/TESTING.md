@@ -417,7 +417,8 @@ DETACH testdb;
 > `mssql`, so `"[mssql]"` matches nothing at all and exits 0. That mismatch is
 > what let `make integration-test` report a passing suite while running 8 of
 > 172 files (and, earlier, 0 of 172). `integration-test` now filters on the
-> **path glob** `test/sql/*` for exactly this reason, with a case-count floor
+> **path glob** `test/sql/*` (minus `~[azure] ~[fabric]`, which are the cloud
+> lane and belong to `make azure-test`) for exactly this reason, with a case-count floor
 > as a tripwire.
 >
 > Practical consequence: moving a file to another directory changes which job

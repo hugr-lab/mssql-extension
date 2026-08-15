@@ -1202,9 +1202,67 @@ jobs:
           name: libduckdb-linux_amd64
           path: lib
 
+      - name: Download mssql extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mssql-extension-linux_amd64
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: duckdb-cli-linux_amd64
+          path: cli
+
       - name: Setup executables
         run: |
-          chmod +x test/unittest
+          chmod +x test/unittest cli/duckdb
+
+      # `--autoloading available` on its own is NOT enough, and is actively
+      # worse than nothing here. In sqllogic_test_runner.cpp it sets
+      # autoload_known_extensions=true, and with LOCAL_EXTENSION_REPO unset
+      # local_extension_repo falls back to DUCKDB_BUILD_DIRECTORY/repository —
+      # a path on the machine that BUILT the artifact, which does not exist in
+      # this job. CheckRequire then takes the `INSTALL <ext> FROM '<repo>'`
+      # branch for EVERY require, not just `require azure`, because neither
+      # `mssql` nor anything else outside AUTOLOADABLE_EXTENSIONS is exempt.
+      # So `require mssql` — the first line of every file in the group — fails
+      # and all 20 cases skip. Reproduced exactly with an isolated HOME and no
+      # repository: "All tests were skipped (total skipped 20) / require mssql: 20".
+      #
+      # Both are required together: LOCAL_EXTENSION_REPO alone leaves
+      # autoloading_mode at NONE, and CheckRequire returns MISSING for any
+      # excluded-from-autoloading extension in that mode. This is why
+      # `make azure-test` sets both.
+      - name: Provision local extension repository
+        run: |
+          set -euo pipefail
+          # Install azure into a scratch HOME purely to learn the version and
+          # platform directory names this build expects, and to obtain the
+          # extension itself.
+          scratch="$PWD/ci-ext-home"
+          mkdir -p "$scratch"
+          if ! HOME="$scratch" ./cli/duckdb -c "INSTALL azure;"; then
+            echo "::error::Could not install the azure extension for this build." >&2
+            echo "  Without it every file behind 'require azure' skips. Check that the" >&2
+            echo "  build stamped a real DuckDB version (a shallow submodule clone" >&2
+            echo "  stamps v0.0.1, and extensions.duckdb.org 404s for it)." >&2
+            exit 1
+          fi
+          extdir=$(ls -d "$scratch"/.duckdb/extensions/v*/*/ 2>/dev/null | head -1 || true)
+          if [ -z "$extdir" ]; then
+            echo "::error::INSTALL azure reported success but wrote no extension directory under $scratch/.duckdb/extensions" >&2
+            exit 1
+          fi
+          echo "Extension directory for this build: $extdir"
+          plat=$(basename "$extdir")
+          ver=$(basename "$(dirname "$extdir")")
+          repo="$PWD/ext-repo/$ver/$plat"
+          mkdir -p "$repo"
+          cp "$extdir"/azure.duckdb_extension "$repo/"
+          cp extension/mssql.duckdb_extension "$repo/"
+          ls -l "$repo"
+          echo "LOCAL_EXTENSION_REPO=$PWD/ext-repo" >> "$GITHUB_ENV"
 
       - name: Run Azure tests
         env:
@@ -1245,10 +1303,12 @@ jobs:
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           echo "============================================"
 
-          # `require azure` is only satisfiable when the runner may install the
-          # azure extension; without --autoloading every file behind that gate
-          # SKIPS and the run exits 0. Both `[azure]` and `[fabric]` are
-          # selected — the tag is the directory name.
+          # LOCAL_EXTENSION_REPO comes from the provisioning step above and
+          # holds both mssql and azure; --autoloading available is what lets
+          # CheckRequire use it at all. Neither works without the other — see
+          # the comment on that step. Both `[azure]` and `[fabric]` are
+          # selected; the tag is the directory name, not the `# group:` header.
+          echo "LOCAL_EXTENSION_REPO: ${LOCAL_EXTENSION_REPO:-<unset>}"
           ./test/unittest "[azure],[fabric]" --autoloading available --force-reload 2>&1 | tee azure-tests.out
 
           asserts=$(grep -oE '[0-9]+ assertions?' azure-tests.out | tail -1 | grep -oE '^[0-9]+' || true)

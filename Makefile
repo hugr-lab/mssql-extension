@@ -136,8 +136,10 @@ export MSSQL_TEST_CONNECTION_STRING
 export MSSQL_TEST_DSN_TLS
 
 # Integration tests - requires SQL Server running.
-# Local Docker lane only: nothing here talks to a cloud database. The Azure
-# files live behind their own env gates and `make azure-test`.
+# Local Docker lane only: nothing here talks to a cloud database. test/sql/azure
+# and test/sql/fabric are excluded by tag below, so that holds whatever the
+# environment contains — not merely while the AZURE_* credentials happen to be
+# unset. `make azure-test` is the lane that runs them.
 integration-test: release
 	@echo "Running integration tests..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
@@ -167,7 +169,15 @@ integration-test: release
 	@# ...and the exit code alone would not have caught any of it. A filter that
 	@# matches nothing is indistinguishable from a suite that passed, so the count
 	@# is asserted, not the status (spec 063 D7).
-	@set -o pipefail; build/release/test/unittest "test/sql/*" --force-reload 2>&1 | tee /tmp/mssql_integration.out
+	@# `~[azure]` / `~[fabric]` exclude the cloud lane BY CONSTRUCTION, not by
+	@# hoping the credentials are unset. azure_lazy_loading.test CREATEs and
+	@# DROPs tables in `dbo` on whatever AZURE_SQL_TEST_DSN points at, and the
+	@# AZURE_* variables are process-wide exports (GNU Make 3.81 has no
+	@# target-specific export), so a developer with real values in .env would
+	@# otherwise get live DDL against their Azure database out of this target.
+	@# Verified: 178 registered files -> 167 with the exclusions, none of them
+	@# under test/sql/azure or test/sql/fabric. `make azure-test` runs those.
+	@set -o pipefail; build/release/test/unittest "test/sql/*" "~[azure]" "~[fabric]" --force-reload 2>&1 | tee /tmp/mssql_integration.out
 	@cases=$$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration.out | tail -1 | grep -oE '^[0-9]+'); \
 	if [ -z "$$cases" ]; then \
 		echo "integration-test: could not read a case count from the output — the suite did not report" >&2; exit 1; \
@@ -199,9 +209,22 @@ integration-test: release
 # ~/.duckdb from another origin makes the runner's INSTALL fail on the origin
 # conflict, which also surfaces as a silent skip.
 #
-# Only NON-EMPTY variables are passed through. Exporting an empty AZURE_APP_ID
-# would satisfy `require-env` and turn a skip into a live OAuth2 rejection —
-# which is exactly what .env.example's placeholder values used to do.
+# Only NON-EMPTY variables are exported. Exporting an empty AZURE_APP_ID would
+# satisfy `require-env` and turn a skip into a live OAuth2 rejection — which is
+# exactly what .env.example's placeholder values used to do.
+#
+# They go through make's own `export`, not a hand-quoted `env VAR='$(VAR)'`
+# splice. Splicing puts the value through the shell: a single quote anywhere in
+# AZURE_APP_SECRET (Azure client secrets are arbitrary printable ASCII) or in a
+# DSN password ends the quoting early, and the remainder of the secret is
+# executed as shell words. `export` passes values verbatim with no shell
+# parsing, which is why every MSSQL_* variable already uses it.
+#
+# Exporting is process-wide rather than per-target — GNU Make 3.81, which is
+# what macOS ships, has no target-specific `export` — so containment cannot
+# rely on these staying unset elsewhere. It doesn't: integration-test and
+# counters-test exclude [azure] and [fabric] by tag, so the cloud files are out
+# of the local lane by construction whatever the environment holds.
 #===----------------------------------------------------------------------===#
 AZURE_EXT_REPO ?= $(CURDIR)/build/release/repository
 AZURE_TEST_HOME ?= $(CURDIR)/build/release/azure-test-home
@@ -215,7 +238,7 @@ AZURE_ENV_VARS := AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
                   AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
                   AZURE_ACCESS_TOKEN AZURE_SQL_TEST_DSN AZURE_SQL_DDL_OK \
                   AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN
-AZURE_ENV := $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)='$($(v))'))
+$(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval export $(v))))
 
 azure-test: release
 	@echo "Running Azure / Fabric tests..."
@@ -240,7 +263,7 @@ azure-test: release
 	cp "$$src" "$$repo_dir"; \
 	rm -rf "$(AZURE_TEST_HOME)"; mkdir -p "$(AZURE_TEST_HOME)"; \
 	set -o pipefail; \
-	env HOME="$(AZURE_TEST_HOME)" LOCAL_EXTENSION_REPO="$(AZURE_EXT_REPO)" $(AZURE_ENV) \
+	env HOME="$(AZURE_TEST_HOME)" LOCAL_EXTENSION_REPO="$(AZURE_EXT_REPO)" \
 		build/release/test/unittest "[azure],[fabric]" --autoloading available --force-reload \
 		2>&1 | tee /tmp/mssql_azure.out
 	@asserts=$$(grep -oE '[0-9]+ assertions?' /tmp/mssql_azure.out | tail -1 | grep -oE '^[0-9]+'); \
@@ -267,7 +290,7 @@ counters-test: release
 	@echo "Running SQL suite with MSSQL_COUNTERS=1..."
 	@echo "NOTE: SQL Server must be running (use 'make docker-up' first)"
 	@echo ""
-	MSSQL_COUNTERS=1 build/release/test/unittest "test/sql/*" --force-reload
+	MSSQL_COUNTERS=1 build/release/test/unittest "test/sql/*" "~[azure]" "~[fabric]" --force-reload
 
 # Run all tests (unit + integration)
 test-all: release
