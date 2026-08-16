@@ -1329,6 +1329,22 @@ jobs:
           # the comment on that step. Both `[azure]` and `[fabric]` are
           # selected; the tag is the directory name, not the `# group:` header.
           echo "LOCAL_EXTENSION_REPO: ${LOCAL_EXTENSION_REPO:-<unset>}"
+
+          # Warm the serverless database. A free/serverless Azure SQL DB
+          # auto-pauses on idle and answers its first logins with 40613
+          # ("not currently available") for 20-60 s while it resumes — which
+          # otherwise lands inside the suite and fails whichever test attaches
+          # first. Best-effort: if it never wakes, the suite fails with the
+          # real 40613 and the message says to retry.
+          if [ -n "${AZURE_SQL_TEST_DSN:-}" ]; then
+            for i in 1 2 3 4 5 6; do
+              if ./cli/duckdb -c "ATTACH '${AZURE_SQL_TEST_DSN}' AS wake (TYPE mssql); SELECT 1;" >/dev/null 2>&1; then
+                echo "serverless database awake (attempt $i)"; break
+              fi
+              echo "waking the serverless database (attempt $i; 40613 while it resumes is expected)..."
+              sleep 20
+            done
+          fi
           ./test/unittest "[azure],[fabric]" --autoloading available --force-reload 2>&1 | tee azure-tests.out
 
           asserts=$(grep -oE '[0-9]+ assertions?' azure-tests.out | tail -1 | grep -oE '^[0-9]+' || true)

@@ -249,6 +249,16 @@ AZURE_ENV_VARS := AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
 # tag-based exclusion below contains the test-SELECTION risk; it does nothing
 # about secrets in unrelated child processes. This does.
 ifneq ($(filter azure-test,$(MAKECMDGOALS)),)
+# Strip ONE layer of surrounding quotes first. `-include .env` reads the file
+# with make's syntax, not the shell's: for the shell `VAR='x'` means x, for
+# make it means 'x' -- quotes included. The MSSQL_* convention is unquoted
+# values so the docker lane never saw this, but dotenv habit is to quote, and
+# every quoted AZURE_* value then reaches ${VAR} substitution in the .test
+# files as 'value', splitting the SQL string it lands in:
+#   Parser Error: syntax error at or near "hugr"
+#   ATTACH 'Server='hugr-lab-dev-sql...';...'
+unquote = $(patsubst "%",%,$(patsubst '%',%,$(1)))
+$(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval $(v) := $(call unquote,$($(v))))))
 $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval export $(v))))
 endif
 
@@ -258,12 +268,16 @@ azure-test: release
 	@echo "      azure extension installed locally: duckdb -c 'INSTALL azure;'"
 	@echo "Variables supplied: $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)))"
 	@echo ""
+# '*/*/', not 'v*/*/': the version directory is the release tag only for a
+# RELEASE build. GetVersionDirectoryName() returns DuckDB::SourceID() -- a
+# commit hash, never 'v'-prefixed -- for anything carrying '-dev', which is
+# every build of the 'main'-branch submodule that is not exactly on a tag.
+# A shallow clone stamps v0.0.1 and hides this; a full one does not.
+# (Make comment, NOT tab-@#-in-a-continuation: a comment line spliced into the
+# 'set -e; \' continuation reaches the shell with its '@#' intact and its
+# backticks LIVE -- `*/*/` executed as command substitution and the recipe
+# died with '@#: command not found' before running a single test.)
 	@set -e; \
-	@# `*/*/`, not `v*/*/`: the version directory is the release tag only for a
-	@# RELEASE build. GetVersionDirectoryName() returns DuckDB::SourceID() -- a
-	@# commit hash, never `v`-prefixed -- for anything carrying `-dev`, which is
-	@# every build of the `main`-branch submodule that is not exactly on a tag.
-	@# A shallow clone stamps v0.0.1 and hides this; a full one does not.
 	repo_dir=$$(ls -d $(AZURE_EXT_REPO)/*/*/ 2>/dev/null | head -1); \
 	if [ -z "$$repo_dir" ]; then \
 		echo "azure-test: no local extension repository under $(AZURE_EXT_REPO)." >&2; \
@@ -279,6 +293,15 @@ azure-test: release
 	fi; \
 	cp "$$src" "$$repo_dir"; \
 	rm -rf "$(AZURE_TEST_HOME)"; mkdir -p "$(AZURE_TEST_HOME)"; \
+	if [ -n "$$AZURE_SQL_TEST_DSN" ]; then \
+		for i in 1 2 3 4 5 6; do \
+			if build/release/duckdb -c "ATTACH '$$AZURE_SQL_TEST_DSN' AS wake (TYPE mssql); SELECT 1;" >/dev/null 2>&1; then \
+				echo "azure-test: database awake (attempt $$i)"; break; \
+			fi; \
+			echo "azure-test: waking the serverless database (attempt $$i; 40613 while it resumes is expected)..."; \
+			sleep 20; \
+		done; \
+	fi; \
 	set -o pipefail; \
 	env HOME="$(AZURE_TEST_HOME)" LOCAL_EXTENSION_REPO="$(AZURE_EXT_REPO)" \
 		build/release/test/unittest "[azure],[fabric]" --autoloading available --force-reload \
