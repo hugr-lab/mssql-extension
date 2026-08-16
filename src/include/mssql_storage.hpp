@@ -87,6 +87,15 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	bool use_azure_auth = false;  // Use Azure AD authentication instead of SQL auth
 	string azure_secret_name;	  // Name of the Azure secret for token acquisition
+	// Tenant to authenticate against, overriding whatever the azure secret carries.
+	// Empty means "use the secret's tenant_id", and for the interactive /
+	// device-code chain an empty tenant falls back to AZURE_DEFAULT_TENANT
+	// ("common") inside azure_device_code.cpp -- which is wrong for any
+	// single-tenant org. `azure_tenant_id` has been a registered mssql-secret
+	// parameter since spec 032 (mssql_secret.cpp, "Optional, tenant for
+	// interactive auth") but was read by nothing until 2026-08-14: every
+	// interactive ATTACH went to /common/ with no way to say otherwise.
+	string azure_tenant_id;
 
 	//===----------------------------------------------------------------------===//
 	// Manual Token Authentication (Spec 032: FEDAUTH Token Provider Enhancements)

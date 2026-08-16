@@ -10,6 +10,18 @@ require mssql
 
 require-env AZURE_SQL_TEST_DSN
 
+# This file is DESTRUCTIVE: it DROPs and CREATEs azure_lazy_test /
+# azure_lazy_test2 in `dbo`, INSERTs, ALTERs and UPDATEs, against whatever
+# AZURE_SQL_TEST_DSN points at. That is a live cloud database, and
+# `make integration-test` used to reach this file through its `test/sql/*` glob
+# — a target whose banner talks about a local Docker container. A developer who
+# exported AZURE_SQL_TEST_DSN because docs/TESTING.md told them to got silent
+# DDL against their Azure database, with orphaned tables left behind on any
+# mid-file abort. So the DSN alone is not enough: say so explicitly.
+#
+#   export AZURE_SQL_DDL_OK=1     # or run `make azure-test`
+require-env AZURE_SQL_DDL_OK
+
 # =============================================================================
 # Setup: Attach Azure SQL Database
 #

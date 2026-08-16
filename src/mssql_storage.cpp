@@ -240,6 +240,14 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 				result->auth_method = AuthMethod::AZURE_AD;	 // Spec 042: keep enum in sync
 			}
 		}
+		// The tenant override that goes with it. mssql_secret.cpp has registered
+		// and stored `azure_tenant_id` since spec 032, and nothing read it back
+		// until 2026-08-14 -- so an interactive-chain azure secret authenticated
+		// against "common" no matter what the user put here.
+		auto azure_tenant_val = kv_secret.TryGetValue("azure_tenant_id");
+		if (!azure_tenant_val.IsNull()) {
+			result->azure_tenant_id = azure_tenant_val.ToString();
+		}
 	}
 	// Default: use_azure_auth = false (SQL auth), auth_method = SQL
 
@@ -1130,7 +1138,7 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 		info.use_encrypt ? "yes" : "no", timeout_seconds);
 
 	// Acquire Azure AD token
-	auto token_result = mssql::azure::AcquireToken(context, info.azure_secret_name);
+	auto token_result = mssql::azure::AcquireToken(context, info.azure_secret_name, info.azure_tenant_id);
 	if (!token_result.success) {
 		throw InvalidInputException("MSSQL Azure AD authentication failed: %s", token_result.error_message);
 	}
@@ -1138,7 +1146,7 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: token acquired successfully");
 
 	// Build FEDAUTH extension data (encodes token to UTF-16LE)
-	auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, info.azure_secret_name);
+	auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, info.azure_secret_name, info.azure_tenant_id);
 	if (!fedauth_data.IsValid()) {
 		throw InvalidInputException("MSSQL Azure AD authentication failed: could not build FEDAUTH data");
 	}
@@ -1450,7 +1458,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;
 	string azure_secret_name;
-	string access_token;  // Spec 032: Direct Azure AD JWT token
+	string azure_tenant_id;	 // Tenant override for the azure secret (interactive auth)
+	string access_token;	 // Spec 032: Direct Azure AD JWT token
 	bool catalog_option_specified = false;
 	bool catalog_enabled_option = true;	 // Default to true
 	string schema_filter_option;		 // Spec 033: ATTACH-level schema filter
@@ -1467,6 +1476,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "azure_secret") {
 			azure_secret_name = it->second.ToString();
+			it = options.options.erase(it);
+		} else if (lower_name == "azure_tenant_id" || lower_name == "azure_tenant") {
+			// Tenant override for the azure secret. The mssql-secret form of this
+			// (`azure_tenant_id`) has existed since spec 032; this is the ATTACH
+			// peer, and it wins over the secret the same way schema_filter does.
+			azure_tenant_id = it->second.ToString();
 			it = options.options.erase(it);
 		} else if (lower_name == "access_token") {
 			// Spec 032: Parse ACCESS_TOKEN ATTACH option
@@ -1542,6 +1557,14 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			"With secret: ATTACH '' AS %s (TYPE mssql, SECRET <secret_name>)\n"
 			"With connection string: ATTACH 'Server=host;Database=db;User Id=user;Password=pass' AS %s (TYPE mssql)",
 			name, name);
+	}
+
+	// Apply the tenant override from ATTACH if specified. ATTACH > secret, same
+	// precedence as schema_filter / table_filter, and it applies to both the
+	// SECRET and the connection-string path.
+	if (!azure_tenant_id.empty()) {
+		connection_info->azure_tenant_id = azure_tenant_id;
+		MSSQL_STORAGE_DEBUG_LOG(1, "AZURE_TENANT_ID option from ATTACH: %s", azure_tenant_id.c_str());
 	}
 
 	// Apply ORDER BY pushdown option from ATTACH if specified (Spec 039)
@@ -1664,7 +1687,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		}
 		// Build FEDAUTH token for pool factory (uses validated credentials when
 		// not lazy; on lazy path the token still has to exist for pool fills).
-		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, connection_info->azure_secret_name);
+		auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, connection_info->azure_secret_name,
+																connection_info->azure_tenant_id);
 		fedauth_token_utf16le = std::move(fedauth_data.token_utf16le);
 	} else if (connection_info->auth_method == AuthMethod::KRB5 ||
 			   connection_info->auth_method == AuthMethod::WINSSPI) {

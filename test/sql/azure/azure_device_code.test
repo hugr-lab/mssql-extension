@@ -1,18 +1,30 @@
 # name: test/sql/azure/azure_device_code.test
-# description: Test Device Code authentication error handling
+# description: Interactive / device-code configuration: the tenant override this
+#              extension supplies, and the azure-secret precondition it needs
 # group: [azure]
 
 require mssql
 
+# NOTE ON FAILURE MODE. This file has no `require-env`, so unlike its neighbours
+# it does not skip quietly when the environment is short of something -- it goes
+# RED. If the runner treats `azure` as satisfiable but never issues LOAD, or an
+# autoload install fails (offline runner, or the ~/.duckdb origin conflict that
+# hits when the extension is already installed from another repo), the first
+# CREATE SECRET below raises "Secret type 'azure' not found" under
+# `statement ok`. azure_secret_token_only.test shares that shape. See
+# `make azure-test` for the provisioning that makes the gate satisfiable.
 require azure
 
-# Note: Interactive device code authentication cannot be fully tested in automated tests
-# because it requires user interaction (visiting URL, entering code).
-# These tests verify error handling and configuration validation only.
+# Note: Interactive device code authentication cannot be fully tested in automated
+# tests because it requires user interaction (visiting URL, entering code).
+# These tests verify configuration handling only.
 
-# Test: Create Azure secret with interactive chain
+# Test: Create Azure secret with interactive chain.
+# CREATE OR REPLACE, not CREATE: this file is run repeatedly against the same
+# `HOME` in the local recipe, and a bare CREATE makes the second run fail on a
+# leftover secret if an earlier run aborted before its DROP.
 statement ok
-CREATE SECRET test_azure_interactive (
+CREATE OR REPLACE SECRET test_azure_interactive (
     TYPE azure,
     PROVIDER credential_chain,
     CHAIN 'interactive'
@@ -24,20 +36,44 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive';
 ----
 1
 
-# Test: Create Azure secret with interactive chain and specific tenant
+# ---------------------------------------------------------------------------
+# The tenant override.
+#
+# A TENANT_ID variant of the azure secret above used to sit here, and it was
+# deleted on 2026-08-13 as "upstream surface, none of our code". That was wrong
+# on the second half. Today's duckdb-azure does reject TENANT_ID on
+# provider=credential_chain -- so the assertion had to go -- but it was the only
+# thing in the tree covering a tenant choice at all, and this extension has its
+# own parameter for exactly that: `azure_tenant_id` on the MSSQL secret,
+# registered since spec 032. It was read by NOTHING in src/ until 2026-08-14,
+# which meant every interactive ATTACH went to the /common/ endpoint
+# (AZURE_DEFAULT_TENANT in azure_device_code.cpp) with no way to say otherwise
+# in a single-tenant org. This is the replacement assertion, on our surface
+# rather than the azure extension's.
+#
+# Scope, honestly: this only shows the parameter is accepted and persisted, and
+# mssql_secret.cpp stored it long before anything read it -- so this assertion
+# passes just as well with the new plumbing ripped out. The one that actually
+# discriminates lives in azure_secret_validation_with_credentials.test, where a
+# valid azure secret plus a deliberately unresolvable tenant proves the override
+# reached AcquireToken. It needs credentials; this one does not.
+# ---------------------------------------------------------------------------
+
 statement ok
-CREATE OR REPLACE SECRET test_azure_interactive_tenant (
-    TYPE azure,
-    PROVIDER credential_chain,
-    CHAIN 'interactive',
-    TENANT_ID 'common'
+CREATE OR REPLACE SECRET test_mssql_tenant (
+    TYPE mssql,
+    HOST 'myserver.database.windows.net',
+    PORT 1433,
+    DATABASE 'mydb',
+    AZURE_SECRET 'test_azure_interactive',
+    AZURE_TENANT_ID 'contoso.onmicrosoft.com'
 );
 
-# Verify secret was created
 query I
-SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive_tenant';
+SELECT secret_string LIKE '%contoso.onmicrosoft.com%'
+FROM duckdb_secrets() WHERE name = 'test_mssql_tenant';
 ----
-1
+true
 
 # Note: Testing mssql_azure_auth_test with interactive secrets would require
 # actual user interaction. In CI environments, this would hang waiting for input.
@@ -46,10 +82,14 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'test_azure_interactive_tenan
 # SELECT mssql_azure_auth_test('test_azure_interactive');
 # -- This will output: "To sign in, visit https://microsoft.com/devicelogin and enter code XXXXXX"
 # -- User must visit the URL and enter the code to complete authentication.
+#
+# The two-argument form takes the tenant explicitly, which is the same override
+# the secret parameter above carries:
+# SELECT mssql_azure_auth_test('test_azure_interactive', 'contoso.onmicrosoft.com');
 
 # Clean up
 statement ok
-DROP SECRET IF EXISTS test_azure_interactive;
+DROP SECRET IF EXISTS test_mssql_tenant;
 
 statement ok
-DROP SECRET IF EXISTS test_azure_interactive_tenant;
+DROP SECRET IF EXISTS test_azure_interactive;

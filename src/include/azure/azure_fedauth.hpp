@@ -63,9 +63,14 @@ std::vector<uint8_t> EncodeFedAuthToken(const std::string &token_utf8);
 //! Acquires token from Azure secret and encodes it for TDS
 //! @param context DuckDB client context for secret access
 //! @param azure_secret_name Name of the Azure secret to use for token acquisition
+//! @param tenant_id_override Tenant to authenticate against, overriding the secret's
+//!        tenant_id. Empty keeps the secret's value; for the interactive /
+//!        device-code chain an empty tenant means "common", which is wrong for a
+//!        single-tenant org.
 //! @return FedAuthData ready for LOGIN7 packet, or invalid if token acquisition failed
 //! @throws ConnectionException if token acquisition fails
-FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azure_secret_name);
+FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azure_secret_name,
+								  const std::string &tenant_id_override = "");
 
 }  // namespace azure
 }  // namespace mssql

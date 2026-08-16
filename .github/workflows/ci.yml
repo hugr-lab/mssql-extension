@@ -580,18 +580,34 @@ jobs:
           # pulls catalog/connection/TLS), so it links the just-built static
           # archives exactly like `make test-cpp` does.
           echo "::group::test_vector_encodings (dictionary/constant vectors -> BCP encoder)"
+          # The archive list is ORDER-SENSITIVE on GNU ld and the order is wrong:
+          # libmssql_extension.a is scanned before anything needs MssqlExtension,
+          # so when libduckdb_static.a's generated_extension_loader.o gets pulled
+          # (it references every statically-registered extension) the linker
+          # cannot go back for the vtable and dies with
+          #   undefined reference to `vtable for duckdb::MssqlExtension'
+          # WHETHER it gets pulled depends on which objects the test happens to
+          # reference -- it flaked on main after #254 and became deterministic on
+          # the spec-068 branch when the tenant wiring shifted the symbol graph.
+          # --start-group makes the resolution iterative, which is what macOS's
+          # ld64 does by default (and why Darwin never failed).
           if [ "$(uname -s)" = "Darwin" ]; then
             PLATLIBS="-framework GSS -framework CoreFoundation -framework Security"
+            GROUP_START=""
+            GROUP_END=""
           else
             PLATLIBS="-ldl -lrt"
+            GROUP_START="-Wl,--start-group"
+            GROUP_END="-Wl,--end-group"
           fi
           "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
             -I src/include -I duckdb/src/include -I "$PREFIX/include" \
             test/cpp/test_vector_encodings.cpp \
+            $GROUP_START \
             build/release/extension/mssql/libmssql_extension.a \
             build/release/src/libduckdb_static.a \
             $(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
-            build/release/src/libduckdb_static.a \
+            $GROUP_END \
             "$PREFIX/lib/libssl.a" "$PREFIX/lib/libcrypto.a" "$PREFIX/lib/libsimdutf.a" \
             $PLATLIBS \
             -o build/test/test_vector_encodings
@@ -1202,30 +1218,198 @@ jobs:
           name: libduckdb-linux_amd64
           path: lib
 
+      - name: Download mssql extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mssql-extension-linux_amd64
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: duckdb-cli-linux_amd64
+          path: cli
+
       - name: Setup executables
         run: |
-          chmod +x test/unittest
+          chmod +x test/unittest cli/duckdb
+
+      # `--autoloading available` on its own is NOT enough, and is actively
+      # worse than nothing here. In sqllogic_test_runner.cpp it sets
+      # autoload_known_extensions=true, and with LOCAL_EXTENSION_REPO unset
+      # local_extension_repo falls back to DUCKDB_BUILD_DIRECTORY/repository —
+      # a path on the machine that BUILT the artifact, which does not exist in
+      # this job. CheckRequire then takes the `INSTALL <ext> FROM '<repo>'`
+      # branch for EVERY require, not just `require azure`, because neither
+      # `mssql` nor anything else outside AUTOLOADABLE_EXTENSIONS is exempt.
+      # So `require mssql` — the first line of every file in the group — fails
+      # and all 20 cases skip. Reproduced exactly with an isolated HOME and no
+      # repository: "All tests were skipped (total skipped 20) / require mssql: 20".
+      #
+      # Both are required together: LOCAL_EXTENSION_REPO alone leaves
+      # autoloading_mode at NONE, and CheckRequire returns MISSING for any
+      # excluded-from-autoloading extension in that mode. This is why
+      # `make azure-test` sets both.
+      - name: Provision local extension repository
+        run: |
+          set -euo pipefail
+          # Install azure into a scratch HOME purely to learn the version and
+          # platform directory names this build expects, and to obtain the
+          # extension itself.
+          scratch="$PWD/ci-ext-home"
+          mkdir -p "$scratch"
+          if ! HOME="$scratch" ./cli/duckdb -c "INSTALL azure;"; then
+            echo "::error::Could not install the azure extension for this build." >&2
+            echo "  Without it every file behind 'require azure' skips." >&2
+            ./cli/duckdb -c "PRAGMA version;" >&2 || true
+            echo "  The most likely cause here is that this is a dev-versioned build of" >&2
+            echo "  duckdb/main: INSTALL then resolves to" >&2
+            echo "    extensions.duckdb.org/<source_id>/<platform>/azure.duckdb_extension.gz" >&2
+            echo "  which exists only if DuckDB's own extension CI published for that exact" >&2
+            echo "  submodule commit. A submodule bump ahead of those publishes fails here" >&2
+            echo "  for a reason unrelated to this extension -- pin the submodule to a SHA" >&2
+            echo "  with published extensions, or build azure from source." >&2
+            exit 1
+          fi
+          # NOT `v*/*/`. The directory is named by
+          # ExtensionHelper::GetVersionDirectoryName(), which returns the
+          # version tag only for a RELEASE build; for anything carrying `-dev`
+          # it returns DuckDB::SourceID() -- a 10-char commit hash, which never
+          # starts with `v`. The duckdb submodule is pinned to `branch = main`
+          # and this workflow passes neither OVERRIDE_GIT_DESCRIBE nor
+          # DUCKDB_EXPLICIT_VERSION, so `git describe` lands off-tag,
+          # DUCKDB_VERSION becomes vX.Y.Z-devN and the hash is what gets used.
+          # A `v*` glob matches nothing here and the step dies before running a
+          # single test. It appeared to work locally only because a shallow
+          # submodule clone stamps v0.0.1, which is release-shaped by accident.
+          extdir=$(ls -d "$scratch"/.duckdb/extensions/*/*/ 2>/dev/null | head -1 || true)
+          if [ -z "$extdir" ]; then
+            echo "::error::INSTALL azure reported success but wrote no extension directory under $scratch/.duckdb/extensions" >&2
+            ./cli/duckdb -c "PRAGMA version;" >&2 || true
+            echo "  The install path is <version-dir>/<platform>/ where version-dir is the" >&2
+            echo "  release tag for a release build and the source_id hash otherwise." >&2
+            exit 1
+          fi
+          echo "Extension directory for this build: $extdir"
+          plat=$(basename "$extdir")
+          ver=$(basename "$(dirname "$extdir")")
+          repo="$PWD/ext-repo/$ver/$plat"
+          mkdir -p "$repo"
+          cp "$extdir"/azure.duckdb_extension "$repo/"
+          cp extension/mssql.duckdb_extension "$repo/"
+          ls -l "$repo"
+          echo "LOCAL_EXTENSION_REPO=$PWD/ext-repo" >> "$GITHUB_ENV"
 
       - name: Run Azure tests
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/lib
           AZURE_SQL_TEST_DSN: ${{ secrets.AZURE_SQL_TEST_DSN }}
+          # azure_lazy_loading.test CREATEs/ALTERs/DROPs tables in `dbo`. The DSN
+          # alone does not authorise that; this is the explicit second gate.
+          AZURE_SQL_DDL_OK: "1"
           AZURE_APP_ID: ${{ secrets.AZURE_APP_ID }}
           AZURE_DIRECTORY_ID: ${{ secrets.AZURE_DIRECTORY_ID }}
           AZURE_APP_SECRET: ${{ secrets.AZURE_APP_SECRET }}
           AZURE_SQL_DB_HOST: ${{ secrets.AZURE_SQL_DB_HOST }}
           AZURE_SQL_DB: ${{ secrets.AZURE_SQL_DB }}
+          # Fabric. The job has been titled "Azure SQL Database and Fabric tests"
+          # since it was written while selecting only `[azure]` — and Catch tags
+          # come from the parent DIRECTORY, so test/sql/fabric/fabric_types.test
+          # is tagged `[fabric]` and was never selected. These three are what it
+          # gates on, and nothing ever set them either, so Fabric had never been
+          # exercised in any lane.
+          AZURE_WH_HOST: ${{ secrets.AZURE_WH_HOST }}
+          AZURE_WH_NAME: ${{ secrets.AZURE_WH_NAME }}
+          AZURE_WH_TOKEN: ${{ secrets.AZURE_WH_TOKEN }}
+          # A group where every file skips still prints "N test cases ... PASSED"
+          # and exits 0 — which is how this job reported success for months while
+          # running zero assertions. Same tripwire as MSSQL_MIN_TEST_CASES.
+          # 60: the azure group alone measured 69 assertions on the first live
+          # dispatch (2026-08-16). Fabric and the DSN-gated files are legitimate
+          # skips when their secrets are absent, so the floor must fit the
+          # azure-only shape; it exists to catch ALL-skip, not partial coverage.
+          AZURE_MIN_ASSERTIONS: "60"
         run: |
+          set -euo pipefail
           echo "============================================"
           echo "Running Azure Tests with unittest"
           echo "============================================"
-          echo "AZURE_APP_ID is set: $([ -n \"$AZURE_APP_ID\" ] && echo 'yes' || echo 'no')"
-          echo "AZURE_DIRECTORY_ID is set: $([ -n \"$AZURE_DIRECTORY_ID\" ] && echo 'yes' || echo 'no')"
-          echo "AZURE_APP_SECRET is set: $([ -n \"$AZURE_APP_SECRET\" ] && echo 'yes' || echo 'no')"
+          # A missing GitHub secret is not an unset variable: the secrets
+          # expression yields '' and the env: block dutifully exports it — and a
+          # SET-BUT-EMPTY variable satisfies `require-env`, so the gated test
+          # RUNS with an empty substitution instead of skipping. That is exactly
+          # how the first live dispatch failed: no AZURE_WH_TOKEN secret in the
+          # environment -> fabric_types.test ran with ACCESS_TOKEN '' -> the
+          # attach fell through to SQL auth -> "Missing 'User Id'". The Makefile
+          # lane already exports only non-empty values; this is the job-side
+          # equivalent. (${!v} indirection, not eval: a DSN value contains ';',
+          # which eval would execute as a command separator.)
+          for v in AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
+                   AZURE_SQL_DB_HOST AZURE_SQL_DB AZURE_SQL_TEST_DSN \
+                   AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN; do
+            if [ -z "${!v:-}" ]; then
+              unset "$v"
+              echo "$v: absent — its tests will skip"
+            else
+              echo "$v: set"
+            fi
+          done
+
+          # AZURE_ACCESS_TOKEN is deliberately NOT a stored secret: a bearer
+          # token for https://database.windows.net/ expires in about an hour, so
+          # a static copy is stale by the second dispatch. Mint one from the
+          # service-principal credentials that are already here; if that fails,
+          # say so and let the token tests skip rather than run with garbage.
+          if [ -n "${AZURE_APP_ID:-}" ] && [ -n "${AZURE_APP_SECRET:-}" ] && [ -n "${AZURE_DIRECTORY_ID:-}" ]; then
+            token=$(curl -s --fail -X POST "https://login.microsoftonline.com/${AZURE_DIRECTORY_ID}/oauth2/v2.0/token" \
+              --data-urlencode "grant_type=client_credentials" \
+              --data-urlencode "client_id=${AZURE_APP_ID}" \
+              --data-urlencode "client_secret=${AZURE_APP_SECRET}" \
+              --data-urlencode "scope=https://database.windows.net/.default" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' || true)
+            if [ -n "$token" ]; then
+              export AZURE_ACCESS_TOKEN="$token"
+              echo "AZURE_ACCESS_TOKEN: minted from the service principal (${#token} chars)"
+            else
+              echo "AZURE_ACCESS_TOKEN: could not mint from the service principal — token tests will skip"
+            fi
+          fi
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           echo "============================================"
 
-          # Run Azure test group
-          ./test/unittest "[azure]" --force-reload
+          # LOCAL_EXTENSION_REPO comes from the provisioning step above and
+          # holds both mssql and azure; --autoloading available is what lets
+          # CheckRequire use it at all. Neither works without the other — see
+          # the comment on that step. Both `[azure]` and `[fabric]` are
+          # selected; the tag is the directory name, not the `# group:` header.
+          echo "LOCAL_EXTENSION_REPO: ${LOCAL_EXTENSION_REPO:-<unset>}"
 
-          echo "Azure tests completed!"
+          # Warm the serverless database. A free/serverless Azure SQL DB
+          # auto-pauses on idle and answers its first logins with 40613
+          # ("not currently available") for 20-60 s while it resumes — which
+          # otherwise lands inside the suite and fails whichever test attaches
+          # first. Best-effort: if it never wakes, the suite fails with the
+          # real 40613 and the message says to retry.
+          if [ -n "${AZURE_SQL_TEST_DSN:-}" ]; then
+            for i in 1 2 3 4 5 6; do
+              if ./cli/duckdb -c "ATTACH '${AZURE_SQL_TEST_DSN}' AS wake (TYPE mssql); SELECT 1;" >/dev/null 2>&1; then
+                echo "serverless database awake (attempt $i)"; break
+              fi
+              echo "waking the serverless database (attempt $i; 40613 while it resumes is expected)..."
+              sleep 20
+            done
+          fi
+          ./test/unittest "[azure],[fabric]" --autoloading available --force-reload 2>&1 | tee azure-tests.out
+
+          asserts=$(grep -oE '[0-9]+ assertions?' azure-tests.out | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ -z "$asserts" ]; then
+            echo "azure-test: could not read an assertion count — the suite did not report" >&2
+            exit 1
+          fi
+          if [ "$asserts" -lt "$AZURE_MIN_ASSERTIONS" ]; then
+            echo "azure-test: only $asserts assertions ran, expected at least $AZURE_MIN_ASSERTIONS." >&2
+            echo "  Every file skipping still exits 0. Check that 'require azure' resolved" >&2
+            echo "  and that the AZURE_* secrets above are actually populated." >&2
+            exit 1
+          fi
+          echo "Azure tests completed! ($asserts assertions, floor $AZURE_MIN_ASSERTIONS)"

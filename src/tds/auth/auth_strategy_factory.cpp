@@ -324,7 +324,7 @@ AuthStrategyPtr AuthStrategyFactory::Create(const MSSQLConnectionInfo &conn_info
 			throw std::runtime_error("AuthStrategyFactory: ClientContext required for Azure authentication");
 		}
 		return CreateFedAuth(*context, conn_info.azure_secret_name, conn_info.database, conn_info.host,
-							 /*tenant_override=*/"", app_name);
+							 conn_info.azure_tenant_id, app_name);
 	} else {
 		// SQL Server authentication
 		return CreateSqlAuth(conn_info.user, conn_info.password, conn_info.database, conn_info.use_encrypt, app_name);

@@ -3,18 +3,25 @@
 # group: [azure]
 
 # This test requires Azure SQL Database credentials set via environment variables:
-# - AZURE_SQL_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
-# - AZURE_SQL_DATABASE: Database name
+# - AZURE_SQL_DB_HOST: Azure SQL server hostname (e.g., myserver.database.windows.net)
+# - AZURE_SQL_DB: Database name
 # - AZURE_APP_ID: Service principal client ID
 # - AZURE_DIRECTORY_ID: Azure AD tenant ID
 # - AZURE_APP_SECRET: Service principal client secret
+#
+# Those are the names `.env.example`, `docs/TESTING.md` and the CI azure job all
+# use. This file gated on AZURE_SQL_HOST / AZURE_SQL_DATABASE until 2026-08-14,
+# which nothing in the repo has ever set, so `require-env` skipped the file
+# before `require azure` was even reached. Same class as MSSQL_TEST_SERVER and
+# MSSQL_TEST_CONNECTION_STRING (see the Makefile) — and `make azure-test` is the
+# target that supplies these.
 
 require mssql
 
 # Skip if Azure SQL connection info not provided
-require-env AZURE_SQL_HOST
+require-env AZURE_SQL_DB_HOST
 
-require-env AZURE_SQL_DATABASE
+require-env AZURE_SQL_DB
 
 require-env AZURE_APP_ID
 
@@ -23,6 +30,16 @@ require-env AZURE_DIRECTORY_ID
 require-env AZURE_APP_SECRET
 
 require azure
+
+# A free-tier serverless Azure SQL database is usually paused when the suite
+# starts, and the first touch gets 40613 while it resumes — which can take well
+# past the 30s default. ATTACH is eager since spec 047 FR-011, so lift the
+# ceiling before attaching rather than after (same as azure_lazy_loading.test).
+statement ok
+SET mssql_connection_timeout = 120;
+
+statement ok
+SET mssql_attach_validation_timeout = 120;
 
 # Create Azure secret for service principal authentication
 statement ok
@@ -38,9 +55,9 @@ CREATE OR REPLACE SECRET azure_sp_secret (
 statement ok
 CREATE OR REPLACE SECRET azure_sql_secret (
     TYPE mssql,
-    HOST '${AZURE_SQL_HOST}',
+    HOST '${AZURE_SQL_DB_HOST}',
     PORT 1433,
-    DATABASE '${AZURE_SQL_DATABASE}',
+    DATABASE '${AZURE_SQL_DB}',
     azure_secret 'azure_sp_secret'
 );
 
@@ -48,15 +65,47 @@ CREATE OR REPLACE SECRET azure_sql_secret (
 statement ok
 ATTACH '' AS azuredb (TYPE mssql, SECRET azure_sql_secret);
 
-# Basic connectivity test - SELECT 1
+# Basic connectivity test - SELECT 1. mssql_scan takes the attached context
+# NAME as a string. The `azuredb.mssql_scan(azuredb, ...)` form this line
+# carried since it was written (WIP commit b8677ef) NEVER worked -- the
+# extension has never registered table functions inside attached catalogs --
+# and never ran either: `require-env` above named variables nothing set, so the
+# whole file was dead weight.
 query I
-SELECT 1 FROM azuredb.mssql_scan(azuredb, 'SELECT 1 AS value');
+SELECT value FROM mssql_scan('azuredb', 'SELECT 1 AS value');
 ----
 1
 
-# Verify we can get connection info
+# mssql_scan goes through MSSQLQueryExecutor and never touches the catalog
+# (mssql_functions.cpp executes it at bind time), so on its own it proves
+# nothing about FEDAUTH + catalog. These two exercise the path the file's
+# description actually promises: metadata load, schema discovery and
+# three-part-name resolution over an Azure AD token. A metadata query that
+# breaks specifically against Azure SQL -- spec 049's sys.partitions subquery,
+# spec 060 native types, the mssql_convert_varchar_max CAST -- fails here and
+# nowhere else.
 query I
-SELECT COUNT(*) >= 0 FROM mssql_pool_stats('azuredb');
+SELECT COUNT(*) > 0 FROM information_schema.schemata
+WHERE catalog_name = 'azuredb' AND schema_name = 'dbo';
+----
+true
+
+# `statement ok`, not a count: how many tables live in dbo is the tenant's
+# business, and asserting `>= 0` on it would be the same tautology this file
+# already carried once. What is being tested is that the table/column metadata
+# query executes and resolves against the attached catalog at all.
+statement ok
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog = 'azuredb' AND table_schema = 'dbo';
+
+# Verify the connection actually went through the pool. `COUNT(*) >= 0` was
+# what this asserted until 2026-08-14, and it cannot fail: mssql_pool_stats
+# swallows an unknown context into zero rows (mssql_diagnostic.cpp, asserted by
+# tds_connection/pool_stats.test), and COUNT(*) over zero rows is 0. It passed
+# with a typo'd catalog name. Assert the counter instead, as tls_connection.test
+# does.
+query I
+SELECT connections_created >= 1 FROM mssql_pool_stats('azuredb');
 ----
 true
 
