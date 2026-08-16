@@ -580,18 +580,34 @@ jobs:
           # pulls catalog/connection/TLS), so it links the just-built static
           # archives exactly like `make test-cpp` does.
           echo "::group::test_vector_encodings (dictionary/constant vectors -> BCP encoder)"
+          # The archive list is ORDER-SENSITIVE on GNU ld and the order is wrong:
+          # libmssql_extension.a is scanned before anything needs MssqlExtension,
+          # so when libduckdb_static.a's generated_extension_loader.o gets pulled
+          # (it references every statically-registered extension) the linker
+          # cannot go back for the vtable and dies with
+          #   undefined reference to `vtable for duckdb::MssqlExtension'
+          # WHETHER it gets pulled depends on which objects the test happens to
+          # reference -- it flaked on main after #254 and became deterministic on
+          # the spec-068 branch when the tenant wiring shifted the symbol graph.
+          # --start-group makes the resolution iterative, which is what macOS's
+          # ld64 does by default (and why Darwin never failed).
           if [ "$(uname -s)" = "Darwin" ]; then
             PLATLIBS="-framework GSS -framework CoreFoundation -framework Security"
+            GROUP_START=""
+            GROUP_END=""
           else
             PLATLIBS="-ldl -lrt"
+            GROUP_START="-Wl,--start-group"
+            GROUP_END="-Wl,--end-group"
           fi
           "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
             -I src/include -I duckdb/src/include -I "$PREFIX/include" \
             test/cpp/test_vector_encodings.cpp \
+            $GROUP_START \
             build/release/extension/mssql/libmssql_extension.a \
             build/release/src/libduckdb_static.a \
             $(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
-            build/release/src/libduckdb_static.a \
+            $GROUP_END \
             "$PREFIX/lib/libssl.a" "$PREFIX/lib/libcrypto.a" "$PREFIX/lib/libsimdutf.a" \
             $PLATLIBS \
             -o build/test/test_vector_encodings
