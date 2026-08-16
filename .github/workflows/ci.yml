@@ -1324,18 +1324,56 @@ jobs:
           # A group where every file skips still prints "N test cases ... PASSED"
           # and exits 0 — which is how this job reported success for months while
           # running zero assertions. Same tripwire as MSSQL_MIN_TEST_CASES.
-          AZURE_MIN_ASSERTIONS: "100"
+          # 60: the azure group alone measured 69 assertions on the first live
+          # dispatch (2026-08-16). Fabric and the DSN-gated files are legitimate
+          # skips when their secrets are absent, so the floor must fit the
+          # azure-only shape; it exists to catch ALL-skip, not partial coverage.
+          AZURE_MIN_ASSERTIONS: "60"
         run: |
           set -euo pipefail
           echo "============================================"
           echo "Running Azure Tests with unittest"
           echo "============================================"
+          # A missing GitHub secret is not an unset variable: the secrets
+          # expression yields '' and the env: block dutifully exports it — and a
+          # SET-BUT-EMPTY variable satisfies `require-env`, so the gated test
+          # RUNS with an empty substitution instead of skipping. That is exactly
+          # how the first live dispatch failed: no AZURE_WH_TOKEN secret in the
+          # environment -> fabric_types.test ran with ACCESS_TOKEN '' -> the
+          # attach fell through to SQL auth -> "Missing 'User Id'". The Makefile
+          # lane already exports only non-empty values; this is the job-side
+          # equivalent. (${!v} indirection, not eval: a DSN value contains ';',
+          # which eval would execute as a command separator.)
           for v in AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
                    AZURE_SQL_DB_HOST AZURE_SQL_DB AZURE_SQL_TEST_DSN \
                    AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN; do
-            eval "val=\${$v:-}"
-            echo "$v is set: $([ -n \"$val\" ] && echo 'yes' || echo 'no')"
+            if [ -z "${!v:-}" ]; then
+              unset "$v"
+              echo "$v: absent — its tests will skip"
+            else
+              echo "$v: set"
+            fi
           done
+
+          # AZURE_ACCESS_TOKEN is deliberately NOT a stored secret: a bearer
+          # token for https://database.windows.net/ expires in about an hour, so
+          # a static copy is stale by the second dispatch. Mint one from the
+          # service-principal credentials that are already here; if that fails,
+          # say so and let the token tests skip rather than run with garbage.
+          if [ -n "${AZURE_APP_ID:-}" ] && [ -n "${AZURE_APP_SECRET:-}" ] && [ -n "${AZURE_DIRECTORY_ID:-}" ]; then
+            token=$(curl -s --fail -X POST "https://login.microsoftonline.com/${AZURE_DIRECTORY_ID}/oauth2/v2.0/token" \
+              --data-urlencode "grant_type=client_credentials" \
+              --data-urlencode "client_id=${AZURE_APP_ID}" \
+              --data-urlencode "client_secret=${AZURE_APP_SECRET}" \
+              --data-urlencode "scope=https://database.windows.net/.default" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' || true)
+            if [ -n "$token" ]; then
+              export AZURE_ACCESS_TOKEN="$token"
+              echo "AZURE_ACCESS_TOKEN: minted from the service principal (${#token} chars)"
+            else
+              echo "AZURE_ACCESS_TOKEN: could not mint from the service principal — token tests will skip"
+            fi
+          fi
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           echo "============================================"
 
