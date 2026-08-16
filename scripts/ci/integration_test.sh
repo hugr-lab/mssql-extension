@@ -164,7 +164,8 @@ cd "$REPO_ROOT"
 
 # The runner reports `require-env` misses as skips, never failures, so a missing variable would
 # quietly reduce the suite to a no-op. The skip list is printed at the end of its output; the
-# expected skips are the optional environments (Azure, Kerberos, TLS, Windows SSPI).
+# expected skips are the optional environments (Kerberos, Windows SSPI, named instance).
+# Azure/Fabric are not among them -- those files are not selected here at all, see below.
 # Select the suite by NAME, not by a path-shaped glob.
 #
 # `test/sql/*` selected zero files here for months while the job reported PASSED
@@ -181,7 +182,21 @@ cd "$REPO_ROOT"
 MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
 
 "$UNITTEST_BIN" --list-tests > /tmp/mssql_all_tests.txt 2>/dev/null || true
-find test/sql -name '*.test' | sort > /tmp/mssql_our_files.txt
+# test/sql/azure and test/sql/fabric are the CLOUD lane and are excluded here for
+# the same reason `make integration-test` excludes them by tag: this job talks to
+# a local SQL Server container, while azure_lazy_loading.test CREATEs, ALTERs and
+# DROPs tables in `dbo` on whatever AZURE_SQL_TEST_DSN points at. They skip today
+# only because this job sets no AZURE_* variables -- which is the "happens to be
+# unset" containment, not containment. Adding those secrets here later would run
+# live DDL against a cloud database from the integration job. `make azure-test`
+# and the azure-test workflow job own these files.
+#
+# Filtering the OWNED list (not just the selection) keeps the
+# every-file-must-be-registered invariant below intact: both counts come from
+# this one file.
+find test/sql -name '*.test' \
+    | grep -v -e '^test/sql/azure/' -e '^test/sql/fabric/' \
+    | sort > /tmp/mssql_our_files.txt
 : > /tmp/mssql_selected.txt
 while read -r f; do
     grep -F -m1 "$f" /tmp/mssql_all_tests.txt | cut -f1 >> /tmp/mssql_selected.txt || true

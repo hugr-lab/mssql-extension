@@ -177,6 +177,9 @@ integration-test: release
 	@# otherwise get live DDL against their Azure database out of this target.
 	@# Verified: 178 registered files -> 167 with the exclusions, none of them
 	@# under test/sql/azure or test/sql/fabric. `make azure-test` runs those.
+	@# The CI integration lane builds its own selection with `find` rather than
+	@# going through this target, so scripts/ci/integration_test.sh carries the
+	@# same exclusion — otherwise the claim would hold for these two targets only.
 	@set -o pipefail; build/release/test/unittest "test/sql/*" "~[azure]" "~[fabric]" --force-reload 2>&1 | tee /tmp/mssql_integration.out
 	@cases=$$(grep -oE '[0-9]+ test cases?' /tmp/mssql_integration.out | tail -1 | grep -oE '^[0-9]+'); \
 	if [ -z "$$cases" ]; then \
@@ -238,7 +241,16 @@ AZURE_ENV_VARS := AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
                   AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
                   AZURE_ACCESS_TOKEN AZURE_SQL_TEST_DSN AZURE_SQL_DDL_OK \
                   AZURE_WH_HOST AZURE_WH_NAME AZURE_WH_TOKEN
+# Gated on the goal, because `export` at makefile scope applies to EVERY recipe
+# in the invocation, not just this one. Ungated, a populated .env would put
+# AZURE_APP_SECRET, AZURE_CLIENT_SECRET, AZURE_ACCESS_TOKEN and the DSN password
+# into the environment of `make release` (cmake, ninja, vcpkg -- which writes
+# build logs), `make docker-up` (the docker CLI), and everything else. The
+# tag-based exclusion below contains the test-SELECTION risk; it does nothing
+# about secrets in unrelated child processes. This does.
+ifneq ($(filter azure-test,$(MAKECMDGOALS)),)
 $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval export $(v))))
+endif
 
 azure-test: release
 	@echo "Running Azure / Fabric tests..."
@@ -247,7 +259,12 @@ azure-test: release
 	@echo "Variables supplied: $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)))"
 	@echo ""
 	@set -e; \
-	repo_dir=$$(ls -d $(AZURE_EXT_REPO)/v*/*/ 2>/dev/null | head -1); \
+	@# `*/*/`, not `v*/*/`: the version directory is the release tag only for a
+	@# RELEASE build. GetVersionDirectoryName() returns DuckDB::SourceID() -- a
+	@# commit hash, never `v`-prefixed -- for anything carrying `-dev`, which is
+	@# every build of the `main`-branch submodule that is not exactly on a tag.
+	@# A shallow clone stamps v0.0.1 and hides this; a full one does not.
+	repo_dir=$$(ls -d $(AZURE_EXT_REPO)/*/*/ 2>/dev/null | head -1); \
 	if [ -z "$$repo_dir" ]; then \
 		echo "azure-test: no local extension repository under $(AZURE_EXT_REPO)." >&2; \
 		echo "  Run 'make release' first." >&2; exit 1; \

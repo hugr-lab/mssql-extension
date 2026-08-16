@@ -1244,14 +1244,34 @@ jobs:
           mkdir -p "$scratch"
           if ! HOME="$scratch" ./cli/duckdb -c "INSTALL azure;"; then
             echo "::error::Could not install the azure extension for this build." >&2
-            echo "  Without it every file behind 'require azure' skips. Check that the" >&2
-            echo "  build stamped a real DuckDB version (a shallow submodule clone" >&2
-            echo "  stamps v0.0.1, and extensions.duckdb.org 404s for it)." >&2
+            echo "  Without it every file behind 'require azure' skips." >&2
+            ./cli/duckdb -c "PRAGMA version;" >&2 || true
+            echo "  The most likely cause here is that this is a dev-versioned build of" >&2
+            echo "  duckdb/main: INSTALL then resolves to" >&2
+            echo "    extensions.duckdb.org/<source_id>/<platform>/azure.duckdb_extension.gz" >&2
+            echo "  which exists only if DuckDB's own extension CI published for that exact" >&2
+            echo "  submodule commit. A submodule bump ahead of those publishes fails here" >&2
+            echo "  for a reason unrelated to this extension -- pin the submodule to a SHA" >&2
+            echo "  with published extensions, or build azure from source." >&2
             exit 1
           fi
-          extdir=$(ls -d "$scratch"/.duckdb/extensions/v*/*/ 2>/dev/null | head -1 || true)
+          # NOT `v*/*/`. The directory is named by
+          # ExtensionHelper::GetVersionDirectoryName(), which returns the
+          # version tag only for a RELEASE build; for anything carrying `-dev`
+          # it returns DuckDB::SourceID() -- a 10-char commit hash, which never
+          # starts with `v`. The duckdb submodule is pinned to `branch = main`
+          # and this workflow passes neither OVERRIDE_GIT_DESCRIBE nor
+          # DUCKDB_EXPLICIT_VERSION, so `git describe` lands off-tag,
+          # DUCKDB_VERSION becomes vX.Y.Z-devN and the hash is what gets used.
+          # A `v*` glob matches nothing here and the step dies before running a
+          # single test. It appeared to work locally only because a shallow
+          # submodule clone stamps v0.0.1, which is release-shaped by accident.
+          extdir=$(ls -d "$scratch"/.duckdb/extensions/*/*/ 2>/dev/null | head -1 || true)
           if [ -z "$extdir" ]; then
             echo "::error::INSTALL azure reported success but wrote no extension directory under $scratch/.duckdb/extensions" >&2
+            ./cli/duckdb -c "PRAGMA version;" >&2 || true
+            echo "  The install path is <version-dir>/<platform>/ where version-dir is the" >&2
+            echo "  release tag for a release build and the source_id hash otherwise." >&2
             exit 1
           fi
           echo "Extension directory for this build: $extdir"
