@@ -247,7 +247,15 @@ AZURE_ENV_VARS := AZURE_APP_ID AZURE_DIRECTORY_ID AZURE_APP_SECRET \
 # into the environment of `make release` (cmake, ninja, vcpkg -- which writes
 # build logs), `make docker-up` (the docker CLI), and everything else. The
 # tag-based exclusion below contains the test-SELECTION risk; it does nothing
-# about secrets in unrelated child processes. This does.
+# about secrets in unrelated child processes.
+#
+# The gate is per-INVOCATION, not per-recipe, so it only helps if nothing else
+# is built in the same command line. `azure-test: release` defeated it
+# completely: `make azure-test` on an unbuilt tree satisfies the gate and then
+# runs cmake/ninja/vcpkg inside it, which is the one invocation the gate exists
+# for. So `release` is NOT a prerequisite -- build separately
+# (`make release && make azure-test`) and the recipe's own guard says so when
+# the build is missing.
 ifneq ($(filter azure-test,$(MAKECMDGOALS)),)
 # Strip ONE layer of surrounding quotes first. `-include .env` reads the file
 # with make's syntax, not the shell's: for the shell `VAR='x'` means x, for
@@ -262,29 +270,49 @@ $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval $(v) := $(call unquote,$($(v))
 $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(eval export $(v))))
 endif
 
-azure-test: release
+azure-test:
 	@echo "Running Azure / Fabric tests..."
-	@echo "NOTE: needs real Azure credentials in .env (see .env.example) and the"
-	@echo "      azure extension installed locally: duckdb -c 'INSTALL azure;'"
+	@echo "NOTE: needs real Azure credentials in .env (see .env.example), a built"
+	@echo "      tree ('make release'), and the azure extension installed locally"
+	@echo "      for THIS build: ./build/release/duckdb -c 'INSTALL azure;'"
 	@echo "Variables supplied: $(foreach v,$(AZURE_ENV_VARS),$(if $($(v)),$(v)))"
 	@echo ""
-# '*/*/', not 'v*/*/': the version directory is the release tag only for a
-# RELEASE build. GetVersionDirectoryName() returns DuckDB::SourceID() -- a
-# commit hash, never 'v'-prefixed -- for anything carrying '-dev', which is
-# every build of the 'main'-branch submodule that is not exactly on a tag.
-# A shallow clone stamps v0.0.1 and hides this; a full one does not.
+# The version directory is the release tag only for a RELEASE build.
+# GetVersionDirectoryName() returns DuckDB::SourceID() -- a commit hash, never
+# 'v'-prefixed -- for anything carrying '-dev', which is every build of the
+# 'main'-branch submodule that is not exactly on a tag. A shallow clone stamps
+# v0.0.1 and hides this; a full one does not.
+#
+# So ASK THE BINARY rather than globbing. `ls */*/ | head -1` takes the
+# lexicographically first of however many directories exist, and
+# build/release/repository is never cleaned between builds -- after a submodule
+# bump it holds the old and the new, and the stale one can win. The failure was
+# loud but named a version this binary does not use, which reads as "install
+# azure" rather than "stale repository directory".
+#
 # (Make comment, NOT tab-@#-in-a-continuation: a comment line spliced into the
 # 'set -e; \' continuation reaches the shell with its '@#' intact and its
 # backticks LIVE -- `*/*/` executed as command substitution and the recipe
 # died with '@#: command not found' before running a single test.)
 	@set -e; \
-	repo_dir=$$(ls -d $(AZURE_EXT_REPO)/*/*/ 2>/dev/null | head -1); \
-	if [ -z "$$repo_dir" ]; then \
-		echo "azure-test: no local extension repository under $(AZURE_EXT_REPO)." >&2; \
+	if [ ! -x build/release/duckdb ]; then \
+		echo "azure-test: build/release/duckdb missing - run 'make release' first." >&2; \
+		exit 1; \
+	fi; \
+	lib_ver=$$(build/release/duckdb -noheader -list -c "SELECT library_version FROM pragma_version();"); \
+	src_id=$$(build/release/duckdb -noheader -list -c "SELECT source_id FROM pragma_version();"); \
+	case "$$lib_ver" in \
+		*-dev*) ver="$$src_id" ;; \
+		*)      ver="$$lib_ver" ;; \
+	esac; \
+	plat=$$(build/release/duckdb -noheader -list -c "PRAGMA platform;"); \
+	echo "azure-test: extension directory for this build: $$ver/$$plat"; \
+	repo_dir="$(AZURE_EXT_REPO)/$$ver/$$plat"; \
+	if [ ! -d "$$repo_dir" ]; then \
+		echo "azure-test: no local extension repository at $$repo_dir." >&2; \
 		echo "  Run 'make release' first." >&2; exit 1; \
 	fi; \
-	rel=$${repo_dir#$(AZURE_EXT_REPO)/}; \
-	src="$$HOME/.duckdb/extensions/$${rel%/}/azure.duckdb_extension"; \
+	src="$$HOME/.duckdb/extensions/$$ver/$$plat/azure.duckdb_extension"; \
 	if [ ! -f "$$src" ]; then \
 		echo "azure-test: $$src not found." >&2; \
 		echo "  Install the azure extension for this DuckDB version first:" >&2; \
@@ -1019,7 +1047,7 @@ help:
 	@echo "Custom targets:"
 	@echo "  make vcpkg-setup          - Bootstrap vcpkg (required for TLS support)"
 	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
-	@echo "  make azure-test           - Run Azure/Fabric tests (requires cloud credentials + azure ext)"
+	@echo "  make azure-test           - Run Azure/Fabric tests (build first; needs cloud creds + azure ext)"
 	@echo "  make counters-test        - Run the SQL suite with MSSQL_COUNTERS=1 (exercises the counter path)"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"

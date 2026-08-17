@@ -953,9 +953,12 @@ DROP SECRET azure_sp;
 3. **Test token acquisition only** - `mssql_azure_auth_test()` validates tokens without SQL Server
 4. **Keep tests in `test/sql/azure/`** - the directory *is* the `[azure]` tag; see the note under
    [Test Groups](#test-groups) — the `# group:` header selects nothing
-5. **Run them with `make azure-test`** - it provisions the azure extension into the local extension
-   repository (without which `require azure` is unsatisfiable and every file skips silently), passes
-   only the non-empty `AZURE_*` variables, and fails if fewer than `AZURE_MIN_ASSERTIONS` ran
+5. **Run them with `make release && make azure-test`** - it provisions the azure extension into the
+   local extension repository (without which `require azure` is unsatisfiable and every file skips
+   silently), passes only the non-empty `AZURE_*` variables, and fails if fewer than
+   `AZURE_MIN_ASSERTIONS` ran. Build as a **separate invocation**: `release` is deliberately not a
+   prerequisite of `azure-test`, because the `AZURE_*` values are exported for the whole invocation
+   and would otherwise reach cmake/ninja/vcpkg
 
 **Azure AD Authentication Methods:**
 

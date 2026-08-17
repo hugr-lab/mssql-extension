@@ -1282,7 +1282,27 @@ jobs:
           # A `v*` glob matches nothing here and the step dies before running a
           # single test. It appeared to work locally only because a shallow
           # submodule clone stamps v0.0.1, which is release-shaped by accident.
-          extdir=$(ls -d "$scratch"/.duckdb/extensions/*/*/ 2>/dev/null | head -1 || true)
+          # $scratch is created fresh in this step, so exactly one directory is
+          # expected; assert that rather than silently taking the first of
+          # several. (The Makefile derives the name from the binary instead,
+          # because build/release/repository is NOT cleaned between builds and
+          # can hold a stale entry. Here the directory is new, so counting is
+          # enough.)
+          #
+          # `dirs=$(...) || dirs=""`, not a pipeline into wc: under
+          # `set -euo pipefail` an unmatched glob makes ls exit 2, pipefail
+          # propagates it through wc/tr, and the assignment then aborts the step
+          # via set -e -- before the diagnostic below could print, in exactly
+          # the case it was written for. That is also why the extdir line has
+          # its `|| true`.
+          dirs=$(ls -d "$scratch"/.duckdb/extensions/*/*/ 2>/dev/null) || dirs=""
+          found=$(printf '%s' "$dirs" | grep -c . || true)
+          if [ "$found" -gt 1 ]; then
+            echo "::error::expected one extension directory under $scratch, found $found:" >&2
+            printf '%s\n' "$dirs" >&2
+            exit 1
+          fi
+          extdir=$(printf '%s' "$dirs" | head -1)
           if [ -z "$extdir" ]; then
             echo "::error::INSTALL azure reported success but wrote no extension directory under $scratch/.duckdb/extensions" >&2
             ./cli/duckdb -c "PRAGMA version;" >&2 || true
