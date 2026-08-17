@@ -7,10 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-17
+
 ### Fixed
 
+- **Azure Synapse Serverless login** (#254; closes
+  [discussion #88](https://github.com/hugr-lab/mssql-extension/discussions/88),
+  [#164](https://github.com/hugr-lab/mssql-extension/issues/164)).
+  `ParseLoginResponse` skipped DONE/DONEPROC/DONEINPROC as 8 bytes after
+  the token byte — the pre-7.2 layout with a 4-byte row count. We negotiate
+  TDS 7.4, where `DoneRowCount` is 8 bytes ([MS-TDS] 2.2.7.9), so every
+  DONE token desynced the parse by 4 bytes. Harmless against regular SQL
+  Server, which sends LOGINACK first and DONE last; fatal against Synapse
+  Serverless, which runs internal procs during login and fronts the
+  LOGINACK with a run of DONEINPROC tokens — the parser never reached the
+  LOGINACK, and every auth path failed with `No LOGINACK token in
+  response`. `ParseDoneForAttentionAck` had the same 8-byte skip; fixed
+  alike. The unit-test DONE helper itself emitted the pre-7.2 layout —
+  which is why the fixtures never caught this — and now emits 7.2+; two
+  regressions replay the Synapse token pattern, and #255 adds a fuzz corpus
+  over login-response token streams plus tests for the quiet casualties of
+  the same skip. Confirmed against a reporter's `MSSQL_DEBUG=2` hex dump of
+  the exact stream.
+
+- **Login errors are translated from the server's error number, not our own
+  wrapper text** (#262, via #263). Every login-time server error used to
+  surface as "check username and password", because the translator
+  pattern-matched the wrapper message it had itself produced.
+  Classification now reads the server's error number: 40613/40197/40501/
+  49918 are named as retryable (Azure serverless resume, reconfiguration,
+  throttling), 18456 keeps and explains its State byte, and the server's
+  own message text is always appended.
+
+- **Kerberos SPN derivation from an IP literal** (#259, via #263). An SPN
+  built from an IP can never match an Active Directory registration. IP
+  literals are now reverse-resolved to the host's name (definitive answers
+  only, memoized); hostnames pass through unresolved. The derivation is
+  shared with the `mssql_kerberos_auth_test` diagnostics, so they cannot
+  report an SPN the connection path would not request.
+
+- **Windows build**: `winsock2.h` is included before anything that reaches
+  `windows.h` in the auth strategy factory (d5408e5).
+
 - **Login-time routing is now followed on every authentication path**
-  (spec 068). A server can answer LOGIN7 with a ROUTING ENVCHANGE (type 20)
+  (spec 068, #258). A server can answer LOGIN7 with a ROUTING ENVCHANGE (type 20)
   meaning "log in over there instead" — Azure SQL Managed Instance, Azure SQL
   under the **Redirect** connection policy (the default for clients connecting
   from inside Azure), Fabric/Synapse gateways, and on-prem AlwaysOn read-only
@@ -43,6 +83,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AuthenticatorFactory` (`(host, port) -> IAuthenticator`) instead of a
   pre-built authenticator. Affects embedders calling the TDS layer directly.
 
+### Added
+
+- **`azure_tenant_id` on ATTACH and MSSQL secrets now works** (#264). The
+  parameter has been registered on the MSSQL secret since spec 032 and was
+  read by nothing: `credential_chain`/`interactive` authentication always
+  fell back to the `/common/` endpoint, with no way to pick a tenant in a
+  single-tenant org (`TENANT_ID` on the *azure* secret is not an
+  alternative — duckdb-azure rejects it on `provider='credential_chain'`).
+  The value now flows into token acquisition (ATTACH option
+  `azure_tenant_id` / `azure_tenant` overrides the secret's value) and into
+  the token-cache key, so two tenants never share a token.
+- **A runnable Azure test lane** (#264, #265). `require azure` was
+  unsatisfiable in every environment the suite ran in, so the whole
+  `[azure]` group silently skipped. `make azure-test` now self-provisions
+  the azure extension into a local extension repository and runs the group
+  against live Azure SQL (serverless warm-up, assertion floor); CI gains a
+  manually dispatched job (`run_azure_tests`) that mints the
+  service-principal token in-job and unsets absent secrets, so files skip
+  instead of failing on empty values. The two tests the skip had hidden —
+  never-executed WIP syntax — are fixed.
+- **Windows SSPI CI coverage** (#260): a context/token test runs on every
+  PR in an ungated job, needing no domain and no SQL Server. **Kerberos
+  routing-hop e2e** (#261): `test/kerberos` gained a routing gateway, so CI
+  shows a real MIT KDC issuing a second service ticket for the routed host.
+- Multi-column read coverage the one-column spec-058 cases could not reach
+  (#251).
+
+### CI / Build
+
+- The DuckDB-compat matrix could pass without comparing and broke its own
+  `--json` output (#250); the LOB detector is excluded from the TruffleHog
+  secret scan (#252); the Security Scan can be dispatched manually (#253).
+- Linux CI fetches the simdutf amalgamation directly instead of a distro
+  package; the unit-test link is wrapped in `--start-group` so GNU ld's
+  single-pass archive scan cannot drop the extension loader (via #264).
+
+> The three sections below were backfilled on 2026-08-17: v0.2.1–v0.2.3
+> shipped without CHANGELOG sections. The spec 052 and credential-wipe
+> entries under 0.2.1 were written at the time but sat under [Unreleased].
+
+## [0.2.3] - 2026-08-07
+
+The performance release. Full v0.2.2 → v0.2.3 report:
+`test/bench/bench_results_v023_report.md` (44 columns × 38M rows,
+interleaved same-session A/B).
+
+### Changed
+
+- **Write path rebuilt** — columnar encode, parallel writers, TABLOCK and
+  flush policy sized to columnstore rowgroups (specs 057/063/064; #234,
+  #240, #241). Like-for-like 1.34×, out of the box ≈6× (parallel writers),
+  sized strings ≈9.7×.
+- **Read path staged** — column-major staging + batch decode (spec 055,
+  #213: read −14…−47%), framing (spec 058, #244), materialization quick
+  wins (spec 054, #209), uniform column chunks published as CONSTANT
+  vectors (spec 056, #221). Reads 1.22–1.40× wall vs 0.2.2.
+- **UTF8SUPPORT advertised in LOGIN7** (#225, #227) — UTF-8-collated
+  columns arrive as UTF-8 instead of being transcoded to UTF-16.
+- Default TDS packet size 4096 → 16384 (`mssql_tds_packet_size`, spec 055).
+- **Target column types and table shape for CTAS/COPY** (spec 060, #230):
+  `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` annotations, `table_kind`
+  (heap/columnstore), UTF-8 collation for created VARCHAR columns.
+
+### Fixed
+
+- Partitioned tables were unreadable, and their row estimate came from one
+  arbitrary partition (spec 049, #85, #223).
+- DATETIME day count widened before epoch conversion (#222).
+- Catalog-scan bind data is serialized, so common-subplan optimization
+  keeps subplans distinct (#211).
+- 0.2.2 segfaulted on dictionary vectors from any real columnar source —
+  found while sizing this release's report, pinned by
+  `test/sql/copy/vector_encodings_bcp.test` (#245).
+
+### Added
+
+- Versioned documentation site (Docusaurus, #243).
+- Staged-read-path test pack — and the four defects it found (spec 059,
+  #220).
+- Local SQL Server version × charset compat matrix (#232).
+
+### CI / Build
+
+- POSIX vcpkg clones pinned to vcpkg.json's builtin-baseline (#249).
+
+## [0.2.2] - 2026-07-28
+
+### Changed
+
+- DuckDB bumped to v1.5.5 (#207); OpenSSL 3.4.1 → 3.5.4 LTS.
+
+### Fixed
+
+- The named-instance resolver (spec 045) is actually wired into ATTACH —
+  `Server=host\instance` resolves through the SQL Server Browser (#205,
+  #206).
+- Reentrant `gmtime_r`/`gmtime_s` in Azure token timestamp formatting
+  (#194).
+- COPY connection leak (#191, #193).
+
+### CI / Build
+
+- The SQLLogicTest suite actually runs in CI (#192); vcpkg binary caching
+  repaired after GitHub removed `x-gha` (#198); CodeQL filters vendored
+  dependencies (#195).
+
+## [0.2.1] - 2026-06-07
+
+### Changed
+
+- DuckDB submodule pinned to v1.5.3 (#148); spec 051 API-compat shim
+  (`mssql_compat.hpp`) so one source tree compiles against both the pinned
+  SHA and rolling DuckDB main (#124).
+- `DATAMODEL.md` — layered architecture reference with diagrams (#130).
+
+### Fixed
+
+- **Integrated-auth LOGIN7 is fragmented across TDS packets** (#138) — an
+  AD-sized Kerberos PAC overflowed a single packet and broke login. Adds
+  the test-only `mssql_login7_max_packet` setting so the multi-packet path
+  is exercisable without a real AD.
+- `mssql_query_timeout` is honored in `mssql_exec()`; long-running
+  statements are no longer dropped (#90, #145).
+- Clean error for DELETE on tables without a primary key (#141).
 - **dbt segfault with `threads >= 2`** (spec 052, closes
   [#126](https://github.com/hugr-lab/mssql-extension/issues/126)).
   Catalog entries (`MSSQLTableEntry`, `MSSQLSchemaEntry`) switched from
@@ -394,5 +558,10 @@ Notable recent specs:
 
 See `specs/` for the full feature design history.
 
-[Unreleased]: https://github.com/oluies/mssql-extension/compare/v0.1.18...HEAD
-[0.1.18]: https://github.com/oluies/mssql-extension/releases/tag/v0.1.18
+[Unreleased]: https://github.com/hugr-lab/mssql-extension/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/hugr-lab/mssql-extension/compare/v0.2.3...v0.2.4
+[0.2.3]: https://github.com/hugr-lab/mssql-extension/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/hugr-lab/mssql-extension/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/hugr-lab/mssql-extension/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/hugr-lab/mssql-extension/compare/v0.1.18...v0.2.0
+[0.1.18]: https://github.com/hugr-lab/mssql-extension/releases/tag/v0.1.18
