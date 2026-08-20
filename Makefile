@@ -671,7 +671,7 @@ TOKEN_SEC_TEST_SOURCES := \
     src/tds/encoding/utf16.cpp
 TOKEN_SEC_TEST_FLAGS := -std=c++17 -g -O1 -pthread -Wno-deprecated-declarations \
     -fsanitize=address,undefined -fno-sanitize-recover=all
-TOKEN_SEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+TOKEN_SEC_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
     -I $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/include
 TOKEN_SEC_TEST_LIBS := -L $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
 
@@ -771,7 +771,7 @@ CODEC_STAGING_TEST_FLAGS := -std=c++17 -O1 -pthread -Wno-deprecated-declarations
 test-column-staging: release
 	@echo "Building codec::staging unit test (spec 055 D3)..."
 	@mkdir -p build/test
-	$(CXX) $(CODEC_STAGING_TEST_FLAGS) -I src/include -I duckdb/src/include \
+	$(CXX) $(CODEC_STAGING_TEST_FLAGS) -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
 	    test/cpp/codec/test_column_staging.cpp \
 	    src/codec/staging/column_staging.cpp \
 	    src/codec/staging/column_ops.cpp \
@@ -838,7 +838,7 @@ test-row-stager-framing: release
 CODEC_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
 CODEC_TEST_VCPKG_TRIPLET := $(shell ls $(CODEC_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
 CODEC_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
-CODEC_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+CODEC_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
     -I $(CODEC_TEST_VCPKG_INSTALLED)/$(CODEC_TEST_VCPKG_TRIPLET)/include
 # Link against built libduckdb.dylib (built by `make debug`) for Value/Vector/hugeint
 # symbols. Tests run with DYLD_LIBRARY_PATH set so the loader can find it.
@@ -936,7 +936,7 @@ test-literal-format: debug
 #   test-issue-96-attach-loop           — Scenario 4   (SC-009, closes #96)
 #   test-spec047-us1                    — meta target: builds + runs both
 SPEC047_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
-SPEC047_TEST_INCLUDES := -I duckdb/src/include
+SPEC047_TEST_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include
 SPEC047_TEST_LIBS := -L build/debug/src -lduckdb
 
 # On Linux, libduckdb.so is ASan/UBSan-instrumented (DuckDB CMake default for

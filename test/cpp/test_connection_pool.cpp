@@ -12,7 +12,7 @@
 //                       Set to "true", "1", or "yes" to enable
 //
 // Compile (from project root):
-//   g++ -std=c++17 -I src/include -I duckdb/src/include \
+//   g++ -std=c++17 -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
 //       test/cpp/test_connection_pool.cpp \
 //       src/tds/tds_connection.cpp src/tds/tds_socket.cpp \
 //       src/tds/tds_protocol.cpp src/tds/tds_packet.cpp \

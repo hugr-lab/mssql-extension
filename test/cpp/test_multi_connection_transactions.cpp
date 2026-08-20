@@ -18,7 +18,7 @@
 //
 // Compile (from project root, after building extension):
 //   # The test links against DuckDB and loads the extension dynamically
-//   g++ -std=c++17 -I duckdb/src/include \
+//   g++ -std=c++17 -I duckdb/src/include -I duckdb/third_party/fmt/include \
 //       test/cpp/test_multi_connection_transactions.cpp \
 //       -L build/release -lduckdb -pthread -o test_multi_conn_txn
 //
