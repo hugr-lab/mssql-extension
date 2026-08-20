@@ -23,8 +23,9 @@
 
 #if __has_include(<duckdb/common/vector/flat_vector.hpp>)
 #include <duckdb/common/vector/flat_vector.hpp>
-// Spec 069: StringVector / StructVector moved out of types/vector.hpp on the
-// same SHAs that relocated FlatVector, so they ride the same sentinel.
+// Spec 069: StringVector / StructVector left types/vector.hpp later than
+// FlatVector did (they are still in types/vector.hpp on v1.5.5), hence the
+// nested probe rather than riding the FlatVector sentinel.
 #if __has_include(<duckdb/common/vector/string_vector.hpp>)
 #include <duckdb/common/vector/string_vector.hpp>
 #include <duckdb/common/vector/struct_vector.hpp>
