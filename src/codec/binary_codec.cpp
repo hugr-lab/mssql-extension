@@ -32,7 +32,8 @@
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/tds_column_metadata.hpp"
 

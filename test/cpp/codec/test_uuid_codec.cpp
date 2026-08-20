@@ -37,7 +37,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cassert>
 #include <cstdint>

@@ -51,7 +51,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include <simdutf.h>
 

@@ -51,7 +51,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstring>
 #include <functional>

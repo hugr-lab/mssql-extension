@@ -40,7 +40,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/decimal_encoding.hpp"
 #include "tds/encoding/type_converter.hpp"

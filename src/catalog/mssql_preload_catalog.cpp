@@ -4,7 +4,8 @@
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_statistics.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -21,8 +22,11 @@ namespace duckdb {
 // Bind Function - Validates arguments at compile time
 //===----------------------------------------------------------------------===//
 
-MSSQL_BIND_SCALAR_SIG(MSSQLPreloadCatalogBind) {
-	MSSQL_BIND_SCALAR_PROLOGUE
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLPreloadCatalogBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	(void)context;
+	(void)arguments;
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_preload_catalog: catalog_name must be a constant, not a parameter");

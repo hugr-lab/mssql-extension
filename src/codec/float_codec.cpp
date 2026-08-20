@@ -26,7 +26,7 @@
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cmath>
 #include <cstdint>

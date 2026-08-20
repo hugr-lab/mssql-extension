@@ -3,7 +3,7 @@
 
 #include "catalog/mssql_refresh_function.hpp"
 #include "catalog/mssql_catalog.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -21,8 +21,11 @@ namespace duckdb {
 // Bind Function - Validates arguments at compile time
 //===----------------------------------------------------------------------===//
 
-MSSQL_BIND_SCALAR_SIG(MSSQLRefreshCacheBind) {
-	MSSQL_BIND_SCALAR_PROLOGUE
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLRefreshCacheBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	(void)context;
+	(void)arguments;
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_refresh_cache: catalog_name must be a constant, not a parameter");

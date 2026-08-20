@@ -33,7 +33,7 @@
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/guid_encoding.hpp"
 #include "tds/tds_column_metadata.hpp"
 

@@ -26,7 +26,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/decimal_encoding.hpp"
 
 #include <cstdint>

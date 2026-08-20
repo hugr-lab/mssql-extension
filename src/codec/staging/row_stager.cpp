@@ -13,7 +13,7 @@
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "duckdb/common/exception.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/type_converter.hpp"
 
 #include <chrono>

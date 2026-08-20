@@ -5,7 +5,7 @@ DuckDB extension for SQL Server via a custom TDS protocol implementation (no Fre
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard)
-- **DuckDB**: main branch, supports both stable (1.4.x) and nightly APIs via `src/include/mssql_compat.hpp`
+- **DuckDB**: main branch (2.0 API track, spec 069). The 1.5.x world lives on branch `duckdb-v1.5.5` for 0.2.x maintenance releases; main compiles against the pinned duckdb submodule SHA only (no dual-API shim since spec 069 retired `mssql_compat.hpp`)
 - **TLS**: OpenSSL via vcpkg (statically linked, symbol visibility controlled)
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC, MinGW/Rtools 4.2)
 
@@ -153,7 +153,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 - **DML**: INSERT uses batched VALUES; UPDATE/DELETE use rowid-based VALUES JOIN pattern with deferred execution in transactions.
 - **DDL**: `CREATE TABLE IF NOT EXISTS` silently succeeds when table exists; `CREATE OR REPLACE TABLE` drops and recreates. Auto-TABLOCK enabled for new table creation (CTAS/COPY TO).
 - **Filter pushdown**: DuckDB filter expressions translated to T-SQL WHERE clauses. Function mapping for common string/date/arithmetic operations.
-- **DuckDB API compat**: `src/include/mssql_compat.hpp` adapts API-shape differences between DuckDB SHAs so a single source tree compiles against both the pinned submodule SHA and rolling main. Detection uses `__has_include` on a target-SHA-only header (no CMake autodetect). Currently shims (spec 051): FlatVector header relocation to `<duckdb/common/vector/flat_vector.hpp>`, and the single-arg `bind_scalar_function_t` signature via `MSSQL_BIND_SCALAR_SIG` / `MSSQL_BIND_SCALAR_PROLOGUE` macros. Unconditional renames (`IsInterrupted`, `SetNullHandling`) live at call sites, not in the header.
+- **DuckDB API (2.0 track, spec 069)**: main targets duckdb main only — `mssql_compat.hpp` (spec 051) is retired; 1.5.x compatibility lives on branch `duckdb-v1.5.5`. The 2.0 contracts that bit during migration and MUST be honored by new code: producers filling vectors call `DataChunk::SetChildCardinality` (vectors carry their own size; the deprecated `SetCardinality` sets only the chunk count and every consumer keyed on `Vector::size()` sees an empty vector); scalar functions that throw at runtime declare `SetFallible()`; writes go through `FlatVector::GetDataMutable`/`ValidityMutable` (checked in release — hoist out of row loops; the per-value `DecodeFromTds` bodies use the `*Unsafe` forms, justified in `specs/069-duckdb-v2-migration/bench-results.md`); every TableFilter handed to a `filter_pushdown` scan must be applied by the scan (DuckDB does not re-check — refused filters run client-side via the net in `table_scan.cpp`); `Identifier` stays at the DuckDB API boundary, internal metadata/TDS/SQL text remain `std::string`.
 
 ## Windows Build Support
 

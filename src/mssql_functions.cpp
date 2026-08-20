@@ -7,12 +7,12 @@
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -292,8 +292,11 @@ struct MSSQLExecBindData : public FunctionData {
 };
 
 // Bind function for mssql_exec
-MSSQL_BIND_SCALAR_SIG(MSSQLExecBind) {
-	MSSQL_BIND_SCALAR_PROLOGUE
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	(void)context;
+	(void)arguments;
 	// First argument is the context name (attached database name, must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");

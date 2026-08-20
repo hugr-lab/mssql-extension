@@ -14,9 +14,10 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "mssql_compat.hpp"		// For FlatVector header relocation (spec 051 M2)
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
 #include "table_scan/filter_encoder.hpp"
