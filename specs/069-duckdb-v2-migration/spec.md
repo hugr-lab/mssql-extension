@@ -136,6 +136,38 @@ Found by the test suite, not the error log — the reason step 7 exists:
   inside the `BOUND_FUNCTION` arm; pushdown equivalence is exactly what the
   filter-pushdown test files must confirm at step 7.
 
+### Cluster G — found by the live integration suite
+
+- **Vectors carry their own size** (`Vector::size()` from the buffer), and
+  every consumer keyed on it — `VectorOperations::IsNull`, filter execution,
+  the hash join — sees an empty vector unless the producer sets it. The
+  deprecated `SetCardinality` sets only the chunk's logical count. All 15
+  producer sites moved to `SetChildCardinality`, plus explicit
+  `FlatVector::SetSize` on the rowid-STRUCT target vectors (they are not in
+  `chunk.data`). One root, five distinct symptoms across 9 red tests.
+- **The filter combiner pushes predicates as `ExpressionFilter`s with
+  `BoundReference(0)`** (the column travels in the filter's slot, not in the
+  expression). Encoder support added (the `filter_column` context). And
+  because 2.0 does NOT re-apply TableFilters behind a `filter_pushdown`
+  scan, a refused filter now silently returns wrong rows — closed by the
+  client-filter net: refused filters run client-side per chunk via their
+  `ToExpression` + `ExpressionExecutor::SelectExpression`, with a fetch loop
+  so a filtered-to-empty chunk does not end the scan.
+- **`LogicalInsert::column_index_map` is no longer populated**: the binder
+  expands the insert child to every physical column, moving an unnamed
+  column's `bound_defaults` slot into the projection (leaving it null) and
+  keeping a named column's slot alive. PlanInsert now reads that tell —
+  unnamed columns stay out of the generated column list, so identity and
+  server-side defaults keep working; the batch serializer addresses the
+  (always full-width) chunk by table ordinal.
+- **Writer-scheduling dilution, not a code bug**: 2.0 parallelizes small
+  scans across sink threads, so a 110k-row COPY split over 8 writers puts
+  every writer below the 102400 columnstore threshold and nothing
+  compresses. The threshold test pins one writer. Follow-up worth a spec:
+  lazy writer ramp-up (spawn writer N+1 only once writer N has buffered a
+  full flush batch) would keep compression for small loads without giving
+  up parallelism on big ones.
+
 ## Out of scope
 
 - Adopting the new (non-Legacy) filter representation — phase 2, own spec.

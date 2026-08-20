@@ -10,10 +10,23 @@
 #include <chrono>
 #include <string>
 #include "duckdb.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "query/mssql_result_stream.hpp"
 
 namespace duckdb {
 namespace mssql {
+
+// A TableFilter the encoder could not push, re-applied client-side over the
+// scan output. On 2.0 DuckDB does not re-check TableFilters behind a
+// filter_pushdown scan, so a refused filter MUST be executed here or the scan
+// returns wrong rows. The expression is the filter's ToExpression over
+// BoundReference(0); the executor holds a reference into it, hence both live
+// here together.
+struct ClientTableFilter {
+	idx_t out_col;
+	unique_ptr<Expression> expr;
+	unique_ptr<ExpressionExecutor> executor;
+};
 
 /**
  * Global execution state for table scan.
@@ -39,6 +52,9 @@ struct TableScanGlobalState : public GlobalTableFunctionState {
 	// Filter pushdown state
 	bool filter_pushdown_applied = false;
 	bool needs_duckdb_filter = false;
+
+	// Filters refused by the encoder, executed client-side per chunk.
+	std::vector<ClientTableFilter> client_filters;
 
 	// Destructor - cleanup and logging
 	~TableScanGlobalState() override;

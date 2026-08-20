@@ -449,7 +449,17 @@ exit_loop:
 			CountChunkForDebug(chunk, row_count);
 		}
 	}
-	chunk.SetCardinality(row_count);
+	// 2.0 vectors carry their own size, and every consumer keyed on
+	// Vector::size() — IsNull, filters, the hash join — sees an empty vector
+	// unless the producer sets it. The deprecated SetCardinality sets only the
+	// chunk's logical count. Target vectors (rowid STRUCT children) are not in
+	// chunk.data, so they are sized explicitly.
+	for (auto *tv : target_vectors_) {
+		if (tv) {
+			FlatVector::SetSize(*tv, row_count);
+		}
+	}
+	chunk.SetChildCardinality(row_count);
 
 	// Log timing summary
 	uint64_t total_ns = 0;

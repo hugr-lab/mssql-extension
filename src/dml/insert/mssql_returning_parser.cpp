@@ -89,7 +89,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 				if (row_count_ >= STANDARD_VECTOR_SIZE) {
 					// Chunk is full - this shouldn't happen for typical INSERT batches
 					// but handle gracefully
-					chunk->SetCardinality(row_count_);
+					chunk->SetChildCardinality(row_count_);
 					return chunk;
 				}
 
@@ -142,7 +142,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 	}
 
 	// Set final cardinality and return
-	chunk->SetCardinality(row_count_);
+	chunk->SetChildCardinality(row_count_);
 
 	// Return nullptr if no rows (shouldn't happen for INSERT but be safe)
 	if (row_count_ == 0) {

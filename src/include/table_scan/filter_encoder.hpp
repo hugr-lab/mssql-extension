@@ -41,7 +41,13 @@ struct ExpressionEncodeResult {
  */
 struct FilterEncoderResult {
 	std::string where_clause;  // Complete WHERE clause (without "WHERE" keyword)
-	bool needs_duckdb_filter;  // True if DuckDB must re-apply all filters
+	bool needs_duckdb_filter;  // True if some filter was not pushed to the server
+	// The filters that were not pushed, keyed by projected column index. On 2.0
+	// DuckDB does NOT re-apply TableFilters behind a filter_pushdown scan — a
+	// refused filter silently returns wrong rows unless the scan applies it
+	// itself (the client-filter net in table_scan.cpp). Pointers alias the
+	// TableFilterSet owned by the physical operator, which outlives the scan.
+	std::vector<std::pair<idx_t, const TableFilter *>> unhandled;
 };
 
 //------------------------------------------------------------------------------
@@ -62,6 +68,11 @@ struct ExpressionEncodeContext {
 	const std::vector<std::string> *pk_column_names = nullptr;
 	const std::vector<LogicalType> *pk_column_types = nullptr;
 	bool pk_is_composite = false;
+
+	// Inside an EXPRESSION_FILTER: the escaped name of the column the filter is
+	// attached to. The 2.0 filter combiner replaces the column reference with
+	// BoundReference(0), so the name travels here instead of in the expression.
+	const std::string *filter_column = nullptr;
 
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
@@ -86,6 +97,7 @@ struct ExpressionEncodeContext {
 		ctx.pk_column_names = pk_column_names;
 		ctx.pk_column_types = pk_column_types;
 		ctx.pk_is_composite = pk_is_composite;
+		ctx.filter_column = filter_column;
 		return ctx;
 	}
 

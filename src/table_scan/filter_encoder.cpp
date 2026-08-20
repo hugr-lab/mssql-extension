@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
@@ -173,10 +174,12 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 			table_col_idx = column_ids[projected_col_idx];
 		}
 
-		// Skip virtual/special columns
+		// Skip virtual/special columns (rowid): not pushable as SQL, but the
+		// filter still binds to an output column, so the client net can run it.
 		if (table_col_idx >= VIRTUAL_COL_START) {
 			MSSQL_FILTER_DEBUG_LOG(2, "  skipping virtual column_id=%llu", (unsigned long long)table_col_idx);
 			result.needs_duckdb_filter = true;
+			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
 			continue;
 		}
 
@@ -203,8 +206,9 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		}
 
 		if (!encode_result.supported) {
-			MSSQL_FILTER_DEBUG_LOG(2, "    filter not fully supported, will need DuckDB re-filter");
+			MSSQL_FILTER_DEBUG_LOG(2, "    filter not fully supported, will need client-side re-filter");
 			result.needs_duckdb_filter = true;
+			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
 		}
 	}
 
@@ -248,10 +252,15 @@ ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, co
 	case TableFilterType::LEGACY_CONJUNCTION_AND:
 		return EncodeConjunctionAnd(filter.Cast<LegacyConjunctionAndFilter>(), column_name, column_type, ctx);
 
-	case TableFilterType::EXPRESSION_FILTER:
-		// Expression filters (for complex expressions) - not yet fully supported
-		// Will be enhanced in later phases
-		return EncodeExpressionFilter(filter.Cast<ExpressionFilter>(), ctx);
+	case TableFilterType::EXPRESSION_FILTER: {
+		// The 2.0 filter combiner rewrites a pushed predicate's column reference
+		// into BoundReference(0) before wrapping it in an ExpressionFilter, so
+		// the expression no longer names its column — the filter's slot does.
+		// Carry the escaped name in the context for the BOUND_REF arm.
+		ExpressionEncodeContext expr_ctx = ctx;
+		expr_ctx.filter_column = &column_name;
+		return EncodeExpressionFilter(filter.Cast<ExpressionFilter>(), expr_ctx);
+	}
 
 	case TableFilterType::LEGACY_OPTIONAL_FILTER:
 	case TableFilterType::LEGACY_STRUCT_EXTRACT:
@@ -396,6 +405,19 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 		return EncodeColumnRef(expr.Cast<BoundColumnRefExpression>(), ctx);
+
+	case ExpressionClass::BOUND_REF: {
+		// Only inside an EXPRESSION_FILTER, where the combiner replaced the
+		// filter column's reference with BoundReference(0) — the combiner
+		// rejects multi-column expressions before pushing, so index 0 is the
+		// filter's own column and anything else is unencodable.
+		auto &ref = expr.Cast<BoundReferenceExpression>();
+		if (ctx.filter_column && ref.Index() == 0) {
+			return {*ctx.filter_column, true};
+		}
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: BOUND_REF outside a filter context, not pushed");
+		return {"", false};
+	}
 
 	case ExpressionClass::BOUND_CONSTANT:
 		return EncodeConstant(expr.Cast<BoundConstantExpression>());

@@ -205,7 +205,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 		auto total_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanFunction: SCAN COMPLETE - total=%ldms", (long)total_ms);
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -213,7 +213,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 

@@ -38,6 +38,16 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS cs (TYPE mssql);
 statement ok
 SET mssql_exec_invalidate_cache = true;
 
+# One writer, deliberately. This file asserts the FLUSH THRESHOLD contract —
+# batches of mssql_copy_flush_rows (102400) land as COMPRESSED rowgroups — and
+# that is only observable when one writer carries the whole load. DuckDB 2.0
+# parallelizes a scan this small across sink threads, and 110000 rows split
+# over N writers puts every writer below the threshold: nothing compresses,
+# which is writer-scheduling dilution, not a threshold regression (spec 069
+# records the ramp-up follow-up).
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
 statement ok
 CREATE OR REPLACE TABLE cs_src AS
 SELECT i AS id, (i % 97) AS k, 'v' || (i % 1000) AS s FROM range(110000) t(i);

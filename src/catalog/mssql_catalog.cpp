@@ -534,9 +534,20 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// If no column map is specified, use all non-identity columns
 	vector<idx_t> insert_col_indices;
 	if (op.column_index_map.empty()) {
-		// All columns - INSERT without column list
+		// 2.0 no longer populates column_index_map: the binder expands the
+		// child plan to every physical column and fills the ones the INSERT
+		// did not name with their bound default. The tell is the move in
+		// ResolveInputProjection — an unnamed column's bound_defaults slot is
+		// moved into the projection and left null, a named column's is only
+		// dereferenced. Unnamed columns stay OUT of the generated column list
+		// so the server applies its own identity/defaults, exactly what the
+		// named-map flow produced on 1.5.x. A full-positional INSERT keeps
+		// every slot non-null and inserts every column, as before.
 		for (idx_t i = 0; i < mssql_columns.size(); i++) {
-			insert_col_indices.push_back(i);
+			const bool unnamed = i < op.bound_defaults.size() && !op.bound_defaults[i];
+			if (!unnamed) {
+				insert_col_indices.push_back(i);
+			}
 		}
 	} else {
 		// Specific columns from the INSERT statement

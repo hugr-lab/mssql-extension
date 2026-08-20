@@ -14,6 +14,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "mssql_compat.hpp"		// For FlatVector header relocation (spec 051 M2)
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
@@ -43,6 +44,34 @@ namespace mssql {
 
 // Forward declarations for internal functions
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+
+// Execute the filters the encoder refused to push (see ClientTableFilter) over
+// a filled output chunk. Each filter's expression sees its column as
+// BoundReference(0), so it runs against a one-column view of the chunk.
+// Returns the surviving row count; the chunk is sliced in place.
+static idx_t ApplyClientFilters(ClientContext &context, MSSQLScanGlobalState &global_state, DataChunk &output,
+								idx_t rows) {
+	for (auto &cf : global_state.client_filters) {
+		if (rows == 0) {
+			break;
+		}
+		if (cf.out_col >= output.ColumnCount()) {
+			throw InternalException("MSSQL scan: client filter column %llu out of range",
+									(unsigned long long)cf.out_col);
+		}
+		DataChunk probe;
+		probe.data.emplace_back(output.data[cf.out_col].GetType());
+		probe.data[0].Reference(output.data[cf.out_col]);
+		probe.SetCardinalityUnsafe(rows);
+		SelectionVector sel(rows);
+		const idx_t approved = cf.executor->SelectExpression(probe, sel);
+		if (approved < rows) {
+			output.Slice(sel, approved);
+			rows = approved;
+		}
+	}
+	return rows;
+}
 
 //------------------------------------------------------------------------------
 // VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
@@ -413,6 +442,40 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		}
 
 		needs_duckdb_filter = encode_result.needs_duckdb_filter;
+
+		// 2.0 does not re-check TableFilters behind a filter_pushdown scan, so
+		// every refused filter is executed client-side over the output chunk.
+		// The filter's expression references its column as BoundReference(0) —
+		// the same convention the combiner used when it built the filter.
+		for (auto &uf : encode_result.unhandled) {
+			const idx_t out_col = uf.first;
+			LogicalType col_type;
+			if (out_col < column_ids.size() && column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
+				col_type = bind_data.rowid_type;
+			} else if (out_col < column_ids.size() && column_ids[out_col] < bind_data.all_types.size()) {
+				col_type = bind_data.all_types[column_ids[out_col]];
+			} else {
+				MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: cannot map refused filter at projected idx %llu",
+									 (unsigned long long)out_col);
+				continue;
+			}
+			try {
+				BoundReferenceExpression col_ref(col_type, 0ULL);
+				mssql::ClientTableFilter cf;
+				cf.out_col = out_col;
+				cf.expr = uf.second->ToExpression(col_ref);
+				cf.executor = make_uniq<ExpressionExecutor>(context);
+				cf.executor->AddExpression(*cf.expr);
+				result->client_filters.push_back(std::move(cf));
+				MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: client-side filter armed on output col %llu",
+									 (unsigned long long)out_col);
+			} catch (const std::exception &e) {
+				// A filter that cannot even build an expression cannot be
+				// applied anywhere — fail loudly instead of returning a
+				// superset of rows.
+				throw NotImplementedException("MSSQL scan: cannot apply pushed-down filter client-side: %s", e.what());
+			}
+		}
 	}
 
 	// 2. Add complex filters (from pushdown_complex_filter callback)
@@ -728,7 +791,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 		auto total_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_SCAN_DEBUG_LOG(1, "Execute: SCAN COMPLETE - total=%ldms", (long)total_ms);
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -736,20 +799,36 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
 	// Fill chunk from result stream
 	try {
-		idx_t rows = global_state.result_stream->FillChunk(output);
-		if (rows == 0) {
-			global_state.done = true;
-			// Surface any warnings
-			global_state.result_stream->SurfaceWarnings(context);
-		} else if (global_state.rowid_requested) {
-			// Populate rowid vector from PK columns
-			PopulateRowIdVector(global_state, output, rows);
+		// Loop: a chunk the client-side filters reduce to zero rows must NOT
+		// reach DuckDB — an empty chunk ends the scan — so fetch the next one.
+		// No output.Reset() between iterations: the composite-PK target
+		// pointers captured on the first call alias this chunk's buffers, and
+		// FillChunk overwrites from row 0 anyway.
+		for (;;) {
+			idx_t rows = global_state.result_stream->FillChunk(output);
+			if (rows == 0) {
+				global_state.done = true;
+				// Surface any warnings
+				global_state.result_stream->SurfaceWarnings(context);
+				break;
+			}
+			if (global_state.rowid_requested) {
+				// Populate rowid vector from PK columns
+				PopulateRowIdVector(global_state, output, rows);
+			}
+			if (!global_state.client_filters.empty()) {
+				rows = ApplyClientFilters(context, global_state, output, rows);
+				if (rows == 0) {
+					continue;
+				}
+			}
+			break;
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;

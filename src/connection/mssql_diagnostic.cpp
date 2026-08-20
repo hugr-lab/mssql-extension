@@ -308,7 +308,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 	auto &gstate = input.global_state->Cast<MssqlPoolStatsGlobalState>();
 
 	if (gstate.current_index >= gstate.pool_names.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -340,7 +340,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 		gstate.current_index++;
 	}
 
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===----------------------------------------------------------------------===//
