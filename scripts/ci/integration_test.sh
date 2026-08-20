@@ -181,7 +181,12 @@ cd "$REPO_ROOT"
 # Whatever prefix the build used, our files are found or the script says so.
 MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
 
-"$UNITTEST_BIN" --list-tests > /tmp/mssql_all_tests.txt 2>/dev/null || true
+# No swallowed stderr here: a binary that cannot START (missing shared
+# libduckdb, wrong arch) must say so, not report "0 of N registered".
+if ! "$UNITTEST_BIN" --list-tests > /tmp/mssql_all_tests.txt; then
+    echo "ERROR: $UNITTEST_BIN --list-tests failed — the runner itself does not run" >&2
+    exit 1
+fi
 # test/sql/azure and test/sql/fabric are the CLOUD lane and are excluded here for
 # the same reason `make integration-test` excludes them by tag: this job talks to
 # a local SQL Server container, while azure_lazy_loading.test CREATEs, ALTERs and

@@ -813,6 +813,17 @@ jobs:
           name: unittest-linux_amd64
           path: unittest
 
+      # DuckDB 2.0 links the unittest binary against the SHARED libduckdb
+      # (@rpath); without the library next to it the binary does not start,
+      # and the registered-tests guard sees an empty listing (its stderr is
+      # deliberately swallowed). The build job has always uploaded this
+      # artifact — the 1.5.x static link is why nothing ever consumed it.
+      - name: Download libduckdb artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: libduckdb-linux_amd64
+          path: lib
+
       - name: Setup executables
         run: |
           chmod +x cli/duckdb
@@ -864,6 +875,7 @@ jobs:
           MSSQL_TEST_PASS: TestPassword1
           MSSQL_TEST_DB: master
         run: |
+          export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension ./unittest/unittest
 
   # ============================================================================
