@@ -808,9 +808,12 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 	try {
 		// Loop: a chunk the client-side filters reduce to zero rows must NOT
 		// reach DuckDB — an empty chunk ends the scan — so fetch the next one.
-		// No output.Reset() between iterations: the composite-PK target
-		// pointers captured on the first call alias this chunk's buffers, and
-		// FillChunk overwrites from row 0 anyway.
+		// FillChunk itself starts with chunk.Reset(), which is what makes the
+		// retry sound: a Slice below rewrites output.data with dictionary
+		// buffers, and Reset re-references the flat cache buffers before the
+		// next fill. The composite-PK target pointers captured on the first
+		// call survive that Reset because they point into the cache-owned
+		// struct storage the Reset re-references, not into the slice.
 		for (;;) {
 			idx_t rows = global_state.result_stream->FillChunk(output);
 			if (rows == 0) {
