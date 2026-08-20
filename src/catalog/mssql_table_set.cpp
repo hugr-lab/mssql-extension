@@ -141,7 +141,7 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
 	try {
-		cache.LoadAllTableMetadata(*connection, schema_.name);
+		cache.LoadAllTableMetadata(*connection, schema_.name.GetIdentifierName());
 	} catch (...) {
 		pool.Release(std::move(connection));
 		throw;
@@ -174,13 +174,14 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	// (CreateTableEntry copies it anyway, so this adds no asymptotic cost).
 	vector<string> names_list;
 	vector<MSSQLTableMetadata> to_create;
-	cache.ForEachTableInSchema(schema_.name, [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
-		stats_provider.PreloadRowCount(schema_.name, table_name, table_meta.approx_row_count);
-		names_list.push_back(table_name);
-		if (have_entries.find(table_name) == have_entries.end()) {
-			to_create.push_back(table_meta);
-		}
-	});
+	cache.ForEachTableInSchema(
+		schema_.name.GetIdentifierName(), [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+			stats_provider.PreloadRowCount(schema_.name.GetIdentifierName(), table_name, table_meta.approx_row_count);
+			names_list.push_back(table_name);
+			if (have_entries.find(table_name) == have_entries.end()) {
+				to_create.push_back(table_meta);
+			}
+		});
 
 	// Pass C: fill entries_/known_table_names_ under names_mutex_ + entry_mutex_
 	// (taken in GetEntry's step-4 nesting order: names before entry). We collect
@@ -322,7 +323,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 		MSSQLTableMetadata table_meta;
 		bool found = false;
 		try {
-			found = cache.GetTableMetadata(*connection, schema_.name, name, table_meta);
+			found = cache.GetTableMetadata(*connection, schema_.name.GetIdentifierName(), name, table_meta);
 		} catch (...) {
 			pool.Release(std::move(connection));
 			throw;

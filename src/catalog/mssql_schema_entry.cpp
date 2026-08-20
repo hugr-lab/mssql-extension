@@ -23,7 +23,7 @@ namespace duckdb {
 
 static CreateSchemaInfo MakeSchemaInfo(const string &name) {
 	CreateSchemaInfo info;
-	info.schema = name;
+	info.SetSchema(Identifier(name));
 	info.internal = false;
 	return info;
 }
@@ -92,7 +92,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 
 	// Get table name, columns, and constraints from bound info
 	auto &base_info = info.Base();
-	string table_name = base_info.table;
+	string table_name = base_info.GetTableName().GetIdentifierName();
 
 	// Check if table already exists for IF NOT EXISTS / OR REPLACE handling (Issue #44)
 	if (!transaction.HasContext()) {
@@ -113,7 +113,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	case OnCreateConflict::REPLACE_ON_CONFLICT: {
 		// OR REPLACE: drop existing table first
 		if (existing_entry) {
-			string drop_sql = MSSQLDDLTranslator::TranslateDropTable(name, table_name);
+			string drop_sql = MSSQLDDLTranslator::TranslateDropTable(name.GetIdentifierName(), table_name);
 			mssql_catalog.ExecuteDDL(transaction.GetContext(), drop_sql);
 		}
 		break;
@@ -161,7 +161,8 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// Generate T-SQL for CREATE TABLE (with constraints). The translator ends the
 	// statement with ');', so a table-option suffix has to go before that
 	// terminator rather than after it.
-	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name, table_name, columns, constraints, varchar_collation);
+	string tsql = MSSQLDDLTranslator::TranslateCreateTable(name.GetIdentifierName(), table_name, columns, constraints,
+														   varchar_collation);
 	const string suffix = table_options.CreateTableSuffix();
 	if (!suffix.empty()) {
 		const auto terminator = tsql.find_last_of(';');
@@ -175,13 +176,13 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 	// Execute DDL on SQL Server
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
 
-	const string post_create = table_options.PostCreateStatement(name, table_name);
+	const string post_create = table_options.PostCreateStatement(name.GetIdentifierName(), table_name);
 	if (!post_create.empty()) {
 		mssql_catalog.ExecuteDDL(transaction.GetContext(), post_create);
 	}
 
 	// Point invalidation: invalidate schema's table list and local table set
-	mssql_catalog.InvalidateSchemaTableSet(name);
+	mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
 
 	// Look up the newly created table (triggers lazy load of table list)
 	return tables_.GetEntry(transaction.GetContext(), table_name);
@@ -257,31 +258,34 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	string tsql;
 
 	// The table name is stored in the base AlterInfo class
-	const string &table_name = alter_table_info.name;
+	const string &table_name = alter_table_info.GetQualifiedName().Name().GetIdentifierName();
 
 	switch (alter_table_info.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename_info = alter_table_info.Cast<RenameTableInfo>();
-		tsql = MSSQLDDLTranslator::TranslateRenameTable(name, table_name, rename_info.new_table_name);
+		tsql = MSSQLDDLTranslator::TranslateRenameTable(name.GetIdentifierName(), table_name,
+														rename_info.new_table_name.GetIdentifierName());
 		break;
 	}
 
 	case AlterTableType::ADD_COLUMN: {
 		auto &add_info = alter_table_info.Cast<AddColumnInfo>();
-		tsql = MSSQLDDLTranslator::TranslateAddColumn(name, table_name, add_info.new_column);
+		tsql = MSSQLDDLTranslator::TranslateAddColumn(name.GetIdentifierName(), table_name, add_info.new_column);
 		break;
 	}
 
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &remove_info = alter_table_info.Cast<RemoveColumnInfo>();
-		tsql = MSSQLDDLTranslator::TranslateDropColumn(name, table_name, remove_info.removed_column);
+		tsql = MSSQLDDLTranslator::TranslateDropColumn(name.GetIdentifierName(), table_name,
+													   remove_info.removed_column.GetIdentifierName());
 		break;
 	}
 
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename_col_info = alter_table_info.Cast<RenameColumnInfo>();
-		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name, table_name, rename_col_info.old_name,
-														 rename_col_info.new_name);
+		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name.GetIdentifierName(), table_name,
+														 rename_col_info.old_name.GetIdentifierName(),
+														 rename_col_info.new_name.GetIdentifierName());
 		break;
 	}
 
@@ -289,7 +293,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
 		// SQL Server requires specifying nullability when altering type
 		// We default to NULL since we don't have that info easily available
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name, table_name, type_info.column_name,
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name.GetIdentifierName(), table_name,
+															type_info.column_name.GetIdentifierName(),
 															type_info.target_type, true);
 		break;
 	}
@@ -318,8 +323,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (!found) {
 			throw CatalogException("Column '%s' not found in table '%s'", notnull_info.column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name, notnull_info.column_name, col_type,
-																   true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(
+			name.GetIdentifierName(), table_name, notnull_info.column_name.GetIdentifierName(), col_type, true);
 		break;
 	}
 
@@ -346,8 +351,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (!found) {
 			throw CatalogException("Column '%s' not found in table '%s'", dropnull_info.column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name, table_name, dropnull_info.column_name,
-																   col_type, false);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(
+			name.GetIdentifierName(), table_name, dropnull_info.column_name.GetIdentifierName(), col_type, false);
 		break;
 	}
 
@@ -365,10 +370,10 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	mssql_catalog.ExecuteDDL(transaction.GetContext(), tsql);
 
 	// Point invalidation: invalidate the altered table's column metadata
-	mssql_catalog.GetMetadataCache().InvalidateTable(name, table_name);
+	mssql_catalog.GetMetadataCache().InvalidateTable(name.GetIdentifierName(), table_name);
 
 	// Invalidate the local table set cache to pick up column changes
-	mssql_catalog.InvalidateSchemaTableSet(name);
+	mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
 }
 
 void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
@@ -378,13 +383,14 @@ void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	// Handle DROP TABLE
 	if (info.type == CatalogType::TABLE_ENTRY) {
 		// Generate T-SQL for DROP TABLE
-		string tsql = MSSQLDDLTranslator::TranslateDropTable(name, info.name);
+		string tsql = MSSQLDDLTranslator::TranslateDropTable(name.GetIdentifierName(),
+															 info.GetQualifiedName().Name().GetIdentifierName());
 
 		// Execute DDL on SQL Server
 		mssql_catalog.ExecuteDDL(context, tsql);
 
 		// Point invalidation: invalidate schema's table list and local table set
-		mssql_catalog.InvalidateSchemaTableSet(name);
+		mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
 		return;
 	}
 

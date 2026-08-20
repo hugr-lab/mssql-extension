@@ -183,7 +183,7 @@ struct MSSQLScanLocalState : public LocalTableFunctionState {
 
 // Bind: validates arguments, determines return schema
 unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
-									   vector<LogicalType> &return_types, vector<string> &names);
+									   vector<LogicalType> &return_types, vector<Identifier> &names);
 
 // Global init: sets up execution state
 unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context, TableFunctionInitInput &input);

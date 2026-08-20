@@ -458,7 +458,7 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 
 	// Handle IF NOT EXISTS: check if schema already exists (Issue #54)
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.schema);
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.SchemaName());
 		auto existing = LookupSchema(transaction, lookup, OnEntryNotFound::RETURN_NULL);
 		if (existing) {
 			return existing.get();
@@ -466,7 +466,7 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 	}
 
 	// Generate T-SQL for CREATE SCHEMA
-	string tsql = MSSQLDDLTranslator::TranslateCreateSchema(info.schema);
+	string tsql = MSSQLDDLTranslator::TranslateCreateSchema(info.SchemaName().GetIdentifierName());
 
 	// Execute DDL on SQL Server
 	ExecuteDDL(transaction.GetContext(), tsql);
@@ -474,7 +474,7 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 	// Point invalidation: invalidate schema list so new schema is visible
 	metadata_cache_->InvalidateAll();
 
-	return &GetOrCreateSchemaEntry(info.schema);
+	return &GetOrCreateSchemaEntry(info.SchemaName().GetIdentifierName());
 }
 
 void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
@@ -483,7 +483,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Handle IF EXISTS: check if schema exists before attempting DROP (Issue #54)
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		CatalogTransaction cat_transaction = GetCatalogTransaction(context);
-		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.name);
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.GetQualifiedName().Name());
 		auto existing = LookupSchema(cat_transaction, lookup, OnEntryNotFound::RETURN_NULL);
 		if (!existing) {
 			return;
@@ -491,7 +491,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	}
 
 	// Generate T-SQL for DROP SCHEMA
-	string tsql = MSSQLDDLTranslator::TranslateDropSchema(info.name);
+	string tsql = MSSQLDDLTranslator::TranslateDropSchema(info.GetQualifiedName().Name().GetIdentifierName());
 
 	// Execute DDL on SQL Server
 	ExecuteDDL(context, tsql);
@@ -506,7 +506,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// against active queries, so we don't need to worry about the catalog
 	// dying mid-query.
 	std::lock_guard<std::mutex> lock(schema_mutex_);
-	schema_entries_.erase(info.name);
+	schema_entries_.erase(info.GetQualifiedName().Name().GetIdentifierName());
 }
 
 //===----------------------------------------------------------------------===//
@@ -524,8 +524,8 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// Build MSSQLInsertTarget from table metadata
 	MSSQLInsertTarget target;
 	target.catalog_name = context_name_;
-	target.schema_name = table_entry.ParentSchema().name;
-	target.table_name = table_entry.name;
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_entry.name.GetIdentifierName();
 
 	// Get MSSQL column info
 	auto &mssql_columns = table_entry.GetMSSQLColumns();
@@ -651,8 +651,8 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// Build MSSQLDeleteTarget from table metadata
 	MSSQLDeleteTarget target;
 	target.catalog_name = context_name_;
-	target.schema_name = table_entry.ParentSchema().name;
-	target.table_name = table_entry.name;
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_entry.name.GetIdentifierName();
 	target.pk_info = pk_info;
 
 	// Load DML configuration from settings
@@ -704,8 +704,8 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// Build MSSQLUpdateTarget from table metadata
 	MSSQLUpdateTarget target;
 	target.catalog_name = context_name_;
-	target.schema_name = table_entry.ParentSchema().name;
-	target.table_name = table_entry.name;
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_entry.name.GetIdentifierName();
 	target.pk_info = pk_info;
 	target.table_columns = mssql_columns;
 

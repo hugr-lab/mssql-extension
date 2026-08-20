@@ -10,8 +10,16 @@
 #include <string>
 #include <vector>
 #include "duckdb.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -173,7 +181,8 @@ private:
 	/**
 	 * Encode CONSTANT_COMPARISON filter (col OP value).
 	 */
-	static ExpressionEncodeResult EncodeConstantComparison(const ConstantFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeConstantComparison(const LegacyConstantFilter &filter,
+														   const std::string &column_name,
 														   const LogicalType &column_type);
 
 	/**
@@ -189,14 +198,14 @@ private:
 	/**
 	 * Encode IN_FILTER (col IN (values)).
 	 */
-	static ExpressionEncodeResult EncodeInFilter(const InFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
 												 const LogicalType &column_type);
 
 	/**
 	 * Encode CONJUNCTION_AND filter.
 	 * Partial pushdown allowed: unsupported children are skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionAnd(const ConjunctionAndFilter &filter,
+	static ExpressionEncodeResult EncodeConjunctionAnd(const LegacyConjunctionAndFilter &filter,
 													   const std::string &column_name, const LogicalType &column_type,
 													   const ExpressionEncodeContext &ctx);
 
@@ -204,8 +213,8 @@ private:
 	 * Encode CONJUNCTION_OR filter.
 	 * All-or-nothing: if any child unsupported, entire OR is skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionOr(const ConjunctionOrFilter &filter, const std::string &column_name,
-													  const LogicalType &column_type,
+	static ExpressionEncodeResult EncodeConjunctionOr(const LegacyConjunctionOrFilter &filter,
+													  const std::string &column_name, const LogicalType &column_type,
 													  const ExpressionEncodeContext &ctx);
 
 	/**
@@ -227,7 +236,7 @@ private:
 	/**
 	 * Encode a comparison expression (left OP right).
 	 */
-	static ExpressionEncodeResult EncodeComparisonExpression(const BoundComparisonExpression &expr,
+	static ExpressionEncodeResult EncodeComparisonExpression(const BoundFunctionExpression &expr,
 															 const ExpressionEncodeContext &ctx);
 
 	/**
@@ -245,7 +254,7 @@ private:
 	/**
 	 * Encode a BETWEEN expression (input BETWEEN lower AND upper).
 	 */
-	static ExpressionEncodeResult EncodeBetweenExpression(const BoundBetweenExpression &expr,
+	static ExpressionEncodeResult EncodeBetweenExpression(const BoundFunctionExpression &expr,
 														  const ExpressionEncodeContext &ctx);
 
 	/**

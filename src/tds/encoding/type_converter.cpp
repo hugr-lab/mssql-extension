@@ -468,7 +468,7 @@ void TypeConverter::WriteAsStringFallback(const uint8_t *value, size_t size, con
 			"with an explicit CAST in the query.",
 			column.type_id);
 	}
-	FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, rendered);
+	FlatVector::GetDataMutable<string_t>(vector)[row_idx] = StringVector::AddString(vector, rendered);
 }
 
 void TypeConverter::WriteAsStringFallback(const std::vector<uint8_t> &value, const ColumnMetadata &column,

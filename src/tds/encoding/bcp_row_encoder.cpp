@@ -175,7 +175,7 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 			continue;
 		}
 		state.vec = &chunk.data[source_idx];
-		state.vec->ToUnifiedFormat(format_count, state.fmt);
+		state.vec->ToUnifiedFormat(state.fmt);
 		if (col.null_only_source) {
 			// Bind admitted this pair for the all-NULL case only (a constant
 			// NULL source arrives typed, indistinguishable from data there).
@@ -1216,7 +1216,7 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 		for (int i = 0; i < 6 - scale; i++) {
 			divisor *= 10;
 		}
-		scaled_value = (value.micros + divisor / 2) / divisor;
+		scaled_value = (value.value + divisor / 2) / divisor;
 		int64_t per_day = Interval::SECS_PER_DAY;
 		for (int i = 0; i < scale; i++) {
 			per_day *= 10;
@@ -1226,7 +1226,7 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 		}
 	} else {
 		// Multiply for scale 7 (100ns units)
-		scaled_value = value.micros * 10;
+		scaled_value = value.value * 10;
 	}
 
 	uint8_t byte_size = GetTimeByteSize(scale);

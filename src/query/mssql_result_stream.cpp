@@ -580,7 +580,7 @@ void MSSQLResultStream::CountChunkForDebug(DataChunk &chunk, idx_t row_count) {
 			// value was), which is a representation question and belongs to a
 			// representation counter, not to this one.
 			UnifiedVectorFormat format;
-			target->ToUnifiedFormat(row_count, format);
+			target->ToUnifiedFormat(format);
 			const string_t *strings = UnifiedVectorFormat::GetData<string_t>(format);
 			for (idx_t row = 0; row < row_count; row++) {
 				const idx_t idx = format.sel->get_index(row);

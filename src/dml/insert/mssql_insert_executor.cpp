@@ -70,7 +70,7 @@ tds::ConnectionPool &MSSQLInsertExecutor::GetConnectionPool() {
 
 	// Spec 047: route through DuckDB catalog (per-catalog pool ownership).
 	// The MssqlPoolManager singleton is gone; pool is owned by MSSQLCatalog.
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	connection_pool_ = &mssql_catalog.GetConnectionPool();
 	return *connection_pool_;
@@ -96,7 +96,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.2000s%s", sql.c_str(), sql.size() > 2000 ? "..." : "");
 
 	// Get catalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Use ConnectionProvider to get connection (handles transaction pinning)
@@ -272,7 +272,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &sql,
 																  const vector<idx_t> &returning_column_ids) {
 	// Get catalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Use ConnectionProvider to get connection (handles transaction pinning)

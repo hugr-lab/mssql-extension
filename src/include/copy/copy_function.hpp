@@ -231,8 +231,8 @@ namespace mssql {
 // @param names Column names from source query
 // @param sql_types Column types from source query
 // @return Bind data for subsequent callbacks
-unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
-									 const vector<LogicalType> &sql_types);
+unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+									 const vector<Identifier> &names, const vector<LogicalType> &sql_types);
 
 // InitGlobal callback: Acquire connection, send INSERT BULK, start BCP
 // @param context Client context

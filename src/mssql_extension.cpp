@@ -170,16 +170,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Reinterpret is the operation actually wanted here — same physical layout,
 	// different logical type — and it permits exactly that.
 	{
-		auto nvarchar_type = LogicalType(LogicalTypeId::VARCHAR);
-		nvarchar_type.SetAlias("MSSQL_NVARCHAR");
+		auto nvarchar_type = LogicalType(LogicalTypeId::VARCHAR).WithAlias("MSSQL_NVARCHAR");
 		loader.RegisterType("MSSQL_NVARCHAR", nvarchar_type, BindMssqlNVarchar);
 		loader.RegisterCastFunction(nvarchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::ReinterpretCast),
 									0);
 		loader.RegisterCastFunction(LogicalType::VARCHAR, nvarchar_type, BoundCastInfo(DefaultCasts::ReinterpretCast),
 									0);
 
-		auto varchar_type = LogicalType(LogicalTypeId::VARCHAR);
-		varchar_type.SetAlias("MSSQL_VARCHAR");
+		auto varchar_type = LogicalType(LogicalTypeId::VARCHAR).WithAlias("MSSQL_VARCHAR");
 		loader.RegisterType("MSSQL_VARCHAR", varchar_type, BindMssqlVarchar);
 		loader.RegisterCastFunction(varchar_type, LogicalType::VARCHAR, BoundCastInfo(DefaultCasts::ReinterpretCast),
 									0);

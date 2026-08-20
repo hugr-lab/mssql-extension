@@ -23,6 +23,12 @@
 
 #if __has_include(<duckdb/common/vector/flat_vector.hpp>)
 #include <duckdb/common/vector/flat_vector.hpp>
+// Spec 069: StringVector / StructVector moved out of types/vector.hpp on the
+// same SHAs that relocated FlatVector, so they ride the same sentinel.
+#if __has_include(<duckdb/common/vector/string_vector.hpp>)
+#include <duckdb/common/vector/string_vector.hpp>
+#include <duckdb/common/vector/struct_vector.hpp>
+#endif
 #define MSSQL_DUCKDB_HAS_NEW_BIND_INPUT 1
 #else
 #include <duckdb/common/types/vector.hpp>

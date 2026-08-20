@@ -46,11 +46,11 @@ bool MSSQLReportsNativeTypes(Catalog &catalog) {
 
 static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata, bool native_types) {
 	CreateTableInfo info;
-	info.table = metadata.name;
+	info.SetTableName(Identifier(metadata.name));
 
 	// Build column definitions
 	for (const auto &col : metadata.columns) {
-		ColumnDefinition column_def(col.name, native_types ? col.NativeDuckDBType() : col.duckdb_type);
+		ColumnDefinition column_def(Identifier(col.name), native_types ? col.NativeDuckDBType() : col.duckdb_type);
 		info.columns.AddColumn(std::move(column_def));
 	}
 
@@ -87,8 +87,8 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	// based on the column_ids from projection pushdown
 	auto catalog_bind_data = make_uniq<MSSQLCatalogScanBindData>();
 	catalog_bind_data->context_name = mssql_catalog.GetContextName();
-	catalog_bind_data->schema_name = mssql_schema.name;
-	catalog_bind_data->table_name = name;
+	catalog_bind_data->schema_name = mssql_schema.name.GetIdentifierName();
+	catalog_bind_data->table_name = name.GetIdentifierName();
 
 	// Store pointer to this table entry for get_bind_info callback.
 	// Spec 052 (Option D): lifetime guaranteed by MSSQLBindAnchors set in
@@ -173,7 +173,8 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// This avoids acquiring a connection + DMV query per table during SHOW ALL TABLES
 	auto &stats_provider = mssql_catalog.GetStatisticsProvider();
 	idx_t cached_row_count = 0;
-	if (stats_provider.TryGetCachedRowCount(mssql_schema.name, name, cached_row_count)) {
+	if (stats_provider.TryGetCachedRowCount(mssql_schema.name.GetIdentifierName(), name.GetIdentifierName(),
+											cached_row_count)) {
 		info.cardinality = cached_row_count;
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)", mssql_schema.name.c_str(),
 					   name.c_str(), (unsigned long long)cached_row_count);
@@ -193,7 +194,8 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 			// fires its quiescence warning on teardown and the D_ASSERT aborts
 			// the debug build.
 			try {
-				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name, name);
+				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name.GetIdentifierName(),
+															 name.GetIdentifierName());
 				info.cardinality = row_count;
 				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
 							   name.c_str(), (unsigned long long)row_count);
@@ -307,8 +309,8 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 			// `active_connections_` — ~ConnectionPool then fires its quiescence
 			// warning on teardown and the D_ASSERT aborts the debug build.
 			try {
-				pk_info_ =
-					mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name, name, cache.GetDatabaseCollation());
+				pk_info_ = mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name.GetIdentifierName(),
+														   name.GetIdentifierName(), cache.GetDatabaseCollation());
 			} catch (...) {
 				pool.Release(std::move(connection));
 				throw;

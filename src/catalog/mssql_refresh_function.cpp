@@ -10,6 +10,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -46,7 +47,7 @@ MSSQL_BIND_SCALAR_SIG(MSSQLRefreshCacheBind) {
 
 		// Validate the catalog exists (Spec 047: per-catalog ownership)
 		try {
-			auto &catalog = Catalog::GetCatalog(context, catalog_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 			if (catalog.GetCatalogType() != "mssql") {
 				throw BinderException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)",
 									  catalog_name, catalog.GetCatalogType());
@@ -69,7 +70,7 @@ MSSQL_BIND_SCALAR_SIG(MSSQLRefreshCacheBind) {
 //===----------------------------------------------------------------------===//
 
 static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<MSSQLRefreshCacheBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLRefreshCacheBindData>();
 
 	auto &catalog_names = args.data[0];
 
@@ -86,7 +87,7 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 		// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 		MSSQLCatalog *catalog_ptr = nullptr;
 		try {
-			auto &raw_catalog = Catalog::GetCatalog(client_context, catalog_name);
+			auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(catalog_name));
 			if (raw_catalog.GetCatalogType() != "mssql") {
 				throw InvalidInputException("mssql_refresh_cache: catalog '%s' is not an MSSQL catalog (type: %s)",
 											catalog_name, raw_catalog.GetCatalogType());
@@ -120,7 +121,7 @@ static MSSQLCatalog &ResolveMSSQLCatalog(ClientContext &context, const string &c
 		throw InvalidInputException("%s: catalog name is required", fn);
 	}
 	try {
-		auto &raw_catalog = Catalog::GetCatalog(context, catalog_name);
+		auto &raw_catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 		if (raw_catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException("%s: catalog '%s' is not an MSSQL catalog (type: %s)", fn, catalog_name,
 										raw_catalog.GetCatalogType());
@@ -146,7 +147,7 @@ static void MSSQLInvalidateCacheExecute(DataChunk &args, ExpressionState &state,
 	const idx_t col_count = args.ColumnCount();
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<bool>(result);
+	auto result_data = FlatVector::GetDataMutable<bool>(result);
 	for (idx_t row = 0; row < args.size(); row++) {
 		string catalog_name = args.GetValue(0, row).ToString();
 		auto &catalog = ResolveMSSQLCatalog(client_context, catalog_name, "mssql_invalidate_cache");
@@ -177,6 +178,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 						MSSQLRefreshCacheBind);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	func.SetVolatile();
+	func.SetFallible();
 	loader.RegisterFunction(func);
 
 	// mssql_invalidate_cache(catalog [, schema [, table]]) -> BOOLEAN
@@ -187,6 +189,7 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 		ScalarFunction overload("mssql_invalidate_cache", arg_types, LogicalType::BOOLEAN, MSSQLInvalidateCacheExecute);
 		overload.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		overload.SetVolatile();
+		overload.SetFallible();
 		invalidate.AddFunction(overload);
 	}
 	loader.RegisterFunction(invalidate);

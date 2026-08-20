@@ -139,7 +139,7 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 		// Composite PK: rowid type is STRUCT
 		child_list_t<LogicalType> children;
 		for (const auto &col : columns) {
-			children.push_back({col.name, col.duckdb_type});
+			children.push_back({Identifier(col.name), col.duckdb_type});
 		}
 		rowid_type = LogicalType::STRUCT(std::move(children));
 		MSSQL_PK_DEBUG("rowid type: STRUCT with %zu fields (composite)", columns.size());

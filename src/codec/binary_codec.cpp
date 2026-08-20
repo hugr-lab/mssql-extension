@@ -69,7 +69,7 @@ std::string HexRender(const uint8_t *data, size_t length) {
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata & /*col*/, Vector &out, idx_t row) {
 	// AddStringOrBlob copies the raw bytes into the vector's string heap.
 	// Works for BLOB, GEOMETRY, and the VARCHAR fallback case (issue #89).
-	FlatVector::GetData<string_t>(out)[row] =
+	FlatVector::GetDataMutable<string_t>(out)[row] =
 		StringVector::AddStringOrBlob(out, reinterpret_cast<const char *>(bytes.data()), bytes.size());
 }
 
@@ -87,7 +87,7 @@ static inline uint32_t TrimTrailingSpaces(const char *data, uint32_t len) {
 
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
 							Vector &out) {
-	string_t *result = FlatVector::GetData<string_t>(out);
+	string_t *result = FlatVector::GetDataMutable<string_t>(out);
 	const idx_t payload = st.PayloadSize();
 
 	if (payload == 0) {

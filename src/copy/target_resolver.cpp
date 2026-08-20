@@ -283,7 +283,7 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 
 	// Verify catalog exists and is an MSSQL catalog
 	try {
-		auto &catalog = Catalog::GetCatalog(context, target.catalog_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name));
 		if (catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException("MSSQL COPY: Catalog '%s' is not an MSSQL catalog (type: %s)",
 										target.catalog_name, catalog.GetCatalogType());
@@ -364,7 +364,7 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 
 	// Verify catalog exists and is an MSSQL catalog
 	try {
-		auto &cat = Catalog::GetCatalog(context, target.catalog_name);
+		auto &cat = Catalog::GetCatalog(context, Identifier(target.catalog_name));
 		if (cat.GetCatalogType() != "mssql") {
 			throw InvalidInputException("MSSQL COPY: Catalog '%s' is not an MSSQL catalog (type: %s)",
 										target.catalog_name, cat.GetCatalogType());
@@ -408,7 +408,7 @@ static string ResolveVarcharCollation(ClientContext &context, const BCPCopyTarge
 	if (!wants_varchar) {
 		return string();
 	}
-	auto &catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+	auto &catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name)).Cast<MSSQLCatalog>();
 	return catalog.ResolveVarcharCollation(context, true, target.IsTempTable());
 }
 
@@ -501,13 +501,13 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// Spec 060: refuse a string type this server cannot store before any DDL is
 	// generated, then resolve the collation once per statement, not per column.
 	{
-		auto &target_catalog = Catalog::GetCatalog(context, target.catalog_name).Cast<MSSQLCatalog>();
+		auto &target_catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name)).Cast<MSSQLCatalog>();
 		target_catalog.ValidateStringTargets(source_types);
 		target_catalog.ValidateTableOptions(config.table_options);
 	}
 	config.varchar_collation = ResolveVarcharCollation(context, target, config, source_types);
 	if (config.text_type_varchar || !config.varchar_collation.empty()) {
-		config.wire_varchar_collation = Catalog::GetCatalog(context, target.catalog_name)
+		config.wire_varchar_collation = Catalog::GetCatalog(context, Identifier(target.catalog_name))
 											.Cast<MSSQLCatalog>()
 											.WireVarcharCollation(config.varchar_collation);
 	}

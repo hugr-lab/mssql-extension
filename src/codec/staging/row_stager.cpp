@@ -365,7 +365,7 @@ void RowStager::BeginChunk(const std::vector<Vector *> &targets) {
 		// here would hand `direct_dst` a single-value view to write 2048 rows into.
 		D_ASSERT(targets_[i]->GetVectorType() == VectorType::FLAT_VECTOR);
 		uint8_t *direct_dst =
-			ops_[i].direct_write ? reinterpret_cast<uint8_t *>(FlatVector::GetData(*targets_[i])) : nullptr;
+			ops_[i].direct_write ? reinterpret_cast<uint8_t *>(FlatVector::GetDataMutable(*targets_[i])) : nullptr;
 		staging_[i]->BeginChunk(direct_dst);
 	}
 }
@@ -635,7 +635,7 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		if (st.null_count == 0) {
 			continue;
 		}
-		ValidityMask &mask = FlatVector::Validity(*targets_[c]);
+		ValidityMask &mask = FlatVector::ValidityMutable(*targets_[c]);
 		mask.EnsureWritable();
 		// AND, not memcpy: a kernel may have set NULLs of its own before this runs
 		// — datetime does, for a datetime2 whose value does not fit the target

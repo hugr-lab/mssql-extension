@@ -116,6 +116,26 @@ unknown at current include points). Files: `mssql_optimizer.cpp`,
   surface — identify at fix time).
 - `CreateSchemaInfo`/`DropInfo`/`CreateTableInfo` field renames (overlaps A).
 
+### Cluster F — runtime contracts invisible to the compiler
+
+Found by the test suite, not the error log — the reason step 7 exists:
+
+- **`ScalarFunction::SetFallible()`**: a scalar function that throws at
+  execution time without declaring `FunctionErrors::CAN_THROW_RUNTIME_ERROR`
+  has its error converted to `INTERNAL Error: ... the function is not marked
+  as fallible` (caught by `tds_connection/ping.test`, the one red test in the
+  first green build). Every mssql scalar function that reaches a server or
+  validates a handle throws by design; all 16 registrations now pair
+  `SetFallible()` with the existing `SetVolatile()`.
+- **Expression restructuring is semantic, not just naming**: comparisons,
+  casts and BETWEEN are `BoundFunctionExpression`s in 2.0 (their old classes
+  survive only as static helper structs — `BoundComparisonExpression::
+  IsComparison/Left/Right`, `BoundCastExpression::IsCast/Child/TargetType`,
+  `BoundBetweenExpression::Input/LowerBound/UpperBound`). The filter
+  encoder's dispatch switched from ExpressionClass cases to type checks
+  inside the `BOUND_FUNCTION` arm; pushdown equivalence is exactly what the
+  filter-pushdown test files must confirm at step 7.
+
 ## Out of scope
 
 - Adopting the new (non-Legacy) filter representation — phase 2, own spec.

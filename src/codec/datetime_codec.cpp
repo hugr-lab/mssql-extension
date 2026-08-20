@@ -697,23 +697,23 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
-		FlatVector::GetData<date_t>(out)[row] = d;
+		FlatVector::GetDataMutable<date_t>(out)[row] = d;
 		return;
 	}
 	case TDS_TYPE_TIME: {
 		dtime_t t = tds::encoding::DateTimeEncoding::ConvertTime(bytes.data(), col.scale);
-		FlatVector::GetData<dtime_t>(out)[row] = t;
+		FlatVector::GetDataMutable<dtime_t>(out)[row] = t;
 		return;
 	}
 	case TDS_TYPE_DATETIME: {
 		// DATETIME wire (~3 ms precision) always decodes to TIMESTAMP (µs).
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_SMALLDATETIME: {
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes.data());
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIME2: {
@@ -730,7 +730,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 			FlatVector::SetNull(out, row, true);
 			return;
 		}
-		FlatVector::GetData<timestamp_t>(out)[row] = timestamp_t(native);
+		FlatVector::GetDataMutable<timestamp_t>(out)[row] = timestamp_t(native);
 		return;
 	}
 	case TDS_TYPE_DATETIMEN: {
@@ -744,14 +744,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		} else {
 			throw InvalidInputException("Invalid DATETIMEN length: %d", bytes.size());
 		}
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
 		// DuckDB has no nanosecond TZ type; catalog always maps DATETIMEOFFSET
 		// to TIMESTAMP_TZ (µs). Existing decoder returns UTC µs which fits.
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes.data(), col.scale);
-		FlatVector::GetData<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	default:
@@ -770,28 +770,28 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
-		date_t *result = FlatVector::GetData<date_t>(out);
+		date_t *result = FlatVector::GetDataMutable<date_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DateTimeEncoding::ConvertDate(base + row * stride);
 		}
 		return;
 	}
 	case TDS_TYPE_TIME: {
-		dtime_t *result = FlatVector::GetData<dtime_t>(out);
+		dtime_t *result = FlatVector::GetDataMutable<dtime_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DateTimeEncoding::ConvertTime(base + row * stride, col.scale);
 		}
 		return;
 	}
 	case TDS_TYPE_DATETIME: {
-		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
 		}
 		return;
 	}
 	case TDS_TYPE_SMALLDATETIME: {
-		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(base + row * stride);
 		}
@@ -800,7 +800,7 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	case TDS_TYPE_DATETIMEN: {
 		// Length-dispatched in the per-value path, but the width is a property of
 		// the COLUMN, so the choice is made once here instead of per value.
-		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
 		if (stride == 8) {
 			for (idx_t row = 0; row < count; row++) {
 				result[row] = tds::encoding::DateTimeEncoding::ConvertDatetime(base + row * stride);
@@ -816,7 +816,7 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 		// The one temporal kernel that is not total: a datetime2 beyond the
 		// target variant's range becomes SQL NULL (issue #168), so this loop has
 		// to know which rows carry real values rather than a stale slot.
-		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
 		const size_t time_len = Datetime2TimeByteLen(col.scale);
 		const LogicalTypeId target = out.GetType().id();
 		for (idx_t row = 0; row < count; row++) {
@@ -833,7 +833,7 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 		return;
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
-		timestamp_t *result = FlatVector::GetData<timestamp_t>(out);
+		timestamp_t *result = FlatVector::GetDataMutable<timestamp_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(base + row * stride, col.scale);
 		}

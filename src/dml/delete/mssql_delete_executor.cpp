@@ -54,7 +54,7 @@ MSSQLDeleteExecutor::MSSQLDeleteExecutor(ClientContext &context, const MSSQLDele
 	// 3. But the connection is in "Executing" state while streaming
 	// Solution: Buffer all rowids during Sink, execute in Finalize after scan completes
 	if (!context.transaction.IsAutoCommit()) {
-		auto &catalog = Catalog::GetCatalog(context, target_.catalog_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(target_.catalog_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
 			defer_execution_ = true;
@@ -169,7 +169,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 	DELETE_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", batch.sql.size());
 
 	// Get the MSSQLCatalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Acquire connection via ConnectionProvider (handles transaction pinning)

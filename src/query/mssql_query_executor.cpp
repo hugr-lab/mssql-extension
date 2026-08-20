@@ -38,7 +38,7 @@ void MSSQLQueryExecutor::ValidateContext(ClientContext &context) {
 	// Throws CatalogException when the alias is not attached; that maps to the
 	// same user-facing "context not found" UX as the singleton lookup did.
 	try {
-		auto &catalog = Catalog::GetCatalog(context, context_name_);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(context_name_));
 		if (catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException("MSSQL context '%s' is attached as a non-MSSQL catalog type '%s'.",
 										context_name_.c_str(), catalog.GetCatalogType());
@@ -56,7 +56,7 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	ValidateContext(context);
 
 	// Get MSSQLCatalog for transaction-aware connection handling
-	auto &catalog = Catalog::GetCatalog(context, context_name_);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(context_name_));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Log pool stats before acquire

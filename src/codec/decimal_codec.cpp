@@ -186,13 +186,13 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// DuckDB DECIMAL uses different storage based on precision.
 	// Mirrors the dispatch in TypeConverter::ConvertDecimal.
 	if (col.precision <= 4) {
-		FlatVector::GetData<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
+		FlatVector::GetDataMutable<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
 	} else if (col.precision <= 9) {
-		FlatVector::GetData<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
+		FlatVector::GetDataMutable<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
 	} else if (col.precision <= 18) {
-		FlatVector::GetData<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
+		FlatVector::GetDataMutable<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
 	} else {
-		FlatVector::GetData<hugeint_t>(out)[row] = int_value;
+		FlatVector::GetDataMutable<hugeint_t>(out)[row] = int_value;
 	}
 }
 
@@ -203,25 +203,25 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	// Total over any byte pattern — a sign byte and a little-endian mantissa are
 	// just loads — so the loop runs over NULL rows too and stays branch-free.
 	if (col.precision <= 4) {
-		int16_t *result = FlatVector::GetData<int16_t>(out);
+		int16_t *result = FlatVector::GetDataMutable<int16_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] =
 				static_cast<int16_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
 		}
 	} else if (col.precision <= 9) {
-		int32_t *result = FlatVector::GetData<int32_t>(out);
+		int32_t *result = FlatVector::GetDataMutable<int32_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] =
 				static_cast<int32_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
 		}
 	} else if (col.precision <= 18) {
-		int64_t *result = FlatVector::GetData<int64_t>(out);
+		int64_t *result = FlatVector::GetDataMutable<int64_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] =
 				static_cast<int64_t>(tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride).lower);
 		}
 	} else {
-		hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+		hugeint_t *result = FlatVector::GetDataMutable<hugeint_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 		}

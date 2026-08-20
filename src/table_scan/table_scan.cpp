@@ -178,7 +178,7 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 //------------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> TableScanBind(ClientContext &context, TableFunctionBindInput &input,
-											  vector<LogicalType> &return_types, vector<string> &names) {
+											  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
 	// from MSSQLTableEntry
 	throw InternalException("TableScanBind should not be called directly");
@@ -399,9 +399,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	bool needs_duckdb_filter = false;
 
 	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
-	if (input.filters && !input.filters->filters.empty()) {
+	if (input.filters && input.filters->HasFilters()) {
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
-							 input.filters->filters.size());
+							 static_cast<size_t>(input.filters->FilterCount()));
 
 		auto encode_result =
 			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types);
@@ -608,7 +608,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 				if (output_idx != UINT64_MAX) {
 					// This PK column is in the projection - copy to STRUCT child
 					auto &src_vector = output.data[output_idx];
-					auto &dst_vector = *entries[pk_idx];
+					auto &dst_vector = entries[pk_idx];
 					VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 					MSSQL_SCAN_DEBUG_LOG(2, "Execute: copied PK column %llu from output[%llu] to STRUCT child",
 										 (unsigned long long)pk_idx, (unsigned long long)output_idx);
@@ -616,7 +616,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 			}
 		}
 
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = FlatVector::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %llu rows",
 							 (unsigned long long)row_count);
@@ -632,14 +632,14 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		for (idx_t pk_idx = 0; pk_idx < state.pk_result_indices.size(); pk_idx++) {
 			idx_t src_col_idx = state.pk_result_indices[pk_idx];
 			auto &src_vector = output.data[src_col_idx];
-			auto &dst_vector = *entries[pk_idx];
+			auto &dst_vector = entries[pk_idx];
 
 			// Copy the PK column data to the struct child
 			VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 		}
 
 		// Set validity for the struct itself (valid if any child is valid)
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = FlatVector::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %llu rows",
@@ -695,7 +695,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
 					if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
 						// This PK column was added - SQL will write to STRUCT child
-						target_vectors.push_back(entries[pk_idx].get());
+						target_vectors.push_back(&entries[pk_idx]);
 						added_pk_count++;
 					}
 					// PK columns already in projection will be copied after FillChunk
@@ -712,7 +712,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				// Composite PK rowid-only: write directly to STRUCT children
 				vector<Vector *> target_vectors;
 				for (auto &entry : entries) {
-					target_vectors.push_back(entry.get());
+					target_vectors.push_back(&entry);
 				}
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(entries.size());
@@ -800,8 +800,8 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
-		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i, (int)filter->type,
-							 (int)filter->GetExpressionClass());
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i,
+							 (int)filter->GetExpressionType(), (int)filter->GetExpressionClass());
 
 		// Try to encode this expression
 		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
@@ -962,7 +962,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	// The alias may since have been detached and re-attached over a different
 	// storage type. Cast<MSSQLCatalogScanBindData> below is unchecked in release
 	// builds, so confirm the catalog is still ours before trusting the entry.
-	auto &catalog = Catalog::GetCatalog(context, context_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(context_name));
 	if (catalog.GetCatalogType() != "mssql") {
 		throw SerializationException("MSSQL: catalog \"%s\" is no longer an MSSQL catalog (now \"%s\")", context_name,
 									 catalog.GetCatalogType());
@@ -970,7 +970,8 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 
 	// Rebuild through the catalog entry so the column/PK metadata comes from the
 	// live catalog rather than from stale serialized copies.
-	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, context_name, schema_name, table_name);
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+		context, QualifiedName(Identifier(context_name), Identifier(schema_name), Identifier(table_name)));
 	unique_ptr<FunctionData> bind_data;
 	entry.GetScanFunction(context, bind_data);
 	if (!bind_data) {

@@ -243,18 +243,21 @@ void RegisterKrb5TestFunction(ExtensionLoader &loader) {
 	// mssql_kerberos_auth_test(host)
 	ScalarFunction func1("mssql_kerberos_auth_test", {LogicalType::VARCHAR}, LogicalType::VARCHAR, Krb5TestHost);
 	func1.SetVolatile();
+	func1.SetFallible();
 	loader.RegisterFunction(func1);
 
 	// mssql_kerberos_auth_test(host, port)
 	ScalarFunction func2("mssql_kerberos_auth_test", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR,
 						 Krb5TestHostPort);
 	func2.SetVolatile();
+	func2.SetFallible();
 	loader.RegisterFunction(func2);
 
 	// mssql_kerberos_auth_test_secret(secret_name)
 	ScalarFunction func3("mssql_kerberos_auth_test_secret", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 						 Krb5TestSecret);
 	func3.SetVolatile();
+	func3.SetFallible();
 	loader.RegisterFunction(func3);
 }
 

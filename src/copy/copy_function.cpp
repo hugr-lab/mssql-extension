@@ -53,9 +53,9 @@ static void CopyDebugLog(int level, const char *format, ...) {
 
 // High-resolution timer for performance analysis
 using Clock = std::chrono::high_resolution_clock;
-using TimePoint = std::chrono::time_point<Clock>;
+using CopyTimePoint = std::chrono::time_point<Clock>;
 
-static double ElapsedMs(TimePoint start) {
+static double ElapsedMs(CopyTimePoint start) {
 	auto end = Clock::now();
 	return std::chrono::duration<double, std::milli>(end - start).count();
 }
@@ -64,7 +64,7 @@ static double ElapsedMs(TimePoint start) {
 // per-chunk intervals through duration_cast<microseconds>, which truncated every
 // short interval to zero and made the phase it measured report approximately
 // nothing. Accumulate ns; divide at print time.
-static uint64_t ElapsedNs(TimePoint start) {
+static uint64_t ElapsedNs(CopyTimePoint start) {
 	auto end = Clock::now();
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 }
@@ -141,13 +141,16 @@ static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &
 // BCPCopyBind - Parse target URL and options
 //===----------------------------------------------------------------------===//
 
-unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
-									 const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+									 const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	auto bind_data = make_uniq<MSSQLCopyBindData>();
 
 	// Store source schema info
 	bind_data->source_types = sql_types;
-	bind_data->source_names = names;
+	bind_data->source_names.reserve(names.size());
+	for (auto &n : names) {
+		bind_data->source_names.push_back(n.GetIdentifierName());
+	}
 
 	// Get the file path (which is actually our target URL or catalog path for MSSQL)
 	const string &target_path = input.info.file_path;
@@ -193,7 +196,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 
 		// Verify catalog exists and is an MSSQL catalog
 		try {
-			auto &catalog = Catalog::GetCatalog(context, catalog_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 			if (catalog.GetCatalogType() != "mssql") {
 				throw InvalidInputException(
 					"MSSQL COPY: Catalog '%s' is not an MSSQL catalog (type: %s). "
@@ -223,7 +226,7 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 	// Then let COPY options override
 	CopyDebugLog(2, "BCPCopyBind: parsing %llu options", (unsigned long long)input.info.options.size());
 	for (auto &option : input.info.options) {
-		auto loption = StringUtil::Lower(option.first);
+		auto loption = StringUtil::Lower(option.first.GetIdentifierName());
 		CopyDebugLog(2, "BCPCopyBind: option '%s' (lower: '%s')", option.first.c_str(), loption.c_str());
 
 		if (loption == "create_table") {
@@ -261,7 +264,8 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 	// honoured there and nvarchar(max) — the default everywhere else — is refused
 	// by the server. Verified against a live warehouse.
 	{
-		auto &target_catalog = Catalog::GetCatalog(context, bind_data->target.catalog_name).Cast<MSSQLCatalog>();
+		auto &target_catalog =
+			Catalog::GetCatalog(context, Identifier(bind_data->target.catalog_name)).Cast<MSSQLCatalog>();
 		if (target_catalog.RequiresSingleByteText()) {
 			bind_data->config.text_type_varchar = true;
 		}
@@ -297,7 +301,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	CopyDebugLog(1, "BCPCopyInitGlobal: starting for %s", bdata.target.GetFullyQualifiedName().c_str());
 
 	// Get the MSSQLCatalog
-	auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bdata.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Check write access
@@ -567,7 +571,7 @@ unique_ptr<LocalFunctionData> BCPCopyInitLocal(ExecutionContext &context, Functi
 void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
 				 LocalFunctionData &lstate, DataChunk &input) {
 	const bool counters = mssql::CountersEnabled();
-	auto start_sink = counters ? Clock::now() : TimePoint{};
+	auto start_sink = counters ? Clock::now() : CopyTimePoint{};
 	auto &bdata = bind_data.Cast<MSSQLCopyBindData>();
 	auto &gdata = gstate.Cast<MSSQLCopyGlobalState>();
 
@@ -592,7 +596,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	auto &ldata = lstate.Cast<MSSQLCopyLocalState>();
 	if (!ldata.init_attempted) {
 		ldata.init_attempted = true;
-		auto &catalog = Catalog::GetCatalog(context.client, bdata.catalog_name);
+		auto &catalog = Catalog::GetCatalog(context.client, Identifier(bdata.catalog_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		BulkLoadSessionParams params;
 		// The POOL, never ConnectionProvider: inside a transaction the provider
@@ -648,7 +652,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// while another thread was still appending to it. Measured at 205376 rows
 		// arriving out of 1000000 — no error anywhere, on either side.
 		std::unique_lock<std::mutex> shared_lock(gdata.write_mutex);
-		auto start_write = counters ? Clock::now() : TimePoint{};
+		auto start_write = counters ? Clock::now() : CopyTimePoint{};
 		idx_t rows_written = gdata.writer->WriteRows(input);
 		const uint64_t encode_ns = counters ? ElapsedNs(start_write) : 0;
 		gdata.rows_sent.fetch_add(rows_written);
@@ -668,7 +672,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			CopyDebugLog(1, "BCPCopySink: triggering server flush (rows_in_batch=%llu, threshold=%llu)...",
 						 (unsigned long long)gdata.writer->GetRowsInCurrentBatch(),
 						 (unsigned long long)bdata.config.flush_rows);
-			auto start_flush = counters ? Clock::now() : TimePoint{};
+			auto start_flush = counters ? Clock::now() : CopyTimePoint{};
 			// Already held from the append above — the two must not be separable.
 			FlushToServer(gdata, bdata);
 			flush_ns = counters ? ElapsedNs(start_flush) : 0;
@@ -953,7 +957,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	CopyDebugLog(1, "BCPCopyFinalize: completing BCP stream");
 
 	// Get catalog early for potential cleanup
-	auto &catalog = Catalog::GetCatalog(context, bdata.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bdata.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 

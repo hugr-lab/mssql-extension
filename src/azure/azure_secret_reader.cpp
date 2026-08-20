@@ -46,7 +46,7 @@ AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secre
 	info.secret_name = secret_name;
 
 	// Read provider from secret metadata (built-in field)
-	info.provider = kv_secret.GetProvider();
+	info.provider = kv_secret.GetProvider().GetIdentifierName();
 	if (info.provider.empty()) {
 		throw InvalidInputException("Azure secret '%s' missing 'provider' field", secret_name);
 	}
@@ -117,7 +117,7 @@ std::string GetAzureSecretType(ClientContext &context, const std::string &secret
 		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 		auto secret_entry = secret_manager.GetSecretByName(transaction, secret_name);
 		if (secret_entry) {
-			return secret_entry->secret->GetType();
+			return secret_entry->secret->GetType().GetIdentifierName();
 		}
 	} catch (...) {
 		// Ignore errors
