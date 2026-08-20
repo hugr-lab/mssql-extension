@@ -95,7 +95,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		throw InvalidInputException("codec::uuid::DecodeFromTds: expected 16 wire bytes, got %zu", bytes.size());
 	}
 	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes.data());
-	FlatVector::GetDataMutable<hugeint_t>(out)[row] = guid;
+	FlatVector::GetDataMutableUnsafe<hugeint_t>(out)[row] = guid;
 }
 
 //===----------------------------------------------------------------------===//

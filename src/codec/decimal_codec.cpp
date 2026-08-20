@@ -186,13 +186,13 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// DuckDB DECIMAL uses different storage based on precision.
 	// Mirrors the dispatch in TypeConverter::ConvertDecimal.
 	if (col.precision <= 4) {
-		FlatVector::GetDataMutable<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
+		FlatVector::GetDataMutableUnsafe<int16_t>(out)[row] = static_cast<int16_t>(int_value.lower);
 	} else if (col.precision <= 9) {
-		FlatVector::GetDataMutable<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
+		FlatVector::GetDataMutableUnsafe<int32_t>(out)[row] = static_cast<int32_t>(int_value.lower);
 	} else if (col.precision <= 18) {
-		FlatVector::GetDataMutable<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
+		FlatVector::GetDataMutableUnsafe<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
 	} else {
-		FlatVector::GetDataMutable<hugeint_t>(out)[row] = int_value;
+		FlatVector::GetDataMutableUnsafe<hugeint_t>(out)[row] = int_value;
 	}
 }
 

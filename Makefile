@@ -423,7 +423,7 @@ LOGIN7_TEST_SOURCES := \
 LOGIN7_TEST_VCPKG_INSTALLED := build/debug/vcpkg_installed
 LOGIN7_TEST_VCPKG_TRIPLET := $(shell ls $(LOGIN7_TEST_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
 LOGIN7_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
-LOGIN7_TEST_INCLUDES := -I src/include -I duckdb/src/include \
+LOGIN7_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
     -I $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/include
 LOGIN7_TEST_LIBS := -L $(LOGIN7_TEST_VCPKG_INSTALLED)/$(LOGIN7_TEST_VCPKG_TRIPLET)/debug/lib -lsimdutf
 
@@ -610,7 +610,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/codec/test_uuid_codec.cpp
 
 STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
-STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include
+STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
 STANDALONE_TEST_UNAME := $(shell uname -s)
 ifeq ($(STANDALONE_TEST_UNAME),Darwin)
@@ -708,7 +708,7 @@ BENCH_UTF16_VCPKG_INSTALLED := build/release/vcpkg_installed
 BENCH_UTF16_VCPKG_TRIPLET := $(shell ls $(BENCH_UTF16_VCPKG_INSTALLED) 2>/dev/null | head -n 1)
 BENCH_UTF16_SOURCES := src/tds/encoding/utf16.cpp
 BENCH_UTF16_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
-BENCH_UTF16_INCLUDES := -I src/include -I duckdb/src/include \
+BENCH_UTF16_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
     -I $(BENCH_UTF16_VCPKG_INSTALLED)/$(BENCH_UTF16_VCPKG_TRIPLET)/include
 # Link against the RELEASE simdutf (optimized SIMD path). The debug build
 # of simdutf disables intrinsics and is dramatically slower; using it for

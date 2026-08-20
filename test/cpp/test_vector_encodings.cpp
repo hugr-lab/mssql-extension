@@ -38,13 +38,12 @@ using duckdb::tds::encoding::BCPRowEncoder;
 
 static int g_failures = 0;
 
-#define CHECK(cond, msg)                                                                   \
-	do {                                                                                   \
-		if (!(cond)) {                                                                     \
-			std::cerr << "FAIL at " << __FILE__ << ":" << __LINE__ << " — " << msg         \
-					  << std::endl;                                                        \
-			g_failures++;                                                                  \
-		}                                                                                  \
+#define CHECK(cond, msg)                                                                         \
+	do {                                                                                         \
+		if (!(cond)) {                                                                           \
+			std::cerr << "FAIL at " << __FILE__ << ":" << __LINE__ << " — " << msg << std::endl; \
+			g_failures++;                                                                        \
+		}                                                                                        \
 	} while (0)
 
 static mssql::BCPColumnMetadata MakeCol(const std::string &name, LogicalType type, uint8_t token, uint16_t max_length,
@@ -66,9 +65,9 @@ static duckdb::vector<mssql::BCPColumnMetadata> TestColumns() {
 	duckdb::vector<mssql::BCPColumnMetadata> cols;
 	cols.push_back(MakeCol("c_int", LogicalType::INTEGER, 0x26, 4));
 	cols.push_back(MakeCol("c_big", LogicalType::BIGINT, 0x26, 8));
-	cols.push_back(MakeCol("c_str", LogicalType::VARCHAR, 0xE7, 80));        // nvarchar(40), USHORT length
-	cols.push_back(MakeCol("c_strmax", LogicalType::VARCHAR, 0xE7, 0xFFFF)); // nvarchar(max), PLP
-	cols.push_back(MakeCol("c_bin", LogicalType::BLOB, 0xA5, 0xFFFF));       // varbinary(max), PLP
+	cols.push_back(MakeCol("c_str", LogicalType::VARCHAR, 0xE7, 80));		  // nvarchar(40), USHORT length
+	cols.push_back(MakeCol("c_strmax", LogicalType::VARCHAR, 0xE7, 0xFFFF));  // nvarchar(max), PLP
+	cols.push_back(MakeCol("c_bin", LogicalType::BLOB, 0xA5, 0xFFFF));		  // varbinary(max), PLP
 	cols.push_back(MakeCol("c_null", LogicalType::BIGINT, 0x26, 8));
 	return cols;
 }
@@ -135,7 +134,8 @@ static void FillDictionary(DataChunk &base, DataChunk &dict) {
 		dict.data[c].Reference(base.data[c]);
 		dict.data[c].Slice(sel, ROWS);
 		CHECK(dict.data[c].GetVectorType() == VectorType::DICTIONARY_VECTOR,
-			  "column " << "must be a dictionary vector after Slice");
+			  "column "
+				  << "must be a dictionary vector after Slice");
 	}
 	dict.SetCardinality(ROWS);
 }
@@ -190,8 +190,10 @@ static void test_dictionary_on_scatter_path() {
 	SelectionVector sel(ROWS);
 	for (idx_t r = 0; r < ROWS; r++) {
 		sel.set_index(r, SEL[r]);
-		flat.SetValue(0, r, SEL[r] == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * SEL[r])));
-		flat.SetValue(1, r, SEL[r] == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * SEL[r])));
+		flat.SetValue(0, r,
+					  SEL[r] == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * SEL[r])));
+		flat.SetValue(
+			1, r, SEL[r] == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * SEL[r])));
 	}
 	flat.SetCardinality(ROWS);
 
@@ -223,7 +225,7 @@ static void test_constant_encodes_like_flat() {
 	cchunk.Initialize(Allocator::DefaultAllocator(), types);
 	for (idx_t c = 0; c < types.size(); c++) {
 		Value v = (c == 5) ? Value(LogicalType::BIGINT) : BaseValue(c, 1);
-		cchunk.data[c].Reference(v);
+		cchunk.data[c].Reference(v, duckdb::count_t(ROWS));
 		CHECK(cchunk.data[c].GetVectorType() == VectorType::CONSTANT_VECTOR, "column must be a constant vector");
 	}
 	cchunk.SetCardinality(ROWS);

@@ -107,7 +107,7 @@ fi
 echo "Building $(basename "$TEST_SRC") ($LABEL)..."
 "$CXX" -std=c++17 -g -O1 -pthread -Wno-deprecated-declarations \
 	${SAN_FLAGS[@]+"${SAN_FLAGS[@]}"} \
-	-I src/include -I duckdb/src/include -I "$PREFIX/include" \
+	-I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include -I "$PREFIX/include" \
 	"${SOURCES[@]}" \
 	-L "$PREFIX/lib" -lsimdutf \
 	-L "$BUILD_DIR/src" -lduckdb \

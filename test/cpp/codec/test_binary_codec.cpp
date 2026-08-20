@@ -32,6 +32,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -108,7 +109,7 @@ void TestDecodeNonPLPEmpty() {
 	std::vector<uint8_t> wire;
 	duckdb::Vector vec(LogicalType::BLOB, 1);
 	duckdb::mssql::codec::binary::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
-	auto stored = duckdb::FlatVector::GetData<duckdb::string_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[0];
 	CHECK_EQ(stored.GetSize(), 0u);
 }
 
@@ -117,7 +118,7 @@ void TestDecodePLPPayload() {
 	std::vector<uint8_t> wire = {0x48, 0x65, 0x6c, 0x6c, 0x6f};
 	duckdb::Vector vec(LogicalType::BLOB, 1);
 	duckdb::mssql::codec::binary::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
-	auto stored = duckdb::FlatVector::GetData<duckdb::string_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[0];
 	CHECK_EQ(std::string(stored.GetData(), stored.GetSize()), std::string("Hello"));
 }
 
@@ -129,7 +130,7 @@ void TestDecodeIntoGeometryVector() {
 								0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 	duckdb::Vector vec(LogicalType::GEOMETRY(), 1);
 	duckdb::mssql::codec::binary::DecodeFromTds(wkb, UnusedColumnMetadata(), vec, 0);
-	auto stored = duckdb::FlatVector::GetData<duckdb::string_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[0];
 	CHECK_EQ(stored.GetSize(), wkb.size());
 	CHECK_TRUE(std::memcmp(stored.GetData(), wkb.data(), wkb.size()) == 0);
 }
@@ -137,7 +138,7 @@ void TestDecodeIntoGeometryVector() {
 void TestEncodeNonPLP() {
 	std::cout << "Test: EncodeToBcp non-PLP — 0xDEADBEEF → 04 00 de ad be ef\n";
 	duckdb::Vector vec(LogicalType::BLOB, 1);
-	auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+	auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
 	const char bytes[] = {(char)0xde, (char)0xad, (char)0xbe, (char)0xef};
 	data[0] = duckdb::StringVector::AddStringOrBlob(vec, bytes, sizeof(bytes));
 
@@ -151,7 +152,7 @@ void TestEncodeNonPLP() {
 void TestEncodePLPEmpty() {
 	std::cout << "Test: EncodeToBcp PLP empty — UNKNOWN_PLP_LEN + terminator\n";
 	duckdb::Vector vec(LogicalType::BLOB, 1);
-	auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+	auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
 	data[0] = duckdb::StringVector::AddStringOrBlob(vec, "", 0);
 
 	BCPColumnMetadata col = MakeBCPColumn(/*plp=*/true);
@@ -165,7 +166,7 @@ void TestEncodePLPEmpty() {
 void TestEncodePLPHello() {
 	std::cout << "Test: EncodeToBcp PLP \"Hello\" — chunk header + payload + terminator\n";
 	duckdb::Vector vec(LogicalType::BLOB, 1);
-	auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+	auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
 	data[0] = duckdb::StringVector::AddStringOrBlob(vec, "Hello", 5);
 
 	BCPColumnMetadata col = MakeBCPColumn(/*plp=*/true);

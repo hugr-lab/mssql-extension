@@ -697,23 +697,23 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
-		FlatVector::GetDataMutable<date_t>(out)[row] = d;
+		FlatVector::GetDataMutableUnsafe<date_t>(out)[row] = d;
 		return;
 	}
 	case TDS_TYPE_TIME: {
 		dtime_t t = tds::encoding::DateTimeEncoding::ConvertTime(bytes.data(), col.scale);
-		FlatVector::GetDataMutable<dtime_t>(out)[row] = t;
+		FlatVector::GetDataMutableUnsafe<dtime_t>(out)[row] = t;
 		return;
 	}
 	case TDS_TYPE_DATETIME: {
 		// DATETIME wire (~3 ms precision) always decodes to TIMESTAMP (µs).
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetime(bytes.data());
-		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutableUnsafe<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_SMALLDATETIME: {
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertSmallDatetime(bytes.data());
-		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutableUnsafe<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIME2: {
@@ -730,7 +730,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 			FlatVector::SetNull(out, row, true);
 			return;
 		}
-		FlatVector::GetDataMutable<timestamp_t>(out)[row] = timestamp_t(native);
+		FlatVector::GetDataMutableUnsafe<timestamp_t>(out)[row] = timestamp_t(native);
 		return;
 	}
 	case TDS_TYPE_DATETIMEN: {
@@ -744,14 +744,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		} else {
 			throw InvalidInputException("Invalid DATETIMEN length: %d", bytes.size());
 		}
-		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutableUnsafe<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	case TDS_TYPE_DATETIMEOFFSET: {
 		// DuckDB has no nanosecond TZ type; catalog always maps DATETIMEOFFSET
 		// to TIMESTAMP_TZ (µs). Existing decoder returns UTC µs which fits.
 		timestamp_t ts = tds::encoding::DateTimeEncoding::ConvertDatetimeOffset(bytes.data(), col.scale);
-		FlatVector::GetDataMutable<timestamp_t>(out)[row] = ts;
+		FlatVector::GetDataMutableUnsafe<timestamp_t>(out)[row] = ts;
 		return;
 	}
 	default:

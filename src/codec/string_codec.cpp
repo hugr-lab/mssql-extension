@@ -816,13 +816,13 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 					str.pop_back();
 				}
 			}
-			FlatVector::GetDataMutable<string_t>(out)[row] = StringVector::AddString(out, str);
+			FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = StringVector::AddString(out, str);
 			return;
 		}
 		string_t slot = StringVector::EmptyString(out, utf8_len);
 		tds::encoding::Utf16LEDecodeValidInto(bytes.data(), byte_len, slot.GetDataWriteable());
 		slot.Finalize();
-		FlatVector::GetDataMutable<string_t>(out)[row] = slot;
+		FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = slot;
 		return;
 	}
 
@@ -835,7 +835,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 			len--;
 		}
 	}
-	FlatVector::GetDataMutable<string_t>(out)[row] =
+	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] =
 		StringVector::AddString(out, reinterpret_cast<const char *>(bytes.data()), len);
 }
 

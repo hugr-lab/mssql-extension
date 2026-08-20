@@ -40,6 +40,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -135,7 +136,7 @@ void TestDecodeDate() {
 	duckdb::Vector vec(LogicalType::DATE, 1);
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATE, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
-	CHECK_EQ(duckdb::FlatVector::GetData<date_t>(vec)[0].days, target.days);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<date_t>(vec)[0].days, target.days);
 }
 
 void TestDecodeTimeScale7() {
@@ -150,7 +151,7 @@ void TestDecodeTimeScale7() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_TIME, 7);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Time::FromTime(14, 30, 0, 0);
-	CHECK_EQ(duckdb::FlatVector::GetData<dtime_t>(vec)[0].micros, expected.micros);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<dtime_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeTimeScale0() {
@@ -166,7 +167,7 @@ void TestDecodeTimeScale0() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_TIME, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Time::FromTime(14, 30, 0, 0);
-	CHECK_EQ(duckdb::FlatVector::GetData<dtime_t>(vec)[0].micros, expected.micros);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<dtime_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeDatetime() {
@@ -183,7 +184,7 @@ void TestDecodeDatetime() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIME, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeSmallDatetime() {
@@ -198,7 +199,7 @@ void TestDecodeSmallDatetime() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_SMALLDATETIME, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeDatetimen8() {
@@ -213,7 +214,7 @@ void TestDecodeDatetimen8() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIMEN, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeDatetimen4() {
@@ -228,7 +229,7 @@ void TestDecodeDatetimen4() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIMEN, 0);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeDatetime2Scale6() {
@@ -248,11 +249,12 @@ void TestDecodeDatetime2Scale6() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIME2, 6);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 123456));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 void TestDecodeDatetime2Scale7NsInRange() {
-	std::cout << "Test: DecodeFromTds — DATETIME2(7) in-range → TIMESTAMP_NS lossless (issue #168 guard not over-eager)\n";
+	std::cout
+		<< "Test: DecodeFromTds — DATETIME2(7) in-range → TIMESTAMP_NS lossless (issue #168 guard not over-eager)\n";
 	// 2024-01-15 14:30:00.1234567 — well within TIMESTAMP_NS's ~[1677,2262] window.
 	int64_t time_ticks = ((14LL * 3600 + 30 * 60) * 10000000LL) + 1234567LL;  // 100-ns ticks
 	auto target_date = duckdb::Date::FromDate(2024, 1, 15);
@@ -270,7 +272,7 @@ void TestDecodeDatetime2Scale7NsInRange() {
 	CHECK_TRUE(!duckdb::FlatVector::IsNull(vec, 0));
 	// ns since epoch = days_since_1970 * 86400 * 1e9 + time_ticks * 100
 	int64_t expected = static_cast<int64_t>(target_date.days) * 86400LL * 1000000000LL + time_ticks * 100LL;
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected);
 }
 
 void TestDecodeDatetime2FarFutureNull() {
@@ -313,7 +315,7 @@ void TestDecodeDatetimeOffset() {
 	auto col = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIMEOFFSET, 7);
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	CHECK_EQ(duckdb::FlatVector::GetData<timestamp_t>(vec)[0].value, expected.value);
+	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
 }
 
 //===----------------------------------------------------------------------===//
@@ -324,7 +326,7 @@ void TestEncodeDateVector() {
 	std::cout << "Test: EncodeToBcp(Vector) DATE — 3-byte LE, length-prefixed\n";
 	duckdb::Vector vec(LogicalType::DATE, 1);
 	auto target = duckdb::Date::FromDate(2024, 1, 15);
-	duckdb::FlatVector::GetData<date_t>(vec)[0] = target;
+	duckdb::FlatVector::GetDataMutable<date_t>(vec)[0] = target;
 	auto col = MakeBCPColumn(LogicalType::DATE, 0);
 	duckdb::vector<uint8_t> buf;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec, 0, col, buf);
@@ -352,7 +354,7 @@ void TestEncodeTimeScale7Vector() {
 	std::cout << "Test: EncodeToBcp(Vector) TIME(7) — 5-byte 100-ns ticks\n";
 	duckdb::Vector vec(LogicalType::TIME, 1);
 	auto target = duckdb::Time::FromTime(14, 30, 0, 0);
-	duckdb::FlatVector::GetData<dtime_t>(vec)[0] = target;
+	duckdb::FlatVector::GetDataMutable<dtime_t>(vec)[0] = target;
 	auto col = MakeBCPColumn(LogicalType::TIME, 7);
 	duckdb::vector<uint8_t> buf;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec, 0, col, buf);
@@ -370,7 +372,7 @@ void TestEncodeTimestampVector() {
 	duckdb::Vector vec(LogicalType::TIMESTAMP, 1);
 	auto target_date = duckdb::Date::FromDate(2024, 1, 15);
 	auto target = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
-	duckdb::FlatVector::GetData<timestamp_t>(vec)[0] = target;
+	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0] = target;
 	auto col = MakeBCPColumn(LogicalType::TIMESTAMP, 7);
 	duckdb::vector<uint8_t> buf;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec, 0, col, buf);
@@ -400,14 +402,14 @@ void TestEncodeTimestampMSandSEC() {
 	auto ts = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
 
 	duckdb::Vector vec_ms(LogicalType::TIMESTAMP_MS, 1);
-	duckdb::FlatVector::GetData<timestamp_t>(vec_ms)[0] = ts;
+	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_ms)[0] = ts;
 	auto col_ms = MakeBCPColumn(LogicalType::TIMESTAMP_MS, 3);
 	duckdb::vector<uint8_t> buf_ms;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec_ms, 0, col_ms, buf_ms);
 	CHECK_EQ(static_cast<int>(buf_ms[0]), 7);  // 4 time @ scale 3 + 3 date
 
 	duckdb::Vector vec_sec(LogicalType::TIMESTAMP_S, 1);
-	duckdb::FlatVector::GetData<timestamp_t>(vec_sec)[0] = ts;
+	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_sec)[0] = ts;
 	auto col_sec = MakeBCPColumn(LogicalType::TIMESTAMP_S, 0);
 	duckdb::vector<uint8_t> buf_sec;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec_sec, 0, col_sec, buf_sec);

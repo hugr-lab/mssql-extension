@@ -37,6 +37,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "mssql_compat.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -125,7 +126,7 @@ void TestDecodeNilUuid() {
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
 
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), std::string("00000000-0000-0000-0000-000000000000"));
 }
 
@@ -135,7 +136,7 @@ void TestDecodeMaxUuid() {
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
 
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), std::string("ffffffff-ffff-ffff-ffff-ffffffffffff"));
 }
 
@@ -147,7 +148,7 @@ void TestDecodeRfc4122Example() {
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
 
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), std::string("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
 }
 
@@ -158,7 +159,7 @@ void TestDecodeMixedBytePattern() {
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
 
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), std::string("01234567-89ab-cdef-0123-456789abcdef"));
 }
 
@@ -171,7 +172,7 @@ void TestDecodeHighBitSet() {
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
 
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), std::string("c2c7f47e-8edd-4e1f-8a3f-aef2a18b1c2d"));
 
 	// XOR mask sanity: DuckDB stores the upper byte 0xC2 -> 0x42 (bit 63 cleared).
@@ -243,7 +244,7 @@ void TestEncodeDecodeRoundTrip() {
 
 	duckdb::Vector vec(LogicalType::UUID, 1);
 	duckdb::mssql::codec::uuid::DecodeFromTds(wire, UnusedColumnMetadata(), vec, 0);
-	auto stored = duckdb::FlatVector::GetData<hugeint_t>(vec)[0];
+	auto stored = duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[0];
 	CHECK_EQ(UUID::ToString(stored), canonical);
 }
 
@@ -353,7 +354,7 @@ void TestEncodeConstantDictionaryVectors() {
 	// CONSTANT vector: any row index resolves to the single value (a raw
 	// FlatVector::GetData[row] read would walk off the 1-element backing array).
 	{
-		duckdb::Vector cv(Value::UUID(uuids[1]));
+		duckdb::Vector cv(Value::UUID(uuids[1]), duckdb::count_t(1));
 		duckdb::vector<uint8_t> b;
 		duckdb::mssql::codec::uuid::EncodeToBcp(cv, 3, col, b);
 		CHECK_TRUE(b == encode_flat(uuids[1]));

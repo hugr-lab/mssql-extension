@@ -32,7 +32,7 @@ namespace boolean {
 
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata & /*col*/, Vector &out, idx_t row) {
 	bool b = !bytes.empty() && bytes[0] != 0;
-	FlatVector::GetDataMutable<bool>(out)[row] = b;
+	FlatVector::GetDataMutableUnsafe<bool>(out)[row] = b;
 }
 
 void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata & /*col*/,

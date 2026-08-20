@@ -101,11 +101,11 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	if (bytes.size() == 4) {
 		float f = 0;
 		std::memcpy(&f, bytes.data(), 4);
-		FlatVector::GetDataMutable<float>(out)[row] = f;
+		FlatVector::GetDataMutableUnsafe<float>(out)[row] = f;
 	} else if (bytes.size() == 8) {
 		double d = 0;
 		std::memcpy(&d, bytes.data(), 8);
-		FlatVector::GetDataMutable<double>(out)[row] = d;
+		FlatVector::GetDataMutableUnsafe<double>(out)[row] = d;
 	}
 	// Other sizes silently skip (mirror legacy ConvertFloat — defensive only).
 }
