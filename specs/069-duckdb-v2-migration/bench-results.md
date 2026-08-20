@@ -54,7 +54,29 @@ bug would actually reach first).
   µs/chunk, `wide_encode_*` 9.5→3.3) — the count-less `ToUnifiedFormat` and
   2.0 vector internals, for free.
 
-## Not covered here
+## E2E write (live SQL Server, wide-write matrix)
 
-The live-server halves of step 7 (end-to-end read/write against SQL Server)
-need the docker lane or CI — the local container is down (Rosetta segfault).
+**Date**: 2026-08-20, local docker SQL Server 2022 (fresh volume), after the
+cluster-G fixes. `test/bench/bench_wide_write.sh` (CTAS of 500k × 20 mixed
+columns), two interleaved rounds per side. Baseline is what a user runs
+today: stock DuckDB v1.5.5 + community mssql 0.2.4 (`BIN`/`PRELUDE_SQL`
+parameters added to the script for exactly this). The fixture's
+`AT TIME ZONE` became a `::TIMESTAMPTZ` cast — it needed icu, which does not
+exist for a dev duckdb SHA; both sides run the identical changed fixture.
+
+| cell | 0.2.4 min | 2.0 min | ratio |
+|---|---|---|---|
+| threads=1 plain nonulls | 3.74 | 3.79 | 1.01× |
+| threads=4 plain nonulls | 1.33 | 1.28 | 0.96× |
+| threads=1 sized nonulls | 2.13 | 2.09 | 0.98× |
+| threads=4 sized nonulls | 0.74 | 0.67 | **0.90×** |
+| threads=1 plain nulls | 3.71 | 3.86 | 1.04× |
+| threads=4 plain nulls | 1.25 | 1.31 | 1.04× |
+| threads=1 sized nulls | 2.10 | 2.10 | 1.00× |
+| threads=4 sized nulls | 0.67 | 0.64 | **0.95×** |
+
+**Geomean 0.985 — wall-time parity.** As predicted from the kernel bench:
+the write path is server-ingest-bound, so the 3–4× cheaper client encode
+does not move wall clock; the visible gains sit exactly where client CPU is
+the binding term (parallel writers on sized strings). The headline stays:
+"client CPU on write −70…75%, wall time server-bound as before."

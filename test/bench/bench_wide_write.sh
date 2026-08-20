@@ -65,7 +65,7 @@ SELECT
     DATE '2020-01-01' + ((i % 365)::INTEGER) AS c_date,
     TIME '12:34:56' + INTERVAL (i % 60) SECOND        AS c_time,
     TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND AS c_ts,
-    (TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND) AT TIME ZONE 'UTC' AS c_tstz,
+    (TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND)::TIMESTAMPTZ AS c_tstz,
     gen_random_uuid()                        AS c_uuid,
     repeat('a', 10) || (i % 100)::VARCHAR    AS c_s1,
     repeat('b', 20) || (i % 100)::VARCHAR    AS c_s2,
