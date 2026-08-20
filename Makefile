@@ -390,7 +390,7 @@ CPP_TEST_SOURCES := \
     src/tds/tls/tds_tls_stub.cpp \
     src/query/mssql_simple_query.cpp
 
-CPP_TEST_INCLUDES := -I src/include -I duckdb/src/include
+CPP_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 CPP_TEST_FLAGS := -std=c++17 -pthread -DMSSQL_TLS_STUB=1 -Wno-deprecated-declarations
 
 # Build and run C++ simple query test
