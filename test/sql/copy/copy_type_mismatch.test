@@ -8,7 +8,7 @@ require mssql
 require-env MSSQL_TEST_SERVER
 
 statement ok
-ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TEST_SERVER}' AS db (TYPE mssql);
 
 #
 # T021: Test VARCHAR to INT mismatch detection

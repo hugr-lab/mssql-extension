@@ -10,7 +10,7 @@ statement ok
 SET mssql_connection_cache=false;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS nbc_all (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS nbc_all (TYPE mssql);
 
 # =============================================================================
 # Setup: Create table with ALL supported types, all nullable + padding for NBCROW

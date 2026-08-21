@@ -23,9 +23,9 @@ require-env AZURE_ACCESS_TOKEN
 #===----------------------------------------------------------------------===#
 
 statement ok
-ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS token_db (
+ATTACH 'Server={AZURE_SQL_DB_HOST};Database={AZURE_SQL_DB}' AS token_db (
     TYPE mssql,
-    ACCESS_TOKEN '${AZURE_ACCESS_TOKEN}'
+    ACCESS_TOKEN '{AZURE_ACCESS_TOKEN}'
 );
 
 # Basic connectivity test
@@ -45,9 +45,9 @@ DETACH token_db;
 statement ok
 CREATE OR REPLACE SECRET mssql_token_secret (
     TYPE mssql,
-    HOST '${AZURE_SQL_DB_HOST}',
-    DATABASE '${AZURE_SQL_DB}',
-    ACCESS_TOKEN '${AZURE_ACCESS_TOKEN}'
+    HOST '{AZURE_SQL_DB_HOST}',
+    DATABASE '{AZURE_SQL_DB}',
+    ACCESS_TOKEN '{AZURE_ACCESS_TOKEN}'
 );
 
 statement ok
@@ -77,7 +77,7 @@ DROP SECRET IF EXISTS mssql_token_secret;
 #===----------------------------------------------------------------------===#
 
 statement error
-ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS bad_token_db (
+ATTACH 'Server={AZURE_SQL_DB_HOST};Database={AZURE_SQL_DB}' AS bad_token_db (
     TYPE mssql,
     ACCESS_TOKEN 'not_a_valid_jwt'
 );
@@ -92,7 +92,7 @@ Invalid access token format: unable to parse JWT
 # This is a JWT with correct audience but expired (exp: 2020-01-01)
 # Header: {"alg":"none","typ":"JWT"} Payload: {"exp":1577836800,"aud":"https://database.windows.net/"}
 statement error
-ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS expired_db (
+ATTACH 'Server={AZURE_SQL_DB_HOST};Database={AZURE_SQL_DB}' AS expired_db (
     TYPE mssql,
     ACCESS_TOKEN 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjE1Nzc4MzY4MDAsImF1ZCI6Imh0dHBzOi8vZGF0YWJhc2Uud2luZG93cy5uZXQvIn0.sig'
 );

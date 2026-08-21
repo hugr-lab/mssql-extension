@@ -14,7 +14,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS defer_test (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS defer_test (TYPE mssql);
 
 # Create several test tables to verify only queried tables load columns
 statement ok

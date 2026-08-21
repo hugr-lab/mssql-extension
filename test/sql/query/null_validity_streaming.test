@@ -16,7 +16,7 @@ require mssql
 require-env MSSQL_TEST_DSN
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS nvdb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS nvdb (TYPE mssql);
 
 # The projection reader: IS NULL must agree with the rendered NULL.
 # ORDER BY v puts the NULL row first (T-SQL sorts NULLs first ascending).

@@ -26,7 +26,7 @@ require-env MSSQL_TEST_PASS
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS cfs_setup (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS cfs_setup (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('cfs_setup', 'IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = ''cfs_other'') EXEC(''CREATE SCHEMA cfs_other'')');
@@ -66,7 +66,7 @@ DETACH cfs_setup;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS ado_tf (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS ado_tf (TYPE mssql);
 
 # Matching table should be queryable
 query IR
@@ -88,7 +88,7 @@ DETACH ado_tf;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};Schema_Filter=^dbo$' AS ado_sf (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN};Schema_Filter=^dbo$' AS ado_sf (TYPE mssql);
 
 # dbo tables should be visible
 query IR
@@ -110,7 +110,7 @@ DETACH ado_sf;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};Schema_Filter=^dbo$;Table_Filter=^cfs_orders$' AS ado_both (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN};Schema_Filter=^dbo$;Table_Filter=^cfs_orders$' AS ado_both (TYPE mssql);
 
 query IR
 SELECT id, total FROM ado_both.dbo.cfs_orders;
@@ -131,7 +131,7 @@ DETACH ado_both;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};SchemaFilter=^dbo$;TableFilter=^cfs_orders$' AS ado_alt (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN};SchemaFilter=^dbo$;TableFilter=^cfs_orders$' AS ado_alt (TYPE mssql);
 
 query IR
 SELECT id, total FROM ado_alt.dbo.cfs_orders;
@@ -151,7 +151,7 @@ DETACH ado_alt;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_URI}?table_filter=^cfs_orders$' AS uri_tf (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_URI}?table_filter=^cfs_orders$' AS uri_tf (TYPE mssql);
 
 query IR
 SELECT id, total FROM uri_tf.dbo.cfs_orders;
@@ -171,7 +171,7 @@ DETACH uri_tf;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_URI}?schema_filter=^dbo$' AS uri_sf (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_URI}?schema_filter=^dbo$' AS uri_sf (TYPE mssql);
 
 query IR
 SELECT id, total FROM uri_sf.dbo.cfs_orders;
@@ -191,7 +191,7 @@ DETACH uri_sf;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_URI}?schema_filter=^dbo$&table_filter=^cfs_orders$' AS uri_both (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_URI}?schema_filter=^dbo$&table_filter=^cfs_orders$' AS uri_both (TYPE mssql);
 
 query IR
 SELECT id, total FROM uri_both.dbo.cfs_orders;
@@ -213,11 +213,11 @@ DETACH uri_both;
 statement ok
 CREATE SECRET cfs_secret_tf (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     table_filter '^cfs_orders$'
 );
 
@@ -247,11 +247,11 @@ DROP SECRET cfs_secret_tf;
 statement ok
 CREATE SECRET cfs_secret_sf (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     schema_filter '^dbo$'
 );
 
@@ -281,11 +281,11 @@ DROP SECRET cfs_secret_sf;
 statement ok
 CREATE SECRET cfs_secret_both (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     schema_filter '^dbo$',
     table_filter '^cfs_orders$'
 );
@@ -315,7 +315,7 @@ DROP SECRET cfs_secret_both;
 
 # Connection string has table_filter=^cfs_orders$, but ATTACH overrides to ^cfs_products$
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS override_test (TYPE mssql, table_filter '^cfs_products$');
+ATTACH '{MSSQL_TESTDB_DSN};Table_Filter=^cfs_orders$' AS override_test (TYPE mssql, table_filter '^cfs_products$');
 
 # cfs_products should be visible (ATTACH override wins)
 query IT
@@ -339,11 +339,11 @@ DETACH override_test;
 statement ok
 CREATE SECRET cfs_secret_override (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     table_filter '^cfs_orders$'
 );
 
@@ -373,7 +373,7 @@ DROP SECRET cfs_secret_override;
 
 # Should match cfs_orders and cfs_products but not cfs_items
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS alt_test (TYPE mssql, table_filter '^(cfs_orders|cfs_products)$');
+ATTACH '{MSSQL_TESTDB_DSN}' AS alt_test (TYPE mssql, table_filter '^(cfs_orders|cfs_products)$');
 
 query IR
 SELECT id, total FROM alt_test.dbo.cfs_orders;
@@ -399,7 +399,7 @@ DETACH alt_test;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS alt_schema (TYPE mssql, schema_filter '^(dbo|cfs_other)$');
+ATTACH '{MSSQL_TESTDB_DSN}' AS alt_schema (TYPE mssql, schema_filter '^(dbo|cfs_other)$');
 
 query IR
 SELECT id, total FROM alt_schema.dbo.cfs_orders;
@@ -419,7 +419,7 @@ DETACH alt_schema;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN};Table_Filter=^(cfs_orders|cfs_products)$' AS ado_alt (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN};Table_Filter=^(cfs_orders|cfs_products)$' AS ado_alt (TYPE mssql);
 
 query IR
 SELECT id, total FROM ado_alt.dbo.cfs_orders;
@@ -439,7 +439,7 @@ DETACH ado_alt;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_URI}?table_filter=^(cfs_orders|cfs_products)$' AS uri_alt (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_URI}?table_filter=^(cfs_orders|cfs_products)$' AS uri_alt (TYPE mssql);
 
 query IR
 SELECT id, total FROM uri_alt.dbo.cfs_orders;
@@ -461,11 +461,11 @@ DETACH uri_alt;
 statement ok
 CREATE SECRET cfs_secret_alt (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     table_filter '^(cfs_orders|cfs_products)$'
 );
 
@@ -493,7 +493,7 @@ DROP SECRET cfs_secret_alt;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS cfs_cleanup (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS cfs_cleanup (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('cfs_cleanup', 'DROP TABLE dbo.cfs_orders');

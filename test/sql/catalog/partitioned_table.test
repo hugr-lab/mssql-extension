@@ -10,7 +10,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS part_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS part_db (TYPE mssql);
 
 # =============================================================================
 # Setup: a table spread over 4 partitions by a clustered index

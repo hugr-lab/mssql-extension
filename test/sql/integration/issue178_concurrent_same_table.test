@@ -13,7 +13,7 @@ require mssql
 require-env MSSQL_TEST_DSN
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS mss (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS mss (TYPE mssql);
 
 # Big enough that LIMIT 10 abandons the TDS stream mid-flight (as in the report).
 # The table is DELIBERATELY persistent (IF OBJECT_ID guard, no DROP): populating

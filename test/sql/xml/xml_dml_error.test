@@ -10,7 +10,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS xml_dml_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS xml_dml_db (TYPE mssql);
 
 # ===========================================================================
 # Setup: Create test table with XML and non-XML columns

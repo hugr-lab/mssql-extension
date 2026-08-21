@@ -16,7 +16,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: READ_ONLY mode blocks INSERT
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_err_ro (TYPE mssql, READ_ONLY);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_insert_err_ro (TYPE mssql, READ_ONLY);
 
 # Try to INSERT into any table - should fail with read-only error
 statement error
@@ -29,7 +29,7 @@ DETACH mssql_insert_err_ro;
 
 # Test 2: Attach with READ_WRITE for constraint tests
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_errors (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_insert_errors (TYPE mssql);
 
 # Test 3: Primary key violation (use mssql_exec for PRIMARY KEY constraint)
 statement ok

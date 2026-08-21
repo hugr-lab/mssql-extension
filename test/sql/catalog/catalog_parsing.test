@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the TestDB database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS testdb_catalog (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS testdb_catalog (TYPE mssql);
 
 # =============================================================================
 # Schema Tests

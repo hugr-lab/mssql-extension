@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_tx (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_tx (TYPE mssql);
 
 # Cleanup any leftover test tables
 statement ok

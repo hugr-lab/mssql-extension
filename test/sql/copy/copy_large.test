@@ -7,7 +7,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
 
 # Test with 10K rows
 statement ok

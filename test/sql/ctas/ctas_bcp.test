@@ -11,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_bcp (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_ctas_bcp (TYPE mssql);
 
 # Cleanup
 statement ok

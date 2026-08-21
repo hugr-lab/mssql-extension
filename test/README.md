@@ -220,7 +220,7 @@ require mssql
 require-env MSSQL_TEST_DSN
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('testdb', 'SELECT 1 AS val');

@@ -21,9 +21,9 @@ true
 # stored values for the ping assertion later.
 statement ok
 CREATE TEMP TABLE close_all_handles AS
-  SELECT mssql_open('${MSSQL_TEST_DSN}') AS h
-  UNION ALL SELECT mssql_open('${MSSQL_TEST_DSN}')
-  UNION ALL SELECT mssql_open('${MSSQL_TEST_DSN}');
+  SELECT mssql_open('{MSSQL_TEST_DSN}') AS h
+  UNION ALL SELECT mssql_open('{MSSQL_TEST_DSN}')
+  UNION ALL SELECT mssql_open('{MSSQL_TEST_DSN}');
 
 query I
 SELECT COUNT(*) FROM close_all_handles;

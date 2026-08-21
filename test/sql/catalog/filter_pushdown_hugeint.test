@@ -26,7 +26,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS hugeint_filter (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS hugeint_filter (TYPE mssql);
 
 # Create + populate a DECIMAL(38,0) column via direct T-SQL. DuckDB's catalog
 # scan exposes it as HUGEINT, so the filter constant in WHERE clauses below is

@@ -8,7 +8,7 @@ require-env MSSQL_TEST_DSN
 
 # Setup: attach database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS scandb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS scandb (TYPE mssql);
 
 # T041: Test mssql_scan with valid context - simple query
 query I

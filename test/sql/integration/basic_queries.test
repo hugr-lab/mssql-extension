@@ -11,7 +11,7 @@ require-env MSSQL_TEST_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS basic_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS basic_db (TYPE mssql);
 
 # Test 1: Simple SELECT
 query I

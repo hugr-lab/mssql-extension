@@ -20,7 +20,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
 
 # --- mssql_query_timeout is honored (was previously ignored) -----------------
 # A 2s timeout must abort a 5s server-side WAITFOR. Before the fix, mssql_exec used a

@@ -22,7 +22,7 @@ require-env MSSQL_TEST_DB
 # Test 1: ATTACH with ADO.NET connection string (key-value format)
 #
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS kv_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS kv_db (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('kv_db', 'SELECT 1 AS val');
@@ -36,7 +36,7 @@ DETACH kv_db;
 # Test 2: ATTACH with URI format connection string
 #
 statement ok
-ATTACH '${MSSQL_TEST_URI}' AS uri_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_URI}' AS uri_db (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('uri_db', 'SELECT 2 AS val');
@@ -52,11 +52,11 @@ DETACH uri_db;
 statement ok
 CREATE SECRET attach_test_secret (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
-    database '${MSSQL_TEST_DB}',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}'
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
+    database '{MSSQL_TEST_DB}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}'
 );
 
 statement ok
@@ -77,13 +77,13 @@ DROP SECRET attach_test_secret;
 # Test 4: Re-attach after detach
 #
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
 
 statement ok
 DETACH reattach_db;
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS reattach_db (TYPE mssql);
 
 statement ok
 DETACH reattach_db;

@@ -16,7 +16,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach the database using connection string
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS ansi_test_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS ansi_test_db (TYPE mssql);
 
 # Test 1: Verify CONCAT_NULL_YIELDS_NULL behavior is ON
 # With CONCAT_NULL_YIELDS_NULL ON, 'test' + NULL = NULL

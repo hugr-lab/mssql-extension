@@ -39,7 +39,7 @@ statement ok
 SET mssql_attach_validation_timeout = 120;
 
 statement ok
-ATTACH '${AZURE_SQL_TEST_DSN}' AS azure_test (TYPE mssql);
+ATTACH '{AZURE_SQL_TEST_DSN}' AS azure_test (TYPE mssql);
 
 # =============================================================================
 # Test 1: Lazy loading - schema discovery on demand

@@ -47,7 +47,7 @@ CREATE OR REPLACE SECRET azure_env_secret (
 
 # ATTACH using the env-based Azure secret
 statement ok
-ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS env_db (
+ATTACH 'Server={AZURE_SQL_DB_HOST};Database={AZURE_SQL_DB}' AS env_db (
     TYPE mssql,
     AZURE_SECRET 'azure_env_secret'
 );
@@ -83,7 +83,7 @@ CREATE OR REPLACE SECRET azure_env_cli_secret (
 );
 
 statement ok
-ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS env_cli_db (
+ATTACH 'Server={AZURE_SQL_DB_HOST};Database={AZURE_SQL_DB}' AS env_cli_db (
     TYPE mssql,
     AZURE_SECRET 'azure_env_cli_secret'
 );

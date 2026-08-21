@@ -32,7 +32,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS ve_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS ve_db (TYPE mssql);
 
 statement ok
 CREATE TABLE ve_src AS
@@ -47,12 +47,12 @@ SELECT i,
 FROM range(400000) t(i);
 
 statement ok
-COPY ve_src TO '__TEST_DIR__/ve_dict.parquet';
+COPY ve_src TO '{TEST_DIR}/ve_dict.parquet';
 
 # --- parquet source: dictionary vectors from the parquet reader ---
 
 statement ok
-COPY (FROM read_parquet('__TEST_DIR__/ve_dict.parquet')) TO 've_db.dbo.VecEnc' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
+COPY (FROM read_parquet('{TEST_DIR}/ve_dict.parquet')) TO 've_db.dbo.VecEnc' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
 
 query I
 SELECT count(*) FROM ve_db.dbo.VecEnc

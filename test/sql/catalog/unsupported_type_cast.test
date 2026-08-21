@@ -16,7 +16,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_cast (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_cast (TYPE mssql);
 
 # =============================================================================
 # Setup: Create table with unsupported types

@@ -10,7 +10,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS topt (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS topt (TYPE mssql);
 
 # =============================================================================
 # Defaults first: with nothing set, a created table is a HEAP with nvarchar(max)

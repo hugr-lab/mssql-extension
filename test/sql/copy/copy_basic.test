@@ -8,7 +8,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Attach to SQL Server
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
 
 # Create a local table with test data
 statement ok

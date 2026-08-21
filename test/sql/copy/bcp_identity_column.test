@@ -18,7 +18,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
 
 # =============================================================================
 # Scenario A: source OMITS the identity column -> server auto-generates it

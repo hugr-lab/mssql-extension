@@ -39,7 +39,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS tr (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS tr (TYPE mssql);
 
 statement ok
 SET mssql_exec_invalidate_cache = true;

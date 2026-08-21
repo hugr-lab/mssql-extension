@@ -10,7 +10,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
 
 # =============================================================================
 # mssql_invalidate_cache() returns true at each granularity

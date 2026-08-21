@@ -36,7 +36,7 @@ require-env MSSQL_COUNTERS
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS ctr_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS ctr_db (TYPE mssql);
 
 statement ok
 CREATE OR REPLACE TABLE ctr_db.dbo.CounterUniform AS

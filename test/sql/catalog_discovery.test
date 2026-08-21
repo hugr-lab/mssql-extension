@@ -10,7 +10,7 @@ require-env MSSQL_TEST_DSN
 # Test 1: Attach and browse schemas
 #
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS mssql_catalog (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS mssql_catalog (TYPE mssql);
 
 # Ensure test data is in a known state (restore if modified by previous test runs)
 statement ok

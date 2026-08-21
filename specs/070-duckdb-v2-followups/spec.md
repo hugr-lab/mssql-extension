@@ -130,6 +130,16 @@ still substituting. Mechanical sweep:
 Do this LAST among the three — it touches every .test file and would sit
 noisily inside any other PR's diff.
 
+**Result.** `${VAR}` → `{VAR}` across 159 `.test` files (334 occurrences).
+The zero-"Replacing deprecated" assertion caught a *second* deprecated form the
+title did not name: `__TEST_DIR__`, which the 2.0 runner deprecates in favour of
+`{TEST_DIR}` and which surfaced the identical warning line. One occurrence pair
+in `copy/vector_encodings_bcp.test` swept the same way — the assertion is on the
+suite log, not on `${`, so both had to go for it to hold. `docs/TESTING.md` and
+`test/README.md` examples converted, with an authoring note added naming the
+brace-only form as canonical. `test/TLS_TESTING.md` left untouched: its `${VAR}`
+are real shell variables in `bash`/`curl` examples, not runner substitutions.
+
 ---
 
 ## Out of scope (all three workstreams)

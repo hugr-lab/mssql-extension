@@ -27,7 +27,7 @@ require-env MSSQL_TEST_DSN
 # Verifies that a TLS connection can be established and used for queries
 # ============================================================================
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS tls_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS tls_db (TYPE mssql);
 
 # Simple query over TLS
 query I
@@ -56,7 +56,7 @@ DETACH tls_db;
 # Verifies that TLS connections are tracked correctly in pool
 # ============================================================================
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS tls_pool_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS tls_pool_db (TYPE mssql);
 
 # Execute a query to ensure connection is established
 query I
@@ -90,7 +90,7 @@ DETACH tls_pool_db;
 # Verifies that TLS can handle larger data transfers
 # ============================================================================
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS tls_large_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS tls_large_db (TYPE mssql);
 
 # Query that returns multiple rows
 query I
@@ -140,10 +140,10 @@ DROP SECRET tls_test_secret;
 # ============================================================================
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS plain_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS plain_db (TYPE mssql);
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS encrypted_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS encrypted_db (TYPE mssql);
 
 # Both should return same data
 query I

@@ -18,7 +18,7 @@ statement ok
 SET mssql_catalog_cache_ttl = 2;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS ttl_test (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS ttl_test (TYPE mssql);
 
 # =============================================================================
 # Test 1: Cache loads on first access

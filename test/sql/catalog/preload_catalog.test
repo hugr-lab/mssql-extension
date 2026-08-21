@@ -14,7 +14,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS preload_test (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS preload_test (TYPE mssql);
 
 # Create some tables for preloading
 statement ok

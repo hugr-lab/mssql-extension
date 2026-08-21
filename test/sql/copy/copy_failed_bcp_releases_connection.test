@@ -12,7 +12,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('db', 'DROP TABLE IF EXISTS dbo.copy_fail_release_test');

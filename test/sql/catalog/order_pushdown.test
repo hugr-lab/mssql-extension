@@ -14,7 +14,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd_setup (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd_setup (TYPE mssql);
 
 # Clean up any previous test table
 statement ok
@@ -51,7 +51,7 @@ DETACH opd_setup;
 
 # Default: pushdown disabled
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd1 (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd1 (TYPE mssql);
 
 # Should work normally (ORDER BY done by DuckDB)
 query IT
@@ -77,7 +77,7 @@ statement ok
 SET mssql_order_pushdown = true;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd2 (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd2 (TYPE mssql);
 
 # With pushdown enabled, ORDER BY should be pushed to SQL Server
 query IT
@@ -104,7 +104,7 @@ SET mssql_order_pushdown = false;
 
 # Global setting disabled, but ATTACH option enables it
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd3 (TYPE mssql, order_pushdown true);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd3 (TYPE mssql, order_pushdown true);
 
 query IT
 SELECT id, name FROM opd3.dbo.order_pushdown_test ORDER BY id ASC;
@@ -126,7 +126,7 @@ statement ok
 SET mssql_order_pushdown = true;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd3b (TYPE mssql, order_pushdown false);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd3b (TYPE mssql, order_pushdown false);
 
 query IT
 SELECT id, name FROM opd3b.dbo.order_pushdown_test ORDER BY id ASC;
@@ -151,7 +151,7 @@ SET mssql_order_pushdown = false;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
 
 query IT
 SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC;
@@ -308,7 +308,7 @@ DETACH opd4;
 
 # Create table with NOT NULL column
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd_nn (TYPE mssql, order_pushdown true);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd_nn (TYPE mssql, order_pushdown true);
 
 statement ok
 DROP TABLE IF EXISTS opd_nn.dbo.order_pushdown_nn;
@@ -350,7 +350,7 @@ DETACH opd_nn;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd_prune (TYPE mssql, order_pushdown true);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd_prune (TYPE mssql, order_pushdown true);
 
 # score is used only for ORDER BY, not in output — should be pruned after pushdown
 query IT
@@ -414,7 +414,7 @@ DETACH opd_prune;
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd_join (TYPE mssql, order_pushdown true);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd_join (TYPE mssql, order_pushdown true);
 
 # Create a local DuckDB table to join against
 statement ok
@@ -485,7 +485,7 @@ DETACH opd_join;
 
 # Final cleanup: drop test table
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS opd_cleanup (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd_cleanup (TYPE mssql);
 
 statement ok
 DROP TABLE IF EXISTS opd_cleanup.dbo.order_pushdown_test;

@@ -16,7 +16,7 @@ require mssql
 require-env MSSQL_TEST_DSN_TLS
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
 
 # ============================================================================
 # Test: Multiple Parallel Scans Over TLS
@@ -92,7 +92,7 @@ statement ok
 DETACH db;
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS db1 (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS db1 (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('db1', 'SELECT 100 AS val');
@@ -103,7 +103,7 @@ statement ok
 DETACH db1;
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS db2 (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS db2 (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('db2', 'SELECT 200 AS val');
@@ -114,7 +114,7 @@ statement ok
 DETACH db2;
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS db3 (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS db3 (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('db3', 'SELECT 300 AS val');
