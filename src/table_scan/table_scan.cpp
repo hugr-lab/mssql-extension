@@ -456,9 +456,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			} else if (out_col < column_ids.size() && column_ids[out_col] < bind_data.all_types.size()) {
 				col_type = bind_data.all_types[column_ids[out_col]];
 			} else {
-				MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: cannot map refused filter at projected idx %llu",
-									 (unsigned long long)out_col);
-				continue;
+				// Same failure class as the catch below, same answer: a filter
+				// we can neither push nor arm client-side must fail by name,
+				// not return a superset of rows (PR #267 review, finding 5).
+				throw NotImplementedException(
+					"MSSQL scan: cannot apply pushed-down filter at projected column %llu client-side",
+					(unsigned long long)out_col);
 			}
 			try {
 				BoundReferenceExpression col_ref(col_type, 0ULL);

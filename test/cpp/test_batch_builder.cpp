@@ -145,7 +145,7 @@ DataChunk CreateTestChunk(idx_t row_count) {
 		name_vec.SetValue(i, Value("name_" + std::to_string(i + 1)));
 	}
 
-	chunk.SetCardinality(row_count);
+	chunk.SetChildCardinality(row_count);
 	return chunk;
 }
 

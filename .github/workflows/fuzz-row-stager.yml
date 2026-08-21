@@ -1,0 +1,79 @@
+name: Fuzz row_stager (manual)
+# The one harness that links libduckdb — deliberately outside the default
+# TARGETS and outside ClusterFuzzLite, which can't build the library. It is
+# also the only harness that compiles the codec/staging/encoder sources, so a
+# branch that rewrites them (spec 069) wants a real campaign here before
+# merge. Dispatch-only: building libduckdb costs most of the job.
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "libFuzzer -max_total_time per run"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+jobs:
+  row-stager:
+    name: Build libduckdb + fuzz the staged read path
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: fuzz-row-stager-${{ hashFiles('.gitmodules') }}
+          max-size: 2G
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+
+      - name: Build vanilla libduckdb (no extension, no shell)
+        run: |
+          cmake -G Ninja -S duckdb -B build-duckdb \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHELL=OFF -DBUILD_UNITTESTS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -C build-duckdb duckdb
+
+      - name: Build fuzz_row_stager (ASan + libFuzzer)
+        run: |
+          CXX=clang++ \
+          MSSQL_DUCKDB_INC=duckdb/src/include \
+          MSSQL_DUCKDB_LIB=build-duckdb/src \
+          TARGETS=row_stager fuzz/build.sh
+
+      - name: Replay the tds_tokens seed corpus
+        # Same input format as fuzz_tds_tokens (raw post-header token stream),
+        # so its corpus doubles as the seed set — a COLMETADATA-first seed is
+        # what makes the walk reachable at all.
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build-duckdb/src"
+          fuzz/out/fuzz_row_stager -runs=0 fuzz/corpus/tds_tokens
+
+      - name: Fuzz
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build-duckdb/src"
+          mkdir -p fuzz-findings
+          fuzz/out/fuzz_row_stager \
+            -max_total_time=${{ inputs.fuzz_seconds }} \
+            -timeout=10 -rss_limit_mb=4096 \
+            -artifact_prefix=fuzz-findings/ \
+            fuzz/corpus/tds_tokens
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: row-stager-findings
+          path: fuzz-findings/
+          if-no-files-found: ignore

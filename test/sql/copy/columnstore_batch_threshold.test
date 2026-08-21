@@ -111,6 +111,38 @@ WHERE o.name = ''CsCtas'' AND rg.state_description = ''COMPRESSED''');
 ----
 true
 
+# -----------------------------------------------------------------------------
+# The default-settings baseline (PR #267 review, finding 4). With writer count
+# derived from threads, DuckDB 2.0 splits even this small scan across sink
+# threads and each writer lands below the 102400 threshold — so COMPRESSED
+# rowgroups are NOT guaranteed here. What IS the contract at defaults: every
+# row lands in the columnstore's rowgroups (whatever their state), none are
+# lost between writers. This is the baseline the lazy-ramp-up follow-up
+# (spec 070 W2) has to move: when it ships, the assertion above this comment
+# should hold WITHOUT the parallel_writers pin, and this one keeps holding.
+# -----------------------------------------------------------------------------
+statement ok
+RESET mssql_copy_parallel_writers;
+
+statement ok
+COPY cs_src TO 'cs.dbo.CsDefaults' (FORMAT bcp, CREATE_TABLE true, replace true, table_kind 'columnstore');
+
+query I
+SELECT COUNT(*) FROM cs.dbo.CsDefaults;
+----
+110000
+
+query I
+SELECT SUM(total_rows) = 110000 FROM mssql_scan('cs', '
+SELECT rg.total_rows FROM sys.column_store_row_groups rg
+JOIN sys.objects o ON o.object_id = rg.object_id
+WHERE o.name = ''CsDefaults''');
+----
+true
+
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
 statement ok
 SET mssql_default_table_kind = 'HEAP';
 
@@ -124,7 +156,7 @@ SELECT COUNT(*) FROM cs.dbo.CsHeap;
 110000
 
 statement ok
-SELECT mssql_exec('cs', 'DROP TABLE dbo.CsThreshold; DROP TABLE dbo.CsExplicit; DROP TABLE dbo.CsCtas; DROP TABLE dbo.CsHeap;');
+SELECT mssql_exec('cs', 'DROP TABLE dbo.CsThreshold; DROP TABLE dbo.CsExplicit; DROP TABLE dbo.CsCtas; DROP TABLE dbo.CsDefaults; DROP TABLE dbo.CsHeap;');
 
 statement ok
 DETACH cs;

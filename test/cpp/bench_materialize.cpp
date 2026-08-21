@@ -229,7 +229,7 @@ size_t FillChunkCurrent(const Fixture &f, DataChunk &chunk, const duckdb::tds::C
 		duckdb::mssql::codec::string::DecodeFromTds(f.rows[row], col, vec, row);
 		out_bytes += FlatVector::GetDataMutable<string_t>(vec)[row].GetSize();
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= out_bytes;
 	return out_bytes;
 }
@@ -460,7 +460,7 @@ size_t FillChunkFixed(const FixedCell &c, DataChunk &chunk) {
 		}
 		c.decode(c.rows[row], c.col, vec, row);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 	return c.in_bytes;
 }
@@ -655,7 +655,7 @@ BcpFixture BuildBcpFixture(const BcpCellSpec &s) {
 		vec.Reference(s.null_pct >= 100 ? duckdb::Value(type) : MakeBcpValue(s.kind, 0), duckdb::count_t(CHUNK_ROWS));
 		break;
 	}
-	f.chunk->SetCardinality(CHUNK_ROWS);
+	f.chunk->SetChildCardinality(CHUNK_ROWS);
 
 	duckdb::mssql::BCPColumnMetadata col("c", type, true);
 	switch (s.kind) {
@@ -851,7 +851,7 @@ WideFixture BuildWideFixture(idx_t ncols) {
 		col.max_length = 8;
 		w.cols.push_back(col);
 	}
-	w.chunk->SetCardinality(CHUNK_ROWS);
+	w.chunk->SetChildCardinality(CHUNK_ROWS);
 	w.stride = 1 + ncols * (1 + 8);
 	return w;
 }
@@ -1842,7 +1842,7 @@ size_t FillChunkBatchA(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		slots[row] = string_t(dst, g_bs.out_len[row]);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1878,7 +1878,7 @@ size_t FillChunkBatchB(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		slots[row] = string_t(base + g_bs.out_off[row], g_bs.out_len[row]);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1904,7 +1904,7 @@ size_t FillChunkBatchAscii(const Fixture &f, const StagedStrings &s, DataChunk &
 		}
 		slots[row] = string_t(base + s.off[row] / 2, s.len[row] / 2);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1933,7 +1933,7 @@ size_t FillChunkBatchC(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		p = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1986,7 +1986,7 @@ size_t FillChunkBatchC2(const Fixture &f, const StagedStrings &s, DataChunk &chu
 		++row;
 		seg = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -2015,7 +2015,7 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2055,7 +2055,7 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 		++row;
 		seg = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2099,7 +2099,7 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2128,7 +2128,7 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 		}
 		seg = p + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2151,7 +2151,7 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2178,7 +2178,7 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 		}
 		seg = p + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2194,7 +2194,7 @@ size_t FillChunkConvertOnlyPrealloc(const Fixture &f, const StagedStrings &s, Da
 							   ? 0
 							   : simdutf::convert_valid_utf16le_to_utf8(
 									 reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units, base);
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2214,7 +2214,7 @@ size_t FillChunkConvertOnly(const Fixture &f, const StagedStrings &s, DataChunk 
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
 											   base);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -2388,7 +2388,7 @@ void FillWirePerValue(const WireImage &w, DataChunk &chunk, std::vector<std::vec
 			}
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 }
 
@@ -2520,7 +2520,7 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 		}
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 }
 
@@ -2839,7 +2839,7 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 							: duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 	return c.in_bytes;
 }

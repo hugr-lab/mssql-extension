@@ -112,7 +112,7 @@ static void FillFlat(DataChunk &chunk) {
 			chunk.SetValue(c, r, BaseValue(c, SEL[r]));
 		}
 	}
-	chunk.SetCardinality(ROWS);
+	chunk.SetChildCardinality(ROWS);
 }
 
 static void FillDictionary(DataChunk &base, DataChunk &dict) {
@@ -123,7 +123,7 @@ static void FillDictionary(DataChunk &base, DataChunk &dict) {
 			base.SetValue(c, k, BaseValue(c, k));
 		}
 	}
-	base.SetCardinality(5);
+	base.SetChildCardinality(5);
 	// …and every column of `dict` is a DICTIONARY vector over it.
 	SelectionVector sel(ROWS);
 	for (idx_t r = 0; r < ROWS; r++) {
@@ -137,7 +137,7 @@ static void FillDictionary(DataChunk &base, DataChunk &dict) {
 			  "column "
 				  << "must be a dictionary vector after Slice");
 	}
-	dict.SetCardinality(ROWS);
+	dict.SetChildCardinality(ROWS);
 }
 
 static void test_dictionary_encodes_like_flat() {
@@ -185,7 +185,7 @@ static void test_dictionary_on_scatter_path() {
 		base.SetValue(0, k, k == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * k)));
 		base.SetValue(1, k, k == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * k)));
 	}
-	base.SetCardinality(5);
+	base.SetChildCardinality(5);
 
 	SelectionVector sel(ROWS);
 	for (idx_t r = 0; r < ROWS; r++) {
@@ -195,7 +195,7 @@ static void test_dictionary_on_scatter_path() {
 		flat.SetValue(
 			1, r, SEL[r] == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * SEL[r])));
 	}
-	flat.SetCardinality(ROWS);
+	flat.SetChildCardinality(ROWS);
 
 	DataChunk dict;
 	dict.Initialize(Allocator::DefaultAllocator(), types);
@@ -203,7 +203,7 @@ static void test_dictionary_on_scatter_path() {
 		dict.data[c].Reference(base.data[c]);
 		dict.data[c].Slice(sel, ROWS);
 	}
-	dict.SetCardinality(ROWS);
+	dict.SetChildCardinality(ROWS);
 
 	duckdb::vector<uint8_t> flat_bytes, dict_bytes;
 	BCPRowEncoder::EncodeChunk(flat_bytes, flat, cols, nullptr);
@@ -228,7 +228,7 @@ static void test_constant_encodes_like_flat() {
 		cchunk.data[c].Reference(v, duckdb::count_t(ROWS));
 		CHECK(cchunk.data[c].GetVectorType() == VectorType::CONSTANT_VECTOR, "column must be a constant vector");
 	}
-	cchunk.SetCardinality(ROWS);
+	cchunk.SetChildCardinality(ROWS);
 
 	DataChunk flat;
 	flat.Initialize(Allocator::DefaultAllocator(), types);
@@ -238,7 +238,7 @@ static void test_constant_encodes_like_flat() {
 			flat.SetValue(c, r, v);
 		}
 	}
-	flat.SetCardinality(ROWS);
+	flat.SetChildCardinality(ROWS);
 
 	duckdb::vector<uint8_t> flat_bytes, const_bytes;
 	BCPRowEncoder::EncodeChunk(flat_bytes, flat, cols, nullptr);
