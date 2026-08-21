@@ -73,7 +73,7 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 	// mssql_metadata_cache.cpp: 1205 on a pure-read metadata query reruns
 	// (bounded), but only while no rows were delivered — after the first row
 	// the callback has state a rerun would duplicate.
-	constexpr int MAX_ATTEMPTS = 3;
+	constexpr int MAX_ATTEMPTS = 6;
 	for (int attempt = 1;; attempt++) {
 		idx_t rows_delivered = 0;
 		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
@@ -93,7 +93,7 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 			return;
 		}
 		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100 * attempt));
+			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
 			continue;
 		}
 		throw IOException("Primary key metadata query failed: %s", result.error_message);

@@ -724,9 +724,10 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// checking; reject a value the stream truncated before it reaches them.
 	const size_t need = FixedTemporalReadLen(col);
 	if (need != 0 && bytes.size() < need) {
-		throw InvalidInputException("MSSQL: temporal column arrived with %zu bytes where %zu were required (TDS type "
-									"0x%02X). The TDS stream is malformed.",
-									bytes.size(), need, col.type_id);
+		throw InvalidInputException(
+			"MSSQL: temporal column arrived with %zu bytes where %zu were required (TDS type "
+			"0x%02X). The TDS stream is malformed.",
+			bytes.size(), need, col.type_id);
 	}
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
@@ -809,9 +810,10 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	// corrupt one once per chunk rather than per row.
 	const size_t need = FixedTemporalReadLen(col);
 	if (need != 0 && stride < need) {
-		throw InvalidInputException("MSSQL: temporal column staged at %u bytes where %zu were required (TDS type "
-									"0x%02X). The TDS stream is malformed.",
-									stride, need, col.type_id);
+		throw InvalidInputException(
+			"MSSQL: temporal column staged at %u bytes where %zu were required (TDS type "
+			"0x%02X). The TDS stream is malformed.",
+			stride, need, col.type_id);
 	}
 
 	switch (col.type_id) {

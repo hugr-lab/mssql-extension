@@ -207,7 +207,7 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 	// delivered no rows yet — after the first row the callback has consumed
 	// state that a rerun would duplicate ("Column already exists" class), so a
 	// mid-stream deadlock stays fatal.
-	constexpr int MAX_ATTEMPTS = 3;
+	constexpr int MAX_ATTEMPTS = 6;
 	auto start = std::chrono::steady_clock::now();
 	for (int attempt = 1;; attempt++) {
 		idx_t rows_delivered = 0;
@@ -236,7 +236,7 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
 			CACHE_DEBUG(1, "RunMetadataQuery: deadlock victim (1205), attempt %d/%d — rerunning", attempt,
 						MAX_ATTEMPTS);
-			std::this_thread::sleep_for(std::chrono::milliseconds(100 * attempt));
+			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
 			continue;
 		}
 		CACHE_DEBUG(1, "RunMetadataQuery: FAILED after %lldms — %s", (long long)elapsed, result.error_message.c_str());
