@@ -890,7 +890,9 @@ static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &ge
 	auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
 	vector<column_t> column_ids;
 	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
-	auto result = FilterEncoder::EncodeExpression(expr, ctx);
+	// Predicate position — the same coercion (bare bit -> `= 1`) the runtime
+	// filter build applies, so the dry-run accepts exactly what will encode.
+	auto result = FilterEncoder::EncodeSearchCondition(expr, ctx);
 	const bool accepted = result.supported && !result.sql.empty();
 	MSSQL_SCAN_DEBUG_LOG(1, "PushdownExpression: type=%d class=%d -> %s", (int)expr.GetExpressionType(),
 						 (int)expr.GetExpressionClass(), accepted ? "PUSHED" : "kept above scan");
@@ -914,8 +916,8 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i,
 							 (int)filter->GetExpressionType(), (int)filter->GetExpressionClass());
 
-		// Try to encode this expression
-		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
+		// Try to encode this expression (predicate position — bare bit -> `= 1`)
+		auto result = FilterEncoder::EncodeSearchCondition(*filter, ctx);
 
 		if (result.supported && !result.sql.empty()) {
 			MSSQL_SCAN_DEBUG_LOG(1, "  filter[%llu]: encoded -> %s", (unsigned long long)i, result.sql.c_str());

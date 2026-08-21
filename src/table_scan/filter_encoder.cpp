@@ -47,23 +47,67 @@ namespace duckdb {
 namespace mssql {
 
 namespace {
-// A temporal logical type — one SQL Server stores as DATE / TIME / DATETIME2.
-// A cast between any two of these is a precision/representation view (the
-// column keeps its server type), so the filter encoder can push straight
-// through it (spec 070 W1).
-bool IsTemporalType(LogicalTypeId id) {
+// A naive (timezone-less) date+time logical type. SQL Server stores all of
+// these as DATETIME2; DuckDB models DATETIME2 as TIMESTAMP_NS and reaches a
+// coarser-precision overload (e.g. year() takes TIMESTAMP) through an implicit
+// cast that only changes sub-second precision. DATE, TIME and TIMESTAMP_TZ are
+// deliberately NOT here: a cast to/from one of them CHANGES THE VALUE (drops the
+// time, drops the date, shifts by an offset), so it is never a free view.
+bool IsNaiveTimestampType(LogicalTypeId id) {
 	switch (id) {
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIME:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_TZ:
 		return true;
 	default:
 		return false;
 	}
+}
+
+// A date-part extraction function: its result is invariant to the sub-second
+// precision an IsNaiveTimestampType->IsNaiveTimestampType cast changes, so
+// stripping that cast over the column argument and letting SQL Server apply the
+// extraction to the column's own DATETIME2 type is exact. This is the ONLY place
+// a temporal cast is stripped (spec 070 W1): in a comparison the same cast would
+// change which rows match (dt::DATE truncates the time; dt::TIME drops the date),
+// so a comparison operand keeps its cast and, being unencodable, falls to the
+// client filter net — correct rather than fast.
+bool IsDatePartFunction(const std::string &name) {
+	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" ||
+		   name == "second" || name == "quarter" || name == "dayofyear" || name == "dayofmonth" || name == "week" ||
+		   name == "dayofweek" || name == "isodow";
+}
+
+// Does this expression already encode to a T-SQL search condition (a predicate
+// valid after WHERE), as opposed to a bit-valued expression? A BOOLEAN column,
+// constant or cast is a VALUE — `WHERE [b]` is a syntax error (SQL Server 4145),
+// the predicate is `WHERE [b] = 1`. Comparisons, conjunctions, BETWEEN/IN,
+// IS [NOT] NULL, NOT and the LIKE-pattern functions already encode as
+// conditions and must not be wrapped again. Used only in predicate position;
+// a boolean OPERAND (e.g. bit = bit) is never coerced (issue: bool pushdown).
+bool EncodesAsSearchCondition(const Expression &expr) {
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		return true;
+	}
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::COMPARE_BETWEEN:
+	case ExpressionType::COMPARE_IN:
+	case ExpressionType::COMPARE_NOT_IN:
+	case ExpressionType::OPERATOR_IS_NULL:
+	case ExpressionType::OPERATOR_IS_NOT_NULL:
+	case ExpressionType::OPERATOR_NOT:
+	case ExpressionType::CONJUNCTION_AND:
+	case ExpressionType::CONJUNCTION_OR:
+		return true;
+	default:
+		break;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+		IsLikePatternFunction(expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName())) {
+		return true;
+	}
+	return false;
 }
 }  // namespace
 
@@ -408,10 +452,27 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const LegacyConjunctio
 
 ExpressionEncodeResult FilterEncoder::EncodeExpressionFilter(const ExpressionFilter &filter,
 															 const ExpressionEncodeContext &ctx) {
-	// Expression filters contain arbitrary expressions
+	// Expression filters contain arbitrary expressions. This is predicate
+	// position (the expression IS the WHERE clause), so a bare bit value must be
+	// coerced to `= 1`.
 	MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpressionFilter: encoding expression type %d",
 						   (int)filter.expr->GetExpressionType());
-	return EncodeExpression(*filter.expr, ctx);
+	return EncodeSearchCondition(*filter.expr, ctx);
+}
+
+ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &expr,
+															const ExpressionEncodeContext &ctx) {
+	auto result = EncodeExpression(expr, ctx);
+	// A BOOLEAN value (bit column / constant / cast) is not a T-SQL predicate:
+	// `WHERE [b]` errors 4145, `WHERE [b] = 1` is the condition. Expressions that
+	// already encode AS a condition (comparison/conjunction/BETWEEN/IN/IS NULL/
+	// NOT/LIKE) are left alone. Boolean operands elsewhere (bit = bit) go through
+	// EncodeExpression, never here, so they keep their bare form.
+	if (result.supported && !result.sql.empty() && expr.GetReturnType().id() == LogicalTypeId::BOOLEAN &&
+		!EncodesAsSearchCondition(expr)) {
+		result.sql = "(" + result.sql + " = 1)";
+	}
+	return result;
 }
 
 //------------------------------------------------------------------------------
@@ -469,17 +530,13 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 			if (target_id == LogicalTypeId::VARCHAR && source_id == LogicalTypeId::VARCHAR) {
 				return EncodeExpression(cast_child, ctx);
 			}
-			// Spec 070 W1: a temporal→temporal cast is a precision/representation
-			// view, not a value conversion — SQL Server stores the column at its
-			// own DATE/TIME/DATETIME2 type and applies the surrounding operation
-			// (YEAR(col), col = literal) to it natively, so encoding straight
-			// through the cast is exact. This is what makes year(a_datetime2)
-			// pushable: DuckDB models our DATETIME2 as TIMESTAMP_NS and year()
-			// takes TIMESTAMP, inserting an implicit TIMESTAMP_NS→TIMESTAMP cast
-			// over the column that would otherwise stop the push.
-			if (IsTemporalType(target_id) && IsTemporalType(source_id)) {
-				return EncodeExpression(cast_child, ctx);
-			}
+			// A temporal cast is NOT stripped here. It is a free view only when the
+			// surrounding operation is precision-insensitive (a date-part
+			// extraction), and only for a naive-timestamp precision change — never
+			// in a comparison, where dt::DATE / dt::TIME / dt::TIMESTAMPTZ change
+			// which rows match. That narrow, provably-exact strip lives in
+			// EncodeFunctionExpression for the date-part functions (spec 070 W1);
+			// every other temporal cast falls through to the client filter net.
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: cast %s -> %s not pushed",
 								   cast_child.GetReturnType().ToString().c_str(), target_type.ToString().c_str());
 			return {"", false};
@@ -543,9 +600,28 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 
 	// Encode all arguments
 	auto child_ctx = ctx.child();
+	const bool datepart = IsDatePartFunction(func_name);
 	std::vector<std::string> encoded_args;
 	for (const auto &child : expr.GetChildren()) {
-		auto result = EncodeExpression(*child, child_ctx);
+		const Expression *arg = child.get();
+		// Spec 070 W1: strip the implicit precision cast DuckDB puts over a
+		// DATETIME2 column when a date-part function takes it. DATETIME2 is
+		// TIMESTAMP_NS to DuckDB; year()/hour()/... take TIMESTAMP, so an
+		// implicit TIMESTAMP_NS->TIMESTAMP cast wraps the column. SQL Server's
+		// YEAR([col]) applies to the column's own DATETIME2 and the extraction is
+		// invariant to the sub-second precision the cast changed, so encoding the
+		// cast's child directly is exact. Restricted to naive-timestamp->
+		// naive-timestamp: a DATE/TIME/TZ cast here changes the value and must not
+		// be stripped.
+		if (datepart && BoundCastExpression::IsCast(*arg)) {
+			const auto &cast_fn = arg->Cast<BoundFunctionExpression>();
+			const auto &cast_child = BoundCastExpression::Child(cast_fn);
+			if (IsNaiveTimestampType(BoundCastExpression::TargetType(cast_fn).id()) &&
+				IsNaiveTimestampType(cast_child.GetReturnType().id())) {
+				arg = &cast_child;
+			}
+		}
+		auto result = EncodeExpression(*arg, child_ctx);
 		if (!result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: argument encoding failed for %s", func_name.c_str());
 			return {"", false};
@@ -627,7 +703,9 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
+		// NOT negates a predicate: its operand is itself predicate position, so a
+		// bare bit child (`NOT flag`) becomes `NOT ([flag] = 1)`, not `NOT [flag]`.
+		auto child_result = EncodeSearchCondition(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -831,7 +909,8 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionExpression(const BoundCon
 	bool all_supported = true;
 
 	for (const auto &child : expr.GetChildren()) {
-		auto result = EncodeExpression(*child, child_ctx);
+		// Each conjunct is predicate position — a bare bit child needs `= 1`.
+		auto result = EncodeSearchCondition(*child, child_ctx);
 		if (is_and) {
 			// AND: partial pushdown allowed - skip unsupported children
 			if (result.supported && !result.sql.empty()) {
