@@ -1,6 +1,8 @@
 # Spec 070 — DuckDB 2.0 follow-ups: expression pushdown, writer ramp-up, test-var syntax
 
-**Status**: DRAFT (not started; blocked on spec 069 / PR #267 merging)
+**Status**: spec 069 merged (main is 2.0). **W1 DONE** (this branch:
+`pushdown_expression` + temporal-cast passthrough + the #242 mapping removal +
+`expression_pushdown.test`). W2/W3 ready to start.
 **Follows**: spec 069, which migrated main to the 2.0 API and deliberately
 left three items out of scope. Each is an independent workstream; they share
 a spec because all three exist for the same reason — 2.0 changed the ground
@@ -8,7 +10,7 @@ under a subsystem — but they can land as separate PRs in any order.
 
 ---
 
-## W1 — Adopt the non-Legacy filter representation (and the capability it unlocks)
+## W1 — Adopt the non-Legacy filter representation (and the capability it unlocks) — DONE
 
 ### What 2.0 actually did to filters
 
@@ -70,6 +72,21 @@ Reconnaissance against duckdb `d7a4366603`:
 - A deliberately unencodable expression filter returns correct rows via the
   net (test pins both the rows and the `needs client re-filter` debug line).
 - Filter-pushdown test files extended; no existing pushdown test regresses.
+
+**Outcome (implemented).** `pushdown_expression` dry-runs the encoder and
+accepts what it can render; `year/month/day(datetime2_col) op const` now push
+(`WHERE (YEAR([dt]) = 2024)`) via a temporal→temporal cast passthrough (DuckDB
+models DATETIME2 as TIMESTAMP_NS; the implicit precision cast over the column is
+a view, so the server applies the part function natively). **#242 closed here,
+not deferred**: W1 widens what pushes, so the semantically-diverging mappings
+had to go with it — `length`/`len` (LEN drops trailing spaces / counts UTF-16),
+`/` (server integer division vs DuckDB float), and `dayofweek`/`week`
+(@@DATEFIRST / non-ISO). Removed, not rewritten: an unmapped function falls to
+the spec-069 client net, correct by construction. `expression_pushdown.test`
+pins both — year pushes, `length(name)=3` returns the row LEN would have lost.
+The `pushdown_complex_filter` path is kept (it still catches multi-expression
+shapes the combiner does not route through `pushdown_expression`); retiring it
+is a measurement left to a follow-up.
 
 ---
 

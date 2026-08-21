@@ -46,6 +46,27 @@ static int GetDebugLevel() {
 namespace duckdb {
 namespace mssql {
 
+namespace {
+// A temporal logical type — one SQL Server stores as DATE / TIME / DATETIME2.
+// A cast between any two of these is a precision/representation view (the
+// column keeps its server type), so the filter encoder can push straight
+// through it (spec 070 W1).
+bool IsTemporalType(LogicalTypeId id) {
+	switch (id) {
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return true;
+	default:
+		return false;
+	}
+}
+}  // namespace
+
 //------------------------------------------------------------------------------
 // Utility Functions
 //------------------------------------------------------------------------------
@@ -443,8 +464,20 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 			// unpushed.
 			const auto &target_type = BoundCastExpression::TargetType(func_expr);
 			const auto &cast_child = BoundCastExpression::Child(func_expr);
-			if (target_type.id() == LogicalTypeId::VARCHAR &&
-				cast_child.GetReturnType().id() == LogicalTypeId::VARCHAR) {
+			const auto target_id = target_type.id();
+			const auto source_id = cast_child.GetReturnType().id();
+			if (target_id == LogicalTypeId::VARCHAR && source_id == LogicalTypeId::VARCHAR) {
+				return EncodeExpression(cast_child, ctx);
+			}
+			// Spec 070 W1: a temporal→temporal cast is a precision/representation
+			// view, not a value conversion — SQL Server stores the column at its
+			// own DATE/TIME/DATETIME2 type and applies the surrounding operation
+			// (YEAR(col), col = literal) to it natively, so encoding straight
+			// through the cast is exact. This is what makes year(a_datetime2)
+			// pushable: DuckDB models our DATETIME2 as TIMESTAMP_NS and year()
+			// takes TIMESTAMP, inserting an implicit TIMESTAMP_NS→TIMESTAMP cast
+			// over the column that would otherwise stop the push.
+			if (IsTemporalType(target_id) && IsTemporalType(source_id)) {
 				return EncodeExpression(cast_child, ctx);
 			}
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: cast %s -> %s not pushed",

@@ -851,35 +851,60 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 // - BETWEEN: col BETWEEN a AND b
 // - Complex arithmetic in filters
 
+// Map a LogicalGet's projected column ids to the table column indices the
+// filter encoder speaks in. Shared by every pushdown callback so the mapping
+// cannot drift between the dry-run (pushdown_expression) and the encode
+// (pushdown_complex_filter). `column_ids_out` backs the context's reference and
+// must outlive it.
+static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const MSSQLCatalogScanBindData &bind_data,
+												  vector<column_t> &column_ids_out) {
+	const auto &get_column_ids = get.GetColumnIds();
+	column_ids_out.clear();
+	column_ids_out.reserve(get_column_ids.size());
+	for (const auto &col_idx : get_column_ids) {
+		column_ids_out.push_back(col_idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : col_idx.GetPrimaryIndex());
+	}
+
+	ExpressionEncodeContext ctx(column_ids_out, bind_data.all_column_names, bind_data.all_types);
+	if (!bind_data.pk_column_names.empty()) {
+		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
+	}
+	return ctx;
+}
+
+// pushdown_expression: the 2.0 filter combiner offers a single-column
+// expression (year(col) = 2024, col LIKE 'x%', octet_length(v) > 2) and asks
+// whether the scan can push it. We answer by DRY-RUNNING the same encoder that
+// pushdown_complex_filter uses: accept iff it produces T-SQL. An accepted
+// expression is later delivered as an EXPRESSION_FILTER and reaches the server
+// in the WHERE clause; if the runtime encode ever refuses what the dry-run
+// accepted, the spec-069 client-filter net applies it, so a disagreement
+// degrades to client-side filtering, never to wrong rows. The combiner has
+// already proven the expression references exactly one column and has NOT yet
+// rewritten its column ref to BoundReference, so EncodeColumnRef sees a real
+// binding here.
+static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	if (!get.bind_data) {
+		return false;
+	}
+	auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
+	vector<column_t> column_ids;
+	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
+	auto result = FilterEncoder::EncodeExpression(expr, ctx);
+	const bool accepted = result.supported && !result.sql.empty();
+	MSSQL_SCAN_DEBUG_LOG(1, "PushdownExpression: type=%d class=%d -> %s", (int)expr.GetExpressionType(),
+						 (int)expr.GetExpressionClass(), accepted ? "PUSHED" : "kept above scan");
+	return accepted;
+}
+
 static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
 								  vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
 
 	MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: processing %zu expression(s)", filters.size());
 
-	// Build context for expression encoding
-	// The expressions from DuckDB use column bindings that reference indices in get.GetColumnIds()
-	// We need to map from those indices to actual table column names
-	// get.GetColumnIds()[i] gives the table column index for projected column i
-	const auto &get_column_ids = get.GetColumnIds();
 	vector<column_t> column_ids;
-	for (const auto &col_idx : get_column_ids) {
-		column_ids.push_back(col_idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : col_idx.GetPrimaryIndex());
-	}
-
-	MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: get.column_ids has %zu entries", column_ids.size());
-	for (idx_t i = 0; i < column_ids.size() && i < 10; i++) {
-		MSSQL_SCAN_DEBUG_LOG(2, "  column_ids[%llu] = %llu", (unsigned long long)i, (unsigned long long)column_ids[i]);
-	}
-
-	ExpressionEncodeContext ctx(column_ids, bind_data.all_column_names, bind_data.all_types);
-
-	// Add PK info for rowid filter pushdown (Spec 001-pk-rowid-semantics)
-	if (!bind_data.pk_column_names.empty()) {
-		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
-		MSSQL_SCAN_DEBUG_LOG(2, "ComplexFilterPushdown: PK info set (%zu columns, composite=%s)",
-							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");
-	}
+	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
 
 	std::vector<std::string> encoded_conditions;
 	std::vector<idx_t> expressions_to_remove;
@@ -1092,6 +1117,12 @@ TableFunction GetCatalogScanFunction() {
 	// Enable complex filter pushdown - allows us to handle expressions like year(col) = 2024
 	// that cannot be represented as simple TableFilter objects
 	func.pushdown_complex_filter = ComplexFilterPushdown;
+
+	// Enable single-column expression pushdown (spec 070 W1). The 2.0 combiner
+	// asks, per expression, whether the scan can push it into a TableFilter; we
+	// accept whatever our encoder can render. Accepted expressions become
+	// EXPRESSION_FILTERs (encoded in InitGlobal, netted client-side on refusal).
+	func.pushdown_expression = MSSQLPushdownExpression;
 
 	// Enable virtual column discovery - exposes rowid column to DuckDB binder
 	// This is called during binding to determine what virtual columns are available

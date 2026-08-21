@@ -24,8 +24,10 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		// String functions
 		{"lower", {"lower", "LOWER({0})", 1}},
 		{"upper", {"upper", "UPPER({0})", 1}},
-		{"length", {"length", "LEN({0})", 1}},
-		{"len", {"len", "LEN({0})", 1}},
+		// length/len deliberately NOT mapped: SQL Server LEN excludes trailing spaces
+		// and counts UTF-16 code units, DuckDB length() counts code points including
+		// them (issue #242). No exact T-SQL form on non-_SC collations. An unmapped
+		// function is applied client-side by the spec-069 net, correct by construction.
 		{"trim", {"trim", "LTRIM(RTRIM({0}))", 1}},
 		{"ltrim", {"ltrim", "LTRIM({0})", 1}},
 		{"rtrim", {"rtrim", "RTRIM({0})", 1}},
@@ -53,7 +55,8 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		{"+", {"+", "({0} + {1})", 2}},
 		{"-", {"-", "({0} - {1})", 2}},
 		{"*", {"*", "({0} * {1})", 2}},
-		{"/", {"/", "({0} / {1})", 2}},
+		// "/" NOT mapped: SQL Server does INTEGER division on integer operands
+		// (5/2 = 2), DuckDB "/" is always floating division (5/2 = 2.5) (issue #242).
 		{"%", {"%", "({0} % {1})", 2}},
 
 		// Unary minus
@@ -72,9 +75,7 @@ static const std::unordered_map<std::string, std::string> &GetDatePartMappingTab
 		{"minute", "minute"},
 		{"second", "second"},
 		{"millisecond", "millisecond"},
-		{"week", "week"},
 		{"quarter", "quarter"},
-		{"dayofweek", "weekday"},
 		{"dayofyear", "dayofyear"},
 	};
 	return mappings;
