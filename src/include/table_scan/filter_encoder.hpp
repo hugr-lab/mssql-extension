@@ -41,7 +41,12 @@ struct ExpressionEncodeResult {
  */
 struct FilterEncoderResult {
 	std::string where_clause;  // Complete WHERE clause (without "WHERE" keyword)
-	bool needs_duckdb_filter;  // True if some filter was not pushed to the server
+	// True if some filter was not pushed to the server. DIAGNOSTIC ONLY — it
+	// gates nothing. What actually makes a refused filter safe is `unhandled`,
+	// which the scan arms as a client-side net; 2.0 does not re-apply
+	// TableFilters behind a filter_pushdown scan. Never set this in place of
+	// populating `unhandled`.
+	bool needs_duckdb_filter;
 	// The filters that were not pushed, keyed by projected column index. On 2.0
 	// DuckDB does NOT re-apply TableFilters behind a filter_pushdown scan — a
 	// refused filter silently returns wrong rows unless the scan applies it

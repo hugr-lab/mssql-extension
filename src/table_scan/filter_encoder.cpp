@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -165,10 +166,14 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 			// No projection - use filter index directly as table column index
 			table_col_idx = projected_col_idx;
 		} else if (projected_col_idx >= column_ids.size()) {
-			MSSQL_FILTER_DEBUG_LOG(1, "  filter column index %llu out of projected range (%zu), skipping",
-								   (unsigned long long)projected_col_idx, column_ids.size());
-			result.needs_duckdb_filter = true;
-			continue;
+			// Cannot map this filter to a column, so it can be neither pushed
+			// to the server nor handed to the client-side net (which needs the
+			// column type). 2.0 does not re-apply TableFilters behind a
+			// filter_pushdown scan, so skipping here would silently return a
+			// superset. Fail instead — a filter over a column outside the
+			// projection is a malformed plan, not a pushdown limitation.
+			throw InternalException("MSSQL scan: filter column %llu outside projection (%llu columns)",
+									(unsigned long long)projected_col_idx, (unsigned long long)column_ids.size());
 		} else {
 			// Map through column_ids to get actual table column index
 			table_col_idx = column_ids[projected_col_idx];
@@ -184,10 +189,10 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		}
 
 		if (table_col_idx >= column_names.size()) {
-			MSSQL_FILTER_DEBUG_LOG(1, "  table column index %llu out of range (%zu), skipping",
-								   (unsigned long long)table_col_idx, column_names.size());
-			result.needs_duckdb_filter = true;
-			continue;
+			// Same reasoning as the projection guard above: unmappable means
+			// undroppable, or the scan returns rows the filter excluded.
+			throw InternalException("MSSQL scan: filter maps to table column %llu, table has %llu",
+									(unsigned long long)table_col_idx, (unsigned long long)column_names.size());
 		}
 
 		const std::string &col_name = column_names[table_col_idx];
