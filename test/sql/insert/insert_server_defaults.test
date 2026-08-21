@@ -1,0 +1,68 @@
+# name: test/sql/insert/insert_server_defaults.test
+# description: Columns the INSERT does not name stay OUT of the generated
+#              column list, so the SERVER applies identity and defaults
+#              (spec 069 G3 regression pin)
+# group: [insert]
+
+# G3: DuckDB 2.0 stopped populating LogicalInsert::column_index_map — the
+# binder expands the insert child to every physical column and fills unnamed
+# ones with a bound default (NULL for anything the client cannot know). The
+# naive all-columns INSERT then sends NULL where the server has IDENTITY or a
+# DEFAULT: identity dies with error 339, a defaulted column silently stores
+# NULL instead of the server's default. PlanInsert detects unnamed columns by
+# their moved-away bound_defaults slot and keeps them out of the column list;
+# this file pins both halves of that behaviour.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS defdb (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('defdb', 'IF OBJECT_ID(''dbo.SrvDefaults'') IS NOT NULL DROP TABLE dbo.SrvDefaults;
+CREATE TABLE dbo.SrvDefaults (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    name NVARCHAR(50) NOT NULL,
+    status NVARCHAR(20) NOT NULL DEFAULT N''pending'',
+    retries INT NOT NULL DEFAULT 3
+)');
+
+statement ok
+SELECT mssql_invalidate_cache('defdb');
+
+# Name only `name`: identity generates, BOTH server defaults apply.
+statement ok
+INSERT INTO defdb.dbo.SrvDefaults (name) VALUES ('first');
+
+# Name one defaulted column: the other default still applies.
+statement ok
+INSERT INTO defdb.dbo.SrvDefaults (name, status) VALUES ('second', 'active');
+
+query IIII
+SELECT id, name, status, retries FROM defdb.dbo.SrvDefaults ORDER BY id;
+----
+1	first	pending	3
+2	second	active	3
+
+# Identity keeps counting across statements (server-generated, not client).
+statement ok
+INSERT INTO defdb.dbo.SrvDefaults (name) VALUES ('third');
+
+query II
+SELECT id, status FROM defdb.dbo.SrvDefaults WHERE name = 'third';
+----
+3	pending
+
+# Full-positional INSERT still names every column and the identity column
+# rejects an explicit value without IDENTITY_INSERT — the pre-069 contract.
+statement error
+INSERT INTO defdb.dbo.SrvDefaults VALUES (99, 'explicit', 'x', 1);
+----
+
+statement ok
+SELECT mssql_exec('defdb', 'DROP TABLE dbo.SrvDefaults');
+
+statement ok
+DETACH defdb;

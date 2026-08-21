@@ -1,0 +1,124 @@
+# name: test/sql/catalog/filter_client_net.test
+# description: a filter the encoder REFUSES must still be applied (spec 069 cluster G2)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Filter pushdown is best-effort: FilterEncoder refuses any shape it cannot turn
+# into T-SQL. What happens to a refused filter changed underneath us.
+#
+# On 1.5.x DuckDB re-checked TableFilters above a filter_pushdown scan, so a
+# refusal cost performance and nothing else. DuckDB 2.0 does NOT — a filter the
+# scan declines to push and does not apply itself is simply never applied, and
+# the query silently returns a SUPERSET. That is a wrong answer, not a slow one.
+#
+# So the scan arms refused filters as client-side expressions over the output
+# chunk (`unhandled` -> ClientTableFilter -> ExpressionExecutor::SelectExpression).
+#
+# `rowid` is the lever. It is a VIRTUAL column with no T-SQL spelling, so
+# FilterEncoder::Encode routes every TableFilter on it to `unhandled` — it is
+# the one branch that populates `unhandled` unconditionally, which makes it the
+# only shape that reliably reaches the net. (An unsupported *function* does not:
+# DuckDB hands those to pushdown_complex_filter and keeps its own filter
+# operator above the scan, so those queries were never at risk.)
+#
+# Every assertion below fails LOUDLY if the net regresses: without it each of
+# these returns the entire table.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cfnet (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# -----------------------------------------------------------------------------
+# Small fixture: 5 rows, rowid == id.
+# -----------------------------------------------------------------------------
+query II
+SELECT rowid, name FROM cfnet.dbo.TestSimplePK WHERE rowid IN (2, 3) ORDER BY rowid;
+----
+2	Second Record
+3	Third Record
+
+query I
+SELECT COUNT(*) FROM cfnet.dbo.TestSimplePK WHERE rowid IN (2, 3);
+----
+2
+
+# Matches nothing. Without the net this is 5 — the loudest form of the bug.
+query I
+SELECT COUNT(*) FROM cfnet.dbo.TestSimplePK WHERE rowid IN (98, 99);
+----
+0
+
+# The projection does not include rowid, but the net still has to evaluate it.
+query I
+SELECT COUNT(*) FROM (SELECT name FROM cfnet.dbo.TestSimplePK WHERE rowid IN (2, 3));
+----
+2
+
+# -----------------------------------------------------------------------------
+# Wide fixture: 5000 rows is several vectors (STANDARD_VECTOR_SIZE is 2048), so
+# a single-row match empties whole chunks. That pins the fetch loop — a chunk
+# that filters to empty must not be mistaken for end-of-stream.
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('cfnet', 'IF OBJECT_ID(''dbo.ClientNetBig'',''U'') IS NOT NULL DROP TABLE dbo.ClientNetBig');
+
+statement ok
+SELECT mssql_exec('cfnet', 'CREATE TABLE dbo.ClientNetBig (id INT NOT NULL PRIMARY KEY, s NVARCHAR(32) NOT NULL)');
+
+statement ok
+INSERT INTO cfnet.dbo.ClientNetBig SELECT i, 'v' || i FROM range(5000) t(i);
+
+query I
+SELECT COUNT(*) FROM cfnet.dbo.ClientNetBig;
+----
+5000
+
+# One row, near the END: every chunk before it filters to empty.
+query IT
+SELECT id, s FROM cfnet.dbo.ClientNetBig WHERE rowid IN (4990);
+----
+4990	v4990
+
+# A few rows in the MIDDLE: chunks both before and after filter to empty.
+query I
+SELECT id FROM cfnet.dbo.ClientNetBig WHERE rowid IN (2498, 2499, 2500) ORDER BY id;
+----
+2498
+2499
+2500
+
+# Nothing matches anywhere: the scan must drain 5000 rows and emit none.
+query I
+SELECT COUNT(*) FROM cfnet.dbo.ClientNetBig WHERE rowid IN (99991, 99992);
+----
+0
+
+# -----------------------------------------------------------------------------
+# Partial pushdown: one predicate the encoder takes (`id`), one it refuses
+# (`rowid`). The pushed half must not be mistaken for the whole filter.
+# -----------------------------------------------------------------------------
+query I
+SELECT COUNT(*) FROM cfnet.dbo.ClientNetBig WHERE id >= 4000 AND rowid IN (4990);
+----
+1
+
+query I
+SELECT COUNT(*) FROM cfnet.dbo.ClientNetBig WHERE id < 4000 AND rowid IN (4990);
+----
+0
+
+statement ok
+SELECT mssql_exec('cfnet', 'DROP TABLE dbo.ClientNetBig;');
+
+statement ok
+DETACH cfnet;

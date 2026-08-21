@@ -41,7 +41,7 @@ void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChun
 		auto total_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_EXEC_DEBUG_LOG(1, "SCAN COMPLETE - total=%ldms", (long)total_ms);
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -49,7 +49,7 @@ void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChun
 	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 

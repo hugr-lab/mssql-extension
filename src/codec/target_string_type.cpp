@@ -20,16 +20,14 @@ static constexpr const char *VARCHAR_ALIAS = "MSSQL_VARCHAR";
 static constexpr const char *COLLATION_PROPERTY = "collation";
 
 LogicalType MakeTargetStringType(const TargetStringType &spec) {
-	LogicalType type(LogicalTypeId::VARCHAR);
-	type.SetAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
+	LogicalType type = LogicalType(LogicalTypeId::VARCHAR).WithAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
 
 	auto info = make_uniq<ExtensionTypeInfo>();
 	info->modifiers.emplace_back(Value::INTEGER(spec.length));
 	if (!spec.unicode && !spec.collation.empty()) {
 		info->properties[COLLATION_PROPERTY] = Value(spec.collation);
 	}
-	type.SetExtensionInfo(std::move(info));
-	return type;
+	return type.WithExtensionInfo(std::move(info));
 }
 
 bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {

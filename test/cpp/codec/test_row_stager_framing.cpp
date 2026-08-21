@@ -51,6 +51,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cstring>
 #include <functional>
@@ -302,7 +303,7 @@ void Run(const Case &c, bool nbc, bool null_via_bitmap = false) {
 	stager.FinalizeChunk(1);
 
 	// 3. The witness. A framing slip of even one byte moves the canary.
-	CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY, what + ": canary INT survives — framing agreed");
+	CHECK_EQ(FlatVector::GetDataMutable<int32_t>(canary)[0], CANARY, what + ": canary INT survives — framing agreed");
 	CHECK_TRUE(FlatVector::Validity(canary).RowIsValid(0), what + ": canary is not NULL");
 
 	// 4. Validity and (optionally) the decoded value of the column itself.
@@ -362,7 +363,7 @@ void RunSkipped(const Case &c, bool nbc) {
 	}
 	stager.FinalizeChunk(1);
 
-	CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY, what + ": canary survives the skipped column");
+	CHECK_EQ(FlatVector::GetDataMutable<int32_t>(canary)[0], CANARY, what + ": canary survives the skipped column");
 }
 
 void RunAllForms(const Case &c) {
@@ -384,7 +385,7 @@ void RunAllForms(const Case &c) {
 
 std::function<void(Vector &)> ExpectString(const std::string &expected) {
 	return [expected](Vector &v) {
-		const string_t got = FlatVector::GetData<string_t>(v)[0];
+		const string_t got = FlatVector::GetDataMutable<string_t>(v)[0];
 		const std::string actual(got.GetData(), got.GetSize());
 		CHECK_EQ(actual, expected, "decoded string value");
 	};
@@ -392,7 +393,7 @@ std::function<void(Vector &)> ExpectString(const std::string &expected) {
 
 std::function<void(Vector &)> ExpectBlob(const std::vector<uint8_t> &expected) {
 	return [expected](Vector &v) {
-		const string_t got = FlatVector::GetData<string_t>(v)[0];
+		const string_t got = FlatVector::GetDataMutable<string_t>(v)[0];
 		CHECK_EQ(got.GetSize(), expected.size(), "decoded blob length");
 		if (got.GetSize() == expected.size()) {
 			CHECK_TRUE(std::memcmp(got.GetData(), expected.data(), expected.size()) == 0, "decoded blob bytes");
@@ -402,7 +403,7 @@ std::function<void(Vector &)> ExpectBlob(const std::vector<uint8_t> &expected) {
 
 template <class T>
 std::function<void(Vector &)> ExpectScalar(T expected, const char *label) {
-	return [expected, label](Vector &v) { CHECK_TRUE(FlatVector::GetData<T>(v)[0] == expected, label); };
+	return [expected, label](Vector &v) { CHECK_TRUE(FlatVector::GetDataMutable<T>(v)[0] == expected, label); };
 }
 
 //===--------------------------------------------------------------------===//
@@ -682,7 +683,7 @@ void TestNbcNullSentinelIsNotALength() {
 		accounted_for++;
 		CHECK_TRUE(!FlatVector::Validity(under_test).RowIsValid(0),
 				   std::string(s.label) + ": 0xFFFF sentinel decodes as NULL, not a 65535-byte value");
-		CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY,
+		CHECK_EQ(FlatVector::GetDataMutable<int32_t>(canary)[0], CANARY,
 				 std::string(s.label) + ": canary INT survives the sentinel");
 	}
 
@@ -765,13 +766,13 @@ void RunBitmapWidth(idx_t column_count, int null_index) {
 
 	// The canary is last, so it only lands correctly if the bitmap width AND
 	// every column before it were framed identically by both walks.
-	CHECK_EQ(FlatVector::GetData<int32_t>(storage[column_count - 1])[0], CANARY, what + ": canary survives");
+	CHECK_EQ(FlatVector::GetDataMutable<int32_t>(storage[column_count - 1])[0], CANARY, what + ": canary survives");
 	for (idx_t i = 0; i + 1 < column_count; i++) {
 		if (static_cast<int>(i) == null_index) {
 			CHECK_TRUE(!FlatVector::Validity(storage[i]).RowIsValid(0), what + ": bitmap NULL decodes as NULL");
 			continue;
 		}
-		CHECK_EQ(FlatVector::GetData<int32_t>(storage[i])[0], static_cast<int32_t>(0x1000 + i),
+		CHECK_EQ(FlatVector::GetDataMutable<int32_t>(storage[i])[0], static_cast<int32_t>(0x1000 + i),
 				 what + ": filler column value");
 	}
 }
@@ -862,7 +863,7 @@ void RunMalformed(const MalformedCase &c) {
 	}
 	CHECK_TRUE(!threw, c.label + ": accepted without throwing — got: " + message);
 	if (!threw) {
-		CHECK_EQ(FlatVector::GetData<int32_t>(canary)[0], CANARY, c.label + ": canary survives");
+		CHECK_EQ(FlatVector::GetDataMutable<int32_t>(canary)[0], CANARY, c.label + ": canary survives");
 	}
 }
 

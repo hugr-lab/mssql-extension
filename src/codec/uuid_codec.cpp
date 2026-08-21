@@ -33,7 +33,7 @@
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/guid_encoding.hpp"
 #include "tds/tds_column_metadata.hpp"
 
@@ -95,7 +95,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		throw InvalidInputException("codec::uuid::DecodeFromTds: expected 16 wire bytes, got %zu", bytes.size());
 	}
 	auto guid = tds::encoding::GuidEncoding::ConvertGuid(bytes.data());
-	FlatVector::GetData<hugeint_t>(out)[row] = guid;
+	FlatVector::GetDataMutableUnsafe<hugeint_t>(out)[row] = guid;
 }
 
 //===----------------------------------------------------------------------===//
@@ -219,7 +219,7 @@ size_t EstimateLiteralSize(const LogicalType & /*type*/) {
 
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata & /*col*/,
 							Vector &out) {
-	hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+	hugeint_t *result = FlatVector::GetDataMutable<hugeint_t>(out);
 	const uint8_t *src = st.buffer.data();
 	for (idx_t row = 0; row < count; row++) {
 		result[row] = tds::encoding::GuidEncoding::ConvertGuid(src + row * GUID_WIRE_SIZE);

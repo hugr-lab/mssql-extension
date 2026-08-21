@@ -26,7 +26,7 @@
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -101,11 +101,11 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	if (bytes.size() == 4) {
 		float f = 0;
 		std::memcpy(&f, bytes.data(), 4);
-		FlatVector::GetData<float>(out)[row] = f;
+		FlatVector::GetDataMutableUnsafe<float>(out)[row] = f;
 	} else if (bytes.size() == 8) {
 		double d = 0;
 		std::memcpy(&d, bytes.data(), 8);
-		FlatVector::GetData<double>(out)[row] = d;
+		FlatVector::GetDataMutableUnsafe<double>(out)[row] = d;
 	}
 	// Other sizes silently skip (mirror legacy ConvertFloat — defensive only).
 }

@@ -10,8 +10,16 @@
 #include <string>
 #include <vector>
 #include "duckdb.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -33,7 +41,18 @@ struct ExpressionEncodeResult {
  */
 struct FilterEncoderResult {
 	std::string where_clause;  // Complete WHERE clause (without "WHERE" keyword)
-	bool needs_duckdb_filter;  // True if DuckDB must re-apply all filters
+	// True if some filter was not pushed to the server. DIAGNOSTIC ONLY — it
+	// gates nothing. What actually makes a refused filter safe is `unhandled`,
+	// which the scan arms as a client-side net; 2.0 does not re-apply
+	// TableFilters behind a filter_pushdown scan. Never set this in place of
+	// populating `unhandled`.
+	bool needs_duckdb_filter;
+	// The filters that were not pushed, keyed by projected column index. On 2.0
+	// DuckDB does NOT re-apply TableFilters behind a filter_pushdown scan — a
+	// refused filter silently returns wrong rows unless the scan applies it
+	// itself (the client-filter net in table_scan.cpp). Pointers alias the
+	// TableFilterSet owned by the physical operator, which outlives the scan.
+	std::vector<std::pair<idx_t, const TableFilter *>> unhandled;
 };
 
 //------------------------------------------------------------------------------
@@ -54,6 +73,11 @@ struct ExpressionEncodeContext {
 	const std::vector<std::string> *pk_column_names = nullptr;
 	const std::vector<LogicalType> *pk_column_types = nullptr;
 	bool pk_is_composite = false;
+
+	// Inside an EXPRESSION_FILTER: the escaped name of the column the filter is
+	// attached to. The 2.0 filter combiner replaces the column reference with
+	// BoundReference(0), so the name travels here instead of in the expression.
+	const std::string *filter_column = nullptr;
 
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
@@ -78,6 +102,7 @@ struct ExpressionEncodeContext {
 		ctx.pk_column_names = pk_column_names;
 		ctx.pk_column_types = pk_column_types;
 		ctx.pk_is_composite = pk_is_composite;
+		ctx.filter_column = filter_column;
 		return ctx;
 	}
 
@@ -173,7 +198,8 @@ private:
 	/**
 	 * Encode CONSTANT_COMPARISON filter (col OP value).
 	 */
-	static ExpressionEncodeResult EncodeConstantComparison(const ConstantFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeConstantComparison(const LegacyConstantFilter &filter,
+														   const std::string &column_name,
 														   const LogicalType &column_type);
 
 	/**
@@ -189,14 +215,14 @@ private:
 	/**
 	 * Encode IN_FILTER (col IN (values)).
 	 */
-	static ExpressionEncodeResult EncodeInFilter(const InFilter &filter, const std::string &column_name,
+	static ExpressionEncodeResult EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
 												 const LogicalType &column_type);
 
 	/**
 	 * Encode CONJUNCTION_AND filter.
 	 * Partial pushdown allowed: unsupported children are skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionAnd(const ConjunctionAndFilter &filter,
+	static ExpressionEncodeResult EncodeConjunctionAnd(const LegacyConjunctionAndFilter &filter,
 													   const std::string &column_name, const LogicalType &column_type,
 													   const ExpressionEncodeContext &ctx);
 
@@ -204,8 +230,8 @@ private:
 	 * Encode CONJUNCTION_OR filter.
 	 * All-or-nothing: if any child unsupported, entire OR is skipped.
 	 */
-	static ExpressionEncodeResult EncodeConjunctionOr(const ConjunctionOrFilter &filter, const std::string &column_name,
-													  const LogicalType &column_type,
+	static ExpressionEncodeResult EncodeConjunctionOr(const LegacyConjunctionOrFilter &filter,
+													  const std::string &column_name, const LogicalType &column_type,
 													  const ExpressionEncodeContext &ctx);
 
 	/**
@@ -227,7 +253,7 @@ private:
 	/**
 	 * Encode a comparison expression (left OP right).
 	 */
-	static ExpressionEncodeResult EncodeComparisonExpression(const BoundComparisonExpression &expr,
+	static ExpressionEncodeResult EncodeComparisonExpression(const BoundFunctionExpression &expr,
 															 const ExpressionEncodeContext &ctx);
 
 	/**
@@ -245,7 +271,7 @@ private:
 	/**
 	 * Encode a BETWEEN expression (input BETWEEN lower AND upper).
 	 */
-	static ExpressionEncodeResult EncodeBetweenExpression(const BoundBetweenExpression &expr,
+	static ExpressionEncodeResult EncodeBetweenExpression(const BoundFunctionExpression &expr,
 														  const ExpressionEncodeContext &ctx);
 
 	/**

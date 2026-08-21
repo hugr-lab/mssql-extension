@@ -225,7 +225,7 @@ TableFunctionSet MSSQLPoolStatsFunction::GetFunctionSet() {
 }
 
 unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
-													  vector<LogicalType> &return_types, vector<string> &names) {
+													  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<MSSQLPoolStatsBindData>();
 
 	// Check for positional argument
@@ -286,13 +286,13 @@ unique_ptr<GlobalTableFunctionState> MSSQLPoolStatsFunction::InitGlobal(ClientCo
 			}
 			auto &catalog = db->GetCatalog();
 			if (catalog.GetCatalogType() == "mssql") {
-				gstate->pool_names.push_back(db->GetName());
+				gstate->pool_names.push_back(db->GetName().GetIdentifierName());
 			}
 		}
 	} else {
 		// Single catalog lookup
 		try {
-			auto &catalog = Catalog::GetCatalog(context, bind_data.context_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 			if (catalog.GetCatalogType() == "mssql") {
 				gstate->pool_names.push_back(bind_data.context_name);
 			}
@@ -308,7 +308,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 	auto &gstate = input.global_state->Cast<MssqlPoolStatsGlobalState>();
 
 	if (gstate.current_index >= gstate.pool_names.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -318,7 +318,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 	while (gstate.current_index < gstate.pool_names.size() && count < max_count) {
 		const auto &pool_name = gstate.pool_names[gstate.current_index];
 		try {
-			auto &catalog = Catalog::GetCatalog(context, pool_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(pool_name));
 			auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 			auto &pool = mssql_catalog.GetConnectionPool();
 			auto stats = pool.GetStats();
@@ -340,7 +340,7 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 		gstate.current_index++;
 	}
 
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //===----------------------------------------------------------------------===//
@@ -364,6 +364,7 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet open_func("mssql_open");
 	ScalarFunction open_fn({LogicalType::VARCHAR}, LogicalType::BIGINT, MSSQLOpenFunction);
 	open_fn.SetVolatile();
+	open_fn.SetFallible();
 	open_func.AddFunction(open_fn);
 	loader.RegisterFunction(open_func);
 
@@ -371,6 +372,7 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet close_func("mssql_close");
 	ScalarFunction close_fn({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLCloseFunction);
 	close_fn.SetVolatile();
+	close_fn.SetFallible();
 	close_func.AddFunction(close_fn);
 	loader.RegisterFunction(close_func);
 
@@ -378,6 +380,7 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet ping_func("mssql_ping");
 	ScalarFunction ping_fn({LogicalType::BIGINT}, LogicalType::BOOLEAN, MSSQLPingFunction);
 	ping_fn.SetVolatile();
+	ping_fn.SetFallible();
 	ping_func.AddFunction(ping_fn);
 	loader.RegisterFunction(ping_func);
 
@@ -392,6 +395,7 @@ void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet close_all_func("mssql_close_all");
 	ScalarFunction close_all_fn({}, LogicalType::INTEGER, MSSQLCloseAllFunction);
 	close_all_fn.SetVolatile();
+	close_all_fn.SetFallible();
 	close_all_func.AddFunction(close_all_fn);
 	loader.RegisterFunction(close_all_func);
 

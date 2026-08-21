@@ -118,15 +118,15 @@ CTASTarget CTASPlanner::ExtractTarget(const LogicalCreateTable &op, MSSQLCatalog
 	CTASTarget target;
 
 	// Get catalog name from the MSSQL catalog
-	target.catalog_name = catalog.GetName();
+	target.catalog_name = catalog.GetName().GetIdentifierName();
 
 	// Extract schema and table from CreateTableInfo via BoundCreateTableInfo
 	// The schema is in op.schema (SchemaCatalogEntry&)
-	target.schema_name = op.schema.name;
+	target.schema_name = op.schema.name.GetIdentifierName();
 
 	// Get table name and on_conflict from the base CreateTableInfo
 	auto &base_info = op.info->Base();
-	target.table_name = base_info.table;
+	target.table_name = base_info.GetTableName().GetIdentifierName();
 
 	// Check for OR REPLACE (from on_conflict behavior)
 	target.on_conflict = base_info.on_conflict;
@@ -164,7 +164,7 @@ vector<CTASColumnDef> CTASPlanner::MapColumns(const LogicalCreateTable &op, Phys
 		CTASColumnDef col_def;
 
 		// Column name
-		col_def.name = col.GetName();
+		col_def.name = col.GetName().GetIdentifierName();
 
 		// DuckDB type from child plan. Spec 060: a plain VARCHAR picks up the
 		// session's default target type here, once, so the DDL text, the INSERT

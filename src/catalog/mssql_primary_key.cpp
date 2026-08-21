@@ -2,7 +2,9 @@
 // Feature: 001-pk-rowid-semantics
 
 #include "catalog/mssql_primary_key.hpp"
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -67,19 +69,33 @@ ORDER BY ic.key_ordinal
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
 static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback) {
-	auto result =
-		MSSQLSimpleQuery::ExecuteWithCallback(connection, sql, [&callback](const std::vector<std::string> &row) {
-			// Convert std::vector to duckdb::vector
-			vector<string> duckdb_row;
-			duckdb_row.reserve(row.size());
-			for (const auto &val : row) {
-				duckdb_row.push_back(val);
-			}
-			callback(duckdb_row);
-			return true;  // continue processing
-		});
+	// Deadlock-victim retry, same contract as RunMetadataQuery in
+	// mssql_metadata_cache.cpp: 1205 on a pure-read metadata query reruns
+	// (bounded), but only while no rows were delivered — after the first row
+	// the callback has state a rerun would duplicate.
+	constexpr int MAX_ATTEMPTS = 6;
+	for (int attempt = 1;; attempt++) {
+		idx_t rows_delivered = 0;
+		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
+			connection, sql, [&callback, &rows_delivered](const std::vector<std::string> &row) {
+				// Convert std::vector to duckdb::vector
+				vector<string> duckdb_row;
+				duckdb_row.reserve(row.size());
+				for (const auto &val : row) {
+					duckdb_row.push_back(val);
+				}
+				rows_delivered++;
+				callback(duckdb_row);
+				return true;  // continue processing
+			});
 
-	if (result.HasError()) {
+		if (!result.HasError()) {
+			return;
+		}
+		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+			continue;
+		}
 		throw IOException("Primary key metadata query failed: %s", result.error_message);
 	}
 }
@@ -139,7 +155,7 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 		// Composite PK: rowid type is STRUCT
 		child_list_t<LogicalType> children;
 		for (const auto &col : columns) {
-			children.push_back({col.name, col.duckdb_type});
+			children.push_back({Identifier(col.name), col.duckdb_type});
 		}
 		rowid_type = LogicalType::STRUCT(std::move(children));
 		MSSQL_PK_DEBUG("rowid type: STRUCT with %zu fields (composite)", columns.size());

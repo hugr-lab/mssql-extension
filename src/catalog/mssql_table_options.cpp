@@ -83,10 +83,10 @@ void MSSQLTableOptions::ApplyWithClause(const case_insensitive_map_t<unique_ptr<
 			throw InvalidInputException("MSSQL: table option '%s' must be a constant", entry.first);
 		}
 		auto &constant = entry.second->Cast<ConstantExpression>();
-		if (constant.value.IsNull()) {
+		if (constant.GetValue().IsNull()) {
 			throw InvalidInputException("MSSQL: table option '%s' must not be NULL", entry.first);
 		}
-		ApplyOption(entry.first, constant.value.ToString());
+		ApplyOption(entry.first, constant.GetValue().ToString());
 	}
 }
 

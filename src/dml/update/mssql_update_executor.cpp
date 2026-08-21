@@ -51,7 +51,7 @@ MSSQLUpdateExecutor::MSSQLUpdateExecutor(ClientContext &context, const MSSQLUpda
 	// 3. But the connection is in "Executing" state while streaming
 	// Solution: Buffer all data during Sink, execute in Finalize after scan completes
 	if (!context.transaction.IsAutoCommit()) {
-		auto &catalog = Catalog::GetCatalog(context, target_.catalog_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(target_.catalog_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
 			defer_execution_ = true;
@@ -68,7 +68,7 @@ tds::ConnectionPool &MSSQLUpdateExecutor::GetConnectionPool() {
 	}
 
 	// Spec 047: route through DuckDB catalog (per-catalog pool ownership).
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	connection_pool_ = &mssql_catalog.GetConnectionPool();
 	return *connection_pool_;
@@ -205,7 +205,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 	UPDATE_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", sql.size());
 
 	// Get the MSSQLCatalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, target_.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
 	// Acquire connection via ConnectionProvider (handles transaction pinning)

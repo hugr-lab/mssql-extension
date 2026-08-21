@@ -62,7 +62,7 @@ static bool IsOrderPushdownEnabled(ClientContext &context, const MSSQLCatalogSca
 
 	// Check ATTACH option second (Spec 047: per-catalog ownership)
 	try {
-		auto &raw_catalog = Catalog::GetCatalog(context, bind_data.context_name);
+		auto &raw_catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 		if (raw_catalog.GetCatalogType() == "mssql") {
 			auto &mssql_catalog = raw_catalog.Cast<MSSQLCatalog>();
 			if (mssql_catalog.GetConnectionInfo().order_pushdown > 0) {
@@ -121,26 +121,27 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get, id
 
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
-		if (ref.index >= col_ids.size()) {
+		if (ref.Index() >= col_ids.size()) {
 			return false;
 		}
-		out_col_ids_index = ref.index;
+		out_col_ids_index = ref.Index();
 		return true;
 	}
 
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 		// Match against the Get's table_index and find column in GetColumnIds
-		if (col_ref.binding.table_index != get.table_index) {
+		if (col_ref.Binding().table_index != get.table_index) {
 			MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF table_index %llu != get.table_index %llu",
-							(unsigned long long)col_ref.binding.table_index, (unsigned long long)get.table_index);
+							(unsigned long long)col_ref.Binding().table_index.index,
+							(unsigned long long)get.table_index.index);
 			return false;
 		}
 		// column_index maps to position in GetColumnIds
-		if (col_ref.binding.column_index >= col_ids.size()) {
+		if (col_ref.Binding().column_index >= col_ids.size()) {
 			return false;
 		}
-		out_col_ids_index = col_ref.binding.column_index;
+		out_col_ids_index = col_ref.Binding().column_index;
 		return true;
 	}
 
@@ -169,10 +170,10 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		// BOUND_REF: positional reference to projection output
 		if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 			auto &ref = expr.Cast<BoundReferenceExpression>();
-			if (ref.index < projection->expressions.size()) {
-				resolve_expr = projection->expressions[ref.index].get();
+			if (ref.Index() < projection->expressions.size()) {
+				resolve_expr = projection->expressions[ref.Index()].get();
 				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_REF[%llu] through projection -> class=%d",
-								(unsigned long long)ref.index, (int)resolve_expr->GetExpressionClass());
+								(unsigned long long)ref.Index(), (int)resolve_expr->GetExpressionClass());
 			} else {
 				return false;
 			}
@@ -181,19 +182,19 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		else if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 			// If binding matches projection's table_index, look through projection
-			if (col_ref.binding.table_index == projection->table_index &&
-				col_ref.binding.column_index < projection->expressions.size()) {
-				resolve_expr = projection->expressions[col_ref.binding.column_index].get();
+			if (col_ref.Binding().table_index == projection->table_index &&
+				col_ref.Binding().column_index < projection->expressions.size()) {
+				resolve_expr = projection->expressions[col_ref.Binding().column_index].get();
 				MSSQL_OPT_DEBUG(2, "  Resolved BOUND_COLUMN_REF[%llu.%llu] through projection -> class=%d",
-								(unsigned long long)col_ref.binding.table_index,
-								(unsigned long long)col_ref.binding.column_index,
+								(unsigned long long)col_ref.Binding().table_index.index,
+								(unsigned long long)col_ref.Binding().column_index,
 								(int)resolve_expr->GetExpressionClass());
 			}
 			// If binding matches Get's table_index, resolve directly against Get (skip projection)
-			else if (col_ref.binding.table_index == get.table_index) {
+			else if (col_ref.Binding().table_index == get.table_index) {
 				MSSQL_OPT_DEBUG(2, "  BOUND_COLUMN_REF[%llu.%llu] references Get directly",
-								(unsigned long long)col_ref.binding.table_index,
-								(unsigned long long)col_ref.binding.column_index);
+								(unsigned long long)col_ref.Binding().table_index.index,
+								(unsigned long long)col_ref.Binding().column_index);
 				// resolve_expr stays as &expr, handled below
 			}
 		}
@@ -216,21 +217,23 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 	// Case 2: Function expression (e.g., YEAR(col))
 	if (resolve_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &func_expr = resolve_expr->Cast<BoundFunctionExpression>();
-		auto *mapping = mssql::GetFunctionMapping(func_expr.function.name);
+		auto *mapping = mssql::GetFunctionMapping(func_expr.Function().GetName().GetIdentifierName());
 		if (!mapping) {
-			MSSQL_OPT_DEBUG(2, "  Unsupported function: %s", func_expr.function.name.c_str());
+			MSSQL_OPT_DEBUG(2, "  Unsupported function: %s",
+							func_expr.Function().GetName().GetIdentifierName().c_str());
 			return false;
 		}
 
-		if (mapping->expected_args != 1 || func_expr.children.size() != 1) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu", func_expr.function.name.c_str(),
-							func_expr.children.size());
+		if (mapping->expected_args != 1 || func_expr.GetChildren().size() != 1) {
+			MSSQL_OPT_DEBUG(2, "  Function %s: expected 1 arg, got %zu",
+							func_expr.Function().GetName().GetIdentifierName().c_str(), func_expr.GetChildren().size());
 			return false;
 		}
 
 		idx_t inner_col_ids_index;
-		if (!ResolveColumnIndex(*func_expr.children[0], get, inner_col_ids_index)) {
-			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref", func_expr.function.name.c_str());
+		if (!ResolveColumnIndex(*func_expr.GetChildren()[0], get, inner_col_ids_index)) {
+			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref",
+							func_expr.Function().GetName().GetIdentifierName().c_str());
 			return false;
 		}
 
@@ -335,7 +338,7 @@ static void CollectGetReferences(const Expression &expr, unordered_set<idx_t> &r
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF: {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
-		refs.insert(ref.index);
+		refs.insert(ref.Index());
 		return;
 	}
 	case ExpressionClass::BOUND_COLUMN_REF: {
@@ -345,14 +348,9 @@ static void CollectGetReferences(const Expression &expr, unordered_set<idx_t> &r
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		for (auto &child : func.children) {
+		for (auto &child : func.GetChildren()) {
 			CollectGetReferences(*child, refs);
 		}
-		return;
-	}
-	case ExpressionClass::BOUND_CAST: {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		CollectGetReferences(*cast.child, refs);
 		return;
 	}
 	default:
@@ -500,7 +498,7 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 	// Full pushdown: remove LogicalOrder from plan, keep Projection if present
 	if (pushed == order.orders.size()) {
 		// Capture projection_map BEFORE destroying LogicalOrder
-		vector<idx_t> projection_map = order.projection_map;
+		vector<idx_t> projection_map(order.projection_map.begin(), order.projection_map.end());
 
 		MSSQL_OPT_DEBUG(1, "Full ORDER BY pushdown - removing LogicalOrder from plan");
 		plan = std::move(plan->children[0]);

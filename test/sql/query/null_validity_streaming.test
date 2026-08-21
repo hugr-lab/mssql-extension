@@ -1,0 +1,56 @@
+# name: test/sql/query/null_validity_streaming.test
+# description: NULLs from a streaming scan must be NULL to EXPRESSIONS, not
+#              only to the renderer (spec 069 G1 regression pin)
+# group: [query]
+
+# G1: DuckDB 2.0 vectors carry their own size; a producer that fills data and
+# validity but never sizes the vectors (the deprecated SetCardinality path)
+# hands every Vector::size()-keyed consumer an empty vector. The symptom this
+# pins: the renderer showed NULL while `v IS NULL` said false — same chunk,
+# two readers, because IsNull iterated zero rows and left its result buffer
+# unwritten. The fix is SetChildCardinality at every producer site; this test
+# is the sentinel that the streaming path stays sized.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+statement ok
+ATTACH '${MSSQL_TEST_DSN}' AS nvdb (TYPE mssql);
+
+# The projection reader: IS NULL must agree with the rendered NULL.
+# ORDER BY v puts the NULL row first (T-SQL sorts NULLs first ascending).
+query II
+SELECT v, v IS NULL FROM mssql_scan('nvdb',
+    'SELECT CAST(NULL AS int) AS v UNION ALL SELECT 7 ORDER BY v');
+----
+NULL	true
+7	false
+
+# The filter reader: WHERE over the same stream. Both directions — the G1
+# breakage returned 2 here (garbage validity view read as all-NULL) and 0 for
+# IS NOT NULL on other layouts.
+query I
+SELECT count(*) FROM mssql_scan('nvdb',
+    'SELECT CAST(NULL AS int) AS v UNION ALL SELECT 7') WHERE v IS NULL;
+----
+1
+
+query I
+SELECT count(*) FROM mssql_scan('nvdb',
+    'SELECT CAST(NULL AS int) AS v UNION ALL SELECT 7') WHERE v IS NOT NULL;
+----
+1
+
+# The join reader: hashing a streamed column keys on vector size too — the G1
+# breakage joined two one-row scans to zero rows (tls_parallel's symptom, but
+# that file needs TLS; this pins it against the plain DSN).
+query II
+SELECT a.id, b.name
+FROM mssql_scan('nvdb', 'SELECT 1 AS id') a
+JOIN mssql_scan('nvdb', 'SELECT 1 AS id, ''Alice'' AS name') b ON a.id = b.id;
+----
+1	Alice
+
+statement ok
+DETACH nvdb;

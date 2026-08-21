@@ -14,8 +14,10 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "mssql_compat.hpp"		// For FlatVector header relocation (spec 051 M2)
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -43,6 +45,34 @@ namespace mssql {
 
 // Forward declarations for internal functions
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+
+// Execute the filters the encoder refused to push (see ClientTableFilter) over
+// a filled output chunk. Each filter's expression sees its column as
+// BoundReference(0), so it runs against a one-column view of the chunk.
+// Returns the surviving row count; the chunk is sliced in place.
+static idx_t ApplyClientFilters(ClientContext &context, MSSQLScanGlobalState &global_state, DataChunk &output,
+								idx_t rows) {
+	for (auto &cf : global_state.client_filters) {
+		if (rows == 0) {
+			break;
+		}
+		if (cf.out_col >= output.ColumnCount()) {
+			throw InternalException("MSSQL scan: client filter column %llu out of range",
+									(unsigned long long)cf.out_col);
+		}
+		DataChunk probe;
+		probe.data.emplace_back(output.data[cf.out_col].GetType());
+		probe.data[0].Reference(output.data[cf.out_col]);
+		probe.SetCardinalityUnsafe(rows);
+		SelectionVector sel(rows);
+		const idx_t approved = cf.executor->SelectExpression(probe, sel);
+		if (approved < rows) {
+			output.Slice(sel, approved);
+			rows = approved;
+		}
+	}
+	return rows;
+}
 
 //------------------------------------------------------------------------------
 // VARCHAR to NVARCHAR Conversion Helpers (Spec 026)
@@ -178,7 +208,7 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 //------------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> TableScanBind(ClientContext &context, TableFunctionBindInput &input,
-											  vector<LogicalType> &return_types, vector<string> &names) {
+											  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
 	// from MSSQLTableEntry
 	throw InternalException("TableScanBind should not be called directly");
@@ -399,9 +429,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	bool needs_duckdb_filter = false;
 
 	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
-	if (input.filters && !input.filters->filters.empty()) {
+	if (input.filters && input.filters->HasFilters()) {
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
-							 input.filters->filters.size());
+							 static_cast<size_t>(input.filters->FilterCount()));
 
 		auto encode_result =
 			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types);
@@ -413,6 +443,43 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		}
 
 		needs_duckdb_filter = encode_result.needs_duckdb_filter;
+
+		// 2.0 does not re-check TableFilters behind a filter_pushdown scan, so
+		// every refused filter is executed client-side over the output chunk.
+		// The filter's expression references its column as BoundReference(0) —
+		// the same convention the combiner used when it built the filter.
+		for (auto &uf : encode_result.unhandled) {
+			const idx_t out_col = uf.first;
+			LogicalType col_type;
+			if (out_col < column_ids.size() && column_ids[out_col] == COLUMN_IDENTIFIER_ROW_ID) {
+				col_type = bind_data.rowid_type;
+			} else if (out_col < column_ids.size() && column_ids[out_col] < bind_data.all_types.size()) {
+				col_type = bind_data.all_types[column_ids[out_col]];
+			} else {
+				// Same failure class as the catch below, same answer: a filter
+				// we can neither push nor arm client-side must fail by name,
+				// not return a superset of rows (PR #267 review, finding 5).
+				throw NotImplementedException(
+					"MSSQL scan: cannot apply pushed-down filter at projected column %llu client-side",
+					(unsigned long long)out_col);
+			}
+			try {
+				BoundReferenceExpression col_ref(col_type, 0ULL);
+				mssql::ClientTableFilter cf;
+				cf.out_col = out_col;
+				cf.expr = uf.second->ToExpression(col_ref);
+				cf.executor = make_uniq<ExpressionExecutor>(context);
+				cf.executor->AddExpression(*cf.expr);
+				result->client_filters.push_back(std::move(cf));
+				MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: client-side filter armed on output col %llu",
+									 (unsigned long long)out_col);
+			} catch (const std::exception &e) {
+				// A filter that cannot even build an expression cannot be
+				// applied anywhere — fail loudly instead of returning a
+				// superset of rows.
+				throw NotImplementedException("MSSQL scan: cannot apply pushed-down filter client-side: %s", e.what());
+			}
+		}
 	}
 
 	// 2. Add complex filters (from pushdown_complex_filter callback)
@@ -608,7 +675,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 				if (output_idx != UINT64_MAX) {
 					// This PK column is in the projection - copy to STRUCT child
 					auto &src_vector = output.data[output_idx];
-					auto &dst_vector = *entries[pk_idx];
+					auto &dst_vector = entries[pk_idx];
 					VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 					MSSQL_SCAN_DEBUG_LOG(2, "Execute: copied PK column %llu from output[%llu] to STRUCT child",
 										 (unsigned long long)pk_idx, (unsigned long long)output_idx);
@@ -616,7 +683,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 			}
 		}
 
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = FlatVector::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: composite_pk_direct_to_struct mode - STRUCT validity set for %llu rows",
 							 (unsigned long long)row_count);
@@ -632,14 +699,14 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		for (idx_t pk_idx = 0; pk_idx < state.pk_result_indices.size(); pk_idx++) {
 			idx_t src_col_idx = state.pk_result_indices[pk_idx];
 			auto &src_vector = output.data[src_col_idx];
-			auto &dst_vector = *entries[pk_idx];
+			auto &dst_vector = entries[pk_idx];
 
 			// Copy the PK column data to the struct child
 			VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
 		}
 
 		// Set validity for the struct itself (valid if any child is valid)
-		auto &validity = FlatVector::Validity(rowid_vector);
+		auto &validity = FlatVector::ValidityMutable(rowid_vector);
 		validity.SetAllValid(row_count);
 
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated composite rowid with %zu fields for %llu rows",
@@ -695,7 +762,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
 					if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
 						// This PK column was added - SQL will write to STRUCT child
-						target_vectors.push_back(entries[pk_idx].get());
+						target_vectors.push_back(&entries[pk_idx]);
 						added_pk_count++;
 					}
 					// PK columns already in projection will be copied after FillChunk
@@ -712,7 +779,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				// Composite PK rowid-only: write directly to STRUCT children
 				vector<Vector *> target_vectors;
 				for (auto &entry : entries) {
-					target_vectors.push_back(entry.get());
+					target_vectors.push_back(&entry);
 				}
 				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
 				global_state.result_stream->SetColumnsToFill(entries.size());
@@ -728,7 +795,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 		auto total_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_SCAN_DEBUG_LOG(1, "Execute: SCAN COMPLETE - total=%ldms", (long)total_ms);
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -736,20 +803,39 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
 	// Fill chunk from result stream
 	try {
-		idx_t rows = global_state.result_stream->FillChunk(output);
-		if (rows == 0) {
-			global_state.done = true;
-			// Surface any warnings
-			global_state.result_stream->SurfaceWarnings(context);
-		} else if (global_state.rowid_requested) {
-			// Populate rowid vector from PK columns
-			PopulateRowIdVector(global_state, output, rows);
+		// Loop: a chunk the client-side filters reduce to zero rows must NOT
+		// reach DuckDB — an empty chunk ends the scan — so fetch the next one.
+		// FillChunk itself starts with chunk.Reset(), which is what makes the
+		// retry sound: a Slice below rewrites output.data with dictionary
+		// buffers, and Reset re-references the flat cache buffers before the
+		// next fill. The composite-PK target pointers captured on the first
+		// call survive that Reset because they point into the cache-owned
+		// struct storage the Reset re-references, not into the slice.
+		for (;;) {
+			idx_t rows = global_state.result_stream->FillChunk(output);
+			if (rows == 0) {
+				global_state.done = true;
+				// Surface any warnings
+				global_state.result_stream->SurfaceWarnings(context);
+				break;
+			}
+			if (global_state.rowid_requested) {
+				// Populate rowid vector from PK columns
+				PopulateRowIdVector(global_state, output, rows);
+			}
+			if (!global_state.client_filters.empty()) {
+				rows = ApplyClientFilters(context, global_state, output, rows);
+				if (rows == 0) {
+					continue;
+				}
+			}
+			break;
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;
@@ -800,8 +886,8 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
-		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i, (int)filter->type,
-							 (int)filter->GetExpressionClass());
+		MSSQL_SCAN_DEBUG_LOG(2, "  filter[%llu]: type=%d class=%d", (unsigned long long)i,
+							 (int)filter->GetExpressionType(), (int)filter->GetExpressionClass());
 
 		// Try to encode this expression
 		auto result = FilterEncoder::EncodeExpression(*filter, ctx);
@@ -962,7 +1048,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	// The alias may since have been detached and re-attached over a different
 	// storage type. Cast<MSSQLCatalogScanBindData> below is unchecked in release
 	// builds, so confirm the catalog is still ours before trusting the entry.
-	auto &catalog = Catalog::GetCatalog(context, context_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(context_name));
 	if (catalog.GetCatalogType() != "mssql") {
 		throw SerializationException("MSSQL: catalog \"%s\" is no longer an MSSQL catalog (now \"%s\")", context_name,
 									 catalog.GetCatalogType());
@@ -970,7 +1056,8 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 
 	// Rebuild through the catalog entry so the column/PK metadata comes from the
 	// live catalog rather than from stale serialized copies.
-	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, context_name, schema_name, table_name);
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+		context, QualifiedName(Identifier(context_name), Identifier(schema_name), Identifier(table_name)));
 	unique_ptr<FunctionData> bind_data;
 	entry.GetScanFunction(context, bind_data);
 	if (!bind_data) {

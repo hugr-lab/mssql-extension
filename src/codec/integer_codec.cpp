@@ -31,7 +31,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/type_converter.hpp"
 
@@ -171,24 +171,24 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	switch (bytes.size()) {
 	case 1:
 		// SQL Server TINYINT is unsigned (0-255).
-		FlatVector::GetData<uint8_t>(out)[row] = bytes[0];
+		FlatVector::GetDataMutableUnsafe<uint8_t>(out)[row] = bytes[0];
 		return;
 	case 2: {
 		int16_t v = 0;
 		std::memcpy(&v, bytes.data(), 2);
-		FlatVector::GetData<int16_t>(out)[row] = v;
+		FlatVector::GetDataMutableUnsafe<int16_t>(out)[row] = v;
 		return;
 	}
 	case 4: {
 		int32_t v = 0;
 		std::memcpy(&v, bytes.data(), 4);
-		FlatVector::GetData<int32_t>(out)[row] = v;
+		FlatVector::GetDataMutableUnsafe<int32_t>(out)[row] = v;
 		return;
 	}
 	case 8: {
 		int64_t v = 0;
 		std::memcpy(&v, bytes.data(), 8);
-		FlatVector::GetData<int64_t>(out)[row] = v;
+		FlatVector::GetDataMutableUnsafe<int64_t>(out)[row] = v;
 		return;
 	}
 	default:

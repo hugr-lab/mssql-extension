@@ -50,6 +50,9 @@
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include <simdutf.h>
 
@@ -224,9 +227,9 @@ size_t FillChunkCurrent(const Fixture &f, DataChunk &chunk, const duckdb::tds::C
 			continue;
 		}
 		duckdb::mssql::codec::string::DecodeFromTds(f.rows[row], col, vec, row);
-		out_bytes += FlatVector::GetData<string_t>(vec)[row].GetSize();
+		out_bytes += FlatVector::GetDataMutable<string_t>(vec)[row].GetSize();
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= out_bytes;
 	return out_bytes;
 }
@@ -246,7 +249,7 @@ bool VerifyChunk(const Fixture &f, DataChunk &chunk, const duckdb::tds::ColumnMe
 			continue;
 		}
 		std::string expect = duckdb::tds::encoding::Utf16LEDecode(f.rows[row].data(), f.rows[row].size());
-		auto got = FlatVector::GetData<string_t>(vec)[row];
+		auto got = FlatVector::GetDataMutable<string_t>(vec)[row];
 		if (std::string(got.GetData(), got.GetSize()) != expect) {
 			return false;
 		}
@@ -457,7 +460,7 @@ size_t FillChunkFixed(const FixedCell &c, DataChunk &chunk) {
 		}
 		c.decode(c.rows[row], c.col, vec, row);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 	return c.in_bytes;
 }
@@ -477,27 +480,27 @@ bool VerifyFixed(const FixedCell &c, DataChunk &chunk) {
 		uint64_t v = RowValue(row);
 		switch (c.type.id()) {
 		case duckdb::LogicalTypeId::BIGINT:
-			if (FlatVector::GetData<int64_t>(vec)[row] != static_cast<int64_t>(v)) {
+			if (FlatVector::GetDataMutable<int64_t>(vec)[row] != static_cast<int64_t>(v)) {
 				return false;
 			}
 			break;
 		case duckdb::LogicalTypeId::INTEGER:
-			if (FlatVector::GetData<int32_t>(vec)[row] != static_cast<int32_t>(v & 0xFFFFFFFF)) {
+			if (FlatVector::GetDataMutable<int32_t>(vec)[row] != static_cast<int32_t>(v & 0xFFFFFFFF)) {
 				return false;
 			}
 			break;
 		case duckdb::LogicalTypeId::SMALLINT:
-			if (FlatVector::GetData<int16_t>(vec)[row] != static_cast<int16_t>(v & 0xFFFF)) {
+			if (FlatVector::GetDataMutable<int16_t>(vec)[row] != static_cast<int16_t>(v & 0xFFFF)) {
 				return false;
 			}
 			break;
 		case duckdb::LogicalTypeId::UTINYINT:
-			if (FlatVector::GetData<uint8_t>(vec)[row] != static_cast<uint8_t>(v & 0xFF)) {
+			if (FlatVector::GetDataMutable<uint8_t>(vec)[row] != static_cast<uint8_t>(v & 0xFF)) {
 				return false;
 			}
 			break;
 		case duckdb::LogicalTypeId::DOUBLE:
-			if (FlatVector::GetData<double>(vec)[row] != static_cast<double>(v) * 1.5) {
+			if (FlatVector::GetDataMutable<double>(vec)[row] != static_cast<double>(v) * 1.5) {
 				return false;
 			}
 			break;
@@ -649,10 +652,10 @@ BcpFixture BuildBcpFixture(const BcpCellSpec &s) {
 		break;
 	}
 	case VecRep::Constant:
-		vec.Reference(s.null_pct >= 100 ? duckdb::Value(type) : MakeBcpValue(s.kind, 0));
+		vec.Reference(s.null_pct >= 100 ? duckdb::Value(type) : MakeBcpValue(s.kind, 0), duckdb::count_t(CHUNK_ROWS));
 		break;
 	}
-	f.chunk->SetCardinality(CHUNK_ROWS);
+	f.chunk->SetChildCardinality(CHUNK_ROWS);
 
 	duckdb::mssql::BCPColumnMetadata col("c", type, true);
 	switch (s.kind) {
@@ -724,7 +727,7 @@ size_t EncodeChunkColumnarFixed(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 	size_t stride = 1;	// 0xD1 ROW token
 	bool all_valid = true;
 	for (idx_t c = 0; c < ncols; ++c) {
-		f.chunk->data[c].ToUnifiedFormat(rows, fmts[c]);
+		f.chunk->data[c].ToUnifiedFormat(fmts[c]);
 		stride += 1 + f.cols[c].max_length;
 		all_valid = all_valid && fmts[c].validity.AllValid();
 	}
@@ -839,7 +842,7 @@ WideFixture BuildWideFixture(idx_t ncols) {
 	w.chunk.reset(new duckdb::DataChunk());
 	w.chunk->Initialize(duckdb::Allocator::DefaultAllocator(), types);
 	for (idx_t c = 0; c < ncols; ++c) {
-		auto *data = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		auto *data = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 		for (idx_t r = 0; r < CHUNK_ROWS; ++r) {
 			data[r] = static_cast<int64_t>(r * 31 + c);
 		}
@@ -848,7 +851,7 @@ WideFixture BuildWideFixture(idx_t ncols) {
 		col.max_length = 8;
 		w.cols.push_back(col);
 	}
-	w.chunk->SetCardinality(CHUNK_ROWS);
+	w.chunk->SetChildCardinality(CHUNK_ROWS);
 	w.stride = 1 + ncols * (1 + 8);
 	return w;
 }
@@ -865,7 +868,7 @@ size_t WideColFull(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	}
 	size_t col_off = 1;
 	for (idx_t c = 0; c < ncols; ++c) {
-		const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		const int64_t *src = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 		for (idx_t r = 0; r < rows; ++r) {
 			uint8_t *p = dst + r * w.stride + col_off;
 			*p = 8;
@@ -915,7 +918,7 @@ size_t WideColTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 
 	size_t col_off = 1;
 	for (idx_t c = 0; c < ncols; ++c) {
-		const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		const int64_t *src = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 		uint8_t *p = dst + col_off + 1;	 // straight to the payload
 		for (idx_t r = 0; r < rows; ++r) {
 			memcpy(p + r * stride, &src[r], 8);
@@ -948,7 +951,7 @@ size_t WideRowBlocked(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block)
 	static duckdb::vector<const int64_t *> srcs;
 	srcs.resize(ncols);
 	for (idx_t c = 0; c < ncols; ++c) {
-		srcs[c] = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		srcs[c] = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 	}
 	for (idx_t r0 = 0; r0 < rows; r0 += block) {
 		const idx_t rend = duckdb::MinValue<idx_t>(r0 + block, rows);
@@ -988,7 +991,7 @@ size_t WideColBlockedZeroFill(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_
 		}
 		size_t col_off = 1;
 		for (idx_t c = 0; c < ncols; ++c) {
-			const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+			const int64_t *src = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 			for (idx_t r = r0; r < rend; ++r) {
 				uint8_t *p = dst + r * w.stride + col_off;
 				*p = 8;
@@ -1038,7 +1041,7 @@ size_t WideColBlockedTemplate(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_
 		// Payload only: no length byte, no ROW token.
 		size_t col_off = 1;
 		for (idx_t c = 0; c < ncols; ++c) {
-			const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+			const int64_t *src = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 			uint8_t *p = bdst + col_off + 1;
 			for (idx_t r = 0; r < brows; ++r) {
 				memcpy(p + r * stride, &src[r0 + r], 8);
@@ -1076,7 +1079,8 @@ size_t WideColTypedWidth(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	}
 	size_t col_off = 1;
 	for (idx_t c = 0; c < ncols; ++c) {
-		const uint8_t *src = reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]));
+		const uint8_t *src =
+			reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]));
 		ScatterWidth<8>(dst, w.stride, col_off, rows, src);
 		col_off += 9;
 	}
@@ -1110,7 +1114,8 @@ size_t WideColTemplateTyped(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	}
 	size_t col_off = 1;
 	for (idx_t c = 0; c < ncols; ++c) {
-		const uint8_t *src = reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]));
+		const uint8_t *src =
+			reinterpret_cast<const uint8_t *>(duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]));
 		ScatterPayloadOnly<8>(dst + col_off + 1, stride, rows, src);
 		col_off += 9;
 	}
@@ -1132,7 +1137,7 @@ size_t WideColBlocked(WideFixture &w, duckdb::vector<uint8_t> &buf, idx_t block)
 		}
 		size_t col_off = 1;
 		for (idx_t c = 0; c < ncols; ++c) {
-			const int64_t *src = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+			const int64_t *src = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 			for (idx_t r = r0; r < rend; ++r) {
 				uint8_t *p = dst + r * w.stride + col_off;
 				*p = 8;
@@ -1154,7 +1159,7 @@ size_t WideRowMajor(WideFixture &w, duckdb::vector<uint8_t> &buf) {
 	static duckdb::vector<const int64_t *> srcs;
 	srcs.resize(ncols);
 	for (idx_t c = 0; c < ncols; ++c) {
-		srcs[c] = duckdb::FlatVector::GetData<int64_t>(w.chunk->data[c]);
+		srcs[c] = duckdb::FlatVector::GetDataMutable<int64_t>(w.chunk->data[c]);
 	}
 	buf.resize(rows * w.stride);
 	uint8_t *p = buf.data();
@@ -1273,7 +1278,7 @@ size_t EncodeChunkReprAwareArena(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 			return buf.size();
 		}
 		duckdb::UnifiedVectorFormat fmt;
-		vec.ToUnifiedFormat(CHUNK_ROWS, fmt);
+		vec.ToUnifiedFormat(fmt);
 		encode_one(vec, fmt, 0, cache);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			buf.push_back(0xD1);
@@ -1298,7 +1303,7 @@ size_t EncodeChunkReprAwareArena(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 		std::fill(done.begin(), done.begin() + child_count, 0);
 
 		duckdb::UnifiedVectorFormat child_fmt;
-		child.ToUnifiedFormat(child_count, child_fmt);
+		child.ToUnifiedFormat(child_fmt);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			const idx_t idx = sel.get_index(row);
 			if (idx >= child_count || done[idx]) {
@@ -1348,7 +1353,7 @@ size_t EncodeChunkBulkUtf16(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 	buf.clear();
 	auto &vec = f.chunk->data[0];
 	duckdb::UnifiedVectorFormat fmt;
-	vec.ToUnifiedFormat(CHUNK_ROWS, fmt);
+	vec.ToUnifiedFormat(fmt);
 	const auto *strs = duckdb::UnifiedVectorFormat::GetData<string_t>(fmt);
 
 	// Gather WITH a U+0000 delimiter after every value (one 0x00 byte in UTF-8,
@@ -1823,7 +1828,7 @@ size_t FillChunkBatchA(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		total += l;
 	}
 	char *base = AllocOutput(vec, total);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 		if (f.null_mask[row]) {
 			FlatVector::SetNull(vec, row, true);
@@ -1837,7 +1842,7 @@ size_t FillChunkBatchA(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		slots[row] = string_t(dst, g_bs.out_len[row]);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1865,7 +1870,7 @@ size_t FillChunkBatchB(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
 											   base);
 	}
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 		if (f.null_mask[row]) {
 			FlatVector::SetNull(vec, row, true);
@@ -1873,7 +1878,7 @@ size_t FillChunkBatchB(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		slots[row] = string_t(base + g_bs.out_off[row], g_bs.out_len[row]);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1891,7 +1896,7 @@ size_t FillChunkBatchAscii(const Fixture &f, const StagedStrings &s, DataChunk &
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
 											   base);
 	}
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 		if (f.null_mask[row]) {
 			FlatVector::SetNull(vec, row, true);
@@ -1899,7 +1904,7 @@ size_t FillChunkBatchAscii(const Fixture &f, const StagedStrings &s, DataChunk &
 		}
 		slots[row] = string_t(base + s.off[row] / 2, s.len[row] / 2);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1913,7 +1918,7 @@ size_t FillChunkBatchC(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		simdutf::utf8_length_from_utf16le(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units);
 	char *base = AllocOutput(vec, total);
 	simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 	const char *p = base;
 	const char *end = base + total;
 	for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
@@ -1928,7 +1933,7 @@ size_t FillChunkBatchC(const Fixture &f, const StagedStrings &s, DataChunk &chun
 		}
 		p = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1943,7 +1948,7 @@ size_t FillChunkBatchC2(const Fixture &f, const StagedStrings &s, DataChunk &chu
 		simdutf::utf8_length_from_utf16le(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units);
 	char *base = AllocOutput(vec, total);
 	simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 
 	idx_t row = 0;
 	const char *seg = base;
@@ -1981,7 +1986,7 @@ size_t FillChunkBatchC2(const Fixture &f, const StagedStrings &s, DataChunk &chu
 		++row;
 		seg = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -1998,7 +2003,7 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 	char *base = AllocOutput(vec, s.delim_units * 3);
 	const size_t written =
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 
 	if (written == s.delim_units) {
 		// All ASCII: 1 unit -> 1 byte, so output offsets are input offsets / 2
@@ -2010,7 +2015,7 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2050,7 +2055,7 @@ size_t FillChunkBatchPrealloc(const Fixture &f, const StagedStrings &s, DataChun
 		++row;
 		seg = nul + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2084,7 +2089,7 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 	char *base = AllocOutput(vec, s.delim_units * 3);
 	const size_t written =
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 
 	if (written == s.delim_units) {
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
@@ -2094,7 +2099,7 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2123,7 +2128,7 @@ size_t FillChunkBatchPreallocSkip(const Fixture &f, const StagedStrings &s, Data
 		}
 		seg = p + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2136,7 +2141,7 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 	char *base = AllocOutput(vec, s.delim_units * 3);
 	const size_t written =
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.delim.data()), s.delim_units, base);
-	auto *slots = FlatVector::GetData<string_t>(vec);
+	auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 
 	if (written == s.delim_units) {
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
@@ -2146,7 +2151,7 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 			}
 			slots[row] = string_t(base + s.doff[row] / 2, s.len[row] / 2);
 		}
-		chunk.SetCardinality(CHUNK_ROWS);
+		chunk.SetChildCardinality(CHUNK_ROWS);
 		g_sink ^= written;
 		return written;
 	}
@@ -2173,7 +2178,7 @@ size_t FillChunkBatchPreallocSkipMemchr(const Fixture &f, const StagedStrings &s
 		}
 		seg = p + 1;
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2189,7 +2194,7 @@ size_t FillChunkConvertOnlyPrealloc(const Fixture &f, const StagedStrings &s, Da
 							   ? 0
 							   : simdutf::convert_valid_utf16le_to_utf8(
 									 reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units, base);
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= written;
 	return written;
 }
@@ -2209,7 +2214,7 @@ size_t FillChunkConvertOnly(const Fixture &f, const StagedStrings &s, DataChunk 
 		simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(s.payload.data()), s.code_units,
 											   base);
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= total;
 	return total;
 }
@@ -2232,7 +2237,7 @@ bool VerifyChunkStandard(const Fixture &f, DataChunk &chunk) {
 		} else {
 			expect = duckdb::tds::encoding::Utf16LEDecode(v.data(), v.size());
 		}
-		auto got = FlatVector::GetData<string_t>(vec)[row];
+		auto got = FlatVector::GetDataMutable<string_t>(vec)[row];
 		if (std::string(got.GetData(), got.GetSize()) != expect) {
 			return false;
 		}
@@ -2383,7 +2388,7 @@ void FillWirePerValue(const WireImage &w, DataChunk &chunk, std::vector<std::vec
 			}
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 }
 
@@ -2416,8 +2421,9 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 		std::fill(rc.validity.begin(), rc.validity.end(), ~0ULL);
 		switch (rc.kind) {
 		case WireCol::Bigint:
-			rc.direct = bigint_via_staging ? rc.raw.data()
-										   : reinterpret_cast<uint8_t *>(FlatVector::GetData<int64_t>(chunk.data[c]));
+			rc.direct = bigint_via_staging
+							? rc.raw.data()
+							: reinterpret_cast<uint8_t *>(FlatVector::GetDataMutable<int64_t>(chunk.data[c]));
 			break;
 		default:
 			rc.raw.clear();
@@ -2464,7 +2470,7 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 	for (size_t c = 0; c < ncols; ++c) {
 		auto &rc = raws[c];
 		auto &vec = chunk.data[c];
-		auto &mask = FlatVector::Validity(vec);
+		auto &mask = FlatVector::ValidityMutable(vec);
 		mask.EnsureWritable();
 		std::memcpy(mask.GetData(), rc.validity.data(), rc.validity.size() * sizeof(uint64_t));
 
@@ -2473,13 +2479,13 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 			if (bigint_via_staging) {
 				// The whole column in one memcpy — legal only because the TDS
 				// layout for INTN(8) already equals DuckDB's int64_t.
-				std::memcpy(FlatVector::GetData<int64_t>(vec), rc.raw.data(), CHUNK_ROWS * 8);
+				std::memcpy(FlatVector::GetDataMutable<int64_t>(vec), rc.raw.data(), CHUNK_ROWS * 8);
 			}
 			break;	// otherwise it was written straight into the vector
 		case WireCol::Uuid:
 			break;
 		case WireCol::Decimal18s6: {
-			auto *out = FlatVector::GetData<int64_t>(vec);
+			auto *out = FlatVector::GetDataMutable<int64_t>(vec);
 			for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 				out[row] = static_cast<int64_t>(ConvertDecimalFast(rc.raw.data() + row * rc.stride, rc.stride).lower);
 			}
@@ -2490,7 +2496,7 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 			char *base = AllocOutput(vec, units * 3);
 			const size_t written =
 				simdutf::convert_valid_utf16le_to_utf8(reinterpret_cast<const char16_t *>(rc.raw.data()), units, base);
-			auto *slots = FlatVector::GetData<string_t>(vec);
+			auto *slots = FlatVector::GetDataMutable<string_t>(vec);
 			if (written == units) {
 				for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 					slots[row] = string_t(base + rc.off[row] / 2, rc.len[row] / 2);
@@ -2514,7 +2520,7 @@ void FillWireStaged(const WireImage &w, DataChunk &chunk, std::vector<RawColumn>
 		}
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 }
 
@@ -2803,7 +2809,7 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 		}
 	}
 	if (prec <= 4) {
-		auto *out = FlatVector::GetData<int16_t>(vec);
+		auto *out = FlatVector::GetDataMutable<int16_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			const duckdb::hugeint_t v =
 				fast ? ConvertDecimalFast(base + row * stride, stride)
@@ -2811,7 +2817,7 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 			out[row] = static_cast<int16_t>(v.lower);
 		}
 	} else if (prec <= 9) {
-		auto *out = FlatVector::GetData<int32_t>(vec);
+		auto *out = FlatVector::GetDataMutable<int32_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			const duckdb::hugeint_t v =
 				fast ? ConvertDecimalFast(base + row * stride, stride)
@@ -2819,7 +2825,7 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 			out[row] = static_cast<int32_t>(v.lower);
 		}
 	} else if (prec <= 18) {
-		auto *out = FlatVector::GetData<int64_t>(vec);
+		auto *out = FlatVector::GetDataMutable<int64_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			const duckdb::hugeint_t v =
 				fast ? ConvertDecimalFast(base + row * stride, stride)
@@ -2827,13 +2833,13 @@ size_t FillChunkDecimalBatch(const FixedCell &c, const StagedFixed &s, DataChunk
 			out[row] = static_cast<int64_t>(v.lower);
 		}
 	} else {
-		auto *out = FlatVector::GetData<duckdb::hugeint_t>(vec);
+		auto *out = FlatVector::GetDataMutable<duckdb::hugeint_t>(vec);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			out[row] = fast ? ConvertDecimalFast(base + row * stride, stride)
 							: duckdb::tds::encoding::DecimalEncoding::ConvertDecimal(base + row * stride, stride);
 		}
 	}
-	chunk.SetCardinality(CHUNK_ROWS);
+	chunk.SetChildCardinality(CHUNK_ROWS);
 	g_sink ^= CHUNK_ROWS;
 	return c.in_bytes;
 }

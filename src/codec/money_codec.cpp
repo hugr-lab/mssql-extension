@@ -26,7 +26,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/decimal_encoding.hpp"
 
 #include <cstdint>
@@ -40,12 +40,12 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	if (bytes.size() == 8) {
 		// MONEY → DECIMAL(19,4), hugeint storage (precision > 18).
 		hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertMoney(bytes.data());
-		FlatVector::GetData<hugeint_t>(out)[row] = int_value;
+		FlatVector::GetDataMutableUnsafe<hugeint_t>(out)[row] = int_value;
 	} else if (bytes.size() == 4) {
 		// SMALLMONEY → DECIMAL(10,4), int64 storage. ConvertSmallMoney returns a
 		// hugeint_t whose .lower carries the sign-extended int32 in its low 64 bits.
 		hugeint_t int_value = tds::encoding::DecimalEncoding::ConvertSmallMoney(bytes.data());
-		FlatVector::GetData<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
+		FlatVector::GetDataMutableUnsafe<int64_t>(out)[row] = static_cast<int64_t>(int_value.lower);
 	} else {
 		throw InvalidInputException("Invalid MONEY length: %d", bytes.size());
 	}
@@ -57,7 +57,7 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	const uint32_t stride = st.stride;
 	if (stride == 8) {
 		// MONEY -> DECIMAL(19,4), hugeint storage.
-		hugeint_t *result = FlatVector::GetData<hugeint_t>(out);
+		hugeint_t *result = FlatVector::GetDataMutable<hugeint_t>(out);
 		for (idx_t row = 0; row < count; row++) {
 			result[row] = tds::encoding::DecimalEncoding::ConvertMoney(base + row * stride);
 		}
@@ -65,7 +65,7 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	}
 	// SMALLMONEY -> DECIMAL(10,4), int64 storage; ConvertSmallMoney returns the
 	// sign-extended int32 in .lower.
-	int64_t *result = FlatVector::GetData<int64_t>(out);
+	int64_t *result = FlatVector::GetDataMutable<int64_t>(out);
 	for (idx_t row = 0; row < count; row++) {
 		result[row] =
 			static_cast<int64_t>(tds::encoding::DecimalEncoding::ConvertSmallMoney(base + row * stride).lower);

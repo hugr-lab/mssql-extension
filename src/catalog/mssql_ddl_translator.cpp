@@ -149,7 +149,7 @@ string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column,
 	string result;
 
 	// Column name
-	result += QuoteIdentifier(column.GetName());
+	result += QuoteIdentifier(column.GetName().GetIdentifierName());
 	result += " ";
 
 	// Column type
@@ -223,7 +223,7 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 						if (i > 0) {
 							result += ", ";
 						}
-						result += QuoteIdentifier(pk_columns[i]);
+						result += QuoteIdentifier(pk_columns[i].GetIdentifierName());
 					}
 				} else if (unique_constraint.HasIndex()) {
 					// Single column constraint by index
@@ -232,7 +232,7 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 					idx_t col_idx = 0;
 					for (auto &column : columns.Logical()) {
 						if (col_idx == idx.index) {
-							result += QuoteIdentifier(column.GetName());
+							result += QuoteIdentifier(column.GetName().GetIdentifierName());
 							break;
 						}
 						col_idx++;

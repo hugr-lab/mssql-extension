@@ -64,8 +64,11 @@ vector<string> MSSQLBatchBuilder::SerializeRow(DataChunk &chunk, idx_t row_index
 		auto col_idx = target_.insert_column_indices[i];
 		const auto &col = target_.columns[col_idx];
 
-		// Get vector from chunk (assumes chunk columns match insert_column_indices order)
-		auto &vector = chunk.data[i];
+		// The 2.0 insert child is always full-width in table order (the binder
+		// resolves defaults into the projection), so the chunk column for a
+		// table column IS its ordinal — including when insert_column_indices
+		// skips unnamed columns.
+		auto &vector = chunk.data[col_idx];
 		auto literal = MSSQLValueSerializer::SerializeFromVector(vector, row_index, col.duckdb_type);
 
 		// XML columns: reject if serialized literal exceeds SQL Server's TDS buffer limit

@@ -32,6 +32,7 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -80,11 +81,11 @@ ColumnMetadata MakeColumn(uint8_t type_id, uint8_t max_length) {
 }
 
 hugeint_t ReadHugeint(duckdb::Vector &vec, duckdb::idx_t row) {
-	return duckdb::FlatVector::GetData<hugeint_t>(vec)[row];
+	return duckdb::FlatVector::GetDataMutable<hugeint_t>(vec)[row];
 }
 
 int64_t ReadInt64(duckdb::Vector &vec, duckdb::idx_t row) {
-	return duckdb::FlatVector::GetData<int64_t>(vec)[row];
+	return duckdb::FlatVector::GetDataMutable<int64_t>(vec)[row];
 }
 
 void TestDecodeMoneyZero() {

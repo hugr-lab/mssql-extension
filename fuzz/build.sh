@@ -171,7 +171,17 @@ if want row_stager; then
 	for f in "${REPO}"/src/codec/*.cpp; do
 		STAGER_SRCS+=("${f}")
 	done
-	INC="${INC} -I${MSSQL_DUCKDB_INC}"
+	# DuckDB 2.0's function.hpp includes "fmt/core.h", which lives outside
+	# src/include. Every standalone compile recipe carries the same extra -I;
+	# derive it from MSSQL_DUCKDB_INC (<duckdb>/src/include) so the documented
+	# invocation keeps working, and allow an override for unusual layouts.
+	MSSQL_DUCKDB_FMT_INC="${MSSQL_DUCKDB_FMT_INC:-${MSSQL_DUCKDB_INC}/../../third_party/fmt/include}"
+	if [[ ! -f "${MSSQL_DUCKDB_FMT_INC}/fmt/core.h" ]]; then
+		echo "ERROR: cannot find fmt/core.h under ${MSSQL_DUCKDB_FMT_INC}." >&2
+		echo "       Set MSSQL_DUCKDB_FMT_INC to <duckdb>/third_party/fmt/include." >&2
+		exit 1
+	fi
+	INC="${INC} -I${MSSQL_DUCKDB_INC} -I${MSSQL_DUCKDB_FMT_INC}"
 	STAGER_OBJS="$(compile_objs stager "${STAGER_SRCS[@]}")"
 	echo ">> linking fuzz_row_stager"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \

@@ -13,6 +13,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "query/mssql_result_stream.hpp"
+#include "table_scan/table_scan_state.hpp"
 
 #include <atomic>
 #include <memory>
@@ -126,6 +127,10 @@ struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 	// Set when complete
 	bool done = false;
 
+	// Filters the encoder refused to push, executed client-side per chunk
+	// (table_scan.cpp; the type lives in table_scan_state.hpp).
+	std::vector<mssql::ClientTableFilter> client_filters;
+
 	// Timing
 	std::chrono::steady_clock::time_point scan_start;
 	bool timing_started = false;
@@ -183,7 +188,7 @@ struct MSSQLScanLocalState : public LocalTableFunctionState {
 
 // Bind: validates arguments, determines return schema
 unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
-									   vector<LogicalType> &return_types, vector<string> &names);
+									   vector<LogicalType> &return_types, vector<Identifier> &names);
 
 // Global init: sets up execution state
 unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context, TableFunctionInitInput &input);

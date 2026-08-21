@@ -33,6 +33,10 @@ set -a; . ./.env; set +a
 DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
 ROWS=${ROWS:-500000}
 OUT=${OUT:-/tmp/bench_wide.log}
+# A/B against another binary: BIN overrides the CLI; PRELUDE_SQL (e.g.
+# "LOAD mssql;") is emitted first for binaries without the extension linked in.
+BIN=${BIN:-./build/release/duckdb}
+PRELUDE_SQL=${PRELUDE_SQL:-}
 
 # The SQL file carries the DSN (password included): mktemp gives it 0600 and the
 # trap removes it however the run ends — a fixed /tmp path outlived the run and
@@ -61,7 +65,7 @@ SELECT
     DATE '2020-01-01' + ((i % 365)::INTEGER) AS c_date,
     TIME '12:34:56' + INTERVAL (i % 60) SECOND        AS c_time,
     TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND AS c_ts,
-    (TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND) AT TIME ZONE 'UTC' AS c_tstz,
+    (TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (i % 10000) SECOND)::TIMESTAMPTZ AS c_tstz,
     gen_random_uuid()                        AS c_uuid,
     repeat('a', 10) || (i % 100)::VARCHAR    AS c_s1,
     repeat('b', 20) || (i % 100)::VARCHAR    AS c_s2,
@@ -88,7 +92,7 @@ for nulls in nonulls nulls; do
 		for threads in 1 4; do
 			cell="threads=${threads} strings=${ann} ${nulls}"
 			{
-				echo ".timer on"
+				echo ".timer on"; [ -n "$PRELUDE_SQL" ] && echo "$PRELUDE_SQL"
 				echo "SET threads = ${threads};"
 				echo "SET mssql_copy_parallel_writers = 0;"
 				echo "ATTACH '${DSN}' AS db (TYPE mssql);"
@@ -103,7 +107,7 @@ for nulls in nonulls nulls; do
 			# A cell that errors, or whose fixture check did not print FIXTURE OK,
 			# aborts the whole run BY NAME — an 8-cell matrix that produced zero
 			# numbers must not exit 0 (the `[mssql]`-filter lesson).
-			if ! MSSQL_COUNTERS=1 ./build/release/duckdb < "$SQLFILE" > "$CELLLOG" 2>&1; then
+			if ! MSSQL_COUNTERS=1 "$BIN" < "$SQLFILE" > "$CELLLOG" 2>&1; then
 				cat "$CELLLOG" >> "$OUT"
 				echo "CELL FAILED: $cell (see $OUT)" >&2
 				exit 1

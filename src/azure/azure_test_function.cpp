@@ -90,6 +90,7 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 						 LogicalType::VARCHAR,							   // return type
 						 AzureAuthTestFunction);
 	func1.SetVolatile();
+	func1.SetFallible();
 	loader.RegisterFunction(func1);
 
 	// Version 2: secret_name + tenant_id (for interactive auth)
@@ -98,6 +99,7 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 						 LogicalType::VARCHAR,							// return type
 						 AzureAuthTestFunctionWithTenant);
 	func2.SetVolatile();
+	func2.SetFallible();
 	loader.RegisterFunction(func2);
 }
 

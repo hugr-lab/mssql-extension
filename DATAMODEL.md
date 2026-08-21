@@ -673,7 +673,7 @@ Two lifetime rules that are easy to get wrong:
 | 042 | `AuthenticationStrategy` / `IAuthenticator` (Kerberos/SSPI) in layer 1 |
 | 045 | Family-dispatch codec layer 5 |
 | 047 | Per-catalog `unique_ptr<ConnectionPool>` (was process-wide); per-catalog `active_streams_`; `TokenCache` keyed by `(DatabaseInstance*, key)` |
-| 051 | `src/include/mssql_compat.hpp` — DuckDB API shims (header relocation, single-arg `BindScalarFunctionInput`) |
+| 051 | `src/include/mssql_compat.hpp` — DuckDB API shims (retired by spec 069: main is 2.0-only, 1.5.x lives on branch `duckdb-v1.5.5`) |
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 | 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
@@ -686,7 +686,6 @@ Two lifetime rules that are easy to get wrong:
 - Bind anchors: `src/include/catalog/mssql_bind_anchors.hpp`, `src/catalog/mssql_bind_anchors.cpp`
 - Pool: `src/include/tds/tds_connection_pool.hpp`, `src/tds/tds_connection_pool.cpp`
 - TDS connection: `src/include/tds/tds_connection.hpp`, `src/tds/tds_connection.cpp`
-- DuckDB API shims: `src/include/mssql_compat.hpp`
 - Codec dispatch: `src/codec/type_family.cpp`, `src/codec/literal_format.cpp`
 - Target string types: `src/include/codec/target_string_type.hpp`, `src/codec/target_string_type.cpp`
 - BCP column metadata (both builders): `src/copy/target_resolver.cpp`

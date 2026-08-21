@@ -7,12 +7,12 @@
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "mssql_compat.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -75,7 +75,7 @@ idx_t MSSQLScanGlobalState::MaxThreads() const {
 }
 
 unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
-									   vector<LogicalType> &return_types, vector<string> &names) {
+									   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_start = std::chrono::steady_clock::now();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: START");
 
@@ -90,7 +90,7 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 
 	// Validate context exists (Spec 047: per-catalog ownership via DuckDB catalog lookup)
 	try {
-		auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->context_name));
 		if (catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException(
 				"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
@@ -121,16 +121,16 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {
-		names.push_back(name);
+		names.push_back(Identifier(name));
 	}
 
 	bind_data->return_types = return_types;
-	bind_data->column_names = names;
+	bind_data->column_names = result_stream->GetColumnNames();
 
 	// Register the result stream for later retrieval in InitGlobal
 	// This avoids executing the query twice (which causes 30s timeout on large datasets)
 	// Spec 047 / US3: registry lives on MSSQLCatalog (previously process-wide singleton).
-	auto &catalog = Catalog::GetCatalog(context, bind_data->context_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->context_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data->result_stream_id.c_str());
@@ -156,7 +156,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	if (!bind_data.result_stream_id.empty()) {
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieving result_stream_id=%s",
 						   bind_data.result_stream_id.c_str());
-		auto &catalog = Catalog::GetCatalog(context, bind_data.context_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		result->result_stream = mssql_catalog.RetrieveStream(bind_data.result_stream_id);
 		if (result->result_stream) {
@@ -205,7 +205,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 		auto total_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - global_state.scan_start).count();
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanFunction: SCAN COMPLETE - total=%ldms", (long)total_ms);
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -213,7 +213,7 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	if (context.IsInterrupted()) {
 		global_state.result_stream->Cancel();
 		global_state.done = true;
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -292,8 +292,11 @@ struct MSSQLExecBindData : public FunctionData {
 };
 
 // Bind function for mssql_exec
-MSSQL_BIND_SCALAR_SIG(MSSQLExecBind) {
-	MSSQL_BIND_SCALAR_PROLOGUE
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	(void)context;
+	(void)arguments;
 	// First argument is the context name (attached database name, must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");
@@ -307,7 +310,7 @@ MSSQL_BIND_SCALAR_SIG(MSSQLExecBind) {
 
 		// Validate the context exists (Spec 047: per-catalog ownership)
 		try {
-			auto &catalog = Catalog::GetCatalog(context, context_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(context_name));
 			if (catalog.GetCatalogType() != "mssql") {
 				throw BinderException(
 					"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, "
@@ -344,7 +347,7 @@ static bool ExecSqlMayChangeSchema(const string &sql) {
 
 // Execute function for mssql_exec
 static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<MSSQLExecBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLExecBindData>();
 
 	auto &context_names = args.data[0];
 	auto &sql_statements = args.data[1];
@@ -368,7 +371,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 		MSSQLCatalog *catalog_ptr = nullptr;
 		try {
-			auto &raw_catalog = Catalog::GetCatalog(client_context, context_name);
+			auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(context_name));
 			if (raw_catalog.GetCatalogType() != "mssql") {
 				throw InvalidInputException("mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)",
 											context_name, raw_catalog.GetCatalogType());
@@ -453,6 +456,7 @@ ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 	// Side-effecting (runs T-SQL on the server): VOLATILE stops the optimizer
 	// from constant-folding the call at plan time or caching it per row.
 	func.SetVolatile();
+	func.SetFallible();
 	return func;
 }
 

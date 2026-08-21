@@ -16,7 +16,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/interval.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
@@ -450,7 +451,7 @@ size_t WalkDelimited(const staging::ColumnStaging &st, idx_t count, const char *
 
 template <bool TRIM>
 void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out) {
-	string_t *result = FlatVector::GetData<string_t>(out);
+	string_t *result = FlatVector::GetDataMutable<string_t>(out);
 	const idx_t units = st.PayloadSize() / 2;
 
 	if (units == 0) {
@@ -816,13 +817,13 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 					str.pop_back();
 				}
 			}
-			FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, str);
+			FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = StringVector::AddString(out, str);
 			return;
 		}
 		string_t slot = StringVector::EmptyString(out, utf8_len);
 		tds::encoding::Utf16LEDecodeValidInto(bytes.data(), byte_len, slot.GetDataWriteable());
 		slot.Finalize();
-		FlatVector::GetData<string_t>(out)[row] = slot;
+		FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = slot;
 		return;
 	}
 
@@ -835,7 +836,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 			len--;
 		}
 	}
-	FlatVector::GetData<string_t>(out)[row] =
+	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] =
 		StringVector::AddString(out, reinterpret_cast<const char *>(bytes.data()), len);
 }
 

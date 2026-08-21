@@ -26,12 +26,14 @@
 #include "dml/ctas/mssql_ctas_config.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -41,6 +43,7 @@
 
 using duckdb::hugeint_t;
 using duckdb::HugeIntValue;
+using duckdb::idx_t;
 using duckdb::LogicalType;
 using duckdb::uhugeint_t;
 using duckdb::Value;
@@ -394,7 +397,7 @@ void TestEncodeToBcpDictionaryConstantVectors() {
 	// CONSTANT vector: any row index must resolve to the single constant value.
 	// (A raw FlatVector::GetData[row] read would walk off the 1-element array.)
 	{
-		duckdb::Vector cv(Value::HUGEINT(vals[1]));	 // Value ctor → constant vector
+		duckdb::Vector cv(Value::HUGEINT(vals[1]), duckdb::count_t(1));	 // Value ctor → constant vector
 		duckdb::vector<uint8_t> b;
 		duckdb::mssql::codec::integer::EncodeToBcp(cv, 3, col, b);
 		CHECK_TRUE(b == encode_flat(vals[1]));

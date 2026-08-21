@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
@@ -142,12 +144,12 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 	FilterEncoderResult result;
 	result.needs_duckdb_filter = false;
 
-	if (!filters || filters->filters.empty()) {
+	if (!filters || !filters->HasFilters()) {
 		MSSQL_FILTER_DEBUG_LOG(1, "Encode: no filters to encode");
 		return result;
 	}
 
-	MSSQL_FILTER_DEBUG_LOG(1, "Encode: encoding %zu filter(s)", filters->filters.size());
+	MSSQL_FILTER_DEBUG_LOG(1, "Encode: encoding %zu filter(s)", static_cast<size_t>(filters->FilterCount()));
 
 	ExpressionEncodeContext ctx(column_ids, column_names, column_types);
 	std::vector<std::string> where_conditions;
@@ -155,8 +157,8 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 	// Virtual/special column identifiers start at 2^63
 	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
 
-	for (const auto &filter_entry : filters->filters) {
-		idx_t projected_col_idx = filter_entry.first;
+	for (const auto &filter_entry : *filters) {
+		idx_t projected_col_idx = filter_entry.GetIndex();
 
 		// Map from projected column index to actual table column index
 		idx_t table_col_idx;
@@ -164,27 +166,33 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 			// No projection - use filter index directly as table column index
 			table_col_idx = projected_col_idx;
 		} else if (projected_col_idx >= column_ids.size()) {
-			MSSQL_FILTER_DEBUG_LOG(1, "  filter column index %llu out of projected range (%zu), skipping",
-								   (unsigned long long)projected_col_idx, column_ids.size());
-			result.needs_duckdb_filter = true;
-			continue;
+			// Cannot map this filter to a column, so it can be neither pushed
+			// to the server nor handed to the client-side net (which needs the
+			// column type). 2.0 does not re-apply TableFilters behind a
+			// filter_pushdown scan, so skipping here would silently return a
+			// superset. Fail instead — a filter over a column outside the
+			// projection is a malformed plan, not a pushdown limitation.
+			throw InternalException("MSSQL scan: filter column %llu outside projection (%llu columns)",
+									(unsigned long long)projected_col_idx, (unsigned long long)column_ids.size());
 		} else {
 			// Map through column_ids to get actual table column index
 			table_col_idx = column_ids[projected_col_idx];
 		}
 
-		// Skip virtual/special columns
+		// Skip virtual/special columns (rowid): not pushable as SQL, but the
+		// filter still binds to an output column, so the client net can run it.
 		if (table_col_idx >= VIRTUAL_COL_START) {
 			MSSQL_FILTER_DEBUG_LOG(2, "  skipping virtual column_id=%llu", (unsigned long long)table_col_idx);
 			result.needs_duckdb_filter = true;
+			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
 			continue;
 		}
 
 		if (table_col_idx >= column_names.size()) {
-			MSSQL_FILTER_DEBUG_LOG(1, "  table column index %llu out of range (%zu), skipping",
-								   (unsigned long long)table_col_idx, column_names.size());
-			result.needs_duckdb_filter = true;
-			continue;
+			// Same reasoning as the projection guard above: unmappable means
+			// undroppable, or the scan returns rows the filter excluded.
+			throw InternalException("MSSQL scan: filter maps to table column %llu, table has %llu",
+									(unsigned long long)table_col_idx, (unsigned long long)column_names.size());
 		}
 
 		const std::string &col_name = column_names[table_col_idx];
@@ -195,7 +203,7 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 							   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx,
 							   col_name.c_str());
 
-		auto encode_result = EncodeFilter(*filter_entry.second, escaped_col, col_type, ctx);
+		auto encode_result = EncodeFilter(filter_entry.Filter(), escaped_col, col_type, ctx);
 
 		if (encode_result.supported && !encode_result.sql.empty()) {
 			where_conditions.push_back(encode_result.sql);
@@ -203,8 +211,9 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		}
 
 		if (!encode_result.supported) {
-			MSSQL_FILTER_DEBUG_LOG(2, "    filter not fully supported, will need DuckDB re-filter");
+			MSSQL_FILTER_DEBUG_LOG(2, "    filter not fully supported, will need client-side re-filter");
 			result.needs_duckdb_filter = true;
+			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
 		}
 	}
 
@@ -230,32 +239,37 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, const std::string &column_name,
 												   const LogicalType &column_type, const ExpressionEncodeContext &ctx) {
 	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON:
-		return EncodeConstantComparison(filter.Cast<ConstantFilter>(), column_name, column_type);
+	case TableFilterType::LEGACY_CONSTANT_COMPARISON:
+		return EncodeConstantComparison(filter.Cast<LegacyConstantFilter>(), column_name, column_type);
 
-	case TableFilterType::IS_NULL:
+	case TableFilterType::LEGACY_IS_NULL:
 		return EncodeIsNull(column_name);
 
-	case TableFilterType::IS_NOT_NULL:
+	case TableFilterType::LEGACY_IS_NOT_NULL:
 		return EncodeIsNotNull(column_name);
 
-	case TableFilterType::IN_FILTER:
-		return EncodeInFilter(filter.Cast<InFilter>(), column_name, column_type);
+	case TableFilterType::LEGACY_IN_FILTER:
+		return EncodeInFilter(filter.Cast<LegacyInFilter>(), column_name, column_type);
 
-	case TableFilterType::CONJUNCTION_OR:
-		return EncodeConjunctionOr(filter.Cast<ConjunctionOrFilter>(), column_name, column_type, ctx);
+	case TableFilterType::LEGACY_CONJUNCTION_OR:
+		return EncodeConjunctionOr(filter.Cast<LegacyConjunctionOrFilter>(), column_name, column_type, ctx);
 
-	case TableFilterType::CONJUNCTION_AND:
-		return EncodeConjunctionAnd(filter.Cast<ConjunctionAndFilter>(), column_name, column_type, ctx);
+	case TableFilterType::LEGACY_CONJUNCTION_AND:
+		return EncodeConjunctionAnd(filter.Cast<LegacyConjunctionAndFilter>(), column_name, column_type, ctx);
 
-	case TableFilterType::EXPRESSION_FILTER:
-		// Expression filters (for complex expressions) - not yet fully supported
-		// Will be enhanced in later phases
-		return EncodeExpressionFilter(filter.Cast<ExpressionFilter>(), ctx);
+	case TableFilterType::EXPRESSION_FILTER: {
+		// The 2.0 filter combiner rewrites a pushed predicate's column reference
+		// into BoundReference(0) before wrapping it in an ExpressionFilter, so
+		// the expression no longer names its column — the filter's slot does.
+		// Carry the escaped name in the context for the BOUND_REF arm.
+		ExpressionEncodeContext expr_ctx = ctx;
+		expr_ctx.filter_column = &column_name;
+		return EncodeExpressionFilter(filter.Cast<ExpressionFilter>(), expr_ctx);
+	}
 
-	case TableFilterType::OPTIONAL_FILTER:
-	case TableFilterType::STRUCT_EXTRACT:
-	case TableFilterType::DYNAMIC_FILTER:
+	case TableFilterType::LEGACY_OPTIONAL_FILTER:
+	case TableFilterType::LEGACY_STRUCT_EXTRACT:
+	case TableFilterType::LEGACY_DYNAMIC_FILTER:
 	default:
 		// These filter types cannot be pushed down to SQL Server
 		MSSQL_FILTER_DEBUG_LOG(1, "Filter type %d cannot be pushed down", (int)filter.filter_type);
@@ -263,7 +277,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, co
 	}
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const ConstantFilter &filter,
+ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConstantFilter &filter,
 															   const std::string &column_name,
 															   const LogicalType &column_type) {
 	std::string op;
@@ -283,7 +297,7 @@ ExpressionEncodeResult FilterEncoder::EncodeIsNotNull(const std::string &column_
 	return {column_name + " IS NOT NULL", true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeInFilter(const InFilter &filter, const std::string &column_name,
+ExpressionEncodeResult FilterEncoder::EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
 													 const LogicalType &column_type) {
 	std::string sql = column_name + " IN (";
 	for (idx_t i = 0; i < filter.values.size(); i++) {
@@ -296,7 +310,7 @@ ExpressionEncodeResult FilterEncoder::EncodeInFilter(const InFilter &filter, con
 	return {sql, true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeConjunctionAnd(const ConjunctionAndFilter &filter,
+ExpressionEncodeResult FilterEncoder::EncodeConjunctionAnd(const LegacyConjunctionAndFilter &filter,
 														   const std::string &column_name,
 														   const LogicalType &column_type,
 														   const ExpressionEncodeContext &ctx) {
@@ -336,7 +350,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionAnd(const ConjunctionAndF
 	return {sql, all_supported};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const ConjunctionOrFilter &filter,
+ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const LegacyConjunctionOrFilter &filter,
 														  const std::string &column_name,
 														  const LogicalType &column_type,
 														  const ExpressionEncodeContext &ctx) {
@@ -374,7 +388,8 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const ConjunctionOrFil
 ExpressionEncodeResult FilterEncoder::EncodeExpressionFilter(const ExpressionFilter &filter,
 															 const ExpressionEncodeContext &ctx) {
 	// Expression filters contain arbitrary expressions
-	MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpressionFilter: encoding expression type %d", (int)filter.expr->type);
+	MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpressionFilter: encoding expression type %d",
+						   (int)filter.expr->GetExpressionType());
 	return EncodeExpression(*filter.expr, ctx);
 }
 
@@ -389,20 +404,64 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 		return {"", false};
 	}
 
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeExpression: type=%d class=%d", (int)expr.type, (int)expr.GetExpressionClass());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeExpression: type=%d class=%d", (int)expr.GetExpressionType(),
+						   (int)expr.GetExpressionClass());
 
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 		return EncodeColumnRef(expr.Cast<BoundColumnRefExpression>(), ctx);
 
+	case ExpressionClass::BOUND_REF: {
+		// Only inside an EXPRESSION_FILTER, where the combiner replaced the
+		// filter column's reference with BoundReference(0) — the combiner
+		// rejects multi-column expressions before pushing, so index 0 is the
+		// filter's own column and anything else is unencodable.
+		auto &ref = expr.Cast<BoundReferenceExpression>();
+		if (ctx.filter_column && ref.Index() == 0) {
+			return {*ctx.filter_column, true};
+		}
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: BOUND_REF outside a filter context, not pushed");
+		return {"", false};
+	}
+
 	case ExpressionClass::BOUND_CONSTANT:
 		return EncodeConstant(expr.Cast<BoundConstantExpression>());
 
-	case ExpressionClass::BOUND_FUNCTION:
-		return EncodeFunctionExpression(expr.Cast<BoundFunctionExpression>(), ctx);
-
-	case ExpressionClass::BOUND_COMPARISON:
-		return EncodeComparisonExpression(expr.Cast<BoundComparisonExpression>(), ctx);
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &func_expr = expr.Cast<BoundFunctionExpression>();
+		if (BoundCastExpression::IsCast(expr)) {
+			// Spec 060: the catalog reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n)
+			// for string columns, and DuckDB reaches a plain VARCHAR overload
+			// through the implicit no-op cast registered with those types. On the
+			// server there is nothing to cast — the column already IS that string
+			// — so encode straight through it. Without this arm the cast reads as
+			// an unsupported expression, the filter stops being pushed, and the
+			// whole column is fetched and filtered on the client instead.
+			//
+			// VARCHAR to VARCHAR only. A real conversion (INTEGER to VARCHAR) has
+			// formatting semantics SQL Server need not reproduce, and stays
+			// unpushed.
+			const auto &target_type = BoundCastExpression::TargetType(func_expr);
+			const auto &cast_child = BoundCastExpression::Child(func_expr);
+			if (target_type.id() == LogicalTypeId::VARCHAR &&
+				cast_child.GetReturnType().id() == LogicalTypeId::VARCHAR) {
+				return EncodeExpression(cast_child, ctx);
+			}
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: cast %s -> %s not pushed",
+								   cast_child.GetReturnType().ToString().c_str(), target_type.ToString().c_str());
+			return {"", false};
+		}
+		// Comparisons and BETWEEN are BoundFunctionExpressions too (their
+		// helper structs only accept that class), dispatched by expression
+		// type, not class.
+		if (BoundComparisonExpression::IsComparison(expr)) {
+			return EncodeComparisonExpression(func_expr, ctx);
+		}
+		if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			return EncodeBetweenExpression(func_expr, ctx);
+		}
+		return EncodeFunctionExpression(func_expr, ctx);
+	}
 
 	case ExpressionClass::BOUND_CONJUNCTION:
 		return EncodeConjunctionExpression(expr.Cast<BoundConjunctionExpression>(), ctx);
@@ -413,31 +472,6 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 	case ExpressionClass::BOUND_CASE:
 		return EncodeCaseExpression(expr.Cast<BoundCaseExpression>(), ctx);
 
-	case ExpressionClass::BOUND_BETWEEN:
-		return EncodeBetweenExpression(expr.Cast<BoundBetweenExpression>(), ctx);
-
-	case ExpressionClass::BOUND_CAST: {
-		// Spec 060: the catalog reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
-		// string columns, and DuckDB reaches a plain VARCHAR overload through the
-		// implicit no-op cast registered with those types. On the server there is
-		// nothing to cast — the column already IS that string — so encode straight
-		// through it. Without this arm the cast reads as an unsupported expression,
-		// the filter stops being pushed, and the whole column is fetched and
-		// filtered on the client instead.
-		//
-		// VARCHAR to VARCHAR only. A real conversion (INTEGER to VARCHAR) has
-		// formatting semantics SQL Server need not reproduce, and stays unpushed.
-		auto &cast = expr.Cast<BoundCastExpression>();
-		if (cast.return_type.id() == LogicalTypeId::VARCHAR && cast.child &&
-			cast.child->return_type.id() == LogicalTypeId::VARCHAR) {
-			return EncodeExpression(*cast.child, ctx);
-		}
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: cast %s -> %s not pushed",
-							   cast.child ? cast.child->return_type.ToString().c_str() : "?",
-							   cast.return_type.ToString().c_str());
-		return {"", false};
-	}
-
 	default:
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: unsupported expression class %d", (int)expr.GetExpressionClass());
 		return {"", false};
@@ -446,17 +480,17 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 
 ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFunctionExpression &expr,
 															   const ExpressionEncodeContext &ctx) {
-	const std::string &func_name = expr.function.name;
+	const std::string &func_name = expr.Function().GetName().GetIdentifierName();
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeFunctionExpression: function=%s, args=%zu", func_name.c_str(),
-						   expr.children.size());
+						   expr.GetChildren().size());
 
 	// Check for LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
 	if (IsLikePatternFunction(func_name)) {
-		if (expr.children.size() >= 2) {
-			return EncodeLikePattern(func_name, *expr.children[0], *expr.children[1], ctx);
+		if (expr.GetChildren().size() >= 2) {
+			return EncodeLikePattern(func_name, *expr.GetChildren()[0], *expr.GetChildren()[1], ctx);
 		}
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: LIKE pattern function %s needs 2 args, got %zu",
-							   func_name.c_str(), expr.children.size());
+							   func_name.c_str(), expr.GetChildren().size());
 		return {"", false};
 	}
 
@@ -468,16 +502,16 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	}
 
 	// Validate argument count
-	if (mapping->expected_args != static_cast<int>(expr.children.size())) {
+	if (mapping->expected_args != static_cast<int>(expr.GetChildren().size())) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s expects %d args, got %zu", func_name.c_str(),
-							   mapping->expected_args, expr.children.size());
+							   mapping->expected_args, expr.GetChildren().size());
 		return {"", false};
 	}
 
 	// Encode all arguments
 	auto child_ctx = ctx.child();
 	std::vector<std::string> encoded_args;
-	for (const auto &child : expr.children) {
+	for (const auto &child : expr.GetChildren()) {
 		auto result = EncodeExpression(*child, child_ctx);
 		if (!result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: argument encoding failed for %s", func_name.c_str());
@@ -501,40 +535,44 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	return {sql, true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundComparisonExpression &expr,
+ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunctionExpression &expr,
 																 const ExpressionEncodeContext &ctx) {
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: type=%d", (int)expr.type);
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: type=%d", (int)expr.GetExpressionType());
+
+	const auto &left = BoundComparisonExpression::Left(expr);
+	const auto &right = BoundComparisonExpression::Right(expr);
 
 	// Check for rowid equality: rowid = value (Spec 001-pk-rowid-semantics)
-	if (expr.type == ExpressionType::COMPARE_EQUAL && ctx.HasPKInfo()) {
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL && ctx.HasPKInfo()) {
 		// Check if left is rowid and right is constant
-		if (IsRowidColumn(*expr.left, ctx)) {
+		if (IsRowidColumn(left, ctx)) {
 			MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: detected rowid = value");
-			return EncodeRowidEquality(*expr.right, ctx);
+			return EncodeRowidEquality(right, ctx);
 		}
 		// Check if right is rowid and left is constant (value = rowid)
-		if (IsRowidColumn(*expr.right, ctx)) {
+		if (IsRowidColumn(right, ctx)) {
 			MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: detected value = rowid");
-			return EncodeRowidEquality(*expr.left, ctx);
+			return EncodeRowidEquality(left, ctx);
 		}
 	}
 
 	// Get the comparison operator
 	std::string op;
-	if (!GetComparisonOperator(expr.type, op)) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: unsupported comparison type %d", (int)expr.type);
+	if (!GetComparisonOperator(expr.GetExpressionType(), op)) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: unsupported comparison type %d",
+							   (int)expr.GetExpressionType());
 		return {"", false};
 	}
 
 	// Encode left and right sides
 	auto child_ctx = ctx.child();
-	auto left_result = EncodeExpression(*expr.left, child_ctx);
+	auto left_result = EncodeExpression(left, child_ctx);
 	if (!left_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: left side encoding failed");
 		return {"", false};
 	}
 
-	auto right_result = EncodeExpression(*expr.right, child_ctx);
+	auto right_result = EncodeExpression(right, child_ctx);
 	if (!right_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: right side encoding failed");
 		return {"", false};
@@ -547,15 +585,16 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundComp
 
 ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperatorExpression &expr,
 															   const ExpressionEncodeContext &ctx) {
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: type=%d, children=%zu", (int)expr.type, expr.children.size());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: type=%d, children=%zu", (int)expr.GetExpressionType(),
+						   expr.GetChildren().size());
 
 	// Handle NOT operator
-	if (expr.type == ExpressionType::OPERATOR_NOT) {
-		if (expr.children.size() != 1) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+		if (expr.GetChildren().size() != 1) {
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.children[0], child_ctx);
+		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -563,24 +602,24 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 	}
 
 	// Handle IS NULL / IS NOT NULL operators
-	if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
-		if (expr.children.size() != 1) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+		if (expr.GetChildren().size() != 1) {
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.children[0], child_ctx);
+		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
 		return {"(" + child_result.sql + " IS NULL)", true};
 	}
 
-	if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-		if (expr.children.size() != 1) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		if (expr.GetChildren().size() != 1) {
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.children[0], child_ctx);
+		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -589,19 +628,19 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 
 	// For other operators, we don't support them yet
 	// Arithmetic is handled via BoundFunctionExpression in DuckDB stable
-	MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: unsupported operator type %d", (int)expr.type);
+	MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: unsupported operator type %d", (int)expr.GetExpressionType());
 	return {"", false};
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpression &expr,
 														   const ExpressionEncodeContext &ctx) {
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeCaseExpression: case_checks=%zu", expr.case_checks.size());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeCaseExpression: case_checks=%zu", expr.CaseChecks().size());
 
 	auto child_ctx = ctx.child();
 	std::string sql = "CASE";
 
 	// Encode each WHEN ... THEN clause
-	for (const auto &check : expr.case_checks) {
+	for (const auto &check : expr.CaseChecks()) {
 		auto when_result = EncodeExpression(*check.when_expr, child_ctx);
 		if (!when_result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: WHEN clause encoding failed");
@@ -618,7 +657,7 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	}
 
 	// Encode ELSE clause
-	auto else_result = EncodeExpression(*expr.else_expr, child_ctx);
+	auto else_result = EncodeExpression(expr.Else(), child_ctx);
 	if (!else_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: ELSE clause encoding failed");
 		return {"", false};
@@ -629,29 +668,31 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	return {sql, true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundBetweenExpression &expr,
+ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctionExpression &expr,
 															  const ExpressionEncodeContext &ctx) {
+	const bool lower_inclusive = BoundBetweenExpression::LowerInclusive(expr);
+	const bool upper_inclusive = BoundBetweenExpression::UpperInclusive(expr);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: lower_inclusive=%s, upper_inclusive=%s",
-						   expr.lower_inclusive ? "true" : "false", expr.upper_inclusive ? "true" : "false");
+						   lower_inclusive ? "true" : "false", upper_inclusive ? "true" : "false");
 
 	auto child_ctx = ctx.child();
 
 	// Encode the input expression (the column or expression being checked)
-	auto input_result = EncodeExpression(*expr.input, child_ctx);
+	auto input_result = EncodeExpression(BoundBetweenExpression::Input(expr), child_ctx);
 	if (!input_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: input encoding failed");
 		return {"", false};
 	}
 
 	// Encode the lower bound
-	auto lower_result = EncodeExpression(*expr.lower, child_ctx);
+	auto lower_result = EncodeExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
 	if (!lower_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
 		return {"", false};
 	}
 
 	// Encode the upper bound
-	auto upper_result = EncodeExpression(*expr.upper, child_ctx);
+	auto upper_result = EncodeExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
 	if (!upper_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");
 		return {"", false};
@@ -659,15 +700,15 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundBetween
 
 	// Build the SQL: (input >= lower AND input <= upper) or variants based on inclusivity
 	// For standard BETWEEN (both inclusive), we can use T-SQL BETWEEN
-	if (expr.lower_inclusive && expr.upper_inclusive) {
+	if (lower_inclusive && upper_inclusive) {
 		std::string sql = "(" + input_result.sql + " BETWEEN " + lower_result.sql + " AND " + upper_result.sql + ")";
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
 		return {sql, true};
 	}
 
 	// For non-standard bounds, use explicit comparisons
-	std::string lower_op = expr.lower_inclusive ? " >= " : " > ";
-	std::string upper_op = expr.upper_inclusive ? " <= " : " < ";
+	std::string lower_op = lower_inclusive ? " >= " : " > ";
+	std::string upper_op = upper_inclusive ? " <= " : " < ";
 	std::string sql = "((" + input_result.sql + lower_op + lower_result.sql + ") AND (" + input_result.sql + upper_op +
 					  upper_result.sql + "))";
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
@@ -677,9 +718,9 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundBetween
 ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpression &expr,
 													  const ExpressionEncodeContext &ctx) {
 	// Get the column binding - this contains the table index and column index
-	const auto &binding = expr.binding;
+	const auto &binding = expr.Binding();
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: table_idx=%llu, column_idx=%llu",
-						   (unsigned long long)binding.table_index, (unsigned long long)binding.column_index);
+						   (unsigned long long)binding.table_index.index, (unsigned long long)binding.column_index);
 
 	// Virtual/special column identifiers start at 2^63
 	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
@@ -734,29 +775,29 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeConstant(const BoundConstantExpression &expr) {
-	std::string sql = ValueToSQLLiteral(expr.value, expr.return_type);
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstant: value=%s, type=%s -> %s", expr.value.ToString().c_str(),
-						   expr.return_type.ToString().c_str(), sql.c_str());
+	std::string sql = ValueToSQLLiteral(expr.GetValue(), expr.GetReturnType());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstant: value=%s, type=%s -> %s", expr.GetValue().ToString().c_str(),
+						   expr.GetReturnType().ToString().c_str(), sql.c_str());
 	return {sql, true};
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeConjunctionExpression(const BoundConjunctionExpression &expr,
 																  const ExpressionEncodeContext &ctx) {
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConjunctionExpression: type=%d, children=%zu", (int)expr.type,
-						   expr.children.size());
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConjunctionExpression: type=%d, children=%zu", (int)expr.GetExpressionType(),
+						   expr.GetChildren().size());
 
-	if (expr.children.empty()) {
+	if (expr.GetChildren().empty()) {
 		return {"", false};
 	}
 
-	bool is_and = (expr.type == ExpressionType::CONJUNCTION_AND);
+	bool is_and = (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND);
 	std::string conj_op = is_and ? " AND " : " OR ";
 
 	auto child_ctx = ctx.child();
 	std::vector<std::string> conditions;
 	bool all_supported = true;
 
-	for (const auto &child : expr.children) {
+	for (const auto &child : expr.GetChildren()) {
 		auto result = EncodeExpression(*child, child_ctx);
 		if (is_and) {
 			// AND: partial pushdown allowed - skip unsupported children
@@ -818,12 +859,12 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 	}
 
 	const auto &pattern_const = pattern_expr.Cast<BoundConstantExpression>();
-	if (pattern_const.value.IsNull()) {
+	if (pattern_const.GetValue().IsNull()) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: pattern is NULL");
 		return {"", false};
 	}
 
-	std::string pattern_str = pattern_const.value.ToString();
+	std::string pattern_str = pattern_const.GetValue().ToString();
 	std::string escaped_pattern = EscapeLikePattern(pattern_str);
 
 	// Convert function name to lowercase for comparison
@@ -873,7 +914,7 @@ bool FilterEncoder::IsRowidColumn(const Expression &expr, const ExpressionEncode
 		return false;
 	}
 	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
-	idx_t projected_idx = col_ref.binding.column_index;
+	idx_t projected_idx = col_ref.Binding().column_index;
 
 	if (ctx.column_ids.empty()) {
 		// No projection - check if the index is COLUMN_IDENTIFIER_ROW_ID
@@ -902,12 +943,12 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 	if (ctx.pk_is_composite) {
 		// Composite PK: rowid = {'col1': val1, 'col2': val2}
 		// Extract struct children and build AND conditions
-		if (const_expr.value.type().id() != LogicalTypeId::STRUCT) {
+		if (const_expr.GetValue().type().id() != LogicalTypeId::STRUCT) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: composite PK expects STRUCT value, got %s",
-								   const_expr.value.type().ToString().c_str());
+								   const_expr.GetValue().type().ToString().c_str());
 			return {"", false};
 		}
-		auto &children = StructValue::GetChildren(const_expr.value);
+		auto &children = StructValue::GetChildren(const_expr.GetValue());
 		if (children.size() != ctx.pk_column_names->size()) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeRowidEquality: STRUCT has %zu children, expected %zu", children.size(),
 								   ctx.pk_column_names->size());
@@ -930,7 +971,7 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		// Scalar PK: rowid = value
 		std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
 		sql += " = ";
-		sql += ValueToSQLLiteral(const_expr.value, (*ctx.pk_column_types)[0]);
+		sql += ValueToSQLLiteral(const_expr.GetValue(), (*ctx.pk_column_types)[0]);
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: scalar PK -> %s", sql.c_str());
 		return {sql, true};
 	}

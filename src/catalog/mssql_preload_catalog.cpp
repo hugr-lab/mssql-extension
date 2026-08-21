@@ -4,12 +4,14 @@
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_statistics.hpp"
-#include "mssql_compat.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -20,8 +22,11 @@ namespace duckdb {
 // Bind Function - Validates arguments at compile time
 //===----------------------------------------------------------------------===//
 
-MSSQL_BIND_SCALAR_SIG(MSSQLPreloadCatalogBind) {
-	MSSQL_BIND_SCALAR_PROLOGUE
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLPreloadCatalogBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	(void)context;
+	(void)arguments;
 	// First argument is the catalog name (must be constant)
 	if (arguments[0]->HasParameter()) {
 		throw InvalidInputException("mssql_preload_catalog: catalog_name must be a constant, not a parameter");
@@ -42,7 +47,7 @@ MSSQL_BIND_SCALAR_SIG(MSSQLPreloadCatalogBind) {
 
 		// Validate the catalog exists (Spec 047: per-catalog ownership)
 		try {
-			auto &catalog = Catalog::GetCatalog(context, catalog_name);
+			auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 			if (catalog.GetCatalogType() != "mssql") {
 				throw BinderException("mssql_preload_catalog: catalog '%s' is not an MSSQL catalog (type: %s)",
 									  catalog_name, catalog.GetCatalogType());
@@ -73,7 +78,7 @@ MSSQL_BIND_SCALAR_SIG(MSSQLPreloadCatalogBind) {
 //===----------------------------------------------------------------------===//
 
 static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<MSSQLPreloadCatalogBindData>();
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLPreloadCatalogBindData>();
 
 	auto &catalog_names = args.data[0];
 
@@ -89,7 +94,7 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 			// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 			MSSQLCatalog *catalog_ptr = nullptr;
 			try {
-				auto &raw_catalog = Catalog::GetCatalog(client_context, catalog_name);
+				auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(catalog_name));
 				if (raw_catalog.GetCatalogType() != "mssql") {
 					throw InvalidInputException(
 						"mssql_preload_catalog: catalog '%s' is not an MSSQL catalog (type: %s)", catalog_name,
@@ -157,12 +162,13 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 
 void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 	// mssql_preload_catalog(catalog_name VARCHAR [, schema_name VARCHAR]) -> VARCHAR
+	// Trailing ctor arg is varargs = VARCHAR: the optional schema_name.
 	ScalarFunction func("mssql_preload_catalog", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
-						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind);
-	func.varargs = LogicalType::VARCHAR;  // Optional schema_name
+						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind, nullptr, nullptr, LogicalType::VARCHAR);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	// Mutates the metadata cache: never constant-fold at plan time (issue #178 D1)
 	func.SetVolatile();
+	func.SetFallible();
 	loader.RegisterFunction(func);
 }
 

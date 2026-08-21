@@ -37,12 +37,12 @@ using BcpEncodeFmtFn = void (*)(Vector &, const UnifiedVectorFormat &, idx_t, co
 
 // Per-row compat shim behind every family's EncodeToBcp(Vector&, idx_t, ...)
 // wrapper (unit-test API; production goes through BCPRowEncoder::EncodeChunk).
-// Keeps the format-construction protocol — the `row + 1` count — in ONE place
-// so no family can silently drift from the fmt-overload contract.
+// Keeps the format construction in ONE place so no family can silently drift
+// from the fmt-overload contract.
 inline void EncodeToBcpViaFormat(BcpEncodeFmtFn encode, Vector &in, idx_t row, const BCPColumnMetadata &col,
 								 duckdb::vector<uint8_t> &buf) {
 	UnifiedVectorFormat fmt;
-	in.ToUnifiedFormat(row + 1, fmt);
+	in.ToUnifiedFormat(fmt);
 	encode(in, fmt, row, col, buf);
 }
 

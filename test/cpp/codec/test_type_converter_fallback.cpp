@@ -13,7 +13,7 @@
 //     - TDS returns the column data in the actual projected type
 //       (DECIMAL, say).
 //     - Pre-spec-045 the dispatcher crashed inside
-//       FlatVector::GetData<hugeint_t>(varchar_vector) with the
+//       FlatVector::GetDataMutable<hugeint_t>(varchar_vector) with the
 //       assertion "Expected vector of type INT128, but found vector
 //       of type VARCHAR".
 //   Post-spec-045 the dispatcher detects the mismatch and renders
@@ -27,6 +27,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
@@ -70,7 +71,7 @@ ColumnMetadata MakeColumn(uint8_t type_id, uint8_t precision = 0, uint8_t scale 
 }
 
 std::string ReadVectorString(duckdb::Vector &vec, duckdb::idx_t row) {
-	auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+	auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
 	return data[row].GetString();
 }
 

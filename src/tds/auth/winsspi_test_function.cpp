@@ -214,17 +214,20 @@ void RegisterWinSspiTestFunction(ExtensionLoader &loader) {
 	// mssql_winsspi_auth_test(host)
 	ScalarFunction f1("mssql_winsspi_auth_test", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestHost);
 	f1.SetVolatile();
+	f1.SetFallible();
 	loader.RegisterFunction(f1);
 
 	// mssql_winsspi_auth_test(host, port)
 	ScalarFunction f2("mssql_winsspi_auth_test", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR,
 					  WinSspiTestHostPort);
 	f2.SetVolatile();
+	f2.SetFallible();
 	loader.RegisterFunction(f2);
 
 	// mssql_winsspi_auth_test_spn(spn)
 	ScalarFunction f3("mssql_winsspi_auth_test_spn", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestSpn);
 	f3.SetVolatile();
+	f3.SetFallible();
 	loader.RegisterFunction(f3);
 }
 

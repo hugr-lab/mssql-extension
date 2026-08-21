@@ -73,7 +73,7 @@ SourceResultType MSSQLPhysicalUpdate::GetDataInternal(ExecutionContext &context,
 	}
 
 	// Return the count of updated rows
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(gstate.total_rows_updated));
 	gstate.returned = true;
 
