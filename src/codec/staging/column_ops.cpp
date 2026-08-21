@@ -133,6 +133,32 @@ bool HasOneBytePrefix(uint8_t type_id) {
 //! DATE is always three bytes; TIME/DATETIME2/DATETIMEOFFSET carry a
 //! scale-dependent time field with a fixed date (and offset) suffix. Every one
 //! of them is fixed for a given COLUMN, which is what makes them stageable.
+//! Wire width of a BARE fixed type — one whose value carries no length on the
+//! wire and whose width is fixed by the type id, not by the declared metadata
+//! width. The codec kernel reads that width unconditionally: DATETIME's
+//! ConvertDatetime always reads 8 bytes, SMALLDATETIME's ConvertSmallDatetime 4,
+//! neither consulting the staged length. So the staged stride MUST come from the
+//! type here, not from `column.max_length`. A stream that declares DATETIME with
+//! a 4-byte width otherwise staged 4 bytes under an 8-byte read — a heap
+//! overflow on the constant path AND a strided over-read on the batch path
+//! (fuzz_row_stager, PR #267). MONEY/SMALLMONEY dispatch on length and were
+//! already safe; canonicalising them keeps the stride==wire-width invariant
+//! true for every bare type rather than most of them.
+uint32_t BareFixedWireWidth(uint8_t type_id) {
+	switch (type_id) {
+	case tds::TDS_TYPE_DATETIME:
+		return 8;
+	case tds::TDS_TYPE_SMALLDATETIME:
+		return 4;
+	case tds::TDS_TYPE_MONEY:
+		return 8;
+	case tds::TDS_TYPE_SMALLMONEY:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
 uint32_t TemporalWireWidth(const tds::ColumnMetadata &column) {
 	const uint32_t time_len = column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
 	switch (column.type_id) {
@@ -347,7 +373,10 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 	// Fixed-width families with a batch kernel: UNIQUEIDENTIFIER and the temporal
 	// types. DATETIME and SMALLDATETIME arrive bare; everything else carries the
 	// one-byte length prefix.
-	const uint32_t fixed_width = width > 0 ? width : TemporalWireWidth(column);
+	// A bare type's width comes from its type id, never the declared width — the
+	// kernel reads the type's width regardless of what the metadata claimed.
+	const uint32_t bare_wire_width = BareFixedWireWidth(column.type_id);
+	const uint32_t fixed_width = bare_wire_width > 0 ? bare_wire_width : (width > 0 ? width : TemporalWireWidth(column));
 	if (fixed_width > 0 && IsStageableFixedWidth(fixed_width)) {
 		const bool staged_family =
 			column.type_id == tds::TDS_TYPE_UNIQUEIDENTIFIER || column.type_id == tds::TDS_TYPE_DATE ||

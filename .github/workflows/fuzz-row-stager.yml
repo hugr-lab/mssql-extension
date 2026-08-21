@@ -63,7 +63,7 @@ jobs:
         # what makes the walk reachable at all.
         run: |
           export LD_LIBRARY_PATH="$PWD/build-duckdb/src"
-          fuzz/out/fuzz_row_stager -runs=0 fuzz/corpus/tds_tokens
+          fuzz/out/fuzz_row_stager -runs=0 fuzz/corpus/tds_tokens fuzz/corpus/row_stager
 
       - name: Fuzz
         run: |
@@ -73,7 +73,7 @@ jobs:
             -max_total_time=${{ inputs.fuzz_seconds || 900 }} \
             -timeout=10 -rss_limit_mb=4096 \
             -artifact_prefix=fuzz-findings/ \
-            fuzz/corpus/tds_tokens
+            fuzz/corpus/row_stager fuzz/corpus/tds_tokens
 
       - name: Upload crash artifacts
         if: failure()

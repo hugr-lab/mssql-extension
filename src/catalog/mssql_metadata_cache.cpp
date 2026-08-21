@@ -1,6 +1,8 @@
 #include "catalog/mssql_metadata_cache.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
 
@@ -197,30 +199,49 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.c_str(),
 				sql.size() > 120 ? "..." : "");
 
+	// Deadlock victim (server error 1205) is retried: metadata queries are pure
+	// reads and the server's own message says "Rerun the transaction". DuckDB
+	// 2.0's higher scan/sink parallelism overlaps a test's DDL (Sch-M) with
+	// catalog loads on sibling pooled connections often enough to make 1205 a
+	// per-run event (PR #267 review). Retry ONLY when the victim query
+	// delivered no rows yet — after the first row the callback has consumed
+	// state that a rerun would duplicate ("Column already exists" class), so a
+	// mid-stream deadlock stays fatal.
+	constexpr int MAX_ATTEMPTS = 3;
 	auto start = std::chrono::steady_clock::now();
-	auto result = MSSQLSimpleQuery::ExecuteWithCallback(
-		connection, sql,
-		[&callback](const std::vector<std::string> &row) {
-			// Convert std::vector to duckdb::vector
-			vector<string> duckdb_row;
-			duckdb_row.reserve(row.size());
-			for (const auto &val : row) {
-				duckdb_row.push_back(val);
-			}
-			callback(duckdb_row);
-			return true;  // continue processing
-		},
-		timeout_ms);
+	for (int attempt = 1;; attempt++) {
+		idx_t rows_delivered = 0;
+		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
+			connection, sql,
+			[&callback, &rows_delivered](const std::vector<std::string> &row) {
+				// Convert std::vector to duckdb::vector
+				vector<string> duckdb_row;
+				duckdb_row.reserve(row.size());
+				for (const auto &val : row) {
+					duckdb_row.push_back(val);
+				}
+				rows_delivered++;
+				callback(duckdb_row);
+				return true;  // continue processing
+			},
+			timeout_ms);
 
-	auto elapsed =
-		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		auto elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
-	if (result.HasError()) {
+		if (!result.HasError()) {
+			CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
+			return;
+		}
+		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
+			CACHE_DEBUG(1, "RunMetadataQuery: deadlock victim (1205), attempt %d/%d — rerunning", attempt,
+						MAX_ATTEMPTS);
+			std::this_thread::sleep_for(std::chrono::milliseconds(100 * attempt));
+			continue;
+		}
 		CACHE_DEBUG(1, "RunMetadataQuery: FAILED after %lldms — %s", (long long)elapsed, result.error_message.c_str());
 		throw IOException("Metadata query failed: %s", result.error_message);
 	}
-
-	CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
 }
 
 //===----------------------------------------------------------------------===//
