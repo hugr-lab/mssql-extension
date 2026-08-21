@@ -693,7 +693,41 @@ size_t Datetime2TimeByteLen(uint8_t scale) {
 	return 5;
 }
 
+// Bytes the fixed-width temporal kernels read for a given column, by type id
+// and scale. The kernels below read this many bytes unconditionally — they do
+// not consult bytes.size() — so a value shorter than this (a malformed or
+// hostile TDS stream; a conforming server always sends the exact width) would
+// read past it. DATETIMEN dispatches on size and validates itself, so it is 0
+// here. Returns 0 for a type without a fixed read.
+static size_t FixedTemporalReadLen(const tds::ColumnMetadata &col) {
+	const size_t time_len = col.scale <= 2 ? 3 : (col.scale <= 4 ? 4 : 5);
+	switch (col.type_id) {
+	case TDS_TYPE_DATE:
+		return 3;
+	case TDS_TYPE_TIME:
+		return time_len;
+	case TDS_TYPE_DATETIME:
+		return 8;
+	case TDS_TYPE_SMALLDATETIME:
+		return 4;
+	case TDS_TYPE_DATETIME2:
+		return 3 + time_len;
+	case TDS_TYPE_DATETIMEOFFSET:
+		return 5 + time_len;
+	default:
+		return 0;
+	}
+}
+
 void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
+	// The fixed-width kernels read a type-fixed number of bytes without bounds
+	// checking; reject a value the stream truncated before it reaches them.
+	const size_t need = FixedTemporalReadLen(col);
+	if (need != 0 && bytes.size() < need) {
+		throw InvalidInputException("MSSQL: temporal column arrived with %zu bytes where %zu were required (TDS type "
+									"0x%02X). The TDS stream is malformed.",
+									bytes.size(), need, col.type_id);
+	}
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
@@ -767,6 +801,18 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 							Vector &out) {
 	const uint8_t *const base = st.buffer.data();
 	const uint32_t stride = st.stride;
+
+	// Each row is read as `base + row * stride`, but the kernels below read a
+	// type-fixed number of bytes; if the staged stride is narrower than that the
+	// last row over-reads the buffer. A conforming stream never stages such a
+	// stride (ResolveAppend sizes it from FixedWireWidth), so this catches a
+	// corrupt one once per chunk rather than per row.
+	const size_t need = FixedTemporalReadLen(col);
+	if (need != 0 && stride < need) {
+		throw InvalidInputException("MSSQL: temporal column staged at %u bytes where %zu were required (TDS type "
+									"0x%02X). The TDS stream is malformed.",
+									stride, need, col.type_id);
+	}
 
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
