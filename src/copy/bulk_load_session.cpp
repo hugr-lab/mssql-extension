@@ -65,10 +65,10 @@ BulkLoadSession::~BulkLoadSession() noexcept {
 	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
 }
 
-bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
-							   const std::atomic<idx_t> &rows_sunk) {
+BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used,
+												 idx_t max_writers, const std::atomic<idx_t> &rows_sunk) {
 	if (max_writers <= 1) {
-		return false;
+		return Claim::Unavailable;
 	}
 	// Warm-up gate (spec 070 W2): hold every extra writer until the load has
 	// produced ONE flush batch (flush_rows) on the shared writer, then let the
@@ -83,14 +83,16 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 	// design — a ramp heuristic, not a correctness bound; the slot cap below
 	// still holds.
 	if (params.warmup_gate && params.flush_rows > 0 && rows_sunk.load(std::memory_order_relaxed) < params.flush_rows) {
-		return false;
+		// Transient — the gate opens once the shared writer crosses flush_rows.
+		// The caller must ask again on a later chunk.
+		return Claim::GateClosed;
 	}
 	// Claim a slot before doing any work, so N threads racing here cannot
 	// collectively exceed the limit.
 	const idx_t slot = slots_used.fetch_add(1);
 	if (slot >= max_writers) {
 		slots_used.fetch_sub(1);
-		return false;
+		return Claim::Unavailable;
 	}
 
 	std::shared_ptr<tds::TdsConnection> conn;
@@ -118,10 +120,13 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		// The stream opens with COLMETADATA; without it the server has no schema
 		// for the ROW tokens that follow.
 		writer_->WriteColmetadata();
-		return true;
+		return Claim::Started;
 	} catch (std::exception &) {
 		// Falling back is the whole contract: put the connection back and let the
-		// thread share the global writer.
+		// thread share the global writer. This is TERMINAL for the load — the pool
+		// is exhausted or the server refused a bulk load, and neither clears on a
+		// later chunk — so the caller stops asking rather than re-blocking a 30 s
+		// Acquire() every chunk (spec 070 W2 review, finding 1).
 		if (conn) {
 			try {
 				params.pool->Release(conn);
@@ -132,7 +137,7 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		connection_.reset();
 		writer_.reset();
 		slots_used.fetch_sub(1);
-		return false;
+		return Claim::Unavailable;
 	}
 }
 

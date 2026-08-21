@@ -280,13 +280,21 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		params.collect_timings = counters;
 		// W2 warm-up only for a columnstore target (see BulkLoadSessionParams).
 		params.warmup_gate = gstate.state.config.table_options.kind == MSSQLTableKind::COLUMNSTORE;
-		if (lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit,
-									gstate.rows_sunk)) {
+		switch (lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit,
+										gstate.rows_sunk)) {
+		case mssql::BulkLoadSession::Claim::Started:
 			CTAS_SINK_LOG("parallel writer started (used=%llu/%llu)",
 						  (unsigned long long)gstate.parallel_writers_used.load(),
 						  (unsigned long long)gstate.parallel_writer_limit);
-		} else if (gstate.parallel_writers_used.load() >= gstate.parallel_writer_limit) {
+			break;
+		case mssql::BulkLoadSession::Claim::GateClosed:
+			// Gate still closed — keep asking on later chunks.
+			break;
+		case mssql::BulkLoadSession::Claim::Unavailable:
+			// Cap reached or acquisition failed — stop asking (spec 070 W2 review,
+			// finding 1: else a pool-exhausted thread re-blocks Acquire() per chunk).
 			lstate.may_claim = false;
+			break;
 		}
 	}
 

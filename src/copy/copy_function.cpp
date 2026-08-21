@@ -629,13 +629,22 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// W2 warm-up only for a columnstore target — a heap load has no
 		// compression to protect and fans out immediately.
 		params.warmup_gate = bdata.config.target_shape == MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
-		if (ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit, gdata.rows_sent)) {
+		switch (
+			ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit, gdata.rows_sent)) {
+		case BulkLoadSession::Claim::Started:
 			CopyDebugLog(1, "BCPCopySink: parallel writer started (used=%llu/%llu, rows so far=%llu)",
 						 (unsigned long long)gdata.parallel_writers_used.load(),
 						 (unsigned long long)gdata.parallel_writer_limit, (unsigned long long)gdata.rows_sent.load());
-		} else if (gdata.parallel_writers_used.load() >= gdata.parallel_writer_limit) {
-			// The cap is reached; no later chunk can change that. Stop asking.
+			break;
+		case BulkLoadSession::Claim::GateClosed:
+			// The warm-up gate is not open yet — keep may_claim and ask again on a
+			// later chunk, once the shared writer has sunk its first batch.
+			break;
+		case BulkLoadSession::Claim::Unavailable:
+			// Cap reached or acquisition failed — no later chunk changes that.
+			// Stop asking, so this thread does not re-block Acquire() every chunk.
 			ldata.may_claim = false;
+			break;
 		}
 	}
 

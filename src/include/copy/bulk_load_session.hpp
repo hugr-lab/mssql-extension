@@ -145,15 +145,22 @@ public:
 	//! writer, which is the pre-parallel behaviour and always correct. A load must
 	//! not fail because it could not go faster.
 	//!
-	//! @return true when this thread now owns a session.
-	//! `rows_sunk` is the load's running total across all writers. TryStart opens
-	//! a new writer only once that total has reached active_writers * flush_rows
-	//! (spec 070 W2 volume gate) — so a small load fans out slowly and its
-	//! batches stay large enough to compress, while a large load still reaches
-	//! the full writer count. Returns false (share the global writer) when the
-	//! gate is closed, the limit is one, or the slot race is lost.
-	bool TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
-				  const std::atomic<idx_t> &rows_sunk);
+	//! `rows_sunk` is the load's running total across all writers. The warm-up
+	//! gate (columnstore targets only) holds every extra writer until that total
+	//! reaches one `flush_rows` batch, so the shared writer lands the first
+	//! rowgroup compressed before any second writer dilutes it; a large load pays
+	//! only that one batch before fanning out to the full writer count.
+	//!
+	//! The THREE outcomes matter to the caller, which is why this is not a bool
+	//! (spec 070 W2 review): `GateClosed` is cheap and transient — no slot
+	//! claimed, no connection touched — so the caller must keep asking on later
+	//! chunks. `Unavailable` is terminal for this load (limit is one, the slot
+	//! cap is reached, or acquiring a connection failed): the caller must STOP
+	//! asking, or it re-attempts a blocking Acquire() on every chunk under pool
+	//! pressure. Only `Started` means this thread now owns a session.
+	enum class Claim { Started, GateClosed, Unavailable };
+	Claim TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
+				   const std::atomic<idx_t> &rows_sunk);
 
 	//! Does this thread own a session? False means "use the shared writer".
 	bool IsOwned() const {
