@@ -11,6 +11,11 @@ on:
         description: "libFuzzer -max_total_time per run"
         required: false
         default: "600"
+  # workflow_dispatch only registers once the file reaches the default branch;
+  # until then, pushing any ref named fuzz/row-stager-run* fires the campaign.
+  push:
+    branches:
+      - 'fuzz/row-stager-run*'
 
 permissions:
   contents: read
@@ -65,7 +70,7 @@ jobs:
           export LD_LIBRARY_PATH="$PWD/build-duckdb/src"
           mkdir -p fuzz-findings
           fuzz/out/fuzz_row_stager \
-            -max_total_time=${{ inputs.fuzz_seconds }} \
+            -max_total_time=${{ inputs.fuzz_seconds || 900 }} \
             -timeout=10 -rss_limit_mb=4096 \
             -artifact_prefix=fuzz-findings/ \
             fuzz/corpus/tds_tokens
