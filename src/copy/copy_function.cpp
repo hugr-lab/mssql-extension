@@ -598,13 +598,27 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		ldata.init_attempted = true;
 		auto &catalog = Catalog::GetCatalog(context.client, Identifier(bdata.catalog_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-		BulkLoadSessionParams params;
 		// The POOL, never ConnectionProvider: inside a transaction the provider
 		// returns the PINNED connection, and two writers on one connection
 		// interleave their ROW tokens into a single bulk load. The policy already
 		// caps a pinned load at one writer, but this is what makes it structural.
-		params.pool = &mssql_catalog.GetConnectionPool();
-		params.pool_handle = mssql_catalog.GetConnectionPoolHandle();
+		ldata.pool = &mssql_catalog.GetConnectionPool();
+		ldata.pool_handle = mssql_catalog.GetConnectionPoolHandle();
+		// Spec 070 W2: whether this thread may keep asking for its own writer on
+		// later chunks. Below the limit of two there is only ever the shared
+		// writer, so never ask.
+		ldata.may_claim = ldata.pool != nullptr && gdata.parallel_writer_limit > 1;
+	}
+
+	// Spec 070 W2: try (or re-try) to claim an own writer while the volume gate
+	// permits it. A thread that shares the writer keeps this alive so a large
+	// load reaches the full writer count even though every thread arrived early;
+	// a small load never opens the gate and stays on one writer, keeping its
+	// batches compressible.
+	if (ldata.may_claim && !ldata.session.IsOwned()) {
+		BulkLoadSessionParams params;
+		params.pool = ldata.pool;
+		params.pool_handle = ldata.pool_handle;
 		params.insert_bulk_sql = &gdata.insert_bulk_sql;
 		params.target = &bdata.target;
 		params.columns = &gdata.columns;
@@ -612,11 +626,16 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		params.flush_rows = bdata.config.flush_rows;
 		params.collect_timings = counters;
 		params.reset_on_release = gdata.reset_on_release;
-		if (params.pool && ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit)) {
-			CopyDebugLog(1, "BCPCopySink: parallel writer started (limit=%llu)",
-						 (unsigned long long)gdata.parallel_writer_limit);
-		} else {
-			CopyDebugLog(1, "BCPCopySink: sharing the global writer");
+		// W2 warm-up only for a columnstore target — a heap load has no
+		// compression to protect and fans out immediately.
+		params.warmup_gate = bdata.config.target_shape == MSSQLIndexKind::CLUSTERED_COLUMNSTORE;
+		if (ldata.session.TryStart(params, gdata.parallel_writers_used, gdata.parallel_writer_limit, gdata.rows_sent)) {
+			CopyDebugLog(1, "BCPCopySink: parallel writer started (used=%llu/%llu, rows so far=%llu)",
+						 (unsigned long long)gdata.parallel_writers_used.load(),
+						 (unsigned long long)gdata.parallel_writer_limit, (unsigned long long)gdata.rows_sent.load());
+		} else if (gdata.parallel_writers_used.load() >= gdata.parallel_writer_limit) {
+			// The cap is reached; no later chunk can change that. Stop asking.
+			ldata.may_claim = false;
 		}
 	}
 

@@ -87,6 +87,13 @@ struct BulkLoadSessionParams {
 	//! the release happens in a destructor that may run on a worker thread, where
 	//! there is no ClientContext to ask (issue #178).
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
+	//! Spec 070 W2: apply the warm-up gate (hold extra writers until one
+	//! flush_rows batch has landed). True only for a COLUMNSTORE target, where a
+	//! second writer splitting a sub-threshold load costs compression. A heap or
+	//! rowstore target has no such cost, so it fans out immediately (the pre-W2
+	//! behaviour) and the warm-up serialization — measured 1.2-1.3x on a large
+	//! parallel load — is not paid where it buys nothing.
+	bool warmup_gate = false;
 };
 
 //! Build the `INSERT BULK` statement that opens a bulk load.
@@ -139,7 +146,14 @@ public:
 	//! not fail because it could not go faster.
 	//!
 	//! @return true when this thread now owns a session.
-	bool TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers);
+	//! `rows_sunk` is the load's running total across all writers. TryStart opens
+	//! a new writer only once that total has reached active_writers * flush_rows
+	//! (spec 070 W2 volume gate) — so a small load fans out slowly and its
+	//! batches stay large enough to compress, while a large load still reaches
+	//! the full writer count. Returns false (share the global writer) when the
+	//! gate is closed, the limit is one, or the slot race is lost.
+	bool TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
+				  const std::atomic<idx_t> &rows_sunk);
 
 	//! Does this thread own a session? False means "use the shared writer".
 	bool IsOwned() const {

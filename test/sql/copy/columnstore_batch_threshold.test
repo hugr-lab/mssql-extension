@@ -38,15 +38,13 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS cs (TYPE mssql);
 statement ok
 SET mssql_exec_invalidate_cache = true;
 
-# One writer, deliberately. This file asserts the FLUSH THRESHOLD contract —
-# batches of mssql_copy_flush_rows (102400) land as COMPRESSED rowgroups — and
-# that is only observable when one writer carries the whole load. DuckDB 2.0
-# parallelizes a scan this small across sink threads, and 110000 rows split
-# over N writers puts every writer below the threshold: nothing compresses,
-# which is writer-scheduling dilution, not a threshold regression (spec 069
-# records the ramp-up follow-up).
-statement ok
-SET mssql_copy_parallel_writers = 1;
+# DEFAULT writer count, deliberately. Spec 070 W2's lazy ramp-up keeps a load
+# this small on one writer until it has produced flush_rows (102400) rows — so
+# its batches stay above the columnstore threshold and compress — while a large
+# load still fans out to the full writer count. Before W2 this needed an
+# explicit SET mssql_copy_parallel_writers = 1 (spec 069) because 2.0 fanned a
+# 110000-row scan across sink threads, putting every writer below the threshold.
+# The removal of that pin IS the W2 acceptance test.
 
 statement ok
 CREATE OR REPLACE TABLE cs_src AS
@@ -111,37 +109,10 @@ WHERE o.name = ''CsCtas'' AND rg.state_description = ''COMPRESSED''');
 ----
 true
 
-# -----------------------------------------------------------------------------
-# The default-settings baseline (PR #267 review, finding 4). With writer count
-# derived from threads, DuckDB 2.0 splits even this small scan across sink
-# threads and each writer lands below the 102400 threshold — so COMPRESSED
-# rowgroups are NOT guaranteed here. What IS the contract at defaults: every
-# row lands in the columnstore's rowgroups (whatever their state), none are
-# lost between writers. This is the baseline the lazy-ramp-up follow-up
-# (spec 070 W2) has to move: when it ships, the assertion above this comment
-# should hold WITHOUT the parallel_writers pin, and this one keeps holding.
-# -----------------------------------------------------------------------------
-statement ok
-RESET mssql_copy_parallel_writers;
-
-statement ok
-COPY cs_src TO 'cs.dbo.CsDefaults' (FORMAT bcp, CREATE_TABLE true, replace true, table_kind 'columnstore');
-
-query I
-SELECT COUNT(*) FROM cs.dbo.CsDefaults;
-----
-110000
-
-query I
-SELECT SUM(total_rows) = 110000 FROM mssql_scan('cs', '
-SELECT rg.total_rows FROM sys.column_store_row_groups rg
-JOIN sys.objects o ON o.object_id = rg.object_id
-WHERE o.name = ''CsDefaults''');
-----
-true
-
-statement ok
-SET mssql_copy_parallel_writers = 1;
+# (The default-settings baseline that PR #267 finding 4 added here is now the
+# CsThreshold case at the top: with spec 070 W2 shipped, a default-settings
+# columnstore load of this size compresses, which is exactly what that case
+# asserts. No separate diluted-writer baseline is needed any more.)
 
 statement ok
 SET mssql_default_table_kind = 'HEAP';
@@ -156,7 +127,7 @@ SELECT COUNT(*) FROM cs.dbo.CsHeap;
 110000
 
 statement ok
-SELECT mssql_exec('cs', 'DROP TABLE dbo.CsThreshold; DROP TABLE dbo.CsExplicit; DROP TABLE dbo.CsCtas; DROP TABLE dbo.CsDefaults; DROP TABLE dbo.CsHeap;');
+SELECT mssql_exec('cs', 'DROP TABLE dbo.CsThreshold; DROP TABLE dbo.CsExplicit; DROP TABLE dbo.CsCtas; DROP TABLE dbo.CsHeap;');
 
 statement ok
 DETACH cs;

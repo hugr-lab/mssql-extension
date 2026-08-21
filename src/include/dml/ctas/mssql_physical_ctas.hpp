@@ -148,6 +148,8 @@ public:
 
 	//! Sessions handed out so far, that first one included.
 	std::atomic<idx_t> parallel_writers_used{1};
+	//! Running total across all writers, gating the W2 ramp (see TryStart).
+	std::atomic<idx_t> rows_sunk{0};
 
 	//! IF NOT EXISTS found the table already there, so no row is to be sent.
 	//!
@@ -207,9 +209,14 @@ public:
 	//! count in Combine.
 	idx_t rows_confirmed = 0;
 
-	//! Acquisition is tried ONCE, on the first chunk. Failure is not an error:
-	//! the thread falls back to the shared writer, which is always correct.
+	//! Catalog lookup (pool + handle) is done ONCE, on the first chunk; the
+	//! per-chunk writer claim (spec 070 W2) reuses them without a lookup.
 	bool init_attempted = false;
+	tds::ConnectionPool *pool = nullptr;
+	weak_ptr<tds::ConnectionPool> pool_handle;
+	//! Spec 070 W2: keep re-asking for an own writer on later chunks until the
+	//! volume gate opens (large load) or the cap is reached / claiming disabled.
+	bool may_claim = false;
 };
 
 }  // namespace duckdb

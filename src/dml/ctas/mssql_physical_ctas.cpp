@@ -260,19 +260,33 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	if (!lstate.init_attempted) {
 		lstate.init_attempted = true;
+		lstate.pool = &catalog_.GetConnectionPool();
+		lstate.pool_handle = catalog_.GetConnectionPoolHandle();
+		lstate.may_claim = lstate.pool != nullptr && gstate.parallel_writer_limit > 1;
+	}
+
+	// Spec 070 W2: claim (or re-try to claim) an own writer while the volume gate
+	// permits it — a small load stays on one writer so its batches compress, a
+	// large one still reaches the full writer count.
+	if (lstate.may_claim && !lstate.session.IsOwned()) {
 		mssql::BulkLoadSessionParams params;
-		params.pool = &catalog_.GetConnectionPool();
-		params.pool_handle = catalog_.GetConnectionPoolHandle();
+		params.pool = lstate.pool;
+		params.pool_handle = lstate.pool_handle;
 		params.insert_bulk_sql = &gstate.state.insert_bulk_sql;
 		params.target = &gstate.state.bcp_target;
 		params.columns = &gstate.state.bcp_columns;
 		params.flush_rows = gstate.state.config.bcp_flush_rows;
 		params.reset_on_release = gstate.state.reset_on_release;
 		params.collect_timings = counters;
-		if (lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit)) {
-			CTAS_SINK_LOG("parallel writer started (limit=%llu)", (unsigned long long)gstate.parallel_writer_limit);
-		} else {
-			CTAS_SINK_LOG("sharing the global writer (limit=%llu)", (unsigned long long)gstate.parallel_writer_limit);
+		// W2 warm-up only for a columnstore target (see BulkLoadSessionParams).
+		params.warmup_gate = gstate.state.config.table_options.kind == MSSQLTableKind::COLUMNSTORE;
+		if (lstate.session.TryStart(params, gstate.parallel_writers_used, gstate.parallel_writer_limit,
+									gstate.rows_sunk)) {
+			CTAS_SINK_LOG("parallel writer started (used=%llu/%llu)",
+						  (unsigned long long)gstate.parallel_writers_used.load(),
+						  (unsigned long long)gstate.parallel_writer_limit);
+		} else if (gstate.parallel_writers_used.load() >= gstate.parallel_writer_limit) {
+			lstate.may_claim = false;
 		}
 	}
 
@@ -284,6 +298,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 			const auto written = lstate.session.Write(chunk);
 			lstate.rows_written += written.rows_written;
 			lstate.rows_confirmed += written.rows_confirmed;
+			gstate.rows_sunk.fetch_add(written.rows_written, std::memory_order_relaxed);
 			if (counters) {
 				gstate.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
 				gstate.counter_sink_ns.fetch_add(ElapsedNsSince(sink_start), std::memory_order_relaxed);
@@ -332,6 +347,10 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 			const uint64_t encode_before = gstate.state.counter_encode_ns;
 			const uint64_t flush_before = gstate.state.counter_flush_ns;
 			gstate.state.AddChunkBCP(context.client, chunk);
+			// W2 gate counter: the shared BCP writer must advance it too, or a
+			// load that starts entirely on the shared writer never opens the gate
+			// and never ramps up (the whole load stays on one writer).
+			gstate.rows_sunk.fetch_add(chunk.size(), std::memory_order_relaxed);
 			if (counters) {
 				gstate.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
 				gstate.counter_sink_ns.fetch_add(ElapsedNsSince(sink_start), std::memory_order_relaxed);
@@ -343,6 +362,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		} else if (gstate.state.insert_executor) {
 			// Legacy INSERT mode
 			gstate.state.rows_produced += chunk.size();
+			gstate.rows_sunk.fetch_add(chunk.size(), std::memory_order_relaxed);
 			idx_t rows_inserted = gstate.state.insert_executor->Execute(chunk);
 			gstate.state.rows_inserted += rows_inserted;
 		}
