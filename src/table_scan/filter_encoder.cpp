@@ -74,9 +74,11 @@ bool IsNaiveTimestampType(LogicalTypeId id) {
 // so a comparison operand keeps its cast and, being unencodable, falls to the
 // client filter net — correct rather than fast.
 bool IsDatePartFunction(const std::string &name) {
-	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" ||
-		   name == "second" || name == "quarter" || name == "dayofyear" || name == "dayofmonth" || name == "week" ||
-		   name == "dayofweek" || name == "isodow";
+	// Exactly the date-part extractors that ARE in FunctionMapping — the cast
+	// strip only runs after GetFunctionMapping succeeds, so listing a function
+	// that does not map would read as if it pushes when it never reaches here.
+	// Add a name here only when its mapping is added too (PR #269 review).
+	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" || name == "second";
 }
 
 // Does this expression already encode to a T-SQL search condition (a predicate
