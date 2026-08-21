@@ -21,7 +21,7 @@ require mssql
 require-env MSSQL_TEST_DSN
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS subplan_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS subplan_db (TYPE mssql);
 
 statement ok
 CREATE OR REPLACE TABLE subplan_db.dbo.SubplanA (c VARCHAR);

@@ -8,7 +8,7 @@ require mssql
 require-env MSSQL_TEST_SERVER
 
 statement ok
-ATTACH '${MSSQL_TEST_SERVER}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TEST_SERVER}' AS db (TYPE mssql);
 
 # This file counts connections, so it has to pin the number a COPY is allowed to
 # open. Spec 057 step 7 let a successful COPY take one bulk-load session per
@@ -138,7 +138,7 @@ loop i 0 10
 
 # Try to COPY to non-existent table with CREATE_TABLE=false
 statement error
-COPY test_data TO 'db.dbo.nonexistent_table_${i}' (FORMAT 'bcp', CREATE_TABLE false);
+COPY test_data TO 'db.dbo.nonexistent_table_{i}' (FORMAT 'bcp', CREATE_TABLE false);
 ----
 does not exist
 

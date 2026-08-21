@@ -35,7 +35,7 @@ statement ok
 SET mssql_connection_limit = 1;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS rc (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc (TYPE mssql);
 
 # -----------------------------------------------------------------------------
 # The lever: one connection, reused. Everything below depends on it.

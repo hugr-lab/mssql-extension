@@ -10,7 +10,7 @@ require-env MSSQL_TEST_DSN
 # Test 1: Single packet query (baseline - small SQL)
 #
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS mp_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS mp_db (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mp_db', 'SELECT 1 AS val');

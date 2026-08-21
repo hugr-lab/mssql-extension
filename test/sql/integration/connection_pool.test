@@ -11,7 +11,7 @@ require-env MSSQL_TEST_DSN
 
 # Test 1: ATTACH creates a connection pool
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS pool_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS pool_db (TYPE mssql);
 
 # Test 2: Pool statistics should be available for attached database
 query IIIIIIII
@@ -61,7 +61,7 @@ SELECT count(*) FROM mssql_pool_stats('pool_db');
 
 # Test 8: Re-attach with connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS pool_db2 (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS pool_db2 (TYPE mssql);
 
 # Pool should be created for connection string attachment too
 query I

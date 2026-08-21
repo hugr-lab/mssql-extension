@@ -18,7 +18,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS defdb (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS defdb (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('defdb', 'IF OBJECT_ID(''dbo.SrvDefaults'') IS NOT NULL DROP TABLE dbo.SrvDefaults;

@@ -16,7 +16,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS view_cast (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS view_cast (TYPE mssql);
 
 # Build a base table whose columns reproduce the issue #89 schema shape:
 #   - A numeric-looking column declared as NVARCHAR (issue #89's "Convenience Fee")

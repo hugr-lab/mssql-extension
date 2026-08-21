@@ -17,7 +17,7 @@ require mssql
 require-env MSSQL_TEST_DSN
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS chunk_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS chunk_db (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('chunk_db', 'DROP TABLE IF EXISTS dbo.ChunkBoundary');

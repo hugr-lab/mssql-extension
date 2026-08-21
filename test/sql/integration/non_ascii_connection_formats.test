@@ -8,7 +8,7 @@
 # REQUIRES: SQL Server running (via `make docker-up`)
 # Connection parameters come from MSSQL_TEST_* env vars exported by the
 # project Makefile. No hardcoded host/port — the URI / ADO.NET strings
-# are constructed from ${MSSQL_TEST_HOST} and ${MSSQL_TEST_PORT}.
+# are constructed from {MSSQL_TEST_HOST} and {MSSQL_TEST_PORT}.
 
 require mssql
 
@@ -27,7 +27,7 @@ require-env MSSQL_TEST_PASS
 # ============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS bootstrap_admin (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS bootstrap_admin (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('bootstrap_admin', '
@@ -80,7 +80,7 @@ DETACH bootstrap_admin;
 # ============================================================================
 
 statement ok
-ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB?encrypt=true&trustservercertificate=true' AS mssql_uri_tls (TYPE mssql);
+ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@{MSSQL_TEST_HOST}:{MSSQL_TEST_PORT}/TestDB?encrypt=true&trustservercertificate=true' AS mssql_uri_tls (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mssql_uri_tls', 'SELECT 1 AS one');
@@ -91,7 +91,7 @@ statement ok
 DETACH mssql_uri_tls;
 
 statement ok
-ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB?encrypt=false' AS mssql_uri_plain (TYPE mssql);
+ATTACH 'mssql://spec043_user_ru:%D0%A2%D0%B5%D1%81%D1%82123%21@{MSSQL_TEST_HOST}:{MSSQL_TEST_PORT}/TestDB?encrypt=false' AS mssql_uri_plain (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mssql_uri_plain', 'SELECT 1 AS one');
@@ -107,7 +107,7 @@ DETACH mssql_uri_plain;
 # ============================================================================
 
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=true;TrustServerCertificate=true' AS mssql_ado_tls (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=true;TrustServerCertificate=true' AS mssql_ado_tls (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mssql_ado_tls', 'SELECT 1 AS one');
@@ -118,7 +118,7 @@ statement ok
 DETACH mssql_ado_tls;
 
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=false' AS mssql_ado_plain (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_ru;Password=Тест123!;Encrypt=false' AS mssql_ado_plain (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mssql_ado_plain', 'SELECT 1 AS one');
@@ -135,8 +135,8 @@ DETACH mssql_ado_plain;
 statement ok
 CREATE OR REPLACE SECRET spec043_secret_ru (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'TestDB',
     "user" 'spec043_user_ru',
     password 'Тест123!',
@@ -164,7 +164,7 @@ DROP SECRET spec043_secret_ru;
 # ============================================================================
 
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_braces;Password={Тест;123!};Encrypt=false' AS mssql_braces (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=TestDB;User Id=spec043_user_braces;Password={Тест;123!};Encrypt=false' AS mssql_braces (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('mssql_braces', 'SELECT 1 AS one');

@@ -17,7 +17,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS geo (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS geo (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('geo', 'IF OBJECT_ID(N''dbo.geo_test'', N''U'') IS NOT NULL DROP TABLE dbo.geo_test;');

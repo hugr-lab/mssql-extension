@@ -21,7 +21,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS u8_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS u8_db (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('u8_db', $$

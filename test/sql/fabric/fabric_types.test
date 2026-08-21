@@ -25,9 +25,9 @@ require-env AZURE_WH_NAME
 require-env AZURE_WH_TOKEN
 
 statement ok
-ATTACH 'Server=${AZURE_WH_HOST};Database=${AZURE_WH_NAME}' AS wh (
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (
     TYPE mssql,
-    ACCESS_TOKEN '${AZURE_WH_TOKEN}'
+    ACCESS_TOKEN '{AZURE_WH_TOKEN}'
 );
 
 # =============================================================================

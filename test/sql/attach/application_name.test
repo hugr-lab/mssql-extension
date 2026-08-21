@@ -21,7 +21,7 @@ require-env MSSQL_TEST_PASS
 # Verifies the value reaches SQL Server's APP_NAME() / program_name.
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppV1' AS appn_adonet1 (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};Application Name=AppV1' AS appn_adonet1 (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_adonet1', 'SELECT APP_NAME() AS app');
@@ -33,7 +33,7 @@ DETACH appn_adonet1;
 
 # Spaceless ADO.NET alias `ApplicationName=...`.
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};ApplicationName=AppV2' AS appn_adonet2 (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};ApplicationName=AppV2' AS appn_adonet2 (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_adonet2', 'SELECT APP_NAME() AS app');
@@ -45,7 +45,7 @@ DETACH appn_adonet2;
 
 # Underscore form `application_name=...` (matches the secret convention).
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};application_name=AppV3' AS appn_adonet3 (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};application_name=AppV3' AS appn_adonet3 (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_adonet3', 'SELECT APP_NAME() AS app');
@@ -59,7 +59,7 @@ DETACH appn_adonet3;
 # Group 2 — URI `?applicationname=...` (spaceless form per URI convention).
 #
 statement ok
-ATTACH 'mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/master?applicationname=UriAppName' AS appn_uri (TYPE mssql);
+ATTACH 'mssql://{MSSQL_TEST_USER}:{MSSQL_TEST_PASS}@{MSSQL_TEST_HOST}:{MSSQL_TEST_PORT}/master?applicationname=UriAppName' AS appn_uri (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_uri', 'SELECT APP_NAME() AS app');
@@ -74,7 +74,7 @@ DETACH appn_uri;
 # extension default string is what SQL Server should see.
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}' AS appn_default (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS}' AS appn_default (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_default', 'SELECT APP_NAME() AS app');
@@ -92,7 +92,7 @@ DETACH appn_default;
 # and an APP_NAME()-based audit assertion would surprise the user.
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' AS appn_clamp (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};Application Name=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' AS appn_clamp (TYPE mssql);
 
 query I
 SELECT app_len FROM mssql_scan('appn_clamp', 'SELECT LEN(APP_NAME()) AS app_len');
@@ -109,10 +109,10 @@ DETACH appn_clamp;
 # captures its own resolved value (spec 047 per-catalog pool ownership).
 #
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppA' AS appn_a (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};Application Name=AppA' AS appn_a (TYPE mssql);
 
 statement ok
-ATTACH 'Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=master;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};Application Name=AppB' AS appn_b (TYPE mssql);
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=master;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};Application Name=AppB' AS appn_b (TYPE mssql);
 
 query I
 SELECT app FROM mssql_scan('appn_a', 'SELECT APP_NAME() AS app');
@@ -138,11 +138,11 @@ DETACH appn_b;
 statement ok
 CREATE SECRET appn_secret_canonical (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'master',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     application_name 'SecretApp'
 );
 
@@ -166,11 +166,11 @@ DROP SECRET appn_secret_canonical;
 statement ok
 CREATE SECRET appn_secret_fallback (
     TYPE mssql,
-    host '${MSSQL_TEST_HOST}',
-    port ${MSSQL_TEST_PORT},
+    host '{MSSQL_TEST_HOST}',
+    port {MSSQL_TEST_PORT},
     database 'master',
-    user '${MSSQL_TEST_USER}',
-    password '${MSSQL_TEST_PASS}',
+    user '{MSSQL_TEST_USER}',
+    password '{MSSQL_TEST_PASS}',
     applicationname 'SecretAppFallback'
 );
 

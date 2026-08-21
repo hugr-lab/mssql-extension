@@ -17,7 +17,7 @@ SET mssql_connection_limit = 2;
 
 # Attach with limited pool using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS limitdb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS limitdb (TYPE mssql);
 
 # Test 2: First query creates a connection
 query I

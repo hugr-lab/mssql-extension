@@ -15,7 +15,7 @@ SET mssql_connection_limit = 16;
 
 # Setup using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS paralleldb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS paralleldb (TYPE mssql);
 
 # Test 1: Two CTEs (may run in parallel depending on DuckDB planner)
 query I

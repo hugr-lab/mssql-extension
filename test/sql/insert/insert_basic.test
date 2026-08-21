@@ -12,7 +12,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database with READ_WRITE mode (required for INSERT)
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_basic (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_insert_basic (TYPE mssql);
 
 # Test 2: Create test table using standard DDL
 statement ok

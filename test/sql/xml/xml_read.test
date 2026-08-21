@@ -10,7 +10,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS xml_db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS xml_db (TYPE mssql);
 
 # ===========================================================================
 # Test 1: SELECT simple XML document (FR-001)

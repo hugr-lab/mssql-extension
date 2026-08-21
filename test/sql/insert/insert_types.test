@@ -21,7 +21,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ins_types (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_ins_types (TYPE mssql);
 
 # Test 2: Create table with all supported types (ensure clean state via mssql_exec)
 statement ok

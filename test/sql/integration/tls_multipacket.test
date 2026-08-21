@@ -15,7 +15,7 @@ require-env MSSQL_TEST_DSN_TLS
 # Test 1: Single packet query over TLS (baseline)
 #
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS tls_mp_db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS tls_mp_db (TYPE mssql);
 
 query I
 SELECT * FROM mssql_scan('tls_mp_db', 'SELECT 1 AS val');

@@ -10,7 +10,7 @@ statement ok
 SET mssql_connection_cache=false;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS dto_scale (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS dto_scale (TYPE mssql);
 
 # Create test table with DATETIMEOFFSET columns of various scales
 statement ok

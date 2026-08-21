@@ -368,7 +368,7 @@ require-env MSSQL_TEST_DSN
 
 # Setup
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS testdb (TYPE mssql);
 
 # Test with expected result
 query II
@@ -394,6 +394,12 @@ does not exist
 statement ok
 DETACH testdb;
 ```
+
+**Environment-variable substitution.** Write `{MSSQL_TEST_DSN}` (braces only).
+The runner substitutes a variable only if the same file `require-env`s it; an
+undeclared name comes through literally. The older `${VAR}` form still
+substitutes but the DuckDB 2.0 sqllogictest runner prints a deprecation warning
+for every occurrence — use the brace-only form in new tests.
 
 ### Query Result Type Codes
 
@@ -466,7 +472,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mydb (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mydb (TYPE mssql);
 
 # Your tests here...
 
@@ -542,7 +548,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Use unique context name to avoid conflicts
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_upd_mytest (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_upd_mytest (TYPE mssql);
 
 # Create test table with PRIMARY KEY (required for rowid-based UPDATE/DELETE)
 # Use mssql_exec for CREATE TABLE with constraints
@@ -623,7 +629,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS txdb (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS txdb (TYPE mssql);
 
 # Test COMMIT: changes persist
 statement ok
@@ -686,7 +692,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS copydb (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS copydb (TYPE mssql);
 
 # Create local source data
 statement ok
@@ -773,7 +779,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_ctas_mytest (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_ctas_mytest (TYPE mssql);
 
 # Clean up target if exists
 statement ok
@@ -861,7 +867,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS db (TYPE mssql);
 
 statement ok
 BEGIN TRANSACTION;
@@ -928,9 +934,9 @@ statement ok
 CREATE SECRET azure_sp (
     TYPE azure,
     provider 'service_principal',
-    tenant_id '${AZURE_TENANT_ID}',
-    client_id '${AZURE_APP_ID}',
-    client_secret '${AZURE_CLIENT_SECRET}'
+    tenant_id '{AZURE_TENANT_ID}',
+    client_id '{AZURE_APP_ID}',
+    client_secret '{AZURE_CLIENT_SECRET}'
 );
 
 # Test token acquisition (no SQL Server connection needed)

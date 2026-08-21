@@ -14,7 +14,7 @@ require-env MSSQL_TESTDB_DSN
 # =============================================================================
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS lazy_test (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS lazy_test (TYPE mssql);
 
 # =============================================================================
 # Test 1: Lazy loading - schema discovery on demand

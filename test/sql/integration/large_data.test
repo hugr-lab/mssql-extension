@@ -11,7 +11,7 @@ require-env MSSQL_TEST_DSN
 
 # Setup using connection string
 statement ok
-ATTACH '${MSSQL_TEST_DSN}' AS largedb (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN}' AS largedb (TYPE mssql);
 
 # Test 1: Result set with GENERATE_SERIES
 query I

@@ -8,7 +8,7 @@ require mssql
 require-env MSSQL_TEST_CONNECTION_STRING
 
 statement ok
-ATTACH '${MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
+ATTACH '{MSSQL_TEST_CONNECTION_STRING}' AS mssql (TYPE mssql);
 
 # Clean up any existing test tables
 statement ok

@@ -10,7 +10,7 @@ statement ok
 SET mssql_connection_cache=false;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS time_test (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS time_test (TYPE mssql);
 
 # Create test table with TIME columns of various scales
 statement ok

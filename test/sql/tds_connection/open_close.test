@@ -9,7 +9,7 @@ require-env MSSQL_TEST_DSN
 # T015: Test successful connection open with connection string
 # Store handle in temp table to avoid hardcoded handle numbers
 statement ok
-CREATE TEMP TABLE conn_handle AS SELECT mssql_open('${MSSQL_TEST_DSN}') AS handle;
+CREATE TEMP TABLE conn_handle AS SELECT mssql_open('{MSSQL_TEST_DSN}') AS handle;
 
 query I
 SELECT handle >= 1 FROM conn_handle;

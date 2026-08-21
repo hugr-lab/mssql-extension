@@ -13,7 +13,7 @@ statement ok
 SET mssql_connection_cache=false;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS nbc_dto (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS nbc_dto (TYPE mssql);
 
 # =============================================================================
 # Setup: Create table with many nullable columns to force NBCROW encoding

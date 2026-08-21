@@ -11,7 +11,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS copytx (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS copytx (TYPE mssql);
 
 # =============================================================================
 # Test 1: COPY within transaction - COMMIT persists data

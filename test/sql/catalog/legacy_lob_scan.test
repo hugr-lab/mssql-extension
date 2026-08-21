@@ -25,7 +25,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS lob (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS lob (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('lob', 'DROP TABLE IF EXISTS dbo.LegacyLobScan');

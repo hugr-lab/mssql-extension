@@ -13,7 +13,7 @@ statement ok
 SET mssql_connection_cache=false;
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS nbc_scales (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS nbc_scales (TYPE mssql);
 
 # =============================================================================
 # Test 1: TIME at all scales via NBCROW

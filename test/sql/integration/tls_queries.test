@@ -16,7 +16,7 @@ require mssql
 require-env MSSQL_TEST_DSN_TLS
 
 statement ok
-ATTACH '${MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS db (TYPE mssql);
 
 # ============================================================================
 # Test: Various Data Types Over TLS

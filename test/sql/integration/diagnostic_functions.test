@@ -12,7 +12,7 @@ require-env MSSQL_TEST_DSN
 # Test 1: mssql_open with connection string - should succeed and return a connection handle
 # Store handle in temp table for use in subsequent tests
 statement ok
-CREATE TEMP TABLE test_handle AS SELECT mssql_open('${MSSQL_TEST_DSN}') AS handle;
+CREATE TEMP TABLE test_handle AS SELECT mssql_open('{MSSQL_TEST_DSN}') AS handle;
 
 query I
 SELECT handle >= 1 FROM test_handle;

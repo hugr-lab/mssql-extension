@@ -13,7 +13,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Test 1: Attach database
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_insert_bulk (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS mssql_insert_bulk (TYPE mssql);
 
 # Test 2: Create test table (use mssql_exec for PRIMARY KEY constraint)
 statement ok
