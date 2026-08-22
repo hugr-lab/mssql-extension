@@ -262,7 +262,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		lstate.init_attempted = true;
 		lstate.pool = &catalog_.GetConnectionPool();
 		lstate.pool_handle = catalog_.GetConnectionPoolHandle();
-		lstate.may_claim = lstate.pool != nullptr && gstate.parallel_writer_limit > 1;
+		lstate.may_claim = gstate.parallel_writer_limit > 1;
 	}
 
 	// Spec 070 W2: claim (or re-try to claim) an own writer while the volume gate

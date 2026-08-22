@@ -607,7 +607,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// Spec 070 W2: whether this thread may keep asking for its own writer on
 		// later chunks. Below the limit of two there is only ever the shared
 		// writer, so never ask.
-		ldata.may_claim = ldata.pool != nullptr && gdata.parallel_writer_limit > 1;
+		ldata.may_claim = gdata.parallel_writer_limit > 1;
 	}
 
 	// Spec 070 W2: try (or re-try) to claim an own writer while the volume gate

@@ -206,8 +206,12 @@ struct MSSQLCopyLocalState : public LocalFunctionData {
 	//! writer, which is the pre-parallel behaviour and always correct.
 	bool init_attempted = false;
 	//! Pool + handle captured at init, so the per-chunk claim retry needs no
-	//! catalog lookup. Null when claiming is disabled (transaction-pinned, limit
-	//! of one, or init failed).
+	//! catalog lookup. ALWAYS set once `init_attempted` is true —
+	//! `MSSQLCatalog::GetConnectionPool()` returns a reference, and a failed
+	//! catalog lookup throws rather than yielding null. `may_claim` is the single
+	//! switch for whether claiming is allowed (transaction-pinned and limit-of-one
+	//! both arrive as `parallel_writer_limit`); do not guard on this pointer
+	//! instead (PR #270 review).
 	tds::ConnectionPool *pool = nullptr;
 	weak_ptr<tds::ConnectionPool> pool_handle;
 	//! Spec 070 W2: a thread that shares the global writer keeps RE-asking for
