@@ -1,0 +1,70 @@
+# name: test/sql/copy/parallel_writers_fanout.test
+# description: The columnstore warm-up ramp must still FAN OUT past one writer (spec 070 W2)
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# WHY THIS TEST EXISTS (PR #270 review — oluies).
+# Every other parallel-writer test asserts row CONTENT — count(*), sum(id),
+# EXCEPT ALL — and all of those hold at ANY writer count. So a gate that
+# regressed to "never opens" (every thread stuck sharing the one global writer)
+# would leave the whole suite green and collapse only throughput, silently. W2
+# makes that failure newly reachable: the writer count used to be a derived
+# constant and is now behind a volume gate with per-chunk re-claiming.
+#
+# The true signal is `writers=used/limit`, emitted to stderr under
+# MSSQL_COUNTERS — not assertable from sqllogictest. So we read it indirectly:
+# on a FRESH pool loading a PRE-CREATED table (no DDL of its own), each parallel
+# writer acquires its own pooled connection, so `connections_created` equals the
+# number of writers that ran. Fan-out => >= 2; a stuck-closed gate => 1.
+
+# --- setup: create the columnstore target on a throwaway attach, then DETACH so
+# --- the measured load begins from a pool with zero connections created ---
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fansetup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('fansetup', 'IF OBJECT_ID(''dbo.W2FanTest'') IS NOT NULL DROP TABLE dbo.W2FanTest;
+CREATE TABLE dbo.W2FanTest (id INT, s VARCHAR(20));
+CREATE CLUSTERED COLUMNSTORE INDEX cci_w2fan ON dbo.W2FanTest;');
+
+statement ok
+DETACH fansetup;
+
+# --- measured load: fresh pool, columnstore target, well past flush_rows
+# --- (102400) so the warm-up gate opens and the rest fans out across writers ---
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fanload (TYPE mssql);
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+statement ok
+COPY (SELECT i::INT AS id, ('v' || (i % 50))::VARCHAR AS s FROM range(600000) t(i))
+TO 'fanload.dbo.W2FanTest' (FORMAT bcp);
+
+# > 1 connection created == more than one writer ran. If the ramp regressed to a
+# gate that never opens, everything loads on the shared writer, this returns 1,
+# and the query goes red. (Absolute writer count is machine-dependent — thread
+# count, load speed — so we assert only that fan-out happened, not how far.)
+query I
+SELECT connections_created > 1 FROM mssql_pool_stats('fanload');
+----
+true
+
+# Fan-out must not lose or duplicate rows across the independent writers.
+query I
+SELECT count(*) FROM fanload.dbo.W2FanTest;
+----
+600000
+
+statement ok
+SELECT mssql_exec('fanload', 'DROP TABLE IF EXISTS dbo.W2FanTest');
+
+statement ok
+DETACH fanload;
