@@ -575,7 +575,7 @@ flowchart TD
         shared["no slot left →<br/>shares the global writer<br/>under gstate.mutex"]
     end
     ddl --> gw
-    lim -.claimed once per thread<br/>on its first chunk.-> lw1
+    lim -.re-asked every chunk<br/>until won or refused.-> lw1
     lim -.-> lw2
     lim -.exhausted.-> shared
     lw1 --> srv[(SQL Server)]
@@ -591,11 +591,43 @@ interrupt check and no counters on the CTAS side at all. It owns the connection,
 the writer, the batch bookkeeping and the mid-bulk-load release protocol; who may
 open one, and how many, is the policy above and is handed to it.
 
-A writer is claimed by a **thread**, on its first chunk — not allocated up front —
-because `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text
-and resolved columns are only settled by the DDL phase. Failing to get one is **not**
-an error: the thread falls back to the shared writer, which is always correct. A load
+A writer is claimed by a **thread**, never allocated up front — because
+`GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text and
+resolved columns are only settled by the DDL phase. Failing to get one is **not** an
+error: the thread falls back to the shared writer, which is always correct. A load
 must not fail because it could not go faster.
+
+Since spec 070 W2 the claim is retried on **every chunk**, not attempted once on the
+first. `BulkLoadSession::TryStart` returns three outcomes, and only the third is
+final:
+
+| Outcome | Meaning | Thread's next chunk |
+|---|---|---|
+| `Started` | this thread now owns a writer | stops asking (it has one) |
+| `GateClosed` | the columnstore warm-up gate is shut | **asks again** |
+| `Unavailable` | slot cap reached, or acquisition failed | stops asking (`may_claim = false`) |
+
+The warm-up gate exists because the two goals collide on a **clustered columnstore**
+target: fanning out immediately splits a small load across writers so no batch
+reaches `MSSQL_COLUMNSTORE_ROWGROUP_ROWS` (102 400 — SQL Server's own threshold for
+writing a batch straight into a COMPRESSED rowgroup), and the load silently lands
+uncompressed in the delta store. So extra writers are held until the shared writer
+has sunk one full rowgroup, then all of them open at once. A big load pays that one
+batch (~0.1-0.2 s) and fans out; a small one never opens the gate and stays on one
+writer, compressed. **Heap targets have no compression to protect and skip the gate
+entirely.**
+
+The threshold is the SERVER's constant, not `mssql_copy_flush_rows` — the setting
+merely defaults to the same number. Keying the gate on the setting made
+`mssql_copy_flush_rows = 1000000` serialize the first million rows onto one writer
+(the shape W2 measured 1.3-1.5x slower and rejected), and made a `flush_rows` below
+the threshold serialize rows for a compression that cannot happen at all. Below the
+threshold the gate stays open.
+
+`may_claim` — not the `pool` pointer — is the single switch for whether a thread may
+claim. `MSSQLCatalog::GetConnectionPool()` returns a reference, so the captured
+pointer is never null once init has run; transaction-pinning and limit-of-one both
+arrive as `parallel_writer_limit`.
 
 The writer count is therefore a **ceiling, not a floor**. With one DuckDB thread
 driving the sink, `mssql_copy_parallel_writers = 8` still yields one writer — which is
@@ -677,7 +709,7 @@ Two lifetime rules that are easy to get wrong:
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 | 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
-| 057 | The write path above. `codec::ResolveWriteColumnOps` resolves a `ScatterArm` per column so the encode loop carries no type test, and one `RowFallback` takes the whole chunk row-major. Both sinks become `ParallelSink`, with writers claimed per thread on first chunk against a `parallel_writer_limit`. CTAS stops using the transaction's pinned connection entirely — its DDL and its rows both go to pool connections, so `ROLLBACK` undoes neither and the compensation is `mssql_ctas_drop_on_failure`'s DROP, wired to `~CTASExecutionState` as well as to the sink's catch blocks. `LogicalTypeId::UTINYINT` becomes the resolved type of a SQL Server `tinyint` column (one unsigned byte), leaving `TINYINT` to mean a signed source that travels as a smallint |
+| 057 | The write path above. `codec::ResolveWriteColumnOps` resolves a `ScatterArm` per column so the encode loop carries no type test, and one `RowFallback` takes the whole chunk row-major. Both sinks become `ParallelSink`, with writers claimed per thread against a `parallel_writer_limit` (spec 070 W2 makes that claim a per-chunk retry behind a columnstore warm-up gate). CTAS stops using the transaction's pinned connection entirely — its DDL and its rows both go to pool connections, so `ROLLBACK` undoes neither and the compensation is `mssql_ctas_drop_on_failure`'s DROP, wired to `~CTASExecutionState` as well as to the sink's catch blocks. `LogicalTypeId::UTINYINT` becomes the resolved type of a SQL Server `tinyint` column (one unsigned byte), leaving `TINYINT` to mean a signed source that travels as a smallint |
 
 ## Where to read the code
 

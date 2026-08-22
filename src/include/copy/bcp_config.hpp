@@ -39,6 +39,19 @@ class ClientContext;
 //! to explain for no gain. Set the option lower and the consequence is yours.
 constexpr idx_t MSSQL_DEFAULT_COPY_FLUSH_ROWS = 102400;
 
+//! SQL Server's own threshold for writing a bulk batch STRAIGHT into a
+//! COMPRESSED columnstore rowgroup. A fixed server constant — not a client
+//! setting, and not derived from `mssql_copy_flush_rows`, which merely defaults
+//! to the same number.
+//!
+//! The two were conflated until PR #270's review: the spec 070 W2 warm-up gate
+//! held extra writers for one `flush_rows` batch, so `SET mssql_copy_flush_rows
+//! = 1000000` serialized the first million rows onto the shared writer (the very
+//! shape W2 measured at 1.3-1.5x slower and rejected), while `flush_rows` below
+//! this threshold serialized rows for a compression that cannot happen at all.
+//! The gate belongs to the SERVER's number; the batch size is the user's.
+constexpr idx_t MSSQL_COLUMNSTORE_ROWGROUP_ROWS = 102400;
+
 //! Parallel bulk-load writers per COPY. 0 = derive from DuckDB's thread count.
 //!
 //! The bound this attacks is SQL Server's ingest rate, not the client and not

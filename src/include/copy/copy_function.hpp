@@ -201,10 +201,24 @@ struct MSSQLCopyLocalState : public LocalFunctionData {
 	//! same type.
 	mssql::BulkLoadSession session;
 
-	//! Acquisition is tried ONCE, on the first chunk. A failure is not an error:
-	//! the thread falls back to the shared writer, which is the pre-parallel
-	//! behaviour and always correct.
+	//! Catalog lookup (pool + handle) is done ONCE, on the first chunk. A failure
+	//! there disables claiming for this thread — it falls back to the shared
+	//! writer, which is the pre-parallel behaviour and always correct.
 	bool init_attempted = false;
+	//! Pool + handle captured at init, so the per-chunk claim retry needs no
+	//! catalog lookup. ALWAYS set once `init_attempted` is true —
+	//! `MSSQLCatalog::GetConnectionPool()` returns a reference, and a failed
+	//! catalog lookup throws rather than yielding null. `may_claim` is the single
+	//! switch for whether claiming is allowed (transaction-pinned and limit-of-one
+	//! both arrive as `parallel_writer_limit`); do not guard on this pointer
+	//! instead (PR #270 review).
+	tds::ConnectionPool *pool = nullptr;
+	weak_ptr<tds::ConnectionPool> pool_handle;
+	//! Spec 070 W2: a thread that shares the global writer keeps RE-asking for
+	//! its own on later chunks, because the volume gate in TryStart may not open
+	//! until the load has produced enough rows. Cleared once it wins a writer or
+	//! claiming is disabled, so the steady state costs nothing.
+	bool may_claim = false;
 };
 
 //===----------------------------------------------------------------------===//

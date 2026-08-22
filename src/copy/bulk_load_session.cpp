@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "connection/mssql_connection_provider.hpp"
+#include "copy/bcp_config.hpp"
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
 
@@ -65,16 +66,45 @@ BulkLoadSession::~BulkLoadSession() noexcept {
 	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
 }
 
-bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers) {
+BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used,
+												 idx_t max_writers, const std::atomic<idx_t> &rows_sunk) {
 	if (max_writers <= 1) {
-		return false;
+		return Claim::Unavailable;
+	}
+	// Warm-up gate (spec 070 W2): hold every extra writer until the load has
+	// produced ONE COMPRESSIBLE batch on the shared writer, then let the full
+	// writer count open. That first batch is what keeps a SMALL columnstore load
+	// compressible — it lands a full rowgroup before any second writer dilutes it
+	// — while a load big enough to want parallelism pays only that one batch
+	// (~102k rows, ~0.1-0.2 s) before it fans out. A gate of active*flush_rows
+	// was tried first and measured 1.3-1.5x slower at threads=4: it kept
+	// ~active*flush_rows rows serialized on the shared writer, far past the point
+	// of diminishing compression return.
+	//
+	// The threshold is the SERVER's (MSSQL_COLUMNSTORE_ROWGROUP_ROWS), not the
+	// user's `flush_rows` (PR #270 review). `mssql_copy_flush_rows` is settable
+	// to anything non-negative and only DEFAULTS to the same number, so keying
+	// the gate on it re-entered the rejected shape through the setting: at
+	// `flush_rows = 1000000` the first million rows serialized onto one writer.
+	// Below the server threshold no batch can compress at all, so there is
+	// nothing for the gate to protect and it stays open — including at
+	// `flush_rows = 0` (no intermediate flush), which is the pre-W2 behaviour.
+	//
+	// The read is racy by design — a ramp heuristic, not a correctness bound; the
+	// slot cap below still holds.
+	const idx_t warmup_rows =
+		params.flush_rows >= MSSQL_COLUMNSTORE_ROWGROUP_ROWS ? MSSQL_COLUMNSTORE_ROWGROUP_ROWS : 0;
+	if (params.warmup_gate && warmup_rows > 0 && rows_sunk.load(std::memory_order_relaxed) < warmup_rows) {
+		// Transient — the gate opens once the shared writer crosses the rowgroup
+		// threshold. The caller must ask again on a later chunk.
+		return Claim::GateClosed;
 	}
 	// Claim a slot before doing any work, so N threads racing here cannot
 	// collectively exceed the limit.
 	const idx_t slot = slots_used.fetch_add(1);
 	if (slot >= max_writers) {
 		slots_used.fetch_sub(1);
-		return false;
+		return Claim::Unavailable;
 	}
 
 	std::shared_ptr<tds::TdsConnection> conn;
@@ -102,10 +132,13 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		// The stream opens with COLMETADATA; without it the server has no schema
 		// for the ROW tokens that follow.
 		writer_->WriteColmetadata();
-		return true;
+		return Claim::Started;
 	} catch (std::exception &) {
 		// Falling back is the whole contract: put the connection back and let the
-		// thread share the global writer.
+		// thread share the global writer. This is TERMINAL for the load — the pool
+		// is exhausted or the server refused a bulk load, and neither clears on a
+		// later chunk — so the caller stops asking rather than re-blocking a 30 s
+		// Acquire() every chunk (spec 070 W2 review, finding 1).
 		if (conn) {
 			try {
 				params.pool->Release(conn);
@@ -116,7 +149,7 @@ bool BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<
 		connection_.reset();
 		writer_.reset();
 		slots_used.fetch_sub(1);
-		return false;
+		return Claim::Unavailable;
 	}
 }
 

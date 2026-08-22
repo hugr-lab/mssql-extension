@@ -87,6 +87,13 @@ struct BulkLoadSessionParams {
 	//! the release happens in a destructor that may run on a worker thread, where
 	//! there is no ClientContext to ask (issue #178).
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
+	//! Spec 070 W2: apply the warm-up gate (hold extra writers until one
+	//! flush_rows batch has landed). True only for a COLUMNSTORE target, where a
+	//! second writer splitting a sub-threshold load costs compression. A heap or
+	//! rowstore target has no such cost, so it fans out immediately (the pre-W2
+	//! behaviour) and the warm-up serialization — measured 1.2-1.3x on a large
+	//! parallel load — is not paid where it buys nothing.
+	bool warmup_gate = false;
 };
 
 //! Build the `INSERT BULK` statement that opens a bulk load.
@@ -138,8 +145,22 @@ public:
 	//! writer, which is the pre-parallel behaviour and always correct. A load must
 	//! not fail because it could not go faster.
 	//!
-	//! @return true when this thread now owns a session.
-	bool TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers);
+	//! `rows_sunk` is the load's running total across all writers. The warm-up
+	//! gate (columnstore targets only) holds every extra writer until that total
+	//! reaches one `flush_rows` batch, so the shared writer lands the first
+	//! rowgroup compressed before any second writer dilutes it; a large load pays
+	//! only that one batch before fanning out to the full writer count.
+	//!
+	//! The THREE outcomes matter to the caller, which is why this is not a bool
+	//! (spec 070 W2 review): `GateClosed` is cheap and transient — no slot
+	//! claimed, no connection touched — so the caller must keep asking on later
+	//! chunks. `Unavailable` is terminal for this load (limit is one, the slot
+	//! cap is reached, or acquiring a connection failed): the caller must STOP
+	//! asking, or it re-attempts a blocking Acquire() on every chunk under pool
+	//! pressure. Only `Started` means this thread now owns a session.
+	enum class Claim { Started, GateClosed, Unavailable };
+	Claim TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
+				   const std::atomic<idx_t> &rows_sunk);
 
 	//! Does this thread own a session? False means "use the shared writer".
 	bool IsOwned() const {

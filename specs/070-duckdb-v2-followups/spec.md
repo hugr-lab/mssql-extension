@@ -116,7 +116,7 @@ client net).
 
 ---
 
-## W2 — Lazy writer ramp-up for parallel bulk loads
+## W2 — Lazy writer ramp-up for parallel bulk loads — DONE
 
 ### The problem (measured in 069)
 
@@ -152,6 +152,30 @@ volume-gated ramp-up:
 - The 069 columnstore test drops its `SET mssql_copy_parallel_writers = 1`
   pin and still sees COMPRESSED rowgroups (that removal IS the test).
 - Wide-write bench: threads=4 cells within noise of pre-change numbers.
+
+**Outcome (implemented).** A per-chunk claim replaces the one-shot claim: a
+thread that shares the writer keeps re-asking, so a large load reaches the full
+writer count even when every thread arrived early. Two dead ends, both measured
+and recorded so they are not re-tried:
+1. Gate `rows_sunk >= active * flush_rows` (the spec's first sketch) measured
+   **1.3-1.5x slower at threads=4** — it kept ~active*flush_rows rows serialized
+   on the shared writer, far past the point of compression return.
+2. A single warm-up batch (`rows_sunk >= flush_rows`) still measured **1.2x**:
+   serializing even one 102400-row batch on a large load costs ~30% by the
+   arithmetic (100k/rate warm-up vs 25k/rate parallel), not the "~0.1-0.2 s
+   noise" the cost model assumed. The penalty is inherent to serializing, not
+   mutex contention.
+
+The fix is to pay the warm-up **only where it buys compression**: the gate is
+active for a COLUMNSTORE target and OFF for heap/rowstore, which fan out
+immediately as before. `total_rows_expected` is never populated, so a small-vs-
+large size test is not available — but a heap load has no compression to protect
+either way, so gating on target shape is both sufficient and free on the common
+path. Final A/B vs main (heap fixture, 1M rows, threads 1 and 4): **geomean
+0.971, threads=4 within noise (0.92-1.01x)**. Columnstore acceptance
+(`columnstore_batch_threshold.test`, default writers) green; a 1M heap CTAS
+reaches 4/4 writers with ~38 ms of ramp overhead. Applied symmetrically to COPY
+and CTAS.
 
 ---
 
