@@ -1,6 +1,8 @@
 # Spec 070 — DuckDB 2.0 follow-ups: expression pushdown, writer ramp-up, test-var syntax
 
-**Status**: DRAFT (not started; blocked on spec 069 / PR #267 merging)
+**Status**: spec 069 merged (main is 2.0). **W1 DONE** (this branch:
+`pushdown_expression` + temporal-cast passthrough + the #242 mapping removal +
+`expression_pushdown.test`). W2/W3 ready to start.
 **Follows**: spec 069, which migrated main to the 2.0 API and deliberately
 left three items out of scope. Each is an independent workstream; they share
 a spec because all three exist for the same reason — 2.0 changed the ground
@@ -8,7 +10,7 @@ under a subsystem — but they can land as separate PRs in any order.
 
 ---
 
-## W1 — Adopt the non-Legacy filter representation (and the capability it unlocks)
+## W1 — Adopt the non-Legacy filter representation (and the capability it unlocks) — DONE
 
 ### What 2.0 actually did to filters
 
@@ -70,6 +72,47 @@ Reconnaissance against duckdb `d7a4366603`:
 - A deliberately unencodable expression filter returns correct rows via the
   net (test pins both the rows and the `needs client re-filter` debug line).
 - Filter-pushdown test files extended; no existing pushdown test regresses.
+
+**Outcome (implemented).** `pushdown_expression` dry-runs the encoder and
+accepts what it can render; `year/month/day(datetime2_col) op const` now push
+(`WHERE (YEAR([dt]) = 2024)`) via a temporal→temporal cast passthrough (DuckDB
+models DATETIME2 as TIMESTAMP_NS; the implicit precision cast over the column is
+a view, so the server applies the part function natively). **#242 closed here,
+not deferred**: W1 widens what pushes, so the semantically-diverging mappings
+had to go with it — `length`/`len` (LEN drops trailing spaces / counts UTF-16),
+`/` (server integer division vs DuckDB float), and `dayofweek`/`week`
+(@@DATEFIRST / non-ISO). Removed, not rewritten: an unmapped function falls to
+the spec-069 client net, correct by construction. `expression_pushdown.test`
+pins both — year pushes, `length(name)=3` returns the row LEN would have lost.
+**`pushdown_complex_filter` currently SHADOWS `pushdown_expression`** (PR #269
+review — recorded here rather than fixed, because fixing it is a trade-off, not
+a bug). In `duckdb/src/optimizer/pushdown/pushdown_get.cpp` the complex-filter
+callback runs FIRST, over every pending filter, using the same
+`EncodeSearchCondition` and the same `BuildEncodeContext`; it erases everything
+it can render. `TryPushdownGenericExpression` — and therefore
+`MSSQLPushdownExpression` — only sees what is left, i.e. exactly what the
+identical encoder just refused, so the dry-run answers `false` by construction.
+What actually delivers `year(dt) = 2024` today is the temporal-cast strip in
+`EncodeFunctionExpression`, reached through `ComplexFilterPushdown`; deleting
+the `func.pushdown_expression = ...` line leaves every test passing.
+
+Making the callback reachable means restricting `ComplexFilterPushdown` to the
+shapes the combiner will not offer (it offers only expressions referencing
+exactly ONE column binding). That is not free: the combiner applies gates the
+complex-filter path does not — it skips volatile expressions, `COMPARE_IN`
+above `InClauseRewriter::IN_CLAUSE_REWRITE_THRESHOLD`, and **any** expression
+where `CanThrow() && filters.size() > 1`. A single-column expression that
+`ComplexFilterPushdown` declines under those conditions is then offered to
+nobody and runs client-side — a silent pushdown REGRESSION against what ships
+today (e.g. a cast-bearing `year(dt) = 2024` alongside a second predicate).
+Deciding between the two paths therefore needs a measurement, not a patch: the
+follow-up should either restrict `ComplexFilterPushdown` and replicate the
+combiner's gates, or drop `pushdown_expression` until it can be the only path.
+Until then the registration is a no-op kept for the API surface, and the
+encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
+asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
+(rows are identical whether the predicate ran on the server or in the spec-069
+client net).
 
 ---
 

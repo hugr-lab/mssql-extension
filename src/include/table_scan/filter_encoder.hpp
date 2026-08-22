@@ -184,6 +184,17 @@ public:
 	 */
 	static ExpressionEncodeResult EncodeExpression(const Expression &expr, const ExpressionEncodeContext &ctx);
 
+	/**
+	 * Encode a DuckDB Expression as a T-SQL SEARCH CONDITION (a predicate valid
+	 * directly after WHERE). Identical to EncodeExpression except that a BOOLEAN
+	 * *value* (a bit column / constant / cast, which SQL Server rejects after
+	 * WHERE — error 4145) is coerced to `(<value> = 1)`. Use this at every
+	 * predicate position (top-level filter, AND/OR child, NOT operand, CASE
+	 * `WHEN` operand); use EncodeExpression for value operands, where a bare bit
+	 * is legal.
+	 */
+	static ExpressionEncodeResult EncodeSearchCondition(const Expression &expr, const ExpressionEncodeContext &ctx);
+
 private:
 	//--------------------------------------------------------------------------
 	// TableFilter Encoding

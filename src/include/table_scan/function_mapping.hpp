@@ -43,13 +43,5 @@ bool IsLikePatternFunction(const std::string &function_name);
  */
 bool IsCaseInsensitiveLikeFunction(const std::string &function_name);
 
-/**
- * Get the SQL Server date part identifier for a DuckDB date part string.
- * @param duckdb_part DuckDB date part (e.g., "year", "month", "day")
- * @param out_result Output: SQL Server date part identifier
- * @return true if mapping found, false if not supported
- */
-bool GetDatePartMapping(const std::string &duckdb_part, std::string &out_result);
-
 }  // namespace mssql
 }  // namespace duckdb

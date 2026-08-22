@@ -24,8 +24,10 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		// String functions
 		{"lower", {"lower", "LOWER({0})", 1}},
 		{"upper", {"upper", "UPPER({0})", 1}},
-		{"length", {"length", "LEN({0})", 1}},
-		{"len", {"len", "LEN({0})", 1}},
+		// length/len deliberately NOT mapped: SQL Server LEN excludes trailing spaces
+		// and counts UTF-16 code units, DuckDB length() counts code points including
+		// them (issue #242). No exact T-SQL form on non-_SC collations. An unmapped
+		// function is applied client-side by the spec-069 net, correct by construction.
 		{"trim", {"trim", "LTRIM(RTRIM({0}))", 1}},
 		{"ltrim", {"ltrim", "LTRIM({0})", 1}},
 		{"rtrim", {"rtrim", "RTRIM({0})", 1}},
@@ -42,40 +44,27 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		{"minute", {"minute", "DATEPART(MINUTE, {0})", 1}},
 		{"second", {"second", "DATEPART(SECOND, {0})", 1}},
 
-		// Date/Time arithmetic and parts
-		// Note: date_diff has args: (part, start, end) -> DATEDIFF(part, start, end)
-		{"date_diff", {"date_diff", "DATEDIFF({0}, {1}, {2})", 3}},
-		// Note: date_add has args: (date, part, amount) -> DATEADD(part, amount, date) - reordered
-		{"date_add", {"date_add", "DATEADD({1}, {2}, {0})", 3}},
-		{"date_part", {"date_part", "DATEPART({0}, {1})", 2}},
+		// date_diff / date_add / date_part are deliberately NOT mapped. Their
+		// datepart argument is a keyword to T-SQL (DATEPART(year, x)), but it
+		// arrives as a VARCHAR constant and would encode as a literal —
+		// DATEPART(N'year', x) / DATEDIFF(N'day', ...) — which SQL Server rejects.
+		// They are also unreachable in practice: DuckDB rewrites date_part('year',
+		// x) to the function `year`, handled by the entry above. Removed rather
+		// than left as a trap for the next reader (PR #269 review).
 
 		// Arithmetic operators (in DuckDB these are function expressions)
 		{"+", {"+", "({0} + {1})", 2}},
 		{"-", {"-", "({0} - {1})", 2}},
 		{"*", {"*", "({0} * {1})", 2}},
-		{"/", {"/", "({0} / {1})", 2}},
+		// "/" NOT mapped: SQL Server does INTEGER division on integer operands
+		// (5/2 = 2), DuckDB "/" is always floating division (5/2 = 2.5) (issue #242).
+		// "%" maps, but only for exact-numeric operands: T-SQL's modulo rejects
+		// float/real ("Operand data type float is invalid for modulo operator").
+		// The operand-type gate lives in EncodeFunctionExpression (PR #269 review).
 		{"%", {"%", "({0} % {1})", 2}},
 
 		// Unary minus
 		{"negate", {"negate", "(-{0})", 1}},
-	};
-	return mappings;
-}
-
-// Date part mappings from DuckDB to SQL Server
-static const std::unordered_map<std::string, std::string> &GetDatePartMappingTable() {
-	static const std::unordered_map<std::string, std::string> mappings = {
-		{"year", "year"},
-		{"month", "month"},
-		{"day", "day"},
-		{"hour", "hour"},
-		{"minute", "minute"},
-		{"second", "second"},
-		{"millisecond", "millisecond"},
-		{"week", "week"},
-		{"quarter", "quarter"},
-		{"dayofweek", "weekday"},
-		{"dayofyear", "dayofyear"},
 	};
 	return mappings;
 }
@@ -103,17 +92,6 @@ bool IsLikePatternFunction(const std::string &function_name) {
 bool IsCaseInsensitiveLikeFunction(const std::string &function_name) {
 	std::string lower_name = ToLower(function_name);
 	return lower_name == "iprefix" || lower_name == "isuffix" || lower_name == "icontains";
-}
-
-bool GetDatePartMapping(const std::string &duckdb_part, std::string &out_result) {
-	std::string lower_part = ToLower(duckdb_part);
-	const auto &mappings = GetDatePartMappingTable();
-	auto it = mappings.find(lower_part);
-	if (it != mappings.end()) {
-		out_result = it->second;
-		return true;
-	}
-	return false;
 }
 
 }  // namespace mssql

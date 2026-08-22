@@ -1,0 +1,117 @@
+# name: test/sql/catalog/expression_pushdown.test
+# description: Single-column expression pushdown (spec 070 W1) and the #242 gate
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ep (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ep', 'IF OBJECT_ID(''dbo.ExprPush'') IS NOT NULL DROP TABLE dbo.ExprPush;
+CREATE TABLE dbo.ExprPush (id INT PRIMARY KEY, name NVARCHAR(50), dt DATETIME2, flag BIT);
+INSERT INTO dbo.ExprPush VALUES
+    (1, N''abc'',  ''2024-06-15 10:30:00'', 1),
+    (2, N''ab '',  ''2023-01-01 00:00:00'', 0),
+    (3, N''xyz'',  ''2024-12-31 00:00:00'', 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ep');
+
+# W1: year()/month()/day() over a DATETIME2 column push to the server. DuckDB
+# models the column as TIMESTAMP_NS and year() takes TIMESTAMP, so an implicit
+# temporal cast sits over the column; the encoder now pushes through it.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE year(dt) = 2024 ORDER BY id;
+----
+1
+3
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE month(dt) = 6;
+----
+1
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE day(dt) = 31;
+----
+3
+
+# The rows are correct whether the filter ran on the server or the client — this
+# asserts the RESULT, which is the contract. (The WHERE clause reaching the
+# server is visible at MSSQL_DEBUG=1; not assertable in a .test.)
+
+# #242 GATE: length() must NOT push as LEN. LEN excludes trailing spaces, so a
+# pushed LEN(name)=3 would DROP row 2 (N'ab ' — DuckDB length 3, LEN 2). With
+# the mapping removed, the spec-069 client net applies length() and all three
+# rows survive. This row is the whole point: a wrong push here is a silent
+# data-loss bug, and the assertion is exactly the row LEN would have lost.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE length(name) = 3 ORDER BY id;
+----
+1
+2
+3
+
+# "/" must not push either: SQL Server does integer division on integer
+# operands (7/2 = 3), DuckDB "/" is floating (7/2 = 3.5). id/2 = 1.5 matches
+# only id 3 in DuckDB; a pushed integer-division 3/2 = 1 would match nothing.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE id / 2 = 1.5;
+----
+3
+
+# W1 TEMPORAL-CAST GATE: the cast passthrough that makes year(dt) pushable must
+# NOT fire for a VALUE-CHANGING cast in a comparison. dt::DATE drops the time,
+# so row 1 (2024-06-15 10:30:00) matches DATE '2024-06-15' in DuckDB. A pushed
+# `[dt] = '2024-06-15'` compares the DATETIME2 to midnight and would return
+# NOTHING — the silent-wrong-rows bug this gate exists to stop. The strip is
+# scoped to date-part functions, so this stays client-side and row 1 survives.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE dt::DATE = DATE '2024-06-15';
+----
+1
+
+# dt::TIME drops the date the same way — row 1's time is 10:30:00. A pushed
+# `[dt] = '10:30:00'` (midnight 1900-01-01 10:30) would match nothing.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE dt::TIME = TIME '10:30:00';
+----
+1
+
+# BIT PUSHDOWN: DuckDB BOOLEAN is SQL Server BIT, which is NOT a search
+# condition — `WHERE [flag]` is a syntax error (4145). A bare boolean predicate
+# (and NOT of one) must be coerced to `= 1` / `= 0`. These push and must return
+# the right rows; a regression to `WHERE [flag]` errors the whole query.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE flag ORDER BY id;
+----
+1
+3
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE NOT flag;
+----
+2
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE flag = true ORDER BY id;
+----
+1
+3
+
+# A bit predicate as a conjunct is predicate position too — it must be coerced
+# inside the AND, alongside a genuinely-pushed year() condition.
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE flag AND year(dt) = 2024 ORDER BY id;
+----
+1
+3
+
+statement ok
+SELECT mssql_exec('ep', 'DROP TABLE dbo.ExprPush');
+
+statement ok
+DETACH ep;
