@@ -1,8 +1,10 @@
 # Spec 070 — DuckDB 2.0 follow-ups: expression pushdown, writer ramp-up, test-var syntax
 
-**Status**: spec 069 merged (main is 2.0). **W1 DONE** (this branch:
-`pushdown_expression` + temporal-cast passthrough + the #242 mapping removal +
-`expression_pushdown.test`). W2/W3 ready to start.
+**Status**: **COMPLETE** — all three workstreams merged to main.
+W1 `pushdown_expression` + temporal-cast passthrough + the #242 mapping removal
++ `expression_pushdown.test` (#269); W2 lazy writer ramp-up (#270); W3 the
+`${VAR}` → `{VAR}` sweep (#271, landed first — it touches every .test file, so
+it went in ahead of the other two rather than sitting in their diffs).
 **Follows**: spec 069, which migrated main to the 2.0 API and deliberately
 left three items out of scope. Each is an independent workstream; they share
 a spec because all three exist for the same reason — 2.0 changed the ground
@@ -179,7 +181,7 @@ and CTAS.
 
 ---
 
-## W3 — `${VAR}` → `{VAR}` in .test files
+## W3 — `${VAR}` → `{VAR}` in .test files — DONE
 
 The 2.0 sqllogictest runner deprecates the `${VAR}` substitution form and
 prints a warning per occurrence per run ("please replace with {VAR}") while
