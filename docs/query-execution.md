@@ -34,14 +34,23 @@ Table scans are implemented as DuckDB table functions. When a query references a
 
 | Category | DuckDB Functions | SQL Server Equivalent |
 |---|---|---|
-| String | `lower`, `upper`, `length`, `trim`, `ltrim`, `rtrim` | `LOWER`, `UPPER`, `LEN`, `TRIM`, `LTRIM`, `RTRIM` |
+| String | `lower`, `upper`, `trim`, `ltrim`, `rtrim` | `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM` |
 | Date extraction | `year`, `month`, `day`, `hour`, `minute`, `second` | `YEAR`, `MONTH`, `DAY`, `DATEPART(...)` |
-| Date arithmetic | `date_diff(part, start, end)` | `DATEDIFF(part, start, end)` |
-| Date arithmetic | `date_add(date, part, amount)` | `DATEADD(part, amount, date)` (reordered) |
-| Arithmetic | `+`, `-`, `*`, `/`, `%` | Same operators |
+| Arithmetic | `+`, `-`, `*`, `%` | Same operators |
 | Pattern | prefix, suffix, contains | `LIKE 'pattern%'`, `LIKE '%pattern'`, `LIKE '%pattern%'` |
 
 **LIKE pattern escaping**: `%` → `[%]`, `_` → `[_]`, `[` → `[[]` (SQL Server bracket syntax).
+
+**Deliberately NOT mapped** (issue #242, spec 070 W1) — these are applied
+client-side by DuckDB, which is the correct answer, not a missing feature:
+
+| DuckDB Function | Why it is not pushed |
+|---|---|
+| `length` / `len` | `LEN` drops trailing spaces and counts UTF-16 code units; `length()` counts code points including them. No exact T-SQL form on non-`_SC` collations. |
+| `/` | T-SQL does INTEGER division on integer operands (`5/2 = 2`); DuckDB `/` is always floating (`5/2 = 2.5`). |
+| `date_diff`, `date_add`, `date_part` | Their date-part argument is a T-SQL *keyword*, but arrives as a VARCHAR constant that would encode as a literal (`DATEPART(N'year', x)`), which SQL Server rejects. DuckDB rewrites `date_part('year', x)` to `year(x)`, which is mapped. |
+| `dayofweek`, `week` | `@@DATEFIRST`-dependent / non-ISO week numbering. |
+| `%` on `FLOAT`/`REAL` | The operator maps, but T-SQL's modulo rejects approximate-numeric operands; float operands fall to the client filter net. |
 
 ### Projection Pushdown
 

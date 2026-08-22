@@ -84,9 +84,35 @@ had to go with it — `length`/`len` (LEN drops trailing spaces / counts UTF-16)
 (@@DATEFIRST / non-ISO). Removed, not rewritten: an unmapped function falls to
 the spec-069 client net, correct by construction. `expression_pushdown.test`
 pins both — year pushes, `length(name)=3` returns the row LEN would have lost.
-The `pushdown_complex_filter` path is kept (it still catches multi-expression
-shapes the combiner does not route through `pushdown_expression`); retiring it
-is a measurement left to a follow-up.
+**`pushdown_complex_filter` currently SHADOWS `pushdown_expression`** (PR #269
+review — recorded here rather than fixed, because fixing it is a trade-off, not
+a bug). In `duckdb/src/optimizer/pushdown/pushdown_get.cpp` the complex-filter
+callback runs FIRST, over every pending filter, using the same
+`EncodeSearchCondition` and the same `BuildEncodeContext`; it erases everything
+it can render. `TryPushdownGenericExpression` — and therefore
+`MSSQLPushdownExpression` — only sees what is left, i.e. exactly what the
+identical encoder just refused, so the dry-run answers `false` by construction.
+What actually delivers `year(dt) = 2024` today is the temporal-cast strip in
+`EncodeFunctionExpression`, reached through `ComplexFilterPushdown`; deleting
+the `func.pushdown_expression = ...` line leaves every test passing.
+
+Making the callback reachable means restricting `ComplexFilterPushdown` to the
+shapes the combiner will not offer (it offers only expressions referencing
+exactly ONE column binding). That is not free: the combiner applies gates the
+complex-filter path does not — it skips volatile expressions, `COMPARE_IN`
+above `InClauseRewriter::IN_CLAUSE_REWRITE_THRESHOLD`, and **any** expression
+where `CanThrow() && filters.size() > 1`. A single-column expression that
+`ComplexFilterPushdown` declines under those conditions is then offered to
+nobody and runs client-side — a silent pushdown REGRESSION against what ships
+today (e.g. a cast-bearing `year(dt) = 2024` alongside a second predicate).
+Deciding between the two paths therefore needs a measurement, not a patch: the
+follow-up should either restrict `ComplexFilterPushdown` and replicate the
+combiner's gates, or drop `pushdown_expression` until it can be the only path.
+Until then the registration is a no-op kept for the API surface, and the
+encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
+asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
+(rows are identical whether the predicate ran on the server or in the spec-069
+client net).
 
 ---
 

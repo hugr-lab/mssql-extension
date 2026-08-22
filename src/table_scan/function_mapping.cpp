@@ -58,6 +58,9 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		{"*", {"*", "({0} * {1})", 2}},
 		// "/" NOT mapped: SQL Server does INTEGER division on integer operands
 		// (5/2 = 2), DuckDB "/" is always floating division (5/2 = 2.5) (issue #242).
+		// "%" maps, but only for exact-numeric operands: T-SQL's modulo rejects
+		// float/real ("Operand data type float is invalid for modulo operator").
+		// The operand-type gate lives in EncodeFunctionExpression (PR #269 review).
 		{"%", {"%", "({0} % {1})", 2}},
 
 		// Unary minus

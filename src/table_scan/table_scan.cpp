@@ -883,6 +883,17 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 // already proven the expression references exactly one column and has NOT yet
 // rewritten its column ref to BoundReference, so EncodeColumnRef sees a real
 // binding here.
+//
+// REACHABILITY (PR #269 review): as long as pushdown_complex_filter is also
+// registered, this callback is effectively unreachable. DuckDB runs
+// pushdown_complex_filter FIRST over every pending filter, with this same
+// encoder and this same context, and erases everything it can render;
+// TryPushdownGenericExpression then only offers what that pass refused — which
+// the dry-run below refuses again by construction. Keeping both is deliberate
+// for now: restricting ComplexFilterPushdown to hand single-column expressions
+// over would lose pushdown for the shapes the combiner itself declines
+// (volatile, oversized IN, and any CanThrow expression when there is more than
+// one filter). See specs/070-duckdb-v2-followups/spec.md, W1 outcome.
 static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	if (!get.bind_data) {
 		return false;

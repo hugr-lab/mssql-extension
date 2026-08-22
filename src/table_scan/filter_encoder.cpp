@@ -81,6 +81,17 @@ bool IsDatePartFunction(const std::string &name) {
 	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" || name == "second";
 }
 
+// SQL Server's modulo operator is not defined for float/real: `[d] % 2` on a
+// FLOAT column fails with "Operand data type float is invalid for modulo
+// operator", and because an encoded predicate is ERASED from the DuckDB plan the
+// whole query fails instead of falling to the client filter net. DuckDB's `%` is
+// defined for DOUBLE, so the mapping has to refuse the float case itself. Integer
+// and decimal operands behave identically on both sides (negatives included), so
+// only the approximate-numeric types are excluded (PR #269 review).
+bool IsApproximateNumeric(LogicalTypeId id) {
+	return id == LogicalTypeId::FLOAT || id == LogicalTypeId::DOUBLE;
+}
+
 // Does this expression already encode to a T-SQL search condition (a predicate
 // valid after WHERE), as opposed to a bit-valued expression? A BOOLEAN column,
 // constant or cast is a VALUE — `WHERE [b]` is a syntax error (SQL Server 4145),
@@ -593,6 +604,17 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 		return {"", false};
 	}
 
+	// Modulo: refuse float/real operands, which T-SQL's `%` rejects outright.
+	if (func_name == "%") {
+		for (const auto &child : expr.GetChildren()) {
+			if (IsApproximateNumeric(child->GetReturnType().id())) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %% on %s not pushed (T-SQL modulo rejects float)",
+									   child->GetReturnType().ToString().c_str());
+				return {"", false};
+			}
+		}
+	}
+
 	// Validate argument count
 	if (mapping->expected_args != static_cast<int>(expr.GetChildren().size())) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s expects %d args, got %zu", func_name.c_str(),
@@ -754,7 +776,10 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 
 	// Encode each WHEN ... THEN clause
 	for (const auto &check : expr.CaseChecks()) {
-		auto when_result = EncodeExpression(*check.when_expr, child_ctx);
+		// A CASE `WHEN` operand is predicate position like any other: a bare bit
+		// there emits `CASE WHEN [flag] THEN ...`, which SQL Server rejects with
+		// error 4145. Coerce it to `([flag] = 1)` (PR #269 review).
+		auto when_result = EncodeSearchCondition(*check.when_expr, child_ctx);
 		if (!when_result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: WHEN clause encoding failed");
 			return {"", false};

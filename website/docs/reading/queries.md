@@ -31,10 +31,9 @@ Supported filter operations for pushdown:
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
 - **Mapped functions** inside predicates:
-  - strings: `lower`, `upper`, `length`/`len`, `trim`, `ltrim`, `rtrim`
-  - dates: `year`, `month`, `day`, `hour`, `minute`, `second`, `date_diff`,
-    `date_add`, `date_part`
-  - arithmetic: `+ - * / %`, negation
+  - strings: `lower`, `upper`, `trim`, `ltrim`, `rtrim`
+  - dates: `year`, `month`, `day`, `hour`, `minute`, `second`
+  - arithmetic: `+ - * %`, negation
   - substring matching: `prefix`/`suffix`/`contains` and their
     case-insensitive variants translate to `LIKE` (constant patterns) —
     including leading-wildcard forms
@@ -44,6 +43,20 @@ Supported filter operations for pushdown:
 `list_contains()`, `regexp_matches()`, and anything else without a T-SQL
 mapping. An expression the encoder cannot translate stays in DuckDB; results
 are unchanged either way.
+
+Some functions are unmapped **on purpose**, because the T-SQL form would
+return different rows than DuckDB does (issue #242):
+
+- `length`/`len` — `LEN` drops trailing spaces and counts UTF-16 code units;
+  `length()` counts code points including them.
+- `/` — SQL Server does integer division on integer operands (`5/2 = 2`);
+  DuckDB's `/` is always floating (`5/2 = 2.5`).
+- `date_diff`, `date_add`, `date_part` — their date-part argument is a T-SQL
+  keyword, not a string literal. Write `year(col)` instead; DuckDB rewrites
+  `date_part('year', col)` to it anyway, and that form does push.
+- `dayofweek`, `week` — `@@DATEFIRST`-dependent / non-ISO week numbering.
+- `%` on a `FLOAT`/`REAL` column — the operator itself maps, but T-SQL's
+  modulo rejects approximate-numeric operands.
 
 > Pushed string predicates follow the **server's comparison semantics**: on a
 > case-insensitive collation, `WHERE name = 'abc'` matches `'ABC'` — exactly
