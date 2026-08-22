@@ -32,7 +32,7 @@ cut by then.
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | Collation-aware ORDER BY pushdown — makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`); the remaining half of #58 / discussion #59 | spec on main (spun off 060) | nothing | M | oluies |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed | L | pair — design review together, then split |
-| 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **W1 MERGED** (#269); **W2 in review** (#270); W3 done ahead of the spec (#271) | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
+| 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
 Blocking prerequisite shared by 062 / 066 / 067 / join-relocation:
 **the single-writer-on-a-given-connection seam** — one place that owns "this
@@ -60,7 +60,7 @@ consume it.
 ## Order of battle (dependency-honest)
 
 ```text
-069 (2.0 migration, #267) ✔ ──► 070.W1 (#269) ✔ + W3 (#271) ✔ ──► 070.W2 (#270) in review
+069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality) ──► 066 ──► 067 ──► MERGE          ← step 0 NOT STARTED, blocks most of the release
 062 (single-writer seam) ──► 067
 061 — independent, any time
