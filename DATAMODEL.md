@@ -380,6 +380,21 @@ classDiagram
   millions, and claiming 0 would make the planner choose it as a build side.
   Gated by `mssql_enable_statistics`, which until this callback was read by
   nothing.
+- **Filter selectivity has to be applied by the scan, because our own pushdown
+  hides the filters from DuckDB.** `RelationStatisticsHelper::ExtractGetStats`
+  walks `get.table_filters` and applies either a stats-derived selectivity or
+  `DEFAULT_SELECTIVITY` (0.2). `ComplexFilterPushdown` encodes each predicate
+  into `complex_filter_where_clause` — a **string** — and erases it from the
+  plan, so `table_filters` is empty and the estimator applies NOTHING. Verified
+  live: `WHERE id < 100` over 200000 rows, inside a join so the join-order
+  optimizer runs, still estimated 200000. The cardinality callback therefore
+  applies DuckDB's own 0.2 itself, and `top_n` is reported as a hard
+  `max_cardinality`. **This is a stopgap that must be deleted** if single-column
+  predicates ever reach `pushdown_expression` and survive as EXPRESSION_FILTERs
+  in `table_filters` — DuckDB would then apply selectivity and doing it here too
+  would double-count. It is the second cost of the shadowing described in
+  `table_scan.cpp`'s reachability note (PR #269): the dead callback is one
+  symptom, a planner that cannot see any predicate is the other.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
 - Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3).
 

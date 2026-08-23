@@ -78,6 +78,44 @@ SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.i
 50
 
 # -----------------------------------------------------------------------------
+# A PUSHED FILTER must reduce the estimate.
+#
+# DuckDB normally does this itself in RelationStatisticsHelper::ExtractGetStats,
+# which walks get.table_filters. It cannot here: ComplexFilterPushdown encodes
+# the predicate into a WHERE-clause STRING and ERASES it from the plan, so
+# table_filters is empty and the estimator applies nothing — verified live, a
+# filtered 200000-row scan inside a join still estimated 200000. So the scan
+# applies DuckDB's own DEFAULT_SELECTIVITY (0.2) itself: 200000 -> 40000.
+#
+# If the filters ever stay visible as EXPRESSION_FILTERs, DuckDB applies this
+# and the scan must stop doing so — these assertions would then catch the
+# double-count.
+# -----------------------------------------------------------------------------
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig WHERE id < 100;
+----
+physical_plan	<REGEX>:.*40[,.]?000.*
+
+# The unfiltered scan must NOT be reduced.
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig;
+----
+physical_plan	<!REGEX>:.*40[,.]?000.*
+
+# Estimates must not change results. 100 of the 200000 rows have id < 100.
+query I
+SELECT count(*) FROM card.dbo.CardScanBig WHERE id < 100;
+----
+100
+
+# The filtered join: both sides reduced (DuckDB propagates id < 100 to the other
+# side of the equijoin, and that filter pushes too), rows unchanged.
+query I
+SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.id = s.id WHERE b.id < 100;
+----
+50
+
+# -----------------------------------------------------------------------------
 # mssql_enable_statistics gates it. The setting existed and was read by NOTHING
 # before this callback; it is now the escape hatch if an estimate ever plans
 # worse than no estimate did, and turning it off restores the old ~1 row.

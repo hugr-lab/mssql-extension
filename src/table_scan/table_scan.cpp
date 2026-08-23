@@ -975,6 +975,48 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 							 bind_data.table_name.c_str());
 		return nullptr;
 	}
+
+	// Filter selectivity. DuckDB normally does this itself:
+	// `RelationStatisticsHelper::ExtractGetStats` walks `get.table_filters` and
+	// either derives a real selectivity from column statistics or, failing that,
+	// applies DEFAULT_SELECTIVITY.
+	//
+	// It cannot do it for us, because OUR pushdown erases the filters before it
+	// looks. `ComplexFilterPushdown` encodes each expression into
+	// `complex_filter_where_clause` — a STRING — and removes it from the plan, so
+	// `get.table_filters.HasFilters()` is false and the estimator applies NOTHING.
+	// Verified against a live server: `WHERE id < 100` over 200000 rows, inside a
+	// join so the join-order optimizer runs, still estimated 200000 rows, and
+	// MSSQL_DEBUG shows "1 expressions handled, 0 remaining for DuckDB".
+	//
+	// So this mirrors DuckDB's own fallback rather than inventing a number — the
+	// same 0.2 constant, applied for the same reason.
+	//
+	// DELETE THIS when the filters stay visible. If single-column expressions
+	// reached `pushdown_expression` instead (they cannot today — the complex-filter
+	// pass runs first and consumes them; see the reachability note above and PR
+	// #269), they would become EXPRESSION_FILTERs in `get.table_filters`, DuckDB
+	// would apply selectivity itself, and doing it here as well would double-count.
+	constexpr double DUCKDB_DEFAULT_SELECTIVITY = 0.2;
+	if (!bind_data.complex_filter_where_clause.empty()) {
+		const idx_t filtered = MaxValue<idx_t>(static_cast<idx_t>(row_count * DUCKDB_DEFAULT_SELECTIVITY), 1);
+		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> %llu rows (%llu * selectivity, WHERE %s)",
+							 bind_data.schema_name.c_str(), bind_data.table_name.c_str(), (unsigned long long)filtered,
+							 (unsigned long long)row_count, bind_data.complex_filter_where_clause.c_str());
+		row_count = filtered;
+	}
+
+	// TOP N is a HARD bound, not an estimate: the server cannot return more.
+	// Reported as max_cardinality so the optimizer may rely on it. Set by our own
+	// OptimizerExtension, which DuckDB runs AFTER the join-order optimizer, so it
+	// is usually still 0 here — this pays off only for the estimates taken later.
+	if (bind_data.top_n > 0) {
+		const idx_t top_n = static_cast<idx_t>(bind_data.top_n);
+		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> capped at TOP %llu", bind_data.schema_name.c_str(),
+							 bind_data.table_name.c_str(), (unsigned long long)top_n);
+		return make_uniq<NodeStatistics>(MinValue<idx_t>(row_count, top_n), top_n);
+	}
+
 	MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> %llu rows", bind_data.schema_name.c_str(),
 						 bind_data.table_name.c_str(), (unsigned long long)row_count);
 	return make_uniq<NodeStatistics>(row_count);
