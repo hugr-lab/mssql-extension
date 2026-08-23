@@ -30,17 +30,26 @@ require-env MSSQL_TESTDB_DSN
 # else covers it.
 #
 # Every assertion is written against the SERVER'S OWN ANSWER rather than a fixed
-# count, so it holds under any collation.
+# count, so what is asserted stays true whatever the collation does.
 #
-# But holding is not the same as DETECTING, and under a _BIN2/_BIN database
-# default this file would be green while testing nothing: there 'ñu' sorts AFTER
-# 'o', so `LIKE N'n%'` and the range `>= N'n' AND < N'o'` agree, and the rewrite
-# this exists to catch would sail through. `mssql_ctas_text_type` defaults to
-# NVARCHAR, so the COPY-created column inherits the database default and the
-# whole question is decided by the server the suite happens to point at. So the
-# first assertion below PINS THE ENVIRONMENT AS DISCRIMINATING — on a server
-# where this test cannot do its job, it says so instead of passing vacuously
-# (PR #276 review).
+# But holding is not the same as DETECTING. Whether this file can detect
+# anything depends on the COLUMN's collation, and a COPY-created column inherits
+# the DATABASE default (`mssql_ctas_text_type` is NVARCHAR) — so the question was
+# decided by whichever server the suite happened to point at. Under _BIN2 the
+# range and the LIKE agree and the whole file passes while testing nothing;
+# under CS_AS the upper-case patterns match nothing on either side and go
+# vacuous too.
+#
+# A previous revision tried to PROBE for that (assert server-LIKE differs from
+# server-range). That was the wrong quantity — the suffix/infix cases depend on
+# CASE-insensitivity, which such a probe never measures — and it was wrong in
+# both directions: false green on CS_AS, false red on CI_AI (job 1133).
+#
+# So the collation is PINNED instead. The table is created explicitly with
+# `COLLATE Latin1_General_CI_AS` (the pattern from varchar_encoding.test) and
+# COPY loads into it, so every assertion below discriminates on every server and
+# no probe is needed. The pin itself is verified, because a server that quietly
+# substituted a different collation would take the file back to vacuous.
 # =============================================================================
 
 statement ok
@@ -53,16 +62,37 @@ statement ok
 CREATE OR REPLACE TABLE lc_src AS SELECT * FROM (VALUES ('nero'), ('Nero'), ('ñu'), ('oslo')) v(name);
 
 statement ok
-COPY lc_src TO 'lc.dbo.LikeCollation' (FORMAT bcp, CREATE_TABLE true, replace true);
+SELECT mssql_exec('lc', 'DROP TABLE IF EXISTS dbo.LikeCollation');
 
-# GUARD: this server must be able to tell the two forms apart at all. If the
-# server's own LIKE and the range rewrite return the SAME count, the assertions
-# below are vacuous and the file must fail rather than reassure.
+# The collation is the whole experiment, so it is stated rather than inherited.
+# CI_AS: case-INsensitive (so 'Nero' matches '%ER%') and accent-SENSITIVE (so
+# 'ñu' is not equal to an 'n' string, yet still sorts between 'n' and 'o' — which
+# is exactly what makes the range rewrite differ from LIKE).
+# NVARCHAR(MAX), not NVARCHAR(n), and that is load-bearing rather than
+# incidental. Spec 060 reports a LENGTH-CARRYING string column as
+# MSSQL_NVARCHAR(n), and DuckDB then reaches the VARCHAR overload through an
+# implicit no-op cast — which makes the column ref a BOUND_FUNCTION, so
+# `FilterCombiner::TryPushdownPrefixFilter` (which requires a bare
+# BOUND_COLUMN_REF) never fires and such a column is ACCIDENTALLY IMMUNE to the
+# rewrite this file exists to catch. Measured: on the restricted build,
+# NVARCHAR(100) pushes `[name] LIKE N'n%'` while NVARCHAR(MAX) pushes
+# `[name] >= N'n' AND [name] < N'o'`. MAX reports as a plain VARCHAR, which is
+# the shape at risk — and the shape COPY and CTAS create by default.
+statement ok
+SELECT mssql_exec('lc', 'CREATE TABLE dbo.LikeCollation (name NVARCHAR(MAX) COLLATE Latin1_General_CI_AS)');
+
+statement ok
+SELECT mssql_refresh_cache('lc');
+
+statement ok
+COPY lc_src TO 'lc.dbo.LikeCollation' (FORMAT bcp);
+
+# The pin must have taken. A server that substituted its own collation would send
+# this file back to passing vacuously, so it fails here instead.
 query I
-SELECT (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''n%'''))
-    <> (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name >= N''n'' AND name < N''o'''));
+SELECT c FROM mssql_scan('lc', 'SELECT CAST(collation_name AS NVARCHAR(128)) AS c FROM sys.columns WHERE object_id = OBJECT_ID(N''dbo.LikeCollation'') AND name = N''name''');
 ----
-true
+Latin1_General_CI_AS
 
 # The invariant: pushing LIKE must not change which rows come back, whatever the
 # server's collation says. Both sides ask the same server the same question.
@@ -73,10 +103,11 @@ SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE 'n%')
 true
 
 # Suffix and infix take the same encoder path. The patterns are UPPER-CASE on
-# purpose: a case-insensitive server matches 'nero'/'Nero' while DuckDB's own
-# binary suffix/contains match nothing, so these separate "the server answered"
-# from "the client answered". Lower-case patterns look equivalent here and
-# cannot fail in either state (PR #276 review).
+# purpose, and the pinned CI_AS collation is what makes that meaningful: the
+# server matches 'nero'/'Nero' (2 and 3 respectively) while DuckDB's own binary
+# suffix/contains match NOTHING (0), so these separate "the server answered"
+# from "the client answered". Lower-case patterns agree on both sides and cannot
+# fail in either state (PR #276 review).
 query I
 SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%O')
      = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%O'''));
