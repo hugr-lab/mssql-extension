@@ -1,0 +1,138 @@
+# name: test/sql/catalog/scan_cardinality.test
+# description: An MSSQL scan must report its row count to the optimizer (roadmap v0.3.0 step 0)
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# WHY THIS EXISTS
+#
+# `TableFunction::cardinality` was never set, so DuckDB had no row count for an
+# MSSQL scan and planned EVERY one of them as ~1 row. A 200000-row table and a
+# 50-row table were indistinguishable, which decides join order, build side and
+# every estimate downstream of them by a coin flip.
+#
+# `MSSQLTableEntry::GetStorageInfo` had computed the real count since spec 023 —
+# a table-function scan just never reads TableStorageInfo, so the number never
+# reached the planner.
+#
+# ROWS CANNOT SEE THIS. Every query returns identical results at any estimate;
+# only the PLAN changes. So these assert the plan text, which is the only place
+# the difference is visible.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS card (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+CREATE OR REPLACE TABLE card_big_src AS SELECT i AS id, 'v' || (i % 100) AS s FROM range(200000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE card_small_src AS SELECT i AS id, 'k' || i AS k FROM range(50) t(i);
+
+statement ok
+COPY card_big_src TO 'card.dbo.CardScanBig' (FORMAT bcp, CREATE_TABLE true, replace true);
+
+statement ok
+COPY card_small_src TO 'card.dbo.CardScanSmall' (FORMAT bcp, CREATE_TABLE true, replace true);
+
+# -----------------------------------------------------------------------------
+# The estimate reaches the plan. 200000 rows renders as "200000" or "200,000"
+# depending on the formatter, so the digits are matched with an optional
+# separator rather than pinning one rendering.
+# -----------------------------------------------------------------------------
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig;
+----
+physical_plan	<REGEX>:.*200[,.]?000.*
+
+# And the scan must NOT still be claiming one row.
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig;
+----
+physical_plan	<!REGEX>:.*MSSQL_CATALOG_SCAN[^~]*~1 row.*
+
+# -----------------------------------------------------------------------------
+# The point of the estimate: two tables three orders of magnitude apart must not
+# look alike. Both counts appear in one join plan.
+# -----------------------------------------------------------------------------
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.id = s.id;
+----
+physical_plan	<REGEX>:.*~50 rows.*
+
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.id = s.id;
+----
+physical_plan	<REGEX>:.*200[,.]?000.*
+
+# Rows are unchanged either way — that is exactly why the plan had to be asserted.
+query I
+SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.id = s.id;
+----
+50
+
+# -----------------------------------------------------------------------------
+# A PUSHED FILTER must reduce the estimate.
+#
+# DuckDB normally does this itself in RelationStatisticsHelper::ExtractGetStats,
+# which walks get.table_filters. It cannot here: ComplexFilterPushdown encodes
+# the predicate into a WHERE-clause STRING and ERASES it from the plan, so
+# table_filters is empty and the estimator applies nothing — verified live, a
+# filtered 200000-row scan inside a join still estimated 200000. So the scan
+# applies DuckDB's own DEFAULT_SELECTIVITY (0.2) itself: 200000 -> 40000.
+#
+# If the filters ever stay visible as EXPRESSION_FILTERs, DuckDB applies this
+# and the scan must stop doing so — these assertions would then catch the
+# double-count.
+# -----------------------------------------------------------------------------
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig WHERE id < 100;
+----
+physical_plan	<REGEX>:.*40[,.]?000.*
+
+# The unfiltered scan must NOT be reduced.
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig;
+----
+physical_plan	<!REGEX>:.*40[,.]?000.*
+
+# Estimates must not change results. 100 of the 200000 rows have id < 100.
+query I
+SELECT count(*) FROM card.dbo.CardScanBig WHERE id < 100;
+----
+100
+
+# The filtered join: both sides reduced (DuckDB propagates id < 100 to the other
+# side of the equijoin, and that filter pushes too), rows unchanged.
+query I
+SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.id = s.id WHERE b.id < 100;
+----
+50
+
+# -----------------------------------------------------------------------------
+# mssql_enable_statistics gates it. The setting existed and was read by NOTHING
+# before this callback; it is now the escape hatch if an estimate ever plans
+# worse than no estimate did, and turning it off restores the old ~1 row.
+# -----------------------------------------------------------------------------
+statement ok
+SET mssql_enable_statistics = false;
+
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanBig;
+----
+physical_plan	<!REGEX>:.*200[,.]?000.*
+
+statement ok
+SET mssql_enable_statistics = true;
+
+statement ok
+SELECT mssql_exec('card', 'DROP TABLE dbo.CardScanBig; DROP TABLE dbo.CardScanSmall;');
+
+statement ok
+DETACH card;
