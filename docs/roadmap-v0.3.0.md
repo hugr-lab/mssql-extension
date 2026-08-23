@@ -25,7 +25,7 @@ cut by then.
 | Spec | Title | State | Depends on | Size | Proposed owner |
 | --- | --- | --- | --- | --- | --- |
 | — (#242 fix) | Filter-mapping correctness: STOP pushing `length()` (no exact T-SQL form on non-`_SC` collations — `LEN` loses rows TODAY) and audit `dayofweek`/`week` (`@@DATEFIRST`-dependent) and `'/'`. Cheap on 2.0: an unmapped function falls to the client net / plan filter, correct by construction | **DONE** — shipped in #269 with 070 W1 | 069 merged (the net) | S | oluies |
-| — (step 0) | Cardinality callback: MSSQL scans estimate 1 row today, poisoning every join order around them | not started; named in 065 research | nothing | S | oluies |
+| — (step 0) | Cardinality callback: MSSQL scans estimate 1 row today, poisoning every join order around them | **DONE** (#274) — plus filter selectivity and a TOP N hard bound | nothing | S | oluies |
 | 062 | INSERT via BCP (replaces batched VALUES; 2–10× on multi-row INSERT) | spec on main | single-writer seam (below) | M | VGSML |
 | 066 | Materialize-own-scan (#239): a DML/JOIN plan that reads the target table materializes through its own scan, not a second query | spec on recon branch | step 0 | M | oluies |
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
@@ -57,11 +57,35 @@ consume it.
   there isn't one on non-`_SC` collations. (`%` was audited with them and kept,
   gated to exact-numeric operands: T-SQL modulo rejects float/real.)
 
+## Learned while doing step 0 (#274) — affects the join/agg workstream
+
+The planner **cannot see a single predicate** on an MSSQL scan.
+`ComplexFilterPushdown` encodes each pushed filter into a WHERE-clause STRING
+and erases the expression from the plan, so `get.table_filters` is empty and
+`RelationStatisticsHelper::ExtractGetStats` — which would apply either a
+stats-derived selectivity or DEFAULT_SELECTIVITY — has nothing to walk.
+Measured live: `WHERE id < 100` over 200000 rows estimated 200000, inside a
+join, with the join-order optimizer running.
+
+#274 works around it by applying DuckDB's own 0.2 inside the cardinality
+callback, and **labels that a stopgap**. The real fix is the measurement spec
+070's W1 outcome already asks for: whether `ComplexFilterPushdown` can be
+restricted so single-column predicates fall through to `pushdown_expression`
+and survive as EXPRESSION_FILTERs. That would make the dead callback live AND
+give the planner filters it can reason about — but risks losing pushdown for
+the shapes DuckDB's combiner itself declines (volatile, oversized IN, and any
+`CanThrow()` expression when there is more than one filter).
+
+This matters most to **join/agg pushdown**, which is exactly the workstream
+that needs the planner to reason about what a scan returns. Do the measurement
+before designing relocation-vs-reduction against estimates the planner cannot
+form.
+
 ## Order of battle (dependency-honest)
 
 ```text
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
-step 0 (cardinality) ──► 066 ──► 067 ──► MERGE          ← step 0 NOT STARTED, blocks most of the release
+step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
 061 — independent, any time
 join/agg — after 066 (+ #242, now closed)
