@@ -68,18 +68,61 @@ Measured live: `WHERE id < 100` over 200000 rows estimated 200000, inside a
 join, with the join-order optimizer running.
 
 #274 works around it by applying DuckDB's own 0.2 inside the cardinality
-callback, and **labels that a stopgap**. The real fix is the measurement spec
-070's W1 outcome already asks for: whether `ComplexFilterPushdown` can be
-restricted so single-column predicates fall through to `pushdown_expression`
-and survive as EXPRESSION_FILTERs. That would make the dead callback live AND
-give the planner filters it can reason about — but risks losing pushdown for
-the shapes DuckDB's combiner itself declines (volatile, oversized IN, and any
-`CanThrow()` expression when there is more than one filter).
+callback, and **labels that a stopgap**.
 
-This matters most to **join/agg pushdown**, which is exactly the workstream
-that needs the planner to reason about what a scan returns. Do the measurement
-before designing relocation-vs-reduction against estimates the planner cannot
-form.
+### The W1 measurement has been run — here is the answer
+
+Spec 070's W1 outcome asked whether `ComplexFilterPushdown` can be restricted
+so single-column predicates fall through to `pushdown_expression` and survive
+as EXPRESSION_FILTERs. Measured on branch `spec/070-w1-measure-shadowing`
+against a live server.
+
+**Most of it worked.** No pushdown was lost — every shape DuckDB's combiner
+gates still reached the server (`IN` at the 6-value threshold,
+`year(dt) = 2024` beside a second predicate, `LIKE`). The planner could finally
+see predicates: `EXPLAIN` showed `Filters: id < 100` on the scan with real
+selectivity. Full suite green. **The objection recorded in #269 — that the
+combiner's gates (volatile, oversized `IN`, `CanThrow() && filters.size() > 1`)
+would silently lose pushdown — DID NOT REPRODUCE.** That reasoning was wrong
+and should not be carried forward.
+
+**What blocks it is unrelated to any of that.** DuckDB rewrites a prefix
+predicate into a range — `prefix(col,'n')` becomes `col >= 'n' AND col < 'o'`
+(`FilterCombiner::TryPushdownPrefixFilter`). Exact for DuckDB's binary string
+comparison; **not** exact for SQL Server, where the collation decides ordering.
+On `SQL_Latin1_General_CP1_CI_AS` — SQL Server's DEFAULT collation — `'ñu'`
+sorts between `'n'` and `'o'`, so the server's `LIKE N'n%'` returns 2 rows and
+the range returns 3. `main` returns 2; the restricted build returns 3. Silent
+wrong rows, and the entire suite passed in that state (#276 adds the missing
+coverage).
+
+Blast radius is narrower than it first looks: a column reported as
+`MSSQL_NVARCHAR(n)` (spec 060) is **accidentally immune**, because DuckDB
+reaches the VARCHAR overload through a no-op cast and
+`TryPushdownPrefixFilter` requires a bare `BOUND_COLUMN_REF`. It is the
+plain-`VARCHAR` columns — `NVARCHAR(MAX)`, i.e. what COPY and CTAS create by
+default — that are exposed.
+
+### OPEN DECISION — does 061 now gate W1? (needs VGSML)
+
+The restriction is not dead, but it has acquired a prerequisite: **the encoder
+must refuse, or correctly translate, DuckDB's range-rewritten prefix filters
+before those predicates may become TableFilters.** That is collation-aware
+pushdown, i.e. spec **061**, which this table still lists as *independent, any
+time*.
+
+If that reading is accepted, the dependency chain becomes:
+
+> **061 → W1 restriction → planner-visible filters → join/agg pushdown**
+
+and 061 stops being optional: it moves onto the critical path for the
+release's headline feature, and the order-of-battle line below should change
+with it. **This is not yet decided** — the alternative is to leave the
+restriction unbuilt, keep #274's 0.2 stopgap, and design join/agg against
+estimates the planner cannot form, which is the worse of the two but is a
+legitimate choice about sequencing.
+
+Either way: do not design relocation-vs-reduction before settling this.
 
 ## Order of battle (dependency-honest)
 
@@ -87,6 +130,7 @@ form.
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
-061 — independent, any time
-join/agg — after 066 (+ #242, now closed)
+061 — independent today; PROPOSED to gate W1 (see OPEN DECISION above), UNDECIDED
+join/agg — after 066 (+ #242, now closed); and after the 061/W1 decision, which
+           determines whether it can rely on planner-visible filters at all
 ```
