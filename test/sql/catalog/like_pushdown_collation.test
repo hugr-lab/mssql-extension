@@ -29,9 +29,18 @@ require-env MSSQL_TESTDB_DSN
 # reachable and this WRONG. The full suite passed in exactly that state; nothing
 # else covers it.
 #
-# The assertion is written against the SERVER'S OWN ANSWER rather than a fixed
-# count, so it holds under any collation: a BIN2 database answers 1, a CI_AS
-# database answers 2, and either way the pushed query must agree.
+# Every assertion is written against the SERVER'S OWN ANSWER rather than a fixed
+# count, so it holds under any collation.
+#
+# But holding is not the same as DETECTING, and under a _BIN2/_BIN database
+# default this file would be green while testing nothing: there 'ñu' sorts AFTER
+# 'o', so `LIKE N'n%'` and the range `>= N'n' AND < N'o'` agree, and the rewrite
+# this exists to catch would sail through. `mssql_ctas_text_type` defaults to
+# NVARCHAR, so the COPY-created column inherits the database default and the
+# whole question is decided by the server the suite happens to point at. So the
+# first assertion below PINS THE ENVIRONMENT AS DISCRIMINATING — on a server
+# where this test cannot do its job, it says so instead of passing vacuously
+# (PR #276 review).
 # =============================================================================
 
 statement ok
@@ -46,6 +55,15 @@ CREATE OR REPLACE TABLE lc_src AS SELECT * FROM (VALUES ('nero'), ('Nero'), ('ñ
 statement ok
 COPY lc_src TO 'lc.dbo.LikeCollation' (FORMAT bcp, CREATE_TABLE true, replace true);
 
+# GUARD: this server must be able to tell the two forms apart at all. If the
+# server's own LIKE and the range rewrite return the SAME count, the assertions
+# below are vacuous and the file must fail rather than reassure.
+query I
+SELECT (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''n%'''))
+    <> (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name >= N''n'' AND name < N''o'''));
+----
+true
+
 # The invariant: pushing LIKE must not change which rows come back, whatever the
 # server's collation says. Both sides ask the same server the same question.
 query I
@@ -54,25 +72,29 @@ SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE 'n%')
 ----
 true
 
-# Same for a suffix and an infix, which take the same encoder path.
+# Suffix and infix take the same encoder path. The patterns are UPPER-CASE on
+# purpose: a case-insensitive server matches 'nero'/'Nero' while DuckDB's own
+# binary suffix/contains match nothing, so these separate "the server answered"
+# from "the client answered". Lower-case patterns look equivalent here and
+# cannot fail in either state (PR #276 review).
 query I
-SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%o')
-     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%o'''));
+SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%O')
+     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%O'''));
 ----
 true
 
 query I
-SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%er%')
-     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%er%'''));
+SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%ER%')
+     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%ER%'''));
 ----
 true
 
-# And the accented row is the one that separates the two forms: it must NOT be
-# returned by a prefix match, on any collation where LIKE excludes it.
-query I
-SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE 'n%' AND name = 'ñu';
-----
-0
+# (A `... AND name = 'ñu'` case was here and is deliberately gone. It asserted a
+# hard-coded 0 — contradicting this file's own server-relative rule, and wrong on
+# an accent-INSENSITIVE collation where the server's LIKE does match 'ñu' — and
+# in the regression it targets DuckDB can fold `name >= 'n' AND name < 'o' AND
+# name = 'ñu'` to empty under its own ordering without asking the server, so it
+# would read 0 either way. The prefix assertion above carries the signal.)
 
 statement ok
 SELECT mssql_exec('lc', 'DROP TABLE dbo.LikeCollation');
