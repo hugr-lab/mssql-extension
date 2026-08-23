@@ -1,0 +1,81 @@
+# name: test/sql/catalog/like_pushdown_collation.test
+# description: A pushed LIKE must agree with the SERVER's own LIKE, not with a range rewrite
+# group: [mssql]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# WHY THIS EXISTS
+#
+# DuckDB rewrites a prefix predicate into a RANGE: `prefix(col, 'n')` becomes
+# `col >= 'n' AND col < 'o'` (FilterCombiner::TryPushdownPrefixFilter). That is
+# exact for DuckDB's own binary string comparison. It is NOT exact for SQL
+# Server, whose collation decides the ordering:
+#
+#   on SQL_Latin1_General_CP1_CI_AS — SQL Server's DEFAULT collation —
+#   'ñu' sorts BETWEEN 'n' and 'o', so the range MATCHES it
+#   while `LIKE N'n%'` does NOT.
+#
+# Measured: 4 rows ('nero', 'Nero', 'ñu', 'oslo'), `LIKE 'n%'` -> 2 on the
+# server, the range -> 3. A scan that pushed the range would silently return an
+# extra row.
+#
+# Today the LIKE is encoded by ComplexFilterPushdown and reaches the server AS a
+# LIKE, so this passes. It is pinned because any change that lets DuckDB's
+# TableFilter machinery see these predicates — which is desirable for other
+# reasons, it is how the planner gets selectivity — makes the range rewrite
+# reachable and this WRONG. The full suite passed in exactly that state; nothing
+# else covers it.
+#
+# The assertion is written against the SERVER'S OWN ANSWER rather than a fixed
+# count, so it holds under any collation: a BIN2 database answers 1, a CI_AS
+# database answers 2, and either way the pushed query must agree.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS lc (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+CREATE OR REPLACE TABLE lc_src AS SELECT * FROM (VALUES ('nero'), ('Nero'), ('ñu'), ('oslo')) v(name);
+
+statement ok
+COPY lc_src TO 'lc.dbo.LikeCollation' (FORMAT bcp, CREATE_TABLE true, replace true);
+
+# The invariant: pushing LIKE must not change which rows come back, whatever the
+# server's collation says. Both sides ask the same server the same question.
+query I
+SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE 'n%')
+     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''n%'''));
+----
+true
+
+# Same for a suffix and an infix, which take the same encoder path.
+query I
+SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%o')
+     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%o'''));
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%er%')
+     = (SELECT c FROM mssql_scan('lc', 'SELECT COUNT(*) AS c FROM dbo.LikeCollation WHERE name LIKE N''%er%'''));
+----
+true
+
+# And the accented row is the one that separates the two forms: it must NOT be
+# returned by a prefix match, on any collation where LIKE excludes it.
+query I
+SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE 'n%' AND name = 'ñu';
+----
+0
+
+statement ok
+SELECT mssql_exec('lc', 'DROP TABLE dbo.LikeCollation');
+
+statement ok
+DETACH lc;
