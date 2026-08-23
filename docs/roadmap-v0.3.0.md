@@ -24,7 +24,7 @@ cut by then.
 
 | Spec | Title | State | Depends on | Size | Proposed owner |
 | --- | --- | --- | --- | --- | --- |
-| — (#242 fix) | Filter-mapping correctness: STOP pushing `length()` (no exact T-SQL form on non-`_SC` collations — `LEN` loses rows TODAY) and audit `dayofweek`/`week` (`@@DATEFIRST`-dependent) and `'/'`. Cheap on 2.0: an unmapped function falls to the client net / plan filter, correct by construction | open bug, repro in #242 | 069 merged (the net) | S | oluies |
+| — (#242 fix) | Filter-mapping correctness: STOP pushing `length()` (no exact T-SQL form on non-`_SC` collations — `LEN` loses rows TODAY) and audit `dayofweek`/`week` (`@@DATEFIRST`-dependent) and `'/'`. Cheap on 2.0: an unmapped function falls to the client net / plan filter, correct by construction | **DONE** — shipped in #269 with 070 W1 | 069 merged (the net) | S | oluies |
 | — (step 0) | Cardinality callback: MSSQL scans estimate 1 row today, poisoning every join order around them | not started; named in 065 research | nothing | S | oluies |
 | 062 | INSERT via BCP (replaces batched VALUES; 2–10× on multi-row INSERT) | spec on main | single-writer seam (below) | M | VGSML |
 | 066 | Materialize-own-scan (#239): a DML/JOIN plan that reads the target table materializes through its own scan, not a second query | spec on recon branch | step 0 | M | oluies |
@@ -32,7 +32,7 @@ cut by then.
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | Collation-aware ORDER BY pushdown — makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`); the remaining half of #58 / discussion #59 | spec on main (spun off 060) | nothing | M | oluies |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed | L | pair — design review together, then split |
-| 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | spec drafted (069 branch) | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
+| 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
 Blocking prerequisite shared by 062 / 066 / 067 / join-relocation:
 **the single-writer-on-a-given-connection seam** — one place that owns "this
@@ -47,16 +47,22 @@ consume it.
 - AVG pushes ONLY by SUM + COUNT_BIG decomposition.
 - Reduction-vs-relocation ladder with materialize-then-decide; relocation of
   a small DuckDB table into #temp is a lever, not a default.
-- Issue **#242 gates function pushdown**: `length`→`LEN` returns wrong rows
-  TODAY; `dayofweek`/`week` and `'/'` mappings need an audit before any of
-  them may enter group keys or join conditions.
+- Issue **#242 gated function pushdown**, and is now CLOSED (#269) — but read
+  how. The audit was resolved by **removal, not by finding exact T-SQL forms**:
+  `length`/`len`, `'/'` and `date_diff`/`date_add`/`date_part` are gone from the
+  mapping table, and `dayofweek`/`week` were already out. So "#242 fixed" does
+  NOT mean those functions push — it means they fall to the client net, which is
+  correct by construction and is the answer for group keys and join conditions
+  too. Anything wanting `length()` server-side needs an exact form first, and
+  there isn't one on non-`_SC` collations. (`%` was audited with them and kept,
+  gated to exact-numeric operands: T-SQL modulo rejects float/real.)
 
 ## Order of battle (dependency-honest)
 
 ```text
-069 (2.0 migration, PR #267) ──► 070.W1/W2/W3
-step 0 (cardinality) ──► 066 ──► 067 ──► MERGE
+069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
+step 0 (cardinality) ──► 066 ──► 067 ──► MERGE          ← step 0 NOT STARTED, blocks most of the release
 062 (single-writer seam) ──► 067
 061 — independent, any time
-join/agg — after 066 + #242 audit
+join/agg — after 066 (+ #242, now closed)
 ```
