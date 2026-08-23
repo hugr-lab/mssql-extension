@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -18,6 +20,7 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -910,6 +913,73 @@ static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &ge
 	return accepted;
 }
 
+// cardinality: what the optimizer thinks this scan returns. WITHOUT this
+// callback DuckDB has no number for a table-function scan and every MSSQL scan
+// plans as ~1 row — a 200000-row table and a 50-row table are indistinguishable,
+// so join order, build-side choice and every downstream estimate around them are
+// decided by a coin flip. `MSSQLTableEntry::GetStorageInfo` has computed the real
+// count since spec 023 and even says so in its comment ("Table-level cardinality
+// is provided via GetStorageInfo") — but a TableFunction scan reads
+// `TableFunction::cardinality`, not TableStorageInfo, so that work never reached
+// the planner (roadmap v0.3.0 "step 0").
+//
+// Deliberately CHEAP and NON-THROWING. This runs inside the optimizer, once per
+// scan per plan, so unlike GetStorageInfo it does NOT acquire a connection to
+// query the DMV: it reads the statistics cache (which `PreloadRowCount` refreshes
+// after a bulk load) and falls back to the count the catalog already loaded with
+// the table metadata. A query must not pay a network round trip to be planned.
+//
+// Returning nullptr means "no estimate" — the pre-existing behaviour — and is the
+// answer whenever the count is 0, because 0 CANNOT BE DISTINGUISHED FROM UNKNOWN
+// here. A VIEW has no `sys.partitions` rows and reports 0 while returning
+// millions; claiming 0 for it would make the planner pick it as a build side and
+// is far worse than claiming nothing. An genuinely empty table therefore also
+// plans as unknown, which costs an estimate nobody had before this callback.
+static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	if (!bind_data_p) {
+		return nullptr;
+	}
+	// mssql_enable_statistics gates this: it is the one optimizer-facing consumer
+	// of the row counts the statistics layer collects, and an escape hatch if an
+	// estimate ever plans worse than no estimate did.
+	if (!LoadStatisticsEnabled(context)) {
+		return nullptr;
+	}
+	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
+	if (!bind_data.table_entry) {
+		return nullptr;
+	}
+	// const_cast: GetMSSQLCatalog()/GetApproxRowCount() are non-const accessors on
+	// the entry, and the bind data holds it as a const pointer. Nothing below
+	// mutates the entry.
+	auto *table_entry = dynamic_cast<MSSQLTableEntry *>(const_cast<TableCatalogEntry *>(bind_data.table_entry.get()));
+	if (!table_entry) {
+		return nullptr;
+	}
+
+	idx_t row_count = 0;
+	try {
+		// Fresher than the catalog metadata when a load has happened since, and
+		// free — TryGetCachedRowCount never opens a connection.
+		auto &stats_provider = table_entry->GetMSSQLCatalog().GetStatisticsProvider();
+		if (!stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name, row_count)) {
+			row_count = table_entry->GetApproxRowCount();
+		}
+	} catch (...) {
+		// Planning must not fail because an estimate was unavailable.
+		return nullptr;
+	}
+
+	if (row_count == 0) {
+		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> unknown (count 0)", bind_data.schema_name.c_str(),
+							 bind_data.table_name.c_str());
+		return nullptr;
+	}
+	MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> %llu rows", bind_data.schema_name.c_str(),
+						 bind_data.table_name.c_str(), (unsigned long long)row_count);
+	return make_uniq<NodeStatistics>(row_count);
+}
+
 static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
 								  vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
@@ -1136,6 +1206,10 @@ TableFunction GetCatalogScanFunction() {
 	// accept whatever our encoder can render. Accepted expressions become
 	// EXPRESSION_FILTERs (encoded in InitGlobal, netted client-side on refusal).
 	func.pushdown_expression = MSSQLPushdownExpression;
+
+	// Report the table's row count to the optimizer. Without this every MSSQL
+	// scan plans as ~1 row and join order around it is arbitrary (roadmap step 0).
+	func.cardinality = MSSQLCatalogScanCardinality;
 
 	// Enable virtual column discovery - exposes rowid column to DuckDB binder
 	// This is called during binding to determine what virtual columns are available

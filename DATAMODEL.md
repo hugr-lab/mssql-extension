@@ -363,6 +363,23 @@ classDiagram
 - `MSSQLMetadataCache` is incremental and lazy. `GetTableMetadata` **copies** the metadata out under the cache mutex — the previous raw-pointer return escaped the lock and raced `Refresh` / bulk reloads freeing the map node (issue #178 review finding).
 - **Locking invariant (issue #178)**: ONE cache-wide `mutex_` guards `schemas_` and everything reachable through it (tables, columns, load states), plus `state_` / `database_collation_`. Loads hold it across their SQL round trip so partial state is never visible — concurrent metadata loads serialize by design. `ttl_seconds_` / `metadata_timeout_ms_` are atomics (written per-lookup by `EnsureCacheLoaded`, read by loaders mid-query while the mutex is held). The pre-#178 split (`mutex_` for Refresh/HasSchema, `schemas_mutex_` for everything else) let `Refresh()` free the whole map under a reader — TSan-confirmed UAF.
 - `MSSQLStatisticsProvider` returns stats by value; no raw-pointer hand-out.
+- **Its row counts reach the planner through `TableFunction::cardinality`, not
+  through `TableStorageInfo`** (roadmap v0.3.0 "step 0"). `MSSQLTableEntry::
+  GetStorageInfo` has filled `TableStorageInfo::cardinality` since spec 023, but
+  DuckDB reads that for a *table* scan; an MSSQL scan is a TABLE FUNCTION, and
+  the optimizer asks the function's `cardinality` callback instead. With the
+  callback unset every MSSQL scan planned as **~1 row**, so a 200000-row and a
+  50-row table were indistinguishable and join order around them was arbitrary.
+  `MSSQLCatalogScanCardinality` (`table_scan.cpp`) closes that, and is
+  deliberately **cheap and non-throwing**: it runs per scan inside the optimizer,
+  so unlike `GetStorageInfo` it never acquires a connection — statistics cache
+  first (`TryGetCachedRowCount`, refreshed by `PreloadRowCount` after a load),
+  then the count the catalog already loaded with the table metadata. It returns
+  **no estimate when the count is 0**, because 0 cannot be told apart from
+  unknown: a VIEW has no `sys.partitions` rows and reports 0 while returning
+  millions, and claiming 0 would make the planner choose it as a build side.
+  Gated by `mssql_enable_statistics`, which until this callback was read by
+  nothing.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
 - Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3).
 
