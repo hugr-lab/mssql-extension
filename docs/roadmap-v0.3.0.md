@@ -30,7 +30,7 @@ cut by then.
 | 066 | Materialize-own-scan (#239): a DML/JOIN plan that reads the target table materializes through its own scan, not a second query | spec on recon branch | step 0 | M | oluies |
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
-| 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main; widened in #277 | nothing | M | oluies |
+| 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main (ORDER BY only); widening proposed in #277 — **OPEN**, mechanism lives on that PR branch | nothing | M | oluies |
 | — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Gated on 061** — DuckDB's prefix→range rewrite is inexact against SQL Server collations, and the pushed predicate is not re-checked. Removing it is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured, gated on 061 | **061** | M | unassigned |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and the W1-restriction row above, which decides whether it can rely on planner-visible filters** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
@@ -68,9 +68,10 @@ better we push, the less the planner knows. Measured live — `WHERE id < 100`
 over 200000 rows estimated 200000, inside a join, with the join-order optimizer
 running.
 
-The mechanism is documented once, in `DATAMODEL.md`'s statistics-layer section
-(the `MSSQLStatisticsProvider` bullets) — it is expected to be DELETED when this
-is fixed, so it is not restated here. What belongs here is the consequence for
+The mechanism is documented once, in
+[`DATAMODEL.md` — Layer 4 (Cache & registries)](../DATAMODEL.md) under the
+`MSSQLStatisticsProvider` bullets — it is expected to be DELETED when this is
+fixed, so it is not restated here. What belongs here is the consequence for
 sequencing.
 
 #274 works around it by applying DuckDB's own 0.2 inside the cardinality
@@ -102,12 +103,14 @@ the range returns 3. `main` returns 2; the restricted build returns 3. Silent
 wrong rows, and the entire suite passed in that state (#276 adds the missing
 coverage).
 
-Blast radius is narrower than it first looks: a column reported as
-`MSSQL_NVARCHAR(n)` (spec 060) is **accidentally immune**, because DuckDB
-reaches the VARCHAR overload through a no-op cast and
-`TryPushdownPrefixFilter` requires a bare `BOUND_COLUMN_REF`. It is the
-plain-`VARCHAR` columns — `NVARCHAR(MAX)`, i.e. what COPY and CTAS create by
-default — that are exposed.
+Blast radius is narrower than it first looks, but wider than "what CTAS
+creates": a column reported as `MSSQL_NVARCHAR(n)` (spec 060) is **accidentally
+immune**, because DuckDB reaches the VARCHAR overload through a no-op cast and
+`TryPushdownPrefixFilter` requires a bare `BOUND_COLUMN_REF`. Exposed is
+everything `MSSQLColumnInfo::NativeDuckDBType` reports as a plain type — every
+column with `max_length <= 0`, so `text` / `ntext` / `varchar(max)` /
+`nvarchar(max)` on PRE-EXISTING user tables as well as the `NVARCHAR(MAX)` that
+COPY and CTAS create by default, plus lengths outside the inline limits.
 
 ### DECIDED (VGSML, #275 / #277) — yes, 061 gates W1. The reason is DML, not SELECT.
 
@@ -129,34 +132,47 @@ either.** It is safe today only because a PK is unique *under the server's own
 comparison*, so `pk = value` cannot hit two rows. Anything that moves a rowid
 comparison to binary semantics client-side breaks that quietly.
 
-Also settled: my #276 conclusion that the restriction is "blocked" was too
-strong. DuckDB's range rewrite returns a **superset** of DuckDB's own answer,
-so the restriction was not wrong — it was **missing the re-check**. DuckDB 2.0
-does not re-apply a `TableFilter` behind a `filter_pushdown` scan, so turning
-predicates into EXPRESSION_FILTERs left nothing to apply them; the spec-069
-client net already does this for *refused* filters and needs arming for
-"pushed, but not authoritative".
+An intermediate conclusion that is now SUPERSEDED, recorded because it was
+briefly the plan: the range rewrite returns a **superset** of DuckDB's own
+answer, so it looked as though the restriction merely needed the spec-069
+client net armed for "pushed, but not authoritative". It does not — arming the
+net is what breaks the semantic contract. See the decision below.
 
 **SELECT semantics — DECIDED (oluies): native stays the default.** #277 § 4.1
 proposed pushing the native predicate and taking exactness from the client net,
 but that net applies DuckDB's *binary* comparison, so `WHERE name = 'abc'`
-would stop matching `'ABC'` on a CI collation — contradicting the first line of
-the recon list below and the user-facing promise in
-`website/docs/reading/queries.md`. Superset-and-re-check and native-by-default
-are mutually exclusive for SELECT (native answer 2, range 3, re-check 1), so
-the contract wins and § 4.1 changes:
+would stop matching `'ABC'` on a CI collation — contradicting the first bullet
+of the recon list ABOVE and the user-facing promise in
+`website/docs/reading/queries.md`. Measured on a `_CI_AS` column: the same
+predicate returns **2 rows pushed and 1 row client-side**. So SELECT pushes the
+**exact** predicate (`= N'abc'`, `LIKE N'n%'`, `IN (…)`) and native semantics
+are preserved by the predicate actually reaching the server.
 
-- SELECT pushes the **exact** predicate (`= N'abc'`, `LIKE N'n%'`, `IN (…)`).
-- DuckDB's prefix→range rewrite is **refused**, not pushed-and-repaired.
-- The client net is **not** armed for "pushed but not authoritative" — arming
-  it is what would break native. It stays for *refused* filters only.
+**Which mechanism delivers that, and the trade it carries.** Two readings, and
+only one of them honours the decision:
 
-**This costs nothing in plan shape**, which is worth recording because the
-opposite was assumed while the question was open: measured on an indexed
-`NVARCHAR(100) COLLATE Latin1_General_CI_AS` column, `LIKE N'n1%'` and
-`>= N'n1' AND < N'n2'` BOTH produce an Index Seek — SQL Server turns a prefix
-LIKE into a seek range itself. Refusing the rewrite keeps the seek AND the
-semantics.
+- **(a) `ComplexFilterPushdown` keeps claiming string-pattern expressions.**
+  This is today's behaviour — verified live, `prefix()` is consumed there and
+  emitted as `[name] LIKE N'n%'`, so DuckDB's `TryPushdownPrefixFilter` never
+  sees it. Native semantics kept, Index Seek kept. **Cost: those predicates
+  stay planner-invisible**, which is exactly the blind spot W1 exists to close.
+  So W1 can make non-string predicates visible; string comparisons cannot join
+  them without 061.
+- **(b) Decline the range at the scan.** Planner-visible, but the original LIKE
+  has already been pruned by the combiner, so nothing is pushed at all: the
+  predicate runs in the client net under DuckDB's **binary** comparison. That
+  loses the Index Seek *and* violates the contract in the same move — refusal
+  is NOT semantics-neutral.
+
+The decision therefore means **(a)**, and W1's reach is narrower than it looked.
+
+**Correction to an earlier version of this section**, since it was briefly the
+stated basis for the decision: it claimed the choice "costs nothing in plan
+shape", citing a measurement that `LIKE N'n1%'` and `>= N'n1' AND < N'n2'` both
+produce an Index Seek. That measurement is real but answers a different
+question — it compares two forms that would both be *pushed*, whereas under the
+restriction the LIKE form is not on the table. The trade is the one stated in
+(a) above: planner visibility, not plan shape.
 
 Still open on #277: whether DML is an exception. If native is the default
 everywhere, a server-side DELETE matching `'ABC'` for `name = 'abc'` is the

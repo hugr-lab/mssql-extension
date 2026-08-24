@@ -100,17 +100,31 @@ the `func.pushdown_expression = ...` line leaves every test passing.
 
 Making the callback reachable means restricting `ComplexFilterPushdown` to the
 shapes the combiner will not offer (it offers only expressions referencing
-exactly ONE column binding). That is not free: the combiner applies gates the
-complex-filter path does not — it skips volatile expressions, `COMPARE_IN`
-above `InClauseRewriter::IN_CLAUSE_REWRITE_THRESHOLD`, and **any** expression
-where `CanThrow() && filters.size() > 1`. A single-column expression that
-`ComplexFilterPushdown` declines under those conditions is then offered to
-nobody and runs client-side — a silent pushdown REGRESSION against what ships
-today (e.g. a cast-bearing `year(dt) = 2024` alongside a second predicate).
-Deciding between the two paths therefore needs a measurement, not a patch: the
-follow-up should either restrict `ComplexFilterPushdown` and replicate the
-combiner's gates, or drop `pushdown_expression` until it can be the only path.
-Until then the registration is a no-op kept for the API surface, and the
+exactly ONE column binding).
+
+**The measurement this section asked for has been run** (branch
+`spec/070-w1-measure-shadowing`; recorded in `docs/roadmap-v0.3.0.md`).
+
+The objection stated here first — that the combiner applies gates the
+complex-filter path does not (volatile, `COMPARE_IN` above
+`InClauseRewriter::IN_CLAUSE_REWRITE_THRESHOLD`, and any expression where
+`CanThrow() && filters.size() > 1`), so a deferred predicate would be offered
+to nobody and silently regress to client-side — **DID NOT REPRODUCE**. Every
+one of those shapes still reached the server, including the cast-bearing
+`year(dt) = 2024` beside a second predicate that this text named. Do not
+re-derive it.
+
+**The real blocker is semantic, and is gated on spec 061.** Once
+`ComplexFilterPushdown` stops claiming a predicate, the combiner rewrites it
+before offering it: `prefix()` becomes a `>=`/`<` RANGE, exact for DuckDB's
+binary comparison and NOT for SQL Server's collation. On the default `_CI_AS`,
+`'ñu'` sorts between `'n'` and `'o'`: the server's `LIKE N'n%'` returns 2 rows
+and the range returns 3. Refusing the range instead pushes nothing at all, and
+the client net then applies DuckDB semantics — 1 row — breaking the
+native-server-semantics contract from the other side. Pinned by
+`test/sql/catalog/like_pushdown_collation.test`.
+
+Until 061 lands, the registration is a no-op kept for the API surface, and the
 encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
 asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
 (rows are identical whether the predicate ran on the server or in the spec-069
