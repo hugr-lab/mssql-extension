@@ -137,16 +137,33 @@ predicates into EXPRESSION_FILTERs left nothing to apply them; the spec-069
 client net already does this for *refused* filters and needs arming for
 "pushed, but not authoritative".
 
-**Still open (on #277): which semantics SELECT ends up with.** #277 § 4.1
-pushes the native predicate and takes exactness from the client net — but that
-net applies DuckDB's binary comparison, so `WHERE name = 'abc'` stops matching
-`'ABC'` on a CI collation. That contradicts the first line of the recon list
-below and `website/docs/reading/queries.md`, which promise NATIVE server
-semantics. Superset-and-re-check and native-by-default are mutually exclusive
-for SELECT: the native answer is 2, the range gives 3, the re-check gives 1.
-Either strict-by-default is adopted deliberately (and this list, the docs and a
-release note change with it) or SELECT must push the exact predicate. **Not yet
-answered — do not design relocation-vs-reduction on top of it until it is.**
+**SELECT semantics — DECIDED (oluies): native stays the default.** #277 § 4.1
+proposed pushing the native predicate and taking exactness from the client net,
+but that net applies DuckDB's *binary* comparison, so `WHERE name = 'abc'`
+would stop matching `'ABC'` on a CI collation — contradicting the first line of
+the recon list below and the user-facing promise in
+`website/docs/reading/queries.md`. Superset-and-re-check and native-by-default
+are mutually exclusive for SELECT (native answer 2, range 3, re-check 1), so
+the contract wins and § 4.1 changes:
+
+- SELECT pushes the **exact** predicate (`= N'abc'`, `LIKE N'n%'`, `IN (…)`).
+- DuckDB's prefix→range rewrite is **refused**, not pushed-and-repaired.
+- The client net is **not** armed for "pushed but not authoritative" — arming
+  it is what would break native. It stays for *refused* filters only.
+
+**This costs nothing in plan shape**, which is worth recording because the
+opposite was assumed while the question was open: measured on an indexed
+`NVARCHAR(100) COLLATE Latin1_General_CI_AS` column, `LIKE N'n1%'` and
+`>= N'n1' AND < N'n2'` BOTH produce an Index Seek — SQL Server turns a prefix
+LIKE into a seek range itself. Refusing the rewrite keeps the seek AND the
+semantics.
+
+Still open on #277: whether DML is an exception. If native is the default
+everywhere, a server-side DELETE matching `'ABC'` for `name = 'abc'` is the
+documented behaviour rather than a violation, and the `_BIN2` pair is needed
+only under the strict annotation — which narrows § 4.2. If DML is deliberately
+strict, that must be stated outright, because a default that differs between
+SELECT and DML is the kind of thing discovered through someone's deleted rows.
 
 ## Order of battle (dependency-honest)
 
