@@ -30,8 +30,8 @@ cut by then.
 | 066 | Materialize-own-scan (#239): a DML/JOIN plan that reads the target table materializes through its own scan, not a second query | spec on recon branch | step 0 | M | oluies |
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
-| 061 | Collation-aware ORDER BY pushdown — makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`); the remaining half of #58 / discussion #59 | spec on main (spun off 060) | nothing | M | oluies |
-| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost, but BLOCKED on DuckDB's prefix→range rewrite being inexact against SQL Server collations.** Removing it is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured, blocked | 061 (proposed — see OPEN DECISION) | M | unassigned |
+| 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main; widened in #277 | nothing | M | oluies |
+| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Gated on 061** — DuckDB's prefix→range rewrite is inexact against SQL Server collations, and the pushed predicate is not re-checked. Removing it is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured, gated on 061 | **061** | M | unassigned |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and the W1-restriction row above, which decides whether it can rely on planner-visible filters** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
@@ -109,26 +109,44 @@ reaches the VARCHAR overload through a no-op cast and
 plain-`VARCHAR` columns — `NVARCHAR(MAX)`, i.e. what COPY and CTAS create by
 default — that are exposed.
 
-### OPEN DECISION — does 061 now gate W1? (needs VGSML)
+### DECIDED (VGSML, #275 / #277) — yes, 061 gates W1. The reason is DML, not SELECT.
 
-The restriction is not dead, but it has acquired a prerequisite: **the encoder
-must refuse, or correctly translate, DuckDB's range-rewritten prefix filters
-before those predicates may become TableFilters.** That is collation-aware
-pushdown, i.e. spec **061**, which this table still lists as *independent, any
-time*.
+> **061 → W1 restriction → planner-visible filters → DML-collapse + join/agg**
 
-If that reading is accepted, the dependency chain becomes:
+I proposed this edge as a SELECT-correctness story. That undersells it, and the
+real reason is worth carrying:
 
-> **061 → W1 restriction → planner-visible filters → join/agg pushdown**
+**A server-side `UPDATE`/`DELETE` has nothing downstream to re-check it.** A
+predicate matching one row too many does not return an extra row — it
+**modifies data DuckDB would never have touched**. So the DML-collapse
+workstream (067, MERGE) needs the pushed predicate to be *exactly* equivalent,
+and on the default `_CI_AS` collation a string predicate is not. That is 061's
+job. For SELECT the same looseness is survivable, because a client pass can
+still fix it; for DML it is not survivable at all.
 
-and 061 stops being optional: it moves onto the critical path for the
-release's headline feature, and the order-of-battle line below should change
-with it. **This is not yet decided** — the alternative is to leave the
-restriction unbuilt, keep #274's 0.2 stopgap, and design join/agg against
-estimates the planner cannot form, which is the worse of the two but is a
-legitimate choice about sequencing.
+Corollary from #275 worth not forgetting: **rowid is not automatically safe
+either.** It is safe today only because a PK is unique *under the server's own
+comparison*, so `pk = value` cannot hit two rows. Anything that moves a rowid
+comparison to binary semantics client-side breaks that quietly.
 
-Either way: do not design relocation-vs-reduction before settling this.
+Also settled: my #276 conclusion that the restriction is "blocked" was too
+strong. DuckDB's range rewrite returns a **superset** of DuckDB's own answer,
+so the restriction was not wrong — it was **missing the re-check**. DuckDB 2.0
+does not re-apply a `TableFilter` behind a `filter_pushdown` scan, so turning
+predicates into EXPRESSION_FILTERs left nothing to apply them; the spec-069
+client net already does this for *refused* filters and needs arming for
+"pushed, but not authoritative".
+
+**Still open (on #277): which semantics SELECT ends up with.** #277 § 4.1
+pushes the native predicate and takes exactness from the client net — but that
+net applies DuckDB's binary comparison, so `WHERE name = 'abc'` stops matching
+`'ABC'` on a CI collation. That contradicts the first line of the recon list
+below and `website/docs/reading/queries.md`, which promise NATIVE server
+semantics. Superset-and-re-check and native-by-default are mutually exclusive
+for SELECT: the native answer is 2, the range gives 3, the re-check gives 1.
+Either strict-by-default is adopted deliberately (and this list, the docs and a
+release note change with it) or SELECT must push the exact predicate. **Not yet
+answered — do not design relocation-vs-reduction on top of it until it is.**
 
 ## Order of battle (dependency-honest)
 
@@ -136,7 +154,7 @@ Either way: do not design relocation-vs-reduction before settling this.
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
-061 — independent today; PROPOSED to gate W1 (see OPEN DECISION above), UNDECIDED
-join/agg — after 066 (+ #242, now closed); and after the 061/W1 decision, which
-           determines whether it can rely on planner-visible filters at all
+061 (collation-faithful, #277) ──► W1 restriction ──► planner-visible filters ──► DML-collapse + join/agg
+join/agg — after 066 (+ #242, now closed) and after 061 → W1, which is what
+           makes planner-visible filters available to it at all
 ```
