@@ -892,11 +892,22 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 // pushdown_complex_filter FIRST over every pending filter, with this same
 // encoder and this same context, and erases everything it can render;
 // TryPushdownGenericExpression then only offers what that pass refused — which
-// the dry-run below refuses again by construction. Keeping both is deliberate
-// for now: restricting ComplexFilterPushdown to hand single-column expressions
-// over would lose pushdown for the shapes the combiner itself declines
-// (volatile, oversized IN, and any CanThrow expression when there is more than
-// one filter). See specs/070-duckdb-v2-followups/spec.md, W1 outcome.
+// the dry-run below refuses again by construction.
+//
+// MEASURED SINCE (roadmap v0.3.0, branch spec/070-w1-measure-shadowing): the
+// reason first given for keeping both — that restricting ComplexFilterPushdown
+// would lose pushdown for the shapes the combiner itself declines (volatile,
+// oversized IN, CanThrow with more than one filter) — DID NOT REPRODUCE. Every
+// one of those still reached the server. Do not re-derive it.
+//
+// The real blocker is semantic. Stop claiming a predicate here and the combiner
+// rewrites it before offering it: prefix() becomes a >=/< RANGE, which is exact
+// for DuckDB's binary comparison and NOT for SQL Server's collation ('ñu' sorts
+// between 'n' and 'o' on the default _CI_AS, so LIKE N'n%' returns 2 rows and
+// the range returns 3). Refusing the range instead pushes nothing at all and
+// the client net applies DuckDB semantics — 1 row — which breaks the
+// native-server-semantics contract just as surely. Pinned by
+// test/sql/catalog/like_pushdown_collation.test. Gated on spec 061.
 static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	if (!get.bind_data) {
 		return false;
@@ -1006,10 +1017,14 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 		row_count = filtered;
 	}
 
-	// TOP N is a HARD bound, not an estimate: the server cannot return more.
-	// Reported as max_cardinality so the optimizer may rely on it. Set by our own
-	// OptimizerExtension, which DuckDB runs AFTER the join-order optimizer, so it
-	// is usually still 0 here — this pays off only for the estimates taken later.
+	// TOP N is a hard bound — the server cannot return more — so it is reported as
+	// max_cardinality. NOTE it is reported but effectively NOT CONSUMED today:
+	// max_cardinality from a table function is read only by StatisticsPropagator,
+	// which runs BEFORE the EXTENSION stage where MSSQLOptimizer sets top_n, and
+	// LogicalGet::EstimateCardinality discards max_cardinality entirely. So only
+	// the MinValue estimate clamp below can take effect, and only if top_n is
+	// somehow already set. Kept because it costs nothing and is correct the day
+	// something does consume it — but do not describe it as a delivered bound.
 	if (bind_data.top_n > 0) {
 		const idx_t top_n = static_cast<idx_t>(bind_data.top_n);
 		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> capped at TOP %llu", bind_data.schema_name.c_str(),
