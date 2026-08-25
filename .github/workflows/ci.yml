@@ -278,32 +278,40 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
-    # Also on a merge to `main` (issue #212 gap 1). A pull request never compiled
-    # the extension, so a C++ regression could reach main behind green checks —
-    # three times in one week when that issue was filed. Building on the merge
-    # catches it on main rather than at the next release, and costs nothing on
-    # the PRs themselves: the `push` trigger is `branches: [main]` and the
-    # workflow's `paths-ignore` keeps docs-only merges free.
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build) || github.event_name == 'schedule' || github.event_name == 'push' }}
+    # On a merge to `main` (issue #212 gap 1) AND on the pull request itself
+    # (issue #279). Building only on the merge turned a green PR into "nobody has
+    # compiled this yet" — the regression is still found, just after it has
+    # landed. #269, #270 and #274 all changed src/table_scan/ or src/copy/ and
+    # none was compiled by CI before merge.
+    #
+    # On a pull request this is LINUX ONLY, deliberately: it is the platform the
+    # integration lane needs anyway, and one compile per PR is the price of the
+    # check. macOS and Windows stay on merge/schedule/dispatch, where a
+    # platform-specific break is still caught before a release rather than at it.
+    # Docs-only PRs are already free via the workflow's `paths-ignore`.
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build)
+          || github.event_name == 'schedule'
+          || github.event_name == 'push'
+          || github.event_name == 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          # Linux x86_64 - with Docker support for integration tests
-          - id: linux_amd64
-            os: linux
-            arch: amd64
-            runner: ubuntu-22.04
-            docker_available: true
-            vcpkg_triplet: x64-linux
-
-          # macOS ARM64 - load-only testing
-          - id: osx_arm64
-            os: osx
-            arch: arm64
-            runner: macos-14
-            docker_available: false
-            vcpkg_triplet: arm64-osx
+        # Linux x86_64 (Docker, and what the integration lane consumes) plus
+        # macOS ARM64 (load-only). A PULL REQUEST builds Linux only (issue
+        # #279): it is the platform integration needs, and one compile per PR is
+        # the price of the check — macOS stays on merge / schedule / dispatch,
+        # where a platform-specific break is still caught before a release.
+        #
+        # Written as fromJSON rather than a condition on the job's `if`, because
+        # GitHub does NOT expose the `matrix` context to `jobs.<id>.if`. A
+        # `matrix.platform.id == '…'` test there evaluates to empty and the job
+        # silently never runs — the failure would look exactly like the coverage
+        # gap this is fixing.
+        platform: >-
+          ${{ github.event_name == 'pull_request'
+              && fromJSON('[{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"}]')
+              || fromJSON('[{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"},{"id":"osx_arm64","os":"osx","arch":"arm64","runner":"macos-14","docker_available":false,"vcpkg_triplet":"arm64-osx"}]') }}
 
     env:
       # Send vcpkg's binary cache to a directory actions/cache persists (see
@@ -769,11 +777,16 @@ jobs:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
     needs: build
-    # On a merge to `main` as well: the suite went from weekly to per-merge, which
-    # is what makes a SQL regression visible while the change is still fresh.
-    # Only worth having because the selection is fixed — this job used to report
-    # PASSED having run zero files (#212 gap 2).
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests) || github.event_name == 'schedule' || github.event_name == 'push' }}
+    # On a merge to `main`, and on the pull request itself (issue #279): the suite
+    # went from weekly to per-merge to per-PR, which is what makes a SQL
+    # regression visible while the change is still a proposal rather than
+    # history. Only worth having because the selection is fixed and floored —
+    # this job used to report PASSED having run zero files (#212 gap 2).
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests)
+          || github.event_name == 'schedule'
+          || github.event_name == 'push'
+          || github.event_name == 'pull_request' }}
 
     services:
       sqlserver:
