@@ -31,7 +31,7 @@ cut by then.
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main (ORDER BY only); widening proposed in #277 — **OPEN**, mechanism lives on that PR branch | nothing | M | oluies |
-| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured, gated on 061 | **061** | M | unassigned |
+| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string predicates only) | M | unassigned |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and 061 → W1, which is what makes planner-visible filters available to it — for non-string predicates now, for string comparisons after 061** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
@@ -97,8 +97,9 @@ and should not be carried forward.
 predicate into a range — `prefix(col,'n')` becomes `col >= 'n' AND col < 'o'`
 (`FilterCombiner::TryPushdownPrefixFilter`). Exact for DuckDB's binary string
 comparison; **not** exact for SQL Server, where the collation decides ordering.
-On `SQL_Latin1_General_CP1_CI_AS` — SQL Server's DEFAULT collation — `'ñu'`
-sorts between `'n'` and `'o'`, so the server's `LIKE N'n%'` returns 2 rows and
+On any collation whose ordering is not binary — e.g. the common
+`SQL_Latin1_General_CP1_CI_AS` install default — `'ñu'` sorts between `'n'` and
+`'o'`, so the server's `LIKE N'n%'` returns 2 rows and
 the range returns 3. `main` returns 2; the restricted build returns 3. Silent
 wrong rows, and the entire suite passed in that state (#276 adds the missing
 coverage).
@@ -132,7 +133,8 @@ real reason is worth carrying:
 predicate matching one row too many does not return an extra row — it
 **modifies data DuckDB would never have touched**. So the DML-collapse
 workstream (067, MERGE) needs the pushed predicate to be *exactly* equivalent,
-and on the default `_CI_AS` collation a string predicate is not. That is 061's
+and on any collation whose ordering is not binary — the common `_CI_AS` install
+default included — a string predicate is not. That is 061's
 job. For SELECT the same looseness is survivable, because a client pass can
 still fix it; for DML it is not survivable at all.
 
@@ -207,9 +209,8 @@ must all be revisited together — three surfaces now encode this dependency.
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
-061 (collation-faithful, #277) ──► W1 restriction (STRING predicates only; the
-                                   non-string half needs no gate) ──► planner-
-                                   visible filters ──► DML-collapse + join/agg
+061 (collation-faithful, #277) ──► W1 restriction, STRING half only ──► planner-visible filters ──► DML-collapse + join/agg
+    (W1's non-string half needs no gate and can be done today)
 join/agg — after 066 (+ #242, now closed) and after 061 → W1, which is what
            makes planner-visible filters available to it at all
 ```

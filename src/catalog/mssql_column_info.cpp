@@ -66,9 +66,16 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 
 LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 	// Only a bounded character column has anything to state. A MAX column
-	// (max_length -1) is already what a plain VARCHAR means, text/ntext are MAX
-	// by nature, and a column the scan has to CAST — geometry, hierarchyid,
-	// sql_variant — does not arrive as the type the catalog names anyway.
+	// (max_length -1) is already what a plain VARCHAR means, and a column the
+	// scan has to CAST — geometry, hierarchyid, sql_variant — does not arrive as
+	// the type the catalog names anyway.
+	//
+	// text/ntext are NOT caught by this guard, despite being MAX by nature:
+	// sys.columns reports max_length 16 for them (the pointer size — the same 16
+	// behind the text->16 CAST truncation), so they pass it and fall through the
+	// unmatched-type-name `else` in the switch below. Same outcome, different
+	// route — worth stating because the guard's clause list reads like a
+	// complete enumeration and is not one.
 	if (duckdb_type.id() != LogicalTypeId::VARCHAR || max_length <= 0 || is_cast_required || is_geometry) {
 		return duckdb_type;
 	}

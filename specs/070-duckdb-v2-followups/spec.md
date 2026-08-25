@@ -98,9 +98,12 @@ What actually delivers `year(dt) = 2024` today is the temporal-cast strip in
 `EncodeFunctionExpression`, reached through `ComplexFilterPushdown`; deleting
 the `func.pushdown_expression = ...` line leaves every test passing.
 
-Making the callback reachable means restricting `ComplexFilterPushdown` to the
-shapes the combiner will not offer (it offers only expressions referencing
-exactly ONE column binding).
+Making the callback reachable means restricting `ComplexFilterPushdown` to
+(i) the shapes the combiner will not offer (it offers only expressions
+referencing exactly ONE column binding) **and (ii) string-pattern expressions,
+which it must keep claiming until 061** — see the split below. Note that (ii)
+makes the restriction TYPE-aware rather than merely offer-aware: it has to hold
+on to shapes the combiner would happily take.
 
 **The measurement this section asked for has been run** (branch
 `spec/070-w1-measure-shadowing`; recorded in `docs/roadmap-v0.3.0.md`).
@@ -137,7 +140,9 @@ and the contract):
   what preserves both the seek and native semantics. They stay
   planner-invisible in the meantime; that is the accepted cost.
 
-Until then the registration is a no-op kept for the API surface, and the
+The registration is a no-op **today**, and stays one for string-pattern
+expressions until 061 — but the non-string half can lift it now, so this is not
+"blocked until 061". The
 encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
 asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
 (rows are identical whether the predicate ran on the server or in the spec-069
