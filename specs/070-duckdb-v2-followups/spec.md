@@ -114,17 +114,30 @@ one of those shapes still reached the server, including the cast-bearing
 `year(dt) = 2024` beside a second predicate that this text named. Do not
 re-derive it.
 
-**The real blocker is semantic, and is gated on spec 061.** Once
+**The real blocker is semantic, and it splits the work in two.** Once
 `ComplexFilterPushdown` stops claiming a predicate, the combiner rewrites it
 before offering it: `prefix()` becomes a `>=`/`<` RANGE, exact for DuckDB's
-binary comparison and NOT for SQL Server's collation. On the default `_CI_AS`,
-`'ñu'` sorts between `'n'` and `'o'`: the server's `LIKE N'n%'` returns 2 rows
-and the range returns 3. Refusing the range instead pushes nothing at all, and
-the client net then applies DuckDB semantics — 1 row — breaking the
+binary comparison and NOT for SQL Server's, on any collation whose ordering is
+not binary — e.g. the common `_CI_AS` install default, where `'ñu'` sorts
+between `'n'` and `'o'` and the server's `LIKE N'n%'` returns 2 rows while the
+range returns 3. Refusing the range instead pushes nothing at all, and the
+client net then applies DuckDB semantics — 1 row — breaking the
 native-server-semantics contract from the other side. Pinned by
 `test/sql/catalog/like_pushdown_collation.test`.
 
-Until 061 lands, the registration is a no-op kept for the API surface, and the
+So the restriction is NOT a single blanket change, and must not be implemented
+as one (that would land the "refuse" case above and lose both the Index Seek
+and the contract):
+
+- **Non-string predicates — available now, no 061 dependency.** Nothing rewrites
+  them into a collation-sensitive form, so they can be deferred to
+  `pushdown_expression` and become planner-visible.
+- **String-pattern expressions — must stay claimed by `ComplexFilterPushdown`
+  until 061.** That is what keeps the exact `LIKE` going to the server, which is
+  what preserves both the seek and native semantics. They stay
+  planner-invisible in the meantime; that is the accepted cost.
+
+Until then the registration is a no-op kept for the API surface, and the
 encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
 asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
 (rows are identical whether the predicate ran on the server or in the spec-069
