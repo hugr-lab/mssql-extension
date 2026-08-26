@@ -148,6 +148,25 @@ bool EncodesAsSearchCondition(const Expression &expr) {
 }
 }  // namespace
 
+// Every VALUE position goes through here (job 1191). T-SQL has no boolean value
+// type, so a search condition is illegal anywhere a value is expected —
+// `CASE … THEN [id] > 5`, `([a] > 1) IS NULL`, `[flag] = ([id] > 5)`,
+// `[x] BETWEEN ([a] > 1) AND …`, `LOWER([a] > 1)`. Each produces T-SQL the
+// server REJECTS, and because ComplexFilterPushdown erases the expression from
+// the DuckDB plan the query FAILS rather than degrading to the client net.
+//
+// The first fix guarded four such positions individually and left comparison
+// operands, BETWEEN and function arguments open — the same bug, three doors
+// down. One helper, routed everywhere, so the next value position cannot be
+// added without it. Predicate positions use EncodeSearchCondition instead.
+static ExpressionEncodeResult EncodeValueExpression(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	if (EncodesAsSearchCondition(expr)) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeValueExpression: refusing a search condition in value position");
+		return {"", false};
+	}
+	return FilterEncoder::EncodeExpression(expr, ctx);
+}
+
 //------------------------------------------------------------------------------
 // Utility Functions
 //------------------------------------------------------------------------------
@@ -671,7 +690,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 				arg = &cast_child;
 			}
 		}
-		auto result = EncodeExpression(*arg, child_ctx);
+		auto result = EncodeValueExpression(*arg, child_ctx);
 		if (!result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: argument encoding failed for %s", func_name.c_str());
 			return {"", false};
@@ -725,13 +744,13 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 
 	// Encode left and right sides
 	auto child_ctx = ctx.child();
-	auto left_result = EncodeExpression(left, child_ctx);
+	auto left_result = EncodeValueExpression(left, child_ctx);
 	if (!left_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: left side encoding failed");
 		return {"", false};
 	}
 
-	auto right_result = EncodeExpression(right, child_ctx);
+	auto right_result = EncodeValueExpression(right, child_ctx);
 	if (!right_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: right side encoding failed");
 		return {"", false};
@@ -767,12 +786,8 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		if (expr.GetChildren().size() != 1) {
 			return {"", false};
 		}
-		// Operand is VALUE position: `([a] > 1) IS NULL` is not T-SQL (job 1113).
-		if (EncodesAsSearchCondition(*expr.GetChildren()[0])) {
-			return {"", false};
-		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
+		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -783,12 +798,8 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		if (expr.GetChildren().size() != 1) {
 			return {"", false};
 		}
-		// Operand is VALUE position (job 1113).
-		if (EncodesAsSearchCondition(*expr.GetChildren()[0])) {
-			return {"", false};
-		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
+		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -825,11 +836,7 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 		// failure is the bad kind — ComplexFilterPushdown erases the expression
 		// from the plan, so the query FAILS instead of falling to the client net
 		// (job 1113).
-		if (EncodesAsSearchCondition(*check.then_expr)) {
-			MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: THEN is a search condition, not a value");
-			return {"", false};
-		}
-		auto then_result = EncodeExpression(*check.then_expr, child_ctx);
+		auto then_result = EncodeValueExpression(*check.then_expr, child_ctx);
 		if (!then_result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: THEN clause encoding failed");
 			return {"", false};
@@ -839,11 +846,7 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	}
 
 	// ELSE is VALUE position too — same refusal as THEN.
-	if (EncodesAsSearchCondition(expr.Else())) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: ELSE is a search condition, not a value");
-		return {"", false};
-	}
-	auto else_result = EncodeExpression(expr.Else(), child_ctx);
+	auto else_result = EncodeValueExpression(expr.Else(), child_ctx);
 	if (!else_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: ELSE clause encoding failed");
 		return {"", false};
@@ -864,21 +867,21 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	auto child_ctx = ctx.child();
 
 	// Encode the input expression (the column or expression being checked)
-	auto input_result = EncodeExpression(BoundBetweenExpression::Input(expr), child_ctx);
+	auto input_result = EncodeValueExpression(BoundBetweenExpression::Input(expr), child_ctx);
 	if (!input_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: input encoding failed");
 		return {"", false};
 	}
 
 	// Encode the lower bound
-	auto lower_result = EncodeExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
+	auto lower_result = EncodeValueExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
 	if (!lower_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
 		return {"", false};
 	}
 
 	// Encode the upper bound
-	auto upper_result = EncodeExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
+	auto upper_result = EncodeValueExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
 	if (!upper_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");
 		return {"", false};

@@ -84,9 +84,11 @@ so single-column predicates fall through to `pushdown_expression` and survive
 as EXPRESSION_FILTERs. Measured on branch `spec/070-w1-measure-shadowing`
 against a live server.
 
-**Most of it worked.** No pushdown was lost — every shape DuckDB's combiner
-gates still reached the server (`IN` at the 6-value threshold,
-`year(dt) = 2024` beside a second predicate). The planner could finally see
+**Most of it worked.** Nothing was lost to the combiner's own GATES — every
+shape they decline still reached the server (`IN` at the 6-value threshold,
+`year(dt) = 2024` beside a second predicate). That is the scoped claim; the
+unscoped "no pushdown lost" it was first written as is false, for the two
+classes below. The planner could finally see
 predicates: `EXPLAIN` showed `Filters: id < 100` on the scan with real
 selectivity. Full suite green. **The objection recorded in #269 — that the
 combiner's gates (volatile, oversized `IN`, `CanThrow() && filters.size() > 1`)
@@ -97,16 +99,25 @@ wrong and should not be carried forward.
 is false** (roborev job 1130, verified against the source). Two classes DO lose,
 neither of them tested by that measurement:
 
-- **Relaxation-only shapes.** `GenerateTableScanFilters` returns
-  `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
+- **Partially-pushed shapes**, and the outcome is worse than "a widened range"
+  for most of them. `GenerateTableScanFilters` returns
+  `PUSHED_DOWN_PARTIALLY` for `LIKE`-prefix, OR-chains, non-dense `IN` and
   temporal-cast filters, and `pushdown_get.cpp` then SKIPS
-  `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN`. So the server
-  receives only the combiner's *relaxation* — prefix bounds, an optional filter,
-  margin-adjusted temporal bounds — and the exact predicate stays above the
-  scan. The `LIKE` result recorded above as "reached the server" was in fact
-  `[name] >= N'n' AND [name] < N'o'`: the relaxation, not the predicate.
-  `WHERE name LIKE 'ab%cd'` over 200k rows streams the whole `ab` prefix range
-  to the client.
+  `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN`. Two different
+  results follow, and only one is a relaxation:
+  - **`LIKE`-prefix** pushes plain comparison bounds the encoder can render, so
+    the server does get `[name] >= N'n' AND [name] < N'o'` — a genuine
+    relaxation, with the exact predicate left above the scan. But this shape is
+    a STRING predicate and is therefore already excluded by the (a)/061 gate
+    below, so it adds nothing new.
+  - **OR-chains, non-dense `IN` and temporal-cast** push through
+    `CreateOptionalExpressionFilter`, i.e. an `ExpressionFilter` wrapping the
+    `optional_filter` scalar function with its real predicate in
+    `OptionalFilterFunctionData`. `EncodeFunctionExpression` has no mapping for
+    that name and refuses, so the scan pushes **NOTHING AT ALL** and sets
+    `needs_duckdb_filter` — a full table stream, not a widened range. These are
+    non-string and otherwise deferrable today, so they are the genuinely new
+    exclusion.
 - **`rowid` predicates lose pushdown entirely.** A rowid filter is
   single-column, so it defers — but `FilterEncoder::Encode` refuses every
   virtual column (`table_col_idx >= VIRTUAL_COL_START`) and routes it to the

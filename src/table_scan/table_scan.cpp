@@ -903,11 +903,14 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 //
 // That is NOT the same as "no pushdown lost" (job 1130). Two classes DO lose and
 // any deferral must exclude them:
-//   * relaxation-only shapes — GenerateTableScanFilters returns
-//     PUSHED_DOWN_PARTIALLY for LIKE / OR-chains / non-dense IN / temporal-cast,
-//     and pushdown_get.cpp then SKIPS TryPushdownGenericExpression, so only the
-//     combiner's relaxation reaches the server and the exact predicate stays
-//     above the scan;
+//   * partially-pushed shapes — GenerateTableScanFilters returns
+//     PUSHED_DOWN_PARTIALLY for LIKE-prefix / OR-chains / non-dense IN /
+//     temporal-cast, and pushdown_get.cpp then SKIPS
+//     TryPushdownGenericExpression. LIKE-prefix pushes comparison bounds the
+//     encoder can render (a real relaxation, but it is a string predicate and
+//     already excluded below). The other three push an `optional_filter` scalar
+//     function the encoder has NO mapping for, so it refuses and the scan pushes
+//     NOTHING — a full table stream, not a widened range;
 //   * rowid — single-column, so it would defer, but FilterEncoder::Encode
 //     refuses virtual columns while EncodeColumnRef (reached only through THIS
 //     path) rewrites rowid to the scalar PK. `rowid > 100` would go from
@@ -1022,6 +1025,12 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 		row_count = table_entry->GetApproxRowCount();
 		if (row_count == 0) {
 			auto &stats_provider = table_entry->GetMSSQLCatalog().GetStatisticsProvider();
+			// Apply the documented TTL at the POINT OF USE (job 1193). Setting it
+			// only in RefreshCache meant `SET mssql_statistics_cache_ttl_seconds = 0`
+			// — the documented way to disable statistics caching — had no effect on
+			// any query unless the user also called mssql_refresh_cache(), which is
+			// not how the setting reads. This is a mutex and an assignment.
+			stats_provider.SetCacheTTL(LoadStatisticsCacheTTL(context));
 			stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name, row_count);
 		}
 	} catch (...) {
@@ -1080,12 +1089,20 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 	// somehow already set. Kept because it costs nothing and is correct the day
 	// something does consume it — but do not describe it as a delivered bound.
 	//
-	// NOT OBSERVABLE IN A PLAN TODAY, measured: `ORDER BY id LIMIT 10` over a
-	// 200000-row table keeps a Top N operator ABOVE the scan and the scan still
-	// reports the full count, with mssql_order_pushdown true as well as false. So
-	// the clamp below is correct but currently unreachable in practice; an
-	// EXPLAIN test for it fails for the wrong reason, which is why there is none
-	// in scan_cardinality.test (job 1127).
+	// The clamp below is therefore correct but currently unreachable, and the
+	// reason is the STAGE ORDER stated above — not anything about a particular
+	// fixture (job 1197). Optimizer extensions run after RunBuiltInOptimizers, so
+	// the get's estimate is already taken by the time MSSQLOptimizer could set
+	// top_n.
+	//
+	// An earlier version of this comment said `ORDER BY id LIMIT 10` "keeps a Top
+	// N above the scan, with mssql_order_pushdown true as well as false" and
+	// presented that as a general rule. It is not: that measurement used
+	// CardScanBig, which COPY creates with every column NULLABLE, and DuckDB's
+	// default NULLS LAST for ASC then fails IsNullOrderCompatible — so TryPushTopN
+	// bailed before touching top_n. Against a NOT NULL column the TopN WOULD fold
+	// and top_n WOULD be set. The conclusion survives; the reason given for it did
+	// not. That is why scan_cardinality.test carries no EXPLAIN assertion here.
 	if (bind_data.top_n > 0) {
 		const idx_t top_n = static_cast<idx_t>(bind_data.top_n);
 		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> capped at TOP %llu", bind_data.schema_name.c_str(),

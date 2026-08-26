@@ -121,13 +121,16 @@ SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.i
 # worse than no estimate did, and turning it off restores the old ~1 row.
 # -----------------------------------------------------------------------------
 # (No TOP-N assertion here, deliberately. The clamp in MSSQLCatalogScanCardinality
-# is real, but I could not construct a plan in which it is OBSERVABLE: measured
-# on this fixture, `ORDER BY id LIMIT 10` keeps a Top N operator above the scan
-# and the scan still reports the full count — with `mssql_order_pushdown = true`
-# as well as with the default false. So the premise that MSSQLOptimizer folds the
-# TopN into the scan and leaves the get over-estimating does not reproduce, and a
-# test asserting it fails for the wrong reason. Recorded in the code comment
-# instead, which is what job 1127 suggested for exactly this outcome.)
+# is real but unreachable, because optimizer EXTENSIONS run after the built-in
+# passes — the get's estimate is already taken by the time MSSQLOptimizer could
+# set `top_n`. That is a stage-order property, not a property of this fixture.
+#
+# Measuring it here would also mislead: CardScanBig is COPY-created, so every
+# column is NULLABLE, and DuckDB's default NULLS LAST for ASC fails
+# IsNullOrderCompatible — TryPushTopN bails before touching `top_n` for a reason
+# that has nothing to do with the clamp. Against a NOT NULL column the TopN would
+# fold. So an EXPLAIN assertion here would pass or fail for the wrong reason
+# either way (jobs 1127, 1197).)
 
 # -----------------------------------------------------------------------------
 # A count of 0 means UNKNOWN, not empty — the rule with the largest blast radius

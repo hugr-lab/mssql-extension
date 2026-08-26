@@ -1123,6 +1123,15 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 	if (it != schema_entries_.end()) {
 		it->second->GetTableSet().Invalidate();
 	}
+
+	// And its row counts (job 1193). THIS is the path almost every size-changing
+	// event takes — COPY/bulk load, CTAS, CREATE/DROP TABLE, and the two-argument
+	// mssql_invalidate_cache(ctx, schema) — so without it InvalidateSchema still
+	// had zero callers and a 1M-row COPY left the pre-load count driving plans
+	// (and duckdb_tables()) for the whole TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateSchema(schema_name);
+	}
 }
 
 void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string &table_name) {

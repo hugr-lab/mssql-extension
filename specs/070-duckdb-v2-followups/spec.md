@@ -141,13 +141,17 @@ re-derive it.
 recorded and is false** (job 1130, verified against the source). Two classes
 lose and must be EXCLUDED from any deferral:
 
-1. **Relaxation-only shapes.** `GenerateTableScanFilters` returns
-   `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
-   temporal-cast filters, and `pushdown_get.cpp` skips
-   `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN` — so the server
-   gets the combiner's relaxation (prefix bounds, an optional filter) while the
-   exact predicate stays above the scan. `WHERE name LIKE 'ab%cd'` sends
-   `[name] >= 'ab' AND [name] < 'ac'` and streams the prefix range.
+1. **Partially-pushed shapes**, with a worse outcome than "a widened range" for
+   most of them. `GenerateTableScanFilters` returns `PUSHED_DOWN_PARTIALLY` for
+   `LIKE`-prefix, OR-chains, non-dense `IN` and temporal-cast filters, and
+   `pushdown_get.cpp` skips `TryPushdownGenericExpression` for anything not
+   `NO_PUSHDOWN`. `LIKE`-prefix pushes plain comparison bounds the encoder can
+   render (a real relaxation — but it is a string predicate, already excluded by
+   the split below). The other three push through
+   `CreateOptionalExpressionFilter`, whose `optional_filter` scalar function has
+   no mapping, so the encoder refuses and the scan pushes **nothing at all** —
+   a full table stream. Those three are non-string and otherwise deferrable, so
+   they are the genuinely new exclusion.
 2. **`rowid`.** Single-column, so it defers — but `FilterEncoder::Encode`
    refuses virtual columns outright, while `ComplexFilterPushdown` reached
    `EncodeColumnRef`, which rewrites rowid to the scalar PK. `WHERE rowid > 100`
