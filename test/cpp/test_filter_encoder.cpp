@@ -264,6 +264,61 @@ static void TestModuloOperandTypes() {
 }
 
 //==============================================================================
+// Test: a search condition is illegal in VALUE position — the mirror of the
+// CASE WHEN case, and the same bad failure mode (job 1113).
+//
+// `CASE WHEN flag THEN id > 5 ELSE id < 2 END` encodes to
+// `CASE WHEN ([flag] = 1) THEN ([id] > 5) ELSE ([id] < 2) END`, which SQL Server
+// rejects with "Incorrect syntax near '>'". Because ComplexFilterPushdown erases
+// the expression from the DuckDB plan, the query FAILS rather than degrading to
+// the client filter net.
+//==============================================================================
+static void TestSearchConditionRefusedInValuePosition() {
+	std::cout << "  TestSearchConditionRefusedInValuePosition..." << std::endl;
+	Fixture fx;
+	auto ctx = fx.Context();
+
+	// CASE WHEN flag THEN (id > 5) ELSE (id < 2) END  — conditions in THEN/ELSE
+	auto then_cond = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, ColRef(fx, COL_ID),
+													   Const(Value::INTEGER(5)));
+	auto else_cond = BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHAN, ColRef(fx, COL_ID),
+													   Const(Value::INTEGER(2)));
+	auto case_expr = make_uniq<BoundCaseExpression>(ColRef(fx, COL_FLAG), std::move(then_cond), std::move(else_cond));
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*case_expr, ctx));
+
+	// (id > 5) IS NULL — condition as the IS NULL operand
+	auto isnull = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	isnull->GetChildrenMutable().push_back(BoundComparisonExpression::Create(
+		ExpressionType::COMPARE_GREATERTHAN, ColRef(fx, COL_ID), Const(Value::INTEGER(5))));
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*isnull, ctx));
+
+	// The legal shape still encodes: values in THEN/ELSE.
+	auto ok_case = make_uniq<BoundCaseExpression>(ColRef(fx, COL_FLAG), ColRef(fx, COL_ID), Const(Value::INTEGER(0)));
+	auto ok_cmp = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(ok_case),
+													Const(Value::INTEGER(0)));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*ok_cmp, ctx), "(CASE WHEN ([flag] = 1) THEN [id] ELSE 0 END > 0)");
+}
+
+//==============================================================================
+// Test: modulo pushes for exact integers only — T-SQL rejects float, real AND
+// money (8117), and money reaches the encoder as DECIMAL, indistinguishable from
+// a real decimal (job 1113).
+//==============================================================================
+static void TestModuloExactIntegersOnly() {
+	std::cout << "  TestModuloExactIntegersOnly..." << std::endl;
+	Fixture fx;
+	auto ctx = fx.Context();
+
+	// DECIMAL is refused: a money column arrives as DECIMAL(19,4) and T-SQL's %
+	// rejects it, so the encoder cannot tell a pushable decimal from a money one.
+	auto dec = Call2("%", LogicalType::DECIMAL(19, 4), LogicalType::DECIMAL(19, 4), LogicalType::DECIMAL(19, 4),
+					 Const(Value::DECIMAL(int64_t(100), 19, 4)), Const(Value::DECIMAL(int64_t(20), 19, 4)));
+	auto dec_cmp = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(dec),
+													 Const(Value::DECIMAL(int64_t(0), 19, 4)));
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*dec_cmp, ctx));
+}
+
+//==============================================================================
 // Main
 //==============================================================================
 int main() {
@@ -275,6 +330,8 @@ int main() {
 	TestCaseWhenIsPredicatePosition();
 	TestDivergingFunctionsNotMapped();
 	TestModuloOperandTypes();
+	TestSearchConditionRefusedInValuePosition();
+	TestModuloExactIntegersOnly();
 
 	std::cout << "All FilterEncoder tests PASSED!" << std::endl;
 	return 0;

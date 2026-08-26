@@ -98,6 +98,38 @@ inline uint64_t MSSQLDeriveWriterLimit(int64_t configured, uint64_t thread_count
 //! temp table (`##name`) is visible to every session, so it keeps N writers —
 //! which is the workflow issue #189 asks for, and passing an accessor that
 //! merges the two would serialise it for no reason.
+//! Rows the spec 070 W2 warm-up gate holds extra bulk-load writers for. 0 means
+//! the gate is open — claim immediately.
+//!
+//! Pure so it can be tested at its boundaries without a server; the gate's
+//! failure mode is SILENT (writers that never open, or open too early and land
+//! everything in the delta store uncompressed), so an integration test that
+//! nobody routinely runs is not coverage. See test/cpp/test_load_policy.cpp.
+//!
+//! The threshold is SQL Server's own rowgroup constant, never the user's
+//! `flush_rows` — keying it on the setting let `flush_rows = 1000000` serialize
+//! the first million rows onto one writer (PR #270 review).
+//!
+//! `flush_rows == 0` means NO INTERMEDIATE FLUSH — one unbounded batch per
+//! writer — NOT "batches too small to compress". It is the case the gate matters
+//! MOST for: every writer's single end-of-load batch can compress, and the gate
+//! is what decides how many of them clear the threshold. Treating 0 as
+//! sub-threshold (it compares numerically less) opened the gate immediately and
+//! sent four uncompressed part-batches to a columnstore target — precisely what
+//! W2 exists to prevent (job 1116).
+inline uint64_t MSSQLWarmupGateRows(bool warmup_gate, uint64_t flush_rows, uint64_t rowgroup_rows) {
+	if (!warmup_gate) {
+		return 0;  // heap target: no compression to protect, fan out immediately
+	}
+	if (flush_rows == 0) {
+		return rowgroup_rows;  // unbounded batch — gate applies
+	}
+	if (flush_rows < rowgroup_rows) {
+		return 0;  // no batch can reach a compressed rowgroup; nothing to protect
+	}
+	return rowgroup_rows;
+}
+
 inline MSSQLLoadPolicy MSSQLResolveLoadPolicy(bool target_is_session_scoped, bool in_transaction,
 											  MSSQLLoadTransactionRole role, int64_t configured_writers,
 											  uint64_t thread_count) {

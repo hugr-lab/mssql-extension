@@ -170,12 +170,52 @@ static void TestPinnedImpliesExactlyOneWriter() {
 	std::cout << "ok: " << checked << " combinations, Pinned always alone and max_writers never 0\n";
 }
 
+//==============================================================================
+// Spec 070 W2: the warm-up gate threshold (job 1116)
+//
+// Pure, branch-free, and its failure mode is SILENT — a gate that never opens
+// serializes a whole load onto one writer; one that opens too early lands
+// everything in a columnstore delta store uncompressed. Both look like success.
+// The integration test covering it needs a live server and is not on the default
+// CI path, so the boundaries are pinned here.
+//==============================================================================
+static void CheckGate(const char *what, uint64_t actual, uint64_t want, const char *why) {
+	if (actual != want) {
+		std::cerr << "FAIL: " << what << " -> " << actual << ", expected " << want << " (" << why << ")\n";
+		++g_failures;
+	} else {
+		std::cout << "ok: " << what << " -> " << actual << " (" << why << ")\n";
+	}
+}
+
+static void TestWarmupGateRows() {
+	constexpr uint64_t RG = 102400;  // MSSQL_COLUMNSTORE_ROWGROUP_ROWS
+
+	CheckGate("heap, flush 102400", MSSQLWarmupGateRows(false, 102400, RG), 0,
+			  "no compression to protect — fan out immediately");
+	CheckGate("heap, flush 0", MSSQLWarmupGateRows(false, 0, RG), 0, "same, whatever the batch size");
+
+	CheckGate("columnstore, flush 50000", MSSQLWarmupGateRows(true, 50000, RG), 0,
+			  "no batch can reach a compressed rowgroup — nothing to protect");
+	CheckGate("columnstore, flush 1", MSSQLWarmupGateRows(true, 1, RG), 0, "same");
+
+	CheckGate("columnstore, flush 102400", MSSQLWarmupGateRows(true, RG, RG), RG, "exactly at the threshold");
+	CheckGate("columnstore, flush 1000000", MSSQLWarmupGateRows(true, 1000000, RG), RG,
+			  "the SERVER's constant, never the setting — keying it on flush_rows "
+			  "serialized the first million rows onto one writer (PR #270)");
+
+	CheckGate("columnstore, flush 0", MSSQLWarmupGateRows(true, 0, RG), RG,
+			  "0 is UNBOUNDED, not sub-threshold: one batch per writer, which CAN "
+			  "compress, so the gate applies (job 1116)");
+}
+
 int main() {
 	std::cout << "== MSSQLResolveLoadPolicy unit tests (spec 063 D1) ==\n";
 	TestTheFourConsumers();
 	TestSessionScopedTarget();
 	TestWriterLimitDerivation();
 	TestPinnedImpliesExactlyOneWriter();
+	TestWarmupGateRows();
 	if (g_failures == 0) {
 		std::cout << "\nAll load-policy tests passed.\n";
 		return 0;
