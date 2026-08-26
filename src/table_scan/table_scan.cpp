@@ -18,6 +18,7 @@
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -923,12 +924,20 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 // contract just as surely. Pinned by
 // test/sql/catalog/like_pushdown_collation.test.
 //
-//   NON-STRING predicates  — safe to defer to pushdown_expression today.
-//   STRING-PATTERN expressions — must stay claimed HERE until spec 061 supplies
-//                                a collation-faithful form; that is what keeps
-//                                the exact LIKE (and the Index Seek) going to
-//                                the server. They stay planner-invisible until
-//                                then, which is the accepted cost.
+//   NON-STRING predicates — safe to defer to pushdown_expression today.
+//   Predicates over a COLLATED STRING COLUMN — comparisons as well as patterns —
+//     must stay claimed HERE until spec 061 supplies a collation-faithful form.
+//     TWO hazards, not one (jobs 1183/1184), which is why the criterion is the
+//     column type and not the prefix() shape:
+//       1. TryPushdownPrefixFilter rewrites prefix() into a >=/< range under
+//          binary ordering — patterns only;
+//       2. once ANY string comparison is a VISIBLE filter, the combiner prunes
+//          contradictions and derives transitive predicates over its constants
+//          under BINARY semantics, on predicates this path used to erase before
+//          it ever saw them. `name = 'abc' AND name = 'ABC'` is contradictory
+//          under binary and satisfiable on _CI_AS, so it can be pruned to empty.
+//     `name = 'abc'` encodes identically either way; making it visible is what
+//     is not free. They stay planner-invisible until 061 — the accepted cost.
 static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	if (!get.bind_data) {
 		return false;
@@ -957,9 +966,18 @@ static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &ge
 //
 // Deliberately CHEAP and NON-THROWING. This runs inside the optimizer, once per
 // scan per plan, so unlike GetStorageInfo it does NOT acquire a connection to
-// query the DMV: it reads the statistics cache (which `PreloadRowCount` refreshes
-// after a bulk load) and falls back to the count the catalog already loaded with
-// the table metadata. A query must not pay a network round trip to be planned.
+// query the DMV: it reads the count the catalog already loaded with the table
+// metadata, falling back to the statistics cache. A query must not pay a network
+// round trip to be planned.
+//
+// Catalog count FIRST, deliberately (job 1124). The statistics cache used to be
+// preferred on the grounds that `PreloadRowCount` refreshes it after a bulk load
+// — it does not: its only callers are metadata loads
+// (mssql_preload_catalog.cpp, mssql_table_set.cpp), both feeding it the same
+// approx_row_count the catalog entry already carries. No COPY/BCP path touches
+// it. And until job 1124 that cache was invalidated by nothing, so a stale count
+// outlived an explicit mssql_invalidate_cache(). The catalog count is refreshed
+// by the metadata reload, which is the thing a user can actually trigger.
 //
 // Returning nullptr means "no estimate" — the pre-existing behaviour — and is the
 // answer whenever the count is 0, because 0 CANNOT BE DISTINGUISHED FROM UNKNOWN
@@ -981,21 +999,30 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 	if (!bind_data.table_entry) {
 		return nullptr;
 	}
+	// static_cast, not dynamic_cast: the codebase avoids RTTI across the extension
+	// boundary (see mssql_storage.cpp:189 and azure_secret_reader.cpp:42, both of
+	// which say so), and a dynamic_cast here would reintroduce it on the planning
+	// path — job 1124. The catalog type is checked first, which is the same
+	// discriminator mssql_optimizer.cpp:66 and mssql_diagnostic.cpp:288 use.
+	//
 	// const_cast: GetMSSQLCatalog()/GetApproxRowCount() are non-const accessors on
 	// the entry, and the bind data holds it as a const pointer. Nothing below
 	// mutates the entry.
-	auto *table_entry = dynamic_cast<MSSQLTableEntry *>(const_cast<TableCatalogEntry *>(bind_data.table_entry.get()));
-	if (!table_entry) {
+	auto *entry_base = const_cast<TableCatalogEntry *>(bind_data.table_entry.get());
+	if (entry_base->ParentCatalog().GetCatalogType() != "mssql") {
 		return nullptr;
 	}
+	auto *table_entry = static_cast<MSSQLTableEntry *>(entry_base);
 
 	idx_t row_count = 0;
 	try {
-		// Fresher than the catalog metadata when a load has happened since, and
-		// free — TryGetCachedRowCount never opens a connection.
-		auto &stats_provider = table_entry->GetMSSQLCatalog().GetStatisticsProvider();
-		if (!stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name, row_count)) {
-			row_count = table_entry->GetApproxRowCount();
+		// The catalog's own count first — it is what a metadata refresh updates.
+		// The statistics cache only as a fallback, for the DMV-sourced count when
+		// the catalog has none.
+		row_count = table_entry->GetApproxRowCount();
+		if (row_count == 0) {
+			auto &stats_provider = table_entry->GetMSSQLCatalog().GetStatisticsProvider();
+			stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name, row_count);
 		}
 	} catch (...) {
 		// Planning must not fail because an estimate was unavailable.
@@ -1024,14 +1051,20 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 	// So this mirrors DuckDB's own fallback rather than inventing a number — the
 	// same 0.2 constant, applied for the same reason.
 	//
-	// DELETE THIS when the filters stay visible. If single-column expressions
-	// reached `pushdown_expression` instead (they cannot today — the complex-filter
-	// pass runs first and consumes them; see the reachability note above and PR
-	// #269), they would become EXPRESSION_FILTERs in `get.table_filters`, DuckDB
-	// would apply selectivity itself, and doing it here as well would double-count.
-	constexpr double DUCKDB_DEFAULT_SELECTIVITY = 0.2;
+	// DELETE THIS PER HALF, not all at once. If single-column expressions reached
+	// `pushdown_expression` they would become EXPRESSION_FILTERs in
+	// `get.table_filters`, DuckDB would apply selectivity itself, and doing it
+	// here too would DOUBLE-COUNT. But the split above means the two halves land
+	// at different times: when the NON-STRING half lands, this must stop applying
+	// to those predicates while still covering string ones (which remain in
+	// `complex_filter_where_clause`); only when the string half lands after 061
+	// does the whole block go. Keying it on `complex_filter_where_clause` being
+	// non-empty already does the right thing — that string holds exactly what
+	// ComplexFilterPushdown still claims — so the likely edit is deletion in one
+	// step at the END, not a flip in the middle.
 	if (!bind_data.complex_filter_where_clause.empty()) {
-		const idx_t filtered = MaxValue<idx_t>(static_cast<idx_t>(row_count * DUCKDB_DEFAULT_SELECTIVITY), 1);
+		const idx_t filtered =
+			MaxValue<idx_t>(static_cast<idx_t>(row_count * RelationStatisticsHelper::DEFAULT_SELECTIVITY), 1);
 		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> %llu rows (%llu * selectivity, WHERE %s)",
 							 bind_data.schema_name.c_str(), bind_data.table_name.c_str(), (unsigned long long)filtered,
 							 (unsigned long long)row_count, bind_data.complex_filter_where_clause.c_str());

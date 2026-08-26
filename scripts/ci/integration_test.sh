@@ -187,7 +187,12 @@ cd "$REPO_ROOT"
 # So the list is built from the files this repository actually owns, matched
 # against what the binary registered by SUFFIX, and passed with --input-file.
 # Whatever prefix the build used, our files are found or the script says so.
-MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-150}
+# Raised from 150 with the TLS fix (issue #278): the suite runs ~169 files, and a
+# floor of 150 could not see the four TLS files going missing — 163 sailed
+# through. This catches a selection that loses a handful, not just one that loses
+# everything. Keep it just under the real count; lower it deliberately, with a
+# reason, if files are genuinely removed.
+MIN_TEST_CASES=${MSSQL_MIN_TEST_CASES:-165}
 
 # Catch exits --list-tests with the NUMBER of tests listed, so a nonzero rc is
 # the success case. The real failure signal for "the binary cannot start"

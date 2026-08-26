@@ -1090,6 +1090,16 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 		metadata_cache_->Invalidate();
 	}
 
+	// The statistics cache too (job 1124). It was invalidated by NOTHING —
+	// InvalidateAll/InvalidateTable/InvalidateSchema had no callers at all — which
+	// was invisible while row counts fed only GetStorageInfo, a number the planner
+	// ignores for a table function. Since the spec-070 cardinality callback they
+	// ARE what the optimizer plans on, so a stale count now survives an explicit
+	// mssql_invalidate_cache() and drives join order for the whole TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateAll();
+	}
+
 	// Also clear the local schema entry cache.
 	// Spec 052 (Option D): in-flight binders are anchored in their
 	// ClientContext's MSSQLBindAnchors; dropping entries_ here just
@@ -1122,6 +1132,13 @@ void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string 
 		// ... and re-check the schema's table list for existence (CREATE/DROP/RENAME), but
 		// WITHOUT dropping every other table's cached columns.
 		metadata_cache_->InvalidateSchemaTableList(schema_name);
+	}
+
+	// Point-invalidate this table's row count as well (job 1124), so a DDL or a
+	// load that changes its size is reflected in the next plan rather than after
+	// the statistics TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateTable(schema_name, table_name);
 	}
 
 	// Evict the single bound entry from the schema's table set (keeps the rest).
@@ -1174,6 +1191,16 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// Load cache TTL and metadata timeout from settings
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+
+	// A refresh means "forget what you think you know", so the statistics cache
+	// is cleared with it — and this is the one place that can also apply the
+	// documented mssql_statistics_cache_ttl_seconds, which reached the provider
+	// through nothing before (SetCacheTTL had no callers either; the provider was
+	// constructed with the compiled-in default and stayed there) — job 1124.
+	if (statistics_provider_) {
+		statistics_provider_->SetCacheTTL(LoadStatisticsCacheTTL(context));
+		statistics_provider_->InvalidateAll();
+	}
 	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 
 	// Acquire connection for full cache refresh

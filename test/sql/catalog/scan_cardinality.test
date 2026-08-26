@@ -120,6 +120,46 @@ SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.i
 # before this callback; it is now the escape hatch if an estimate ever plans
 # worse than no estimate did, and turning it off restores the old ~1 row.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# TOP N clamps the estimate. This is the fix for the over-estimation finding on
+# the first cardinality commit, and it had no assertion — MSSQLOptimizer folds
+# the LogicalTopN INTO the scan and removes the node, so without the clamp the
+# scan claims the full table count for an operator that emits at most N.
+# -----------------------------------------------------------------------------
+query II
+EXPLAIN SELECT * FROM card.dbo.CardScanBig ORDER BY id LIMIT 10;
+----
+physical_plan	<!REGEX>:.*MSSQL_CATALOG_SCAN[^~]*~200[,.]?000 rows.*
+
+# -----------------------------------------------------------------------------
+# A count of 0 means UNKNOWN, not empty — the rule with the largest blast radius
+# and, until now, no assertion. A VIEW has no `sys.partitions` rows and reports
+# 0 while returning millions; reporting 0 would make the planner choose it as a
+# build side. The scan must therefore carry NO estimate for a view, not "~0".
+# -----------------------------------------------------------------------------
+statement ok
+SELECT mssql_exec('card', 'IF OBJECT_ID(''dbo.CardScanView'') IS NOT NULL DROP VIEW dbo.CardScanView');
+
+statement ok
+SELECT mssql_exec('card', 'CREATE VIEW dbo.CardScanView AS SELECT id, s FROM dbo.CardScanBig');
+
+statement ok
+SELECT mssql_refresh_cache('card');
+
+query II
+EXPLAIN SELECT count(*) FROM card.dbo.CardScanView;
+----
+physical_plan	<!REGEX>:.*MSSQL_CATALOG_SCAN[^~]*~0 rows.*
+
+# The view still returns its rows — the estimate is the only thing at issue.
+query I
+SELECT count(*) FROM card.dbo.CardScanView;
+----
+200000
+
+statement ok
+SELECT mssql_exec('card', 'DROP VIEW dbo.CardScanView');
+
 statement ok
 SET mssql_enable_statistics = false;
 
