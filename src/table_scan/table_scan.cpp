@@ -1079,6 +1079,13 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 	// the MinValue estimate clamp below can take effect, and only if top_n is
 	// somehow already set. Kept because it costs nothing and is correct the day
 	// something does consume it — but do not describe it as a delivered bound.
+	//
+	// NOT OBSERVABLE IN A PLAN TODAY, measured: `ORDER BY id LIMIT 10` over a
+	// 200000-row table keeps a Top N operator ABOVE the scan and the scan still
+	// reports the full count, with mssql_order_pushdown true as well as false. So
+	// the clamp below is correct but currently unreachable in practice; an
+	// EXPLAIN test for it fails for the wrong reason, which is why there is none
+	// in scan_cardinality.test (job 1127).
 	if (bind_data.top_n > 0) {
 		const idx_t top_n = static_cast<idx_t>(bind_data.top_n);
 		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> capped at TOP %llu", bind_data.schema_name.c_str(),

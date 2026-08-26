@@ -120,16 +120,14 @@ SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.i
 # before this callback; it is now the escape hatch if an estimate ever plans
 # worse than no estimate did, and turning it off restores the old ~1 row.
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# TOP N clamps the estimate. This is the fix for the over-estimation finding on
-# the first cardinality commit, and it had no assertion — MSSQLOptimizer folds
-# the LogicalTopN INTO the scan and removes the node, so without the clamp the
-# scan claims the full table count for an operator that emits at most N.
-# -----------------------------------------------------------------------------
-query II
-EXPLAIN SELECT * FROM card.dbo.CardScanBig ORDER BY id LIMIT 10;
-----
-physical_plan	<!REGEX>:.*MSSQL_CATALOG_SCAN[^~]*~200[,.]?000 rows.*
+# (No TOP-N assertion here, deliberately. The clamp in MSSQLCatalogScanCardinality
+# is real, but I could not construct a plan in which it is OBSERVABLE: measured
+# on this fixture, `ORDER BY id LIMIT 10` keeps a Top N operator above the scan
+# and the scan still reports the full count — with `mssql_order_pushdown = true`
+# as well as with the default false. So the premise that MSSQLOptimizer folds the
+# TopN into the scan and leaves the get over-estimating does not reproduce, and a
+# test asserting it fails for the wrong reason. Recorded in the code comment
+# instead, which is what job 1127 suggested for exactly this outcome.)
 
 # -----------------------------------------------------------------------------
 # A count of 0 means UNKNOWN, not empty — the rule with the largest blast radius
