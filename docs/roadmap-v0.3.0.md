@@ -31,8 +31,8 @@ cut by then.
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main (ORDER BY only); widening proposed in #277 — **OPEN**, mechanism lives on that PR branch | nothing | M | oluies |
-| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Gated on 061** — DuckDB's prefix→range rewrite is inexact against SQL Server collations, and the pushed predicate is not re-checked. Removing it is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured, gated on 061 | **061** | M | unassigned |
-| — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and the W1-restriction row above, which decides whether it can rely on planner-visible filters** | L | pair — design review together, then split |
+| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string predicates only) | M | unassigned |
+| — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and 061 → W1, which is what makes planner-visible filters available to it — for non-string predicates now, for string comparisons after 061** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
 Blocking prerequisite shared by 062 / 066 / 067 / join-relocation:
@@ -69,7 +69,7 @@ over 200000 rows estimated 200000, inside a join, with the join-order optimizer
 running.
 
 The mechanism is documented once, in
-[`DATAMODEL.md` — Layer 4 (Cache & registries)](../DATAMODEL.md) under the
+[`DATAMODEL.md` — Layer 4 (Cache & registries)](../DATAMODEL.md#layer-4--cache--registries) under the
 `MSSQLStatisticsProvider` bullets — it is expected to be DELETED when this is
 fixed, so it is not restated here. What belongs here is the consequence for
 sequencing.
@@ -97,20 +97,30 @@ and should not be carried forward.
 predicate into a range — `prefix(col,'n')` becomes `col >= 'n' AND col < 'o'`
 (`FilterCombiner::TryPushdownPrefixFilter`). Exact for DuckDB's binary string
 comparison; **not** exact for SQL Server, where the collation decides ordering.
-On `SQL_Latin1_General_CP1_CI_AS` — SQL Server's DEFAULT collation — `'ñu'`
-sorts between `'n'` and `'o'`, so the server's `LIKE N'n%'` returns 2 rows and
+On any collation whose ordering is not binary — e.g. the common
+`SQL_Latin1_General_CP1_CI_AS` install default — `'ñu'` sorts between `'n'` and
+`'o'`, so the server's `LIKE N'n%'` returns 2 rows and
 the range returns 3. `main` returns 2; the restricted build returns 3. Silent
 wrong rows, and the entire suite passed in that state (#276 adds the missing
 coverage).
 
-Blast radius is narrower than it first looks, but wider than "what CTAS
-creates": a column reported as `MSSQL_NVARCHAR(n)` (spec 060) is **accidentally
-immune**, because DuckDB reaches the VARCHAR overload through a no-op cast and
-`TryPushdownPrefixFilter` requires a bare `BOUND_COLUMN_REF`. Exposed is
-everything `MSSQLColumnInfo::NativeDuckDBType` reports as a plain type — every
-column with `max_length <= 0`, so `text` / `ntext` / `varchar(max)` /
-`nvarchar(max)` on PRE-EXISTING user tables as well as the `NVARCHAR(MAX)` that
-COPY and CTAS create by default, plus lengths outside the inline limits.
+Blast radius: a column reported as `MSSQL_NVARCHAR(n)` (spec 060) is
+**accidentally immune**, because DuckDB reaches the VARCHAR overload through a
+no-op cast and `TryPushdownPrefixFilter` requires a bare `BOUND_COLUMN_REF`.
+Exposed is everything `MSSQLColumnInfo::NativeDuckDBType` leaves as a plain
+VARCHAR:
+
+- MAX columns (`max_length <= 0`) — including the `NVARCHAR(MAX)` COPY and CTAS
+  create by default, and `varchar(max)` / `nvarchar(max)` on pre-existing tables;
+- `text` / `ntext`, which reach it with a type name it does not map at all and
+  fall through the final `else` — NOT via the `max_length <= 0` guard, since
+  `sys.columns` reports 16 for them (the pointer size, the same 16 behind the
+  known `text`→16 CAST truncation);
+- cast-required and geometry columns, and lengths outside the inline limits;
+- **and every string column, `NVARCHAR(100)` included, whenever
+  `mssql_catalog_native_types` is `false`** — `NativeDuckDBType` is only
+  consulted when that setting is on, so turning it off removes the immunity
+  wholesale.
 
 ### DECIDED (VGSML, #275 / #277) — yes, 061 gates W1. The reason is DML, not SELECT.
 
@@ -123,7 +133,8 @@ real reason is worth carrying:
 predicate matching one row too many does not return an extra row — it
 **modifies data DuckDB would never have touched**. So the DML-collapse
 workstream (067, MERGE) needs the pushed predicate to be *exactly* equivalent,
-and on the default `_CI_AS` collation a string predicate is not. That is 061's
+and on any collation whose ordering is not binary — the common `_CI_AS` install
+default included — a string predicate is not. That is 061's
 job. For SELECT the same looseness is survivable, because a client pass can
 still fix it; for DML it is not survivable at all.
 
@@ -181,13 +192,25 @@ only under the strict annotation — which narrows § 4.2. If DML is deliberatel
 strict, that must be stated outright, because a default that differs between
 SELECT and DML is the kind of thing discovered through someone's deleted rows.
 
+**This open question can withdraw one of the two reasons for the `061 → W1`
+edge, so do not treat that edge as fully settled.** The edge currently rests on
+DML exactness — "nothing downstream can re-check a server-side DML". If DML
+inherits native semantics by default, that requirement lapses and the `_BIN2`
+pair is needed only under the strict annotation. What survives either way is
+the mechanism-(a) reason: string comparisons cannot become planner-visible
+without a collation-faithful form. If the DML answer comes back "native
+everywhere", the W1 row, the order-of-battle edge, and the matching notes in
+`specs/070-duckdb-v2-followups/spec.md` and `src/table_scan/table_scan.cpp`
+must all be revisited together — three surfaces now encode this dependency.
+
 ## Order of battle (dependency-honest)
 
 ```text
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
-061 (collation-faithful, #277) ──► W1 restriction ──► planner-visible filters ──► DML-collapse + join/agg
+061 (collation-faithful, #277) ──► W1 restriction, STRING half only ──► planner-visible filters ──► DML-collapse + join/agg
+    (W1's non-string half needs no gate and can be done today)
 join/agg — after 066 (+ #242, now closed) and after 061 → W1, which is what
            makes planner-visible filters available to it at all
 ```

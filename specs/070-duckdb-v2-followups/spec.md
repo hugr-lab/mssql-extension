@@ -98,9 +98,12 @@ What actually delivers `year(dt) = 2024` today is the temporal-cast strip in
 `EncodeFunctionExpression`, reached through `ComplexFilterPushdown`; deleting
 the `func.pushdown_expression = ...` line leaves every test passing.
 
-Making the callback reachable means restricting `ComplexFilterPushdown` to the
-shapes the combiner will not offer (it offers only expressions referencing
-exactly ONE column binding).
+Making the callback reachable means restricting `ComplexFilterPushdown` to
+(i) the shapes the combiner will not offer (it offers only expressions
+referencing exactly ONE column binding) **and (ii) string-pattern expressions,
+which it must keep claiming until 061** — see the split below. Note that (ii)
+makes the restriction TYPE-aware rather than merely offer-aware: it has to hold
+on to shapes the combiner would happily take.
 
 **The measurement this section asked for has been run** (branch
 `spec/070-w1-measure-shadowing`; recorded in `docs/roadmap-v0.3.0.md`).
@@ -114,17 +117,32 @@ one of those shapes still reached the server, including the cast-bearing
 `year(dt) = 2024` beside a second predicate that this text named. Do not
 re-derive it.
 
-**The real blocker is semantic, and is gated on spec 061.** Once
+**The real blocker is semantic, and it splits the work in two.** Once
 `ComplexFilterPushdown` stops claiming a predicate, the combiner rewrites it
 before offering it: `prefix()` becomes a `>=`/`<` RANGE, exact for DuckDB's
-binary comparison and NOT for SQL Server's collation. On the default `_CI_AS`,
-`'ñu'` sorts between `'n'` and `'o'`: the server's `LIKE N'n%'` returns 2 rows
-and the range returns 3. Refusing the range instead pushes nothing at all, and
-the client net then applies DuckDB semantics — 1 row — breaking the
+binary comparison and NOT for SQL Server's, on any collation whose ordering is
+not binary — e.g. the common `_CI_AS` install default, where `'ñu'` sorts
+between `'n'` and `'o'` and the server's `LIKE N'n%'` returns 2 rows while the
+range returns 3. Refusing the range instead pushes nothing at all, and the
+client net then applies DuckDB semantics — 1 row — breaking the
 native-server-semantics contract from the other side. Pinned by
 `test/sql/catalog/like_pushdown_collation.test`.
 
-Until 061 lands, the registration is a no-op kept for the API surface, and the
+So the restriction is NOT a single blanket change, and must not be implemented
+as one (that would land the "refuse" case above and lose both the Index Seek
+and the contract):
+
+- **Non-string predicates — available now, no 061 dependency.** Nothing rewrites
+  them into a collation-sensitive form, so they can be deferred to
+  `pushdown_expression` and become planner-visible.
+- **String-pattern expressions — must stay claimed by `ComplexFilterPushdown`
+  until 061.** That is what keeps the exact `LIKE` going to the server, which is
+  what preserves both the seek and native semantics. They stay
+  planner-invisible in the meantime; that is the accepted cost.
+
+The registration is a no-op **today**, and stays one for string-pattern
+expressions until 061 — but the non-string half can lift it now, so this is not
+"blocked until 061". The
 encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
 asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see
 (rows are identical whether the predicate ran on the server or in the spec-069

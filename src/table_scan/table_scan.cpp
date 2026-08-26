@@ -900,14 +900,23 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 // oversized IN, CanThrow with more than one filter) — DID NOT REPRODUCE. Every
 // one of those still reached the server. Do not re-derive it.
 //
-// The real blocker is semantic. Stop claiming a predicate here and the combiner
-// rewrites it before offering it: prefix() becomes a >=/< RANGE, which is exact
-// for DuckDB's binary comparison and NOT for SQL Server's collation ('ñu' sorts
-// between 'n' and 'o' on the default _CI_AS, so LIKE N'n%' returns 2 rows and
-// the range returns 3). Refusing the range instead pushes nothing at all and
-// the client net applies DuckDB semantics — 1 row — which breaks the
-// native-server-semantics contract just as surely. Pinned by
-// test/sql/catalog/like_pushdown_collation.test. Gated on spec 061.
+// The real blocker is semantic, and it splits the work in two — do NOT lift this
+// as one blanket change. Stop claiming a predicate here and the combiner
+// rewrites it before offering it: prefix() becomes a >=/< RANGE, exact for
+// DuckDB's binary comparison and NOT for SQL Server's on any collation whose
+// ordering is not binary (e.g. the common _CI_AS install default, where 'ñu'
+// sorts between 'n' and 'o', so LIKE N'n%' returns 2 rows and the range
+// returns 3). Refusing the range instead pushes nothing at all and the client
+// net applies DuckDB semantics — 1 row — breaking the native-server-semantics
+// contract just as surely. Pinned by
+// test/sql/catalog/like_pushdown_collation.test.
+//
+//   NON-STRING predicates  — safe to defer to pushdown_expression today.
+//   STRING-PATTERN expressions — must stay claimed HERE until spec 061 supplies
+//                                a collation-faithful form; that is what keeps
+//                                the exact LIKE (and the Index Seek) going to
+//                                the server. They stay planner-invisible until
+//                                then, which is the accepted cost.
 static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	if (!get.bind_data) {
 		return false;
