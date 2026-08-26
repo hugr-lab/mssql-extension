@@ -56,6 +56,10 @@ cd "$(dirname "$0")/../.."
 # meant to skip the file. Anything NOT here must be exported by the Makefile.
 OPT_IN='^(AZURE_|MSSQL_COUNTERS$|MSSQL_KERBEROS_TEST$|MSSQL_WINSSPI_TEST$|MSSQL_NAMED_INSTANCE_HOST$)'
 
+# The OTHER lane that runs this suite. `make integration-test` is not what CI
+# uses; this is (.github/workflows/ci.yml, "Run integration tests").
+CI_LANE='scripts/ci/integration_test.sh'
+
 fail=0
 
 #===----------------------------------------------------------------------===#
@@ -84,16 +88,27 @@ for v in $vars; do
 	fi
 	# Assigned is not enough — an unexported make variable never reaches the
 	# test binary. Require an actual `export`.
-	if grep -qE "^export[[:space:]]+${v}([[:space:]]|=|:=|\?=|$)" Makefile; then
+	#
+	# And require it in BOTH lanes (issue #278). Two different things run this
+	# suite: `make integration-test` and, in CI, scripts/ci/integration_test.sh,
+	# which builds its own selection and exports its own environment. This check
+	# used to look only at the Makefile — so when MSSQL_TEST_DSN_TLS was fixed
+	# there, the four TLS files kept skipping in CI and this script kept printing
+	# OK. A variable exported in one lane and not the other is exactly the shape
+	# that produced that.
+	missing=""
+	grep -qE "^export[[:space:]]+${v}([[:space:]]|=|:=|\?=|$)" Makefile || missing="Makefile"
+	grep -qE "^export[[:space:]]+${v}=" "$CI_LANE" || missing="${missing:+${missing} and }${CI_LANE}"
+	if [ -z "$missing" ]; then
 		continue
 	fi
-	echo "check_require_env: ${v} is not exported by the Makefile — these files SKIP silently:" >&2
+	echo "check_require_env: ${v} is not exported by ${missing} — these files SKIP silently there:" >&2
 	echo "    ${files}" >&2
-	if grep -qE "^[[:space:]]*${v}[[:space:]]*[:?]?=" Makefile; then
+	if [ "$missing" = "Makefile" ] && grep -qE "^[[:space:]]*${v}[[:space:]]*[:?]?=" Makefile; then
 		echo "    (it IS assigned in the Makefile, but never exported — assignment alone" >&2
 		echo "     does not reach the child process.)" >&2
 	fi
-	echo "    Fix: 'export ${v}' in the Makefile, or add it to OPT_IN in $0" >&2
+	echo "    Fix: export it in BOTH the Makefile and ${CI_LANE}, or add it to OPT_IN in $0" >&2
 	fail=1
 done
 

@@ -44,6 +44,14 @@ export MSSQL_TESTDB_DSN="${MSSQL_TESTDB_DSN:-Server=${MSSQL_TEST_HOST},${MSSQL_T
 export MSSQL_TESTDB_URI="${MSSQL_TESTDB_URI:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB}"
 export MSSQL_TEST_SERVER="${MSSQL_TEST_SERVER:-$MSSQL_TEST_DSN}"
 export MSSQL_TEST_CONNECTION_STRING="${MSSQL_TEST_CONNECTION_STRING:-$MSSQL_TEST_DSN}"
+# Issue #278. The Makefile exports this; THIS lane did not, so the four TLS files
+# (tls_connection, tls_queries, tls_parallel, tls_multipacket) skipped on every
+# CI run while the job reported PASSED — 163 cases here against 167 locally, a
+# difference nothing was watching. The 2022 service container this job starts has
+# TLS on by default with a self-signed certificate (see tls_connection.test), so
+# there is nothing to opt into. check_require_env.sh now requires the export in
+# both lanes, and will fail if this line is removed.
+export MSSQL_TEST_DSN_TLS="${MSSQL_TEST_DSN_TLS:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/${MSSQL_TEST_DB}?encrypt=true}"
 
 if [[ -z "$DUCKDB_CLI" ]] || [[ -z "$EXTENSION_PATH" ]]; then
     echo "ERROR: Both arguments required" >&2
