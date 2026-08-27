@@ -81,6 +81,20 @@ public:
 	//! Try to get cached row count without connection (returns false if no valid cache entry)
 	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, idx_t &out_row_count);
 
+	//! Same, but judged against a CALLER-SUPPLIED TTL rather than the provider's.
+	//!
+	//! `mssql_statistics_cache_ttl_seconds` is a SESSION setting, and this
+	//! provider is one object shared by the whole catalog (job 1203). Calling
+	//! SetCacheTTL from a planning ClientContext therefore rewrote the TTL every
+	//! OTHER session sees — one session's `SET ... = 3600` handed every other
+	//! session a staleness window it never asked for, and `SET ... = 0` forced
+	//! them all onto the per-table DMV path. Pass the value in at the read
+	//! instead, so a session setting governs only that session's lookups.
+	//! SetCacheTTL stays for the ATTACH / RefreshCache path, which is catalog-wide
+	//! by nature.
+	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, int64_t ttl_seconds,
+							  idx_t &out_row_count);
+
 	//! Set the cache TTL
 	void SetCacheTTL(int64_t seconds);
 
@@ -93,6 +107,9 @@ private:
 
 	//! Check if cached statistics are still valid
 	bool IsCacheValid(const MSSQLTableStatistics &stats) const;
+
+	//! Same, against a caller-supplied TTL (see the TryGetCachedRowCount overload).
+	bool IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds) const;
 
 	//! Fetch row count from SQL Server
 	idx_t FetchRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name);

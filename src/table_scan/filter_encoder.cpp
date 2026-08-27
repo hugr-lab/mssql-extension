@@ -1035,7 +1035,11 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 
 	// Encode the column expression
 	auto child_ctx = ctx.child();
-	auto column_result = EncodeExpression(column_expr, child_ctx);
+	// Value position like every other (job 1203) — this was the one site the
+	// helper did not cover, which contradicted its own stated invariant. No live
+	// bug today (reaching it with a condition needs a BOOLEAN->VARCHAR cast, which
+	// the cast arm refuses), but it is the same "three doors down" shape.
+	auto column_result = EncodeValueExpression(column_expr, child_ctx);
 	if (!column_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: column encoding failed");
 		return {"", false};

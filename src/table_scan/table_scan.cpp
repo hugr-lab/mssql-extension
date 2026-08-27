@@ -1025,13 +1025,13 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 		row_count = table_entry->GetApproxRowCount();
 		if (row_count == 0) {
 			auto &stats_provider = table_entry->GetMSSQLCatalog().GetStatisticsProvider();
-			// Apply the documented TTL at the POINT OF USE (job 1193). Setting it
-			// only in RefreshCache meant `SET mssql_statistics_cache_ttl_seconds = 0`
-			// — the documented way to disable statistics caching — had no effect on
-			// any query unless the user also called mssql_refresh_cache(), which is
-			// not how the setting reads. This is a mutex and an assignment.
-			stats_provider.SetCacheTTL(LoadStatisticsCacheTTL(context));
-			stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name, row_count);
+			// Apply the documented TTL at the POINT OF USE (job 1193) — but PASS it
+			// in rather than calling SetCacheTTL (job 1203). The provider is one
+			// object per CATALOG while the setting is per SESSION, so mutating it
+			// from the planner let one session's `SET ... = 3600` hand every other
+			// session a staleness window it never asked for.
+			stats_provider.TryGetCachedRowCount(bind_data.schema_name, bind_data.table_name,
+												LoadStatisticsCacheTTL(context), row_count);
 		}
 	} catch (...) {
 		// Planning must not fail because an estimate was unavailable.

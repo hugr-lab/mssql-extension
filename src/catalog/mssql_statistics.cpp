@@ -116,6 +116,18 @@ bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, co
 	return false;
 }
 
+bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
+												   int64_t ttl_seconds, idx_t &out_row_count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto key = BuildCacheKey(schema_name, table_name);
+	auto it = cache_.find(key);
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds)) {
+		out_row_count = it->second.row_count;
+		return true;
+	}
+	return false;
+}
+
 void MSSQLStatisticsProvider::SetCacheTTL(int64_t seconds) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	cache_ttl_seconds_ = seconds;
@@ -135,19 +147,23 @@ string MSSQLStatisticsProvider::BuildCacheKey(const string &schema_name, const s
 }
 
 bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats) const {
+	return IsCacheValid(stats, cache_ttl_seconds_);
+}
+
+bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds) const {
 	if (!stats.is_valid) {
 		return false;
 	}
 
 	// TTL of 0 means no caching (always fetch fresh)
-	if (cache_ttl_seconds_ <= 0) {
+	if (ttl_seconds <= 0) {
 		return false;
 	}
 
 	auto now = std::chrono::steady_clock::now();
 	auto age = std::chrono::duration_cast<std::chrono::seconds>(now - stats.fetched_at).count();
 
-	return age < cache_ttl_seconds_;
+	return age < ttl_seconds;
 }
 
 idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, const string &schema_name,
