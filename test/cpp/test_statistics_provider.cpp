@@ -31,12 +31,9 @@ static void Check(const char *what, bool ok, const char *why) {
 	}
 }
 
-static void TestConstructionAndExplicitSet() {
+static void TestConstruction() {
 	MSSQLStatisticsProvider provider(300);
 	Check("constructed TTL is honoured", provider.GetCacheTTL() == 300, "300 in, 300 out");
-	provider.SetCacheTTL(600);
-	Check("SetCacheTTL still works as the catalog-wide knob", provider.GetCacheTTL() == 600,
-		  "explicit, not per-session");
 }
 
 static void TestInvalidationDoesNotCrash() {
@@ -63,22 +60,28 @@ static void TestCallerSuppliedTTLGovernsAndDoesNotLeak() {
 	provider.PreloadRowCount("dbo", "t", 42);
 
 	idx_t out = 0;
-	Check("3-arg read uses the provider's TTL", provider.TryGetCachedRowCount("dbo", "t", out) && out == 42,
-		  "300 s provider, fresh entry");
-
-	out = 0;
-	Check("a passed TTL of 0 refuses the same entry", !provider.TryGetCachedRowCount("dbo", "t", 0, out),
-		  "the caller's session disabled caching; the provider's 300 must not win");
+	Check("the read returns the preloaded count", provider.TryGetCachedRowCount("dbo", "t", 300, out) && out == 42,
+		  "fresh entry, generous TTL");
 
 	Check("the passed TTL did NOT mutate shared state", provider.GetCacheTTL() == 300,
 		  "one session's setting must not reach another's lookups (jobs 1203, 1216)");
 
-	// And the reverse direction: a provider that caches nothing must still honour
-	// a caller who wants caching.
+	// A CATALOG-SOURCED entry is exempt from the TTL: it is refreshed by
+	// invalidation, not by age. Ageing it out sent SHOW ALL TABLES to a per-table
+	// DMV query on a catalog that had just loaded every count (job 1217).
+	out = 0;
+	Check("a preloaded entry survives a TTL of 0", provider.TryGetCachedRowCount("dbo", "t", 0, out) && out == 42,
+		  "`SET ttl = 0` must mean 'always fresh', not 'N connections per listing'");
+
+	provider.InvalidateTable("dbo", "t");
+	out = 0;
+	Check("invalidation still clears a preloaded entry", !provider.TryGetCachedRowCount("dbo", "t", 0, out),
+		  "the exemption is from ageing, not from invalidation");
+
 	MSSQLStatisticsProvider strict(0);
 	strict.PreloadRowCount("dbo", "t", 7);
 	out = 0;
-	Check("a passed TTL of 3600 accepts on a 0-TTL provider",
+	Check("a 0-TTL provider still serves a caller-supplied read",
 		  strict.TryGetCachedRowCount("dbo", "t", 3600, out) && out == 7,
 		  "the read is governed by the argument, not the field");
 	Check("and still did not mutate it", strict.GetCacheTTL() == 0, "no write-back");
@@ -86,7 +89,7 @@ static void TestCallerSuppliedTTLGovernsAndDoesNotLeak() {
 
 int main() {
 	std::cout << "== MSSQLStatisticsProvider unit tests ==\n";
-	TestConstructionAndExplicitSet();
+	TestConstruction();
 	TestInvalidationDoesNotCrash();
 	TestCallerSuppliedTTLGovernsAndDoesNotLeak();
 	if (g_failures == 0) {

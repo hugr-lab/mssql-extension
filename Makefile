@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: azure-test test-cpp test-cpp-run vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -581,7 +581,7 @@ test-load-policy:
 # ---------------------------------------------------------------------------
 # Standalone C++ unit tests (no Catch, no SQL Server, own main()).
 #
-# These 12 files existed in test/cpp/ for a long time WITHOUT being built by
+# These files existed in test/cpp/ for a long time WITHOUT being built by
 # anything — not CMake, not this Makefile, not CI. Nothing compiled them, so
 # nothing noticed when the code moved underneath: four expectations were stale
 # (HUGEINT and INTERVAL "unsupported" since spec 045 made them DECIMAL(38,0) and
@@ -621,7 +621,14 @@ else
 STANDALONE_TEST_PLATFORM_LIBS := -lgssapi_krb5 -ldl -lrt
 endif
 
-test-cpp: release
+# `test-cpp` builds first; `test-cpp-run` assumes the archives already exist, so
+# CI can run the SAME list after its own cmake build without triggering a
+# rebuild. STANDALONE_TEST_SOURCES is then the single source of truth for what
+# gets run, locally and in CI (job 1217) — the CI job used to hand-enumerate a
+# subset, so tests added here did not gate a PR.
+test-cpp: release test-cpp-run
+
+test-cpp-run:
 	@echo "Building standalone C++ unit tests..."
 	@mkdir -p build/test
 	@if [ ! -f build/release/extension/mssql/libmssql_extension.a ]; then \

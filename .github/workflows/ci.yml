@@ -709,6 +709,17 @@ jobs:
           fi
           echo "OK: no gssapi/krb5 in DT_NEEDED — extension loads without the Kerberos runtime installed."
 
+      # The SAME list `make test-cpp` runs locally — STANDALONE_TEST_SOURCES —
+      # rather than a hand-enumerated subset (job 1217). The lightweight "C++
+      # Unit Tests" job earlier in this workflow compiles a handful of
+      # libduckdb-free files for fast PR feedback; it cannot link the ones that
+      # need the extension archive, so tests added to that list (e.g.
+      # test_filter_encoder, test_statistics_provider) gated nothing until this
+      # step existed. `test-cpp-run` skips the `release` prerequisite because the
+      # archives were just built above.
+      - name: Standalone C++ unit tests (make test-cpp-run)
+        run: make test-cpp-run
+
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
         with:
