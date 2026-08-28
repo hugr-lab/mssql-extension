@@ -615,10 +615,22 @@ STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
 STANDALONE_TEST_UNAME := $(shell uname -s)
+# GNU ld resolves archives in ONE pass and in order, so libmssql_extension.a is
+# scanned before libduckdb_static.a's generated_extension_loader.o pulls in a
+# reference to MssqlExtension's vtable — and the link dies with "undefined
+# reference to `vtable for duckdb::MssqlExtension'". macOS's ld64 is iterative by
+# default, which is why this target passed locally for its whole life and failed
+# the first time CI ran it on Linux (PR #283). ci.yml's hand-written
+# test_vector_encodings step already documented and worked around exactly this;
+# the Makefile did not, because nothing ran it on Linux.
 ifeq ($(STANDALONE_TEST_UNAME),Darwin)
 STANDALONE_TEST_PLATFORM_LIBS := -framework GSS -framework CoreFoundation -framework Security
+STANDALONE_TEST_GROUP_START :=
+STANDALONE_TEST_GROUP_END :=
 else
 STANDALONE_TEST_PLATFORM_LIBS := -lgssapi_krb5 -ldl -lrt
+STANDALONE_TEST_GROUP_START := -Wl,--start-group
+STANDALONE_TEST_GROUP_END := -Wl,--end-group
 endif
 
 # `test-cpp` builds first; `test-cpp-run` assumes the archives already exist, so
@@ -642,8 +654,9 @@ test-cpp-run:
 	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a"; \
 	for f in $(STANDALONE_TEST_SOURCES); do \
 		n=$$(basename $$f .cpp); \
-		$(CXX) $(STANDALONE_TEST_FLAGS) $(STANDALONE_TEST_INCLUDES) $$f $$libs $(STANDALONE_TEST_PLATFORM_LIBS) \
-		    -o build/test/$$n 2>build/test/$$n.log || { echo "  BUILD FAIL $$n (see build/test/$$n.log)"; fail=1; continue; }; \
+		$(CXX) $(STANDALONE_TEST_FLAGS) $(STANDALONE_TEST_INCLUDES) $$f \
+		    $(STANDALONE_TEST_GROUP_START) $$libs $(STANDALONE_TEST_GROUP_END) $(STANDALONE_TEST_PLATFORM_LIBS) \
+		    -o build/test/$$n 2>build/test/$$n.log || { echo "  BUILD FAIL $$n:"; tail -20 build/test/$$n.log; fail=1; continue; }; \
 		if build/test/$$n >build/test/$$n.out 2>&1; then echo "  PASS $$n"; \
 		else echo "  FAIL $$n"; tail -5 build/test/$$n.out; fail=1; fi; \
 	done; \
