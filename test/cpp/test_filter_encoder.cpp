@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -309,6 +310,20 @@ static void TestSearchConditionRefusedInValuePosition() {
 	auto fn_cmp =
 		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(fn_arg), Const(Value("x")));
 	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*fn_cmp, ctx));
+
+	// BETWEEN input — the third position the previous round asked for, which did
+	// not land then (job 1216). EncodeBetweenExpression routes input and both
+	// bounds through the helper, and the helper's own doc names this shape.
+	auto btw_bad =
+		BoundBetweenExpression::Create(BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN,
+																		 ColRef(fx, COL_ID), Const(Value::INTEGER(5))),
+									   Const(Value::INTEGER(1)), Const(Value::INTEGER(10)), true, true);
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*btw_bad, ctx));
+
+	// and the plain form still encodes
+	auto btw_ok = BoundBetweenExpression::Create(ColRef(fx, COL_ID), Const(Value::INTEGER(1)),
+												 Const(Value::INTEGER(10)), true, true);
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*btw_ok, ctx), "([id] BETWEEN 1 AND 10)");
 
 	// The legal shapes still encode — the routing change must not OVER-refuse,
 	// which a refusal-only test cannot tell apart from the fix working.

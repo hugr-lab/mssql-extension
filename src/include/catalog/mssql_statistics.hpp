@@ -55,7 +55,11 @@ public:
 	//! @param schema_name SQL Server schema name
 	//! @param table_name SQL Server table name
 	//! @return Approximate row count
-	idx_t GetRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name);
+	//! @param ttl_seconds TTL to judge the cached entry against — the CALLER's
+	//!        session value, not the provider's. See TryGetCachedRowCount below
+	//!        for why the provider's own field must not be set from a session.
+	idx_t GetRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+					  int64_t ttl_seconds);
 
 	//! Get base statistics for DuckDB optimizer
 	//! @param connection Connection to use for querying
@@ -90,8 +94,14 @@ public:
 	//! session a staleness window it never asked for, and `SET ... = 0` forced
 	//! them all onto the per-table DMV path. Pass the value in at the read
 	//! instead, so a session setting governs only that session's lookups.
-	//! SetCacheTTL stays for the ATTACH / RefreshCache path, which is catalog-wide
-	//! by nature.
+	//! Every read now takes its TTL this way — the planner, GetStorageInfo and
+	//! GetRowCount alike. `SetCacheTTL` survives only as the explicit catalog-wide
+	//! knob; NOTHING calls it from a session path any more. (An earlier version of
+	//! this comment said it "stays for the ATTACH / RefreshCache path, which is
+	//! catalog-wide by nature" — inaccurate twice over: RefreshCache is reached
+	//! from the session-scoped mssql_refresh_cache(), and there is no ATTACH-time
+	//! call at all; the provider is constructed with the compiled-in default —
+	//! job 1216.)
 	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, int64_t ttl_seconds,
 							  idx_t &out_row_count);
 

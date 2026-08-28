@@ -28,14 +28,14 @@ MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds) : ca
 //===----------------------------------------------------------------------===//
 
 idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const string &schema_name,
-										   const string &table_name) {
+										   const string &table_name, int64_t ttl_seconds) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
 	auto key = BuildCacheKey(schema_name, table_name);
 	auto it = cache_.find(key);
 
 	// Check if we have valid cached statistics
-	if (it != cache_.end() && IsCacheValid(it->second)) {
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds)) {
 		return it->second.row_count;
 	}
 
@@ -55,7 +55,10 @@ idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const
 unique_ptr<BaseStatistics> MSSQLStatisticsProvider::GetTableStatistics(tds::TdsConnection &connection,
 																	   const string &schema_name,
 																	   const string &table_name) {
-	idx_t row_count = GetRowCount(connection, schema_name, table_name);
+	// This overload has no session context, so it uses the provider's own TTL —
+	// the catalog-wide default. It has no callers today; if one appears it should
+	// take a ttl_seconds too (job 1216).
+	idx_t row_count = GetRowCount(connection, schema_name, table_name, GetCacheTTL());
 
 	// Create base statistics with cardinality estimate
 	auto stats = make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(LogicalType::BIGINT));

@@ -1201,13 +1201,15 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
 
-	// A refresh means "forget what you think you know", so the statistics cache
-	// is cleared with it — and this is the one place that can also apply the
-	// documented mssql_statistics_cache_ttl_seconds, which reached the provider
-	// through nothing before (SetCacheTTL had no callers either; the provider was
-	// constructed with the compiled-in default and stayed there) — job 1124.
+	// A refresh means "forget what you think you know", so the statistics cache is
+	// cleared with it.
+	//
+	// It does NOT set the TTL (job 1216). mssql_refresh_cache() is session-scoped
+	// while the provider is one object per catalog, so doing that here let one
+	// session's `SET mssql_statistics_cache_ttl_seconds` govern every other
+	// session's lookups — the same leak the planner path had. Every reader now
+	// passes its own TTL in at the read instead.
 	if (statistics_provider_) {
-		statistics_provider_->SetCacheTTL(LoadStatisticsCacheTTL(context));
 		statistics_provider_->InvalidateAll();
 	}
 	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
