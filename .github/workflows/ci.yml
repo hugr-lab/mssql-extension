@@ -718,7 +718,14 @@ jobs:
       # step existed. `test-cpp-run` skips the `release` prerequisite because the
       # archives were just built above.
       - name: Standalone C++ unit tests (make test-cpp-run)
-        run: make test-cpp-run
+        run: |
+          # The Makefile `include`s extension-ci-tools/makefiles/…, and this
+          # workflow only checks out the `duckdb` submodule — so `make` cannot
+          # even PARSE the Makefile without this. (Caught by CI on PR #283: the
+          # first version of this step failed with "No rule to make target
+          # 'extension-ci-tools/makefiles/duckdb_extension.Makefile'".)
+          git submodule update --init --depth 1 extension-ci-tools
+          make test-cpp-run
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7
