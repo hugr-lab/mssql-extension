@@ -277,6 +277,16 @@ tie-broken by the server (already true for non-string keys today, so not new
 here), and the above-BMP caveat of § 5's D1 applies to the forced key exactly as
 it does to a naturally-`_BIN2` one.
 
+**Which is why the pushdown can now default to on** (D3). It shipped disabled
+because it changed results; forcing the key removes that, so the remaining
+question is only where the sort runs. A second setting,
+`mssql_order_pushdown_native_collation`, keeps the *other* behaviour reachable —
+push without forcing and take the server's linguistic order, which is faster
+still (no sort at any collation) and is what a user comparing against SSMS
+actually wants. One default that matches DuckDB, one opt-in that matches the
+server; nobody has to choose between correct and fast without being told which
+they picked.
+
 ### 4.4 Summary
 
 **The default differs between reads and writes. That is deliberate, and it is the
@@ -345,11 +355,40 @@ reports. Nothing new has to be fetched.
   Fabric closes the connection on that function.
 - **D2 Feed it into the existing gate**, beside the NULL-order check that is
   already there. An ORDER BY is pushed only if every key passes.
-- **D3 A third setting value.** `mssql_order_pushdown` becomes
-  `off` (today's default) / `safe` / `always`, or stays BOOLEAN with a companion
-  — to be decided in review. `safe` is the one that should eventually become the
-  default; `always` preserves today's opt-in for users who know their collation
-  matches or do not care about tie order.
+- **D3 Two settings, and the default flips ON.** § 4.3 removes the reason the
+  pushdown shipped disabled: with the key's collation forced, the pushed order
+  *is* DuckDB's, so there is nothing left for a user to get wrong by leaving it
+  on. The three-valued `off`/`safe`/`always` sketched in the first draft is
+  dropped — it made the user choose between correctness and speed, and the
+  measurement says they no longer have to.
+
+  - **`mssql_order_pushdown`** stays BOOLEAN — so a script that already says
+    `SET mssql_order_pushdown = false` keeps working — and its **default becomes
+    `true`**. On means: push `ORDER BY`/`TOP` and *preserve DuckDB's order* —
+    the native key for a `_BIN2` or non-string key (ordered index scan, free),
+    `COLLATE Latin1_General_BIN2` on any other string key (bounded `Sort(TOP k)`,
+    ~6 ms/200 k rows). Results are identical to not pushing at all; only the plan
+    and the memory profile change.
+  - **`mssql_order_pushdown_native_collation`** is new, BOOLEAN, default
+    `false`. On means: push the key **without** forcing — the server orders by
+    its own collation. This *changes results* (that is the point: it is the
+    SSMS-like ordering, and it makes ORDER BY agree with the native filter
+    semantics of § 4.1), and it buys the ordered-index path on any collation, no
+    sort at all. It is the knob for someone who wants the server's linguistic
+    order deliberately.
+
+  The two compose in one direction only: the native flag chooses **how** a key
+  is pushed, never **whether**. With `mssql_order_pushdown = false` nothing is
+  pushed no matter what the native flag says, and that must be asserted — an
+  opt-in that silently re-enables a disabled pushdown is the worst of both.
+
+- **D3a NULL ordering is untouched, and is now the only blanket decline.** The
+  existing check (§ 1) refuses a nullable key because SQL Server sorts NULLs
+  first in ASC and DuckDB sorts them last. Worth noting the same forcing trick
+  would fix it — `ORDER BY CASE WHEN k IS NULL THEN 1 ELSE 0 END, k COLLATE …` —
+  at the cost of the ordered-index path, exactly as the collation force does.
+  Deliberately **not** in this spec's scope: it is a second, independent
+  widening, and bundling it would make the ORDER BY change impossible to bisect.
 - **D4 Tests that assert the ORDER, not the row count.** The regression this
   guards is a reordering, so a test that counts rows cannot see it. The shape is
   the § 1 table: the same seven rows under a `_CI_AS` column and under a `_BIN2`
@@ -401,13 +440,30 @@ F5. (§ 4.3) On a `_CI_AS` string key, `ORDER BY s LIMIT k` returns DuckDB's row
 
 **ORDER BY (§ 1–2):**
 
-O1. With the default setting, generated SQL is byte-identical to today's.
-O2. Under `safe`, a `_CI_AS` string key is **not** pushed and results match
-    plain DuckDB exactly, including with `LIMIT`.
-O3. Under `safe`, a `_BIN2` string key **is** pushed, and the result is identical
-    to the un-pushed one — asserted row by row, not by count.
-O4. A mixed ORDER BY (one `_BIN2` key, one `_CI_AS` key) is not pushed at all.
-O5. On Fabric, `safe` pushes — the warehouse collation qualifies.
+O1. **The default now pushes.** With no settings touched, `ORDER BY s LIMIT k` on
+    a `_CI_AS` string key reaches the server (visible at `MSSQL_DEBUG=1`) and
+    returns DuckDB's rows in DuckDB's order — asserted element by element on § 1's
+    seven values, not by count. This is the criterion that replaces the old
+    "generated SQL is byte-identical to today's": the SQL deliberately is not.
+O2. A `_BIN2` string key and a non-string key are pushed **without** a `COLLATE`
+    clause — the free path — and the emitted SQL is asserted, not just the rows,
+    so a regression that forces the collation everywhere is caught by cost rather
+    than by correctness (it would pass O1).
+O3. `SET mssql_order_pushdown = false` restores today's behaviour exactly: no
+    ORDER BY reaches the server, including when
+    `mssql_order_pushdown_native_collation` is `true`. An opt-in must not
+    re-enable a disabled pushdown.
+O4. `SET mssql_order_pushdown_native_collation = true` on a `_CI_AS` key emits no
+    `COLLATE`, and the result is the **server's** order — asserted as the § 1
+    "on" row (`_x | Ähre | Apple | apple`), which is a different *set* under
+    `LIMIT`. The divergence is the feature; it is pinned so it cannot regress
+    into the faithful path unnoticed.
+O5. A nullable key is still declined (D3a), under every combination of the two
+    settings.
+O6. A mixed ORDER BY (one `_BIN2` key, one `_CI_AS` key) pushes both — each key is
+    judged independently, the `_BIN2` one bare and the other forced.
+O7. On Fabric, the default pushes with no `COLLATE` clause — the warehouse
+    collation is already `_BIN2`, so it takes the free path.
 
 ## 7. Risks
 
@@ -419,10 +475,16 @@ O5. On Fabric, `safe` pushes — the warehouse collation qualifies.
   upper(s)` has no collation of its own; it inherits the argument's. The first
   cut should push only bare column references and treat anything else as
   unsafe, which is narrower than what spec 039 already supports.
-- **Making `safe` the default is still a behaviour change** for anyone with a
-  `_BIN2` database who was relying on DuckDB doing the sort — the results are
-  identical, but the *plan* and the memory profile change. Worth a release note
-  rather than a silent flip.
+- **Flipping `mssql_order_pushdown` on by default is a behaviour change even
+  though results do not move.** The sort relocates to SQL Server: plans, memory
+  profile and where a slow query shows up all change, and a server under load now
+  absorbs work DuckDB used to do. Results being identical is what makes it
+  *safe*, not what makes it invisible — it needs a release note, and
+  `mssql_order_pushdown = false` is the documented way back.
+- **`mssql_order_pushdown_native_collation` changes results by design.** It is
+  the one setting in this spec that makes a query return different rows, so its
+  documentation has to say so in the first sentence rather than describe it as a
+  performance option.
 
 Risks specific to the widened scope:
 
