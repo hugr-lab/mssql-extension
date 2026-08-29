@@ -382,13 +382,60 @@ reports. Nothing new has to be fetched.
   pushed no matter what the native flag says, and that must be asserted — an
   opt-in that silently re-enables a disabled pushdown is the worst of both.
 
-- **D3a NULL ordering is untouched, and is now the only blanket decline.** The
-  existing check (§ 1) refuses a nullable key because SQL Server sorts NULLs
-  first in ASC and DuckDB sorts them last. Worth noting the same forcing trick
-  would fix it — `ORDER BY CASE WHEN k IS NULL THEN 1 ELSE 0 END, k COLLATE …` —
-  at the cost of the ordered-index path, exactly as the collation force does.
-  Deliberately **not** in this spec's scope: it is a second, independent
-  widening, and bundling it would make the ORDER BY change impossible to bisect.
+- **D3a NULL ordering: split it server-side, do not put it in the sort key.**
+  The existing check (§ 1) declines a nullable key outright because SQL Server
+  sorts NULLs first in ASC and DuckDB sorts them last. An earlier draft of this
+  decision said the fix — moving the NULL test into the ORDER BY as
+  `CASE WHEN k IS NULL THEN 1 ELSE 0 END` — would cost the ordered-index path.
+  **Measured, that is wrong**, and the working form is a `UNION ALL` of two
+  bounded `TOP`s rather than a compound sort key:
+
+  ```sql
+  SELECT TOP k … FROM (
+      SELECT TOP k …, 0 AS g FROM t WHERE key IS NOT NULL ORDER BY key
+      UNION ALL
+      SELECT TOP k …, 1 AS g FROM t WHERE key IS NULL
+  ) x ORDER BY g, key
+  ```
+
+  On a nullable `_BIN2` key over 200 000 rows the plan contains **no Sort
+  operator at all** —
+
+  ```text
+  Top(10)
+    └─ Merge Join(Concatenation)
+         ├─ Top(10) → Index Seek(key IsNotNull) ORDERED FORWARD
+         └─ Top(10) → Index Seek(key = NULL)    ORDERED FORWARD
+  ```
+
+  — because both branches arrive already ordered and the server concatenates
+  them by merge. **~0 ms, against ~6–7 ms for the `CASE`-in-ORDER-BY form**,
+  which degrades to `Sort(TOP k)` over an unordered Index Scan. `IS NOT NULL`
+  becomes a *seek predicate*; the `CASE` expression cannot, which is the whole
+  difference.
+
+  Two consequences:
+
+  - **A nullable key stops being a blanket decline.** For a `_BIN2` or
+    non-string key it now pushes on the free path — no sort — where today it
+    does not push at all.
+  - **For a forced-collation key the NULL split is free anyway**, because that
+    query is already paying a `Sort(TOP k)` for the collation: measured, the
+    non-NULL branch keeps its `Index Seek(IsNotNull) ORDERED FORWARD` feeding
+    that same bounded sort.
+
+  The naive shapes both fail and are recorded so they are not retried: putting
+  the `CASE` in the sort key loses the seek (above), and wrapping an
+  index-ordered subquery in an outer sort — `SELECT … FROM (SELECT TOP 100
+  PERCENT … ORDER BY key) x ORDER BY CASE …` — is **flattened by the optimizer
+  into exactly the same plan as the plain `CASE` sort**, measured identical.
+  T-SQL does not preserve a subquery's order without a bound, so the ordering
+  has to be re-expressed as something the optimizer can turn into a seek, which
+  is what the two-branch form does.
+
+  Still deliberately a **separate change from the collation work**: it is a
+  second, independent widening, and landing it in the same commit would make an
+  ORDER BY regression impossible to bisect.
 - **D4 Tests that assert the ORDER, not the row count.** The regression this
   guards is a reordering, so a test that counts rows cannot see it. The shape is
   the § 1 table: the same seven rows under a `_CI_AS` column and under a `_BIN2`
@@ -458,8 +505,12 @@ O4. `SET mssql_order_pushdown_native_collation = true` on a `_CI_AS` key emits n
     "on" row (`_x | Ähre | Apple | apple`), which is a different *set* under
     `LIMIT`. The divergence is the feature; it is pinned so it cannot regress
     into the faithful path unnoticed.
-O5. A nullable key is still declined (D3a), under every combination of the two
-    settings.
+O5. A nullable key pushes via the two-branch form (D3a) and returns DuckDB's
+    NULLS-LAST order; on a `_BIN2` key the plan is asserted to contain **no Sort
+    operator**, since the whole point is that the seek survives. Both naive
+    shapes are pinned as rejected: the `CASE`-in-sort-key form and the
+    `TOP 100 PERCENT` subquery form produce a sort, so the assertion is on the
+    plan, not the rows — the rows are identical either way.
 O6. A mixed ORDER BY (one `_BIN2` key, one `_CI_AS` key) pushes both — each key is
     judged independently, the `_BIN2` one bare and the other forced.
 O7. On Fabric, the default pushes with no `COLLATE` clause — the warehouse
