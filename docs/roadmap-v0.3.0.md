@@ -31,7 +31,7 @@ cut by then.
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main (ORDER BY only); widening proposed in #277 — **OPEN**, mechanism lives on that PR branch | nothing | M | oluies |
-| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): no pushdown lost. Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string predicates only) | M | unassigned |
+| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): the #269 gates objection did not reproduce, but two shapes DO lose pushdown and must be excluded from the deferral (relaxation-only filters, and `rowid`). Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string predicates only) | M | unassigned |
 | — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and 061 → W1, which is what makes planner-visible filters available to it — for non-string predicates now, for string comparisons after 061** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
@@ -86,12 +86,38 @@ against a live server.
 
 **Most of it worked.** No pushdown was lost — every shape DuckDB's combiner
 gates still reached the server (`IN` at the 6-value threshold,
-`year(dt) = 2024` beside a second predicate, `LIKE`). The planner could finally
-see predicates: `EXPLAIN` showed `Filters: id < 100` on the scan with real
+`year(dt) = 2024` beside a second predicate). The planner could finally see
+predicates: `EXPLAIN` showed `Filters: id < 100` on the scan with real
 selectivity. Full suite green. **The objection recorded in #269 — that the
 combiner's gates (volatile, oversized `IN`, `CanThrow() && filters.size() > 1`)
-would silently lose pushdown — DID NOT REPRODUCE.** That reasoning was wrong
-and should not be carried forward.
+would silently lose pushdown — DID NOT REPRODUCE.** That specific reasoning was
+wrong and should not be carried forward.
+
+**But "no pushdown lost" was too broad a generalisation from those shapes, and
+is false** (roborev job 1130, verified against the source). Two classes DO lose,
+neither of them tested by that measurement:
+
+- **Relaxation-only shapes.** `GenerateTableScanFilters` returns
+  `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
+  temporal-cast filters, and `pushdown_get.cpp` then SKIPS
+  `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN`. So the server
+  receives only the combiner's *relaxation* — prefix bounds, an optional filter,
+  margin-adjusted temporal bounds — and the exact predicate stays above the
+  scan. The `LIKE` result recorded above as "reached the server" was in fact
+  `[name] >= N'n' AND [name] < N'o'`: the relaxation, not the predicate.
+  `WHERE name LIKE 'ab%cd'` over 200k rows streams the whole `ab` prefix range
+  to the client.
+- **`rowid` predicates lose pushdown entirely.** A rowid filter is
+  single-column, so it defers — but `FilterEncoder::Encode` refuses every
+  virtual column (`table_col_idx >= VIRTUAL_COL_START`) and routes it to the
+  client net, whereas `ComplexFilterPushdown` reached `EncodeColumnRef`, which
+  rewrites rowid to the scalar PK column and pushes real T-SQL. So
+  `WHERE rowid > 100` goes from `WHERE [id] > 100` to a full table scan. Rows
+  stay correct; the wire cost does not.
+
+Neither is a reason the restriction cannot be done — both are shapes the
+deferral must EXCLUDE. But the tracked claim has to be "the #269 gates objection
+did not reproduce", not "no pushdown lost".
 
 **What blocks it is unrelated to any of that.** DuckDB rewrites a prefix
 predicate into a range — `prefix(col,'n')` becomes `col >= 'n' AND col < 'o'`

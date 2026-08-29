@@ -112,10 +112,26 @@ The objection stated here first — that the combiner applies gates the
 complex-filter path does not (volatile, `COMPARE_IN` above
 `InClauseRewriter::IN_CLAUSE_REWRITE_THRESHOLD`, and any expression where
 `CanThrow() && filters.size() > 1`), so a deferred predicate would be offered
-to nobody and silently regress to client-side — **DID NOT REPRODUCE**. Every
-one of those shapes still reached the server, including the cast-bearing
+to nobody and silently regress to client-side — **DID NOT REPRODUCE**. Each of
+those shapes still reached the server, including the cast-bearing
 `year(dt) = 2024` beside a second predicate that this text named. Do not
 re-derive it.
+
+**Do not read that as "no pushdown lost", which was the generalisation first
+recorded and is false** (job 1130, verified against the source). Two classes
+lose and must be EXCLUDED from any deferral:
+
+1. **Relaxation-only shapes.** `GenerateTableScanFilters` returns
+   `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
+   temporal-cast filters, and `pushdown_get.cpp` skips
+   `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN` — so the server
+   gets the combiner's relaxation (prefix bounds, an optional filter) while the
+   exact predicate stays above the scan. `WHERE name LIKE 'ab%cd'` sends
+   `[name] >= 'ab' AND [name] < 'ac'` and streams the prefix range.
+2. **`rowid`.** Single-column, so it defers — but `FilterEncoder::Encode`
+   refuses virtual columns outright, while `ComplexFilterPushdown` reached
+   `EncodeColumnRef`, which rewrites rowid to the scalar PK. `WHERE rowid > 100`
+   goes from `WHERE [id] > 100` to a full scan.
 
 **The real blocker is semantic, and it splits the work in two.** Once
 `ComplexFilterPushdown` stops claiming a predicate, the combiner rewrites it

@@ -897,8 +897,20 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 // MEASURED SINCE (roadmap v0.3.0, branch spec/070-w1-measure-shadowing): the
 // reason first given for keeping both — that restricting ComplexFilterPushdown
 // would lose pushdown for the shapes the combiner itself declines (volatile,
-// oversized IN, CanThrow with more than one filter) — DID NOT REPRODUCE. Every
-// one of those still reached the server. Do not re-derive it.
+// oversized IN, CanThrow with more than one filter) — DID NOT REPRODUCE. Each
+// of those still reached the server. Do not re-derive it.
+//
+// That is NOT the same as "no pushdown lost" (job 1130). Two classes DO lose and
+// any deferral must exclude them:
+//   * relaxation-only shapes — GenerateTableScanFilters returns
+//     PUSHED_DOWN_PARTIALLY for LIKE / OR-chains / non-dense IN / temporal-cast,
+//     and pushdown_get.cpp then SKIPS TryPushdownGenericExpression, so only the
+//     combiner's relaxation reaches the server and the exact predicate stays
+//     above the scan;
+//   * rowid — single-column, so it would defer, but FilterEncoder::Encode
+//     refuses virtual columns while EncodeColumnRef (reached only through THIS
+//     path) rewrites rowid to the scalar PK. `rowid > 100` would go from
+//     `[id] > 100` to a full scan.
 //
 // The real blocker is semantic, and it splits the work in two — do NOT lift this
 // as one blanket change. Stop claiming a predicate here and the combiner
