@@ -24,6 +24,16 @@ struct MSSQLTableStatistics {
 
 	//! Whether the statistics are valid
 	bool is_valid = false;
+
+	//! Filled by PreloadRowCount from the CATALOG's own metadata load, not by a
+	//! DMV query. Such an entry is not stale-by-age — it is refreshed when the
+	//! metadata is invalidated — so the TTL does not apply to it (job 1217).
+	//!
+	//! Without this, `SET mssql_statistics_cache_ttl_seconds = 0` turned
+	//! `SHOW ALL TABLES` into one pool acquire + one sys.dm_db_partition_stats
+	//! round trip PER TABLE, on a catalog that had just loaded every count in a
+	//! single query. "Always fresh" should not mean "N connections per listing".
+	bool from_catalog_metadata = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -54,16 +64,12 @@ public:
 	//! @param connection Connection to use for querying
 	//! @param schema_name SQL Server schema name
 	//! @param table_name SQL Server table name
+	//! @param ttl_seconds TTL to judge the cached entry against — the CALLER's
+	//!        session value, not the provider's. See TryGetCachedRowCount below
+	//!        for why the provider's own field must not be set from a session.
 	//! @return Approximate row count
-	idx_t GetRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name);
-
-	//! Get base statistics for DuckDB optimizer
-	//! @param connection Connection to use for querying
-	//! @param schema_name SQL Server schema name
-	//! @param table_name SQL Server table name
-	//! @return BaseStatistics with cardinality estimate
-	unique_ptr<BaseStatistics> GetTableStatistics(tds::TdsConnection &connection, const string &schema_name,
-												  const string &table_name);
+	idx_t GetRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+					  int64_t ttl_seconds);
 
 	//! Invalidate statistics for a specific table
 	void InvalidateTable(const string &schema_name, const string &table_name);
@@ -78,11 +84,38 @@ public:
 	//! Avoids per-table DMV queries when cardinality is already known
 	void PreloadRowCount(const string &schema_name, const string &table_name, idx_t row_count);
 
-	//! Try to get cached row count without connection (returns false if no valid cache entry)
-	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, idx_t &out_row_count);
-
-	//! Set the cache TTL
-	void SetCacheTTL(int64_t seconds);
+	//! Same, but judged against a CALLER-SUPPLIED TTL rather than the provider's.
+	//!
+	//! `mssql_statistics_cache_ttl_seconds` is a SESSION setting, and this
+	//! provider is one object shared by the whole catalog (job 1203). Calling
+	//! SetCacheTTL from a planning ClientContext therefore rewrote the TTL every
+	//! OTHER session sees — one session's `SET ... = 3600` handed every other
+	//! session a staleness window it never asked for, and `SET ... = 0` forced
+	//! them all onto the per-table DMV path. Pass the value in at the read
+	//! instead, so a session setting governs only that session's lookups.
+	//! THE ONLY READ. Every caller passes its own TTL — the planner,
+	//! GetStorageInfo and GetRowCount alike.
+	//!
+	//! The TTL-less overload and `SetCacheTTL` were REMOVED rather than left
+	//! unused (job 1217): after the fix nothing called them, and a mutable
+	//! catalog-wide TTL sitting next to a per-session setting is precisely the
+	//! shape that invited this bug twice (jobs 1203, 1216). The type can no longer
+	//! express it.
+	//! @param exempt_catalog_sourced When true, an entry filled by PreloadRowCount
+	//!        (the catalog's own metadata load, not a DMV query) ignores the TTL —
+	//!        it is refreshed by invalidation, not by age. ONLY the table-listing
+	//!        path wants this: it is what keeps `SET
+	//!        mssql_statistics_cache_ttl_seconds = 0` from turning SHOW ALL TABLES
+	//!        into one connection + DMV round trip per table.
+	//!
+	//!        Deliberately NOT the default (job 1230). Making it unconditional
+	//!        exempted every entry the cache can hold in practice — PreloadRowCount
+	//!        is its only populator on the reachable paths — so the TTL governed
+	//!        nothing, GetRowCount's DMV re-read became unreachable, and the test
+	//!        written to guard the caller-supplied-TTL invariant passed even with
+	//!        that invariant reverted.
+	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, int64_t ttl_seconds,
+							  idx_t &out_row_count, bool exempt_catalog_sourced = false);
 
 	//! Get the cache TTL
 	int64_t GetCacheTTL() const;
@@ -92,7 +125,8 @@ private:
 	static string BuildCacheKey(const string &schema_name, const string &table_name);
 
 	//! Check if cached statistics are still valid
-	bool IsCacheValid(const MSSQLTableStatistics &stats) const;
+	//! Judged against the CALLER's TTL — there is deliberately no TTL-less form.
+	bool IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds, bool exempt_catalog_sourced) const;
 
 	//! Fetch row count from SQL Server
 	idx_t FetchRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name);

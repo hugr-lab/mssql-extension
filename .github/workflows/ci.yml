@@ -275,6 +275,48 @@ jobs:
   # Build Job - Build against DuckDB stable on representative platforms
   # (Manual trigger only via workflow_dispatch)
   # ============================================================================
+
+  # Owns the build platform list, so it exists exactly ONCE (job 1182). It was
+  # briefly written out twice inside one expression — a PR array and a full array
+  # — which meant an edit to one (a runner bump, a triplet change, a new field)
+  # would silently make pull requests build a DIFFERENT configuration than merges
+  # to main: green PR, broken main, which is the very class #279 exists to close.
+  #
+  # A job output rather than a condition on `build`'s own `if`, because GitHub
+  # does not expose the `matrix` context to `jobs.<id>.if` — a
+  # `matrix.platform.id == '...'` test there evaluates empty and the job silently
+  # never runs.
+  build-matrix:
+    name: Resolve build matrix
+    runs-on: ubuntu-22.04
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build)
+          || github.event_name == 'schedule'
+          || github.event_name == 'push'
+          || github.event_name == 'pull_request' }}
+    outputs:
+      platforms: ${{ steps.pick.outputs.platforms }}
+    steps:
+      - id: pick
+        env:
+          # The single source of truth for both entries.
+          ALL: >-
+            [{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"},
+             {"id":"osx_arm64","os":"osx","arch":"arm64","runner":"macos-14","docker_available":false,"vcpkg_triplet":"arm64-osx"}]
+          EVENT: ${{ github.event_name }}
+        run: |
+          # A pull request builds Linux only: it is the platform the integration
+          # lane consumes, and one compile per PR is the price of the check.
+          # macOS stays on merge / schedule / dispatch, where a platform-specific
+          # break is still caught before a release rather than at it.
+          if [ "$EVENT" = "pull_request" ]; then
+            picked=$(printf '%s' "$ALL" | jq -c '[.[] | select(.id == "linux_amd64")]')
+          else
+            picked=$(printf '%s' "$ALL" | jq -c '.')
+          fi
+          echo "platforms=$picked" >> "$GITHUB_OUTPUT"
+          echo "Building: $(printf '%s' "$picked" | jq -r '[.[].id] | join(", ")')"
+
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
@@ -286,32 +328,21 @@ jobs:
     #
     # On a pull request this is LINUX ONLY, deliberately: it is the platform the
     # integration lane needs anyway, and one compile per PR is the price of the
-    # check. macOS and Windows stay on merge/schedule/dispatch, where a
-    # platform-specific break is still caught before a release rather than at it.
+    # check. macOS stays on merge/schedule/dispatch, where a platform-specific
+    # break is still caught before a release rather than at it. WINDOWS is
+    # dispatch-ONLY (`inputs.run_windows_build`) — it runs on neither merge nor
+    # schedule, so an MSVC/MinGW break is caught only when someone asks.
     # Docs-only PRs are already free via the workflow's `paths-ignore`.
     if: >-
       ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build)
           || github.event_name == 'schedule'
           || github.event_name == 'push'
           || github.event_name == 'pull_request' }}
+    needs: build-matrix
     strategy:
       fail-fast: false
       matrix:
-        # Linux x86_64 (Docker, and what the integration lane consumes) plus
-        # macOS ARM64 (load-only). A PULL REQUEST builds Linux only (issue
-        # #279): it is the platform integration needs, and one compile per PR is
-        # the price of the check — macOS stays on merge / schedule / dispatch,
-        # where a platform-specific break is still caught before a release.
-        #
-        # Written as fromJSON rather than a condition on the job's `if`, because
-        # GitHub does NOT expose the `matrix` context to `jobs.<id>.if`. A
-        # `matrix.platform.id == '…'` test there evaluates to empty and the job
-        # silently never runs — the failure would look exactly like the coverage
-        # gap this is fixing.
-        platform: >-
-          ${{ github.event_name == 'pull_request'
-              && fromJSON('[{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"}]')
-              || fromJSON('[{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"},{"id":"osx_arm64","os":"osx","arch":"arm64","runner":"macos-14","docker_available":false,"vcpkg_triplet":"arm64-osx"}]') }}
+        platform: ${{ fromJSON(needs.build-matrix.outputs.platforms) }}
 
     env:
       # Send vcpkg's binary cache to a directory actions/cache persists (see
@@ -579,48 +610,13 @@ jobs:
             echo "::endgroup::"
           done
 
-          # PR #245: dictionary/constant vectors through the BCP encoder,
-          # constructed explicitly. The SQL twin (vector_encodings_bcp.test)
-          # relies on the parquet reader / storage layer CHOOSING dictionary
-          # encoding and would keep passing if they stopped; this one cannot go
-          # vacuous. Needs Vector/DataChunk plus the encoder's full dependency
-          # cone (BCPColumnMetadata methods live in target_resolver.cpp, which
-          # pulls catalog/connection/TLS), so it links the just-built static
-          # archives exactly like `make test-cpp` does.
-          echo "::group::test_vector_encodings (dictionary/constant vectors -> BCP encoder)"
-          # The archive list is ORDER-SENSITIVE on GNU ld and the order is wrong:
-          # libmssql_extension.a is scanned before anything needs MssqlExtension,
-          # so when libduckdb_static.a's generated_extension_loader.o gets pulled
-          # (it references every statically-registered extension) the linker
-          # cannot go back for the vtable and dies with
-          #   undefined reference to `vtable for duckdb::MssqlExtension'
-          # WHETHER it gets pulled depends on which objects the test happens to
-          # reference -- it flaked on main after #254 and became deterministic on
-          # the spec-068 branch when the tenant wiring shifted the symbol graph.
-          # --start-group makes the resolution iterative, which is what macOS's
-          # ld64 does by default (and why Darwin never failed).
-          if [ "$(uname -s)" = "Darwin" ]; then
-            PLATLIBS="-framework GSS -framework CoreFoundation -framework Security"
-            GROUP_START=""
-            GROUP_END=""
-          else
-            PLATLIBS="-ldl -lrt"
-            GROUP_START="-Wl,--start-group"
-            GROUP_END="-Wl,--end-group"
-          fi
-          "${CXX:-c++}" -std=c++17 -pthread -Wno-deprecated-declarations \
-            -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include -I "$PREFIX/include" \
-            test/cpp/test_vector_encodings.cpp \
-            $GROUP_START \
-            build/release/extension/mssql/libmssql_extension.a \
-            build/release/src/libduckdb_static.a \
-            $(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
-            $GROUP_END \
-            "$PREFIX/lib/libssl.a" "$PREFIX/lib/libcrypto.a" "$PREFIX/lib/libsimdutf.a" \
-            $PLATLIBS \
-            -o build/test/test_vector_encodings
-          ./build/test/test_vector_encodings
-          echo "::endgroup::"
+          # (The hand-rolled test_vector_encodings link that lived here is gone —
+          # job 1251. `test_vector_encodings` is in STANDALONE_TEST_SOURCES, so
+          # `make test-cpp-run` below already compiles, statically links and runs
+          # it; keeping this block meant doing that work TWICE in one job, from two
+          # copies of the link line that had already drifted apart (-lgssapi_krb5
+          # here vs not, --start-group there vs not). That drift is what cost three
+          # CI rounds on PR #283. One link line now: the Makefile's.)
 
           # spec 055: the staging structures. `make test-column-staging` existed
           # from the day they landed but nothing invoked it, so the whole staged
@@ -677,6 +673,24 @@ jobs:
             exit 1
           fi
           echo "OK: no gssapi/krb5 in DT_NEEDED — extension loads without the Kerberos runtime installed."
+
+      # The SAME list `make test-cpp` runs locally — STANDALONE_TEST_SOURCES —
+      # rather than a hand-enumerated subset (job 1217). The lightweight "C++
+      # Unit Tests" job earlier in this workflow compiles a handful of
+      # libduckdb-free files for fast PR feedback; it cannot link the ones that
+      # need the extension archive, so tests added to that list (e.g.
+      # test_filter_encoder, test_statistics_provider) gated nothing until this
+      # step existed. `test-cpp-run` skips the `release` prerequisite because the
+      # archives were just built above.
+      - name: Standalone C++ unit tests (make test-cpp-run)
+        run: |
+          # The Makefile `include`s extension-ci-tools/makefiles/…, and this
+          # workflow only checks out the `duckdb` submodule — so `make` cannot
+          # even PARSE the Makefile without this. (Caught by CI on PR #283: the
+          # first version of this step failed with "No rule to make target
+          # 'extension-ci-tools/makefiles/duckdb_extension.Makefile'".)
+          git submodule update --init --depth 1 extension-ci-tools
+          make test-cpp-run
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7

@@ -100,10 +100,30 @@ the `func.pushdown_expression = ...` line leaves every test passing.
 
 Making the callback reachable means restricting `ComplexFilterPushdown` to
 (i) the shapes the combiner will not offer (it offers only expressions
-referencing exactly ONE column binding) **and (ii) string-pattern expressions,
-which it must keep claiming until 061** — see the split below. Note that (ii)
-makes the restriction TYPE-aware rather than merely offer-aware: it has to hold
-on to shapes the combiner would happily take.
+referencing exactly ONE column binding) **and (ii) every predicate over a
+collated string column, which it must keep claiming until 061** — see the split
+below. (ii) makes the restriction depend on the OPERAND TYPE, not just on what
+the combiner offers: it has to hold on to shapes the combiner would happily
+take.
+
+**The criterion is the string COLUMN, not the `prefix()` shape** (jobs 1183,
+1184). An earlier revision said "string-pattern expressions", which
+under-restricts, and the roadmap said "string comparisons", which over-restricts
+relative to the reason then given — two surfaces naming different sets for the
+single test an implementer has to write. There are two hazards, not one:
+
+- **Rewrite.** `FilterCombiner::TryPushdownPrefixFilter` turns `prefix()` into a
+  `>=`/`<` range under binary ordering. Covers pattern predicates only.
+- **Constant reasoning.** Once ANY string comparison is a visible filter, the
+  combiner prunes contradictions and derives transitive predicates over its
+  constants under **binary** semantics — on predicates `ComplexFilterPushdown`
+  used to erase before it ever saw them. `name = 'abc' AND name = 'ABC'` is
+  contradictory under binary and satisfiable on a `_CI_AS` server, so the
+  combiner can prune to empty a filter the server would have matched.
+
+The second hazard is what makes the broader term the right one: `name = 'abc'`
+encodes to the same exact `= N'abc'` either way, but making it VISIBLE is not
+semantically free.
 
 **The measurement this section asked for has been run** (branch
 `spec/070-w1-measure-shadowing`; recorded in `docs/roadmap-v0.3.0.md`).
@@ -121,13 +141,17 @@ re-derive it.
 recorded and is false** (job 1130, verified against the source). Two classes
 lose and must be EXCLUDED from any deferral:
 
-1. **Relaxation-only shapes.** `GenerateTableScanFilters` returns
-   `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
-   temporal-cast filters, and `pushdown_get.cpp` skips
-   `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN` — so the server
-   gets the combiner's relaxation (prefix bounds, an optional filter) while the
-   exact predicate stays above the scan. `WHERE name LIKE 'ab%cd'` sends
-   `[name] >= 'ab' AND [name] < 'ac'` and streams the prefix range.
+1. **Partially-pushed shapes**, with a worse outcome than "a widened range" for
+   most of them. `GenerateTableScanFilters` returns `PUSHED_DOWN_PARTIALLY` for
+   `LIKE`-prefix, OR-chains, non-dense `IN` and temporal-cast filters, and
+   `pushdown_get.cpp` skips `TryPushdownGenericExpression` for anything not
+   `NO_PUSHDOWN`. `LIKE`-prefix pushes plain comparison bounds the encoder can
+   render (a real relaxation — but it is a string predicate, already excluded by
+   the split below). The other three push through
+   `CreateOptionalExpressionFilter`, whose `optional_filter` scalar function has
+   no mapping, so the encoder refuses and the scan pushes **nothing at all** —
+   a full table stream. Those three are non-string and otherwise deferrable, so
+   they are the genuinely new exclusion.
 2. **`rowid`.** Single-column, so it defers — but `FilterEncoder::Encode`
    refuses virtual columns outright, while `ComplexFilterPushdown` reached
    `EncodeColumnRef`, which rewrites rowid to the scalar PK. `WHERE rowid > 100`
@@ -151,13 +175,14 @@ and the contract):
 - **Non-string predicates — available now, no 061 dependency.** Nothing rewrites
   them into a collation-sensitive form, so they can be deferred to
   `pushdown_expression` and become planner-visible.
-- **String-pattern expressions — must stay claimed by `ComplexFilterPushdown`
-  until 061.** That is what keeps the exact `LIKE` going to the server, which is
+- **Predicates over a collated string column — must stay claimed by
+  `ComplexFilterPushdown` until 061.** Comparisons as well as patterns; see the
+  two hazards above. That is what keeps the exact `LIKE` going to the server, which is
   what preserves both the seek and native semantics. They stay
   planner-invisible in the meantime; that is the accepted cost.
 
-The registration is a no-op **today**, and stays one for string-pattern
-expressions until 061 — but the non-string half can lift it now, so this is not
+The registration is a no-op **today**, and stays one for string-column
+predicates until 061 — but the non-string half can lift it now, so this is not
 "blocked until 061". The
 encoder-level behaviour is pinned by `test/cpp/test_filter_encoder.cpp` — which
 asserts the T-SQL STRING, the thing a row-comparing sqllogictest cannot see

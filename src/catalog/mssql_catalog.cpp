@@ -1090,6 +1090,16 @@ void MSSQLCatalog::InvalidateMetadataCache() {
 		metadata_cache_->Invalidate();
 	}
 
+	// The statistics cache too (job 1124). It was invalidated by NOTHING —
+	// InvalidateAll/InvalidateTable/InvalidateSchema had no callers at all — which
+	// was invisible while row counts fed only GetStorageInfo, a number the planner
+	// ignores for a table function. Since the spec-070 cardinality callback they
+	// ARE what the optimizer plans on, so a stale count now survives an explicit
+	// mssql_invalidate_cache() and drives join order for the whole TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateAll();
+	}
+
 	// Also clear the local schema entry cache.
 	// Spec 052 (Option D): in-flight binders are anchored in their
 	// ClientContext's MSSQLBindAnchors; dropping entries_ here just
@@ -1113,6 +1123,15 @@ void MSSQLCatalog::InvalidateSchemaTableSet(const string &schema_name) {
 	if (it != schema_entries_.end()) {
 		it->second->GetTableSet().Invalidate();
 	}
+
+	// And its row counts (job 1193). THIS is the path almost every size-changing
+	// event takes — COPY/bulk load, CTAS, CREATE/DROP TABLE, and the two-argument
+	// mssql_invalidate_cache(ctx, schema) — so without it InvalidateSchema still
+	// had zero callers and a 1M-row COPY left the pre-load count driving plans
+	// (and duckdb_tables()) for the whole TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateSchema(schema_name);
+	}
 }
 
 void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string &table_name) {
@@ -1122,6 +1141,13 @@ void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string 
 		// ... and re-check the schema's table list for existence (CREATE/DROP/RENAME), but
 		// WITHOUT dropping every other table's cached columns.
 		metadata_cache_->InvalidateSchemaTableList(schema_name);
+	}
+
+	// Point-invalidate this table's row count as well (job 1124), so a DDL or a
+	// load that changes its size is reflected in the next plan rather than after
+	// the statistics TTL.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateTable(schema_name, table_name);
 	}
 
 	// Evict the single bound entry from the schema's table set (keeps the rest).
@@ -1174,6 +1200,18 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// Load cache TTL and metadata timeout from settings
 	int64_t cache_ttl = LoadCatalogCacheTTL(context);
 	metadata_cache_->SetTTL(cache_ttl);
+
+	// A refresh means "forget what you think you know", so the statistics cache is
+	// cleared with it.
+	//
+	// It does NOT set the TTL (job 1216). mssql_refresh_cache() is session-scoped
+	// while the provider is one object per catalog, so doing that here let one
+	// session's `SET mssql_statistics_cache_ttl_seconds` govern every other
+	// session's lookups — the same leak the planner path had. Every reader now
+	// passes its own TTL in at the read instead.
+	if (statistics_provider_) {
+		statistics_provider_->InvalidateAll();
+	}
 	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 
 	// Acquire connection for full cache refresh

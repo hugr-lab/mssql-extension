@@ -81,15 +81,39 @@ bool IsDatePartFunction(const std::string &name) {
 	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" || name == "second";
 }
 
-// SQL Server's modulo operator is not defined for float/real: `[d] % 2` on a
+// T-SQL's modulo operator accepts only exact INTEGER operands. `[d] % 2` on a
 // FLOAT column fails with "Operand data type float is invalid for modulo
-// operator", and because an encoded predicate is ERASED from the DuckDB plan the
-// whole query fails instead of falling to the client filter net. DuckDB's `%` is
-// defined for DOUBLE, so the mapping has to refuse the float case itself. Integer
-// and decimal operands behave identically on both sides (negatives included), so
-// only the approximate-numeric types are excluded (PR #269 review).
-bool IsApproximateNumeric(LogicalTypeId id) {
-	return id == LogicalTypeId::FLOAT || id == LogicalTypeId::DOUBLE;
+// operator" (8117), and because an encoded predicate is ERASED from the DuckDB
+// plan the whole query fails instead of falling to the client filter net.
+//
+// So the gate is a whitelist, not a float blacklist (job 1113). The first
+// version excluded FLOAT/DOUBLE and let everything else through on the reasoning
+// that "integer and decimal behave identically on both sides" — but the encoder
+// sees only the DUCKDB type, and `money` / `smallmoney` reach it as
+// DECIMAL(19,4) / DECIMAL(10,4) (mssql_column_info.cpp). T-SQL rejects `money`
+// for `%` with the same 8117, so a DECIMAL allowance re-opens the bug for any
+// money column, invisibly — the source type is not recoverable here.
+//
+// Cost of the whitelist: `decimal_col % 2` no longer pushes and runs in the
+// client net. That is the project's usual trade — correct by construction over
+// fast — and it is the only form available without threading the SQL Server type
+// name into the encode context.
+bool IsExactIntegerForModulo(LogicalTypeId id) {
+	switch (id) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+		return true;
+	default:
+		return false;
+	}
 }
 
 // Does this expression already encode to a T-SQL search condition (a predicate
@@ -123,6 +147,25 @@ bool EncodesAsSearchCondition(const Expression &expr) {
 	return false;
 }
 }  // namespace
+
+// Every VALUE position goes through here (job 1191). T-SQL has no boolean value
+// type, so a search condition is illegal anywhere a value is expected —
+// `CASE … THEN [id] > 5`, `([a] > 1) IS NULL`, `[flag] = ([id] > 5)`,
+// `[x] BETWEEN ([a] > 1) AND …`, `LOWER([a] > 1)`. Each produces T-SQL the
+// server REJECTS, and because ComplexFilterPushdown erases the expression from
+// the DuckDB plan the query FAILS rather than degrading to the client net.
+//
+// The first fix guarded four such positions individually and left comparison
+// operands, BETWEEN and function arguments open — the same bug, three doors
+// down. One helper, routed everywhere, so the next value position cannot be
+// added without it. Predicate positions use EncodeSearchCondition instead.
+static ExpressionEncodeResult EncodeValueExpression(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	if (EncodesAsSearchCondition(expr)) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeValueExpression: refusing a search condition in value position");
+		return {"", false};
+	}
+	return FilterEncoder::EncodeExpression(expr, ctx);
+}
 
 //------------------------------------------------------------------------------
 // Utility Functions
@@ -604,12 +647,14 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 		return {"", false};
 	}
 
-	// Modulo: refuse float/real operands, which T-SQL's `%` rejects outright.
+	// Modulo: push only for exact integer operands. T-SQL's `%` rejects float,
+	// real AND money (8117), and money is indistinguishable from decimal here.
 	if (func_name == "%") {
 		for (const auto &child : expr.GetChildren()) {
-			if (IsApproximateNumeric(child->GetReturnType().id())) {
-				MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %% on %s not pushed (T-SQL modulo rejects float)",
-									   child->GetReturnType().ToString().c_str());
+			if (!IsExactIntegerForModulo(child->GetReturnType().id())) {
+				MSSQL_FILTER_DEBUG_LOG(
+					1, "EncodeFunctionExpression: %% on %s not pushed (T-SQL modulo takes exact integers only)",
+					child->GetReturnType().ToString().c_str());
 				return {"", false};
 			}
 		}
@@ -645,7 +690,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 				arg = &cast_child;
 			}
 		}
-		auto result = EncodeExpression(*arg, child_ctx);
+		auto result = EncodeValueExpression(*arg, child_ctx);
 		if (!result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: argument encoding failed for %s", func_name.c_str());
 			return {"", false};
@@ -699,13 +744,13 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 
 	// Encode left and right sides
 	auto child_ctx = ctx.child();
-	auto left_result = EncodeExpression(left, child_ctx);
+	auto left_result = EncodeValueExpression(left, child_ctx);
 	if (!left_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: left side encoding failed");
 		return {"", false};
 	}
 
-	auto right_result = EncodeExpression(right, child_ctx);
+	auto right_result = EncodeValueExpression(right, child_ctx);
 	if (!right_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: right side encoding failed");
 		return {"", false};
@@ -742,7 +787,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
+		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -754,7 +799,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
-		auto child_result = EncodeExpression(*expr.GetChildren()[0], child_ctx);
+		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
 		}
@@ -785,7 +830,13 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 			return {"", false};
 		}
 
-		auto then_result = EncodeExpression(*check.then_expr, child_ctx);
+		// THEN is VALUE position — the mirror of the WHEN case above. T-SQL has no
+		// boolean value type, so a search condition is illegal here:
+		// `CASE WHEN c THEN [id] > 5 ...` is "Incorrect syntax near '>'". And the
+		// failure is the bad kind — ComplexFilterPushdown erases the expression
+		// from the plan, so the query FAILS instead of falling to the client net
+		// (job 1113).
+		auto then_result = EncodeValueExpression(*check.then_expr, child_ctx);
 		if (!then_result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: THEN clause encoding failed");
 			return {"", false};
@@ -794,8 +845,8 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 		sql += " WHEN " + when_result.sql + " THEN " + then_result.sql;
 	}
 
-	// Encode ELSE clause
-	auto else_result = EncodeExpression(expr.Else(), child_ctx);
+	// ELSE is VALUE position too — same refusal as THEN.
+	auto else_result = EncodeValueExpression(expr.Else(), child_ctx);
 	if (!else_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: ELSE clause encoding failed");
 		return {"", false};
@@ -816,21 +867,21 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	auto child_ctx = ctx.child();
 
 	// Encode the input expression (the column or expression being checked)
-	auto input_result = EncodeExpression(BoundBetweenExpression::Input(expr), child_ctx);
+	auto input_result = EncodeValueExpression(BoundBetweenExpression::Input(expr), child_ctx);
 	if (!input_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: input encoding failed");
 		return {"", false};
 	}
 
 	// Encode the lower bound
-	auto lower_result = EncodeExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
+	auto lower_result = EncodeValueExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
 	if (!lower_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
 		return {"", false};
 	}
 
 	// Encode the upper bound
-	auto upper_result = EncodeExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
+	auto upper_result = EncodeValueExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
 	if (!upper_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");
 		return {"", false};
@@ -984,7 +1035,11 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 
 	// Encode the column expression
 	auto child_ctx = ctx.child();
-	auto column_result = EncodeExpression(column_expr, child_ctx);
+	// Value position like every other (job 1203) — this was the one site the
+	// helper did not cover, which contradicted its own stated invariant. No live
+	// bug today (reaching it with a condition needs a BOOLEAN->VARCHAR cast, which
+	// the cast arm refuses), but it is the same "three doors down" shape.
+	auto column_result = EncodeValueExpression(column_expr, child_ctx);
 	if (!column_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: column encoding failed");
 		return {"", false};

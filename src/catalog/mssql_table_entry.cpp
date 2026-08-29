@@ -5,6 +5,7 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
 #include "duckdb/common/exception.hpp"
@@ -173,8 +174,12 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// This avoids acquiring a connection + DMV query per table during SHOW ALL TABLES
 	auto &stats_provider = mssql_catalog.GetStatisticsProvider();
 	idx_t cached_row_count = 0;
-	if (stats_provider.TryGetCachedRowCount(mssql_schema.name.GetIdentifierName(), name.GetIdentifierName(),
-											cached_row_count)) {
+	// The CALLER's session TTL, passed in — never SetCacheTTL (job 1216). The
+	// provider is one object per catalog; setting its field from a session hands
+	// every other session a window it never chose.
+	const int64_t stats_ttl = LoadStatisticsCacheTTL(context);
+	if (stats_provider.TryGetCachedRowCount(mssql_schema.name.GetIdentifierName(), name.GetIdentifierName(), stats_ttl,
+											cached_row_count, /*exempt_catalog_sourced=*/true)) {
 		info.cardinality = cached_row_count;
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)", mssql_schema.name.c_str(),
 					   name.c_str(), (unsigned long long)cached_row_count);
@@ -195,7 +200,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 			// the debug build.
 			try {
 				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name.GetIdentifierName(),
-															 name.GetIdentifierName());
+															 name.GetIdentifierName(), stats_ttl);
 				info.cardinality = row_count;
 				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
 							   name.c_str(), (unsigned long long)row_count);

@@ -97,14 +97,22 @@ for v in $vars; do
 	# OK. A variable exported in one lane and not the other is exactly the shape
 	# that produced that.
 	missing=""
-	grep -qE "^export[[:space:]]+${v}([[:space:]]|=|:=|\?=|$)" Makefile || missing="Makefile"
+	makefile_missing=0
+	if ! grep -qE "^export[[:space:]]+${v}([[:space:]]|=|:=|\?=|$)" Makefile; then
+		missing="Makefile"
+		makefile_missing=1
+	fi
 	grep -qE "^export[[:space:]]+${v}=" "$CI_LANE" || missing="${missing:+${missing} and }${CI_LANE}"
 	if [ -z "$missing" ]; then
 		continue
 	fi
 	echo "check_require_env: ${v} is not exported by ${missing} — these files SKIP silently there:" >&2
 	echo "    ${files}" >&2
-	if [ "$missing" = "Makefile" ] && grep -qE "^[[:space:]]*${v}[[:space:]]*[:?]?=" Makefile; then
+	# Gate on the MAKEFILE leg alone (job 1182). Testing `missing = "Makefile"`
+	# suppressed this hint whenever BOTH lanes were missing — which is exactly the
+	# historical case that motivated the script: MSSQL_TEST_DSN_TLS assigned at
+	# Makefile:96 with its export commented out AND absent from the CI lane.
+	if [ "$makefile_missing" -eq 1 ] && grep -qE "^[[:space:]]*${v}[[:space:]]*[:?]?=" Makefile; then
 		echo "    (it IS assigned in the Makefile, but never exported — assignment alone" >&2
 		echo "     does not reach the child process.)" >&2
 	fi

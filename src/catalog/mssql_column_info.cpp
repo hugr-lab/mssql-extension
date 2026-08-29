@@ -71,9 +71,12 @@ LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 	// the type the catalog names anyway.
 	//
 	// text/ntext are NOT caught by this guard, despite being MAX by nature:
-	// sys.columns reports max_length 16 for them (the pointer size — the same 16
-	// behind the text->16 CAST truncation), so they pass it and fall through the
-	// unmatched-type-name `else` in the switch below. Same outcome, different
+	// sys.columns reports max_length 16 for them (the in-row pointer size, which
+	// is why GetNVarcharLength has to special-case them to MAX rather than derive
+	// a CAST length from it — issue #197, already fixed), so they pass it and
+	// fall through the
+	// unmatched-type-name `else` at the end of the if/else-if chain below. Same
+	// outcome, different
 	// route — worth stating because the guard's clause list reads like a
 	// complete enumeration and is not one.
 	if (duckdb_type.id() != LogicalTypeId::VARCHAR || max_length <= 0 || is_cast_required || is_geometry) {

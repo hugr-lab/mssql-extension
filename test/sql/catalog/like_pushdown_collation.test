@@ -87,6 +87,21 @@ SELECT mssql_refresh_cache('lc');
 statement ok
 COPY lc_src TO 'lc.dbo.LikeCollation' (FORMAT bcp);
 
+# The column must also still REPORT as a plain VARCHAR. This is the second
+# load-bearing precondition and it already bit once: an NVARCHAR(100) revision of
+# this file passed on the restricted build, because spec 060 reports a
+# length-carrying column as MSSQL_NVARCHAR(n), DuckDB reaches VARCHAR through a
+# no-op cast, and TryPushdownPrefixFilter needs a bare BOUND_COLUMN_REF — so such
+# a column is accidentally IMMUNE to the rewrite this file exists to catch.
+# NVARCHAR(MAX) avoids that only because NativeDuckDBType bails on
+# max_length <= 0, which is an implementation detail this file otherwise asserts
+# nothing about. Pin it, so a change there fails loudly instead of silently
+# disarming every assertion below (job 1135).
+query I
+SELECT column_type = 'VARCHAR' FROM (DESCRIBE SELECT name FROM lc.dbo.LikeCollation);
+----
+true
+
 # The pin must have taken. A server that substituted its own collation would send
 # this file back to passing vacuously, so it fails here instead.
 query I
@@ -104,9 +119,9 @@ true
 
 # Suffix and infix take the same encoder path. The patterns are UPPER-CASE on
 # purpose, and the pinned CI_AS collation is what makes that meaningful: the
-# server matches 'nero'/'Nero' (2 and 3 respectively) while DuckDB's own binary
-# suffix/contains match NOTHING (0), so these separate "the server answered"
-# from "the client answered". Lower-case patterns agree on both sides and cannot
+# server matches 'oslo'/'nero'/'Nero' for '%O' (3) and 'nero'/'Nero' for '%ER%'
+# (2), while DuckDB's own binary suffix/contains match NOTHING (0) — so these
+# separate "the server answered" from "the client answered". Lower-case patterns agree on both sides and cannot
 # fail in either state (PR #276 review).
 query I
 SELECT (SELECT count(*) FROM lc.dbo.LikeCollation WHERE name LIKE '%O')

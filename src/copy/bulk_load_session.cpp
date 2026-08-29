@@ -87,14 +87,16 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 	// the gate on it re-entered the rejected shape through the setting: at
 	// `flush_rows = 1000000` the first million rows serialized onto one writer.
 	// Below the server threshold no batch can compress at all, so there is
-	// nothing for the gate to protect and it stays open — including at
-	// `flush_rows = 0` (no intermediate flush), which is the pre-W2 behaviour.
+	// nothing for the gate to protect and it stays open. `flush_rows = 0` is NOT
+	// that case — it means one UNBOUNDED batch per writer, which can compress, so
+	// the gate applies there (job 1116). The rule is MSSQLWarmupGateRows, which is
+	// pure and unit-tested at its boundaries.
 	//
 	// The read is racy by design — a ramp heuristic, not a correctness bound; the
 	// slot cap below still holds.
 	const idx_t warmup_rows =
-		params.flush_rows >= MSSQL_COLUMNSTORE_ROWGROUP_ROWS ? MSSQL_COLUMNSTORE_ROWGROUP_ROWS : 0;
-	if (params.warmup_gate && warmup_rows > 0 && rows_sunk.load(std::memory_order_relaxed) < warmup_rows) {
+		MSSQLWarmupGateRows(params.warmup_gate, params.flush_rows, MSSQL_COLUMNSTORE_ROWGROUP_ROWS);
+	if (warmup_rows > 0 && rows_sunk.load(std::memory_order_relaxed) < warmup_rows) {
 		// Transient — the gate opens once the shared writer crosses the rowgroup
 		// threshold. The caller must ask again on a later chunk.
 		return Claim::GateClosed;

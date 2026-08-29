@@ -31,8 +31,8 @@ cut by then.
 | 067 | DML staging: UPDATE/DELETE via #temp bulk load + set-based JOIN; match-key ladder makes rowid/PK optional; closes #140 | spec on recon branch | 062 (bulk-load path), 066 | L | VGSML |
 | — | MERGE pushdown (T-SQL MERGE from DuckDB MERGE INTO; semantics mapped in 065 research) | recon only | 067 | M | VGSML |
 | 061 | **Collation-faithful pushdown** (widened in #277 from ORDER BY only). Makes the spec-039 ORDER BY/TOP pushdown default-safe (today experimental, opt-in `mssql_order_pushdown`) — the remaining half of #58 / discussion #59 — AND supplies the exactness that server-side DML requires: `native AND … COLLATE …_BIN2` plus a trailing-space sentinel, added beside the native predicate so the Index Seek survives. **Now a prerequisite, not an independent item** | spec on main (ORDER BY only); widening proposed in #277 — **OPEN**, mechanism lives on that PR branch | nothing | M | oluies |
-| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): the #269 gates objection did not reproduce, but two shapes DO lose pushdown and must be excluded from the deferral (relaxation-only filters, and `rowid`). Partially gated on 061** — available for NON-STRING predicates now; string comparisons must stay claimed by `ComplexFilterPushdown` until 061 supplies a collation-faithful form, because the combiner rewrites `prefix()` into a range that is inexact on any non-binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string predicates only) | M | unassigned |
-| — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and 061 → W1, which is what makes planner-visible filters available to it — for non-string predicates now, for string comparisons after 061** | L | pair — design review together, then split |
+| — (W1 restriction) | Stop `ComplexFilterPushdown` shadowing `pushdown_expression`, so pushed predicates survive as EXPRESSION_FILTERs the planner can estimate. **Measured (see below): the #269 gates objection did not reproduce, but two shapes DO lose pushdown and must be excluded from the deferral (partially-pushed filters, and `rowid`). Partially gated on 061** — available for NON-STRING predicates now; predicates over a collated STRING COLUMN — comparisons as well as patterns — must stay claimed by `ComplexFilterPushdown` until 061, because the combiner both rewrites `prefix()` into a range and reasons over comparison constants, in each case under binary ordering. The re-check route is REJECTED (it breaks native semantics). Removing the string half is what deletes #274's selectivity stopgap (`table_scan.cpp` "DELETE THIS when the filters stay visible", `DATAMODEL.md` likewise) | measured; non-string half unblocked, string half gated on 061 | **061** (string-column predicates only) | M | unassigned |
+| — | JOIN / aggregation pushdown (`join-agg-pushdown.md` on the recon branch): reduction-vs-relocation ladder, materialize-then-decide; the community ask in discussion #75 | recon only | 066; #242 fixed; **and 061 → W1, which is what makes planner-visible filters available to it — for non-string predicates now, for string-column predicates after 061** | L | pair — design review together, then split |
 | 070 | 2.0 follow-ups: `pushdown_expression` (W1), lazy writer ramp-up (W2), `${VAR}`→`{VAR}` (W3) | **DONE** — W1 (#269), W2 (#270), W3 (#271) all merged | 069 merged | W1 M / W2 S / W3 S | W1 VGSML, W2+W3 oluies |
 
 Blocking prerequisite shared by 062 / 066 / 067 / join-relocation:
@@ -84,9 +84,11 @@ so single-column predicates fall through to `pushdown_expression` and survive
 as EXPRESSION_FILTERs. Measured on branch `spec/070-w1-measure-shadowing`
 against a live server.
 
-**Most of it worked.** No pushdown was lost — every shape DuckDB's combiner
-gates still reached the server (`IN` at the 6-value threshold,
-`year(dt) = 2024` beside a second predicate). The planner could finally see
+**Most of it worked.** Nothing was lost to the combiner's own GATES — every
+shape they decline still reached the server (`IN` at the 6-value threshold,
+`year(dt) = 2024` beside a second predicate). That is the scoped claim; the
+unscoped "no pushdown lost" it was first written as is false, for the two
+classes below. The planner could finally see
 predicates: `EXPLAIN` showed `Filters: id < 100` on the scan with real
 selectivity. Full suite green. **The objection recorded in #269 — that the
 combiner's gates (volatile, oversized `IN`, `CanThrow() && filters.size() > 1`)
@@ -97,16 +99,25 @@ wrong and should not be carried forward.
 is false** (roborev job 1130, verified against the source). Two classes DO lose,
 neither of them tested by that measurement:
 
-- **Relaxation-only shapes.** `GenerateTableScanFilters` returns
-  `PUSHED_DOWN_PARTIALLY` for `LIKE`, OR-chains, non-dense `IN` and
+- **Partially-pushed shapes**, and the outcome is worse than "a widened range"
+  for most of them. `GenerateTableScanFilters` returns
+  `PUSHED_DOWN_PARTIALLY` for `LIKE`-prefix, OR-chains, non-dense `IN` and
   temporal-cast filters, and `pushdown_get.cpp` then SKIPS
-  `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN`. So the server
-  receives only the combiner's *relaxation* — prefix bounds, an optional filter,
-  margin-adjusted temporal bounds — and the exact predicate stays above the
-  scan. The `LIKE` result recorded above as "reached the server" was in fact
-  `[name] >= N'n' AND [name] < N'o'`: the relaxation, not the predicate.
-  `WHERE name LIKE 'ab%cd'` over 200k rows streams the whole `ab` prefix range
-  to the client.
+  `TryPushdownGenericExpression` for anything not `NO_PUSHDOWN`. Two different
+  results follow, and only one is a relaxation:
+  - **`LIKE`-prefix** pushes plain comparison bounds the encoder can render, so
+    the server does get `[name] >= N'n' AND [name] < N'o'` — a genuine
+    relaxation, with the exact predicate left above the scan. But this shape is
+    a STRING predicate and is therefore already excluded by the (a)/061 gate
+    below, so it adds nothing new.
+  - **OR-chains, non-dense `IN` and temporal-cast** push through
+    `CreateOptionalExpressionFilter`, i.e. an `ExpressionFilter` wrapping the
+    `optional_filter` scalar function with its real predicate in
+    `OptionalFilterFunctionData`. `EncodeFunctionExpression` has no mapping for
+    that name and refuses, so the scan pushes **NOTHING AT ALL** and sets
+    `needs_duckdb_filter` — a full table stream, not a widened range. These are
+    non-string and otherwise deferrable today, so they are the genuinely new
+    exclusion.
 - **`rowid` predicates lose pushdown entirely.** A rowid filter is
   single-column, so it defers — but `FilterEncoder::Encode` refuses every
   virtual column (`table_col_idx >= VIRTUAL_COL_START`) and routes it to the
@@ -140,8 +151,9 @@ VARCHAR:
   create by default, and `varchar(max)` / `nvarchar(max)` on pre-existing tables;
 - `text` / `ntext`, which reach it with a type name it does not map at all and
   fall through the final `else` — NOT via the `max_length <= 0` guard, since
-  `sys.columns` reports 16 for them (the pointer size, the same 16 behind the
-  known `text`→16 CAST truncation);
+  `sys.columns` reports 16 for them (the in-row pointer size — which is why
+  `GetNVarcharLength` special-cases them to MAX instead of deriving a CAST
+  length from it, issue #197, already fixed);
 - cast-required and geometry columns, and lengths outside the inline limits;
 - **and every string column, `NVARCHAR(100)` included, whenever
   `mssql_catalog_native_types` is `false`** — `NativeDuckDBType` is only
@@ -188,13 +200,14 @@ are preserved by the predicate actually reaching the server.
 **Which mechanism delivers that, and the trade it carries.** Two readings, and
 only one of them honours the decision:
 
-- **(a) `ComplexFilterPushdown` keeps claiming string-pattern expressions.**
+- **(a) `ComplexFilterPushdown` keeps claiming every predicate over a collated string column.**
   This is today's behaviour — verified live, `prefix()` is consumed there and
   emitted as `[name] LIKE N'n%'`, so DuckDB's `TryPushdownPrefixFilter` never
   sees it. Native semantics kept, Index Seek kept. **Cost: those predicates
   stay planner-invisible**, which is exactly the blind spot W1 exists to close.
-  So W1 can make non-string predicates visible; string comparisons cannot join
-  them without 061.
+  So W1 can make non-string predicates visible; string-column predicates cannot
+  join them without 061 — two hazards, detailed in spec 070's W1 outcome: the
+  `prefix()` range rewrite, and binary constant reasoning over comparisons.
 - **(b) Decline the range at the scan.** Planner-visible, but the original LIKE
   has already been pruned by the combiner, so nothing is pushed at all: the
   predicate runs in the client net under DuckDB's **binary** comparison. That
@@ -223,7 +236,7 @@ edge, so do not treat that edge as fully settled.** The edge currently rests on
 DML exactness — "nothing downstream can re-check a server-side DML". If DML
 inherits native semantics by default, that requirement lapses and the `_BIN2`
 pair is needed only under the strict annotation. What survives either way is
-the mechanism-(a) reason: string comparisons cannot become planner-visible
+the mechanism-(a) reason: string-column predicates cannot become planner-visible
 without a collation-faithful form. If the DML answer comes back "native
 everywhere", the W1 row, the order-of-battle edge, and the matching notes in
 `specs/070-duckdb-v2-followups/spec.md` and `src/table_scan/table_scan.cpp`
@@ -235,7 +248,7 @@ must all be revisited together — three surfaces now encode this dependency.
 069 (2.0 migration, #267) ✔ ──► 070 W1 (#269) ✔ W2 (#270) ✔ W3 (#271) ✔   ← spec 070 COMPLETE
 step 0 (cardinality, #274) ✔ ──► 066 ──► 067 ──► MERGE   ← 066 is now the head of the critical path
 062 (single-writer seam) ──► 067
-061 (collation-faithful, #277) ──► W1 restriction, STRING half only ──► planner-visible filters ──► DML-collapse + join/agg
+061 (collation-faithful, #277) ──► W1 restriction, STRING-COLUMN half only ──► planner-visible filters ──► DML-collapse + join/agg
     (W1's non-string half needs no gate and can be done today)
 join/agg — after 066 (+ #242, now closed) and after 061 → W1, which is what
            makes planner-visible filters available to it at all

@@ -28,14 +28,14 @@ MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds) : ca
 //===----------------------------------------------------------------------===//
 
 idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const string &schema_name,
-										   const string &table_name) {
+										   const string &table_name, int64_t ttl_seconds) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
 	auto key = BuildCacheKey(schema_name, table_name);
 	auto it = cache_.find(key);
 
 	// Check if we have valid cached statistics
-	if (it != cache_.end() && IsCacheValid(it->second)) {
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds, /*exempt_catalog_sourced=*/false)) {
 		return it->second.row_count;
 	}
 
@@ -50,22 +50,6 @@ idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const
 	cache_[key] = stats;
 
 	return row_count;
-}
-
-unique_ptr<BaseStatistics> MSSQLStatisticsProvider::GetTableStatistics(tds::TdsConnection &connection,
-																	   const string &schema_name,
-																	   const string &table_name) {
-	idx_t row_count = GetRowCount(connection, schema_name, table_name);
-
-	// Create base statistics with cardinality estimate
-	auto stats = make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(LogicalType::BIGINT));
-
-	// Note: BaseStatistics doesn't directly store row count, but the optimizer
-	// uses table statistics through TableStatistics which wraps cardinality.
-	// For now we return a basic statistics object. The actual cardinality
-	// is typically exposed through the TableFunction's cardinality method.
-
-	return stats;
 }
 
 void MSSQLStatisticsProvider::InvalidateTable(const string &schema_name, const string &table_name) {
@@ -101,24 +85,21 @@ void MSSQLStatisticsProvider::PreloadRowCount(const string &schema_name, const s
 	stats.row_count = row_count;
 	stats.fetched_at = std::chrono::steady_clock::now();
 	stats.is_valid = true;
+	stats.from_catalog_metadata = true;	 // refreshed by invalidation, not by age
 	cache_[key] = stats;
 }
 
 bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
-												   idx_t &out_row_count) {
+												   int64_t ttl_seconds, idx_t &out_row_count,
+												   bool exempt_catalog_sourced) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto key = BuildCacheKey(schema_name, table_name);
 	auto it = cache_.find(key);
-	if (it != cache_.end() && IsCacheValid(it->second)) {
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds, exempt_catalog_sourced)) {
 		out_row_count = it->second.row_count;
 		return true;
 	}
 	return false;
-}
-
-void MSSQLStatisticsProvider::SetCacheTTL(int64_t seconds) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	cache_ttl_seconds_ = seconds;
 }
 
 int64_t MSSQLStatisticsProvider::GetCacheTTL() const {
@@ -134,20 +115,30 @@ string MSSQLStatisticsProvider::BuildCacheKey(const string &schema_name, const s
 	return schema_name + "." + table_name;
 }
 
-bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats) const {
+bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds,
+										   bool exempt_catalog_sourced) const {
 	if (!stats.is_valid) {
 		return false;
 	}
 
+	// A catalog-sourced count is not stale-by-age — it is refreshed when the
+	// metadata is invalidated — but only the caller knows whether that matters
+	// more than freshness. The listing path asks for the exemption because ageing
+	// it out costs a connection + DMV query PER TABLE (job 1217); the planner does
+	// not, so its TTL still means something (job 1230).
+	if (exempt_catalog_sourced && stats.from_catalog_metadata) {
+		return true;
+	}
+
 	// TTL of 0 means no caching (always fetch fresh)
-	if (cache_ttl_seconds_ <= 0) {
+	if (ttl_seconds <= 0) {
 		return false;
 	}
 
 	auto now = std::chrono::steady_clock::now();
 	auto age = std::chrono::duration_cast<std::chrono::seconds>(now - stats.fetched_at).count();
 
-	return age < cache_ttl_seconds_;
+	return age < ttl_seconds;
 }
 
 idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, const string &schema_name,
