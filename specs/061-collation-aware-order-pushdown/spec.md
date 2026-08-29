@@ -272,6 +272,15 @@ the `_BIN2` case § 2 already allows for free. So:
 - **Mixed keys** → the rule is per key; a forced key and a native key can appear
   in one `ORDER BY` since each is independent.
 
+**The transformation must stay local to a key, and that is a hard constraint,
+not a preference.** An `ORDER BY` carries several keys, so anything emitted has
+to compose by concatenation: `ORDER BY a COLLATE …, b COLLATE …, c` is still one
+clause and still one plan. A `COLLATE` suffix has that property; a rewrite of the
+statement's *shape* does not. It is the structural reason the two-branch NULL
+form of D3a is deferred rather than merely descoped — partitioning on the
+null-ness of n keys needs 2^n branches, so the trick that is free for one key is
+unusable for three.
+
 Unchanged: the existing NULL-ordering check still gates, ties remain
 tie-broken by the server (already true for non-string keys today, so not new
 here), and the above-BMP caveat of § 5's D1 applies to the forced key exactly as
@@ -374,8 +383,16 @@ reports. Nothing new has to be fetched.
     its own collation. This *changes results* (that is the point: it is the
     SSMS-like ordering, and it makes ORDER BY agree with the native filter
     semantics of § 4.1), and it buys the ordered-index path on any collation, no
-    sort at all. It is the knob for someone who wants the server's linguistic
-    order deliberately.
+    sort at all.
+
+    **Under this flag every gate drops away, including the NULL one.** The user
+    has asked for the server's ordering, and where the server puts NULLs *is*
+    the server's ordering — so declining a nullable `ASC` key here would be
+    refusing to deliver the thing that was requested. Collation is likewise
+    irrelevant: nothing is being matched against DuckDB. So the flag means
+    **push every key**, no collation test, no `IsNullOrderCompatible` call, and
+    the ordered index is used throughout. It is both the fastest mode and the
+    simplest one to implement — a straight emit.
 
   The two compose in one direction only: the native flag chooses **how** a key
   is pushed, never **whether**. With `mssql_order_pushdown = false` nothing is
@@ -497,6 +514,10 @@ O4. `SET mssql_order_pushdown_native_collation = true` on a `_CI_AS` key emits n
     "on" row (`_x | Ähre | Apple | apple`), which is a different *set* under
     `LIMIT`. The divergence is the feature; it is pinned so it cannot regress
     into the faithful path unnoticed.
+O4a. Under the same flag a **nullable `ASC`** key pushes too — the gate that
+    declines it by default does not run here — and returns the server's NULL
+    placement (NULLs first). Asserted because it is the one place where the flag
+    widens *what* is pushed rather than only *how*.
 O5. NULL handling is unchanged (D3a): a `NOT NULL` string key of any collation
     now pushes, a nullable key sorted plain `ASC` is still declined, and a
     nullable `DESC` key still pushes. Asserted as behaviour, so that widening the
