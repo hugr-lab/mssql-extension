@@ -66,16 +66,27 @@ static void TestCallerSuppliedTTLGovernsAndDoesNotLeak() {
 	Check("the passed TTL did NOT mutate shared state", provider.GetCacheTTL() == 300,
 		  "one session's setting must not reach another's lookups (jobs 1203, 1216)");
 
-	// A CATALOG-SOURCED entry is exempt from the TTL: it is refreshed by
-	// invalidation, not by age. Ageing it out sent SHOW ALL TABLES to a per-table
-	// DMV query on a catalog that had just loaded every count (job 1217).
+	// THE DISCRIMINATING ASSERTION (job 1230). By DEFAULT the caller's TTL
+	// governs, exemption or not — so a TTL of 0 refuses even a preloaded entry.
+	// Revert IsCacheValid to reading the provider's own field and this fails,
+	// which is the whole point: the earlier version of this test passed against
+	// the reverted code because the exemption short-circuited before the argument
+	// was read.
 	out = 0;
-	Check("a preloaded entry survives a TTL of 0", provider.TryGetCachedRowCount("dbo", "t", 0, out) && out == 42,
-		  "`SET ttl = 0` must mean 'always fresh', not 'N connections per listing'");
+	Check("a passed TTL of 0 refuses the entry by default", !provider.TryGetCachedRowCount("dbo", "t", 0, out),
+		  "the caller's session disabled caching; the provider's 300 must not win");
+
+	// The exemption is OPT-IN, and only the table-listing path asks for it:
+	// ageing a catalog-sourced count out costs a connection + DMV query per table.
+	out = 0;
+	Check("...but survives when the caller opts into the catalog exemption",
+		  provider.TryGetCachedRowCount("dbo", "t", 0, out, /*exempt_catalog_sourced=*/true) && out == 42,
+		  "SHOW ALL TABLES must not become N connections per listing (job 1217)");
 
 	provider.InvalidateTable("dbo", "t");
 	out = 0;
-	Check("invalidation still clears a preloaded entry", !provider.TryGetCachedRowCount("dbo", "t", 0, out),
+	Check("invalidation still clears an exempt entry",
+		  !provider.TryGetCachedRowCount("dbo", "t", 0, out, /*exempt_catalog_sourced=*/true),
 		  "the exemption is from ageing, not from invalidation");
 
 	MSSQLStatisticsProvider strict(0);

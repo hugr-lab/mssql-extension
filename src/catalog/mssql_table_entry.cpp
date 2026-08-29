@@ -179,7 +179,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// every other session a window it never chose.
 	const int64_t stats_ttl = LoadStatisticsCacheTTL(context);
 	if (stats_provider.TryGetCachedRowCount(mssql_schema.name.GetIdentifierName(), name.GetIdentifierName(), stats_ttl,
-											cached_row_count)) {
+											cached_row_count, /*exempt_catalog_sourced=*/true)) {
 		info.cardinality = cached_row_count;
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (stats cache hit)", mssql_schema.name.c_str(),
 					   name.c_str(), (unsigned long long)cached_row_count);

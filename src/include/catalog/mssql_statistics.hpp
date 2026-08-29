@@ -101,8 +101,21 @@ public:
 	//! catalog-wide TTL sitting next to a per-session setting is precisely the
 	//! shape that invited this bug twice (jobs 1203, 1216). The type can no longer
 	//! express it.
+	//! @param exempt_catalog_sourced When true, an entry filled by PreloadRowCount
+	//!        (the catalog's own metadata load, not a DMV query) ignores the TTL —
+	//!        it is refreshed by invalidation, not by age. ONLY the table-listing
+	//!        path wants this: it is what keeps `SET
+	//!        mssql_statistics_cache_ttl_seconds = 0` from turning SHOW ALL TABLES
+	//!        into one connection + DMV round trip per table.
+	//!
+	//!        Deliberately NOT the default (job 1230). Making it unconditional
+	//!        exempted every entry the cache can hold in practice — PreloadRowCount
+	//!        is its only populator on the reachable paths — so the TTL governed
+	//!        nothing, GetRowCount's DMV re-read became unreachable, and the test
+	//!        written to guard the caller-supplied-TTL invariant passed even with
+	//!        that invariant reverted.
 	bool TryGetCachedRowCount(const string &schema_name, const string &table_name, int64_t ttl_seconds,
-							  idx_t &out_row_count);
+							  idx_t &out_row_count, bool exempt_catalog_sourced = false);
 
 	//! Get the cache TTL
 	int64_t GetCacheTTL() const;
@@ -113,7 +126,7 @@ private:
 
 	//! Check if cached statistics are still valid
 	//! Judged against the CALLER's TTL — there is deliberately no TTL-less form.
-	bool IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds) const;
+	bool IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds, bool exempt_catalog_sourced) const;
 
 	//! Fetch row count from SQL Server
 	idx_t FetchRowCount(tds::TdsConnection &connection, const string &schema_name, const string &table_name);

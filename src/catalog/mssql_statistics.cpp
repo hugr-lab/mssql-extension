@@ -35,7 +35,7 @@ idx_t MSSQLStatisticsProvider::GetRowCount(tds::TdsConnection &connection, const
 	auto it = cache_.find(key);
 
 	// Check if we have valid cached statistics
-	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds)) {
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds, /*exempt_catalog_sourced=*/false)) {
 		return it->second.row_count;
 	}
 
@@ -90,11 +90,12 @@ void MSSQLStatisticsProvider::PreloadRowCount(const string &schema_name, const s
 }
 
 bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
-												   int64_t ttl_seconds, idx_t &out_row_count) {
+												   int64_t ttl_seconds, idx_t &out_row_count,
+												   bool exempt_catalog_sourced) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto key = BuildCacheKey(schema_name, table_name);
 	auto it = cache_.find(key);
-	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds)) {
+	if (it != cache_.end() && IsCacheValid(it->second, ttl_seconds, exempt_catalog_sourced)) {
 		out_row_count = it->second.row_count;
 		return true;
 	}
@@ -114,16 +115,18 @@ string MSSQLStatisticsProvider::BuildCacheKey(const string &schema_name, const s
 	return schema_name + "." + table_name;
 }
 
-bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds) const {
+bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats, int64_t ttl_seconds,
+										   bool exempt_catalog_sourced) const {
 	if (!stats.is_valid) {
 		return false;
 	}
 
-	// A catalog-sourced count is not stale-by-age: it is refreshed when the
-	// metadata is invalidated, which the invalidation paths now do. Ageing it out
-	// would send SHOW ALL TABLES to a per-table DMV query on a catalog that just
-	// loaded every count in one round trip (job 1217).
-	if (stats.from_catalog_metadata) {
+	// A catalog-sourced count is not stale-by-age — it is refreshed when the
+	// metadata is invalidated — but only the caller knows whether that matters
+	// more than freshness. The listing path asks for the exemption because ageing
+	// it out costs a connection + DMV query PER TABLE (job 1217); the planner does
+	// not, so its TTL still means something (job 1230).
+	if (exempt_catalog_sourced && stats.from_catalog_metadata) {
 		return true;
 	}
 
