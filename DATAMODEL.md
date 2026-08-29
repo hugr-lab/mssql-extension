@@ -363,6 +363,19 @@ classDiagram
 - `MSSQLMetadataCache` is incremental and lazy. `GetTableMetadata` **copies** the metadata out under the cache mutex — the previous raw-pointer return escaped the lock and raced `Refresh` / bulk reloads freeing the map node (issue #178 review finding).
 - **Locking invariant (issue #178)**: ONE cache-wide `mutex_` guards `schemas_` and everything reachable through it (tables, columns, load states), plus `state_` / `database_collation_`. Loads hold it across their SQL round trip so partial state is never visible — concurrent metadata loads serialize by design. `ttl_seconds_` / `metadata_timeout_ms_` are atomics (written per-lookup by `EnsureCacheLoaded`, read by loaders mid-query while the mutex is held). The pre-#178 split (`mutex_` for Refresh/HasSchema, `schemas_mutex_` for everything else) let `Refresh()` free the whole map under a reader — TSan-confirmed UAF.
 - `MSSQLStatisticsProvider` returns stats by value; no raw-pointer hand-out.
+- **TTL ownership and the listing exemption.** `mssql_statistics_cache_ttl_seconds`
+  is a SESSION setting; the provider is ONE object per catalog. So every read
+  passes its TTL in as an argument and nothing writes it back — a mutable
+  catalog-wide TTL next to a per-session setting produced the same cross-session
+  leak twice (one session's `SET` governing another's plans). The mutable knob
+  has been removed so the type cannot express it.
+  A count loaded by the CATALOG (`PreloadRowCount`) is exempt from ageing on the
+  table-LISTING path only (`MSSQLTableEntry::GetStorageInfo` opts in): it is
+  refreshed by invalidation, not by time, and ageing it out costs a connection +
+  DMV query per table on a catalog that just loaded every count in one query.
+  The exemption is opt-in per read, NOT a property of the entry — making it
+  unconditional exempted every entry the cache holds in practice, so the TTL
+  governed nothing and the DMV re-read became unreachable.
 - **Its row counts reach the planner through `TableFunction::cardinality`, not
   through `TableStorageInfo`** (roadmap v0.3.0 "step 0"). `MSSQLTableEntry::
   GetStorageInfo` has filled `TableStorageInfo::cardinality` since spec 023, but
