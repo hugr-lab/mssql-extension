@@ -414,6 +414,29 @@ reports. Nothing new has to be fetched.
   becomes a *seek predicate*; the `CASE` expression cannot, which is the whole
   difference.
 
+  **The metadata for this already exists and is already read.**
+  `MSSQLColumnInfo::is_nullable` is populated by all three catalog query shapes
+  (`mssql_metadata_cache.cpp`) and the gate consults it today —
+  `mssql_optimizer.cpp:306` feeds it to `IsNullOrderCompatible`. So the two-branch
+  form needs no new metadata and no extra round trip; it needs the gate to emit a
+  different query instead of giving up.
+
+  **And the gate is narrower than "nullable declines".** Reading it against
+  DuckDB's default (`default_null_order = NULLS_LAST`, verified, for ASC *and*
+  DESC):
+
+  | key | DuckDB asks | SQL Server's default | today |
+  |---|---|---|---|
+  | `NOT NULL` | — | — | **pushes** (the check returns early) |
+  | nullable, `DESC` | NULLS LAST | DESC → NULLs last | **pushes** — they agree |
+  | nullable, `ASC` | NULLS LAST | ASC → NULLs first | **declined** |
+  | nullable, `ASC NULLS FIRST` (explicit) | NULLS FIRST | NULLs first | **pushes** |
+
+  So the only shape that loses is **a nullable key sorted plain ascending** —
+  which is `ORDER BY col`, the most common ORDER BY there is. That is what the
+  two-branch form buys back, and why it is worth more than the collation work it
+  is bundled beside.
+
   Two consequences:
 
   - **A nullable key stops being a blanket decline.** For a `_BIN2` or
