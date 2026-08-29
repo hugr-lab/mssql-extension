@@ -217,14 +217,65 @@ Forms whose superset property is unproven (§ 3.3) do not collapse: they fall
 back to the existing rowid round trip, which targets rows by identity rather
 than by predicate and is correct under any collation.
 
-### 4.3 ORDER BY — § 2's passive rule, plus an option
+### 4.3 ORDER BY and TOP — the widening the same trick buys
 
-Sorting has no superset: `TOP k` under the wrong order returns the wrong *set*,
-and a client re-sort of truncated rows cannot recover it. So § 2 stands — push
-when the key is already `_BIN2` or non-string. `ORDER BY a COLLATE …_BIN2` is
-available and correct, but it forces a server-side sort (the index order no
-longer applies), so it is worth it only when `TOP k` avoids transferring the
-table. Offered as an opt-in, not a default.
+Sorting has no superset to fall back on: `TOP k` under the wrong order returns
+the wrong **set**, and no client re-sort of already-truncated rows recovers it.
+§ 1 measures exactly that — four rows, two disjoint answers.
+
+Note this is **not** in tension with § 4.1's native-by-default. Both apply the
+same principle — *preserve what ships* — to surfaces where what ships differs.
+Filters push today, so their shipped behaviour is the server's semantics. ORDER
+BY does **not** push today (`mssql_order_pushdown` has been `false` since spec
+039), so its shipped behaviour is **DuckDB's** order. Preserving each therefore
+points in opposite directions, and that is a consequence of history, not an
+inconsistency.
+
+**§ 2's rule (push only a `_BIN2` or non-string key) is correct but empty on a
+default install.** The active form of § 3 fixes that, and here it is genuinely
+cheap. Measured, 200 000-row `nvarchar(100) COLLATE SQL_Latin1_General_CP1_CI_AS`
+with an index on the key:
+
+| pushed | plan | 5-run elapsed |
+|---|---|---|
+| `TOP 10 … ORDER BY s` (native) | `Top` → **Index Scan ORDERED FORWARD** — no sort at all | ~0–1 ms |
+| `TOP 10 … ORDER BY s COLLATE …BIN2` | `Top` → **`Sort(TOP 10)`** → Compute Scalar → Index Scan | ~6–7 ms |
+
+Two things follow.
+
+**It is correct.** On § 1's own seven values the collation-forced order is
+DuckDB's, element for element:
+
+```text
+DuckDB           ORDER BY s LIMIT 4 :  Apple | BANANA | Zebra | _x
+server, native CI_AS              :  _x    | Ähre   | apple | Apple
+server, COLLATE …_BIN2            :  Apple | BANANA | Zebra | _x   ← identical
+```
+
+Including `_x` sorting *after* the uppercase letters, which is where the
+linguistic collation departs most sharply.
+
+**It is affordable.** The forced order costs the ordered-index fast path, but
+SQL Server answers with a **bounded `Sort(TOP 10)`** — a priority queue over the
+scan, not a full sort — so the cost is one pass, ~6 ms per 200 k rows. Set that
+against the alternative for a non-`_BIN2` column, which today is *no pushdown at
+all*: transferring the whole column to DuckDB to find ten rows.
+
+And there is no regression to trade away. The ordered-index path exists only
+when the column's own collation already matches the requested order — precisely
+the `_BIN2` case § 2 already allows for free. So:
+
+- **`_BIN2` or non-string key** → push as today, ordered index scan, no sort.
+- **Any other string key** → push `ORDER BY key COLLATE Latin1_General_BIN2`
+  with the `TOP`, taking the bounded sort. Widens TopN pushdown from "nothing on
+  a default install" to every string column.
+- **Mixed keys** → the rule is per key; a forced key and a native key can appear
+  in one `ORDER BY` since each is independent.
+
+Unchanged: the existing NULL-ordering check still gates, ties remain
+tie-broken by the server (already true for non-string keys today, so not new
+here), and the above-BMP caveat of § 5's D1 applies to the forced key exactly as
+it does to a naturally-`_BIN2` one.
 
 ### 4.4 Summary
 
@@ -241,50 +292,43 @@ run a `DELETE` will see it (`docs/dml-collation-semantics`, merged as #286).
 | DML-collapse, superset forms | native **+** `COLLATE …BIN2` (+ sentinel on `=`) | strict | DuckDB's |
 | DML, everything else | — | — | rowid round trip |
 | Column already `_BIN2`, or non-string | native predicate only | identical either way | both |
-| ORDER BY | only when `_BIN2` / non-string | native | § 2 |
+| ORDER BY / TOP, `_BIN2` or non-string key | native predicate only | ordered index scan | both agree |
+| ORDER BY / TOP, any other string key | `ORDER BY key COLLATE …_BIN2` | strict | DuckDB's (§ 4.3) |
 
-### 4.5 Extending what pushes — exact forms for functions #242 removed
+### 4.5 Extending what pushes — the simple exact forms
 
 Native semantics settle *comparison*. They say nothing about a scalar function's
 **value**: `length('ab ')` is 3 in DuckDB whatever the collation, so a mapping to
-`LEN` that answers 2 is a plain value bug, which is what issue #242 found and
+`LEN` that answers 2 is a plain value bug — which is what issue #242 found and
 #269 fixed by removing four mappings.
 
-Removing them was right. The conclusion drawn alongside it — *"there is no exact
-T-SQL form"* — turns out to be too strong for three of the four. Measured
-DuckDB-vs-server, same inputs:
+**Take (measured exact, direct 1:1 forms):** `abs` → `ABS`, `floor` → `FLOOR`,
+`ceil`/`ceiling` → `CEILING`, `round` → `ROUND`, `substring` → `SUBSTRING`.
+Verified DuckDB-vs-server on the cases that usually separate implementations:
+`round` agrees on half-away-from-zero, on negatives (`round(-2.5)` = −3 both
+sides) and in the 2-argument form; `ceil(-2.3)` = −2 and `floor(-2.3)` = −3 both
+sides; `substring` agrees **including** the `start = 0` edge, where both answer
+`ab` for `substring('abcdef', 0, 3)`. No collation is involved in any of them,
+so native-vs-strict does not arise.
 
-| DuckDB | exact T-SQL | evidence |
+**Leave to DuckDB (decision, 2026-08-29):** `/`, `week`, `dayofweek`, `length`.
+Exact T-SQL forms *do* exist for all four and are recorded below so the next
+reader of #242 does not re-derive them — but they are **not worth pushing**:
+each needs a compound rewrite, and a compound expression over a column defeats
+the index just as surely as the naive mapping did, while the queries that use
+them are narrow. DuckDB computes them on the rows the other predicates already
+selected.
+
+| DuckDB | exact form, for the record | why it stays unpushed |
 |---|---|---|
-| `/` | `({0} * 1.0 / NULLIF({1}, 0))` | `5/2`→2.5, `7/2`→3.5 both sides. `* 1.0` defeats integer division; `NULLIF` defeats the server's **divide-by-zero error** — measured, raw `5*1.0/0` aborts the query while DuckDB yields `inf`. NULL and `inf` behave identically in predicate position (the row is excluded either way — verified in DuckDB). |
-| `length` / `len` | `LEN({0} + N'~') - 1` | `'ab '`→**3** both sides; the naive `LEN` answers 2. The sentinel of § 3.1 again: it stops the space being trailing. |
-| `week` | `DATEPART(ISO_WEEK, {0})` | 2024-01-04→1, 2024-12-30→1, 2021-01-01→53 on both. DuckDB's `week()` *is* the ISO week, and T-SQL has an ISO datepart — the original mapping simply used the wrong one. |
-| `dayofweek` | `((DATEDIFF(day, '19000107', {0}) % 7) + 7) % 7` | Sun→0, Wed→3 on both, and 1899-05-10→3 for a date *before* the anchor. Anchored on a known Sunday, so it is **`@@DATEFIRST`-independent** — the property that disqualified `DATEPART(weekday, …)`. The `+7 %7` is not decoration: without it T-SQL's sign-preserving `%` answers −4 for pre-anchor dates. |
+| `/` | `({0} * 1.0 / NULLIF({1}, 0))` | `5/2`→2.5 both sides; `NULLIF` is not optional — raw `5*1.0/0` **aborts the query** server-side while DuckDB yields `inf` (NULL and `inf` behave alike in predicate position, verified). Two wrappers to fix one operator. |
+| `week` | `DATEPART(ISO_WEEK, {0})` | Genuinely exact — DuckDB's `week()` *is* the ISO week and T-SQL has the datepart; the original mapping just used the wrong one (1, 1, 53 on both sides for 2024-01-04 / 2024-12-30 / 2021-01-01). Cheap to restore later if a real query wants it. |
+| `dayofweek` | `((DATEDIFF(day,'19000107',{0}) % 7) + 7) % 7` | Anchored on a known Sunday, so `@@DATEFIRST`-independent — the property that disqualified `DATEPART(weekday, …)`. The `+7 %7` is load-bearing: without it T-SQL's sign-preserving `%` answers −4 for pre-anchor dates. Correct, and unreadable in a WHERE clause. |
+| `length` | `LEN({0} + N'~') - 1` | Rejected on correctness as well as cost: `LEN` counts **UTF-16 code units**, DuckDB counts code points, so `'a😀b'` is 3 in DuckDB and **4** on the server. Exact only for BMP-only data — not a guarantee worth shipping. |
 
-**`length` carries one limit that does not go away.** `LEN` counts UTF-16 code
-units and DuckDB counts code points, so they part company above the BMP:
-`'a😀b'` is **3** in DuckDB and **4** on the server. The form is exact for BMP-only
-data and wrong for supplementary characters (emoji, rare CJK), so it either ships
-gated or does not ship — this is a judgement for review, not something to decide
-by measurement. The other three have no such caveat.
-
-**Also verified exact, and currently unmapped** — no collation involvement, so
-these are pure value equivalences: `abs` → `ABS`, `floor` → `FLOOR`,
-`ceil`/`ceiling` → `CEILING`, `round` → `ROUND` (agrees on half-away-from-zero
-and on negatives: `round(-2.5)` = −3 both sides; the 2-argument form agrees too),
-`substring` → `SUBSTRING` (**including** the `start = 0` edge, where both answer
-`ab` for `substring('abcdef',0,3)`).
-
-**What this does not change: SARGability.** A function wrapping a column defeats
-an index seek whether it is `LEN(x + N'~') - 1` or the `YEAR(x)` we already push.
-That is a property of function-in-predicate, not of these forms, so the extension
-costs nothing that today's mappings do not already cost — and it saves the full
-column transfer that an unmapped function forces.
-
-Sequencing note: this subsection is independent of § 4.1–4.4. It needs no
-collation machinery and could ship on its own; it lives here because #242 is
-where the four removals are recorded and a future reader of that issue should
-find the exact forms next to it.
+SARGability is unchanged by the five we take: a function wrapping a column
+defeats a seek whether it is `ABS(x)` or the `YEAR(x)` already pushed. The gain
+is not transferring the column.
 
 ## 5. What has to be built
 
@@ -344,12 +388,16 @@ F2. A collapsed `UPDATE`/`DELETE` on a `_CI_AS` column affects exactly the rows
     shows the seek survived (§ 3.2).
 F3. A string `<>` predicate does **not** collapse: it falls back (client-side for
     SELECT, rowid for DML) and returns DuckDB's rows.
-F4. (§ 4.5, independent) For each restored mapping, the pushed result equals the
-    un-pushed one on the values that broke the original: `'ab '` for `length`,
-    `5/2` for `/`, an ISO week-53 boundary date for `week`, a pre-1900 date for
-    `dayofweek`, and a `b = 0` row for the division guard (which must not error).
-    If `length` ships, a supplementary-plane string is either asserted or
-    excluded by the gate — never left unasserted.
+F4. (§ 4.5, independent) Each newly mapped function returns the same rows pushed
+    as un-pushed, asserted on the values that separate implementations:
+    `round(-2.5)`, a 2-argument `round`, `ceil`/`floor` of a negative, and
+    `substring(s, 0, 3)`. The four left to DuckDB stay unmapped — a test that
+    `length`/`week`/`dayofweek`/`/` are still absent from the mapping table keeps
+    § 4.5's decision from being undone by someone reading only the exact forms.
+F5. (§ 4.3) On a `_CI_AS` string key, `ORDER BY s LIMIT k` returns DuckDB's rows
+    in DuckDB's order — asserted element by element on § 1's seven values, the
+    set that motivated this spec — and the plan shows the sort happened on the
+    server (nothing transferred beyond `k` rows).
 
 **ORDER BY (§ 1–2):**
 
@@ -398,8 +446,8 @@ Risks specific to the widened scope:
 - **`NVARCHAR` under `_BIN2` compares UTF-16 code units**, DuckDB compares UTF-8
   bytes. They agree across the BMP and disagree above U+FFFF (supplementary
   plane: emoji, rare CJK). § 5's D1 risk note already flags this for ordering;
-  it applies identically to the forced-collation equality of § 4.2 and needs the
-  same above-U+FFFF test.
+  it applies identically to the forced-collation equality of § 4.2 and to the
+  forced ORDER BY key of § 4.3, and needs the same above-U+FFFF test in all three.
 - **The sentinel changes the expression's type and length.** `a + '~'` on a
   `varchar(8000)`/`MAX` column risks truncation or an implicit conversion the
   plan shows as `CONVERT_IMPLICIT` (visible in the § 3.2 measurement). Pick the
