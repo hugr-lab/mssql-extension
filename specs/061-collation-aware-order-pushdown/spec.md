@@ -382,13 +382,28 @@ reports. Nothing new has to be fetched.
   pushed no matter what the native flag says, and that must be asserted — an
   opt-in that silently re-enables a disabled pushdown is the worst of both.
 
-- **D3a NULL ordering: split it server-side, do not put it in the sort key.**
-  The existing check (§ 1) declines a nullable key outright because SQL Server
-  sorts NULLs first in ASC and DuckDB sorts them last. An earlier draft of this
-  decision said the fix — moving the NULL test into the ORDER BY as
-  `CASE WHEN k IS NULL THEN 1 ELSE 0 END` — would cost the ordered-index path.
-  **Measured, that is wrong**, and the working form is a `UNION ALL` of two
-  bounded `TOP`s rather than a compound sort key:
+- **D3a NULL ordering: unchanged, and nullable-ASC stays out of scope.** The
+  existing `IsNullOrderCompatible` (`mssql_optimizer.cpp:265`) already decides
+  this correctly and is **not touched** by this spec. What ships here is the
+  collation work applied to whatever that gate already passes. Read against
+  DuckDB's verified default (`default_null_order = NULLS_LAST`, ASC *and* DESC):
+
+  | key | DuckDB asks | SQL Server's default | gate |
+  |---|---|---|---|
+  | `NOT NULL` | — | — | **passes** (returns early) |
+  | nullable, `DESC` | NULLS LAST | DESC → NULLs last | **passes** — they agree |
+  | nullable, `ASC NULLS FIRST` (explicit) | NULLS FIRST | NULLs first | **passes** |
+  | nullable, `ASC` | NULLS LAST | ASC → NULLs first | **declined** |
+
+  So this spec widens TopN for **NOT NULL keys of any collation** (today: only
+  `_BIN2`), plus the nullable shapes that already pass. A nullable key sorted
+  plain ascending keeps being declined, exactly as today — no regression, no new
+  behaviour.
+
+  **Recorded for whoever picks it up later**, because it was measured and should
+  not be re-derived. `ORDER BY col` on a nullable column — the most common ORDER
+  BY there is — is the one shape that loses, and it is recoverable *server-side*
+  with two bounded branches rather than a compound sort key:
 
   ```sql
   SELECT TOP k … FROM (
@@ -398,67 +413,21 @@ reports. Nothing new has to be fetched.
   ) x ORDER BY g, key
   ```
 
-  On a nullable `_BIN2` key over 200 000 rows the plan contains **no Sort
-  operator at all** —
+  On a nullable `_BIN2` key over 200 000 rows that plan contains **no Sort
+  operator at all** — `Top → Merge Join(Concatenation) → two Index Seeks
+  (`IsNotNull` / `= NULL`) ORDERED FORWARD` — at **~0 ms**, because `IS NOT NULL`
+  becomes a *seek predicate* and both branches arrive ordered. The two obvious
+  alternatives both measure ~6–7 ms and are recorded as dead ends: putting
+  `CASE WHEN k IS NULL …` in the sort key degrades to `Sort(TOP k)` over an
+  unordered Index Scan, and wrapping an index-ordered subquery
+  (`SELECT TOP 100 PERCENT … ORDER BY key`) in an outer sort is **flattened by
+  the optimizer into that identical plan** — T-SQL does not preserve a
+  subquery's order without a bound.
 
-  ```text
-  Top(10)
-    └─ Merge Join(Concatenation)
-         ├─ Top(10) → Index Seek(key IsNotNull) ORDERED FORWARD
-         └─ Top(10) → Index Seek(key = NULL)    ORDERED FORWARD
-  ```
+  `MSSQLColumnInfo::is_nullable` is already populated by all three catalog query
+  shapes and already read at `mssql_optimizer.cpp:306`, so that follow-up needs
+  no new metadata and no extra round trip — only a different emitted query.
 
-  — because both branches arrive already ordered and the server concatenates
-  them by merge. **~0 ms, against ~6–7 ms for the `CASE`-in-ORDER-BY form**,
-  which degrades to `Sort(TOP k)` over an unordered Index Scan. `IS NOT NULL`
-  becomes a *seek predicate*; the `CASE` expression cannot, which is the whole
-  difference.
-
-  **The metadata for this already exists and is already read.**
-  `MSSQLColumnInfo::is_nullable` is populated by all three catalog query shapes
-  (`mssql_metadata_cache.cpp`) and the gate consults it today —
-  `mssql_optimizer.cpp:306` feeds it to `IsNullOrderCompatible`. So the two-branch
-  form needs no new metadata and no extra round trip; it needs the gate to emit a
-  different query instead of giving up.
-
-  **And the gate is narrower than "nullable declines".** Reading it against
-  DuckDB's default (`default_null_order = NULLS_LAST`, verified, for ASC *and*
-  DESC):
-
-  | key | DuckDB asks | SQL Server's default | today |
-  |---|---|---|---|
-  | `NOT NULL` | — | — | **pushes** (the check returns early) |
-  | nullable, `DESC` | NULLS LAST | DESC → NULLs last | **pushes** — they agree |
-  | nullable, `ASC` | NULLS LAST | ASC → NULLs first | **declined** |
-  | nullable, `ASC NULLS FIRST` (explicit) | NULLS FIRST | NULLs first | **pushes** |
-
-  So the only shape that loses is **a nullable key sorted plain ascending** —
-  which is `ORDER BY col`, the most common ORDER BY there is. That is what the
-  two-branch form buys back, and why it is worth more than the collation work it
-  is bundled beside.
-
-  Two consequences:
-
-  - **A nullable key stops being a blanket decline.** For a `_BIN2` or
-    non-string key it now pushes on the free path — no sort — where today it
-    does not push at all.
-  - **For a forced-collation key the NULL split is free anyway**, because that
-    query is already paying a `Sort(TOP k)` for the collation: measured, the
-    non-NULL branch keeps its `Index Seek(IsNotNull) ORDERED FORWARD` feeding
-    that same bounded sort.
-
-  The naive shapes both fail and are recorded so they are not retried: putting
-  the `CASE` in the sort key loses the seek (above), and wrapping an
-  index-ordered subquery in an outer sort — `SELECT … FROM (SELECT TOP 100
-  PERCENT … ORDER BY key) x ORDER BY CASE …` — is **flattened by the optimizer
-  into exactly the same plan as the plain `CASE` sort**, measured identical.
-  T-SQL does not preserve a subquery's order without a bound, so the ordering
-  has to be re-expressed as something the optimizer can turn into a seek, which
-  is what the two-branch form does.
-
-  Still deliberately a **separate change from the collation work**: it is a
-  second, independent widening, and landing it in the same commit would make an
-  ORDER BY regression impossible to bisect.
 - **D4 Tests that assert the ORDER, not the row count.** The regression this
   guards is a reordering, so a test that counts rows cannot see it. The shape is
   the § 1 table: the same seven rows under a `_CI_AS` column and under a `_BIN2`
@@ -528,12 +497,10 @@ O4. `SET mssql_order_pushdown_native_collation = true` on a `_CI_AS` key emits n
     "on" row (`_x | Ähre | Apple | apple`), which is a different *set* under
     `LIMIT`. The divergence is the feature; it is pinned so it cannot regress
     into the faithful path unnoticed.
-O5. A nullable key pushes via the two-branch form (D3a) and returns DuckDB's
-    NULLS-LAST order; on a `_BIN2` key the plan is asserted to contain **no Sort
-    operator**, since the whole point is that the seek survives. Both naive
-    shapes are pinned as rejected: the `CASE`-in-sort-key form and the
-    `TOP 100 PERCENT` subquery form produce a sort, so the assertion is on the
-    plan, not the rows — the rows are identical either way.
+O5. NULL handling is unchanged (D3a): a `NOT NULL` string key of any collation
+    now pushes, a nullable key sorted plain `ASC` is still declined, and a
+    nullable `DESC` key still pushes. Asserted as behaviour, so that widening the
+    collation rule cannot accidentally widen the NULL rule with it.
 O6. A mixed ORDER BY (one `_BIN2` key, one `_CI_AS` key) pushes both — each key is
     judged independently, the `_BIN2` one bare and the other forced.
 O7. On Fabric, the default pushes with no `COLLATE` clause — the warehouse
