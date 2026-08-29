@@ -89,6 +89,24 @@ static void TestCallerSuppliedTTLGovernsAndDoesNotLeak() {
 		  !provider.TryGetCachedRowCount("dbo", "t", 0, out, /*exempt_catalog_sourced=*/true),
 		  "the exemption is from ageing, not from invalidation");
 
+	// THE OTHER HALF OF THE PREDICATE (job 1259). Everything above uses
+	// PreloadRowCount, so every entry is catalog-sourced — which means weakening
+	// `exempt_catalog_sourced && stats.from_catalog_metadata` to
+	// `exempt_catalog_sourced` alone would leave all of it green. On the live path
+	// that weakening is the hazard: GetStorageInfo passes true unconditionally and
+	// GetRowCount writes DMV entries back with from_catalog_metadata = false, so
+	// the blanket form would serve a DMV-sourced count that never ages out.
+	provider.SeedRowCountForTesting("dbo", "dmv", 99, /*from_catalog_metadata=*/false);
+	out = 0;
+	Check("a DMV-sourced entry is refused at TTL 0 EVEN WITH the exemption asked for",
+		  !provider.TryGetCachedRowCount("dbo", "dmv", 0, out, /*exempt_catalog_sourced=*/true),
+		  "the exemption is for catalog-sourced counts only");
+
+	out = 0;
+	Check("...and is accepted at a generous TTL",
+		  provider.TryGetCachedRowCount("dbo", "dmv", 3600, out, /*exempt_catalog_sourced=*/true) && out == 99,
+		  "it ages normally, which is the whole difference");
+
 	MSSQLStatisticsProvider strict(0);
 	strict.PreloadRowCount("dbo", "t", 7);
 	out = 0;

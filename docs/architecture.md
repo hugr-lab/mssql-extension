@@ -242,7 +242,7 @@ src/
 | `mssql_enable_statistics` | true | Expose row count to optimizer |
 | `mssql_statistics_level` | 0 | 0=rowcount, 1=histogram, 2=NDV |
 | `mssql_statistics_use_dbcc` | false | Use DBCC SHOW_STATISTICS (requires permissions) |
-| `mssql_statistics_cache_ttl_seconds` | 300 | Statistics cache TTL |
+| `mssql_statistics_cache_ttl_seconds` | 300 | How long a cached row count stays usable — read at the point of use, from the SESSION that asks, never written into the shared per-catalog provider (one session's `SET` must not govern another's plans). It governs the PLANNER's cardinality lookup. It does **not** age out a count the CATALOG loaded (`PreloadRowCount`) on the table-LISTING path: `SHOW ALL TABLES` / `duckdb_tables()` exempt those deliberately, because ageing them would cost a connection plus a `sys.dm_db_partition_stats` round trip **per table** on a catalog that had just loaded every count in one query. Such entries are refreshed by invalidation instead — `mssql_invalidate_cache()`, DDL, COPY/CTAS — not by time. A DMV-sourced count ages normally on every path. |
 
 ### INSERT Tuning
 | Setting | Default | Description |
