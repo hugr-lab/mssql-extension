@@ -62,6 +62,10 @@ return different rows than DuckDB does (issue #242):
 > case-insensitive collation, `WHERE name = 'abc'` matches `'ABC'` — exactly
 > what the same query returns in SSMS. See the collation notes under
 > [Target Column Types](/writing/table-options/).
+>
+> **This applies to `UPDATE` and `DELETE` too**, where it is not merely a
+> different answer but a different set of rows modified — see
+> [String comparisons and collation](/writing/dml/#collation).
 
 ### ORDER BY Pushdown (Experimental)
 

@@ -202,6 +202,42 @@ src/
 | `PhysicalOperator` | `MSSQLPhysicalDelete` | DELETE execution operator |
 | `PhysicalOperator` | `MSSQLPhysicalCreateTableAs` | CTAS execution operator (Sink) |
 
+## Query Pushdown
+
+The scan is a **table function**, not a table, which decides most of what
+follows. DuckDB hands it three separate opportunities and they are easy to
+confuse:
+
+| Callback | What it is asked | Where it lives |
+|---|---|---|
+| `filter_pushdown` + `TableFilter`s | "render these simple filters as SQL" | `FilterEncoder::Encode` |
+| `pushdown_complex_filter` | "take whatever you can of these expressions" | `ComplexFilterPushdown` |
+| `pushdown_expression` | "can you push this one single-column expression?" | `MSSQLPushdownExpression` |
+| `cardinality` | "how many rows will you return?" | `MSSQLCatalogScanCardinality` |
+
+Two consequences are load-bearing and non-obvious:
+
+- **A filter handed to a `filter_pushdown` scan MUST be applied by the scan.**
+  DuckDB 2.0 does not re-check it. Anything the encoder refuses is caught by the
+  client-filter net in `table_scan.cpp`; without that net a refused filter
+  returns wrong rows silently.
+- **`pushdown_complex_filter` runs FIRST** and erases every expression it can
+  render, so `pushdown_expression` only ever sees what that pass refused — it is
+  registered but effectively unreachable today. The predicates it consumes leave
+  the plan entirely (they become a WHERE-clause string), which is why the
+  planner cannot estimate their selectivity and why `cardinality` applies a
+  stopgap factor of its own.
+
+**Comparison semantics are the server's.** A pushed string predicate is
+evaluated by SQL Server under the column's collation, so `WHERE name = 'abc'`
+matches `'ABC'` on a `_CI_AS` column. That extends to `UPDATE`/`DELETE`, which
+target rows by primary key sourced from such a scan — see
+[String comparisons and collation](../website/docs/writing/dml.md).
+
+`DATAMODEL.md` carries the depth: the statistics/cardinality invariants, the
+selectivity stopgap and its removal condition, and the collation hazards that
+gate widening this further (spec 061).
+
 ## Registered Functions
 
 | Function | Type | Signature | Purpose |
@@ -239,10 +275,10 @@ src/
 ### Statistics
 | Setting | Default | Description |
 |---|---|---|
-| `mssql_enable_statistics` | true | Expose row count to optimizer |
-| `mssql_statistics_level` | 0 | 0=rowcount, 1=histogram, 2=NDV |
-| `mssql_statistics_use_dbcc` | false | Use DBCC SHOW_STATISTICS (requires permissions) |
-| `mssql_statistics_cache_ttl_seconds` | 300 | Statistics cache TTL |
+| `mssql_enable_statistics` | true | Report each scan's row count to the optimizer via `TableFunction::cardinality`. Without it every MSSQL scan plans as ~1 row and join order around it is arbitrary |
+| `mssql_statistics_level` | 0 | **Registered but READ BY NOTHING.** `LoadStatisticsConfig` assembles it and has no callers; histogram (1) and NDV (2) are not implemented. Setting it has no effect |
+| `mssql_statistics_use_dbcc` | false | **Registered but READ BY NOTHING**, same as above |
+| `mssql_statistics_cache_ttl_seconds` | 300 | How long a cached row count stays usable. Read at the point of use from the asking session — never written into the shared per-catalog provider. Counts loaded by the catalog are exempt on the table-listing path (refreshed by invalidation, not by age) |
 
 ### INSERT Tuning
 | Setting | Default | Description |

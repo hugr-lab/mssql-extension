@@ -55,6 +55,8 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Native TDS protocol implementation (no external dependencies)
 - Stream query results directly into DuckDB without buffering
 - Full DuckDB catalog integration with three-part naming and lazy metadata loading
+- **Filter pushdown**: `WHERE` clauses are translated to T-SQL and evaluated by SQL Server, including mapped functions (`year`, `lower`, `LIKE` patterns, arithmetic). Anything the translator declines is applied locally instead — with the string-comparison caveat below
+- Row-count estimates reported to the DuckDB optimizer, so join order around an MSSQL scan is planned rather than guessed
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits and automatic session reset
 - TLS/SSL encrypted connections
@@ -69,6 +71,15 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Custom `Application Name` propagated to SQL Server `APP_NAME()` / `sys.dm_exec_sessions.program_name`
 - ATTACH-time credential validation (opt-out via `lazy_validation true`)
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
+
+> **A note on string comparisons.** A pushed predicate is evaluated by SQL
+> Server, so it follows the **column's collation**, not DuckDB's byte
+> comparison: on a case-insensitive collation `WHERE name = 'abc'` matches
+> `'ABC'` — the same answer SSMS gives. This applies to `UPDATE` and `DELETE`
+> too, where it changes which rows are *modified*. It also means a predicate
+> that pushes and the same predicate evaluated locally can disagree on a
+> case-insensitive column ([#272](https://github.com/hugr-lab/mssql-extension/issues/272)).
+> See [String comparisons and collation](https://hugr-lab.github.io/docs/writing/dml/#collation).
 
 
 ## Quick Start

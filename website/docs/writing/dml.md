@@ -96,6 +96,82 @@ SET mssql_dml_batch_size = 500;
 - Tables must have a primary key (uses rowid for row identification)
 - Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the primary key (scalar or composite)
 
+## String comparisons and collation {#collation}
+
+:::warning A `DELETE` can remove more rows than a DuckDB user expects
+
+`UPDATE` and `DELETE` choose their rows the same way a `SELECT` does: the
+`WHERE` clause is pushed to SQL Server, and **SQL Server's collation decides
+what matches** — not DuckDB's byte comparison.
+
+On a case-insensitive collation (`_CI_AS`, the default for most installations)
+that means:
+
+```sql
+-- table dbo.T contains 'abc' and 'ABC'
+SELECT count(*) FROM mssql.dbo.T WHERE name = 'abc';   -- 2
+DELETE FROM mssql.dbo.T WHERE name = 'abc';            -- deletes BOTH
+```
+
+The same statement against a native DuckDB table deletes one row. This is
+consistent — the `DELETE` removes exactly the rows the equivalent `SELECT`
+returns, and exactly what SSMS would do — but it is not what a reader who
+thinks in DuckDB semantics will predict, and on a destructive statement the
+difference is not recoverable.
+:::
+
+### Why it works this way
+
+Pushing the predicate is what makes the operation fast, and the pushed
+predicate is evaluated by the server. `UPDATE`/`DELETE` then target rows by
+primary key (see the rowid note in Limitations above), so the rows acted on are
+precisely the rows the scan returned — with the server's comparison rules
+already applied.
+
+The consequences worth knowing:
+
+| collation | `WHERE name = 'abc'` also matches | so `DELETE` also removes |
+|---|---|---|
+| `_CI_AS` (case-insensitive) | `'ABC'`, `'Abc'` | those rows |
+| `_CI_AI` (accent-insensitive too) | `'ábc'` | those rows |
+| `_BIN2` / `_BIN` | nothing extra | nothing extra |
+
+Trailing spaces are their own case: SQL Server pads on comparison, so
+`name = 'abc'` matches `'abc '` under **every** collation including `_BIN2`.
+
+### Making a statement collation-exact
+
+**Look before you delete.** The matching statement is the cheapest check there
+is, and it is exact — the `SELECT` returns precisely the rows the `DELETE`
+will take:
+
+```sql
+SELECT * FROM mssql.dbo.T WHERE name = 'abc';   -- these rows, exactly
+DELETE FROM mssql.dbo.T WHERE name = 'abc';
+```
+
+**To force exact-byte comparison**, write the T-SQL yourself with an explicit
+`COLLATE`, via [`mssql_exec()`](/reference/functions):
+
+```sql
+SELECT mssql_exec('mssql',
+  'DELETE FROM dbo.T WHERE name = N''abc'' COLLATE Latin1_General_BIN2');
+```
+
+That is case- and accent-sensitive whatever the column's collation says. Note
+it still will not distinguish a trailing space, because SQL Server pads on
+comparison under every collation — for that, add a sentinel:
+`WHERE name + N'~' = N'abc~'`.
+
+### Planned change
+
+Spec 061 proposes making server-side `UPDATE`/`DELETE` **collation-exact by
+default** — emitting the native predicate *and* a forced `COLLATE …_BIN2`
+comparison, so the rows modified are the rows DuckDB's own predicate selects.
+That is a deliberate divergence from `SELECT`, which keeps native server
+semantics: a destructive statement should be the conservative one. Until that
+lands, the behaviour on this page is what applies.
+
 ## DELETE
 
 DELETE operations are supported for tables with primary keys.
