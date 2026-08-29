@@ -67,7 +67,8 @@ for case-sensitive keys.
 § 2's rule is *"push only when the collation happens to already agree."* It is
 correct but passive: on a default `_CI_AS` install nothing qualifies. There is
 an active form — **force the comparison's collation in the emitted T-SQL** — and
-it is what makes filters and DML tractable.
+it is what makes the DML path tractable. § 4 is where it applies and where it
+deliberately does not.
 
 ### 3.1 What `COLLATE` fixes, measured
 
@@ -131,30 +132,73 @@ when the native predicate returns a **superset** of DuckDB's answer.
   the server *excludes* `'AB'` from `a <> 'ab'` while DuckDB keeps it, so the
   server returns a **subset** and no later filtering can put the row back.
 
-## 4. Three consumers, three different rules
+## 4. Three consumers, three different rules — and one independent widening
 
-The rule differs by whether anything downstream can re-check the server's answer.
+§ 4.1–4.4 are the collation question: the rule differs by whether anything
+downstream can re-check the server's answer. § 4.5 is separate — exact T-SQL
+forms for functions #242 removed, which needs no collation machinery and could
+ship on its own.
 
-### 4.1 SELECT filters — one pass on the server, one in DuckDB
+### 4.1 SELECT filters — push the exact predicate, refuse the inexact rewrite
 
-Push **only the native predicate** (SARGable, superset) and let DuckDB apply the
-exact one. Nothing is forced into the T-SQL, so the seek, the plan shape and the
-cardinality estimate are all untouched; the price is transferring the superset
-delta, which for a selective predicate is a handful of rows.
+**Decided: native server semantics stay the default** (@oluies on #275, merged to
+`main` as `3579f63`). A pushed string predicate must return *the server's own
+answer* — `WHERE name = 'abc'` keeps matching `'ABC'` on a case-insensitive
+collation, which is what `website/docs/reading/queries.md` promises users today
+and what `collation_filter.test` asserts.
 
-This needs no new machinery: the spec-069 **client filter net** already re-applies
-filters the encoder refused. The change is to arm it for a filter that *was*
-pushed — "pushed, but not authoritative" — because DuckDB 2.0 does **not**
-re-check a `TableFilter` behind a `filter_pushdown` scan (the contract recorded
-in `CLAUDE.md`).
+An earlier draft of this section proposed the opposite: push a superset and
+re-check exactly in DuckDB. It is recorded here because the two are **mutually
+exclusive**, and the arithmetic is the clearest statement of why. For `LIKE 'n%'`
+over `nero`, `Nero`, `ñu`:
 
-**This is also what unblocks the W1 restriction** measured on
-`spec/070-w1-measure-shadowing` (PR #275/#276). That branch made single-column
-predicates survive as `EXPRESSION_FILTER`s so the planner could see them — and
-found the rewritten range returning 3 rows where the server's own `LIKE` returns
-2. Under this rule that is not a bug but the expected superset: the client net
-drops `Nero` and `ñu` and the answer is DuckDB's. The missing piece was the
-re-check, not the restriction.
+| | rows |
+|---|---|
+| server's own `LIKE N'n%'` — the contract's answer | **2** |
+| DuckDB's prefix→range rewrite, pushed | 3 |
+| that range, re-checked in DuckDB | 1 |
+
+Nothing in the superset-plus-re-check shape produces 2. So under native
+semantics:
+
+- **Push the exact predicate** — `= N'abc'`, `LIKE N'n%'`, `IN (…)`. The server
+  evaluates it under the column's collation, which is the answer the contract
+  names. `LIKE` prefix stays SARGable: the optimizer derives a seek range from
+  it itself (measured in § 3.2, `>= 'Mþ' AND < 'O'`).
+- **Refuse DuckDB's prefix→range rewrite.** It is exact for DuckDB's binary
+  comparison and wrong for the server's — the `ñu` row of § 3.1. This is the
+  "the encoder must refuse or correctly translate" half, and it is far less than
+  the full `_BIN2` machinery.
+- **Do NOT arm the client net for pushed filters.** The net applies DuckDB's
+  binary comparison, so it would return 1 where the contract requires 2. It
+  stays what it is: the backstop for filters the encoder *refused*.
+
+**What this means for the W1 restriction.** Not one blanket change. String-pattern
+expressions must stay claimed by `ComplexFilterPushdown` until this spec supplies
+a collation-faithful form — that is what keeps the exact `LIKE`, the seek and the
+semantics together; they stay planner-invisible meanwhile, which is the accepted
+cost. Non-string predicates carry no collation and can defer to
+`pushdown_expression` today. `specs/070-duckdb-v2-followups/spec.md` and
+`src/table_scan/table_scan.cpp` carry that split on `main`.
+
+**Shapes any deferral must exclude** (verified against source, roborev job 1130).
+These lose pushdown entirely rather than degrading, and no client re-check
+recovers the wire cost:
+
+- **`rowid` predicates.** The two encoder paths disagree by construction:
+  `EncodeColumnRef` tests `COLUMN_IDENTIFIER_ROW_ID` *before* the virtual-column
+  gate and rewrites it to the scalar PK, while `FilterEncoder::Encode` refuses
+  everything `>= VIRTUAL_COL_START` into `unhandled`. Defer a rowid predicate and
+  `WHERE rowid > 100` goes from `WHERE [id] > 100` to a full table scan. Rows stay
+  correct; the scan is unbounded.
+- **OR-chains, non-dense `IN`, and temporal casts**, which arrive through
+  `CreateOptionalExpressionFilter` as an `optional_filter` scalar function the
+  encoder has no mapping for. It refuses, so the scan pushes *nothing at all*.
+
+**Consequence, stated plainly:** native-by-default does **not** close issue #272.
+A pushed `=` still answers differently from an un-pushed one, because the server
+compares by collation and DuckDB by bytes. That divergence is the price of the
+contract, and #272 stays open to track it rather than being marked resolved here.
 
 ### 4.2 DML-collapse — both predicates, on the server
 
@@ -184,14 +228,63 @@ table. Offered as an opt-in, not a default.
 
 ### 4.4 Summary
 
-| Path | Sent to the server | What makes it exact |
+**The default differs between reads and writes. That is deliberate, and it is the
+single most surprising thing in this spec:** the same predicate on the same
+column selects four rows and deletes one. A destructive statement being the
+conservative one is defensible, but it must be documented where someone about to
+run a `DELETE` will see it (`docs/dml-collation-semantics`, merged as #286).
+
+| Path | Sent to the server | Semantics | Whose answer |
+|---|---|---|---|
+| SELECT, strings (`=`, `IN`, `LIKE`) | the **exact** predicate; inexact rewrites refused | native | the server's |
+| SELECT, `<>` / `NOT LIKE` on strings | nothing | — | DuckDB's |
+| DML-collapse, superset forms | native **+** `COLLATE …BIN2` (+ sentinel on `=`) | strict | DuckDB's |
+| DML, everything else | — | — | rowid round trip |
+| Column already `_BIN2`, or non-string | native predicate only | identical either way | both |
+| ORDER BY | only when `_BIN2` / non-string | native | § 2 |
+
+### 4.5 Extending what pushes — exact forms for functions #242 removed
+
+Native semantics settle *comparison*. They say nothing about a scalar function's
+**value**: `length('ab ')` is 3 in DuckDB whatever the collation, so a mapping to
+`LEN` that answers 2 is a plain value bug, which is what issue #242 found and
+#269 fixed by removing four mappings.
+
+Removing them was right. The conclusion drawn alongside it — *"there is no exact
+T-SQL form"* — turns out to be too strong for three of the four. Measured
+DuckDB-vs-server, same inputs:
+
+| DuckDB | exact T-SQL | evidence |
 |---|---|---|
-| SELECT, superset forms (`=`, `IN`, prefix/`LIKE`) | native predicate only | DuckDB client net |
-| SELECT, `<>` / `NOT LIKE` on strings | nothing | DuckDB |
-| DML-collapse, superset forms | native **+** `COLLATE …BIN2` (+ sentinel on `=`) | the T-SQL itself |
-| DML, everything else | — | rowid round trip |
-| Column already `_BIN2`, or non-string | native predicate only | already exact |
-| ORDER BY | only when `_BIN2` / non-string | § 2 |
+| `/` | `({0} * 1.0 / NULLIF({1}, 0))` | `5/2`→2.5, `7/2`→3.5 both sides. `* 1.0` defeats integer division; `NULLIF` defeats the server's **divide-by-zero error** — measured, raw `5*1.0/0` aborts the query while DuckDB yields `inf`. NULL and `inf` behave identically in predicate position (the row is excluded either way — verified in DuckDB). |
+| `length` / `len` | `LEN({0} + N'~') - 1` | `'ab '`→**3** both sides; the naive `LEN` answers 2. The sentinel of § 3.1 again: it stops the space being trailing. |
+| `week` | `DATEPART(ISO_WEEK, {0})` | 2024-01-04→1, 2024-12-30→1, 2021-01-01→53 on both. DuckDB's `week()` *is* the ISO week, and T-SQL has an ISO datepart — the original mapping simply used the wrong one. |
+| `dayofweek` | `((DATEDIFF(day, '19000107', {0}) % 7) + 7) % 7` | Sun→0, Wed→3 on both, and 1899-05-10→3 for a date *before* the anchor. Anchored on a known Sunday, so it is **`@@DATEFIRST`-independent** — the property that disqualified `DATEPART(weekday, …)`. The `+7 %7` is not decoration: without it T-SQL's sign-preserving `%` answers −4 for pre-anchor dates. |
+
+**`length` carries one limit that does not go away.** `LEN` counts UTF-16 code
+units and DuckDB counts code points, so they part company above the BMP:
+`'a😀b'` is **3** in DuckDB and **4** on the server. The form is exact for BMP-only
+data and wrong for supplementary characters (emoji, rare CJK), so it either ships
+gated or does not ship — this is a judgement for review, not something to decide
+by measurement. The other three have no such caveat.
+
+**Also verified exact, and currently unmapped** — no collation involvement, so
+these are pure value equivalences: `abs` → `ABS`, `floor` → `FLOOR`,
+`ceil`/`ceiling` → `CEILING`, `round` → `ROUND` (agrees on half-away-from-zero
+and on negatives: `round(-2.5)` = −3 both sides; the 2-argument form agrees too),
+`substring` → `SUBSTRING` (**including** the `start = 0` edge, where both answer
+`ab` for `substring('abcdef',0,3)`).
+
+**What this does not change: SARGability.** A function wrapping a column defeats
+an index seek whether it is `LEN(x + N'~') - 1` or the `YEAR(x)` we already push.
+That is a property of function-in-predicate, not of these forms, so the extension
+costs nothing that today's mappings do not already cost — and it saves the full
+column transfer that an unmapped function forces.
+
+Sequencing note: this subsection is independent of § 4.1–4.4. It needs no
+collation machinery and could ship on its own; it lives here because #242 is
+where the four removals are recorded and a future reader of that issue should
+find the exact forms next to it.
 
 ## 5. What has to be built
 
@@ -240,16 +333,23 @@ reports. Nothing new has to be fetched.
 **Filters (§ 3–4):**
 
 F1. On a `_CI_AS` column, `WHERE a = 'ab'`, `a IN (…)` and `a LIKE 'n%'` return
-    DuckDB's exact rows, and return the **same** rows whether or not the filter
-    was pushed — the push/no-push disagreement of issue #272 is the regression
-    this guards (block pushdown with a `LIMIT` to get the other side). PR #276's
-    `ñu` case is included.
+    the **server's** rows — `'AB'` matches — and the emitted T-SQL contains the
+    exact predicate, never DuckDB's prefix→range rewrite. `like_pushdown_collation.test`
+    (PR #276, on `main`) already pins the `LIKE`-vs-range half; the `=` and `IN`
+    halves join it. Note this does NOT assert push/no-push agreement — under
+    native semantics they legitimately differ, which is why #272 stays open.
 F2. A collapsed `UPDATE`/`DELETE` on a `_CI_AS` column affects exactly the rows
     DuckDB's predicate selects — asserted by row identity, not by count —
     including a value with a trailing space and a case variant. The plan check
     shows the seek survived (§ 3.2).
 F3. A string `<>` predicate does **not** collapse: it falls back (client-side for
     SELECT, rowid for DML) and returns DuckDB's rows.
+F4. (§ 4.5, independent) For each restored mapping, the pushed result equals the
+    un-pushed one on the values that broke the original: `'ab '` for `length`,
+    `5/2` for `/`, an ISO week-53 boundary date for `week`, a pre-1900 date for
+    `dayofweek`, and a `b = 0` row for the division guard (which must not error).
+    If `length` ships, a supplementary-plane string is either asserted or
+    excluded by the gate — never left unasserted.
 
 **ORDER BY (§ 1–2):**
 
@@ -278,13 +378,17 @@ O5. On Fabric, `safe` pushes — the warehouse collation qualifies.
 
 Risks specific to the widened scope:
 
-- **This changes a documented contract.** `test/sql/catalog/collation_filter.test`
-  asserts *server* semantics today — `WHERE col_default = 'Apple'` returns
-  `Apple`, `apple`, `APPLE`. Under § 4.1 the answer becomes DuckDB's (`Apple`
-  only). That is the point — it is what makes pushed and un-pushed agree — but it
-  must be a **decision recorded and the test rewritten**, never a test quietly
-  fitted to new behaviour. Users relying on case-insensitive matching get it back
-  by writing `lower(a) = 'apple'`, which is explicit.
+- **The read/write split is the risk this spec ships.** SELECT keeps server
+  semantics (`collation_filter.test` stands as written); DML-collapse is strict.
+  So `SELECT … WHERE name = 'abc'` matches `'ABC'` and `DELETE … WHERE name =
+  'abc'` does not. Defensible — the destructive statement is the careful one —
+  but it is exactly the shape that gets discovered through someone's deleted
+  rows, so it is documented user-side (#286) rather than left to this spec.
+- **#272 is not closed by this design.** Pushed and un-pushed `=` still disagree,
+  because the server compares by collation and DuckDB by bytes. An earlier draft
+  of § 4.1 closed it by making both answers DuckDB's; that was rejected because
+  it inverts the shipped contract. The divergence is now a *known and documented*
+  cost rather than a bug, and #272 tracks it.
 - **The superset property for prefixes is argued, not proven** (§ 3.3). A
   collation with expansions or ignorable characters could in principle order a
   byte-in-range value outside the linguistic range, which would *lose* rows —
