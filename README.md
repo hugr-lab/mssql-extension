@@ -79,7 +79,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 > too, where it changes which rows are *modified*. It also means a predicate
 > that pushes and the same predicate evaluated locally can disagree on a
 > case-insensitive column ([#272](https://github.com/hugr-lab/mssql-extension/issues/272)).
-> See [String comparisons and collation](https://hugr-lab.github.io/docs/writing/dml/#collation).
+> See [String comparisons and collation](https://hugr-lab.github.io/mssql-extension/next/writing/dml/#collation).
 
 
 ## Quick Start

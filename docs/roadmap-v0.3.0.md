@@ -227,7 +227,8 @@ the mechanism-(a) reason: string comparisons cannot become planner-visible
 without a collation-faithful form. If the DML answer comes back "native
 everywhere", the W1 row, the order-of-battle edge, and the matching notes in
 `specs/070-duckdb-v2-followups/spec.md` and `src/table_scan/table_scan.cpp`
-must all be revisited together — three surfaces now encode this dependency.
+must all be revisited together — and `website/docs/writing/dml.md`, which is
+the only one USERS read. Four surfaces now encode this dependency.
 
 ## Order of battle (dependency-honest)
 

@@ -26,10 +26,10 @@ sidebar_position: 1
 
 | Setting                            | Type    | Default | Range | Description                           |
 | ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
-| `mssql_enable_statistics`          | BOOLEAN | true    | -     | Enable statistics collection          |
-| `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
-| `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |
-| `mssql_statistics_cache_ttl_seconds` | BIGINT | 300    | ≥0    | Statistics cache TTL (seconds)        |
+| `mssql_enable_statistics`          | BOOLEAN | true    | -     | Report each scan's row count to the DuckDB optimizer. With it off, every MSSQL scan plans as ~1 row |
+| `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | **Not implemented.** Accepted and ignored — histogram (1) and NDV (2) statistics do not exist; setting it has no effect |
+| `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | **Not implemented.** Accepted and ignored |
+| `mssql_statistics_cache_ttl_seconds` | BIGINT | 300    | ≥0    | Statistics cache TTL (seconds). Currently fixed at the default — the value you set is accepted but not yet read |
 
 
 ### Wire Protocol Settings
@@ -99,9 +99,6 @@ SET mssql_connection_limit = 20;
 
 -- Reduce batch size for tables with large rows
 SET mssql_insert_batch_size = 100;
-
--- Enable detailed statistics for query optimization
-SET mssql_statistics_level = 2;
 
 -- Disable connection caching for debugging
 SET mssql_connection_cache = false;

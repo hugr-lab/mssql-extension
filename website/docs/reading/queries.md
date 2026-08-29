@@ -65,7 +65,7 @@ return different rows than DuckDB does (issue #242):
 >
 > **This applies to `UPDATE` and `DELETE` too**, where it is not merely a
 > different answer but a different set of rows modified — see
-> [String comparisons and collation](/writing/dml/#collation).
+> [String comparisons and collation](../writing/dml.md#collation).
 
 ### ORDER BY Pushdown (Experimental)
 

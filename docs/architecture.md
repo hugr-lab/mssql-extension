@@ -278,7 +278,7 @@ gate widening this further (spec 061).
 | `mssql_enable_statistics` | true | Report each scan's row count to the optimizer via `TableFunction::cardinality`. Without it every MSSQL scan plans as ~1 row and join order around it is arbitrary |
 | `mssql_statistics_level` | 0 | **Registered but READ BY NOTHING.** `LoadStatisticsConfig` assembles it and has no callers; histogram (1) and NDV (2) are not implemented. Setting it has no effect |
 | `mssql_statistics_use_dbcc` | false | **Registered but READ BY NOTHING**, same as above |
-| `mssql_statistics_cache_ttl_seconds` | 300 | How long a cached row count stays usable. Read at the point of use from the asking session — never written into the shared per-catalog provider. Counts loaded by the catalog are exempt on the table-listing path (refreshed by invalidation, not by age) |
+| `mssql_statistics_cache_ttl_seconds` | 300 | **Registered but READ BY NOTHING** on this branch, same as the two above: `LoadStatisticsCacheTTL` is called only by the callerless `LoadStatisticsConfig`, `SetCacheTTL` has no callers, and the provider is constructed with the compiled-in 300. The observed lifetime matches the documented default only because both are 300. (A change making every read take its TTL from the asking session — and exempting catalog-loaded counts on the listing path — is in flight; this row moves when it lands, not before.) |
 
 ### INSERT Tuning
 | Setting | Default | Description |

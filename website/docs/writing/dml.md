@@ -100,9 +100,9 @@ SET mssql_dml_batch_size = 500;
 
 :::warning A `DELETE` can remove more rows than a DuckDB user expects
 
-`UPDATE` and `DELETE` choose their rows the same way a `SELECT` does: the
-`WHERE` clause is pushed to SQL Server, and **SQL Server's collation decides
-what matches** — not DuckDB's byte comparison.
+`UPDATE` and `DELETE` choose their rows the same way a `SELECT` does: when the
+`WHERE` clause is pushed to SQL Server, **SQL Server's collation decides what
+matches** — not DuckDB's byte comparison.
 
 On a case-insensitive collation (`_CI_AS`, the default for most installations)
 that means:
@@ -139,6 +139,22 @@ The consequences worth knowing:
 Trailing spaces are their own case: SQL Server pads on comparison, so
 `name = 'abc'` matches `'abc '` under **every** collation including `_BIN2`.
 
+:::note This is a property of the *predicate*, not of the column
+
+Pushdown happens per predicate. A `WHERE` clause the extension cannot translate
+to T-SQL is evaluated by **DuckDB** instead, byte-wise — the opposite outcome on
+the very same column:
+
+```sql
+DELETE FROM mssql.dbo.T WHERE name = 'abc';               -- pushed  -> removes 'abc' AND 'ABC'
+DELETE FROM mssql.dbo.T WHERE some_unmapped_fn(name)='x'; -- not pushed -> DuckDB's byte comparison
+```
+
+So the table above tells you what happens *when the predicate pushes*. Set
+`MSSQL_DEBUG=1` to see which way a given statement went — the log names each
+filter as encoded or "not supported, will be applied by DuckDB".
+:::
+
 ### Making a statement collation-exact
 
 **Look before you delete.** The matching statement is the cheapest check there
@@ -163,14 +179,18 @@ it still will not distinguish a trailing space, because SQL Server pads on
 comparison under every collation — for that, add a sentinel:
 `WHERE name + N'~' = N'abc~'`.
 
-### Planned change
+### Under discussion
 
-Spec 061 proposes making server-side `UPDATE`/`DELETE` **collation-exact by
-default** — emitting the native predicate *and* a forced `COLLATE …_BIN2`
-comparison, so the rows modified are the rows DuckDB's own predicate selects.
-That is a deliberate divergence from `SELECT`, which keeps native server
-semantics: a destructive statement should be the conservative one. Until that
-lands, the behaviour on this page is what applies.
+Whether destructive statements should default to **collation-exact** matching —
+emitting the native predicate *and* a forced `COLLATE …_BIN2` comparison, so the
+rows modified are the rows DuckDB's own predicate selects — is being decided in
+[#277](https://github.com/hugr-lab/mssql-extension/pull/277). The argument for
+it is that a destructive statement should be the conservative one, which would
+make `UPDATE`/`DELETE` diverge deliberately from `SELECT`.
+
+Nothing about it is settled or implemented: the released spec 061 covers ORDER BY
+only. **The behaviour documented on this page is what applies today**, and this
+page is one of the surfaces that changes if that discussion concludes otherwise.
 
 ## DELETE
 
