@@ -1,22 +1,87 @@
-# Dependabot keeps GitHub Actions versions current. Pinning to commit SHAs is
-# the safer hardening but produces noisier PRs; the project currently pins to
-# major-version tags (e.g. actions/checkout@v4), so monthly PRs bumping those
-# tags when v5 ships is the right cadence.
+# Dependabot configuration.
 #
-# vcpkg deps are NOT covered here -- Dependabot has no native vcpkg ecosystem
-# yet. vcpkg.json is bumped manually when DuckDB upgrades its baseline.
+# Shape follows GitHub's "tame Dependabot" guidance: group each ecosystem into
+# one PR, keep the cadence slow, and let security updates ignore both. Security
+# fixes are raised as soon as an advisory lands -- `groups`, `schedule` and
+# `cooldown` shape VERSION updates only -- so slowing the version stream costs
+# nothing in vulnerability response time.
+#
+# Ecosystems deliberately NOT covered, recorded so the omissions read as
+# decisions rather than oversights:
+#
+#   vcpkg (vcpkg.json)  No Dependabot ecosystem exists for it. Bumped by hand
+#                       when DuckDB moves its baseline.
+#   git submodules      duckdb and extension-ci-tools are pinned to reviewed
+#                       SHAs on purpose -- main compiles against the pinned
+#                       duckdb SHA only, so tracking their branch HEADs would
+#                       break the build on someone else's commit.
+#   docker (10 files)   Every base image is either a floating tag Dependabot
+#                       cannot compare (`:latest`, `mssql/server:2022-latest`)
+#                       or a deliberate pin: docker/Dockerfile.build stays on
+#                       ubuntu:22.04 for the glibc the released Linux binary
+#                       links against, and the kerberos / named-instance
+#                       fixtures pin the OS they were written against.
+#   web/index.html      Loads @duckdb/duckdb-wasm and @observablehq/plot from
+#                       jsDelivr at pinned versions. They are in no manifest,
+#                       so Dependabot cannot see them -- bump by hand.
 
 version: 2
 
 updates:
+  # GitHub Actions. Workflows pin major-version tags (actions/checkout@v7), so
+  # every update here is in practice a major bump; one grouped PR per month.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - ci
     commit-message:
       prefix: ci
+      include: scope
+
+  # Docusaurus documentation site: 1391 transitive packages that `npm ci` runs
+  # inside the Pages deploy, which holds `pages: write` + `id-token: write`.
+  # Much the largest third-party surface in the repo, and until now the only
+  # one Dependabot watched not at all.
+  #
+  # Only the minor/patch stream is grouped, and that asymmetry is the point:
+  # a major here means Docusaurus 3 -> 4 or React 19 -> 20 and wants its own
+  # review, so majors are left UNGROUPED and Dependabot gives each its own PR
+  # -- one that can be merged, reverted or bisected on its own. Grouping them
+  # would do the opposite, landing Docusaurus 4 and React 20 in a single
+  # branch mergeable only as a unit.
+  #
+  # Every PR from this ecosystem is built by .github/workflows/docs-build.yml,
+  # which runs `npm ci && npx docusaurus build` on any PR touching website/.
+  # pages.yml -- the only other place that builds the site -- has no
+  # pull_request trigger, so without that workflow these PRs would carry no
+  # evidence the site still builds.
+  - package-ecosystem: npm
+    directory: /website
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      website-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - documentation
+    commit-message:
+      prefix: docs
       include: scope

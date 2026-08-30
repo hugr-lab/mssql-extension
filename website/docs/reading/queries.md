@@ -61,11 +61,11 @@ return different rows than DuckDB does (issue #242):
 > Pushed string predicates follow the **server's comparison semantics**: on a
 > case-insensitive collation, `WHERE name = 'abc'` matches `'ABC'` — exactly
 > what the same query returns in SSMS. See the collation notes under
-> [Target Column Types](/writing/table-options/).
+> [Target Column Types](../writing/table-options.md).
 >
 > **This applies to `UPDATE` and `DELETE` too**, where it is not merely a
 > different answer but a different set of rows modified — see
-> [String comparisons and collation](/writing/dml/#collation).
+> [String comparisons and collation](../writing/dml.md#collation).
 
 ### ORDER BY Pushdown (Experimental)
 
