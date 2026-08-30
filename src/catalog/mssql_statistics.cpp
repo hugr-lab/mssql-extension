@@ -89,6 +89,18 @@ void MSSQLStatisticsProvider::PreloadRowCount(const string &schema_name, const s
 	cache_[key] = stats;
 }
 
+void MSSQLStatisticsProvider::SeedRowCountForTesting(const string &schema_name, const string &table_name,
+													 idx_t row_count, bool from_catalog_metadata) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto key = BuildCacheKey(schema_name, table_name);
+	MSSQLTableStatistics stats;
+	stats.row_count = row_count;
+	stats.fetched_at = std::chrono::steady_clock::now();
+	stats.is_valid = true;
+	stats.from_catalog_metadata = from_catalog_metadata;
+	cache_[key] = stats;
+}
+
 bool MSSQLStatisticsProvider::TryGetCachedRowCount(const string &schema_name, const string &table_name,
 												   int64_t ttl_seconds, idx_t &out_row_count,
 												   bool exempt_catalog_sourced) {

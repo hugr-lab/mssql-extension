@@ -278,7 +278,7 @@ gate widening this further (spec 061).
 | `mssql_enable_statistics` | true | Report each scan's row count to the optimizer via `TableFunction::cardinality`. Without it every MSSQL scan plans as ~1 row and join order around it is arbitrary |
 | `mssql_statistics_level` | 0 | **Registered but READ BY NOTHING.** `LoadStatisticsConfig` assembles it and has no callers; histogram (1) and NDV (2) are not implemented. Setting it has no effect |
 | `mssql_statistics_use_dbcc` | false | **Registered but READ BY NOTHING**, same as above |
-| `mssql_statistics_cache_ttl_seconds` | 300 | How long a cached row count stays usable. Read at the point of use from the asking session — never written into the shared per-catalog provider. Counts loaded by the catalog are exempt on the table-listing path (refreshed by invalidation, not by age) |
+| `mssql_statistics_cache_ttl_seconds` | 300 | How long a cached row count stays usable — read at the point of use, from the SESSION that asks, never written into the shared per-catalog provider (one session's `SET` must not govern another's plans). It governs the PLANNER's cardinality lookup. It does **not** age out a count the CATALOG loaded (`PreloadRowCount`) on the table-LISTING path: `SHOW ALL TABLES` / `duckdb_tables()` exempt those deliberately, because ageing them would cost a connection plus a `sys.dm_db_partition_stats` round trip **per table** on a catalog that had just loaded every count in one query. Such entries are refreshed by invalidation instead — `mssql_invalidate_cache()`, DDL, COPY/CTAS — not by time. A DMV-sourced count ages normally on every path. |
 
 ### INSERT Tuning
 | Setting | Default | Description |

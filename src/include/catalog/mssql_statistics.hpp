@@ -84,6 +84,16 @@ public:
 	//! Avoids per-table DMV queries when cardinality is already known
 	void PreloadRowCount(const string &schema_name, const string &table_name, idx_t row_count);
 
+	//! Seed an entry with an explicit provenance. Exists so a test can create a
+	//! DMV-SHAPED entry (`from_catalog_metadata = false`) without a connection —
+	//! otherwise PreloadRowCount is the only reachable populator, every entry is
+	//! catalog-sourced, and the `stats.from_catalog_metadata` half of the
+	//! exemption predicate is unpinned: weakening it to `if (exempt_catalog_sourced)`
+	//! alone leaves the suite green while making SHOW ALL TABLES serve a
+	//! DMV-sourced count that never ages out (job 1259).
+	void SeedRowCountForTesting(const string &schema_name, const string &table_name, idx_t row_count,
+								bool from_catalog_metadata);
+
 	//! Same, but judged against a CALLER-SUPPLIED TTL rather than the provider's.
 	//!
 	//! `mssql_statistics_cache_ttl_seconds` is a SESSION setting, and this
