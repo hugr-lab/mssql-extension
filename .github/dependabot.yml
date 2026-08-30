@@ -53,9 +53,18 @@ updates:
   # Much the largest third-party surface in the repo, and until now the only
   # one Dependabot watched not at all.
   #
-  # Split by update-type instead of one all-in group: a major here means
-  # Docusaurus 3 -> 4 or React 19 -> 20 and wants its own review, while the
-  # minor/patch stream is the one that should land in a single routine PR.
+  # Only the minor/patch stream is grouped, and that asymmetry is the point:
+  # a major here means Docusaurus 3 -> 4 or React 19 -> 20 and wants its own
+  # review, so majors are left UNGROUPED and Dependabot gives each its own PR
+  # -- one that can be merged, reverted or bisected on its own. Grouping them
+  # would do the opposite, landing Docusaurus 4 and React 20 in a single
+  # branch mergeable only as a unit.
+  #
+  # Every PR from this ecosystem is built by .github/workflows/docs-build.yml,
+  # which runs `npm ci && npx docusaurus build` on any PR touching website/.
+  # pages.yml -- the only other place that builds the site -- has no
+  # pull_request trigger, so without that workflow these PRs would carry no
+  # evidence the site still builds.
   - package-ecosystem: npm
     directory: /website
     schedule:
@@ -68,11 +77,6 @@ updates:
         update-types:
           - minor
           - patch
-      website-major:
-        patterns:
-          - "*"
-        update-types:
-          - major
     cooldown:
       default-days: 7
     labels:

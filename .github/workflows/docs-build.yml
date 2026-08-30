@@ -1,0 +1,55 @@
+name: Docs site build
+
+# Builds website/ on pull requests, and nothing else.
+#
+# pages.yml is the only other place that runs `npm ci && npx docusaurus
+# build`, and it triggers on release / schedule / push-to-main /
+# workflow_dispatch -- never on pull_request. ci.yml does run on these PRs
+# (its paths-ignore covers only **.md, docs/, LICENSE and .gitignore) but it
+# is a C++ build and test suite and exercises none of website/. So without
+# this file a Dependabot npm PR could be merged with no evidence the site
+# still builds, and a bad bump among the 1391 packages in
+# website/package-lock.json would first surface on main as a failed Pages
+# deploy -- which also stops the weekly refresh of _site/download-metrics.svg
+# that the README hotlinks.
+#
+# Deliberately a separate workflow rather than a pull_request trigger added
+# to pages.yml: that workflow holds `concurrency: group: pages,
+# cancel-in-progress: true` and `environment: github-pages`, so a PR run
+# there would cancel an in-flight production deploy and enter the deployment
+# environment for a change that is not being deployed. Build only; no
+# `pages:` or `id-token:` permission is needed or granted.
+
+on:
+  pull_request:
+    paths:
+      - "website/**"
+      - ".github/workflows/docs-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: npm ci && docusaurus build
+        working-directory: website
+        run: |
+          npm ci
+          npx docusaurus build
