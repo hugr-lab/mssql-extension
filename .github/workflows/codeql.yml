@@ -99,7 +99,7 @@ jobs:
             vcpkg-bincache-x64-linux-
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.37.3
+        uses: github/codeql-action/init@v4.37.8
         with:
           languages: cpp
           # security-extended adds queries beyond the default suite that are
@@ -149,7 +149,7 @@ jobs:
           echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4.37.3
+        uses: github/codeql-action/analyze@v4.37.8
         with:
           category: cpp
           # Write SARIF to disk instead of uploading: the filter step below
@@ -194,7 +194,7 @@ jobs:
           output: sarif-results/cpp.sarif
 
       - name: Upload filtered SARIF
-        uses: github/codeql-action/upload-sarif@v4.37.3
+        uses: github/codeql-action/upload-sarif@v4.37.8
         with:
           sarif_file: sarif-results/cpp.sarif
           # Must match the analyze category above, otherwise the upload is
