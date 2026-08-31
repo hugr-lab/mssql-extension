@@ -28,17 +28,26 @@
 version: 2
 
 updates:
-  # GitHub Actions. Workflows pin major-version tags (actions/checkout@v7), so
-  # every update here is in practice a major bump; one grouped PR per month.
+  # GitHub Actions. Split by update-type for the same reason as npm below, and
+  # the two pinning styles in use here are why: most workflows pin a major tag
+  # (actions/checkout@v7) where the only possible bump is a major, but
+  # codeql.yml pins a full patch version (github/codeql-action@v4.37.3) that
+  # moves on patch releases. So this ecosystem really does have both streams,
+  # and grouping all of it would ride a major in on the same approval as a
+  # patch -- PR #291 did exactly that, landing setup-node v6 -> v7 alongside a
+  # codeql-action patch. Majors are left ungrouped and get their own PR.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
     groups:
-      github-actions:
+      github-actions-minor-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
     cooldown:
       default-days: 7
     labels:
