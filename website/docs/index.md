@@ -26,7 +26,7 @@ ATTACH 'Server=localhost;Database=AdventureWorks;User Id=sa;Password=...' AS mss
 SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 ```
 
-→ **[Getting Started](/getting-started/)** · **[Settings Reference](/reference/settings/)** · **[Download metrics](https://hugr-lab.github.io/mssql-extension/metrics/)**
+→ **[Getting Started](./getting-started.md)** · **[Settings Reference](./reference/settings.md)** · **[Download metrics](https://hugr-lab.github.io/mssql-extension/metrics/)**
 
 ## Community Extension Downloads
 

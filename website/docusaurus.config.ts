@@ -21,7 +21,13 @@ const config: Config = {
   projectName: 'mssql-extension',
 
   onBrokenLinks: 'throw',
-  onBrokenMarkdownLinks: 'warn',
+  // 'throw', not 'warn': docs-build.yml is the PR gate for website/, and a
+  // gate that exits 0 on a broken cross-page anchor does not gate anything.
+  // A dangling anchor is exactly the breakage that reached main from #286 --
+  // the build reported it and passed. onBrokenMarkdownLinks lives under
+  // markdown.hooks now; the top-level key is deprecated in Docusaurus 3.10
+  // and removed in v4.
+  onBrokenAnchors: 'throw',
 
   i18n: {
     defaultLocale: 'en',
@@ -59,6 +65,9 @@ const config: Config = {
 
   markdown: {
     mermaid: true,
+    hooks: {
+      onBrokenMarkdownLinks: 'throw',
+    },
   },
 
   themeConfig: {

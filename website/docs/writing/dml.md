@@ -151,7 +151,7 @@ DELETE FROM mssql.dbo.T WHERE name = 'abc';
 ```
 
 **To force exact-byte comparison**, write the T-SQL yourself with an explicit
-`COLLATE`, via [`mssql_exec()`](/reference/functions):
+`COLLATE`, via [`mssql_exec()`](../reference/functions.md):
 
 ```sql
 SELECT mssql_exec('mssql',

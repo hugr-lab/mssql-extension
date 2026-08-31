@@ -63,7 +63,7 @@ Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 
 **Solutions:**
 
-- Check the [Type Mapping](/reading/types/) section for supported types
+- Check the [Type Mapping](../reading/types.md) section for supported types
 - Cast unsupported columns to supported types in your query
 - Exclude unsupported columns from SELECT
 
