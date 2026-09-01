@@ -75,7 +75,7 @@ bare identifier, so anything else is rejected at bind time rather than
 concatenated into a `CREATE TABLE`.
 
 On Microsoft Fabric only two collations exist and both are UTF-8; naming any
-other is refused before the DDL is built. See [AZURE.md](/connection/azure/#two-collations-both-utf-8).
+other is refused before the DDL is built. See [AZURE.md](../connection/azure.md#two-collations-both-utf-8).
 
 #### Using them with COPY
 

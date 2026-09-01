@@ -1,10 +1,15 @@
 # Dependabot configuration.
 #
-# Shape follows GitHub's "tame Dependabot" guidance: group each ecosystem into
-# one PR, keep the cadence slow, and let security updates ignore both. Security
-# fixes are raised as soon as an advisory lands -- `groups`, `schedule` and
-# `cooldown` shape VERSION updates only -- so slowing the version stream costs
-# nothing in vulnerability response time.
+# Shape follows GitHub's "tame Dependabot" guidance -- group your updates, slow
+# the cadence, keep security fast -- with one deliberate departure: the grouping
+# is per-STREAM, not per-ecosystem. Both ecosystems group only minor/patch and
+# leave majors ungrouped, so a major arrives in a PR that can be merged,
+# reverted or bisected on its own instead of riding in under a routine
+# approval. Cadence is monthly, with a 7-day cooldown.
+#
+# Security fixes are raised as soon as an advisory lands -- `groups`, `schedule`
+# and `cooldown` shape VERSION updates only -- so slowing the version stream
+# costs nothing in vulnerability response time.
 #
 # Ecosystems deliberately NOT covered, recorded so the omissions read as
 # decisions rather than oversights:
@@ -31,16 +36,21 @@ updates:
   # GitHub Actions. Split by update-type for the same reason as npm below, and
   # the two pinning styles in use here are why: most workflows pin a major tag
   # (actions/checkout@v7) where the only possible bump is a major, but
-  # codeql.yml pins a full patch version (github/codeql-action@v4.37.3) that
-  # moves on patch releases. So this ecosystem really does have both streams,
-  # and grouping all of it would ride a major in on the same approval as a
-  # patch -- PR #291 did exactly that, landing setup-node v6 -> v7 alongside a
-  # codeql-action patch. Majors are left ungrouped and get their own PR.
+  # codeql.yml pins a full patch version (github/codeql-action@v4.37.8 as of
+  # #291, and it moves again on the next patch). So this ecosystem really does
+  # have both streams, and grouping all of it would ride a major in on the same
+  # approval as a patch -- PR #291 did exactly that, landing setup-node
+  # v6 -> v7 alongside a codeql-action patch. Majors are left ungrouped and get
+  # their own PR.
+  #
+  # The limit is 10, not the default 5: the workflows use ~20 distinct actions
+  # and each major-updated one now takes a PR of its own, so 5 could silently
+  # withhold updates rather than merely defer them.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     groups:
       github-actions-minor-patch:
         patterns:
@@ -78,7 +88,7 @@ updates:
     directory: /website
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     groups:
       website-minor-patch:
         patterns:
@@ -86,6 +96,22 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # @docusaurus/theme-mermaid 3.10.2 declares a peerOptional of
+      # @mermaid-js/layout-elk ^0.1.9, so anything in 0.2.x fails `npm ci`
+      # outright:
+      #   npm error ERESOLVE could not resolve
+      #   npm error peerOptional @mermaid-js/layout-elk@"^0.1.9"
+      #                          from @docusaurus/theme-mermaid@3.10.2
+      # Not a judgement call about the release -- the tree cannot install.
+      # Closing the PR does not hold: #289 was closed by hand and Dependabot
+      # re-raised it as #293 sixty-seven seconds after the next push to main,
+      # because it re-evaluates on every push.
+      #
+      # REMOVE THIS ENTRY once @docusaurus/theme-mermaid widens the peer range
+      # to accept 0.2.x -- check its package.json on the next Docusaurus bump.
+      - dependency-name: "@mermaid-js/layout-elk"
+        versions: [">=0.2.0"]
     cooldown:
       default-days: 7
     labels:

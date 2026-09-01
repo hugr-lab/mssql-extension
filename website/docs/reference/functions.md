@@ -185,7 +185,7 @@ The function loads metadata per-schema to avoid SQL Server tempdb sort spills on
 ### Authentication Test Functions
 
 Connectivity diagnostics that exercise the auth path without a full query.
-Details on the auth pages: [Azure AD](/connection/azure/), [Kerberos / SSPI](/connection/kerberos/).
+Details on the auth pages: [Azure AD](../connection/azure.md), [Kerberos / SSPI](../connection/kerberos.md).
 
 | Function | Description |
 |---|---|

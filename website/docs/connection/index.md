@@ -89,9 +89,9 @@ CREATE SECRET secret_name (
 | `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
 | `schema_filter` | VARCHAR | No     | Regex pattern to filter visible schemas (case-insensitive partial match) |
 | `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
-| `azure_secret`  | VARCHAR | No     | Name of an Azure secret (DuckDB Azure extension) for Azure AD auth — see [AZURE.md](/connection/azure/) |
-| `access_token`  | VARCHAR | No     | Pre-acquired Azure AD JWT (hidden in `duckdb_secrets()`) — see [AZURE.md](/connection/azure/) |
-| `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows SSPI) — Kerberos / SSPI integrated auth, see [Kerberos.md](/connection/kerberos/) |
+| `azure_secret`  | VARCHAR | No     | Name of an Azure secret (DuckDB Azure extension) for Azure AD auth — see [AZURE.md](./azure.md) |
+| `access_token`  | VARCHAR | No     | Pre-acquired Azure AD JWT (hidden in `duckdb_secrets()`) — see [AZURE.md](./azure.md) |
+| `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows SSPI) — Kerberos / SSPI integrated auth, see [Kerberos.md](./kerberos.md) |
 | `krb5_configfile`    | VARCHAR | No | Per-secret `/etc/krb5.conf` override (Linux only) |
 | `krb5_keytabfile`    | VARCHAR | No | Path to a keytab — selects keytab credential mode (Linux only) |
 | `krb5_credcachefile` | VARCHAR | No | ccache path override (Linux only) |
@@ -114,9 +114,9 @@ ATTACH '' AS context_name (TYPE mssql, SECRET secret_name);
 | `User Id`                   | `Uid`, `User`                        |
 | `Password`                  | `Pwd`                                |
 | `Encrypt`                   | `Use Encryption for Data`, `TrustServerCertificate` |
-| `Trusted_Connection`        | `Trusted Connection`, `TrustedConnection` (yes/true/SSPI/1 -> Kerberos on POSIX, SSPI on Windows; see [Kerberos.md](/connection/kerberos/)) |
+| `Trusted_Connection`        | `Trusted Connection`, `TrustedConnection` (yes/true/SSPI/1 -> Kerberos on POSIX, SSPI on Windows; see [Kerberos.md](./kerberos.md)) |
 | `Integrated Security`       | `IntegratedSecurity`, `Integrated_Security` (same resolution as `Trusted_Connection`) |
-| `authenticator`             | `krb5` or `winsspi` (see [Kerberos.md](/connection/kerberos/)) |
+| `authenticator`             | `krb5` or `winsspi` (see [Kerberos.md](./kerberos.md)) |
 | `krb5-keytabfile`           | `krb5_keytabfile` (path to keytab; selects keytab mode, Linux only) |
 | `krb5-configfile`           | `krb5_configfile` (per-connection `/etc/krb5.conf` override, Linux only) |
 | `krb5-credcachefile`        | `krb5_credcachefile` (ccache path override, Linux only) |
@@ -149,7 +149,7 @@ Three credential modes are supported on POSIX:
 
 On Windows, **SSPI** (`authenticator=winsspi` or `Trusted_Connection=yes`) authenticates with the current Windows logon session via `secur32.dll`'s Negotiate package — no `kinit` needed. The connection-string surface is identical to POSIX; `Trusted_Connection=yes` / `Integrated Security=SSPI` resolve to `winsspi` automatically on Windows hosts.
 
-See [Kerberos.md](/connection/kerberos/) for prerequisites, full connection-string
+See [Kerberos.md](./kerberos.md) for prerequisites, full connection-string
 reference, the bundled docker-compose test stack (no real AD required),
 troubleshooting (including WSL2 specifics), and SPN verification.
 
@@ -307,7 +307,7 @@ In addition to options propagated from the secret / connection string, the follo
 | ------------------- | ------- | ---------------------------------------------------------------------------- |
 | `SECRET`            | VARCHAR | Name of an MSSQL secret holding connection parameters                        |
 | `azure_secret`      | VARCHAR | Override / supply Azure secret name for Azure AD auth                        |
-| `access_token`      | VARCHAR | Pre-acquired Azure AD JWT (see [AZURE.md](/connection/azure/))                         |
+| `access_token`      | VARCHAR | Pre-acquired Azure AD JWT (see [AZURE.md](./azure.md))                         |
 | `catalog`           | BOOLEAN | Enable catalog integration (default `true`)                                  |
 | `schema_filter`     | VARCHAR | Override secret schema_filter for this ATTACH                                |
 | `table_filter`      | VARCHAR | Override secret table_filter for this ATTACH                                 |

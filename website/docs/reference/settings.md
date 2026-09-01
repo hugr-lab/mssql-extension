@@ -11,7 +11,7 @@ sidebar_position: 1
 | -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
 | `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
-| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](/performance/#owning-the-session-mssql_reset_connection)) |
+| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](../performance.md#owning-the-session-mssql_reset_connection)) |
 | `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |

@@ -63,7 +63,7 @@ Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 
 **Solutions:**
 
-- Check the [Type Mapping](/reading/types/) section for supported types
+- Check the [Type Mapping](../reading/types.md) section for supported types
 - Cast unsupported columns to supported types in your query
 - Exclude unsupported columns from SELECT
 
@@ -85,7 +85,7 @@ Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 - **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
 - **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
 - **Updating primary key columns**: UPDATE cannot modify primary key columns (used for row identification)
-- **Keytab / raw Kerberos credentials on macOS**: macOS's `GSS.framework` lacks MIT extensions for `gss_acquire_cred_from` keytab and raw-password paths. macOS supports credential-cache mode only (via `kinit`); keytab and raw-credentials modes are Linux-only. See [Kerberos.md](/connection/kerberos/) for the WSL2 / Docker testing path.
+- **Keytab / raw Kerberos credentials on macOS**: macOS's `GSS.framework` lacks MIT extensions for `gss_acquire_cred_from` keytab and raw-password paths. macOS supports credential-cache mode only (via `kinit`); keytab and raw-credentials modes are Linux-only. See [Kerberos.md](../connection/kerberos.md) for the WSL2 / Docker testing path.
 - **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
 - **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
@@ -157,6 +157,6 @@ The codec validates the input first and falls back to a slower scalar implementa
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
-- Microsoft Fabric Warehouse has no `nvarchar` type at all, and no `datetimeoffset` — so a `TIMESTAMP WITH TIME ZONE` column cannot be created there. `varchar(max)` is supported. See [AZURE.md](/connection/azure/#microsoft-fabric)
+- Microsoft Fabric Warehouse has no `nvarchar` type at all, and no `datetimeoffset` — so a `TIMESTAMP WITH TIME ZONE` column cannot be created there. `varchar(max)` is supported. See [AZURE.md](../connection/azure.md#microsoft-fabric)
 - A `#temp` table cannot be a BCP target on Microsoft Fabric: the load fails inside Fabric with an I/O error against a parquet file. Load into a permanent table
 

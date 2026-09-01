@@ -11,7 +11,7 @@ sidebar_position: 1
 | -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
 | `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
-| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](/performance/#owning-the-session-mssql_reset_connection)) |
+| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](../performance.md#owning-the-session-mssql_reset_connection)) |
 | `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |
@@ -43,7 +43,7 @@ sidebar_position: 1
 
 ### Bulk Load (COPY / CTAS) Settings
 
-Details: [COPY TO](/writing/copy/) and [CTAS](/writing/ctas/).
+Details: [COPY TO](../writing/copy.md) and [CTAS](../writing/ctas.md).
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
@@ -56,7 +56,7 @@ Details: [COPY TO](/writing/copy/) and [CTAS](/writing/ctas/).
 
 ### Target Type Settings
 
-Details: [Target Column Types and Table Shape](/writing/table-options/).
+Details: [Target Column Types and Table Shape](../writing/table-options.md).
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
@@ -72,7 +72,7 @@ Details: [Target Column Types and Table Shape](/writing/table-options/).
 | ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
 | `mssql_order_pushdown`             | BOOLEAN | false   | -     | Enable ORDER BY pushdown to SQL Server |
 
-The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY Pushdown](/reading/queries/#order-by-pushdown-experimental) for details.
+The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY Pushdown](../reading/queries.md#order-by-pushdown-experimental) for details.
 
 ### INSERT Settings
 
