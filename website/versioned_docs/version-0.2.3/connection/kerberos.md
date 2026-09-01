@@ -6,7 +6,7 @@ sidebar_position: 3
 # Kerberos / Integrated Authentication
 
 End-user guide for connecting to Active-Directory-joined SQL Server via Kerberos
-(POSIX) or SSPI (Windows). Spec 042. Mirrors the structure of [AZURE.md](/connection/azure/).
+(POSIX) or SSPI (Windows). Spec 042. Mirrors the structure of [AZURE.md](./azure.md).
 
 ## Table of Contents
 
@@ -805,7 +805,7 @@ Names verbatim from `microsoft/go-mssqldb`'s `integratedauth/` package.
 
 ### See Also
 
-- [AZURE.md](/connection/azure/) — Azure AD authentication (Entra ID, Service Principal,
+- [AZURE.md](./azure.md) — Azure AD authentication (Entra ID, Service Principal,
   device code, manual access token)
 - [README.md](/) — main extension documentation
 - [docs/architecture.md](https://github.com/hugr-lab/mssql-extension/blob/main/docs/architecture.md) — IAuthenticator abstraction and

@@ -82,7 +82,7 @@ before any of that batch is sent.
 The `VARCHAR` row is the only one you can change, and it is the one worth
 changing: `nvarchar(max)` is an off-row LOB and measured 4.1× slower to load
 than a sized column. See
-[Target Column Types and Table Shape](/writing/table-options/) for
+[Target Column Types and Table Shape](./table-options.md) for
 `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`, `mssql_default_string_length` and
 `mssql_ctas_text_type`.
 
@@ -95,7 +95,7 @@ than a sized column. See
 | `mssql_ctas_drop_on_failure` | BOOLEAN | `false` | Drop table if data transfer phase fails |
 
 Column lengths and the table's shape come from
-[Target Column Types and Table Shape](/writing/table-options/) —
+[Target Column Types and Table Shape](./table-options.md) —
 cast a column to `MSSQL_NVARCHAR(n)` in the SELECT list to size it, since CTAS
 has no options syntax of its own.
 

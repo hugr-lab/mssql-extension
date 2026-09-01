@@ -24,6 +24,7 @@ on:
   pull_request:
     paths:
       - "website/**"
+      - "scripts/ci/check_docs_links.py"
       - ".github/workflows/docs-build.yml"
   workflow_dispatch:
 
@@ -41,6 +42,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+
+      # Cheap, and runs before the ~90 s npm install so a link error reports
+      # in seconds. Docusaurus cannot catch this class itself: an absolute
+      # link resolves to a page that really exists in the released version,
+      # so onBrokenLinks sees nothing wrong.
+      - name: No absolute internal doc links
+        run: python3 scripts/ci/check_docs_links.py
 
       - uses: actions/setup-node@v7
         with:

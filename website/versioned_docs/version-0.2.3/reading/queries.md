@@ -48,7 +48,7 @@ are unchanged either way.
 > Pushed string predicates follow the **server's comparison semantics**: on a
 > case-insensitive collation, `WHERE name = 'abc'` matches `'ABC'` — exactly
 > what the same query returns in SSMS. See the collation notes under
-> [Target Column Types](/writing/table-options/).
+> [Target Column Types](../writing/table-options.md).
 
 ### ORDER BY Pushdown (Experimental)
 
