@@ -20,7 +20,14 @@ on:
     # manual-dispatch only, so without this the C++ unit tests it carries
     # (incl. test_login_error_state, issue #164) and the integration suite get
     # no automatic coverage between releases. Runs build + smoke + integration;
-    # Windows / Azure stay manual (cost, and #165 keeps MSVC red).
+    # Windows / Azure stay manual (CI cost).
+    #
+    # That used to read "and #165 keeps MSVC red". #165 was CLOSED/COMPLETED on
+    # 2026-08-02, and v0.2.4 -- released 2026-08-17, after it -- ships both
+    # mssql-0.2.4-windows_amd64.duckdb_extension (MSVC) and the MinGW build, so
+    # MSVC is green on the release path. The comment outlived the issue it
+    # named and was still being read as current state a month later
+    # (discussion #298). Cost is now the only reason these are gated.
     - cron: '0 5 * * 1'
   workflow_dispatch:
     inputs:
