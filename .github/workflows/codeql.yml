@@ -70,7 +70,7 @@ jobs:
       - name: Checkout DuckDB submodule
         # --recursive picks up DuckDB's own third_party/* submodules that the
         # build needs (parquet decoders, etc.). extension-ci-tools is skipped.
-        run: git submodule update --init --recursive duckdb
+        run: scripts/ci/checkout_duckdb.sh
 
       # The step that used to live here re-exported ACTIONS_CACHE_URL and
       # ACTIONS_RUNTIME_TOKEN into the environment so vcpkg's x-gha provider

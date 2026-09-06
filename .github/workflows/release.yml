@@ -107,7 +107,7 @@ jobs:
       - name: Checkout DuckDB submodule
         shell: bash
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -262,7 +262,7 @@ jobs:
       - name: Checkout DuckDB submodule
         shell: bash
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -401,7 +401,7 @@ jobs:
       - name: Checkout DuckDB submodule
         shell: bash
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
