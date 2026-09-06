@@ -19,15 +19,29 @@ on:
     # Weekly regression build (Mondays 05:00 UTC). The heavy build job is
     # manual-dispatch only, so without this the C++ unit tests it carries
     # (incl. test_login_error_state, issue #164) and the integration suite get
-    # no automatic coverage between releases. Runs build + smoke + integration;
-    # Windows / Azure stay manual (CI cost).
+    # no automatic coverage between releases. Runs build + smoke + integration.
     #
-    # That used to read "and #165 keeps MSVC red". #165 was CLOSED/COMPLETED on
-    # 2026-08-02, and v0.2.4 -- released 2026-08-17, after it -- ships both
-    # mssql-0.2.4-windows_amd64.duckdb_extension (MSVC) and the MinGW build, so
-    # MSVC is green on the release path. The comment outlived the issue it
-    # named and was still being read as current state a month later
-    # (discussion #298). Cost is now the only reason these are gated.
+    # Windows BUILDS stay manual, for CI cost alone. Note "builds": the
+    # windows-sspi-test job below carries no `if:` guard and compiles
+    # winsspi_authenticator.cpp with MSVC `cl /std:c++17` on every push, PR and
+    # scheduled run, so MSVC compilation is continuously exercised already.
+    #
+    # Azure stays manual for reasons that are NOT cost: the job needs the
+    # 'test' environment's secrets, and its `if:` refuses to run on main by
+    # design (see the run_azure_tests input -- feature branches only).
+    #
+    # This block used to say "and #165 keeps MSVC red". #165 was CLOSED as
+    # COMPLETED on 2026-08-02; v0.2.4, released 2026-08-17 after it, ships both
+    # mssql-0.2.4-windows_amd64.duckdb_extension (MSVC) and the MinGW build.
+    # The comment outlived the issue it named and was still being quoted as
+    # current state a month later, in discussion #298, as grounds for believing
+    # Windows-on-PRs was blocked behind a compiler bug.
+    #
+    # Confirmed on the CI lane, not just the release lane -- those do not share
+    # runner configuration, so the release artifacts alone did not settle it.
+    # Dispatch with run_windows_build=true, 2026-09-03, actions run
+    # 33793132193: Build Windows (MSVC), Build Windows (MinGW), Smoke Test
+    # Windows (MSVC), Smoke Test Windows (MinGW) -- all success.
     - cron: '0 5 * * 1'
   workflow_dispatch:
     inputs:
