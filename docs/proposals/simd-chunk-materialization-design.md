@@ -136,7 +136,7 @@ All checked directly in the pinned v1.5.5 submodule — not from memory.
      local builds, our CI, and community-extensions builds alike (the config ships with the
      extension; no pipeline knob needed).
    - Gate before adoption: full-matrix build + tests (Linux GCC, macOS Clang, **MSVC and
-     MinGW** — bundled fmt is a known MSVC sore spot, cf. issue #165; watch for C++17
+     MinGW** — bundled fmt is a known MSVC sore spot, cf. issue #165 (closed 2026-08-02); watch for C++17
      removals like `std::random_shuffle` in third_party).
    - **Adoption stance (maintainer decision):** C++17 is *not scheduled*. It is taken up only
      when a concrete kernel or refactor is demonstrably better in C++17 (readability or
@@ -465,7 +465,7 @@ it measured report approximately nothing.
 | [#197](https://github.com/hugr-lab/mssql-extension/issues/197) — NTEXT/IMAGE unreadable (no decoder for wire types 0x63/0x22) | Decode-path gap in the same row-reader/codec layer the staging refactor rewrites | **Phase 1** ride-along: add legacy LONGLEN readers while the value-read dispatch is being restructured (cheaper to do during the pivot than before/after) |
 | [#153](https://github.com/hugr-lab/mssql-extension/issues/153) — should BCP COPY allow compatible numeric coercion (BIGINT→INT) into existing tables? | Write-path type-mapping policy, adjacent to the representation-aware encoder | Open question for **Phase 3**: batch encoders make per-column coercion kernels cheap; policy decision (error vs range-checked coercion) stays a spec-level question |
 
-Not related (tracked separately): #199 (test infra), #204/#122 (connectivity), #140 (DML), #85/#86 (catalog), #189, #129, #165 (MSVC fmt — relevant only as a C++17-gate canary, §2.7), #119.
+Not related (tracked separately): #199 (test infra), #204/#122 (connectivity), #140 (DML), #85/#86 (catalog), #189, #129, #119. (#165, the MSVC fmt C++17-gate canary of §2.7, was closed 2026-08-02.)
 
 ## 10. Phasing → specs
 
