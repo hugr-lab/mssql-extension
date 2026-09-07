@@ -16,10 +16,14 @@ on:
     # The green tick was the problem: four checks ran and passed, so the page
     # looked fine. Only counting them against another PR showed the ten missing.
     #
-    # This also makes ci.yml consistent with every other workflow in the repo --
-    # it was the only one filtering PRs by base branch; the rest scope by
-    # `paths:`. Cost is CI minutes on stacked PRs, which is the point: a PR
-    # merging into a feature branch still reaches main eventually.
+    # This also makes ci.yml consistent with every other workflow in the repo:
+    # it was the only one filtering PRs by BASE BRANCH. The rest either scope
+    # by `paths:` (cflite-pr, concurrency-tests, docs-build, kerberos,
+    # named-instance) or take every PR unconditionally (lint-extra,
+    # security-scan) -- which is why those ran on #284 and this did not.
+    #
+    # Cost is CI minutes on stacked PRs, which is the point: a PR merging into
+    # a feature branch still reaches main eventually.
     #
     # Docs-only PRs skip CI (lint + C++ unit tests). Prose-scanning workflows
     # (prompt-injection, secret scan) have their own triggers and still run.
