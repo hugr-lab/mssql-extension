@@ -133,6 +133,17 @@ jobs:
       - name: Issue -> test index is well-formed
         run: python3 scripts/ci/issue_links.py
 
+      # scripts/ci/ now holds five shell scripts on the CI critical path, one
+      # of which does `rm -rf` against a path it derives. Their clean state was
+      # established by hand once and nothing kept it that way -- an unquoted
+      # expansion reintroduced later would be found by the next incident, not
+      # by the PR. ~25 s in a 10-minute job.
+      - name: shellcheck the CI scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning scripts/ci/*.sh
+
   # ============================================================================
   # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.
   # Runs on every push/PR (unlike the heavy build job, which is manual).
@@ -420,6 +431,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Checkout DuckDB submodule
+        # The script bounds each ATTEMPT (perl alarm) so a hang retries; this
+        # bounds the step as a whole, well above 3 x 600 s + backoff, so it can
+        # only fire if the script itself wedges.
+        timeout-minutes: 40
         run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
@@ -931,6 +946,7 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
@@ -1099,6 +1115,7 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata

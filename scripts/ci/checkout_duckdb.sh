@@ -31,19 +31,66 @@
 
 set -uo pipefail
 
-ATTEMPTS="${DUCKDB_CHECKOUT_ATTEMPTS:-3}"
+# Anchor at the repo root before anything relative happens. `rm -rf duckdb`
+# below is a relative destructive path, so running from elsewhere -- a future
+# `working-directory:`, or a local shell -- would delete something else and
+# then fail confusingly. No `|| .git` fallback: outside a repository this
+# script cannot do its job at all, so say so.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "::error::checkout_duckdb.sh must run inside the repository"
+    exit 1
+}
+cd "$repo_root" || exit 1
 
-# Abort a transfer sitting under 1 KB/s for 60 s instead of waiting forever.
+ATTEMPTS="${DUCKDB_CHECKOUT_ATTEMPTS:-3}"
+# Wall clock per attempt. A healthy clone here is a couple of minutes, so this
+# is ~5x headroom; three attempts plus backoff stay well inside the job's own
+# bound.
+ATTEMPT_TIMEOUT="${DUCKDB_CHECKOUT_TIMEOUT:-600}"
+
+# A secondary, faster signal: abort a transfer sitting under 1 KB/s for 60 s.
+# It is NOT the main guard -- see RunAttempt.
 export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
 export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
+
+# Run one attempt under a wall-clock bound, so that ANY hang becomes an exit
+# status the retry loop can act on.
+#
+# GIT_HTTP_LOW_SPEED_* alone is not enough, and assuming it was is what the
+# previous version got wrong: it bounds the HTTP TRANSFER only. It does not
+# bound TCP/TLS connect, delta resolution, index and worktree writes, or the
+# recursive pass over DuckDB's own third_party submodules. The failure this
+# exists for (run 34050028399: 45 minutes, no log, no failing step) never
+# identified which of those it was, so guarding one of them is a guess.
+#
+# timeout(1) is the obvious tool and is not in base macOS. perl's alarm is,
+# and is present on the ubuntu and macOS runners and in Git Bash on Windows.
+# If perl is somehow missing, run unbounded rather than not at all -- the
+# job-level timeout-minutes is the last backstop either way.
+run_attempt() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift; exec @ARGV or exit 127' \
+            "$ATTEMPT_TIMEOUT" git submodule update --init --recursive duckdb
+    else
+        git submodule update --init --recursive duckdb
+    fi
+}
 
 reset_state() {
     # `git rev-parse --git-dir` rather than a literal .git/, because in a git
     # WORKTREE .git is a file and .git/modules/duckdb does not exist.
     local git_dir
-    git_dir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+    git_dir="$(git rev-parse --git-dir)"
     git submodule deinit -f duckdb >/dev/null 2>&1 || true
     rm -rf duckdb "${git_dir}/modules/duckdb"
+    # Assert it actually happened. Without this the reset is unfalsifiable:
+    # rm's status is discarded, so a locked file on a Windows leg or a
+    # permission problem would log "Resetting partial submodule state" and
+    # then hand attempt N+1 exactly the wreckage this exists to prevent.
+    if [ -e duckdb ] || [ -e "${git_dir}/modules/duckdb" ]; then
+        echo "::error::could not reset partial DuckDB submodule state"
+        exit 1
+    fi
 }
 
 for attempt in $(seq 1 "$ATTEMPTS"); do
@@ -52,12 +99,21 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
         reset_state
     fi
 
-    if git submodule update --init --recursive duckdb; then
+    # `status=$?` AFTER the if would capture the if-construct's own status --
+    # 0 when the condition fails and no branch runs -- so the 142 test below
+    # could never fire. It has to be read inside the else.
+    if run_attempt; then
         echo "DuckDB submodule checked out on attempt ${attempt}"
         exit 0
+    else
+        status=$?
     fi
 
-    echo "::warning::DuckDB submodule checkout failed (attempt ${attempt}/${ATTEMPTS})"
+    if [ "$status" -eq 142 ]; then
+        echo "::warning::DuckDB submodule checkout exceeded ${ATTEMPT_TIMEOUT}s (attempt ${attempt}/${ATTEMPTS})"
+    else
+        echo "::warning::DuckDB submodule checkout failed with status ${status} (attempt ${attempt}/${ATTEMPTS})"
+    fi
 
     # No backoff after the last attempt -- it would delay the failure without
     # any remaining attempt to space out.

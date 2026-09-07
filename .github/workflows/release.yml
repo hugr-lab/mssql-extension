@@ -39,6 +39,7 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
     needs: lint
     strategy:
       fail-fast: false
@@ -236,6 +237,7 @@ jobs:
   build-windows-msvc:
     name: Build (windows_amd64)
     runs-on: windows-latest
+    timeout-minutes: 90
     needs: lint
 
     env:
@@ -375,6 +377,7 @@ jobs:
   build-windows-mingw:
     name: Build (windows_amd64_mingw)
     runs-on: windows-latest
+    timeout-minutes: 90
     needs: lint
     env:
       CC: gcc

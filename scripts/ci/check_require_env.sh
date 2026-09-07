@@ -50,7 +50,7 @@
 #
 # Run: scripts/ci/check_require_env.sh
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit 1
 
 # Variables a developer or a workflow supplies deliberately, and whose absence is
 # meant to skip the file. Anything NOT here must be exported by the Makefile.
