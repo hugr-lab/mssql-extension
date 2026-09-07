@@ -123,6 +123,15 @@ jobs:
       - name: Every require-env variable is actually set
         run: scripts/ci/check_require_env.sh
 
+      # The issue -> regression-test index. Validates the `# issue:` /
+      # `// issue:` header declarations and prints the count; the backlog of
+      # files that name an issue in prose without declaring one is reported,
+      # not enforced, because deciding whether a mention is a guard needs a
+      # human. See docs/TESTING.md "Linking a test to the issue it guards".
+      # No build needed -- it reads files.
+      - name: Issue -> test index is well-formed
+        run: python3 scripts/ci/issue_links.py
+
   # ============================================================================
   # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.
   # Runs on every push/PR (unlike the heavy build job, which is manual).

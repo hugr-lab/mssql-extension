@@ -5,6 +5,7 @@
 #   FlatVector::GetData<hugeint_t>(varchar_vector). Post-spec-045 the dispatcher renders
 #   the value as a string via the per-family RenderAsString fallback.
 # group: [sql]
+# issue: 89
 #
 # Setup pattern: a base table with NVARCHAR(255) column storing numeric data, then a
 # view that CASTs that column to DECIMAL(19,4). sys.columns for the view *can* report

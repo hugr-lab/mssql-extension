@@ -1,6 +1,7 @@
 # name: test/sql/catalog/ddl_if_not_exists.test
 # description: Test CREATE TABLE IF NOT EXISTS DDL (Issue #44)
 # group: [catalog]
+# issue: 44
 
 require mssql
 

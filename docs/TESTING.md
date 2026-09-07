@@ -395,6 +395,50 @@ statement ok
 DETACH testdb;
 ```
 
+### Linking a test to the issue it guards
+
+A test that exists to keep a fixed bug fixed declares the issue in its header,
+under `# group:`:
+
+```sql
+# name: test/sql/copy/copy_varchar_length.test
+# description: BCP COPY into an existing VARCHAR(n) must accept n characters
+# group: [copy]
+# issue: 181
+```
+
+C++ tests use the same field in their banner comment, under the path line:
+
+```cpp
+// test/cpp/test_load_policy.cpp
+// issue: 189
+```
+
+Several issues on one test is `# issue: 140, 141`. The field must sit in the
+**header block** -- the run of comment lines at the very top, ending at the
+first blank line.
+
+Query the index with `scripts/ci/issue_links.py`:
+
+```bash
+python3 scripts/ci/issue_links.py            # validate + summary (runs in CI)
+python3 scripts/ci/issue_links.py --index    # every issue -> its tests
+python3 scripts/ci/issue_links.py --issue 181
+python3 scripts/ci/issue_links.py --backlog  # mentions an issue, declares none
+```
+
+**Why a declared field and not a grep for "issue #NNN".** A test may *mention*
+an issue without guarding it, and the difference is the entire point. The
+clearest case is `test/sql/query/legacy_lob_types.test`, a test for #197 whose
+prose says of #224 "deliberately not pinned here". A grep-built index reports
+#224 as covered when the file explicitly says it is not -- worse than no index,
+because it answers "is this still covered?" with a confident wrong answer. A
+declaration cannot be produced by accident; a prose mention can.
+
+`--backlog` is reported but never enforced. Whether a mention should become a
+declaration is a judgement about what the test actually pins, so the tool
+surfaces the list and leaves the call to a person.
+
 **Environment-variable substitution.** Write `{MSSQL_TEST_DSN}` (braces only).
 The runner substitutes a variable only if the same file `require-env`s it; an
 undeclared name comes through literally. The older `${VAR}` form still

@@ -1,6 +1,7 @@
 # name: test/sql/copy/copy_hugeint_bcp.test
 # description: Issue #177 — HUGEINT (SUM() output) through COPY (FORMAT 'bcp') and default CTAS
 # group: [copy]
+# issue: 177
 
 require mssql
 

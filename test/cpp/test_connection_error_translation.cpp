@@ -1,4 +1,5 @@
 // test/cpp/test_connection_error_translation.cpp
+// issue: 164, 262
 // Unit tests for TranslateConnectionError (issue #262).
 //
 // The bug this pins: the translator used to decide "this is a credential

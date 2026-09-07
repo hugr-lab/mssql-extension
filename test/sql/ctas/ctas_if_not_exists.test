@@ -1,6 +1,7 @@
 # name: test/sql/ctas/ctas_if_not_exists.test
 # description: Test CREATE TABLE AS IF NOT EXISTS behavior (Issue #44)
 # group: [ctas]
+# issue: 44
 
 require mssql
 

@@ -1,6 +1,7 @@
 # name: test/sql/integration/reset_connection.test
 # description: mssql_reset_connection decides whether a pooled connection's session survives (issue #189)
 # group: [mssql]
+# issue: 189
 #
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

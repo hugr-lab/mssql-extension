@@ -1,6 +1,7 @@
 # name: test/sql/copy/compatible_type_conversion.test
 # description: COPY into an EXISTING table whose column types differ from the source's (issue #153, spec 057 step 3)
 # group: [mssql]
+# issue: 153
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
