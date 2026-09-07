@@ -10,6 +10,7 @@
 #include "codec/string_codec.hpp"
 
 #include "codec/target_string_type.hpp"
+#include "codec/utf8_guard.hpp"
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
@@ -35,28 +36,8 @@ namespace string {
 
 namespace {
 
-// Is every byte ASCII? Inlined deliberately: this replaces a simdutf
-// validate_utf8 call, and the whole point is that a CALL costs ~3.1 ns on a
-// short value while the byte test costs a fraction of that.
-//
-// Eight bytes at a time through a uint64 mask — the same trick simdutf uses at
-// its tail, minus the dispatch.
-inline bool IsAsciiRun(const char *data, size_t size) {
-	size_t i = 0;
-	for (; i + 8 <= size; i += 8) {
-		uint64_t w;
-		std::memcpy(&w, data + i, 8);
-		if (w & 0x8080808080808080ULL) {
-			return false;
-		}
-	}
-	for (; i < size; i++) {
-		if (static_cast<uint8_t>(data[i]) & 0x80) {
-			return false;
-		}
-	}
-	return true;
-}
+// IsAsciiRun lives in codec/utf8_guard.hpp now, shared with binary_codec's
+// staged path so the issue #224 check and its message exist in one place.
 
 // ASCII -> UTF-16LE: every byte becomes itself plus a zero high byte. Written as
 // a plain loop so it inlines and vectorises at the call site; simdutf does the
@@ -856,17 +837,12 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		}
 	}
 	const char *chars = reinterpret_cast<const char *>(bytes.data());
-	// ASCII first: same reasoning as IsAsciiRun's own comment -- it costs a
-	// fraction of a validate_utf8 call, and it is the overwhelmingly common
-	// case, so the check below is only reached by genuinely non-ASCII values.
-	if (len > 0 && !IsAsciiRun(chars, len) && !simdutf::validate_utf8(chars, len)) {
-		throw InvalidInputException(
-			"Column \"%s\" is a non-Unicode CHAR/VARCHAR whose bytes are not valid UTF-8 "
-			"(collation 0x%08X, sort id %u). DuckDB VARCHAR must be UTF-8, and this "
-			"extension does not transcode legacy code pages. Either CAST it in the query -- "
-			"CAST(\"%s\" AS NVARCHAR(4000)) -- or read the table through the attached "
-			"catalog, which casts server-side.",
-			col.name, col.collation, static_cast<uint32_t>(col.collation_sort_id), col.name);
+	// ASCII first: it costs a fraction of a validate_utf8 call and is the
+	// overwhelmingly common case, so the check below is only reached by
+	// genuinely non-ASCII values. See codec/utf8_guard.hpp for why this
+	// column class needs the check at all (issue #224).
+	if (len > 0 && IsSingleByteTextColumn(col) && !IsAsciiRun(chars, len) && !simdutf::validate_utf8(chars, len)) {
+		ThrowNonUtf8Column(col, SIZE_MAX);
 	}
 	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = StringVector::AddString(out, chars, len);
 }

@@ -65,6 +65,56 @@ SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, CAST(v AS NVARCHAR(50)) AS v FR
 2	naïve
 3	plain ascii
 
+# Values whose bytes JOIN across the staging boundary. Staged values are packed
+# contiguously with no separator, so 0xC3 followed by a value starting 0xA9
+# concatenates to C3 A9 -- valid UTF-8 for U+00E9 -- although neither value is
+# valid on its own. Validating the whole payload in one call accepted exactly
+# this and published both rows. The guard's fast path is all-ASCII for that
+# reason, and this is the case that distinguishes the two.
+statement ok
+SELECT mssql_exec('cpdb', 'IF OBJECT_ID(''dbo.CodePageJoin'', ''U'') IS NOT NULL DROP TABLE dbo.CodePageJoin');
+
+statement ok
+SELECT mssql_exec('cpdb', 'CREATE TABLE dbo.CodePageJoin (id INT, v VARCHAR(50) COLLATE SQL_Latin1_General_CP1_CI_AS)');
+
+statement ok
+SELECT mssql_exec('cpdb', 'INSERT INTO dbo.CodePageJoin VALUES (1, CHAR(195)), (2, CHAR(169) + ''abc'')');
+
+statement error
+SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, v FROM dbo.CodePageJoin ORDER BY id');
+----
+not valid UTF-8
+
+statement ok
+SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageJoin');
+
+# Legacy TEXT shares the staged binary kernel with CHAR/VARCHAR (LobStageBinary
+# -> FinalizeKernel::Binary) and lands in a VARCHAR vector, so it has the same
+# defect. IMAGE shares the arm too but lands in a BLOB, where arbitrary bytes
+# are the point, and must keep working.
+statement ok
+SELECT mssql_exec('cpdb', 'IF OBJECT_ID(''dbo.CodePageText'', ''U'') IS NOT NULL DROP TABLE dbo.CodePageText');
+
+statement ok
+SELECT mssql_exec('cpdb', 'CREATE TABLE dbo.CodePageText (id INT, t TEXT COLLATE SQL_Latin1_General_CP1_CI_AS, b IMAGE)');
+
+statement ok
+SELECT mssql_exec('cpdb', 'INSERT INTO dbo.CodePageText VALUES (1, ''caf'' + CHAR(233), 0xC3), (2, ''ascii only'', 0x00FF)');
+
+statement error
+SELECT id, t FROM mssql_scan('cpdb', 'SELECT id, t FROM dbo.CodePageText ORDER BY id');
+----
+not valid UTF-8
+
+# The ASCII row alone still reads, and IMAGE bytes are never validated.
+query ITT
+SELECT id, t, b FROM mssql_scan('cpdb', 'SELECT id, t, b FROM dbo.CodePageText WHERE id = 2');
+----
+2	ascii only	\x00\xFF
+
+statement ok
+SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageText');
+
 statement ok
 SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageScan');
 

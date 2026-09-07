@@ -256,6 +256,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 	column.precision = 0;
 	column.scale = 0;
 	column.collation = 0;
+	column.collation_sort_id = 0;
 
 	switch (column.type_id) {
 	// Fixed-length types (no additional metadata)
@@ -406,6 +407,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 			column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
 							   (static_cast<uint32_t>(data[offset + 2]) << 16) |
 							   (static_cast<uint32_t>(data[offset + 3]) << 24);
+			column.collation_sort_id = data[offset + 4];
 			offset += 5;
 		}
 		// TableName: 1 byte part count, then each part as US_VARCHAR.

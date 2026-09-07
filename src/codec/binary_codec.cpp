@@ -29,6 +29,7 @@
 
 #include "codec/binary_codec.hpp"
 
+#include "codec/utf8_guard.hpp"
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
@@ -117,39 +118,36 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	char *const blob = blob_slot.GetDataWriteable();
 	std::memcpy(blob, st.buffer.data(), payload);
 
-	// Single-byte CHAR/VARCHAR reaches this BINARY kernel because its bytes are
-	// copied verbatim, exactly like VARBINARY (column_ops: P2StageBinary /
-	// PlpStageBinary). The difference is the destination: those bytes land in a
-	// VARCHAR vector, and DuckDB VARCHAR is UTF-8 by contract.
+	// Single-byte text (CHAR / VARCHAR / TEXT) reaches this BINARY kernel
+	// because its bytes are copied verbatim, exactly like VARBINARY
+	// (column_ops: P2StageBinary / PlpStageBinary / LobStageBinary). The
+	// difference is the destination: those bytes land in a VARCHAR vector, and
+	// DuckDB VARCHAR is UTF-8 by contract -- issue #224.
 	//
-	// The catalog path is safe because it CASTs to NVARCHAR server-side, which
-	// is what column_ops means by "collation handling lives in the scan's
-	// SELECT list". A raw mssql_scan() has no such CAST, so a legacy-collation
-	// column arrives here as code-page bytes and used to be published as an
-	// invalid string -- issue #224, where upper() on a scanned 'naïve' gave
-	// "NA". VARBINARY is untouched: its bytes are meant to be arbitrary.
+	// The catalog path casts non-Unicode string columns to NVARCHAR server-side,
+	// which is what column_ops means by "collation handling lives in the scan's
+	// SELECT list" -- EXCEPT a declared VARCHAR(MAX) when mssql_convert_varchar_max
+	// is off, which NeedsNVarcharConversion deliberately opts out of, so that one
+	// configuration reaches this kernel through the catalog too and now errors
+	// where it previously published a corrupt string. A raw mssql_scan() has no
+	// CAST at all. VARBINARY and IMAGE are untouched: their bytes are meant to be
+	// arbitrary, and they land in a BLOB.
 	//
-	// One validate over the whole payload in the good case. Concatenated valid
-	// UTF-8 is valid UTF-8, so a single call clears every row; only when it
-	// fails is the per-row loop entered, and only to name the offending row.
-	const bool char_target = col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_BIGVARCHAR;
-	if (char_target && !simdutf::validate_utf8(blob, payload)) {
+	// The fast path is ASCII, not a whole-payload validate_utf8. Staged values
+	// are packed contiguously with no separator, so a lead byte ending one value
+	// and continuation bytes starting the next form a valid sequence ACROSS the
+	// boundary -- 0xC3 then a value beginning 0xA9 validates as U+00E9 although
+	// neither value is valid alone, which would wave the corruption straight
+	// through. All-ASCII carries no such case: every byte is a whole character.
+	if (IsSingleByteTextColumn(col) && !IsAsciiRun(blob, payload)) {
 		for (idx_t row = 0; row < count; row++) {
 			if (!st.IsValid(row)) {
 				continue;
 			}
 			const char *value = blob + st.offsets[row];
-			if (simdutf::validate_utf8(value, st.lengths[row])) {
-				continue;
+			if (!simdutf::validate_utf8(value, st.lengths[row])) {
+				ThrowNonUtf8Column(col, static_cast<size_t>(row));
 			}
-			throw InvalidInputException(
-				"Column \"%s\" is a non-Unicode CHAR/VARCHAR whose bytes are not valid UTF-8 "
-				"(collation 0x%08X, sort id %u; first bad value at row %llu). DuckDB VARCHAR must "
-				"be UTF-8, and this extension does not transcode legacy code pages. Either CAST it "
-				"in the query -- CAST(\"%s\" AS NVARCHAR(4000)) -- or read the table through the "
-				"attached catalog, which casts server-side.",
-				col.name, col.collation, static_cast<uint32_t>(col.collation_sort_id),
-				static_cast<unsigned long long>(row), col.name);
 		}
 	}
 
