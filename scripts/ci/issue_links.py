@@ -36,8 +36,12 @@ import sys
 ROOTS = ("test/sql", "test/cpp")
 SQL_FIELD = re.compile(r"^#\s*issue:\s*(.+?)\s*$", re.I)
 CPP_FIELD = re.compile(r"^//\s*issue:\s*(.+?)\s*$", re.I)
-NUMBERS = re.compile(r"#?(\d{1,5})")
-PROSE = re.compile(r"issue\s*#?(\d{2,5})", re.I)
+FIELD_SHAPE = re.compile(r"#?\d+(?:\s*,\s*#?\d+)*\Z")
+NUMBERS = re.compile(r"#?(\d+)")
+# Plural, and the separators this tree actually uses: "issues #90",
+# "issue-#89", "issue: 224". Still requires the word, which usefully
+# excludes "PR #213".
+PROSE = re.compile(r"issues?[\s#:,-]*(\d{2,5})", re.I)
 
 
 def header_lines(path):
@@ -48,10 +52,13 @@ def header_lines(path):
     that is exactly sqllogictest's own `# name:` / `# description:` /
     `# group:` triple; for a .cpp test it is the leading banner comment.
 
-    Deliberately narrow. If the block extended through every leading comment,
-    a declaration could sit forty lines down inside a prose preamble, which is
-    both easy to miss when reading and easy to add by accident when editing --
-    and the whole point of a declaration is that it cannot happen by accident.
+    Note this is narrower than "every leading comment" but NOT as narrow as it
+    may sound: .test files in this tree routinely run their prose preamble
+    straight on from the header with a bare `#` rather than a blank line, so
+    the block can be long -- legacy_lob_scan.test's is 21 lines, and
+    copy_nvarchar_length_validation.test's was 28 before it was normalised. The
+    rule is chosen because it is simple and matches where the back-fill puts
+    the field, not because it bounds the block to a few lines.
     """
     comment = "//" if path.endswith((".cpp", ".hpp")) else "#"
     with open(path, errors="replace") as fh:
@@ -76,11 +83,16 @@ def declared(path):
         m = field.match(line.strip())
         if not m:
             continue
-        nums = NUMBERS.findall(m.group(1))
-        if not nums:
-            errors.append("issue field names no number: %r" % line.strip())
+        value = m.group(1)
+        # Validate the WHOLE field, not just scan it for digits. Scanning let
+        # `# issue: 181 (see spec 057)` index 181 AND 57, and `# issue: 123456`
+        # split into 12345 and 6 -- both inside the range check -- registering
+        # guards for issues nobody wrote. That is precisely the "cannot be
+        # produced by accident" property this field exists to have.
+        if not FIELD_SHAPE.match(value):
+            errors.append("issue field is not a comma-separated number list: %r" % line.strip())
             continue
-        found.extend(int(n) for n in nums)
+        found.extend(int(n) for n in NUMBERS.findall(value))
     return found, errors
 
 
@@ -88,6 +100,16 @@ def mentioned(path):
     """Issue numbers named anywhere in the file, declaration or not."""
     with open(path, errors="replace") as fh:
         return {int(n) for n in PROSE.findall(fh.read())}
+
+
+def missing_roots():
+    """Roots that do not exist.
+
+    os.walk on a missing directory yields nothing and raises nothing, so a
+    moved test tree would make this print "0 issue(s) guarded" and exit 0 --
+    a CI gate passing because it indexed nothing at all.
+    """
+    return [r for r in ROOTS if not os.path.isdir(r)]
 
 
 def walk():
@@ -119,7 +141,21 @@ def collect():
 
 
 def main(argv):
+    gone = missing_roots()
+    if gone:
+        for root in gone:
+            print("ERROR missing docs/test root: %s" % root, file=sys.stderr)
+        return 1
+
     index, backlog, bad = collect()
+    # Printed in EVERY mode. Reporting them only in the default mode meant
+    # `--index` after a mistyped field showed a table quietly missing that file
+    # and exited 0.
+    for path, why in bad:
+        print("ERROR %s: %s" % (path, why), file=sys.stderr)
+
+    if bad and ("--index" in argv or "--issue" in argv or "--backlog" in argv):
+        return 1
 
     if "--index" in argv:
         for n in sorted(index):
@@ -135,7 +171,9 @@ def main(argv):
         hits = index.get(want)
         if not hits:
             print("no test declares itself a guard for #%d" % want)
-            return 1
+            # 3, not 1: "no guard" is an answer, and a caller must be able to
+            # tell it from "the index is invalid", which returns 1.
+            return 3
         for path in hits:
             print(path)
         return 0
@@ -145,8 +183,6 @@ def main(argv):
             print(path)
         return 0
 
-    for path, why in bad:
-        print("ERROR %s: %s" % (path, why))
     if bad:
         return 1
 

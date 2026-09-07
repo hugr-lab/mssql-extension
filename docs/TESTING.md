@@ -416,7 +416,10 @@ C++ tests use the same field in their banner comment, under the path line:
 
 Several issues on one test is `# issue: 140, 141`. The field must sit in the
 **header block** -- the run of comment lines at the very top, ending at the
-first blank line.
+first blank line. That block is often longer than it sounds: many `.test` files
+continue straight into a prose preamble with a bare `#` instead of a blank
+line, so the rule is about a simple, predictable boundary rather than a short
+one. Put the field directly under `# group:`, where the back-fill puts it.
 
 Query the index with `scripts/ci/issue_links.py`:
 

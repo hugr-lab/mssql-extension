@@ -1,6 +1,7 @@
 # name: test/sql/query/exec_query_timeout.test
 # description: mssql_exec() must honor the mssql_query_timeout setting for long-running server-side queries (regression for issues #90 and #145)
 # group: [mssql]
+# issue: 90, 145
 #
 # Before the fix, mssql_exec() ignored mssql_query_timeout and used a hardcoded 30s
 # ceiling inside MSSQLSimpleQuery. A server-side statement that ran longer than ~30s
