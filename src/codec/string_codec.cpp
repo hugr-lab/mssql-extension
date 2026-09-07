@@ -827,17 +827,49 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		return;
 	}
 
-	// CHAR/VARCHAR are single-byte (collation-dependent in theory; in
-	// practice the test fixtures and the pre-spec-045 path treated the
-	// bytes as UTF-8 / CP1252 indistinguishably for ASCII).
+	// CHAR/VARCHAR arrive as raw bytes in the COLUMN'S CODE PAGE, and the type
+	// token does not say which. With UTF8SUPPORT negotiated a UTF-8-collated
+	// column arrives here already UTF-8; a legacy code page (CP1252 and
+	// friends) arrives here as the same TDS type carrying bytes that are not
+	// UTF-8 at all. DuckDB VARCHAR is UTF-8 by contract, so passing the latter
+	// straight through produced an invalid string that every downstream
+	// function then mangled -- issue #224, where `upper()` on a scanned
+	// 'naïve' returned "NA".
+	//
+	// The catalog path never reaches this: BuildColumnExpression wraps
+	// non-Unicode string columns in a server-side CAST to NVARCHAR, so those
+	// arrive as UTF-16. Only a raw mssql_scan() lands here.
+	//
+	// Validate rather than decide from the collation. #224 suggested keying
+	// the error off the collation's UTF-8 flag, but the bytes are the thing we
+	// actually have to be right about: this way a UTF-8 column is passed
+	// through because it IS valid UTF-8, and ASCII-only data in ANY code page
+	// keeps working, which is most legacy data in practice. Reading the
+	// collation to classify would refuse those and would depend on getting a
+	// protocol flag bit right; validating cannot emit an invalid string
+	// whatever the flag says. The collation is used only to make the error
+	// name the culprit.
 	size_t len = bytes.size();
 	if (trim_trailing_spaces) {
 		while (len > 0 && bytes[len - 1] == 0x20) {
 			len--;
 		}
 	}
+	const char *chars = reinterpret_cast<const char *>(bytes.data());
+	// ASCII first: same reasoning as IsAsciiRun's own comment -- it costs a
+	// fraction of a validate_utf8 call, and it is the overwhelmingly common
+	// case, so the check below is only reached by genuinely non-ASCII values.
+	if (len > 0 && !IsAsciiRun(chars, len) && !simdutf::validate_utf8(chars, len)) {
+		throw InvalidInputException(
+			"Column \"%s\" is a non-Unicode CHAR/VARCHAR whose bytes are not valid UTF-8 "
+			"(collation 0x%08X, sort id %u). DuckDB VARCHAR must be UTF-8, and this "
+			"extension does not transcode legacy code pages. Either CAST it in the query -- "
+			"CAST(\"%s\" AS NVARCHAR(4000)) -- or read the table through the attached "
+			"catalog, which casts server-side.",
+			col.name, col.collation, static_cast<uint32_t>(col.collation_sort_id), col.name);
+	}
 	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] =
-		StringVector::AddString(out, reinterpret_cast<const char *>(bytes.data()), len);
+		StringVector::AddString(out, chars, len);
 }
 
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,

@@ -1,0 +1,72 @@
+# name: test/sql/query/scan_codepage_invalid_utf8.test
+# description: mssql_scan() must not put code-page bytes into a DuckDB VARCHAR (issue #224)
+# group: [mssql]
+# issue: 224
+#
+# DuckDB VARCHAR is UTF-8 by contract. A CHAR/VARCHAR column with a legacy
+# collation arrives on the wire as the same TDS type as a UTF-8-collated one,
+# carrying bytes that are not UTF-8 -- so passing them through produced a
+# string every downstream function then mangled: upper('naïve') returned "NA".
+#
+# The catalog path is deliberately NOT covered here: it wraps non-Unicode
+# string columns in a server-side CAST to NVARCHAR (BuildColumnExpression), so
+# it never reaches the decoder under test. Both paths are asserted below
+# precisely because the difference between them IS the bug.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cpdb (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cpdb', 'IF OBJECT_ID(''dbo.CodePageScan'', ''U'') IS NOT NULL DROP TABLE dbo.CodePageScan');
+
+statement ok
+SELECT mssql_exec('cpdb', 'CREATE TABLE dbo.CodePageScan (id INT, v VARCHAR(50) COLLATE SQL_Latin1_General_CP1_CI_AS)');
+
+# CHAR(233) is 0xE9 -- 'é' in CP1252, and not a valid UTF-8 sequence alone.
+statement ok
+SELECT mssql_exec('cpdb', 'INSERT INTO dbo.CodePageScan VALUES (1, ''caf'' + CHAR(233)), (2, ''na'' + CHAR(239) + ''ve''), (3, ''plain ascii'')');
+
+# The catalog path casts server-side, so it reads correctly and must keep doing so.
+query IT
+SELECT id, v FROM cpdb.dbo.CodePageScan ORDER BY id;
+----
+1	café
+2	naïve
+3	plain ascii
+
+# ASCII-only rows still stream through a raw scan: the guard validates the
+# BYTES, so data that happens to be ASCII in any code page keeps working.
+query IT
+SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, v FROM dbo.CodePageScan WHERE id = 3');
+----
+3	plain ascii
+
+# The non-UTF-8 rows must fail loudly rather than yield a corrupt string.
+statement error
+SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, v FROM dbo.CodePageScan WHERE id = 1');
+----
+not valid UTF-8
+
+# The error names the column and points at the workaround.
+statement error
+SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, v FROM dbo.CodePageScan ORDER BY id');
+----
+CAST
+
+# And the workaround it names actually works.
+query IT
+SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, CAST(v AS NVARCHAR(50)) AS v FROM dbo.CodePageScan ORDER BY id');
+----
+1	café
+2	naïve
+3	plain ascii
+
+statement ok
+SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageScan');
+
+statement ok
+DETACH cpdb;

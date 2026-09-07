@@ -314,7 +314,11 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 		column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
 						   (static_cast<uint32_t>(data[offset + 2]) << 16) |
 						   (static_cast<uint32_t>(data[offset + 3]) << 24);
-		offset += 5;  // collation is 5 bytes but we only store 4
+		// The 5th byte is the SortId, which is what names the code page for a
+		// SQL_* collation. Discarding it (issue #224) meant a decode error
+		// could not say which collation it had met.
+		column.collation_sort_id = data[offset + 4];
+		offset += 5;
 		break;
 
 	// Variable-length binary types (2 bytes length)

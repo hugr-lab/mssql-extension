@@ -18,7 +18,11 @@ struct ColumnMetadata {
 	uint16_t max_length;  // Maximum length for variable types
 	uint8_t precision;	  // Precision for DECIMAL/NUMERIC
 	uint8_t scale;		  // Scale for DECIMAL/NUMERIC or TIME
-	uint32_t collation;	  // Collation ID for string types
+	uint32_t collation;	  // Collation LCID + flags (first 4 of 5 wire bytes)
+	// The 5th collation byte. It is the SortId, and it is what identifies the
+	// CODE PAGE for the SQL_* collations -- the first four give LCID and flags
+	// only. Parsed but previously discarded (issue #224).
+	uint8_t collation_sort_id;
 	uint16_t flags;		  // Column flags (nullable, identity, etc.)
 
 	// Derived properties
