@@ -474,6 +474,40 @@ sequenceDiagram
 
 ## Layer 5 — Codec (spec 045)
 
+**Invariant: single-byte text is validated as UTF-8 before it is published (issue #224).**
+
+DuckDB `VARCHAR` is UTF-8 by contract. SQL Server's `CHAR` / `VARCHAR` / `TEXT`
+carry bytes in the column's own code page, and the TDS type token does not say
+which — with `UTF8SUPPORT` negotiated, a UTF-8-collated column and a CP1252 one
+arrive as the *same* type. So the bytes are checked, not classified by
+collation, and a column that is not valid UTF-8 raises rather than publishing a
+string every downstream function would mangle.
+
+Three decoders publish these bytes, and the guard has to sit on all of them —
+each was found only after the previous fix was believed complete:
+
+| path | decoder | when |
+|---|---|---|
+| staged batch | `binary::DecodeChunkFromStaging` | the ordinary scan |
+| constant | `binary::DecodeFromTds` via `TryEmitConstant` → `DecodeFirstValue` | a chunk whose values are uniform and non-NULL |
+| per value | `string::DecodeFromTds` | `TypeConverter::ConvertValue`, INSERT…RETURNING |
+
+Single-byte text reaches the **binary** kernel because its bytes are copied
+verbatim, exactly like `VARBINARY` (`P2StageBinary` / `PlpStageBinary` /
+`LobStageBinary` → `FinalizeKernel::Binary`); only the destination vector
+differs. `IMAGE` shares the staging arm but lands in a `BLOB`, where arbitrary
+bytes are the point, and is excluded.
+
+The catalog path is normally exempt because `BuildColumnExpression` casts
+non-Unicode string columns to `NVARCHAR` server-side — **except** a declared
+`VARCHAR(MAX)` when `mssql_convert_varchar_max` is off, which
+`NeedsNVarcharConversion` deliberately opts out. That configuration reaches the
+decoder through the catalog and now errors where it previously returned a
+corrupt string.
+
+Shared check and message: `src/include/codec/utf8_guard.hpp`.
+
+
 ```mermaid
 classDiagram
     class TypeFamily {

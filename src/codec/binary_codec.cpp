@@ -70,11 +70,24 @@ std::string HexRender(const uint8_t *data, size_t length) {
 
 }  // namespace
 
-void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata & /*col*/, Vector &out, idx_t row) {
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
+	// Single-byte text needs the same UTF-8 guard the batch kernel applies, and
+	// this is not a redundant second copy of it: RowStager::FinalizeColumn tries
+	// TryEmitConstant BEFORE the batch kernel, and a chunk whose values are
+	// uniform and non-NULL is decoded from row 0 through HERE
+	// (DecodeFirstValue), so DecodeChunkFromStaging and its guard are never
+	// entered. Two identical code-page rows were enough to publish invalid
+	// UTF-8 -- a low-cardinality legacy column is the common case, not a
+	// contrived one. IsSingleByteTextColumn is false for BIGBINARY /
+	// BIGVARBINARY / IMAGE, so the BLOB callers are unaffected.
+	const char *chars = reinterpret_cast<const char *>(bytes.data());
+	if (!bytes.empty() && IsSingleByteTextColumn(col) && !IsAsciiRun(chars, bytes.size()) &&
+		!simdutf::validate_utf8(chars, bytes.size())) {
+		ThrowNonUtf8Column(col, SIZE_MAX);
+	}
 	// AddStringOrBlob copies the raw bytes into the vector's string heap.
 	// Works for BLOB, GEOMETRY, and the VARCHAR fallback case (issue #89).
-	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] =
-		StringVector::AddStringOrBlob(out, reinterpret_cast<const char *>(bytes.data()), bytes.size());
+	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = StringVector::AddStringOrBlob(out, chars, bytes.size());
 }
 
 //! Length of `data[0..len)` with trailing 0x20 bytes removed.
@@ -140,14 +153,46 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	// neither value is valid alone, which would wave the corruption straight
 	// through. All-ASCII carries no such case: every byte is a whole character.
 	if (IsSingleByteTextColumn(col) && !IsAsciiRun(blob, payload)) {
-		for (idx_t row = 0; row < count; row++) {
-			if (!st.IsValid(row)) {
-				continue;
+		// Not a validate_utf8 call per row. With mssql_utf8_support on -- the
+		// default -- a UTF-8 collated column arrives as BIGVARCHAR, so any
+		// chunk holding non-ASCII text fails the ASCII test and would pay a
+		// call per value on the hot path, which is the cost IsAsciiRun exists
+		// to avoid.
+		//
+		// Whole-payload validity is not sufficient on its own (values are
+		// packed with no separator, so bytes join across a boundary), but it
+		// IS sufficient together with "no value begins on a continuation
+		// byte": if the concatenation is valid and every value starts on a
+		// character boundary, each value spans a whole number of characters
+		// and is therefore individually valid. That is one call plus O(count)
+		// byte tests, and it rejects exactly the join-across-boundary case --
+		// 0xC3 followed by a value starting 0xA9 is caught because 0xA9 is a
+		// continuation byte.
+		bool sound = simdutf::validate_utf8(blob, payload);
+		if (sound) {
+			for (idx_t row = 0; row < count; row++) {
+				if (!st.IsValid(row) || st.lengths[row] == 0) {
+					continue;
+				}
+				if ((static_cast<uint8_t>(blob[st.offsets[row]]) & 0xC0) == 0x80) {
+					sound = false;
+					break;
+				}
 			}
-			const char *value = blob + st.offsets[row];
-			if (!simdutf::validate_utf8(value, st.lengths[row])) {
-				ThrowNonUtf8Column(col, static_cast<size_t>(row));
+		}
+		if (!sound) {
+			// Only now, and only to name the offending row.
+			for (idx_t row = 0; row < count; row++) {
+				if (!st.IsValid(row)) {
+					continue;
+				}
+				const char *value = blob + st.offsets[row];
+				if (!simdutf::validate_utf8(value, st.lengths[row])) {
+					ThrowNonUtf8Column(col, static_cast<size_t>(row));
+				}
 			}
+			// Every value validated alone, so the failure was a boundary join.
+			ThrowNonUtf8Column(col, SIZE_MAX);
 		}
 	}
 

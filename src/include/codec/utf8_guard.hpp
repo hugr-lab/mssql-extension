@@ -16,10 +16,12 @@
 #pragma once
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "tds/tds_column_metadata.hpp"
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace duckdb {
 namespace mssql {

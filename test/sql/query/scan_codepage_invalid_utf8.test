@@ -8,10 +8,13 @@
 # carrying bytes that are not UTF-8 -- so passing them through produced a
 # string every downstream function then mangled: upper('naïve') returned "NA".
 #
-# The catalog path is deliberately NOT covered here: it wraps non-Unicode
-# string columns in a server-side CAST to NVARCHAR (BuildColumnExpression), so
-# it never reaches the decoder under test. Both paths are asserted below
-# precisely because the difference between them IS the bug.
+# The catalog path casts non-Unicode string columns to NVARCHAR server-side
+# (BuildColumnExpression), so it normally never reaches the decoder under test
+# -- both paths are asserted below precisely because that difference IS the
+# bug. One exception is covered at the end: NeedsNVarcharConversion opts a
+# declared VARCHAR(MAX) out when mssql_convert_varchar_max is off, so that one
+# configuration DOES reach the decoder through the catalog, and this change
+# turns it from a corrupt string into a query error.
 
 require mssql
 
@@ -65,6 +68,20 @@ SELECT id, v FROM mssql_scan('cpdb', 'SELECT id, CAST(v AS NVARCHAR(50)) AS v FR
 2	naïve
 3	plain ascii
 
+# Two IDENTICAL non-UTF-8 rows. A chunk whose values are uniform and non-NULL
+# takes TryEmitConstant -> DecodeFirstValue -> binary::DecodeFromTds, which
+# bypasses the batch kernel and its guard entirely. Low-cardinality code-page
+# columns are the common case, not a contrived one; every other erroring case
+# in this file is a single row or has distinct values, so none of them reach
+# the constant path.
+statement ok
+SELECT mssql_exec('cpdb', 'INSERT INTO dbo.CodePageScan VALUES (4, ''caf'' + CHAR(233)), (5, ''caf'' + CHAR(233))');
+
+statement error
+SELECT v FROM mssql_scan('cpdb', 'SELECT v FROM dbo.CodePageScan WHERE id IN (4,5)');
+----
+not valid UTF-8
+
 # Values whose bytes JOIN across the staging boundary. Staged values are packed
 # contiguously with no separator, so 0xC3 followed by a value starting 0xA9
 # concatenates to C3 A9 -- valid UTF-8 for U+00E9 -- although neither value is
@@ -117,6 +134,45 @@ SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageText');
 
 statement ok
 SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageScan');
+
+# The catalog-path exception. With mssql_convert_varchar_max off a declared
+# VARCHAR(MAX) is NOT cast, so its code-page bytes reach the decoder through
+# the catalog too. Behaviour there changes from publishing a corrupt string to
+# raising -- user-visible, so it is pinned rather than left implicit.
+statement ok
+SELECT mssql_exec('cpdb', 'IF OBJECT_ID(''dbo.CodePageMax'', ''U'') IS NOT NULL DROP TABLE dbo.CodePageMax');
+
+statement ok
+SELECT mssql_exec('cpdb', 'CREATE TABLE dbo.CodePageMax (id INT, v VARCHAR(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS)');
+
+statement ok
+SELECT mssql_exec('cpdb', 'INSERT INTO dbo.CodePageMax VALUES (1, ''caf'' + CHAR(233))');
+
+statement ok
+SET mssql_convert_varchar_max = false;
+
+statement ok
+SELECT mssql_invalidate_cache('cpdb');
+
+statement error
+SELECT id, v FROM cpdb.dbo.CodePageMax ORDER BY id;
+----
+not valid UTF-8
+
+# With the conversion on (the default) the CAST is applied and it reads fine.
+statement ok
+SET mssql_convert_varchar_max = true;
+
+statement ok
+SELECT mssql_invalidate_cache('cpdb');
+
+query IT
+SELECT id, v FROM cpdb.dbo.CodePageMax ORDER BY id;
+----
+1	café
+
+statement ok
+SELECT mssql_exec('cpdb', 'DROP TABLE dbo.CodePageMax');
 
 statement ok
 DETACH cpdb;

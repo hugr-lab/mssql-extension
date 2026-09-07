@@ -817,10 +817,10 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 	// function then mangled -- issue #224, where `upper()` on a scanned
 	// 'naïve' returned "NA".
 	//
-	// The catalog path never reaches this: BuildColumnExpression wraps
-	// non-Unicode string columns in a server-side CAST to NVARCHAR, so those
-	// arrive as UTF-16. Only a raw mssql_scan() lands here.
-	//
+	// On which paths this is reachable, and why the catalog path is only
+	// MOSTLY safe (a declared VARCHAR(MAX) with mssql_convert_varchar_max
+	// off is not cast), see codec/utf8_guard.hpp -- stated once there
+	// rather than three times here.
 	// Validate rather than decide from the collation. #224 suggested keying
 	// the error off the collation's UTF-8 flag, but the bytes are the thing we
 	// actually have to be right about: this way a UTF-8 column is passed
