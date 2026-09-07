@@ -37,6 +37,8 @@
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/tds_column_metadata.hpp"
 
+#include <simdutf.h>
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -114,6 +116,42 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	string_t blob_slot = StringVector::EmptyString(out, payload);
 	char *const blob = blob_slot.GetDataWriteable();
 	std::memcpy(blob, st.buffer.data(), payload);
+
+	// Single-byte CHAR/VARCHAR reaches this BINARY kernel because its bytes are
+	// copied verbatim, exactly like VARBINARY (column_ops: P2StageBinary /
+	// PlpStageBinary). The difference is the destination: those bytes land in a
+	// VARCHAR vector, and DuckDB VARCHAR is UTF-8 by contract.
+	//
+	// The catalog path is safe because it CASTs to NVARCHAR server-side, which
+	// is what column_ops means by "collation handling lives in the scan's
+	// SELECT list". A raw mssql_scan() has no such CAST, so a legacy-collation
+	// column arrives here as code-page bytes and used to be published as an
+	// invalid string -- issue #224, where upper() on a scanned 'naïve' gave
+	// "NA". VARBINARY is untouched: its bytes are meant to be arbitrary.
+	//
+	// One validate over the whole payload in the good case. Concatenated valid
+	// UTF-8 is valid UTF-8, so a single call clears every row; only when it
+	// fails is the per-row loop entered, and only to name the offending row.
+	const bool char_target = col.type_id == tds::TDS_TYPE_BIGCHAR || col.type_id == tds::TDS_TYPE_BIGVARCHAR;
+	if (char_target && !simdutf::validate_utf8(blob, payload)) {
+		for (idx_t row = 0; row < count; row++) {
+			if (!st.IsValid(row)) {
+				continue;
+			}
+			const char *value = blob + st.offsets[row];
+			if (simdutf::validate_utf8(value, st.lengths[row])) {
+				continue;
+			}
+			throw InvalidInputException(
+				"Column \"%s\" is a non-Unicode CHAR/VARCHAR whose bytes are not valid UTF-8 "
+				"(collation 0x%08X, sort id %u; first bad value at row %llu). DuckDB VARCHAR must "
+				"be UTF-8, and this extension does not transcode legacy code pages. Either CAST it "
+				"in the query -- CAST(\"%s\" AS NVARCHAR(4000)) -- or read the table through the "
+				"attached catalog, which casts server-side.",
+				col.name, col.collation, static_cast<uint32_t>(col.collation_sort_id),
+				static_cast<unsigned long long>(row), col.name);
+		}
+	}
 
 	// Two loops rather than a test per value: whether the column is fixed-length
 	// CHAR is decided by its type, not its data.

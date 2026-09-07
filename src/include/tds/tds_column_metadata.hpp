@@ -23,7 +23,7 @@ struct ColumnMetadata {
 	// CODE PAGE for the SQL_* collations -- the first four give LCID and flags
 	// only. Parsed but previously discarded (issue #224).
 	uint8_t collation_sort_id;
-	uint16_t flags;		  // Column flags (nullable, identity, etc.)
+	uint16_t flags;	 // Column flags (nullable, identity, etc.)
 
 	// Derived properties
 	bool IsNullable() const {

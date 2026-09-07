@@ -868,8 +868,7 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 			"catalog, which casts server-side.",
 			col.name, col.collation, static_cast<uint32_t>(col.collation_sort_id), col.name);
 	}
-	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] =
-		StringVector::AddString(out, chars, len);
+	FlatVector::GetDataMutableUnsafe<string_t>(out)[row] = StringVector::AddString(out, chars, len);
 }
 
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col,
