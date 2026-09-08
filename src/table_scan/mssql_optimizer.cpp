@@ -695,9 +695,28 @@ static void CollectCatalogScans(LogicalOperator &op, std::map<string, vector<MSS
 }
 
 static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOperator &plan) {
+	// KNOWN GAP: this sees only `mssql_catalog_scan`. `mssql_scan()` is a separate
+	// table function that takes the SAME pinned connection through
+	// ConnectionProvider::GetConnection, so a transaction mixing the two — or
+	// holding two raw scans — still fails with "not in Idle state". Both shapes
+	// reproduce. The set this ought to count is "consumers of the pinned
+	// connection", which is larger than "scans the optimizer recognises".
+	//
+	// Closing it is NOT just widening this test. A lock only helps a holder that
+	// releases the connection inside InitGlobal, which is what materializing
+	// does; a raw scan that took the lock and then streamed lazily would hold it
+	// until drained, and the second scan would block in InitGlobal so the
+	// pipeline could never drain the first — a hang instead of an error. So
+	// mssql_scan() has to gain the same drain before it can be counted here.
+	//
 	// Autocommit gives every scan its own pooled connection, so there is nothing
 	// to share and nothing to serialize. This is the same test the DML executors
 	// use to decide whether they are on a pinned connection.
+	//
+	// Read at optimize time and used at execute time, which is only sound if the
+	// plan cannot outlive the transaction state it was built under. Verified that
+	// it cannot: PREPARE in autocommit then EXECUTE inside BEGIN re-plans, so the
+	// flag is never stale.
 	if (context.transaction.IsAutoCommit()) {
 		return;
 	}

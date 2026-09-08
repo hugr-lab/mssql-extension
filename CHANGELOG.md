@@ -26,9 +26,16 @@ than like a query function.
   current_schema()` now answers `dbo` after `USE <catalog>`, and unqualified
   names resolve.
 
-- **Two scans of one catalog inside an explicit transaction no longer break the
-  pinned connection**
+- **Two *catalog* scans of one catalog inside an explicit transaction no longer
+  break the pinned connection**
   ([#239](https://github.com/hugr-lab/mssql-extension/issues/239)).
+
+  Read the emphasis: this covers scans of attached tables — three-part names,
+  and the correlated subqueries and joins over them. It does **not** yet cover
+  `mssql_scan()`, which is a different table function taking the same pinned
+  connection, so a transaction mixing the two, or holding two raw scans, still
+  fails the same way. Tracked separately; the general case needs those scans
+  materialized too, not merely counted.
   A transaction pins ONE TDS connection per catalog and routes every read on
   that catalog to it, while a scan holds that connection from init until its
   last row is drained. DuckDB does not promise to drain one source before
