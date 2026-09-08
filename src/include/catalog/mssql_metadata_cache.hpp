@@ -64,7 +64,20 @@ struct MSSQLTableMetadata {
 	// accurate by its name and misleading to its only consumer. The kind comes
 	// from sys.indexes.type, which separates them.
 	MSSQLIndexKind index_kind = MSSQLIndexKind::HEAP;
-	idx_t partition_count = 0;
+
+	// Is the object partitioned? Spec 071 W1: this replaces a `partition_count`
+	// that nothing ever read — it was written here and not even copied into
+	// MSSQLTableEntry, while the COUNT(*) producing it is what forced the
+	// GROUP BY over sys.partitions that made every metadata query scan
+	// sys.sysrowsets. Every comment that referred to the count phrased its
+	// meaning as "> 1 marks a partitioned object", which is what this is.
+	//
+	// Source is sys.indexes.data_space_id against sys.partition_schemes, which
+	// seeks (6 logical reads) where sys.partitions cannot seek at all —
+	// sysrowsets is clustered on rowsetid and object_id is derived, so a lookup
+	// by object_id costs a full scan (3200 reads at 200K tables) whatever form
+	// it takes. See specs/071-catalog-metadata-cost/spec.md.
+	bool is_partitioned = false;
 
 	// Incremental cache state for columns.
 	// Issue #178 (D6): all fields — including these states — are guarded by the
@@ -148,6 +161,26 @@ public:
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
 	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
 	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
+
+	//! The single-schema bulk load. Kept because mssql_preload_catalog('schema')
+	//! names one deliberately; the listing path goes through
+	//! LoadAllSchemasMetadata instead. Caller must hold mutex_ via the public entry.
+	void LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name);
+
+	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
+	//!
+	//! Both the listing path and mssql_preload_catalog() go through here. It costs
+	//! one pass over the catalog; asking per schema costs one pass EACH, because
+	//! sys.objects filters metadata visibility per object in the database and no
+	//! predicate turns that scan into a seek. Break-even is under five schemas.
+	//!
+	//! Rows arrive UNORDERED and are grouped on object_id in a hash map — dropping
+	//! the ORDER BY is what makes the single query possible at all, since sorting
+	//! millions of rows is what forced the per-schema loop this replaces.
+	//!
+	//! Caller must NOT hold mutex_; this takes it.
+	void LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
+								idx_t &column_count);
 
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);

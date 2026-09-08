@@ -1,4 +1,5 @@
 #include "catalog/mssql_metadata_cache.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -27,13 +28,48 @@ namespace duckdb {
 // SQL Queries for Metadata Discovery
 //===----------------------------------------------------------------------===//
 
-// Row counts come from a pre-aggregated sys.partitions subquery, never a direct
-// join: sys.partitions holds one row PER PARTITION, so joining it raw multiplies
-// every object (and every column) by the partition count. On a partitioned table
-// that surfaced as "Column with name <x> already exists!" (issue #85) and, silently,
-// as an approx_rows taken from one arbitrary partition instead of the whole table.
-// index_id IN (0, 1) selects the heap (0) or the clustered index (1) — a table has
-// exactly one of the two, so SUM() does not double-count.
+// PHYSICAL SHAPE COMES FROM sys.indexes, NOT sys.partitions (spec 071 W1).
+//
+// Every query below used to carry one pre-aggregated sys.partitions subquery that
+// produced approx_rows, index_type and partition_count together. It was there for
+// a real reason — sys.partitions holds one row PER PARTITION, so joining it raw
+// multiplied every object and every column by the partition count, which is issue
+// #85 ("Column with name <x> already exists!") — but the aggregate it was replaced
+// with turned out to be the single most expensive thing in the catalog layer.
+//
+// sys.partitions reads sys.sysrowsets, which is clustered on rowsetid; object_id
+// is derived and has no index. Measured on a 200,000-table catalog, a lookup BY
+// object_id costs:
+//
+//     sys.partitions              sysrowsets   3200 logical reads (2 scans)
+//     sys.dm_db_partition_stats   sysrowsets   1600 logical reads (1 scan)
+//     sys.indexes                 sysidxstats     6 logical reads (SEEK)
+//
+// So the row count is O(catalog) however it is asked for and the index shape is
+// O(1); they had no business sharing a subquery. Worse, what forced the GROUP BY
+// was COUNT(*) AS partition_count — a value nothing in the tree ever read.
+//
+// The shape now comes from a correlated OUTER APPLY over sys.indexes (seekable),
+// with "is this partitioned" answered by sys.partition_schemes rather than by
+// counting partitions. index_id IN (0, 1) still selects the heap (0) or the
+// clustered index (1); a table has exactly one of the two.
+//
+// Row counts come from OBJECTPROPERTYEX(object_id, 'Cardinality'), which answers
+// out of object metadata — 3 logical reads on sysschobjs, 0 ms CPU — and needs
+// neither sys.partitions nor statistics to exist on the table. Measured against
+// sys.partitions on the same objects it agrees exactly, including 0 for an empty
+// table and NULL (-> 0) for a VIEW, which is the value the catalog already
+// carried for a view. Fetching every row count in the database costs 84 ms this
+// way against 2400 ms through sys.partitions or sys.dm_db_partition_stats.
+//
+// Dropping the count instead was tried and rejected: it is what gives the
+// planner its cardinality (MSSQLCatalogScanCardinality reads the catalog's copy
+// first), and scan_cardinality.test catches its loss. sys.sysindexes is equally
+// cheap and was rejected as deprecated; sys.dm_db_stats_properties is cheap but
+// returns nothing for a table with no statistics — which is exactly a table this
+// extension has just created by CTAS or COPY.
+//
+// See specs/071-catalog-metadata-cost/spec.md.
 
 // Query to discover all user schemas (including empty ones)
 // Excludes system schemas: INFORMATION_SCHEMA (3), sys (4), and other built-in schemas
@@ -54,16 +90,15 @@ static const char *TABLE_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     o.name AS object_name,
     o.type AS object_type,
-    ISNULL(p.rows, 0) AS approx_rows,
-    ISNULL(p.index_type, 0) AS index_type,
-    ISNULL(p.partition_count, 0) AS partition_count
+    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
+    ISNULL(shape.index_type, 0) AS index_type,
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned
 FROM sys.objects o
-LEFT JOIN (SELECT p.object_id, SUM(p.[rows]) AS [rows],
-                  MAX(ISNULL(i.type, 0)) AS index_type, COUNT(*) AS partition_count
-           FROM sys.partitions p
-           LEFT JOIN sys.indexes i ON i.object_id = p.object_id AND i.index_id = p.index_id
-           WHERE p.index_id IN (0, 1)
-           GROUP BY p.object_id) p ON p.object_id = o.object_id
+OUTER APPLY (SELECT MAX(i.type) AS index_type,
+                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
+             FROM sys.indexes i
+             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
   AND SCHEMA_NAME(o.schema_id) = '%s')";
@@ -73,7 +108,7 @@ WHERE o.type IN ('U', 'V')
 static const char *SINGLE_TABLE_METADATA_SQL_TEMPLATE = R"(
 SELECT
     o.type AS object_type,
-    ISNULL(p.rows, 0) AS approx_rows,
+    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     c.name AS column_name,
     c.column_id,
     ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
@@ -82,17 +117,16 @@ SELECT
     c.scale,
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
-    ISNULL(p.index_type, 0) AS index_type,
-    ISNULL(p.partition_count, 0) AS partition_count
+    ISNULL(shape.index_type, 0) AS index_type,
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN (SELECT p.object_id, SUM(p.[rows]) AS [rows],
-                  MAX(ISNULL(i.type, 0)) AS index_type, COUNT(*) AS partition_count
-           FROM sys.partitions p
-           LEFT JOIN sys.indexes i ON i.object_id = p.object_id AND i.index_id = p.index_id
-           WHERE p.index_id IN (0, 1)
-           GROUP BY p.object_id) p ON p.object_id = o.object_id
+OUTER APPLY (SELECT MAX(i.type) AS index_type,
+                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
+             FROM sys.indexes i
+             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
 WHERE o.object_id = OBJECT_ID('%s')
 ORDER BY c.column_id
 )";
@@ -104,7 +138,7 @@ SELECT
     s.name AS schema_name,
     o.name AS object_name,
     o.type AS object_type,
-    ISNULL(p.rows, 0) AS approx_rows,
+    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     c.name AS column_name,
     c.column_id,
     ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
@@ -113,18 +147,17 @@ SELECT
     c.scale,
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
-    ISNULL(p.index_type, 0) AS index_type,
-    ISNULL(p.partition_count, 0) AS partition_count
+    ISNULL(shape.index_type, 0) AS index_type,
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-LEFT JOIN (SELECT p.object_id, SUM(p.[rows]) AS [rows],
-                  MAX(ISNULL(i.type, 0)) AS index_type, COUNT(*) AS partition_count
-           FROM sys.partitions p
-           LEFT JOIN sys.indexes i ON i.object_id = p.object_id AND i.index_id = p.index_id
-           WHERE p.index_id IN (0, 1)
-           GROUP BY p.object_id) p ON p.object_id = o.object_id
+OUTER APPLY (SELECT MAX(i.type) AS index_type,
+                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
+             FROM sys.indexes i
+             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
 WHERE s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
@@ -133,6 +166,61 @@ WHERE s.schema_id NOT IN (3, 4)
   AND o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
   AND s.name = '%s')";
+
+// Whole-catalog metadata: every schema, every table, every column, in ONE query.
+//
+// Spec 071 W2. What made this impossible before was the ORDER BY, not the size:
+// BulkLoadAll iterated schema by schema precisely because sorting millions of
+// rows by (schema, object, column_id) overran the memory grant and spilled to
+// tempdb. But the sort was only ever there to let a STREAMING group-by parse
+// detect table boundaries. Group on object_id in a hash map instead and the sort
+// is not needed, so neither is the loop.
+//
+// That loop is the whole of issue #86. Listing one schema costs a pass over the
+// catalog whatever the predicate says -- sys.objects filters metadata visibility
+// per object in the DATABASE, so an EMPTY schema measured 484 ms of server CPU at
+// 200K objects, and no form of the schema predicate turns that scan into a seek
+// (sys.objects, sys.tables and INFORMATION_SCHEMA.TABLES all plan as a Clustered
+// Index Scan on sysschobjs.clst, with a literal nsid as much as with SCHEMA_ID()).
+// N schemas therefore cost N passes: 10,000 empty schemas extrapolate to ~80
+// minutes. One query for all of them measured 1917 ms. Break-even is under five
+// schemas, so there is no catalog size at which the per-schema loop wins.
+//
+// object_id leads the SELECT list because it is the grouping key: two schemas may
+// hold tables of the same name, so the name alone cannot identify the group.
+static const char *BULK_METADATA_ALL_SQL = R"(
+SELECT
+    o.object_id,
+    s.name AS schema_name,
+    o.name AS object_name,
+    o.type AS object_type,
+    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
+    c.name AS column_name,
+    c.column_id,
+    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    ISNULL(c.collation_name, '') AS collation_name,
+    ISNULL(shape.index_type, 0) AS index_type,
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+FROM sys.schemas s
+INNER JOIN sys.objects o ON o.schema_id = s.schema_id
+INNER JOIN sys.columns c ON c.object_id = o.object_id
+LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
+OUTER APPLY (SELECT MAX(i.type) AS index_type,
+                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
+             FROM sys.indexes i
+             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
+WHERE s.schema_id NOT IN (3, 4)
+  AND s.principal_id != 0
+  AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
+                     'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
+                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
+  AND o.type IN ('U', 'V')
+  AND o.is_ms_shipped = 0)";
 
 // Query to discover columns in a table/view
 // Note: ISNULL is used for collation_name to avoid NBCROW parsing issues with NULL values
@@ -153,25 +241,23 @@ ORDER BY c.column_id
 )";
 
 //===----------------------------------------------------------------------===//
-// Physical shape of the object, parsed out of the aggregated sys.partitions
-// subquery. index_type and partition_count always sit last in the SELECT list,
-// so each caller passes their own indices.
+// Physical shape of the object, parsed out of the correlated sys.indexes lookup.
+// index_type and is_partitioned always sit last in the SELECT list, so each
+// caller passes their own indices.
 //
 // The two values are parsed into locals and published together: a malformed
-// partition_count must not discard an index_type that parsed fine.
+// is_partitioned must not discard an index_type that parsed fine.
 //===----------------------------------------------------------------------===//
 
-static void ParseTableShape(const vector<string> &values, idx_t index_type_idx, idx_t partition_count_idx,
+static void ParseTableShape(const vector<string> &values, idx_t index_type_idx, idx_t is_partitioned_idx,
 							MSSQLTableMetadata &table_meta) {
 	const MSSQLIndexKind kind = MSSQLIndexKindFromSysIndexesType(values[index_type_idx]);
-	idx_t partitions = 0;
-	try {
-		partitions = static_cast<idx_t>(std::stoll(values[partition_count_idx]));
-	} catch (...) {
-		partitions = 0;
-	}
+	// The server sends the CASE result, so anything but "1" is "not partitioned"
+	// — including a value that is missing or unparseable, which is the honest
+	// answer when the shape lookup produced nothing.
+	const bool partitioned = values[is_partitioned_idx] == "1";
 	table_meta.index_kind = kind;
-	table_meta.partition_count = partitions;
+	table_meta.is_partitioned = partitioned;
 }
 
 //===----------------------------------------------------------------------===//
@@ -379,13 +465,19 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	ExecuteMetadataQuery(
 		connection, query,
 		[this, &table_meta, &first_row](const vector<string> &values) {
-			// 12 columns: object_type, approx_rows, the eight per-column fields, then
-			// index_id and partition_count. The guard has to cover the LAST index read.
+			// 11 columns: object_type, the eight per-column fields, then index_type
+			// and is_partitioned. The guard has to cover the LAST index read.
+			//
+			// approx_rows is still here, but it no longer costs a scan of
+			// sys.sysrowsets: 3200 logical reads for these six rows became 3 (see the
+			// header). It has to stay — MSSQLCatalogScanCardinality reads the
+			// catalog's copy before anything else, so removing it plans every direct
+			// query at ~1 row.
 			if (values.size() < 12) {
 				return;
 			}
 
-			// First row: extract object type and row count
+			// First row: extract object type and physical shape
 			if (first_row) {
 				first_row = false;
 				if (!values[0].empty() && values[0][0] == 'V') {
@@ -393,20 +485,18 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 				} else {
 					table_meta.object_type = MSSQLObjectType::TABLE;
 				}
+				// values[9] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap — and values[10] says whether the object sits on
+				// a partition scheme. Both drive the write path's TABLOCK and sort
+				// decisions. Per object, so it belongs in the first-row branch.
 				try {
 					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
 				} catch (...) {
 					table_meta.approx_row_count = 0;
 				}
-				// Physical shape from the same aggregated subquery (see the header):
-				// values[10] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-				// object. Both drive the write path's TABLOCK and sort decisions.
-				// Per object, so it belongs in the first-row branch.
 				ParseTableShape(values, 10, 11, table_meta);
-				CACHE_DEBUG(2, "table shape: %s kind=%d partitions=%llu rows=%llu", table_meta.name.c_str(),
-							(int)table_meta.index_kind, (unsigned long long)table_meta.partition_count,
-							(unsigned long long)table_meta.approx_row_count);
+				CACHE_DEBUG(2, "table shape: %s kind=%d partitioned=%d", table_meta.name.c_str(),
+							(int)table_meta.index_kind, (int)table_meta.is_partitioned);
 			}
 
 			// Parse column info
@@ -535,9 +625,23 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 		}
 	}
 
-	// Bulk load all tables + columns for this schema in one query
-	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — bulk loading from SQL Server", schema_name.c_str());
+	// Not cached: load the WHOLE catalog, not just this schema (spec 071 W2).
+	//
+	// Counter-intuitive only until the cost is measured. Listing one schema costs
+	// a full pass over sys.objects whatever the predicate says, because metadata
+	// visibility is filtered per object in the DATABASE — an EMPTY schema measured
+	// 484 ms of server CPU at 200K objects. DuckDB drives this once per schema, so
+	// the per-schema shape is O(schemas x objects); one query for all of them
+	// measured 1917 ms total. Break-even is under five schemas.
+	//
+	// The plain `SELECT * FROM db.sch.tbl` path does NOT come here — it goes to
+	// GetTableMetadata, one table, one seek — so ordinary queries stay lazy.
+	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loading every schema in one query", schema_name.c_str());
+	idx_t all_schemas = 0, all_tables = 0, all_columns = 0;
+	LoadAllSchemasMetadata(connection, all_schemas, all_tables, all_columns);
+}
 
+void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name) {
 	string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
 
 	// Push table filter to SQL Server if convertible to LIKE
@@ -571,7 +675,7 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 		connection, sql,
 		[&](const vector<string> &values) {
 			// 14 columns: schema, object, type, approx_rows, the eight per-column
-			// fields, then index_id and partition_count. Guard the LAST index read.
+			// fields, then index_type and is_partitioned. Guard the LAST index read.
 			if (values.size() < 14) {
 				return;
 			}
@@ -609,10 +713,10 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 				} catch (...) {
 					table_meta.approx_row_count = 0;
 				}
-				// Physical shape from the same aggregated subquery (see the header):
+				// Physical shape from the correlated sys.indexes lookup (see the header):
 				// values[12] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-				// object. Both drive the write path's TABLOCK and sort decisions.
+				// COLUMNSTORE, 0 heap — and values[13] says whether the object sits on a
+				// partition scheme. Both drive the write path's TABLOCK and sort decisions.
 				ParseTableShape(values, 12, 13, table_meta);
 				schema.tables.emplace(current_table, std::move(table_meta));
 				auto table_it = schema.tables.find(current_table);
@@ -676,17 +780,187 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 // Bulk Catalog Preload (Spec 033: US5)
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Whole-catalog metadata load (spec 071 W2)
+//===----------------------------------------------------------------------===//
+
+void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
+												idx_t &column_count) {
+	schema_count = 0;
+	table_count = 0;
+	column_count = 0;
+
+	string sql = BULK_METADATA_ALL_SQL;
+	// Both filters push to the server where they convert to LIKE. The schema one
+	// matters most here: it is the only thing that can make this query smaller
+	// than the whole catalog, which is what a user with 10,000 schemas reaches for.
+	if (filter_ && filter_->HasSchemaFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+		}
+	}
+	if (filter_ && filter_->HasTableFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+		}
+	}
+
+	std::lock_guard<std::mutex> lock(mutex_);
+
+	// object_id -> the entry it owns. Pointers into schemas_[x].tables stay valid
+	// across insertion because both containers are node-based unordered_maps.
+	unordered_map<string, MSSQLTableMetadata *> by_object_id;
+	// Which schemas this pass actually created or refilled, so the publication
+	// below marks exactly those and leaves any others alone.
+	unordered_map<string, MSSQLSchemaMetadata *> touched;
+
+	ExecuteMetadataQuery(
+		connection, sql,
+		[&](const vector<string> &values) {
+			// 15 columns: object_id, schema, object, type, approx_rows, the eight
+			// per-column fields, then index_type and is_partitioned. Guard the LAST
+			// index read.
+			if (values.size() < 15) {
+				return;
+			}
+			const string &object_id = values[0];
+			auto found = by_object_id.find(object_id);
+			MSSQLTableMetadata *table_meta;
+			if (found == by_object_id.end()) {
+				const string &schema_name = values[1];
+				if (filter_ && !filter_->MatchesSchema(schema_name)) {
+					return;
+				}
+				const string &table_name = values[2];
+				if (filter_ && !filter_->MatchesTable(table_name)) {
+					return;
+				}
+				auto schema_it = schemas_.find(schema_name);
+				if (schema_it == schemas_.end()) {
+					schema_it = schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name)).first;
+					schema_count++;
+				}
+				auto &schema = schema_it->second;
+				if (touched.emplace(schema_name, &schema).second) {
+					// First row for this schema in this pass: drop whatever an
+					// earlier partial load left, so the query's answer is the whole
+					// answer rather than a merge with a stale one.
+					schema.tables.clear();
+				}
+				auto &slot = schema.tables[table_name];
+				slot = MSSQLTableMetadata();
+				slot.name = table_name;
+				if (!values[3].empty() && values[3][0] == 'V') {
+					slot.object_type = MSSQLObjectType::VIEW;
+				} else {
+					slot.object_type = MSSQLObjectType::TABLE;
+				}
+				try {
+					slot.approx_row_count = static_cast<idx_t>(std::stoll(values[4]));
+				} catch (...) {
+					slot.approx_row_count = 0;
+				}
+				ParseTableShape(values, 13, 14, slot);
+				table_meta = &slot;
+				by_object_id.emplace(object_id, table_meta);
+				table_count++;
+			} else {
+				table_meta = found->second;
+			}
+
+			int32_t col_id = 0;
+			try {
+				col_id = static_cast<int32_t>(std::stoi(values[6]));
+			} catch (...) {
+			}
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(values[8]));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(values[9]));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(values[10]));
+			} catch (...) {
+			}
+			const bool nullable = (values[11] == "1" || values[11] == "true" || values[11] == "True");
+			table_meta->columns.push_back(MSSQLColumnInfo(values[5], col_id, values[7], max_len, prec, scl, nullable,
+														  values[12], database_collation_));
+			column_count++;
+		},
+		[&]() {
+			// Restartable (PR #308): a deadlock victim reruns from the top, so the
+			// grouping state and everything it published have to go back. Only the
+			// schemas this pass touched are cleared — one it never reached still
+			// holds whatever it legitimately had.
+			for (auto &pair : touched) {
+				pair.second->tables.clear();
+			}
+			by_object_id.clear();
+			touched.clear();
+			schema_count = 0;
+			table_count = 0;
+			column_count = 0;
+		});
+
+	// Columns arrive in no particular order, so put each table's list back into
+	// column_id order before publishing: every consumer indexes by position.
+	const auto now = std::chrono::steady_clock::now();
+	for (auto &pair : by_object_id) {
+		auto &columns = pair.second->columns;
+		std::sort(columns.begin(), columns.end(),
+				  [](const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) { return a.column_id < b.column_id; });
+		pair.second->columns_load_state = CacheLoadState::LOADED;
+		pair.second->columns_last_refresh = now;
+	}
+	for (auto &pair : touched) {
+		pair.second->tables_load_state = CacheLoadState::LOADED;
+		pair.second->tables_last_refresh = now;
+	}
+	// A schema the query returned NO rows for is still loaded — it is empty, and
+	// saying so is what stops the next Scan from asking again.
+	for (auto &pair : schemas_) {
+		if (filter_ && !filter_->MatchesSchema(pair.first)) {
+			continue;
+		}
+		if (touched.find(pair.first) == touched.end()) {
+			pair.second.tables.clear();
+			pair.second.tables_load_state = CacheLoadState::LOADED;
+			pair.second.tables_last_refresh = now;
+		}
+	}
+
+	CACHE_DEBUG(1, "LoadAllSchemasMetadata — %llu schema(s), %llu table(s), %llu column(s) in ONE query",
+				(unsigned long long)touched.size(), (unsigned long long)table_count, (unsigned long long)column_count);
+}
+
 void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count,
 									 idx_t &table_count, idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
 
-	// Determine which schemas to load.
-	// When schema_name is empty, we iterate per-schema instead of one massive cross-schema
-	// query. This avoids SQL Server tempdb sort spills on large catalogs (200K+ tables)
-	// where the ORDER BY s.name, o.name, c.column_id on millions of rows exceeds the
-	// memory grant and causes non-linear performance degradation.
+	// With no schema named, ONE query covers the catalog (spec 071 W2).
+	//
+	// This used to iterate per schema, and the reason recorded here was the sort:
+	// "ORDER BY s.name, o.name, c.column_id on millions of rows exceeds the memory
+	// grant and causes non-linear performance degradation". True, and the sort was
+	// only ever there so a STREAMING parse could see table boundaries. Grouping on
+	// object_id in a hash map removes the sort, and with it the reason to loop —
+	// which was also the reason mssql_preload_catalog() was O(schemas x objects)
+	// and could not rescue issue #86 however often it was recommended.
+	if (schema_name.empty()) {
+		LoadAllSchemasMetadata(connection, schema_count, table_count, column_count);
+		return;
+	}
+
 	vector<string> schemas_to_load;
 	if (!schema_name.empty()) {
 		schemas_to_load.push_back(schema_name);
@@ -749,7 +1023,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 			connection, sql,
 			[&](const vector<string> &values) {
 				// 14 columns: schema, object, type, approx_rows, the eight per-column
-				// fields, then index_id and partition_count. Guard the LAST index read.
+				// fields, then index_type and is_partitioned. Guard the LAST index read.
 				if (values.size() < 14) {
 					return;
 				}
@@ -794,11 +1068,11 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 						} catch (...) {
 							table_meta.approx_row_count = 0;
 						}
-						// Physical shape from the same aggregated subquery (see the header):
-						// values[12] is sys.indexes.type — 1 clustered rowstore, 5
-						// clustered COLUMNSTORE, 0 heap — and partition_count > 1 marks
-						// a partitioned object. Both drive the write path's TABLOCK and
-						// sort decisions.
+						// Physical shape from the correlated sys.indexes lookup (see the
+						// header): values[12] is sys.indexes.type — 1 clustered rowstore,
+						// 5 clustered COLUMNSTORE, 0 heap — and values[13] says whether the
+						// object sits on a partition scheme. Both drive the write path's
+						// TABLOCK and sort decisions.
 						ParseTableShape(values, 12, 13, table_meta);
 
 						tables.emplace(current_table, std::move(table_meta));
@@ -1136,8 +1410,8 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 		ExecuteMetadataQuery(
 			connection, query,
 			[&schema](const vector<string> &values) {
-				// 5 columns: object_name, object_type, approx_rows, index_id,
-				// partition_count. Guard the LAST index read, not the first.
+				// 5 columns: object_name, object_type, approx_rows, index_type,
+				// is_partitioned. Guard the LAST index read, not the first.
 				if (values.size() >= 5) {
 					MSSQLTableMetadata table_meta;
 					table_meta.name = values[0];
@@ -1151,16 +1425,17 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 						table_meta.object_type = MSSQLObjectType::TABLE;
 					}
 
-					// Parse row count
+					// Row count from OBJECTPROPERTYEX, not sys.partitions: it answers from
+					// object metadata (3 logical reads on sysschobjs) where a lookup through
+					// sys.partitions scans sysrowsets, which cannot be seeked by object_id.
 					try {
 						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
 					} catch (...) {
 						table_meta.approx_row_count = 0;
 					}
-					// Physical shape from the same aggregated subquery (see the header):
 					// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-					// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-					// object. Both drive the write path's TABLOCK and sort decisions.
+					// COLUMNSTORE, 0 heap — and values[4] says whether the object sits on a
+					// partition scheme. Both drive the write path's TABLOCK and sort decisions.
 					ParseTableShape(values, 3, 4, table_meta);
 
 					// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
@@ -1320,8 +1595,8 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 	ExecuteMetadataQuery(
 		connection, query,
 		[&schema_meta](const vector<string> &values) {
-			// 5 columns: object_name, object_type, approx_rows, index_id,
-			// partition_count. Guard the LAST index read, not the first.
+			// 5 columns: object_name, object_type, approx_rows, index_type,
+			// is_partitioned. Guard the LAST index read, not the first.
 			if (values.size() >= 5) {
 				MSSQLTableMetadata table_meta;
 				table_meta.name = values[0];
@@ -1336,16 +1611,17 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 					table_meta.object_type = MSSQLObjectType::TABLE;
 				}
 
-				// Parse row count
+				// Row count from OBJECTPROPERTYEX, not sys.partitions: it answers from
+				// object metadata (3 logical reads on sysschobjs) where a lookup through
+				// sys.partitions scans sysrowsets, which cannot be seeked by object_id.
 				try {
 					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
 				} catch (...) {
 					table_meta.approx_row_count = 0;
 				}
-				// Physical shape from the same aggregated subquery (see the header):
 				// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-				// object. Both drive the write path's TABLOCK and sort decisions.
+				// COLUMNSTORE, 0 heap — and values[4] says whether the object sits on a
+				// partition scheme. Both drive the write path's TABLOCK and sort decisions.
 				ParseTableShape(values, 3, 4, table_meta);
 
 				schema_meta.tables[table_meta.name] = std::move(table_meta);
