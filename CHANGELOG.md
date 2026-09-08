@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-08
+
+Two fixes that a generic catalog consumer hits immediately. Found while building
+a DuckLake catalog manager on top of an attached MSSQL database, but neither is
+specific to that: both are about the extension behaving like a catalog rather
+than like a query function.
+
+### Fixed
+
+- **The catalog's default schema is `dbo`, not DuckDB's `main`**
+  ([#129](https://github.com/hugr-lab/mssql-extension/issues/129)).
+  `MSSQLCatalog` did not override `Catalog::GetDefaultSchema()`, so the base
+  answer `main` came back — a schema no SQL Server database has. Anything that
+  resolves an unqualified name through the catalog's default failed with
+  `Schema 'main' not found in MSSQL database`; the workaround in the wild was to
+  CREATE a schema literally called `main` on the server. `SELECT
+  current_schema()` now answers `dbo` after `USE <catalog>`, and unqualified
+  names resolve.
+
+- **Two scans of one catalog inside an explicit transaction no longer break the
+  pinned connection**
+  ([#239](https://github.com/hugr-lab/mssql-extension/issues/239)).
+  A transaction pins ONE TDS connection per catalog and routes every read on
+  that catalog to it, while a scan holds that connection from init until its
+  last row is drained. DuckDB does not promise to drain one source before
+  initializing the next — a correlated subquery in a predicate plans as
+  `LEFT_DELIM_JOIN` and initializes both — so the second scan met a busy
+  connection:
+
+  - `threads = 1` → `Cannot execute: connection not in Idle state (current: Executing)`
+  - `threads > 1` → `Connection closed while waiting for COLMETADATA`, a torn stream
+
+  In an explicit transaction, a plan holding more than one scan of the same
+  catalog now drains each of them into a buffer-managed collection at init and
+  releases the connection before returning, and holds a per-catalog lock across
+  batch-and-drain so concurrent initializations serialize. **Autocommit is
+  unchanged**: there every scan takes its own pooled connection, which is why
+  the same query always worked outside a transaction.
+
+  The mechanism mirrors duckdb-postgres, which has the same one-connection
+  constraint. Memory is bounded by the buffer manager, and only the plans that
+  would otherwise fail are affected.
+
 ## [0.2.4] - 2026-08-17
 
 ### Fixed
