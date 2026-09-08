@@ -107,6 +107,7 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
           scripts/ci/checkout_duckdb.sh
 
@@ -263,6 +264,7 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
           scripts/ci/checkout_duckdb.sh
 
@@ -403,6 +405,7 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
           scripts/ci/checkout_duckdb.sh
 

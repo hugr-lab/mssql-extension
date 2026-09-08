@@ -69,25 +69,56 @@ export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
 # job-level timeout-minutes is the last backstop either way.
 run_attempt() {
     if command -v perl >/dev/null 2>&1; then
-        perl -e 'alarm shift; exec @ARGV or exit 127' \
-            "$ATTEMPT_TIMEOUT" git submodule update --init --recursive duckdb
+        # fork + setpgrp + kill the GROUP, not exec + alarm.
+        #
+        # `exec` replaces this process with git, so SIGALRM reaches only the
+        # top-level `git submodule update`. Its children -- git clone /
+        # git-remote-https, one per nested submodule -- are orphaned and keep
+        # running: still writing into duckdb/ and holding locks while the next
+        # attempt's reset_state does `rm -rf` on the tree they are populating.
+        # A stub test of the exec form showed exactly this, an orphaned child
+        # outliving the killed parent by its full sleep.
+        perl -e '
+            my $t = shift;
+            my $p = fork;
+            die "fork failed: $!" unless defined $p;
+            if (!$p) { setpgrp(0, 0); exec @ARGV; exit 127 }
+            $SIG{ALRM} = sub { kill("KILL", -$p); waitpid($p, 0); exit 142 };
+            alarm $t;
+            waitpid($p, 0);
+            my $st = $?;
+            exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+        ' "$ATTEMPT_TIMEOUT" git submodule update --init --recursive duckdb
     else
+        # Say so. A leg running unbounded must not look identical in the log to
+        # one running bounded -- the only backstop left is the step timeout,
+        # which kills without retrying.
+        echo "::warning::perl not found; DuckDB checkout attempt runs UNBOUNDED (step timeout is the only backstop)"
         git submodule update --init --recursive duckdb
     fi
 }
 
 reset_state() {
-    # `git rev-parse --git-dir` rather than a literal .git/, because in a git
-    # WORKTREE .git is a file and .git/modules/duckdb does not exist.
-    local git_dir
+    # BOTH candidates, because where a submodule's git dir lives depends on how
+    # the checkout was made. Measured in this repo's own worktree:
+    #   --git-dir        .git/worktrees/<name>   modules/duckdb PRESENT
+    #   --git-common-dir .git                    modules/duckdb ABSENT
+    # A plain clone puts it under the common dir instead. Removing only one is
+    # how a stale submodule gitdir survives a "reset" and poisons the retry.
+    local git_dir common_dir
     git_dir="$(git rev-parse --git-dir)"
+    common_dir="$(git rev-parse --git-common-dir)"
+    # Unchecked, an empty result would make the next line rm -rf "/modules/duckdb"
+    # -- an absolute path outside the repository.
+    if [ -z "$git_dir" ] || [ -z "$common_dir" ]; then
+        echo "::error::could not resolve the git dir; refusing to reset"
+        exit 1
+    fi
+
     git submodule deinit -f duckdb >/dev/null 2>&1 || true
-    rm -rf duckdb "${git_dir}/modules/duckdb"
-    # Assert it actually happened. Without this the reset is unfalsifiable:
-    # rm's status is discarded, so a locked file on a Windows leg or a
-    # permission problem would log "Resetting partial submodule state" and
-    # then hand attempt N+1 exactly the wreckage this exists to prevent.
-    if [ -e duckdb ] || [ -e "${git_dir}/modules/duckdb" ]; then
+    rm -rf duckdb "${git_dir}/modules/duckdb" "${common_dir}/modules/duckdb"
+
+    if [ -e duckdb ] || [ -e "${git_dir}/modules/duckdb" ] || [ -e "${common_dir}/modules/duckdb" ]; then
         echo "::error::could not reset partial DuckDB submodule state"
         exit 1
     fi

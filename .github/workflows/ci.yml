@@ -133,16 +133,27 @@ jobs:
       - name: Issue -> test index is well-formed
         run: python3 scripts/ci/issue_links.py
 
-      # scripts/ci/ now holds five shell scripts on the CI critical path, one
-      # of which does `rm -rf` against a path it derives. Their clean state was
-      # established by hand once and nothing kept it that way -- an unquoted
-      # expansion reintroduced later would be found by the next incident, not
-      # by the PR. ~25 s in a 10-minute job.
-      - name: shellcheck the CI scripts
+      # Seven shell scripts across three directories sit on the CI critical
+      # path, one of which does `rm -rf` against a path it derives. Their clean
+      # state was established by hand once and nothing kept it that way -- an
+      # unquoted expansion reintroduced later would be found by the next
+      # incident, not by the PR. ~25 s in a 10-minute job.
+      - name: shellcheck the workflow-invoked shell scripts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-          shellcheck -S warning scripts/ci/*.sh
+          # shellcheck ships on the ubuntu-latest image, so this normally
+          # installs nothing. The install is conditional rather than
+          # unconditional because the step above already runs `apt-get update`
+          # in this job, and a second index refresh is exactly the command
+          # whose Signed-By conflict broke this repo's CI once before.
+          command -v shellcheck >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          }
+          shellcheck --version | head -2
+          # Every shell script a workflow invokes, not just scripts/ci/:
+          # fuzz/build.sh runs in fuzz-row-stager.yml and
+          # run_staging_test.sh in this file.
+          shellcheck -S warning scripts/ci/*.sh fuzz/build.sh test/cpp/codec/run_staging_test.sh
 
   # ============================================================================
   # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.

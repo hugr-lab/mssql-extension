@@ -85,7 +85,8 @@ compile_objs() {  # $1=tag, rest=sources ; echoes object paths
 	local tag="$1"; shift
 	local objs=()
 	for s in "$@"; do
-		local o="${WORK}/${tag}_$(basename "${s%.cpp}").o"
+		local o
+		o="${WORK}/${tag}_$(basename "${s%.cpp}").o"
 		"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} -c "${s}" -o "${o}"
 		objs+=("${o}")
 	done
