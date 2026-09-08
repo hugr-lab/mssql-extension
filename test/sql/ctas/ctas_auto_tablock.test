@@ -1,6 +1,7 @@
 # name: test/sql/ctas/ctas_auto_tablock.test
 # description: Test auto-TABLOCK for new tables (Issue #45)
 # group: [ctas]
+# issue: 45
 
 require mssql
 

@@ -107,7 +107,7 @@ echo ""
 
 # Create a temporary SQL file that loads the extension first
 TEMP_SQL=$(mktemp)
-trap "rm -f $TEMP_SQL" EXIT
+trap 'rm -f "$TEMP_SQL"' EXIT
 
 cat > "$TEMP_SQL" << EOF
 -- Load extension first

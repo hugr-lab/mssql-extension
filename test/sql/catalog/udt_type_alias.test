@@ -1,6 +1,7 @@
 # name: test/sql/catalog/udt_type_alias.test
 # description: Test that User-Defined Type (UDT) aliases are correctly resolved to base types
 # group: [mssql]
+# issue: 81
 #
 # Regression test for issue #81: UDT aliases caused "Expected vector of type INT32,
 # but found vector of type VARCHAR" because metadata queries joined sys.types on

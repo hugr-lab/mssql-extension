@@ -1,6 +1,7 @@
 # name: test/sql/query/counters_uniform_chunk.test
 # description: the debug counters must survive a CONSTANT-published column chunk (issue #233)
 # group: [mssql]
+# issue: 233
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

@@ -1,4 +1,5 @@
 // test/cpp/test_spn_host_resolution.cpp
+// issue: 259
 // Unit tests for ResolveHostForSpn (issue #259).
 //
 // Active Directory registers SQL Server SPNs against the host's FQDN. Building

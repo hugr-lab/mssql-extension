@@ -1,6 +1,7 @@
 # name: test/sql/query/utf8_support.test
 # description: UTF8SUPPORT changes the wire form of UTF-8 collation columns, never the value (issue #225)
 # group: [mssql]
+# issue: 225
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

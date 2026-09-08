@@ -4,7 +4,27 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # NO `branches:` filter, deliberately (issue #285). With `branches: [main]`
+    # a PR whose base was another branch ran none of this -- and stacked PRs are
+    # normal here. #283 (base main) got 14 checks; #284, open the same day with
+    # base fix/roborev-backlog, got 4, all from workflows that have their own
+    # triggers. No Build, no Integration, no C++ Unit Tests, no Lint. #284's
+    # whole change was to THIS FILE, deleting twelve test blocks on the argument
+    # that `make test-cpp-run` covers them -- exactly what Build verifies, and
+    # exactly what its own checks could not.
+    #
+    # The green tick was the problem: four checks ran and passed, so the page
+    # looked fine. Only counting them against another PR showed the ten missing.
+    #
+    # This also makes ci.yml consistent with every other workflow in the repo:
+    # it was the only one filtering PRs by BASE BRANCH. The rest either scope
+    # by `paths:` (cflite-pr, concurrency-tests, docs-build, kerberos,
+    # named-instance) or take every PR unconditionally (lint-extra,
+    # security-scan) -- which is why those ran on #284 and this did not.
+    #
+    # Cost is CI minutes on stacked PRs, which is the point: a PR merging into
+    # a feature branch still reaches main eventually.
+    #
     # Docs-only PRs skip CI (lint + C++ unit tests). Prose-scanning workflows
     # (prompt-injection, secret scan) have their own triggers and still run.
     # NOTE: if Lint / "C++ Unit Tests" are required status checks, GitHub treats
@@ -85,6 +105,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -103,6 +124,37 @@ jobs:
       - name: Every require-env variable is actually set
         run: scripts/ci/check_require_env.sh
 
+      # The issue -> regression-test index. Validates the `# issue:` /
+      # `// issue:` header declarations and prints the count; the backlog of
+      # files that name an issue in prose without declaring one is reported,
+      # not enforced, because deciding whether a mention is a guard needs a
+      # human. See docs/TESTING.md "Linking a test to the issue it guards".
+      # No build needed -- it reads files.
+      - name: Issue -> test index is well-formed
+        run: python3 scripts/ci/issue_links.py
+
+      # Seven shell scripts across three directories sit on the CI critical
+      # path, one of which does `rm -rf` against a path it derives. Their clean
+      # state was established by hand once and nothing kept it that way -- an
+      # unquoted expansion reintroduced later would be found by the next
+      # incident, not by the PR. ~25 s in a 10-minute job.
+      - name: shellcheck the workflow-invoked shell scripts
+        run: |
+          # shellcheck ships on the ubuntu-latest image, so this normally
+          # installs nothing. The install is conditional rather than
+          # unconditional because the step above already runs `apt-get update`
+          # in this job, and a second index refresh is exactly the command
+          # whose Signed-By conflict broke this repo's CI once before.
+          command -v shellcheck >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          }
+          shellcheck --version | head -2
+          # Every shell script a workflow invokes, not just scripts/ci/:
+          # fuzz/build.sh runs in fuzz-row-stager.yml and
+          # run_staging_test.sh in this file.
+          shellcheck -S warning scripts/ci/*.sh fuzz/build.sh test/cpp/codec/run_staging_test.sh
+
   # ============================================================================
   # C++ Unit Tests Job - lightweight, no SQL Server / DuckDB build required.
   # Runs on every push/PR (unlike the heavy build job, which is manual).
@@ -113,6 +165,7 @@ jobs:
   cpp-unit-tests:
     name: C++ Unit Tests (${{ matrix.os.id }})
     runs-on: ${{ matrix.os.runner }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -270,6 +323,7 @@ jobs:
   windows-sspi-test:
     name: Windows SSPI Unit Test
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -310,6 +364,7 @@ jobs:
   build-matrix:
     name: Resolve build matrix
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     if: >-
       ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build)
           || github.event_name == 'schedule'
@@ -341,6 +396,17 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
+    # 90, not 60. Warm-cache runs are 16-22 min (osx_arm64) and 23-32 min
+    # (linux_amd64), but the ccache key carries the DuckDB submodule SHA, so
+    # bumping it -- routine on a repo tracking duckdb main -- falls back to
+    # the platform-only restore-key and rebuilds most of DuckDB. Sizing the
+    # bound on the warm number would turn every submodule-bump PR into a
+    # timeout that looks exactly like the wedge this is meant to catch.
+    # Without this the GitHub default applies -- SIX HOURS -- so a runner that
+    # wedges burns the quota instead of failing. That is not hypothetical: the
+    # osx_arm64 leg of the #300 merge sat in "Checkout DuckDB submodule" for 45
+    # minutes and died there with no log and no failing step.
+    timeout-minutes: 90
     # On a merge to `main` (issue #212 gap 1) AND on the pull request itself
     # (issue #279). Building only on the merge turned a green PR into "nobody has
     # compiled this yet" — the regression is still found, just after it has
@@ -376,8 +442,11 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Checkout DuckDB submodule
-        run: |
-          git submodule update --init --recursive duckdb
+        # The script bounds each ATTEMPT (perl alarm) so a hang retries; this
+        # bounds the step as a whole, well above 3 x 600 s + backoff, so it can
+        # only fire if the script itself wedges.
+        timeout-minutes: 40
+        run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -704,6 +773,7 @@ jobs:
   smoke-test:
     name: Smoke Test (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 20
     needs: build
     # Follows the build on a merge to `main`: an extension that COMPILES can still
     # fail to LOAD (symbol visibility, a missing runtime dependency), and that is
@@ -765,6 +835,7 @@ jobs:
   integration-test:
     name: Integration Test (linux_amd64)
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     needs: build
     # On a merge to `main`, and on the pull request itself (issue #279): the suite
     # went from weekly to per-merge to per-PR, which is what makes a SQL
@@ -888,6 +959,7 @@ jobs:
   build-windows-msvc:
     name: Build Windows (MSVC)
     runs-on: windows-latest
+    timeout-minutes: 90
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
 
     env:
@@ -904,8 +976,8 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
-        run: |
-          git submodule update --init --recursive duckdb
+        timeout-minutes: 40
+        run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -1060,6 +1132,7 @@ jobs:
   build-windows-mingw:
     name: Build Windows (MinGW)
     runs-on: windows-latest
+    timeout-minutes: 90
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
     env:
       CC: gcc
@@ -1073,8 +1146,8 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
-        run: |
-          git submodule update --init --recursive duckdb
+        timeout-minutes: 40
+        run: scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -1173,6 +1246,7 @@ jobs:
   smoke-test-windows:
     name: Smoke Test Windows (${{ matrix.config.name }})
     runs-on: windows-latest
+    timeout-minutes: 30
     needs: [build-windows-msvc, build-windows-mingw]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
     strategy:
@@ -1215,6 +1289,7 @@ jobs:
   azure-test:
     name: Azure Test (linux_amd64)
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     needs: build
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_azure_tests && github.ref != 'refs/heads/main' }}
     environment: test

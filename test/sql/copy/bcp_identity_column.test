@@ -1,6 +1,7 @@
 # name: test/sql/copy/bcp_identity_column.test
 # description: COPY ... TO (FORMAT 'bcp') against a table with an IDENTITY column, with and without the identity column in the source (regression for issue #125)
 # group: [mssql]
+# issue: 125
 #
 # Before the fix, the BCP COPY path declared ALL target columns (including an unmapped
 # IDENTITY column) in the INSERT BULK statement and streamed NULL for the identity, failing

@@ -1,6 +1,7 @@
 # name: test/sql/catalog/filter_pushdown_hugeint.test
 # description: Regression test for spec 045 FR-020 (b) — HUGEINT filter literal correctness.
 # group: [sql]
+# issue: 177
 #
 # Spec 045 Phase 3 (US1, T022): filter pushdown of HUGEINT literals via
 # codec::integer::FormatSqlLiteral now renders bare digits (e.g., "12345")

@@ -39,6 +39,7 @@ jobs:
   build:
     name: Build (${{ matrix.platform.id }})
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
     needs: lint
     strategy:
       fail-fast: false
@@ -106,8 +107,9 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -255,6 +257,7 @@ jobs:
   build-windows-msvc:
     name: Build (windows_amd64)
     runs-on: windows-latest
+    timeout-minutes: 90
     needs: lint
 
     env:
@@ -280,8 +283,9 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb
@@ -395,6 +399,7 @@ jobs:
   build-windows-mingw:
     name: Build (windows_amd64_mingw)
     runs-on: windows-latest
+    timeout-minutes: 90
     needs: lint
     env:
       CC: gcc
@@ -420,8 +425,9 @@ jobs:
 
       - name: Checkout DuckDB submodule
         shell: bash
+        timeout-minutes: 40
         run: |
-          git submodule update --init --recursive duckdb
+          scripts/ci/checkout_duckdb.sh
 
       - name: Log build metadata
         id: duckdb

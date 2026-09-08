@@ -5,6 +5,7 @@
 #              variant, default fallback, 128-char clamp, and isolation
 #              between two simultaneous ATTACHes.
 # group: [attach]
+# issue: 82
 
 require mssql
 

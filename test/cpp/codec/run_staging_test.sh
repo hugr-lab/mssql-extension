@@ -93,6 +93,8 @@ done
 SAN_FLAGS=()
 LABEL="assertions only, SANITIZE=0"
 if [ "$SANITIZE" != "0" ]; then
+	# shellcheck disable=SC2054  # the comma is part of the -fsanitize flag,
+	# not an array separator; spelling it as two elements breaks the flag.
 	SAN_FLAGS=(-fsanitize=address,undefined -fno-sanitize-recover=all)
 	LABEL="ASan+UBSan"
 fi

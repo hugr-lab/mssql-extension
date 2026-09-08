@@ -6,6 +6,8 @@
 # Post-spec-045 the client-side String-family encoder pre-validates the
 # UTF-16LE byte length against col.max_length and throws a clear error
 # naming the column plus observed-vs-allowed code units.
+# group: [copy]
+# issue: 91
 #
 # Acceptance scenarios from spec/user-story-5:
 #   (a) 500 chars (250 ASCII + 250 Cyrillic) into nvarchar(500) — 500 UCS-2
@@ -24,8 +26,6 @@
 # Pre-spec-045 baseline (on `main`-at-kickoff): (a) and (b) succeed; (c)
 # fails with the opaque server-side "Received an invalid column length"
 # message that does NOT name the column or the code-unit counts.
-
-# group: [copy]
 
 require mssql
 

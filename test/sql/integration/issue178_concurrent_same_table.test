@@ -1,6 +1,7 @@
 # name: test/sql/integration/issue178_concurrent_same_table.test
 # description: Issue #178 — concurrent scans of the SAME table from multiple connections crash
 # group: [integration]
+# issue: 178
 #
 # Repro for https://github.com/hugr-lab/mssql-extension/issues/178
 # Two (or more) client connections concurrently scanning the same attached table

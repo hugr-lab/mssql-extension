@@ -1,6 +1,7 @@
 # name: test/sql/copy/copy_varchar_collation.test
 # description: a varchar column COPY creates must be collated UTF-8, permanent or temp (spec 060 / issue #225)
 # group: [mssql]
+# issue: 225
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
