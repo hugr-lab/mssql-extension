@@ -37,7 +37,7 @@ echo ""
 
 # Create a temporary SQL file for the smoke test
 SMOKE_SQL=$(mktemp)
-trap "rm -f $SMOKE_SQL" EXIT
+trap 'rm -f "$SMOKE_SQL"' EXIT
 
 cat > "$SMOKE_SQL" << 'EOF'
 -- Load-only smoke test
