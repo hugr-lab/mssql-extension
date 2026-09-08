@@ -64,7 +64,20 @@ struct MSSQLTableMetadata {
 	// accurate by its name and misleading to its only consumer. The kind comes
 	// from sys.indexes.type, which separates them.
 	MSSQLIndexKind index_kind = MSSQLIndexKind::HEAP;
-	idx_t partition_count = 0;
+
+	// Is the object partitioned? Spec 071 W1: this replaces a `partition_count`
+	// that nothing ever read — it was written here and not even copied into
+	// MSSQLTableEntry, while the COUNT(*) producing it is what forced the
+	// GROUP BY over sys.partitions that made every metadata query scan
+	// sys.sysrowsets. Every comment that referred to the count phrased its
+	// meaning as "> 1 marks a partitioned object", which is what this is.
+	//
+	// Source is sys.indexes.data_space_id against sys.partition_schemes, which
+	// seeks (6 logical reads) where sys.partitions cannot seek at all —
+	// sysrowsets is clustered on rowsetid and object_id is derived, so a lookup
+	// by object_id costs a full scan (3200 reads at 200K tables) whatever form
+	// it takes. See specs/071-catalog-metadata-cost/spec.md.
+	bool is_partitioned = false;
 
 	// Incremental cache state for columns.
 	// Issue #178 (D6): all fields — including these states — are guarded by the
