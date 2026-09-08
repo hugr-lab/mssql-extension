@@ -205,7 +205,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	OptimizerExtension mssql_optimizer;
-	mssql_optimizer.optimize_function = MSSQLOptimizer::Optimize;
+	mssql_optimizer.optimize_function = MSSQLOptimizer::OptimizeRoot;
 	OptimizerExtension::Register(config, std::move(mssql_optimizer));
 }
 

@@ -1,0 +1,155 @@
+# name: test/sql/transaction/transaction_multi_scan_materialization.test
+# description: Two scans of one catalog inside an explicit transaction share the pinned connection (issue #239)
+# group: [mssql]
+# issue: 239
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# An explicit transaction pins ONE TDS connection per catalog and routes every
+# read on that catalog to it. A scan holds that connection from InitGlobal until
+# its last row is drained, and DuckDB does not promise to drain one source before
+# initializing the next. Before the fix this failed two different ways:
+#
+#   threads = 1   IO Error: ... Cannot execute: connection not in Idle state
+#                 (current: Executing)
+#   threads > 1   IO Error: Connection closed while waiting for COLMETADATA
+#                 (the two InitGlobals race and tear the stream)
+#
+# THE QUERY SHAPE MATTERS AND IS NOT THE OBVIOUS ONE. A correlated subquery in
+# the SELECT list -- `SELECT p.id, (SELECT list(c.v) ... )` -- does NOT reproduce
+# it: DuckDB decorrelates that into a hash join whose sources are drained in
+# sequence, and it passes on the broken build too. What reproduces it is a
+# correlated subquery in a PREDICATE, which plans as LEFT_DELIM_JOIN + DELIM_SCAN
+# and initializes both sides before draining either. Verified both ways against
+# the pre-fix binary.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS i239 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i239', 'IF OBJECT_ID(''dbo.I239Child'',''U'') IS NOT NULL DROP TABLE dbo.I239Child');
+
+statement ok
+SELECT mssql_exec('i239', 'IF OBJECT_ID(''dbo.I239Parent'',''U'') IS NOT NULL DROP TABLE dbo.I239Parent');
+
+statement ok
+SELECT mssql_exec('i239', 'CREATE TABLE dbo.I239Parent (id INT PRIMARY KEY, name VARCHAR(50))');
+
+statement ok
+SELECT mssql_exec('i239', 'CREATE TABLE dbo.I239Child (cid INT PRIMARY KEY, pid INT, v VARCHAR(50))');
+
+# Enough rows that a scan spans several chunks: at three rows the first source
+# finishes inside one chunk and the sources never overlap, so even the DELIM plan
+# passes on a broken build.
+statement ok
+SELECT mssql_exec('i239', 'INSERT INTO dbo.I239Parent (id, name) SELECT TOP 5000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), ''p'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+statement ok
+SELECT mssql_exec('i239', 'INSERT INTO dbo.I239Child (cid, pid, v) SELECT TOP 12000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 5000) + 1, ''v'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+# =============================================================================
+# Single-threaded: the "not in Idle state" failure
+# =============================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM i239.dbo.I239Parent p
+WHERE p.id > (SELECT count(*) FROM i239.dbo.I239Child c WHERE c.pid = p.id);
+----
+4997
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# Multi-threaded: the torn-stream failure. Materializing at InitGlobal is not
+# enough on its own here -- the two InitGlobals run concurrently, so the drain
+# has not happened when the second batch is sent. This passes only because a
+# materialized scan also holds the catalog's materialize mutex across its batch.
+# =============================================================================
+
+statement ok
+SET threads = 4;
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM i239.dbo.I239Parent p
+WHERE p.id > (SELECT count(*) FROM i239.dbo.I239Child c WHERE c.pid = p.id);
+----
+4997
+
+statement ok
+COMMIT;
+
+# Three scans of the same catalog, still one connection.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM i239.dbo.I239Parent p
+WHERE p.id > (SELECT count(*) FROM i239.dbo.I239Child c WHERE c.pid = p.id)
+  AND p.id < (SELECT max(x.id) FROM i239.dbo.I239Parent x);
+----
+4996
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# Autocommit is untouched: each scan takes its own pooled connection, so the
+# same query never needed materializing and must not start doing so.
+# =============================================================================
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT count(*) FROM i239.dbo.I239Parent p
+WHERE p.id > (SELECT count(*) FROM i239.dbo.I239Child c WHERE c.pid = p.id);
+----
+4997
+
+# =============================================================================
+# The materialized rows are the same rows, not merely the same count: the drain
+# reuses FillChunk, so projection, ordering and values have to survive it.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query II
+SELECT p.id, p.name FROM i239.dbo.I239Parent p
+WHERE p.id > (SELECT count(*) FROM i239.dbo.I239Child c WHERE c.pid = p.id)
+ORDER BY p.id LIMIT 3;
+----
+4	p
+5	p
+6	p
+
+statement ok
+COMMIT;
+
+statement ok
+SET threads = 1;
+
+# Cleanup
+statement ok
+SELECT mssql_exec('i239', 'DROP TABLE dbo.I239Child');
+
+statement ok
+SELECT mssql_exec('i239', 'DROP TABLE dbo.I239Parent');
+
+statement ok
+DETACH i239;

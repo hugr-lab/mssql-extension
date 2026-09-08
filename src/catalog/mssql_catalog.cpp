@@ -292,6 +292,11 @@ string MSSQLCatalog::GetCatalogType() {
 	return "mssql";
 }
 
+string MSSQLCatalog::GetDefaultSchema() const {
+	// See the header for why this is a constant and not SCHEMA_NAME().
+	return "dbo";
+}
+
 //===----------------------------------------------------------------------===//
 // Schema Operations
 //===----------------------------------------------------------------------===//
