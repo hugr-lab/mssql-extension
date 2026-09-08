@@ -1,0 +1,130 @@
+# name: test/sql/transaction/transaction_mssql_scan_materialization.test
+# description: mssql_scan() inside an explicit transaction releases the pinned connection (issue #316)
+# group: [mssql]
+# issue: 316
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Issue #239 taught catalog scans to materialize on the transaction's pinned
+# connection. mssql_scan() was left out, and it is NOT reachable by the same fix:
+# MSSQLScanBind executes the query to read COLMETADATA and hands the live stream
+# to InitGlobal. So a second scan of the catalog fails inside its own BIND, before
+# any InitGlobal runs and long before the optimizer gate that #239 added.
+#
+# The fix drains at Bind whenever the session is not in autocommit. The trigger is
+# "in a transaction", not "more than one scan": Bind cannot see the rest of the
+# plan, so by the time a count would be available the connection is already held.
+#
+# Pre-fix failures, reproduced on this build:
+#   A  IO Error: Connection closed unexpectedly
+#   B  IO Error: Failed to execute SQL batch: Cannot execute: connection not in
+#      Idle state (current: Executing)
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS i316 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i316', 'IF OBJECT_ID(''dbo.I316Rows'',''U'') IS NOT NULL DROP TABLE dbo.I316Rows');
+
+statement ok
+SELECT mssql_exec('i316', 'CREATE TABLE dbo.I316Rows (id INT, v VARCHAR(20))');
+
+# Enough rows to span several chunks -- at a handful the first scan finishes
+# inside one chunk and the two never overlap.
+statement ok
+SELECT mssql_exec('i316', 'INSERT INTO dbo.I316Rows SELECT TOP 5000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), ''x'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+statement ok
+SELECT mssql_invalidate_cache('i316');
+
+statement ok
+SET threads = 4;
+
+# =============================================================================
+# A: a catalog scan and an mssql_scan of the same catalog
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM i316.dbo.I316Rows p
+WHERE p.id > (SELECT count(*) FROM mssql_scan('i316', 'SELECT id FROM dbo.I316Rows') c WHERE c.id = p.id);
+----
+4999
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# B: two mssql_scan calls, no catalog scan at all -- the optimizer gate never
+# sees these, so only the Bind-time drain saves them.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*)
+FROM mssql_scan('i316', 'SELECT id FROM dbo.I316Rows') a,
+     mssql_scan('i316', 'SELECT id FROM dbo.I316Rows') b
+WHERE a.id = b.id;
+----
+5000
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# The materialized rows are the same rows, not merely the same count.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query II
+SELECT id, v FROM mssql_scan('i316', 'SELECT id, v FROM dbo.I316Rows') ORDER BY id LIMIT 3;
+----
+1	x
+2	x
+3	x
+
+# A single scan in a transaction is materialized too, and must still see the
+# transaction's own uncommitted rows -- the drain runs on the pinned connection.
+statement ok
+SELECT mssql_exec('i316', 'INSERT INTO dbo.I316Rows VALUES (99999, ''tx'')');
+
+query I
+SELECT count(*) FROM mssql_scan('i316', 'SELECT id FROM dbo.I316Rows WHERE id = 99999');
+----
+1
+
+statement ok
+COMMIT;
+
+# =============================================================================
+# Autocommit is untouched: each scan takes its own pooled connection and streams.
+# =============================================================================
+
+query I
+SELECT count(*)
+FROM mssql_scan('i316', 'SELECT id FROM dbo.I316Rows') a,
+     mssql_scan('i316', 'SELECT id FROM dbo.I316Rows') b
+WHERE a.id = b.id;
+----
+5001
+
+statement ok
+SET threads = 1;
+
+# Cleanup
+statement ok
+SELECT mssql_exec('i316', 'DROP TABLE dbo.I316Rows');
+
+statement ok
+DETACH i316;

@@ -683,7 +683,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				chunk_types.push_back(bind_data.all_types[column_ids[i]]);
 			}
 		}
-		result->materialized = make_uniq<ColumnDataCollection>(Allocator::Get(context), chunk_types);
+		// ClientContext, not Allocator::Get(context) (#318, found by @oluies). The
+		// Allocator overload builds an IN_MEMORY_ALLOCATOR collection — unaccounted
+		// against the buffer manager and unable to spill — so a large materialized
+		// scan grew in process memory until it OOMed, while the docs promised the
+		// opposite. The ClientContext overload defaults to BUFFER_MANAGER_ALLOCATOR.
+		// The chunk below deliberately keeps the plain Allocator: it is one DataChunk,
+		// not the accumulating collection.
+		result->materialized = make_uniq<ColumnDataCollection>(context, chunk_types);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), chunk_types);
 		idx_t total = 0;

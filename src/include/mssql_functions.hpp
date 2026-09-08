@@ -38,6 +38,28 @@ struct MSSQLScanBindData : public FunctionData {
 	// no pre-built stream (InitGlobal then re-executes the query).
 	string result_stream_id;
 
+	// Issue #316: inside an explicit transaction, Bind drains the result here and
+	// closes the stream instead of registering it.
+	//
+	// mssql_scan executes its query at BIND time — it has to, the schema comes
+	// from the batch's own COLMETADATA — and then holds the connection open until
+	// execution drains it. In a transaction that connection is the ONE pinned
+	// connection, so a second mssql_scan fails in its own Bind, before any
+	// InitGlobal runs. The catalog scan's fix cannot reach that: materializing at
+	// InitGlobal is too late, and the optimizer gate that decides it runs later
+	// still.
+	//
+	// So the trigger here is "in a transaction", not "more than one scan": Bind
+	// cannot know what else the plan will hold. That does buffer a lone
+	// mssql_scan that would have streamed — but inside a transaction such a scan
+	// could not have coexisted with anything else on that catalog anyway, so this
+	// turns a failing case into a slower one rather than taking a working case
+	// away.
+	//
+	// shared_ptr because FunctionData::Copy has to share it rather than duplicate
+	// the rows.
+	shared_ptr<ColumnDataCollection> materialized;
+
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
 };
@@ -144,6 +166,12 @@ struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 	// before the next scan on the same catalog initializes. Execution then serves
 	// chunks from the collection and never touches the connection.
 	std::unique_ptr<ColumnDataCollection> materialized;
+
+	// Issue #316: the raw mssql_scan materializes at BIND, not here, so its
+	// collection is owned by the bind data and shared rather than moved — the
+	// same bind data can init more than one global state.
+	shared_ptr<ColumnDataCollection> materialized_shared;
+
 	ColumnDataScanState materialized_scan;
 
 	// Context name for pool return
