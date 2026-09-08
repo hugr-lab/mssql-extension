@@ -126,11 +126,30 @@ jobs:
         run: |
           mkdir -p build/release
           cd build/release
+          # -DENABLE_UNITTEST_CPP_TESTS=FALSE drops DuckDB's OWN C++ unit tests
+          # (its test/ subdirs api, appender, arrow, catalog, common, logging,
+          # memoryleak, secrets, optimizer, serialize, sql, ossfuzz, mbedtls,
+          # encryption, persistence). Not an optimisation dressed up as a fix:
+          # `make` has ALWAYS passed it -- extension-ci-tools has it in
+          # BUILD_FLAGS -- so every cmake line in these workflows was configuring
+          # a different build from the one developers run, and compiling upstream
+          # test code that nothing in this repo executes. Measured on this tree:
+          # 1937 -> 1706 build edges, with the `unittest` and test/sqlite targets
+          # identical either way. They sit OUTSIDE the gate in DuckDB's
+          # test/CMakeLists.txt, which is why the sqllogictest driver the
+          # integration job runs is unaffected.
+          #
+          # It stopped being merely wasteful on the v2.0-cyanoptera bump: a
+          # compile error in duckdb/test/common/test_http_transport_manager.cpp
+          # -- returning unique_ptr<MockHTTPParams> where unique_ptr<HTTPParams>
+          # is declared, which GCC rejects -- failed Build (linux_amd64) on a PR
+          # that touched none of it.
           cmake -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_MANIFEST_DIR="$(pwd)/../.." \
             -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../extension_config.cmake" \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
             ../../duckdb
           cmake --build . --config Release --target mssql_loadable_extension
 
