@@ -54,8 +54,20 @@ than like a query function.
   the same query always worked outside a transaction.
 
   The mechanism mirrors duckdb-postgres, which has the same one-connection
-  constraint. Memory is bounded by the buffer manager, and only the plans that
-  would otherwise fail are affected.
+  constraint. Memory is bounded by the buffer manager and spills rather than
+  growing in process memory — but only since
+  [#318](https://github.com/hugr-lab/mssql-extension/pull/318), which is in this
+  release: the collection was first built from `Allocator::Get(context)`, and
+  that overload is duckdb's `IN_MEMORY_ALLOCATOR` one, unaccounted and unable to
+  spill.
+
+  The gate is **wider than the failure it prevents**, which is worth stating
+  plainly. At planning time DuckDB does not say in which order it will drain a
+  plan's sources, so the decision cannot be "these two would have overlapped":
+  any plan holding two or more scans of one catalog in a transaction
+  materializes all of them, including a plain hash join between two of that
+  catalog's tables that would have drained one side and then the other. Guessing
+  the other way costs a hung connection, not a slow query.
 
 ## [0.2.4] - 2026-08-17
 
