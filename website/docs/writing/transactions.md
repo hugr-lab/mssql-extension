@@ -62,11 +62,11 @@ large, and the connection is released immediately afterwards.
 ```sql
 BEGIN;
 
--- Two scans of `mssql`: the outer table and the correlated subquery.
+-- Two scans of `sqlserver`: the outer table and the correlated subquery.
 -- Both are read fully as they start, then served from memory.
 SELECT o.id
-FROM mssql.dbo.orders o
-WHERE o.total > (SELECT avg(x.total) FROM mssql.dbo.orders x WHERE x.customer_id = o.customer_id);
+FROM sqlserver.dbo.orders o
+WHERE o.total > (SELECT avg(x.total) FROM sqlserver.dbo.orders x WHERE x.customer_id = o.customer_id);
 
 COMMIT;
 ```
@@ -105,10 +105,10 @@ connection, so uncommitted writes are visible as usual.
 
 ```sql
 BEGIN;
-INSERT INTO mssql.dbo.orders (id, total) VALUES (1, 10);
+INSERT INTO sqlserver.dbo.orders (id, total) VALUES (1, 10);
 
 -- Sees the uncommitted row: read on the same pinned connection, then buffered.
-SELECT count(*) FROM mssql_scan('mssql', 'SELECT id FROM dbo.orders');
+SELECT count(*) FROM mssql_scan('sqlserver', 'SELECT id FROM dbo.orders');
 
 COMMIT;
 ```
