@@ -282,7 +282,19 @@ private:
 
 	// Execute metadata query with configured timeout (metadata_timeout_ms_)
 	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
-	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback);
+	//! Called before a retried attempt re-runs the query, to discard whatever the
+	//! previous attempt's row callback had already accumulated.
+	//!
+	//! A deadlock-victim (1205) rerun is only safe if the caller's accumulation
+	//! can be taken back to its pre-query state; without that, a query that died
+	//! after delivering rows had to be fatal, because rerunning it appended the
+	//! same rows twice ("Column with name x already exists!"). Passing this makes
+	//! the mid-stream case recoverable — and passing it is how a call site states
+	//! that it has thought about restartability. Every call site supplies one,
+	//! including the ones whose accumulation is already idempotent, which say so.
+	using MetadataResetCallback = std::function<void()>;
+	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+							  MetadataResetCallback reset);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables

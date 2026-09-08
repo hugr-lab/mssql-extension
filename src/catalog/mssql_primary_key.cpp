@@ -68,11 +68,14 @@ ORDER BY ic.key_ordinal
 
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
-static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback) {
+static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+								 const std::function<void()> &reset) {
 	// Deadlock-victim retry, same contract as RunMetadataQuery in
 	// mssql_metadata_cache.cpp: 1205 on a pure-read metadata query reruns
-	// (bounded), but only while no rows were delivered — after the first row
-	// the callback has state a rerun would duplicate.
+	// (bounded), and `reset` undoes whatever the aborted attempt accumulated so
+	// the rerun is legal after rows have already been delivered. A PK query
+	// returns one row per key column, so a composite key can and does die
+	// mid-stream.
 	constexpr int MAX_ATTEMPTS = 6;
 	for (int attempt = 1;; attempt++) {
 		idx_t rows_delivered = 0;
@@ -92,7 +95,10 @@ static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &s
 		if (!result.HasError()) {
 			return;
 		}
-		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
+		if (result.error_number == 1205 && attempt < MAX_ATTEMPTS && (rows_delivered == 0 || reset)) {
+			if (rows_delivered > 0) {
+				reset();
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
 			continue;
 		}
@@ -174,47 +180,55 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const st
 	string query = StringUtil::Format(PK_DISCOVERY_SQL_TEMPLATE, full_name);
 
 	// Execute PK discovery query
-	ExecuteMetadataQuery(connection, query, [&info, &database_collation](const vector<string> &values) {
-		if (values.size() >= 8) {
-			string col_name = values[0];
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(values[1]));
-			} catch (...) {
+	ExecuteMetadataQuery(
+		connection, query,
+		[&info, &database_collation](const vector<string> &values) {
+			if (values.size() >= 8) {
+				string col_name = values[0];
+				int32_t col_id = 0;
+				try {
+					col_id = static_cast<int32_t>(std::stoi(values[1]));
+				} catch (...) {
+				}
+
+				int32_t key_ordinal = 0;
+				try {
+					key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
+				} catch (...) {
+				}
+
+				string type_name = values[3];
+				int16_t max_len = 0;
+				try {
+					max_len = static_cast<int16_t>(std::stoi(values[4]));
+				} catch (...) {
+				}
+
+				uint8_t prec = 0;
+				try {
+					prec = static_cast<uint8_t>(std::stoi(values[5]));
+				} catch (...) {
+				}
+
+				uint8_t scl = 0;
+				try {
+					scl = static_cast<uint8_t>(std::stoi(values[6]));
+				} catch (...) {
+				}
+
+				string collation = values[7];
+
+				auto pk_col = PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
+														 collation, database_collation);
+				info.columns.push_back(std::move(pk_col));
 			}
-
-			int32_t key_ordinal = 0;
-			try {
-				key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
-			} catch (...) {
-			}
-
-			string type_name = values[3];
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(values[4]));
-			} catch (...) {
-			}
-
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(values[5]));
-			} catch (...) {
-			}
-
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(values[6]));
-			} catch (...) {
-			}
-
-			string collation = values[7];
-
-			auto pk_col = PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
-													 collation, database_collation);
-			info.columns.push_back(std::move(pk_col));
-		}
-	});
+		},
+		[&info]() {
+			// push_back per key column: a composite PK aborted after its first column
+			// would otherwise come back with that column listed twice, and the rowid
+			// STRUCT built from it would be wrong rather than merely missing.
+			info.columns.clear();
+		});
 
 	// Check if we found any PK columns
 	if (info.columns.empty()) {
