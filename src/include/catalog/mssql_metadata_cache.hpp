@@ -162,6 +162,26 @@ public:
 	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
 	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
 
+	//! The single-schema bulk load. Kept because mssql_preload_catalog('schema')
+	//! names one deliberately; the listing path goes through
+	//! LoadAllSchemasMetadata instead. Caller must hold mutex_ via the public entry.
+	void LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name);
+
+	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
+	//!
+	//! Both the listing path and mssql_preload_catalog() go through here. It costs
+	//! one pass over the catalog; asking per schema costs one pass EACH, because
+	//! sys.objects filters metadata visibility per object in the database and no
+	//! predicate turns that scan into a seek. Break-even is under five schemas.
+	//!
+	//! Rows arrive UNORDERED and are grouped on object_id in a hash map — dropping
+	//! the ORDER BY is what makes the single query possible at all, since sorting
+	//! millions of rows is what forced the per-schema loop this replaces.
+	//!
+	//! Caller must NOT hold mutex_; this takes it.
+	void LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
+								idx_t &column_count);
+
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);
 

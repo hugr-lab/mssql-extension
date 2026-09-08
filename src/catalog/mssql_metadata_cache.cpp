@@ -1,4 +1,5 @@
 #include "catalog/mssql_metadata_cache.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -165,6 +166,61 @@ WHERE s.schema_id NOT IN (3, 4)
   AND o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
   AND s.name = '%s')";
+
+// Whole-catalog metadata: every schema, every table, every column, in ONE query.
+//
+// Spec 071 W2. What made this impossible before was the ORDER BY, not the size:
+// BulkLoadAll iterated schema by schema precisely because sorting millions of
+// rows by (schema, object, column_id) overran the memory grant and spilled to
+// tempdb. But the sort was only ever there to let a STREAMING group-by parse
+// detect table boundaries. Group on object_id in a hash map instead and the sort
+// is not needed, so neither is the loop.
+//
+// That loop is the whole of issue #86. Listing one schema costs a pass over the
+// catalog whatever the predicate says -- sys.objects filters metadata visibility
+// per object in the DATABASE, so an EMPTY schema measured 484 ms of server CPU at
+// 200K objects, and no form of the schema predicate turns that scan into a seek
+// (sys.objects, sys.tables and INFORMATION_SCHEMA.TABLES all plan as a Clustered
+// Index Scan on sysschobjs.clst, with a literal nsid as much as with SCHEMA_ID()).
+// N schemas therefore cost N passes: 10,000 empty schemas extrapolate to ~80
+// minutes. One query for all of them measured 1917 ms. Break-even is under five
+// schemas, so there is no catalog size at which the per-schema loop wins.
+//
+// object_id leads the SELECT list because it is the grouping key: two schemas may
+// hold tables of the same name, so the name alone cannot identify the group.
+static const char *BULK_METADATA_ALL_SQL = R"(
+SELECT
+    o.object_id,
+    s.name AS schema_name,
+    o.name AS object_name,
+    o.type AS object_type,
+    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
+    c.name AS column_name,
+    c.column_id,
+    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    ISNULL(c.collation_name, '') AS collation_name,
+    ISNULL(shape.index_type, 0) AS index_type,
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+FROM sys.schemas s
+INNER JOIN sys.objects o ON o.schema_id = s.schema_id
+INNER JOIN sys.columns c ON c.object_id = o.object_id
+LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
+OUTER APPLY (SELECT MAX(i.type) AS index_type,
+                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
+             FROM sys.indexes i
+             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
+WHERE s.schema_id NOT IN (3, 4)
+  AND s.principal_id != 0
+  AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
+                     'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
+                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
+  AND o.type IN ('U', 'V')
+  AND o.is_ms_shipped = 0)";
 
 // Query to discover columns in a table/view
 // Note: ISNULL is used for collation_name to avoid NBCROW parsing issues with NULL values
@@ -569,9 +625,23 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 		}
 	}
 
-	// Bulk load all tables + columns for this schema in one query
-	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — bulk loading from SQL Server", schema_name.c_str());
+	// Not cached: load the WHOLE catalog, not just this schema (spec 071 W2).
+	//
+	// Counter-intuitive only until the cost is measured. Listing one schema costs
+	// a full pass over sys.objects whatever the predicate says, because metadata
+	// visibility is filtered per object in the DATABASE — an EMPTY schema measured
+	// 484 ms of server CPU at 200K objects. DuckDB drives this once per schema, so
+	// the per-schema shape is O(schemas x objects); one query for all of them
+	// measured 1917 ms total. Break-even is under five schemas.
+	//
+	// The plain `SELECT * FROM db.sch.tbl` path does NOT come here — it goes to
+	// GetTableMetadata, one table, one seek — so ordinary queries stay lazy.
+	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loading every schema in one query", schema_name.c_str());
+	idx_t all_schemas = 0, all_tables = 0, all_columns = 0;
+	LoadAllSchemasMetadata(connection, all_schemas, all_tables, all_columns);
+}
 
+void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name) {
 	string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
 
 	// Push table filter to SQL Server if convertible to LIKE
@@ -710,17 +780,187 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 // Bulk Catalog Preload (Spec 033: US5)
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Whole-catalog metadata load (spec 071 W2)
+//===----------------------------------------------------------------------===//
+
+void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
+												idx_t &column_count) {
+	schema_count = 0;
+	table_count = 0;
+	column_count = 0;
+
+	string sql = BULK_METADATA_ALL_SQL;
+	// Both filters push to the server where they convert to LIKE. The schema one
+	// matters most here: it is the only thing that can make this query smaller
+	// than the whole catalog, which is what a user with 10,000 schemas reaches for.
+	if (filter_ && filter_->HasSchemaFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+		}
+	}
+	if (filter_ && filter_->HasTableFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
+		}
+	}
+
+	std::lock_guard<std::mutex> lock(mutex_);
+
+	// object_id -> the entry it owns. Pointers into schemas_[x].tables stay valid
+	// across insertion because both containers are node-based unordered_maps.
+	unordered_map<string, MSSQLTableMetadata *> by_object_id;
+	// Which schemas this pass actually created or refilled, so the publication
+	// below marks exactly those and leaves any others alone.
+	unordered_map<string, MSSQLSchemaMetadata *> touched;
+
+	ExecuteMetadataQuery(
+		connection, sql,
+		[&](const vector<string> &values) {
+			// 15 columns: object_id, schema, object, type, approx_rows, the eight
+			// per-column fields, then index_type and is_partitioned. Guard the LAST
+			// index read.
+			if (values.size() < 15) {
+				return;
+			}
+			const string &object_id = values[0];
+			auto found = by_object_id.find(object_id);
+			MSSQLTableMetadata *table_meta;
+			if (found == by_object_id.end()) {
+				const string &schema_name = values[1];
+				if (filter_ && !filter_->MatchesSchema(schema_name)) {
+					return;
+				}
+				const string &table_name = values[2];
+				if (filter_ && !filter_->MatchesTable(table_name)) {
+					return;
+				}
+				auto schema_it = schemas_.find(schema_name);
+				if (schema_it == schemas_.end()) {
+					schema_it = schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name)).first;
+					schema_count++;
+				}
+				auto &schema = schema_it->second;
+				if (touched.emplace(schema_name, &schema).second) {
+					// First row for this schema in this pass: drop whatever an
+					// earlier partial load left, so the query's answer is the whole
+					// answer rather than a merge with a stale one.
+					schema.tables.clear();
+				}
+				auto &slot = schema.tables[table_name];
+				slot = MSSQLTableMetadata();
+				slot.name = table_name;
+				if (!values[3].empty() && values[3][0] == 'V') {
+					slot.object_type = MSSQLObjectType::VIEW;
+				} else {
+					slot.object_type = MSSQLObjectType::TABLE;
+				}
+				try {
+					slot.approx_row_count = static_cast<idx_t>(std::stoll(values[4]));
+				} catch (...) {
+					slot.approx_row_count = 0;
+				}
+				ParseTableShape(values, 13, 14, slot);
+				table_meta = &slot;
+				by_object_id.emplace(object_id, table_meta);
+				table_count++;
+			} else {
+				table_meta = found->second;
+			}
+
+			int32_t col_id = 0;
+			try {
+				col_id = static_cast<int32_t>(std::stoi(values[6]));
+			} catch (...) {
+			}
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(values[8]));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(values[9]));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(values[10]));
+			} catch (...) {
+			}
+			const bool nullable = (values[11] == "1" || values[11] == "true" || values[11] == "True");
+			table_meta->columns.push_back(MSSQLColumnInfo(values[5], col_id, values[7], max_len, prec, scl, nullable,
+														  values[12], database_collation_));
+			column_count++;
+		},
+		[&]() {
+			// Restartable (PR #308): a deadlock victim reruns from the top, so the
+			// grouping state and everything it published have to go back. Only the
+			// schemas this pass touched are cleared — one it never reached still
+			// holds whatever it legitimately had.
+			for (auto &pair : touched) {
+				pair.second->tables.clear();
+			}
+			by_object_id.clear();
+			touched.clear();
+			schema_count = 0;
+			table_count = 0;
+			column_count = 0;
+		});
+
+	// Columns arrive in no particular order, so put each table's list back into
+	// column_id order before publishing: every consumer indexes by position.
+	const auto now = std::chrono::steady_clock::now();
+	for (auto &pair : by_object_id) {
+		auto &columns = pair.second->columns;
+		std::sort(columns.begin(), columns.end(),
+				  [](const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) { return a.column_id < b.column_id; });
+		pair.second->columns_load_state = CacheLoadState::LOADED;
+		pair.second->columns_last_refresh = now;
+	}
+	for (auto &pair : touched) {
+		pair.second->tables_load_state = CacheLoadState::LOADED;
+		pair.second->tables_last_refresh = now;
+	}
+	// A schema the query returned NO rows for is still loaded — it is empty, and
+	// saying so is what stops the next Scan from asking again.
+	for (auto &pair : schemas_) {
+		if (filter_ && !filter_->MatchesSchema(pair.first)) {
+			continue;
+		}
+		if (touched.find(pair.first) == touched.end()) {
+			pair.second.tables.clear();
+			pair.second.tables_load_state = CacheLoadState::LOADED;
+			pair.second.tables_last_refresh = now;
+		}
+	}
+
+	CACHE_DEBUG(1, "LoadAllSchemasMetadata — %llu schema(s), %llu table(s), %llu column(s) in ONE query",
+				(unsigned long long)touched.size(), (unsigned long long)table_count, (unsigned long long)column_count);
+}
+
 void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count,
 									 idx_t &table_count, idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
 
-	// Determine which schemas to load.
-	// When schema_name is empty, we iterate per-schema instead of one massive cross-schema
-	// query. This avoids SQL Server tempdb sort spills on large catalogs (200K+ tables)
-	// where the ORDER BY s.name, o.name, c.column_id on millions of rows exceeds the
-	// memory grant and causes non-linear performance degradation.
+	// With no schema named, ONE query covers the catalog (spec 071 W2).
+	//
+	// This used to iterate per schema, and the reason recorded here was the sort:
+	// "ORDER BY s.name, o.name, c.column_id on millions of rows exceeds the memory
+	// grant and causes non-linear performance degradation". True, and the sort was
+	// only ever there so a STREAMING parse could see table boundaries. Grouping on
+	// object_id in a hash map removes the sort, and with it the reason to loop —
+	// which was also the reason mssql_preload_catalog() was O(schemas x objects)
+	// and could not rescue issue #86 however often it was recommended.
+	if (schema_name.empty()) {
+		LoadAllSchemasMetadata(connection, schema_count, table_count, column_count);
+		return;
+	}
+
 	vector<string> schemas_to_load;
 	if (!schema_name.empty()) {
 		schemas_to_load.push_back(schema_name);
