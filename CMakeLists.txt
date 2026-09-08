@@ -266,6 +266,17 @@ target_link_libraries(${EXTENSION_NAME} simdutf::simdutf)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
+elseif(APPLE)
+    # macOS: httplib reads the trusted roots out of the system keychain rather
+    # than an OpenSSL CA bundle -- it turns CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+    # on by itself for Apple + clang + OpenSSL, and calls SecTrustSettingsCopyCertificates
+    # and the CoreFoundation accessors around it. Without these two frameworks the
+    # link fails outright on undefined _SecTrustSettingsCopyCertificates / _CFRelease.
+    #
+    # This is what we WANT on macOS: vcpkg's static OpenSSL carries no CA bundle,
+    # so the alternative (CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES)
+    # leaves Azure AD token acquisition verifying against an empty trust store.
+    target_link_libraries(${EXTENSION_NAME} "-framework CoreFoundation" "-framework Security")
 endif()
 
 # Integrated Authentication (Spec 042) — compile defines + link libs per platform
@@ -309,6 +320,17 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} simdutf::simdutf)
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)
+elseif(APPLE)
+    # macOS: httplib reads the trusted roots out of the system keychain rather
+    # than an OpenSSL CA bundle -- it turns CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+    # on by itself for Apple + clang + OpenSSL, and calls SecTrustSettingsCopyCertificates
+    # and the CoreFoundation accessors around it. Without these two frameworks the
+    # link fails outright on undefined _SecTrustSettingsCopyCertificates / _CFRelease.
+    #
+    # This is what we WANT on macOS: vcpkg's static OpenSSL carries no CA bundle,
+    # so the alternative (CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES)
+    # leaves Azure AD token acquisition verifying against an empty trust store.
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} "-framework CoreFoundation" "-framework Security")
 endif()
 
 # Integrated Authentication (Spec 042) — compile defines + link libs per platform

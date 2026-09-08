@@ -45,16 +45,24 @@ bool MSSQLReportsNativeTypes(Catalog &catalog) {
 	return setting.IsNull() ? true : setting.GetValue<bool>();
 }
 
-static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata, bool native_types) {
-	CreateTableInfo info;
-	info.SetTableName(Identifier(metadata.name));
-
-	// Build column definitions
+static ColumnList MakeColumnList(const MSSQLTableMetadata &metadata, bool native_types) {
+	ColumnList columns;
 	for (const auto &col : metadata.columns) {
 		ColumnDefinition column_def(Identifier(col.name), native_types ? col.NativeDuckDBType() : col.duckdb_type);
-		info.columns.AddColumn(std::move(column_def));
+		columns.AddColumn(std::move(column_def));
 	}
+	return columns;
+}
 
+//! Everything the base constructor still reads out of a CreateTableInfo, which
+//! since duckdb 888cd17bee is the name and nothing else this entry sets — the
+//! columns moved to MakeColumnList / columns_, and MSSQL tables carry no
+//! DuckDB-side constraints. Deliberately does NOT fill info.columns: the base
+//! no longer looks at them, so populating the list here would build every
+//! table's columns twice and leave a copy nobody reads.
+static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata) {
+	CreateTableInfo info;
+	info.SetTableName(Identifier(metadata.name));
 	return info;
 }
 
@@ -63,17 +71,24 @@ static CreateTableInfo MakeTableInfo(const MSSQLTableMetadata &metadata, bool na
 //===----------------------------------------------------------------------===//
 
 MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const MSSQLTableMetadata &metadata)
+	// The base takes a non-const lvalue reference, so a temporary cannot bind;
+	// the thread_local is the storage that outlives the argument expression.
 	: TableCatalogEntry(catalog, schema,
 						[&]() -> CreateTableInfo & {
 							static thread_local CreateTableInfo info;
-							info = MakeTableInfo(metadata, MSSQLReportsNativeTypes(catalog));
+							info = MakeTableInfo(metadata);
 							return info;
 						}()),
+	  columns_(MakeColumnList(metadata, MSSQLReportsNativeTypes(catalog))),
 	  mssql_columns_(metadata.columns),
 	  object_type_(metadata.object_type),
 	  approx_row_count_(metadata.approx_row_count) {}
 
 MSSQLTableEntry::~MSSQLTableEntry() = default;
+
+const ColumnList &MSSQLTableEntry::GetColumns() const {
+	return columns_;
+}
 
 //===----------------------------------------------------------------------===//
 // Required Overrides

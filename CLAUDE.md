@@ -5,7 +5,7 @@ DuckDB extension for SQL Server via a custom TDS protocol implementation (no Fre
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard)
-- **DuckDB**: main branch (2.0 API track, spec 069). The 1.5.x world lives on branch `duckdb-v1.5.5` for 0.2.x maintenance releases; main compiles against the pinned duckdb submodule SHA only (no dual-API shim since spec 069 retired `mssql_compat.hpp`)
+- **DuckDB**: `v2.0-cyanoptera`, DuckDB's v2.0 pre-release stabilisation branch (2.0 API track, spec 069). Tracked instead of `main` since the branch was cut on 2026-09-03: it is where the 2.0 line is being stabilised, and `main` has already diverged from it. The 1.5.x world lives on branch `duckdb-v1.5.5` for 0.2.x maintenance releases; main compiles against the pinned duckdb submodule SHA only (no dual-API shim since spec 069 retired `mssql_compat.hpp`)
 - **TLS**: OpenSSL via vcpkg (statically linked, symbol visibility controlled)
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC, MinGW/Rtools 4.2)
 
