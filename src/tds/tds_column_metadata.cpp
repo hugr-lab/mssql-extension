@@ -256,6 +256,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 	column.precision = 0;
 	column.scale = 0;
 	column.collation = 0;
+	column.collation_sort_id = 0;
 
 	switch (column.type_id) {
 	// Fixed-length types (no additional metadata)
@@ -314,7 +315,11 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 		column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
 						   (static_cast<uint32_t>(data[offset + 2]) << 16) |
 						   (static_cast<uint32_t>(data[offset + 3]) << 24);
-		offset += 5;  // collation is 5 bytes but we only store 4
+		// The 5th byte is the SortId, which is what names the code page for a
+		// SQL_* collation. Discarding it meant a message about such a column could
+		// not say which collation it had met (issue #224).
+		column.collation_sort_id = data[offset + 4];
+		offset += 5;
 		break;
 
 	// Variable-length binary types (2 bytes length)
@@ -402,6 +407,7 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 			column.collation = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
 							   (static_cast<uint32_t>(data[offset + 2]) << 16) |
 							   (static_cast<uint32_t>(data[offset + 3]) << 24);
+			column.collation_sort_id = data[offset + 4];
 			offset += 5;
 		}
 		// TableName: 1 byte part count, then each part as US_VARCHAR.

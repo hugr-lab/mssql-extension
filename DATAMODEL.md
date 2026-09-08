@@ -474,6 +474,60 @@ sequenceDiagram
 
 ## Layer 5 — Codec (spec 045)
 
+**Single-byte text is published verbatim, and is not guaranteed UTF-8 (issue #224).**
+
+DuckDB `VARCHAR` is UTF-8 by contract. SQL Server's `CHAR` / `VARCHAR` / `TEXT`
+carry bytes in the column's own code page, and with `UTF8SUPPORT` negotiated a
+UTF-8-collated column and a CP1252 one arrive as the **same TDS type** — only
+the collation tells them apart. The extension copies those bytes through
+unchanged rather than validating them, which is a deliberate decision and not an
+oversight: validating costs the scan's hot path in order to make a hand-written
+`mssql_scan()` query fail loudly, and it would bill hardest exactly the
+configuration spec 069 / issue #225 optimised for. The caller writes the T-SQL
+and can write `CAST(col AS NVARCHAR(MAX))`.
+
+Instead it is said **once per query**, over COLMETADATA, in
+`MSSQLResultStream::SurfaceWarnings` — a handful of columns, never a per-row
+cost. It reaches `duckdb_logs` at `WARNING`.
+
+Three decoders publish these bytes:
+
+| path | decoder | when |
+|---|---|---|
+| staged batch | `binary::DecodeChunkFromStaging` | the ordinary scan |
+| constant | `binary::DecodeFromTds` via `TryEmitConstant` → `DecodeFirstValue` | a chunk whose values are uniform and non-NULL |
+| per value | `string::DecodeFromTds` | `TypeConverter::ConvertValue`, INSERT…RETURNING |
+
+Single-byte text reaches the **binary** kernel because its bytes are copied
+verbatim, exactly like `VARBINARY` (`P2StageBinary` / `PlpStageBinary` /
+`LobStageBinary` → `FinalizeKernel::Binary`); only the destination vector
+differs. `IMAGE` shares the staging arm but lands in a `BLOB`, where arbitrary
+bytes are the point.
+
+The catalog path is normally exempt because `BuildColumnExpression` casts
+non-Unicode string columns to `NVARCHAR` server-side — **except** a declared
+`VARCHAR(MAX)` when `mssql_convert_varchar_max` is off, which
+`NeedsNVarcharConversion` deliberately opts out of. That configuration reaches
+the decoder through the catalog, and the warning fires there too.
+
+### Reading a column's collation
+
+`ColumnMetadata` carries all five wire bytes of the TDS collation
+(MS-TDS 2.2.5.1.2): `collation` holds 20 bits of LCID, 8 of flags and 4 of
+version, and `collation_sort_id` holds the SortId byte.
+
+- `IsUtf8Collation()` tests the fUTF8 flag, which lands at `0x04000000` in the
+  word. Verified against a live SQL Server 2025, not read off the spec:
+  `Latin1_General_100_BIN2_UTF8` → `0x26000409` (set),
+  `Cyrillic_General_CI_AS` → `0x00D00419` (clear). UTF-8 collations are SQL
+  Server 2019+, so the bit is never set on an older server.
+- **The SortId is not redundant.** For the `SQL_*` collations it is the only
+  thing that names the code page: `SQL_Latin1_General_CP1_CI_AS` (CP1252) and
+  `SQL_Latin1_General_CP1251_CI_AS` (CP1251) both report **LCID 0x0409**, and
+  differ only as SortId 52 vs 106.
+- The installation default is `SQL_Latin1_General_CP1_CI_AS`, so a legacy code
+  page is the majority case rather than an edge case.
+
 ```mermaid
 classDiagram
     class TypeFamily {

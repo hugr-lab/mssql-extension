@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A non-UTF-8 text column now says so, once per query**
+  ([#224](https://github.com/hugr-lab/mssql-extension/issues/224)). A
+  `CHAR`/`VARCHAR`/`TEXT` column whose collation is not a UTF-8 one is handed
+  back as code-page bytes in a DuckDB `VARCHAR`, which is UTF-8 by contract.
+  That stays **documented rather than enforced** — validating costs the scan's
+  hot path in order to make a hand-written `mssql_scan()` fail loudly, and it
+  bills hardest the UTF-8 configuration #225 optimised for. Instead the check
+  runs over COLMETADATA when the stream closes — a handful of columns, never a
+  per-row cost — and reaches `duckdb_logs` at `WARNING`, naming the column, its
+  LCID and its SortId. The predicate is the TDS fUTF8 flag, verified against a
+  live SQL Server rather than read off MS-TDS.
+
+### Fixed
+
+- **SQL Server INFO messages were collected and thrown away.**
+  `SurfaceWarnings` walked them and did nothing, on the grounds that "DuckDB
+  doesn't have a built-in warning API" — true when it was written, not true
+  now. `PRINT` output, `RAISERROR` below severity 11 and procedure progress
+  notices now reach `duckdb_logs`.
+
+- **The 5th collation byte was parsed and discarded** (`offset += 5; // we only
+  store 4`), thanks [@oluies](https://github.com/oluies) —
+  [#305](https://github.com/hugr-lab/mssql-extension/pull/305). It is the
+  SortId, and for the `SQL_*` collations it is the *only* thing that names the
+  code page: `SQL_Latin1_General_CP1_CI_AS` (CP1252) and
+  `SQL_Latin1_General_CP1251_CI_AS` (CP1251) both report LCID `0x0409` and
+  differ only as SortId 52 vs 106.
+
 ## [0.2.4] - 2026-08-17
 
 ### Fixed

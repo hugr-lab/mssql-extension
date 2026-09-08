@@ -18,8 +18,13 @@ struct ColumnMetadata {
 	uint16_t max_length;  // Maximum length for variable types
 	uint8_t precision;	  // Precision for DECIMAL/NUMERIC
 	uint8_t scale;		  // Scale for DECIMAL/NUMERIC or TIME
-	uint32_t collation;	  // Collation ID for string types
-	uint16_t flags;		  // Column flags (nullable, identity, etc.)
+	uint32_t collation;	  // Collation LCID + flags: the first 4 of the 5 wire bytes
+	// The 5th collation byte, previously parsed and thrown away. It is the
+	// SortId, and for the SQL_* collations it is what names the CODE PAGE --
+	// the first four carry LCID and flags only, so without it a message about
+	// a collation cannot say which one it met (issue #224, from @oluies' #305).
+	uint8_t collation_sort_id;
+	uint16_t flags;	 // Column flags (nullable, identity, etc.)
 
 	// Derived properties
 	bool IsNullable() const {
@@ -30,6 +35,42 @@ struct ColumnMetadata {
 	}
 	bool IsComputed() const {
 		return (flags & COL_FLAG_COMPUTED) != 0;
+	}
+
+	//! True when this column's collation names a UTF-8 code page, so its bytes
+	//! are already what a DuckDB VARCHAR requires.
+	//!
+	//! MS-TDS 2.2.5.1.2 packs the collation as 20 bits of LCID, 8 bits of
+	//! flags, 4 bits of version, then the SortId byte. `collation` holds the
+	//! first four bytes, so the flags occupy bits 20-27 and fUTF8 -- 0x40
+	//! within them -- lands at 0x04000000 in the word.
+	//!
+	//! Verified against a live SQL Server 2025 rather than read off the spec,
+	//! by dumping the COLMETADATA bytes for known collations:
+	//!
+	//!     Latin1_General_100_CI_AS_SC_UTF8   0x24D00409   set
+	//!     Latin1_General_100_BIN2_UTF8       0x26000409   set
+	//!     Latin1_General_CI_AS      (cp1252) 0x00D00409   clear
+	//!     Cyrillic_General_CI_AS    (cp1251) 0x00D00419   clear
+	//!
+	//! Each decodes without remainder (CI -> fIgnoreCase, AS -> fIgnoreAccent
+	//! clear, BIN2 -> fBinary2), and it degrades correctly on older servers:
+	//! UTF-8 collations are SQL Server 2019+, so the bit is never set before
+	//! that. Note that the installation default SQL_Latin1_General_CP1_CI_AS is
+	//! CP1252 -- a legacy code page is the majority case, not an edge case.
+	bool IsUtf8Collation() const {
+		return (collation & 0x04000000u) != 0;
+	}
+
+	//! True for the single-byte text types: CHAR, VARCHAR and the deprecated
+	//! TEXT. Their bytes are copied to the client verbatim and land in a DuckDB
+	//! VARCHAR, which is UTF-8 by contract -- so these are the columns whose
+	//! collation decides whether that contract holds. NCHAR / NVARCHAR / NTEXT
+	//! are UTF-16 on the wire and always transcoded; BINARY / VARBINARY / IMAGE
+	//! are copied verbatim too but land in a BLOB, where arbitrary bytes are
+	//! the point.
+	bool IsSingleByteTextColumn() const {
+		return type_id == TDS_TYPE_BIGCHAR || type_id == TDS_TYPE_BIGVARCHAR || type_id == TDS_TYPE_TEXT;
 	}
 
 	// Get human-readable type name for error messages

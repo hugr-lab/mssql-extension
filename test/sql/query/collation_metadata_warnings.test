@@ -1,0 +1,110 @@
+# name: test/sql/query/collation_metadata_warnings.test
+# description: Non-UTF-8 single-byte text columns warn once per query, and server INFO messages surface (issue #224)
+# group: [mssql]
+# issue: 224
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# #224 is settled as documented-but-not-enforced: a CHAR/VARCHAR/TEXT column
+# whose collation is not a UTF-8 one is handed back as code-page bytes in a
+# DuckDB VARCHAR, and validating that per value would cost the scan's hot path
+# to make a hand-written query fail loudly. So it is said ONCE PER QUERY over
+# COLMETADATA instead, which costs nothing per row.
+#
+# The predicate is the fUTF8 flag, bit 0x40 of the collation flags byte, which
+# lands at 0x04000000 in the 4-byte word the extension stores. Verified against
+# a live server rather than read off MS-TDS.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS coll (TYPE mssql);
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+# =============================================================================
+# Windows collations: the fUTF8 bit decides, and only the single-byte text
+# columns are candidates at all.
+# =============================================================================
+
+query I
+SELECT count(*) FROM mssql_scan('coll', '
+    SELECT CAST(''a'' AS VARCHAR(10)) COLLATE Cyrillic_General_CI_AS         AS w_cp1251,
+           CAST(''b'' AS VARCHAR(10)) COLLATE Latin1_General_CI_AS           AS w_cp1252,
+           CAST(''c'' AS VARCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8   AS w_utf8,
+           CAST(N''d'' AS NVARCHAR(10))                                      AS w_nvarchar');
+----
+1
+
+# Exactly the two non-UTF-8 varchars. A UTF-8 collation is already what DuckDB
+# wants, and NVARCHAR is UTF-16 on the wire and always transcoded.
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%w_cp1251%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%w_cp1252%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%w_utf8%';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%w_nvarchar%';
+----
+0
+
+# =============================================================================
+# The 5th collation byte earns its place here: both of these SQL_* collations
+# carry LCID 0x0409, so the first four bytes cannot tell them apart. The SortId
+# is what names the code page -- 52 is CP1252, 106 is CP1251.
+# =============================================================================
+
+query I
+SELECT count(*) FROM mssql_scan('coll', '
+    SELECT CAST(''a'' AS VARCHAR(10)) COLLATE SQL_Latin1_General_CP1_CI_AS     AS s_cp1252,
+           CAST(''b'' AS VARCHAR(10)) COLLATE SQL_Latin1_General_CP1251_CI_AS  AS s_cp1251');
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%s_cp1252%' AND message LIKE '%LCID 0x0409, SortId 52%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%s_cp1251%' AND message LIKE '%LCID 0x0409, SortId 106%';
+----
+1
+
+# =============================================================================
+# INFO tokens. The stream has collected these since the token parser was
+# written and SurfaceWarnings dropped every one of them -- PRINT output,
+# RAISERROR below severity 11, and anything a procedure reports about itself.
+# =============================================================================
+
+query I
+SELECT count(*) FROM mssql_scan('coll', 'PRINT ''surfaced from the server''; SELECT 1 AS a');
+----
+1
+
+# log_level matters here and not only for tidiness: the test harness logs the
+# query text itself at INFO, and that text contains this string too.
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%surfaced from the server%';
+----
+1
+
+statement ok
+DETACH coll;

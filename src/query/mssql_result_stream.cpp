@@ -8,6 +8,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mssql_counters.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -905,17 +906,46 @@ void MSSQLResultStream::DrainRemainingTokens() {
 }
 
 void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
-	// Surface INFO messages as warnings to DuckDB
-	// DuckDB doesn't have a built-in warning API, but we can log to the client context
+	// Called once when a stream is finished or closed -- never per row, and
+	// never per chunk. Both loops below walk metadata, not data.
+
+	// SQL Server INFO tokens: PRINT output, RAISERROR at severity <= 10, the
+	// "Changed database context" notices, and anything a stored procedure says
+	// about its own progress. The stream has collected these since the token
+	// parser was written and this function dropped every one of them on the
+	// floor -- the comment claimed DuckDB had no warning API, which was true
+	// when it was written and is not now.
 	for (const auto &info : info_messages_) {
-		if (!info.message.empty()) {
-			// Log INFO messages at info level (severity 1-10 are informational in SQL Server)
-			// Use DuckDB's context to add a message
-			// For now, we store them for the caller to retrieve
-			(void)context;	// Context can be used for logging if needed
+		if (info.message.empty()) {
+			continue;
 		}
+		const std::string where = info.proc_name.empty() ? std::string() : " (in " + info.proc_name + ")";
+		DUCKDB_LOG_WARNING(context, "mssql: [%u] %s%s", info.number, info.message.c_str(), where.c_str());
 	}
-	// Note: info_messages_ can be retrieved via GetInfoMessages() for caller inspection
+
+	// Issue #224: a CHAR / VARCHAR / TEXT column whose collation is not a UTF-8
+	// one arrives as code-page bytes and is handed to a DuckDB VARCHAR, which
+	// is UTF-8 by contract. This is documented behaviour and deliberately NOT
+	// enforced -- validating would cost the scan's hot path in order to make a
+	// hand-written query fail loudly, and it would bill exactly the UTF-8
+	// configuration that #225 optimised hardest for, since a non-UTF8 varchar
+	// never reaches the binary kernel on the catalog path at all.
+	//
+	// So say it once per query instead of once per value. The check is over
+	// COLMETADATA, which is a handful of columns, and it fires only when such a
+	// column actually arrived: on the catalog path NeedsNVarcharConversion has
+	// usually already cast it to NVARCHAR server-side, and what is left is a
+	// raw mssql_scan(), or a declared VARCHAR(MAX) with
+	// mssql_convert_varchar_max off.
+	for (const auto &col : column_metadata_) {
+		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
+			continue;
+		}
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" has a non-UTF-8 collation (LCID 0x%04X, SortId %u); its bytes are "
+						   "returned verbatim and may not be valid UTF-8. CAST it to NVARCHAR in the query to convert.",
+						   col.name.c_str(), (unsigned)(col.collation & 0xFFFFFu), (unsigned)col.collation_sort_id);
+	}
 }
 
 }  // namespace duckdb
