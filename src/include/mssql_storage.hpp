@@ -147,7 +147,12 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	// Endpoint Type Flags (T040-T041: cached at ATTACH time for performance)
 	//===----------------------------------------------------------------------===//
-	bool is_fabric_endpoint = false;  // True if targeting Microsoft Fabric (no BCP/INSERT BULK support)
+	// True if targeting Microsoft Fabric. Read ONLY by
+	// MSSQLCatalog::RequiresSingleByteText(): Fabric has no `nvarchar`, so CTAS,
+	// COPY and the collation choice pick single-byte text there. It does not gate
+	// the bulk-load path — `bcp`, whose INSERT BULK protocol this extension
+	// speaks, is supported on Fabric as a preview feature.
+	bool is_fabric_endpoint = false;
 
 	// Issue #225: did the server grant the LOGIN7 UTF8SUPPORT feature? Observed by
 	// the ATTACH-time validation login, which happens on every non-lazy attach, so

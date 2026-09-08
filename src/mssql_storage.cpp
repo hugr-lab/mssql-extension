@@ -1612,11 +1612,25 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// both of which read the (now resolved) host/port.
 	connection_info->ResolveNamedInstance(context);
 
-	// T040 (Bug 0.7): Cache endpoint type at ATTACH time for performance
-	// Fabric endpoints don't support BCP/INSERT BULK, need fallback to INSERT
+	// Cache the endpoint type at ATTACH time: the test is a host-name match and
+	// several paths ask repeatedly.
+	//
+	// This does NOT disable BCP, whatever this comment used to say. The flag's
+	// only consumer is MSSQLCatalog::RequiresSingleByteText(), which exists
+	// because Fabric Warehouse has no `nvarchar` type at all; through it the flag
+	// reaches the CTAS planner, COPY's target types and the collation choice, and
+	// nothing else. Grep src/copy/ for it and there is no hit — the bulk-load path
+	// has never tested it, so the "fallback to INSERT" it described did not exist.
+	//
+	// The claim was wrong about Fabric too, not merely unimplemented: `bcp` is
+	// supported there as a preview feature (Microsoft's "T-SQL surface area in
+	// Fabric Data Warehouse" lists BULK LOAD as unsupported and exempts `bcp`),
+	// and INSERT BULK is the protocol `bcp` itself speaks. Our own docs already
+	// implied the load runs: the Fabric known-issue says a `#temp` table cannot be
+	// a BCP TARGET there, which is a limit only a working load can reach.
 	connection_info->is_fabric_endpoint = connection_info->IsFabricEndpoint();
 	if (connection_info->is_fabric_endpoint) {
-		MSSQL_STORAGE_DEBUG_LOG(1, "Fabric endpoint detected: %s (BCP disabled, using INSERT fallback)",
+		MSSQL_STORAGE_DEBUG_LOG(1, "Fabric endpoint detected: %s (no nvarchar — single-byte text types)",
 								connection_info->host.c_str());
 	}
 
