@@ -194,7 +194,7 @@ static bool IsTTLExpired(const std::chrono::steady_clock::time_point &last_refre
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
 static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
-							 int timeout_ms) {
+							 int timeout_ms, const std::function<void()> &reset) {
 	// Log the query being executed (truncated for readability)
 	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.c_str(),
 				sql.size() > 120 ? "..." : "");
@@ -203,10 +203,21 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 	// reads and the server's own message says "Rerun the transaction". DuckDB
 	// 2.0's higher scan/sink parallelism overlaps a test's DDL (Sch-M) with
 	// catalog loads on sibling pooled connections often enough to make 1205 a
-	// per-run event (PR #267 review). Retry ONLY when the victim query
-	// delivered no rows yet — after the first row the callback has consumed
-	// state that a rerun would duplicate ("Column already exists" class), so a
-	// mid-stream deadlock stays fatal.
+	// per-run event (PR #267 review).
+	//
+	// The rerun used to be allowed ONLY before the first row, because after it
+	// the callback holds state a second pass would duplicate ("Column with name
+	// x already exists!"). That guard made the retry useless exactly where 1205
+	// actually lands: the bulk catalog query streams one row per COLUMN of every
+	// table, so by the time two sessions collide it has almost always delivered
+	// rows. `reset` closes that — the caller undoes its partial accumulation and
+	// the query is re-run from the top.
+	//
+	// Note what this is and is not. It does not stop the deadlock; the cycle is
+	// between our multi-table catalog join (holding a key in sys.sysschobjs,
+	// wanting sys.sysrowsets) and a concurrent DROP TABLE holding the reverse,
+	// and no client-side isolation setting reaches it — catalog reads ignore the
+	// session isolation level. This only makes losing the race recoverable.
 	constexpr int MAX_ATTEMPTS = 6;
 	auto start = std::chrono::steady_clock::now();
 	for (int attempt = 1;; attempt++) {
@@ -233,9 +244,12 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 			CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
 			return;
 		}
-		if (result.error_number == 1205 && rows_delivered == 0 && attempt < MAX_ATTEMPTS) {
-			CACHE_DEBUG(1, "RunMetadataQuery: deadlock victim (1205), attempt %d/%d — rerunning", attempt,
-						MAX_ATTEMPTS);
+		if (result.error_number == 1205 && attempt < MAX_ATTEMPTS && (rows_delivered == 0 || reset)) {
+			CACHE_DEBUG(1, "RunMetadataQuery: deadlock victim (1205) after %llu row(s), attempt %d/%d — rerunning",
+						(unsigned long long)rows_delivered, attempt, MAX_ATTEMPTS);
+			if (rows_delivered > 0) {
+				reset();
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
 			continue;
 		}
@@ -355,67 +369,77 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	table_meta.name = table_name;
 
 	bool first_row = true;
-	ExecuteMetadataQuery(connection, query, [this, &table_meta, &first_row](const vector<string> &values) {
-		// 12 columns: object_type, approx_rows, the eight per-column fields, then
-		// index_id and partition_count. The guard has to cover the LAST index read.
-		if (values.size() < 12) {
-			return;
-		}
-
-		// First row: extract object type and row count
-		if (first_row) {
-			first_row = false;
-			if (!values[0].empty() && values[0][0] == 'V') {
-				table_meta.object_type = MSSQLObjectType::VIEW;
-			} else {
-				table_meta.object_type = MSSQLObjectType::TABLE;
+	// Restartable: the slot was created empty by the erase/emplace above, so
+	// putting it back to that state is the whole undo.
+	auto reset_slot = [&table_meta, &table_name, &first_row]() {
+		table_meta = MSSQLTableMetadata();
+		table_meta.name = table_name;
+		first_row = true;
+	};
+	ExecuteMetadataQuery(
+		connection, query,
+		[this, &table_meta, &first_row](const vector<string> &values) {
+			// 12 columns: object_type, approx_rows, the eight per-column fields, then
+			// index_id and partition_count. The guard has to cover the LAST index read.
+			if (values.size() < 12) {
+				return;
 			}
+
+			// First row: extract object type and row count
+			if (first_row) {
+				first_row = false;
+				if (!values[0].empty() && values[0][0] == 'V') {
+					table_meta.object_type = MSSQLObjectType::VIEW;
+				} else {
+					table_meta.object_type = MSSQLObjectType::TABLE;
+				}
+				try {
+					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
+				} catch (...) {
+					table_meta.approx_row_count = 0;
+				}
+				// Physical shape from the same aggregated subquery (see the header):
+				// values[10] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+				// object. Both drive the write path's TABLOCK and sort decisions.
+				// Per object, so it belongs in the first-row branch.
+				ParseTableShape(values, 10, 11, table_meta);
+				CACHE_DEBUG(2, "table shape: %s kind=%d partitions=%llu rows=%llu", table_meta.name.c_str(),
+							(int)table_meta.index_kind, (unsigned long long)table_meta.partition_count,
+							(unsigned long long)table_meta.approx_row_count);
+			}
+
+			// Parse column info
+			string col_name = values[2];
+			int32_t col_id = 0;
 			try {
-				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
+				col_id = static_cast<int32_t>(std::stoi(values[3]));
 			} catch (...) {
-				table_meta.approx_row_count = 0;
 			}
-			// Physical shape from the same aggregated subquery (see the header):
-			// values[10] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-			// object. Both drive the write path's TABLOCK and sort decisions.
-			// Per object, so it belongs in the first-row branch.
-			ParseTableShape(values, 10, 11, table_meta);
-			CACHE_DEBUG(2, "table shape: %s kind=%d partitions=%llu rows=%llu", table_meta.name.c_str(),
-						(int)table_meta.index_kind, (unsigned long long)table_meta.partition_count,
-						(unsigned long long)table_meta.approx_row_count);
-		}
+			string type_name = values[4];
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(values[5]));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(values[6]));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(values[7]));
+			} catch (...) {
+			}
+			bool nullable = (values[8] == "1" || values[8] == "true" || values[8] == "True");
+			string collation = values[9];
 
-		// Parse column info
-		string col_name = values[2];
-		int32_t col_id = 0;
-		try {
-			col_id = static_cast<int32_t>(std::stoi(values[3]));
-		} catch (...) {
-		}
-		string type_name = values[4];
-		int16_t max_len = 0;
-		try {
-			max_len = static_cast<int16_t>(std::stoi(values[5]));
-		} catch (...) {
-		}
-		uint8_t prec = 0;
-		try {
-			prec = static_cast<uint8_t>(std::stoi(values[6]));
-		} catch (...) {
-		}
-		uint8_t scl = 0;
-		try {
-			scl = static_cast<uint8_t>(std::stoi(values[7]));
-		} catch (...) {
-		}
-		bool nullable = (values[8] == "1" || values[8] == "true" || values[8] == "True");
-		string collation = values[9];
-
-		MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-								 database_collation_);
-		table_meta.columns.push_back(std::move(col_info));
-	});
+			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+									 database_collation_);
+			table_meta.columns.push_back(std::move(col_info));
+		},
+		reset_slot);
 
 	// If no rows returned, table doesn't exist -- roll back the slot we inserted.
 	if (first_row) {
@@ -543,85 +567,97 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 	// Clear old table entries — bulk reload replaces everything
 	schema.tables.clear();
 
-	ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
-		// 14 columns: schema, object, type, approx_rows, the eight per-column
-		// fields, then index_id and partition_count. Guard the LAST index read.
-		if (values.size() < 14) {
-			return;
-		}
-
-		string row_table = values[1];
-		string row_type = values[2];
-		string row_approx_rows = values[3];
-		string col_name = values[4];
-		string col_id_str = values[5];
-		string type_name = values[6];
-		string max_len_str = values[7];
-		string prec_str = values[8];
-		string scale_str = values[9];
-		string nullable_str = values[10];
-		string collation = values[11];
-
-		// Apply table filter
-		if (filter_ && !filter_->MatchesTable(row_table)) {
-			return;
-		}
-
-		// New table group?
-		if (row_table != current_table) {
-			current_table = row_table;
-
-			MSSQLTableMetadata table_meta;
-			table_meta.name = current_table;
-			if (!row_type.empty() && row_type[0] == 'V') {
-				table_meta.object_type = MSSQLObjectType::VIEW;
-			} else {
-				table_meta.object_type = MSSQLObjectType::TABLE;
+	ExecuteMetadataQuery(
+		connection, sql,
+		[&](const vector<string> &values) {
+			// 14 columns: schema, object, type, approx_rows, the eight per-column
+			// fields, then index_id and partition_count. Guard the LAST index read.
+			if (values.size() < 14) {
+				return;
 			}
+
+			string row_table = values[1];
+			string row_type = values[2];
+			string row_approx_rows = values[3];
+			string col_name = values[4];
+			string col_id_str = values[5];
+			string type_name = values[6];
+			string max_len_str = values[7];
+			string prec_str = values[8];
+			string scale_str = values[9];
+			string nullable_str = values[10];
+			string collation = values[11];
+
+			// Apply table filter
+			if (filter_ && !filter_->MatchesTable(row_table)) {
+				return;
+			}
+
+			// New table group?
+			if (row_table != current_table) {
+				current_table = row_table;
+
+				MSSQLTableMetadata table_meta;
+				table_meta.name = current_table;
+				if (!row_type.empty() && row_type[0] == 'V') {
+					table_meta.object_type = MSSQLObjectType::VIEW;
+				} else {
+					table_meta.object_type = MSSQLObjectType::TABLE;
+				}
+				try {
+					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+				} catch (...) {
+					table_meta.approx_row_count = 0;
+				}
+				// Physical shape from the same aggregated subquery (see the header):
+				// values[12] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+				// object. Both drive the write path's TABLOCK and sort decisions.
+				ParseTableShape(values, 12, 13, table_meta);
+				schema.tables.emplace(current_table, std::move(table_meta));
+				auto table_it = schema.tables.find(current_table);
+				current_table_meta = &table_it->second;
+				table_count++;
+			}
+
+			// Parse column
+			int32_t col_id = 0;
 			try {
-				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+				col_id = static_cast<int32_t>(std::stoi(col_id_str));
 			} catch (...) {
-				table_meta.approx_row_count = 0;
 			}
-			// Physical shape from the same aggregated subquery (see the header):
-			// values[12] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-			// object. Both drive the write path's TABLOCK and sort decisions.
-			ParseTableShape(values, 12, 13, table_meta);
-			schema.tables.emplace(current_table, std::move(table_meta));
-			auto table_it = schema.tables.find(current_table);
-			current_table_meta = &table_it->second;
-			table_count++;
-		}
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(max_len_str));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(prec_str));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(scale_str));
+			} catch (...) {
+			}
+			bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
 
-		// Parse column
-		int32_t col_id = 0;
-		try {
-			col_id = static_cast<int32_t>(std::stoi(col_id_str));
-		} catch (...) {
-		}
-		int16_t max_len = 0;
-		try {
-			max_len = static_cast<int16_t>(std::stoi(max_len_str));
-		} catch (...) {
-		}
-		uint8_t prec = 0;
-		try {
-			prec = static_cast<uint8_t>(std::stoi(prec_str));
-		} catch (...) {
-		}
-		uint8_t scl = 0;
-		try {
-			scl = static_cast<uint8_t>(std::stoi(scale_str));
-		} catch (...) {
-		}
-		bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
-
-		MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-								 database_collation_);
-		current_table_meta->columns.push_back(std::move(col_info));
-		column_count++;
-	});
+			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+									 database_collation_);
+			current_table_meta->columns.push_back(std::move(col_info));
+			column_count++;
+		},
+		[&]() {
+			// The pre-query state was an empty table map (cleared above) and a
+			// group-by parse that has not seen a row. Restoring both is the undo;
+			// the counters are the caller's totals for THIS schema, so they go too.
+			schema.tables.clear();
+			current_table.clear();
+			current_table_meta = nullptr;
+			table_count = 0;
+			column_count = 0;
+		});
 
 	// Mark all tables as loaded
 	auto now = std::chrono::steady_clock::now();
@@ -672,7 +708,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 					schemas_to_load.push_back(values[0]);
 				}
 			},
-			metadata_timeout_ms_);
+			metadata_timeout_ms_, [&]() { schemas_to_load.clear(); });
 
 		CACHE_DEBUG(1, "BulkLoadAll: discovered %zu schemas to load", schemas_to_load.size());
 	}
@@ -709,101 +745,119 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		idx_t schema_tables = 0;
 		idx_t schema_columns = 0;
 
-		ExecuteMetadataQuery(connection, sql, [&](const vector<string> &values) {
-			// 14 columns: schema, object, type, approx_rows, the eight per-column
-			// fields, then index_id and partition_count. Guard the LAST index read.
-			if (values.size() < 14) {
-				return;
-			}
-
-			string row_table = values[1];
-			string row_type = values[2];
-			string row_approx_rows = values[3];
-			string col_name = values[4];
-			string col_id_str = values[5];
-			string type_name = values[6];
-			string max_len_str = values[7];
-			string prec_str = values[8];
-			string scale_str = values[9];
-			string nullable_str = values[10];
-			string collation = values[11];
-
-			// Apply table filter
-			if (filter_ && !filter_->MatchesTable(row_table)) {
-				return;
-			}
-
-			// New table group?
-			if (row_table != current_table) {
-				current_table = row_table;
-
-				auto &tables = schema.tables;
-				auto table_it = tables.find(current_table);
-				if (table_it == tables.end()) {
-					MSSQLTableMetadata table_meta;
-					table_meta.name = current_table;
-
-					// Object type
-					if (!row_type.empty() && row_type[0] == 'V') {
-						table_meta.object_type = MSSQLObjectType::VIEW;
-					} else {
-						table_meta.object_type = MSSQLObjectType::TABLE;
-					}
-
-					// Approximate row count
-					try {
-						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
-					} catch (...) {
-						table_meta.approx_row_count = 0;
-					}
-					// Physical shape from the same aggregated subquery (see the header):
-					// values[12] is sys.indexes.type — 1 clustered rowstore, 5
-					// clustered COLUMNSTORE, 0 heap — and partition_count > 1 marks
-					// a partitioned object. Both drive the write path's TABLOCK and
-					// sort decisions.
-					ParseTableShape(values, 12, 13, table_meta);
-
-					tables.emplace(current_table, std::move(table_meta));
-					table_it = tables.find(current_table);
-					schema_tables++;
-					table_count++;
-				} else {
-					// Table already exists (e.g. columns loaded by a prior single-table query).
-					// Clear columns to avoid duplicates, since we're reloading from bulk query.
-					table_it->second.columns.clear();
+		ExecuteMetadataQuery(
+			connection, sql,
+			[&](const vector<string> &values) {
+				// 14 columns: schema, object, type, approx_rows, the eight per-column
+				// fields, then index_id and partition_count. Guard the LAST index read.
+				if (values.size() < 14) {
+					return;
 				}
-				current_table_meta = &table_it->second;
-			}
 
-			// Parse column info
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(col_id_str));
-			} catch (...) {
-			}
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(max_len_str));
-			} catch (...) {
-			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(prec_str));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(scale_str));
-			} catch (...) {
-			}
-			bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+				string row_table = values[1];
+				string row_type = values[2];
+				string row_approx_rows = values[3];
+				string col_name = values[4];
+				string col_id_str = values[5];
+				string type_name = values[6];
+				string max_len_str = values[7];
+				string prec_str = values[8];
+				string scale_str = values[9];
+				string nullable_str = values[10];
+				string collation = values[11];
 
-			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-									 database_collation_);
-			current_table_meta->columns.push_back(std::move(col_info));
-			schema_columns++;
-			column_count++;
-		});
+				// Apply table filter
+				if (filter_ && !filter_->MatchesTable(row_table)) {
+					return;
+				}
+
+				// New table group?
+				if (row_table != current_table) {
+					current_table = row_table;
+
+					auto &tables = schema.tables;
+					auto table_it = tables.find(current_table);
+					if (table_it == tables.end()) {
+						MSSQLTableMetadata table_meta;
+						table_meta.name = current_table;
+
+						// Object type
+						if (!row_type.empty() && row_type[0] == 'V') {
+							table_meta.object_type = MSSQLObjectType::VIEW;
+						} else {
+							table_meta.object_type = MSSQLObjectType::TABLE;
+						}
+
+						// Approximate row count
+						try {
+							table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+						} catch (...) {
+							table_meta.approx_row_count = 0;
+						}
+						// Physical shape from the same aggregated subquery (see the header):
+						// values[12] is sys.indexes.type — 1 clustered rowstore, 5
+						// clustered COLUMNSTORE, 0 heap — and partition_count > 1 marks
+						// a partitioned object. Both drive the write path's TABLOCK and
+						// sort decisions.
+						ParseTableShape(values, 12, 13, table_meta);
+
+						tables.emplace(current_table, std::move(table_meta));
+						table_it = tables.find(current_table);
+						schema_tables++;
+						table_count++;
+					} else {
+						// Table already exists (e.g. columns loaded by a prior single-table query).
+						// Clear columns to avoid duplicates, since we're reloading from bulk query.
+						table_it->second.columns.clear();
+					}
+					current_table_meta = &table_it->second;
+				}
+
+				// Parse column info
+				int32_t col_id = 0;
+				try {
+					col_id = static_cast<int32_t>(std::stoi(col_id_str));
+				} catch (...) {
+				}
+				int16_t max_len = 0;
+				try {
+					max_len = static_cast<int16_t>(std::stoi(max_len_str));
+				} catch (...) {
+				}
+				uint8_t prec = 0;
+				try {
+					prec = static_cast<uint8_t>(std::stoi(prec_str));
+				} catch (...) {
+				}
+				uint8_t scl = 0;
+				try {
+					scl = static_cast<uint8_t>(std::stoi(scale_str));
+				} catch (...) {
+				}
+				bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+
+				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+										 database_collation_);
+				current_table_meta->columns.push_back(std::move(col_info));
+				schema_columns++;
+				column_count++;
+			},
+			[&]() {
+				// Deliberately NOT schema.tables.clear(): unlike LoadAllTableMetadata
+				// this pass MERGES into a map that may already hold tables from an
+				// earlier single-table load, and clearing would drop entries this
+				// query never covers (a table filtered out by table_filter, say).
+				// It does not need to: emptying current_table makes the rerun's first
+				// row take the new-table branch, which clears that table's columns
+				// before refilling them. Only the group-by cursor and this schema's
+				// share of the running totals have to be given back.
+				current_table.clear();
+				current_table_meta = nullptr;
+				table_count -= schema_tables;
+				column_count -= schema_columns;
+				schema_tables = 0;
+				schema_columns = 0;
+			});
 
 		CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns", target_schema.c_str(),
 					(unsigned long long)schema_tables, (unsigned long long)schema_columns);
@@ -965,8 +1019,9 @@ int MSSQLMetadataCache::GetMetadataTimeoutMs() const {
 }
 
 void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql,
-											  MSSQLMetadataCache::MetadataRowCallback callback) {
-	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_);
+											  MSSQLMetadataCache::MetadataRowCallback callback,
+											  MSSQLMetadataCache::MetadataResetCallback reset) {
+	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1006,13 +1061,19 @@ void MSSQLMetadataCache::EnsureSchemasLoaded(tds::TdsConnection &connection) {
 		}
 		schema_sql += "\nORDER BY s.name";
 
-		ExecuteMetadataQuery(connection, schema_sql, [this](const vector<string> &values) {
-			if (!values.empty()) {
-				string schema_name = values[0];
-				// Create schema with only name - tables NOT loaded (tables_load_state = NOT_LOADED)
-				schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name));
-			}
-		});
+		ExecuteMetadataQuery(
+			connection, schema_sql,
+			[this](const vector<string> &values) {
+				if (!values.empty()) {
+					string schema_name = values[0];
+					// Create schema with only name - tables NOT loaded (tables_load_state = NOT_LOADED)
+					schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name));
+				}
+			},
+			[]() {
+				// Nothing to undo: emplace() on an existing key is a no-op, so a
+				// second pass over the same schema names converges on the same map.
+			});
 
 		// Update state
 		CACHE_DEBUG(1, "EnsureSchemasLoaded — loaded %zu schemas", schemas_.size());
@@ -1072,38 +1133,48 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 		}
 		query += "\nORDER BY o.name";
 
-		ExecuteMetadataQuery(connection, query, [&schema](const vector<string> &values) {
-			// 5 columns: object_name, object_type, approx_rows, index_id,
-			// partition_count. Guard the LAST index read, not the first.
-			if (values.size() >= 5) {
-				MSSQLTableMetadata table_meta;
-				table_meta.name = values[0];
+		ExecuteMetadataQuery(
+			connection, query,
+			[&schema](const vector<string> &values) {
+				// 5 columns: object_name, object_type, approx_rows, index_id,
+				// partition_count. Guard the LAST index read, not the first.
+				if (values.size() >= 5) {
+					MSSQLTableMetadata table_meta;
+					table_meta.name = values[0];
 
-				// Object type: 'U' = table, 'V' = view
-				string type_char = values[1];
-				if (!type_char.empty()) {
-					char c = type_char[0];
-					table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
-				} else {
-					table_meta.object_type = MSSQLObjectType::TABLE;
+					// Object type: 'U' = table, 'V' = view
+					string type_char = values[1];
+					if (!type_char.empty()) {
+						char c = type_char[0];
+						table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
+					} else {
+						table_meta.object_type = MSSQLObjectType::TABLE;
+					}
+
+					// Parse row count
+					try {
+						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
+					} catch (...) {
+						table_meta.approx_row_count = 0;
+					}
+					// Physical shape from the same aggregated subquery (see the header):
+					// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+					// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+					// object. Both drive the write path's TABLOCK and sort decisions.
+					ParseTableShape(values, 3, 4, table_meta);
+
+					// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
+					schema.tables.emplace(table_meta.name, std::move(table_meta));
 				}
-
-				// Parse row count
-				try {
-					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
-				} catch (...) {
-					table_meta.approx_row_count = 0;
-				}
-				// Physical shape from the same aggregated subquery (see the header):
-				// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-				// object. Both drive the write path's TABLOCK and sort decisions.
-				ParseTableShape(values, 3, 4, table_meta);
-
-				// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
-				schema.tables.emplace(table_meta.name, std::move(table_meta));
-			}
-		});
+			},
+			[&schema]() {
+				// emplace() is a no-op on a key already present, so a partial pass
+				// followed by a full one lands the same entries — but only because
+				// this query carries no columns. Clear anyway: entries this attempt
+				// created hold a row count and index shape read from a catalog that
+				// a concurrent DDL was in the middle of changing.
+				schema.tables.clear();
+			});
 
 		// Update state
 		CACHE_DEBUG(1, "EnsureTablesLoaded('%s') — loaded %zu tables (no column queries)", schema_name.c_str(),
@@ -1215,14 +1286,21 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 	}
 	sql += "\nORDER BY s.name";
 
-	ExecuteMetadataQuery(connection, sql, [this](const vector<string> &values) {
-		if (!values.empty()) {
-			string schema_name = values[0];
-			MSSQLSchemaMetadata schema_meta;
-			schema_meta.name = schema_name;
-			schemas_[schema_name] = std::move(schema_meta);
-		}
-	});
+	ExecuteMetadataQuery(
+		connection, sql,
+		[this](const vector<string> &values) {
+			if (!values.empty()) {
+				string schema_name = values[0];
+				MSSQLSchemaMetadata schema_meta;
+				schema_meta.name = schema_name;
+				schemas_[schema_name] = std::move(schema_meta);
+			}
+		},
+		[this]() {
+			// schemas_[name] = ... overwrites, so re-running only rewrites the same
+			// entries. Not cleared: schemas_ may hold tables loaded earlier that
+			// this query does not re-report.
+		});
 }
 
 void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string &schema_name) {
@@ -1239,38 +1317,46 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 
 	auto &schema_meta = schemas_[schema_name];
 
-	ExecuteMetadataQuery(connection, query, [&schema_meta](const vector<string> &values) {
-		// 5 columns: object_name, object_type, approx_rows, index_id,
-		// partition_count. Guard the LAST index read, not the first.
-		if (values.size() >= 5) {
-			MSSQLTableMetadata table_meta;
-			table_meta.name = values[0];
+	ExecuteMetadataQuery(
+		connection, query,
+		[&schema_meta](const vector<string> &values) {
+			// 5 columns: object_name, object_type, approx_rows, index_id,
+			// partition_count. Guard the LAST index read, not the first.
+			if (values.size() >= 5) {
+				MSSQLTableMetadata table_meta;
+				table_meta.name = values[0];
 
-			// Object type: 'U' = table, 'V' = view
-			string type_char = values[1];
-			if (!type_char.empty()) {
-				// Trim whitespace from type (SQL Server pads char columns)
-				char c = type_char[0];
-				table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
-			} else {
-				table_meta.object_type = MSSQLObjectType::TABLE;
+				// Object type: 'U' = table, 'V' = view
+				string type_char = values[1];
+				if (!type_char.empty()) {
+					// Trim whitespace from type (SQL Server pads char columns)
+					char c = type_char[0];
+					table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
+				} else {
+					table_meta.object_type = MSSQLObjectType::TABLE;
+				}
+
+				// Parse row count
+				try {
+					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
+				} catch (...) {
+					table_meta.approx_row_count = 0;
+				}
+				// Physical shape from the same aggregated subquery (see the header):
+				// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
+				// object. Both drive the write path's TABLOCK and sort decisions.
+				ParseTableShape(values, 3, 4, table_meta);
+
+				schema_meta.tables[table_meta.name] = std::move(table_meta);
 			}
-
-			// Parse row count
-			try {
-				table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
-			} catch (...) {
-				table_meta.approx_row_count = 0;
-			}
-			// Physical shape from the same aggregated subquery (see the header):
-			// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-			// COLUMNSTORE, 0 heap — and partition_count > 1 marks a partitioned
-			// object. Both drive the write path's TABLOCK and sort decisions.
-			ParseTableShape(values, 3, 4, table_meta);
-
-			schema_meta.tables[table_meta.name] = std::move(table_meta);
-		}
-	});
+		},
+		[&schema_meta]() {
+			// tables[name] = ... overwrites rather than appends, so the rerun is
+			// idempotent for the rows it re-reads; clearing gives back the entries
+			// the aborted pass had already written from a catalog mid-change.
+			schema_meta.tables.clear();
+		});
 }
 
 void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const string &schema_name,
@@ -1281,38 +1367,46 @@ void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const strin
 	// Build query with object name
 	string query = StringUtil::Format(COLUMN_DISCOVERY_SQL_TEMPLATE, full_name);
 
-	ExecuteMetadataQuery(connection, query, [this, &table_metadata](const vector<string> &values) {
-		if (values.size() >= 8) {
-			string col_name = values[0];
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(values[1]));
-			} catch (...) {
-			}
-			string type_name = values[2];
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(values[3]));
-			} catch (...) {
-			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(values[4]));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(values[5]));
-			} catch (...) {
-			}
-			bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
-			string collation = values[7];
+	ExecuteMetadataQuery(
+		connection, query,
+		[this, &table_metadata](const vector<string> &values) {
+			if (values.size() >= 8) {
+				string col_name = values[0];
+				int32_t col_id = 0;
+				try {
+					col_id = static_cast<int32_t>(std::stoi(values[1]));
+				} catch (...) {
+				}
+				string type_name = values[2];
+				int16_t max_len = 0;
+				try {
+					max_len = static_cast<int16_t>(std::stoi(values[3]));
+				} catch (...) {
+				}
+				uint8_t prec = 0;
+				try {
+					prec = static_cast<uint8_t>(std::stoi(values[4]));
+				} catch (...) {
+				}
+				uint8_t scl = 0;
+				try {
+					scl = static_cast<uint8_t>(std::stoi(values[5]));
+				} catch (...) {
+				}
+				bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
+				string collation = values[7];
 
-			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-									 database_collation_);
-			table_metadata.columns.push_back(std::move(col_info));
-		}
-	});
+				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+										 database_collation_);
+				table_metadata.columns.push_back(std::move(col_info));
+			}
+		},
+		[&table_metadata]() {
+			// push_back: the one accumulation that is outright wrong to repeat.
+			// This is the "Column with name x already exists!" the old
+			// rows_delivered == 0 guard existed to prevent.
+			table_metadata.columns.clear();
+		});
 }
 
 }  // namespace duckdb
