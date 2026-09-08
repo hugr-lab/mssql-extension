@@ -30,6 +30,30 @@ sidebar_position: 3
 | `NCHAR(n)`        | `VARCHAR`      | UTF-16LE decoded             |
 | `NVARCHAR(n)`     | `VARCHAR`      | UTF-16LE decoded             |
 
+**Non-Unicode `CHAR` / `VARCHAR` carry a code page, and only the catalog casts it away.**
+`CHAR`, `VARCHAR` and `TEXT` hold bytes in the *column's* code page —
+`Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS` is CP1251 — while
+DuckDB `VARCHAR` is UTF-8 by contract. A **catalog scan** rewrites those columns
+to `CAST(col AS NVARCHAR(...))` server-side, so three-part-name queries (and the
+`COPY` / `CREATE TABLE AS` that read through them) always get UTF-8. A raw
+`mssql_scan()` has no such rewrite: the bytes arrive unchanged, and for anything
+outside ASCII the result is **not valid UTF-8** — it is not rejected, it is
+stored and then mangled by whatever touches it (`upper('naïve')` → `'NA'`).
+
+Add the cast yourself in the T-SQL:
+
+```sql
+SELECT * FROM mssql_scan('db',
+    'SELECT id, CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
+```
+
+`NVARCHAR(MAX)` rather than a fixed width: SQL Server does not raise on a
+narrowing character `CAST`, so `NVARCHAR(50)` would silently truncate. Columns
+with a UTF-8 collation (`..._UTF8`, SQL Server 2019+) need nothing — they are
+already UTF-8 — but note that the default collation of a SQL Server
+installation is *not* one of those. See
+[Troubleshooting](../reference/troubleshooting.md#raw-mssql_scan-does-not-transcode-code-pages).
+
 ### Binary Types
 
 | SQL Server Type   | DuckDB Type    | Notes                        |

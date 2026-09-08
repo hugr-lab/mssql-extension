@@ -123,15 +123,72 @@ SET mssql_convert_varchar_max = false;
 
 **Notes:**
 
-1. **Catalog queries only**: This conversion applies only to catalog-based queries (three-part naming like `db.schema.table`). When using `mssql_scan()` with raw SQL, you must manually add CAST expressions:
+1. **Catalog queries only**: This conversion applies only to catalog-based queries (three-part naming like `db.schema.table`). When using `mssql_scan()` with raw SQL, you must add the CAST yourself — see [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages) below for what happens if you do not.
 
 ```sql
--- Without CAST: may fail with UTF-8 validation error for extended ASCII
+-- No CAST: the raw code-page bytes are returned as-is. For a non-UTF8
+-- collation that is NOT valid UTF-8, and string functions will mangle it.
 FROM mssql_scan('db', 'SELECT name FROM dbo.customers');
 
--- With CAST: properly handles extended ASCII characters
-FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(100)) AS name FROM dbo.customers');
+-- With CAST: SQL Server transcodes to UTF-16 and the extension decodes it.
+FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
 ```
+
+### Raw `mssql_scan()` does not transcode code pages
+
+**Symptom.** A string read through `mssql_scan()` looks right in the output but
+behaves as if it were truncated. The classic shape is a string function
+returning less than it was given:
+
+```sql
+SELECT upper(name) FROM mssql_scan('db', 'SELECT name FROM dbo.t');
+-- 'naïve' comes back as 'NA'
+```
+
+**Cause.** SQL Server's `CHAR` / `VARCHAR` / `TEXT` carry bytes in the
+**column's own code page** — `Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS`
+is CP1251, and so on. DuckDB `VARCHAR` is UTF-8 by contract. The extension does
+not transcode legacy code pages: it hands those bytes to DuckDB unchanged, and
+for anything outside ASCII the result is not valid UTF-8. It is not rejected —
+it is stored, displayed, and then mangled by whatever touches it. `ï` in CP1252
+is the single byte `0xEF`, which UTF-8 reads as the start of a three-byte
+sequence, so `upper()` consumes the two bytes after it and returns `NA`.
+
+The transcoding SQL Server *will* do for you is a `CAST` to a Unicode type, and
+that is what the fix is.
+
+**Fix — one of:**
+
+```sql
+-- 1. CAST in the query. NVARCHAR(MAX), not NVARCHAR(n): SQL Server does not
+--    raise on a narrowing character CAST, so a fixed width silently truncates.
+SELECT * FROM mssql_scan('db',
+    'SELECT id, CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
+
+-- 2. Read through the attached catalog instead, which adds that CAST for you.
+SELECT id, name FROM db.dbo.customers;
+```
+
+**When this cannot happen:**
+
+- **Catalog scans** (three-part names, and therefore `COPY`/`CREATE TABLE AS`
+  reading from them) — the generated `SELECT` casts every non-Unicode string
+  column server-side. The one exception is a declared `VARCHAR(MAX)` when
+  `mssql_convert_varchar_max = false`, which opts out of that cast on purpose.
+- **`NCHAR` / `NVARCHAR` / `NTEXT` / `XML`** — always UTF-16 on the wire,
+  always decoded.
+- **UTF-8 collations** (`..._UTF8`, SQL Server 2019 and later). Those columns
+  are already UTF-8, so the bytes are correct with or without a cast. Note that
+  the *default* collation of a SQL Server installation is not one of these —
+  `SQL_Latin1_General_CP1_CI_AS` is CP1252 — so a `varchar` column is in a
+  legacy code page unless somebody chose otherwise.
+- **ASCII-only data**, in any code page: every byte is already valid UTF-8.
+
+Tracked as [issue #224](https://github.com/hugr-lab/mssql-extension/issues/224).
+Validating every value on read was considered and rejected: the check would sit
+on the scan's hot path, and it would be paid mostly by UTF-8 columns that cannot
+be affected. An explicit `CAST` in a query you wrote yourself is the cheaper
+contract.
 
 
 ### Unicode Transcoding (simdutf)
@@ -154,6 +211,7 @@ The codec validates the input first and falls back to a slower scalar implementa
 ### Known Issues
 
 - Catalog scans auto-CAST server-specific types (`SQL_VARIANT`, `hierarchyid`, CLR UDTs) to `NVARCHAR(MAX)`, so three-part-name queries succeed; raw `mssql_scan()` needs an explicit CAST for such columns
+- Raw `mssql_scan()` returns non-Unicode `CHAR`/`VARCHAR`/`TEXT` bytes in the column's code page without transcoding them, so a non-ASCII value is not valid UTF-8 and string functions mangle it silently — add `CAST(col AS NVARCHAR(MAX))`, or read through the catalog. See [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages)
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
