@@ -10,7 +10,7 @@
 // We must look through these projections to find the underlying scan.
 
 #include "table_scan/mssql_optimizer.hpp"
-#include <cstdlib>
+#include <map>
 #include <unordered_set>
 #include "catalog/mssql_catalog.hpp"
 #include "duckdb/main/database.hpp"
@@ -645,6 +645,72 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 //------------------------------------------------------------------------------
 // Main optimizer entry point
 //------------------------------------------------------------------------------
+//===----------------------------------------------------------------------===//
+// Issue #239: two scans of one catalog cannot share a pinned connection
+//===----------------------------------------------------------------------===//
+//
+// An explicit transaction pins ONE TDS connection per catalog, and every read on
+// that catalog is routed to it. A scan holds that connection from InitGlobal
+// until its last row is drained, and DuckDB does not promise to drain one source
+// before initializing the next — a decorrelated subquery (LEFT_DELIM_JOIN +
+// DELIM_SCAN) initializes both, and the second batch finds the connection in
+// Executing:
+//
+//     Cannot execute: connection not in Idle state (current: Executing)
+//
+// With threads > 1 the two run concurrently and it is a torn stream instead.
+//
+// So: in an explicit transaction, a plan with MORE THAN ONE scan of the same
+// catalog materializes all of them. Autocommit is untouched — there each scan
+// takes its own pooled connection, which is why the same query passes outside a
+// transaction.
+//
+// ALL of them, not "all but the first": which source DuckDB initializes first is
+// a scheduling detail rather than a plan property, and the DELIM case initializes
+// both before draining either. duckdb-postgres, which has the same one-connection
+// constraint, does the same.
+//
+// Memory is bounded by the buffer manager — ColumnDataCollection spills — and the
+// shape that needs this is metadata-sized by nature: it is a transaction doing
+// several reads of its own catalog, not a bulk scan.
+static void CollectCatalogScans(LogicalOperator &op, std::map<string, vector<MSSQLCatalogScanBindData *>> &by_catalog) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		// static_cast, not dynamic_cast: this repo keeps RTTI off the planning path
+		// (job 1124 removed one from MSSQLCatalogScanCardinality for the same
+		// reason; mssql_storage.cpp and azure_secret_reader.cpp say why). The
+		// function-name test above is the discriminator — a LogicalGet naming
+		// mssql_catalog_scan can only carry our bind data, because we are the only
+		// thing that binds it.
+		if (get.function.name == "mssql_catalog_scan" && get.bind_data) {
+			auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
+			by_catalog[bind_data.context_name].push_back(&bind_data);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectCatalogScans(*child, by_catalog);
+	}
+}
+
+static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOperator &plan) {
+	// Autocommit gives every scan its own pooled connection, so there is nothing
+	// to share and nothing to serialize. This is the same test the DML executors
+	// use to decide whether they are on a pinned connection.
+	if (context.transaction.IsAutoCommit()) {
+		return;
+	}
+	std::map<string, vector<MSSQLCatalogScanBindData *>> by_catalog;
+	CollectCatalogScans(plan, by_catalog);
+	for (auto &entry : by_catalog) {
+		if (entry.second.size() < 2) {
+			continue;
+		}
+		for (auto *bind_data : entry.second) {
+			bind_data->requires_materialization = true;
+		}
+	}
+}
+
 void MSSQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	// Try each pattern on the current node
 	TryPushTopN(input.context, plan);
@@ -655,6 +721,12 @@ void MSSQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	for (auto &child : plan->children) {
 		Optimize(input, child);
 	}
+}
+
+void MSSQLOptimizer::OptimizeRoot(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	Optimize(input, plan);
+	// Whole-plan property, so it runs once at the root rather than per node.
+	MaterializeSharedConnectionScans(input.context, *plan);
 }
 
 }  // namespace duckdb

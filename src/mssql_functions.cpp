@@ -250,6 +250,7 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	// ORDER BY pushdown fields (Spec 039)
 	result->order_by_clause = order_by_clause;
 	result->top_n = top_n;
+	result->requires_materialization = requires_materialization;
 	// RowId support fields
 	result->rowid_requested = rowid_requested;
 	result->pk_column_names = pk_column_names;

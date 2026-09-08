@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
@@ -49,6 +50,7 @@ namespace mssql {
 
 // Forward declarations for internal functions
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, idx_t row_count);
 
 // Execute the filters the encoder refused to push (see ClientTableFilter) over
 // a filled output chunk. Each filter's expression sees its column as
@@ -516,7 +518,20 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
-	// Execute the query
+	// Execute the query.
+	//
+	// Issue #239: a materialized scan holds the catalog's materialize mutex from
+	// here until after its drain below. R2's drain alone is enough at threads = 1,
+	// where DuckDB initializes the two sources in sequence; with threads > 1 the
+	// InitGlobals race and the second batch lands mid-stream. The lock makes the
+	// pair sequential, which they already are by construction — they share one
+	// pinned connection.
+	std::unique_lock<std::mutex> materialize_lock;
+	if (bind_data.requires_materialization) {
+		// Identifier at the DuckDB API boundary, std::string inside (CLAUDE.md).
+		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
+		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutex());
+	}
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, query);
 
@@ -639,6 +654,58 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		}
 	}
 
+	// Issue #239: drain now, so the connection is Idle before the next scan on this
+	// catalog initializes.
+	//
+	// Only reachable when MSSQLOptimizer set the flag, which it does for a plan
+	// holding more than one scan of this catalog inside an explicit transaction —
+	// the case where all of them share the one pinned connection. Streaming is
+	// untouched everywhere else.
+	//
+	// The drain deliberately reuses the normal execution path rather than a second
+	// row reader: FillChunk applies the projection, the rowid construction and the
+	// warnings exactly as a streaming scan would, so a materialized scan and a
+	// streamed one cannot diverge in what they produce.
+	if (bind_data.requires_materialization && result->result_stream) {
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materializing (issue #239 — shared pinned connection)");
+		// The output shape, derived the same way DuckDB derives it for Execute:
+		// one slot per column_id, the rowid slot carrying the bind data's rowid
+		// type and any other virtual/empty identifier carrying a placeholder that
+		// is never written (projected_column_count bounds what FillChunk fills).
+		vector<LogicalType> chunk_types;
+		chunk_types.reserve(column_ids.size());
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
+				chunk_types.push_back(bind_data.rowid_type);
+			} else if (column_ids[i] >= VIRTUAL_COL_START || column_ids[i] >= bind_data.all_types.size()) {
+				chunk_types.push_back(LogicalType::BIGINT);
+			} else {
+				chunk_types.push_back(bind_data.all_types[column_ids[i]]);
+			}
+		}
+		result->materialized = make_uniq<ColumnDataCollection>(Allocator::Get(context), chunk_types);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(context), chunk_types);
+		idx_t total = 0;
+		for (;;) {
+			chunk.Reset();
+			const idx_t rows = result->result_stream->FillChunk(chunk);
+			if (rows == 0) {
+				break;
+			}
+			PopulateRowIdVector(*result, chunk, rows);
+			result->materialized->Append(chunk);
+			total += rows;
+		}
+		result->result_stream->SurfaceWarnings(context);
+		// Closing the stream is what releases the connection back to Idle. Without
+		// it the drain would have read every row and still deadlocked the next scan.
+		result->result_stream.reset();
+		result->materialized->InitializeScan(result->materialized_scan);
+		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: materialized %llu row(s), connection released",
+							 (unsigned long long)total);
+	}
+
 	return std::move(result);
 }
 
@@ -731,6 +798,19 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &global_state = data.global_state->Cast<MSSQLScanGlobalState>();
+
+	// Issue #239: a materialized scan has no stream — InitGlobal drained it and
+	// released the connection. Serve from the collection. This has to come first:
+	// the rowid/PK plumbing below all keys off result_stream, and the rows in the
+	// collection already went through it during the drain.
+	if (global_state.materialized) {
+		output.Reset();
+		global_state.materialized->Scan(global_state.materialized_scan, output);
+		if (output.size() == 0) {
+			global_state.done = true;
+		}
+		return;
+	}
 
 	// Start timing on first call
 	if (!global_state.timing_started) {
@@ -1270,6 +1350,10 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 	serializer.WriteProperty(103, "complex_filter_where_clause", bind_data.complex_filter_where_clause);
 	serializer.WriteProperty(104, "order_by_clause", bind_data.order_by_clause);
 	serializer.WriteProperty(105, "top_n", bind_data.top_n);
+	// Two scans of one catalog that differ ONLY in this flag must not be folded
+	// together by the common-subplan optimizer: one holds its connection open and
+	// the other does not, which is the whole point of the flag.
+	serializer.WriteProperty(106, "requires_materialization", bind_data.requires_materialization);
 }
 
 // NOTE: nothing in DuckDB round-trips a logical plan today — the only caller of
@@ -1285,6 +1369,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto complex_filter_where_clause = deserializer.ReadProperty<string>(103, "complex_filter_where_clause");
 	auto order_by_clause = deserializer.ReadProperty<string>(104, "order_by_clause");
 	auto top_n = deserializer.ReadProperty<int64_t>(105, "top_n");
+	auto requires_materialization = deserializer.ReadProperty<bool>(106, "requires_materialization");
 
 	auto &context = deserializer.Get<ClientContext &>();
 
@@ -1309,6 +1394,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	}
 
 	auto &result = bind_data->Cast<MSSQLCatalogScanBindData>();
+	result.requires_materialization = requires_materialization;
 	result.complex_filter_where_clause = complex_filter_where_clause;
 	result.order_by_clause = order_by_clause;
 	result.top_n = top_n;
