@@ -4,6 +4,7 @@
 #              (UTF-16), so the declared wire length must be 2x the sys.columns byte
 #              length, not the raw value (which halved the effective capacity).
 # group: [copy] [integration]
+# issue: 181
 
 require mssql
 

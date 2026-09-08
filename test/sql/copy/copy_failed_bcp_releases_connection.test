@@ -6,6 +6,7 @@
 #              open, holding locks on the target table until process exit. Every later statement
 #              touching that table then blocked until the query timeout.
 # group: [copy] [integration]
+# issue: 191
 
 require mssql
 

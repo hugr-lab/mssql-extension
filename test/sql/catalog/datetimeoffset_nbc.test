@@ -1,6 +1,7 @@
 # name: test/sql/catalog/datetimeoffset_nbc.test
 # description: Integration tests for DATETIMEOFFSET in NBCROW encoding (issue #78)
 # group: [sql]
+# issue: 78
 #
 # REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
 # Run with: make integration-test

@@ -1,4 +1,5 @@
 // test/cpp/test_gssapi_runtime.cpp
+// issue: 161
 //
 // Unit tests for the lazy GSSAPI/krb5 runtime loader (spec 053, issue #161).
 //

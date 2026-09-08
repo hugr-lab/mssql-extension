@@ -1,6 +1,7 @@
 # name: test/sql/copy/copy_auto_tablock.test
 # description: Test auto-TABLOCK for COPY TO new tables (Issue #45)
 # group: [copy]
+# issue: 45
 
 require mssql
 

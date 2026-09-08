@@ -1,6 +1,7 @@
 # name: test/sql/dml/no_pk_update_delete.test
 # description: UPDATE/DELETE on tables without a primary key must fail with a clean, consistent BinderException (regression for issues #140 and #141)
 # group: [mssql]
+# issue: 140, 141
 #
 # Issue #140: UPDATE on a no-PK table fails with a Binder Error (working as designed).
 # Issue #141: DELETE on a no-PK table fails with an INTERNAL assertion failure

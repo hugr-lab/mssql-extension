@@ -1,6 +1,7 @@
 # name: test/sql/catalog/exec_invalidate_cache_setting.test
 # description: mssql_exec_invalidate_cache setting + mssql_invalidate_cache() point invalidation (issue #151 follow-up)
 # group: [mssql]
+# issue: 151
 #
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

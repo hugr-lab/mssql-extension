@@ -1,6 +1,7 @@
 # name: test/sql/catalog/partitioned_table.test
 # description: Partitioned tables must not duplicate columns or under-report rows (issue #85)
 # group: [mssql]
+# issue: 85
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

@@ -1,6 +1,7 @@
 # name: test/sql/query/legacy_lob_types.test
 # description: TEXT / NTEXT / IMAGE are readable — catalog scan and mssql_scan (issue #197)
 # group: [mssql]
+# issue: 197
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database

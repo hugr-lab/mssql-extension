@@ -1,4 +1,5 @@
 // test/cpp/test_issue_96_attach_loop.cpp
+// issue: 96
 //
 // Spec 047 (Process-Wide State Cleanup) — US1 acceptance test, T024.
 // C++ port of the verbatim Python loop from
