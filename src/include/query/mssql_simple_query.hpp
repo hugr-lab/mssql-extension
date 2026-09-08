@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include "tds/tds_connection.hpp"
+#include "tds/tds_token_parser.hpp"
 
 namespace duckdb {
 
@@ -40,6 +41,13 @@ struct SimpleQueryResult {
 
 	// Affected row count from DONE token (for DML operations)
 	int64_t rows_affected = 0;
+
+	//! INFO tokens the server sent: PRINT output, RAISERROR below severity 11,
+	//! procedure progress notices. Collected rather than dropped so the callers
+	//! that have a ClientContext can log them; this class has none by design --
+	//! every catalog metadata query goes through it too, and a normal query
+	//! sends no INFO tokens at all, so an untouched empty vector costs nothing.
+	std::vector<tds::TdsInfo> info_messages;
 
 	bool HasError() const {
 		return !success;

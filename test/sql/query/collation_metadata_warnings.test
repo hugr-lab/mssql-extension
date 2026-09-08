@@ -106,5 +106,70 @@ SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%
 ----
 1
 
+# =============================================================================
+# A query that stops early. This is the shape most likely to meet a code-page
+# column for the first time, and it is the one that said nothing until the
+# warning moved to init: the executor simply stops asking for chunks, the stream
+# is closed undrained, and the drain-end call is never reached.
+#
+# TOP 5000 on the server against LIMIT 1 on the client, so the stream really is
+# abandoned with rows outstanding rather than finishing inside one chunk.
+# =============================================================================
+
+query I
+SELECT count(*) FROM (
+    SELECT v FROM mssql_scan('coll', '
+        SELECT TOP 5000 CAST(''x'' AS VARCHAR(50)) COLLATE Cyrillic_General_CI_AS AS v
+        FROM sys.all_objects a CROSS JOIN sys.all_objects b') LIMIT 1);
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%"v"%';
+----
+1
+
+# Exactly one, not two. SurfaceWarnings is deliberately called twice per stream
+# now -- once when COLMETADATA is known and once at the drain -- so the column
+# half has to be one-shot. A fully drained stream is the case where both calls
+# actually happen.
+query I
+SELECT count(*) FROM mssql_scan('coll', '
+    SELECT CAST(''y'' AS VARCHAR(50)) COLLATE Cyrillic_General_CI_AS AS drained');
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%"drained"%';
+----
+1
+
+# =============================================================================
+# mssql_exec() runs on a different path -- MSSQLSimpleQuery, which has no
+# ClientContext by design because every catalog metadata query goes through it
+# too -- and its token loop said `case Info: // Ignore informational messages`.
+# Running a procedure that PRINTs was dropping every line of it.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('coll', 'PRINT ''printed by mssql_exec''');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%printed by mssql_exec%';
+----
+1
+
+# The notices of a batch that ultimately FAILED are the ones most worth reading,
+# so they are logged before the error is raised rather than lost with it.
+statement error
+SELECT mssql_exec('coll', 'PRINT ''reached step one''; RAISERROR(''deliberate'', 16, 1)');
+----
+deliberate
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%reached step one%';
+----
+1
+
 statement ok
 DETACH coll;

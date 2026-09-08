@@ -112,6 +112,7 @@ SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, cons
 	result.error_number = collect_result.error_number;
 	result.column_names = collect_result.column_names;
 	result.rows_affected = collect_result.rows_affected;
+	result.info_messages = std::move(collect_result.info_messages);
 
 	return result;
 }
@@ -311,7 +312,10 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 			}
 
 			case tds::ParsedTokenType::Info:
-				// Ignore informational messages
+				// Kept rather than ignored, so a caller holding a ClientContext
+				// can log them. mssql_exec() is the one that matters: running a
+				// procedure that PRINTs was silently dropping every line.
+				result.info_messages.push_back(parser.GetInfo());
 				break;
 
 			default:

@@ -16,18 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   That stays **documented rather than enforced** — validating costs the scan's
   hot path in order to make a hand-written `mssql_scan()` fail loudly, and it
   bills hardest the UTF-8 configuration #225 optimised for. Instead the check
-  runs over COLMETADATA when the stream closes — a handful of columns, never a
-  per-row cost — and reaches `duckdb_logs` at `WARNING`, naming the column, its
-  LCID and its SortId. The predicate is the TDS fUTF8 flag, verified against a
-  live SQL Server rather than read off MS-TDS.
+  runs over COLMETADATA — a handful of columns, never a per-row cost — as soon
+  as the stream has its column types *and* again when it is drained, and reaches
+  `duckdb_logs` at `WARNING` naming the column, its LCID and its SortId. Both
+  calls matter: warning only at the drain says nothing for any query that stops
+  early, which is the `LIMIT` that a code-page column is most likely to be met
+  by first. The predicate is the TDS fUTF8 flag, verified against a live SQL
+  Server rather than read off MS-TDS.
 
 ### Fixed
 
 - **SQL Server INFO messages were collected and thrown away.**
   `SurfaceWarnings` walked them and did nothing, on the grounds that "DuckDB
   doesn't have a built-in warning API" — true when it was written, not true
-  now. `PRINT` output, `RAISERROR` below severity 11 and procedure progress
-  notices now reach `duckdb_logs`.
+  now. `mssql_exec()` was worse: its token loop read
+  `case Info: // Ignore informational messages`, so running a procedure that
+  `PRINT`s dropped every line. `PRINT` output, `RAISERROR` below severity 11 and
+  procedure progress notices now reach `duckdb_logs` on both paths — and on the
+  `mssql_exec()` path they are logged **before** a failing batch raises, since
+  the notices of a batch that failed are the ones worth reading.
 
 - **The 5th collation byte was parsed and discarded** (`offset += 5; // we only
   store 4`), thanks [@oluies](https://github.com/oluies) —

@@ -906,8 +906,9 @@ void MSSQLResultStream::DrainRemainingTokens() {
 }
 
 void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
-	// Called once when a stream is finished or closed -- never per row, and
-	// never per chunk. Both loops below walk metadata, not data.
+	// Called when the stream has its COLMETADATA and again when it is drained --
+	// never per row, never per chunk. Both loops below walk metadata, not data,
+	// and both are written to be safe under repeated calls.
 
 	// SQL Server INFO tokens: PRINT output, RAISERROR at severity <= 10, the
 	// "Changed database context" notices, and anything a stored procedure says
@@ -915,7 +916,10 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// parser was written and this function dropped every one of them on the
 	// floor -- the comment claimed DuckDB had no warning API, which was true
 	// when it was written and is not now.
-	for (const auto &info : info_messages_) {
+	// Resume where the last call stopped: a stream is visited at least twice and
+	// these accumulate as the batch runs.
+	for (; info_surfaced_ < info_messages_.size(); info_surfaced_++) {
+		const auto &info = info_messages_[info_surfaced_];
 		if (info.message.empty()) {
 			continue;
 		}
@@ -937,6 +941,12 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// usually already cast it to NVARCHAR server-side, and what is left is a
 	// raw mssql_scan(), or a declared VARCHAR(MAX) with
 	// mssql_convert_varchar_max off.
+	// One shot per stream. COLMETADATA does not change under us, and this is
+	// reached from both the init-time and the drain-time call.
+	if (collations_warned_) {
+		return;
+	}
+	collations_warned_ = true;
 	for (const auto &col : column_metadata_) {
 		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
 			continue;

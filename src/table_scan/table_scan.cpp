@@ -520,6 +520,13 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, query);
 
+	// COLMETADATA is known now, so say what is wrong with the columns before any
+	// rows move. Waiting for the drain-end call loses this entirely on a query
+	// that stops early -- any LIMIT (issue #224).
+	if (result->result_stream) {
+		result->result_stream->SurfaceWarnings(context);
+	}
+
 	// Set the number of columns to actually fill in the output chunk
 	// When valid_column_ids is empty (e.g., COUNT(*)), we don't fill any columns
 	// EXCEPT when pk_direct_to_rowid is true - then we fill the PK directly to rowid position

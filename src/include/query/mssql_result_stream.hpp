@@ -134,7 +134,16 @@ public:
 		target_vectors_ = std::move(targets);
 	}
 
-	// Surface warnings to DuckDB context
+	//! Surface warnings to DuckDB's log. Idempotent and incremental, so it is
+	//! safe -- and necessary -- to call more than once per stream: the column
+	//! warnings fire on the first call and never again, and INFO messages
+	//! resume from where the previous call stopped.
+	//!
+	//! Call it once the stream has its COLMETADATA and again when it is drained.
+	//! Only the drain-end call existed at first, and a query that stops early
+	//! (any LIMIT, and the executor simply not asking for another chunk) never
+	//! reached it -- so the shape most likely to meet a code-page column for the
+	//! first time was the one shape that said nothing.
 	void SurfaceWarnings(ClientContext &context);
 
 private:
@@ -194,6 +203,11 @@ private:
 	// Accumulated messages
 	std::vector<tds::TdsError> errors_;
 	std::vector<tds::TdsInfo> info_messages_;
+
+	// SurfaceWarnings bookkeeping: how many info_messages_ have been logged
+	// already, and whether the one-shot column warnings have been emitted.
+	size_t info_surfaced_ = 0;
+	bool collations_warned_ = false;
 
 	// Statistics
 	uint64_t rows_read_;

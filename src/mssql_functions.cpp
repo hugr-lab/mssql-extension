@@ -10,6 +10,7 @@
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -160,6 +161,9 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		result->result_stream = mssql_catalog.RetrieveStream(bind_data.result_stream_id);
 		if (result->result_stream) {
+			// COLMETADATA is known, so warn before any rows move -- the drain-end
+			// call is missed entirely by a query that stops early (issue #224).
+			result->result_stream->SurfaceWarnings(context);
 			auto init_end = std::chrono::steady_clock::now();
 			auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieved from registry in %ldms", (long)init_ms);
@@ -173,6 +177,9 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: executing query for data...");
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, bind_data.query);
+	if (result->result_stream) {
+		result->result_stream->SurfaceWarnings(context);
+	}
 	auto exec_end = std::chrono::steady_clock::now();
 	auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(exec_end - exec_start).count();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: query executed in %ldms", (long)exec_ms);
@@ -412,6 +419,19 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		}
 		try {
 			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql, timeout_ms);
+
+			// PRINT output and RAISERROR below severity 11 from whatever was run
+			// here -- a procedure's progress notices, most of all. Logged before
+			// the error check below, because a batch that ultimately failed is
+			// exactly when its notices are worth reading.
+			for (const auto &info : query_result.info_messages) {
+				if (info.message.empty()) {
+					continue;
+				}
+				const std::string where = info.proc_name.empty() ? std::string() : " (in " + info.proc_name + ")";
+				DUCKDB_LOG_WARNING(client_context, "mssql: [%u] %s%s", info.number, info.message.c_str(),
+								   where.c_str());
+			}
 
 			// Release connection via ConnectionProvider (no-op if in transaction)
 			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));

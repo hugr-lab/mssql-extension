@@ -486,9 +486,17 @@ oversight: validating costs the scan's hot path in order to make a hand-written
 configuration spec 069 / issue #225 optimised for. The caller writes the T-SQL
 and can write `CAST(col AS NVARCHAR(MAX))`.
 
-Instead it is said **once per query**, over COLMETADATA, in
+Instead it is said **once per stream**, over COLMETADATA, in
 `MSSQLResultStream::SurfaceWarnings` — a handful of columns, never a per-row
 cost. It reaches `duckdb_logs` at `WARNING`.
+
+That function is called **twice** per stream and is written for it: once at
+`InitGlobal`, as soon as COLMETADATA is parsed, and once when the stream drains.
+The column warnings are one-shot (`collations_warned_`) and the INFO messages
+resume from a cursor (`info_surfaced_`). The init-time call is not redundant —
+a query that stops early never reaches the drain, so warning only there says
+nothing for any `LIMIT`, which is the shape a code-page column is most likely to
+be met by first.
 
 Three decoders publish these bytes:
 
