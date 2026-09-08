@@ -210,11 +210,32 @@ are worth keeping.
 
 ## 4. Risks
 
-- **`OBJECTPROPERTYEX` availability.** Standard T-SQL metadata function, present
-  on SQL Server and Azure SQL Database. **Microsoft Fabric Warehouse is not
-  verified here** and is a supported target — worth a check before merge. The
-  fallback is mechanical (`ISNULL(..., 0)` already yields "unknown", which the
-  cardinality callback handles as "no estimate").
+- **`OBJECTPROPERTYEX` availability — checked against the documentation, and it
+  covers every target.** Its *Applies to* list is SQL Server, Azure SQL Database,
+  Azure SQL Managed Instance, **Azure Synapse Analytics**, Analytics Platform
+  System (PDW), **SQL analytics endpoint in Microsoft Fabric**, **Warehouse in
+  Microsoft Fabric** and **SQL database in Microsoft Fabric** — the page's own
+  monikers include `fabric`, `fabric-sqldb` (the preview surface),
+  `azure-sqldw-latest` and `aps-pdw-2016`. The `Cardinality` property is marked
+  "SQL Server 2012 (11.x) and later", an engine-version bound rather than a
+  platform one. Fabric's *T-SQL surface area* page, which enumerates what is
+  **not** supported, does not list `OBJECTPROPERTYEX`, `OBJECTPROPERTY`,
+  `sys.partitions`, `sys.indexes` or `sys.partition_schemes`.
+
+  Not verified by execution on Fabric or Synapse — no access — so what matters is
+  that the failure mode is benign: `ISNULL(..., 0)` yields 0, which
+  `MSSQLCatalogScanCardinality` already treats as "unknown" and answers with no
+  estimate. That is the same path a VIEW takes today. The documentation adds a
+  second, more likely route to it: `OBJECTPROPERTYEX` returns `NULL` when the
+  caller lacks permission to view the object's metadata, so a low-privilege user
+  degrades to "no estimate" rather than to an error.
+
+  **`mssql_enable_statistics` is not the kill switch for this**, despite the name.
+  It is `SetScope::GLOBAL`, and it is read only by `MSSQLCatalogScanCardinality` —
+  it gates whether an estimate reaches the planner, not whether the metadata query
+  asks for one. If a per-catalog escape ever proves necessary, the seam that
+  already exists is `MSSQLCatalog::IsFabricEndpoint()`
+  (`src/catalog/mssql_catalog.cpp:927`), the same one that disables BCP.
 - **W2 changes when work happens, not how much.** A user who touches one schema
   of a 10,000-schema catalog and never lists anything pays nothing extra: `Scan`
   is the listing path, `GetEntry` is the query path. A user who lists *one* schema
