@@ -184,11 +184,34 @@ SELECT id, name FROM db.dbo.customers;
   legacy code page unless somebody chose otherwise.
 - **ASCII-only data**, in any code page: every byte is already valid UTF-8.
 
-Tracked as [issue #224](https://github.com/hugr-lab/mssql-extension/issues/224).
-Validating every value on read was considered and rejected: the check would sit
-on the scan's hot path, and it would be paid mostly by UTF-8 columns that cannot
-be affected. An explicit `CAST` in a query you wrote yourself is the cheaper
-contract.
+### Why this is not validated for you
+
+Tracked as [issue #224](https://github.com/hugr-lab/mssql-extension/issues/224),
+and deliberately answered with documentation rather than a runtime check.
+
+The obvious fix is to validate every value as it is decoded and raise on the
+first one that is not UTF-8. It was considered and rejected, because of where
+that check would have to live.
+
+**The string codec is built to avoid exactly that call.** Its ASCII fast path
+exists for one reason, recorded next to it in `codec/string_codec.hpp`: measured
+on 12-byte values, *a simdutf call costs ~3.1 ns of pure overhead* against *~3 ns
+of actual byte work* — the call is as expensive as the transcoding it performs.
+Adding validation to the read path puts one back, per value, and as a **second
+pass over bytes the decoder has already copied**. That is a real cost on every
+scan, paid in full by the UTF-8 and `NVARCHAR` columns that cannot be affected by
+this in the first place.
+
+**And it would be paid on the wrong path.** The catalog scan — three-part names,
+and the `COPY` / `CREATE TABLE AS` built on them — is the path that carries
+volume, and it is already safe here: it casts non-Unicode string columns
+server-side, so the bytes it decodes are Unicode by construction. `mssql_scan()`
+is the escape hatch for hand-written T-SQL. Slowing the main path to guard the
+escape hatch is the wrong trade.
+
+**What the escape hatch gets instead is this page.** Someone writing raw T-SQL is
+already choosing the exact columns and can add `CAST(col AS NVARCHAR(MAX))`; what
+they were missing was any statement that they had to. That is what changed.
 
 
 ### Unicode Transcoding (simdutf)
