@@ -1270,8 +1270,9 @@ jobs:
           # ExtensionHelper::GetVersionDirectoryName(), which returns the
           # version tag only for a RELEASE build; for anything carrying `-dev`
           # it returns DuckDB::SourceID() -- a 10-char commit hash, which never
-          # starts with `v`. The duckdb submodule is pinned to `branch = main`
-          # and this workflow passes neither OVERRIDE_GIT_DESCRIBE nor
+          # starts with `v`. The duckdb submodule is pinned to a SHA on
+          # `branch = v2.0-cyanoptera` and this workflow passes neither
+          # OVERRIDE_GIT_DESCRIBE nor
           # DUCKDB_EXPLICIT_VERSION, so `git describe` lands off-tag,
           # DUCKDB_VERSION becomes vX.Y.Z-devN and the hash is what gets used.
           # A `v*` glob matches nothing here and the step dies before running a

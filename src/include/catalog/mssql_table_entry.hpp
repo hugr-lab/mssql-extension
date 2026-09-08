@@ -53,6 +53,14 @@ public:
 	// Required Overrides
 	//===----------------------------------------------------------------------===//
 
+	// Since duckdb 888cd17bee ("moving ColumnList ownership out of
+	// TableCatalogEntry and into DuckTableEntry") the base class no longer
+	// holds the column list: it declares GetColumns() pure virtual and its
+	// constructor takes nothing but the name, constraints and flags out of the
+	// CreateTableInfo it is handed. Every catalog entry now owns its own list,
+	// so this one does too — see columns_ below.
+	const ColumnList &GetColumns() const override;
+
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
@@ -112,6 +120,11 @@ public:
 	const mssql::PrimaryKeyInfo &GetPrimaryKeyInfo(ClientContext &context);
 
 private:
+	// The DuckDB-visible columns. Owned here since the base stopped owning
+	// them; GetInfo() and the whole binder read the table's shape through
+	// GetColumns(), so this is what makes the entry a table at all.
+	ColumnList columns_;
+
 	vector<MSSQLColumnInfo> mssql_columns_;	 // Column metadata with collation
 	MSSQLObjectType object_type_;			 // TABLE or VIEW
 	idx_t approx_row_count_;				 // Cardinality estimate

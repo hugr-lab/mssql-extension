@@ -458,7 +458,7 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 
 	// Handle IF NOT EXISTS: check if schema already exists (Issue #54)
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.SchemaName());
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(info.SchemaName()));
 		auto existing = LookupSchema(transaction, lookup, OnEntryNotFound::RETURN_NULL);
 		if (existing) {
 			return existing.get();
@@ -483,7 +483,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	// Handle IF EXISTS: check if schema exists before attempting DROP (Issue #54)
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		CatalogTransaction cat_transaction = GetCatalogTransaction(context);
-		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, info.GetQualifiedName().Name());
+		EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(info.GetQualifiedName().Name()));
 		auto existing = LookupSchema(cat_transaction, lookup, OnEntryNotFound::RETURN_NULL);
 		if (!existing) {
 			return;
