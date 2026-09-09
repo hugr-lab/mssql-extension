@@ -490,8 +490,24 @@ Instead it is said **once per stream**, over COLMETADATA, in
 `MSSQLResultStream::SurfaceWarnings` — a handful of columns, never a per-row
 cost. It reaches `duckdb_logs` at `WARNING`.
 
+`mssql_warn_non_utf8_collation` turns it off, because the trigger is the
+majority configuration: `SQL_Latin1_General_CP1_CI_AS` is the installation
+default.
+
+Server INFO tokens — `PRINT`, `RAISERROR` at severity 10 or below, "Changed
+database context" — go through `LogTdsInfo` at **`INFO`**, deliberately not
+`WARNING`, so server chatter cannot dilute the collation warning. Severity
+cannot be used to make that split, which is worth recording because it is the
+obvious idea: measured against SQL Server 2025, `PRINT` is severity 0 and 5701
+is *also* 0 on the wire (`sys.messages` calls it 10; severity 10 is sent as
+class 0), while anything above 10 arrives as an ERROR token and never reaches
+this path. The message number is what separates them, so number and severity are
+both in the text.
+
 That function is called **twice** per stream and is written for it: once at
-`InitGlobal`, as soon as COLMETADATA is parsed, and once when the stream drains.
+`InitGlobal`, as soon as COLMETADATA is parsed, and once when the stream drains
+— plus from the mid-stream failure handlers, so the notices immediately
+preceding a server error are not lost with it.
 The column warnings are one-shot (`collations_warned_`) and the INFO messages
 resume from a cursor (`info_surfaced_`). The init-time call is not redundant —
 a query that stops early never reaches the drain, so warning only there says

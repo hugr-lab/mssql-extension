@@ -11,6 +11,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mssql_counters.hpp"
+#include "query/tds_info_log.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/encoding/utf16.hpp"
 #include "tds/tds_packet.hpp"
@@ -919,12 +920,7 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// Resume where the last call stopped: a stream is visited at least twice and
 	// these accumulate as the batch runs.
 	for (; info_surfaced_ < info_messages_.size(); info_surfaced_++) {
-		const auto &info = info_messages_[info_surfaced_];
-		if (info.message.empty()) {
-			continue;
-		}
-		const std::string where = info.proc_name.empty() ? std::string() : " (in " + info.proc_name + ")";
-		DUCKDB_LOG_WARNING(context, "mssql: [%u] %s%s", info.number, info.message.c_str(), where.c_str());
+		LogTdsInfo(context, info_messages_[info_surfaced_]);
 	}
 
 	// Issue #224: a CHAR / VARCHAR / TEXT column whose collation is not a UTF-8
@@ -947,14 +943,31 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 		return;
 	}
 	collations_warned_ = true;
+
+	// The off switch (mssql_warn_non_utf8_collation). Read here rather than
+	// cached because the answer is the asking session's, and read after the
+	// one-shot flag is set so flipping it mid-session cannot make an already
+	// visited stream warn late.
+	Value warn_setting;
+	if (context.TryGetCurrentSetting("mssql_warn_non_utf8_collation", warn_setting) && !warn_setting.GetValue<bool>()) {
+		return;
+	}
+
 	for (const auto &col : column_metadata_) {
 		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
 			continue;
 		}
+		// Two remediations, because the two paths give the caller different levers.
+		// A raw mssql_scan() caller wrote the T-SQL and can cast in it; a catalog
+		// scan's SQL is generated, and the only reason such a column reached here
+		// at all is that mssql_convert_varchar_max was turned off.
+		const char *fix = is_catalog_scan_ ? "Set mssql_convert_varchar_max=true so the server converts it."
+										   : "CAST it to NVARCHAR in the query to convert.";
 		DUCKDB_LOG_WARNING(context,
 						   "mssql: column \"%s\" has a non-UTF-8 collation (LCID 0x%04X, SortId %u); its bytes are "
-						   "returned verbatim and may not be valid UTF-8. CAST it to NVARCHAR in the query to convert.",
-						   col.name.c_str(), (unsigned)(col.collation & 0xFFFFFu), (unsigned)col.collation_sort_id);
+						   "returned verbatim and may not be valid UTF-8. %s",
+						   col.name.c_str(), (unsigned)(col.collation & 0xFFFFFu), (unsigned)col.collation_sort_id,
+						   fix);
 	}
 }
 

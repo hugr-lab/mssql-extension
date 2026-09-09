@@ -17,6 +17,7 @@
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/tds_info_log.hpp"
 #include "tds/tds_connection.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
@@ -234,6 +235,17 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;
+		// The server's own notices about the batch that just failed -- and the ones
+		// immediately preceding the failure are the useful ones. Without this they
+		// are lost with the stream, which contradicts the rule the mssql_exec path
+		// already follows (PR #320 review).
+		//
+		// Swallowing a throw from here is deliberate: whatever the logger does, it
+		// must not replace the exception the caller is waiting for.
+		try {
+			global_state.result_stream->SurfaceWarnings(context);
+		} catch (...) {	 // NOLINT: never mask the original error
+		}
 		throw;
 	}
 }
@@ -425,12 +437,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 			// the error check below, because a batch that ultimately failed is
 			// exactly when its notices are worth reading.
 			for (const auto &info : query_result.info_messages) {
-				if (info.message.empty()) {
-					continue;
-				}
-				const std::string where = info.proc_name.empty() ? std::string() : " (in " + info.proc_name + ")";
-				DUCKDB_LOG_WARNING(client_context, "mssql: [%u] %s%s", info.number, info.message.c_str(),
-								   where.c_str());
+				LogTdsInfo(client_context, info);
 			}
 
 			// Release connection via ConnectionProvider (no-op if in transaction)

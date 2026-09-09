@@ -29,6 +29,11 @@ SET logging_storage = 'memory';
 statement ok
 SET enable_logging = true;
 
+# Server INFO tokens log at INFO, not WARNING -- see the PRINT section below for
+# why severity cannot be used to separate the useful ones from the routine ones.
+statement ok
+SET logging_level = 'INFO';
+
 # =============================================================================
 # Windows collations: the fUTF8 bit decides, and only the single-byte text
 # columns are candidates at all.
@@ -91,7 +96,19 @@ SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%
 # =============================================================================
 # INFO tokens. The stream has collected these since the token parser was
 # written and SurfaceWarnings dropped every one of them -- PRINT output,
-# RAISERROR below severity 11, and anything a procedure reports about itself.
+# RAISERROR at severity 10 or below, and anything a procedure reports about
+# itself.
+#
+# They log at INFO, not WARNING, so that server chatter does not dilute the
+# collation warning above, which is a real warning about possibly corrupt data.
+# Severity cannot be used to make that split, which is worth recording because
+# it is the obvious idea: measured against SQL Server 2025, PRINT is severity 0
+# and 5701 "Changed database context" is ALSO 0 on the wire (sys.messages calls
+# it 10; severity 10 is sent as class 0), while anything above 10 arrives as an
+# ERROR token and never reaches here at all.
+#
+# The `mssql: [` prefix is what separates our rows from the harness's own
+# query-text logging, which is at INFO too and quotes these same strings.
 # =============================================================================
 
 query I
@@ -99,10 +116,19 @@ SELECT count(*) FROM mssql_scan('coll', 'PRINT ''surfaced from the server''; SEL
 ----
 1
 
-# log_level matters here and not only for tidiness: the test harness logs the
-# query text itself at INFO, and that text contains this string too.
 query I
-SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%surfaced from the server%';
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'INFO' AND message LIKE 'mssql: [%' AND message LIKE '%surfaced from the server%';
+----
+1
+
+# The severity is carried in the message, and it is really read rather than
+# hard-coded: RAISERROR below 10 reports the level it was given.
+statement ok
+SELECT mssql_exec('coll', 'RAISERROR(''sev seven here'', 7, 1)');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'mssql: [50000 sev 7]%sev seven here%';
 ----
 1
 
@@ -155,7 +181,8 @@ statement ok
 SELECT mssql_exec('coll', 'PRINT ''printed by mssql_exec''');
 
 query I
-SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%printed by mssql_exec%';
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'INFO' AND message LIKE 'mssql: [%' AND message LIKE '%printed by mssql_exec%';
 ----
 1
 
@@ -167,7 +194,44 @@ SELECT mssql_exec('coll', 'PRINT ''reached step one''; RAISERROR(''deliberate'',
 deliberate
 
 query I
-SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%reached step one%';
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'INFO' AND message LIKE 'mssql: [%' AND message LIKE '%reached step one%';
+----
+1
+
+# =============================================================================
+# The off switch. The trigger IS the majority configuration --
+# SQL_Latin1_General_CP1_CI_AS is the SQL Server installation default -- so a
+# raw mssql_scan() over such a server logs one line per varchar column per
+# query, forever, including for data that is pure ASCII and therefore already
+# valid UTF-8. Someone who has read it once needs a way to stop hearing it.
+# =============================================================================
+
+statement ok
+SET mssql_warn_non_utf8_collation = false;
+
+query I
+SELECT count(*) FROM mssql_scan('coll', '
+    SELECT CAST(''q'' AS VARCHAR(50)) COLLATE Cyrillic_General_CI_AS AS silenced');
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%"silenced"%' AND message LIKE '%non-UTF-8 collation%';
+----
+0
+
+statement ok
+SET mssql_warn_non_utf8_collation = true;
+
+query I
+SELECT count(*) FROM mssql_scan('coll', '
+    SELECT CAST(''q'' AS VARCHAR(50)) COLLATE Cyrillic_General_CI_AS AS audible');
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%"audible"%' AND message LIKE '%non-UTF-8 collation%';
 ----
 1
 

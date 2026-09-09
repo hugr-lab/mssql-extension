@@ -134,6 +134,14 @@ public:
 		target_vectors_ = std::move(targets);
 	}
 
+	//! Mark this stream as belonging to a catalog table scan rather than a raw
+	//! mssql_scan(). Only affects which remediation a warning suggests: the two
+	//! paths give the caller different levers -- an mssql_scan() caller wrote the
+	//! T-SQL and can cast in it, while a catalog scan's SQL is generated.
+	void MarkCatalogScan() {
+		is_catalog_scan_ = true;
+	}
+
 	//! Surface warnings to DuckDB's log. Idempotent and incremental, so it is
 	//! safe -- and necessary -- to call more than once per stream: the column
 	//! warnings fire on the first call and never again, and INFO messages
@@ -208,6 +216,7 @@ private:
 	// already, and whether the one-shot column warnings have been emitted.
 	size_t info_surfaced_ = 0;
 	bool collations_warned_ = false;
+	bool is_catalog_scan_ = false;
 
 	// Statistics
 	uint64_t rows_read_;

@@ -524,6 +524,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// rows move. Waiting for the drain-end call loses this entirely on a query
 	// that stops early -- any LIMIT (issue #224).
 	if (result->result_stream) {
+		result->result_stream->MarkCatalogScan();
 		result->result_stream->SurfaceWarnings(context);
 	}
 
@@ -850,6 +851,17 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;
+		// The server's own notices about the batch that just failed -- and the ones
+		// immediately preceding the failure are the useful ones. Without this they
+		// are lost with the stream, which contradicts the rule the mssql_exec path
+		// already follows (PR #320 review).
+		//
+		// Swallowing a throw from here is deliberate: whatever the logger does, it
+		// must not replace the exception the caller is waiting for.
+		try {
+			global_state.result_stream->SurfaceWarnings(context);
+		} catch (...) {	 // NOLINT: never mask the original error
+		}
 		throw;
 	}
 }

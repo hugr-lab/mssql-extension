@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls matter: warning only at the drain says nothing for any query that stops
   early, which is the `LIMIT` that a code-page column is most likely to be met
   by first. The predicate is the TDS fUTF8 flag, verified against a live SQL
-  Server rather than read off MS-TDS.
+  Server rather than read off MS-TDS. `mssql_warn_non_utf8_collation` (default
+  `true`) turns it off: the trigger is the majority configuration, since
+  `SQL_Latin1_General_CP1_CI_AS` is the installation default, so anyone who has
+  read the warning once and decided their data is fine needs a way to stop
+  hearing it.
 
 ### Fixed
 
@@ -31,10 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doesn't have a built-in warning API" — true when it was written, not true
   now. `mssql_exec()` was worse: its token loop read
   `case Info: // Ignore informational messages`, so running a procedure that
-  `PRINT`s dropped every line. `PRINT` output, `RAISERROR` below severity 11 and
-  procedure progress notices now reach `duckdb_logs` on both paths — and on the
-  `mssql_exec()` path they are logged **before** a failing batch raises, since
-  the notices of a batch that failed are the ones worth reading.
+  `PRINT`s dropped every line. `PRINT` output, `RAISERROR` at severity 10 or
+  below and procedure progress notices now reach `duckdb_logs` on both paths,
+  at `INFO` (`SET logging_level = 'INFO'` to see them), carrying the message
+  number and severity. They are logged **before** a failing batch raises — the
+  notices of a batch that failed are the ones worth reading — including when a
+  scan fails mid-stream.
 
 - **The 5th collation byte was parsed and discarded** (`offset += 5; // we only
   store 4`), thanks [@oluies](https://github.com/oluies) —
