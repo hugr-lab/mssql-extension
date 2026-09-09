@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A metadata load that fails mid-query no longer mutates the cache**
+  ([#317](https://github.com/hugr-lab/mssql-extension/issues/317), reported by
+  [@oluies](https://github.com/oluies)). `LoadAllSchemasMetadata` cleared each
+  schema's table map from inside the row callback and only re-published
+  `tables_load_state` after the query returned, so a non-retryable throw —
+  metadata timeout, reset connection, killed session — left every schema the
+  callback had touched **emptied while still carrying its previous load
+  state**. The reset lambda covered the 1205 retry path only. It is the shape
+  the #178 review fixed for `Refresh()`, and spec 071 widened the blast radius
+  from one schema to the whole catalog by replacing the per-schema loop with a
+  single query. Nothing is written into the cache now until the query has
+  returned. See the PR for why the reported symptom is not currently reachable
+  and the fix is worth having anyway.
+
 ### Added
+
+- **`mssql_test_fail_metadata_after_rows`** (test-only, default 0 = off): make
+  a metadata query throw after N rows. Every cause of a mid-query metadata
+  failure in the wild arrives from outside and cannot be asked for from SQL, so
+  without it the invariant above is untestable — which is how it came to be
+  broken twice. Off costs nothing: the row callback is passed through unwrapped.
 
 - **`MSSQL_VARCHAR('MAX', 'collation')` — a per-column MAX target**
   ([#321](https://github.com/hugr-lab/mssql-extension/issues/321)). The

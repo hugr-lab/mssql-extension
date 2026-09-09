@@ -70,6 +70,10 @@ int LoadQueryTimeout(ClientContext &context);
 // Load metadata query timeout setting (0 = no timeout)
 int LoadMetadataTimeout(ClientContext &context);
 
+//! TEST ONLY (issue #317): rows after which a metadata query should throw.
+//! 0 = off.
+int64_t LoadTestFailMetadataAfterRows(ClientContext &context);
+
 // Load ATTACH credential-validation timeout (spec 047 / US2).
 // Returns mssql_attach_validation_timeout if > 0, else mssql_connection_timeout.
 int LoadAttachValidationTimeout(ClientContext &context);
