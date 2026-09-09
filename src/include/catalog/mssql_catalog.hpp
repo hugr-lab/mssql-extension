@@ -70,6 +70,51 @@ public:
 
 	string GetCatalogType() override;
 
+	//! SQL Server's default schema, not DuckDB's `main`.
+	//!
+	//! The base Catalog answers `main`, which no SQL Server database has, so
+	//! anything that resolves an unqualified name through the catalog's default
+	//! fails with "Schema 'main' not found in MSSQL database". ducklake hits this
+	//! on ATTACH — DuckLakeTransaction::GetDefaultSchemaName() asks for it before
+	//! any table exists — and issue #129 shows a user working around it by
+	//! CREATEing a schema literally called `main` on the server.
+	//!
+	//! `dbo` is the constant answer rather than a per-login lookup: it is the
+	//! default for every login that has not been given another, and resolving
+	//! SCHEMA_NAME() would put a round trip on ATTACH and need an answer on the
+	//! lazy-validation path, where no connection has been made yet. A login whose
+	//! default schema is not `dbo` still addresses its tables by qualified name;
+	//! only the unqualified default is wrong for it, which is the pre-existing
+	//! behaviour minus the crash.
+	//!
+	//! On the duckdb 2.0 line the return type is optional<Identifier>, and the
+	//! three answers are distinct: a value means "probe this schema for
+	//! unqualified names", nullopt means "this catalog HAS no default, never
+	//! probe", and an empty Identifier means "unspecified" elsewhere in the
+	//! catalog. We mean the first, so this returns Identifier("dbo") and neither
+	//! of the empty forms. (The v0.2.x line on duckdb 1.5.5 returns a plain
+	//! string; that is the only difference between the two ports.)
+	optional<Identifier> GetDefaultSchema() const override;
+
+	//! Serializes materialized catalog scans against each other (issue #239).
+	//!
+	//! R2 drains a scan inside InitGlobal so the pinned connection is Idle again
+	//! before the next scan starts — which is enough at threads = 1, where DuckDB
+	//! initializes the two sources in sequence. With threads > 1 the two
+	//! InitGlobals run CONCURRENTLY and the drain has not happened yet when the
+	//! second one sends its batch: the failure becomes a torn stream
+	//! ("Connection closed while waiting for COLMETADATA") instead of the clean
+	//! "not in Idle state". Materialization alone cannot fix that, because the
+	//! race is between the initializations, not inside them.
+	//!
+	//! So a materialized scan holds this from before its batch until after its
+	//! drain. It is contended only by scans that are already serialized by
+	//! construction — they share one pinned connection and cannot run in parallel
+	//! anyway — so it costs nothing that was not already sequential.
+	std::mutex &MaterializeMutex() {
+		return materialize_mutex_;
+	}
+
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
 												  OnEntryNotFound if_not_found) override;
 
@@ -280,6 +325,11 @@ protected:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
+	//! See MaterializeMutex(). Not the transaction's connection_mutex_: that one
+	//! guards the pinned-connection member accessors and is taken and released
+	//! inside them, where this must span a whole batch-and-drain.
+	std::mutex materialize_mutex_;
+
 	// Issue #225: -1 = not observed yet, 0 = declined, 1 = granted.
 	std::atomic<int8_t> utf8_support_acked_{-1};
 

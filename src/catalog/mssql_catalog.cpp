@@ -292,6 +292,12 @@ string MSSQLCatalog::GetCatalogType() {
 	return "mssql";
 }
 
+optional<Identifier> MSSQLCatalog::GetDefaultSchema() const {
+	// See the header: a value (not nullopt, not an empty Identifier) is what says
+	// "probe dbo for unqualified names".
+	return Identifier("dbo");
+}
+
 //===----------------------------------------------------------------------===//
 // Schema Operations
 //===----------------------------------------------------------------------===//

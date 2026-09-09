@@ -49,6 +49,8 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->return_types = return_types;
 	result->column_names = column_names;
 	result->result_stream_id = result_stream_id;
+	// Shared, not copied: the rows are the same rows (issue #316).
+	result->materialized = materialized;
 	return std::move(result);
 }
 
@@ -129,13 +131,44 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	bind_data->return_types = return_types;
 	bind_data->column_names = result_stream->GetColumnNames();
 
-	// Register the result stream for later retrieval in InitGlobal
-	// This avoids executing the query twice (which causes 30s timeout on large datasets)
-	// Spec 047 / US3: registry lives on MSSQLCatalog (previously process-wide singleton).
 	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->context_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-	bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data->result_stream_id.c_str());
+
+	if (!context.transaction.IsAutoCommit()) {
+		// Issue #316: this connection is the transaction's ONE pinned connection.
+		// Holding it open until execution makes the NEXT mssql_scan fail in its own
+		// Bind, before any InitGlobal runs — which is why the catalog scan's fix
+		// cannot reach this path. Drain here and close it. See the `materialized`
+		// comment on MSSQLScanBindData for why the trigger is the transaction and
+		// not a count of scans.
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: in a transaction — draining to release the pinned connection");
+		auto collection = make_shared_ptr<ColumnDataCollection>(context, bind_data->return_types);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(context), bind_data->return_types);
+		idx_t total = 0;
+		for (;;) {
+			chunk.Reset();
+			const idx_t rows = result_stream->FillChunk(chunk);
+			if (rows == 0) {
+				break;
+			}
+			collection->Append(chunk);
+			total += rows;
+		}
+		result_stream->SurfaceWarnings(context);
+		// Closing is what returns the connection to Idle; draining alone does not.
+		result_stream.reset();
+		bind_data->materialized = std::move(collection);
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: materialized %llu row(s), pinned connection released",
+						   (unsigned long long)total);
+	} else {
+		// Autocommit: this scan holds a pooled connection of its own, so streaming
+		// costs nobody anything. Register the stream so execution reuses it instead
+		// of running the query twice (a 30 s timeout on large results).
+		// Spec 047 / US3: registry lives on MSSQLCatalog.
+		bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data->result_stream_id.c_str());
+	}
 
 	auto bind_end = std::chrono::steady_clock::now();
 	auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bind_end - bind_start).count();
@@ -151,6 +184,15 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	auto &bind_data = input.bind_data->Cast<MSSQLScanBindData>();
 	auto result = make_uniq<MSSQLScanGlobalState>();
 	result->context_name = bind_data.context_name;
+
+	// Issue #316: Bind already drained this one and released the connection.
+	if (bind_data.materialized) {
+		result->materialized_shared = bind_data.materialized;
+		result->materialized_shared->InitializeScan(result->materialized_scan);
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: serving %llu materialized row(s)",
+						   (unsigned long long)result->materialized_shared->Count());
+		return std::move(result);
+	}
 
 	// Try to retrieve pre-initialized result stream from registry
 	// This was created in Bind and avoids executing the query twice
@@ -199,6 +241,17 @@ unique_ptr<LocalTableFunctionState> MSSQLScanInitLocal(ExecutionContext &context
 
 void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &global_state = data.global_state->Cast<MSSQLScanGlobalState>();
+
+	// Issue #316: materialized at Bind, so there is no stream to read. Must come
+	// before the `!result_stream` test below, which would report "done" at once.
+	if (global_state.materialized_shared) {
+		output.Reset();
+		global_state.materialized_shared->Scan(global_state.materialized_scan, output);
+		if (output.size() == 0) {
+			global_state.done = true;
+		}
+		return;
+	}
 
 	// Start timing on first call
 	if (!global_state.timing_started) {
@@ -269,6 +322,7 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	// ORDER BY pushdown fields (Spec 039)
 	result->order_by_clause = order_by_clause;
 	result->top_n = top_n;
+	result->requires_materialization = requires_materialization;
 	// RowId support fields
 	result->rowid_requested = rowid_requested;
 	result->pk_column_names = pk_column_names;
