@@ -127,6 +127,36 @@ SELECT length(s) FROM i321.dbo.I321Copy;
 5000
 
 # =============================================================================
+# What the type PRINTS as. All three spellings normalize to one type, and it
+# renders as the T-SQL word rather than the sentinel -- `MSSQL_VARCHAR(0)` would
+# read as a zero-length column and `(-1)` as nothing at all.
+#
+# Note the asymmetry, which is why the parser refusal above is asserted: the
+# form DESCRIBE prints is exactly the form the parser will NOT accept back.
+# Pasting `MSSQL_VARCHAR(MAX)` into a cast needs quotes around MAX.
+# =============================================================================
+
+statement ok
+CREATE TABLE local_shapes AS
+SELECT 'a'::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS a_by_string,
+       'a'::MSSQL_VARCHAR(-1)                                    AS b_by_negative,
+       'a'::MSSQL_VARCHAR(0)                                     AS c_by_zero,
+       'a'::MSSQL_NVARCHAR('MAX')                                AS d_nvarchar,
+       'a'::MSSQL_VARCHAR(50)                                    AS e_bounded;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'local_shapes' ORDER BY column_name;
+----
+a_by_string	MSSQL_VARCHAR(MAX)
+b_by_negative	MSSQL_VARCHAR(MAX)
+c_by_zero	MSSQL_VARCHAR(MAX)
+d_nvarchar	MSSQL_NVARCHAR(MAX)
+e_bounded	MSSQL_VARCHAR(50)
+
+statement ok
+DROP TABLE local_shapes;
+
+# =============================================================================
 # The cap still applies to a stated length, and the message names the way out.
 # =============================================================================
 

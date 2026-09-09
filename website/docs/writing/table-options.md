@@ -58,6 +58,19 @@ A bare `MAX` keyword — `MSSQL_VARCHAR(MAX, …)`, the way T-SQL spells it — 
 before the extension is consulted, and answers
 `Parser Error: Expected a constant as type modifier`. Quote it.
 
+That matters more than it looks, because the type **prints** as the unquoted
+form:
+
+```sql
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'docs';
+-- body   MSSQL_VARCHAR(MAX)
+-- notes  MSSQL_NVARCHAR(MAX)
+```
+
+So the name `DESCRIBE` shows you is the one the parser will refuse if you paste
+it back into a cast. Add the quotes. (The alternative was printing the internal
+sentinel, `MSSQL_VARCHAR(0)`, which reads as a zero-length column — worse.)
+
 Without this, a MAX column's type could only be chosen session-wide, through
 `mssql_ctas_text_type` and `mssql_utf8_collation` — which library code creating
 tables through CTAS or `COPY` cannot set, since it would change the type of

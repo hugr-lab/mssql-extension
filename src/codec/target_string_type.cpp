@@ -19,11 +19,29 @@ static constexpr const char *VARCHAR_ALIAS = "MSSQL_VARCHAR";
 //! every varchar in the database.
 static constexpr const char *COLLATION_PROPERTY = "collation";
 
+//! What the length modifier reads as for the MAX form. See MakeTargetStringType.
+static constexpr const char *MAX_MODIFIER = "MAX";
+
 LogicalType MakeTargetStringType(const TargetStringType &spec) {
 	LogicalType type = LogicalType(LogicalTypeId::VARCHAR).WithAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
 
 	auto info = make_uniq<ExtensionTypeInfo>();
-	info->modifiers.emplace_back(Value::INTEGER(spec.length));
+	// The modifier is what DESCRIBE and duckdb_columns() PRINT, so the MAX form
+	// carries the word rather than the sentinel. DuckDB renders it unquoted, so
+	// the column reads as `MSSQL_VARCHAR(MAX)` -- T-SQL's own spelling -- where
+	// the sentinel would have printed `MSSQL_VARCHAR(0)`, which says zero-length,
+	// or `(-1)`, which says nothing at all. The internal `length` stays numeric;
+	// this is the one boundary where it becomes something a person reads.
+	//
+	// The printed form is deliberately NOT round-trippable: unquoted MAX in a
+	// cast is refused by DuckDB's parser, before this extension is consulted.
+	// Documented in website/docs/writing/table-options.md, since the obvious
+	// thing to do with a type name is paste it back.
+	if (IsMaxLength(spec.length)) {
+		info->modifiers.emplace_back(Value(MAX_MODIFIER));
+	} else {
+		info->modifiers.emplace_back(Value::INTEGER(spec.length));
+	}
 	if (!spec.unicode && !spec.collation.empty()) {
 		info->properties[COLLATION_PROPERTY] = Value(spec.collation);
 	}
@@ -48,7 +66,17 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 	if (info.modifiers.size() != 1 || info.modifiers[0].value.IsNull()) {
 		return false;
 	}
-	result.length = info.modifiers[0].value.GetValue<int32_t>();
+	const auto &length_modifier = info.modifiers[0].value;
+	if (length_modifier.type().id() == LogicalTypeId::VARCHAR) {
+		// The MAX form. Nothing else is stored as a string, and a stray one
+		// would be a type this codec did not build.
+		if (!StringUtil::CIEquals(length_modifier.ToString(), MAX_MODIFIER)) {
+			return false;
+		}
+		result.length = MAX_LENGTH;
+	} else {
+		result.length = length_modifier.GetValue<int32_t>();
+	}
 
 	const auto entry = info.properties.find(COLLATION_PROPERTY);
 	result.collation = entry == info.properties.end() ? std::string() : entry->second.ToString();

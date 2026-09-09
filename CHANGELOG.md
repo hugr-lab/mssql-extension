@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `-1` are now all accepted in the length position and mean the same thing
   (`0` matches `mssql_default_string_length`, `-1` matches
   `sys.columns.max_length`). A bare `MAX` keyword cannot be supported — DuckDB's
-  parser rejects a non-constant type modifier before the extension is consulted.
+  parser rejects a non-constant type modifier before the extension is consulted
+  — note that this is also the form the type *prints* as (`MSSQL_VARCHAR(MAX)`
+  in `DESCRIBE` / `duckdb_columns()`), so pasting it back into a cast needs the
+  quotes added.
 
 - **A non-UTF-8 text column now says so, once per query**
   ([#224](https://github.com/hugr-lab/mssql-extension/issues/224)). A
