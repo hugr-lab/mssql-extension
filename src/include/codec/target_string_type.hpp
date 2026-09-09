@@ -64,6 +64,15 @@ inline bool IsMaxLength(int32_t length) {
 	return length == MAX_LENGTH;
 }
 
+//! The word the MAX form is written and printed as. Exported for the same
+//! reason MAX_LENGTH is: the binder accepts it and MakeTargetStringType stores
+//! it, and if those two ever disagreed the binder would build a type
+//! TryGetTargetStringType then refuses to read back.
+static constexpr const char *MAX_MODIFIER = "MAX";
+
+//! Case-insensitive, because the length modifier is written by hand.
+bool IsMaxKeyword(const std::string &text);
+
 //! Build the annotated VARCHAR. Used by the type binder and by the catalog.
 LogicalType MakeTargetStringType(const TargetStringType &spec);
 

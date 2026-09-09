@@ -19,9 +19,6 @@ static constexpr const char *VARCHAR_ALIAS = "MSSQL_VARCHAR";
 //! every varchar in the database.
 static constexpr const char *COLLATION_PROPERTY = "collation";
 
-//! What the length modifier reads as for the MAX form. See MakeTargetStringType.
-static constexpr const char *MAX_MODIFIER = "MAX";
-
 LogicalType MakeTargetStringType(const TargetStringType &spec) {
 	LogicalType type = LogicalType(LogicalTypeId::VARCHAR).WithAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
 
@@ -70,7 +67,7 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 	if (length_modifier.type().id() == LogicalTypeId::VARCHAR) {
 		// The MAX form. Nothing else is stored as a string, and a stray one
 		// would be a type this codec did not build.
-		if (!StringUtil::CIEquals(length_modifier.ToString(), MAX_MODIFIER)) {
+		if (!IsMaxKeyword(length_modifier.ToString())) {
 			return false;
 		}
 		result.length = MAX_LENGTH;
@@ -123,6 +120,10 @@ LogicalType ApplyDefaultStringType(const LogicalType &type, bool unicode, int32_
 bool NeedsVarcharCollation(const LogicalType &type) {
 	TargetStringType spec;
 	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();
+}
+
+bool IsMaxKeyword(const std::string &text) {
+	return StringUtil::CIEquals(text, MAX_MODIFIER);
 }
 
 bool IsValidCollationName(const std::string &name) {

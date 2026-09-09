@@ -17,6 +17,7 @@
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/types.hpp"
+#include "tds/tds_types.hpp"
 
 using namespace duckdb;
 using namespace duckdb::mssql;
@@ -239,6 +240,53 @@ void test_tds_max_length_for_annotated() {
 }
 
 //==============================================================================
+// Test: the INSERT BULK column metadata for an annotated MAX target (issue #321)
+//
+// GetTDSMaxLength is NOT the last word for the flagship case. When the target
+// is a varchar naming a UTF-8 collation, GenerateColumnMetadata retargets the
+// column to TDS_TYPE_BIGVARCHAR and OVERWRITES max_length with its own branch,
+// so the number this case actually puts on the wire comes from there. Covering
+// only GetTDSMaxLength left that branch to the live-server test, which the PR
+// CI lane does not run (found in review of #326).
+//
+// If the IsMaxLength arm regressed, max_length would be 0: the INSERT BULK text
+// would declare `varchar(0)` and the encoder's guard -- `!IsPLPType() &&
+// utf8_len > max_length` -- would truncate every value, which is precisely the
+// silent failure this feature exists to avoid.
+//==============================================================================
+void test_bcp_metadata_for_annotated_max() {
+	std::cout << "\n=== Test: INSERT BULK metadata for annotated strings ===" << std::endl;
+
+	const std::string COLL = "Latin1_General_100_BIN2_UTF8";
+	vector<LogicalType> types = {MakeTarget(false, mssql::codec::MAX_LENGTH, COLL), MakeTarget(false, 50, COLL),
+								 MakeTarget(true, mssql::codec::MAX_LENGTH, ""), LogicalType::VARCHAR};
+	vector<string> names = {"v_max", "v_bounded", "n_max", "plain"};
+
+	auto cols = TargetResolver::GenerateColumnMetadata(types, names, COLL, /*single_byte_text=*/false);
+	ASSERT_EQ(cols.size(), (size_t)4);
+
+	// The flagship case: retargeted to UTF-8 bytes, and PLP because it is MAX.
+	ASSERT_EQ((int)cols[0].tds_type_token, (int)tds::TDS_TYPE_BIGVARCHAR);
+	ASSERT_EQ((int)cols[0].max_length, 0xFFFF);
+	ASSERT_EQ(cols[0].collation_name, COLL);
+	ASSERT_EQ(cols[0].GetSQLServerTypeDeclaration(), "varchar(max) COLLATE " + COLL);
+
+	// Bounded, for contrast: same retarget, a real length, and BYTES rather than
+	// the doubling an nvarchar declaration does.
+	ASSERT_EQ((int)cols[1].tds_type_token, (int)tds::TDS_TYPE_BIGVARCHAR);
+	ASSERT_EQ((int)cols[1].max_length, 50);
+	ASSERT_EQ(cols[1].GetSQLServerTypeDeclaration(), "varchar(50) COLLATE " + COLL);
+
+	// An nvarchar MAX target stays on the UTF-16 wire and is PLP there.
+	ASSERT_EQ((int)cols[2].max_length, 0xFFFF);
+
+	// A plain VARCHAR states no length, so it was already MAX before #321.
+	ASSERT_EQ((int)cols[3].max_length, 0xFFFF);
+
+	std::cout << "PASSED!" << std::endl;
+}
+
+//==============================================================================
 // Test: CTAS Binary Type Mapping
 //==============================================================================
 void test_ctas_binary() {
@@ -424,6 +472,7 @@ int main() {
 		test_ctas_strings_varchar();
 		test_ctas_annotated_strings();
 		test_tds_max_length_for_annotated();
+		test_bcp_metadata_for_annotated_max();
 		test_ctas_binary();
 		test_ctas_datetime();
 		test_ctas_uuid();

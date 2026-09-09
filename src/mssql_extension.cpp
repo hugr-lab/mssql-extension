@@ -93,8 +93,9 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 	// DuckDB, not to this function.
 	auto &length_val = modifiers[0].GetValue();
 	if (!length_val.IsNull() && length_val.type().id() == LogicalTypeId::VARCHAR) {
-		if (!StringUtil::CIEquals(length_val.ToString(), "max")) {
-			throw BinderException("%s(n): a string modifier must be 'MAX'; got '%s'", name, length_val.ToString());
+		if (!mssql::codec::IsMaxKeyword(length_val.ToString())) {
+			throw BinderException("%s(n): a string modifier must be '%s'; got '%s'", name, mssql::codec::MAX_MODIFIER,
+								  length_val.ToString());
 		}
 		spec.length = mssql::codec::MAX_LENGTH;
 	} else {
