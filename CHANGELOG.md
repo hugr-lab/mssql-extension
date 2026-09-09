@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Forward-port of the v0.2.5 fixes to the duckdb 2.0 line** (#314). The
+  released v0.2.5 sits on the `duckdb-v1.5.5` maintenance branch; these are the
+  same two fixes against duckdb `main`.
+  - **An MSSQL catalog's default schema is `dbo`** (#129). `Catalog::GetDefaultSchema()`
+    answered `main` from the base class, which no SQL Server database has, so
+    anything resolving an unqualified name through the catalog default failed
+    with `Schema 'main' not found` — ducklake hits it on ATTACH, before any
+    table exists. On the 2.0 API the signature is `optional<Identifier>`, where
+    `nullopt` means "this catalog has no default, do not try"; we return
+    `Identifier("dbo")`.
+  - **Two scans of one catalog inside a transaction** (#239). A transaction pins
+    one connection and routes every read of that catalog to it, but a scan holds
+    that connection from `InitGlobal` until its last row, and DuckDB does not
+    promise to drain one source before starting the next. Such plans are now
+    materialized into a buffer-managed collection as each scan starts, freeing
+    the connection immediately. Autocommit is untouched.
+
+- **`mssql_scan()` inside a transaction took the pinned connection and kept it**
+  (#316). The #239 gate runs on the optimized plan and sees only
+  `mssql_catalog_scan`. `mssql_scan()` is unreachable from there by construction:
+  it executes its query during **binding** — that is how it reads the result's
+  column types — so a second scan of the catalog failed inside its own Bind,
+  before any `InitGlobal` and long before the gate. Reported shapes were
+  `Connection closed unexpectedly` (catalog scan + `mssql_scan`) and
+  `Cannot execute: connection not in Idle state` (two `mssql_scan`). It now
+  drains at Bind whenever the session is not in autocommit — the trigger is "in
+  a transaction", not "more than one scan", because Bind cannot see the rest of
+  the plan. Autocommit still streams.
+
+- **The materialized scan could not spill** (#318, thanks @oluies). It was built
+  from `Allocator::Get(context)`, and that overload is duckdb's
+  `IN_MEMORY_ALLOCATOR` one: unaccounted against the buffer manager and unable to
+  spill, so a large materialized scan grew in process memory until it OOMed while
+  the docs promised the opposite. Built from the `ClientContext` overload, which
+  defaults to `BUFFER_MANAGER_ALLOCATOR`.
+
 ## [0.2.4] - 2026-08-17
 
 ### Fixed

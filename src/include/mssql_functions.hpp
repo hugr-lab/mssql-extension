@@ -10,6 +10,7 @@
 
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "query/mssql_result_stream.hpp"
@@ -36,6 +37,28 @@ struct MSSQLScanBindData : public FunctionData {
 	// owning MSSQLCatalog at Bind time (spec 047 / US3). Empty when there is
 	// no pre-built stream (InitGlobal then re-executes the query).
 	string result_stream_id;
+
+	// Issue #316: inside an explicit transaction, Bind drains the result here and
+	// closes the stream instead of registering it.
+	//
+	// mssql_scan executes its query at BIND time — it has to, the schema comes
+	// from the batch's own COLMETADATA — and then holds the connection open until
+	// execution drains it. In a transaction that connection is the ONE pinned
+	// connection, so a second mssql_scan fails in its own Bind, before any
+	// InitGlobal runs. The catalog scan's fix cannot reach that: materializing at
+	// InitGlobal is too late, and the optimizer gate that decides it runs later
+	// still.
+	//
+	// So the trigger here is "in a transaction", not "more than one scan": Bind
+	// cannot know what else the plan will hold. That does buffer a lone
+	// mssql_scan that would have streamed — but inside a transaction such a scan
+	// could not have coexisted with anything else on that catalog anyway, so this
+	// turns a failing case into a slower one rather than taking a working case
+	// away.
+	//
+	// shared_ptr because FunctionData::Copy has to share it rather than duplicate
+	// the rows.
+	shared_ptr<ColumnDataCollection> materialized;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
@@ -79,6 +102,27 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// 0 = no TOP (default), >0 = SELECT TOP N
 	int64_t top_n = 0;
 
+	// Drain this scan into a ColumnDataCollection at InitGlobal instead of
+	// streaming it (issue #239).
+	//
+	// A scan normally holds its TDS connection open across GetData calls. That is
+	// fine while each scan has its own pooled connection, and wrong the moment two
+	// of them must share one — which is exactly what an explicit transaction does,
+	// because the transaction pins a single connection and every read on that
+	// catalog is routed to it. DuckDB does not promise to drain one source before
+	// initializing the next; for a decorrelated subquery (LEFT_DELIM_JOIN +
+	// DELIM_SCAN) it initializes both, and the second batch finds the connection
+	// in Executing:
+	//
+	//     Cannot execute: connection not in Idle state (current: Executing)
+	//
+	// With threads > 1 the two run concurrently and the failure is a torn stream
+	// instead. Materializing releases the connection before InitGlobal returns, so
+	// the next scan finds it Idle.
+	//
+	// Set by MSSQLOptimizer, hence mutable — same as order_by_clause above.
+	mutable bool requires_materialization = false;
+
 	//===----------------------------------------------------------------------===//
 	// RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//
@@ -116,6 +160,19 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 	// Result stream from SQL Server
 	std::unique_ptr<MSSQLResultStream> result_stream;
+
+	// Issue #239: when the bind data asked for materialization, InitGlobal drains
+	// the stream into here and closes it, so the pinned connection is Idle again
+	// before the next scan on the same catalog initializes. Execution then serves
+	// chunks from the collection and never touches the connection.
+	std::unique_ptr<ColumnDataCollection> materialized;
+
+	// Issue #316: the raw mssql_scan materializes at BIND, not here, so its
+	// collection is owned by the bind data and shared rather than moved — the
+	// same bind data can init more than one global state.
+	shared_ptr<ColumnDataCollection> materialized_shared;
+
+	ColumnDataScanState materialized_scan;
 
 	// Context name for pool return
 	string context_name;

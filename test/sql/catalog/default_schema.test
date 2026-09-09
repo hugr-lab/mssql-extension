@@ -1,0 +1,57 @@
+# name: test/sql/catalog/default_schema.test
+# description: An MSSQL catalog's default schema is dbo, not DuckDB's main (issue #129)
+# group: [mssql]
+# issue: 129
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Catalog::GetDefaultSchema() answers `main` in the base class, which no SQL
+# Server database has. Anything resolving an unqualified name through the
+# catalog's default therefore failed with "Schema 'main' not found in MSSQL
+# database" -- ducklake hits it on ATTACH, before any table exists, and issue
+# #129 shows a user working around it by CREATEing a schema called `main` on the
+# server.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS defsch (TYPE mssql);
+
+statement ok
+USE defsch;
+
+query I
+SELECT current_schema();
+----
+dbo
+
+# The point of the default: an unqualified name resolves without the caller
+# naming a schema, which is what every generic catalog consumer does.
+statement ok
+SELECT mssql_exec('defsch', 'IF OBJECT_ID(''dbo.DefSchProbe'',''U'') IS NOT NULL DROP TABLE dbo.DefSchProbe');
+
+statement ok
+SELECT mssql_exec('defsch', 'CREATE TABLE dbo.DefSchProbe (id INT)');
+
+statement ok
+SELECT mssql_exec('defsch', 'INSERT INTO dbo.DefSchProbe VALUES (7)');
+
+statement ok
+SELECT mssql_invalidate_cache('defsch');
+
+query I
+SELECT id FROM DefSchProbe;
+----
+7
+
+statement ok
+SELECT mssql_exec('defsch', 'DROP TABLE dbo.DefSchProbe');
+
+statement ok
+USE memory;
+
+statement ok
+DETACH defsch;

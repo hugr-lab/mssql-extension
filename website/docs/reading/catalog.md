@@ -45,6 +45,33 @@ WHERE status = 'active'
 LIMIT 100;
 ```
 
+### The default schema is `dbo`
+
+After `USE <catalog>`, unqualified names resolve against `dbo`:
+
+```sql
+USE sqlserver;
+
+SELECT current_schema();
+-- dbo
+
+-- resolves as sqlserver.dbo.customers
+SELECT id FROM customers;
+```
+
+This matters beyond convenience. DuckDB's own default is `main`, which no SQL
+Server database has, so anything that asks the catalog for its default schema —
+generic tooling, or an extension layering its own catalog on top of this one —
+used to fail with `Schema 'main' not found in MSSQL database` before it could
+read anything. The workaround in the wild was to create a schema literally named
+`main` on the server.
+
+`dbo` is a constant, not a per-login lookup: it is the default for every login
+that has not been given another, and resolving it per connection would cost a
+round trip on every `ATTACH`. If your login's default schema is something else,
+address those tables by their qualified name — `catalog.schema.table` works
+regardless, and is what the three-part naming above is for.
+
 ### Cross-Catalog Joins
 
 Join SQL Server tables with local DuckDB tables:
