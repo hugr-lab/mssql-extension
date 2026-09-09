@@ -156,6 +156,100 @@ e_bounded	MSSQL_VARCHAR(50)
 statement ok
 DROP TABLE local_shapes;
 
+# Case is normalized, so 'max' and 'MAX' are ONE type rather than two that
+# happen to mean the same -- otherwise a set operation over both would have to
+# reconcile two identities.
+query II
+SELECT typeof(a) = typeof(b), typeof(a) = typeof(c)
+FROM (SELECT 'x'::MSSQL_VARCHAR('max') AS a, 'x'::MSSQL_VARCHAR('MAX') AS b, 'x'::MSSQL_VARCHAR(-1) AS c);
+----
+true	true
+
+# The type survives being stored and read back, which a view exercises.
+statement ok
+CREATE VIEW max_view AS SELECT 'a'::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS c;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'max_view';
+----
+c	MSSQL_VARCHAR(MAX)
+
+statement ok
+DROP VIEW max_view;
+
+# =============================================================================
+# The explicit DDL path. CREATE TABLE with a column list goes through a
+# DIFFERENT translator from CTAS, so exercising only the CTAS one leaves half
+# the feature untested.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Ddl'',''U'') IS NOT NULL DROP TABLE dbo.I321Ddl');
+
+statement ok
+CREATE TABLE i321.dbo.I321Ddl (
+    id    INTEGER,
+    body  MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8'),
+    notes MSSQL_NVARCHAR('MAX')
+);
+
+query TTIT
+SELECT name, type_name, max_length, collation_name
+FROM mssql_scan('i321', '
+  SELECT c.name AS name, t.name AS type_name, c.max_length AS max_length, c.collation_name AS collation_name
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Ddl'')')
+WHERE name <> 'id'
+ORDER BY name;
+----
+body	varchar	-1	Latin1_General_100_BIN2_UTF8
+notes	nvarchar	-1	SQL_Latin1_General_CP1_CI_AS
+
+# And the column really holds an unbounded value once it exists -- this INSERT
+# goes through the existing-table path, which reads the catalog rather than the
+# annotation, so it is a second, independent check that the column is MAX.
+statement ok
+INSERT INTO i321.dbo.I321Ddl VALUES (1, repeat('ю', 5000), 'n');
+
+query II
+SELECT id, length(body) FROM i321.dbo.I321Ddl;
+----
+1	5000
+
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Ddl');
+
+# =============================================================================
+# The annotation outranks mssql_default_string_length, which only ever applies
+# to a column that stated nothing.
+# =============================================================================
+
+statement ok
+SET mssql_default_string_length = 100;
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Def'',''U'') IS NOT NULL DROP TABLE dbo.I321Def');
+
+statement ok
+CREATE TABLE i321.dbo.I321Def AS SELECT 'a'::MSSQL_VARCHAR('MAX') AS annotated, 'b' AS plain;
+
+query TTI
+SELECT name, type_name, max_length
+FROM mssql_scan('i321', '
+  SELECT c.name AS name, t.name AS type_name, c.max_length AS max_length
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Def'')')
+ORDER BY name;
+----
+annotated	varchar	-1
+plain	nvarchar	200
+
+statement ok
+SET mssql_default_string_length = 0;
+
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Def');
+
 # =============================================================================
 # The cap still applies to a stated length, and the message names the way out.
 # =============================================================================

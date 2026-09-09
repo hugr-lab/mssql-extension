@@ -92,6 +92,16 @@ LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 		// sys.columns reports these in bytes, two per UTF-16 code unit.
 		spec.unicode = true;
 		spec.length = max_length / 2;
+		// The `< 1` half is load-bearing and not merely tidy since issue #321
+		// gave 0 a meaning. A MAX column reports max_length = -1 here, and
+		// -1 / 2 truncates to 0, which IS the MAX sentinel — so relaxing this
+		// test would start reporting MSSQL_NVARCHAR(MAX) for such columns by
+		// accident rather than by decision. Doing it ON PURPOSE is the open
+		// half of #321: it would complete the round trip
+		// mssql_catalog_native_types promises (a varchar(max) COLLATE X source
+		// currently reaches a target as a plain VARCHAR and loses X), at the
+		// cost of changing the type name DESCRIBE prints for every MAX column
+		// in every attached database.
 		if (spec.length < 1 || spec.length > mssql::codec::MAX_NVARCHAR_LENGTH) {
 			return duckdb_type;
 		}
