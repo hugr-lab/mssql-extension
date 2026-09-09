@@ -78,16 +78,40 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 	mssql::codec::TargetStringType spec;
 	spec.unicode = unicode;
 
+	// Three spellings of the MAX form reach here, and all three normalize to the
+	// one sentinel so that nothing downstream has to know there was a choice
+	// (issue #321):
+	//
+	//   'MAX'   reads like the T-SQL it stands for
+	//   0       this extension's own convention -- mssql_default_string_length = 0
+	//           IS the MAX form (spec 060 § 9), and is what gets stored
+	//   -1      SQL Server's convention, from sys.columns.max_length
+	//
+	// A bare MAX keyword is NOT among them and cannot be: DuckDB's parser rejects
+	// it before the extension is consulted -- "Parser Error: Expected a constant
+	// as type modifier" -- so `MSSQL_VARCHAR(MAX, 'c')` would need a change to
+	// DuckDB, not to this function.
 	auto &length_val = modifiers[0].GetValue();
-	if (length_val.IsNull() || !length_val.type().IsIntegral()) {
-		throw BinderException("%s(n): n must be a non-NULL integer", name);
-	}
-	spec.length = length_val.DefaultCastAs(LogicalType::INTEGER).GetValue<int32_t>();
-	if (spec.length < 1 || spec.length > limit) {
-		// n is SQL Server's own unit for the type named: UTF-16 code units for
-		// nvarchar, BYTES for varchar. Past the limit SQL Server requires MAX,
-		// which is what a plain VARCHAR already asks for.
-		throw BinderException("%s(n): n must be between 1 and %d (use VARCHAR for MAX)", name, limit);
+	if (!length_val.IsNull() && length_val.type().id() == LogicalTypeId::VARCHAR) {
+		if (!StringUtil::CIEquals(length_val.ToString(), "max")) {
+			throw BinderException("%s(n): a string modifier must be 'MAX'; got '%s'", name, length_val.ToString());
+		}
+		spec.length = mssql::codec::MAX_LENGTH;
+	} else {
+		if (length_val.IsNull() || !length_val.type().IsIntegral()) {
+			throw BinderException("%s(n): n must be a non-NULL integer, or 'MAX'", name);
+		}
+		const int32_t n = length_val.DefaultCastAs(LogicalType::INTEGER).GetValue<int32_t>();
+		if (n == 0 || n == -1) {
+			spec.length = mssql::codec::MAX_LENGTH;
+		} else if (n < 1 || n > limit) {
+			// n is SQL Server's own unit for the type named: UTF-16 code units for
+			// nvarchar, BYTES for varchar. Past the limit SQL Server requires MAX,
+			// which this now spells rather than refusing.
+			throw BinderException("%s(n): n must be between 1 and %d, or 0 / -1 / 'MAX' for the MAX form", name, limit);
+		} else {
+			spec.length = n;
+		}
 	}
 
 	if (modifiers.size() == 2) {

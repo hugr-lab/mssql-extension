@@ -31,7 +31,9 @@ struct TargetStringType {
 	//! `length` counts BYTES, which is SQL Server's own unit for it: the same n
 	//! in the two types does not hold the same data (spec 060 § 3).
 	bool unicode = true;
-	//! n, in the unit `unicode` implies.
+	//! n, in the unit `unicode` implies, or MAX_LENGTH for the MAX form.
+	//! The default is MAX_LENGTH, which reads correctly: a spec that states no
+	//! length means MAX, exactly as a plain VARCHAR does in this extension.
 	int32_t length = 0;
 	//! Collation for a varchar column. Empty means "fall back to
 	//! mssql_utf8_collation", which in turn may be empty to inherit the
@@ -42,6 +44,25 @@ struct TargetStringType {
 //! Longest n SQL Server accepts before the type must become MAX.
 static constexpr int32_t MAX_NVARCHAR_LENGTH = 4000;
 static constexpr int32_t MAX_VARCHAR_LENGTH = 8000;
+
+//! `length` sentinel for the MAX form: `varchar(max)` / `nvarchar(max)`.
+//!
+//! 0, not SQL Server's own -1, because this extension already spells MAX that
+//! way: `mssql_default_string_length = 0` IS the MAX form and is the default
+//! (spec 060 § 9). One concept, one sentinel. `MSSQL_VARCHAR(-1)` is still
+//! accepted at the binder for anyone with sys.columns habits, and normalized
+//! here.
+//!
+//! It removes the sign-overflow trap that -1 carries (`-1 * 2 = -2`, which is
+//! not `> 8000`, and casts to 65534) but NOT the need to branch: 0 arithmetic
+//! yields 0, and 0 is not the PLP sentinel either. Every site that computes on
+//! `length` must test IsMaxLength FIRST.
+static constexpr int32_t MAX_LENGTH = 0;
+
+//! True for the MAX form, which has no bound and therefore no arithmetic.
+inline bool IsMaxLength(int32_t length) {
+	return length == MAX_LENGTH;
+}
 
 //! Build the annotated VARCHAR. Used by the type binder and by the catalog.
 LogicalType MakeTargetStringType(const TargetStringType &spec);

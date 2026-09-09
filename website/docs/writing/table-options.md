@@ -36,6 +36,33 @@ CREATE TABLE mssql_db.dbo.report AS
 `varchar(50)`, so the same `n` in the two types does not hold the same data —
 50 bytes of UTF-8 is about 16 Cyrillic characters.
 
+#### Asking for MAX
+
+A column with no length bound is `'MAX'` in the length position:
+
+```sql
+CREATE TABLE mssql_db.dbo.docs AS
+    SELECT body::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS body,
+           notes::MSSQL_NVARCHAR('MAX')                               AS notes
+    FROM local_table;
+```
+
+→ `varchar(max) COLLATE Latin1_General_100_BIN2_UTF8` and `nvarchar(max)`.
+
+`0` and `-1` mean the same thing and are accepted interchangeably — `0` because
+that is what `mssql_default_string_length` already uses for MAX, `-1` because
+that is what `sys.columns.max_length` reports for such a column.
+
+A bare `MAX` keyword — `MSSQL_VARCHAR(MAX, …)`, the way T-SQL spells it — does
+**not** work, and cannot: DuckDB's parser rejects a non-constant type modifier
+before the extension is consulted, and answers
+`Parser Error: Expected a constant as type modifier`. Quote it.
+
+Without this, a MAX column's type could only be chosen session-wide, through
+`mssql_ctas_text_type` and `mssql_utf8_collation` — which library code creating
+tables through CTAS or `COPY` cannot set, since it would change the type of
+every other unannotated string column in the caller's session.
+
 #### Naming a collation
 
 `MSSQL_VARCHAR` takes an optional second argument: the collation for that one

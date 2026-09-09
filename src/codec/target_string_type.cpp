@@ -56,11 +56,14 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 }
 
 std::string FormatTargetStringDdl(const TargetStringType &spec, const std::string &fallback_collation) {
+	// `max` is a keyword in T-SQL's length position, not a number (issue #321).
+	const std::string length = IsMaxLength(spec.length) ? "max" : StringUtil::Format("%d", spec.length);
+
 	if (spec.unicode) {
-		return StringUtil::Format("nvarchar(%d)", spec.length);
+		return "nvarchar(" + length + ")";
 	}
 
-	std::string ddl = StringUtil::Format("varchar(%d)", spec.length);
+	std::string ddl = "varchar(" + length + ")";
 	const std::string &collation = spec.collation.empty() ? fallback_collation : spec.collation;
 	if (!collation.empty()) {
 		ddl += " COLLATE " + collation;

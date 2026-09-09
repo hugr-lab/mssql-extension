@@ -12,6 +12,8 @@
 #include <iostream>
 
 #include "catalog/mssql_ddl_translator.hpp"
+#include "codec/target_string_type.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
 #include "duckdb/common/types.hpp"
@@ -151,6 +153,87 @@ void test_ctas_strings_varchar() {
 
 	// VARCHAR maps to VARCHAR(MAX) when setting is VARCHAR
 	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(LogicalType::VARCHAR, config), "VARCHAR(MAX)");
+
+	std::cout << "PASSED!" << std::endl;
+}
+
+//==============================================================================
+// Test: the annotated string types, including the MAX form (issue #321)
+//
+// The DDL is the whole point of the annotation -- it is the only thing that
+// reaches the server -- and it is a pure function, so it belongs in a test CI
+// runs rather than one that needs a live SQL Server.
+//==============================================================================
+static LogicalType MakeTarget(bool unicode, int32_t length, const std::string &collation) {
+	mssql::codec::TargetStringType spec;
+	spec.unicode = unicode;
+	spec.length = length;
+	spec.collation = collation;
+	return mssql::codec::MakeTargetStringType(spec);
+}
+
+void test_ctas_annotated_strings() {
+	std::cout << "\n=== Test: CTAS Annotated String Types (MSSQL_VARCHAR / MSSQL_NVARCHAR) ===" << std::endl;
+
+	CTASConfig config;
+	config.varchar_collation = "Latin1_General_100_BIN2_UTF8";
+
+	// Bounded: unchanged by issue #321, and the regression that would matter most.
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(false, 50, "Cyrillic_General_CI_AS"), config),
+			  "varchar(50) COLLATE Cyrillic_General_CI_AS");
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(true, 200, ""), config), "nvarchar(200)");
+
+	// MAX. `max` is a keyword in T-SQL's length position, never a number, so a
+	// sentinel that reached the "%d" path would emit `varchar(0)` -- accepted by
+	// no server, and the reason this is asserted rather than assumed.
+	const int32_t MAXLEN = mssql::codec::MAX_LENGTH;
+	ASSERT_EQ(
+		MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(false, MAXLEN, "Latin1_General_100_BIN2_UTF8"), config),
+		"varchar(max) COLLATE Latin1_General_100_BIN2_UTF8");
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(true, MAXLEN, ""), config), "nvarchar(max)");
+
+	// A MAX varchar naming no collation of its own takes the statement's, the
+	// same fallback a bounded one takes.
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(false, MAXLEN, ""), config),
+			  "varchar(max) COLLATE Latin1_General_100_BIN2_UTF8");
+
+	// ...and with no fallback either, no COLLATE clause at all: the column
+	// inherits the database default, which is correct on Fabric.
+	CTASConfig no_collation;
+	no_collation.varchar_collation = "";
+	ASSERT_EQ(MSSQLDDLTranslator::MapLogicalTypeToCTAS(MakeTarget(false, MAXLEN, ""), no_collation), "varchar(max)");
+
+	std::cout << "PASSED!" << std::endl;
+}
+
+//==============================================================================
+// Test: the wire length for an annotated column (issue #321)
+//
+// GetTDSMaxLength feeds the INSERT BULK declaration AND the encoder's overflow
+// guard. The guard treats 0xFFFF as "no bound"; any other number is a bound. So
+// a MAX column that does not report exactly 0xFFFF here is a column the encoder
+// will reject long values for -- silently, since the DDL would still say max.
+//==============================================================================
+void test_tds_max_length_for_annotated() {
+	std::cout << "\n=== Test: TDS wire length for annotated strings ===" << std::endl;
+
+	// Bounded: nvarchar counts UTF-16 bytes, so 2n.
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(true, 200, "")), 400);
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(false, 50, "c")), 100);
+
+	// The inline boundary is 8000 WIRE bytes and it is inclusive, so the largest
+	// nvarchar that still fits inline is exactly 4000 units. One unit more, and a
+	// varchar(8000) (16000 wire bytes), go PLP.
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(true, 4000, "")), 8000);
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(false, 4001, "c")), 0xFFFF);
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(false, 8000, "c")), 0xFFFF);
+
+	// MAX is PLP, and is tested BEFORE the arithmetic rather than falling
+	// through it: 0 * 2 is 0, which is neither > 8000 nor the sentinel, so
+	// without the branch an unbounded column is declared zero-length and the
+	// encoder rejects every non-empty value while the DDL still says max.
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(false, mssql::codec::MAX_LENGTH, "c")), 0xFFFF);
+	ASSERT_EQ((int)TargetResolver::GetTDSMaxLength(MakeTarget(true, mssql::codec::MAX_LENGTH, "")), 0xFFFF);
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -339,6 +422,8 @@ int main() {
 		test_ctas_decimal_clamping();
 		test_ctas_strings_nvarchar();
 		test_ctas_strings_varchar();
+		test_ctas_annotated_strings();
+		test_tds_max_length_for_annotated();
 		test_ctas_binary();
 		test_ctas_datetime();
 		test_ctas_uuid();
