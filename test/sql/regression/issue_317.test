@@ -116,6 +116,59 @@ SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'i317' AND schema = 'i31
 ----
 2
 
+# =============================================================================
+# THE DISCRIMINATING CASE, and it is a different loader.
+#
+# BulkLoadAll's per-schema branch -- where mssql_preload_catalog(ctx, 'schema')
+# routes -- had the same defect, and there the corruption IS observable, which
+# is what the whole-catalog case above lacks. The reason is a single line: that
+# loop cleared the columns of a table ALREADY in the cache, one whose
+# columns_load_state was already LOADED from an earlier load. A throw before the
+# publication left it holding whatever columns had arrived while still claiming
+# to be complete, so LoadAllTableMetadata's guard saw a finished schema and never
+# reloaded -- and a two-column table came back from SELECT * with one column, for
+# the rest of the session.
+#
+# The setup matters and is not the obvious one:
+#   * the first preload must SUCCEED, so the schema and its tables are LOADED;
+#   * it must not be followed by a listing, because that builds DuckDB table
+#     ENTRIES which then answer duckdb_columns() from their own copy and hide
+#     the cache underneath;
+#   * so the first touch of the table has to come AFTER the failed load.
+# Verified failing on the un-staged build: column_count 1, and SELECT * returning
+# one column.
+# =============================================================================
+
+statement ok
+SELECT mssql_invalidate_cache('i317');
+
+statement ok
+SELECT mssql_preload_catalog('i317', 'i317s');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT mssql_preload_catalog('i317', 'i317s');
+----
+injected metadata failure
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# First touch of A builds its entry from the metadata cache. Both columns, not
+# the one that had arrived when the load died.
+query II
+SELECT * FROM i317.i317s.A;
+----
+
+query II
+SELECT table_name, column_count FROM duckdb_tables()
+WHERE database_name = 'i317' AND schema_name = 'i317s' ORDER BY table_name;
+----
+A	2
+B	2
+
 # Cleanup
 statement ok
 SELECT mssql_exec('i317', 'DROP TABLE i317s.A');

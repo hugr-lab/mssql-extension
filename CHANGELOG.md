@@ -20,8 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the #178 review fixed for `Refresh()`, and spec 071 widened the blast radius
   from one schema to the whole catalog by replacing the per-schema loop with a
   single query. Nothing is written into the cache now until the query has
-  returned. See the PR for why the reported symptom is not currently reachable
-  and the fix is worth having anyway.
+  returned.
+
+  The same defect was in the sibling loader — `BulkLoadAll`'s per-schema branch,
+  where `mssql_preload_catalog(ctx, 'schema')` routes — and **there it was
+  observable** (found by @oluies reviewing the first fix). That loop cleared the
+  columns of a table already cached and already marked `LOADED`, so a throw
+  before publication left it claiming to be complete with only the columns that
+  had arrived: a two-column table came back from `SELECT *` with one column, for
+  the rest of the session. Both loaders are staged now.
 
 ### Added
 
