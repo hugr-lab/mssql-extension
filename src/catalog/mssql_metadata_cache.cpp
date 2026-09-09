@@ -809,12 +809,45 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	// object_id -> the entry it owns. Pointers into schemas_[x].tables stay valid
-	// across insertion because both containers are node-based unordered_maps.
+	// Nothing is written into schemas_ until the query has RETURNED. Issue #317:
+	// this used to clear each schema's table map from inside the row callback and
+	// only re-publish tables_load_state afterwards, so a non-retryable throw
+	// mid-query -- a metadata timeout, a reset connection, any TDS error -- left
+	// every schema the callback had already touched EMPTIED while still carrying
+	// its previous load state. The reset lambda covered the 1205 retry only.
+	//
+	// It is the same shape the issue #178 review fixed for Refresh(), and spec
+	// 071 widened the blast radius from one schema to every schema in the catalog
+	// by replacing the per-schema loop with a single query.
+	//
+	// It was LATENT rather than live, recorded so nobody "simplifies" this back
+	// after finding the same reassurance. Two things hid it, neither of them
+	// here: the publication of each table's columns_load_state is ALSO deferred
+	// to after the query, so a touched schema comes out of a failed load either
+	// empty or holding tables whose columns say NOT_LOADED -- and
+	// LoadAllTableMetadata rejects both (`all_columns_loaded &&
+	// !tables.empty()`) and reloads. The one reader that would trust the broken
+	// state, EnsureTablesLoaded, is reachable only from GetTableNames, which has
+	// no callers.
+	//
+	// So the old code was safe by three deferrals happening to line up, on
+	// layers that do not know about each other. This one is safe because this
+	// function does not publish until it has an answer.
+	//
+	// The cost is one extra copy of the table metadata for the duration of a
+	// load, PROPORTIONAL TO THE CATALOG and held while mutex_ is held. Measured
+	// +~2 MB peak RSS on a warm reload of 2039 tables / 16202 columns -- which is
+	// ~1% of the scale this file is written for (the 200K-object figures at the
+	// top and on LoadAllTableMetadata), so read it as a rate, not a ceiling.
+	//
+	// Staging the TABLE MAPS rather than whole MSSQLSchemaMetadata values keeps
+	// each schema's other fields (its name, and any state a future field adds)
+	// instead of rebuilding them from nothing.
+	unordered_map<string, unordered_map<string, MSSQLTableMetadata>> staged;
+	// object_id -> the entry it owns, pointing into `staged`. Valid across
+	// insertion because both containers are node-based unordered_maps, and read
+	// only before the publication below moves anything.
 	unordered_map<string, MSSQLTableMetadata *> by_object_id;
-	// Which schemas this pass actually created or refilled, so the publication
-	// below marks exactly those and leaves any others alone.
-	unordered_map<string, MSSQLSchemaMetadata *> touched;
 
 	ExecuteMetadataQuery(
 		connection, sql,
@@ -837,19 +870,10 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 				if (filter_ && !filter_->MatchesTable(table_name)) {
 					return;
 				}
-				auto schema_it = schemas_.find(schema_name);
-				if (schema_it == schemas_.end()) {
-					schema_it = schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name)).first;
-					schema_count++;
-				}
-				auto &schema = schema_it->second;
-				if (touched.emplace(schema_name, &schema).second) {
-					// First row for this schema in this pass: drop whatever an
-					// earlier partial load left, so the query's answer is the whole
-					// answer rather than a merge with a stale one.
-					schema.tables.clear();
-				}
-				auto &slot = schema.tables[table_name];
+				// Creating the staged map IS what "this pass touched the schema"
+				// means; the cache itself is not consulted or modified here.
+				auto &tables = staged[schema_name];
+				auto &slot = tables[table_name];
 				slot = MSSQLTableMetadata();
 				slot.name = table_name;
 				if (!values[3].empty() && values[3][0] == 'V') {
@@ -897,21 +921,21 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 		},
 		[&]() {
 			// Restartable (PR #308): a deadlock victim reruns from the top, so the
-			// grouping state and everything it published have to go back. Only the
-			// schemas this pass touched are cleared — one it never reached still
-			// holds whatever it legitimately had.
-			for (auto &pair : touched) {
-				pair.second->tables.clear();
-			}
+			// grouping state goes back. Nothing published needs undoing any more —
+			// the cache has not been touched at this point (issue #317).
+			staged.clear();
 			by_object_id.clear();
-			touched.clear();
 			schema_count = 0;
 			table_count = 0;
 			column_count = 0;
 		});
 
+	// Everything below runs only if ExecuteMetadataQuery returned. A throw takes
+	// the staged copy with it and leaves the cache exactly as it was (#317).
+
 	// Columns arrive in no particular order, so put each table's list back into
 	// column_id order before publishing: every consumer indexes by position.
+	// Must precede the move below, which invalidates by_object_id.
 	const auto now = std::chrono::steady_clock::now();
 	for (auto &pair : by_object_id) {
 		auto &columns = pair.second->columns;
@@ -920,9 +944,20 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 		pair.second->columns_load_state = CacheLoadState::LOADED;
 		pair.second->columns_last_refresh = now;
 	}
-	for (auto &pair : touched) {
-		pair.second->tables_load_state = CacheLoadState::LOADED;
-		pair.second->tables_last_refresh = now;
+	by_object_id.clear();
+
+	// Publish. A schema's old table map is replaced, not merged, so the query's
+	// answer is the whole answer.
+	for (auto &pair : staged) {
+		auto schema_it = schemas_.find(pair.first);
+		if (schema_it == schemas_.end()) {
+			schema_it = schemas_.emplace(pair.first, MSSQLSchemaMetadata(pair.first)).first;
+			schema_count++;
+		}
+		auto &schema = schema_it->second;
+		schema.tables = std::move(pair.second);
+		schema.tables_load_state = CacheLoadState::LOADED;
+		schema.tables_last_refresh = now;
 	}
 	// A schema the query returned NO rows for is still loaded — it is empty, and
 	// saying so is what stops the next Scan from asking again.
@@ -930,7 +965,7 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 		if (filter_ && !filter_->MatchesSchema(pair.first)) {
 			continue;
 		}
-		if (touched.find(pair.first) == touched.end()) {
+		if (staged.find(pair.first) == staged.end()) {
 			pair.second.tables.clear();
 			pair.second.tables_load_state = CacheLoadState::LOADED;
 			pair.second.tables_last_refresh = now;
@@ -938,7 +973,7 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 	}
 
 	CACHE_DEBUG(1, "LoadAllSchemasMetadata — %llu schema(s), %llu table(s), %llu column(s) in ONE query",
-				(unsigned long long)touched.size(), (unsigned long long)table_count, (unsigned long long)column_count);
+				(unsigned long long)staged.size(), (unsigned long long)table_count, (unsigned long long)column_count);
 }
 
 void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count,
@@ -1013,7 +1048,24 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		}
 		sql += "\nORDER BY s.name, o.name, c.column_id";
 
-		// Streaming group-by parse for this schema
+		// Streaming group-by parse for this schema.
+		//
+		// Staged, for the reason LoadAllSchemasMetadata is (issue #317) — and here
+		// the corruption was OBSERVABLE, which the whole-catalog one was not. This
+		// loop used to write into the LIVE schemas_ from the callback, including
+		// `columns.clear()` on a table that an earlier single-table load had
+		// already marked columns_load_state = LOADED. A throw between that clear
+		// and the publication below left the table holding whatever columns had
+		// arrived, still claiming to be fully loaded, and the guard in
+		// LoadAllTableMetadata (`all_columns_loaded && !tables.empty()`) then saw
+		// a complete schema and never reloaded. Reproduced: a two-column table
+		// came back from `SELECT *` with one column, for the rest of the session.
+		//
+		// The publication MERGES rather than replaces, which is why the staging is
+		// per table and not a whole table map: this query may not cover every
+		// table the schema legitimately holds (one excluded by table_filter, say),
+		// and those must survive.
+		unordered_map<string, MSSQLTableMetadata> staged_tables;
 		string current_table;
 		MSSQLTableMetadata *current_table_meta = nullptr;
 		idx_t schema_tables = 0;
@@ -1049,9 +1101,12 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 				if (row_table != current_table) {
 					current_table = row_table;
 
-					auto &tables = schema.tables;
-					auto table_it = tables.find(current_table);
-					if (table_it == tables.end()) {
+					// Seed the staged entry from the cache when the table is
+					// already known, so a field this query does not carry is not
+					// silently dropped; its columns start empty either way,
+					// because this query is the whole answer for them.
+					auto table_it = staged_tables.find(current_table);
+					if (table_it == staged_tables.end()) {
 						MSSQLTableMetadata table_meta;
 						table_meta.name = current_table;
 
@@ -1075,13 +1130,19 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 						// TABLOCK and sort decisions.
 						ParseTableShape(values, 12, 13, table_meta);
 
-						tables.emplace(current_table, std::move(table_meta));
-						table_it = tables.find(current_table);
-						schema_tables++;
-						table_count++;
+						table_it = staged_tables.emplace(current_table, std::move(table_meta)).first;
+						// Counts tables NEW TO THE CACHE, which is what the
+						// preload status message has always reported — not
+						// tables seen in this query. Staging moved the find
+						// off schema.tables, so ask it directly.
+						if (schema.tables.find(current_table) == schema.tables.end()) {
+							schema_tables++;
+							table_count++;
+						}
 					} else {
-						// Table already exists (e.g. columns loaded by a prior single-table query).
-						// Clear columns to avoid duplicates, since we're reloading from bulk query.
+						// Same table twice in one pass. The ORDER BY makes that a
+						// non-group, but if it ever happened the second group is
+						// the authority, exactly as before.
 						table_it->second.columns.clear();
 					}
 					current_table_meta = &table_it->second;
@@ -1117,14 +1178,11 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 				column_count++;
 			},
 			[&]() {
-				// Deliberately NOT schema.tables.clear(): unlike LoadAllTableMetadata
-				// this pass MERGES into a map that may already hold tables from an
-				// earlier single-table load, and clearing would drop entries this
-				// query never covers (a table filtered out by table_filter, say).
-				// It does not need to: emptying current_table makes the rerun's first
-				// row take the new-table branch, which clears that table's columns
-				// before refilling them. Only the group-by cursor and this schema's
-				// share of the running totals have to be given back.
+				// Restartable (PR #308). Nothing published needs undoing since
+				// issue #317 staged this loop — the cache has not been touched at
+				// this point — so the staging area and the group-by cursor go back
+				// together, along with this schema's share of the running totals.
+				staged_tables.clear();
 				current_table.clear();
 				current_table_meta = nullptr;
 				table_count -= schema_tables;
@@ -1132,6 +1190,14 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 				schema_tables = 0;
 				schema_columns = 0;
 			});
+
+		// Publish, only now that the query has returned. Per table rather than
+		// wholesale: this query may not cover every table the schema legitimately
+		// holds — one excluded by table_filter, or loaded singly and not matched
+		// here — and replacing the map would drop those.
+		for (auto &staged : staged_tables) {
+			schema.tables[staged.first] = std::move(staged.second);
+		}
 
 		CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns", target_schema.c_str(),
 					(unsigned long long)schema_tables, (unsigned long long)schema_columns);
@@ -1292,9 +1358,45 @@ int MSSQLMetadataCache::GetMetadataTimeoutMs() const {
 	return metadata_timeout_ms_;
 }
 
+void MSSQLMetadataCache::SetTestFailAfterRows(int64_t rows) {
+	test_fail_after_rows_ = rows;
+}
+
 void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql,
 											  MSSQLMetadataCache::MetadataRowCallback callback,
 											  MSSQLMetadataCache::MetadataResetCallback reset) {
+	// Issue #317: the only deliberate way to a mid-query failure. Everything
+	// that causes one in the wild — a metadata timeout, a reset connection, a
+	// killed session — arrives from outside and cannot be asked for from SQL.
+	// Off is the normal case and is free: the callback goes through unwrapped,
+	// so the row loop carries no test.
+	const int64_t fail_after = test_fail_after_rows_;
+	if (fail_after > 0) {
+		auto seen = make_shared_ptr<int64_t>(0);
+		auto inner = std::move(callback);
+		// Throw ON row N, not after it: `> fail_after` needed N+1 rows, so a
+		// fixture returning exactly N made the whole lever a no-op that still
+		// passed every non-error assertion written around it.
+		callback = [inner, seen, fail_after](const vector<string> &values) {
+			inner(values);
+			if (++(*seen) >= fail_after) {
+				throw IOException("mssql: injected metadata failure at row %lld (mssql_test_fail_metadata_after_rows)",
+								  (long long)fail_after);
+			}
+		};
+		// The reset lambda has to zero the counter too. RunMetadataQuery reruns
+		// the query from the top on a deadlock victim (PR #308), and a count
+		// carried over from attempt 1 would fire immediately on attempt 2 -- so
+		// the lever would behave differently on exactly the retry path a
+		// partial-load bug is most likely to be reasoned about.
+		auto inner_reset = std::move(reset);
+		reset = [inner_reset, seen]() {
+			*seen = 0;
+			if (inner_reset) {
+				inner_reset();
+			}
+		};
+	}
 	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 

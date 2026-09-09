@@ -1,0 +1,183 @@
+# name: test/sql/regression/issue_317.test
+# description: a metadata load that fails mid-query leaves the cache exactly as it was (issue #317)
+# group: [mssql]
+# issue: 317
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# LoadAllSchemasMetadata used to clear each schema's table map from INSIDE the
+# row callback and only re-publish tables_load_state after the query returned.
+# A non-retryable throw in between -- a metadata timeout, a reset connection, a
+# killed session -- therefore left every schema the callback had already touched
+# EMPTIED while still carrying its previous load state. The reset lambda covered
+# only the 1205 retry path.
+#
+# It is the same shape the issue #178 review fixed for Refresh(), and spec 071
+# widened the blast radius from one schema to all of them by replacing the
+# per-schema loop with a single whole-catalog query.
+#
+# The failure is now impossible by construction rather than repaired: nothing is
+# written into the cache until the query has returned.
+#
+# WHAT THIS TEST DOES AND DOES NOT DO. It passes on the PRE-FIX build too --
+# verified, not assumed -- so it is not a regression test for #317 and must not
+# be read as one. The corrupted state is unobservable through any live path,
+# because the same deferral that leaves a schema emptied ALSO defers publishing
+# its tables' columns_load_state: a touched schema therefore comes out of a
+# failed load either empty or holding tables whose columns say NOT_LOADED, and
+# LoadAllTableMetadata rejects both (`all_columns_loaded && !tables.empty()`)
+# and reloads. The one reader that would trust the broken state,
+# EnsureTablesLoaded, is reachable only from GetTableNames, which has no callers.
+#
+# So what it pins is the CONTRACT, which is what a user can actually see: a
+# metadata load that fails leaves the catalog exactly as usable as it was, and a
+# later load still works. That contract held before by three separate deferrals
+# happening to line up, and holds now because one function keeps it. If someone
+# removes the downstream guard or gives GetTableNames a caller, this test starts
+# discriminating -- which is the point of writing it down rather than leaving the
+# invariant to be rediscovered.
+#
+# mssql_test_fail_metadata_after_rows is how the failure is reached on purpose.
+# Every cause in the wild arrives from outside mid-query and cannot be asked for
+# from SQL; without the lever this invariant is untestable, which is how it came
+# to be broken twice.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS i317 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i317', 'IF SCHEMA_ID(''i317s'') IS NULL EXEC(''CREATE SCHEMA i317s'')');
+
+statement ok
+SELECT mssql_exec('i317', 'IF OBJECT_ID(''i317s.A'',''U'') IS NULL CREATE TABLE i317s.A (a INT, b VARCHAR(20))');
+
+statement ok
+SELECT mssql_exec('i317', 'IF OBJECT_ID(''i317s.B'',''U'') IS NULL CREATE TABLE i317s.B (c INT, d VARCHAR(20))');
+
+statement ok
+SELECT mssql_invalidate_cache('i317');
+
+# Warm by LISTING, which is what marks the schema's table list loaded. A single
+# table query does NOT -- it goes to GetTableMetadata, one table, one seek.
+query I
+SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'i317' AND schema = 'i317s';
+----
+2
+
+# =============================================================================
+# Fail the whole-catalog load partway through. Row 1 is early enough that the
+# callback has certainly touched a schema and certainly not finished it.
+# =============================================================================
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT mssql_preload_catalog('i317');
+----
+injected metadata failure
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# The cache is unchanged: same tables, still listed, no reload required to see
+# them and no stale emptiness cached in their place.
+query I
+SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'i317' AND schema = 'i317s';
+----
+2
+
+query II
+SELECT table_name, column_count FROM duckdb_tables()
+WHERE database_name = 'i317' AND schema_name = 'i317s' ORDER BY table_name;
+----
+A	2
+B	2
+
+# Reading through the columns as well: a half-published table would have kept
+# whichever columns arrived before the throw.
+query I
+SELECT count(*) FROM i317.i317s.A;
+----
+0
+
+# And a successful load still works afterwards -- the failure left no state that
+# blocks the next attempt.
+statement ok
+SELECT mssql_preload_catalog('i317');
+
+query I
+SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'i317' AND schema = 'i317s';
+----
+2
+
+# =============================================================================
+# THE DISCRIMINATING CASE, and it is a different loader.
+#
+# BulkLoadAll's per-schema branch -- where mssql_preload_catalog(ctx, 'schema')
+# routes -- had the same defect, and there the corruption IS observable, which
+# is what the whole-catalog case above lacks. The reason is a single line: that
+# loop cleared the columns of a table ALREADY in the cache, one whose
+# columns_load_state was already LOADED from an earlier load. A throw before the
+# publication left it holding whatever columns had arrived while still claiming
+# to be complete, so LoadAllTableMetadata's guard saw a finished schema and never
+# reloaded -- and a two-column table came back from SELECT * with one column, for
+# the rest of the session.
+#
+# The setup matters and is not the obvious one:
+#   * the first preload must SUCCEED, so the schema and its tables are LOADED;
+#   * it must not be followed by a listing, because that builds DuckDB table
+#     ENTRIES which then answer duckdb_columns() from their own copy and hide
+#     the cache underneath;
+#   * so the first touch of the table has to come AFTER the failed load.
+# Verified failing on the un-staged build: column_count 1, and SELECT * returning
+# one column.
+# =============================================================================
+
+statement ok
+SELECT mssql_invalidate_cache('i317');
+
+statement ok
+SELECT mssql_preload_catalog('i317', 'i317s');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT mssql_preload_catalog('i317', 'i317s');
+----
+injected metadata failure
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# First touch of A builds its entry from the metadata cache. Both columns, not
+# the one that had arrived when the load died.
+query II
+SELECT * FROM i317.i317s.A;
+----
+
+query II
+SELECT table_name, column_count FROM duckdb_tables()
+WHERE database_name = 'i317' AND schema_name = 'i317s' ORDER BY table_name;
+----
+A	2
+B	2
+
+# Cleanup
+statement ok
+SELECT mssql_exec('i317', 'DROP TABLE i317s.A');
+
+statement ok
+SELECT mssql_exec('i317', 'DROP TABLE i317s.B');
+
+statement ok
+SELECT mssql_exec('i317', 'DROP SCHEMA i317s');
+
+statement ok
+DETACH i317;

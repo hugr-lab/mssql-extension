@@ -130,6 +130,22 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "since its bytes are returned verbatim into a DuckDB VARCHAR (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_test_fail_metadata_after_rows - TEST ONLY (issue #317).
+	//
+	// Makes a metadata query throw after N rows have been parsed, which is the
+	// only way to reach the partial-load path deliberately: the failures that
+	// reach it in the wild — a query timeout, a reset connection, a killed
+	// session — all arrive mid-query and cannot be induced from SQL. Without it
+	// the invariant "a metadata load that fails leaves the cache exactly as it
+	// was" is untestable, and it has now been broken twice (issue #178 in
+	// Refresh(), issue #317 in LoadAllSchemasMetadata).
+	//
+	// 0 = off, and off is free: ExecuteMetadataQuery passes the row callback
+	// through untouched, so there is no per-row test to pay for.
+	config.AddExtensionOption("mssql_test_fail_metadata_after_rows",
+							  "TEST ONLY: make a metadata query fail after this many rows (0 = off)",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
 	// Short by design — Browser is on the critical path of every named-instance attach.
@@ -504,6 +520,14 @@ int LoadQueryTimeout(ClientContext &context) {
 		return static_cast<int>(val.GetValue<int64_t>());
 	}
 	return tds::DEFAULT_QUERY_TIMEOUT;	// Default: 30 seconds
+}
+
+int64_t LoadTestFailMetadataAfterRows(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_test_fail_metadata_after_rows", val)) {
+		return val.GetValue<int64_t>();
+	}
+	return 0;
 }
 
 int LoadMetadataTimeout(ClientContext &context) {

@@ -239,6 +239,12 @@ public:
 	// Set metadata query timeout in seconds (0 = no timeout)
 	void SetMetadataTimeout(int timeout_seconds);
 
+	//! TEST ONLY (issue #317). Make the NEXT metadata query throw once it has
+	//! parsed this many rows, so the partial-load path can be reached
+	//! deliberately. 0 disables it, and disabled costs nothing: the row callback
+	//! is passed through unwrapped.
+	void SetTestFailAfterRows(int64_t rows);
+
 	// Get metadata query timeout in milliseconds
 	int GetMetadataTimeoutMs() const;
 
@@ -352,8 +358,9 @@ private:
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query
 	// (ExecuteMetadataQuery runs WITH mutex_ held, so these must be lock-free).
-	std::atomic<int64_t> ttl_seconds_;		// Cache TTL (0 = manual only)
-	std::atomic<int> metadata_timeout_ms_;	// Metadata query timeout in ms (default 5 min)
+	std::atomic<int64_t> ttl_seconds_;				// Cache TTL (0 = manual only)
+	std::atomic<int> metadata_timeout_ms_;			// Metadata query timeout in ms (default 5 min)
+	std::atomic<int64_t> test_fail_after_rows_{0};	// TEST ONLY, issue #317
 
 	// Incremental cache state for schema list (catalog-level) — guarded by mutex_
 	CacheLoadState schemas_load_state_ = CacheLoadState::NOT_LOADED;
