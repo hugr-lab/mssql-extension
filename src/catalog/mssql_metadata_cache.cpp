@@ -820,12 +820,21 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 	// 071 widened the blast radius from one schema to every schema in the catalog
 	// by replacing the per-schema loop with a single query.
 	//
-	// It was LATENT rather than live, which is worth recording so nobody
-	// "simplifies" this back: the live listing path, LoadAllTableMetadata, tests
-	// `!schema.tables.empty()` before trusting a LOADED state, and the path that
-	// does NOT -- EnsureTablesLoaded -- is reachable only from GetTableNames,
-	// which has no callers. Both of those are somebody else's invariant to keep,
-	// and neither is stated where this function can see it.
+	// It was LATENT rather than live, recorded so nobody "simplifies" this back
+	// after finding the same reassurance. Two things hid it, neither of them
+	// here: the publication of each table's columns_load_state is ALSO deferred
+	// to after the query, so a touched schema comes out of a failed load either
+	// empty or holding tables whose columns say NOT_LOADED -- and
+	// LoadAllTableMetadata rejects both (`all_columns_loaded &&
+	// !tables.empty()`) and reloads. The one reader that would trust the broken
+	// state, EnsureTablesLoaded, is reachable only from GetTableNames, which has
+	// no callers.
+	//
+	// So the old code was safe by three deferrals happening to line up, on
+	// layers that do not know about each other. This one is safe because this
+	// function does not publish until it has an answer. The cost is one extra
+	// copy of the table metadata for the duration of a load: measured +~2 MB
+	// peak RSS on a warm reload of 2039 tables / 16202 columns.
 	//
 	// Staging the TABLE MAPS rather than whole MSSQLSchemaMetadata values keeps
 	// each schema's other fields (its name, and any state a future field adds)

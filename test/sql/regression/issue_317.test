@@ -18,7 +18,25 @@
 # per-schema loop with a single whole-catalog query.
 #
 # The failure is now impossible by construction rather than repaired: nothing is
-# written into the cache until the query has returned. This test pins that.
+# written into the cache until the query has returned.
+#
+# WHAT THIS TEST DOES AND DOES NOT DO. It passes on the PRE-FIX build too --
+# verified, not assumed -- so it is not a regression test for #317 and must not
+# be read as one. The corrupted state is unobservable through any live path,
+# because the same deferral that leaves a schema emptied ALSO defers publishing
+# its tables' columns_load_state: a touched schema therefore comes out of a
+# failed load either empty or holding tables whose columns say NOT_LOADED, and
+# LoadAllTableMetadata rejects both (`all_columns_loaded && !tables.empty()`)
+# and reloads. The one reader that would trust the broken state,
+# EnsureTablesLoaded, is reachable only from GetTableNames, which has no callers.
+#
+# So what it pins is the CONTRACT, which is what a user can actually see: a
+# metadata load that fails leaves the catalog exactly as usable as it was, and a
+# later load still works. That contract held before by three separate deferrals
+# happening to line up, and holds now because one function keeps it. If someone
+# removes the downstream guard or gives GetTableNames a caller, this test starts
+# discriminating -- which is the point of writing it down rather than leaving the
+# invariant to be rediscovered.
 #
 # mssql_test_fail_metadata_after_rows is how the failure is reached on purpose.
 # Every cause in the wild arrives from outside mid-query and cannot be asked for
