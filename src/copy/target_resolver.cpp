@@ -1209,7 +1209,13 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 					// Both sides count bytes now, so the length is not doubled the
 					// way an nvarchar declaration doubles it. An unannotated column
 					// stated no length and is varchar(max) — the PLP sentinel.
-					const bool is_max = !annotated_varchar || spec.length > MAX_INLINE_VARCHAR_BYTES;
+					// An ANNOTATED max column (issue #321) reaches here with
+					// length 0, which is not > MAX_INLINE_VARCHAR_BYTES and
+					// would otherwise be declared as varchar(0) on the wire.
+					// Only the unannotated case was max before, so the
+					// IsMaxLength arm is the new one.
+					const bool is_max =
+						!annotated_varchar || codec::IsMaxLength(spec.length) || spec.length > MAX_INLINE_VARCHAR_BYTES;
 					col.max_length = is_max ? 0xFFFF : static_cast<uint16_t>(spec.length);
 					col.collation = UTF8_WIRE_COLLATION;
 					col.collation_name = collation;
@@ -1479,6 +1485,15 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	// — permissive, never rejecting a value the column would have accepted.
 	codec::TargetStringType target_string;
 	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {
+		// MAX is not a length, so it is tested BEFORE the arithmetic rather
+		// than falling through it (issue #321). 0 * 2 is 0, which is not > 8000
+		// and is not the PLP sentinel either, so without this a column with no
+		// bound would be declared zero-length on the wire and the encoder's
+		// overflow guard -- which reads exactly 0xFFFF as "no bound" -- would
+		// reject every non-empty value while the DDL still said max.
+		if (codec::IsMaxLength(target_string.length)) {
+			return 0xFFFF;
+		}
 		const int32_t wire_bytes = target_string.length * 2;
 		// Past 8000 bytes the inline NVARCHAR form is out of room and the value
 		// has to travel as PLP, exactly as an oversized existing column does.

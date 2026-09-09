@@ -23,7 +23,22 @@ LogicalType MakeTargetStringType(const TargetStringType &spec) {
 	LogicalType type = LogicalType(LogicalTypeId::VARCHAR).WithAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
 
 	auto info = make_uniq<ExtensionTypeInfo>();
-	info->modifiers.emplace_back(Value::INTEGER(spec.length));
+	// The modifier is what DESCRIBE and duckdb_columns() PRINT, so the MAX form
+	// carries the word rather than the sentinel. DuckDB renders it unquoted, so
+	// the column reads as `MSSQL_VARCHAR(MAX)` -- T-SQL's own spelling -- where
+	// the sentinel would have printed `MSSQL_VARCHAR(0)`, which says zero-length,
+	// or `(-1)`, which says nothing at all. The internal `length` stays numeric;
+	// this is the one boundary where it becomes something a person reads.
+	//
+	// The printed form is deliberately NOT round-trippable: unquoted MAX in a
+	// cast is refused by DuckDB's parser, before this extension is consulted.
+	// Documented in website/docs/writing/table-options.md, since the obvious
+	// thing to do with a type name is paste it back.
+	if (IsMaxLength(spec.length)) {
+		info->modifiers.emplace_back(Value(MAX_MODIFIER));
+	} else {
+		info->modifiers.emplace_back(Value::INTEGER(spec.length));
+	}
 	if (!spec.unicode && !spec.collation.empty()) {
 		info->properties[COLLATION_PROPERTY] = Value(spec.collation);
 	}
@@ -48,7 +63,17 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 	if (info.modifiers.size() != 1 || info.modifiers[0].value.IsNull()) {
 		return false;
 	}
-	result.length = info.modifiers[0].value.GetValue<int32_t>();
+	const auto &length_modifier = info.modifiers[0].value;
+	if (length_modifier.type().id() == LogicalTypeId::VARCHAR) {
+		// The MAX form. Nothing else is stored as a string, and a stray one
+		// would be a type this codec did not build.
+		if (!IsMaxKeyword(length_modifier.ToString())) {
+			return false;
+		}
+		result.length = MAX_LENGTH;
+	} else {
+		result.length = length_modifier.GetValue<int32_t>();
+	}
 
 	const auto entry = info.properties.find(COLLATION_PROPERTY);
 	result.collation = entry == info.properties.end() ? std::string() : entry->second.ToString();
@@ -56,11 +81,14 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 }
 
 std::string FormatTargetStringDdl(const TargetStringType &spec, const std::string &fallback_collation) {
+	// `max` is a keyword in T-SQL's length position, not a number (issue #321).
+	const std::string length = IsMaxLength(spec.length) ? "max" : StringUtil::Format("%d", spec.length);
+
 	if (spec.unicode) {
-		return StringUtil::Format("nvarchar(%d)", spec.length);
+		return "nvarchar(" + length + ")";
 	}
 
-	std::string ddl = StringUtil::Format("varchar(%d)", spec.length);
+	std::string ddl = "varchar(" + length + ")";
 	const std::string &collation = spec.collation.empty() ? fallback_collation : spec.collation;
 	if (!collation.empty()) {
 		ddl += " COLLATE " + collation;
@@ -92,6 +120,10 @@ LogicalType ApplyDefaultStringType(const LogicalType &type, bool unicode, int32_
 bool NeedsVarcharCollation(const LogicalType &type) {
 	TargetStringType spec;
 	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();
+}
+
+bool IsMaxKeyword(const std::string &text) {
+	return StringUtil::CIEquals(text, MAX_MODIFIER);
 }
 
 bool IsValidCollationName(const std::string &name) {

@@ -1,0 +1,280 @@
+# name: test/sql/ctas/annotated_max_string.test
+# description: MSSQL_VARCHAR/MSSQL_NVARCHAR can state the MAX form, with a collation (issue #321)
+# group: [mssql]
+# issue: 321
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Spec 060 gave a column two ways to state its SQL Server type and they did not
+# overlap: the annotation was capped at 8000/4000, and the MAX form could only
+# be reached by leaving the column unannotated -- where which of varchar(max) /
+# nvarchar(max) it becomes, and with which collation, is decided by two GLOBAL
+# settings. So a MAX column with a stated collation could only be asked for
+# session-wide, which library code creating tables through CTAS or COPY cannot
+# do without changing the type of every other unannotated string column in the
+# user's session.
+#
+# The DDL is what this is about; the pure-function half is covered server-free
+# in test/cpp/test_ctas_type_mapping.cpp, which CI runs. Here is the end of the
+# wire: what SQL Server actually created, and whether a value too long for the
+# inline form survives it.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS i321 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Max'',''U'') IS NOT NULL DROP TABLE dbo.I321Max');
+
+# =============================================================================
+# A bare MAX keyword cannot work and this is not an oversight: DuckDB's PARSER
+# refuses it before the extension is consulted, so supporting it would take a
+# change to DuckDB. Asserted so that nobody re-tries it and calls it a bug.
+# =============================================================================
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR(MAX, 'Latin1_General_100_BIN2_UTF8');
+----
+Expected a constant as type modifier
+
+# =============================================================================
+# The three spellings that do work, all normalizing to one sentinel, plus a
+# bounded column to show the cap still applies to everything else.
+# =============================================================================
+
+statement ok
+CREATE TABLE i321.dbo.I321Max AS
+SELECT s::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS a_by_string,
+       s::MSSQL_VARCHAR(-1, 'Latin1_General_100_BIN2_UTF8')    AS b_by_negative,
+       s::MSSQL_VARCHAR(0, 'Latin1_General_100_BIN2_UTF8')     AS c_by_zero,
+       s::MSSQL_NVARCHAR('MAX')                                AS d_nvarchar,
+       s::MSSQL_VARCHAR(50, 'Latin1_General_100_BIN2_UTF8')    AS e_bounded
+FROM (VALUES ('hello')) t(s);
+
+# max_length is -1 in sys.columns for a MAX column -- SQL Server's own spelling
+# of it, and the reason -1 is accepted at the binder even though 0 is stored.
+#
+# The collation is the point of the exercise: it is what the annotation could
+# not state before. A _BIN2_ one is not a preference for the case that prompted
+# this -- DuckLake pushes string comparisons against min/max statistics DuckDB
+# computed in UTF-8 byte order, so a CI/AS collation prunes wrongly and drops
+# rows.
+query TTIT
+SELECT name, type_name, max_length, collation_name
+FROM mssql_scan('i321', '
+  SELECT c.name AS name, t.name AS type_name, c.max_length AS max_length, c.collation_name AS collation_name
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Max'')')
+ORDER BY name;
+----
+a_by_string	varchar	-1	Latin1_General_100_BIN2_UTF8
+b_by_negative	varchar	-1	Latin1_General_100_BIN2_UTF8
+c_by_zero	varchar	-1	Latin1_General_100_BIN2_UTF8
+d_nvarchar	nvarchar	-1	SQL_Latin1_General_CP1_CI_AS
+e_bounded	varchar	50	Latin1_General_100_BIN2_UTF8
+
+# =============================================================================
+# A value past the inline limit. This is the half a DDL-only test would miss:
+# GetTDSMaxLength feeds both the INSERT BULK declaration and the encoder's
+# overflow guard, and the guard reads 0xFFFF as "no bound" and anything else as
+# a bound. A MAX column reporting a number there would reject this row while
+# the DDL still said max. 6000 Cyrillic characters are 12000 UTF-8 bytes.
+# =============================================================================
+
+statement ok
+INSERT INTO i321.dbo.I321Max
+SELECT repeat('ы', 6000), '', '', '', 'x';
+
+query II
+SELECT length(a_by_string), strlen(a_by_string)
+FROM i321.dbo.I321Max ORDER BY length(a_by_string) DESC LIMIT 1;
+----
+6000	12000
+
+query I
+SELECT count(*) FROM i321.dbo.I321Max WHERE a_by_string = repeat('ы', 6000);
+----
+1
+
+# =============================================================================
+# COPY ... (CREATE_TABLE true) reaches the same DDL by a different route, and
+# it is the route the reporting use case actually takes.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Copy'',''U'') IS NOT NULL DROP TABLE dbo.I321Copy');
+
+statement ok
+COPY (SELECT repeat('щ', 5000)::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS s)
+TO 'mssql://i321/dbo/I321Copy' (FORMAT 'bcp', CREATE_TABLE true);
+
+query TIT
+SELECT type_name, max_length, collation_name
+FROM mssql_scan('i321', '
+  SELECT t.name AS type_name, c.max_length AS max_length, c.collation_name AS collation_name
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Copy'')');
+----
+varchar	-1	Latin1_General_100_BIN2_UTF8
+
+query I
+SELECT length(s) FROM i321.dbo.I321Copy;
+----
+5000
+
+# =============================================================================
+# What the type PRINTS as. All three spellings normalize to one type, and it
+# renders as the T-SQL word rather than the sentinel -- `MSSQL_VARCHAR(0)` would
+# read as a zero-length column and `(-1)` as nothing at all.
+#
+# Note the asymmetry, which is why the parser refusal above is asserted: the
+# form DESCRIBE prints is exactly the form the parser will NOT accept back.
+# Pasting `MSSQL_VARCHAR(MAX)` into a cast needs quotes around MAX.
+# =============================================================================
+
+statement ok
+CREATE TABLE local_shapes AS
+SELECT 'a'::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS a_by_string,
+       'a'::MSSQL_VARCHAR(-1)                                    AS b_by_negative,
+       'a'::MSSQL_VARCHAR(0)                                     AS c_by_zero,
+       'a'::MSSQL_NVARCHAR('MAX')                                AS d_nvarchar,
+       'a'::MSSQL_VARCHAR(50)                                    AS e_bounded;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'local_shapes' ORDER BY column_name;
+----
+a_by_string	MSSQL_VARCHAR(MAX)
+b_by_negative	MSSQL_VARCHAR(MAX)
+c_by_zero	MSSQL_VARCHAR(MAX)
+d_nvarchar	MSSQL_NVARCHAR(MAX)
+e_bounded	MSSQL_VARCHAR(50)
+
+statement ok
+DROP TABLE local_shapes;
+
+# Case is normalized, so 'max' and 'MAX' are ONE type rather than two that
+# happen to mean the same -- otherwise a set operation over both would have to
+# reconcile two identities.
+query II
+SELECT typeof(a) = typeof(b), typeof(a) = typeof(c)
+FROM (SELECT 'x'::MSSQL_VARCHAR('max') AS a, 'x'::MSSQL_VARCHAR('MAX') AS b, 'x'::MSSQL_VARCHAR(-1) AS c);
+----
+true	true
+
+# The type survives being stored and read back, which a view exercises.
+statement ok
+CREATE VIEW max_view AS SELECT 'a'::MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8') AS c;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'max_view';
+----
+c	MSSQL_VARCHAR(MAX)
+
+statement ok
+DROP VIEW max_view;
+
+# =============================================================================
+# The explicit DDL path. CREATE TABLE with a column list goes through a
+# DIFFERENT translator from CTAS, so exercising only the CTAS one leaves half
+# the feature untested.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Ddl'',''U'') IS NOT NULL DROP TABLE dbo.I321Ddl');
+
+statement ok
+CREATE TABLE i321.dbo.I321Ddl (
+    id    INTEGER,
+    body  MSSQL_VARCHAR('MAX', 'Latin1_General_100_BIN2_UTF8'),
+    notes MSSQL_NVARCHAR('MAX')
+);
+
+query TTIT
+SELECT name, type_name, max_length, collation_name
+FROM mssql_scan('i321', '
+  SELECT c.name AS name, t.name AS type_name, c.max_length AS max_length, c.collation_name AS collation_name
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Ddl'')')
+WHERE name <> 'id'
+ORDER BY name;
+----
+body	varchar	-1	Latin1_General_100_BIN2_UTF8
+notes	nvarchar	-1	SQL_Latin1_General_CP1_CI_AS
+
+# And the column really holds an unbounded value once it exists -- this INSERT
+# goes through the existing-table path, which reads the catalog rather than the
+# annotation, so it is a second, independent check that the column is MAX.
+statement ok
+INSERT INTO i321.dbo.I321Ddl VALUES (1, repeat('ю', 5000), 'n');
+
+query II
+SELECT id, length(body) FROM i321.dbo.I321Ddl;
+----
+1	5000
+
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Ddl');
+
+# =============================================================================
+# The annotation outranks mssql_default_string_length, which only ever applies
+# to a column that stated nothing.
+# =============================================================================
+
+statement ok
+SET mssql_default_string_length = 100;
+
+statement ok
+SELECT mssql_exec('i321', 'IF OBJECT_ID(''dbo.I321Def'',''U'') IS NOT NULL DROP TABLE dbo.I321Def');
+
+statement ok
+CREATE TABLE i321.dbo.I321Def AS SELECT 'a'::MSSQL_VARCHAR('MAX') AS annotated, 'b' AS plain;
+
+query TTI
+SELECT name, type_name, max_length
+FROM mssql_scan('i321', '
+  SELECT c.name AS name, t.name AS type_name, c.max_length AS max_length
+  FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+  WHERE c.object_id = OBJECT_ID(''dbo.I321Def'')')
+ORDER BY name;
+----
+annotated	varchar	-1
+plain	nvarchar	200
+
+statement ok
+SET mssql_default_string_length = 0;
+
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Def');
+
+# =============================================================================
+# The cap still applies to a stated length, and the message names the way out.
+# =============================================================================
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR(8001);
+----
+n must be between 1 and 8000, or 0 / -1 / 'MAX' for the MAX form
+
+statement error
+SELECT 'x'::MSSQL_NVARCHAR(4001);
+----
+n must be between 1 and 4000, or 0 / -1 / 'MAX' for the MAX form
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR('nope');
+----
+a string modifier must be 'MAX'
+
+# Cleanup
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Copy');
+
+statement ok
+SELECT mssql_exec('i321', 'DROP TABLE dbo.I321Max');
+
+statement ok
+DETACH i321;

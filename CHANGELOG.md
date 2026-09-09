@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MSSQL_VARCHAR('MAX', 'collation')` — a per-column MAX target**
+  ([#321](https://github.com/hugr-lab/mssql-extension/issues/321)). The
+  annotation was capped at 8000/4000, so the MAX form could only be reached by
+  leaving a column *unannotated* — where which of `varchar(max)` /
+  `nvarchar(max)` it becomes, and with which collation, is decided by two
+  GLOBAL settings. Library code creating tables through CTAS or
+  `COPY … (CREATE_TABLE true)` cannot set those: it would change the type of
+  every other unannotated string column in the caller's session. `'MAX'`, `0`
+  and `-1` are now all accepted in the length position and mean the same thing
+  (`0` matches `mssql_default_string_length`, `-1` matches
+  `sys.columns.max_length`). A bare `MAX` keyword cannot be supported — DuckDB's
+  parser rejects a non-constant type modifier before the extension is consulted
+  — note that this is also the form the type *prints* as (`MSSQL_VARCHAR(MAX)`
+  in `DESCRIBE` / `duckdb_columns()`), so pasting it back into a cast needs the
+  quotes added.
+
 - **A non-UTF-8 text column now says so, once per query**
   ([#224](https://github.com/hugr-lab/mssql-extension/issues/224)). A
   `CHAR`/`VARCHAR`/`TEXT` column whose collation is not a UTF-8 one is handed
