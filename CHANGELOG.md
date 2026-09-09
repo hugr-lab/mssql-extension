@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A non-UTF-8 text column now says so, once per query**
+  ([#224](https://github.com/hugr-lab/mssql-extension/issues/224)). A
+  `CHAR`/`VARCHAR`/`TEXT` column whose collation is not a UTF-8 one is handed
+  back as code-page bytes in a DuckDB `VARCHAR`, which is UTF-8 by contract.
+  That stays **documented rather than enforced** — validating costs the scan's
+  hot path in order to make a hand-written `mssql_scan()` fail loudly, and it
+  bills hardest the UTF-8 configuration #225 optimised for. Instead the check
+  runs over COLMETADATA — a handful of columns, never a per-row cost — as soon
+  as the stream has its column types *and* again when it is drained, and reaches
+  `duckdb_logs` at `WARNING` naming the column, its LCID and its SortId. Both
+  calls matter: warning only at the drain says nothing for any query that stops
+  early, which is the `LIMIT` that a code-page column is most likely to be met
+  by first. The predicate is the TDS fUTF8 flag, verified against a live SQL
+  Server rather than read off MS-TDS. `mssql_warn_non_utf8_collation` (default
+  `true`) turns it off: the trigger is the majority configuration, since
+  `SQL_Latin1_General_CP1_CI_AS` is the installation default, so anyone who has
+  read the warning once and decided their data is fine needs a way to stop
+  hearing it.
+
 ### Fixed
 
 - **Forward-port of the v0.2.5 fixes to the duckdb 2.0 line** (#314). The
@@ -44,6 +65,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spill, so a large materialized scan grew in process memory until it OOMed while
   the docs promised the opposite. Built from the `ClientContext` overload, which
   defaults to `BUFFER_MANAGER_ALLOCATOR`.
+
+- **SQL Server INFO messages were collected and thrown away.**
+  `SurfaceWarnings` walked them and did nothing, on the grounds that "DuckDB
+  doesn't have a built-in warning API" — true when it was written, not true
+  now. `mssql_exec()` was worse: its token loop read
+  `case Info: // Ignore informational messages`, so running a procedure that
+  `PRINT`s dropped every line. `PRINT` output, `RAISERROR` at severity 10 or
+  below and procedure progress notices now reach `duckdb_logs` on both paths,
+  at `INFO` (`SET logging_level = 'INFO'` to see them), carrying the message
+  number and severity. They are logged **before** a failing batch raises — the
+  notices of a batch that failed are the ones worth reading — including when a
+  scan fails mid-stream.
+
+- **The 5th collation byte was parsed and discarded** (`offset += 5; // we only
+  store 4`), thanks [@oluies](https://github.com/oluies) —
+  [#305](https://github.com/hugr-lab/mssql-extension/pull/305). It is the
+  SortId, and for the `SQL_*` collations it is the *only* thing that names the
+  code page: `SQL_Latin1_General_CP1_CI_AS` (CP1252) and
+  `SQL_Latin1_General_CP1251_CI_AS` (CP1251) both report LCID `0x0409` and
+  differ only as SortId 52 vs 106.
 
 ## [0.2.4] - 2026-08-17
 

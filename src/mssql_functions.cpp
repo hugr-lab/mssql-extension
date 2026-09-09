@@ -10,12 +10,14 @@
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/tds_info_log.hpp"
 #include "tds/tds_connection.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
@@ -202,6 +204,9 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		result->result_stream = mssql_catalog.RetrieveStream(bind_data.result_stream_id);
 		if (result->result_stream) {
+			// COLMETADATA is known, so warn before any rows move -- the drain-end
+			// call is missed entirely by a query that stops early (issue #224).
+			result->result_stream->SurfaceWarnings(context);
 			auto init_end = std::chrono::steady_clock::now();
 			auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: retrieved from registry in %ldms", (long)init_ms);
@@ -215,6 +220,9 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: executing query for data...");
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, bind_data.query);
+	if (result->result_stream) {
+		result->result_stream->SurfaceWarnings(context);
+	}
 	auto exec_end = std::chrono::steady_clock::now();
 	auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(exec_end - exec_start).count();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: query executed in %ldms", (long)exec_ms);
@@ -280,6 +288,17 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;
+		// The server's own notices about the batch that just failed -- and the ones
+		// immediately preceding the failure are the useful ones. Without this they
+		// are lost with the stream, which contradicts the rule the mssql_exec path
+		// already follows (PR #320 review).
+		//
+		// Swallowing a throw from here is deliberate: whatever the logger does, it
+		// must not replace the exception the caller is waiting for.
+		try {
+			global_state.result_stream->SurfaceWarnings(context);
+		} catch (...) {	 // NOLINT: never mask the original error
+		}
 		throw;
 	}
 }
@@ -466,6 +485,14 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 		}
 		try {
 			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql, timeout_ms);
+
+			// PRINT output and RAISERROR below severity 11 from whatever was run
+			// here -- a procedure's progress notices, most of all. Logged before
+			// the error check below, because a batch that ultimately failed is
+			// exactly when its notices are worth reading.
+			for (const auto &info : query_result.info_messages) {
+				LogTdsInfo(client_context, info);
+			}
 
 			// Release connection via ConnectionProvider (no-op if in transaction)
 			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));

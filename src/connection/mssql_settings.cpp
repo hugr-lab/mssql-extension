@@ -116,6 +116,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "UTF-8 instead of UTF-16 (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_warn_non_utf8_collation - the off switch for the issue #224 warning.
+	// On by default because the whole point is that the behaviour is documented
+	// rather than enforced, and a documented behaviour nobody is told about is
+	// not much better than an undocumented one. But the trigger IS the majority
+	// configuration -- SQL_Latin1_General_CP1_CI_AS is the installation default --
+	// so a raw mssql_scan() over a legacy-collation server logs one line per
+	// varchar column per query, forever, including for data that is pure ASCII
+	// and therefore already valid UTF-8. Anyone who has read the warning once and
+	// decided their data is fine needs a way to stop hearing it.
+	config.AddExtensionOption("mssql_warn_non_utf8_collation",
+							  "Log a warning when a CHAR/VARCHAR/TEXT column arrives with a non-UTF-8 collation, "
+							  "since its bytes are returned verbatim into a DuckDB VARCHAR (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
 	// Short by design — Browser is on the critical path of every named-instance attach.

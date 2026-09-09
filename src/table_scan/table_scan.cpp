@@ -535,6 +535,14 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, query);
 
+	// COLMETADATA is known now, so say what is wrong with the columns before any
+	// rows move. Waiting for the drain-end call loses this entirely on a query
+	// that stops early -- any LIMIT (issue #224).
+	if (result->result_stream) {
+		result->result_stream->MarkCatalogScan();
+		result->result_stream->SurfaceWarnings(context);
+	}
+
 	// Set the number of columns to actually fill in the output chunk
 	// When valid_column_ids is empty (e.g., COUNT(*)), we don't fill any columns
 	// EXCEPT when pk_direct_to_rowid is true - then we fill the PK directly to rowid position
@@ -930,6 +938,17 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;
+		// The server's own notices about the batch that just failed -- and the ones
+		// immediately preceding the failure are the useful ones. Without this they
+		// are lost with the stream, which contradicts the rule the mssql_exec path
+		// already follows (PR #320 review).
+		//
+		// Swallowing a throw from here is deliberate: whatever the logger does, it
+		// must not replace the exception the caller is waiting for.
+		try {
+			global_state.result_stream->SurfaceWarnings(context);
+		} catch (...) {	 // NOLINT: never mask the original error
+		}
 		throw;
 	}
 }

@@ -601,6 +601,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_spn_host_resolution.cpp \
     test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/test_vector_encodings.cpp \
+    test/cpp/test_collation_metadata.cpp \
     test/cpp/codec/test_binary_codec.cpp \
     test/cpp/codec/test_boolean_codec.cpp \
     test/cpp/codec/test_datetime_codec.cpp \
