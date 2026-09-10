@@ -69,6 +69,10 @@ std::vector<uint8_t> EncodeFedAuthToken(const std::string &token_utf8);
 //!        single-tenant org.
 //! @return FedAuthData ready for LOGIN7 packet, or invalid if token acquisition failed
 //! @throws ConnectionException if token acquisition fails
+//! The FEDAUTH payload for a token already in hand. The pool factory holds a
+//! freshly acquired token and no context (issue #302).
+FedAuthData BuildFedAuthData(const std::string &access_token);
+
 FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azure_secret_name,
 								  const std::string &tenant_id_override = "");
 

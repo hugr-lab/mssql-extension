@@ -1,0 +1,64 @@
+# name: test/sql/regression/issue_302.test
+# description: a connection the pool cannot create fails fast and says why (issue #302, spec 073)
+# group: [mssql]
+# issue: 302
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The reporter's Azure SQL catalog could not open a NEW connection two hours
+# after ATTACH -- the Azure AD token the pool factory had captured was 60
+# minutes old -- and every symptom of that was
+#
+#   IO Error: MSSQL: Failed to acquire connection from pool (timeout)
+#
+# after the full acquire timeout. The token half needs Azure and an hour, and
+# lives in the azure lane. This is the pool half, which needs neither: a
+# factory that cannot succeed -- here, a wrong password -- used to be treated
+# as an exhausted pool. Acquire waited for a Release that could not come, and
+# the server's own reason, recorded in the connection's last_error_, was thrown
+# away. Now: nothing is active, so the failure comes back at once, and it names
+# what the server said.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Long on purpose. Before the fix this is how long the statement below took
+# to fail; after it, the timeout is never reached because nothing is active
+# and waiting would only run out the clock.
+statement ok
+SET mssql_acquire_timeout = 30;
+
+# Connection-string keys: last one wins, so this overrides the DSN's password.
+# lazy_validation defers the login to the first statement, which is what makes
+# the POOL do it rather than ATTACH.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};Password=this-is-not-the-password' AS bad (TYPE mssql, lazy_validation true);
+
+# The message carries the pool's name, says a connection could not be CREATED
+# (not "timeout"), and quotes the server.
+statement error
+SELECT * FROM bad.dbo.SomeTable;
+----
+could not create a connection
+
+statement error
+SELECT * FROM bad.dbo.SomeTable;
+----
+Login failed for user
+
+# mssql_exec goes through the same provider.
+statement error
+SELECT mssql_exec('bad', 'SELECT 1');
+----
+could not create a connection
+
+# Nothing leaked into the pool by trying.
+query II
+SELECT total_connections, active_connections FROM mssql_pool_stats('bad');
+----
+0	0
+
+statement ok
+DETACH bad;

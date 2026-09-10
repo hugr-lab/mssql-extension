@@ -1,4 +1,6 @@
 #include "tds/tds_connection_pool.hpp"
+#include <algorithm>
+#include "duckdb/common/error_data.hpp"
 
 #include "duckdb/common/assert.hpp"
 
@@ -168,13 +170,20 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 			return conn;
 		}
 
-		// Try to create a new connection if under limit
-		if (stats_.total_connections < config_.connection_limit) {
+		// Try to create a new connection if under limit -- and, once a creation
+		// has failed, only when the backoff since that failure has elapsed
+		// (issue #302).
+		if (stats_.total_connections < config_.connection_limit &&
+			std::chrono::steady_clock::now() >= next_create_allowed_) {
 			lock.unlock();
 			conn = CreateNewConnection();
 			lock.lock();
 
 			if (conn) {
+				// A success resets the backoff so a transient failure does not
+				// slow the next refill.
+				create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
+				next_create_allowed_ = std::chrono::steady_clock::time_point{};
 				uint64_t id = next_connection_id_++;
 				active_connections_[id] = conn;
 				stats_.total_connections++;
@@ -187,6 +196,28 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 				stats_.acquire_wait_total_ms += elapsed;
 				return conn;
 			}
+
+			// Creation failed. Issue #302: this used to fall through to the same
+			// wait an exhausted pool does -- for a Release that, with nothing
+			// active, cannot come -- and report "(timeout)" after the full
+			// acquire_timeout, with the reason discarded. Measured: an expired
+			// Azure AD token cost 600 s and two login attempts, and read
+			// identically to a wrong password or an unreachable host.
+			stats_.creation_failures++;
+			next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
+			create_backoff_ms_ = std::min(create_backoff_ms_ * 2, CREATE_BACKOFF_MAX_MS);
+			if (stats_.active_connections == 0) {
+				// Nothing can be released, so waiting would only run out the
+				// clock. Fail now; the caller reads GetLastCreateError().
+				auto elapsed =
+					std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+						.count();
+				stats_.acquire_wait_total_ms += elapsed;
+				return nullptr;
+			}
+			// Others are active: a Release may still serve this request, so
+			// keep waiting -- but retry creation on the backoff schedule, not on
+			// every wakeup.
 		}
 
 		// Pool exhausted, wait for a connection to be released
@@ -205,6 +236,12 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 		}
 
 		int remaining = timeout_ms - static_cast<int>(elapsed);
+		// Wake for the next creation attempt if that comes first (issue #302).
+		if (next_create_allowed_ > now && stats_.total_connections < config_.connection_limit) {
+			auto until_create =
+				std::chrono::duration_cast<std::chrono::milliseconds>(next_create_allowed_ - now).count();
+			remaining = std::min<int>(remaining, static_cast<int>(until_create) + 1);
+		}
 		available_cv_.wait_for(lock, std::chrono::milliseconds(remaining));
 
 		if (shutdown_flag_.load()) {
@@ -322,7 +359,47 @@ std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdle() {
 
 std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
 	// pool_mutex_ must NOT be held (blocking I/O)
-	return factory_();
+	std::shared_ptr<TdsConnection> conn;
+	std::string error;
+	try {
+		conn = factory_();
+		if (!conn) {
+			error = "connection factory returned no connection and no reason";
+		}
+	} catch (const std::exception &e) {
+		// The factory says why -- an expired token, the server's login error,
+		// a refused dial. Kept for the caller; the pool itself only needs the
+		// nullptr (issue #302). ErrorData, not what(): a DuckDB exception's
+		// what() is its JSON serialization on the 2.0 line, and the first
+		// version of this pasted `{"exception_type":"Connection",...}` into the
+		// user's error.
+		error = ErrorData(e).RawMessage();
+	}
+	if (!error.empty()) {
+		std::lock_guard<std::mutex> lock(pool_mutex_);
+		last_create_error_ = error;
+		MSSQL_POOL_DEBUG_LOG(1, "CreateNewConnection failed on pool '%s': %s", context_name_.c_str(), error.c_str());
+	}
+	return conn;
+}
+
+std::string ConnectionPool::GetLastCreateError() const {
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	return last_create_error_;
+}
+
+std::string ConnectionPool::DescribeAcquireFailure() const {
+	// Two different things end in a nullptr from Acquire and used to read the
+	// same: the pool is full and nobody released in time, or the pool tried to
+	// create a connection and could not -- an expired Azure AD token, the
+	// server's login error, a refused dial (issue #302). One renderer, so the
+	// provider and the nine catalog-internal callers say the same thing.
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (!last_create_error_.empty()) {
+		return "pool '" + context_name_ + "' could not create a connection: " + last_create_error_;
+	}
+	return "pool '" + context_name_ + "' timed out (" + std::to_string(stats_.active_connections) + " active of " +
+		   std::to_string(stats_.total_connections) + ", limit " + std::to_string(config_.connection_limit) + ")";
 }
 
 bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection> &conn) {

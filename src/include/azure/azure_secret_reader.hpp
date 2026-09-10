@@ -43,6 +43,13 @@ struct AzureSecretInfo {
 //===----------------------------------------------------------------------===//
 AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secret_name);
 
+//! The same read from a DatabaseInstance, for callers that have no ClientContext:
+//! a connection-pool factory runs on whatever thread asks the pool, for as long
+//! as the catalog lives, after the ATTACH context is gone (issue #302, spec 073).
+//! The secret store and the system transaction are both per-DatabaseInstance,
+//! so nothing here needs the context beyond what it forwards.
+AzureSecretInfo ReadAzureSecret(DatabaseInstance &db, const std::string &secret_name);
+
 //===----------------------------------------------------------------------===//
 // ValidateAzureSecretExists - Check if an Azure secret exists (lightweight)
 //

@@ -361,10 +361,49 @@ SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');
 ### Token Caching
 
 Tokens are cached automatically:
-- Cache is per secret name, thread-safe
+- Cache is per secret name (and per DuckDB instance), thread-safe
 - Tokens refresh automatically 5 minutes before expiration
 - First call: ~200ms (acquires from Azure AD)
 - Subsequent calls: ~0ms (uses cache)
+
+### Token Lifetime and Long-Running Sessions
+
+An Azure AD access token lives **60 minutes**. Two things follow, and the
+extension handles both (issue #302):
+
+- **A connection that is already open keeps working.** SQL Server validates
+  the token at login only; a live session is never re-authenticated. A catalog
+  attached for hours is fine as long as it keeps reusing its pooled
+  connections.
+- **A *new* connection needs a token that is still valid.** The pool creates
+  one whenever a query needs more connections than it has, or after an idle
+  connection was closed (`mssql_idle_timeout`). The pool resolves the token
+  **when it creates the connection**, not when the catalog was attached: the
+  cached token is used while it is good, and past the refresh margin the
+  secret is read again and a new token minted. `service_principal`, `cli` and
+  `env` refresh silently.
+
+Two kinds of secret cannot refresh, and they say so **by name** rather than
+timing out — Azure SQL does not answer an expired token with an error, it
+drops the connection, so the client has to diagnose expiry itself:
+
+```text
+Azure AD access token in secret 'x' expired at 2026-09-10 08:49:00 UTC;
+a fixed token cannot be refreshed -- DETACH and ATTACH with a new one
+
+Azure AD token for secret 'x' has expired and its credential chain needs
+interactive authentication, which cannot run from a pooled connection;
+DETACH and ATTACH to authenticate again
+```
+
+That is `PROVIDER access_token` (a fixed string) and the interactive
+device-code chain (nobody is at a terminal inside a query on a worker thread).
+For a script that runs longer than an hour against Azure, use
+`service_principal` or `cli`.
+
+Before this, an expired token surfaced as
+`Failed to acquire connection from pool (timeout)` after the full
+`mssql_acquire_timeout`, and only `DETACH` / `ATTACH` fixed it.
 
 ---
 

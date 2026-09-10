@@ -136,7 +136,7 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	catalog.EnsureCacheLoaded(context);
 	auto connection = pool.Acquire();
 	if (!connection) {
-		throw IOException("Failed to acquire connection for table scan");
+		throw IOException("Failed to acquire connection for table scan: " + pool.DescribeAcquireFailure());
 	}
 
 	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
@@ -314,7 +314,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 	try {
 		auto connection = pool.Acquire();
 		if (!connection) {
-			throw IOException("Failed to acquire connection for table loading");
+			throw IOException("Failed to acquire connection for table loading: " + pool.DescribeAcquireFailure());
 		}
 		// Issue #178 review: metadata is COPIED out of the cache under its
 		// mutex (see GetTableMetadata contract) — the old raw-pointer return

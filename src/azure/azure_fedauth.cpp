@@ -41,10 +41,13 @@ FedAuthData BuildFedAuthExtension(ClientContext &context, const std::string &azu
 	}
 
 	// Build the FEDAUTH extension data
+	return BuildFedAuthData(token_result.access_token);
+}
+
+FedAuthData BuildFedAuthData(const std::string &access_token) {
 	FedAuthData data;
 	data.library = FedAuthLibrary::MSAL;
-	data.token_utf16le = EncodeFedAuthToken(token_result.access_token);
-
+	data.token_utf16le = EncodeFedAuthToken(access_token);
 	return data;
 }
 

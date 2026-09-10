@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attached Azure AD catalog can open new connections after its token has
+  expired** ([#302](https://github.com/hugr-lab/mssql-extension/issues/302),
+  spec 073). The pool factory captured the FEDAUTH token bytes at `ATTACH` and
+  presented them for every connection it ever created; an Azure AD token lives
+  **60 minutes**, so a pool refill hours later — a second scan in a join, an
+  `UPDATE` after the idle connection was reaped — was dropped by the gateway
+  and reported as `Failed to acquire connection from pool (timeout)` after the
+  full `mssql_acquire_timeout` (measured: 600 s, then `DETACH`/`ATTACH` and it
+  worked). The token is now resolved when a *connection* is created: the
+  factory holds the secret's name and the `DatabaseInstance`, `TokenCache`
+  answers while the token is good and the secret is re-read and a new token
+  minted past the refresh margin. A fixed `access_token` secret, and an
+  interactive credential chain that cannot mint silently from a worker thread,
+  fail **by name** — *"expired at …; DETACH and ATTACH …"* — before any socket
+  is opened, because Azure SQL will not say "expired" itself: it hangs up.
+
+- **A connection the pool cannot create no longer looks like a full pool.**
+  `Acquire` treated a factory failure as exhaustion and waited for a `Release`
+  that, with nothing active, could not come — then said "(timeout)" and threw
+  the reason away. Now: nothing active → fail at once; others active → keep
+  waiting for a release, but retry creation on a backoff (250 ms doubling to
+  4 s), not on every wakeup; and the message carries the factory's reason —
+  `could not create a connection: Login failed for user 'sa'.` A wrong
+  password used to take `mssql_acquire_timeout` seconds to say nothing.
+
+- **`mssql_connection_timeout` now bounds a pool refill.** Every factory passed
+  no timeout to `Connect` (compiled-in 30 s), and every login-phase read —
+  PRELOGIN, TLS, LOGIN7 and FEDAUTH responses, on all three auth paths — had
+  `DEFAULT_CONNECTION_TIMEOUT` spelled out. The setting governed `ATTACH`-time
+  validation and nothing after it. This is the reporter's "31 seconds": one
+  30 s login read on a connection the gateway had dropped.
+
 - **A metadata load that fails mid-query no longer mutates the cache**
   ([#317](https://github.com/hugr-lab/mssql-extension/issues/317), reported by
   [@oluies](https://github.com/oluies)). `LoadAllSchemasMetadata` cleared each

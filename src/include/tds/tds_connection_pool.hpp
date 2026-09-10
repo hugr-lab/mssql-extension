@@ -41,6 +41,7 @@ struct PoolStatistics {
 	size_t connections_closed = 0;
 	size_t acquire_count = 0;
 	size_t acquire_timeout_count = 0;
+	size_t creation_failures = 0;  // factory threw or returned nothing (issue #302)
 	uint64_t acquire_wait_total_ms = 0;
 	int64_t pinned_count = 0;  // Connections pinned to active transactions (spec 047 FR-005)
 };
@@ -91,6 +92,18 @@ public:
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
 
+	//! Why the last attempt to create a connection failed -- the factory's
+	//! exception text, or a fixed line if it returned nullptr silently. Empty
+	//! until a creation has failed. Issue #302: before this, an expired Azure AD
+	//! token, a wrong password and an unreachable host all reached the caller as
+	//! "Failed to acquire connection from pool (timeout)".
+	std::string GetLastCreateError() const;
+
+	//! Why Acquire() returned nullptr, ready to append to a caller's message:
+	//! "pool 'x' could not create a connection: <reason>" or
+	//! "pool 'x' timed out (N active of M, limit L)".
+	std::string DescribeAcquireFailure() const;
+
 	// Pin counter — tracks connections currently pinned to active DuckDB
 	// transactions (spec 047 FR-005). Migrated from the deleted
 	// MssqlPoolManager::pinned_counts_ map. Lock-free; safe to call from any
@@ -111,6 +124,16 @@ private:
 	std::string context_name_;
 	PoolConfiguration config_;
 	ConnectionFactory factory_;
+
+	// Creation-failure state, guarded by pool_mutex_ (issue #302). A factory
+	// that has just failed is not retried on every wakeup: the next attempt
+	// waits create_backoff_ms_, doubling to CREATE_BACKOFF_MAX_MS. Each attempt
+	// against a server that drops the connection costs a full login read.
+	static constexpr int CREATE_BACKOFF_INITIAL_MS = 250;
+	static constexpr int CREATE_BACKOFF_MAX_MS = 4000;
+	std::string last_create_error_;
+	std::chrono::steady_clock::time_point next_create_allowed_{};
+	int create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
 
 	// Connection storage
 	std::queue<ConnectionMetadata> idle_connections_;
