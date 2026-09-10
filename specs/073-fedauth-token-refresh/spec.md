@@ -10,7 +10,7 @@ its claims against the code rather than taking them as read: four hold, one
 does not explain what it was offered for, and one thing it did not say turns
 out to be the design constraint the fix has to be built around.
 
-Reconnaissance. Implementation is a separate PR.
+Reconnaissance, including a live reproduction on the reporter's line. Implementation is a separate PR.
 
 ## 0. How everything below was measured
 
@@ -25,9 +25,22 @@ Reconnaissance. Implementation is a separate PR.
   `mssql_acquire_timeout = 5`, one scan.
 - **The token half, live**: stock DuckDB v1.5.5 with community `mssql` 0.2.5
   (the reporter's line), a service-principal secret, `mssql_idle_timeout = 60`
-  so the first connection is reaped, a 75-minute sleep, then a statement that
-  needs a fresh connection. In flight at the time of writing; § 1 F5 records
-  what it is expected to settle.
+  so the first connection is reaped, `mssql_acquire_timeout = 600` (the
+  reporter's value), a 75-minute sleep, then a statement that needs a fresh
+  connection. Result:
+
+  ```text
+  T0        pool 1 total / 1 idle / created 1 / closed 0; two FEDAUTH logins OK
+  T+75min   pool 0 total / 0 idle / created 1 / closed 1   (reaped at 60 s)
+            SELECT mssql_exec('az','SELECT 1')
+            IO Error: MSSQL: Failed to acquire connection from pool (timeout)
+            Run Time (s): real 600.319
+            pool 0 / 0 / created 1 / closed 1 / acquire_timeout_count 1
+            DETACH; ATTACH; SELECT mssql_exec(...)  ->  1
+  ```
+
+  Inside the 600 s: one `Acquire`, **two** creation attempts, and the wire for
+  each is in F7.
 
 ## 1. The findings
 
@@ -140,22 +153,48 @@ path does not touch the context at all. A `DatabaseInstance`-bound acquirer is
 therefore implementable, and `DatabaseInstance` is what the catalog already
 outlives nothing of.
 
-### F5 — The 31 seconds in the report are not explained by the code, on either branch
+### F5 — The 31 seconds: 30 of them are F3's login read, and the code waits `acquire_timeout`
 
-The issue attributes them to the pool factory's 30 s connect default. That
-default is real (F3), but it does not produce the observed *total*: after a
-failed creation, `Acquire` waits for a release until `acquire_timeout` (F2),
-which the reporter had at 600 s. `ConnectionProvider::GetConnection` defaults
+The issue attributes them to the pool factory's 30 s connect default. Close,
+but the wrong 30 seconds, and it is not the whole number. Measured (§ 0):
+with `acquire_timeout = 600` the statement fails after **600.3 s**, exactly
+the code's prediction — after a failed creation `Acquire` waits for a release
+until the deadline (F2). `ConnectionProvider::GetConnection` defaults
 `timeout_ms` to -1 and every catalog-internal `Acquire()` uses the same
-default, on `main` and on `duckdb-v1.5.5` alike — so with 600 s configured the
-code predicts a ten-minute wait, not thirty-one seconds.
+default, on `main` and `duckdb-v1.5.5` alike.
 
-Two readings fit ~30 s and neither is confirmed: the factory's `Connect` or
-login read hit its own 30 s default and *then* something ended the wait early;
-or the effective `acquire_timeout` was 30 in that session. The live repro
-(§ 0) sets `acquire_timeout = 600` deliberately so the timeline settles this.
-Until it does, the fix does not depend on the answer — W2 makes the wait
-after a failed creation short and the reason visible either way.
+Inside those 600 s the pool made **two** creation attempts, and each one is
+~30 s long for the reason in F7: the server never answers, and the login read
+is the hard-coded 30 s of F3. So the reporter's 31 s is one such attempt
+followed by a deadline that had already passed — which is what
+`acquire_timeout = 30` produces, and `acquire_timeout = 600` cannot. Their
+`SET mssql_acquire_timeout = 600` did not reach the session that attached;
+that is a host-side matter (DuckDB.NET, judging by the C# mention) and not
+this extension's. The fix does not depend on it: W2 makes a failed creation
+fail fast and say why, and W3 makes the 30 s a setting.
+
+### F7 — Azure SQL does not say "expired"; it hangs up
+
+The wire, from the § 0 run, for the two creation attempts inside the wait:
+
+```text
+attempt 1   PRELOGIN ok → TLS → LOGIN7 sent → (no FEDAUTHINFO) → connection closed
+attempt 2   PRELOGIN ok → TLS → LOGIN7 → FEDAUTHINFO received → FEDAUTH_TOKEN sent
+            → (no LOGINACK, no ERROR token) → connection closed
+```
+
+Not once did an ERROR token arrive. The gateway drops the connection on an
+expired token, so what `DoLogin7WithFedAuth` records is
+`"Failed to receive LOGINACK after FEDAUTH_TOKEN: <socket error>"` (`:675`),
+never an AADSTS message — and it records it only after the 30 s read of F3
+has run out. Two consequences for the design:
+
+- **the expiry has to be diagnosed on the client**, from the token's `exp`
+  (the JWT parser and `IsTokenExpired` already exist for exactly this), before
+  a socket is opened — the server will not supply the words;
+- **surfacing `last_error_` (W2) is necessary but not sufficient** for this
+  case: it would say "failed to receive", which is true and unhelpful. W1's
+  own message is the one that names the token.
 
 ### F6 — The template already exists in the next `case`
 
@@ -174,7 +213,8 @@ override — never the token, never the client secret — and on each creation:
 
 1. asks `TokenCache` (keyed by `DatabaseInstance`, spec 047 FR-012) for the
    secret's token; the cache already refuses one within `IsTokenExpired`'s
-   300 s margin;
+   300 s margin — and this check runs **before any socket is opened**, because
+   the server will not diagnose expiry for us (F7);
 2. on a miss, re-reads the secret from `SecretManager::Get(db)` under
    `GetSystemTransaction(db)` and mints a new token — an
    `AcquireToken(DatabaseInstance &, ...)` overload alongside the existing one,
