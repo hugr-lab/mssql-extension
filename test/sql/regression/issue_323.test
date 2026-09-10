@@ -20,6 +20,15 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# One connection, so every statement below reuses the one the EXEC ran on --
+# which is the whole premise: a desync on statement N shows up on statement
+# N+1 only if N+1 lands on the same physical connection. The pool reads its
+# limit ONCE, at ATTACH, so this has to come first; the first draft set it
+# afterwards, and the three "1 1" pool-stats assertions held only because the
+# scan happens to be single-threaded (PR #332 review).
+statement ok
+SET mssql_connection_limit = 1;
+
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS i323 (TYPE mssql);
 
@@ -47,9 +56,12 @@ SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323O @x INT OUTPUT AS 
 statement ok
 SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323N AS BEGIN INSERT INTO dbo.I323T VALUES (4); END');
 
-# One connection, so every statement below reuses the one the EXEC ran on.
+# The objects above were created through mssql_exec, which does not tell the
+# catalog (mssql_exec_invalidate_cache defaults to false). The catalog read
+# below worked only because nothing had populated dbo's lazy cache yet; the
+# repo's convention is to refresh after such DDL, and this file now does.
 statement ok
-SET mssql_connection_limit = 1;
+SELECT mssql_invalidate_cache('i323');
 
 # =============================================================================
 # The issue's shape: a DML procedure through mssql_exec, then the next statement

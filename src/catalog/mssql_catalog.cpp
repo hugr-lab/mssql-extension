@@ -1080,8 +1080,7 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 
 		if (!result.success) {
 			connection_pool_->Release(std::move(connection));
-			throw CatalogException("MSSQL DDL error: SQL Server error %d: %s", result.error_number,
-								   result.error_message);
+			throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
 		}
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));

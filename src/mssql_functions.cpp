@@ -498,15 +498,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
 
 			if (!query_result.success) {
-				// error_number 0 is not a server error -- it is a query timeout or,
-				// since issue #323, a TDS parse error the exec path used to swallow.
-				// "SQL Server error 0: TDS parse error" blames the wrong party.
-				if (query_result.error_number == 0) {
-					throw InvalidInputException("MSSQL execution error: %s", query_result.error_message);
-				}
-				// Surface SQL Server error with details
-				throw InvalidInputException("MSSQL execution error: SQL Server error %d: %s", query_result.error_number,
-											query_result.error_message);
+				throw InvalidInputException("MSSQL execution error: %s", query_result.DescribeError());
 			}
 
 			// Issue #151: raw DDL run through mssql_exec() bypasses the catalog metadata
