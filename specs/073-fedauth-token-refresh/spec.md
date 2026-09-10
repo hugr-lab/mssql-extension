@@ -6,11 +6,16 @@ while — `MSSQL: Failed to acquire connection from pool (timeout)` — while th
 connection it already has keeps working, and `DETACH` / `ATTACH` fixes it.
 
 The issue carries a source analysis. The reconnaissance below checked each of
-its claims against the code rather than taking them as read: four hold, one
-does not explain what it was offered for, and one thing it did not say turns
-out to be the design constraint the fix has to be built around.
+its claims against the code rather than taking them as read: four hold (F1,
+F2, F3, F6), one does not explain what it was offered for (F5), and two things
+it did not say turn out to be what the fix has to be built around — the
+refresh path it points at is unreachable (F4), and the server never says
+"expired" (F7).
 
-Reconnaissance, including a live reproduction on the reporter's line. Implementation is a separate PR.
+Reconnaissance, a live reproduction on the reporter's line, and the
+implementation, in one PR. Where § 2 says "now", it describes the code as
+merged; the first draft of this document proposed mechanisms the code did not
+have, and review caught each one before it was built.
 
 ## 0. How everything below was measured
 
@@ -126,11 +131,19 @@ DEFAULT_CONNECTION_TIMEOUT * 1000)` — so a login that the server holds or drop
 costs 30 s regardless of any setting. The reporter's `mssql_connection_timeout
 = 600` governed ATTACH-time validation and nothing after it.
 
-### F4 — The refresh infrastructure exists, has no callers, and cannot be called from where it is needed
+### F4 — The refresh infrastructure exists, is unreachable, and could not be called from where it is needed
 
 The issue names `TokenCache::GetToken`, `FedAuthStrategy::IsTokenExpired` and
 `AuthStrategyFactory::BuildTokenAcquirer`. All three exist. `BuildTokenAcquirer`
-has **no callers**, and this is what it does (`auth_strategy_factory.cpp:361`):
+has exactly one caller — `CreateFedAuth` (`auth_strategy_factory.cpp:349`) —
+and **`CreateFedAuth` is itself unreachable**: the Azure branch of
+`AuthStrategyFactory::Create` (`:321-327`) runs only when given a
+`ClientContext`, and both live `Create` call sites (`mssql_catalog.cpp:193`,
+`mssql_storage.cpp:1412`) are the spec-068 integrated-auth hop factories,
+which pass none. The first draft of this document said "no callers"; the truth
+is one caller that nothing reaches, which is the same finding with a longer
+removal list (§ 3). This is what `BuildTokenAcquirer` does
+(`auth_strategy_factory.cpp:361`):
 
 ```cpp
 // Capture context by reference - caller must ensure context lifetime
@@ -173,6 +186,14 @@ that is a host-side matter (DuckDB.NET, judging by the C# mention) and not
 this extension's. The fix does not depend on it: W2 makes a failed creation
 fail fast and say why, and W3 makes the 30 s a setting.
 
+### F6 — The template already exists in the next `case`
+
+`mssql_catalog.cpp:167-200`, the integrated-auth factory, builds a fresh
+authenticator **per connection** so a `kinit`-refreshed ticket is picked up,
+and on failure prints `conn->GetLastError()` before returning `nullptr`. It is
+the shape the Azure factory should have had: credentials resolved at creation
+time, and the reason preserved when creation fails.
+
 ### F7 — Azure SQL does not say "expired"; it hangs up
 
 The wire, from the § 0 run, for the two creation attempts inside the wait:
@@ -196,66 +217,128 @@ has run out. Two consequences for the design:
   case: it would say "failed to receive", which is true and unhelpful. W1's
   own message is the one that names the token.
 
-### F6 — The template already exists in the next `case`
-
-`mssql_catalog.cpp:167-200`, the integrated-auth factory, builds a fresh
-authenticator **per connection** so a `kinit`-refreshed ticket is picked up,
-and on failure prints `conn->GetLastError()` before returning `nullptr`. It is
-the shape the Azure factory should have had: credentials resolved at creation
-time, and the reason preserved when creation fails.
-
 ## 2. The work
 
 ### W1 — Resolve the token at creation time, not at ATTACH
 
-The factory captures `DatabaseInstance &`, the secret name and the tenant
-override — never the token, never the client secret — and on each creation:
+Two auth methods shared the old factory `case`, and they get different
+treatment, because only one of them has anything to refresh from.
 
-1. asks `TokenCache` (keyed by `DatabaseInstance`, spec 047 FR-012) for the
-   secret's token; the cache already refuses one within `IsTokenExpired`'s
-   300 s margin — and this check runs **before any socket is opened**, because
-   the server will not diagnose expiry for us (F7);
-2. on a miss, re-reads the secret from `SecretManager::Get(db)` under
-   `GetSystemTransaction(db)` and mints a new token — an
-   `AcquireToken(DatabaseInstance &, ...)` overload alongside the existing one,
-   sharing the body;
-3. builds the FEDAUTH bytes from the string — `BuildFedAuthExtension` gains a
-   form that takes the token rather than the context.
+**`AZURE_AD` (a secret)**: the factory captures `DatabaseInstance *`, the
+secret name and the tenant override — never the token, never the client
+secret — and on each creation calls `AcquireToken(DatabaseInstance &,
+secret, tenant, allow_interactive = false)`, a second entry point sharing the
+body of the context one. It re-reads the secret through `SecretManager::Get(db)`
+under `GetSystemTransaction(db)`, and builds the FEDAUTH bytes with
+`BuildFedAuthData(token)`. `service_principal`, `cli` and `env` mint silently;
+an interactive chain refuses by name (nobody is at a terminal inside a query on
+a worker thread).
 
-Providers that cannot mint silently — `access_token` (a fixed string), and the
-interactive ones after their first use — fail with a message that says what
-happened and what to do: *"Azure AD token for secret 'x' expired at <time>;
-DETACH and ATTACH to authenticate again"*. That is the same outcome as today,
-minus the thirty-one seconds and the word "timeout".
+**`MANUAL_TOKEN` (`access_token=` given to ATTACH)**: the captured bytes *are*
+the credential — there is no secret to re-resolve, and `~MSSQLCatalog`
+cleanses them for that reason — so the factory keeps them, and gains the check
+below. The first draft of this document dropped this method; review caught it.
+
+**Expiry is diagnosed from the token's own `exp`, on the client, before any
+socket is opened.** The server will not do it (F7), and `TokenCache` cannot:
+its `expires_at` was real for `service_principal` only and a fabricated
+`now + 3600` for `access_token`, `cli` and `env` — so a cache hit proved the
+entry was *young*, not that the JWT was *unexpired*, and a token minted 55
+minutes before it reached `CREATE SECRET` walked straight into the F7 hangup.
+Now `AcquireToken` parses the JWT (`ParseJwtClaims`) and records **its** `exp`
+for every provider; a fixed token past its `exp` fails at once; `MANUAL_TOKEN`
+parses the raw token once at factory build and tests it per creation. The
+messages:
+
+```text
+Azure AD access token in secret 'x' expired at 2026-09-10 08:49:00 UTC;
+a fixed token cannot be refreshed -- DETACH and ATTACH with a new one
+
+Azure AD token for secret 'x' has expired and its credential chain needs
+interactive authentication, which cannot run from a pooled connection;
+DETACH and ATTACH to authenticate again
+```
+
+That is the same outcome as before for those two cases, minus the wait and
+the word "timeout".
 
 ### W2 — A failed creation is a failure, not a full pool
 
-The pool keeps the last creation error (a string, under `pool_mutex_`), and:
+**The channel.** `ConnectionFactory` is `std::function<shared_ptr<TdsConnection>()>`
+and the `TdsConnection` holding `last_error_` dies inside the closure — the
+first draft promised to "surface the reason" through a signature with nowhere
+to put it. The contract now: the factory **throws** `ConnectionException` with
+the reason (all three factories do, in place of `return nullptr`), and
+`CreateNewConnection` catches, records `last_create_error_` under
+`pool_mutex_`, and returns nullptr — no signature change, so
+`test_connection_pool.cpp` and `test_tls_connection.cpp` keep their factories.
+`ErrorData(e).RawMessage()`, not `what()`: on the 2.0 line a DuckDB exception's
+`what()` is its JSON serialization, and the first cut pasted
+`{"exception_type":"Connection",...}` into the user's error.
 
-- when creation fails and **no connection is active** — nothing can be
-  released, so waiting is pointless — `Acquire` returns at once;
-- when others are active, it keeps waiting as now, since a release may still
-  serve the request, but re-tries creation with a backoff rather than on every
-  wake;
-- on any `nullptr` return the provider's message carries the reason:
-  `Failed to acquire connection from pool 'x' after 5 s: Azure AD
-  authentication failed (error 18456): Login failed for user '<token-identified
-  principal>'`.
+**The wait.** In `Acquire`, after a failed creation:
+
+- **no connection active** — nothing can be released, so waiting only runs out
+  the clock — return at once;
+- **others active** — a release may still serve the request, so keep waiting
+  for the caller's budget, but retry creation on a backoff (250 ms doubling to
+  4 s) rather than on every wakeup; each attempt against a server that hangs
+  up costs a full login read.
+
+**The message.** One renderer, `ConnectionPool::DescribeAcquireFailure()`,
+used by `ConnectionProvider` and by every catalog-internal `Acquire()` caller
+(schema lookup, table scan, table loading, DDL, cache refresh, preload — a
+metadata load is the likeliest *first* thing to need a fresh connection after
+the token expires):
+
+```text
+MSSQL: Failed to acquire connection: pool 'az' could not create a connection:
+Azure AD token for secret 'sp': Azure AD access token in secret 'sp' expired
+at 2026-09-10 08:49:00 UTC; a fixed token cannot be refreshed -- ...
+```
+
+and `mssql_pool_stats()` gains `creation_failures` and `last_create_error` —
+the two numbers missing while the reporter watched "1 idle, 0 closed" for two
+hours.
 
 ### W3 — Plumb `mssql_connection_timeout` where it was meant to go
 
-Every factory calls `conn->SetConnectTimeout(pool_config.connection_timeout)`
-before `Connect`, and `DoLogin7WithFedAuth` reads its responses with
-`connect_timeout_seconds_ * 1000`, as the routing-hop path already does.
+Every factory passes `pool_config_.connection_timeout` to `Connect(host, port,
+timeout)` (there is no setter; `Connect` stores it), and **all eight**
+login-phase reads that spelled out `DEFAULT_CONNECTION_TIMEOUT` now use
+`connect_timeout_seconds_` — not only the two in `DoLogin7WithFedAuth`
+(`:597`, `:674`) that the first draft named, but the PRELOGIN response and TLS
+enable on the FEDAUTH path (`:500`, `:531`), their SQL-auth twins (`:214`,
+`:245`), and the integrated-auth reads (`:865`, `:1002`). Without the other
+six, a gateway that accepts the dial and goes quiet still cost up to 60 s of
+un-configurable wait per attempt, and F3's acceptance criterion would not
+have held. Anything that never calls `Connect` with a timeout keeps the
+default.
 
 ### W4 — Tests
 
-- **Pool, server-free, gates a PR**: a factory that fails; with nothing active,
-  `Acquire` returns promptly and the error is readable; with one connection
-  active, it waits and returns the error on timeout.
-- **Azure lane** (`make azure-test`, manual dispatch): `PROVIDER access_token`
-  with a real but already-expired token exercises W1's cannot-refresh message
-  deterministically, since the client rejects it before the server would.
+- **Pool, server-free, gates a PR** — `test/cpp/test_pool_creation_failure.cpp`,
+  a **new** file in `STANDALONE_TEST_SOURCES`. Not `test_connection_pool.cpp`:
+  that file exists and is wired into nothing, but it is not revivable as a
+  standalone test — its factory dials a real server with real credentials.
+  The new one throws, returns nullptr, or hands back an unconnected
+  `TdsConnection` to stand in for an active one. Link surface is the usual
+  standalone lane's (`libmssql_extension.a` pulls `TdsConnection`, hence
+  OpenSSL/simdutf from vcpkg), which `make test-cpp-run` already satisfies.
+  Cases: throwing factory fails fast with the reason and is *not* counted as
+  an acquire timeout; a silent nullptr still gets a reason; one active →
+  waits the budget, 2–4 attempts in 800 ms on the backoff, reason kept; a
+  success resets the backoff. Does not compile against the pre-fix archive.
+- **`test/sql/regression/issue_302.test`** — wrong password, `lazy_validation`,
+  `acquire_timeout = 30`. On the pre-fix code: "(timeout)" and 92 s for three
+  statements. Now: `could not create a connection: Login failed for user` at
+  once, pool 0/0.
+- **Azure lane** (`make azure-test`, manual dispatch):
+  `test/sql/azure/fedauth_expired_access_token.test` — `PROVIDER access_token`
+  with a well-formed token whose `exp` is 1000000000 (2001-09-09), refused at
+  ATTACH with *"expired at 2001-09-09"*. Deterministic **only because** W1
+  diagnoses from the JWT's `exp` — the first draft assumed the cache did, and
+  the review pointed out it did not (it stored `now + 3600`).
 - **The 60-minute path** cannot be shortened — Azure AD does not issue
   short-lived tokens on request — so it stays a documented manual run: the
   script from § 0, recorded in the azure lane's README with its expected
@@ -275,23 +358,31 @@ refills, which it did not.
 - **Re-authenticating idle connections.** The server does not re-validate a
   live session, and neither should the pool. What ages is the ability to open
   a *new* one.
-- **Fixing `BuildTokenAcquirer` in place.** Its contract — a `ClientContext`
-  captured by reference — is the problem, not a detail. It is replaced by the
-  `DatabaseInstance`-bound acquirer and removed, along with the strategy-side
-  `IsTokenExpired` overrides if the `mssql_open` path turns out to be their only
-  consumer.
+- **Fixing `BuildTokenAcquirer` in place, or removing it here.** Its contract
+  — a `ClientContext` captured by reference — is the problem, not a detail,
+  and it is superseded by the `DatabaseInstance`-bound `AcquireToken`. It is
+  *not* removed in this PR because it does not come alone: its only caller is
+  `CreateFedAuth`, which is unreachable (F4), and unhooking that means the
+  Azure branch of `AuthStrategyFactory::Create`, `FedAuthStrategy::SetTokenAcquirer`
+  / `GetFedAuthToken`, and the `TokenAcquirer` typedef. That is a
+  dead-code removal with its own diff, and it should not ride on a bug fix.
 
 ## 4. Risks
 
 - **Secret access from a worker thread.** `SecretManager::Get(db)` with a
   system transaction is what DuckDB itself uses off-context; the factory runs
-  with `pool_mutex_` released, so no lock is held across it. Worth an explicit
-  check for a `SecretManager` lock the pool's cleanup thread could contend on.
+  with `pool_mutex_` released, so no pool lock is held across it. The
+  contention that can exist is between **concurrent `Acquire` callers on
+  request threads** each running the factory — the cleanup thread never calls
+  it (it only reaps idle connections). Two such callers may both find the cache
+  stale and both mint a token; the second `SetToken` wins and both connections
+  are valid. Acceptable, and bounded by the pool limit.
 - **W2 changes `Acquire`'s timing** when creation fails with nothing active —
   from `acquire_timeout` to immediate. Intended; any caller that relied on the
   wait was relying on a timeout to tell it about a wrong password.
-- **The reporter is on the 1.5.5 line.** The fix lands on `main` and is
-  backported to `duckdb-v1.5.5` for a 0.2.6, the same route v0.2.5 took.
+- **The reporter is on the 1.5.5 line, and this is not backported.** Releases
+  now come from `main` on the duckdb 2.0 line only; v0.2.5 was the last from
+  `duckdb-v1.5.5`. They get this in the next 2.0-line release.
 
 ## 5. Acceptance
 

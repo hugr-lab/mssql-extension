@@ -498,6 +498,19 @@ TokenResult AcquireToken(DatabaseInstance &db_instance, const std::string &secre
 
 		// Cache successful result
 		if (result.success) {
+			// The cache's expiry must be the TOKEN's, not a guess: the CLI, env
+			// and static-token paths used to store now + 3600 s, so a cache hit
+			// proved the entry was young, not that the JWT was unexpired -- and a
+			// token minted 55 minutes before it reached us walked straight into
+			// the F7 hangup with a "valid" cache entry (spec 073 review). Every
+			// Azure AD access token is a JWT with an exp; the fabricated lifetime
+			// stays only for a token that does not parse as one.
+			{
+				JwtClaims claims = ParseJwtClaims(result.access_token);
+				if (claims.valid && claims.exp > 0) {
+					result.expires_at = std::chrono::system_clock::from_time_t(static_cast<time_t>(claims.exp));
+				}
+			}
 			TokenCache::Instance().SetToken(db_instance, cache_key, result.access_token, result.expires_at);
 		}
 
