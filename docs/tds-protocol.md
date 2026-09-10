@@ -307,8 +307,21 @@ Detection via `IsAzureEndpoint()`, `IsFabricEndpoint()`, `IsSynapseEndpoint()` i
 | `INFO` | 0xAB | Informational message |
 | `ENVCHANGE` | 0xE3 | Environment change (database, packet size, transaction) |
 | `LOGINACK` | 0xAD | Login succeeded |
-| `ORDER` | 0xA9 | ORDER BY column list |
-| `RETURNSTATUS` | 0x79 | Stored procedure return value |
+| `ORDER` | 0xA9 | ORDER BY column list (USHORT length, skipped) |
+| `TABNAME` | 0xA4 | Table names for a browsable result (USHORT length, skipped) |
+| `COLINFO` | 0xA5 | Column provenance for a browsable result (USHORT length, skipped) |
+| `RETURNSTATUS` | 0x79 | Stored procedure return value — **fixed**: type byte + LONG, five bytes, no length field |
+| `RETURNVALUE` | 0xAC | OUTPUT parameter / UDF return — **no length field**; sized by its own TypeInfo. Sent only for RPC, which this extension does not issue; refused by name if it ever arrives |
+
+Two traps recorded from issue #323. `RETURNSTATUS` was skipped as if it carried a
+USHORT length, so its value was read as one — a procedure returning 0 left two
+bytes behind, one returning *n* ate *n* bytes of the DONEPROC that follows — and
+every stored-procedure call desynced the stream. And `TABNAME` was registered as
+0x04, which is the **packet type** `TABULAR_RESULT` above, not a token: any
+`FOR BROWSE` result failed. The length class in bits 5–4 of the token byte
+([MS-TDS] 2.2.4.1) would have caught the first, but it has exceptions this
+parser relies on (DONE class-decodes to 8 bytes and is 13), so the rule is not
+used as a check; the tokens above are each verified against their section.
 
 ### COLMETADATA Token (0x81)
 
