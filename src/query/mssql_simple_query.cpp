@@ -324,6 +324,24 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 			}
 		}
 
+		// A parser in the Error state answers NeedMoreData forever, so the loop
+		// above has exited and will exit at once for every later packet. Until
+		// issue #323 that was indistinguishable from "waiting for the next
+		// packet": the code below forced done and RETURNED SUCCESS, with every
+		// token after the desync dropped -- later result sets, later row counts,
+		// and a SQL Server ERROR token following a stored-procedure call, which
+		// is exactly the one a caller most needs. Record it as the failure it is.
+		// The drain to EOM still happens below, on purpose: that is what leaves
+		// the socket clean for the next statement on this connection, so the
+		// connection can go back to Idle rather than be discarded. A SQL Server
+		// error already recorded keeps precedence -- it says more than this does.
+		if (parser.GetState() == tds::ParserState::Error && result.success) {
+			result.success = false;
+			result.error_number = 0;
+			result.error_message = "TDS parse error: " + parser.GetParseError();
+			SIMPLE_QUERY_DEBUG(1, "ExecuteWithCallback: %s", result.error_message.c_str());
+		}
+
 		// If EOM was set and we're not done, there's no more data coming
 		// This handles the case where the parser needs more data but EOM indicates complete response
 		if (is_eom && !done) {
