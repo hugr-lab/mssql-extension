@@ -99,6 +99,11 @@ public:
 	//! "Failed to acquire connection from pool (timeout)".
 	std::string GetLastCreateError() const;
 
+	//! Why Acquire() returned nullptr, ready to append to a caller's message:
+	//! "pool 'x' could not create a connection: <reason>" or
+	//! "pool 'x' timed out (N active of M, limit L)".
+	std::string DescribeAcquireFailure() const;
+
 	// Pin counter — tracks connections currently pinned to active DuckDB
 	// transactions (spec 047 FR-005). Migrated from the deleted
 	// MssqlPoolManager::pinned_counts_ map. Lock-free; safe to call from any

@@ -1,5 +1,6 @@
 #include "tds/tds_connection_pool.hpp"
 #include <algorithm>
+#include "duckdb/common/error_data.hpp"
 
 #include "duckdb/common/assert.hpp"
 
@@ -368,8 +369,11 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
 	} catch (const std::exception &e) {
 		// The factory says why -- an expired token, the server's login error,
 		// a refused dial. Kept for the caller; the pool itself only needs the
-		// nullptr (issue #302).
-		error = e.what();
+		// nullptr (issue #302). ErrorData, not what(): a DuckDB exception's
+		// what() is its JSON serialization on the 2.0 line, and the first
+		// version of this pasted `{"exception_type":"Connection",...}` into the
+		// user's error.
+		error = ErrorData(e).RawMessage();
 	}
 	if (!error.empty()) {
 		std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -382,6 +386,20 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
 std::string ConnectionPool::GetLastCreateError() const {
 	std::lock_guard<std::mutex> lock(pool_mutex_);
 	return last_create_error_;
+}
+
+std::string ConnectionPool::DescribeAcquireFailure() const {
+	// Two different things end in a nullptr from Acquire and used to read the
+	// same: the pool is full and nobody released in time, or the pool tried to
+	// create a connection and could not -- an expired Azure AD token, the
+	// server's login error, a refused dial (issue #302). One renderer, so the
+	// provider and the nine catalog-internal callers say the same thing.
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (!last_create_error_.empty()) {
+		return "pool '" + context_name_ + "' could not create a connection: " + last_create_error_;
+	}
+	return "pool '" + context_name_ + "' timed out (" + std::to_string(stats_.active_connections) + " active of " +
+		   std::to_string(stats_.total_connections) + ", limit " + std::to_string(config_.connection_limit) + ")";
 }
 
 bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection> &conn) {

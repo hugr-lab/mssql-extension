@@ -417,7 +417,8 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		connection = connection_pool_->Acquire();
 	}
 	if (!connection) {
-		throw IOException("Failed to acquire connection for schema lookup");
+		throw IOException("Failed to acquire connection for schema lookup: " +
+						  connection_pool_->DescribeAcquireFailure());
 	}
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
@@ -1144,7 +1145,8 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 
 	auto connection = connection_pool_->Acquire();
 	if (!connection) {
-		throw IOException("Failed to acquire connection for DDL execution");
+		throw IOException("Failed to acquire connection for DDL execution: " +
+						  connection_pool_->DescribeAcquireFailure());
 	}
 
 	try {
@@ -1297,7 +1299,8 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// Acquire connection for full cache refresh
 	auto connection = connection_pool_->Acquire();
 	if (!connection) {
-		throw IOException("Failed to acquire connection for cache refresh");
+		throw IOException("Failed to acquire connection for cache refresh: " +
+						  connection_pool_->DescribeAcquireFailure());
 	}
 
 	// Perform full eager cache refresh.

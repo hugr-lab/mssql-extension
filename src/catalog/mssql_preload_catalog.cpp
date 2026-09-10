@@ -119,7 +119,8 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 			// Acquire connection
 			auto connection = pool.Acquire();
 			if (!connection) {
-				throw IOException("mssql_preload_catalog: failed to acquire connection");
+				throw IOException("mssql_preload_catalog: failed to acquire connection: " +
+								  pool.DescribeAcquireFailure());
 			}
 
 			// Execute bulk preload (ensure connection is returned to pool even on exception)

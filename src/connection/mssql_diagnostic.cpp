@@ -264,6 +264,13 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 
 	names.emplace_back("pinned_count");
 	return_types.emplace_back(LogicalType::BIGINT);
+	// Issue #302: the two numbers that were missing when the reporter stared at
+	// "1 idle, 0 closed" for two hours -- how many times the pool tried to
+	// create a connection and could not, and what the last attempt said.
+	names.emplace_back("creation_failures");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("last_create_error");
+	return_types.emplace_back(LogicalType::VARCHAR);
 
 	return std::move(bind_data);
 }
@@ -332,6 +339,8 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 			output.data[6].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_count)));
 			output.data[7].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.acquire_timeout_count)));
 			output.data[8].SetValue(count, Value::BIGINT(stats.pinned_count));
+			output.data[9].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.creation_failures)));
+			output.data[10].SetValue(count, Value(pool.GetLastCreateError()));
 
 			count++;
 		} catch (...) {
