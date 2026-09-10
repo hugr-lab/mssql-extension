@@ -324,18 +324,15 @@ private:
 	// TLS state
 	bool tls_enabled_;
 
-	// Connect timeout the caller supplied to Connect(), remembered so a routing
-	// hop dials on the SAME budget (spec 068). Without this a user who sets
-	// mssql_connection_timeout=5 and gets routed to an unreachable replica waits
-	// the compiled-in default per hop instead of the 5 they asked for.
-	//
-	// Scope, precisely: this covers the TCP DIAL. The handshake receives that
-	// follow -- PRELOGIN response, TLS enable, LOGIN7 response, on all three
-	// auth paths -- still pass DEFAULT_CONNECTION_TIMEOUT, on the first attempt
-	// as well as on a hop. So a replica that accepts the connection and then
-	// never answers still costs the compiled-in default. Threading the caller's
-	// value through those sites would change every login's behaviour, not just a
-	// routed one, and belongs in its own change.
+	// The timeout SetConnectTimeout stores. Scope: the TCP dial AND every
+	// handshake receive that follows -- PRELOGIN response, TLS enable, LOGIN7 /
+	// FEDAUTH responses, on all three auth paths, first attempt and routing hop
+	// alike. Until issue #302 those receives passed DEFAULT_CONNECTION_TIMEOUT
+	// spelled out, so a server that accepted the dial and then dropped the
+	// connection -- which is what Azure SQL does with an expired FEDAUTH token
+	// -- cost the compiled-in 30 s per attempt whatever mssql_connection_timeout
+	// said. Anything that never calls SetConnectTimeout still gets the default,
+	// so only callers that ask see a change.
 	int connect_timeout_seconds_ = DEFAULT_CONNECTION_TIMEOUT;
 
 	// Frame size we ask for in LOGIN7 (spec 055). Defaults to the pre-055

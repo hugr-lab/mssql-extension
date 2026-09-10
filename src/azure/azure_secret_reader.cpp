@@ -9,6 +9,7 @@
 #include "azure/azure_secret_reader.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
@@ -17,12 +18,18 @@ namespace mssql {
 namespace azure {
 
 AzureSecretInfo ReadAzureSecret(ClientContext &context, const std::string &secret_name) {
+	return ReadAzureSecret(*context.db, secret_name);
+}
+
+AzureSecretInfo ReadAzureSecret(DatabaseInstance &db, const std::string &secret_name) {
 	if (secret_name.empty()) {
 		throw InvalidInputException("Error: Secret name required");
 	}
 
-	auto &secret_manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	// Per-DatabaseInstance forms of what the ClientContext ones resolve to; the
+	// pool factory that refreshes a token has a DatabaseInstance and nothing else.
+	auto &secret_manager = SecretManager::Get(db);
+	auto transaction = CatalogTransaction::GetSystemTransaction(db);
 
 	// Try to lookup the secret by name
 	auto secret_entry = secret_manager.GetSecretByName(transaction, secret_name);

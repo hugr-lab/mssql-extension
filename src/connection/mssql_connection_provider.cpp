@@ -106,6 +106,26 @@ bool ConnectionProvider::IsSqlServerTransactionActive(ClientContext &context, MS
 // ConnectionProvider::GetConnection
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Why an Acquire came back empty (issue #302)
+//
+// Two different things end here and used to read the same: the pool is full
+// and nobody released in time, or the pool tried to create a connection and
+// could not -- an expired Azure AD token, the server's login error, a refused
+// dial. The pool now keeps the factory's reason; say it.
+//===----------------------------------------------------------------------===//
+static std::string DescribeAcquireFailure(tds::ConnectionPool &pool, const std::string &context_name) {
+	const std::string reason = pool.GetLastCreateError();
+	const auto stats = pool.GetStats();
+	if (!reason.empty()) {
+		return "MSSQL: Failed to acquire connection from pool '" + context_name +
+			   "': could not create a connection: " + reason;
+	}
+	return "MSSQL: Failed to acquire connection from pool '" + context_name +
+		   "' (timeout: " + std::to_string(stats.active_connections) + " active of " +
+		   std::to_string(stats.total_connections) + ")";
+}
+
 std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientContext &context, MSSQLCatalog &catalog,
 																	  int timeout_ms) {
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
@@ -126,7 +146,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 					   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 		auto conn = pool.Acquire(timeout_ms);
 		if (!conn) {
-			throw IOException("MSSQL: Failed to acquire connection from pool (timeout)");
+			throw IOException(DescribeAcquireFailure(pool, catalog.GetContextName()));
 		}
 		auto stats_after = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool connection acquired, tds_conn=%p, spid=%d, has_txn_desc=%d",
@@ -157,7 +177,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 				   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 	auto conn = pool.Acquire(timeout_ms);
 	if (!conn) {
-		throw IOException("MSSQL: Failed to acquire connection from pool for transaction (timeout)");
+		throw IOException(DescribeAcquireFailure(pool, catalog.GetContextName()) + " (for transaction)");
 	}
 	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning", (void *)conn.get(), conn->GetSpid());
 

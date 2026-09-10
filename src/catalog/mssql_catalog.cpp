@@ -2,7 +2,9 @@
 #include <openssl/crypto.h>
 #include "codec/target_string_type.hpp"
 
+#include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
+#include "azure/jwt_parser.hpp"
 #include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_schema_entry.hpp"
@@ -133,11 +135,62 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 
 	tds::ConnectionFactory factory;
 	switch (connection_info_->auth_method) {
-	case AuthMethod::AZURE_AD:
+	case AuthMethod::AZURE_AD: {
+		// Issue #302 / spec 073: the token is resolved when a CONNECTION is
+		// created, not when the catalog was. ATTACH still acquires one -- that
+		// is what makes a wrong secret fail at ATTACH -- but the factory does
+		// not keep it: an Azure AD token lives 60 minutes, and a pool refill
+		// hours later that presented the ATTACH-time bytes was dropped by the
+		// gateway without a word, then reported as "(timeout)".
+		//
+		// What the factory holds is the secret's NAME, the tenant override and
+		// the DatabaseInstance -- never the token and never the client secret.
+		// TokenCache answers while the token is good (spec 047 FR-012 keys it
+		// by DatabaseInstance); past the refresh margin it re-reads the secret
+		// and mints a new one. Interactive chains cannot mint from here (no
+		// user, no terminal, a worker thread mid-query) and say so by name.
+		//
+		// A DatabaseInstance and not a ClientContext: the ATTACH context is gone
+		// long before the pool stops refilling (issue #178's constraint), and
+		// the DatabaseInstance owns the AttachedDatabase that owns this catalog.
+		auto host = connection_info_->host;
+		auto port = connection_info_->port;
+		auto database = connection_info_->database;
+		auto encrypt = connection_info_->use_encrypt;
+		auto tds_packet_size = connection_info_->tds_packet_size;
+		auto utf8_support = connection_info_->utf8_support;
+		auto secret_name = connection_info_->azure_secret_name;
+		auto tenant = connection_info_->azure_tenant_id;
+		const int connect_timeout = pool_config_.connection_timeout;
+		DatabaseInstance *db = &GetDatabase();
+		factory = [db, host, port, database, encrypt, app_name, tds_packet_size, utf8_support, secret_name, tenant,
+				   connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
+			auto token_result = mssql::azure::AcquireToken(*db, secret_name, tenant, /*allow_interactive=*/false);
+			if (!token_result.success) {
+				throw ConnectionException("Azure AD token for secret '%s': %s", secret_name,
+										  token_result.error_message);
+			}
+			auto fedauth = mssql::azure::BuildFedAuthData(token_result.access_token);
+			auto conn = std::make_shared<tds::TdsConnection>();
+			conn->SetRequestedPacketSize(tds_packet_size);
+			conn->SetRequestUtf8Support(utf8_support);
+			if (!conn->Connect(host, port, connect_timeout)) {
+				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
+										  conn->GetLastError());
+			}
+			if (!conn->AuthenticateWithFedAuth(database, fedauth.token_utf16le, encrypt, app_name)) {
+				throw ConnectionException("Azure AD authentication failed: %s", conn->GetLastError());
+			}
+			return conn;
+		};
+		break;
+	}
 	case AuthMethod::MANUAL_TOKEN: {
-		// FEDAUTH path: token was pre-built by MSSQLAttach (acquire happens
-		// there so credential errors surface before catalog construction).
-		// Captured by value in the factory closure; same lifetime as the pool.
+		// A token handed to ATTACH directly. There is no secret to refresh it
+		// from, so its own `exp` decides, and it decides BEFORE a socket is
+		// opened: Azure SQL does not answer an expired FEDAUTH token with an
+		// error, it drops the connection (spec 073 F7), so the server-side
+		// message would be "failed to receive" after the login read ran out.
 		auto host = connection_info_->host;
 		auto port = connection_info_->port;
 		auto database = connection_info_->database;
@@ -145,16 +198,31 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto token = fedauth_token_utf16le_;
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
-		factory = [host, port, database, encrypt, token, app_name, tds_packet_size,
-				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
+		const int connect_timeout = pool_config_.connection_timeout;
+		int64_t exp = 0;
+		{
+			auto claims = mssql::azure::ParseJwtClaims(connection_info_->access_token);
+			if (claims.valid && claims.exp > 0) {
+				exp = claims.exp;
+			}
+		}
+		factory = [host, port, database, encrypt, token, app_name, tds_packet_size, utf8_support, connect_timeout,
+				   exp]() -> std::shared_ptr<tds::TdsConnection> {
+			if (exp > 0 && mssql::azure::IsTokenExpired(exp, /*margin_seconds=*/0)) {
+				throw ConnectionException(
+					"Azure AD access token supplied at ATTACH expired at %s; a fixed token cannot "
+					"be refreshed -- DETACH and ATTACH with a new one",
+					mssql::azure::FormatTimestamp(exp));
+			}
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
-			if (!conn->Connect(host, port)) {
-				return nullptr;
+			if (!conn->Connect(host, port, connect_timeout)) {
+				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
+										  conn->GetLastError());
 			}
 			if (!conn->AuthenticateWithFedAuth(database, token, encrypt, app_name)) {
-				return nullptr;
+				throw ConnectionException("Azure AD authentication failed: %s", conn->GetLastError());
 			}
 			return conn;
 		};
@@ -166,14 +234,14 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		// gss_init_sec_context state is independent across pool refills and a
 		// kinit-refreshed ticket is picked up on the next fill. (Spec 042.)
 		MSSQLConnectionInfo info_copy = *connection_info_;
-		factory = [info_copy, app_name]() -> std::shared_ptr<tds::TdsConnection> {
+		const int connect_timeout = pool_config_.connection_timeout;
+		factory = [info_copy, app_name, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
 			conn->SetRequestUtf8Support(info_copy.utf8_support);
-			if (!conn->Connect(info_copy.host, info_copy.port)) {
-				fprintf(stderr, "[MSSQL POOL] integrated-auth: TCP connect to %s:%u failed: %s\n",
-						info_copy.host.c_str(), static_cast<unsigned>(info_copy.port), conn->GetLastError().c_str());
-				return nullptr;
+			if (!conn->Connect(info_copy.host, info_copy.port, connect_timeout)) {
+				throw ConnectionException("integrated-auth: TCP connect to %s:%u failed: %s", info_copy.host,
+										  static_cast<unsigned>(info_copy.port), conn->GetLastError());
 			}
 			// Spec 068 D3: a factory, not an instance. It is called once per
 			// login attempt, so a routing hop gets a ticket for the ROUTED
@@ -207,8 +275,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			};
 			if (!conn->AuthenticateIntegrated(info_copy.database, auth_factory, info_copy.use_encrypt, app_name,
 											  info_copy.login7_max_packet)) {
-				fprintf(stderr, "[MSSQL POOL] integrated-auth: %s\n", conn->GetLastError().c_str());
-				return nullptr;
+				throw ConnectionException("integrated-auth: %s", conn->GetLastError());
 			}
 			return conn;
 		};
@@ -225,16 +292,21 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto encrypt = connection_info_->use_encrypt;
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
-		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size,
-				   utf8_support]() -> std::shared_ptr<tds::TdsConnection> {
+		const int connect_timeout = pool_config_.connection_timeout;
+		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size, utf8_support,
+				   connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
-			if (!conn->Connect(host, port)) {
-				return nullptr;
+			// Throw, do not return nullptr: the pool keeps the reason and the
+			// caller finally sees "Login failed for user ..." instead of
+			// "(timeout)" (issue #302).
+			if (!conn->Connect(host, port, connect_timeout)) {
+				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
+										  conn->GetLastError());
 			}
 			if (!conn->Authenticate(username, password, database, encrypt, app_name)) {
-				return nullptr;
+				throw ConnectionException("%s", conn->GetLastError());
 			}
 			return conn;
 		};

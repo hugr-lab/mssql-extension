@@ -16,6 +16,7 @@
 #include <utility>
 #include "azure_secret_reader.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
@@ -176,6 +177,22 @@ private:
 //===----------------------------------------------------------------------===//
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 						 const std::string &tenant_id_override = "");
+
+//! The same acquisition from a DatabaseInstance, for a caller with no
+//! ClientContext -- the connection-pool factory refreshing a token for a new
+//! connection (issue #302, spec 073). `allow_interactive = false` refuses the
+//! device-code / interactive chain with a message naming the way out rather
+//! than prompting a user from inside a query on a worker thread.
+TokenResult AcquireToken(DatabaseInstance &db, const std::string &secret_name, const std::string &tenant_id_override,
+						 bool allow_interactive);
+
+//! The same acquisition from a DatabaseInstance, for a caller with no
+//! ClientContext -- the connection-pool factory refreshing a token for a new
+//! connection (issue #302, spec 073). `allow_interactive = false` refuses the
+//! device-code / interactive chain with a message naming the way out rather
+//! than prompting a user from inside a query on a worker thread.
+TokenResult AcquireToken(DatabaseInstance &db, const std::string &secret_name, const std::string &tenant_id_override,
+						 bool allow_interactive);
 
 }  // namespace azure
 }  // namespace mssql
