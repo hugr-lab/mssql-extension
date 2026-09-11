@@ -1,0 +1,37 @@
+# clangd (the vscode-clangd extension reads this; cpptools reads
+# .vscode/settings.json) has no compile command for the standalone C++ tests
+# in test/cpp/: they are compiled by the Makefile (STANDALONE_TEST_SOURCES,
+# `make test-cpp`), not by CMake, so they are absent from
+# build/*/compile_commands.json and clangd falls back to flags that know
+# nothing about the vcpkg tree -- every <openssl/*.h> shows as "file not
+# found". This is the standalone lane's include set from the Makefile.
+#
+# clangd passes these flags verbatim to a fallback command whose working
+# directory is the FILE's directory (not this file's), so the paths are
+# written relative to test/cpp/ and to test/cpp/codec/. Triplets that do not
+# exist on a given machine are harmless.
+If:
+  PathMatch: test/cpp/[^/]+\.cpp
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I../../src/include
+    - -I../../duckdb/src/include
+    - -I../../duckdb/third_party/fmt/include
+    - -I../../build/release/vcpkg_installed/arm64-osx/include
+    - -I../../build/release/vcpkg_installed/x64-osx/include
+    - -I../../build/release/vcpkg_installed/x64-linux/include
+    - -I../../build/release/vcpkg_installed/x64-windows-static-release/include
+---
+If:
+  PathMatch: test/cpp/codec/.*\.cpp
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I../../../src/include
+    - -I../../../duckdb/src/include
+    - -I../../../duckdb/third_party/fmt/include
+    - -I../../../build/release/vcpkg_installed/arm64-osx/include
+    - -I../../../build/release/vcpkg_installed/x64-osx/include
+    - -I../../../build/release/vcpkg_installed/x64-linux/include
+    - -I../../../build/release/vcpkg_installed/x64-windows-static-release/include
