@@ -10,6 +10,7 @@
 //   ./build/release/test/unittest "*jwt*"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
 
