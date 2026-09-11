@@ -101,7 +101,7 @@ constexpr uint8_t FEDAUTHINFO_OPT_SPN = 0x02;	   // Server Principal Name
 
 // TDS Token Types (response parsing)
 enum class TokenType : uint8_t {
-	TABNAME = 0x04,	 // Table name for browsable results
+	TABNAME = 0xA4,	 // Table name for browsable results ([MS-TDS] 2.2.7.22; was 0x04 — issue #323)
 	COLINFO = 0xA5,	 // Column info for browsable results
 	DONE = 0xFD,
 	DONEPROC = 0xFE,

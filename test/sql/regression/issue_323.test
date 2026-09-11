@@ -1,0 +1,185 @@
+# name: test/sql/regression/issue_323.test
+# description: stored-procedure calls no longer desync the TDS parser (issue #323, spec 072)
+# group: [mssql]
+# issue: 323
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# RETURNSTATUS (0x79) is a fixed five-byte token with no length field. The
+# parser skipped it as if it carried one, so every EXEC desynced the stream at
+# the DONEPROC that closes it. The two consumers then failed in opposite ways:
+# mssql_scan threw "TDS parse error: Unknown token type: 0x0" and the pool
+# discarded the connection; mssql_exec SWALLOWED it and reported success with
+# every token after the procedure dropped -- including a SQL Server ERROR
+# raised after the EXEC. The byte-level half is test/cpp/test_token_parser_tokens.cpp,
+# which CI runs; this is the end of the wire, on one pinned connection so a
+# desync on statement N shows up on statement N+1.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# One connection, so every statement below reuses the one the EXEC ran on --
+# which is the whole premise: a desync on statement N shows up on statement
+# N+1 only if N+1 lands on the same physical connection. The pool reads its
+# limit ONCE, at ATTACH, so this has to come first; the first draft set it
+# afterwards, and the three "1 1" pool-stats assertions held only because the
+# scan happens to be single-threaded (PR #332 review).
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS i323 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i323', 'DROP PROCEDURE IF EXISTS dbo.I323P, dbo.I323R, dbo.I323S, dbo.I323O, dbo.I323N');
+
+statement ok
+SELECT mssql_exec('i323', 'DROP TABLE IF EXISTS dbo.I323T');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE TABLE dbo.I323T (id INT)');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323P AS BEGIN SET NOCOUNT ON; INSERT INTO dbo.I323T VALUES (1),(2),(3); END');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323R AS BEGIN SET NOCOUNT ON; RETURN 7; END');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323S AS BEGIN SET NOCOUNT ON; SELECT id FROM dbo.I323T WHERE id <= 3 ORDER BY id; END');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323O @x INT OUTPUT AS BEGIN SET NOCOUNT ON; SET @x = 42; END');
+
+statement ok
+SELECT mssql_exec('i323', 'CREATE OR ALTER PROCEDURE dbo.I323N AS BEGIN INSERT INTO dbo.I323T VALUES (4); END');
+
+# The objects above were created through mssql_exec, which does not tell the
+# catalog (mssql_exec_invalidate_cache defaults to false). The catalog read
+# below worked only because nothing had populated dbo's lazy cache yet; the
+# repo's convention is to refresh after such DDL, and this file now does.
+statement ok
+SELECT mssql_invalidate_cache('i323');
+
+# =============================================================================
+# The issue's shape: a DML procedure through mssql_exec, then the next statement
+# on the same connection. Before the fix the exec reported 0 (it still does --
+# NOCOUNT ON), the parser died silently, and the follow-up only worked when the
+# whole response had fit one packet.
+# =============================================================================
+
+query I
+SELECT mssql_exec('i323', 'EXEC dbo.I323P');
+----
+0
+
+query I
+SELECT count(*) FROM i323.dbo.I323T;
+----
+3
+
+# Same connection, still Idle, not discarded.
+query II
+SELECT total_connections, idle_connections FROM mssql_pool_stats('i323');
+----
+1	1
+
+# =============================================================================
+# A non-zero status. Before the fix the value 7 was read as a length and ate
+# five bytes of the DONEPROC.
+# =============================================================================
+
+query I
+SELECT mssql_exec('i323', 'EXEC dbo.I323R');
+----
+0
+
+# mssql_exec reports DONE's row count, and a SELECT counts its rows: 1.
+query I
+SELECT mssql_exec('i323', 'SELECT 1');
+----
+1
+
+# NOCOUNT OFF: the row count is reported, and it was reported before the fix
+# too -- DONEINPROC precedes RETURNSTATUS. Pinned so the fix does not change it.
+query I
+SELECT mssql_exec('i323', 'EXEC dbo.I323N');
+----
+1
+
+# =============================================================================
+# THE CASE THAT FAILED SILENTLY. A SQL Server error raised after the procedure
+# arrives after RETURNSTATUS, i.e. after the desync, and was dropped: this
+# returned 0 with no error. The same RAISERROR without the EXEC always surfaced.
+# =============================================================================
+
+statement error
+SELECT mssql_exec('i323', 'EXEC dbo.I323R; RAISERROR(''error after the proc'', 16, 1)');
+----
+error after the proc
+
+statement error
+SELECT mssql_exec('i323', 'RAISERROR(''control'', 16, 1)');
+----
+control
+
+# The connection survived both errors.
+query II
+SELECT total_connections, idle_connections FROM mssql_pool_stats('i323');
+----
+1	1
+
+# =============================================================================
+# Through mssql_scan: a procedure that returns rows. Before the fix the rows
+# arrived and then the scan threw at the DONEPROC.
+# =============================================================================
+
+query I
+SELECT id FROM mssql_scan('i323', 'EXEC dbo.I323S');
+----
+1
+2
+3
+
+# mssql_exec reports DONE's row count, and a SELECT counts its rows: 1.
+query I
+SELECT mssql_exec('i323', 'SELECT 1');
+----
+1
+
+# An OUTPUT parameter over SQL_BATCH stays server-side and comes back as an
+# ordinary row; no RETURNVALUE token is involved. Pinned because the survey
+# relied on it.
+query I
+SELECT v FROM mssql_scan('i323', 'DECLARE @v INT; EXEC dbo.I323O @v OUTPUT; SELECT @v AS v');
+----
+42
+
+# =============================================================================
+# FOR BROWSE: TABNAME (0xA4) and COLINFO (0xA5) precede the rows. TABNAME was
+# registered as 0x04, so this failed with "Unknown token type: 0x164".
+# =============================================================================
+
+query I
+SELECT id FROM mssql_scan('i323', 'SELECT id FROM dbo.I323T WHERE id <= 3 ORDER BY id FOR BROWSE');
+----
+1
+2
+3
+
+query II
+SELECT total_connections, idle_connections FROM mssql_pool_stats('i323');
+----
+1	1
+
+# Cleanup
+statement ok
+SELECT mssql_exec('i323', 'DROP PROCEDURE IF EXISTS dbo.I323P, dbo.I323R, dbo.I323S, dbo.I323O, dbo.I323N');
+
+statement ok
+SELECT mssql_exec('i323', 'DROP TABLE IF EXISTS dbo.I323T');
+
+statement ok
+DETACH i323;

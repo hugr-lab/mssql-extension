@@ -1,4 +1,5 @@
 #include "tds/tds_column_metadata.hpp"
+#include <cstdio>
 #include <stdexcept>
 #include "tds/encoding/utf16.hpp"
 
@@ -83,8 +84,15 @@ std::string ColumnMetadata::GetTypeName() const {
 		return "TEXT";
 	case TDS_TYPE_NTEXT:
 		return "NTEXT";
-	default:
-		return "UNKNOWN(0x" + std::to_string(type_id) + ")";
+	default: {
+		// Hex prefix, hex digits: 0xAF, not 0x175. The parser's unknown-token
+		// message had the same defect (spec 072 W5); this is the type-byte twin,
+		// and it reaches users through "Unsupported SQL Server type" and
+		// "Unsupported type in RowReader" -- the lines the next #323 gets pasted from.
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "UNKNOWN(0x%02X)", static_cast<unsigned>(type_id));
+		return buf;
+	}
 	}
 }
 

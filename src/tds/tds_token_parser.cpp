@@ -152,13 +152,41 @@ ParsedTokenType TokenParser::TryParseNext() {
 			}
 			return ParsedTokenType::NeedMoreData;
 
-		case TokenType::ORDER:
 		case TokenType::RETURNSTATUS:
+			// Fixed-length: TokenType(1) + Value(LONG 4), no length field ([MS-TDS]
+			// 2.2.7.16). Issue #323: this sat in the 2-byte-length group below, so
+			// the low two bytes of the return VALUE were read as a length -- a
+			// status of 0 left two bytes behind, a status of n consumed n bytes of
+			// whatever token followed, and every stored-procedure call desynced the
+			// stream at the DONEPROC that closes it. Nothing reads the value: the
+			// extension returns row counts, not procedure statuses.
+			if (Available() < 5) {
+				return ParsedTokenType::NeedMoreData;
+			}
+			ConsumeBytes(5);
+			continue;
+
 		case TokenType::RETURNVALUE:
+			// No length field either ([MS-TDS] 2.2.7.17: ParamOrdinal, ParamName,
+			// Status, UserType, Flags, TypeInfo, Value) -- its size is only knowable
+			// by parsing TypeInfo. It cannot be skipped, and it cannot arrive: the
+			// server sends it only in reply to an RPC request (packet type 3), and
+			// this extension sends SQL_BATCH only. Verified: an OUTPUT parameter over
+			// SQL_BATCH stays server-side and comes back as an ordinary row. So it
+			// fails BY NAME here rather than mis-skipping silently as it used to,
+			// and this arm is where TypeInfo parsing goes if RPC is ever added.
+			parse_error_ = "RETURNVALUE (0xAC) token: sent only for RPC requests, which this extension does not issue";
+			state_ = ParserState::Error;
+			return ParsedTokenType::None;
+
+		case TokenType::ORDER:
 		case TokenType::LOGINACK:
 		case TokenType::TABNAME:
 		case TokenType::COLINFO:
-			// Skip these tokens - they have a 2-byte length
+			// Skip these tokens - they have a 2-byte length. Every member of this
+			// group has been checked against [MS-TDS] byte for byte (issue #323):
+			// ORDER 2.2.7.13, LOGINACK 2.2.7.12, TABNAME 2.2.7.22, COLINFO 2.2.7.5.
+			// RETURNSTATUS and RETURNVALUE used to be here and do not fit.
 			if (Available() < 3) {
 				return ParsedTokenType::NeedMoreData;
 			}
@@ -233,7 +261,13 @@ ParsedTokenType TokenParser::TryParseNext() {
 				TDS_PARSER_DEBUG(1, "Unknown token 0x%02x at pos=%zu, buffer_size=%zu, available=%zu, hex: %s",
 								 token_type, buffer_pos_, buffer_.size(), Available(), hex_dump.str().c_str());
 			}
-			parse_error_ = "Unknown token type: 0x" + std::to_string(token_type);
+			// Hex, not std::to_string -- which is decimal, so 0xA4 used to report as
+			// "0x164" (issue #323).
+			{
+				char hex_byte[5];
+				snprintf(hex_byte, sizeof(hex_byte), "0x%02X", static_cast<unsigned>(token_type));
+				parse_error_ = std::string("Unknown token type: ") + hex_byte;
+			}
 			state_ = ParserState::Error;
 			return ParsedTokenType::None;
 		}

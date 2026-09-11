@@ -498,9 +498,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
 
 			if (!query_result.success) {
-				// Surface SQL Server error with details
-				throw InvalidInputException("MSSQL execution error: SQL Server error %d: %s", query_result.error_number,
-											query_result.error_message);
+				throw InvalidInputException("MSSQL execution error: %s", query_result.DescribeError());
 			}
 
 			// Issue #151: raw DDL run through mssql_exec() bypasses the catalog metadata
