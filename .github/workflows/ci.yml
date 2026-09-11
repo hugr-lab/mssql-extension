@@ -273,7 +273,8 @@ jobs:
           if [ "${{ matrix.os.id }}" = "macos" ]; then
             OPENSSL_PREFIX="$(brew --prefix openssl@3)"
             EXTRA_INC="-I $OPENSSL_PREFIX/include"
-            EXTRA_LIB="-L $OPENSSL_PREFIX/lib"
+            # Spec 074: the TLS TU reads the keychain on macOS.
+            EXTRA_LIB="-L $OPENSSL_PREFIX/lib -framework CoreFoundation -framework Security"
           else
             EXTRA_INC=""
             EXTRA_LIB=""

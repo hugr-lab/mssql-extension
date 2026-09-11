@@ -518,6 +518,10 @@ Protocol details, the hop budget and the normalization rules are in
 - `request_fedauth` — Include FEDAUTHREQUIRED option
 - `sni_hostname` — SNI hostname for Azure routing
 
+**TlsOptions** (spec 074, `TdsConnection::SetTlsOptions`):
+- `verify_certificate` — chain against the platform trust store and name against `expected_host`; `false` = `TrustServerCertificate=true`
+- `expected_host` — `HostNameInCertificate`; empty = the host dialled (the routed host after a hop)
+
 **Login7Options**:
 - `database`, `username`, `password` — Connection parameters
 - `fedauth_token_utf16le` — Pre-acquired token (for validation)

@@ -287,7 +287,8 @@ bool TdsSocket::IsConnected() const {
 	return connected_ && fd_ >= 0;
 }
 
-bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string &sni_hostname) {
+bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string &sni_hostname,
+						  const TlsOptions &tls_options) {
 	// For TDS 7.x, TLS handshake data must be wrapped in TDS PRELOGIN packets
 	// See MS-TDS spec: "If encryption was negotiated in TDS 7.x, the TDS client MUST
 	// initiate a TLS/SSL handshake, send to the server a TLS/SSL message obtained from
@@ -320,7 +321,7 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	tls_context_.reset(new TlsTdsContext());
 
 	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: initializing TLS context...");
-	if (!tls_context_->Initialize()) {
+	if (!tls_context_->Initialize(tls_options)) {
 		last_error_ = "TLS initialization failed: " + tls_context_->GetLastError();
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - init: %s", last_error_.c_str());
 		tls_context_.reset();
@@ -558,7 +559,15 @@ bool TdsSocket::EnableTls(uint8_t &packet_id, int timeout_ms, const std::string 
 	// Perform TLS handshake (will use our TDS-wrapped callbacks)
 	MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: performing TDS-wrapped TLS handshake...");
 	if (!tls_context_->Handshake(timeout_ms)) {
-		last_error_ = "TLS handshake failed: " + tls_context_->GetLastError();
+		if (tls_context_->GetLastErrorCode() == TlsErrorCode::CERT_VERIFY_FAILED) {
+			// Spec 074 D2: OpenSSL's reason verbatim, and the two ways out by name.
+			last_error_ = tls_context_->GetLastError() +
+						  ". Set TrustServerCertificate=yes to accept this server's certificate without "
+						  "verification, or HostNameInCertificate=<name> if the certificate is valid but issued "
+						  "for a different name";
+		} else {
+			last_error_ = "TLS handshake failed: " + tls_context_->GetLastError();
+		}
 		MSSQL_SOCKET_DEBUG_LOG(1, "EnableTls: FAILED - handshake: %s", last_error_.c_str());
 		tls_context_->ClearBioCallbacks();
 		tls_context_.reset();

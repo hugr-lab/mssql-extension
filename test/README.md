@@ -45,14 +45,14 @@ make test
 Integration tests require a running SQL Server instance:
 
 ```bash
-export MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1"
+export MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
 make integration-test
 ```
 
 Or run directly:
 
 ```bash
-MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1" \
+MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes" \
   ./build/release/test/unittest "[integration]" --force-reload
 ```
 

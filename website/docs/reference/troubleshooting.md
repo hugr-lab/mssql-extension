@@ -42,6 +42,27 @@ Error: Server requires encryption but TLS is not available
 - Enable encryption in connection: `use_encrypt true` or `Encrypt=yes`
 - Ensure extension was built with OpenSSL (default for vcpkg builds)
 
+### Certificate Verification Failed
+
+```text
+TLS handshake failed: certificate verification failed for localhost: self-signed certificate. Set TrustServerCertificate=yes to accept this server's certificate without verification, or HostNameInCertificate=<name> if the certificate is valid but issued for a different name
+```
+
+The server's certificate could not be verified (spec 074): the chain does not
+lead to a root in the platform trust store (`self-signed certificate`, `unable
+to get local issuer certificate`), or its subject is not the host you connected
+to (`hostname mismatch`).
+
+**Solutions:**
+
+- A self-signed certificate you know (docker, an on-prem instance with none
+  installed): add `TrustServerCertificate=yes` / `trust_server_certificate true`
+- The certificate is valid but you connect through a tunnel, an IP or an alias:
+  add `HostNameInCertificate=<the name in the certificate>`
+- `unable to get local issuer certificate` on a minimal Linux image: install
+  `ca-certificates`, or point `SSL_CERT_FILE` at a bundle; a private CA goes
+  into the platform store or `SSL_CERT_FILE`
+
 ### TLS Handshake Failed
 
 ```text

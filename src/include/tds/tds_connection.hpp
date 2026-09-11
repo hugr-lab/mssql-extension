@@ -276,6 +276,14 @@ public:
 		request_utf8_support_ = request;
 	}
 
+	// Spec 074: the server-certificate policy for every TLS handshake this
+	// connection performs, including the one after a routing hop. Set before
+	// Authenticate*, like SetRequestedPacketSize. The default verifies against
+	// the host dialled.
+	void SetTlsOptions(const TlsOptions &options) {
+		tls_options_ = options;
+	}
+
 	// True only if this connection asked for UTF8SUPPORT and the server acked it,
 	// i.e. UTF-8-collation columns arrive as UTF-8 rather than transcoded UTF-16.
 	bool UTF8SupportAcked() const {
@@ -298,6 +306,9 @@ private:
 
 	std::unique_ptr<TdsSocket> socket_;
 	std::atomic<ConnectionState> state_;
+
+	// Spec 074: handed to TdsSocket::EnableTls on every handshake.
+	TlsOptions tls_options_;
 
 	// Issue #225: requested in LOGIN7, confirmed by FEATUREEXTACK.
 	bool request_utf8_support_ = true;

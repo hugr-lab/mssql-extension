@@ -14,6 +14,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
+#include "tds/tls/tds_tls_options.hpp"
 
 #include <atomic>
 #include <mutex>
@@ -59,6 +60,21 @@ struct MSSQLConnectionInfo {
 	string user;
 	string password;
 	bool use_encrypt = true;  // Enable TLS encryption (default: true for security)
+	// Spec 074: the other two TLS options, as the Microsoft drivers define them.
+	// TrustServerCertificate (default false): skip verifying the server's
+	// certificate chain and name. HostNameInCertificate (default empty = the
+	// host dialled): the name the certificate must carry. Both ignored when
+	// use_encrypt is false -- there is no certificate then.
+	bool trust_server_certificate = false;
+	string host_name_in_certificate;
+
+	// What every TdsConnection this info opens hands to the TLS layer.
+	tds::TlsOptions GetTlsOptions() const {
+		tds::TlsOptions options;
+		options.verify_certificate = !trust_server_certificate;
+		options.expected_host = host_name_in_certificate;
+		return options;
+	}
 	bool connected = false;
 	bool catalog_enabled = true;  // Enable DuckDB catalog integration (false = raw query mode only)
 

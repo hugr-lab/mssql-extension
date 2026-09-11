@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the server certificate is verified by default** (spec 074).
+  `Encrypt`, `TrustServerCertificate` and the new `HostNameInCertificate` now
+  mean what they mean in the Microsoft drivers (ODBC 18, SqlClient 4.0, JDBC
+  10.2, go-mssqldb): `Encrypt` (default `true`) says whether the session is
+  encrypted; `TrustServerCertificate` (default `false`) whether the server's
+  certificate chain is checked against the platform trust store (Windows
+  ROOT + CA, macOS keychain, OpenSSL's default paths; `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` honoured) and its subject against the host connected to;
+  `HostNameInCertificate` names the subject when it differs from the address
+  dialled (an IP, an SSH tunnel, an alias), and after a login-time routing
+  hop the routed host is checked unless it was given. `TrustServerCertificate`
+  used to be an alias of `Encrypt`, and giving both with different values was
+  an ATTACH error; `Encrypt=true;TrustServerCertificate=false` is now simply
+  the default. **A connection to a server on a self-signed certificate** --
+  the docker image, an on-prem instance with none installed -- **now fails**
+  with `certificate verification failed for <host>: self-signed certificate`
+  and needs `TrustServerCertificate=yes`, exactly as `sqlcmd -C` does. The
+  message names that, and `HostNameInCertificate=<name>` for the case where
+  the certificate is valid but issued for another name. URI spellings
+  `trustservercertificate` / `hostnameincertificate`; secret fields
+  `trust_server_certificate` / `host_name_in_certificate`.
+
 ### Removed
 
 - **`mssql_open()` / `mssql_close()` / `mssql_ping()` / `mssql_close_all()`**,

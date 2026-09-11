@@ -13,6 +13,9 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
 
 #include <cerrno>
 #include <chrono>
@@ -24,6 +27,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+// After winsock2.h (the blank line keeps clang-format from sorting it first):
+// wincrypt.h is where the ROOT / CA store enumeration for spec 074 lives.
+#include <wincrypt.h>
 #else
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +40,12 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#endif
+
+#ifdef __APPLE__
+// After the OpenSSL headers, as cpp-httplib orders them.
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
 #endif
 
 namespace duckdb {
@@ -73,6 +86,11 @@ struct TlsImplContext {
 	TlsRecvCallback recv_callback;
 	int current_timeout_ms;	 // Timeout for current operation
 
+	// Spec 074: the certificate policy Initialize() was given, and the name the
+	// certificate is matched against (resolved in WrapSocket, kept for messages).
+	bool verify_certificate;
+	std::string expected_host;
+
 	TlsImplContext()
 		: ssl_ctx(nullptr),
 		  ssl(nullptr),
@@ -81,7 +99,8 @@ struct TlsImplContext {
 		  handshake_complete(false),
 		  socket_fd(-1),
 		  last_error_code(0),
-		  current_timeout_ms(30000) {}
+		  current_timeout_ms(30000),
+		  verify_certificate(true) {}
 
 	~TlsImplContext() {
 		if (ssl) {
@@ -266,6 +285,97 @@ static void ClearOpenSSLErrors() {
 }
 
 // =============================================================================
+// Platform trust store (spec 074 D4)
+// =============================================================================
+// The routine cpp-httplib uses for the Azure OAuth client, so the TDS tunnel
+// trusts what the token request trusts: the Windows ROOT + CA system stores,
+// the macOS keychain trust settings, and OpenSSL's own default paths -- on
+// macOS in ADDITION to the keychain, so SSL_CERT_FILE / SSL_CERT_DIR are
+// honoured there too (httplib skips the paths once the keychain yields
+// anything). Nothing is reported from here: an empty store is not an error at
+// this point, and the handshake's "unable to get local issuer certificate"
+// names the problem better than a failure here could.
+
+static void AddDerCertificate(X509_STORE *store, const unsigned char *der, long der_len) {
+	const unsigned char *p = der;
+	X509 *x509 = d2i_X509(nullptr, &p, der_len);
+	if (!x509) {
+		ERR_clear_error();
+		return;
+	}
+	// The same root can sit in more than one store or domain. OpenSSL 1.x
+	// reported the duplicate as an error and 3.x accepts it; neither matters.
+	X509_STORE_add_cert(store, x509);
+	ERR_clear_error();
+	X509_free(x509);
+}
+
+static void LoadPlatformTrustStore(SSL_CTX *ssl_ctx) {
+	X509_STORE *store = SSL_CTX_get_cert_store(ssl_ctx);
+	if (!store) {
+		return;
+	}
+#ifdef _WIN32
+	static const wchar_t *store_names[] = {L"ROOT", L"CA"};
+	for (const wchar_t *store_name : store_names) {
+		HCERTSTORE system_store = CertOpenSystemStoreW(0, store_name);
+		if (!system_store) {
+			continue;
+		}
+		PCCERT_CONTEXT cert = nullptr;
+		while ((cert = CertEnumCertificatesInStore(system_store, cert)) != nullptr) {
+			AddDerCertificate(store, cert->pbCertEncoded, static_cast<long>(cert->cbCertEncoded));
+		}
+		CertCloseStore(system_store, 0);
+	}
+#endif
+#ifdef __APPLE__
+	const SecTrustSettingsDomain domains[] = {kSecTrustSettingsDomainSystem, kSecTrustSettingsDomainAdmin,
+											  kSecTrustSettingsDomainUser};
+	for (SecTrustSettingsDomain domain : domains) {
+		CFArrayRef certs = nullptr;
+		if (SecTrustSettingsCopyCertificates(domain, &certs) != errSecSuccess || !certs) {
+			if (certs) {
+				CFRelease(certs);
+			}
+			continue;
+		}
+		const CFIndex count = CFArrayGetCount(certs);
+		for (CFIndex i = 0; i < count; i++) {
+			auto cert = reinterpret_cast<SecCertificateRef>(const_cast<void *>(CFArrayGetValueAtIndex(certs, i)));
+			CFDataRef der = SecCertificateCopyData(cert);
+			if (!der) {
+				continue;
+			}
+			AddDerCertificate(store, CFDataGetBytePtr(der), static_cast<long>(CFDataGetLength(der)));
+			CFRelease(der);
+		}
+		CFRelease(certs);
+	}
+#endif
+	// OpenSSL's own paths on every platform: the OPENSSLDIR the library was
+	// built with (/etc/ssl on the vcpkg build), or SSL_CERT_FILE / SSL_CERT_DIR.
+	if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
+		ERR_clear_error();
+	}
+}
+
+// An expected name that is an IP literal is matched against iPAddress SANs
+// (X509_VERIFY_PARAM_set1_ip_asc), a DNS name against dNSName / CN
+// (X509_VERIFY_PARAM_set1_host). OpenSSL does not decide this by itself, but
+// its own address parser is the one to ask -- not inet_pton, which MinGW gates
+// behind _WIN32_WINNT.
+static bool IsIpLiteral(const std::string &name) {
+	ASN1_OCTET_STRING *ip = a2i_IPADDRESS(name.c_str());
+	if (!ip) {
+		ERR_clear_error();
+		return false;
+	}
+	ASN1_OCTET_STRING_free(ip);
+	return true;
+}
+
+// =============================================================================
 // TlsImpl class implementation
 // =============================================================================
 
@@ -282,7 +392,7 @@ TlsImpl::~TlsImpl() noexcept {
 	}
 }
 
-bool TlsImpl::Initialize() {
+bool TlsImpl::Initialize(const TlsOptions &options) {
 	MSSQL_TLS_DEBUG_LOG(1, "Initialize: starting TLS context initialization");
 
 	if (ctx_->initialized) {
@@ -303,9 +413,16 @@ bool TlsImpl::Initialize() {
 	// Set minimum TLS version (1.2 for SQL Server)
 	SSL_CTX_set_min_proto_version(ctx_->ssl_ctx, TLS1_2_VERSION);
 
-	// Disable certificate verification (same as mbedTLS VERIFY_NONE)
-	// This is appropriate for development/testing - production should verify
-	SSL_CTX_set_verify(ctx_->ssl_ctx, SSL_VERIFY_NONE, nullptr);
+	// Spec 074 D2: TrustServerCertificate=false verifies the chain against the
+	// platform store and (in WrapSocket) the name; =true accepts any certificate.
+	ctx_->verify_certificate = options.verify_certificate;
+	ctx_->expected_host = options.expected_host;
+	if (options.verify_certificate) {
+		SSL_CTX_set_verify(ctx_->ssl_ctx, SSL_VERIFY_PEER, nullptr);
+		LoadPlatformTrustStore(ctx_->ssl_ctx);
+	} else {
+		SSL_CTX_set_verify(ctx_->ssl_ctx, SSL_VERIFY_NONE, nullptr);
+	}
 
 	// Create SSL object
 	ctx_->ssl = SSL_new(ctx_->ssl_ctx);
@@ -356,6 +473,35 @@ bool TlsImpl::WrapSocket(int socket_fd, const std::string &hostname) {
 			return false;
 		}
 		MSSQL_TLS_DEBUG_LOG(2, "WrapSocket: SNI hostname set to '%s'", hostname.c_str());
+	}
+
+	// Spec 074 D3/D5: the name the certificate must carry. HostNameInCertificate
+	// if given, else the SNI name, which is the host dialled (the routed host
+	// after a hop). Matching itself is OpenSSL's: SAN dNSName, CN fallback under
+	// its rules, one-label wildcards only.
+	if (ctx_->verify_certificate) {
+		const std::string expected = ctx_->expected_host.empty() ? hostname : ctx_->expected_host;
+		if (expected.empty()) {
+			ctx_->last_error_code = 1;	// INIT_FAILED
+			ctx_->last_error = "certificate verification needs a host name to match and none was given";
+			return false;
+		}
+		X509_VERIFY_PARAM *param = SSL_get0_param(ctx_->ssl);
+		int ok;
+		if (IsIpLiteral(expected)) {
+			ok = X509_VERIFY_PARAM_set1_ip_asc(param, expected.c_str());
+		} else {
+			X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+			ok = X509_VERIFY_PARAM_set1_host(param, expected.c_str(), 0);
+		}
+		if (ok != 1) {
+			ctx_->last_error_code = 1;	// INIT_FAILED
+			ctx_->last_error =
+				"Failed to set the expected certificate name '" + expected + "': " + FormatOpenSSLError();
+			return false;
+		}
+		ctx_->expected_host = expected;
+		MSSQL_TLS_DEBUG_LOG(2, "WrapSocket: certificate must be for '%s'", expected.c_str());
 	}
 
 	return true;
@@ -426,6 +572,21 @@ bool TlsImpl::Handshake(int timeout_ms) {
 			continue;
 		}
 
+		// Spec 074 D2: a rejected certificate is reported with OpenSSL's own reason
+		// -- "self-signed certificate", "hostname mismatch", "unable to get local
+		// issuer certificate", "certificate has expired" -- so it can be searched for.
+		if (ctx_->verify_certificate) {
+			const long verify_result = SSL_get_verify_result(ctx_->ssl);
+			if (verify_result != X509_V_OK) {
+				ctx_->last_error_code = 10;	 // CERT_VERIFY_FAILED
+				ctx_->last_error = "certificate verification failed for " + ctx_->expected_host + ": " +
+								   X509_verify_cert_error_string(verify_result);
+				ClearOpenSSLErrors();
+				MSSQL_TLS_DEBUG_LOG(1, "Handshake: FAILED - %s", ctx_->last_error.c_str());
+				return false;
+			}
+		}
+
 		// Other error
 		ctx_->last_error_code = 2;	// HANDSHAKE_FAILED
 		ctx_->last_error = "Handshake failed: " + FormatOpenSSLError();
@@ -437,7 +598,9 @@ bool TlsImpl::Handshake(int timeout_ms) {
 
 	const char *cipher = SSL_get_cipher(ctx_->ssl);
 	const char *version = SSL_get_version(ctx_->ssl);
-	MSSQL_TLS_DEBUG_LOG(1, "Handshake: SUCCESS - %s, %s", version ? version : "unknown", cipher ? cipher : "unknown");
+	MSSQL_TLS_DEBUG_LOG(1, "Handshake: SUCCESS - %s, %s, peer certificate %s", version ? version : "unknown",
+						cipher ? cipher : "unknown",
+						ctx_->verify_certificate ? "verified" : "not verified (TrustServerCertificate)");
 
 	return true;
 }

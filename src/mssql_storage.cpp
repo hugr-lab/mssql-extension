@@ -211,6 +211,16 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	}
 	// Default is true (use_encrypt initialized to true in struct definition)
 
+	// Spec 074: certificate policy. Absent = verify against the host dialled.
+	auto trust_cert_val = kv_secret.TryGetValue("trust_server_certificate");
+	if (!trust_cert_val.IsNull()) {
+		result->trust_server_certificate = trust_cert_val.GetValue<bool>();
+	}
+	auto host_in_cert_val = kv_secret.TryGetValue("host_name_in_certificate");
+	if (!host_in_cert_val.IsNull()) {
+		result->host_name_in_certificate = host_in_cert_val.ToString();
+	}
+
 	// Read optional catalog (defaults to true)
 	// When false, catalog integration is disabled (raw query mode only)
 	auto catalog_val = kv_secret.TryGetValue("catalog");
@@ -448,6 +458,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["encrypt"] = value;
 				} else if (lower_key == "trustservercertificate") {
 					result["trustservercertificate"] = value;
+				} else if (lower_key == "hostnameincertificate" || lower_key == "host_name_in_certificate") {
+					result["hostnameincertificate"] = value;
 				} else if (lower_key == "schema_filter" || lower_key == "schemafilter") {
 					result["schema_filter"] = value;
 				} else if (lower_key == "table_filter" || lower_key == "tablefilter") {
@@ -608,6 +620,9 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["encrypt"] = value;
 		} else if (lower_key == "trustservercertificate") {
 			result["trustservercertificate"] = value;
+		} else if (lower_key == "hostnameincertificate") {
+			// ADO.NET spells it HostNameInCertificate, ODBC HostnameInCertificate; both lower to this.
+			result["hostnameincertificate"] = value;
 		} else if (lower_key == "schemafilter" || lower_key == "schema_filter") {
 			result["schema_filter"] = value;
 		} else if (lower_key == "tablefilter" || lower_key == "table_filter") {
@@ -882,40 +897,29 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	result->user = params["user"];
 	result->password = params["password"];
 
-	// Parse optional encrypt and trustservercertificate parameters
-	// TrustServerCertificate is an alias for Encrypt (both enable TLS)
-	// Default: TLS enabled for security (use_encrypt = true in struct definition)
-	bool encrypt_specified = params.find("encrypt") != params.end();
-	bool trust_cert_specified = params.find("trustservercertificate") != params.end();
-
-	// Only override the default (true) if explicitly specified
-	if (encrypt_specified || trust_cert_specified) {
-		bool encrypt_value = true;	// Default when not specified
-		bool trust_cert_value = true;
-
-		if (encrypt_specified) {
-			auto encrypt_val = StringUtil::Lower(params["encrypt"]);
-			// "no" or "false" disables TLS; anything else enables it
-			encrypt_value = !(encrypt_val == "no" || encrypt_val == "false" || encrypt_val == "0");
-		}
-
-		if (trust_cert_specified) {
-			auto trust_val = StringUtil::Lower(params["trustservercertificate"]);
-			trust_cert_value = !(trust_val == "no" || trust_val == "false" || trust_val == "0");
-		}
-
-		// Check for conflicting values
-		if (encrypt_specified && trust_cert_specified && encrypt_value != trust_cert_value) {
-			throw InvalidInputException(
-				"MSSQL Error: Conflicting values for Encrypt (%s) and TrustServerCertificate (%s). "
-				"These parameters must have the same value or only one should be specified.",
-				encrypt_value ? "true" : "false", trust_cert_value ? "true" : "false");
-		}
-
-		// Apply: if any is specified, use their value (both must agree if both specified)
-		result->use_encrypt = encrypt_specified ? encrypt_value : trust_cert_value;
+	// Spec 074: the three TLS options as the Microsoft drivers define them.
+	// Encrypt says whether the session is encrypted (default true).
+	// TrustServerCertificate says whether the server's certificate is verified
+	// against the platform trust store and the connected host name (default
+	// false, i.e. verify). HostNameInCertificate is the name the certificate
+	// must carry when it differs from the address dialled. They are
+	// independent: `Encrypt=true;TrustServerCertificate=false` is the canonical
+	// secure string. Under Encrypt=false there is no certificate and the other
+	// two are ignored. Absent keys keep the struct defaults.
+	auto flag_value = [](const string &raw) {
+		auto value = StringUtil::Lower(raw);
+		// "no" / "false" / "0" clear the flag; anything else sets it
+		return !(value == "no" || value == "false" || value == "0");
+	};
+	if (params.find("encrypt") != params.end()) {
+		result->use_encrypt = flag_value(params["encrypt"]);
 	}
-	// If neither specified, use_encrypt keeps its default value (true from struct definition)
+	if (params.find("trustservercertificate") != params.end()) {
+		result->trust_server_certificate = flag_value(params["trustservercertificate"]);
+	}
+	if (params.find("hostnameincertificate") != params.end()) {
+		result->host_name_in_certificate = params["hostnameincertificate"];
+	}
 
 	// Parse optional Catalog parameter (defaults to true)
 	// When false, catalog integration is disabled (raw query mode only)
@@ -1159,6 +1163,7 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
+	conn.SetTlsOptions(info.GetTlsOptions());
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
@@ -1233,6 +1238,7 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
+	conn.SetTlsOptions(info.GetTlsOptions());
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
@@ -1298,6 +1304,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
+	conn.SetTlsOptions(info.GetTlsOptions());
 
 	// Attempt TCP connection
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
@@ -1383,6 +1390,7 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 	tds::TdsConnection conn;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
+	conn.SetTlsOptions(info.GetTlsOptions());
 	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
 		string error = conn.GetLastError();
 		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, "", info.database);

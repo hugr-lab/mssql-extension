@@ -242,7 +242,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 		// Server agreed to encryption (ENCRYPT_ON or ENCRYPT_REQ)
 		// Enable TLS on the socket BEFORE sending LOGIN7
 		// Pass next_packet_id_ so TLS handshake packets continue the sequence
-		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000, "", tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}
@@ -528,7 +528,7 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 		}
 
 		// Enable TLS - optionally override SNI hostname for Azure routing
-		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000, sni_hostname)) {
+		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000, sni_hostname, tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}

@@ -53,6 +53,8 @@ const char *TlsErrorCodeToString(TlsErrorCode code) {
 		return "Server does not support encryption";
 	case TlsErrorCode::TLS_NOT_AVAILABLE:
 		return "TLS not available";
+	case TlsErrorCode::CERT_VERIFY_FAILED:
+		return "Server certificate verification failed";
 	default:
 		return "Unknown TLS error";
 	}
@@ -94,7 +96,7 @@ TlsTdsContext &TlsTdsContext::operator=(TlsTdsContext &&other) noexcept {
 	return *this;
 }
 
-bool TlsTdsContext::Initialize() {
+bool TlsTdsContext::Initialize(const TlsOptions &options) {
 	MSSQL_TLS_DEBUG_LOG(1, "Initialize: starting");
 	if (!impl_->tls) {
 		impl_->last_error_code = TlsErrorCode::TLS_NOT_AVAILABLE;
@@ -103,7 +105,7 @@ bool TlsTdsContext::Initialize() {
 		return false;
 	}
 
-	if (impl_->tls->Initialize()) {
+	if (impl_->tls->Initialize(options)) {
 		MSSQL_TLS_DEBUG_LOG(1, "Initialize: SUCCESS");
 		return true;
 	}

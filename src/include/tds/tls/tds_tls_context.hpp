@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include "../tds_platform.hpp"
+#include "tds_tls_options.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -33,7 +34,8 @@ enum class TlsErrorCode {
 	NOT_INITIALIZED,	// TLS context not initialized
 	PEER_CLOSED,		// Peer closed connection gracefully
 	SERVER_NO_ENCRYPT,	// Server does not support encryption
-	TLS_NOT_AVAILABLE	// TLS support not compiled in (loadable extension)
+	TLS_NOT_AVAILABLE,	// TLS support not compiled in (loadable extension)
+	CERT_VERIFY_FAILED	// Server certificate rejected: chain or host name (spec 074)
 };
 
 // Convert TLS error code to string
@@ -60,8 +62,9 @@ public:
 	TlsTdsContext &operator=(TlsTdsContext &&other) noexcept;
 
 	// Initialize TLS context (entropy, RNG, config)
-	// Must be called before WrapSocket/Handshake
-	bool Initialize();
+	// Must be called before WrapSocket/Handshake. The options decide whether the
+	// server certificate is verified (spec 074); the default verifies.
+	bool Initialize(const TlsOptions &options = TlsOptions());
 
 	// Wrap an existing socket file descriptor
 	// The socket must already be connected via TCP

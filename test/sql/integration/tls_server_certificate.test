@@ -1,0 +1,51 @@
+# name: test/sql/integration/tls_server_certificate.test
+# description: spec 074 -- the server certificate is verified by default; TrustServerCertificate=yes accepts it
+# group: [integration]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The docker server runs on its self-generated certificate, which is why the
+# test DSN carries TrustServerCertificate=yes. Last key wins, so switching it
+# off here is what a user gets with no key at all: the default.
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN};TrustServerCertificate=no' AS strict (TYPE mssql);
+----
+certificate verification failed for
+
+# OpenSSL's reason, verbatim.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN};TrustServerCertificate=no' AS strict (TYPE mssql);
+----
+self-signed certificate
+
+# And both ways out, by name.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN};TrustServerCertificate=no' AS strict (TYPE mssql);
+----
+Set TrustServerCertificate=yes to accept this server's certificate without verification, or HostNameInCertificate=<name>
+
+# The canonical secure string is a certificate failure, not a parse error.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN};Encrypt=true;TrustServerCertificate=false' AS strict (TYPE mssql);
+----
+certificate verification failed for
+
+query I
+SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'strict';
+----
+0
+
+# Trusted: accepted, and the session is still encrypted.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS trusted (TYPE mssql);
+
+query I
+SELECT * FROM mssql_scan('trusted', 'SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID');
+----
+TRUE
+
+statement ok
+DETACH trusted;

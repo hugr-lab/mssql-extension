@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include "../tds_platform.hpp"
+#include "tds_tls_options.hpp"
 
 namespace duckdb {
 namespace tds {
@@ -44,8 +45,9 @@ public:
 	TlsImpl(const TlsImpl &) = delete;
 	TlsImpl &operator=(const TlsImpl &) = delete;
 
-	// Initialize TLS context (entropy, RNG, config)
-	bool Initialize();
+	// Initialize TLS context (entropy, RNG, config). The options say whether the
+	// peer certificate is verified (spec 074); the default is to verify.
+	bool Initialize(const TlsOptions &options = TlsOptions());
 
 	// Wrap an existing socket file descriptor
 	// hostname is optional, used for SNI (Server Name Indication)

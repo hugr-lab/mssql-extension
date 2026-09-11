@@ -73,11 +73,14 @@ handshake fails otherwise, with OpenSSL's own reason and the two ways out named
 in the message:
 
 ```text
-TLS certificate verification failed for sql.example.com:1433: self-signed certificate.
-Set TrustServerCertificate=yes to accept this server's certificate without
-verification, or HostNameInCertificate=<name> if the certificate is valid but
-issued for a different name.
+TLS handshake failed: certificate verification failed for sql.example.com: self-signed
+certificate. Set TrustServerCertificate=yes to accept this server's certificate without
+verification, or HostNameInCertificate=<name> if the certificate is valid but issued
+for a different name
 ```
+
+(ATTACH wraps it in its own `MSSQL connection validation failed: TLS negotiation
+failed to sql.example.com:1433 ...` line, which is where the port is.)
 
 The reason is `X509_verify_cert_error_string(SSL_get_verify_result())` verbatim
 — `self-signed certificate`, `unable to get local issuer certificate`,
