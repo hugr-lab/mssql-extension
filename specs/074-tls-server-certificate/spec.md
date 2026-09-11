@@ -170,13 +170,16 @@ through its routing hop, is the live acceptance.
 - **Server-free**, `test/cpp/test_tls_verification.cpp` in
   `STANDALONE_TEST_SOURCES`: an OpenSSL server in-process on a socket pair,
   on a certificate generated at runtime. `TlsImpl` does direct socket I/O
-  when no TDS callbacks are set, so no TDS framing is needed. Four outcomes:
+  when no TDS callbacks are set, so no TDS framing is needed. The outcomes:
   verify against the self-signed certificate fails and the message carries
   `self-signed certificate` and both hints; trust succeeds and a cipher is
   negotiated; with the certificate made trusted (`SSL_CERT_FILE` pointed at
   it) and the expected name equal to its SAN, verification succeeds; with the
   same trust and a different expected name, it fails with `hostname mismatch`.
-  The four are the four cells of D2 × D3.
+  Those are the four cells of D2 × D3; three more pin D5 and the trust
+  branch: an IP literal matches the `iPAddress` SAN, a different IP fails
+  with `IP address mismatch`, and under `TrustServerCertificate=true` the
+  expected name is ignored.
 - **Docker**, `test/sql/tls/trust_server_certificate.test`: the default
   string fails with the reason and the hint; `TrustServerCertificate=yes`
   connects; `Encrypt=true;TrustServerCertificate=false` is accepted by the
@@ -255,6 +258,7 @@ CHANGELOG (**Removed**) follow.
   is not a parse error.
 - Azure SQL and Fabric (through its hop) connect under the default; a wrong
   `HostNameInCertificate` fails with `hostname mismatch`.
-- The server-free test covers the four D2 × D3 cells and is in
+- The server-free test covers the four D2 × D3 cells, the IP-literal pair and
+  the ignored name under trust, and is in
   `STANDALONE_TEST_SOURCES`.
 - Full suite green with the W3 DSNs; docs and CHANGELOG updated.
