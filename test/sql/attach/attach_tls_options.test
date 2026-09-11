@@ -1,0 +1,63 @@
+# name: test/sql/attach/attach_tls_options.test
+# description: spec 074 -- Encrypt, TrustServerCertificate and HostNameInCertificate are three independent options
+# group: [attach]
+
+require mssql
+
+# No server here: the host does not resolve, so every ATTACH below fails at
+# validation. What is being checked is that it gets THAT far -- the string was
+# parsed. Until spec 074 `Encrypt=true;TrustServerCertificate=false`, the
+# canonical secure ADO.NET string, was rejected as "Conflicting values".
+
+statement error
+ATTACH 'Server=nonexistent.invalid.host,1433;Database=master;User Id=sa;Password=test;Encrypt=true;TrustServerCertificate=false' AS tls_strict (TYPE mssql);
+----
+MSSQL connection validation failed
+
+statement error
+ATTACH 'Server=nonexistent.invalid.host,1433;Database=master;User Id=sa;Password=test;TrustServerCertificate=false;Encrypt=true' AS tls_strict2 (TYPE mssql);
+----
+MSSQL connection validation failed
+
+statement error
+ATTACH 'Server=nonexistent.invalid.host,1433;Database=master;User Id=sa;Password=test;HostNameInCertificate=sql.example.com' AS tls_named (TYPE mssql);
+----
+MSSQL connection validation failed
+
+# Encrypt=false: there is no certificate, TrustServerCertificate is ignored.
+statement error
+ATTACH 'Server=nonexistent.invalid.host,1433;Database=master;User Id=sa;Password=test;Encrypt=false;TrustServerCertificate=true' AS tls_plain (TYPE mssql);
+----
+MSSQL connection validation failed
+
+# URI spellings
+statement error
+ATTACH 'mssql://sa:test@nonexistent.invalid.host:1433/master?encrypt=true&trustservercertificate=false&hostnameincertificate=sql.example.com' AS tls_uri (TYPE mssql);
+----
+MSSQL connection validation failed
+
+query I
+SELECT COUNT(*) FROM duckdb_databases() WHERE database_name LIKE 'tls_%';
+----
+0
+
+# Secret spellings
+statement ok
+CREATE SECRET tls_secret (
+    TYPE mssql,
+    host 'sql.example.com',
+    port 1433,
+    database 'db',
+    user 'u',
+    password 'p',
+    trust_server_certificate false,
+    host_name_in_certificate 'sql.example.com'
+);
+
+query I
+SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'tls_secret';
+----
+1
+
+statement ok
+DROP SECRET tls_secret;

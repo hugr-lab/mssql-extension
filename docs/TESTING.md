@@ -200,8 +200,8 @@ export MSSQL_TEST_HOST=localhost
 export MSSQL_TEST_PORT=1433
 export MSSQL_TEST_USER=sa
 export MSSQL_TEST_PASS=TestPassword1
-export MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1"
-export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1"
+export MSSQL_TEST_DSN="Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
+export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
 
 build/release/test/unittest "[sql]" --force-reload
 ```
@@ -1178,7 +1178,7 @@ Ensure:
 echo $MSSQL_TESTDB_DSN
 
 # Set manually if needed
-export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1"
+export MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
 ```
 
 #### 6. UPDATE/DELETE fails with "Table has no primary key"
@@ -1488,8 +1488,8 @@ jobs:
           MSSQL_TEST_PORT: 1433
           MSSQL_TEST_USER: sa
           MSSQL_TEST_PASS: TestPassword1
-          MSSQL_TEST_DSN: "Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1"
-          MSSQL_TESTDB_DSN: "Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1"
+          MSSQL_TEST_DSN: "Server=localhost,1433;Database=master;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
+          MSSQL_TESTDB_DSN: "Server=localhost,1433;Database=TestDB;User Id=sa;Password=TestPassword1;TrustServerCertificate=yes"
         run: |
           build/release/test/unittest "[integration]" --force-reload
           build/release/test/unittest "[sql]" --force-reload

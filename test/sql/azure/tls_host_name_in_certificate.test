@@ -1,0 +1,34 @@
+# name: test/sql/azure/tls_host_name_in_certificate.test
+# description: spec 074 -- Azure SQL's certificate passes the default verification; HostNameInCertificate decides which name it must carry
+# group: [azure]
+
+# Environment variables required:
+#   AZURE_SQL_TEST_DSN - Connection string to Azure SQL Database (SQL auth)
+
+require mssql
+
+require-env AZURE_SQL_TEST_DSN
+
+# The default: chain against the platform trust store, name against the host
+# dialled. Azure SQL presents a publicly-chained certificate for it.
+statement ok
+ATTACH '{AZURE_SQL_TEST_DSN}' AS az_tls (TYPE mssql);
+
+query I
+SELECT mssql_exec('az_tls', 'SELECT 1');
+----
+1
+
+statement ok
+DETACH az_tls;
+
+# The chain is still good; the name is not the one asked for.
+statement error
+ATTACH '{AZURE_SQL_TEST_DSN};HostNameInCertificate=wrong.invalid' AS az_wrong (TYPE mssql);
+----
+certificate verification failed for wrong.invalid: hostname mismatch
+
+query I
+SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'az_wrong';
+----
+0

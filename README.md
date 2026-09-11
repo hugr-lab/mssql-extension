@@ -59,7 +59,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Row-count estimates reported to the DuckDB optimizer, so join order around an MSSQL scan is planned rather than guessed
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits and automatic session reset
-- TLS/SSL encrypted connections
+- TLS with the server certificate verified by default; `Encrypt`, `TrustServerCertificate` and `HostNameInCertificate` mean what they mean in the Microsoft drivers
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE
 - CREATE TABLE AS SELECT (CTAS) with streaming and type mapping
 - High-performance COPY TO via TDS BulkLoadBCP protocol

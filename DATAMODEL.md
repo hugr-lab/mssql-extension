@@ -115,6 +115,7 @@ classDiagram
 ```
 
 - `TdsConnection` owns the socket and (when `encrypt=true`) the TLS context. It exposes the packet-level operations the rest of the extension uses: PRELOGIN, LOGIN7, SQL_BATCH, ATTENTION.
+- **The TLS context verifies the server certificate unless told not to** (spec 074): chain against the platform trust store, loaded the way the Azure OAuth client loads it, and subject against the host the socket dialled -- which after a routing hop is the routed host, so the expected name follows the hop with no code of its own. `TlsOptions` (`verify_certificate`, `expected_host` = `HostNameInCertificate`) travel `MSSQLConnectionInfo` -> `TdsConnection::SetTlsOptions` -> `TdsSocket::EnableTls` -> `TlsImpl::Initialize`; a rejected certificate surfaces as `TlsErrorCode::CERT_VERIFY_FAILED` with OpenSSL's reason.
 - Auth strategies cover SQL auth, FEDAUTH (Azure AD), Kerberos (POSIX), and Windows SSPI. `IAuthenticator` is the SPNEGO continuation interface for integrated auth (spec 042).
 - All destructors in this layer are `noexcept` (spec 047 T046k) — the teardown chain has no place to swallow errors except via `MSSQL_POOL_DEBUG_LOG`.
 

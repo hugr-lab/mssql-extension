@@ -189,6 +189,11 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 		result->secret_map[MSSQL_SECRET_USE_ENCRYPT] = Value::BOOLEAN(true);
 	}
 
+	// Spec 074: optional certificate policy. Absent means verify the server's
+	// certificate against the platform store and the host dialled.
+	result->TrySetValue(MSSQL_SECRET_TRUST_SERVER_CERTIFICATE, input);
+	result->TrySetValue(MSSQL_SECRET_HOST_NAME_IN_CERTIFICATE, input);
+
 	// Handle optional catalog parameter (defaults to true if not provided)
 	// When false, catalog integration is disabled (raw query mode only)
 	auto catalog_it = input.options.find(MSSQL_SECRET_CATALOG);
@@ -246,7 +251,9 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 	create_func.named_parameters[MSSQL_SECRET_DATABASE] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_USER] = LogicalType::VARCHAR;
 	create_func.named_parameters[MSSQL_SECRET_PASSWORD] = LogicalType::VARCHAR;
-	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;	 // Optional
+	create_func.named_parameters[MSSQL_SECRET_USE_ENCRYPT] = LogicalType::BOOLEAN;				 // Optional
+	create_func.named_parameters[MSSQL_SECRET_TRUST_SERVER_CERTIFICATE] = LogicalType::BOOLEAN;	 // Optional, spec 074
+	create_func.named_parameters[MSSQL_SECRET_HOST_NAME_IN_CERTIFICATE] = LogicalType::VARCHAR;	 // Optional, spec 074
 	create_func.named_parameters[MSSQL_SECRET_CATALOG] = LogicalType::BOOLEAN;		 // Optional, defaults to true
 	create_func.named_parameters[MSSQL_SECRET_AZURE_SECRET] = LogicalType::VARCHAR;	 // Optional, for Azure AD auth
 	create_func.named_parameters[MSSQL_SECRET_AZURE_TENANT_ID] =

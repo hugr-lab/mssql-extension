@@ -73,8 +73,10 @@ struct TestConfig {
 
 	std::string GetAttachString() const {
 		std::ostringstream oss;
-		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user << ";Password="
-		    << pass;
+		// The CI / docker server runs on its self-generated certificate, and the server
+		// certificate is verified by default since spec 074.
+		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user
+			<< ";Password=" << pass << ";TrustServerCertificate=yes";
 		return oss.str();
 	}
 };
@@ -221,7 +223,8 @@ void test_commit_visibility(DuckDB &db, const TestConfig &config) {
 	// While conn1's transaction is active, conn2 queries a DIFFERENT table
 	// (can't query same rows due to SQL Server READ COMMITTED locking)
 	auto product_count = QuerySingleInt(conn2, "SELECT COUNT(*) FROM db.dbo.TxTestProducts");
-	std::cout << "Connection 2: queried different table (count=" << product_count << ") while conn1 has uncommitted changes" << std::endl;
+	std::cout << "Connection 2: queried different table (count=" << product_count
+			  << ") while conn1 has uncommitted changes" << std::endl;
 
 	// Commit
 	assert(ExecuteQuery(conn1, "COMMIT", &error));
@@ -288,7 +291,8 @@ void test_parallel_transactions(DuckDB &db, const TestConfig &config) {
 	std::cout << "Connection 2: COMMIT" << std::endl;
 
 	// Now both rows should be visible to everyone
-	auto final_count = QuerySingleInt(conn1, "SELECT COUNT(*) FROM db.dbo.tx_test WHERE name IN ('parallel_1', 'parallel_2')");
+	auto final_count =
+		QuerySingleInt(conn1, "SELECT COUNT(*) FROM db.dbo.tx_test WHERE name IN ('parallel_1', 'parallel_2')");
 	std::cout << "Final count of parallel rows: " << final_count << std::endl;
 	assert(final_count == 2);
 
@@ -332,7 +336,7 @@ void test_concurrent_threads(DuckDB &db, const TestConfig &config) {
 				for (int i = 0; i < rows_per_thread; i++) {
 					std::ostringstream sql;
 					sql << "INSERT INTO db.dbo.tx_test (name, value) VALUES ('thread_" << t << "_row_" << i << "', "
-					    << (t * 1000 + i) << ")";
+						<< (t * 1000 + i) << ")";
 
 					if (!ExecuteQuery(conn, sql.str(), &error)) {
 						std::cerr << "Thread " << t << " INSERT failed: " << error << std::endl;
@@ -369,8 +373,7 @@ void test_concurrent_threads(DuckDB &db, const TestConfig &config) {
 
 	// Verify results
 	Connection verify_conn(db);
-	auto total_rows =
-	    QuerySingleInt(verify_conn, "SELECT COUNT(*) FROM db.dbo.tx_test WHERE name LIKE 'thread_%'");
+	auto total_rows = QuerySingleInt(verify_conn, "SELECT COUNT(*) FROM db.dbo.tx_test WHERE name LIKE 'thread_%'");
 	std::cout << "Total rows inserted by threads: " << total_rows << std::endl;
 
 	int expected_rows = success_count * rows_per_thread;
@@ -423,7 +426,8 @@ void test_update_delete_in_transaction(DuckDB &db, const TestConfig &config) {
 
 	// Conn2 queries a different table (can't query conn1's locked rows)
 	auto product_count = QuerySingleInt(conn2, "SELECT COUNT(*) FROM db.dbo.TxTestProducts");
-	std::cout << "Connection 2: queried different table (count=" << product_count << ") while conn1 has uncommitted changes" << std::endl;
+	std::cout << "Connection 2: queried different table (count=" << product_count
+			  << ") while conn1 has uncommitted changes" << std::endl;
 
 	// Rollback
 	assert(ExecuteQuery(conn1, "ROLLBACK", &error));
@@ -431,7 +435,7 @@ void test_update_delete_in_transaction(DuckDB &db, const TestConfig &config) {
 
 	// Verify rollback worked
 	auto sum_after_rollback =
-	    QuerySingleInt(conn1, "SELECT SUM(value) FROM db.dbo.tx_test WHERE name LIKE 'upd_del_%'");
+		QuerySingleInt(conn1, "SELECT SUM(value) FROM db.dbo.tx_test WHERE name LIKE 'upd_del_%'");
 	std::cout << "Sum after rollback: " << sum_after_rollback << std::endl;
 	assert(sum_after_rollback == 600);
 
@@ -479,7 +483,7 @@ int main() {
 
 	try {
 		// Create DuckDB instance
-		DuckDB db(nullptr);  // In-memory database
+		DuckDB db(nullptr);	 // In-memory database
 		Connection setup_conn(db);
 
 		std::string error;
@@ -517,7 +521,8 @@ int main() {
 			auto count = QuerySingleInt(setup_conn, "SELECT COUNT(*) FROM db.dbo.tx_test");
 			std::cout << "Test table db.dbo.tx_test exists with " << count << " rows" << std::endl;
 		} catch (const std::exception &e) {
-			std::cerr << "Test table db.dbo.tx_test not found. Please run init-transaction-tests.sql first." << std::endl;
+			std::cerr << "Test table db.dbo.tx_test not found. Please run init-transaction-tests.sql first."
+					  << std::endl;
 			std::cerr << "Error: " << e.what() << std::endl;
 			return 1;
 		}

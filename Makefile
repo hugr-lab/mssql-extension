@@ -91,12 +91,16 @@ MSSQL_TEST_PASS ?= TestPassword1
 MSSQL_TEST_DB ?= master
 
 # Derived connection strings (computed from base variables)
-MSSQL_TEST_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=$(MSSQL_TEST_DB);User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
-MSSQL_TEST_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)
-MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)?encrypt=true
+# TrustServerCertificate=yes on every DSN that reaches the docker server: it runs on
+# its self-generated certificate, and since spec 074 the extension verifies the
+# server certificate by default, as sqlcmd 18 does (which is why the compose
+# healthcheck passes -C). The test for the default itself overrides this key.
+MSSQL_TEST_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=$(MSSQL_TEST_DB);User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS);TrustServerCertificate=yes
+MSSQL_TEST_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)?trustservercertificate=true
+MSSQL_TEST_DSN_TLS = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/$(MSSQL_TEST_DB)?encrypt=true&trustservercertificate=true
 # TestDB connection strings for catalog tests
-MSSQL_TESTDB_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=TestDB;User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS)
-MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/TestDB
+MSSQL_TESTDB_DSN = Server=$(MSSQL_TEST_HOST),$(MSSQL_TEST_PORT);Database=TestDB;User Id=$(MSSQL_TEST_USER);Password=$(MSSQL_TEST_PASS);TrustServerCertificate=yes
+MSSQL_TESTDB_URI = mssql://$(MSSQL_TEST_USER):$(MSSQL_TEST_PASS)@$(MSSQL_TEST_HOST):$(MSSQL_TEST_PORT)/TestDB?trustservercertificate=true
 # Four COPY tests gate on MSSQL_TEST_SERVER, which nothing has ever set — not
 # this Makefile and not CI — so copy_connection_leak, copy_type_mismatch,
 # copy_empty_schema and copy_existing_temp have been skipping silently since they
@@ -467,6 +471,14 @@ test-login-error-state: debug
 # and no libduckdb: tds_connection.cpp reaches nothing outside the TDS layer,
 # so the link set is the LOGIN7 one plus the socket + TLS TUs and OpenSSL.
 # (The TLS TUs come in via tds_socket.hpp; the test itself runs use_encrypt=false.)
+# Spec 074: tds_tls_impl.cpp loads the platform trust store, which on macOS is the
+# keychain (Security + CoreFoundation frameworks); Linux needs nothing beyond OpenSSL.
+ifeq ($(shell uname -s),Darwin)
+TLS_TEST_PLATFORM_LIBS := -framework CoreFoundation -framework Security
+else
+TLS_TEST_PLATFORM_LIBS :=
+endif
+
 ROUTING_TEST_SOURCES := \
     src/tds/tds_connection.cpp \
     src/tds/tds_socket.cpp \
@@ -484,7 +496,7 @@ test-login-routing-hops: debug
 	$(CXX) $(LOGIN7_TEST_FLAGS) $(LOGIN7_TEST_INCLUDES) \
 	    test/cpp/test_login_routing_hops.cpp \
 	    $(ROUTING_TEST_SOURCES) \
-	    $(LOGIN7_TEST_LIBS) -lssl -lcrypto \
+	    $(LOGIN7_TEST_LIBS) -lssl -lcrypto $(TLS_TEST_PLATFORM_LIBS) \
 	    -o build/test/test_login_routing_hops
 	@echo ""
 	@echo "Running login routing hop-driver unit test..."
@@ -602,6 +614,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_insert_bulk_sql.cpp \
     test/cpp/test_vector_encodings.cpp \
     test/cpp/test_collation_metadata.cpp \
+    test/cpp/test_tls_verification.cpp \
     test/cpp/test_pool_creation_failure.cpp \
     test/cpp/test_token_parser_tokens.cpp \
     test/cpp/codec/test_binary_codec.cpp \
@@ -617,6 +630,10 @@ STANDALONE_TEST_SOURCES := \
 STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
+# The vcpkg include dir is for test_tls_verification.cpp (spec 074), whose
+# in-process server is written against OpenSSL directly. Appended here, after
+# the lib dir it is derived from, because both are simply-expanded.
+STANDALONE_TEST_INCLUDES += -I $(STANDALONE_TEST_VCPKG_LIB)/../include
 STANDALONE_TEST_UNAME := $(shell uname -s)
 # GNU ld resolves archives in ONE pass and in order, so libmssql_extension.a is
 # scanned before libduckdb_static.a's generated_extension_loader.o pulls in a

@@ -53,6 +53,7 @@ statement ok
 CREATE SECRET attach_test_secret (
     TYPE mssql,
     host '{MSSQL_TEST_HOST}',
+    trust_server_certificate true,
     port {MSSQL_TEST_PORT},
     database '{MSSQL_TEST_DB}',
     user '{MSSQL_TEST_USER}',

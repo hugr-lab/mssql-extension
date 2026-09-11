@@ -40,7 +40,10 @@ public:
 	// (TLS handshake is wrapped in TDS PRELOGIN packets which need sequential packet IDs)
 	// Optional sni_hostname overrides the default (host_) for TLS SNI - useful for Azure routing
 	// Returns true on success, false on failure (check GetLastError())
-	bool EnableTls(uint8_t &packet_id, int timeout_ms = 30000, const std::string &sni_hostname = "");
+	// tls_options (spec 074): whether and against which name the server certificate
+	// is verified. The default verifies against the host dialled.
+	bool EnableTls(uint8_t &packet_id, int timeout_ms = 30000, const std::string &sni_hostname = "",
+				   const TlsOptions &tls_options = TlsOptions());
 
 	// Check if TLS is currently enabled
 	bool IsTlsEnabled() const;

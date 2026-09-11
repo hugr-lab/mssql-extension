@@ -71,8 +71,10 @@ struct TestConfig {
 
 	std::string DsnFor(const std::string &database) const {
 		std::ostringstream oss;
+		// The CI / docker server runs on its self-generated certificate, and the server
+		// certificate is verified by default since spec 074.
 		oss << "Server=" << host << "," << port << ";Database=" << database << ";User Id=" << user
-			<< ";Password=" << pass;
+			<< ";Password=" << pass << ";TrustServerCertificate=yes";
 		return oss.str();
 	}
 };

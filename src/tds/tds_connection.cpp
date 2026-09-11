@@ -92,6 +92,8 @@ TdsConnection::~TdsConnection() noexcept {
 TdsConnection::TdsConnection(TdsConnection &&other) noexcept
 	: socket_(std::move(other.socket_)),
 	  state_(other.state_.load()),
+	  tls_options_(std::move(other.tls_options_)),
+	  request_utf8_support_(other.request_utf8_support_),
 	  host_(std::move(other.host_)),
 	  port_(other.port_),
 	  database_(std::move(other.database_)),
@@ -99,9 +101,10 @@ TdsConnection::TdsConnection(TdsConnection &&other) noexcept
 	  created_at_(other.created_at_),
 	  last_used_at_(other.last_used_at_),
 	  last_error_(std::move(other.last_error_)),
-	  tls_enabled_(other.tls_enabled_),
 	  next_packet_id_(other.next_packet_id_),
+	  tls_enabled_(other.tls_enabled_),
 	  connect_timeout_seconds_(other.connect_timeout_seconds_),
+	  requested_packet_size_(other.requested_packet_size_),
 	  negotiated_packet_size_(other.negotiated_packet_size_) {
 	other.state_.store(ConnectionState::Disconnected);
 	other.spid_ = 0;
@@ -125,6 +128,9 @@ TdsConnection &TdsConnection::operator=(TdsConnection &&other) noexcept {
 		next_packet_id_ = other.next_packet_id_;
 		connect_timeout_seconds_ = other.connect_timeout_seconds_;
 		negotiated_packet_size_ = other.negotiated_packet_size_;
+		tls_options_ = std::move(other.tls_options_);
+		request_utf8_support_ = other.request_utf8_support_;
+		requested_packet_size_ = other.requested_packet_size_;
 
 		other.state_.store(ConnectionState::Disconnected);
 		other.spid_ = 0;
@@ -252,7 +258,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 		// Server agreed to encryption (ENCRYPT_ON or ENCRYPT_REQ)
 		// Enable TLS on the socket BEFORE sending LOGIN7
 		// Pass next_packet_id_ so TLS handshake packets continue the sequence
-		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000)) {
+		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000, "", tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}
@@ -538,7 +544,7 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 		}
 
 		// Enable TLS - optionally override SNI hostname for Azure routing
-		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000, sni_hostname)) {
+		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000, sni_hostname, tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}

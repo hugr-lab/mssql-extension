@@ -12,7 +12,7 @@ sidebar_position: 1
 ATTACH '' AS sqlserver (TYPE mssql, SECRET my_secret);
 
 -- Attach with connection string
-ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass'
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass;TrustServerCertificate=yes'
     AS sqlserver (TYPE mssql);
 
 -- Detach when done

@@ -21,7 +21,7 @@ filters or the application name.
 
 ```sql
 -- The basics: host, port, database, SQL authentication, TLS on
-ATTACH 'Server=localhost,1433;Database=AdventureWorks;User Id=sa;Password=...;Encrypt=yes'
+ATTACH 'Server=localhost,1433;Database=AdventureWorks;User Id=sa;Password=...;Encrypt=yes;TrustServerCertificate=yes'
     AS mssql (TYPE mssql);
 
 -- Named instance: the port is resolved through SQL Server Browser (UDP 1434)
@@ -55,7 +55,8 @@ Recognized query parameters:
 | Parameter | Values | Description |
 |---|---|---|
 | `encrypt` | `true`/`false` | TLS (default: true) |
-| `trustservercertificate` | `true`/`false` | Accept a self-signed server certificate |
+| `trustservercertificate` | `true`/`false` | Accept the server certificate without verifying it (default: `false`, verify) |
+| `hostnameincertificate` | host name | Name the certificate must carry, when it differs from the host connected to |
 | `catalog` | `true`/`false` | Catalog integration (default: true) |
 | `schema_filter` / `table_filter` | regex | Limit visible schemas / tables |
 | `applicationname` | string | LOGIN7 `program_name` (spaceless form in URIs) |
@@ -86,6 +87,8 @@ CREATE SECRET secret_name (
 | `user`        | VARCHAR | Yes\*    | SQL Server username (\*not required for `authenticator='krb5'` ccache mode or Azure AD) |
 | `password`    | VARCHAR | Yes\*    | Password (hidden in `duckdb_secrets()`; required only for SQL auth + Kerberos raw mode) |
 | `use_encrypt` | BOOLEAN | No       | Enable TLS encryption (default: true) |
+| `trust_server_certificate` | BOOLEAN | No | Accept the server certificate without verifying it (default: false, verify) |
+| `host_name_in_certificate` | VARCHAR | No | Name the certificate must carry, when it differs from `host` |
 | `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
 | `schema_filter` | VARCHAR | No     | Regex pattern to filter visible schemas (case-insensitive partial match) |
 | `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
@@ -113,7 +116,9 @@ ATTACH '' AS context_name (TYPE mssql, SECRET secret_name);
 | `Database`                  | `Initial Catalog`                    |
 | `User Id`                   | `Uid`, `User`                        |
 | `Password`                  | `Pwd`                                |
-| `Encrypt`                   | `Use Encryption for Data`, `TrustServerCertificate` |
+| `Encrypt`                   | `Use Encryption for Data`            |
+| `TrustServerCertificate`    | (no alias; see TLS/SSL Configuration) |
+| `HostNameInCertificate`     | `HostnameInCertificate` (ODBC spelling) |
 | `Trusted_Connection`        | `Trusted Connection`, `TrustedConnection` (yes/true/SSPI/1 -> Kerberos on POSIX, SSPI on Windows; see [Kerberos.md](./kerberos.md)) |
 | `Integrated Security`       | `IntegratedSecurity`, `Integrated_Security` (same resolution as `Trusted_Connection`) |
 | `authenticator`             | `krb5` or `winsspi` (see [Kerberos.md](./kerberos.md)) |
@@ -155,49 +160,58 @@ troubleshooting (including WSL2 specifics), and SPN verification.
 
 ### TLS/SSL Configuration
 
-To enable encrypted connections:
+Three options, with the meanings and defaults of the Microsoft drivers (ODBC 18,
+`Microsoft.Data.SqlClient` 4.0, JDBC 10.2, `go-mssqldb`):
 
-#### Using Secret
-
-```sql
-CREATE SECRET secure_conn (
-    TYPE mssql,
-    host 'sql-server.example.com',
-    port 1433,
-    database 'MyDatabase',
-    user 'sa',
-    password 'Password123',
-    use_encrypt true
-);
-```
-
-#### Using Connection String
+| ADO.NET key / URI parameter / secret field | Default | Meaning |
+|---|---|---|
+| `Encrypt` / `encrypt` / `use_encrypt` | `true` | Encrypt the session. `false` sends no TLS at all, the login packet included, and the two options below are ignored. |
+| `TrustServerCertificate` / `trustservercertificate` / `trust_server_certificate` | `false` | `false`: the server's certificate chain must validate against the platform trust store, and its subject must match the host connected to. `true`: any certificate is accepted; the channel is still encrypted, what is given up is knowing who is at the other end. |
+| `HostNameInCertificate` / `hostnameincertificate` / `host_name_in_certificate` | the host connected to | The name the certificate must carry when it differs from the address you connect to: an IP, an SSH tunnel to `localhost`, an alias the certificate was not issued for. After a login-time routing hop (Azure SQL redirect, Fabric) the routed host is checked, unless this is set, in which case it applies to every hop. |
 
 ```sql
-ATTACH 'Server=sql-server.example.com,1433;Database=MyDatabase;User Id=sa;Password=Password123;Encrypt=yes'
-    AS db (TYPE mssql);
+-- Production: encrypted and verified (both are the defaults)
+ATTACH 'Server=sql.example.com,1433;Database=Sales;User Id=app;Password=...' AS db (TYPE mssql);
+
+-- Through an SSH tunnel: the certificate says sql.example.com, the socket says localhost
+ATTACH 'Server=localhost,14330;Database=Sales;User Id=app;Password=...;HostNameInCertificate=sql.example.com' AS db (TYPE mssql);
+
+-- A self-signed certificate (docker, an on-prem instance with none installed)
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=...;TrustServerCertificate=yes' AS db (TYPE mssql);
+
+-- URI and secret spellings
+ATTACH 'mssql://app:...@localhost:14330/Sales?hostnameincertificate=sql.example.com' AS db (TYPE mssql);
+CREATE SECRET dev (TYPE mssql, host 'localhost', port 1433, database 'master', user 'sa', password '...',
+                   trust_server_certificate true);
 ```
 
-#### Using URI
+#### Self-signed certificates
 
-```sql
-ATTACH 'mssql://sa:Password123@sql-server.example.com:1433/MyDatabase?encrypt=true'
-    AS db (TYPE mssql);
+Every SQL Server without an installed certificate, the docker image included,
+runs on a self-generated one. The default rejects it and says so:
+
+```text
+TLS handshake failed: certificate verification failed for localhost: self-signed certificate. Set TrustServerCertificate=yes to accept this server's certificate without verification, or HostNameInCertificate=<name> if the certificate is valid but issued for a different name
 ```
 
-> **Note**: TLS is enabled by default for security. Use `use_encrypt=false` or `Encrypt=no` to disable. TLS support is available in both static and loadable extension builds (using OpenSSL).
+Add `TrustServerCertificate=yes`, which is what `sqlcmd -C` does. The reason in
+the message is OpenSSL's own (`self-signed certificate`, `unable to get local
+issuer certificate`, `hostname mismatch`, `certificate has expired`), so it can
+be searched for.
 
-#### TrustServerCertificate Parameter
+#### Where the trusted roots come from
 
-For compatibility with ADO.NET connection strings, `TrustServerCertificate` is supported as an alias for `Encrypt`:
+The platform's store, the same one the Azure AD token request uses: on Windows
+the `ROOT` and `CA` system stores; on macOS the keychain trust settings plus
+OpenSSL's default paths; on Linux OpenSSL's default paths (`/etc/ssl/certs`,
+package `ca-certificates`). `SSL_CERT_FILE` / `SSL_CERT_DIR` override the
+paths on every platform. A private CA goes into the platform store or into
+`SSL_CERT_FILE`; there is no per-connection CA-file option.
 
-```sql
--- Using TrustServerCertificate (equivalent to Encrypt=yes)
-ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=pass;TrustServerCertificate=true'
-    AS db (TYPE mssql);
-```
-
-> **Note**: If both `Encrypt` and `TrustServerCertificate` are specified with conflicting values (e.g., `Encrypt=true;TrustServerCertificate=false`), ATTACH will fail with an error. Either omit one parameter or ensure they have the same value.
+> **Changed in spec 074**: `TrustServerCertificate` used to be an alias of
+> `Encrypt` and nothing verified the server certificate. It is now its own
+> option, `false` by default. A connection string that reached a self-signed
+> server without it needs `TrustServerCertificate=yes` added.
 
 ### Catalog-Free Mode
 
@@ -279,7 +293,7 @@ ATTACH 'Server=nonexistent.host,1433;Database=master;User Id=sa;Password=pass'
 -- Error: MSSQL connection validation failed: Cannot resolve hostname 'nonexistent.host'
 
 -- Invalid credentials - fails immediately
-ATTACH 'Server=localhost,1433;Database=master;User Id=wrong;Password=wrong'
+ATTACH 'Server=localhost,1433;Database=master;User Id=wrong;Password=wrong;TrustServerCertificate=yes'
     AS db (TYPE mssql);
 -- Error: MSSQL connection validation failed: Authentication failed for user 'wrong'
 ```

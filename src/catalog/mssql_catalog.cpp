@@ -159,12 +159,13 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto encrypt = connection_info_->use_encrypt;
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
+		auto tls_options = connection_info_->GetTlsOptions();
 		auto secret_name = connection_info_->azure_secret_name;
 		auto tenant = connection_info_->azure_tenant_id;
 		const int connect_timeout = pool_config_.connection_timeout;
 		DatabaseInstance *db = &GetDatabase();
-		factory = [db, host, port, database, encrypt, app_name, tds_packet_size, utf8_support, secret_name, tenant,
-				   connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
+		factory = [db, host, port, database, encrypt, app_name, tds_packet_size, utf8_support, tls_options, secret_name,
+				   tenant, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto token_result = mssql::azure::AcquireToken(*db, secret_name, tenant, /*allow_interactive=*/false);
 			if (!token_result.success) {
 				throw ConnectionException("Azure AD token for secret '%s': %s", secret_name,
@@ -174,6 +175,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
+			conn->SetTlsOptions(tls_options);
 			if (!conn->Connect(host, port, connect_timeout)) {
 				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
 										  conn->GetLastError());
@@ -198,6 +200,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto token = fedauth_token_utf16le_;
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
+		auto tls_options = connection_info_->GetTlsOptions();
 		const int connect_timeout = pool_config_.connection_timeout;
 		int64_t exp = 0;
 		{
@@ -206,8 +209,8 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 				exp = claims.exp;
 			}
 		}
-		factory = [host, port, database, encrypt, token, app_name, tds_packet_size, utf8_support, connect_timeout,
-				   exp]() -> std::shared_ptr<tds::TdsConnection> {
+		factory = [host, port, database, encrypt, token, app_name, tds_packet_size, utf8_support, tls_options,
+				   connect_timeout, exp]() -> std::shared_ptr<tds::TdsConnection> {
 			if (exp > 0 && mssql::azure::IsTokenExpired(exp, /*margin_seconds=*/0)) {
 				throw ConnectionException(
 					"Azure AD access token supplied at ATTACH expired at %s; a fixed token cannot "
@@ -217,6 +220,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
+			conn->SetTlsOptions(tls_options);
 			if (!conn->Connect(host, port, connect_timeout)) {
 				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
 										  conn->GetLastError());
@@ -239,6 +243,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
 			conn->SetRequestUtf8Support(info_copy.utf8_support);
+			conn->SetTlsOptions(info_copy.GetTlsOptions());
 			if (!conn->Connect(info_copy.host, info_copy.port, connect_timeout)) {
 				throw ConnectionException("integrated-auth: TCP connect to %s:%u failed: %s", info_copy.host,
 										  static_cast<unsigned>(info_copy.port), conn->GetLastError());
@@ -292,12 +297,14 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto encrypt = connection_info_->use_encrypt;
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
+		auto tls_options = connection_info_->GetTlsOptions();
 		const int connect_timeout = pool_config_.connection_timeout;
 		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size, utf8_support,
-				   connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
+				   tls_options, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
+			conn->SetTlsOptions(tls_options);
 			// Throw, do not return nullptr: the pool keeps the reason and the
 			// caller finally sees "Login failed for user ..." instead of
 			// "(timeout)" (issue #302).

@@ -22,7 +22,7 @@ second, full DML and transactions.
 INSTALL mssql FROM community;
 LOAD mssql;
 
-ATTACH 'Server=localhost;Database=AdventureWorks;User Id=sa;Password=...' AS mssql (TYPE mssql);
+ATTACH 'Server=localhost;Database=AdventureWorks;User Id=sa;Password=...;TrustServerCertificate=yes' AS mssql (TYPE mssql);
 SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 ```
 
@@ -41,7 +41,7 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 - Full DuckDB catalog integration with three-part naming and lazy metadata loading
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits and automatic session reset
-- TLS/SSL encrypted connections
+- TLS with the server certificate verified by default; `Encrypt`, `TrustServerCertificate` and `HostNameInCertificate` mean what they mean in the Microsoft drivers
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE
 - CREATE TABLE AS SELECT (CTAS) with streaming and type mapping
 - High-performance COPY TO via TDS BulkLoadBCP protocol

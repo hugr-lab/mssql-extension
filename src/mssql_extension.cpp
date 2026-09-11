@@ -163,7 +163,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// 5. Register connection pool settings
 	RegisterMSSQLSettings(loader);
 
-	// 6. Register diagnostic functions (mssql_open, mssql_close, mssql_ping, mssql_pool_stats)
+	// 6. Register diagnostic functions (mssql_pool_stats)
 	RegisterMSSQLDiagnosticFunctions(loader);
 
 	// 7. Register mssql_refresh_cache function
