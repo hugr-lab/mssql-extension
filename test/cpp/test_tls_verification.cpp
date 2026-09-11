@@ -29,6 +29,7 @@ int main() {
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 
 #include <cstdio>
 #include <cstdlib>
@@ -195,6 +196,15 @@ static Outcome Connect(TestServer &server, const TlsOptions &options, const std:
 
 	Outcome out;
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef SO_NOSIGPIPE
+	// macOS has no MSG_NOSIGNAL (the TLS layer's send() passes 0 there), and
+	// the server side of a REJECTED handshake closes first: the client's alert
+	// or close_notify then lands on a closed peer, and the default SIGPIPE
+	// killed the whole test binary on the CI runner with no output at all.
+	// TdsSocket sets this on its own sockets; this raw one needs it too.
+	int nosigpipe = 1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 	sockaddr_in addr;
 	std::memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -226,6 +236,10 @@ static Outcome Connect(TestServer &server, const TlsOptions &options, const std:
 }
 
 int main() {
+	// Belt and braces with SO_NOSIGPIPE above: a write to a peer that has gone
+	// must come back as EPIPE, never as a signal that ends the test silently.
+	signal(SIGPIPE, SIG_IGN);
+
 	ServerIdentity id;
 	if (!id.Create()) {
 		std::cerr << "could not mint the test certificate" << std::endl;
@@ -240,6 +254,7 @@ int main() {
 
 	// D2 verify, self-signed, not trusted: the default rejects it and says why.
 	{
+		std::cerr << "case: verify, untrusted" << std::endl;
 		TlsOptions verify;
 		auto out = Connect(server, verify, kName, "");
 		Check(!out.ok, "verify/untrusted: handshake rejected");
@@ -252,6 +267,7 @@ int main() {
 
 	// D2 trust: the same certificate is accepted, and the channel is encrypted.
 	{
+		std::cerr << "case: trust" << std::endl;
 		TlsOptions trust;
 		trust.verify_certificate = false;
 		auto out = Connect(server, trust, kName, "");
@@ -261,6 +277,7 @@ int main() {
 
 	// D2 verify with the certificate in the trust store, expected name = SNI name.
 	{
+		std::cerr << "case: verify, trusted" << std::endl;
 		TlsOptions verify;
 		auto out = Connect(server, verify, kName, id.pem_path);
 		Check(out.ok, "verify/trusted: handshake succeeds (" + out.error + ")");
@@ -268,6 +285,7 @@ int main() {
 
 	// D3 a different expected name: the chain is fine, the name is not.
 	{
+		std::cerr << "case: verify, trusted, other name" << std::endl;
 		TlsOptions verify;
 		verify.expected_host = "other.test.invalid";
 		auto out = Connect(server, verify, kName, id.pem_path);
@@ -281,6 +299,7 @@ int main() {
 
 	// D5 an IP literal is matched against the iPAddress SAN, not dNSName.
 	{
+		std::cerr << "case: verify, trusted, IP in SAN" << std::endl;
 		TlsOptions verify;
 		verify.expected_host = "127.0.0.1";
 		auto out = Connect(server, verify, kName, id.pem_path);
@@ -297,6 +316,7 @@ int main() {
 
 	// D3 under trust the expected name is ignored.
 	{
+		std::cerr << "case: trust, other name" << std::endl;
 		TlsOptions trust;
 		trust.verify_certificate = false;
 		trust.expected_host = "other.test.invalid";
