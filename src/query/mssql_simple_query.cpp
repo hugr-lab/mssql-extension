@@ -233,9 +233,14 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 
 		bool is_eom = packet.IsEndOfMessage();
 
-		// Feed packet payload to parser (without header)
+		// Feed packet payload to parser (without header) -- unless the parser is
+		// already in Error. Feed() only appends; the buffer is compacted from
+		// ConsumeBytes(), which a parser that has stopped consuming never calls,
+		// so the drain to EOM below would otherwise hold the whole remaining
+		// response in memory for nothing. The packets are still READ: that is
+		// what leaves the socket clean for the next statement.
 		const auto &payload = packet.GetPayload();
-		if (!payload.empty()) {
+		if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
 			parser.Feed(payload);
 		}
 

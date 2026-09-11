@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tds/tds_column_metadata.hpp"
 #include "tds/tds_token_parser.hpp"
 
 using duckdb::tds::ParsedTokenType;
@@ -212,6 +213,17 @@ static void TestUnknownTokenMessageIsHex() {
 	Check(msg.find("153") == std::string::npos, "0x99: message does not say 153 (" + msg + ")");
 }
 
+// The type-byte twin of the message above: ColumnMetadata::GetTypeName() had
+// the same hex-prefix/decimal-digits defect, and it reaches users through
+// "Unsupported SQL Server type" / "Unsupported type in RowReader" (#332 review).
+static void TestUnknownTypeNameIsHex() {
+	duckdb::tds::ColumnMetadata col;
+	col.type_id = 0x99;	 // not a TDS type
+	const std::string name = col.GetTypeName();
+	Check(name == "UNKNOWN(0x99)", "type 0x99: GetTypeName says UNKNOWN(0x99) (" + name + ")");
+	Check(name.find("153") == std::string::npos, "type 0x99: GetTypeName does not say 153 (" + name + ")");
+}
+
 int main() {
 	TestReturnStatusValues();
 	TestReturnStatusSplitAcrossPackets();
@@ -219,6 +231,7 @@ int main() {
 	TestForBrowseTabnameColinfo();
 	TestReturnValueFailsByName();
 	TestUnknownTokenMessageIsHex();
+	TestUnknownTypeNameIsHex();
 
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;
