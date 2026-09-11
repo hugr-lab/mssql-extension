@@ -12,7 +12,7 @@ require-env AZURE_SQL_TEST_DSN
 # The default: chain against the platform trust store, name against the host
 # dialled. Azure SQL presents a publicly-chained certificate for it.
 statement ok
-ATTACH '${AZURE_SQL_TEST_DSN}' AS az_tls (TYPE mssql);
+ATTACH '{AZURE_SQL_TEST_DSN}' AS az_tls (TYPE mssql);
 
 query I
 SELECT mssql_exec('az_tls', 'SELECT 1');
@@ -24,7 +24,7 @@ DETACH az_tls;
 
 # The chain is still good; the name is not the one asked for.
 statement error
-ATTACH '${AZURE_SQL_TEST_DSN};HostNameInCertificate=wrong.invalid' AS az_wrong (TYPE mssql);
+ATTACH '{AZURE_SQL_TEST_DSN};HostNameInCertificate=wrong.invalid' AS az_wrong (TYPE mssql);
 ----
 certificate verification failed for wrong.invalid: hostname mismatch
 
