@@ -24,9 +24,9 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "insert/mssql_batch_builder.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
+#include "dml/insert/mssql_batch_builder.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
+#include "dml/insert/mssql_insert_target.hpp"
 
 using namespace duckdb;
 

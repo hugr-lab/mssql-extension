@@ -21,10 +21,10 @@
 #include <iostream>
 
 #include "duckdb/common/types.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_error.hpp"
-#include "insert/mssql_insert_executor.hpp"
-#include "insert/mssql_insert_target.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
+#include "dml/insert/mssql_insert_error.hpp"
+#include "dml/insert/mssql_insert_executor.hpp"
+#include "dml/insert/mssql_insert_target.hpp"
 
 using namespace duckdb;
 

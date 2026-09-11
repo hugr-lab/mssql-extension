@@ -28,7 +28,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "insert/mssql_value_serializer.hpp"
+#include "dml/insert/mssql_value_serializer.hpp"
 
 using namespace duckdb;
 

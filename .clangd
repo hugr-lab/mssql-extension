@@ -18,6 +18,7 @@ CompileFlags:
     - -I../../src/include
     - -I../../duckdb/src/include
     - -I../../duckdb/third_party/fmt/include
+    - -I../../duckdb/third_party/catch
     - -I../../build/release/vcpkg_installed/arm64-osx/include
     - -I../../build/release/vcpkg_installed/x64-osx/include
     - -I../../build/release/vcpkg_installed/x64-linux/include
@@ -31,6 +32,7 @@ CompileFlags:
     - -I../../../src/include
     - -I../../../duckdb/src/include
     - -I../../../duckdb/third_party/fmt/include
+    - -I../../../duckdb/third_party/catch
     - -I../../../build/release/vcpkg_installed/arm64-osx/include
     - -I../../../build/release/vcpkg_installed/x64-osx/include
     - -I../../../build/release/vcpkg_installed/x64-linux/include
