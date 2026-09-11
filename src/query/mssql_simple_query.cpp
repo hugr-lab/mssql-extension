@@ -233,9 +233,14 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 
 		bool is_eom = packet.IsEndOfMessage();
 
-		// Feed packet payload to parser (without header)
+		// Feed packet payload to parser (without header) -- unless the parser is
+		// already in Error. Feed() only appends; the buffer is compacted from
+		// ConsumeBytes(), which a parser that has stopped consuming never calls,
+		// so the drain to EOM below would otherwise hold the whole remaining
+		// response in memory for nothing. The packets are still READ: that is
+		// what leaves the socket clean for the next statement.
 		const auto &payload = packet.GetPayload();
-		if (!payload.empty()) {
+		if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
 			parser.Feed(payload);
 		}
 
@@ -322,6 +327,24 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 				// Skip other tokens (EnvChange, etc.)
 				break;
 			}
+		}
+
+		// A parser in the Error state answers NeedMoreData forever, so the loop
+		// above has exited and will exit at once for every later packet. Until
+		// issue #323 that was indistinguishable from "waiting for the next
+		// packet": the code below forced done and RETURNED SUCCESS, with every
+		// token after the desync dropped -- later result sets, later row counts,
+		// and a SQL Server ERROR token following a stored-procedure call, which
+		// is exactly the one a caller most needs. Record it as the failure it is.
+		// The drain to EOM still happens below, on purpose: that is what leaves
+		// the socket clean for the next statement on this connection, so the
+		// connection can go back to Idle rather than be discarded. A SQL Server
+		// error already recorded keeps precedence -- it says more than this does.
+		if (parser.GetState() == tds::ParserState::Error && result.success) {
+			result.success = false;
+			result.error_number = 0;
+			result.error_message = "TDS parse error: " + parser.GetParseError();
+			SIMPLE_QUERY_DEBUG(1, "ExecuteWithCallback: %s", result.error_message.c_str());
 		}
 
 		// If EOM was set and we're not done, there's no more data coming

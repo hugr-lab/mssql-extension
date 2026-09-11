@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stored-procedure calls desynced the TDS parser**
+  ([#323](https://github.com/hugr-lab/mssql-extension/issues/323), spec 072).
+  RETURNSTATUS (0x79) is a fixed five-byte token with no length field, and the
+  parser skipped it as if it carried one: a procedure returning 0 left two bytes
+  behind, one returning *n* ate *n* bytes of the DONEPROC that follows. Through
+  `mssql_scan` that was `TDS parse error: Unknown token type: 0x0` and a
+  discarded connection. Through `mssql_exec` it was **worse and silent**: the
+  batch reported success with every token after the procedure dropped —
+  including a SQL Server ERROR raised after `EXEC`, so `EXEC p; RAISERROR(…)`
+  returned 0 with no error. Three more in the same group, found by the survey:
+  TABNAME was registered as 0x04 (the wire says 0xA4, so any `FOR BROWSE`
+  result failed); RETURNVALUE has no length field either and now fails by name
+  instead of mis-skipping (it is unreachable — sent only for RPC, which the
+  extension does not issue); and the unknown-token message printed decimal
+  after `0x`, so 0xA4 read as `0x164`. `mssql_exec` now reports a parser error
+  as an error rather than as end-of-batch, after draining to EOM so the
+  connection stays reusable.
+
 - **A metadata load that fails mid-query no longer mutates the cache**
   ([#317](https://github.com/hugr-lab/mssql-extension/issues/317), reported by
   [@oluies](https://github.com/oluies)). `LoadAllSchemasMetadata` cleared each
