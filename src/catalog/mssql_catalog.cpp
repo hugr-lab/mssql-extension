@@ -414,11 +414,14 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		connection = ConnectionProvider::GetConnection(*transaction.context, *this);
 	} else {
 		// Fallback to direct pool access if no context available
-		connection = connection_pool_->Acquire();
+		std::string why;
+		connection = connection_pool_->Acquire(-1, &why);
+		if (!connection) {
+			throw IOException("Failed to acquire connection for schema lookup: " + why);
+		}
 	}
 	if (!connection) {
-		throw IOException("Failed to acquire connection for schema lookup: " +
-						  connection_pool_->DescribeAcquireFailure());
+		throw IOException("Failed to acquire connection for schema lookup");
 	}
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
@@ -1143,10 +1146,10 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 		throw IOException("MSSQL connection pool not initialized - cannot execute DDL");
 	}
 
-	auto connection = connection_pool_->Acquire();
+	std::string why;
+	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
-		throw IOException("Failed to acquire connection for DDL execution: " +
-						  connection_pool_->DescribeAcquireFailure());
+		throw IOException("Failed to acquire connection for DDL execution: " + why);
 	}
 
 	try {
@@ -1297,10 +1300,10 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	metadata_cache_->SetTestFailAfterRows(LoadTestFailMetadataAfterRows(context));
 
 	// Acquire connection for full cache refresh
-	auto connection = connection_pool_->Acquire();
+	std::string why;
+	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
-		throw IOException("Failed to acquire connection for cache refresh: " +
-						  connection_pool_->DescribeAcquireFailure());
+		throw IOException("Failed to acquire connection for cache refresh: " + why);
 	}
 
 	// Perform full eager cache refresh.

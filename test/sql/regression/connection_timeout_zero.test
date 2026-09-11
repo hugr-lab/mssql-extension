@@ -1,0 +1,38 @@
+# name: test/sql/regression/connection_timeout_zero.test
+# description: mssql_connection_timeout = 0 is a legal value and means the default, not an instant timeout (spec 073 review)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The setting is registered with ValidateNonNegative, so 0 has always been
+# accepted. Until spec 073 the pool factories ignored it and every login read
+# used the compiled-in 30 s; W3 passes it through to the TCP dial and every
+# login-phase read, where a literal 0 is poll(fd, 1, 0) -- an instant "Socket
+# timeout waiting for data" on every pooled connection. 0 (or less) now means
+# the compiled-in default at the one boundary every path crosses,
+# TdsConnection::Connect; NOT "wait forever", since a dial or a login read
+# that never completes must not hang a pool refill.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_timeout = 0;
+
+# lazy_validation so the POOL performs the login: the pool captures the
+# setting at ATTACH time, and it is the pool's connections W3 changed.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS zero_timeout (TYPE mssql, lazy_validation true);
+
+query I
+SELECT mssql_exec('zero_timeout', 'SELECT 1');
+----
+1
+
+statement ok
+DETACH zero_timeout;
+
+statement ok
+RESET mssql_connection_timeout;

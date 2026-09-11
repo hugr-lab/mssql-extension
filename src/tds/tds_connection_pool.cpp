@@ -144,9 +144,12 @@ void ConnectionPool::Shutdown() {
 	D_ASSERT(leaked == 0);
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
+std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::string *failure) {
 	MSSQL_POOL_DEBUG_LOG(1, "Acquire called on pool '%s'", context_name_.c_str());
 	if (shutdown_flag_.load()) {
+		if (failure) {
+			*failure = "pool '" + context_name_ + "' is shut down";
+		}
 		return nullptr;
 	}
 
@@ -156,6 +159,12 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 	}
 
 	auto start = std::chrono::steady_clock::now();
+
+	// Why THIS call's own creation attempt failed, if it made one and then went
+	// on to wait for a Release. Per call, not pool state (review 1538): a
+	// timeout on a healthy pool must not be rendered with a reason some other
+	// thread hit hours ago.
+	std::string own_create_error;
 
 	std::unique_lock<std::mutex> lock(pool_mutex_);
 	stats_.acquire_count++;
@@ -170,20 +179,30 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 			return conn;
 		}
 
-		// Try to create a new connection if under limit -- and, once a creation
-		// has failed, only when the backoff since that failure has elapsed
-		// (issue #302).
+		// Try to create a new connection if under the limit. The backoff after
+		// a failed creation applies only while others are active: then a
+		// Release may serve this caller, and the pool should not dial on every
+		// wakeup. With nothing active there is nothing to wait for, so every
+		// Acquire dials once and reports its own result -- the first draft
+		// applied the backoff there too, and back-to-back failing statements on
+		// an empty pool stalled 250 ms .. 4 s each before the same error
+		// (issue #302, review 1538).
 		if (stats_.total_connections < config_.connection_limit &&
-			std::chrono::steady_clock::now() >= next_create_allowed_) {
+			(stats_.active_connections == 0 || std::chrono::steady_clock::now() >= next_create_allowed_)) {
+			std::string error;
 			lock.unlock();
-			conn = CreateNewConnection();
+			conn = CreateNewConnection(error);
 			lock.lock();
 
 			if (conn) {
 				// A success resets the backoff so a transient failure does not
-				// slow the next refill.
+				// slow the next refill, and clears the recorded error: a pool
+				// that has recovered has nothing to report. The first draft kept
+				// it forever, and every later exhaustion timeout was rendered as
+				// that stale creation failure (review 1538).
 				create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
 				next_create_allowed_ = std::chrono::steady_clock::time_point{};
+				last_create_error_.clear();
 				uint64_t id = next_connection_id_++;
 				active_connections_[id] = conn;
 				stats_.total_connections++;
@@ -204,11 +223,20 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 			// Azure AD token cost 600 s and two login attempts, and read
 			// identically to a wrong password or an unreachable host.
 			stats_.creation_failures++;
+			last_create_error_ = error;
+			own_create_error = error;
 			next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
-			create_backoff_ms_ = std::min(create_backoff_ms_ * 2, CREATE_BACKOFF_MAX_MS);
+			// Not std::min: it binds CREATE_BACKOFF_MAX_MS by reference, which
+			// odr-uses an in-class constexpr with no out-of-line definition
+			// before C++17 (review 1538).
+			create_backoff_ms_ =
+				create_backoff_ms_ * 2 > CREATE_BACKOFF_MAX_MS ? CREATE_BACKOFF_MAX_MS : create_backoff_ms_ * 2;
 			if (stats_.active_connections == 0) {
 				// Nothing can be released, so waiting would only run out the
-				// clock. Fail now; the caller reads GetLastCreateError().
+				// clock. Fail now, with this call's reason.
+				if (failure) {
+					*failure = "pool '" + context_name_ + "' could not create a connection: " + error;
+				}
 				auto elapsed =
 					std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
 						.count();
@@ -223,6 +251,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 		// Pool exhausted, wait for a connection to be released
 		if (timeout_ms == 0) {
 			stats_.acquire_timeout_count++;
+			if (failure) {
+				*failure = DescribeTimeoutLocked(own_create_error);
+			}
 			return nullptr;
 		}
 
@@ -232,6 +263,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 		if (elapsed >= timeout_ms) {
 			stats_.acquire_timeout_count++;
 			stats_.acquire_wait_total_ms += elapsed;
+			if (failure) {
+				*failure = DescribeTimeoutLocked(own_create_error);
+			}
 			return nullptr;
 		}
 
@@ -245,6 +279,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms) {
 		available_cv_.wait_for(lock, std::chrono::milliseconds(remaining));
 
 		if (shutdown_flag_.load()) {
+			if (failure) {
+				*failure = "pool '" + context_name_ + "' is shut down";
+			}
 			return nullptr;
 		}
 	}
@@ -357,10 +394,10 @@ std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdle() {
 	return nullptr;
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
+std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection(std::string &error) {
 	// pool_mutex_ must NOT be held (blocking I/O)
 	std::shared_ptr<TdsConnection> conn;
-	std::string error;
+	error.clear();
 	try {
 		conn = factory_();
 		if (!conn) {
@@ -376,8 +413,6 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection() {
 		error = ErrorData(e).RawMessage();
 	}
 	if (!error.empty()) {
-		std::lock_guard<std::mutex> lock(pool_mutex_);
-		last_create_error_ = error;
 		MSSQL_POOL_DEBUG_LOG(1, "CreateNewConnection failed on pool '%s': %s", context_name_.c_str(), error.c_str());
 	}
 	return conn;
@@ -388,18 +423,21 @@ std::string ConnectionPool::GetLastCreateError() const {
 	return last_create_error_;
 }
 
-std::string ConnectionPool::DescribeAcquireFailure() const {
+std::string ConnectionPool::DescribeTimeoutLocked(const std::string &own_create_error) const {
 	// Two different things end in a nullptr from Acquire and used to read the
 	// same: the pool is full and nobody released in time, or the pool tried to
 	// create a connection and could not -- an expired Azure AD token, the
-	// server's login error, a refused dial (issue #302). One renderer, so the
-	// provider and the nine catalog-internal callers say the same thing.
-	std::lock_guard<std::mutex> lock(pool_mutex_);
-	if (!last_create_error_.empty()) {
-		return "pool '" + context_name_ + "' could not create a connection: " + last_create_error_;
+	// server's login error, a refused dial (issue #302). This is the first;
+	// when the caller also tried to create on the way and failed, that reason
+	// rides along, because with others active it is the one that explains why
+	// the pool did not simply grow.
+	std::string message = "pool '" + context_name_ + "' timed out (" + std::to_string(stats_.active_connections) +
+						  " active of " + std::to_string(stats_.total_connections) + ", limit " +
+						  std::to_string(config_.connection_limit) + ")";
+	if (!own_create_error.empty()) {
+		message += "; this call's own attempt to create a connection failed: " + own_create_error;
 	}
-	return "pool '" + context_name_ + "' timed out (" + std::to_string(stats_.active_connections) + " active of " +
-		   std::to_string(stats_.total_connections) + ", limit " + std::to_string(config_.connection_limit) + ")";
+	return message;
 }
 
 bool ConnectionPool::ValidateConnection(std::shared_ptr<TdsConnection> &conn) {

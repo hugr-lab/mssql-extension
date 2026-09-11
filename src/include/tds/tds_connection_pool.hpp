@@ -81,10 +81,15 @@ public:
 	ConnectionPool(ConnectionPool &&) = delete;
 	ConnectionPool &operator=(ConnectionPool &&) = delete;
 
-	// Acquire a connection from the pool
-	// Blocks up to acquire_timeout if pool is exhausted
-	// Returns nullptr on timeout
-	std::shared_ptr<TdsConnection> Acquire(int timeout_ms = -1);
+	// Acquire a connection from the pool. Blocks up to acquire_timeout (or
+	// timeout_ms) while others are active and a Release may serve the request;
+	// with nothing active a creation that fails is reported at once.
+	// Returns nullptr on failure and, if `failure` is given, says why THIS call
+	// failed: "pool 'x' could not create a connection: <reason>" or
+	// "pool 'x' timed out (N active of M, limit L)". Per call, not pool state:
+	// a timeout on a healthy pool is never rendered with a creation failure some
+	// other thread hit earlier (issue #302, review 1538).
+	std::shared_ptr<TdsConnection> Acquire(int timeout_ms = -1, std::string *failure = nullptr);
 
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
@@ -94,15 +99,12 @@ public:
 
 	//! Why the last attempt to create a connection failed -- the factory's
 	//! exception text, or a fixed line if it returned nullptr silently. Empty
-	//! until a creation has failed. Issue #302: before this, an expired Azure AD
-	//! token, a wrong password and an unreachable host all reached the caller as
-	//! "Failed to acquire connection from pool (timeout)".
+	//! until a creation has failed, and cleared again by the next success, so
+	//! `mssql_pool_stats` shows a live problem rather than history. Issue #302:
+	//! before this, an expired Azure AD token, a wrong password and an
+	//! unreachable host all reached the caller as "Failed to acquire connection
+	//! from pool (timeout)".
 	std::string GetLastCreateError() const;
-
-	//! Why Acquire() returned nullptr, ready to append to a caller's message:
-	//! "pool 'x' could not create a connection: <reason>" or
-	//! "pool 'x' timed out (N active of M, limit L)".
-	std::string DescribeAcquireFailure() const;
 
 	// Pin counter — tracks connections currently pinned to active DuckDB
 	// transactions (spec 047 FR-005). Migrated from the deleted
@@ -125,10 +127,12 @@ private:
 	PoolConfiguration config_;
 	ConnectionFactory factory_;
 
-	// Creation-failure state, guarded by pool_mutex_ (issue #302). A factory
-	// that has just failed is not retried on every wakeup: the next attempt
-	// waits create_backoff_ms_, doubling to CREATE_BACKOFF_MAX_MS. Each attempt
-	// against a server that drops the connection costs a full login read.
+	// Creation-failure state, guarded by pool_mutex_ (issue #302). While others
+	// are active a factory that has just failed is not retried on every wakeup:
+	// the next attempt waits create_backoff_ms_, doubling to
+	// CREATE_BACKOFF_MAX_MS, since each attempt against a server that drops the
+	// connection costs a full login read. With nothing active there is nothing
+	// to wait for, and every Acquire dials once.
 	static constexpr int CREATE_BACKOFF_INITIAL_MS = 250;
 	static constexpr int CREATE_BACKOFF_MAX_MS = 4000;
 	std::string last_create_error_;
@@ -163,7 +167,13 @@ private:
 	// Internal methods
 	void CleanupThreadFunc();
 	std::shared_ptr<TdsConnection> TryAcquireIdle();
-	std::shared_ptr<TdsConnection> CreateNewConnection();
+	// Runs the factory with pool_mutex_ RELEASED (blocking I/O). On failure
+	// returns nullptr and puts the reason in `error`; the caller records it.
+	std::shared_ptr<TdsConnection> CreateNewConnection(std::string &error);
+
+	// "pool 'x' timed out (N active of M, limit L)", plus this call's own
+	// creation failure when it made one. pool_mutex_ must be held.
+	std::string DescribeTimeoutLocked(const std::string &own_create_error) const;
 	bool ValidateConnection(std::shared_ptr<TdsConnection> &conn);
 };
 

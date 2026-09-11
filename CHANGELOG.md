@@ -28,11 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A connection the pool cannot create no longer looks like a full pool.**
   `Acquire` treated a factory failure as exhaustion and waited for a `Release`
   that, with nothing active, could not come — then said "(timeout)" and threw
-  the reason away. Now: nothing active → fail at once; others active → keep
-  waiting for a release, but retry creation on a backoff (250 ms doubling to
-  4 s), not on every wakeup; and the message carries the factory's reason —
-  `could not create a connection: Login failed for user 'sa'.` A wrong
-  password used to take `mssql_acquire_timeout` seconds to say nothing.
+  the reason away. Now: nothing active → fail at once, every time; others
+  active → keep waiting for a release, but retry creation on a backoff
+  (250 ms doubling to 4 s), not on every wakeup; and the message carries the
+  reason of **this** call's attempt — `could not create a connection: Login
+  failed for user 'sa'.` — while a timeout on a pool that has since recovered
+  is reported as the timeout it is. A wrong password used to take
+  `mssql_acquire_timeout` seconds to say nothing.
 
 - **`mssql_connection_timeout` now bounds a pool refill.** Every factory passed
   no timeout to `Connect` (compiled-in 30 s), and every login-phase read —

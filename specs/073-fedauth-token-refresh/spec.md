@@ -269,9 +269,13 @@ and the `TdsConnection` holding `last_error_` dies inside the closure — the
 first draft promised to "surface the reason" through a signature with nowhere
 to put it. The contract now: the factory **throws** `ConnectionException` with
 the reason (all three factories do, in place of `return nullptr`), and
-`CreateNewConnection` catches, records `last_create_error_` under
-`pool_mutex_`, and returns nullptr — no signature change, so
-`test_connection_pool.cpp` and `test_tls_connection.cpp` keep their factories.
+`CreateNewConnection` catches and hands the reason back to `Acquire`, which
+records it under `pool_mutex_` and returns nullptr — the factory signature
+is unchanged, so `test_connection_pool.cpp` and `test_tls_connection.cpp`
+keep their factories. A later success **clears** the recorded error: a pool
+that has recovered has nothing to report (review 1538 — the first draft kept
+it forever, and every later exhaustion timeout was rendered as that stale
+creation failure).
 `ErrorData(e).RawMessage()`, not `what()`: on the 2.0 line a DuckDB exception's
 `what()` is its JSON serialization, and the first cut pasted
 `{"exception_type":"Connection",...}` into the user's error.
@@ -279,17 +283,25 @@ the reason (all three factories do, in place of `return nullptr`), and
 **The wait.** In `Acquire`, after a failed creation:
 
 - **no connection active** — nothing can be released, so waiting only runs out
-  the clock — return at once;
+  the clock — return at once, **every time**: no backoff applies here, each
+  Acquire dials once and reports its own result (the first draft applied the
+  backoff on an empty pool too, and back-to-back failing statements stalled
+  250 ms .. 4 s each before the same error — review 1538);
 - **others active** — a release may still serve the request, so keep waiting
   for the caller's budget, but retry creation on a backoff (250 ms doubling to
   4 s) rather than on every wakeup; each attempt against a server that hangs
   up costs a full login read.
 
-**The message.** One renderer, `ConnectionPool::DescribeAcquireFailure()`,
-used by `ConnectionProvider` and by every catalog-internal `Acquire()` caller
-(schema lookup, table scan, table loading, DDL, cache refresh, preload — a
-metadata load is the likeliest *first* thing to need a fresh connection after
-the token expires):
+**The message.** `Acquire(timeout, &why)` says why **this call** failed —
+"could not create a connection: <reason>" or "timed out (N active of M,
+limit L)", the latter carrying this call's own creation failure when it made
+one on the way. Per call, not pool state: a timeout on a healthy pool is never
+rendered with a reason another thread hit earlier (the first draft's
+pool-global renderer did exactly that — review 1538). Used by
+`ConnectionProvider` and by every catalog-internal `Acquire()` caller that
+throws (schema lookup, table scan, table loading, DDL, cache refresh, preload
+— a metadata load is the likeliest *first* thing to need a fresh connection
+after the token expires):
 
 ```text
 MSSQL: Failed to acquire connection: pool 'az' could not create a connection:
@@ -315,6 +327,16 @@ un-configurable wait per attempt, and F3's acceptance criterion would not
 have held. Anything that never calls `Connect` with a timeout keeps the
 default.
 
+**`0` means the default, not "no timeout".** The setting is registered with
+`ValidateNonNegative`, so `0` was always legal and, while the factories
+ignored it, harmless. Now that it reaches every login read a literal `0` is
+`poll(fd, 1, 0)` — an instant "Socket timeout" on every pooled connection
+(review 1538). `TdsConnection::Connect` — the one boundary every path
+crosses — maps `<= 0` to `DEFAULT_CONNECTION_TIMEOUT`. Not to an infinite
+poll, unlike `mssql_metadata_timeout`'s `0`: a dial or a login read that never
+completes must not hang a pool refill forever. `connection_timeout_zero.test`
+pins it.
+
 ### W4 — Tests
 
 - **Pool, server-free, gates a PR** — `test/cpp/test_pool_creation_failure.cpp`,
@@ -326,13 +348,23 @@ default.
   standalone lane's (`libmssql_extension.a` pulls `TdsConnection`, hence
   OpenSSL/simdutf from vcpkg), which `make test-cpp-run` already satisfies.
   Cases: throwing factory fails fast with the reason and is *not* counted as
-  an acquire timeout; a silent nullptr still gets a reason; one active →
-  waits the budget, 2–4 attempts in 800 ms on the backoff, reason kept; a
-  success resets the backoff. Does not compile against the pre-fix archive.
+  an acquire timeout; a silent nullptr still gets a reason; three failing
+  Acquires back to back on an empty pool each return at once with their own
+  attempt's reason; one active → waits the budget, 2–4 attempts in 800 ms on
+  the backoff, reported as a timeout that carries this call's creation
+  failure; a success clears the recorded error; and the review-1538 day — one
+  failure, then a healthy pool at its limit — is reported as exhaustion, not
+  as the morning's error. Does not compile against the pre-fix archive.
 - **`test/sql/regression/issue_302.test`** — wrong password, `lazy_validation`,
   `acquire_timeout = 30`. On the pre-fix code: "(timeout)" and 92 s for three
   statements. Now: `could not create a connection: Login failed for user` at
   once, pool 0/0.
+- **`test/sql/tds_connection/pool_stats_no_credentials.test`** (the SC-005
+  redaction gate) greps `last_create_error` as well as `db`, and provokes a
+  creation failure with a sentinel password so the new column is non-empty
+  when grepped — its header had stated that `db` was the only VARCHAR, which
+  W2 made untrue (review 1538, carried from 1536).
+- **`test/sql/regression/connection_timeout_zero.test`** — W3's edge.
 - **Azure lane** (`make azure-test`, manual dispatch):
   `test/sql/azure/fedauth_expired_access_token.test` — `PROVIDER access_token`
   with a well-formed token whose `exp` is 1000000000 (2001-09-09), refused at

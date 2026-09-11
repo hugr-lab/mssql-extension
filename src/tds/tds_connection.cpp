@@ -142,6 +142,16 @@ bool TdsConnection::Connect(const std::string &host, uint16_t port, int timeout_
 		return false;
 	}
 
+	// Spec 073 review: `mssql_connection_timeout` is registered non-negative, so
+	// 0 is legal, and since W3 the value reaches the dial and every login-phase
+	// read -- where a literal 0 is poll(fd, 1, 0), an instant "Socket timeout"
+	// on every pooled connection. 0 (or less) means the compiled-in default at
+	// this one boundary every path crosses. Not "wait forever": a dial or a
+	// login read that never completes must not hang a pool refill.
+	if (timeout_seconds <= 0) {
+		timeout_seconds = DEFAULT_CONNECTION_TIMEOUT;
+	}
+
 	host_ = host;
 	port_ = port;
 	connect_timeout_seconds_ = timeout_seconds;
