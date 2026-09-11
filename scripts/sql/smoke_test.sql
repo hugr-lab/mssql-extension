@@ -18,7 +18,11 @@ CREATE SECRET smoke_test_secret (
     port CAST(getenv('MSSQL_TEST_PORT') AS INTEGER),
     database getenv('MSSQL_TEST_DB'),
     user getenv('MSSQL_TEST_USER'),
-    password getenv('MSSQL_TEST_PASS')
+    password getenv('MSSQL_TEST_PASS'),
+    -- The CI SQL Server runs on its self-generated certificate, and since
+    -- spec 074 the server certificate is verified by default (as sqlcmd 18
+    -- does, which is why the compose healthcheck passes -C).
+    trust_server_certificate true
 );
 
 ATTACH '' AS mssql_smoke (TYPE mssql, SECRET smoke_test_secret);

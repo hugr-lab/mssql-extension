@@ -38,10 +38,13 @@ export MSSQL_TEST_DB="${MSSQL_TEST_DB:-master}"
 # definitions verbatim — they used to exist ONLY in the Makefile, so CI never set them and every
 # .test file silently skipped (issue #192). A `require-env` miss is a SKIP, not a failure, so
 # getting these wrong makes the suite pass by doing nothing. Keep in sync with the Makefile.
-export MSSQL_TEST_DSN="${MSSQL_TEST_DSN:-Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}}"
-export MSSQL_TEST_URI="${MSSQL_TEST_URI:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/${MSSQL_TEST_DB}}"
-export MSSQL_TESTDB_DSN="${MSSQL_TESTDB_DSN:-Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}}"
-export MSSQL_TESTDB_URI="${MSSQL_TESTDB_URI:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB}"
+# TrustServerCertificate on every default that reaches the CI SQL Server: it runs
+# on its self-generated certificate, and since spec 074 the extension verifies the
+# server certificate by default. A caller-supplied value wins and must say so itself.
+export MSSQL_TEST_DSN="${MSSQL_TEST_DSN:-Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};TrustServerCertificate=yes}"
+export MSSQL_TEST_URI="${MSSQL_TEST_URI:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/${MSSQL_TEST_DB}?trustservercertificate=true}"
+export MSSQL_TESTDB_DSN="${MSSQL_TESTDB_DSN:-Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};TrustServerCertificate=yes}"
+export MSSQL_TESTDB_URI="${MSSQL_TESTDB_URI:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/TestDB?trustservercertificate=true}"
 export MSSQL_TEST_SERVER="${MSSQL_TEST_SERVER:-$MSSQL_TEST_DSN}"
 export MSSQL_TEST_CONNECTION_STRING="${MSSQL_TEST_CONNECTION_STRING:-$MSSQL_TEST_DSN}"
 # Issue #278. The Makefile exports this; THIS lane did not, so the four TLS files
@@ -51,7 +54,7 @@ export MSSQL_TEST_CONNECTION_STRING="${MSSQL_TEST_CONNECTION_STRING:-$MSSQL_TEST
 # TLS on by default with a self-signed certificate (see tls_connection.test), so
 # there is nothing to opt into. check_require_env.sh now requires the export in
 # both lanes, and will fail if this line is removed.
-export MSSQL_TEST_DSN_TLS="${MSSQL_TEST_DSN_TLS:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/${MSSQL_TEST_DB}?encrypt=true}"
+export MSSQL_TEST_DSN_TLS="${MSSQL_TEST_DSN_TLS:-mssql://${MSSQL_TEST_USER}:${MSSQL_TEST_PASS}@${MSSQL_TEST_HOST}:${MSSQL_TEST_PORT}/${MSSQL_TEST_DB}?encrypt=true&trustservercertificate=true}"
 
 if [[ -z "$DUCKDB_CLI" ]] || [[ -z "$EXTENSION_PATH" ]]; then
     echo "ERROR: Both arguments required" >&2
@@ -153,8 +156,8 @@ if [[ ! -x "$UNITTEST_BIN" ]]; then
 fi
 
 echo "Runner: $UNITTEST_BIN"
-echo "  MSSQL_TEST_DSN:   Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};User Id=${MSSQL_TEST_USER};Password=***"
-echo "  MSSQL_TESTDB_DSN: Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=***"
+echo "  MSSQL_TEST_DSN:   Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=${MSSQL_TEST_DB};User Id=${MSSQL_TEST_USER};Password=***;TrustServerCertificate=yes"
+echo "  MSSQL_TESTDB_DSN: Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=***;TrustServerCertificate=yes"
 echo ""
 
 # Fail if the seed is missing rather than letting every test skip or fail one by one.

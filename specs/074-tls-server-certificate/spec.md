@@ -159,9 +159,15 @@ opened outside these eight sites.
 The docker server's certificate is self-generated, so every DSN that reaches
 it says so: `MSSQL_TEST_DSN` / `MSSQL_TESTDB_DSN` gain
 `;TrustServerCertificate=yes` and `MSSQL_TEST_DSN_TLS` gains
-`&trustservercertificate=true` in the Makefile (CI builds its DSNs there and
-nowhere else); the test files that spell a `localhost` DSN inline get the same
-(21 files); the Kerberos stack's examples already carry it. The Azure lane
+`&trustservercertificate=true` in the Makefile **and** in
+`scripts/ci/integration_test.sh`, which is the CI lane's own copy of those
+defaults (it mirrors the Makefile "verbatim" by its own comment, and the first
+push of this PR proved that a change to one is not a change to the other: the
+Linux integration job failed on its smoke test's secret and its DSN defaults
+alone). The CI smoke test's secret (`scripts/sql/smoke_test.sql`) says
+`trust_server_certificate true`; the test files that spell a `localhost` DSN
+or build one from `MSSQL_TEST_HOST` get the same (ten files); the Kerberos
+stack's examples already carry it. The Azure lane
 runs with the default: the chain check against Azure SQL, and against Fabric
 through its routing hop, is the live acceptance.
 
