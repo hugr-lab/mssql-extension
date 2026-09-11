@@ -615,6 +615,13 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_vector_encodings.cpp \
     test/cpp/test_collation_metadata.cpp \
     test/cpp/test_tls_verification.cpp \
+    test/cpp/test_value_serializer.cpp \
+    test/cpp/test_batch_builder.cpp \
+    test/cpp/test_insert_executor.cpp \
+    test/cpp/test_jwt_parser.cpp \
+    test/cpp/test_fedauth_encoding.cpp \
+    test/cpp/test_bcp_row_encoder.cpp \
+    test/cpp/test_incremental_cache.cpp \
     test/cpp/test_pool_creation_failure.cpp \
     test/cpp/test_token_parser_tokens.cpp \
     test/cpp/codec/test_binary_codec.cpp \

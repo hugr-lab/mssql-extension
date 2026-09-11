@@ -21,12 +21,12 @@
 #include <cstring>
 #include <iostream>
 
+#include "dml/insert/mssql_batch_builder.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
+#include "dml/insert/mssql_insert_target.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "insert/mssql_batch_builder.hpp"
-#include "insert/mssql_insert_config.hpp"
-#include "insert/mssql_insert_target.hpp"
 
 using namespace duckdb;
 
@@ -132,8 +132,10 @@ MSSQLInsertConfig CreateTestConfig(idx_t batch_size = 10, idx_t max_sql_bytes = 
 	return config;
 }
 
-DataChunk CreateTestChunk(idx_t row_count) {
-	DataChunk chunk;
+// unique_ptr, not by value: DataChunk is neither copyable nor movable.
+unique_ptr<DataChunk> CreateTestChunk(idx_t row_count) {
+	auto chunk_ptr = make_uniq<DataChunk>();
+	auto &chunk = *chunk_ptr;
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
 	chunk.Initialize(Allocator::DefaultAllocator(), types);
 
@@ -146,7 +148,7 @@ DataChunk CreateTestChunk(idx_t row_count) {
 	}
 
 	chunk.SetChildCardinality(row_count);
-	return chunk;
+	return chunk_ptr;
 }
 
 //==============================================================================
@@ -163,7 +165,8 @@ void test_add_row_basic() {
 	ASSERT_EQ(builder.GetPendingRowCount(), 0u);
 	ASSERT_EQ(builder.GetBatchCount(), 0u);
 
-	auto chunk = CreateTestChunk(3);
+	auto chunk_ptr = CreateTestChunk(3);
+	auto &chunk = *chunk_ptr;
 
 	// Add first row
 	ASSERT_TRUE(builder.AddRow(chunk, 0));
@@ -191,7 +194,8 @@ void test_flush_batch() {
 	auto config = CreateTestConfig(10);
 	MSSQLBatchBuilder builder(target, config, false);
 
-	auto chunk = CreateTestChunk(3);
+	auto chunk_ptr = CreateTestChunk(3);
+	auto &chunk = *chunk_ptr;
 
 	// Add 3 rows
 	builder.AddRow(chunk, 0);
@@ -212,7 +216,7 @@ void test_flush_batch() {
 	ASSERT_EQ(batch.row_count, 3u);
 	ASSERT_EQ(batch.row_offset_start, 0u);
 	ASSERT_EQ(batch.row_offset_end, 3u);
-	ASSERT_EQ(batch.state, MSSQLInsertBatch::State::READY);
+	ASSERT_EQ(static_cast<int>(batch.state), static_cast<int>(MSSQLInsertBatch::State::READY));
 
 	// Verify SQL contains expected parts
 	ASSERT_CONTAINS(batch.sql_statement, "INSERT INTO");
@@ -235,7 +239,8 @@ void test_row_count_limit() {
 	auto config = CreateTestConfig(3);	// Only 3 rows per batch
 	MSSQLBatchBuilder builder(target, config, false);
 
-	auto chunk = CreateTestChunk(5);
+	auto chunk_ptr = CreateTestChunk(5);
+	auto &chunk = *chunk_ptr;
 
 	// Add rows up to limit
 	ASSERT_TRUE(builder.AddRow(chunk, 0));
@@ -271,7 +276,8 @@ void test_progress_tracking() {
 	auto config = CreateTestConfig(2);	// 2 rows per batch
 	MSSQLBatchBuilder builder(target, config, false);
 
-	auto chunk = CreateTestChunk(6);
+	auto chunk_ptr = CreateTestChunk(6);
+	auto &chunk = *chunk_ptr;
 
 	// Add rows and track offsets
 	builder.AddRow(chunk, 0);
@@ -316,7 +322,8 @@ void test_output_clause() {
 	auto config = CreateTestConfig(10);
 	MSSQLBatchBuilder builder(target, config, true);  // With OUTPUT
 
-	auto chunk = CreateTestChunk(2);
+	auto chunk_ptr = CreateTestChunk(2);
+	auto &chunk = *chunk_ptr;
 	builder.AddRow(chunk, 0);
 	builder.AddRow(chunk, 1);
 
@@ -360,7 +367,8 @@ void test_large_batch() {
 	auto config = CreateTestConfig(100, 1024 * 1024);  // 100 rows, 1MB
 	MSSQLBatchBuilder builder(target, config, false);
 
-	auto chunk = CreateTestChunk(100);
+	auto chunk_ptr = CreateTestChunk(100);
+	auto &chunk = *chunk_ptr;
 
 	// Add 100 rows
 	for (idx_t i = 0; i < 100; i++) {

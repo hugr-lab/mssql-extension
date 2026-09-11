@@ -343,13 +343,11 @@ test/
 │   └── tls_secret.test             # TLS secret tests
 └── cpp/                            # C++ unit tests
     ├── test_batch_builder.cpp      # INSERT batch building
-    ├── test_connection_pool.cpp    # Connection pooling
     ├── test_ddl_translator.cpp     # DDL translation
     ├── test_insert_executor.cpp    # INSERT execution
     ├── test_multi_connection_transactions.cpp # Multi-connection transaction isolation
     ├── test_simple_query.cpp       # Basic query execution
     ├── test_statistics_provider.cpp # Statistics collection
-    ├── test_tls_connection.cpp     # TLS connection support
     └── test_value_serializer.cpp   # Type serialization
 ```
 
