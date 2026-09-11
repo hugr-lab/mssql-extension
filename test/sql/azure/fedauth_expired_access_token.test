@@ -1,0 +1,46 @@
+# name: test/sql/azure/fedauth_expired_access_token.test
+# description: a fixed Azure AD token that has already expired is refused BY NAME, before any socket (issue #302, spec 073)
+# group: [azure]
+# issue: 302
+
+# Environment variables required:
+#   AZURE_SQL_DB_HOST, AZURE_SQL_DB - an Azure SQL endpoint (the login is never reached)
+#
+# Azure SQL does not answer an expired FEDAUTH token with an error token; it
+# drops the connection, and the client learns nothing but "failed to receive"
+# after the login read runs out (spec 073 F7). So the expiry has to be
+# diagnosed on the client, from the token's own `exp`, before dialing. The
+# `access_token` provider used to be given a flat hour from the moment the
+# secret was read, whatever its exp said.
+#
+# The token below is well-formed, unsigned, and expired at 2001-09-09 01:46:40
+# UTC (exp = 1000000000). It is refused at ATTACH, which is where a fixed token
+# is first read; the pool factory applies the same check to a refill.
+
+require mssql
+
+require azure
+
+require-env AZURE_SQL_DB_HOST
+
+require-env AZURE_SQL_DB
+
+statement ok
+CREATE SECRET expired_token (
+    TYPE azure,
+    PROVIDER access_token,
+    ACCESS_TOKEN 'eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJSUzI1NiJ9.eyJhdWQiOiAiaHR0cHM6Ly9kYXRhYmFzZS53aW5kb3dzLm5ldC8iLCAiaXNzIjogImh0dHBzOi8vc3RzLndpbmRvd3MubmV0LyIsICJpYXQiOiA5OTk5OTY0MDAsICJuYmYiOiA5OTk5OTY0MDAsICJleHAiOiAxMDAwMDAwMDAwfQ.fake-signature'
+);
+
+statement error
+ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS az (TYPE mssql, AZURE_SECRET expired_token);
+----
+expired at 2001-09-09
+
+statement error
+ATTACH 'Server=${AZURE_SQL_DB_HOST};Database=${AZURE_SQL_DB}' AS az (TYPE mssql, AZURE_SECRET expired_token);
+----
+DETACH and ATTACH with a new one
+
+statement ok
+DROP SECRET expired_token;

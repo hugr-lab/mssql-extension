@@ -18,6 +18,7 @@
 #include <map>
 #include <sstream>
 #include <vector>
+#include "azure/jwt_parser.hpp"
 
 // Windows compatibility for popen/pclose
 #ifdef _WIN32
@@ -411,9 +412,13 @@ static std::string ExtractErrorMessage(const std::exception &e) {
 
 TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 						 const std::string &tenant_id_override) {
+	return AcquireToken(*context.db, secret_name, tenant_id_override, /*allow_interactive=*/true);
+}
+
+TokenResult AcquireToken(DatabaseInstance &db_instance, const std::string &secret_name,
+						 const std::string &tenant_id_override, bool allow_interactive) {
 	// Spec 047 FR-012: cache lookups are namespaced by DatabaseInstance address
 	// so two DuckDB instances sharing a secret name cannot alias each other's tokens.
-	auto &db_instance = *context.db;
 
 	// Check cache first (include tenant in cache key for interactive auth)
 	std::string cache_key = secret_name;
@@ -429,7 +434,7 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 
 	try {
 		// Read Azure secret
-		AzureSecretInfo info = ReadAzureSecret(context, secret_name);
+		AzureSecretInfo info = ReadAzureSecret(db_instance, secret_name);
 
 		// Apply tenant_id override for interactive auth
 		if (!tenant_id_override.empty()) {
@@ -440,8 +445,24 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 
 		// Choose authentication method based on provider
 		if (info.provider == "access_token") {
-			// Issue #57: Pre-provided token - return directly, no HTTP/CLI needed
+			// A fixed token cannot be refreshed, so its own `exp` is the only
+			// thing that can say when it stops working -- and it must say it
+			// HERE, before a socket is opened: Azure SQL does not answer an
+			// expired FEDAUTH token with an error, it drops the connection, so
+			// the server-side message is "failed to receive" after the login read
+			// times out (spec 073 F7). The old code gave every static token a
+			// flat hour from the moment it was read, whatever its exp said.
 			auto expires_at = std::chrono::system_clock::now() + std::chrono::seconds(DEFAULT_TOKEN_LIFETIME_SECONDS);
+			JwtClaims claims = ParseJwtClaims(info.access_token);
+			if (claims.valid && claims.exp > 0) {
+				if (IsTokenExpired(claims.exp, /*margin_seconds=*/0)) {
+					return TokenResult::Failure(
+						"Azure AD access token in secret '" + secret_name + "' expired at " +
+						FormatTimestamp(claims.exp) +
+						"; a fixed token cannot be refreshed -- DETACH and ATTACH with a new one");
+				}
+				expires_at = std::chrono::system_clock::from_time_t(static_cast<time_t>(claims.exp));
+			}
 			result = TokenResult::Success(info.access_token, expires_at);
 		} else if (info.provider == "service_principal") {
 			result = AcquireTokenForServicePrincipal(info);
@@ -453,6 +474,16 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 			} else if (ChainContainsCLI(info.chain)) {
 				result = AcquireTokenWithAzureCLI(info);
 			} else if (ChainContainsInteractive(info.chain)) {
+				if (!allow_interactive) {
+					// A pooled connection is created on a worker thread, in the
+					// middle of a query, with no user watching a terminal.
+					// Prompting there would hang the statement on a device code
+					// nobody will enter.
+					return TokenResult::Failure("Azure AD token for secret '" + secret_name +
+												"' has expired and its credential chain needs interactive "
+												"authentication, which cannot run from a pooled connection; DETACH "
+												"and ATTACH to authenticate again");
+				}
 				result = AcquireInteractiveToken(info);
 			} else {
 				result = TokenResult::Failure("Unsupported credential chain: " + info.chain +
@@ -467,6 +498,19 @@ TokenResult AcquireToken(ClientContext &context, const std::string &secret_name,
 
 		// Cache successful result
 		if (result.success) {
+			// The cache's expiry must be the TOKEN's, not a guess: the CLI, env
+			// and static-token paths used to store now + 3600 s, so a cache hit
+			// proved the entry was young, not that the JWT was unexpired -- and a
+			// token minted 55 minutes before it reached us walked straight into
+			// the F7 hangup with a "valid" cache entry (spec 073 review). Every
+			// Azure AD access token is a JWT with an exp; the fabricated lifetime
+			// stays only for a token that does not parse as one.
+			{
+				JwtClaims claims = ParseJwtClaims(result.access_token);
+				if (claims.valid && claims.exp > 0) {
+					result.expires_at = std::chrono::system_clock::from_time_t(static_cast<time_t>(claims.exp));
+				}
+			}
 			TokenCache::Instance().SetToken(db_instance, cache_key, result.access_token, result.expires_at);
 		}
 

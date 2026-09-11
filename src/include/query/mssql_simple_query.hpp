@@ -52,6 +52,20 @@ struct SimpleQueryResult {
 	bool HasError() const {
 		return !success;
 	}
+
+	//! The failure for a human, naming the server only when it spoke:
+	//! "SQL Server error 18456: Login failed for user 'sa'." -- or, when
+	//! error_number is 0 (a query timeout, a socket failure, and since issue
+	//! #323 a TDS parse error), just the message. Two callers used to format
+	//! this independently, and when #323 taught one of them not to blame the
+	//! server for the client's own parser, the other kept doing it (PR #332
+	//! review).
+	std::string DescribeError() const {
+		if (error_number == 0) {
+			return error_message;
+		}
+		return "SQL Server error " + std::to_string(error_number) + ": " + error_message;
+	}
 	bool HasRows() const {
 		return !rows.empty();
 	}

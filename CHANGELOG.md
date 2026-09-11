@@ -43,6 +43,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attached Azure AD catalog can open new connections after its token has
+  expired** ([#302](https://github.com/hugr-lab/mssql-extension/issues/302),
+  spec 073). The pool factory captured the FEDAUTH token bytes at `ATTACH` and
+  presented them for every connection it ever created; an Azure AD token lives
+  **60 minutes**, so a pool refill hours later — a second scan in a join, an
+  `UPDATE` after the idle connection was reaped — was dropped by the gateway
+  and reported as `Failed to acquire connection from pool (timeout)` after the
+  full `mssql_acquire_timeout` (measured: 600 s, then `DETACH`/`ATTACH` and it
+  worked). The token is now resolved when a *connection* is created: the
+  factory holds the secret's name and the `DatabaseInstance`, `TokenCache`
+  answers while the token is good and the secret is re-read and a new token
+  minted past the refresh margin. A fixed `access_token` secret, and an
+  interactive credential chain that cannot mint silently from a worker thread,
+  fail **by name** — *"expired at …; DETACH and ATTACH …"* — before any socket
+  is opened, because Azure SQL will not say "expired" itself: it hangs up.
+
+- **A connection the pool cannot create no longer looks like a full pool.**
+  `Acquire` treated a factory failure as exhaustion and waited for a `Release`
+  that, with nothing active, could not come — then said "(timeout)" and threw
+  the reason away. Now: nothing active → fail at once, every time; others
+  active → keep waiting for a release, but retry creation on a backoff
+  (250 ms doubling to 4 s), not on every wakeup; and the message carries the
+  reason of **this** call's attempt — `could not create a connection: Login
+  failed for user 'sa'.` — while a timeout on a pool that has since recovered
+  is reported as the timeout it is. A wrong password used to take
+  `mssql_acquire_timeout` seconds to say nothing.
+
+- **`mssql_connection_timeout` now bounds a pool refill.** Every factory passed
+  no timeout to `Connect` (compiled-in 30 s), and every login-phase read —
+  PRELOGIN, TLS, LOGIN7 and FEDAUTH responses, on all three auth paths — had
+  `DEFAULT_CONNECTION_TIMEOUT` spelled out. The setting governed `ATTACH`-time
+  validation and nothing after it. This is the reporter's "31 seconds": one
+  30 s login read on a connection the gateway had dropped.
+
+- **Stored-procedure calls desynced the TDS parser**
+  ([#323](https://github.com/hugr-lab/mssql-extension/issues/323), spec 072).
+  RETURNSTATUS (0x79) is a fixed five-byte token with no length field, and the
+  parser skipped it as if it carried one: a procedure returning 0 left two bytes
+  behind, one returning *n* ate *n* bytes of the DONEPROC that follows. Through
+  `mssql_scan` that was `TDS parse error: Unknown token type: 0x0` and a
+  discarded connection. Through `mssql_exec` it was **worse and silent**: the
+  batch reported success with every token after the procedure dropped —
+  including a SQL Server ERROR raised after `EXEC`, so `EXEC p; RAISERROR(…)`
+  returned 0 with no error. Three more in the same group, found by the survey:
+  TABNAME was registered as 0x04 (the wire says 0xA4, so any `FOR BROWSE`
+  result failed); RETURNVALUE has no length field either and now fails by name
+  instead of mis-skipping (it is unreachable — sent only for RPC, which the
+  extension does not issue); and the unknown-token message printed decimal
+  after `0x`, so 0xA4 read as `0x164`. `mssql_exec` now reports a parser error
+  as an error rather than as end-of-batch, after draining to EOM so the
+  connection stays reusable.
+
 - **A metadata load that fails mid-query no longer mutates the cache**
   ([#317](https://github.com/hugr-lab/mssql-extension/issues/317), reported by
   [@oluies](https://github.com/oluies)). `LoadAllSchemasMetadata` cleared each

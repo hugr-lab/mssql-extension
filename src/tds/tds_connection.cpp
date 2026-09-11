@@ -142,6 +142,16 @@ bool TdsConnection::Connect(const std::string &host, uint16_t port, int timeout_
 		return false;
 	}
 
+	// Spec 073 review: `mssql_connection_timeout` is registered non-negative, so
+	// 0 is legal, and since W3 the value reaches the dial and every login-phase
+	// read -- where a literal 0 is poll(fd, 1, 0), an instant "Socket timeout"
+	// on every pooled connection. 0 (or less) means the compiled-in default at
+	// this one boundary every path crosses. Not "wait forever": a dial or a
+	// login read that never completes must not hang a pool refill.
+	if (timeout_seconds <= 0) {
+		timeout_seconds = DEFAULT_CONNECTION_TIMEOUT;
+	}
+
 	host_ = host;
 	port_ = port;
 	connect_timeout_seconds_ = timeout_seconds;
@@ -211,7 +221,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 	}
 
 	std::vector<uint8_t> response;
-	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+	if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 		last_error_ = "Failed to receive PRELOGIN response: " + socket_->GetLastError();
 		return false;
 	}
@@ -242,7 +252,7 @@ bool TdsConnection::DoPrelogin(bool use_encrypt) {
 		// Server agreed to encryption (ENCRYPT_ON or ENCRYPT_REQ)
 		// Enable TLS on the socket BEFORE sending LOGIN7
 		// Pass next_packet_id_ so TLS handshake packets continue the sequence
-		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000, "", tls_options_)) {
+		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000, "", tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}
@@ -497,7 +507,7 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 	}
 
 	std::vector<uint8_t> response;
-	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+	if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 		last_error_ = "Failed to receive PRELOGIN response: " + socket_->GetLastError();
 		return false;
 	}
@@ -528,7 +538,7 @@ bool TdsConnection::DoPreloginWithFedAuth(bool use_encrypt, const std::string &s
 		}
 
 		// Enable TLS - optionally override SNI hostname for Azure routing
-		if (!socket_->EnableTls(next_packet_id_, DEFAULT_CONNECTION_TIMEOUT * 1000, sni_hostname, tls_options_)) {
+		if (!socket_->EnableTls(next_packet_id_, connect_timeout_seconds_ * 1000, sni_hostname, tls_options_)) {
 			last_error_ = "TLS handshake failed: " + socket_->GetLastError();
 			return false;
 		}
@@ -594,7 +604,7 @@ LoginAttemptOutcome TdsConnection::DoLogin7WithFedAuth(const std::string &databa
 
 	// Step 2: Receive response (should contain FEDAUTHINFO token)
 	std::vector<uint8_t> response;
-	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+	if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 		last_error_ = "Failed to receive LOGIN7 response: " + socket_->GetLastError();
 		MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ReceiveMessage failed: %s", last_error_.c_str());
 		return LoginAttemptOutcome::Failure;
@@ -671,7 +681,7 @@ LoginAttemptOutcome TdsConnection::DoLogin7WithFedAuth(const std::string &databa
 
 		// Step 4: Receive final response (LOGINACK or ROUTING)
 		response.clear();
-		if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+		if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 			last_error_ = "Failed to receive LOGINACK after FEDAUTH_TOKEN: " + socket_->GetLastError();
 			MSSQL_CONN_DEBUG_LOG(1, "DoLogin7WithFedAuth: ReceiveMessage after token failed: %s", last_error_.c_str());
 			return LoginAttemptOutcome::Failure;
@@ -862,7 +872,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 		constexpr int MAX_SSPI_ROUNDS = 8;	// SPNEGO with cross-realm trust typically 2-3 rounds
 		for (int round = 0; round < MAX_SSPI_ROUNDS; round++) {
 			std::vector<uint8_t> response;
-			if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+			if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 				last_error_ = "Failed to receive LOGIN7 response (integrated): " + socket_->GetLastError();
 				return LoginAttemptOutcome::Failure;
 			}
@@ -999,7 +1009,7 @@ LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const s
 	}
 
 	std::vector<uint8_t> response;
-	if (!socket_->ReceiveMessage(response, DEFAULT_CONNECTION_TIMEOUT * 1000)) {
+	if (!socket_->ReceiveMessage(response, connect_timeout_seconds_ * 1000)) {
 		last_error_ = "Failed to receive LOGIN7 response: " + socket_->GetLastError();
 		return LoginAttemptOutcome::Failure;
 	}
