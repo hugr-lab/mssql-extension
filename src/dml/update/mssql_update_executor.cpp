@@ -280,9 +280,15 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 			bool is_eom = packet.IsEndOfMessage();
 
-			// Feed packet payload to parser
+			// Feed packet payload to parser -- but not into a parser already in
+			// Error. From there TryParseNext returns at once, so ConsumeBytes and
+			// with it CompactBuffer never run, and every fed byte is retained;
+			// a desync early in a batched response buffers the whole tail for
+			// nothing. The drain to EOM below still runs: that is what leaves the
+			// socket clean for the next statement. MSSQLSimpleQuery already does
+			// this (issue #323); these four loops are copies of the same loop.
 			const auto &payload = packet.GetPayload();
-			if (!payload.empty()) {
+			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
 				parser.Feed(payload);
 			}
 
@@ -318,6 +324,18 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 					// Skip other tokens
 					break;
 				}
+			}
+
+			// A parser stuck in Error answers NeedMoreData forever, so the token
+			// loop above has already exited and the EOM branch below forces done
+			// and reports SUCCESS -- dropping every token after the desync,
+			// including a SQL Server ERROR token following a stored-procedure
+			// call, which is the one a caller most needs. Record it as the
+			// failure it is. A SQL error already captured keeps precedence.
+			if (parser.GetState() == tds::ParserState::Error && error_message.empty()) {
+				error_number = 0;
+				error_message = "TDS parse error: " + parser.GetParseError();
+				UPDATE_DEBUG(1, "ExecuteBatch: %s", error_message.c_str());
 			}
 
 			// Handle EOM without done token

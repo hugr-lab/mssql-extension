@@ -234,7 +234,8 @@ bool CTASExecutionState::TableExists(ClientContext &context) {
 	auto &pool = catalog->GetConnectionPool();
 	auto conn = pool.Acquire();
 	if (!conn) {
-		throw IOException("Failed to acquire connection to check table existence");
+		throw IOException("Failed to acquire connection to check table existence: " +
+						  pool.DescribeAcquireFailure());
 	}
 
 	try {
@@ -258,7 +259,8 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 	auto &pool = catalog->GetConnectionPool();
 	auto conn = pool.Acquire();
 	if (!conn) {
-		throw IOException("Failed to acquire connection to check schema existence");
+		throw IOException("Failed to acquire connection to check schema existence: " +
+						  pool.DescribeAcquireFailure());
 	}
 
 	try {
@@ -543,7 +545,8 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	auto &pool = catalog->GetConnectionPool();
 	connection = pool.Acquire();
 	if (!connection) {
-		throw IOException("CTAS BCP: Failed to acquire connection from pool");
+		throw IOException("CTAS BCP: Failed to acquire connection from pool: " +
+						  pool.DescribeAcquireFailure());
 	}
 
 	try {
