@@ -102,10 +102,6 @@ bool ConnectionProvider::IsSqlServerTransactionActive(ClientContext &context, MS
 	return txn->IsSqlServerTransactionActive();
 }
 
-//===----------------------------------------------------------------------===//
-// ConnectionProvider::GetConnection
-//===----------------------------------------------------------------------===//
-
 std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientContext &context, MSSQLCatalog &catalog,
 																	  int timeout_ms) {
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
@@ -124,9 +120,10 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		auto stats_before = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
 					   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
-		auto conn = pool.Acquire(timeout_ms);
+		std::string why;
+		auto conn = pool.Acquire(timeout_ms, &why);
 		if (!conn) {
-			throw IOException("MSSQL: Failed to acquire connection from pool (timeout)");
+			throw IOException("MSSQL: Failed to acquire connection: " + why);
 		}
 		auto stats_after = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool connection acquired, tds_conn=%p, spid=%d, has_txn_desc=%d",
@@ -155,9 +152,10 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	auto stats_before = pool.GetStats();
 	MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
 				   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
-	auto conn = pool.Acquire(timeout_ms);
+	std::string why;
+	auto conn = pool.Acquire(timeout_ms, &why);
 	if (!conn) {
-		throw IOException("MSSQL: Failed to acquire connection from pool for transaction (timeout)");
+		throw IOException("MSSQL: Failed to acquire connection for transaction: " + why);
 	}
 	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning", (void *)conn.get(), conn->GetSpid());
 

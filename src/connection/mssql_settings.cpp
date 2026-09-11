@@ -70,7 +70,10 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  SetScope::GLOBAL);
 
 	// mssql_connection_timeout - TCP connection timeout in seconds
-	config.AddExtensionOption("mssql_connection_timeout", "TCP connection timeout in seconds", LogicalType::BIGINT,
+	// 0 means the compiled-in default (30 s), not "no timeout" -- see
+	// TdsConnection::Connect (spec 073 review).
+	config.AddExtensionOption("mssql_connection_timeout",
+							  "TCP connection and login timeout in seconds (0 = the default, 30)", LogicalType::BIGINT,
 							  Value::BIGINT(tds::DEFAULT_CONNECTION_TIMEOUT), ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_login7_max_packet - TEST-ONLY (issue #138). Lowers the LOGIN7 / SSPI
