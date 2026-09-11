@@ -20,11 +20,11 @@
 #include <cstring>
 #include <iostream>
 
-#include "duckdb/common/types.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_error.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
+#include "duckdb/common/types.hpp"
 
 using namespace duckdb;
 

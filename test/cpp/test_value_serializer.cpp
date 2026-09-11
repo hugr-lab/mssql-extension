@@ -22,13 +22,13 @@
 #include <iostream>
 #include <limits>
 
+#include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "dml/insert/mssql_value_serializer.hpp"
 
 using namespace duckdb;
 
@@ -233,8 +233,11 @@ void test_serialize_string_sql_injection() {
 	ASSERT_STARTS_WITH(result, "N'");
 	// Single quote should be doubled
 	ASSERT_CONTAINS(result, "''");
-	// Should NOT contain unescaped single quote followed by semicolon
-	ASSERT_NOT_CONTAINS(result, "';");
+	// The whole input stays INSIDE one literal: the quote is doubled and the
+	// literal closes only at the very end. (The old assertion, "no ';
+	// anywhere", was wrong: N'''; DROP ...' legitimately contains it, as the
+	// doubled quote followed by the input's own semicolon.)
+	ASSERT_EQ(result, std::string("N'''; DROP TABLE users; --'"));
 	std::cout << "  Injection attempt 1: " << result << std::endl;
 
 	// SQL injection with comment
@@ -247,8 +250,10 @@ void test_serialize_string_sql_injection() {
 	// Multiple quotes in injection
 	val = Value("' OR ''='");
 	result = MSSQLValueSerializer::Serialize(val, LogicalType::VARCHAR);
-	// All quotes should be doubled
-	ASSERT_NOT_CONTAINS(result, "' OR");  // Opening quote should be escaped
+	// All quotes should be doubled -- exactly: the input's three quotes become
+	// six inside the literal. ("no ' OR anywhere" was the old assertion, and
+	// the correct output contains it: a doubled quote followed by the input.)
+	ASSERT_EQ(result, std::string("N''' OR ''''='''"));
 	std::cout << "  Injection attempt 3: " << result << std::endl;
 
 	// UNION-based injection
@@ -262,7 +267,8 @@ void test_serialize_string_sql_injection() {
 	result = MSSQLValueSerializer::Serialize(val, LogicalType::VARCHAR);
 	ASSERT_CONTAINS(result, "''");
 	// Make sure the semicolon is inside the string, not breaking out
-	ASSERT_NOT_CONTAINS(result, "';");
+	// Exactly: both quotes doubled, the literal closes only at the end.
+	ASSERT_EQ(result, std::string("N'''; INSERT INTO users VALUES(''hacker''); --'"));
 	std::cout << "  Injection attempt 5: " << result << std::endl;
 
 	// Unicode-based injection attempts
@@ -430,13 +436,13 @@ void test_serialize_blob() {
 	std::cout << "\n=== Test: SerializeBlob ===" << std::endl;
 
 	// Simple blob
-	Value val = Value::BLOB("\x00\x01\x02\x03", 4);
+	Value val = Value::BLOB(reinterpret_cast<const_data_ptr_t>("\x00\x01\x02\x03"), 4);
 	auto result = MSSQLValueSerializer::Serialize(val, LogicalType::BLOB);
 	ASSERT_STARTS_WITH(result, "0x");
 	ASSERT_CONTAINS(result, "00010203");
 
 	// Empty blob
-	val = Value::BLOB("", 0);
+	val = Value::BLOB(reinterpret_cast<const_data_ptr_t>(""), 0);
 	result = MSSQLValueSerializer::Serialize(val, LogicalType::BLOB);
 	ASSERT_EQ(result, "0x");
 
@@ -445,7 +451,9 @@ void test_serialize_blob() {
 	all_bytes += '\xFF';
 	all_bytes += '\x00';
 	all_bytes += '\xAB';
-	val = Value::BLOB(all_bytes);
+	// The string overload of Value::BLOB PARSES its argument (\xNN escapes,
+	// non-ASCII bytes rejected); raw bytes go through the pointer overload.
+	val = Value::BLOB(reinterpret_cast<const_data_ptr_t>(all_bytes.data()), all_bytes.size());
 	result = MSSQLValueSerializer::Serialize(val, LogicalType::BLOB);
 	ASSERT_STARTS_WITH(result, "0x");
 	ASSERT_CONTAINS(result, "FF00AB");
@@ -504,9 +512,9 @@ void test_serialize_timestamp() {
 	ASSERT_CONTAINS(result, "15");
 	ASSERT_CONTAINS(result, "14");
 	ASSERT_CONTAINS(result, "30");
-	// Should use CAST to datetime2
-	ASSERT_CONTAINS(result, "CAST");
-	ASSERT_CONTAINS(result, "datetime2");
+	// A CAST to DATETIME2(7) -- the type name is upper-case, and the literal
+	// carries the full seven digits (the old check wanted lower-case "datetime2").
+	ASSERT_EQ(result, std::string("CAST('2024-01-15T14:30:00.0000000' AS DATETIME2(7))"));
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -577,9 +585,19 @@ void test_serialize_ubigint() {
 void test_serialize_small_integers() {
 	std::cout << "\n=== Test: SerializeTinyInt and SmallInt ===" << std::endl;
 
-	// TINYINT
-	Value val = Value::TINYINT(255);
+	// DuckDB TINYINT is a signed int8 (-128..127); Value::TINYINT(255) wraps to
+	// -1, which is what the old assertion tripped on. SQL Server's tinyint is
+	// 0..255 and maps to DuckDB UTINYINT, tested below.
+	Value val = Value::TINYINT(127);
 	auto result = MSSQLValueSerializer::Serialize(val, LogicalType::TINYINT);
+	ASSERT_EQ(result, "127");
+
+	val = Value::TINYINT(-128);
+	result = MSSQLValueSerializer::Serialize(val, LogicalType::TINYINT);
+	ASSERT_EQ(result, "-128");
+
+	val = Value::UTINYINT(255);
+	result = MSSQLValueSerializer::Serialize(val, LogicalType::UTINYINT);
 	ASSERT_EQ(result, "255");
 
 	val = Value::TINYINT(0);

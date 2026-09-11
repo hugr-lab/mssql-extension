@@ -12,6 +12,19 @@
 
 #include "catalog/mssql_metadata_cache.hpp"
 
+// ASSERT_EQ streams both sides; the cache state enums have no operator<<.
+namespace duckdb {
+static std::ostream &operator<<(std::ostream &os, CacheLoadState s) {
+	return os << static_cast<int>(s);
+}
+static std::ostream &operator<<(std::ostream &os, MSSQLCacheState s) {
+	return os << static_cast<int>(s);
+}
+static std::ostream &operator<<(std::ostream &os, MSSQLObjectType s) {
+	return os << static_cast<int>(s);
+}
+}  // namespace duckdb
+
 using namespace duckdb;
 
 //==============================================================================

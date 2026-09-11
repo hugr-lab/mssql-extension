@@ -127,7 +127,8 @@ Tests that don't require SQL Server:
 
 | Test File | Description |
 |-----------|-------------|
-| `test_connection_pool.cpp` | Connection pool integration tests |
+| `test_pool_creation_failure.cpp` | Pool behaviour when a connection cannot be created (server-free) |
+| `test_tls_verification.cpp` | Server-certificate verification against an in-process TLS server (server-free) |
 | `test_simple_query.cpp` | MSSQLSimpleQuery API tests (metadata query execution) |
 
 #### Running C++ Tests
@@ -146,35 +147,10 @@ make test-simple-query
 
 **Connection Pool Test (manual compilation):**
 
-```bash
-# Compile the test
-clang++ -std=c++17 -I src/include -I duckdb/src/include \
-    test/cpp/test_connection_pool.cpp \
-    src/tds/connection_pool.cpp \
-    src/tds/tds_connection.cpp \
-    src/tds/tds_protocol.cpp \
-    src/tds/tds_types.cpp \
-    src/tds/tds_socket.cpp \
-    src/tds/tds_packet.cpp \
-    src/encoding/utf16.cpp \
-    -o build/debug/test_connection_pool \
-    -pthread
-
-# Run the test
-MSSQL_TEST_HOST=localhost \
-MSSQL_TEST_PORT=1433 \
-MSSQL_TEST_USER=sa \
-MSSQL_TEST_PASS=TestPassword1 \
-MSSQL_TEST_DB=master \
-./build/debug/test_connection_pool
-```
-
-The test verifies:
-- Basic acquire/release from pool
-- Connection reuse efficiency
-- Pool limit enforcement
-- Parallel connection acquisition
-- Connection validation
+The server-free C++ tests are the `STANDALONE_TEST_SOURCES` list in the
+Makefile; `make test-cpp` builds and runs every one of them against the
+release archive, and CI runs the same list. Add a new test there, nowhere
+else: a test file the list does not name is compiled by nothing.
 
 ## Environment Variables
 
