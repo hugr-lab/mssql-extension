@@ -238,9 +238,11 @@ CHANGELOG (**Removed**) follow.
   is honoured.
 - **Fabric's routing hop.** The routed worker's certificate must match the
   routed host name for D3's default to hold. `go-mssqldb` relies on the same
-  thing; it is checked live on the Azure lane before merge, and if it does
-  not hold, `HostNameInCertificate` is the documented way through and D3 is
-  revisited.
+  thing. **Checked live before merge**: the full Azure lane run from the
+  branch with an `azure` extension built against the 2.0 pin — 26 cases, 276
+  assertions, none skipped — passes `fabric_types.test` through the Fabric
+  Warehouse's login-time redirect under the default verification. Had it not
+  held, `HostNameInCertificate` was the documented way through.
 - **Windows store enumeration** (`CertEnumCertificatesInStore`) runs once per
   TLS context, i.e. once per pooled connection creation, not per query. The
   Azure client already pays it once per token request.
