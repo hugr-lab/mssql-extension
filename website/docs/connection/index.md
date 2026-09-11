@@ -21,7 +21,7 @@ filters or the application name.
 
 ```sql
 -- The basics: host, port, database, SQL authentication, TLS on
-ATTACH 'Server=localhost,1433;Database=AdventureWorks;User Id=sa;Password=...;Encrypt=yes'
+ATTACH 'Server=localhost,1433;Database=AdventureWorks;User Id=sa;Password=...;Encrypt=yes;TrustServerCertificate=yes'
     AS mssql (TYPE mssql);
 
 -- Named instance: the port is resolved through SQL Server Browser (UDP 1434)
@@ -293,7 +293,7 @@ ATTACH 'Server=nonexistent.host,1433;Database=master;User Id=sa;Password=pass'
 -- Error: MSSQL connection validation failed: Cannot resolve hostname 'nonexistent.host'
 
 -- Invalid credentials - fails immediately
-ATTACH 'Server=localhost,1433;Database=master;User Id=wrong;Password=wrong'
+ATTACH 'Server=localhost,1433;Database=master;User Id=wrong;Password=wrong;TrustServerCertificate=yes'
     AS db (TYPE mssql);
 -- Error: MSSQL connection validation failed: Authentication failed for user 'wrong'
 ```

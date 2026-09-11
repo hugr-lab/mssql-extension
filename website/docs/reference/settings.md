@@ -12,10 +12,10 @@ sidebar_position: 1
 | `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
 | `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
 | `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](../performance.md#owning-the-session-mssql_reset_connection)) |
-| `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | TCP connection timeout (seconds)         |
+| `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | Connection timeout (seconds): the TCP dial **and** every login-phase read after it (PRELOGIN, TLS, LOGIN7 / FEDAUTH), for ATTACH validation and for every pool refill. `0` means the 30 s default, **not** "no timeout": a dial or a login read that never completes must not hang a pool refill. |
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Minimum connections to maintain          |
-| `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | Connection acquire timeout (seconds)     |
+| `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | How long a query waits for a pooled connection to be **released** when the pool is at its limit. Not how long a failed connection takes to report: a connection the pool cannot create — wrong password, expired Azure AD token, refused dial — fails at once with the reason (`could not create a connection: Login failed for user 'sa'.`) when nothing is active, and with others active the pool keeps waiting for a release but retries creation on a backoff. |
 | `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite) |
 | `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |

@@ -352,6 +352,21 @@ Tokens are cached automatically:
 - First call: ~200ms (acquires from Azure AD)
 - Subsequent calls: ~0ms (uses cache)
 
+### Certificates
+
+Azure SQL Database, Azure SQL Managed Instance and Fabric Warehouse present
+publicly-chained certificates, so the default — the chain checked against the
+platform trust store and the subject against the host you connect to — passes
+with nothing added, including through the login-time redirect Fabric and the
+Redirect connection policy use (the redirected host is the one checked). Two
+cases need a word:
+
+- **A private endpoint or an SSH tunnel** reached under a name the certificate
+  was not issued for: add `HostNameInCertificate=<the server's public name>`
+  (URI `hostnameincertificate`, secret `host_name_in_certificate`).
+- **`TrustServerCertificate=yes`** turns verification off and is never needed
+  for Azure. See [TLS/SSL Configuration](./index.md#tlsssl-configuration).
+
 ### Token Lifetime and Long-Running Sessions
 
 An Azure AD access token lives **60 minutes**. Two things follow, and the
