@@ -1,0 +1,91 @@
+# name: test/sql/catalog/metadata_query_parameterized.test
+# description: the per-table metadata queries take the names as sp_executesql parameters (spec 075 W4)
+# group: [mssql]
+# issue: 334
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The table list, a table's columns, its primary key and its row-count estimate
+# used to carry the schema and table names inside the query text, so every
+# first touch of a table compiled a plan. They now travel as @s / @t
+# parameters of one fixed text per shape. A name that carries a quote and a
+# bracket is what would have broken the old text had it been escaped by hand;
+# here it goes through untouched.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mq75 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mq75', 'IF OBJECT_ID(''[o''''br]]ack].[t''''b]]l]'') IS NOT NULL DROP TABLE [o''br]]ack].[t''b]]l]');
+
+statement ok
+SELECT mssql_exec('mq75', 'IF SCHEMA_ID(''o''''br]ack'') IS NOT NULL DROP SCHEMA [o''br]]ack]');
+
+statement ok
+SELECT mssql_exec('mq75', 'CREATE SCHEMA [o''br]]ack]');
+
+statement ok
+SELECT mssql_exec('mq75', 'CREATE TABLE [o''br]]ack].[t''b]]l](id int NOT NULL PRIMARY KEY, name nvarchar(30) NULL); INSERT INTO [o''br]]ack].[t''b]]l] VALUES (1, N''a''), (2, N''b''), (3, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('mq75');
+
+# table list for the schema
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'mq75' AND schema_name = 'o''br]ack';
+----
+t'b]l
+
+# columns
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'mq75' AND schema_name = 'o''br]ack' AND table_name = 't''b]l' ORDER BY column_index;
+----
+id	INTEGER
+name	MSSQL_NVARCHAR(30)
+
+# the rows, the primary key (rowid), and the row-count estimate
+query II
+SELECT id, name FROM mq75."o'br]ack"."t'b]l" ORDER BY id;
+----
+1	a
+2	b
+3	NULL
+
+query I
+SELECT count(*) FROM mq75."o'br]ack"."t'b]l" WHERE rowid IS NOT NULL;
+----
+3
+
+query I
+SELECT estimated_size FROM duckdb_tables() WHERE database_name = 'mq75' AND schema_name = 'o''br]ack';
+----
+3
+
+# invalidate and load again through the same parameterised text
+statement ok
+SELECT mssql_invalidate_cache('mq75');
+
+query I
+SELECT count(*) FROM mq75."o'br]ack"."t'b]l";
+----
+3
+
+# DML through the rowid path, which needs the primary key the parameterised query found
+statement ok
+UPDATE mq75."o'br]ack"."t'b]l" SET name = 'c' WHERE id = 3;
+
+query I
+SELECT name FROM mq75."o'br]ack"."t'b]l" WHERE id = 3;
+----
+c
+
+statement ok
+SELECT mssql_exec('mq75', 'DROP TABLE [o''br]]ack].[t''b]]l]; DROP SCHEMA [o''br]]ack]');
+
+statement ok
+DETACH mq75;

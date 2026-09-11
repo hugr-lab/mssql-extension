@@ -233,6 +233,7 @@ test/
 │   │   ├── catalog_filter.test    # Catalog filter (schema_filter/table_filter) tests
 │   │   ├── catalog_filter_sources.test # Catalog filter configuration source tests
 │   │   ├── order_pushdown.test    # ORDER BY/TOP N pushdown tests (experimental)
+│   │   ├── metadata_query_parameterized.test # names as sp_executesql parameters (spec 075)
 │   │   ├── preload_catalog.test   # mssql_preload_catalog() bulk preload tests
 │   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests
@@ -283,6 +284,10 @@ test/
 │   │   ├── cancellation.test
 │   │   ├── error_handling.test
 │   │   ├── info_messages.test
+│   │   ├── mssql_params.test       # mssql_scan_params / mssql_exec_params (spec 075)
+│   │   ├── mssql_scan_bind_describe.test # mssql_scan describes at bind, runs at init (spec 075)
+│   │   ├── mssql_scan_describe_types.test # describe's types agree with the stream's (spec 075)
+│   │   ├── mssql_scan_prepared.test # prepared := true via sp_prepare (spec 075)
 │   │   └── type_mapping.test
 │   ├── rowid/                      # Rowid pseudo-column tests
 │   │   ├── composite_pk_rowid.test # Composite PK rowid behavior
@@ -300,6 +305,7 @@ test/
 │   │   ├── transaction_catalog_restriction.test # Catalog scans in transactions
 │   │   ├── transaction_commit.test           # DML commit operations
 │   │   ├── transaction_mssql_exec.test       # mssql_exec in transactions
+│   │   ├── sink_reads_own_catalog.test       # COPY / INSERT reading the catalog they write to (spec 075)
 │   │   ├── transaction_mssql_scan.test       # mssql_scan in transactions
 │   │   └── transaction_rollback.test         # Rollback operations
 │   ├── copy/                       # COPY TO MSSQL (BulkLoadBCP) tests

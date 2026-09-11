@@ -303,7 +303,7 @@ disagreeing on some type, or a procedure describing one shape and executing
 another — fails with a message that names both shapes and the query, rather
 than reading rows into the wrong columns. Today that mismatch cannot occur
 because bind executed; after W1 it is the one new failure mode, and it is
-loud. A prepared scan sends `sp_unprepare` once its result is drained.
+loud. A prepared scan sends no `sp_unprepare`: the handle lives in one session, and that session is reset when the connection returns to the pool (autocommit — the held connection is released when the bind data dies) or when the transaction ends (the pinned connection); a round trip to free what the reset frees anyway would be the second compile's cost in another form.
 
 `RegisterStream` / `RetrieveStream` and `result_stream_id` stay, used by the
 fallback only; their comments say so.

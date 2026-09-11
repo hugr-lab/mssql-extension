@@ -162,6 +162,7 @@ set(EXTENSION_SOURCES
     src/query/mssql_query_executor.cpp
     src/query/mssql_result_stream.cpp
     src/query/mssql_simple_query.cpp
+    src/query/mssql_sql_params.cpp
     # Connection management layer (DuckDB integration)
     src/connection/mssql_settings.cpp
     src/connection/mssql_diagnostic.cpp

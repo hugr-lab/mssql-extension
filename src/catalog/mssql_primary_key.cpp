@@ -8,6 +8,7 @@
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/mssql_sql_params.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetPKDebugLevel() {
@@ -58,7 +59,7 @@ JOIN sys.columns c
 JOIN sys.types t
     ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 WHERE kc.type = 'PK'
-    AND kc.parent_object_id = OBJECT_ID('%s')
+    AND kc.parent_object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY ic.key_ordinal
 )";
 
@@ -176,8 +177,10 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const st
 	string full_name = "[" + schema_name + "].[" + table_name + "]";
 	MSSQL_PK_DEBUG("Discovering primary key for %s", full_name.c_str());
 
-	// Build query with object name
-	string query = StringUtil::Format(PK_DISCOVERY_SQL_TEMPLATE, full_name);
+	// Spec 075 W4 (#334): names as sp_executesql parameters -- one plan for every table.
+	string query = mssql::BuildExecuteSqlBatch(
+		PK_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
+		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	// Execute PK discovery query
 	ExecuteMetadataQuery(

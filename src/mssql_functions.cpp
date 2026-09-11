@@ -10,6 +10,7 @@
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -17,7 +18,9 @@
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "query/tds_info_log.hpp"
+#include "tds/encoding/type_converter.hpp"
 #include "tds/tds_connection.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
@@ -51,12 +54,19 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->result_stream_id = result_stream_id;
 	// Shared, not copied: the rows are the same rows (issue #316).
 	result->materialized = materialized;
+	result->execute_sql = execute_sql;
+	result->prepared = prepared;
+	result->prepared_session = prepared_session;
+	result->executed_at_bind = executed_at_bind;
 	return std::move(result);
 }
 
 bool MSSQLScanBindData::Equals(const FunctionData &other) const {
 	auto &other_data = other.Cast<MSSQLScanBindData>();
-	return context_name == other_data.context_name && query == other_data.query;
+	// execute_sql carries the parameter values of mssql_scan_params: two
+	// calls with one text and different values must not be merged into one scan.
+	return context_name == other_data.context_name && query == other_data.query &&
+		   execute_sql == other_data.execute_sql && prepared == other_data.prepared;
 }
 
 MSSQLScanGlobalState::~MSSQLScanGlobalState() {
@@ -78,73 +88,303 @@ idx_t MSSQLScanGlobalState::MaxThreads() const {
 	return 1;
 }
 
-unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
-									   vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto bind_start = std::chrono::steady_clock::now();
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: START");
+//===----------------------------------------------------------------------===//
+// Spec 075: describe at Bind, execute at InitGlobal
+//===----------------------------------------------------------------------===//
 
-	// Extract arguments
-	if (input.inputs.size() != 2) {
-		throw InvalidInputException("MSSQL Error: mssql_scan requires 2 arguments: context_name and query");
+MSSQLPreparedSession::~MSSQLPreparedSession() {
+	if (!connection) {
+		return;
 	}
+	// A connection that is not Idle here was cut off mid-stream: close it rather
+	// than pool it. Mirrors ~MSSQLResultStream, and like it touches no
+	// ClientContext -- bind data can die on a worker thread.
+	auto conn_state = connection->GetState();
+	if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
+		connection->Close();
+	}
+	if (auto pool = pool_handle.lock()) {
+		try {
+			connection->SetNeedsReset(reset_on_release);
+			pool->Release(std::move(connection));
+		} catch (...) {
+			connection.reset();
+		}
+	}
+	connection.reset();
+}
 
-	auto bind_data = make_uniq<MSSQLScanBindData>();
-	bind_data->context_name = input.inputs[0].GetValue<string>();
-	bind_data->query = input.inputs[1].GetValue<string>();
+// What Bind learned about a statement's first result set.
+struct MSSQLDescribedShape {
+	vector<LogicalType> types;
+	vector<string> names;
+	bool ok = false;
+	string reason;	// why not, for the debug log and the prepared error
+};
 
-	// Validate context exists (Spec 047: per-catalog ownership via DuckDB catalog lookup)
+static int FindResultColumn(const std::vector<std::string> &names, const char *wanted) {
+	for (size_t i = 0; i < names.size(); i++) {
+		if (StringUtil::Lower(names[i]) == wanted) {
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
+}
+
+static int QueryTimeoutMs(ClientContext &context) {
+	int query_timeout_s = LoadQueryTimeout(context);
+	if (query_timeout_s <= 0 || query_timeout_s > INT_MAX / 1000) {
+		return 0;
+	}
+	return query_timeout_s * 1000;
+}
+
+static string TypeListToString(const vector<LogicalType> &types) {
+	string out;
+	for (const auto &t : types) {
+		if (!out.empty()) {
+			out += ", ";
+		}
+		out += t.ToString();
+	}
+	return out;
+}
+
+// sp_describe_first_result_set: one row per column of the FIRST result set,
+// which is also the one MSSQLResultStream serves (a second COLMETADATA is an
+// error there). The name of the type comes back as T-SQL text --
+// `nvarchar(50)`, `decimal(10,2)`, `varchar(max)` -- and the numbers beside it
+// are what the catalog's own mapping takes. One fold on top of it (datetime2,
+// below) makes the result the STREAM's type, which is what mssql_scan reports
+// and what InitGlobal checks the executed COLMETADATA against.
+static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection, const string &statement,
+												  const string &declarations, int timeout_ms) {
+	MSSQLDescribedShape shape;
+	string batch = "EXEC sp_describe_first_result_set " + mssql::NVarcharLiteral(statement) + ", " +
+				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", 0";
+	auto result = MSSQLSimpleQuery::Execute(connection, batch, timeout_ms);
+	if (!result.success) {
+		shape.reason = result.DescribeError();
+		return shape;
+	}
+	const int name_idx = FindResultColumn(result.column_names, "name");
+	const int type_idx = FindResultColumn(result.column_names, "system_type_name");
+	const int len_idx = FindResultColumn(result.column_names, "max_length");
+	const int prec_idx = FindResultColumn(result.column_names, "precision");
+	const int scale_idx = FindResultColumn(result.column_names, "scale");
+	const int hidden_idx = FindResultColumn(result.column_names, "is_hidden");
+	const int err_idx = FindResultColumn(result.column_names, "error_number");
+	if (name_idx < 0 || type_idx < 0 || len_idx < 0 || prec_idx < 0 || scale_idx < 0) {
+		shape.reason = "sp_describe_first_result_set answered with an unexpected shape";
+		return shape;
+	}
+	if (result.rows.empty()) {
+		shape.reason = "the statement returns no result set";
+		return shape;
+	}
+	for (const auto &row : result.rows) {
+		if (err_idx >= 0) {
+			const string &err = row[err_idx];
+			if (!err.empty() && err != "NULL" && err != "0") {
+				shape.reason = "sp_describe_first_result_set could not determine the shape (error " + err + ")";
+				return shape;
+			}
+		}
+		if (hidden_idx >= 0 && row[hidden_idx] == "1") {
+			continue;
+		}
+		const string &type_name = row[type_idx];
+		if (type_name.empty() || type_name == "NULL") {
+			shape.reason = "sp_describe_first_result_set reported a column without a type";
+			return shape;
+		}
+		string base = StringUtil::Lower(type_name.substr(0, type_name.find('(')));
+		auto max_length = static_cast<int16_t>(std::atoi(row[len_idx].c_str()));
+		auto precision = static_cast<uint8_t>(std::atoi(row[prec_idx].c_str()));
+		auto scale = static_cast<uint8_t>(std::atoi(row[scale_idx].c_str()));
+		LogicalType type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(base, max_length, precision, scale);
+		// The stream reads every datetime2 into TIMESTAMP whatever its scale; the
+		// catalog's mapping picks TIMESTAMP_S/_MS/_NS by it (spec 045, for the
+		// catalog scan). mssql_scan has always reported the stream's type, and
+		// InitGlobal holds the two to be equal.
+		if (base == "datetime2") {
+			type = LogicalType::TIMESTAMP;
+		}
+		shape.types.push_back(type);
+		const string &name = row[name_idx];
+		shape.names.push_back(name == "NULL" ? string() : name);
+	}
+	if (shape.types.empty()) {
+		shape.reason = "the statement returns no visible column";
+		return shape;
+	}
+	shape.ok = true;
+	return shape;
+}
+
+// sp_prepare: the server compiles once and answers with the statement's
+// COLMETADATA (a zero-row result set) before the handle. The types are read
+// off that token exactly as the stream reads them at execution.
+static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, const string &statement,
+											const string &declarations, int timeout_ms, int32_t &handle) {
+	MSSQLDescribedShape shape;
+	string batch = "DECLARE @h int;\nEXEC sp_prepare @h OUTPUT, " +
+				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", " +
+				   mssql::NVarcharLiteral(statement) + ";\nSELECT @h";
+	auto result = MSSQLSimpleQuery::Execute(connection, batch, timeout_ms);
+	if (!result.success) {
+		shape.reason = result.DescribeError();
+		return shape;
+	}
+	if (result.rows.empty() || result.rows.back().empty() || result.rows.back()[0].empty()) {
+		shape.reason = "sp_prepare returned no handle";
+		return shape;
+	}
+	handle = std::atoi(result.rows.back()[0].c_str());
+	if (result.result_sets.size() < 2) {
+		shape.reason = "the statement returns no result set";
+		return shape;
+	}
+	for (const auto &col : result.result_sets.front()) {
+		shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
+		shape.names.push_back(col.name);
+	}
+	shape.ok = true;
+	return shape;
+}
+
+static void ValidateScanContext(ClientContext &context, const string &context_name) {
+	// Spec 047: per-catalog ownership via DuckDB catalog lookup
 	try {
-		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->context_name));
+		auto &catalog = Catalog::GetCatalog(context, Identifier(context_name));
 		if (catalog.GetCatalogType() != "mssql") {
 			throw InvalidInputException(
 				"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
 				"...)",
-				bind_data->context_name, bind_data->context_name);
+				context_name, context_name);
 		}
 	} catch (const std::exception &) {
 		throw InvalidInputException(
 			"MSSQL Error: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
-			bind_data->context_name, bind_data->context_name);
+			context_name, context_name);
+	}
+}
+
+static bool ReadPreparedOption(const TableFunctionBindInput &input) {
+	auto it = input.named_parameters.find("prepared");
+	if (it == input.named_parameters.end() || it->second.IsNull()) {
+		return false;
+	}
+	return BooleanValue::Get(it->second);
+}
+
+// The part of Bind shared by mssql_scan and mssql_scan_params: settle the
+// shape without running the query, or -- when the server cannot describe it --
+// run it at Bind as this function always had (spec 075 F1). `bind_data` arrives
+// with context_name, query, execute_sql and prepared set; `params` is empty for
+// mssql_scan.
+static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_data, const mssql::SqlParamSet &params,
+							  vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto bind_start = std::chrono::steady_clock::now();
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+	const bool in_transaction = !context.transaction.IsAutoCommit();
+	const int timeout_ms = QueryTimeoutMs(context);
+	const string declarations = params.Declarations();
+
+	MSSQLDescribedShape shape;
+	auto connection = ConnectionProvider::GetConnection(context, mssql_catalog);
+	if (!connection) {
+		throw IOException("mssql_scan: Failed to acquire connection from pool for '%s'", bind_data.context_name);
+	}
+	bool held = false;
+	const bool wanted_prepared = bind_data.prepared;
+	try {
+		if (wanted_prepared) {
+			int32_t handle = 0;
+			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle);
+			if (shape.ok) {
+				auto session = make_shared_ptr<MSSQLPreparedSession>();
+				session->handle = handle;
+				if (!in_transaction) {
+					// The handle lives in this session: keep the connection until the
+					// bind data dies. In a transaction it is the pinned one, which the
+					// transaction keeps for us.
+					session->connection = connection;
+					session->pool_handle = mssql_catalog.GetConnectionPoolHandle();
+					session->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
+					held = true;
+				}
+				bind_data.prepared_session = std::move(session);
+				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
+				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: prepared handle %d", (int)handle);
+			} else {
+				// The server took the statement but did not settle its shape (a
+				// batch of more than one statement), or refused it: degrade to the
+				// default path -- describe, and failing that run it at Bind as a
+				// plain batch, where a real error surfaces as such. A handle it did
+				// hand out dies with the session reset.
+				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: sp_prepare gave no shape (%s), describing instead",
+								   shape.reason.c_str());
+				bind_data.prepared = false;
+				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms);
+			}
+		} else {
+			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms);
+		}
+	} catch (...) {
+		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
+		throw;
+	}
+	if (!held) {
+		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
 	}
 
-	// Execute query to get schema from COLMETADATA
+	if (shape.ok) {
+		return_types = shape.types;
+		names.clear();
+		for (const auto &name : shape.names) {
+			names.push_back(Identifier(name));
+		}
+		bind_data.return_types = shape.types;
+		bind_data.column_names = shape.names;
+		auto bind_ms =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - bind_start)
+				.count();
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: described %llu column(s) in %ldms, query deferred to InitGlobal",
+						   (unsigned long long)shape.types.size(), (long)bind_ms);
+		return;
+	}
+
+	// F1 fallback: the server would not describe it, so learn the shape the way
+	// this function always had -- by running it.
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: describe fell back to execution: %s", shape.reason.c_str());
+	bind_data.executed_at_bind = true;
 	auto exec_start = std::chrono::steady_clock::now();
-	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: executing query for schema...");
-	MSSQLQueryExecutor executor(bind_data->context_name);
-	auto result_stream = executor.Execute(context, bind_data->query);
-	auto exec_end = std::chrono::steady_clock::now();
-	auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(exec_end - exec_start).count();
+	MSSQLQueryExecutor executor(bind_data.context_name);
+	auto result_stream = executor.Execute(context, bind_data.execute_sql);
+	auto exec_ms =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - exec_start).count();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: query executed in %ldms", (long)exec_ms);
 
-	// Get schema from result stream
-	const auto &stream_types = result_stream->GetColumnTypes();
-	return_types.clear();
-	for (const auto &type : stream_types) {
-		return_types.push_back(type);
-	}
-
+	return_types = result_stream->GetColumnTypes();
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {
 		names.push_back(Identifier(name));
 	}
+	bind_data.return_types = return_types;
+	bind_data.column_names = result_stream->GetColumnNames();
 
-	bind_data->return_types = return_types;
-	bind_data->column_names = result_stream->GetColumnNames();
-
-	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->context_name));
-	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-
-	if (!context.transaction.IsAutoCommit()) {
+	if (in_transaction) {
 		// Issue #316: this connection is the transaction's ONE pinned connection.
 		// Holding it open until execution makes the NEXT mssql_scan fail in its own
-		// Bind, before any InitGlobal runs — which is why the catalog scan's fix
-		// cannot reach this path. Drain here and close it. See the `materialized`
-		// comment on MSSQLScanBindData for why the trigger is the transaction and
-		// not a count of scans.
+		// Bind, before any InitGlobal runs. Drain here and close it. See the
+		// `materialized` comment on MSSQLScanBindData for why the trigger is the
+		// transaction and not a count of scans.
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: in a transaction — draining to release the pinned connection");
-		auto collection = make_shared_ptr<ColumnDataCollection>(context, bind_data->return_types);
+		auto collection = make_shared_ptr<ColumnDataCollection>(context, bind_data.return_types);
 		DataChunk chunk;
-		chunk.Initialize(Allocator::Get(context), bind_data->return_types);
+		chunk.Initialize(Allocator::Get(context), bind_data.return_types);
 		idx_t total = 0;
 		for (;;) {
 			chunk.Reset();
@@ -158,22 +398,59 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 		result_stream->SurfaceWarnings(context);
 		// Closing is what returns the connection to Idle; draining alone does not.
 		result_stream.reset();
-		bind_data->materialized = std::move(collection);
+		bind_data.materialized = std::move(collection);
 		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: materialized %llu row(s), pinned connection released",
 						   (unsigned long long)total);
 	} else {
 		// Autocommit: this scan holds a pooled connection of its own, so streaming
 		// costs nobody anything. Register the stream so execution reuses it instead
-		// of running the query twice (a 30 s timeout on large results).
-		// Spec 047 / US3: registry lives on MSSQLCatalog.
-		bind_data->result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
-		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data->result_stream_id.c_str());
+		// of running the query twice. Spec 047 / US3: registry lives on MSSQLCatalog.
+		bind_data.result_stream_id = mssql_catalog.RegisterStream(std::move(result_stream));
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: registered result_stream_id=%s", bind_data.result_stream_id.c_str());
 	}
-
-	auto bind_end = std::chrono::steady_clock::now();
-	auto bind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bind_end - bind_start).count();
+	auto bind_ms =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - bind_start).count();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: END (total %ldms)", (long)bind_ms);
+}
 
+unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
+									   vector<LogicalType> &return_types, vector<Identifier> &names) {
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: START");
+	if (input.inputs.size() != 2) {
+		throw InvalidInputException("MSSQL Error: mssql_scan requires 2 arguments: context_name and query");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	bind_data->execute_sql = bind_data->query;
+	bind_data->prepared = ReadPreparedOption(input);
+	ValidateScanContext(context, bind_data->context_name);
+	mssql::SqlParamSet no_params;
+	BindDescribedScan(context, *bind_data, no_params, return_types, names);
+	return std::move(bind_data);
+}
+
+// mssql_scan_params(context, statement, {name: value, ...} [, declarations])
+unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFunctionBindInput &input,
+											 vector<LogicalType> &return_types, vector<Identifier> &names) {
+	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanParamsBind: START");
+	if (input.inputs.size() < 3 || input.inputs.size() > 4) {
+		throw InvalidInputException(
+			"mssql_scan_params requires context_name, a statement and a STRUCT of parameters, "
+			"with an optional declaration list");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	string declarations_override;
+	if (input.inputs.size() == 4 && !input.inputs[3].IsNull()) {
+		declarations_override = input.inputs[3].GetValue<string>();
+	}
+	bind_data->prepared = ReadPreparedOption(input);
+	ValidateScanContext(context, bind_data->context_name);
+	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
+	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	BindDescribedScan(context, *bind_data, params, return_types, names);
 	return std::move(bind_data);
 }
 
@@ -184,6 +461,69 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	auto &bind_data = input.bind_data->Cast<MSSQLScanBindData>();
 	auto result = make_uniq<MSSQLScanGlobalState>();
 	result->context_name = bind_data.context_name;
+
+	if (!bind_data.executed_at_bind) {
+		// Spec 075 W2: the query runs here, on the shape Bind described.
+		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
+		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		// Inside a transaction the stream is on the ONE pinned connection: take the
+		// catalog's MaterializeMutex BEFORE sending the batch, so a catalog scan
+		// materialising on another thread has drained (or has not started) -- the
+		// same order table_scan.cpp keeps. Held through the drain below.
+		std::unique_lock<std::mutex> materialize_lock;
+		const bool in_transaction = !context.transaction.IsAutoCommit();
+		if (in_transaction) {
+			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+		}
+		MSSQLQueryExecutor executor(bind_data.context_name);
+		unique_ptr<MSSQLResultStream> stream;
+		if (bind_data.prepared_session && bind_data.prepared_session->connection) {
+			// The handle lives in the held session; the stream borrows it and gives
+			// it back to the session, not to the pool.
+			stream = executor.ExecuteOn(context, bind_data.prepared_session->connection, bind_data.execute_sql, false,
+										false);
+		} else {
+			stream = executor.Execute(context, bind_data.execute_sql);
+		}
+		stream->SurfaceWarnings(context);
+		if (stream->GetColumnTypes() != bind_data.return_types) {
+			// The described shape is what the plan was built on; serving rows of
+			// another shape would be a silent wrong answer.
+			throw InvalidInputException(
+				"mssql_scan: the statement's result shape changed between bind and execution: bound (%s), got (%s)",
+				TypeListToString(bind_data.return_types), TypeListToString(stream->GetColumnTypes()));
+		}
+		if (in_transaction) {
+			// The stream is on the transaction's ONE pinned connection: drain it now
+			// so the next scan or sink of this catalog finds the connection Idle
+			// (issue #239 / #316).
+			auto collection = make_uniq<ColumnDataCollection>(context, bind_data.return_types);
+			DataChunk chunk;
+			chunk.Initialize(Allocator::Get(context), bind_data.return_types);
+			idx_t total = 0;
+			for (;;) {
+				chunk.Reset();
+				const idx_t rows = stream->FillChunk(chunk);
+				if (rows == 0) {
+					break;
+				}
+				collection->Append(chunk);
+				total += rows;
+			}
+			stream.reset();
+			result->materialized = std::move(collection);
+			result->materialized->InitializeScan(result->materialized_scan);
+			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: materialized %llu row(s), pinned connection released",
+							   (unsigned long long)total);
+		} else {
+			result->result_stream = std::move(stream);
+		}
+		auto init_ms =
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - init_start)
+				.count();
+		MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: executed at init in %ldms", (long)init_ms);
+		return std::move(result);
+	}
 
 	// Issue #316: Bind already drained this one and released the connection.
 	if (bind_data.materialized) {
@@ -219,7 +559,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 	auto exec_start = std::chrono::steady_clock::now();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: executing query for data...");
 	MSSQLQueryExecutor executor(bind_data.context_name);
-	result->result_stream = executor.Execute(context, bind_data.query);
+	result->result_stream = executor.Execute(context, bind_data.execute_sql);
 	if (result->result_stream) {
 		result->result_stream->SurfaceWarnings(context);
 	}
@@ -247,6 +587,15 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	if (global_state.materialized_shared) {
 		output.Reset();
 		global_state.materialized_shared->Scan(global_state.materialized_scan, output);
+		if (output.size() == 0) {
+			global_state.done = true;
+		}
+		return;
+	}
+	// Spec 075 W2: materialized at InitGlobal (in a transaction).
+	if (global_state.materialized) {
+		output.Reset();
+		global_state.materialized->Scan(global_state.materialized_scan, output);
 		if (output.size() == 0) {
 			global_state.done = true;
 		}
@@ -364,41 +713,51 @@ struct MSSQLExecBindData : public FunctionData {
 	}
 };
 
-// Bind function for mssql_exec
-static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecBind(duckdb::BindScalarFunctionInput &input) {
-	auto &context = input.GetClientContext();
-	auto &arguments = input.GetArguments();
-	(void)context;
-	(void)arguments;
+// The context-name half of Bind, shared by mssql_exec and mssql_exec_params.
+static string BindExecContextName(ClientContext &context, const Expression &argument, const char *function_name) {
 	// First argument is the context name (attached database name, must be constant)
-	if (arguments[0]->HasParameter()) {
-		throw InvalidInputException("mssql_exec: context_name must be a constant, not a parameter");
+	if (argument.HasParameter()) {
+		throw InvalidInputException("%s: context_name must be a constant, not a parameter", function_name);
 	}
-
-	// Extract the context name if it's a constant
 	string context_name;
-	if (arguments[0]->IsFoldable()) {
-		auto context_val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (argument.IsFoldable()) {
+		auto context_val = ExpressionExecutor::EvaluateScalar(context, argument);
 		context_name = context_val.ToString();
-
 		// Validate the context exists (Spec 047: per-catalog ownership)
 		try {
 			auto &catalog = Catalog::GetCatalog(context, Identifier(context_name));
 			if (catalog.GetCatalogType() != "mssql") {
 				throw BinderException(
-					"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, "
-					"SECRET ...)",
-					context_name, context_name);
+					"%s: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+					function_name, context_name, context_name);
 			}
 		} catch (const std::exception &) {
 			throw BinderException(
-				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
-				"...)",
-				context_name, context_name);
+				"%s: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET ...)",
+				function_name, context_name, context_name);
 		}
 	}
+	return context_name;
+}
 
-	return make_uniq<MSSQLExecBindData>(context_name);
+// Bind function for mssql_exec
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	return make_uniq<MSSQLExecBindData>(BindExecContextName(context, *arguments[0], "mssql_exec"));
+}
+
+// mssql_exec_params(context, statement, {name: value, ...} [, declarations])
+static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecParamsBind(duckdb::BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	if (arguments[2]->GetReturnType().id() != LogicalTypeId::STRUCT) {
+		throw BinderException(
+			"mssql_exec_params: the parameters must be a STRUCT of name -> value, e.g. {'a': 1, "
+			"'b': 'x'}; got %s",
+			arguments[2]->GetReturnType().ToString());
+	}
+	return make_uniq<MSSQLExecBindData>(BindExecContextName(context, *arguments[0], "mssql_exec_params"));
 }
 
 // Heuristic: does this raw T-SQL statement potentially change schema/catalog
@@ -416,6 +775,98 @@ static bool ExecSqlMayChangeSchema(const string &sql) {
 		}
 	}
 	return false;
+}
+
+// Run one batch on the named catalog and return the DONE row count: the body
+// of mssql_exec, shared with mssql_exec_params. `statement` is the caller's
+// text for the DDL heuristic -- for mssql_exec_params the batch wraps it in
+// sp_executesql, whose name would otherwise trip the EXEC keyword every time.
+static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const string &sql,
+							const string &statement) {
+	// Get the MSSQL catalog (Spec 047: per-catalog ownership)
+	MSSQLCatalog *catalog_ptr = nullptr;
+	try {
+		auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(context_name));
+		if (raw_catalog.GetCatalogType() != "mssql") {
+			throw InvalidInputException("mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)",
+										context_name, raw_catalog.GetCatalogType());
+		}
+		catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
+	} catch (const InvalidInputException &) {
+		throw;
+	} catch (const std::exception &) {
+		throw InvalidInputException(
+			"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
+			"...)",
+			context_name, context_name);
+	}
+	auto &catalog = *catalog_ptr;
+	if (catalog.IsReadOnly()) {
+		throw InvalidInputException("Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
+									context_name);
+	}
+
+	// Get connection via ConnectionProvider (handles transaction pinning)
+	auto connection = ConnectionProvider::GetConnection(client_context, catalog);
+
+	if (!connection) {
+		throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
+	}
+
+	// Execute the SQL.
+	// Honor the mssql_query_timeout setting (in seconds) the same way mssql_scan
+	// does — previously mssql_exec used MSSQLSimpleQuery's hardcoded 30s default and
+	// dropped long-running server-side queries regardless of the setting (#90/#145).
+	// 0 (or negative / absurdly large) means no timeout.
+	int query_timeout_s = LoadQueryTimeout(client_context);
+	int timeout_ms;
+	if (query_timeout_s <= 0 || query_timeout_s > INT_MAX / 1000) {
+		timeout_ms = 0;	 // no timeout (wait indefinitely)
+	} else {
+		timeout_ms = query_timeout_s * 1000;
+	}
+	try {
+		auto query_result = MSSQLSimpleQuery::Execute(*connection, sql, timeout_ms);
+
+		// PRINT output and RAISERROR below severity 11 from whatever was run
+		// here -- a procedure's progress notices, most of all. Logged before
+		// the error check below, because a batch that ultimately failed is
+		// exactly when its notices are worth reading.
+		for (const auto &info : query_result.info_messages) {
+			LogTdsInfo(client_context, info);
+		}
+
+		// Release connection via ConnectionProvider (no-op if in transaction)
+		ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
+
+		if (!query_result.success) {
+			throw InvalidInputException("MSSQL execution error: %s", query_result.DescribeError());
+		}
+
+		// Issue #151: raw DDL run through mssql_exec() bypasses the catalog metadata
+		// cache. If the statement may have changed schema, invalidate the cache so a
+		// subsequent CREATE TABLE IF NOT EXISTS / read sees the real server-side state
+		// instead of a stale cached entry (which caused "Invalid object name" after a
+		// raw DROP followed by CREATE ... IF NOT EXISTS). InvalidateMetadataCache() is
+		// the lazy path: it marks the metadata cache stale AND invalidates each schema's
+		// table set (evicting bound table entries), with reload deferred to next access.
+		// Gated by mssql_exec_invalidate_cache, which defaults to FALSE (like the Postgres
+		// extension's postgres_execute): by default the caller invalidates manually via
+		// mssql_invalidate_cache(); set the flag true to auto-invalidate here.
+		if (ExecSqlMayChangeSchema(statement) && LoadExecInvalidateCache(client_context)) {
+			catalog.InvalidateMetadataCache();
+		}
+
+		// Return affected row count from DONE token
+		// For DML operations (INSERT/UPDATE/DELETE), this is the number of affected rows
+		// For DDL and SELECT statements, this may be 0
+		return query_result.rows_affected;
+
+	} catch (...) {
+		// Release connection on error
+		ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
+		throw;
+	}
 }
 
 // Execute function for mssql_exec
@@ -438,93 +889,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 
 		MSSQL_FN_DEBUG_LOG(1, "mssql_exec: context=%s, sql=%s", context_name.c_str(), sql.c_str());
 
-		// Get context from the state
-		auto &client_context = state.GetContext();
-
-		// Get the MSSQL catalog (Spec 047: per-catalog ownership)
-		MSSQLCatalog *catalog_ptr = nullptr;
-		try {
-			auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(context_name));
-			if (raw_catalog.GetCatalogType() != "mssql") {
-				throw InvalidInputException("mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)",
-											context_name, raw_catalog.GetCatalogType());
-			}
-			catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
-		} catch (const InvalidInputException &) {
-			throw;
-		} catch (const std::exception &) {
-			throw InvalidInputException(
-				"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
-				"...)",
-				context_name, context_name);
-		}
-		auto &catalog = *catalog_ptr;
-		if (catalog.IsReadOnly()) {
-			throw InvalidInputException("Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
-										context_name);
-		}
-
-		// Get connection via ConnectionProvider (handles transaction pinning)
-		auto connection = ConnectionProvider::GetConnection(client_context, catalog);
-
-		if (!connection) {
-			throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
-		}
-
-		// Execute the SQL.
-		// Honor the mssql_query_timeout setting (in seconds) the same way mssql_scan
-		// does — previously mssql_exec used MSSQLSimpleQuery's hardcoded 30s default and
-		// dropped long-running server-side queries regardless of the setting (#90/#145).
-		// 0 (or negative / absurdly large) means no timeout.
-		int query_timeout_s = LoadQueryTimeout(client_context);
-		int timeout_ms;
-		if (query_timeout_s <= 0 || query_timeout_s > INT_MAX / 1000) {
-			timeout_ms = 0;	 // no timeout (wait indefinitely)
-		} else {
-			timeout_ms = query_timeout_s * 1000;
-		}
-		try {
-			auto query_result = MSSQLSimpleQuery::Execute(*connection, sql, timeout_ms);
-
-			// PRINT output and RAISERROR below severity 11 from whatever was run
-			// here -- a procedure's progress notices, most of all. Logged before
-			// the error check below, because a batch that ultimately failed is
-			// exactly when its notices are worth reading.
-			for (const auto &info : query_result.info_messages) {
-				LogTdsInfo(client_context, info);
-			}
-
-			// Release connection via ConnectionProvider (no-op if in transaction)
-			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
-
-			if (!query_result.success) {
-				throw InvalidInputException("MSSQL execution error: %s", query_result.DescribeError());
-			}
-
-			// Issue #151: raw DDL run through mssql_exec() bypasses the catalog metadata
-			// cache. If the statement may have changed schema, invalidate the cache so a
-			// subsequent CREATE TABLE IF NOT EXISTS / read sees the real server-side state
-			// instead of a stale cached entry (which caused "Invalid object name" after a
-			// raw DROP followed by CREATE ... IF NOT EXISTS). InvalidateMetadataCache() is
-			// the lazy path: it marks the metadata cache stale AND invalidates each schema's
-			// table set (evicting bound table entries), with reload deferred to next access.
-			// Gated by mssql_exec_invalidate_cache, which defaults to FALSE (like the Postgres
-			// extension's postgres_execute): by default the caller invalidates manually via
-			// mssql_invalidate_cache(); set the flag true to auto-invalidate here.
-			if (ExecSqlMayChangeSchema(sql) && LoadExecInvalidateCache(client_context)) {
-				catalog.InvalidateMetadataCache();
-			}
-
-			// Return affected row count from DONE token
-			// For DML operations (INSERT/UPDATE/DELETE), this is the number of affected rows
-			// For DDL and SELECT statements, this may be 0
-			return query_result.rows_affected;
-
-		} catch (...) {
-			// Release connection on error
-			ConnectionProvider::ReleaseConnection(client_context, catalog, std::move(connection));
-			throw;
-		}
+		return RunExecBatch(state.GetContext(), context_name, sql, sql);
 	});
 }
 
@@ -539,9 +904,53 @@ ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 	return func;
 }
 
+// Execute function for mssql_exec_params: one server round trip per row, the
+// values rendered into a DECLARE block ahead of sp_executesql (see
+// query/mssql_sql_params.hpp for why not `@p = <literal>`).
+static void MSSQLExecParamsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLExecBindData>();
+	auto &client_context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetDataMutable<int64_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
+	const bool has_declarations = args.ColumnCount() > 3;
+	for (idx_t i = 0; i < args.size(); i++) {
+		Value context_val = args.data[0].GetValue(i);
+		Value sql_val = args.data[1].GetValue(i);
+		Value params_val = args.data[2].GetValue(i);
+		Value decl_val = has_declarations ? args.data[3].GetValue(i) : Value();
+		if (context_val.IsNull() || sql_val.IsNull()) {
+			validity.SetInvalid(i);
+			continue;
+		}
+		string context_name = bind_data.context_name.empty() ? context_val.ToString() : bind_data.context_name;
+		string statement = sql_val.ToString();
+		auto params = mssql::BuildSqlParams(params_val, decl_val.IsNull() ? string() : decl_val.ToString());
+		string batch = params.ExecuteSqlBatch(statement);
+		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.c_str());
+		out[i] = RunExecBatch(client_context, context_name, batch, statement);
+	}
+}
+
 void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
 	auto func = MSSQLExecScalarFunction::GetFunction();
 	loader.RegisterFunction(func);
+
+	// mssql_exec_params(context, statement, STRUCT [, declarations]) -> BIGINT
+	ScalarFunctionSet params_set("mssql_exec_params");
+	for (int with_declarations = 0; with_declarations < 2; with_declarations++) {
+		vector<LogicalType> arguments{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
+		if (with_declarations) {
+			arguments.push_back(LogicalType::VARCHAR);
+		}
+		ScalarFunction f("mssql_exec_params", arguments, LogicalType::BIGINT, MSSQLExecParamsExecute,
+						 MSSQLExecParamsBind);
+		f.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		f.SetVolatile();
+		f.SetFallible();
+		params_set.AddFunction(f);
+	}
+	loader.RegisterFunction(params_set);
 }
 
 //===----------------------------------------------------------------------===//
@@ -553,7 +962,24 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 	// -> dynamic return schema based on query result columns
 	TableFunction mssql_scan("mssql_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLScanFunction,
 							 MSSQLScanBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
+	// Spec 075: `prepared := true` compiles once via sp_prepare instead of
+	// describing at bind and compiling again at execution.
+	mssql_scan.named_parameters["prepared"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(mssql_scan);
+
+	// mssql_scan_params(context, statement, STRUCT [, declarations], prepared := false)
+	TableFunctionSet scan_params("mssql_scan_params");
+	for (int with_declarations = 0; with_declarations < 2; with_declarations++) {
+		vector<LogicalType> arguments{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
+		if (with_declarations) {
+			arguments.push_back(LogicalType::VARCHAR);
+		}
+		TableFunction f("mssql_scan_params", arguments, MSSQLScanFunction, MSSQLScanParamsBind, MSSQLScanInitGlobal,
+						MSSQLScanInitLocal);
+		f.named_parameters["prepared"] = LogicalType::BOOLEAN;
+		scan_params.AddFunction(f);
+	}
+	loader.RegisterFunction(scan_params);
 }
 
 }  // namespace duckdb

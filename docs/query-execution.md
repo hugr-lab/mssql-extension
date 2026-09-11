@@ -282,12 +282,24 @@ DELETE also uses deferred execution in explicit transactions.
 SELECT * FROM mssql_scan('mydb', 'SELECT TOP 10 * FROM users');
 ```
 
-**Implementation** (`src/mssql_functions.cpp`):
-1. **Bind**: Executes the query once to discover column types (via COLMETADATA token), stores result stream for reuse
-2. **InitGlobal**: Retrieves the stored result stream (avoids double execution)
-3. **Execute**: Calls `MSSQLResultStream::FillChunk()` to stream rows
+**Implementation** (`src/mssql_functions.cpp`, spec 075):
+1. **Bind**: asks the server for the shape without running the statement — `EXEC sp_describe_first_result_set N'<query>', NULL, 0` — and maps each row's `system_type_name` / `max_length` / `precision` / `scale` through the catalog's own type mapping. With `prepared := true` it sends `sp_prepare` instead: the server compiles once, answers with the statement's COLMETADATA, and the handle is kept for execution (on a pooled connection held from bind to init in autocommit; on the pinned connection in a transaction). A statement the server cannot describe — a batch that reads a `#temp` table it creates, a procedure — falls back to what Bind always did: run it, read COLMETADATA, and register the live stream on the catalog (`MSSQLCatalog::RegisterStream`) for InitGlobal to pick up.
+2. **InitGlobal**: runs the query (`EXEC sp_execute <handle>` when prepared) and checks the stream's COLMETADATA against the bound types — a shape that changed between bind and execution is an error, never a silent wrong answer. Inside a transaction the rows are drained into a `ColumnDataCollection` under the catalog's `MaterializeMutex`, so the pinned connection is Idle again before the next scan or sink of the plan initializes.
+3. **Execute**: `MSSQLResultStream::FillChunk()` streams rows, or the materialised collection is scanned.
 
-A singleton result stream registry prevents the query from being executed twice (once for schema inference, once for data).
+A `DESCRIBE` or `EXPLAIN` therefore no longer executes the statement (it did until spec 075: a batch with an INSERT ahead of its SELECT inserted at bind), and a query with a side effect runs once.
+
+### mssql_scan_params
+
+`mssql_scan_params(context_name, statement, {name: value, ...} [, declarations] [, prepared := false])` is `mssql_scan` with parameters. Each STRUCT key becomes `@name`; its declaration is derived from the DuckDB type (`INTEGER` → `int`, `VARCHAR` → `nvarchar(4000)` or `nvarchar(max)` past 4000 bytes, `MSSQL_VARCHAR(20)` → `varchar(20)`, `TIMESTAMP` → `datetime2(6)`, `DECIMAL(10,2)` → `decimal(10,2)`, …) or taken from the caller's list (`'@ts datetime, @c varchar(8)'`, every key declared and every declaration supplied). The batch declares variables and calls `sp_executesql`:
+
+```sql
+DECLARE @id int = 42, @since datetime2(6) = CAST('2024-01-02T00:00:00.000000' AS DATETIME2(7));
+EXEC sp_executesql N'SELECT id, name FROM dbo.users WHERE id > @id AND created > @since',
+     N'@id int, @since datetime2(6)', @id = @id, @since = @since
+```
+
+The inner text and declarations are what the server keys its plan on, so every call with the same statement — from any session — reuses one plan. The DECLARE line differs per call and is a trivial batch. A bare `NULL` (no type), a LIST/STRUCT (a table-valued parameter needs RPC) and a key that is not a T-SQL identifier are refused at bind with the fix named.
 
 ## mssql_exec Function
 
@@ -303,6 +315,13 @@ SELECT mssql_exec('mydb', 'DELETE FROM users WHERE id = 1');
 2. Execute SQL_BATCH
 3. Parse response for DONE token with DONE_COUNT flag
 4. Return row count (0 for DDL/SELECT)
+
+`mssql_exec_params(context_name, statement, {name: value, ...} [, declarations])` takes the same parameter contract as `mssql_scan_params` and runs one `sp_executesql` batch per row, so a statement executed for many rows compiles once on the server:
+
+```sql
+SELECT mssql_exec_params('mydb', 'UPDATE dbo.users SET name = @n WHERE id = @id', {'n': name, 'id': id})
+FROM changes;
+```
 
 ## DML Configuration Summary
 

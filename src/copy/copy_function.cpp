@@ -1,5 +1,7 @@
 #include "copy/copy_function.hpp"
 
+#include <mutex>
+
 #include "catalog/mssql_catalog.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
@@ -322,6 +324,16 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	gstate->transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 	gstate->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
+
+	// Spec 075 W3: inside a transaction the source scans of this catalog drain
+	// under the catalog's MaterializeMutex, and DuckDB initialises this sink on
+	// another thread while they do. Wait for them here rather than find the
+	// pinned connection mid-stream; held for the rest of the init, because the
+	// CREATE TABLE below goes down the same connection.
+	std::unique_lock<std::mutex> materialize_lock;
+	if (gstate->transaction_pinned) {
+		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+	}
 
 	// Helper to release connection on error
 	auto release_connection_on_error = [&]() {

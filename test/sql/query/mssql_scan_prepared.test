@@ -1,0 +1,106 @@
+# name: test/sql/query/mssql_scan_prepared.test
+# description: mssql_scan(..., prepared := true) compiles once via sp_prepare and executes by handle (spec 075)
+# group: [mssql]
+# issue: 336
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The default path describes at bind and compiles again at execution (the
+# server's ad hoc cache keeps the second compile cheap, but it is a compile).
+# `prepared := true` sends sp_prepare at bind: the server compiles once, answers
+# with the statement's COLMETADATA, and execution is `EXEC sp_execute <handle>`
+# on the session that holds the handle -- a pooled connection kept from bind
+# to execution in autocommit, the pinned connection in a transaction.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS pr75 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('pr75', 'IF OBJECT_ID(''dbo.pr75_t'') IS NOT NULL DROP TABLE dbo.pr75_t; CREATE TABLE dbo.pr75_t(id int NOT NULL, name nvarchar(20) NULL); INSERT INTO dbo.pr75_t VALUES (1, N''one''), (2, N''two''), (3, NULL)');
+
+statement ok
+SELECT mssql_exec('pr75', 'IF OBJECT_ID(''dbo.pr75_side'') IS NOT NULL DROP TABLE dbo.pr75_side; CREATE TABLE dbo.pr75_side(id int)');
+
+# 1. The shape comes from the prepare's answer; the rows from sp_execute.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('pr75', 'SELECT id, name FROM dbo.pr75_t ORDER BY id', prepared := true));
+----
+id	INTEGER
+name	VARCHAR
+
+query II
+SELECT id, name FROM mssql_scan('pr75', 'SELECT id, name FROM dbo.pr75_t ORDER BY id', prepared := true);
+----
+1	one
+2	two
+3	NULL
+
+# 2. A batch: the prepare compiles the whole batch, the handle runs it.
+query I
+SELECT id FROM mssql_scan('pr75', 'DECLARE @x int = 2; SELECT id FROM dbo.pr75_t WHERE id > @x', prepared := true);
+----
+3
+
+# 3. The same prepared scan read twice in one statement: two handles, two sessions.
+query I
+SELECT count(*) FROM mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t', prepared := true) t1
+JOIN mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t', prepared := true) t2 USING (id);
+----
+3
+
+# 4. EXPLAIN prepares and leaves no side effect: the INSERT in the batch does not run.
+statement ok
+EXPLAIN SELECT * FROM mssql_scan('pr75', 'INSERT INTO dbo.pr75_side VALUES (1); SELECT id FROM dbo.pr75_side', prepared := true);
+
+query I
+SELECT count(*) FROM mssql_scan('pr75', 'SELECT id FROM dbo.pr75_side');
+----
+0
+
+# 5. A #temp batch: the server prepares it without a shape, so the scan takes
+#    the fallback and still returns its rows.
+query I
+SELECT v FROM mssql_scan('pr75', 'CREATE TABLE #pr75_t(v int); INSERT INTO #pr75_t VALUES (7); SELECT v FROM #pr75_t', prepared := true);
+----
+7
+
+# 6. Inside a transaction: the handle lives in the pinned connection; the rows
+#    are materialised at init so the connection is Idle for the next scan.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t', prepared := true);
+----
+3
+
+query I
+SELECT count(*) FROM mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t', prepared := true) t1,
+                     mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t WHERE id < 3', prepared := true) t2;
+----
+6
+
+query I
+SELECT (SELECT max(id) FROM mssql_scan('pr75', 'SELECT id FROM dbo.pr75_t', prepared := true)) + (SELECT count(*) FROM pr75.dbo.pr75_t);
+----
+6
+
+statement ok
+COMMIT;
+
+# 7. A statement the server cannot compile fails at bind with the server's error.
+statement error
+SELECT * FROM mssql_scan('pr75', 'SELECT * FROM dbo.pr75_no_such_table', prepared := true);
+----
+Invalid object name
+
+statement ok
+SELECT mssql_exec('pr75', 'DROP TABLE dbo.pr75_t; DROP TABLE dbo.pr75_side');
+
+statement ok
+DETACH pr75;

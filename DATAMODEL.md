@@ -422,7 +422,8 @@ classDiagram
   `FilterPushdown::PushdownGet` and is estimated normally — so the blind spot is
   exactly the successful pushdowns.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
-- Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3).
+- Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3). Since spec 075 that bridge is the **fallback** only: Bind learns the shape from `sp_describe_first_result_set` (or from `sp_prepare`'s answer with `prepared := true`) and the query runs at InitGlobal; a statement the server cannot describe still executes at Bind and registers its stream here. Inside a transaction every scan of a catalog drains at init under `MSSQLCatalog::MaterializeMutex()`, and the optimizer flags the catalog scans of any catalog the plan also **sinks into** (COPY, INSERT) for materialisation, because the sink's batches go down the same pinned connection.
+- The per-table metadata queries — table list, columns, primary key, row count — carry the schema and table names as `sp_executesql` parameters (`@s sysname, @t sysname`; `query/mssql_sql_params.hpp`), so their text is one fixed string per shape and the server keeps one plan for every table instead of compiling one per first touch (#334).
 
 ### Cache invalidation
 
