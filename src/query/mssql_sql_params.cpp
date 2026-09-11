@@ -112,6 +112,30 @@ static std::string StringDeclaration(const LogicalType &type, const Value &value
 	return "nvarchar(4000)";
 }
 
+// decimal(38,0) is the widest exact numeric T-SQL has: +/-(10^38 - 1), i.e. at
+// most 38 decimal digits. HUGEINT reaches ~1.7e38 and UHUGEINT ~3.4e38, so both
+// can carry a 39-digit value that no SQL Server numeric can hold. Comparing the
+// rendered digits keeps this free of DuckDB's hugeint internals and is exact:
+// the literal we would emit is the same text.
+static bool ValueFitsDecimal38(const Value &value) {
+	if (value.IsNull()) {
+		return true;
+	}
+	std::string digits = value.ToString();
+	if (!digits.empty() && (digits[0] == '-' || digits[0] == '+')) {
+		digits.erase(0, 1);
+	}
+	// A hugeint renders as an integer, so anything else is not ours to judge.
+	for (size_t i = 0; i < digits.size(); i++) {
+		if (digits[i] < '0' || digits[i] > '9') {
+			return true;
+		}
+	}
+	size_t first = digits.find_first_not_of('0');
+	const size_t significant = (first == std::string::npos) ? 1 : digits.size() - first;
+	return significant <= 38;
+}
+
 std::string DeclarationForValue(const std::string &name, const LogicalType &type, const Value &value) {
 	switch (type.id()) {
 	case LogicalTypeId::SQLNULL:
@@ -134,6 +158,17 @@ std::string DeclarationForValue(const std::string &name, const LogicalType &type
 		return "decimal(20,0)";
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
+		// decimal(38,0) holds +/-(10^38 - 1); HUGEINT reaches ~1.7e38 and UHUGEINT
+		// ~3.4e38, so the widest values render as literals the server cannot
+		// convert -- "Arithmetic overflow error converting numeric to data type
+		// numeric", which names neither the parameter nor the cause. Refuse here
+		// instead, the way the LIST and NULL arms already do.
+		if (!ValueFitsDecimal38(value)) {
+			throw InvalidInputException(
+				"parameter '%s' does not fit T-SQL decimal(38,0), the widest exact numeric SQL Server has; "
+				"cast it to VARCHAR and convert server-side",
+				name);
+		}
 		return "decimal(38,0)";
 	case LogicalTypeId::FLOAT:
 		return "real";
@@ -281,6 +316,21 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 		// DuckDB already refuses a STRUCT whose keys differ only in case, which is
 		// the one collision T-SQL would see.
 		std::string key = StringUtil::Lower(name);
+		// W5: T-SQL variable names are case-insensitive, so two struct keys that
+		// differ only in case DECLARE the same variable twice. Refuse here and
+		// name both spellings -- otherwise the batch reaches the server and comes
+		// back as "The variable name '@A' has already been declared", which does
+		// not say which struct key to change. The map was already built for this;
+		// nothing was reading it.
+		{
+			auto dup = seen.find(key);
+			if (dup != seen.end()) {
+				throw InvalidInputException(
+					"parameter names '%s' and '%s' differ only in case; T-SQL variable names are "
+					"case-insensitive, so both declare @%s",
+					dup->second, name, key);
+			}
+		}
 		seen[key] = name;
 		SqlParam p;
 		p.name = name;
