@@ -21,7 +21,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(mssql, loader) {
 3. **Table functions** (`RegisterMSSQLFunctions`) — `mssql_scan` for raw SQL queries
 4. **Scalar functions** (`RegisterMSSQLExecFunction`) — `mssql_exec` for DDL/DML execution
 5. **Settings** (`RegisterMSSQLSettings`) — connection pool, statistics, DML, COPY tuning
-6. **Diagnostic functions** (`RegisterMSSQLDiagnosticFunctions`) — `mssql_open`, `mssql_close`, `mssql_ping`, `mssql_pool_stats`
+6. **Diagnostic functions** (`RegisterMSSQLDiagnosticFunctions`) — `mssql_pool_stats`
 7. **Cache refresh** (`RegisterMSSQLRefreshCacheFunction`) — `mssql_refresh_cache`
 8. **Catalog preload** (`RegisterMSSQLPreloadCatalogFunction`) — `mssql_preload_catalog`
 9. **COPY functions** (`RegisterMSSQLCopyFunctions`) — `bcp` format for COPY TO
@@ -119,7 +119,7 @@ src/
 │   ├── mssql_pool_manager.cpp    # Global pool registry (singleton)
 │   ├── mssql_connection_provider.cpp # Transaction-aware connection acquisition
 │   ├── mssql_settings.cpp        # Extension settings registration
-│   └── mssql_diagnostic.cpp      # mssql_open/close/ping/pool_stats
+│   └── mssql_diagnostic.cpp      # mssql_pool_stats
 │
 ├── tds/                          # TDS protocol implementation
 │   ├── tds_connection.cpp        # TCP connection, authentication, state machine
@@ -244,9 +244,6 @@ gate widening this further (spec 061).
 |---|---|---|---|
 | `mssql_scan` | Table | `(context VARCHAR, query VARCHAR)` | Execute raw T-SQL, stream results |
 | `mssql_exec` | Scalar | `(context VARCHAR, sql VARCHAR) → BIGINT` | Execute DDL/DML, return affected rows |
-| `mssql_open` | Scalar | `(conn_string VARCHAR) → BIGINT` | Open diagnostic connection |
-| `mssql_close` | Scalar | `(handle BIGINT) → BOOLEAN` | Close diagnostic connection |
-| `mssql_ping` | Scalar | `(handle BIGINT) → BOOLEAN` | Test connection liveness |
 | `mssql_pool_stats` | Table | `(context VARCHAR?)` | Pool statistics |
 | `mssql_refresh_cache` | Scalar | `(catalog VARCHAR) → BOOLEAN` | Refresh metadata cache |
 | `mssql_preload_catalog` | Scalar | `(catalog VARCHAR, schema? VARCHAR) → VARCHAR` | Bulk-load all metadata per-schema |

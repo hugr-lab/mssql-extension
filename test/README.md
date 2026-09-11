@@ -83,7 +83,6 @@ Tests that require a running SQL Server:
 | `parallel_queries.test` | Multiple CTEs with GENERATE_SERIES |
 | `large_data.test` | Large datasets and big row data (VARCHAR, VARBINARY) |
 | `query_cancellation.test` | Query cancellation with LIMIT |
-| `diagnostic_functions.test` | mssql_open, mssql_ping, mssql_close with connection strings |
 | `tls_connection.test` | TLS connection tests (requires loadable extension) |
 | `tls_queries.test` | Data type tests over TLS (requires loadable extension) |
 | `tls_parallel.test` | Parallel query tests over TLS (requires loadable extension) |
@@ -108,7 +107,6 @@ Low-level TDS protocol tests:
 
 | Test File | Description |
 |-----------|-------------|
-| `open_close.test` | mssql_open/mssql_close functions |
 | `ping.test` | Connection validation |
 | `pool_stats.test` | Pool statistics function |
 | `settings.test` | Extension settings |

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`mssql_open()` / `mssql_close()` / `mssql_ping()` / `mssql_close_all()`**,
+  the standalone diagnostic-handle API, and the `MSSQLConnectionHandleManager`
+  singleton behind it. Marked `[DEPRECATED]` in spec 047 (v0.2.1) for removal
+  at the next major boundary, which the first release on the duckdb 2.0 line
+  is; it was the last extension-internal process-wide state. `ATTACH` plus
+  `mssql_scan` / `mssql_exec` / `mssql_pool_stats` cover every use it had,
+  inside the catalog lifecycle and the per-catalog pool.
+
 ### Fixed
 
 - **A metadata load that fails mid-query no longer mutates the cache**

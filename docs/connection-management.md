@@ -261,12 +261,7 @@ DETACH DATABASE mydb
 
 | Function | Purpose |
 |---|---|
-| `mssql_open(conn_string)` | Open standalone connection (URI, ADO.NET, or secret name) |
-| `mssql_close(handle)` | Close connection by handle |
-| `mssql_ping(handle)` | Test connection liveness via TDS ping |
 | `mssql_pool_stats([context])` | View pool statistics (all pools or specific) |
-
-`MSSQLConnectionHandleManager` is a thread-safe singleton that maps handles to diagnostic connections, separate from the pool system.
 
 ## Debug Logging
 
