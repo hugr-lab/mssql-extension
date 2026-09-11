@@ -296,6 +296,9 @@ static void ClearOpenSSLErrors() {
 // this point, and the handshake's "unable to get local issuer certificate"
 // names the problem better than a failure here could.
 
+// Only the Windows and macOS stores hand us DER; elsewhere OpenSSL's default
+// paths do the loading and GCC would flag this as unused.
+#if defined(_WIN32) || defined(__APPLE__)
 static void AddDerCertificate(X509_STORE *store, const unsigned char *der, long der_len) {
 	const unsigned char *p = der;
 	X509 *x509 = d2i_X509(nullptr, &p, der_len);
@@ -309,6 +312,7 @@ static void AddDerCertificate(X509_STORE *store, const unsigned char *der, long 
 	ERR_clear_error();
 	X509_free(x509);
 }
+#endif
 
 static void LoadPlatformTrustStore(SSL_CTX *ssl_ctx) {
 	X509_STORE *store = SSL_CTX_get_cert_store(ssl_ctx);

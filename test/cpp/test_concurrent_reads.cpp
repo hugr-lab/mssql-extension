@@ -65,7 +65,10 @@ struct TestConfig {
 
 	std::string Dsn(const std::string &db) const {
 		std::ostringstream oss;
-		oss << "Server=" << host << "," << port << ";Database=" << db << ";User Id=" << user << ";Password=" << pass;
+		// The CI / docker server runs on its self-generated certificate, and the server
+		// certificate is verified by default since spec 074.
+		oss << "Server=" << host << "," << port << ";Database=" << db << ";User Id=" << user << ";Password=" << pass
+			<< ";TrustServerCertificate=yes";
 		return oss.str();
 	}
 };
@@ -87,7 +90,7 @@ void load_extension(Connection &conn) {
 struct WorkerResult {
 	int thread_id;
 	int iterations_done;
-	std::string first_error;	// empty = no error
+	std::string first_error;  // empty = no error
 };
 
 void worker(DuckDB &db, int thread_id, int iterations, std::atomic<bool> &abort_flag, WorkerResult &out) {
@@ -105,7 +108,7 @@ void worker(DuckDB &db, int thread_id, int iterations, std::atomic<bool> &abort_
 			sql = "SELECT COUNT(*) FROM mssql_scan('mssql', 'SELECT TOP 50 name FROM sys.tables')";
 		} else {
 			sql = "SELECT COUNT(*) FROM mssql_scan('mssql', 'SELECT TOP " + std::to_string(10 + i % 30) +
-			      " object_id FROM sys.objects')";
+				  " object_id FROM sys.objects')";
 		}
 
 		auto result = conn.Query(sql);
@@ -151,21 +154,23 @@ bool scenario_concurrent_mixed_reads(const TestConfig &cfg, int num_threads, int
 
 	threads.reserve(num_threads);
 	for (int t = 0; t < num_threads; ++t) {
-		threads.emplace_back(worker, std::ref(db), t, iterations_per_thread, std::ref(abort_flag), std::ref(results[t]));
+		threads.emplace_back(worker, std::ref(db), t, iterations_per_thread, std::ref(abort_flag),
+							 std::ref(results[t]));
 	}
 	for (auto &th : threads) {
 		th.join();
 	}
 
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	int total_done = 0;
 	bool any_error = false;
 	for (auto &r : results) {
 		total_done += r.iterations_done;
 		if (!r.first_error.empty()) {
-			std::cerr << "  Thread " << r.thread_id << " ERROR after " << r.iterations_done << " iters: "
-					  << r.first_error << std::endl;
+			std::cerr << "  Thread " << r.thread_id << " ERROR after " << r.iterations_done
+					  << " iters: " << r.first_error << std::endl;
 			any_error = true;
 		}
 	}
@@ -187,8 +192,7 @@ bool scenario_concurrent_mixed_reads(const TestConfig &cfg, int num_threads, int
 // under concurrent setup.
 // ---------------------------------------------------------------------------
 bool scenario_concurrent_attach(const TestConfig &cfg, int num_threads) {
-	std::cout << "\n=== Concurrent ATTACHes: " << num_threads << " threads, one ATTACH + N reads each ==="
-			  << std::endl;
+	std::cout << "\n=== Concurrent ATTACHes: " << num_threads << " threads, one ATTACH + N reads each ===" << std::endl;
 
 	DuckDB db(nullptr);
 	{
@@ -214,8 +218,8 @@ bool scenario_concurrent_attach(const TestConfig &cfg, int num_threads) {
 				return;
 			}
 			for (int i = 0; i < 10 && !abort_flag.load(); ++i) {
-				std::string sql = "SELECT COUNT(*) FROM mssql_scan('" + alias +
-				                  "', 'SELECT TOP 10 name FROM sys.tables')";
+				std::string sql =
+					"SELECT COUNT(*) FROM mssql_scan('" + alias + "', 'SELECT TOP 10 name FROM sys.tables')";
 				auto r2 = conn.Query(sql);
 				if (r2->HasError()) {
 					errors[t] = "iter " + std::to_string(i) + ": " + r2->GetError();
@@ -228,7 +232,8 @@ bool scenario_concurrent_attach(const TestConfig &cfg, int num_threads) {
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	bool any_error = false;
 	for (int t = 0; t < num_threads; ++t) {
@@ -269,16 +274,17 @@ bool scenario_concurrent_catalog_reads(const TestConfig &cfg, int num_threads, i
 		}
 		// Drop + recreate test table with a few rows.
 		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.concurrent_read_test')");
-		auto cr = setup.Query("SELECT mssql_exec('mssql', 'CREATE TABLE dbo.concurrent_read_test (id INT PRIMARY KEY, "
-		                       "name NVARCHAR(100), v INT)')");
+		auto cr = setup.Query(
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.concurrent_read_test (id INT PRIMARY KEY, "
+			"name NVARCHAR(100), v INT)')");
 		if (cr->HasError()) {
 			std::cerr << "  CREATE TABLE failed: " << cr->GetError() << std::endl;
 			return false;
 		}
 		for (int i = 0; i < 100; ++i) {
 			auto ins = setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.concurrent_read_test VALUES (" +
-			                       std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
-			                       std::to_string(i * 7) + ")')");
+								   std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
+								   std::to_string(i * 7) + ")')");
 			if (ins->HasError()) {
 				std::cerr << "  INSERT failed: " << ins->GetError() << std::endl;
 				return false;
@@ -310,7 +316,7 @@ bool scenario_concurrent_catalog_reads(const TestConfig &cfg, int num_threads, i
 					break;
 				case 3:
 					sql = "SELECT id, v FROM mssql.dbo.concurrent_read_test WHERE v > " + std::to_string(i * 10) +
-					      " ORDER BY id LIMIT 10";
+						  " ORDER BY id LIMIT 10";
 					break;
 				}
 				auto r = conn.Query(sql);
@@ -326,15 +332,16 @@ bool scenario_concurrent_catalog_reads(const TestConfig &cfg, int num_threads, i
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	int total_done = 0;
 	bool any_error = false;
 	for (auto &r : results) {
 		total_done += r.iterations_done;
 		if (!r.first_error.empty()) {
-			std::cerr << "  Thread " << r.thread_id << " ERROR after " << r.iterations_done << " iters: "
-			          << r.first_error << std::endl;
+			std::cerr << "  Thread " << r.thread_id << " ERROR after " << r.iterations_done
+					  << " iters: " << r.first_error << std::endl;
 			any_error = true;
 		}
 	}
@@ -365,8 +372,8 @@ bool scenario_concurrent_catalog_reads(const TestConfig &cfg, int num_threads, i
 // to the end of their bind/execute. Must run for `duration_seconds` clean.
 // ---------------------------------------------------------------------------
 bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int duration_seconds, int invalidator_ms) {
-	std::cout << "\n=== Concurrent invalidation race: " << num_readers << " readers + invalidator @ "
-	          << invalidator_ms << "ms for " << duration_seconds << "s ===" << std::endl;
+	std::cout << "\n=== Concurrent invalidation race: " << num_readers << " readers + invalidator @ " << invalidator_ms
+			  << "ms for " << duration_seconds << "s ===" << std::endl;
 
 	DuckDB db(nullptr);
 	{
@@ -380,16 +387,17 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 			return false;
 		}
 		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.invalidation_race_test')");
-		auto cr = setup.Query("SELECT mssql_exec('mssql', 'CREATE TABLE dbo.invalidation_race_test (id INT PRIMARY KEY, "
-		                       "name NVARCHAR(100), v INT)')");
+		auto cr = setup.Query(
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.invalidation_race_test (id INT PRIMARY KEY, "
+			"name NVARCHAR(100), v INT)')");
 		if (cr->HasError()) {
 			std::cerr << "  CREATE TABLE failed: " << cr->GetError() << std::endl;
 			return false;
 		}
 		for (int i = 0; i < 100; ++i) {
 			auto ins = setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.invalidation_race_test VALUES (" +
-			                       std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
-			                       std::to_string(i * 7) + ")')");
+								   std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
+								   std::to_string(i * 7) + ")')");
 			if (ins->HasError()) {
 				std::cerr << "  INSERT failed: " << ins->GetError() << std::endl;
 				return false;
@@ -425,8 +433,8 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 					sql = "SELECT name FROM mssql.dbo.invalidation_race_test WHERE id = " + std::to_string(i % 100);
 					break;
 				case 3:
-					sql = "SELECT id, v FROM mssql.dbo.invalidation_race_test WHERE v > " + std::to_string((i * 10) % 700) +
-					      " ORDER BY id LIMIT 10";
+					sql = "SELECT id, v FROM mssql.dbo.invalidation_race_test WHERE v > " +
+						  std::to_string((i * 10) % 700) + " ORDER BY id LIMIT 10";
 					break;
 				}
 				auto r = conn.Query(sql);
@@ -461,15 +469,16 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	int total_done = 0;
 	bool any_error = false;
 	for (auto &r : results) {
 		total_done += r.iterations_done;
 		if (!r.first_error.empty()) {
-			std::cerr << "  Reader " << r.thread_id << " ERROR after " << r.iterations_done << " iters: "
-			          << r.first_error << std::endl;
+			std::cerr << "  Reader " << r.thread_id << " ERROR after " << r.iterations_done
+					  << " iters: " << r.first_error << std::endl;
 			any_error = true;
 		}
 	}
@@ -484,8 +493,8 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.invalidation_race_test')");
 	}
 
-	std::cout << "  Readers completed " << total_done << " queries; " << invalidations.load() << " invalidations injected; "
-	          << elapsed << " ms total" << std::endl;
+	std::cout << "  Readers completed " << total_done << " queries; " << invalidations.load()
+			  << " invalidations injected; " << elapsed << " ms total" << std::endl;
 	if (any_error) {
 		std::cerr << "  FAILED" << std::endl;
 		return false;
@@ -504,7 +513,7 @@ bool scenario_invalidation_race(const TestConfig &cfg, int num_readers, int dura
 // ---------------------------------------------------------------------------
 bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int duration_seconds, int invalidator_ms) {
 	std::cout << "\n=== Sibling-cache stress: " << num_readers << " readers + invalidator + schema-walker for "
-	          << duration_seconds << "s ===" << std::endl;
+			  << duration_seconds << "s ===" << std::endl;
 
 	DuckDB db(nullptr);
 	{
@@ -518,16 +527,17 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 			return false;
 		}
 		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.sibling_cache_test')");
-		auto cr = setup.Query("SELECT mssql_exec('mssql', 'CREATE TABLE dbo.sibling_cache_test (id INT PRIMARY KEY, "
-		                       "name NVARCHAR(100), v INT)')");
+		auto cr = setup.Query(
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.sibling_cache_test (id INT PRIMARY KEY, "
+			"name NVARCHAR(100), v INT)')");
 		if (cr->HasError()) {
 			std::cerr << "  CREATE TABLE failed: " << cr->GetError() << std::endl;
 			return false;
 		}
 		for (int i = 0; i < 50; ++i) {
 			auto ins = setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.sibling_cache_test VALUES (" +
-			                       std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
-			                       std::to_string(i * 7) + ")')");
+								   std::to_string(i) + ", N''row " + std::to_string(i) + "'', " +
+								   std::to_string(i * 7) + ")')");
 			if (ins->HasError()) {
 				std::cerr << "  INSERT failed: " << ins->GetError() << std::endl;
 				return false;
@@ -555,7 +565,7 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 			int i = 0;
 			while (!stop_flag.load() && !abort_flag.load()) {
 				std::string sql = "SELECT id, name, v FROM mssql.dbo.sibling_cache_test WHERE id < " +
-				                  std::to_string(20 + (i % 10)) + " ORDER BY id";
+								  std::to_string(20 + (i % 10)) + " ORDER BY id";
 				auto r = conn.Query(sql);
 				if (r->HasError()) {
 					results[t].first_error = "iter " + std::to_string(i) + ": " + r->GetError();
@@ -590,8 +600,12 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 		int i = 0;
 		while (!stop_flag.load() && !abort_flag.load()) {
 			auto kind = i % 2;
-			auto r = (kind == 0) ? conn.Query("SELECT database_name, schema_name FROM duckdb_schemas() WHERE database_name = 'mssql'")
-			                     : conn.Query("SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE database_name = 'mssql' LIMIT 100");
+			auto r = (kind == 0)
+						 ? conn.Query(
+							   "SELECT database_name, schema_name FROM duckdb_schemas() WHERE database_name = 'mssql'")
+						 : conn.Query(
+							   "SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE database_name "
+							   "= 'mssql' LIMIT 100");
 			if (r->HasError()) {
 				walker_error = "iter " + std::to_string(i) + ": " + r->GetError();
 				abort_flag.store(true);
@@ -607,15 +621,16 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	int total_done = 0;
 	bool any_error = false;
 	for (auto &r : results) {
 		total_done += r.iterations_done;
 		if (!r.first_error.empty()) {
-			std::cerr << "  Reader " << r.thread_id << " ERROR after " << r.iterations_done << " iters: "
-			          << r.first_error << std::endl;
+			std::cerr << "  Reader " << r.thread_id << " ERROR after " << r.iterations_done
+					  << " iters: " << r.first_error << std::endl;
 			any_error = true;
 		}
 	}
@@ -634,8 +649,8 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.sibling_cache_test')");
 	}
 
-	std::cout << "  Readers completed " << total_done << " queries; " << invalidations.load()
-	          << " invalidations; " << schema_walks.load() << " schema walks; " << elapsed << " ms total" << std::endl;
+	std::cout << "  Readers completed " << total_done << " queries; " << invalidations.load() << " invalidations; "
+			  << schema_walks.load() << " schema walks; " << elapsed << " ms total" << std::endl;
 	if (any_error) {
 		std::cerr << "  FAILED" << std::endl;
 		return false;
@@ -660,8 +675,8 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 // integration layer between writes and reads would surface here.
 // ---------------------------------------------------------------------------
 bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, int duration_seconds) {
-	std::cout << "\n=== Concurrent writes to ONE table: " << num_writers
-	          << " writers + 1 reader for " << duration_seconds << "s ===" << std::endl;
+	std::cout << "\n=== Concurrent writes to ONE table: " << num_writers << " writers + 1 reader for "
+			  << duration_seconds << "s ===" << std::endl;
 
 	DuckDB db(nullptr);
 	{
@@ -676,16 +691,16 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 		}
 		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_race_shared')");
 		auto cr = setup.Query(
-		    "SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_race_shared (id INT PRIMARY KEY, v INT, name NVARCHAR(64))')");
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_race_shared (id INT PRIMARY KEY, v INT, name "
+			"NVARCHAR(64))')");
 		if (cr->HasError()) {
 			std::cerr << "  CREATE shared table failed: " << cr->GetError() << std::endl;
 			return false;
 		}
 		// Pre-populate so the reader always sees rows even if writers are mid-cycle.
 		for (int i = 0; i < 100; ++i) {
-			setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.write_race_shared VALUES (" +
-			            std::to_string(i) + ", " + std::to_string(i * 3) + ", N''seed " + std::to_string(i) +
-			            "'')')");
+			setup.Query("SELECT mssql_exec('mssql', 'INSERT INTO dbo.write_race_shared VALUES (" + std::to_string(i) +
+						", " + std::to_string(i * 3) + ", N''seed " + std::to_string(i) + "'')')");
 		}
 		setup.Query("SELECT mssql_refresh_cache('mssql')");
 	}
@@ -710,7 +725,7 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 			int base = 1000 + t * 1000;
 			int i = 0;
 			while (!stop_flag.load() && !abort_flag.load()) {
-				int row_id = base + (i % 100);  // recycle 100 IDs per writer
+				int row_id = base + (i % 100);	// recycle 100 IDs per writer
 				auto step = [&](const std::string &label, const std::string &sql) -> bool {
 					auto r = conn.Query(sql);
 					if (r->HasError()) {
@@ -723,22 +738,21 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 				// INSERT — the DELETE at end of previous cycle removed any prior row
 				// at this id. If the very first cycle's id collides with a seeded row
 				// it'd PK-fail, but base ids are 1000+ so no collision with seeds (0-99).
-				if (!step("INSERT",
-				          "INSERT INTO mssql.dbo.write_race_shared (id, v, name) VALUES (" +
-				              std::to_string(row_id) + ", " + std::to_string(i) + ", 'writer_" +
-				              std::to_string(t) + "_" + std::to_string(i) + "')")) {
+				if (!step("INSERT", "INSERT INTO mssql.dbo.write_race_shared (id, v, name) VALUES (" +
+										std::to_string(row_id) + ", " + std::to_string(i) + ", 'writer_" +
+										std::to_string(t) + "_" + std::to_string(i) + "')")) {
 					return;
 				}
 				++total_inserts;
 				// UPDATE
-				if (!step("UPDATE", "UPDATE mssql.dbo.write_race_shared SET v = v + 1 WHERE id = " +
-				                        std::to_string(row_id))) {
+				if (!step("UPDATE",
+						  "UPDATE mssql.dbo.write_race_shared SET v = v + 1 WHERE id = " + std::to_string(row_id))) {
 					return;
 				}
 				++total_updates;
 				// SELECT (catalog-bound read of our own row)
-				if (!step("SELECT", "SELECT id, v FROM mssql.dbo.write_race_shared WHERE id = " +
-				                        std::to_string(row_id))) {
+				if (!step("SELECT",
+						  "SELECT id, v FROM mssql.dbo.write_race_shared WHERE id = " + std::to_string(row_id))) {
 					return;
 				}
 				// DELETE
@@ -773,15 +787,16 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	bool any_error = false;
 	int total_writer_iters = 0;
 	for (auto &r : results) {
 		total_writer_iters += r.iterations_done;
 		if (!r.first_error.empty()) {
-			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done << " cycles: "
-			          << r.first_error << std::endl;
+			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done
+					  << " cycles: " << r.first_error << std::endl;
 			any_error = true;
 		}
 	}
@@ -796,10 +811,9 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_race_shared')");
 	}
 
-	std::cout << "  Writers: " << total_writer_iters << " complete cycles ("
-	          << total_inserts.load() << " INSERT, " << total_updates.load() << " UPDATE, "
-	          << total_deletes.load() << " DELETE); reader: " << reader_iters.load() << " iters; "
-	          << elapsed << " ms total" << std::endl;
+	std::cout << "  Writers: " << total_writer_iters << " complete cycles (" << total_inserts.load() << " INSERT, "
+			  << total_updates.load() << " UPDATE, " << total_deletes.load()
+			  << " DELETE); reader: " << reader_iters.load() << " iters; " << elapsed << " ms total" << std::endl;
 	if (any_error) {
 		std::cerr << "  FAILED" << std::endl;
 		return false;
@@ -818,8 +832,8 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 // the first time, pk_load_mutex_ must serialise them).
 // ---------------------------------------------------------------------------
 bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int duration_seconds) {
-	std::cout << "\n=== Pure concurrent writes to ONE table: " << num_writers
-	          << " writers for " << duration_seconds << "s ===" << std::endl;
+	std::cout << "\n=== Pure concurrent writes to ONE table: " << num_writers << " writers for " << duration_seconds
+			  << "s ===" << std::endl;
 
 	DuckDB db(nullptr);
 	{
@@ -834,8 +848,8 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 		}
 		setup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_only_shared')");
 		auto cr = setup.Query(
-		    "SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_only_shared (id BIGINT PRIMARY KEY, v INT, "
-		    "name NVARCHAR(64))')");
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.write_only_shared (id BIGINT PRIMARY KEY, v INT, "
+			"name NVARCHAR(64))')");
 		if (cr->HasError()) {
 			std::cerr << "  CREATE failed: " << cr->GetError() << std::endl;
 			return false;
@@ -861,8 +875,8 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 			while (!stop_flag.load() && !abort_flag.load()) {
 				int64_t row_id = base + offset;
 				std::string sql = "INSERT INTO mssql.dbo.write_only_shared (id, v, name) VALUES (" +
-				                  std::to_string(row_id) + ", " + std::to_string(offset) + ", 'w" +
-				                  std::to_string(t) + "_" + std::to_string(offset) + "')";
+								  std::to_string(row_id) + ", " + std::to_string(offset) + ", 'w" + std::to_string(t) +
+								  "_" + std::to_string(offset) + "')";
 				auto r = conn.Query(sql);
 				if (r->HasError()) {
 					results[t].first_error = "iter " + std::to_string(offset) + ": " + r->GetError();
@@ -881,13 +895,14 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 	for (auto &th : threads) {
 		th.join();
 	}
-	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
 	bool any_error = false;
 	for (auto &r : results) {
 		if (!r.first_error.empty()) {
-			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done << ": "
-			          << r.first_error << std::endl;
+			std::cerr << "  Writer " << r.thread_id << " ERROR after " << r.iterations_done << ": " << r.first_error
+					  << std::endl;
 			any_error = true;
 		}
 	}
@@ -898,9 +913,9 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.write_only_shared')");
 	}
 
-	std::cout << "  Total INSERTs: " << total_inserts.load() << " across " << num_writers
-	          << " threads; " << elapsed << " ms total ("
-	          << (total_inserts.load() * 1000 / std::max<int64_t>(elapsed, 1)) << " inserts/sec)" << std::endl;
+	std::cout << "  Total INSERTs: " << total_inserts.load() << " across " << num_writers << " threads; " << elapsed
+			  << " ms total (" << (total_inserts.load() * 1000 / std::max<int64_t>(elapsed, 1)) << " inserts/sec)"
+			  << std::endl;
 	if (any_error) {
 		std::cerr << "  FAILED" << std::endl;
 		return false;
