@@ -130,8 +130,11 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 				return nullptr;
 			}
 
+			// Not into a parser already in Error -- see the DML executors: from
+			// there nothing consumes, so buffer_ grows by the whole remaining
+			// response (issue #323).
 			const auto &payload = packet.GetPayload();
-			if (!payload.empty()) {
+			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
 				parser.Feed(payload);
 			}
 

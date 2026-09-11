@@ -173,6 +173,18 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::stri
 		// Try to get an idle connection
 		auto conn = TryAcquireIdle();
 		if (conn) {
+			// A usable connection is evidence the pool is working, however it was
+			// obtained. The creation path clears the recorded error for exactly
+			// that reason; a pool at or near its limit recovers by REUSE and
+			// never reaches that path, so without this last_create_error_ stays
+			// set for the pool's life. The thrown message no longer depends on
+			// it (own_create_error carries this call's reason), but
+			// mssql_pool_stats.last_create_error does -- and it would show a
+			// long-dead reason for a healthy pool, which is the opposite of what
+			// that column was added for.
+			create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
+			next_create_allowed_ = std::chrono::steady_clock::time_point{};
+			last_create_error_.clear();
 			auto elapsed =
 				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 			stats_.acquire_wait_total_ms += elapsed;

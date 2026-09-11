@@ -232,9 +232,10 @@ bool CTASExecutionState::TableExists(ClientContext &context) {
 						   MSSQLDDLTranslator::EscapeStringLiteral(target.table_name));
 
 	auto &pool = catalog->GetConnectionPool();
-	auto conn = pool.Acquire();
+	std::string why;
+	auto conn = pool.Acquire(-1, &why);
 	if (!conn) {
-		throw IOException("Failed to acquire connection to check table existence");
+		throw IOException("Failed to acquire connection to check table existence: " + why);
 	}
 
 	try {
@@ -256,9 +257,10 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 										  MSSQLDDLTranslator::EscapeStringLiteral(target.schema_name));
 
 	auto &pool = catalog->GetConnectionPool();
-	auto conn = pool.Acquire();
+	std::string why;
+	auto conn = pool.Acquire(-1, &why);
 	if (!conn) {
-		throw IOException("Failed to acquire connection to check schema existence");
+		throw IOException("Failed to acquire connection to check schema existence: " + why);
 	}
 
 	try {
@@ -541,9 +543,10 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	// complete — it did not exist before the statement — and needs no shared
 	// transaction. That is what mssql_ctas_drop_on_failure does.
 	auto &pool = catalog->GetConnectionPool();
-	connection = pool.Acquire();
+	std::string why;
+	connection = pool.Acquire(-1, &why);
 	if (!connection) {
-		throw IOException("CTAS BCP: Failed to acquire connection from pool");
+		throw IOException("CTAS BCP: Failed to acquire connection from pool: " + why);
 	}
 
 	try {
