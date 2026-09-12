@@ -33,6 +33,30 @@ namespace duckdb {
 
 MSSQLQueryExecutor::MSSQLQueryExecutor(const std::string &context_name) : context_name_(context_name) {}
 
+unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::ExecuteOn(ClientContext &context,
+															std::shared_ptr<tds::TdsConnection> connection,
+															const std::string &sql, bool transaction_pinned,
+															bool release_to_pool) {
+	ValidateContext(context);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(context_name_));
+	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+	if (!connection) {
+		throw InternalException("MSSQLQueryExecutor::ExecuteOn: no connection");
+	}
+	const int query_timeout = LoadQueryTimeout(context);
+	const bool reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
+	weak_ptr<tds::ConnectionPool> pool_handle;
+	if (release_to_pool && !transaction_pinned) {
+		pool_handle = mssql_catalog.GetConnectionPoolHandle();
+	}
+	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, pool_handle,
+													  transaction_pinned, query_timeout, reset_on_release);
+	if (!result_stream->Initialize()) {
+		throw IOException("Failed to initialize query result stream");
+	}
+	return result_stream;
+}
+
 void MSSQLQueryExecutor::ValidateContext(ClientContext &context) {
 	// Spec 047: validate via DuckDB catalog lookup (per-catalog pool ownership).
 	// Throws CatalogException when the alias is not attached; that maps to the

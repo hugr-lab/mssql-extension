@@ -1,0 +1,115 @@
+# name: test/sql/transaction/sink_reads_own_catalog.test
+# description: COPY and INSERT ... SELECT reading from the catalog they write to, inside a transaction (spec 075 W3)
+# group: [mssql]
+# issue: 239
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# An explicit transaction pins ONE connection per catalog. A sink into that
+# catalog -- COPY's INSERT BULK, INSERT's batches -- sends on it while the scan
+# feeding the sink is still streaming from it:
+#
+#   IO Error: Failed to execute SQL batch: Cannot execute: connection not in
+#   Idle state (current: Executing)
+#
+# The planner now materialises every scan of a catalog the plan also sinks
+# into, so the scan is drained before the sink's first batch. Both halves
+# failed on main; #239 documented the COPY one as a limitation.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sk75 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sk75', 'IF OBJECT_ID(''dbo.sk75_src'') IS NOT NULL DROP TABLE dbo.sk75_src; IF OBJECT_ID(''dbo.sk75_copy'') IS NOT NULL DROP TABLE dbo.sk75_copy; IF OBJECT_ID(''dbo.sk75_ins'') IS NOT NULL DROP TABLE dbo.sk75_ins');
+
+# 5000 rows: more than one INSERT batch (mssql_insert_batch_size = 1000) and
+# more than one chunk.
+statement ok
+COPY (SELECT i::INTEGER AS id, ('v' || i)::VARCHAR AS v FROM range(1, 5001) t(i)) TO 'mssql://sk75/dbo/sk75_src' (FORMAT 'bcp', CREATE_TABLE true);
+
+statement ok
+SELECT mssql_exec('sk75', 'CREATE TABLE dbo.sk75_ins(id int NOT NULL, v nvarchar(20) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('sk75');
+
+# --- COPY from the catalog's own table into another table of it, in a transaction
+statement ok
+BEGIN;
+
+statement ok
+COPY (SELECT id, v FROM sk75.dbo.sk75_src) TO 'mssql://sk75/dbo/sk75_copy' (FORMAT 'bcp', CREATE_TABLE true);
+
+# visible before COMMIT, on the same pinned connection. Read through mssql_scan:
+# a catalog read of a table created inside the transaction would load its
+# metadata on a pooled session and block on the schema lock (copy_transaction
+# reads the same way).
+query I
+SELECT c FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_copy');
+----
+5000
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_copy');
+----
+1
+
+query I
+SELECT c FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_copy');
+----
+5000
+
+# --- INSERT ... SELECT past one batch, in a transaction, then ROLLBACK
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sk75.dbo.sk75_ins SELECT id, v FROM sk75.dbo.sk75_src;
+
+query I
+SELECT count(*) FROM sk75.dbo.sk75_ins;
+----
+5000
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT c FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_ins');
+----
+0
+
+# the source is untouched by any of it
+query II
+SELECT count(*), sum(id) FROM sk75.dbo.sk75_src;
+----
+5000	12502500
+
+# --- and the same INSERT committed
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sk75.dbo.sk75_ins SELECT id, v FROM sk75.dbo.sk75_src WHERE id <= 2500;
+
+statement ok
+COMMIT;
+
+query I
+SELECT c FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_ins');
+----
+2500
+
+statement ok
+SELECT mssql_exec('sk75', 'DROP TABLE dbo.sk75_src; DROP TABLE dbo.sk75_copy; DROP TABLE dbo.sk75_ins');
+
+statement ok
+DETACH sk75;

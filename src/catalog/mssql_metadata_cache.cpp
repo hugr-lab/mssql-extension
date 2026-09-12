@@ -6,6 +6,7 @@
 #include <thread>
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/mssql_sql_params.hpp"
 
 // Debug logging for metadata cache operations
 static int GetMetadataCacheDebugLevel() {
@@ -101,7 +102,7 @@ OUTER APPLY (SELECT MAX(i.type) AS index_type,
              WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
-  AND SCHEMA_NAME(o.schema_id) = '%s')";
+  AND SCHEMA_NAME(o.schema_id) = @s)";
 
 // Single-table metadata query: loads object type, row count, and all columns for ONE table
 // in a single round trip. Used by GetTableMetadata() to avoid loading all tables in schema.
@@ -127,7 +128,7 @@ OUTER APPLY (SELECT MAX(i.type) AS index_type,
              FROM sys.indexes i
              LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
              WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
-WHERE o.object_id = OBJECT_ID('%s')
+WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";
 
@@ -165,7 +166,7 @@ WHERE s.schema_id NOT IN (3, 4)
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
   AND o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
-  AND s.name = '%s')";
+  AND s.name = @s)";
 
 // Whole-catalog metadata: every schema, every table, every column, in ONE query.
 //
@@ -236,7 +237,7 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name
 FROM sys.columns c
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-WHERE c.object_id = OBJECT_ID('%s')
+WHERE c.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";
 
@@ -432,8 +433,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loading from SQL Server (single query)", schema_name.c_str(),
 				table_name.c_str());
 
-	string full_name = "[" + schema_name + "].[" + table_name + "]";
-	string query = StringUtil::Format(SINGLE_TABLE_METADATA_SQL_TEMPLATE, full_name);
+	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so the
+	// text -- and the server's cached plan -- is the same for every table.
+	string query = mssql::BuildExecuteSqlBatch(
+		SINGLE_TABLE_METADATA_SQL_TEMPLATE, "@s sysname, @t sysname",
+		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	// Populate the cache slot in place so we never take the address of a stack
 	// local that gets moved out. GCC's -Wreturn-local-addr can't prove the
@@ -642,7 +646,7 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 }
 
 void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name) {
-	string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, schema_name);
+	string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
 
 	// Push table filter to SQL Server if convertible to LIKE
 	if (filter_ && filter_->HasTableFilter()) {
@@ -654,6 +658,8 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 		}
 	}
 	sql += "\nORDER BY s.name, o.name, c.column_id";
+	// Spec 075 W4: one plan per schema-load shape, the schema as a parameter.
+	sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
 
 	// Streaming group-by parse (same as BulkLoadAll but for one schema)
 	string current_table;
@@ -1037,7 +1043,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		auto &schema = schema_it->second;
 
 		// Build per-schema query
-		string sql = StringUtil::Format(BULK_METADATA_SCHEMA_SQL_TEMPLATE, target_schema);
+		string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
 
 		// Push table filter to SQL Server if convertible to LIKE
 		if (filter_ && filter_->HasTableFilter()) {
@@ -1047,6 +1053,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 			}
 		}
 		sql += "\nORDER BY s.name, o.name, c.column_id";
+		sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(target_schema)}});
 
 		// Streaming group-by parse for this schema.
 		//
@@ -1497,7 +1504,7 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 		schema.tables.clear();
 
 		// Build query with schema name
-		string query = StringUtil::Format(TABLE_DISCOVERY_SQL_TEMPLATE, schema_name);
+		string query = TABLE_DISCOVERY_SQL_TEMPLATE;
 		// Push table filter to SQL Server if convertible to LIKE
 		if (filter_ && filter_->HasTableFilter()) {
 			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
@@ -1508,6 +1515,7 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 			}
 		}
 		query += "\nORDER BY o.name";
+		query = mssql::BuildExecuteSqlBatch(query, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
 
 		ExecuteMetadataQuery(
 			connection, query,
@@ -1682,7 +1690,7 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 
 void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string &schema_name) {
 	// Build query with schema name (safe: schema names are identifiers, not user input)
-	string query = StringUtil::Format(TABLE_DISCOVERY_SQL_TEMPLATE, schema_name);
+	string query = TABLE_DISCOVERY_SQL_TEMPLATE;
 	// Push table filter to SQL Server if convertible to LIKE
 	if (filter_ && filter_->HasTableFilter()) {
 		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
@@ -1691,6 +1699,7 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 		}
 	}
 	query += "\nORDER BY o.name";
+	query = mssql::BuildExecuteSqlBatch(query, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
 
 	auto &schema_meta = schemas_[schema_name];
 
@@ -1739,11 +1748,9 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 
 void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const string &schema_name,
 									 const string &table_name, MSSQLTableMetadata &table_metadata) {
-	// Build fully qualified object name
-	string full_name = "[" + schema_name + "].[" + table_name + "]";
-
-	// Build query with object name
-	string query = StringUtil::Format(COLUMN_DISCOVERY_SQL_TEMPLATE, full_name);
+	string query = mssql::BuildExecuteSqlBatch(
+		COLUMN_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
+		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	ExecuteMetadataQuery(
 		connection, query,

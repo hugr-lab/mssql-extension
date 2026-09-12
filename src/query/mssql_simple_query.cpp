@@ -111,6 +111,7 @@ SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, cons
 	result.error_message = collect_result.error_message;
 	result.error_number = collect_result.error_number;
 	result.column_names = collect_result.column_names;
+	result.result_sets = std::move(collect_result.result_sets);
 	result.rows_affected = collect_result.rows_affected;
 	result.info_messages = std::move(collect_result.info_messages);
 
@@ -251,6 +252,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 			case tds::ParsedTokenType::ColMetadata:
 				// Store column metadata
 				columns = parser.GetColumnMetadata();
+				result.result_sets.push_back(columns);
 				result.column_names.clear();
 				for (const auto &col : columns) {
 					result.column_names.push_back(col.name);

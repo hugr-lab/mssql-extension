@@ -1,0 +1,120 @@
+# name: test/sql/query/mssql_scan_bind_describe.test
+# description: mssql_scan learns its shape from sp_describe_first_result_set at bind and runs the query at init (spec 075)
+# group: [mssql]
+# issue: 336, 329
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Before spec 075 Bind EXECUTED the query to read its COLMETADATA: a DESCRIBE or
+# an EXPLAIN of a batch with an INSERT inserted, a query with a side effect ran
+# twice, and inside a transaction the second scan of a statement found the
+# pinned connection Executing (#329). Now Bind asks the server to describe the
+# statement; only a statement the server cannot describe (one that reads a
+# #temp table it creates) is still run at Bind, exactly as before.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS bd75 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bd75', 'IF OBJECT_ID(''dbo.bd75_side'') IS NOT NULL DROP TABLE dbo.bd75_side; CREATE TABLE dbo.bd75_side(id int)');
+
+# 1. DESCRIBE settles the shape of the batch's first result set without running it:
+#    the INSERT ahead of the SELECT leaves the table empty. Fails on main.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('bd75', 'INSERT INTO dbo.bd75_side VALUES (1); SELECT id FROM dbo.bd75_side'));
+----
+id	INTEGER
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan('bd75', 'INSERT INTO dbo.bd75_side VALUES (1); SELECT id FROM dbo.bd75_side');
+
+query I
+SELECT count(*) FROM mssql_scan('bd75', 'SELECT id FROM dbo.bd75_side');
+----
+0
+
+# 2. Executing it runs the batch exactly once.
+query I
+SELECT id FROM mssql_scan('bd75', 'INSERT INTO dbo.bd75_side VALUES (1); SELECT id FROM dbo.bd75_side');
+----
+1
+
+query I
+SELECT count(*) FROM mssql_scan('bd75', 'SELECT id FROM dbo.bd75_side');
+----
+1
+
+# 3. The fallback: the server refuses to describe a batch that reads a #temp
+#    table it creates, so Bind runs it as it always had -- and the rows arrive.
+query I
+SELECT v FROM mssql_scan('bd75', 'CREATE TABLE #bd75_t(v int); INSERT INTO #bd75_t VALUES (7); SELECT v FROM #bd75_t');
+----
+7
+
+statement ok
+BEGIN;
+
+query I
+SELECT v FROM mssql_scan('bd75', 'CREATE TABLE #bd75_t2(v int); INSERT INTO #bd75_t2 VALUES (8); SELECT v FROM #bd75_t2');
+----
+8
+
+# ... and a second one in the same transaction still finds the pinned connection Idle.
+query I
+SELECT v FROM mssql_scan('bd75', 'CREATE TABLE #bd75_t3(v int); INSERT INTO #bd75_t3 VALUES (9); SELECT v FROM #bd75_t3');
+----
+9
+
+statement ok
+COMMIT;
+
+# 4. #329's two shapes inside a transaction: two mssql_scans in one statement,
+#    and an mssql_scan beside a catalog scan as scalar subqueries.
+statement ok
+BEGIN;
+
+query I
+WITH a AS NOT MATERIALIZED (SELECT * FROM mssql_scan('bd75', 'SELECT 1 AS x')),
+     b AS NOT MATERIALIZED (SELECT * FROM mssql_scan('bd75', 'SELECT 2 AS x'))
+SELECT a.x + b.x + (SELECT count(*) FROM bd75.dbo.bd75_side) FROM a, b;
+----
+4
+
+query I
+SELECT (SELECT x FROM mssql_scan('bd75', 'SELECT 3 AS x')) + (SELECT count(*) FROM bd75.dbo.bd75_side);
+----
+4
+
+# 5. A scan larger than one chunk inside a transaction is materialised at init
+#    and read back whole.
+query II
+SELECT count(*), sum(n) FROM mssql_scan('bd75', 'SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns a CROSS JOIN sys.all_columns b');
+----
+20000	200010000
+
+statement ok
+COMMIT;
+
+# 6. Outside a transaction the scan streams: the same statement, the same rows.
+query II
+SELECT count(*), sum(n) FROM mssql_scan('bd75', 'SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns a CROSS JOIN sys.all_columns b');
+----
+20000	200010000
+
+# 7. A statement that returns no rows at all: the describe answers with no
+#    result set, the fallback runs it, and the error is the server's own.
+statement error
+SELECT * FROM mssql_scan('bd75', 'SELECT * FROM dbo.bd75_no_such_table');
+----
+Invalid object name
+
+statement ok
+SELECT mssql_exec('bd75', 'DROP TABLE dbo.bd75_side');
+
+statement ok
+DETACH bd75;

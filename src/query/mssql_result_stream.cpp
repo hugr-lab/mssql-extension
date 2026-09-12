@@ -98,8 +98,12 @@ MSSQLResultStream::~MSSQLResultStream() {
 	// (PR #179 review).
 	if (connection_) {
 		auto conn_state = connection_->GetState();
-		if (conn_state != tds::ConnectionState::Idle && conn_state != tds::ConnectionState::Disconnected) {
-			// Connection is in unexpected state - close it to prevent pool corruption
+		if (batch_sent_ && conn_state != tds::ConnectionState::Idle &&
+			conn_state != tds::ConnectionState::Disconnected) {
+			// Connection is in unexpected state - close it to prevent pool corruption.
+			// Only when this stream is the one that put it there: an Initialize
+			// refused because the pinned connection was busy must leave the
+			// connection to the stream that is using it (spec 075).
 			connection_->Close();
 		}
 
@@ -140,6 +144,7 @@ bool MSSQLResultStream::Initialize() {
 	if (!connection_->ExecuteBatch(sql_)) {
 		throw IOException("Failed to execute SQL batch: " + connection_->GetLastError());
 	}
+	batch_sent_ = true;
 
 	// Read and parse until we get COLMETADATA
 	while (state_ == MSSQLResultStreamState::Initializing) {

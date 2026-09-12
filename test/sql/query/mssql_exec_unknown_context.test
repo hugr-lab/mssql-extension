@@ -1,0 +1,34 @@
+# name: test/sql/query/mssql_exec_unknown_context.test
+# description: mssql_exec / mssql_exec_params name themselves when the context is unknown
+# group: [query]
+#
+# The bind-time check in BindExecContextName only runs `if (argument.IsFoldable())`,
+# so a CONSTANT context never reaches RunExecBatch -- it is answered by the
+# BinderException instead. Every existing test used a constant, which is why a
+# missing format argument in RunExecBatch's own copy of that message went
+# unnoticed: three %s, two args, so the user got an InternalException with a
+# "please file a bug report" banner instead of the guidance, from nothing worse
+# than a typo'd catalog name.
+#
+# A column reference is not foldable, so these reach the runtime path.
+
+require mssql
+
+# Constant context: answered at bind time.
+statement error
+SELECT mssql_exec('no_such_ctx_bind', 'SELECT 1');
+----
+mssql_exec: Unknown context 'no_such_ctx_bind'
+
+# Non-foldable context: reaches RunExecBatch. Must name mssql_exec, and must not
+# be an INTERNAL error.
+statement error
+SELECT mssql_exec(c, 'SELECT 1') FROM (VALUES ('no_such_ctx_run')) t(c);
+----
+mssql_exec: Unknown context 'no_such_ctx_run'
+
+# Same path, reported under its own name rather than mssql_exec's.
+statement error
+SELECT mssql_exec_params(c, 'SELECT 1', {'a': 1}) FROM (VALUES ('no_such_ctx_run')) t(c);
+----
+mssql_exec_params: Unknown context 'no_such_ctx_run'

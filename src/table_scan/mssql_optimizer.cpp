@@ -11,14 +11,19 @@
 
 #include "table_scan/mssql_optimizer.hpp"
 #include <map>
+#include <set>
 #include <unordered_set>
 #include "catalog/mssql_catalog.hpp"
+#include "copy/copy_function.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -673,7 +678,17 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 // Memory is bounded by the buffer manager — ColumnDataCollection spills — and the
 // shape that needs this is metadata-sized by nature: it is a transaction doing
 // several reads of its own catalog, not a bulk scan.
-static void CollectCatalogScans(LogicalOperator &op, std::map<string, vector<MSSQLCatalogScanBindData *>> &by_catalog) {
+// The scans of one catalog a plan holds: the catalog scans, which the flag
+// below can materialise, and the raw mssql_scan / mssql_scan_params ones, which
+// since spec 075 run at InitGlobal too and materialise there unconditionally
+// inside a transaction. A raw scan counts towards "more than one" because the
+// catalog scan beside it must drain before it, or after it -- never alongside.
+struct MSSQLCatalogScanTally {
+	vector<MSSQLCatalogScanBindData *> catalog_scans;
+	idx_t raw_scans = 0;
+};
+
+static void CollectCatalogScans(LogicalOperator &op, std::map<string, MSSQLCatalogScanTally> &by_catalog) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		// static_cast, not dynamic_cast: this repo keeps RTTI off the planning path
@@ -684,11 +699,41 @@ static void CollectCatalogScans(LogicalOperator &op, std::map<string, vector<MSS
 		// thing that binds it.
 		if (get.function.name == "mssql_catalog_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
-			by_catalog[bind_data.context_name].push_back(&bind_data);
+			by_catalog[bind_data.context_name].catalog_scans.push_back(&bind_data);
+		} else if ((get.function.name == "mssql_scan" || get.function.name == "mssql_scan_params") && get.bind_data) {
+			auto &bind_data = get.bind_data->Cast<MSSQLScanBindData>();
+			by_catalog[bind_data.context_name].raw_scans++;
 		}
 	}
 	for (auto &child : op.children) {
 		CollectCatalogScans(*child, by_catalog);
+	}
+}
+
+// Spec 075 W3: the catalogs the plan WRITES to. A COPY (BulkLoadBCP) and an
+// INSERT run on the same pinned connection as a scan of their own catalog, and
+// a scan still open when the sink sends its first batch collides with it -- the
+// bulk load with `connection not in Idle state`, the INSERT past its first
+// batch the same way. So one scan is one too many when the plan also sinks into
+// that catalog.
+static void CollectSinkCatalogs(LogicalOperator &op, std::set<string> &catalogs) {
+	if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
+		auto &copy = op.Cast<LogicalCopyToFile>();
+		if (copy.function.name == "bcp" && copy.bind_data) {
+			const auto &name = copy.bind_data->Cast<MSSQLCopyBindData>().catalog_name;
+			MSSQL_OPT_DEBUG(1, "sink: COPY into catalog '%s'", name.c_str());
+			catalogs.insert(name);
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_INSERT) {
+		auto &insert = op.Cast<LogicalInsert>();
+		auto &catalog = insert.table.ParentCatalog();
+		if (catalog.GetCatalogType() == "mssql") {
+			MSSQL_OPT_DEBUG(1, "sink: INSERT into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
+			catalogs.insert(catalog.GetName().GetIdentifierName());
+		}
+	}
+	for (auto &child : op.children) {
+		CollectSinkCatalogs(*child, catalogs);
 	}
 }
 
@@ -699,13 +744,21 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 	if (context.transaction.IsAutoCommit()) {
 		return;
 	}
-	std::map<string, vector<MSSQLCatalogScanBindData *>> by_catalog;
+	std::map<string, MSSQLCatalogScanTally> by_catalog;
 	CollectCatalogScans(plan, by_catalog);
+	std::set<string> sink_catalogs;
+	CollectSinkCatalogs(plan, sink_catalogs);
 	for (auto &entry : by_catalog) {
-		if (entry.second.size() < 2) {
+		auto &tally = entry.second;
+		const idx_t scans = tally.catalog_scans.size() + tally.raw_scans;
+		const bool has_sink = sink_catalogs.count(entry.first) > 0;
+		MSSQL_OPT_DEBUG(1, "catalog '%s': %llu catalog scan(s), %llu raw scan(s), sink=%d", entry.first.c_str(),
+						(unsigned long long)tally.catalog_scans.size(), (unsigned long long)tally.raw_scans,
+						has_sink ? 1 : 0);
+		if (scans < 2 && !has_sink) {
 			continue;
 		}
-		for (auto *bind_data : entry.second) {
+		for (auto *bind_data : tally.catalog_scans) {
 			bind_data->requires_materialization = true;
 		}
 	}

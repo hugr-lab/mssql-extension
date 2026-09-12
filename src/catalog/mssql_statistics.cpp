@@ -1,5 +1,6 @@
 #include "catalog/mssql_statistics.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/mssql_sql_params.hpp"
 
 #include <sstream>
 
@@ -16,8 +17,8 @@ SELECT ISNULL(SUM(p.rows), 0) AS row_count
 FROM sys.dm_db_partition_stats p
 INNER JOIN sys.objects o ON p.object_id = o.object_id
 INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
-WHERE s.name = '%s'
-  AND o.name = '%s'
+WHERE s.name = @s
+  AND o.name = @t
   AND p.index_id IN (0, 1)
 )";
 
@@ -155,28 +156,15 @@ bool MSSQLStatisticsProvider::IsCacheValid(const MSSQLTableStatistics &stats, in
 
 idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, const string &schema_name,
 											 const string &table_name) {
-	// Escape single quotes in schema/table names to prevent SQL injection
-	string safe_schema = schema_name;
-	string safe_table = table_name;
-
-	// Replace ' with '' for SQL escaping
-	size_t pos = 0;
-	while ((pos = safe_schema.find('\'', pos)) != string::npos) {
-		safe_schema.replace(pos, 1, "''");
-		pos += 2;
-	}
-	pos = 0;
-	while ((pos = safe_table.find('\'', pos)) != string::npos) {
-		safe_table.replace(pos, 1, "''");
-		pos += 2;
-	}
-
-	// Build the query
-	char sql_buffer[1024];
-	snprintf(sql_buffer, sizeof(sql_buffer), ROW_COUNT_SQL_TEMPLATE, safe_schema.c_str(), safe_table.c_str());
+	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so one
+	// plan serves every table; the quoting the old snprintf path did by hand
+	// is NVarcharLiteral's.
+	std::string sql = mssql::BuildExecuteSqlBatch(
+		ROW_COUNT_SQL_TEMPLATE, "@s sysname, @t sysname",
+		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	// Execute query and get result
-	std::string result = MSSQLSimpleQuery::ExecuteScalar(connection, sql_buffer);
+	std::string result = MSSQLSimpleQuery::ExecuteScalar(connection, sql);
 
 	if (result.empty()) {
 		return 0;

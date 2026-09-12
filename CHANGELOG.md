@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`mssql_scan_params` and `mssql_exec_params`** (spec 075): the raw-SQL
+  functions with parameters. `mssql_scan_params(ctx, statement, {'id': 42,
+  'since': TIMESTAMP '2024-01-02'})` sends `@id` and `@since` through
+  `sp_executesql`, declared from the DuckDB types (`VARCHAR` →
+  `nvarchar(4000)`, or `nvarchar(max)` past 4000 bytes; `MSSQL_VARCHAR(20)` →
+  `varchar(20)`; `TIMESTAMP` → `datetime2(6)`; `DECIMAL(10,2)` →
+  `decimal(10,2)`; the full table is in `docs/query-execution.md`) or from
+  the caller's own list as a fourth argument (`'@ts datetime, @c
+  varchar(8)'`). The server keys its plan on the statement text and the
+  declarations, so every call — from any session — reuses one compiled plan
+  instead of compiling per distinct value; a statement `mssql_exec_params`
+  runs for a thousand rows compiles once. A bare `NULL`, a LIST or STRUCT
+  value and a key that is not a T-SQL identifier are refused at bind with
+  the fix named.
+- **`mssql_scan(..., prepared := true)`** (spec 075): compile once via
+  `sp_prepare` — the shape comes from the prepare's answer and execution is
+  `sp_execute` by handle, on the session that holds it. The default path
+  describes at bind and compiles again at execution; the server's ad hoc
+  cache makes that second compile cheap, but a statement the plan cache
+  will not keep (`optimize for ad hoc workloads`, a large batch) pays it in
+  full. A statement the server prepares without a shape — a batch of more
+  than one statement — degrades to the default path.
+
 ### Changed
+
+- **`mssql_scan` no longer executes its query at bind** (spec 075, #336).
+  Bind asks `sp_describe_first_result_set` for the result's shape; the query
+  runs when the scan initialises. A `DESCRIBE` or `EXPLAIN` of a batch with
+  an `INSERT` ahead of its `SELECT` therefore inserts nothing, and a query
+  with a side effect runs exactly once. A statement the server cannot
+  describe — a batch that reads a `#temp` table it creates, a procedure — is
+  still run at bind, as before. Should the shape at execution differ from
+  the one bound, the scan fails loudly rather than serving rows of another
+  shape.
+- **The per-table metadata queries are parameterised** (spec 075, #334).
+  The table list, a table's columns, its primary key and its row-count
+  estimate used to carry the schema and table names inside the query text,
+  so the server compiled a plan on every first touch of a table — measured
+  at ~30 ms per table before, 0–1 ms after, because the text is now one
+  fixed string per shape with `@s` / `@t` as `sp_executesql` parameters.
 
 - **Breaking: the server certificate is verified by default** (spec 074).
   `Encrypt`, `TrustServerCertificate` and the new `HostNameInCertificate` now
@@ -42,6 +83,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the catalog lifecycle and the per-catalog pool.
 
 ### Fixed
+
+- **Two reads of one catalog inside a transaction** (spec 075, #329). Two
+  `mssql_scan` calls in one statement, or an `mssql_scan` beside a catalog
+  scan, collided on the transaction's pinned connection (`Cannot execute:
+  connection not in Idle state`) because the raw scan held it from bind to
+  the last row. Inside a transaction every scan of a catalog now drains at
+  initialisation under the catalog's materialise lock, in whatever order
+  DuckDB initialises them.
+- **A sink reading from the catalog it writes to, inside a transaction**
+  (spec 075, #239). `COPY (SELECT ... FROM srv.dbo.t) TO 'mssql://srv/...'`
+  and `INSERT INTO srv.dbo.t2 SELECT ... FROM srv.dbo.t` past one batch
+  failed with `Connection is busy executing another query`: the bulk load or
+  the second INSERT batch went down the pinned connection the source scan
+  was still streaming from. The planner now materialises the scans of any
+  catalog the plan also sinks into, and the bulk load opens its stream
+  (`INSERT BULK` + COLMETADATA) on the first chunk rather than when the sink
+  is created -- DuckDB creates the sink before it initialises the source, so
+  an open stream at that point would have collided with the source's drain.
+  Documented as a limitation until now.
 
 - **An attached Azure AD catalog can open new connections after its token has
   expired** ([#302](https://github.com/hugr-lab/mssql-extension/issues/302),

@@ -624,6 +624,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_incremental_cache.cpp \
     test/cpp/test_pool_creation_failure.cpp \
     test/cpp/test_token_parser_tokens.cpp \
+    test/cpp/test_sql_params.cpp \
     test/cpp/codec/test_binary_codec.cpp \
     test/cpp/codec/test_boolean_codec.cpp \
     test/cpp/codec/test_datetime_codec.cpp \

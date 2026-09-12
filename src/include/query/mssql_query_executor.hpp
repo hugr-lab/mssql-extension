@@ -24,6 +24,14 @@ public:
 	// Throws on connection failure or initial protocol errors
 	unique_ptr<MSSQLResultStream> Execute(ClientContext &context, const std::string &sql);
 
+	//! Spec 075: run `sql` on a connection the caller already holds -- the
+	//! transaction's pinned one, or the session a prepared handle lives in. When
+	//! `release_to_pool` is false the stream drops its reference at the end and
+	//! the caller keeps ownership; when true the stream returns it to the pool as
+	//! the pool-acquired path does.
+	unique_ptr<MSSQLResultStream> ExecuteOn(ClientContext &context, std::shared_ptr<tds::TdsConnection> connection,
+											const std::string &sql, bool transaction_pinned, bool release_to_pool);
+
 	// Validate that the context exists
 	void ValidateContext(ClientContext &context);
 
