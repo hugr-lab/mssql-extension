@@ -28,9 +28,12 @@
 #include <iostream>
 #include <string>
 
+using duckdb::Hugeint;
+using duckdb::hugeint_t;
 using duckdb::Identifier;
 using duckdb::InvalidInputException;
 using duckdb::LogicalType;
+using duckdb::NumericLimits;
 using duckdb::Value;
 using duckdb::mssql::BuildExecuteSqlBatch;
 using duckdb::mssql::BuildSqlParams;
