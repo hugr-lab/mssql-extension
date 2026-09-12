@@ -513,16 +513,11 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// Cache the INSERT BULK SQL for re-execution on batch flush
 		gstate->insert_bulk_sql = insert_bulk;
 
-		// Execute INSERT BULK to prepare server for bulk load
-		auto result = MSSQLSimpleQuery::Execute(*gstate->connection, insert_bulk);
-		if (!result.success) {
-			throw InvalidInputException("MSSQL COPY: Failed to execute INSERT BULK: %s", result.error_message);
-		}
-
-		// Transition connection to Executing state for BCP
-		if (!gstate->connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-			throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
-		}
+		// INSERT BULK is NOT sent here. DuckDB creates the sink state before it
+		// initialises the source (an open job scheduled from RequestFileState),
+		// and inside a transaction the source scan drains on this same pinned
+		// connection; a stream opened here would be the collision W3 exists to
+		// remove. The stream opens on the first chunk -- StartBulkStream.
 
 		// Create BCP writer with optional column mapping
 		gstate->writer =
@@ -552,10 +547,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 					 (unsigned long long)gstate->parallel_writer_limit, gstate->transaction_pinned ? 1 : 0,
 					 bdata.target.is_temp_table ? 1 : 0);
 
-		// Send COLMETADATA token to start the BCP stream
-		gstate->writer->WriteColmetadata();
-
-		CopyDebugLog(1, "BCPCopyInitGlobal: BCP stream started, ready to receive rows");
+		CopyDebugLog(1, "BCPCopyInitGlobal: ready; the BCP stream opens on the first chunk (spec 075 W3)");
 
 	} catch (...) {
 		// Release connection on any error during initialization
@@ -569,6 +561,28 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 //===----------------------------------------------------------------------===//
 // BCPCopyInitLocal - Create per-thread buffer
 //===----------------------------------------------------------------------===//
+
+// Open the bulk-load stream on the shared writer's connection: INSERT BULK,
+// Idle -> Executing, COLMETADATA. Called under write_mutex from the first
+// BCPCopySink that reaches the shared writer, and from FlushToServer to reopen
+// it after a batch's DONE -- the same three steps in both places. Not from
+// BCPCopyInitGlobal (spec 075 W3): DuckDB creates the sink state before it
+// initialises the source, on an open job that runs concurrently with the
+// source's InitGlobal, and in a transaction that source drains on this very
+// pinned connection. By the first chunk the source has produced rows, so the
+// connection is Idle whichever of the two initialised first.
+static void StartBulkStream(MSSQLCopyGlobalState &gdata, const char *caller) {
+	auto result = MSSQLSimpleQuery::Execute(*gdata.connection, gdata.insert_bulk_sql);
+	if (!result.success) {
+		throw InvalidInputException("MSSQL COPY: Failed to execute INSERT BULK: %s", result.error_message);
+	}
+	if (!gdata.connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
+		throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
+	}
+	gdata.writer->WriteColmetadata();
+	gdata.bulk_started = true;
+	CopyDebugLog(1, "%s: BCP stream started", caller);
+}
 
 unique_ptr<LocalFunctionData> BCPCopyInitLocal(ExecutionContext &context, FunctionData &bind_data) {
 	// No local buffering needed - we write directly to BCPWriter
@@ -692,6 +706,9 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// while another thread was still appending to it. Measured at 205376 rows
 		// arriving out of 1000000 — no error anywhere, on either side.
 		std::unique_lock<std::mutex> shared_lock(gdata.write_mutex);
+		if (!gdata.bulk_started) {
+			StartBulkStream(gdata, "BCPCopySink");
+		}
 		auto start_write = counters ? Clock::now() : CopyTimePoint{};
 		idx_t rows_written = gdata.writer->WriteRows(input);
 		const uint64_t encode_ns = counters ? ElapsedNs(start_write) : 0;
@@ -782,26 +799,14 @@ static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &
 					 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)confirmed,
 					 (unsigned long long)gdata.rows_confirmed.load());
 
-		// Re-execute INSERT BULK to prepare for next batch
-		auto start_insert = Clock::now();
-		CopyDebugLog(1, "FlushToServer: >> Re-executing INSERT BULK...");
-		auto result = MSSQLSimpleQuery::Execute(*gdata.connection, gdata.insert_bulk_sql);
-		double insert_ms = ElapsedMs(start_insert);
-		CopyDebugLog(1, "FlushToServer: >> INSERT BULK done in %.2f ms", insert_ms);
-		if (!result.success) {
-			throw InvalidInputException("MSSQL COPY: Failed to re-execute INSERT BULK: %s", result.error_message);
-		}
-
-		// Transition connection back to Executing state for BCP
-		if (!gdata.connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-			throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
-		}
-
-		// Reset writer for next batch
+		// Reset the writer, then reopen the stream: INSERT BULK, Executing,
+		// COLMETADATA -- the same three steps the first chunk ran.
 		auto start_reset = Clock::now();
 		gdata.writer->ResetForNextBatch();
-		gdata.writer->WriteColmetadata();
 		double reset_ms = ElapsedMs(start_reset);
+		auto start_insert = Clock::now();
+		StartBulkStream(gdata, "FlushToServer");
+		double insert_ms = ElapsedMs(start_insert);
 
 		double total_ms = ElapsedMs(start_total);
 		double rows_per_sec = (total_ms > 0) ? (rows_in_batch * 1000.0 / total_ms) : 0;
@@ -1070,13 +1075,19 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 			CopyDebugLog(1, "BCPCopyFinalize: sending empty DONE to close BCP stream");
 		}
 
-		// Send DONE token for the final batch (even if 0 rows)
-		gdata.writer->WriteDone(rows_in_final_batch);
-
-		CopyDebugLog(1, "BCPCopyFinalize: data sent, waiting for SQL Server to process...");
-
-		// Read server response and get confirmed row count
-		idx_t final_batch_confirmed = gdata.writer->Finalize();
+		idx_t final_batch_confirmed = 0;
+		if (gdata.bulk_started) {
+			// Send DONE token for the final batch (even if 0 rows)
+			gdata.writer->WriteDone(rows_in_final_batch);
+			CopyDebugLog(1, "BCPCopyFinalize: data sent, waiting for SQL Server to process...");
+			// Read server response and get confirmed row count
+			final_batch_confirmed = gdata.writer->Finalize();
+		} else {
+			// No chunk ever reached the shared writer -- an empty source, or every
+			// thread on a session of its own -- so no stream was opened and there
+			// is nothing to close; the connection never left Idle.
+			CopyDebugLog(1, "BCPCopyFinalize: no BCP stream was opened on the shared writer");
+		}
 		gdata.rows_confirmed.fetch_add(final_batch_confirmed);
 
 		CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows", (unsigned long long)final_batch_confirmed);

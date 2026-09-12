@@ -97,8 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed with `Connection is busy executing another query`: the bulk load or
   the second INSERT batch went down the pinned connection the source scan
   was still streaming from. The planner now materialises the scans of any
-  catalog the plan also sinks into, so the source is drained before the
-  first batch is sent. Documented as a limitation until now.
+  catalog the plan also sinks into, and the bulk load opens its stream
+  (`INSERT BULK` + COLMETADATA) on the first chunk rather than when the sink
+  is created -- DuckDB creates the sink before it initialises the source, so
+  an open stream at that point would have collided with the source's drain.
+  Documented as a limitation until now.
 
 - **An attached Azure AD catalog can open new connections after its token has
   expired** ([#302](https://github.com/hugr-lab/mssql-extension/issues/302),

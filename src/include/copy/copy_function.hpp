@@ -144,6 +144,9 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 
 	// INSERT BULK SQL (cached for re-execution on flush)
 	string insert_bulk_sql;
+	//! Spec 075 W3: whether INSERT BULK + COLMETADATA have been sent on the
+	//! shared writer's connection. Not at init -- see StartBulkStream.
+	bool bulk_started = false;
 
 	// Write synchronization
 	std::mutex write_mutex;
