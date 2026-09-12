@@ -869,13 +869,13 @@ static bool ExecSqlMayChangeSchema(const string &sql) {
 // text for the DDL heuristic -- for mssql_exec_params the batch wraps it in
 // sp_executesql, whose name would otherwise trip the EXEC keyword every time.
 static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const string &sql,
-							const string &statement) {
+							const string &statement, const char *function_name) {
 	// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 	MSSQLCatalog *catalog_ptr = nullptr;
 	try {
 		auto &raw_catalog = Catalog::GetCatalog(client_context, Identifier(context_name));
 		if (raw_catalog.GetCatalogType() != "mssql") {
-			throw InvalidInputException("mssql_exec: Context '%s' is attached as a non-MSSQL catalog (type: %s)",
+			throw InvalidInputException("%s: Context '%s' is attached as a non-MSSQL catalog (type: %s)", function_name,
 										context_name, raw_catalog.GetCatalogType());
 		}
 		catalog_ptr = &raw_catalog.Cast<MSSQLCatalog>();
@@ -883,13 +883,13 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 		throw;
 	} catch (const std::exception &) {
 		throw InvalidInputException(
-			"mssql_exec: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
+			"%s: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
 			"...)",
-			context_name, context_name);
+			function_name, context_name, context_name);
 	}
 	auto &catalog = *catalog_ptr;
 	if (catalog.IsReadOnly()) {
-		throw InvalidInputException("Cannot execute mssql_exec: catalog '%s' is attached in read-only mode",
+		throw InvalidInputException("Cannot execute %s: catalog '%s' is attached in read-only mode", function_name,
 									context_name);
 	}
 
@@ -897,7 +897,7 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 	auto connection = ConnectionProvider::GetConnection(client_context, catalog);
 
 	if (!connection) {
-		throw IOException("mssql_exec: Failed to acquire connection from pool for '%s'", context_name);
+		throw IOException("%s: Failed to acquire connection from pool for '%s'", function_name, context_name);
 	}
 
 	// Execute the SQL.
@@ -976,7 +976,7 @@ static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &re
 
 		MSSQL_FN_DEBUG_LOG(1, "mssql_exec: context=%s, sql=%s", context_name.c_str(), sql.c_str());
 
-		return RunExecBatch(state.GetContext(), context_name, sql, sql);
+		return RunExecBatch(state.GetContext(), context_name, sql, sql, "mssql_exec");
 	});
 }
 
@@ -1015,7 +1015,7 @@ static void MSSQLExecParamsExecute(DataChunk &args, ExpressionState &state, Vect
 		auto params = mssql::BuildSqlParams(params_val, decl_val.IsNull() ? string() : decl_val.ToString());
 		string batch = params.ExecuteSqlBatch(statement);
 		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.c_str());
-		out[i] = RunExecBatch(client_context, context_name, batch, statement);
+		out[i] = RunExecBatch(client_context, context_name, batch, statement, "mssql_exec_params");
 	}
 }
 

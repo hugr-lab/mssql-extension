@@ -87,15 +87,31 @@ const hugeint_t &MaxDecimal38() {
 	return max;
 }
 
+}  // namespace
+
+// The range rule itself, exported (integer_codec.hpp): mssql_sql_params needs
+// it for a parameter DECLARE and had forked it as a digit-count over
+// Value::ToString, which is a second source of truth for the same constant.
+bool HugeintFitsDecimal38(const hugeint_t &value) {
+	const hugeint_t &max = MaxDecimal38();
+	const hugeint_t min = Hugeint::Negate(max);
+	return !Hugeint::GreaterThan(value, max) && !Hugeint::GreaterThan(min, value);
+}
+
+bool UhugeintFitsDecimal38(const uhugeint_t &value) {
+	const uhugeint_t max(static_cast<uint64_t>(MaxDecimal38().upper), MaxDecimal38().lower);
+	return !(value > max);
+}
+
+namespace {
+
 void CheckHugeintFitsDecimal38(const hugeint_t &value, const std::string &col_name) {
 	// Bound both ends directly instead of negating `value`: Hugeint::Negate on
 	// HUGEINT min (-2^127) is itself out of int128 range, so the old
 	// abs-then-compare let that one value slip the guard (or threw a raw
 	// overflow). +/-(10^38-1) are both representable (< 2^127), so the range
 	// check is exact and keeps the column-named message for every input.
-	const hugeint_t &max = MaxDecimal38();
-	const hugeint_t min = Hugeint::Negate(max);
-	if (Hugeint::GreaterThan(value, max) || Hugeint::GreaterThan(min, value)) {
+	if (!HugeintFitsDecimal38(value)) {
 		throw InvalidInputException(
 			"MSSQL: HUGEINT value %s in column \"%s\" is out of range for DECIMAL(38,0) (max 38 digits)",
 			Hugeint::ToString(value), col_name);
@@ -103,8 +119,7 @@ void CheckHugeintFitsDecimal38(const hugeint_t &value, const std::string &col_na
 }
 
 void CheckUhugeintFitsDecimal38(const uhugeint_t &value, const std::string &col_name) {
-	const uhugeint_t max(static_cast<uint64_t>(MaxDecimal38().upper), MaxDecimal38().lower);
-	if (value > max) {
+	if (!UhugeintFitsDecimal38(value)) {
 		throw InvalidInputException(
 			"MSSQL: UHUGEINT value %s in column \"%s\" is out of range for DECIMAL(38,0) (max 38 digits)",
 			Uhugeint::ToString(value), col_name);

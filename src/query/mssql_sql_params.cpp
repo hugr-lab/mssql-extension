@@ -3,6 +3,7 @@
 #include <cctype>
 #include <map>
 
+#include "codec/integer_codec.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
@@ -112,6 +113,19 @@ static std::string StringDeclaration(const LogicalType &type, const Value &value
 	return "nvarchar(4000)";
 }
 
+// Thin dispatch onto codec::integer's exported range rule -- the same one the
+// BCP encoder enforces (#177). Kept as a one-liner rather than inlined twice so
+// the HUGEINT and UHUGEINT arms cannot drift apart.
+static bool ValueFitsDecimal38(const LogicalType &type, const Value &value) {
+	if (value.IsNull()) {
+		return true;
+	}
+	if (type.id() == LogicalTypeId::UHUGEINT) {
+		return codec::integer::UhugeintFitsDecimal38(UhugeIntValue::Get(value));
+	}
+	return codec::integer::HugeintFitsDecimal38(HugeIntValue::Get(value));
+}
+
 std::string DeclarationForValue(const std::string &name, const LogicalType &type, const Value &value) {
 	switch (type.id()) {
 	case LogicalTypeId::SQLNULL:
@@ -134,6 +148,20 @@ std::string DeclarationForValue(const std::string &name, const LogicalType &type
 		return "decimal(20,0)";
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
+		// decimal(38,0) holds +/-(10^38 - 1) and HUGEINT reaches ~1.7e38, so the
+		// widest values render as literals the server cannot convert --
+		// "Arithmetic overflow error converting numeric to data type numeric",
+		// which names neither the parameter nor the cause. Same rule the BCP
+		// encoder has enforced since #177, shared from codec::integer rather than
+		// re-derived. (UHUGEINT cannot actually reach here today: FormatSqlLiteral
+		// refuses it a few lines below. Checked anyway so the two stay symmetric
+		// if that arm is ever implemented.)
+		if (!ValueFitsDecimal38(type, value)) {
+			throw InvalidInputException(
+				"parameter '%s' does not fit T-SQL decimal(38,0), the widest exact numeric SQL Server has; "
+				"cast it to VARCHAR and convert server-side",
+				name);
+		}
 		return "decimal(38,0)";
 	case LogicalTypeId::FLOAT:
 		return "real";
@@ -278,9 +306,23 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 				"parameter name '%s' is not a T-SQL identifier (letters, digits and '_', not starting with a digit)",
 				name);
 		}
-		// DuckDB already refuses a STRUCT whose keys differ only in case, which is
-		// the one collision T-SQL would see.
+		// T-SQL variable names are case-insensitive, so two keys differing only in
+		// case DECLARE the same variable twice. A STRUCT built by the parser is
+		// already safe -- Identifier compares case-insensitively and both
+		// struct-literal sites use identifier_set_t, so {'a':1,'A':2} is refused
+		// at bind with "Duplicate struct entry name". This is the backstop for a
+		// STRUCT that did not come from there: a direct Value::STRUCT, an
+		// inferred-schema file read, another extension. Without it the batch
+		// reaches the server and returns "The variable name '@A' has already been
+		// declared", which does not say which key to change.
 		std::string key = StringUtil::Lower(name);
+		auto dup = seen.find(key);
+		if (dup != seen.end()) {
+			throw InvalidInputException(
+				"parameter names '%s' and '%s' differ only in case; T-SQL variable names are "
+				"case-insensitive, so both declare @%s",
+				dup->second, name, key);
+		}
 		seen[key] = name;
 		SqlParam p;
 		p.name = name;
@@ -289,6 +331,17 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 			if (it == declared.end()) {
 				throw InvalidInputException("parameter '%s' has a value but no declaration in '%s'", name,
 											declarations_override);
+			}
+			// Naming the type does not make the value fit it: a 39-digit HUGEINT
+			// under an explicit `@p decimal(38,0)` used to skip the check below
+			// and come back as the server's bare "Arithmetic overflow", which is
+			// the error this guard exists to replace.
+			if ((type.id() == LogicalTypeId::HUGEINT || type.id() == LogicalTypeId::UHUGEINT) &&
+				!ValueFitsDecimal38(type, value)) {
+				throw InvalidInputException(
+					"parameter '%s' does not fit T-SQL decimal(38,0), the widest exact numeric SQL Server has; "
+					"cast it to VARCHAR and convert server-side",
+					name);
 			}
 			p.declaration = it->second;
 		} else {
