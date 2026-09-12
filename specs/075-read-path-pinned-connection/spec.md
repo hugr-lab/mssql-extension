@@ -139,9 +139,11 @@ present on everything TDS 7.4 reaches (SQL Server 2012+, Azure SQL, Synapse;
 Fabric to be confirmed on the Azure lane). It is a procedure, so it needed
 #332; it returns the first result set's shape **as rows** — `system_type_name`,
 `max_length`, `precision`, `scale`, `collation_name`, nullability — which are
-exactly the inputs `sys.columns` gives the catalog, and the catalog already
-maps them: `MSSQLColumnInfo::MapSQLServerTypeToDuckDB`
-(`mssql_column_info.cpp:194`). Where the shape cannot be determined it says
+enough to synthesise the COLMETADATA the server would send for the column
+and map it with the stream's own `TypeConverter::GetDuckDBType`. (The first
+draft used the catalog's `MapSQLServerTypeToDuckDB` and disagreed with the
+stream on datetime2 scales, on `rowversion`, and on the types the stream
+refuses.) Where the shape cannot be determined the server says
 so by number: 11526 for a batch that creates and reads a `#temp` table, 11509
 for a procedure whose branches return different shapes — an error at bind,
 never metadata that execution then contradicts. It touches no session state.
@@ -256,9 +258,11 @@ index seek.
 **Default.** `MSSQLScanBind` runs `EXEC sp_describe_first_result_set N'<query>',
 NULL, 0` through `MSSQLSimpleQuery` on whatever connection the provider gives
 it — pooled in autocommit, the pinned one in a transaction — and builds
-`return_types` / `names` from the rows with `MapSQLServerTypeToDuckDB`,
-called the way the stream's mapping behaves (no `MSSQL_VARCHAR(n)` extension
-types: `mssql_scan` reports plain `VARCHAR` today and keeps doing so). A
+`return_types` / `names` from the rows by turning each into the COLMETADATA
+the server would send and calling `TypeConverter::GetDuckDBType` — the
+stream's mapping, not a second one (no `MSSQL_VARCHAR(n)` extension types:
+`mssql_scan` reports plain `VARCHAR` today and keeps doing so). A name the
+synthesiser does not know sends the statement down the fallback. A
 column the server names `NULL` (an unnamed expression) gets the name the
 stream would have given it. Nothing is left open, nothing is registered.
 
@@ -549,11 +553,12 @@ plan per shape; `PARAMETERIZATION FORCED` no longer needed for this);
 
 ## 4. Risks
 
-- **Two type mappings.** The default describe maps names
-  (`MapSQLServerTypeToDuckDB`), execution maps TDS tokens
-  (`GetDuckDBType`); they were written to agree and have never been checked
-  against each other for every type. W6's type-matrix test does, and W2's
-  init check makes any drift a named error rather than misread rows.
+- **One type mapping, reached two ways.** The describe synthesises
+  COLMETADATA from the row and calls `GetDuckDBType`, the function execution
+  calls on the wire token. W6's type-matrix test holds the two paths equal
+  column for column (the first draft used the catalog's mapping and disagreed
+  on datetime2 scales, `rowversion` and the refused types), and W2's init
+  check makes any remaining drift a named error rather than misread rows.
 - **What the describe refuses** (`#temp` batches, branch-dependent
   procedures) takes the fallback and keeps today's behaviour and cost.
   Fabric's support for `sp_describe_first_result_set` and `sp_prepare` is

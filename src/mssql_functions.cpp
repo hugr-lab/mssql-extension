@@ -22,6 +22,7 @@
 #include "query/tds_info_log.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_connection.hpp"
+#include "tds/tds_types.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetFunctionDebugLevel() {
@@ -150,13 +151,101 @@ static string TypeListToString(const vector<LogicalType> &types) {
 	return out;
 }
 
+// The TDS type the server sends for a column sp_describe_first_result_set
+// names -- `nvarchar(50)`, `decimal(10,2)`, `timestamp` -- with the length,
+// precision and scale beside it. The described shape is then whatever
+// TypeConverter::GetDuckDBType makes of that COLMETADATA, i.e. the STREAM's
+// type by construction: the catalog's own mapping (spec 045) differs from it
+// for datetime2 scales, for `rowversion`, and for the types the stream refuses
+// (sql_variant, the UDTs), and mssql_scan has always reported the stream's.
+// Unknown names return false and the statement is run at bind, as before.
+static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, uint8_t precision, uint8_t scale,
+									   tds::ColumnMetadata &column) {
+	column.precision = precision;
+	column.scale = scale;
+	// -1 is the describe's MAX; the converter does not read the length of a
+	// variable type, only of the fixed-width N variants set below.
+	column.max_length = max_length < 0 ? 0xFFFF : static_cast<uint16_t>(max_length);
+	if (base == "tinyint") {
+		column.type_id = tds::TDS_TYPE_INTN;
+		column.max_length = 1;
+	} else if (base == "smallint") {
+		column.type_id = tds::TDS_TYPE_INTN;
+		column.max_length = 2;
+	} else if (base == "int") {
+		column.type_id = tds::TDS_TYPE_INTN;
+		column.max_length = 4;
+	} else if (base == "bigint") {
+		column.type_id = tds::TDS_TYPE_INTN;
+		column.max_length = 8;
+	} else if (base == "bit") {
+		column.type_id = tds::TDS_TYPE_BITN;
+	} else if (base == "real") {
+		column.type_id = tds::TDS_TYPE_FLOATN;
+		column.max_length = 4;
+	} else if (base == "float") {
+		column.type_id = tds::TDS_TYPE_FLOATN;
+		column.max_length = 8;
+	} else if (base == "decimal" || base == "numeric") {
+		column.type_id = tds::TDS_TYPE_DECIMAL;
+	} else if (base == "money") {
+		column.type_id = tds::TDS_TYPE_MONEYN;
+		column.max_length = 8;
+	} else if (base == "smallmoney") {
+		column.type_id = tds::TDS_TYPE_MONEYN;
+		column.max_length = 4;
+	} else if (base == "char") {
+		column.type_id = tds::TDS_TYPE_BIGCHAR;
+	} else if (base == "varchar") {
+		column.type_id = tds::TDS_TYPE_BIGVARCHAR;
+	} else if (base == "nchar") {
+		column.type_id = tds::TDS_TYPE_NCHAR;
+	} else if (base == "nvarchar" || base == "sysname") {
+		column.type_id = tds::TDS_TYPE_NVARCHAR;
+	} else if (base == "text") {
+		column.type_id = tds::TDS_TYPE_TEXT;
+	} else if (base == "ntext") {
+		column.type_id = tds::TDS_TYPE_NTEXT;
+	} else if (base == "binary" || base == "timestamp" || base == "rowversion") {
+		column.type_id = tds::TDS_TYPE_BIGBINARY;
+	} else if (base == "varbinary") {
+		column.type_id = tds::TDS_TYPE_BIGVARBINARY;
+	} else if (base == "image") {
+		column.type_id = tds::TDS_TYPE_IMAGE;
+	} else if (base == "uniqueidentifier") {
+		column.type_id = tds::TDS_TYPE_UNIQUEIDENTIFIER;
+	} else if (base == "date") {
+		column.type_id = tds::TDS_TYPE_DATE;
+	} else if (base == "time") {
+		column.type_id = tds::TDS_TYPE_TIME;
+	} else if (base == "datetime2") {
+		column.type_id = tds::TDS_TYPE_DATETIME2;
+	} else if (base == "datetimeoffset") {
+		column.type_id = tds::TDS_TYPE_DATETIMEOFFSET;
+	} else if (base == "datetime") {
+		column.type_id = tds::TDS_TYPE_DATETIMEN;
+		column.max_length = 8;
+	} else if (base == "smalldatetime") {
+		column.type_id = tds::TDS_TYPE_DATETIMEN;
+		column.max_length = 4;
+	} else if (base == "xml") {
+		column.type_id = tds::TDS_TYPE_XML;
+	} else if (base == "sql_variant") {
+		column.type_id = tds::TDS_TYPE_SQL_VARIANT;
+	} else if (base == "hierarchyid" || base == "geography" || base == "geometry") {
+		column.type_id = tds::TDS_TYPE_UDT;
+	} else {
+		return false;
+	}
+	return true;
+}
+
 // sp_describe_first_result_set: one row per column of the FIRST result set,
 // which is also the one MSSQLResultStream serves (a second COLMETADATA is an
-// error there). The name of the type comes back as T-SQL text --
-// `nvarchar(50)`, `decimal(10,2)`, `varchar(max)` -- and the numbers beside it
-// are what the catalog's own mapping takes. One fold on top of it (datetime2,
-// below) makes the result the STREAM's type, which is what mssql_scan reports
-// and what InitGlobal checks the executed COLMETADATA against.
+// error there). Each row is turned into the COLMETADATA the server would send
+// for it and mapped by the stream's own converter, so a type the stream
+// refuses (sql_variant, a UDT) is refused here, at bind, with the same message
+// it always had.
 static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection, const string &statement,
 												  const string &declarations, int timeout_ms) {
 	MSSQLDescribedShape shape;
@@ -202,17 +291,15 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 		auto max_length = static_cast<int16_t>(std::atoi(row[len_idx].c_str()));
 		auto precision = static_cast<uint8_t>(std::atoi(row[prec_idx].c_str()));
 		auto scale = static_cast<uint8_t>(std::atoi(row[scale_idx].c_str()));
-		LogicalType type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(base, max_length, precision, scale);
-		// The stream reads every datetime2 into TIMESTAMP whatever its scale; the
-		// catalog's mapping picks TIMESTAMP_S/_MS/_NS by it (spec 045, for the
-		// catalog scan). mssql_scan has always reported the stream's type, and
-		// InitGlobal holds the two to be equal.
-		if (base == "datetime2") {
-			type = LogicalType::TIMESTAMP;
-		}
-		shape.types.push_back(type);
 		const string &name = row[name_idx];
-		shape.names.push_back(name == "NULL" ? string() : name);
+		tds::ColumnMetadata column;
+		column.name = name == "NULL" ? string() : name;
+		if (!DescribedTypeToTdsMetadata(base, max_length, precision, scale, column)) {
+			shape.reason = "the describe names a type this extension does not map: " + type_name;
+			return shape;
+		}
+		shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(column));
+		shape.names.push_back(column.name);
 	}
 	if (shape.types.empty()) {
 		shape.reason = "the statement returns no visible column";
