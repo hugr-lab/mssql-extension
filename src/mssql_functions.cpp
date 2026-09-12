@@ -798,7 +798,7 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 		throw InvalidInputException(
 			"%s: Unknown context '%s'. Attach a database first with: ATTACH '' AS %s (TYPE mssql, SECRET "
 			"...)",
-			context_name, context_name);
+			function_name, context_name, context_name);
 	}
 	auto &catalog = *catalog_ptr;
 	if (catalog.IsReadOnly()) {

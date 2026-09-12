@@ -19,7 +19,9 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/identifier.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -105,6 +107,21 @@ void TestDeclarationForValue() {
 	CHECK_EQ(DeclarationForValue("p", LogicalType::BIGINT, Value::BIGINT(1)), std::string("bigint"));
 	CHECK_EQ(DeclarationForValue("p", LogicalType::UBIGINT, Value::UBIGINT(1)), std::string("decimal(20,0)"));
 	CHECK_EQ(DeclarationForValue("p", LogicalType::HUGEINT, Value::HUGEINT(1)), std::string("decimal(38,0)"));
+	// decimal(38,0) holds +/-(10^38 - 1). 38 nines is the widest that fits; the
+	// 39-digit neighbours must be refused CLIENT-side, or the server answers with
+	// a bare "Arithmetic overflow" naming neither the parameter nor the cause.
+	// HUGEINT min is the case an abs-then-compare would miss (#177).
+	{
+		const hugeint_t max38 = Hugeint::POWERS_OF_TEN[38] - 1;
+		CHECK_EQ(DeclarationForValue("p", LogicalType::HUGEINT, Value::HUGEINT(max38)), std::string("decimal(38,0)"));
+		CHECK_EQ(DeclarationForValue("p", LogicalType::HUGEINT, Value::HUGEINT(Hugeint::Negate(max38))),
+				 std::string("decimal(38,0)"));
+		CHECK_THROWS_WITH(DeclarationForValue("p", LogicalType::HUGEINT, Value::HUGEINT(Hugeint::POWERS_OF_TEN[38])),
+						  "does not fit T-SQL decimal(38,0)");
+		CHECK_THROWS_WITH(
+			DeclarationForValue("p", LogicalType::HUGEINT, Value::HUGEINT(NumericLimits<hugeint_t>::Minimum())),
+			"does not fit T-SQL decimal(38,0)");
+	}
 	CHECK_EQ(DeclarationForValue("p", LogicalType::FLOAT, Value::FLOAT(1.5f)), std::string("real"));
 	CHECK_EQ(DeclarationForValue("p", LogicalType::DOUBLE, Value::DOUBLE(1.5)), std::string("float"));
 	CHECK_EQ(DeclarationForValue("p", LogicalType::DECIMAL(10, 2), Value::DECIMAL(int64_t(1234), 10, 2)),
@@ -187,6 +204,22 @@ void TestBuildSqlParamsOverride() {
 					  "names '@p' twice");
 }
 
+void TestBuildSqlParamsCaseCollision() {
+	// Value::STRUCT bypasses struct_pack's identifier_set_t dedupe, so this is the
+	// one construction where two keys differing only in case actually reach
+	// BuildSqlParams. Both DECLARE @a, which the server reports as "The variable
+	// name '@A' has already been declared" -- an error that does not say which key
+	// to change.
+	CHECK_THROWS_WITH(
+		BuildSqlParams(Struct({{Identifier("a"), Value::INTEGER(1)}, {Identifier("A"), Value::INTEGER(2)}}), ""),
+		"differ only in case");
+	// Naming the type does not make the value fit it: the declarations override
+	// used to skip the range check entirely.
+	CHECK_THROWS_WITH(
+		BuildSqlParams(Struct({{Identifier("p"), Value::HUGEINT(Hugeint::POWERS_OF_TEN[38])}}), "@p decimal(38,0)"),
+		"does not fit T-SQL decimal(38,0)");
+}
+
 void TestBuildSqlParamsRefusals() {
 	CHECK_THROWS_WITH(BuildSqlParams(Value::INTEGER(5), ""), "parameters must be a STRUCT of name -> value");
 	CHECK_THROWS_WITH(BuildSqlParams(Struct({{Identifier("my p"), Value::INTEGER(1)}}), ""),
@@ -205,6 +238,7 @@ int main() {
 	TestBuildSqlParamsDerived();
 	TestBuildSqlParamsOverride();
 	TestBuildSqlParamsRefusals();
+	TestBuildSqlParamsCaseCollision();
 	if (failures) {
 		std::cerr << failures << " failure(s)\n";
 		return 1;
