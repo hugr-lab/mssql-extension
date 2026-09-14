@@ -61,6 +61,15 @@ struct SqlParam {
 struct SqlParamSet {
 	std::vector<SqlParam> params;
 
+	//! sp_executesql takes at most 2100 parameters; a filter set past this
+	//! keeps its remaining constants as literals rather than fail.
+	static constexpr size_t MAX_PARAMS = 2000;
+
+	//! Register a parameter and return its name (without the '@'): "p<N>",
+	//! numbered by position so a set copied from the bind data and extended
+	//! at init stays collision-free.
+	std::string Add(const std::string &declaration, const std::string &literal);
+
 	//! "@a int, @b nvarchar(4000)" -- sp_executesql's / sp_prepare's second
 	//! argument; empty when there are no parameters.
 	std::string Declarations() const;

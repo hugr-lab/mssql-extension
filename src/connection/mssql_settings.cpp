@@ -235,6 +235,16 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// Statistics Settings
 	//===----------------------------------------------------------------------===//
 
+	// mssql_scan_parameterize_filters (spec 076): the constants of a pushed
+	// filter travel as sp_executesql parameters declared from the column, so
+	// one server plan serves every value instead of one ad-hoc plan per
+	// distinct text. Off is the escape hatch for parameter sniffing -- a plan
+	// compiled for one value and reused for a worse one -- and what a reviewer
+	// flips to compare plans.
+	config.AddExtensionOption("mssql_scan_parameterize_filters",
+							  "Send pushed filter constants as sp_executesql parameters (one plan per shape)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_enable_statistics - Enable statistics collection for optimizer
 	config.AddExtensionOption("mssql_enable_statistics",
 							  "Enable statistics collection from SQL Server for query optimizer", LogicalType::BOOLEAN,
@@ -545,6 +555,14 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context) {
 		return val.GetValue<int64_t>();
 	}
 	return 0;
+}
+
+bool LoadScanParameterizeFilters(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_scan_parameterize_filters", val)) {
+		return val.GetValue<bool>();
+	}
+	return true;
 }
 
 int64_t LoadTestFailParseAfterTokens(ClientContext &context) {

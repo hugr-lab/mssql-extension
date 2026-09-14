@@ -45,6 +45,15 @@ std::string BuildExecuteSqlBatch(const std::string &statement, const std::string
 // SqlParamSet
 //===----------------------------------------------------------------------===//
 
+std::string SqlParamSet::Add(const std::string &declaration, const std::string &literal) {
+	SqlParam p;
+	p.name = "p" + std::to_string(params.size());
+	p.declaration = declaration;
+	p.literal = literal;
+	params.push_back(std::move(p));
+	return params.back().name;
+}
+
 std::string SqlParamSet::Declarations() const {
 	std::string out;
 	for (const auto &p : params) {

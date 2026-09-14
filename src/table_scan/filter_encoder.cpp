@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "catalog/mssql_column_info.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -25,6 +28,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/function_mapping.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
@@ -256,12 +260,305 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 }
 
 //------------------------------------------------------------------------------
+// Spec 076: constants as parameters, declared from the column
+//------------------------------------------------------------------------------
+
+namespace {
+
+bool IsAscii(const std::string &text) {
+	for (unsigned char c : text) {
+		if (c >= 0x80) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
+// sequence (a surrogate pair). This is nvarchar's unit.
+size_t Utf16Units(const std::string &text) {
+	size_t units = 0;
+	for (unsigned char c : text) {
+		if ((c & 0xC0) != 0x80) {
+			units += (c >= 0xF0) ? 2 : 1;
+		}
+	}
+	return units;
+}
+
+// Width rank of the integer family, so a parameter is never narrower than
+// the column OR the constant: bit < tinyint < smallint < int < bigint <
+// decimal(20,0) < decimal(38,0). -1 = not an integer type.
+int IntegerRankOfColumn(const std::string &sql_type) {
+	if (sql_type == "bit") {
+		return 0;
+	}
+	if (sql_type == "tinyint") {
+		return 1;
+	}
+	if (sql_type == "smallint") {
+		return 2;
+	}
+	if (sql_type == "int") {
+		return 3;
+	}
+	if (sql_type == "bigint") {
+		return 4;
+	}
+	return -1;
+}
+
+int IntegerRankOfValue(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return 0;
+	case LogicalTypeId::UTINYINT:
+		return 1;
+	case LogicalTypeId::TINYINT:  // signed: SQL Server's tinyint is not
+	case LogicalTypeId::SMALLINT:
+		return 2;
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::INTEGER:
+		return 3;
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::BIGINT:
+		return 4;
+	case LogicalTypeId::UBIGINT:
+		return 5;
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		return 6;
+	default:
+		return -1;
+	}
+}
+
+const char *IntegerNameOfRank(int rank) {
+	static const char *names[] = {"bit", "tinyint", "smallint", "int", "bigint", "decimal(20,0)", "decimal(38,0)"};
+	return names[rank];
+}
+
+// Fractional-second digits a DuckDB temporal constant carries.
+int TemporalScaleOfValue(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+		return 0;
+	case LogicalTypeId::TIMESTAMP_MS:
+		return 3;
+	case LogicalTypeId::TIMESTAMP_NS:
+		return 7;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_TZ:
+		return 6;
+	default:
+		return -1;
+	}
+}
+
+// The constant's own declaration (spec 075 W5's table), or empty for a type
+// it refuses; the constant then stays a literal.
+std::string DeclarationOfValueOrEmpty(const Value &value, const LogicalType &type) {
+	try {
+		return mssql::DeclarationForValue("p", type, value);
+	} catch (const std::exception &) {
+		return "";
+	}
+}
+
+}  // namespace
+
+std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, const Value &value,
+												const LogicalType &type) {
+	if (column.is_cast_required || column.is_geometry) {
+		return "";
+	}
+	const std::string t = StringUtil::Lower(column.sql_type_name);
+	const int col_rank = IntegerRankOfColumn(t);
+	if (col_rank >= 0) {
+		const int value_rank = IntegerRankOfValue(type);
+		if (value_rank < 0) {
+			// A DECIMAL or DOUBLE constant against an integer column: DuckDB
+			// compared in the constant's type, so declare it that way.
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		return IntegerNameOfRank(col_rank > value_rank ? col_rank : value_rank);
+	}
+	if (t == "decimal" || t == "numeric") {
+		if (type.id() != LogicalTypeId::DECIMAL) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		int precision = column.precision > DecimalType::GetWidth(type) ? column.precision : DecimalType::GetWidth(type);
+		int scale = column.scale > DecimalType::GetScale(type) ? column.scale : DecimalType::GetScale(type);
+		if (precision < scale) {
+			precision = scale;
+		}
+		if (precision > 38) {
+			precision = 38;
+		}
+		return "decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+	}
+	if (t == "money" || t == "smallmoney") {
+		return type.id() == LogicalTypeId::DECIMAL ? t : DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "float" || t == "real") {
+		// Value-driven: declaring a DOUBLE constant as real would round it and
+		// turn a DuckDB "not equal" into an "equal".
+		return DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "text") {
+		return type.id() == LogicalTypeId::VARCHAR ? "varchar(max)" : DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "ntext") {
+		return type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "char" || t == "varchar" || t == "nchar" || t == "nvarchar" || t == "sysname") {
+		if (type.id() != LogicalTypeId::VARCHAR) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		const std::string &text = StringValue::Get(value);
+		// varchar keeps the column's kind -- that is what keeps an index on it
+		// seekable -- for an ASCII constant. A non-ASCII one goes as nvarchar
+		// whatever the column's collation, as the N'...' literal always did: a
+		// varchar VARIABLE takes the DATABASE's code page, not the column's, so
+		// `@p varchar(max) = N'ы...'` against a UTF-8 column arrives as '?'
+		// (annotated_max_string.test, #321, caught the UTF-8 exemption).
+		const bool unicode = column.is_unicode || !IsAscii(text);
+		if (unicode) {
+			// max_length is bytes; nvarchar counts UTF-16 units.
+			size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);
+			const size_t units = Utf16Units(text);
+			if (units > k) {
+				k = units;
+			}
+			if (column.max_length < 0 || k > 4000) {
+				return "nvarchar(max)";
+			}
+			return "nvarchar(" + std::to_string(k == 0 ? 1 : k) + ")";
+		}
+		size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length);
+		if (text.size() > k) {
+			k = text.size();
+		}
+		if (column.max_length < 0 || k > 8000) {
+			return "varchar(max)";
+		}
+		return "varchar(" + std::to_string(k == 0 ? 1 : k) + ")";
+	}
+	if (t == "date") {
+		return type.id() == LogicalTypeId::DATE ? "date" : DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "time" || t == "datetime2" || t == "datetimeoffset") {
+		const int value_scale = TemporalScaleOfValue(type);
+		if (value_scale < 0) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		const int scale = column.scale > value_scale ? column.scale : value_scale;
+		return t + "(" + std::to_string(scale) + ")";
+	}
+	if (t == "datetime" || t == "smalldatetime") {
+		// Value-driven, as the literal form (a CAST to datetime2) always was.
+		return DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "uniqueidentifier") {
+		return type.id() == LogicalTypeId::UUID ? "uniqueidentifier" : DeclarationOfValueOrEmpty(value, type);
+	}
+	if (t == "binary" || t == "varbinary" || t == "image" || t == "timestamp" || t == "rowversion") {
+		if (type.id() != LogicalTypeId::BLOB) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		size_t k = (t == "image" || column.max_length < 0) ? 0 : static_cast<size_t>(column.max_length);
+		const size_t bytes = StringValue::Get(value).size();
+		if (bytes > k) {
+			k = bytes;
+		}
+		if (t == "image" || column.max_length < 0 || k > 8000) {
+			return "varbinary(max)";
+		}
+		return "varbinary(" + std::to_string(k == 0 ? 1 : k) + ")";
+	}
+	return "";
+}
+
+std::string FilterEncoder::EncodeConstantValue(const Value &value, const LogicalType &type,
+											   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer) {
+	std::string literal = ValueToSQLLiteral(value, type);
+	if (!ctx.params || value.IsNull() || ctx.params->params.size() >= mssql::SqlParamSet::MAX_PARAMS) {
+		return literal;
+	}
+	std::string declaration = peer ? DeclarationForColumn(*peer, value, type) : DeclarationOfValueOrEmpty(value, type);
+	if (declaration.empty()) {
+		return literal;
+	}
+	std::string name = ctx.params->Add(declaration, literal);
+	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstantValue: @%s %s = %s", name.c_str(), declaration.c_str(), literal.c_str());
+	return "@" + name;
+}
+
+// The SQL Server column an expression IS, when it is a plain reference to
+// one: the peer a constant compared with it is declared from.
+static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const ExpressionEncodeContext &ctx) {
+	if (!ctx.mssql_columns) {
+		return nullptr;
+	}
+	// Spec 060 reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for string columns
+	// and DuckDB reaches the plain VARCHAR operators through an implicit no-op
+	// cast over the column: the column under it is still the peer.
+	const Expression *expr = &expr_in;
+	while (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION && BoundCastExpression::IsCast(*expr)) {
+		expr = &BoundCastExpression::Child(expr->Cast<BoundFunctionExpression>());
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		// Inside an EXPRESSION_FILTER the combiner replaced the column reference
+		// with BoundReference(0): the filter's own column.
+		return ctx.filter_column_info;
+	}
+	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	const auto &binding = expr->Cast<BoundColumnRefExpression>().Binding();
+	column_t table_col_idx;
+	if (ctx.column_ids.empty()) {
+		table_col_idx = binding.column_index;
+	} else if (binding.column_index < ctx.column_ids.size()) {
+		table_col_idx = ctx.column_ids[binding.column_index];
+	} else {
+		return nullptr;
+	}
+	if (table_col_idx < ctx.mssql_columns->size()) {
+		return &(*ctx.mssql_columns)[table_col_idx];
+	}
+	return nullptr;
+}
+
+static const MSSQLColumnInfo *ColumnInfoByName(const std::string &name, const ExpressionEncodeContext &ctx) {
+	if (!ctx.mssql_columns) {
+		return nullptr;
+	}
+	for (const auto &col : *ctx.mssql_columns) {
+		if (col.name == name) {
+			return &col;
+		}
+	}
+	return nullptr;
+}
+
+//------------------------------------------------------------------------------
 // Main Encode Function
 //------------------------------------------------------------------------------
 
 FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
 										  const std::vector<std::string> &column_names,
 										  const std::vector<LogicalType> &column_types) {
+	return Encode(filters, column_ids, column_names, column_types, nullptr, nullptr);
+}
+
+FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
+										  const std::vector<std::string> &column_names,
+										  const std::vector<LogicalType> &column_types,
+										  const std::vector<MSSQLColumnInfo> *mssql_columns,
+										  mssql::SqlParamSet *params) {
 	FilterEncoderResult result;
 	result.needs_duckdb_filter = false;
 
@@ -273,6 +570,8 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 	MSSQL_FILTER_DEBUG_LOG(1, "Encode: encoding %zu filter(s)", static_cast<size_t>(filters->FilterCount()));
 
 	ExpressionEncodeContext ctx(column_ids, column_names, column_types);
+	ctx.mssql_columns = mssql_columns;
+	ctx.params = params;
 	std::vector<std::string> where_conditions;
 
 	// Virtual/special column identifiers start at 2^63
@@ -319,6 +618,8 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		const std::string &col_name = column_names[table_col_idx];
 		const LogicalType &col_type = column_types[table_col_idx];
 		std::string escaped_col = "[" + EscapeBracketIdentifier(col_name) + "]";
+		ctx.filter_column_info =
+			(mssql_columns && table_col_idx < mssql_columns->size()) ? &(*mssql_columns)[table_col_idx] : nullptr;
 
 		MSSQL_FILTER_DEBUG_LOG(2, "  encoding filter for column: projected_idx=%llu -> table_idx=%llu -> %s",
 							   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx,
@@ -361,7 +662,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, co
 												   const LogicalType &column_type, const ExpressionEncodeContext &ctx) {
 	switch (filter.filter_type) {
 	case TableFilterType::LEGACY_CONSTANT_COMPARISON:
-		return EncodeConstantComparison(filter.Cast<LegacyConstantFilter>(), column_name, column_type);
+		return EncodeConstantComparison(filter.Cast<LegacyConstantFilter>(), ctx, column_name, column_type);
 
 	case TableFilterType::LEGACY_IS_NULL:
 		return EncodeIsNull(column_name);
@@ -399,6 +700,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, co
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConstantFilter &filter,
+															   const ExpressionEncodeContext &ctx,
 															   const std::string &column_name,
 															   const LogicalType &column_type) {
 	std::string op;
@@ -406,7 +708,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConst
 		return {"", false};
 	}
 
-	std::string sql = column_name + op + ValueToSQLLiteral(filter.constant, column_type);
+	std::string sql = column_name + op + EncodeConstantValue(filter.constant, column_type, ctx, ctx.filter_column_info);
 	return {sql, true};
 }
 
@@ -563,7 +865,7 @@ ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, c
 	}
 
 	case ExpressionClass::BOUND_CONSTANT:
-		return EncodeConstant(expr.Cast<BoundConstantExpression>());
+		return EncodeConstant(expr.Cast<BoundConstantExpression>(), ctx);
 
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func_expr = expr.Cast<BoundFunctionExpression>();
@@ -743,14 +1045,18 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 	}
 
 	// Encode left and right sides
-	auto child_ctx = ctx.child();
-	auto left_result = EncodeValueExpression(left, child_ctx);
+	// Spec 076: a constant on one side is declared from the column on the other.
+	auto left_ctx = ctx.child();
+	left_ctx.constant_peer = ColumnInfoOf(right, ctx);
+	auto right_ctx = ctx.child();
+	right_ctx.constant_peer = ColumnInfoOf(left, ctx);
+	auto left_result = EncodeValueExpression(left, left_ctx);
 	if (!left_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: left side encoding failed");
 		return {"", false};
 	}
 
-	auto right_result = EncodeValueExpression(right, child_ctx);
+	auto right_result = EncodeValueExpression(right, right_ctx);
 	if (!right_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: right side encoding failed");
 		return {"", false};
@@ -874,6 +1180,8 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	}
 
 	// Encode the lower bound
+	// Spec 076: the bounds are compared with the input column.
+	child_ctx.constant_peer = ColumnInfoOf(BoundBetweenExpression::Input(expr), ctx);
 	auto lower_result = EncodeValueExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
 	if (!lower_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
@@ -963,8 +1271,9 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 	return {sql, true};
 }
 
-ExpressionEncodeResult FilterEncoder::EncodeConstant(const BoundConstantExpression &expr) {
-	std::string sql = ValueToSQLLiteral(expr.GetValue(), expr.GetReturnType());
+ExpressionEncodeResult FilterEncoder::EncodeConstant(const BoundConstantExpression &expr,
+													 const ExpressionEncodeContext &ctx) {
+	std::string sql = EncodeConstantValue(expr.GetValue(), expr.GetReturnType(), ctx, ctx.constant_peer);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstant: value=%s, type=%s -> %s", expr.GetValue().ToString().c_str(),
 						   expr.GetReturnType().ToString().c_str(), sql.c_str());
 	return {sql, true};
@@ -1070,20 +1379,22 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 	bool case_insensitive = IsCaseInsensitiveLikeFunction(function_name);
 
 	// Build the LIKE pattern based on function type
-	std::string like_pattern;
+	std::string pattern_text;
 	if (lower_func == "prefix" || lower_func == "iprefix") {
-		// prefix: column LIKE 'pattern%'
-		like_pattern = "N'" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "%'";
+		pattern_text = escaped_pattern + "%";
 	} else if (lower_func == "suffix" || lower_func == "isuffix") {
-		// suffix: column LIKE '%pattern'
-		like_pattern = "N'%" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "'";
+		pattern_text = "%" + escaped_pattern;
 	} else if (lower_func == "contains" || lower_func == "icontains") {
-		// contains: column LIKE '%pattern%'
-		like_pattern = "N'%" + codec::string::EscapeSqlSingleQuotes(escaped_pattern) + "%'";
+		pattern_text = "%" + escaped_pattern + "%";
 	} else {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: unknown LIKE pattern function %s", function_name.c_str());
 		return {"", false};
 	}
+	// Spec 076: the pattern is compared with the column, so it is declared from
+	// it (a varchar column keeps a seekable prefix pattern); without a sink this
+	// is the N'...' literal it always was.
+	std::string like_pattern =
+		EncodeConstantValue(Value(pattern_text), LogicalType::VARCHAR, child_ctx, ColumnInfoOf(column_expr, ctx));
 
 	// Build the T-SQL expression
 	std::string sql;
@@ -1156,7 +1467,8 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 			}
 			sql += "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[i]) + "]";
 			sql += " = ";
-			sql += ValueToSQLLiteral(children[i], (*ctx.pk_column_types)[i]);
+			sql += EncodeConstantValue(children[i], (*ctx.pk_column_types)[i], ctx,
+									   ColumnInfoByName((*ctx.pk_column_names)[i], ctx));
 		}
 		sql += ")";
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: composite PK -> %s", sql.c_str());
@@ -1165,7 +1477,8 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		// Scalar PK: rowid = value
 		std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
 		sql += " = ";
-		sql += ValueToSQLLiteral(const_expr.GetValue(), (*ctx.pk_column_types)[0]);
+		sql += EncodeConstantValue(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
+								   ColumnInfoByName((*ctx.pk_column_names)[0], ctx));
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: scalar PK -> %s", sql.c_str());
 		return {sql, true};
 	}

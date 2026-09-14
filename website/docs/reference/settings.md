@@ -26,6 +26,7 @@ sidebar_position: 1
 
 | Setting                            | Type    | Default | Range | Description                           |
 | ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
+| `mssql_scan_parameterize_filters` | `true` | Send the constants of a pushed filter as `sp_executesql` parameters, declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
 | `mssql_enable_statistics`          | BOOLEAN | true    | -     | Enable statistics collection          |
 | `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
 | `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |

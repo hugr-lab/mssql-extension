@@ -59,7 +59,10 @@ counted from `MSSQL_DEBUG=1`:
 | the scan itself | 31 | `TableScanInitGlobal` |
 
 Three metadata round trips per fresh table, plus two identical collation
-queries per ATTACH. Spec 075 took the compile out of each (30 ms → 0–1 ms on
+queries per ATTACH. (Found in W2: the collation is asked twice because the
+catalog is *initialised* twice — by the storage extension's attach callback
+and again by DuckDB's `AttachedDatabase::Initialize` — and the second pass
+builds a second pool and logs in again; that, not the query, is the cost.) Spec 075 took the compile out of each (30 ms → 0–1 ms on
 this server); what remains is the round trip, which is the whole cost against
 a remote server: ~100 ms before the first row on Azure, three times what one
 batch would cost.
@@ -142,7 +145,7 @@ found through the column reference on the other side of the comparison:
 | `int`, `bigint`, `smallint`, `tinyint`, `bit` | the column's type, unless the DuckDB constant is wider (a BIGINT constant against `int`) — then the constant's type from W5's table |
 | `decimal(p,s)` / `numeric(p,s)`, `money`, `smallmoney` | the column's type |
 | `float`, `real` | the column's type |
-| `varchar(n)`, `char(n)` | `varchar(k)` with k = max(n, constant bytes), `varchar(max)` past 8000 — never narrower than the constant |
+| `varchar(n)`, `char(n)` | `varchar(k)` with k = max(n, constant bytes), `varchar(max)` past 8000 — never narrower than the constant; an ASCII constant only. A non-ASCII constant goes as `nvarchar(k)`: a varchar *variable* takes the database's code page, not the column's, so `@p varchar(max) = N'ы'` against a UTF-8 column arrives as `?` (found by `annotated_max_string.test`) |
 | `nvarchar(n)`, `nchar(n)` | `nvarchar(k)` with k = max(n, constant UTF-16 units), `nvarchar(max)` past 4000 |
 | `date`, `time(s)`, `datetime`, `smalldatetime`, `datetime2(s)`, `datetimeoffset(s)` | the column's type, precision included |
 | `uniqueidentifier`, `varbinary(n)`, `binary(n)` | the column's type (`varbinary(max)` past 8000) |
@@ -171,8 +174,9 @@ from the filter set, not from the text.
   separates them (spec 075). `EnsurePKLoaded` then finds the PK already
   cached on the entry and sends nothing. The bulk path
   (`mssql_preload_catalog`) is untouched.
-- `MSSQLCatalog::QueryDatabaseCollation` runs once per ATTACH; the second
-  call reads the cached value. Both callers are inside the catalog.
+- `MSSQLCatalog::Initialize` is a no-op once the pool exists: the second
+  call (DuckDB's `AttachedDatabase::Initialize`, after the attach callback's
+  own) used to rebuild the pool, log in again and ask the collation again.
 
 Measured target: a fresh table costs one metadata round trip before its scan
 (§ 0.2 counted three), ATTACH one collation query (counted two).

@@ -435,8 +435,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 
 	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so the
 	// text -- and the server's cached plan -- is the same for every table.
+	// Spec 076 W2: the primary key in the same batch -- a second result set
+	// off the same @s / @t -- so a fresh table pays one round trip.
 	string query = mssql::BuildExecuteSqlBatch(
-		SINGLE_TABLE_METADATA_SQL_TEMPLATE, "@s sysname, @t sysname",
+		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::PrimaryKeyInfo::DiscoverySqlTemplate(),
+		"@s sysname, @t sysname",
 		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	// Populate the cache slot in place so we never take the address of a stack
@@ -477,6 +480,12 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// header). It has to stay — MSSQLCatalogScanCardinality reads the
 			// catalog's copy before anything else, so removing it plans every direct
 			// query at ~1 row.
+			// The second result set: a primary-key column (8 values), see
+			// PrimaryKeyInfo::DiscoverySqlTemplate. The table rows have 12.
+			if (values.size() == 8) {
+				mssql::PrimaryKeyInfo::AppendColumnFromRow(table_meta.pk_info, values, database_collation_);
+				return;
+			}
 			if (values.size() < 12) {
 				return;
 			}
@@ -544,11 +553,14 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	}
 
 	// Cache the result (slot is already in the map)
+	table_meta.pk_info.exists = !table_meta.pk_info.columns.empty();
+	table_meta.pk_info.ComputeRowIdType();
+	table_meta.pk_loaded = true;
 	table_meta.columns_load_state = CacheLoadState::LOADED;
 	table_meta.columns_last_refresh = std::chrono::steady_clock::now();
 
-	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns", schema_name.c_str(), table_name.c_str(),
-				table_meta.columns.size());
+	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns, PK with %zu column(s)", schema_name.c_str(),
+				table_name.c_str(), table_meta.columns.size(), table_meta.pk_info.columns.size());
 
 	out_meta = table_meta;	// copy under mutex_ — see header contract
 	return true;

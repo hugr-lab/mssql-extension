@@ -63,6 +63,15 @@ struct PrimaryKeyInfo {
 	// Factory method - discovers PK from SQL Server
 	static PrimaryKeyInfo Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
 								   const string &database_collation);
+
+	//! Spec 076 W2: the discovery statement, parameterised on @s / @t, so the
+	//! catalog can send it in the same batch as the table's metadata and read
+	//! its rows off the second result set instead of paying a round trip.
+	static const char *DiscoverySqlTemplate();
+	//! One row of that statement (8 columns) appended as a PK column; false
+	//! when the row does not have that shape.
+	static bool AppendColumnFromRow(PrimaryKeyInfo &info, const vector<string> &values,
+									const string &database_collation);
 };
 
 }  // namespace mssql

@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "catalog/mssql_column_info.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 
 using namespace duckdb;
@@ -364,6 +366,132 @@ static void TestModuloExactIntegersOnly() {
 //==============================================================================
 // Main
 //==============================================================================
+//==============================================================================
+// Spec 076: constants as parameters, declared from the column
+//==============================================================================
+
+namespace {
+
+MSSQLColumnInfo Col(const std::string &name, int32_t id, const std::string &sql_type, int16_t max_length,
+					uint8_t precision, uint8_t scale, const std::string &collation = "") {
+	return MSSQLColumnInfo(name, id, sql_type, max_length, precision, scale, true, collation,
+						   "SQL_Latin1_General_CP1_CI_AS");
+}
+
+}  // namespace
+
+// Without a sink the text is the literal form it always was; with one, every
+// constant is @pN and the declaration comes from the column on the other side
+// of the comparison -- the fixture's `name` is varchar(20), `id` is int.
+static void TestParameterSinkDeclaresFromColumn() {
+	std::cout << "  TestParameterSinkDeclaresFromColumn..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "varchar", 20, 0, 0),
+										 Col("d", 5, "float", 8, 53, 0)};
+	auto literal_ctx = fx.Context();
+	literal_ctx.mssql_columns = &cols;
+	auto lit =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME), Const(Value("ab")));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*lit, literal_ctx), "([name] = N'ab')");
+
+	SqlParamSet params;
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	ctx.params = &params;
+	auto cmp =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME), Const(Value("ab")));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp, ctx), "([name] = @p0)");
+	ASSERT_TRUE(params.params.size() == 1);
+	ASSERT_TRUE(params.params[0].declaration == "varchar(20)");
+	ASSERT_TRUE(params.params[0].literal == "N'ab'");
+
+	// the constant on the LEFT, the column on the right: same peer
+	auto flipped = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, Const(Value::INTEGER(5)),
+													 ColRef(fx, COL_ID));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*flipped, ctx), "(@p1 > [id])");
+	ASSERT_TRUE(params.params[1].declaration == "int");
+
+	// a BIGINT constant against the int column widens the declaration
+	auto wide = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_ID),
+												  Const(Value::BIGINT(3000000000LL)));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*wide, ctx), "([id] = @p2)");
+	ASSERT_TRUE(params.params[2].declaration == "bigint");
+
+	// a constant with no column peer (inside an expression) is declared from
+	// its own type; a NULL stays a literal and registers nothing
+	auto year = Call1("year", LogicalType::TIMESTAMP_NS, LogicalType::BIGINT, ColRef(fx, COL_DT));
+	auto yc =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(year), Const(Value::BIGINT(2024)));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*yc, ctx), "(YEAR([dt]) = @p3)");
+	ASSERT_TRUE(params.params[3].declaration == "bigint");
+	ASSERT_TRUE(params.params.size() == 4);
+
+	ASSERT_TRUE(params.ExecuteSqlBatch("SELECT 1") ==
+				"DECLARE @p0 varchar(20) = N'ab', @p1 int = 5, @p2 bigint = 3000000000, @p3 bigint = 2024;\n"
+				"EXEC sp_executesql N'SELECT 1', N'@p0 varchar(20), @p1 int, @p2 bigint, @p3 bigint', "
+				"@p0 = @p0, @p1 = @p1, @p2 = @p2, @p3 = @p3");
+}
+
+// The declaration table of spec 076 W1: the column's kind, never narrower
+// than the constant.
+static void TestDeclarationForColumn() {
+	std::cout << "  TestDeclarationForColumn..." << std::endl;
+	auto decl = [](const MSSQLColumnInfo &c, const Value &v) {
+		return FilterEncoder::DeclarationForColumn(c, v, v.type());
+	};
+	// strings: the column's kind and length, widened to the constant
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("ab")) == "varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("abcdefghijklmnopqrstuvwxy")) == "varchar(25)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", -1, 0, 0), Value("ab")) == "varchar(max)");
+	ASSERT_TRUE(decl(Col("c", 1, "char", 4, 0, 0), Value("ab")) == "varchar(4)");
+	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 20, 0, 0), Value("ab")) == "nvarchar(10)");
+	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 20, 0, 0), Value("\xC3\xBC\xC3\xB1\xC3\xAF")) == "nvarchar(10)");
+	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 4, 0, 0), Value("\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80")) ==
+				"nvarchar(6)");
+	// a non-ASCII constant goes as nvarchar whatever the column's collation, as
+	// the N'...' literal always did: a varchar variable takes the DATABASE's
+	// code page, so even a UTF-8 column would see '?' through a varchar one
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "nvarchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8"), Value("\xC3\xBC")) ==
+				"nvarchar(20)");
+	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("x")) == "varchar(max)");
+	// integers: the wider of column and constant
+	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::INTEGER(1)) == "int");
+	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::BIGINT(1)) == "bigint");
+	ASSERT_TRUE(decl(Col("b", 1, "bigint", 8, 19, 0), Value::INTEGER(1)) == "bigint");
+	ASSERT_TRUE(decl(Col("t", 1, "tinyint", 1, 3, 0), Value::TINYINT(-1)) == "smallint");
+	ASSERT_TRUE(decl(Col("f", 1, "bit", 1, 1, 0), Value::BOOLEAN(true)) == "bit");
+	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::HUGEINT(1)) == "decimal(38,0)");
+	// decimals: the wider precision and scale
+	ASSERT_TRUE(decl(Col("d", 1, "decimal", 5, 9, 2), Value::DECIMAL(int64_t(15000), 10, 4)) == "decimal(10,4)");
+	ASSERT_TRUE(decl(Col("d", 1, "numeric", 5, 9, 2), Value::DECIMAL(int64_t(150), 4, 1)) == "decimal(9,2)");
+	ASSERT_TRUE(decl(Col("d", 1, "decimal", 5, 9, 2), Value::INTEGER(2)) == "int");
+	ASSERT_TRUE(decl(Col("m", 1, "money", 8, 19, 4), Value::DECIMAL(int64_t(150), 4, 2)) == "money");
+	// floats: value-driven (declaring a DOUBLE as real would round it)
+	ASSERT_TRUE(decl(Col("r", 1, "real", 4, 24, 0), Value::DOUBLE(1.5)) == "float");
+	ASSERT_TRUE(decl(Col("r", 1, "real", 4, 24, 0), Value::FLOAT(1.5f)) == "real");
+	// temporals: the column's kind at the wider scale
+	ASSERT_TRUE(decl(Col("dt", 1, "date", 3, 10, 0), Value(LogicalType::DATE)) == "date");
+	ASSERT_TRUE(decl(Col("ts", 1, "datetime2", 7, 23, 3), Value(LogicalType::TIMESTAMP)) == "datetime2(6)");
+	ASSERT_TRUE(decl(Col("ts", 1, "datetime2", 7, 23, 3), Value(LogicalType::TIMESTAMP_MS)) == "datetime2(3)");
+	ASSERT_TRUE(decl(Col("ts", 1, "datetime2", 8, 27, 7), Value(LogicalType::TIMESTAMP)) == "datetime2(7)");
+	ASSERT_TRUE(decl(Col("tm", 1, "time", 4, 12, 3), Value(LogicalType::TIME)) == "time(6)");
+	ASSERT_TRUE(decl(Col("o", 1, "datetimeoffset", 9, 30, 3), Value(LogicalType::TIMESTAMP_TZ)) == "datetimeoffset(6)");
+	ASSERT_TRUE(decl(Col("d", 1, "datetime", 8, 23, 3), Value(LogicalType::TIMESTAMP)) == "datetime2(6)");
+	// the rest
+	ASSERT_TRUE(decl(Col("u", 1, "uniqueidentifier", 16, 0, 0), Value(LogicalType::UUID)) == "uniqueidentifier");
+	ASSERT_TRUE(decl(Col("b", 1, "varbinary", 8, 0, 0), Value::BLOB_RAW(std::string("\x01\x02", 2))) == "varbinary(8)");
+	ASSERT_TRUE(decl(Col("b", 1, "varbinary", -1, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) == "varbinary(max)");
+	// rowversion is not a known type to the column mapper (is_cast_required), so
+	// the scan casts it and the constant stays a literal
+	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))).empty());
+	// no parameter form: stays a literal
+	ASSERT_TRUE(decl(Col("x", 1, "xml", -1, 0, 0), Value("<a/>")).empty());
+	ASSERT_TRUE(decl(Col("g", 1, "geography", -1, 0, 0), Value("x")).empty());
+	ASSERT_TRUE(decl(Col("s", 1, "sql_variant", 8016, 0, 0), Value::INTEGER(1)).empty());
+}
+
 int main() {
 	std::cout << "Running FilterEncoder unit tests..." << std::endl;
 
@@ -375,6 +503,8 @@ int main() {
 	TestModuloOperandTypes();
 	TestSearchConditionRefusedInValuePosition();
 	TestModuloExactIntegersOnly();
+	TestParameterSinkDeclaresFromColumn();
+	TestDeclarationForColumn();
 
 	std::cout << "All FilterEncoder tests PASSED!" << std::endl;
 	return 0;

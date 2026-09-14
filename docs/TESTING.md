@@ -234,6 +234,7 @@ test/
 │   │   ├── catalog_filter_sources.test # Catalog filter configuration source tests
 │   │   ├── order_pushdown.test    # ORDER BY/TOP N pushdown tests (experimental)
 │   │   ├── metadata_query_parameterized.test # names as sp_executesql parameters (spec 075)
+│   │   ├── scan_parameterized_filters.test # pushed filter constants as parameters declared from the column (spec 076)
 │   │   ├── preload_catalog.test   # mssql_preload_catalog() bulk preload tests
 │   │   ├── read_only.test          # Read-only catalog tests
 │   │   ├── select_queries.test     # SELECT query tests

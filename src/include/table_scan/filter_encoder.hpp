@@ -22,6 +22,13 @@
 #include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
+struct MSSQLColumnInfo;
+namespace mssql {
+struct SqlParamSet;
+}
+}  // namespace duckdb
+
+namespace duckdb {
 namespace mssql {
 
 //------------------------------------------------------------------------------
@@ -79,6 +86,19 @@ struct ExpressionEncodeContext {
 	// BoundReference(0), so the name travels here instead of in the expression.
 	const std::string *filter_column = nullptr;
 
+	// Spec 076: when `params` is set, a constant becomes a @pN parameter
+	// registered there instead of a literal in the text (see
+	// FilterEncoder::EncodeConstantValue). `mssql_columns` is parallel to
+	// column_names and supplies the SQL Server type the parameter is declared
+	// from; `filter_column_info` is the LEGACY_* filter's own column;
+	// `constant_peer` is the column the constant being encoded is compared
+	// with, set by the comparison for the constant side only and not
+	// inherited by children (a constant inside `col + 1` has no peer).
+	mssql::SqlParamSet *params = nullptr;
+	const std::vector<MSSQLColumnInfo> *mssql_columns = nullptr;
+	const MSSQLColumnInfo *filter_column_info = nullptr;
+	const MSSQLColumnInfo *constant_peer = nullptr;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
@@ -103,6 +123,9 @@ struct ExpressionEncodeContext {
 		ctx.pk_column_types = pk_column_types;
 		ctx.pk_is_composite = pk_is_composite;
 		ctx.filter_column = filter_column;
+		ctx.params = params;
+		ctx.mssql_columns = mssql_columns;
+		ctx.filter_column_info = filter_column_info;
 		return ctx;
 	}
 
@@ -140,6 +163,35 @@ public:
 	static FilterEncoderResult Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
 									  const std::vector<std::string> &column_names,
 									  const std::vector<LogicalType> &column_types);
+
+	/**
+	 * Spec 076: the same, with the SQL Server column types and a parameter
+	 * sink. With `params` non-null every constant is rendered as @pN and
+	 * registered there, declared from the column it is compared with; the
+	 * caller wraps the statement with SqlParamSet::ExecuteSqlBatch.
+	 */
+	static FilterEncoderResult Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
+									  const std::vector<std::string> &column_names,
+									  const std::vector<LogicalType> &column_types,
+									  const std::vector<MSSQLColumnInfo> *mssql_columns, mssql::SqlParamSet *params);
+
+	/**
+	 * A constant in the text: its literal, or -- with ctx.params set -- a @pN
+	 * registered in the sink and declared from `peer` (the column it is
+	 * compared with) or, with no peer, from the constant's own type. A NULL, a
+	 * type with no SQL Server declaration, and a set at MAX_PARAMS stay
+	 * literal. Public for the unit test.
+	 */
+	static std::string EncodeConstantValue(const Value &value, const LogicalType &type,
+										   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer);
+
+	/**
+	 * The T-SQL declaration a parameter compared with `column` gets (spec 076
+	 * W1): the column's kind, never narrower than the constant. Empty when the
+	 * column's type is not one a parameter can carry (xml, sql_variant, a UDT).
+	 * Public for the unit test.
+	 */
+	static std::string DeclarationForColumn(const MSSQLColumnInfo &column, const Value &value, const LogicalType &type);
 
 	//--------------------------------------------------------------------------
 	// Utility Functions (public for testing)
@@ -210,6 +262,7 @@ private:
 	 * Encode CONSTANT_COMPARISON filter (col OP value).
 	 */
 	static ExpressionEncodeResult EncodeConstantComparison(const LegacyConstantFilter &filter,
+														   const ExpressionEncodeContext &ctx,
 														   const std::string &column_name,
 														   const LogicalType &column_type);
 
@@ -294,7 +347,8 @@ private:
 	/**
 	 * Encode a constant value.
 	 */
-	static ExpressionEncodeResult EncodeConstant(const BoundConstantExpression &expr);
+	static ExpressionEncodeResult EncodeConstant(const BoundConstantExpression &expr,
+												 const ExpressionEncodeContext &ctx);
 
 	/**
 	 * Encode a conjunction (AND/OR) expression.

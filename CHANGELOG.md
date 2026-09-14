@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pushed filters are parameterised** (spec 076). The constants of a pushed
+  filter travel as `sp_executesql` parameters declared from the column they
+  are compared with, so the statement text is one fixed string per filter
+  shape and SQL Server keeps one plan for it — 40 scans with 40 distinct
+  two-predicate filters left 40 ad-hoc plans (2.3 MB) before and leave 1
+  (57 KB) now. Declared from the column, not the constant: varchar stays
+  varchar and an index on it stays seekable, the width is never narrower
+  than the constant, a non-ASCII constant goes as nvarchar whatever the
+  column's collation (a varchar variable takes the database's code page). `IN` lists and `IS NULL` stay literal.
+  `mssql_scan_parameterize_filters = false` restores literal SQL, the
+  escape hatch for parameter sniffing.
+- **A fresh table's first touch is one round trip** (spec 076 W2). The
+  catalog loaded a table's metadata and columns in one query and its primary
+  key in a second, on a second connection; the discovery statement now rides
+  in the same `sp_executesql` batch as the table's metadata (a second result
+  set off the same `@s` / `@t`) and the entry is created with its key already
+  known. Against a remote server that is the difference between two login
+  round trips and one before the first row.
+- **ATTACH initialised the catalog twice** (spec 076 W2). The storage
+  extension's attach callback called `MSSQLCatalog::Initialize` and DuckDB's
+  `AttachedDatabase::Initialize` called it again right after: the second
+  call built a second connection pool (the first, with its freshly logged-in
+  connection, was thrown away), logged in again and asked the database
+  collation again — two of the three logins an ATTACH cost (#324), and the
+  "collation query twice" the spec measured. `Initialize` is now a no-op
+  once the pool exists.
+
 - **`mssql_scan_params` and `mssql_exec_params`** (spec 075): the raw-SQL
   functions with parameters. `mssql_scan_params(ctx, statement, {'id': 42,
   'since': TIMESTAMP '2024-01-02'})` sends `@id` and `@since` through
