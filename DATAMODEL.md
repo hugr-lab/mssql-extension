@@ -703,7 +703,7 @@ than tolerated: `ROLLBACK` undoes neither a CTAS's table nor its rows.
 flowchart TD
     subgraph GS["GlobalSinkState (one per statement)"]
         ddl["DDL phase<br/>CREATE TABLE — pool conn, autocommits"]
-        gw["global BCPWriter<br/>+ its own connection + INSERT BULK"]
+        gw["shared BulkLoadSession<br/>adopts the operator's connection<br/>(pinned in a txn, else pool)"]
         lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8"]
         failed["load_failed (atomic)"]
     end
@@ -732,6 +732,20 @@ diverged nine ways within it — `ROWS_PER_BATCH` sent by one and not the other,
 interrupt check and no counters on the CTAS side at all. It owns the connection,
 the writer, the batch bookkeeping and the mid-bulk-load release protocol; who may
 open one, and how many, is the policy above and is handed to it.
+
+Since spec 062 W0 the **shared** writer is the same type. `TryStart` claims a
+slot and a pool connection and may decline; `Adopt` takes the connection the
+operator already holds — the transaction's pinned one, or the pool connection its
+init acquired — and never declines. From there the two are one session: the
+stream opens on the first `Write` (spec 075 W3 — never at init, where inside a
+transaction the source may still be draining on that same pinned connection),
+batches close and reopen at `flush_rows`, `Finish` sends the last DONE and hands
+the connection back to whoever owns it (pinned stays pinned; a pool connection
+goes back with `mssql_reset_connection` honoured, as on every other release path).
+Before W0, COPY (`StartBulkStream` / `FlushToServer` / `BCPCopyFinalize`) and CTAS
+(`ExecuteBCPInsert` / `AddChunkBCP` / `FlushBCP`) each carried a third copy of that
+sequence; INSERT via BCP (spec 062) is built on the adopted session rather than a
+fourth.
 
 A writer is claimed by a **thread**, never allocated up front — because
 `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text and

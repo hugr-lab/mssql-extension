@@ -1,6 +1,6 @@
 #pragma once
 
-#include "copy/bcp_writer.hpp"
+#include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
@@ -72,10 +72,15 @@ struct CTASExecutionState {
 	//===----------------------------------------------------------------------===//
 	// BCP State (Spec 027) - used when config.use_bcp = true
 	//===----------------------------------------------------------------------===//
-	unique_ptr<BCPWriter> bcp_writer;
+	//! The shared bulk-load session (spec 062 W0): the pool connection
+	//! ExecuteBCPInsert acquires, adopted; the stream opens on the first chunk,
+	//! batches close and reopen at bcp_flush_rows, FlushBCP sends the last DONE
+	//! and returns the connection. Before W0 this was `bcp_writer` +
+	//! `connection` + `bcp_rows_in_batch` and its own copy of the
+	//! flush/reopen sequence.
+	BulkLoadSession bcp_session;
 	vector<BCPColumnMetadata> bcp_columns;
 	BCPCopyTarget bcp_target;
-	idx_t bcp_rows_in_batch = 0;  // Rows accumulated since last flush
 
 	//! The INSERT BULK text, built once in ExecuteBCPInsert. Every batch boundary
 	//! re-executes it, and each parallel writer opens its own session with it, so
@@ -83,12 +88,6 @@ struct CTASExecutionState {
 	//! from bcp_columns in two places before, which is two places to keep in step
 	//! with the TABLOCK decision that is resolved just above it.
 	string insert_bulk_sql;
-
-	//! The first bulk-load connection, taken from the pool and returned to it.
-	//!
-	//! Never the connection an explicit DuckDB transaction has pinned — see
-	//! ExecuteBCPInsert for why CTAS deliberately loads outside the transaction.
-	std::shared_ptr<tds::TdsConnection> connection;
 
 	// Weak handle to the catalog's pool so error/teardown paths can release the
 	// connection without touching the catalog pointer (issue #191 pattern from

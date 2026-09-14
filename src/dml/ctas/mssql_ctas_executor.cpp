@@ -3,7 +3,6 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/bcp_config.hpp"
-#include "copy/bcp_writer.hpp"
 #include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
@@ -77,10 +76,11 @@ CTASExecutionState::~CTASExecutionState() {
 }
 
 void CTASExecutionState::ReleaseBCPConnectionOnError() noexcept {
-	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract).
-	// Always a pool connection here — CTAS never loads on the pinned one — so it
-	// is always returned rather than dropped.
-	ReleaseBcpConnectionOnError(connection, pool_handle, /*transaction_pinned=*/false, reset_on_release);
+	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract,
+	// which BulkLoadSession::Abandon runs). Always a pool connection here — CTAS
+	// never loads on the pinned one — so it is always returned rather than
+	// dropped. A no-op when the session holds nothing.
+	bcp_session.Abandon();
 }
 
 void CTASExecutionState::Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
@@ -279,7 +279,7 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 
 void CTASExecutionState::FlushInserts(ClientContext &context) {
 	// Branch based on mode (Spec 027)
-	if (config.use_bcp && bcp_writer) {
+	if (config.use_bcp && bcp_session.IsOwned()) {
 		// BCP mode: flush remaining batch and finalize
 		auto insert_start = std::chrono::steady_clock::now();
 
@@ -545,91 +545,53 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	// transaction. That is what mssql_ctas_drop_on_failure does.
 	auto &pool = catalog->GetConnectionPool();
 	std::string why;
-	connection = pool.Acquire(-1, &why);
+	auto connection = pool.Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("CTAS BCP: Failed to acquire connection from pool: " + why);
 	}
 
-	try {
-		// Built once here, after the TABLOCK decision above: every batch boundary
-		// and every parallel writer re-executes exactly this text.
-		insert_bulk_sql = BuildInsertBulkSql();
-		DebugLog(2, "INSERT BULK: %s", insert_bulk_sql.c_str());
+	// Built once here, after the TABLOCK decision above: every batch boundary
+	// and every parallel writer re-executes exactly this text.
+	insert_bulk_sql = BuildInsertBulkSql();
+	DebugLog(2, "INSERT BULK: %s", insert_bulk_sql.c_str());
 
-		// Execute INSERT BULK to put connection in BulkLoad mode
-		auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk_sql);
+	// The session adopts the connection; INSERT BULK and COLMETADATA go down it
+	// on the first chunk, not here (the same deferral COPY runs — spec 075 W3).
+	BulkLoadSessionParams params;
+	params.pool_handle = pool_handle;
+	params.insert_bulk_sql = &insert_bulk_sql;
+	params.target = &bcp_target;
+	params.columns = &bcp_columns;
+	params.flush_rows = config.bcp_flush_rows;
+	params.collect_timings = mssql::CountersEnabled();
+	params.reset_on_release = reset_on_release;
+	bcp_session.Adopt(std::move(connection), params, /*transaction_pinned=*/false);
 
-		// Verify connection is now in correct state for BCP
-		// After INSERT BULK, connection should be in BulkLoad mode
-		connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
-
-		// Create BCPWriter
-		bcp_writer = make_uniq<BCPWriter>(*connection, bcp_target, bcp_columns);
-
-		// Write COLMETADATA token to start the bulk load
-		bcp_writer->WriteColmetadata();
-
-		DebugLog(1, "BCP session started, ready to receive data");
-
-	} catch (std::exception &e) {
-		pool.Release(connection);
-		connection = nullptr;
-		throw;
-	}
+	DebugLog(1, "BCP session ready, the stream opens on the first chunk");
 }
 
 void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
-	if (!bcp_writer) {
-		throw InternalException("CTAS BCP: BCPWriter not initialized");
+	if (!bcp_session.IsOwned()) {
+		throw InternalException("CTAS BCP: bulk-load session not initialized");
 	}
 
-	idx_t chunk_rows = chunk.size();
-	if (chunk_rows == 0) {
+	if (chunk.size() == 0) {
 		return;
 	}
 
-	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk_rows,
-			 (unsigned long long)bcp_rows_in_batch);
+	DebugLog(2, "AddChunkBCP: %llu rows (batch has %llu rows)", (unsigned long long)chunk.size(),
+			 (unsigned long long)bcp_session.RowsInBatch());
 
-	const bool counters = mssql::CountersEnabled();
 	try {
-		// Write rows to BCP writer
-		auto encode_start = std::chrono::steady_clock::now();
-		idx_t written = bcp_writer->WriteRows(chunk);
-		if (counters) {
-			counter_encode_ns += static_cast<uint64_t>(
-				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - encode_start)
-					.count());
-		}
-		bcp_rows_in_batch += written;
-		rows_produced += written;
-		auto flush_start = std::chrono::steady_clock::now();
-
-		// Check if we need to flush the batch
-		if (config.bcp_flush_rows > 0 && bcp_rows_in_batch >= config.bcp_flush_rows) {
-			DebugLog(1, "BCP batch threshold reached (%llu >= %llu), flushing", (unsigned long long)bcp_rows_in_batch,
-					 (unsigned long long)config.bcp_flush_rows);
-
-			// Flush current batch
-			idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
-			rows_inserted += confirmed;
-
-			// Reset for next batch
-			bcp_writer->ResetForNextBatch();
-			bcp_rows_in_batch = 0;
-
-			// Re-execute INSERT BULK for next batch
-			auto result = MSSQLSimpleQuery::Execute(*connection, insert_bulk_sql);
-			connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing);
-
-			// Write COLMETADATA for next batch
-			bcp_writer->WriteColmetadata();
-
-			if (counters) {
-				counter_flush_ns += static_cast<uint64_t>(
-					std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flush_start)
-						.count());
-			}
+		// Encode + send, and at the threshold the batch's DONE, the server's
+		// confirmation and the next INSERT BULK — all inside the session.
+		const auto written = bcp_session.Write(chunk);
+		rows_produced += written.rows_written;
+		rows_inserted += written.rows_confirmed;
+		counter_encode_ns += written.encode_ns;
+		counter_flush_ns += written.flush_ns;
+		if (written.flushed) {
+			DebugLog(1, "BCP batch flushed: %llu rows confirmed", (unsigned long long)written.rows_confirmed);
 		}
 	} catch (...) {
 		// Row encode or batch flush failed mid-BCP-stream (e.g. the #177
@@ -637,51 +599,28 @@ void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 		// the error propagates so the server rolls back the bulk load and
 		// releases its locks.
 		ReleaseBCPConnectionOnError();
-		bcp_writer.reset();
 		throw;
 	}
 }
 
 void CTASExecutionState::FlushBCP(ClientContext &context) {
-	if (!bcp_writer) {
+	if (!bcp_session.IsOwned()) {
 		return;
 	}
 
-	DebugLog(1, "FlushBCP: finalizing with %llu rows in current batch", (unsigned long long)bcp_rows_in_batch);
+	DebugLog(1, "FlushBCP: finalizing with %llu rows in current batch", (unsigned long long)bcp_session.RowsInBatch());
 
 	try {
-		if (bcp_rows_in_batch > 0) {
-			// Flush final batch
-			idx_t confirmed = bcp_writer->FlushBatch(bcp_rows_in_batch);
-			rows_inserted += confirmed;
-			bcp_rows_in_batch = 0;
-
-			DebugLog(1, "BCP final batch flushed: %llu rows confirmed", (unsigned long long)confirmed);
-		} else {
-			// No rows to flush - need to send empty DONE token
-			// Build DONE token and send
-			bcp_writer->WriteDone(0);
-			bcp_writer->Finalize();
-			DebugLog(1, "BCP completed with no additional rows");
-		}
-
-		// Back to the pool. Never the pinned connection, so this is a real release
-		// and not the provider's no-op.
-		if (connection) {
-			catalog->GetConnectionPool().Release(connection);
-			connection = nullptr;
-		}
-
-		// Clean up BCP writer
-		bcp_writer.reset();
-
+		// The final DONE (sent even for zero rows when the stream is open), the
+		// server's confirmation, and the connection back to the pool. Never the
+		// pinned connection, so this is a real release and not the provider's
+		// no-op. On failure the session releases the connection the error way —
+		// closed, not reused — and rethrows.
+		const idx_t confirmed = bcp_session.Finish();
+		rows_inserted += confirmed;
 		DebugLog(1, "BCP completed: %llu total rows transferred", (unsigned long long)rows_inserted);
-
 	} catch (std::exception &) {
-		// Release connection on failure. The stream died mid-bulk-load, so the
-		// connection must be closed, not reused (see ReleaseBCPConnectionOnError).
 		ReleaseBCPConnectionOnError();
-		bcp_writer.reset();
 		throw;
 	}
 }

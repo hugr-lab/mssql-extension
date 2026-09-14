@@ -102,7 +102,7 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 		// deliberately outside the transaction either way (see ExecuteBCPInsert) —
 		// so writer number two is in exactly the same position as writer number
 		// one, and there is nothing left for the cap to protect.
-		if (gstate->state.config.use_bcp && gstate->state.bcp_writer) {
+		if (gstate->state.config.use_bcp && gstate->state.bcp_session.IsOwned()) {
 			Value pw;
 			int64_t configured = 0;
 			if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
@@ -350,7 +350,7 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	// Execute data transfer using BCP or INSERT mode (Spec 027)
 	try {
-		if (gstate.state.config.use_bcp && gstate.state.bcp_writer) {
+		if (gstate.state.config.use_bcp && gstate.state.bcp_session.IsOwned()) {
 			// BCP mode: delegate to AddChunkBCP
 			const uint64_t encode_before = gstate.state.counter_encode_ns;
 			const uint64_t flush_before = gstate.state.counter_flush_ns;

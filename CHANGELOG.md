@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One bulk-load session type for every writer** (spec 062 W0). COPY's and
+  CTAS's shared writer — the one on the operator's own connection — ran their
+  own copies of the INSERT BULK / COLMETADATA / flush-and-reopen / DONE
+  sequence; both now run it through `BulkLoadSession`, which the parallel
+  writers already used, via a second entry point that adopts a connection the
+  operator holds (the transaction's pinned one, or a pool connection). No
+  wire change. One release path changed: a COPY or CTAS returning its pool
+  connection after a successful load now sets the reset flag from
+  `mssql_reset_connection`, as every other release path did — before, the
+  success path returned it without.
+
 - **`mssql_scan` no longer executes its query at bind** (spec 075, #336).
   Bind asks `sp_describe_first_result_set` for the result's shape; the query
   runs when the scan initialises. A `DESCRIBE` or `EXPLAIN` of a batch with
