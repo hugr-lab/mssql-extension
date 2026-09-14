@@ -62,8 +62,9 @@ string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMet
 BulkLoadSession::~BulkLoadSession() noexcept {
 	// The writer goes first: it holds a reference to the connection, and the
 	// release protocol closes the socket underneath it.
+	SnapshotWriterCounters();
 	writer_.reset();
-	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
+	ReleaseBcpConnectionOnError(connection_, pool_handle_, transaction_pinned_, reset_on_release_);
 }
 
 BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used,
@@ -71,6 +72,7 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 	if (max_writers <= 1) {
 		return Claim::Unavailable;
 	}
+
 	// Warm-up gate (spec 070 W2): hold every extra writer until the load has
 	// produced ONE COMPRESSIBLE batch on the shared writer, then let the full
 	// writer count open. That first batch is what keeps a SMALL columnstore load
@@ -101,6 +103,7 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		// threshold. The caller must ask again on a later chunk.
 		return Claim::GateClosed;
 	}
+
 	// Claim a slot before doing any work, so N threads racing here cannot
 	// collectively exceed the limit.
 	const idx_t slot = slots_used.fetch_add(1);
@@ -115,25 +118,11 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
 			throw IOException("no idle connection available for a parallel writer");
 		}
-		auto result = MSSQLSimpleQuery::Execute(*conn, *params.insert_bulk_sql);
-		if (!result.success) {
-			throw IOException("INSERT BULK failed on the parallel connection: %s", result.error_message);
-		}
-		if (!conn->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-			throw IOException("could not transition the parallel connection to Executing");
-		}
-
-		pool_handle_ = params.pool_handle;
-		insert_bulk_sql_ = params.insert_bulk_sql;
-		flush_rows_ = params.flush_rows;
-		collect_timings_ = params.collect_timings;
-		reset_on_release_ = params.reset_on_release;
-		connection_ = conn;
-		writer_ = make_uniq<BCPWriter>(*connection_, *params.target, *params.columns,
-									   params.column_mapping ? *params.column_mapping : vector<int32_t>());
-		// The stream opens with COLMETADATA; without it the server has no schema
-		// for the ROW tokens that follow.
-		writer_->WriteColmetadata();
+		Adopt(conn, params, /*transaction_pinned=*/false);
+		// A parallel writer opens its stream at once: it exists to carry rows and
+		// has a chunk in hand, and a failure to open is what makes the claim fall
+		// back rather than surface later as a write error.
+		OpenStream();
 		return Claim::Started;
 	} catch (std::exception &) {
 		// Falling back is the whole contract: put the connection back and let the
@@ -141,6 +130,8 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		// is exhausted or the server refused a bulk load, and neither clears on a
 		// later chunk — so the caller stops asking rather than re-blocking a 30 s
 		// Acquire() every chunk (spec 070 W2 review, finding 1).
+		writer_.reset();
+		stream_open_ = false;
 		if (conn) {
 			try {
 				params.pool->Release(conn);
@@ -149,32 +140,55 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 			}
 		}
 		connection_.reset();
-		writer_.reset();
 		slots_used.fetch_sub(1);
 		return Claim::Unavailable;
 	}
 }
 
-void BulkLoadSession::ReopenBatch() {
-	auto result = MSSQLSimpleQuery::Execute(*connection_, *insert_bulk_sql_);
+void BulkLoadSession::Adopt(std::shared_ptr<tds::TdsConnection> connection, const BulkLoadSessionParams &params,
+							bool transaction_pinned) {
+	pool_handle_ = params.pool_handle;
+	insert_bulk_sql_ = *params.insert_bulk_sql;
+	flush_rows_ = params.flush_rows;
+	collect_timings_ = params.collect_timings;
+	reset_on_release_ = params.reset_on_release;
+	transaction_pinned_ = transaction_pinned;
+	connection_ = std::move(connection);
+	writer_ = make_uniq<BCPWriter>(*connection_, *params.target, *params.columns,
+								   params.column_mapping ? *params.column_mapping : vector<int32_t>());
+	stream_open_ = false;
+	rows_in_batch_ = 0;
+	batches_flushed_ = 0;
+}
+
+void BulkLoadSession::OpenStream() {
+	auto result = MSSQLSimpleQuery::Execute(*connection_, insert_bulk_sql_);
 	if (!result.success) {
-		throw IOException("failed to re-execute INSERT BULK on a parallel connection: %s", result.error_message);
+		throw IOException("INSERT BULK failed: %s", result.error_message);
 	}
 	if (!connection_->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-		throw IOException("failed to transition a parallel connection to Executing");
+		throw IOException("could not transition the bulk-load connection to Executing");
 	}
-	writer_->ResetForNextBatch();
+	// The stream opens with COLMETADATA; without it the server has no schema
+	// for the ROW tokens that follow.
 	writer_->WriteColmetadata();
+	stream_open_ = true;
+}
+
+void BulkLoadSession::ReopenBatch() {
+	writer_->ResetForNextBatch();
+	OpenStream();
 }
 
 BulkLoadWriteResult BulkLoadSession::Write(DataChunk &chunk) {
 	BulkLoadWriteResult out;
-
+	if (!stream_open_) {
+		OpenStream();
+	}
 	auto encode_start = collect_timings_ ? Clock::now() : TimePoint{};
 	out.rows_written = writer_->WriteRows(chunk);
 	out.encode_ns = collect_timings_ ? ElapsedNs(encode_start) : 0;
 	rows_in_batch_ += out.rows_written;
-
 	if (flush_rows_ > 0 && rows_in_batch_ >= flush_rows_) {
 		auto flush_start = collect_timings_ ? Clock::now() : TimePoint{};
 		out.rows_confirmed = writer_->FlushBatch(rows_in_batch_);
@@ -188,27 +202,57 @@ BulkLoadWriteResult BulkLoadSession::Write(DataChunk &chunk) {
 	return out;
 }
 
+void BulkLoadSession::SnapshotWriterCounters() {
+	if (!writer_) {
+		return;
+	}
+	counter_build_send_ns_ = writer_->GetBuildSendNs();
+	counter_server_wait_ns_ = writer_->GetServerWaitNs();
+	counter_send_calls_ = writer_->GetSendCalls();
+}
+
+void BulkLoadSession::ReleaseConnection() {
+	if (!connection_) {
+		return;
+	}
+	connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+	if (transaction_pinned_) {
+		// The MSSQLTransaction owns the pin; just drop our reference.
+		connection_.reset();
+		return;
+	}
+	if (auto pool = pool_handle_.lock()) {
+		connection_->SetNeedsReset(reset_on_release_);
+		pool->Release(connection_);
+	}
+	connection_.reset();
+}
+
 idx_t BulkLoadSession::Finish() {
 	if (!writer_) {
 		return 0;
 	}
-	// Always send DONE, even for zero rows: INSERT BULK left the connection in
-	// Executing, and only DONE closes the stream so it can be pooled again.
-	writer_->WriteDone(rows_in_batch_);
-	const idx_t confirmed = writer_->Finalize();
-	if (rows_in_batch_ > 0) {
-		++batches_flushed_;
+	idx_t confirmed = 0;
+	if (stream_open_) {
+		try {
+			// Always send DONE, even for zero rows: INSERT BULK left the
+			// connection in Executing, and only DONE closes the stream so it can
+			// be pooled again.
+			writer_->WriteDone(rows_in_batch_);
+			confirmed = writer_->Finalize();
+		} catch (...) {
+			Abandon();
+			throw;
+		}
+		if (rows_in_batch_ > 0) {
+			++batches_flushed_;
+		}
+		stream_open_ = false;
 	}
 	rows_in_batch_ = 0;
+	SnapshotWriterCounters();
 	writer_.reset();
-
-	if (connection_) {
-		connection_->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-		if (auto pool = pool_handle_.lock()) {
-			pool->Release(connection_);
-		}
-		connection_.reset();
-	}
+	ReleaseConnection();
 	return confirmed;
 }
 
@@ -217,8 +261,10 @@ void BulkLoadSession::Abandon() noexcept {
 	// sitting mid-bulk-load on the very table a cleanup DROP has to take a schema
 	// lock on. Leaving it open until the destructor runs would have that DROP
 	// block on this same thread's work.
+	SnapshotWriterCounters();
 	writer_.reset();
-	ReleaseBcpConnectionOnError(connection_, pool_handle_, /*transaction_pinned=*/false, reset_on_release_);
+	ReleaseBcpConnectionOnError(connection_, pool_handle_, transaction_pinned_, reset_on_release_);
+	stream_open_ = false;
 	rows_in_batch_ = 0;
 }
 

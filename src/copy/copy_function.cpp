@@ -57,11 +57,6 @@ static void CopyDebugLog(int level, const char *format, ...) {
 using Clock = std::chrono::high_resolution_clock;
 using CopyTimePoint = std::chrono::time_point<Clock>;
 
-static double ElapsedMs(CopyTimePoint start) {
-	auto end = Clock::now();
-	return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
 // Nanoseconds, deliberately. Spec 055 D0 found the read path accumulating
 // per-chunk intervals through duration_cast<microseconds>, which truncated every
 // short interval to zero and made the phase it measured report approximately
@@ -125,9 +120,12 @@ void RegisterMSSQLCopyFunctions(ExtensionLoader &loader) {
 //===----------------------------------------------------------------------===//
 
 MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
-	// No-op on every path that already released: BCPCopyInitGlobal's error helper and
-	// BCPCopyFinalize (both success and error) reset() `connection`. This only fires when the sink
-	// threw and copy_to_finalize was never called — see the contract note on the declaration.
+	// `connection` is non-null only if BCPCopyInitGlobal threw before handing it
+	// to `shared` (its own error helper resets it on the paths it owns). After
+	// that hand-over the session holds the connection and releases it itself on
+	// every path — Finish, Abandon, or its own destructor when the sink threw
+	// and copy_to_finalize was never called (see the contract note on the
+	// declaration).
 	//
 	// Shared mid-BCP release protocol (see ReleaseBcpConnectionOnError contract) — worker-thread
 	// safe per issue #178 / PR #179.
@@ -135,9 +133,6 @@ MSSQLCopyGlobalState::~MSSQLCopyGlobalState() {
 }
 
 namespace mssql {
-
-// Forward declarations
-static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &bdata);
 
 //===----------------------------------------------------------------------===//
 // BCPCopyBind - Parse target URL and options
@@ -517,11 +512,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// initialises the source (an open job scheduled from RequestFileState),
 		// and inside a transaction the source scan drains on this same pinned
 		// connection; a stream opened here would be the collision W3 exists to
-		// remove. The stream opens on the first chunk -- StartBulkStream.
-
-		// Create BCP writer with optional column mapping
-		gstate->writer =
-			make_uniq<BCPWriter>(*gstate->connection, bdata.target, gstate->columns, gstate->column_mapping);
+		// remove. The shared session opens its stream on the first chunk.
 
 		// How many bulk-load sessions this COPY may open, and on whose connection
 		// (spec 057 step 7; resolved by one shared function since spec 063 D1,
@@ -547,6 +538,23 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 					 (unsigned long long)gstate->parallel_writer_limit, gstate->transaction_pinned ? 1 : 0,
 					 bdata.target.is_temp_table ? 1 : 0);
 
+		// The connection is the session's from here: the last step of init, so
+		// every throw above still goes through release_connection_on_error and
+		// every release after this point is the session's.
+		{
+			BulkLoadSessionParams params;
+			params.pool_handle = gstate->pool_handle;
+			params.insert_bulk_sql = &gstate->insert_bulk_sql;
+			params.target = &bdata.target;
+			params.columns = &gstate->columns;
+			params.column_mapping = &gstate->column_mapping;
+			params.flush_rows = bdata.config.flush_rows;
+			params.collect_timings = mssql::CountersEnabled();
+			params.reset_on_release = gstate->reset_on_release;
+			gstate->shared.Adopt(std::move(gstate->connection), params, gstate->transaction_pinned);
+			gstate->connection.reset();
+		}
+
 		CopyDebugLog(1, "BCPCopyInitGlobal: ready; the BCP stream opens on the first chunk (spec 075 W3)");
 
 	} catch (...) {
@@ -561,28 +569,6 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 //===----------------------------------------------------------------------===//
 // BCPCopyInitLocal - Create per-thread buffer
 //===----------------------------------------------------------------------===//
-
-// Open the bulk-load stream on the shared writer's connection: INSERT BULK,
-// Idle -> Executing, COLMETADATA. Called under write_mutex from the first
-// BCPCopySink that reaches the shared writer, and from FlushToServer to reopen
-// it after a batch's DONE -- the same three steps in both places. Not from
-// BCPCopyInitGlobal (spec 075 W3): DuckDB creates the sink state before it
-// initialises the source, on an open job that runs concurrently with the
-// source's InitGlobal, and in a transaction that source drains on this very
-// pinned connection. By the first chunk the source has produced rows, so the
-// connection is Idle whichever of the two initialised first.
-static void StartBulkStream(MSSQLCopyGlobalState &gdata, const char *caller) {
-	auto result = MSSQLSimpleQuery::Execute(*gdata.connection, gdata.insert_bulk_sql);
-	if (!result.success) {
-		throw InvalidInputException("MSSQL COPY: Failed to execute INSERT BULK: %s", result.error_message);
-	}
-	if (!gdata.connection->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
-		throw IOException("MSSQL COPY: Failed to transition connection to Executing state");
-	}
-	gdata.writer->WriteColmetadata();
-	gdata.bulk_started = true;
-	CopyDebugLog(1, "%s: BCP stream started", caller);
-}
 
 unique_ptr<LocalFunctionData> BCPCopyInitLocal(ExecutionContext &context, FunctionData &bind_data) {
 	// No local buffering needed - we write directly to BCPWriter
@@ -697,48 +683,29 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			return;
 		}
 
-		// SHARED writer: every thread that did not get its own session appends to
-		// this one, so the append and the batch flush must be under the SAME lock.
+		// SHARED session: every thread that did not get its own appends to this
+		// one, so the append and the batch flush must be under the SAME lock.
 		//
 		// They were not, and it silently lost rows the moment the sink became
 		// parallel: WriteRows takes BCPWriter's own internal mutex while the flush
 		// took gdata.write_mutex, so a flush could send and clear the accumulator
 		// while another thread was still appending to it. Measured at 205376 rows
-		// arriving out of 1000000 — no error anywhere, on either side.
+		// arriving out of 1000000 — no error anywhere, on either side. The
+		// session does both inside one call now, and the lock is around the call.
 		std::unique_lock<std::mutex> shared_lock(gdata.write_mutex);
-		if (!gdata.bulk_started) {
-			StartBulkStream(gdata, "BCPCopySink");
+		const auto written = gdata.shared.Write(input);
+		gdata.rows_sent.fetch_add(written.rows_written);
+		if (written.flushed) {
+			gdata.rows_confirmed.fetch_add(written.rows_confirmed);
+			gdata.batches_flushed.fetch_add(1);
+			CopyDebugLog(1, "BCPCopySink: batch %llu confirmed %llu rows in %.2f ms (total confirmed: %llu)",
+						 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)written.rows_confirmed,
+						 written.flush_ns / 1e6, (unsigned long long)gdata.rows_confirmed.load());
 		}
-		auto start_write = counters ? Clock::now() : CopyTimePoint{};
-		idx_t rows_written = gdata.writer->WriteRows(input);
-		const uint64_t encode_ns = counters ? ElapsedNs(start_write) : 0;
-		gdata.rows_sent.fetch_add(rows_written);
 
-		CopyDebugLog(2, "BCPCopySink: encoded %llu rows in %.3f ms, checking flush...",
-					 (unsigned long long)rows_written, encode_ns / 1e6);
-
-		// Check for interrupt after encoding
+		// Check for interrupt after the write
 		if (context.client.IsInterrupted()) {
 			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after encoding");
-			throw InterruptException();
-		}
-
-		// Check if we should flush to SQL Server
-		uint64_t flush_ns = 0;
-		if (bdata.config.ShouldFlushToServer(gdata.writer->GetRowsInCurrentBatch())) {
-			CopyDebugLog(1, "BCPCopySink: triggering server flush (rows_in_batch=%llu, threshold=%llu)...",
-						 (unsigned long long)gdata.writer->GetRowsInCurrentBatch(),
-						 (unsigned long long)bdata.config.flush_rows);
-			auto start_flush = counters ? Clock::now() : CopyTimePoint{};
-			// Already held from the append above — the two must not be separable.
-			FlushToServer(gdata, bdata);
-			flush_ns = counters ? ElapsedNs(start_flush) : 0;
-			CopyDebugLog(1, "BCPCopySink: server flush completed in %.2f ms", flush_ns / 1e6);
-		}
-
-		// Check for interrupt after flush
-		if (context.client.IsInterrupted()) {
-			CopyDebugLog(1, "BCPCopySink: INTERRUPT detected after flush");
 			throw InterruptException();
 		}
 
@@ -749,74 +716,12 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		if (counters) {
 			gdata.counter_sink_calls.fetch_add(1, std::memory_order_relaxed);
 			gdata.counter_sink_ns.fetch_add(ElapsedNs(start_sink), std::memory_order_relaxed);
-			gdata.counter_encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
-			gdata.counter_flush_ns.fetch_add(flush_ns, std::memory_order_relaxed);
+			gdata.counter_encode_ns.fetch_add(written.encode_ns, std::memory_order_relaxed);
+			gdata.counter_flush_ns.fetch_add(written.flush_ns, std::memory_order_relaxed);
 		}
 	} catch (std::exception &e) {
 		// Record the error for finalize to handle cleanup
 		CopyDebugLog(1, "BCPCopySink: ERROR - %s", e.what());
-		{
-			// First failure wins: with N writers, one broken load fails them all,
-			// and the first message is the one that explains it.
-			std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
-			if (gdata.error_message.empty()) {
-				gdata.error_message = e.what();
-			}
-		}
-		gdata.has_error.store(true, std::memory_order_release);
-		throw;
-	}
-}
-
-//===----------------------------------------------------------------------===//
-// FlushToServer - Flush accumulated data to SQL Server
-//===----------------------------------------------------------------------===//
-
-static void FlushToServer(MSSQLCopyGlobalState &gdata, const MSSQLCopyBindData &bdata) {
-	auto start_total = Clock::now();
-	idx_t rows_in_batch = gdata.writer->GetRowsInCurrentBatch();
-	if (rows_in_batch == 0) {
-		return;
-	}
-
-	idx_t total_sent = gdata.rows_sent.load();
-	CopyDebugLog(1, "FlushToServer: flushing batch %llu: %llu rows (total: %llu), buffer: %zu MB",
-				 (unsigned long long)(gdata.batches_flushed.load() + 1), (unsigned long long)rows_in_batch,
-				 (unsigned long long)total_sent, gdata.writer->GetAccumulatorSize() / (1024 * 1024));
-
-	try {
-		// Flush the current batch - this sends DONE token and reads response
-		auto start_flush = Clock::now();
-		CopyDebugLog(1, "FlushToServer: >> Sending data to server...");
-		idx_t confirmed = gdata.writer->FlushBatch(rows_in_batch);
-		double flush_ms = ElapsedMs(start_flush);
-		CopyDebugLog(1, "FlushToServer: >> Server confirmed %llu rows in %.2f ms", (unsigned long long)confirmed,
-					 flush_ms);
-		gdata.rows_confirmed.fetch_add(confirmed);
-		gdata.batches_flushed.fetch_add(1);
-
-		CopyDebugLog(1, "FlushToServer: batch %llu confirmed %llu rows, total confirmed: %llu",
-					 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)confirmed,
-					 (unsigned long long)gdata.rows_confirmed.load());
-
-		// Reset the writer, then reopen the stream: INSERT BULK, Executing,
-		// COLMETADATA -- the same three steps the first chunk ran.
-		auto start_reset = Clock::now();
-		gdata.writer->ResetForNextBatch();
-		double reset_ms = ElapsedMs(start_reset);
-		auto start_insert = Clock::now();
-		StartBulkStream(gdata, "FlushToServer");
-		double insert_ms = ElapsedMs(start_insert);
-
-		double total_ms = ElapsedMs(start_total);
-		double rows_per_sec = (total_ms > 0) ? (rows_in_batch * 1000.0 / total_ms) : 0;
-		CopyDebugLog(1,
-					 "FlushToServer: DONE batch %llu - %llu rows in %.2f ms (flush: %.2f, INSERT BULK: %.2f, reset: "
-					 "%.2f) | %.0f rows/s",
-					 (unsigned long long)gdata.batches_flushed.load(), (unsigned long long)confirmed, total_ms,
-					 flush_ms, insert_ms, reset_ms, rows_per_sec);
-
-	} catch (std::exception &e) {
 		{
 			// First failure wins: with N writers, one broken load fails them all,
 			// and the first message is the one that explains it.
@@ -897,14 +802,12 @@ void BCPCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 // whole batch sitting outside this summary.
 //===----------------------------------------------------------------------===//
 
-// Must run before gdata.writer.reset(), which happens on every exit path.
+// After the shared session's Finish or Abandon, which snapshot them from the
+// writer before it goes.
 static void SnapshotWriterCounters(MSSQLCopyGlobalState &gdata) {
-	if (!gdata.writer) {
-		return;
-	}
-	gdata.counter_build_send_ns = gdata.writer->GetBuildSendNs();
-	gdata.counter_server_wait_ns = gdata.writer->GetServerWaitNs();
-	gdata.counter_send_calls = gdata.writer->GetSendCalls();
+	gdata.counter_build_send_ns = gdata.shared.BuildSendNs();
+	gdata.counter_server_wait_ns = gdata.shared.ServerWaitNs();
+	gdata.counter_send_calls = gdata.shared.SendCalls();
 }
 
 static void PrintWriteCounters(MSSQLCopyGlobalState &gdata, idx_t rows) {
@@ -1006,35 +909,13 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 
-	// Helper lambda for cleanup on error
+	// Helper lambda for cleanup on error: the stream is dead, so the connection
+	// is closed rather than returned (the server rolls the load back and drops
+	// its locks); a pinned connection is closed and left to its transaction.
 	auto cleanup_on_error = [&](const string &error_msg) {
 		CopyDebugLog(1, "BCPCopyFinalize: ERROR - %s", error_msg.c_str());
-
-		// Try to clean up connection state
-		if (gdata.connection) {
-			gdata.connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-
-			// Try to send ATTENTION to cancel any pending operation
-			try {
-				// Note: In a real implementation, we might send an ATTENTION packet here
-				// For now, just transition the state
-			} catch (...) {
-				// Ignore cleanup errors
-			}
-
-			// Release the connection
-			if (bdata.target.IsTempTable() && in_transaction) {
-				// Keep pinned for transaction cleanup
-				ConnectionProvider::ReleaseConnection(context, mssql_catalog, gdata.connection);
-			} else {
-				mssql_catalog.GetConnectionPool().Release(gdata.connection);
-			}
-			gdata.connection.reset();
-		}
-
-		// Release the writer
+		gdata.shared.Abandon();
 		SnapshotWriterCounters(gdata);
-		gdata.writer.reset();
 	};
 
 	if (gdata.has_error.load(std::memory_order_acquire)) {
@@ -1055,7 +936,7 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	}
 
 	idx_t total_rows = gdata.rows_sent.load();
-	idx_t rows_in_final_batch = gdata.writer->GetRowsInCurrentBatch();
+	idx_t rows_in_final_batch = gdata.shared.RowsInBatch();
 	idx_t previously_confirmed = gdata.rows_confirmed.load();
 
 	CopyDebugLog(1, "BCPCopyFinalize: total_rows=%llu, previously_confirmed=%llu, rows_in_final_batch=%llu",
@@ -1063,31 +944,21 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 				 (unsigned long long)rows_in_final_batch);
 
 	try {
-		// Send final DONE token and finalize the BCP stream
-		// Note: We must ALWAYS send DONE and finalize, even if rows_in_final_batch == 0.
-		// After intermediate flushes, we restart BCP with ExecuteBatch + WriteColmetadata,
-		// leaving the connection in Executing state. We need DONE to close the stream
-		// and transition back to Idle so the connection can be reused.
-		if (rows_in_final_batch > 0) {
-			CopyDebugLog(1, "BCPCopyFinalize: sending final batch: %llu rows, buffer: %zu MB",
-						 (unsigned long long)rows_in_final_batch, gdata.writer->GetAccumulatorSize() / (1024 * 1024));
+		// The final DONE, the server's confirmation, and the connection back to
+		// whoever owns it. Sent even for zero rows when the stream is open; a
+		// stream that never opened -- an empty source, or every thread on a
+		// session of its own -- sends nothing and the connection never left Idle.
+		if (!gdata.shared.IsOpen()) {
+			CopyDebugLog(1, "BCPCopyFinalize: no BCP stream was opened on the shared writer");
+		} else if (rows_in_final_batch > 0) {
+			CopyDebugLog(1, "BCPCopyFinalize: sending final batch: %llu rows", (unsigned long long)rows_in_final_batch);
 		} else {
 			CopyDebugLog(1, "BCPCopyFinalize: sending empty DONE to close BCP stream");
 		}
 
-		idx_t final_batch_confirmed = 0;
-		if (gdata.bulk_started) {
-			// Send DONE token for the final batch (even if 0 rows)
-			gdata.writer->WriteDone(rows_in_final_batch);
-			CopyDebugLog(1, "BCPCopyFinalize: data sent, waiting for SQL Server to process...");
-			// Read server response and get confirmed row count
-			final_batch_confirmed = gdata.writer->Finalize();
-		} else {
-			// No chunk ever reached the shared writer -- an empty source, or every
-			// thread on a session of its own -- so no stream was opened and there
-			// is nothing to close; the connection never left Idle.
-			CopyDebugLog(1, "BCPCopyFinalize: no BCP stream was opened on the shared writer");
-		}
+		// Finish releases the connection the error way and rethrows on failure.
+		const idx_t final_batch_confirmed = gdata.shared.Finish();
+		SnapshotWriterCounters(gdata);
 		gdata.rows_confirmed.fetch_add(final_batch_confirmed);
 
 		CopyDebugLog(1, "BCPCopyFinalize: final batch confirmed %llu rows", (unsigned long long)final_batch_confirmed);
@@ -1106,7 +977,8 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 
 	} catch (std::exception &e) {
 		string error_msg = e.what();
-		cleanup_on_error(error_msg);
+		// Finish already released the connection; this only records the counters.
+		SnapshotWriterCounters(gdata);
 
 		if (in_transaction) {
 			throw IOException(
@@ -1119,37 +991,23 @@ void BCPCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		}
 	}
 
-	// Release the writer
-	SnapshotWriterCounters(gdata);
-	gdata.writer.reset();
-
-	// Note: BCPWriter::Finalize() already transitions connection back to Idle state
-
-	// Handle connection release based on transaction state
+	// The connection went back with Finish: pinned stays pinned so subsequent
+	// operations (queries, COPY, DML) use the same transaction context; a pool
+	// connection is released with the reset flag.
 	if (in_transaction) {
-		// In a transaction, keep connection pinned so subsequent operations
-		// (queries, COPY, DML) use the same transaction context.
-		// ConnectionProvider::ReleaseConnection is a no-op when in a transaction.
 		if (bdata.target.IsTempTable()) {
 			CopyDebugLog(1, "BCPCopyFinalize: temp table '%s' - connection stays pinned to transaction",
 						 bdata.target.table_name.c_str());
 		} else {
 			CopyDebugLog(1, "BCPCopyFinalize: connection stays pinned to transaction");
 		}
-		ConnectionProvider::ReleaseConnection(context, mssql_catalog, gdata.connection);
-	} else {
-		// Not in transaction - release connection back to pool
-		if (bdata.target.IsTempTable()) {
-			CopyDebugLog(1,
-						 "WARNING: COPY to temp table '%s' in auto-commit mode. "
-						 "Temp table will be dropped when connection is released. "
-						 "Use BEGIN TRANSACTION to keep the temp table accessible.",
-						 bdata.target.table_name.c_str());
-		}
-		mssql_catalog.GetConnectionPool().Release(gdata.connection);
+	} else if (bdata.target.IsTempTable()) {
+		CopyDebugLog(1,
+					 "WARNING: COPY to temp table '%s' in auto-commit mode. "
+					 "Temp table will be dropped when connection is released. "
+					 "Use BEGIN TRANSACTION to keep the temp table accessible.",
+					 bdata.target.table_name.c_str());
 	}
-
-	gdata.connection.reset();
 
 	idx_t final_confirmed = gdata.rows_confirmed.load();
 	CopyDebugLog(1, "BCPCopyFinalize: COPY completed successfully, %llu rows transferred",

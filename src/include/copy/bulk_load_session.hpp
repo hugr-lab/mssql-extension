@@ -118,7 +118,20 @@ string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMet
 						  idx_t rows_per_batch);
 
 //! A bulk-load session owned by ONE thread. Not thread-safe and not meant to be:
-//! a thread either owns one of these or shares the operator's global writer.
+//! a thread either owns one of these or shares the operator's global session
+//! under the operator's lock.
+//!
+//! Two ways in, one object (spec 062 W0). `TryStart` claims a slot and a POOL
+//! connection for a parallel writer and may decline; `Adopt` takes a connection
+//! the operator already holds — the transaction's pinned one, or the pool
+//! connection the operator's init acquired — and never declines. From there the
+//! two are the same session: the stream opens on the first Write (spec 075 W3:
+//! never at init, where inside a transaction the source may still be draining
+//! on the very same pinned connection), batches close and reopen at
+//! `flush_rows`, Finish sends the last DONE and returns the connection to
+//! whoever owns it. COPY, CTAS and INSERT all run their shared writer through
+//! this; before W0 each of the first two carried its own copy of the sequence,
+//! and INSERT would have been the third.
 class BulkLoadSession {
 public:
 	BulkLoadSession() = default;
@@ -162,20 +175,46 @@ public:
 	Claim TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
 				   const std::atomic<idx_t> &rows_sunk);
 
-	//! Does this thread own a session? False means "use the shared writer".
+	//! Take over a connection the operator holds. No wire traffic: the stream
+	//! opens on the first Write. `transaction_pinned` says whose the connection
+	//! is — a pinned one is handed back to its transaction untouched on every
+	//! path (Finish drops the reference, the error paths close it and drop the
+	//! reference, as ReleaseBcpConnectionOnError always did); a pool connection
+	//! is released with `params.reset_on_release`, which is `mssql_reset_connection`
+	//! honoured on this release path like on every other (issue #189) — COPY's
+	//! own success path used to skip it.
+	void Adopt(std::shared_ptr<tds::TdsConnection> connection, const BulkLoadSessionParams &params,
+			   bool transaction_pinned);
+
+	//! Does this session hold a connection and a writer? For a per-thread
+	//! session: false means "use the shared writer".
 	bool IsOwned() const {
 		return writer_ != nullptr;
 	}
 
-	//! Write one chunk, flushing and re-opening the batch at the threshold.
-	//! Throws on a protocol or server error; the caller owns the failure policy.
+	//! Has INSERT BULK + COLMETADATA gone down the connection? False until the
+	//! first Write, and after Finish.
+	bool IsOpen() const {
+		return stream_open_;
+	}
+
+	//! Write one chunk, opening the stream if this is the first, flushing and
+	//! re-opening the batch at the threshold. Throws on a protocol or server
+	//! error; the caller owns the failure policy.
 	BulkLoadWriteResult Write(DataChunk &chunk);
 
 	//! DONE for whatever is unflushed, the server's confirmation, then the
-	//! connection goes back to the pool.
+	//! connection goes back to whoever owns it (see Adopt).
 	//!
-	//! DONE is sent even for zero rows: INSERT BULK left the connection in
-	//! Executing, and only DONE closes the stream so it can be pooled again.
+	//! DONE is sent whenever the stream is open, even for zero rows: INSERT BULK
+	//! left the connection in Executing, and only DONE closes the stream so it
+	//! can be pooled again. A session whose stream never opened — an empty
+	//! source, or every chunk went to other writers — sends nothing and just
+	//! returns the connection.
+	//!
+	//! A failure here (the server rejecting the final batch) releases the
+	//! connection the error way — closed, so the server rolls the load back and
+	//! drops its locks — and rethrows.
 	//!
 	//! @return rows the server confirmed for the final batch.
 	idx_t Finish();
@@ -195,10 +234,29 @@ public:
 		return batches_flushed_;
 	}
 
+	//! The writer's wire counters (spec 057 step 0b), snapshotted when the
+	//! writer is torn down — Finish and Abandon both — because the summary
+	//! prints after that, and reading a destroyed writer there gave zeroes.
+	uint64_t BuildSendNs() const {
+		return counter_build_send_ns_;
+	}
+	uint64_t ServerWaitNs() const {
+		return counter_server_wait_ns_;
+	}
+	idx_t SendCalls() const {
+		return counter_send_calls_;
+	}
+
 private:
-	//! Re-open the batch after FlushBatch closed it: INSERT BULK again, back to
-	//! Executing, fresh COLMETADATA.
+	//! INSERT BULK, Idle -> Executing, COLMETADATA: the three steps that open a
+	//! stream, run for the first chunk and again after every FlushBatch.
+	void OpenStream();
+	//! Re-open the batch after FlushBatch closed it.
 	void ReopenBatch();
+	//! Read the writer's counters before it goes.
+	void SnapshotWriterCounters();
+	//! The normal release: pinned stays pinned, pooled goes back with the reset flag.
+	void ReleaseConnection();
 
 	std::shared_ptr<tds::TdsConnection> connection_;
 	unique_ptr<BCPWriter> writer_;
@@ -208,16 +266,22 @@ private:
 	//! disagree. Finish() runs inside the statement so a raw pointer was safe
 	//! there; the point is that nothing now has to know that.
 	weak_ptr<tds::ConnectionPool> pool_handle_;
-	//! Owned by the operator's GLOBAL state, which DuckDB destroys after every
-	//! local state — so this outlives the session that dereferences it on every
-	//! batch boundary.
-	const string *insert_bulk_sql_ = nullptr;
+	//! Own copy: re-executed at every batch boundary, and the operator's string
+	//! may not outlive a session moved out of its local state (spec 062 W2).
+	string insert_bulk_sql_;
 	idx_t flush_rows_ = 0;
 	bool collect_timings_ = false;
 	bool reset_on_release_ = tds::DEFAULT_RESET_CONNECTION;
+	//! Adopt only: the connection is the DuckDB transaction's, never released here.
+	bool transaction_pinned_ = false;
+	bool stream_open_ = false;
 
 	idx_t rows_in_batch_ = 0;
 	idx_t batches_flushed_ = 0;
+
+	uint64_t counter_build_send_ns_ = 0;
+	uint64_t counter_server_wait_ns_ = 0;
+	idx_t counter_send_calls_ = 0;
 };
 
 }  // namespace mssql
