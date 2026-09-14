@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include "dml/insert/mssql_insert_batch.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_error.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
@@ -106,11 +107,14 @@ private:
 	// Initialize batch builder if needed
 	void EnsureBatchBuilder(bool with_output);
 
-	// Execute a single batch and return rows affected
-	idx_t ExecuteBatch(const string &sql);
+	// Execute a single batch and return rows affected. Takes the batch, not
+	// its text: an error names the batch's own statement index and row range,
+	// which the builder has already moved past by the time it runs.
+	idx_t ExecuteBatch(const MSSQLInsertBatch &batch);
 
 	// Execute a batch and parse OUTPUT results
-	unique_ptr<DataChunk> ExecuteBatchWithOutput(const string &sql, const vector<idx_t> &returning_column_ids);
+	unique_ptr<DataChunk> ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
+												 const vector<idx_t> &returning_column_ids);
 
 	// Get connection pool from catalog
 	tds::ConnectionPool &GetConnectionPool();

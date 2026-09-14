@@ -74,6 +74,12 @@ unique_ptr<FunctionData> MSSQLPoolStatsFunction::Bind(ClientContext &context, Ta
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("last_create_error");
 	return_types.emplace_back(LogicalType::VARCHAR);
+	// How old that error is. A pool at its limit recovers by reuse and never
+	// reaches the creation-success path that clears the error, so without the
+	// age a reader cannot tell a live failure from one the pool has outlived.
+	// NULL when there is no recorded error.
+	names.emplace_back("last_create_error_age_ms");
+	return_types.emplace_back(LogicalType::BIGINT);
 
 	return std::move(bind_data);
 }
@@ -144,6 +150,8 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 			output.data[8].SetValue(count, Value::BIGINT(stats.pinned_count));
 			output.data[9].SetValue(count, Value::BIGINT(static_cast<int64_t>(stats.creation_failures)));
 			output.data[10].SetValue(count, Value(pool.GetLastCreateError()));
+			const int64_t age_ms = pool.GetLastCreateErrorAgeMs();
+			output.data[11].SetValue(count, age_ms < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(age_ms));
 
 			count++;
 		} catch (...) {

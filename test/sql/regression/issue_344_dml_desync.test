@@ -1,0 +1,155 @@
+# name: test/sql/regression/issue_344_dml_desync.test
+# description: a TDS desync in a DML response is reported, names what the server did, and never hangs (issues #323, #344)
+# group: [mssql]
+# issue: 344
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The four DML response loops -- the INSERT batch, INSERT ... RETURNING, UPDATE,
+# DELETE -- are copies of one loop, and the fifth copy (MSSQLSimpleQuery) got
+# the #323 fixes alone. A parser that desynced mid-response was fed the whole
+# remaining response for nothing, and then reported SUCCESS: the EOM branch
+# forced `done` and nothing checked the parser's state. The RETURNING copy did
+# worse: its loop has no EOM exit at all, so it blocked on the next packet for
+# the full 30 s and then blamed the socket.
+#
+# A desync is a client-side framing failure -- by the time it is noticed the
+# server has run the batch -- and in autocommit every batch is its own
+# committed statement (#344, decided: report it, say how far it got, no
+# compensation; the batches themselves go with spec 062 / 066). So each case
+# below checks two things: the statement fails naming the desync and what was
+# executed, and the rows the server DID apply are there afterwards.
+#
+# mssql_test_fail_parse_after_tokens is the lever: a desync cannot be induced
+# from SQL since spec 072, so the loops put their parser into Error after N
+# tokens themselves, as a framing error would. The counts below depend on the
+# batch sizes: mssql_dml_batch_size = 500, mssql_insert_batch_size = 1000.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i344 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i344', 'IF OBJECT_ID(''dbo.i344'') IS NOT NULL DROP TABLE dbo.i344; CREATE TABLE dbo.i344 (id INT NOT NULL PRIMARY KEY, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('i344');
+
+statement ok
+INSERT INTO i344.dbo.i344 SELECT i, 1 FROM range(1, 1201) t(i);
+
+query I
+SELECT count(*) FROM i344.dbo.i344;
+----
+1200
+
+# --- UPDATE: 1200 rows = batches of 500, 500, 200. The first batch's response
+# desyncs at its first token: the statement fails, names the batch, and the
+# 500 rows of that batch ARE updated -- the server ran it.
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+UPDATE i344.dbo.i344 SET n = 2;
+----
+TDS parse error
+
+statement error
+UPDATE i344.dbo.i344 SET n = 2;
+----
+the server executed this batch (batch 1)
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+# two failed statements above, each ran its first batch: rows 1-500 twice
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE n = 2;
+----
+500
+
+# the connection the desync happened on is usable again (drained to EOM, Idle)
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE n = 1;
+----
+700
+
+# --- DELETE: the same shape; the first batch of 500 is gone, the rest stays.
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+DELETE FROM i344.dbo.i344;
+----
+the server executed this batch
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM i344.dbo.i344;
+----
+700
+
+# --- INSERT batch: 1200 rows = statements of 1000 and 200. Statement 0 runs
+# and its response desyncs: the error says so, without a "[0]" server code,
+# and its 1000 rows are in.
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+INSERT INTO i344.dbo.i344 SELECT i, 3 FROM range(2001, 3201) t(i);
+----
+INSERT failed at statement 0 (rows 0-999): TDS parse error
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE n = 3;
+----
+1000
+
+# --- INSERT ... RETURNING: the loop that used to hang for its full 30 s and
+# then report the socket. It now fails at once naming the desync, and the row
+# is in.
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+INSERT INTO i344.dbo.i344 VALUES (9001, 4) RETURNING id;
+----
+TDS parse error
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE id = 9001;
+----
+1
+
+# --- with the lever off, every path is what it was (ids 1-500 went with the
+# DELETE's first batch; 2001-3000 came in with the INSERT's first statement)
+statement ok
+UPDATE i344.dbo.i344 SET n = 5 WHERE id BETWEEN 2001 AND 2010;
+
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE n = 5;
+----
+10
+
+query I
+INSERT INTO i344.dbo.i344 VALUES (9002, 6) RETURNING id;
+----
+9002
+
+statement ok
+SELECT mssql_exec('i344', 'DROP TABLE dbo.i344');
+
+statement ok
+DETACH i344;

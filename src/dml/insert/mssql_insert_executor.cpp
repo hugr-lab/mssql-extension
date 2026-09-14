@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -90,7 +91,8 @@ void MSSQLInsertExecutor::EnsureBatchBuilder(bool with_output) {
 // Batch Execution
 //===----------------------------------------------------------------------===//
 
-idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
+idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
+	const string &sql = batch.sql_statement;
 	INSERT_DEBUG(1, "ExecuteBatch: starting, sql_length=%zu", sql.size());
 	// Print first 2000 chars of SQL for debugging
 	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.2000s%s", sql.c_str(), sql.size() > 2000 ? "..." : "");
@@ -130,9 +132,9 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 		if (!connection->ExecuteBatch(sql)) {
 			INSERT_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", connection->GetLastError().c_str());
 			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount();
-			error.row_offset_start = batch_builder_->GetCurrentRowOffset() - batch_builder_->GetPendingRowCount();
-			error.row_offset_end = batch_builder_->GetCurrentRowOffset();
+			error.statement_index = batch_builder_->GetBatchCount() - 1;
+			error.row_offset_start = batch.row_offset_start;
+			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 
@@ -144,6 +146,8 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
+		const int64_t fail_after_tokens = LoadTestFailParseAfterTokens(context_);
+		int64_t tokens_seen = 0;
 		bool done = false;
 		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -201,6 +205,12 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 			// Parse tokens
 			tds::ParsedTokenType token;
 			while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
+				if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
+					// Test lever (mssql_test_fail_parse_after_tokens): drop this token
+					// and desync, as a framing error would.
+					parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
+					break;
+				}
 				INSERT_DEBUG(2, "ExecuteBatch: parsed token type=%d", (int)token);
 				switch (token) {
 				case tds::ParsedTokenType::Done: {
@@ -260,11 +270,16 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 		// Check for errors
 		if (!error_message.empty()) {
 			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount();
-			error.row_offset_start = batch_builder_->GetCurrentRowOffset() - batch_builder_->GetPendingRowCount();
-			error.row_offset_end = batch_builder_->GetCurrentRowOffset();
+			error.statement_index = batch_builder_->GetBatchCount() - 1;
+			error.row_offset_start = batch.row_offset_start;
+			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = error_number;
 			error.sql_error_message = error_message;
+			error.rows_applied_before = statistics_.total_rows_inserted;
+			// A parse error is a client-side framing failure: the server ran this
+			// statement (issue #344). The message says so; a SQL error says the
+			// server rejected it.
+			error.statement_executed = (error_number == 0);
 
 			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
@@ -287,8 +302,9 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const string &sql) {
 	return rows_affected;
 }
 
-unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &sql,
+unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
 																  const vector<idx_t> &returning_column_ids) {
+	const string &sql = batch.sql_statement;
 	// Get catalog for ConnectionProvider
 	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
@@ -316,9 +332,9 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 		// Send the SQL batch (with OUTPUT clause)
 		if (!connection->ExecuteBatch(sql)) {
 			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount();
-			error.row_offset_start = batch_builder_->GetCurrentRowOffset() - batch_builder_->GetPendingRowCount();
-			error.row_offset_end = batch_builder_->GetCurrentRowOffset();
+			error.statement_index = batch_builder_->GetBatchCount() - 1;
+			error.row_offset_start = batch.row_offset_start;
+			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 
@@ -328,16 +344,18 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const string &
 
 		// Parse the OUTPUT INSERTED results using MSSQLReturningParser
 		MSSQLReturningParser parser(target_, returning_column_ids);
-		result_chunk = parser.ParseResponse(*connection, 30000);
+		result_chunk = parser.ParseResponse(*connection, 30000, LoadTestFailParseAfterTokens(context_));
 
 		// Check for errors from parser
 		if (parser.HasError()) {
 			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount();
-			error.row_offset_start = batch_builder_->GetCurrentRowOffset() - batch_builder_->GetPendingRowCount();
-			error.row_offset_end = batch_builder_->GetCurrentRowOffset();
+			error.statement_index = batch_builder_->GetBatchCount() - 1;
+			error.row_offset_start = batch.row_offset_start;
+			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = parser.GetErrorNumber();
 			error.sql_error_message = parser.GetErrorMessage();
+			error.rows_applied_before = statistics_.total_rows_inserted;
+			error.statement_executed = parser.IsParseError();
 
 			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 			throw MSSQLInsertException(error);
@@ -384,7 +402,7 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 			auto batch = batch_builder_->FlushBatch();
 			INSERT_DEBUG(1, "Execute: flushed batch with %llu rows, %llu bytes", (unsigned long long)batch.row_count,
 						 (unsigned long long)batch.sql_bytes);
-			total_inserted += ExecuteBatch(batch.sql_statement);
+			total_inserted += ExecuteBatch(batch);
 
 			// Now add the row that didn't fit
 			if (!batch_builder_->AddRow(input_chunk, row_idx)) {
@@ -423,7 +441,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 		if (!batch_builder_->AddRow(input_chunk, row_idx)) {
 			// Batch is full, flush it with OUTPUT
 			auto batch = batch_builder_->FlushBatch();
-			auto batch_result = ExecuteBatchWithOutput(batch.sql_statement, returning_column_ids);
+			auto batch_result = ExecuteBatchWithOutput(batch, returning_column_ids);
 
 			// Accumulate results
 			if (batch_result) {
@@ -466,7 +484,7 @@ void MSSQLInsertExecutor::Finalize() {
 					 (unsigned long long)batch_builder_->GetPendingRowCount());
 		auto batch = batch_builder_->FlushBatch();
 		INSERT_DEBUG(1, "Finalize: executing final batch with %llu bytes", (unsigned long long)batch.sql_bytes);
-		ExecuteBatch(batch.sql_statement);
+		ExecuteBatch(batch);
 		INSERT_DEBUG(1, "Finalize: done");
 	} else {
 		INSERT_DEBUG(1, "Finalize: no pending rows");
@@ -482,7 +500,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::FinalizeWithReturning() {
 
 	if (batch_builder_ && batch_builder_->HasPendingRows()) {
 		auto batch = batch_builder_->FlushBatch();
-		return ExecuteBatchWithOutput(batch.sql_statement, returning_column_ids_);
+		return ExecuteBatchWithOutput(batch, returning_column_ids_);
 	}
 
 	return nullptr;

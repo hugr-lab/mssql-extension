@@ -48,18 +48,21 @@ void MSSQLReturningParser::ProcessRow(const tds::RowData &row, const std::vector
 //===----------------------------------------------------------------------===//
 
 unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection, tds::TokenParser &parser,
-												  tds::TdsSocket &socket, int timeout_ms) {
+												  tds::TdsSocket &socket, int timeout_ms, int64_t fail_after_tokens) {
 	// Initialize result chunk
 	auto chunk = InitializeResultChunk();
 	row_count_ = 0;
 	error_message_.clear();
 	error_number_ = 0;
+	is_parse_error_ = false;
 
 	// Calculate deadline
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
 	std::vector<tds::ColumnMetadata> columns;
 	bool done = false;
+	bool last_packet_eom = false;
+	int64_t tokens_seen = 0;
 
 	while (!done) {
 		// Check timeout
@@ -77,6 +80,10 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 		// Try to parse tokens from existing buffer
 		tds::ParsedTokenType token;
 		while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
+			if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
+				parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
+				break;
+			}
 			switch (token) {
 			case tds::ParsedTokenType::ColMetadata:
 				columns = parser.GetColumnMetadata();
@@ -122,6 +129,24 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 			}
 		}
 
+		// A parser in Error never yields the DONE-final that ends this loop:
+		// name the desync (a SQL error already captured keeps precedence) and
+		// leave at EOM, which the drain below still reads to. Before this the
+		// loop went on to the next ReceivePacket, blocked for the whole
+		// timeout, and reported the socket rather than the parse error --
+		// with the connection left Executing (issue #344).
+		if (parser.GetState() == tds::ParserState::Error) {
+			if (error_message_.empty()) {
+				error_number_ = 0;
+				error_message_ = "TDS parse error: " + parser.GetParseError();
+				is_parse_error_ = true;
+			}
+			if (last_packet_eom) {
+				connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+				return nullptr;
+			}
+		}
+
 		// If we need more data and not done, read from socket
 		if (!done) {
 			tds::TdsPacket packet;
@@ -130,6 +155,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 				return nullptr;
 			}
 
+			last_packet_eom = packet.IsEndOfMessage();
 			// Not into a parser already in Error -- see the DML executors: from
 			// there nothing consumes, so buffer_ grows by the whole remaining
 			// response (issue #323).
@@ -159,7 +185,8 @@ unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection
 // Parse from Fresh Connection
 //===----------------------------------------------------------------------===//
 
-unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &connection, int timeout_ms) {
+unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &connection, int timeout_ms,
+														  int64_t fail_after_tokens) {
 	auto *socket = connection.GetSocket();
 	if (!socket) {
 		error_message_ = "Connection socket is null";
@@ -170,7 +197,7 @@ unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &co
 	tds::TokenParser parser;
 
 	// Parse the response
-	return Parse(connection, parser, *socket, timeout_ms);
+	return Parse(connection, parser, *socket, timeout_ms, fail_after_tokens);
 }
 
 }  // namespace duckdb

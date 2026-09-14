@@ -45,15 +45,17 @@ public:
 	// @param socket TDS socket for reading more data
 	// @param timeout_ms Read timeout in milliseconds
 	// @return DataChunk containing OUTPUT INSERTED results, or nullptr if empty
+	// @param fail_after_tokens TEST ONLY (mssql_test_fail_parse_after_tokens): desync after this many tokens
 	unique_ptr<DataChunk> Parse(tds::TdsConnection &connection, tds::TokenParser &parser, tds::TdsSocket &socket,
-								int timeout_ms = 30000);
+								int timeout_ms = 30000, int64_t fail_after_tokens = 0);
 
 	// Parse from a fresh connection (sends no query, just reads response)
 	// Use this after ExecuteBatch() has been called
 	// @param connection TDS connection with pending response
 	// @param timeout_ms Read timeout in milliseconds
 	// @return DataChunk containing OUTPUT INSERTED results, or nullptr if empty
-	unique_ptr<DataChunk> ParseResponse(tds::TdsConnection &connection, int timeout_ms = 30000);
+	unique_ptr<DataChunk> ParseResponse(tds::TdsConnection &connection, int timeout_ms = 30000,
+										int64_t fail_after_tokens = 0);
 
 	//===----------------------------------------------------------------------===//
 	// Result Information
@@ -77,6 +79,12 @@ public:
 	// Get SQL Server error number (if any)
 	uint32_t GetErrorNumber() const {
 		return error_number_;
+	}
+	//! The error is a TDS desync (issue #344): the server ran the statement and
+	//! the failure is in reading its answer. False for a SQL error, a timeout
+	//! or a dropped socket, where that cannot be claimed.
+	bool IsParseError() const {
+		return is_parse_error_;
 	}
 
 	// Get the DuckDB types for the result columns
@@ -105,6 +113,7 @@ private:
 	idx_t row_count_ = 0;
 	string error_message_;
 	uint32_t error_number_ = 0;
+	bool is_parse_error_ = false;
 };
 
 }  // namespace duckdb

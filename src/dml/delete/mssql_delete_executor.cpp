@@ -5,10 +5,12 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_settings.hpp"
 #include "dml/delete/mssql_delete_statement.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_packet.hpp"
@@ -208,6 +210,8 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
+		const int64_t fail_after_tokens = LoadTestFailParseAfterTokens(context_);
+		int64_t tokens_seen = 0;
 		bool done = false;
 		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -259,6 +263,12 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 			// Parse tokens
 			tds::ParsedTokenType token;
 			while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
+				if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
+					// Test lever (mssql_test_fail_parse_after_tokens): drop this token
+					// and desync, as a framing error would.
+					parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
+					break;
+				}
 				DELETE_DEBUG(2, "ExecuteBatch: parsed token type=%d", (int)token);
 				switch (token) {
 				case tds::ParsedTokenType::Done: {
@@ -316,6 +326,16 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		// Check for errors
 		if (!error_message.empty()) {
 			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			if (error_number == 0) {
+				// A parse error is a client-side framing failure: the server ran
+				// this batch (issue #344) -- see the UPDATE executor.
+				return MSSQLDMLResult::Failure(
+					StringUtil::Format("DELETE failed: %s; the server executed this batch, and %llu row(s) from the "
+									   "%llu batch(es) before it are applied",
+									   error_message, (unsigned long long)total_rows_deleted_,
+									   (unsigned long long)(batch_count_ - 1)),
+					0, batch_count_);
+			}
 			return MSSQLDMLResult::Failure("DELETE failed: " + error_message, 0, batch_count_);
 		}
 

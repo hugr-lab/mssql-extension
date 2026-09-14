@@ -173,18 +173,12 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::stri
 		// Try to get an idle connection
 		auto conn = TryAcquireIdle();
 		if (conn) {
-			// A usable connection is evidence the pool is working, however it was
-			// obtained. The creation path clears the recorded error for exactly
-			// that reason; a pool at or near its limit recovers by REUSE and
-			// never reaches that path, so without this last_create_error_ stays
-			// set for the pool's life. The thrown message no longer depends on
-			// it (own_create_error carries this call's reason), but
-			// mssql_pool_stats.last_create_error does -- and it would show a
-			// long-dead reason for a healthy pool, which is the opposite of what
-			// that column was added for.
-			create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
-			next_create_allowed_ = std::chrono::steady_clock::time_point{};
-			last_create_error_.clear();
+			// A reuse says nothing about whether LOGIN works, so it touches
+			// neither the creation backoff (#302: a failing factory must not be
+			// dialled on every wakeup while others are active) nor the recorded
+			// error. The error carries its age instead -- see
+			// GetLastCreateErrorAgeMs -- so pool stats can show a live failure
+			// beside a healthy pool without a reuse blanking it.
 			auto elapsed =
 				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 			stats_.acquire_wait_total_ms += elapsed;
@@ -215,6 +209,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::stri
 				create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
 				next_create_allowed_ = std::chrono::steady_clock::time_point{};
 				last_create_error_.clear();
+				last_create_error_at_ = std::chrono::steady_clock::time_point{};
 				uint64_t id = next_connection_id_++;
 				active_connections_[id] = conn;
 				stats_.total_connections++;
@@ -236,6 +231,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::stri
 			// identically to a wrong password or an unreachable host.
 			stats_.creation_failures++;
 			last_create_error_ = error;
+			last_create_error_at_ = std::chrono::steady_clock::now();
 			own_create_error = error;
 			next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
 			// Not std::min: it binds CREATE_BACKOFF_MAX_MS by reference, which
@@ -433,6 +429,16 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection(std::string &
 std::string ConnectionPool::GetLastCreateError() const {
 	std::lock_guard<std::mutex> lock(pool_mutex_);
 	return last_create_error_;
+}
+
+int64_t ConnectionPool::GetLastCreateErrorAgeMs() const {
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (last_create_error_.empty()) {
+		return -1;
+	}
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+																 last_create_error_at_)
+		.count();
 }
 
 std::string ConnectionPool::DescribeTimeoutLocked(const std::string &own_create_error) const {

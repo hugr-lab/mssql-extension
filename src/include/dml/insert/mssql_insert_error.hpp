@@ -26,6 +26,9 @@ struct MSSQLInsertError {
 	int32_t sql_error_number;  // SQL Server error number (e.g., 2627 for PK violation)
 	string sql_error_message;  // SQL Server error text
 	string sql_state;		   // SQLSTATE code if available
+	// Issue #344: what the caller can rely on when this is thrown.
+	idx_t rows_applied_before = 0;	  // rows the earlier statements put in
+	bool statement_executed = false;  // the failing statement ran on the server (a parse error)
 
 	// Default constructor
 	MSSQLInsertError() : statement_index(0), row_offset_start(0), row_offset_end(0), sql_error_number(0) {}
@@ -46,10 +49,23 @@ struct MSSQLInsertError {
 
 	// Format error message for display
 	// Returns: "INSERT failed at statement N (rows X-Y): [error_num] message"
+	// A parse error is not "SQL Server error 0" (commit 73e6da3): no [code]
+	// for it, and a note that the server DID run the statement -- the failure
+	// is in reading the answer, so the rows are in (issue #344).
 	string FormatMessage() const {
-		return StringUtil::Format("INSERT failed at statement %d (rows %d-%d): [%d] %s", statement_index,
-								  row_offset_start, row_offset_end > 0 ? row_offset_end - 1 : 0, sql_error_number,
-								  sql_error_message);
+		string msg = StringUtil::Format("INSERT failed at statement %d (rows %d-%d): ", statement_index,
+										row_offset_start, row_offset_end > 0 ? row_offset_end - 1 : 0);
+		if (sql_error_number != 0) {
+			msg += StringUtil::Format("[%d] ", sql_error_number);
+		}
+		msg += sql_error_message;
+		if (statement_executed) {
+			msg += StringUtil::Format(
+				"; the server executed this statement, and %d row(s) from the statements "
+				"before it are applied",
+				rows_applied_before);
+		}
+		return msg;
 	}
 };
 

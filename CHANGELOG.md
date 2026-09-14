@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A DML batch whose response cannot be parsed is an error, not a silent
+  success** (#344). In autocommit UPDATE and DELETE run in batches of
+  `mssql_dml_batch_size` and INSERT in statements of `mssql_insert_batch_size`,
+  each committed on its own; a desync in batch K therefore leaves batches 1..K
+  applied and K+1.. never sent, and the error says exactly that. Chosen over
+  the previous behaviour, which applied everything and reported success with
+  the server's own errors after the desync dropped, and as an interim: spec
+  062 and the UPDATE/DELETE rework move DML to one server-side statement per
+  DuckDB statement, and the batch boundary goes with them.
+
 - **Breaking: the server certificate is verified by default** (spec 074).
   `Encrypt`, `TrustServerCertificate` and the new `HostNameInCertificate` now
   mean what they mean in the Microsoft drivers (ODBC 18, SqlClient 4.0, JDBC
@@ -42,6 +52,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the catalog lifecycle and the per-catalog pool.
 
 ### Fixed
+
+- **A TDS desync in a DML response is reported, names what the server did,
+  and never hangs** (#323 follow-up, #344; the four response loops of the
+  INSERT batch, `INSERT ... RETURNING`, UPDATE and DELETE). A parser that
+  desynced mid-response was fed the whole remaining response for nothing and
+  then reported success — every token after the desync dropped, including a
+  SQL Server error following a procedure call. `INSERT ... RETURNING` did
+  worse: its loop had no end-of-message exit, so it blocked for its full 30 s
+  and then blamed the socket, leaving the connection `Executing`. Each loop
+  now stops feeding a parser in Error, drains to end-of-message, and fails
+  with the parse error; the message says the server executed the batch (a
+  desync is a client-side framing failure, noticed after the batch ran) and
+  how many rows the batches before it applied. A parse error no longer
+  renders as `[0]`, which read as a server error code. Test lever:
+  `mssql_test_fail_parse_after_tokens`. Found on the way: an INSERT error
+  named the statement after the failing one and an empty row range
+  (`statement 1 (rows 1000-999)`), because the batch builder had already
+  moved past the batch by the time it ran; the batch's own index and range
+  are reported now.
+- **`mssql_pool_stats.last_create_error` carries its age.** A pool at its
+  limit recovers by reuse and never reaches the creation-success path that
+  clears the recorded error, so the column could show a reason the pool had
+  outlived for hours — or, had a reuse cleared it, blank out a live failure
+  (an expired Azure AD token beside warm connections). The new
+  `last_create_error_age_ms` says which; the creation backoff of #302 is
+  untouched by reuse.
+- **CTAS names why it could not get a connection.** Its four `Acquire` calls
+  (existence checks, the bulk load, the cleanup DROP) threw without the
+  reason the pool now records; an expired token read as "Failed to acquire
+  connection to check table existence" and nothing more.
 
 - **An attached Azure AD catalog can open new connections after its token has
   expired** ([#302](https://github.com/hugr-lab/mssql-extension/issues/302),

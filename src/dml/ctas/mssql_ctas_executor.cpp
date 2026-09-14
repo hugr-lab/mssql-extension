@@ -351,9 +351,10 @@ void CTASExecutionState::AttemptCleanupNoContext() noexcept {
 
 	std::shared_ptr<tds::TdsConnection> conn;
 	try {
-		conn = pool->Acquire();
+		std::string why;
+		conn = pool->Acquire(-1, &why);
 		if (!conn) {
-			cleanup_error = "no connection available for cleanup DROP";
+			cleanup_error = "no connection available for cleanup DROP: " + why;
 			return;
 		}
 		auto result = MSSQLSimpleQuery::Execute(*conn, drop_sql);
