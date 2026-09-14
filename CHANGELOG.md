@@ -167,6 +167,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`INSERT … RETURNING` returned only the last statement's rows** once the
+  insert spanned several statements: the executor kept the last result
+  chunk "for simplicity", so a RETURNING insert of more than one
+  statement's worth of rows (1000 before, `1000 / columns` after the cap
+  above) silently lost the earlier rows from its RETURNING output while
+  inserting all of them. Every statement's rows come back now
+  (`insert_returning_batches.test`).
+
 - **A failed INSERT, UPDATE or DELETE leaves the table as it was** (spec 062
   W1c, closes #344). The three statement executors took a pool connection
   per batch in autocommit, and each batch committed on its own, so a failure

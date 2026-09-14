@@ -268,9 +268,19 @@ server auto-parameterises: 3 columns → 333 rows a statement at 4 ms instead
 of 1000 rows at 74 ms, no plan left behind per statement. Measured 5.5× at
 the boundary, more as statements grow. This governs everything that stays on
 the statement path — the rows below the threshold, `RETURNING`, the explicit
-identity column — and a `RETURNING` insert of a million rows goes from 74 s
-to ~14 s with no other change. Still 20× slower than the bulk path, which is
-why the threshold exists.
+identity column. Not every one of them gains: a `RETURNING` insert of a
+million rows measured 69.8 s before and 70.2 s after (§ 6.4) — an `OUTPUT
+INSERTED` statement is never auto-parameterised, and its cost is ~70 µs a
+row on the server whatever the statement size, so the cap neither helps nor
+hurts it. Plain inserts under the threshold are what the cap is for. Still
+20× slower than the bulk path, which is why the threshold exists.
+
+A riding fix the cap made urgent: `MSSQLInsertExecutor::ExecuteWithReturning`
+kept the LAST statement's `OUTPUT INSERTED` chunk only ("for simplicity"),
+so a `RETURNING` insert spanning several statements inserted every row and
+returned a fraction of them — above 1000 rows before, above `1000 /
+columns` with the cap. It returns every statement's chunk now
+(`insert_returning_batches.test`, hashed against the plain sequence).
 
 Rejected by the same measurement, and recorded so it is not proposed again:
 sending the sub-threshold statement as `sp_executesql` with a `DECLARE` block
@@ -664,7 +674,17 @@ server for those. The multi-column case of § 0.1 — where the statement path
 had left the auto-parameterisation line — is the wide end: 74 s against
 1.8 s, 40×.
 
-### 6.4 Before the INSERT work
+### 6.4 `RETURNING` at 1M rows, before and after W1b (2026-09-14)
+
+`INSERT INTO t SELECT * FROM src RETURNING id`, 1M rows × 3 columns, the
+pre-062 binary (1000-row statements) against this branch (333-row
+statements): **69.8 s → 70.2 s**. The `OUTPUT INSERTED` statement is not
+auto-parameterised at any size, and its cost is per row (~70 µs) rather than
+per statement, so the cap is neutral for it. `RETURNING` stays the one large
+INSERT nothing here speeds up; an `OUTPUT`-free bulk load followed by a read
+is the way to get rows back fast.
+
+### 6.5 Before the INSERT work
 
 § 0.1 and § 0.4 are the baseline: a DuckDB table of 1M rows into an existing
 3-column heap costs the text path 73.7 / 74.2 / 74.9 s across three cold runs

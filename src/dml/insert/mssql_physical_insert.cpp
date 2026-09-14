@@ -241,9 +241,9 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 		std::lock_guard<std::mutex> lock(gstate.mutex);
 
 		if (gstate.return_chunk) {
-			// RETURNING mode - use ExecuteWithReturning
-			auto result = gstate.executor->ExecuteWithReturning(chunk, gstate.returning_column_ids);
-			if (result && result->size() > 0) {
+			// RETURNING mode - use ExecuteWithReturning; every statement's rows
+			auto results = gstate.executor->ExecuteWithReturning(chunk, gstate.returning_column_ids);
+			for (auto &result : results) {
 				gstate.total_rows_inserted += result->size();
 				gstate.result_chunks.push_back(std::move(result));
 			}

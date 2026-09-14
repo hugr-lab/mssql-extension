@@ -435,8 +435,8 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 // Execute with RETURNING (Mode B)
 //===----------------------------------------------------------------------===//
 
-unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input_chunk,
-																const vector<idx_t> &returning_column_ids) {
+vector<unique_ptr<DataChunk>> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input_chunk,
+																		const vector<idx_t> &returning_column_ids) {
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after Finalize");
 	}
@@ -446,8 +446,12 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 	// Store returning column IDs for later use
 	returning_column_ids_ = returning_column_ids;
 
-	// Accumulate results across batches
-	unique_ptr<DataChunk> accumulated_results;
+	// One result chunk per statement this input chunk completes. This used to
+	// keep the LAST one only ("for simplicity"), so an INSERT ... RETURNING of
+	// more rows than one statement carries silently lost the earlier
+	// statements' rows -- above 1000 rows before, above 1000 / columns rows
+	// once spec 062 W1b sized statements under the auto-parameterisation line.
+	vector<unique_ptr<DataChunk>> results;
 
 	// Process each row in the chunk
 	for (idx_t row_idx = 0; row_idx < input_chunk.size(); row_idx++) {
@@ -456,17 +460,8 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 			// Batch is full, flush it with OUTPUT
 			auto batch = batch_builder_->FlushBatch();
 			auto batch_result = ExecuteBatchWithOutput(batch, returning_column_ids);
-
-			// Accumulate results
-			if (batch_result) {
-				if (!accumulated_results) {
-					accumulated_results = std::move(batch_result);
-				} else {
-					// Append batch_result to accumulated_results
-					// For simplicity, we'll just return the last batch for now
-					// Full accumulation would require a more complex data structure
-					accumulated_results = std::move(batch_result);
-				}
+			if (batch_result && batch_result->size() > 0) {
+				results.push_back(std::move(batch_result));
 			}
 
 			// Now add the row that didn't fit
@@ -476,7 +471,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 		}
 	}
 
-	return accumulated_results;
+	return results;
 }
 
 //===----------------------------------------------------------------------===//

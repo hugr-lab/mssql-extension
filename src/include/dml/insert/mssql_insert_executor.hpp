@@ -62,9 +62,12 @@ public:
 	// Execute INSERT with RETURNING (uses OUTPUT INSERTED)
 	// @param input_chunk DataChunk with rows to insert
 	// @param returning_column_ids Column IDs to return
-	// @return DataChunk containing OUTPUT INSERTED results
+	// @return one DataChunk of OUTPUT INSERTED rows per statement this chunk
+	//         completed -- every one of them, not the last (a 2048-row chunk
+	//         is several statements; the earlier ones used to be dropped)
 	// @throws MSSQLInsertException on failure
-	unique_ptr<DataChunk> ExecuteWithReturning(DataChunk &input_chunk, const vector<idx_t> &returning_column_ids);
+	vector<unique_ptr<DataChunk>> ExecuteWithReturning(DataChunk &input_chunk,
+													   const vector<idx_t> &returning_column_ids);
 
 	//===----------------------------------------------------------------------===//
 	// Finalization
