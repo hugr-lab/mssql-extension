@@ -256,3 +256,60 @@ parameter set on the bind data, the first-touch batch), `docs/query-execution.md
 - § 0.2's fresh table: one metadata batch before the scan; ATTACH sends the
   collation query once.
 - All existing pushdown, rowid and statistics tests green with the default.
+
+## 6. Bench against the 2.0 baseline (2026-09-14)
+
+Same-session interleaved A/B per `test/bench` rules, two rounds each side,
+minimum per cell. **A** = `main` at the spec-069 merge (`1d74ae2`, DuckDB
+`d7a4366`), the last state measured on the 2.0 line; **B** = this branch at
+`55f36de` (DuckDB `070ce1f6`). Local docker SQL Server 2022, Apple M4 Max,
+`threads = 1`, 500 000 rows, reads ×10 in one process, writes ×2. Both bench
+DSNs needed `TrustServerCertificate=yes` for B (spec 074 verifies by default);
+the scripts carry it now.
+
+### Live server, per family
+
+| step (min over rounds) | wall A | wall B | B/A | CPU ns/value A | B | B/A |
+|---|---:|---:|---:|---:|---:|---:|
+| startup (invocation + ATTACH) | 0.561 | 0.384 | **0.68** | – | – | – |
+| read_bigint | 1.315 | 1.161 | 0.88 | 21.8 | 23.8 | 1.09 |
+| read_int | 1.310 | 1.157 | 0.88 | 17.8 | 35.6 | see below |
+| read_dec18 / dec38 | 1.328 / 1.388 | 1.163 / 1.191 | 0.88 / 0.86 | 27.0 / 31.4 | 28.2 / 30.2 | 1.04 / 0.96 |
+| read_double / ts / date / uuid | 1.32 / 1.31 / 1.30 / 1.34 | 1.15 / 1.14 / 1.11 / 1.16 | 0.87 / 0.87 / 0.85 / 0.86 | 28.4 / 26.4 / 18.4 / 28.8 | 28.2 / 24.6 / 17.0 / 28.0 | 0.99 / 0.93 / 0.92 / 0.97 |
+| read_str16 / str16u / str16max | 1.424 / 1.349 / 2.090 | 1.259 / 1.189 / 1.932 | 0.88 / 0.88 / 0.92 | 45.0 / 41.4 / 60.0 | 45.8 / 41.4 / 60.4 | 1.02 / 1.00 / 1.01 |
+| read_str200 / vstr200 | 3.911 / 2.573 | 3.853 / 2.413 | 0.99 / 0.94 | 295.6 / 161.2 | 284.6 / 161.8 | 0.96 / 1.00 |
+| read_wide_min / wide_drain | 1.200 / 1.190 | 1.016 / 0.998 | 0.85 / 0.84 | 36.1 / 64.8 | 35.7 / 63.7 | 0.99 / 0.98 |
+| write_bigint / int / str16 / str200 | 0.861 / 0.821 / 0.902 / 1.727 | 0.698 / 0.649 / 0.740 / 1.476 | 0.81 / 0.79 / 0.82 / 0.85 | 19 / 8 / 39 / 157 | 19 / 16 / 32 / 152 | noise / 0.82 / 0.97 |
+| write_wide | 1.865 | 1.695 | 0.91 | 27.1 | 33.6 | 1.24 |
+
+**Reading:** client CPU per value is at parity across the 22 read families
+(0.92–1.09), and every step's wall clock is 0.15–0.18 s shorter on B — the
+same amount on every step, and the amount of one login: it is the `startup`
+control (W2's double `Initialize` fix, one login fewer per ATTACH), not the
+codec. `read_int`'s 2.0× CPU in the two-round table did not survive three
+more interleaved pairs of that one step (A 32.8 / 37.6 / 25.6 vs B 26.0 /
+37.2 / 28.2 ns/value) nor the per-phase counters (parse 18.1 vs 18.2 ns/row,
+process 16.2 vs 16.3, the difference all in the socket wait): noise. Write
+CPU on the narrow families is 0.001–0.05 s over a million values — timer
+resolution, reported in both directions (bool 8 → 1, dec38 28 → 48) and not
+a signal; the string families, where the number is measurable, are at
+parity.
+
+### Wide-write matrix (`bench_wide_write.sh`, CTAS 500k × 20 columns)
+
+| cell | A min | B min | B/A |
+|---|---:|---:|---:|
+| threads=1 plain nonulls | 4.48 | 4.43 | 0.99 |
+| threads=1 plain nulls | 4.38 | 4.35 | 0.99 |
+| threads=1 sized nonulls | 2.24 | 2.20 | 0.98 |
+| threads=1 sized nulls | 2.24 | 2.21 | 0.99 |
+| threads=4 (four cells) | 1.17–2.69 | 0.84–2.75 | 0.56–1.74 |
+
+`threads=1` is parity. The `threads=4` cells swing both ways by up to 1.7×
+between two rounds — four parallel writers on a shared docker server; per
+the harness rules that is not a difference, and a claim about parallel
+writes would need six pairs.
+
+**What this bench does not see:** the plan-cache effect of W1 (40 → 1
+plans, § 0.1) — every step here runs one filter shape, and a trivial plan
+compiles in under a millisecond either way.
