@@ -747,6 +747,47 @@ Before W0, COPY (`StartBulkStream` / `FlushToServer` / `BCPCopyFinalize`) and CT
 sequence; INSERT via BCP (spec 062) is built on the adopted session rather than a
 fourth.
 
+### The INSERT sink (spec 062 W2)
+
+`MSSQLPhysicalInsert` has two paths, decided in `MSSQLCatalog::PlanInsert`
+(`MSSQLInsertBulkPlan`): the statement path — batched `INSERT … VALUES`
+through `MSSQLInsertExecutor` — for `RETURNING`, for an explicitly named
+identity column (`MSSQLColumnInfo::is_identity`, W4: `INSERT BULK` keeps such a
+value where a statement lets the server refuse it) and under
+`mssql_insert_use_bcp = false`; the bulk path otherwise. The plan carries the
+COLMETADATA of the inserted columns built from the catalog's own column
+metadata (`BCPColumnMetadata::FromServerColumn`, W3 — no round trip), the
+`INSERT BULK` text with `CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS` (a bulk
+load ignores all three by default; an INSERT may not), and the target's shape.
+
+At run time the rows are **staged** (`MSSQLStagedRows`, a `ColumnDataCollection`)
+until they exceed `mssql_insert_bcp_threshold`; a load that never does goes as
+statements from `Finalize`, byte for byte what the statement path sends. The
+chunk that crosses the line opens the shared session — `Adopt` on the
+transaction's pinned connection, else on a pool connection with a server
+transaction of its own (`own_transaction`) — drains the buffer into it, and
+every later chunk streams: a thread claims a writer of its own by COPY's
+policy, or appends to the shared session under `write_mutex`. `Combine` closes
+a thread's stream (`CloseStream`) and moves the session, connection and open
+transaction included, into the global state; `Finalize` closes the shared
+stream, commits every session, releases every connection. A failure anywhere
+abandons them all — the load is rolled back, the message names the batch.
+
+Parallel writers only where their transactional loads cannot block each other:
+a heap under TABLOCK (BU locks) or a clustered columnstore without it. Anything
+else — a clustered rowstore, a heap on row locks — gets one writer, because two
+writers whose locks conflict deadlock **client-side**: B waits on a lock A's
+uncommitted rows hold, so the server stops reading B's stream, so B's thread
+blocks in `send()`, while A's commit is in `Finalize`, which waits for B's
+`Combine`. The server sees no deadlock and nothing times out.
+
+`mssql::LoadTransaction` (`copy/load_transaction.hpp`) is the bracket itself,
+on one connection: `BEGIN TRANSACTION` with the ENVCHANGE descriptor captured
+(every later request must carry it), `COMMIT` / `ROLLBACK` clearing it, a
+no-op on a pinned connection. The three statement executors hold one through
+`MSSQLStatementConnection` (W1c) — one connection per statement, so an
+autocommit INSERT, UPDATE or DELETE is atomic too.
+
 A writer is claimed by a **thread**, never allocated up front — because
 `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text and
 resolved columns are only settled by the DDL phase. Failing to get one is **not** an

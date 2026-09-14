@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **INSERT loads through BCP** (spec 062). An INSERT with more rows than
+  `mssql_insert_bcp_threshold` (default 1000), no `RETURNING` and no
+  explicitly named identity column goes through `INSERT BULK` — the wire
+  COPY and CTAS use — on the transaction's pinned connection or on a pool
+  connection inside a server transaction of its own, with parallel writers
+  where their loads cannot block each other (a heap under TABLOCK, a
+  clustered columnstore without it). Measured: 1M rows × 3 columns into an
+  existing table in 1.8 s on one writer and 0.5 s on four, where the
+  statement path took 74 s. The rows are staged until the threshold decides
+  the path, so the decision is exact; `RETURNING`, an identity column and
+  `mssql_insert_use_bcp = false` keep the statement path. The bulk wire
+  carries `CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS` so the INSERT still
+  checks constraints, fires triggers and keeps its NULLs — a bulk load
+  ignores all three by default, and COPY still does. A failed load names
+  the batch and says `rolled back`. The batch size, TABLOCK policy and
+  writer count are the `mssql_copy_*` settings.
+
 - **The catalog knows which columns are IDENTITY** (spec 062 W4, the
   metadata half of #327). `sys.columns.is_identity` rides in the four
   column-metadata queries and on `MSSQLColumnInfo`; the INSERT planner reads

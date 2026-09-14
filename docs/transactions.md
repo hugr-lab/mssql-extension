@@ -71,6 +71,18 @@ When no explicit `BEGIN` is issued, each statement is independent:
 4. Connection returns to pool immediately after statement completes
 5. No `MSSQLTransaction` object involved
 
+One exception, since spec 062: a DML statement that the extension sends as
+SEVERAL requests — the batches of an INSERT, UPDATE or DELETE, or the
+INSERT BULK batches of a bulk-path INSERT — brackets them in a server
+transaction of its own (`mssql::LoadTransaction`, `copy/load_transaction.hpp`):
+`BEGIN TRANSACTION` on the statement's connection before the first request,
+`COMMIT TRANSACTION` after the last, `ROLLBACK` on any failure. The
+transaction descriptor the server answers with rides in ALL_HEADERS exactly
+as for a pinned connection, and is cleared at the commit. So an autocommit
+DML statement is atomic (issue #344), and holds its one pool connection for
+its whole duration. Inside an explicit transaction the helper is a no-op —
+the pinned connection's transaction already spans every request.
+
 ### Explicit Transaction Mode
 
 After `BEGIN` is issued:

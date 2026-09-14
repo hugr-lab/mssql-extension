@@ -116,7 +116,15 @@ still one plan, a 3-column 340-row one is not): below that line a workload of
 distinct inserts shares ONE plan per (table, column list, row count) and
 costs 14 µs a row; above it every statement compiles its own ad-hoc plan at
 70 µs a row and leaves it behind — which is the 74 s of § 0.1, since today's
-1000-row statements carry 3000 constants. **An explicit `sp_executesql` with
+1000-row statements carry 3000 constants. One refinement, found while
+writing the test: auto-parameterisation needs a *trivial* plan, and an
+INSERT into a table with a clustered index stops being trivial past about
+250 rows per statement (250 Prepared, 256 Adhoc — the optimizer adds a
+sort). Those statements compile their own plan but at the cheap end: 5.3 ms
+against the heap's 4.7 ms for 333 rows, not 23 ms. The line that matters
+for cost is the constant line; the plan-cache claim holds for heaps and for
+clustered targets up to 250 rows a statement, and not at all for a statement
+with an `OUTPUT` clause (`RETURNING`), which is never auto-parameterised. **An explicit `sp_executesql` with
 the values in a `DECLARE` block does not help and hurts:** the outer batch
 still carries the literals, is itself ad-hoc, and at 300 declarations costs
 16× the literal form. The batch form of parameters the extension can send
@@ -246,8 +254,8 @@ streams every later chunk directly.
 
 Settings: `mssql_insert_use_bcp` (BOOLEAN, default true, the escape hatch that
 `mssql_ctas_use_bcp` is for CTAS) and `mssql_insert_bcp_threshold` (BIGINT,
-rows, provisional default 1000 — one text statement; W8 measures the crossover
-and the default follows it before merge).
+rows, default 1000 — measured in § 6.2: the paths cross near 300 rows on a
+local server and near 1000 at a 20 ms RTT).
 
 ### W1b — the statement path stays auto-parameterised
 
@@ -336,15 +344,46 @@ before `Finalize`, and the connection must stay open until the commit.
 transaction on every autocommit connection and releases them; the pinned
 connection stays pinned. Two pieces, shaped for spec 066 as much as for this
 (§ 2.9): `BulkLoadSession::Finish()` splits into `CloseStream()` — the last
-DONE and the server's confirmation, the connection kept — and `Release()`,
-with `Finish()` staying the pair for COPY and CTAS; and the transaction lives
-in a small owner-side helper, `LoadTransaction` (in `copy/`), that wraps ONE
+DONE and the server's confirmation, the connection kept — `Commit()` and
+`Release()`, with `Finish()` staying the three for COPY and CTAS; and the
+transaction is a small helper, `LoadTransaction` (in `copy/`), that wraps ONE
 connection: `Begin()` sends `BEGIN TRANSACTION` unless the connection is
 pinned (then the DuckDB transaction owns it and every call is a no-op),
-`Commit()` / `Rollback()` send theirs, and its destructor rolls back whatever
+captures the transaction descriptor the server answers with — every later
+request on the connection must carry it, error 3989 otherwise — `Commit()` /
+`Rollback()` send theirs and clear it, and its destructor rolls back whatever
 was begun and not committed — from a worker thread, without a
-`ClientContext`, the #178 rule. The session knows nothing about it: a
-session is one writer's stream, a transaction is the connection owner's. Between the first and the last `COMMIT` of a multi-writer load there is
+`ClientContext`, the #178 rule. The statement executors hold one directly
+(W1c). A bulk session holds one for the connection it owns, on a params
+flag (`own_transaction`): a parallel writer acquires its connection and
+sends its first `INSERT BULK` in one step, so the bracket has to go there,
+and the shared session takes the same flag so the two are treated alike;
+COPY and CTAS leave it off, which is their per-batch-commit contract.
+
+**Parallel writers, only where their locks cannot conflict.** COPY's writers
+commit every batch; an INSERT's hold their locks until `Finalize` commits
+them together, and two writers whose locks conflict deadlock CLIENT-SIDE:
+writer B waits on a lock A's uncommitted rows hold, so the server stops
+reading B's stream, so B's thread blocks in `send()`; A's commit is in
+`Finalize`, which waits for B's `Combine`. The server sees no deadlock (one
+side is a client) and nothing times out — measured as a hang past ten
+minutes on a heap on row locks, and a 30 s BCP read timeout on a clustered
+rowstore. Two shapes let concurrent transactional bulk loads coexist: a heap
+under TABLOCK (BU locks are mutually compatible, nothing escalates) and a
+clustered columnstore without it (each session fills its own rowgroups) —
+measured 1M rows in 0.49 s and 0.80 s at four writers against 1.78 s at one.
+Everything else — a clustered rowstore index, a heap on row locks, a
+columnstore under a table lock — gets one writer. Under `mssql_copy_tablock
+= auto` that is: heaps and columnstores fan out, clustered rowstore tables
+do not.
+
+**Statement semantics on the bulk wire.** A bulk load ignores CHECK
+constraints, does not fire triggers, and writes a column's DEFAULT where the
+stream says NULL — bcp's contract, and COPY's (measured: a 1000-row INSERT
+with a CHECK violation in row 950 loaded all 1000 rows). An INSERT is a
+statement, so its `INSERT BULK` carries `CHECK_CONSTRAINTS, FIRE_TRIGGERS,
+KEEP_NULLS` (`InsertBulkHints::StatementSemantics()` in
+`BuildInsertBulkSql`); COPY's hint set is unchanged. Between the first and the last `COMMIT` of a multi-writer load there is
 a window in which a failed commit leaves the earlier writers' rows in place —
 the usual two-phase gap of any multi-connection load; it is named in the docs,
 and it does not exist for one writer, which is every load inside a
@@ -436,9 +475,14 @@ place messages are rendered (#344).
   exactly as it was, and each message says `rolled back`; inside `BEGIN …
   ROLLBACK` the same statements leave nothing behind and the message says
   the rows are in the open transaction.
-- `insert_bcp_parallel.test`: `SET threads = 4`, a 500k-row heap load shows
-  `parallel_writers_used > 1` through the counters, and inside a transaction
-  exactly 1.
+- `insert_bcp_parallel.test`: `SET threads = 4`, a 400k-row load fans out
+  on a heap and on a clustered columnstore (`connections_created` grows by
+  the extra writers) and stays on one writer against a clustered rowstore
+  and under `mssql_copy_parallel_writers = 1`; inside a transaction exactly
+  1 (`insert_bcp_transaction.test`).
+- `insert_bcp_semantics.test`: CHECK constraints enforced, triggers fired,
+  explicit NULLs kept over a DEFAULT, omitted columns defaulted — on both
+  paths.
 - `insert_server_defaults.test` and `bcp_identity_column.test` keep passing
   unchanged (identity, defaults).
 - C++: `FromServerColumn` on the type table (one case per family, the UTF-8
@@ -566,7 +610,61 @@ earlier A/B of that matrix did (spec 076 § 6: ±1.7×), and need six pairs to
 say anything. Client CPU per statement is 0.07–0.14 s on every cell, below
 what two rounds can rank.
 
-### 6.2 Before the INSERT work
+### 6.2 The crossover, and the threshold default (2026-09-14)
+
+Local docker, 3-column heap, 20 statements per cell with fresh values, the
+two paths interleaved per cell, two rounds (40 timings); statements are
+`mssql_insert_use_bcp = false`, bulk is `mssql_insert_bcp_threshold = 1`.
+
+| rows per INSERT | statements, min / median | bulk, min / median |
+| --- | --- | --- |
+| 10 | 1 / 2 ms | 3 / 4 ms |
+| 100 | 2 / 3 ms | 3 / 4 ms |
+| 1000 | 12 / 14 ms | 4 / 5 ms |
+| 10000 | 113 / 134 ms | 13 / 15 ms |
+
+The bulk path's fixed cost is about 2 ms here — the two extra round trips
+(`INSERT BULK`, `DONE`) at a local RTT — and the statement path costs about
+12 µs a row on top of its own round trip per 333 rows. They cross near 300
+rows locally; at a 20 ms RTT the two extra round trips cost 40 ms and the
+crossing moves to about 1000 rows. The default stays **1000**: at or below
+it an INSERT is one to three statements, and the bulk path never loses by
+more than a round trip or two. `mssql_insert_bcp_threshold` moves it.
+
+### 6.3 Per family, 1M rows (2026-09-14)
+
+`bench_live_server.sh` group `insert`: `INSERT INTO db.dbo.t SELECT c FROM
+src.syn`, one column per family, 500k rows × 2 iterations, the two paths
+interleaved per family in one run (the A/B is a setting). The statement path
+is the W1b one — one column, so 1000 rows a statement, every statement
+auto-parameterised: its best case.
+
+| family | bulk wall | statements wall | ratio | bulk client CPU | statements client CPU |
+| --- | --- | --- | --- | --- | --- |
+| bigint | 0.70 s | 5.53 s | 7.9 | 0.04 s | 0.24 s |
+| int | 0.64 s | 5.44 s | 8.5 | 0.04 s | 0.29 s |
+| double | 0.67 s | 6.84 s | 10.3 | 0.05 s | 0.44 s |
+| decimal(18,2) | 0.74 s | 6.58 s | 8.9 | 0.05 s | 0.34 s |
+| decimal(38,10) | 0.77 s | 7.14 s | 9.3 | 0.05 s | 0.62 s |
+| bit | 0.67 s | 5.31 s | 7.9 | 0.03 s | 0.13 s |
+| date | 0.67 s | 6.96 s | 10.5 | 0.03 s | 0.45 s |
+| datetime2 | 0.68 s | 12.13 s | 17.9 | 0.04 s | 0.77 s |
+| uniqueidentifier | 0.72 s | 7.16 s | 9.9 | 0.04 s | 0.27 s |
+| varbinary(max) | 0.70 s | 6.57 s | 9.3 | 0.04 s | 0.51 s |
+| nvarchar(4) / (16) / (200) | 0.67 / 0.76 / 1.88 s | 6.35 / 7.52 / 11.01 s | 9.4 / 10.0 / 5.9 | 0.04 / 0.09 / 0.26 s | 0.49 / 1.52 / 2.01 s |
+| nvarchar(max), 16-char values | 2.48 s | 7.25 s | 2.9 | 0.06 s | 0.27 s |
+| varchar(16) / (200) UTF-8 | 0.73 / 1.30 s | 6.80 / 10.26 s | 9.3 / 7.9 | 0.05 / 0.11 s | 0.57 / 1.92 s |
+| varchar(max) UTF-8 | 2.50 s | 7.61 s | 3.0 | 0.06 s | 0.70 s |
+| nvarchar(16), NULLs | 0.70 s | 5.88 s | 8.4 | 0.05 s | 0.36 s |
+
+Three to eighteen times on wall, six to seventeen on client CPU. The MAX
+string families are the narrow end (3×): the bulk wire sends them as PLP
+chunks, the statement path as inline literals, and both are bound by the
+server for those. The multi-column case of § 0.1 — where the statement path
+had left the auto-parameterisation line — is the wide end: 74 s against
+1.8 s, 40×.
+
+### 6.4 Before the INSERT work
 
 § 0.1 and § 0.4 are the baseline: a DuckDB table of 1M rows into an existing
 3-column heap costs the text path 73.7 / 74.2 / 74.9 s across three cold runs
