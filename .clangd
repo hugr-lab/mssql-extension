@@ -1,7 +1,17 @@
 # clangd (the vscode-clangd extension reads this; cpptools reads
-# .vscode/settings.json) has no compile command for the standalone C++ tests
-# in test/cpp/: they are compiled by the Makefile (STANDALONE_TEST_SOURCES,
-# `make test-cpp`), not by CMake, so they are absent from
+# .vscode/settings.json).
+#
+# The extension's own sources get their flags from the compile database the
+# release build writes. clangd only looks for compile_commands.json in the
+# source file's ancestors and in <workspace>/build/, and ours is one level
+# deeper -- without this every "catalog/mssql_catalog.hpp" in src/ shows as
+# "file not found". The path is relative to this file.
+CompileFlags:
+  CompilationDatabase: build/release
+---
+# The standalone C++ tests in test/cpp/ have no compile command at all: they
+# are compiled by the Makefile (STANDALONE_TEST_SOURCES, `make test-cpp`),
+# not by CMake, so they are absent from
 # build/*/compile_commands.json and clangd falls back to flags that know
 # nothing about the vcpkg tree -- every <openssl/*.h> shows as "file not
 # found". This is the standalone lane's include set from the Makefile.
@@ -18,6 +28,7 @@ CompileFlags:
     - -I../../src/include
     - -I../../duckdb/src/include
     - -I../../duckdb/third_party/fmt/include
+    - -I../../duckdb/third_party/catch
     - -I../../build/release/vcpkg_installed/arm64-osx/include
     - -I../../build/release/vcpkg_installed/x64-osx/include
     - -I../../build/release/vcpkg_installed/x64-linux/include
@@ -31,6 +42,7 @@ CompileFlags:
     - -I../../../src/include
     - -I../../../duckdb/src/include
     - -I../../../duckdb/third_party/fmt/include
+    - -I../../../duckdb/third_party/catch
     - -I../../../build/release/vcpkg_installed/arm64-osx/include
     - -I../../../build/release/vcpkg_installed/x64-osx/include
     - -I../../../build/release/vcpkg_installed/x64-linux/include

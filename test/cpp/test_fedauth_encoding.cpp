@@ -108,7 +108,7 @@ void test_fedauth_token_encoding_jwt_like() {
 
 	// Verify '.' in the middle
 	size_t dot_pos = token.find('.');
-	ASSERT_EQ(encoded[dot_pos * 2], 0x2E);      // '.'
+	ASSERT_EQ(encoded[dot_pos * 2], 0x2E);	// '.'
 	ASSERT_EQ(encoded[dot_pos * 2 + 1], 0x00);
 
 	std::cout << "PASSED!" << std::endl;
@@ -131,7 +131,7 @@ void test_fedauth_data_get_size_with_token() {
 	std::cout << "\n=== Test: FedAuthData::GetDataSize - With Token ===" << std::endl;
 
 	FedAuthData data;
-	data.token_utf16le = {0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00};  // "test" in UTF-16LE
+	data.token_utf16le = {0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00};	// "test" in UTF-16LE
 
 	// 4 bytes for options + 8 bytes for token
 	ASSERT_EQ(data.GetDataSize(), static_cast<size_t>(12));
@@ -153,7 +153,7 @@ void test_fedauth_data_is_valid_with_token() {
 	std::cout << "\n=== Test: FedAuthData::IsValid - With Token ===" << std::endl;
 
 	FedAuthData data;
-	data.token_utf16le = {0x74, 0x00};  // Minimal token
+	data.token_utf16le = {0x74, 0x00};	// Minimal token
 
 	// Has token, so valid
 	ASSERT_TRUE(data.IsValid());
@@ -179,7 +179,7 @@ void test_is_azure_endpoint_azure_sql() {
 
 	// Standard Azure SQL Database endpoint
 	ASSERT_TRUE(IsAzureEndpoint("myserver.database.windows.net"));
-	ASSERT_TRUE(IsAzureEndpoint("MYSERVER.DATABASE.WINDOWS.NET"));  // Case insensitive
+	ASSERT_TRUE(IsAzureEndpoint("MYSERVER.DATABASE.WINDOWS.NET"));	// Case insensitive
 	ASSERT_TRUE(IsAzureEndpoint("server-123.database.windows.net"));
 
 	std::cout << "PASSED!" << std::endl;
@@ -256,21 +256,19 @@ void test_get_endpoint_type() {
 
 	// Azure SQL Database
 	ASSERT_EQ(static_cast<int>(GetEndpointType("myserver.database.windows.net")),
-	          static_cast<int>(EndpointType::AzureSQL));
+			  static_cast<int>(EndpointType::AzureSQL));
 
 	// Microsoft Fabric (most specific, checked first)
 	ASSERT_EQ(static_cast<int>(GetEndpointType("workspace.datawarehouse.fabric.microsoft.com")),
-	          static_cast<int>(EndpointType::Fabric));
+			  static_cast<int>(EndpointType::Fabric));
 
 	// Azure Synapse
 	ASSERT_EQ(static_cast<int>(GetEndpointType("workspace.sql.azuresynapse.net")),
-	          static_cast<int>(EndpointType::Synapse));
+			  static_cast<int>(EndpointType::Synapse));
 
 	// On-Premises
-	ASSERT_EQ(static_cast<int>(GetEndpointType("localhost")),
-	          static_cast<int>(EndpointType::OnPremises));
-	ASSERT_EQ(static_cast<int>(GetEndpointType("sqlserver.company.local")),
-	          static_cast<int>(EndpointType::OnPremises));
+	ASSERT_EQ(static_cast<int>(GetEndpointType("localhost")), static_cast<int>(EndpointType::OnPremises));
+	ASSERT_EQ(static_cast<int>(GetEndpointType("sqlserver.company.local")), static_cast<int>(EndpointType::OnPremises));
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -400,8 +398,11 @@ void test_login7_no_fedauth_extension_with_sql_auth() {
 	const uint8_t EXTENSION_FLAG = 0x10;
 	bool has_extension = (option_flags3 & EXTENSION_FLAG) != 0;
 
-	ASSERT_FALSE(has_extension);
-	std::cout << "PASSED! Standard LOGIN7 does not have FeatureExt flag set." << std::endl;
+	// Since issue #225 every LOGIN7 carries a FeatureExt list -- UTF8SUPPORT
+	// (0x0A) is advertised on SQL auth too -- so the flag IS set; what SQL auth
+	// must not carry is the FEDAUTH feature, which the FEDAUTH tests above check.
+	ASSERT_TRUE(has_extension);
+	std::cout << "PASSED! Standard LOGIN7 has the FeatureExt flag (UTF8SUPPORT, #225)." << std::endl;
 }
 
 void test_login7_with_fedauth_has_extension() {
@@ -409,7 +410,7 @@ void test_login7_with_fedauth_has_extension() {
 
 	// Build FEDAUTH LOGIN7
 	// client_hostname = workstation name, server_name = TDS server address
-	std::vector<uint8_t> fake_token = {0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00};  // "test"
+	std::vector<uint8_t> fake_token = {0x74, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00};	 // "test"
 	auto packet = tds::TdsProtocol::BuildLogin7WithFedAuth("testworkstation", "testserver", "testdb", fake_token);
 	const auto &payload = packet.GetPayload();
 

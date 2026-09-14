@@ -10,6 +10,7 @@
 //   ./build/release/test/unittest "*jwt*"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -53,8 +54,7 @@ using namespace duckdb::mssql::azure;
 //==============================================================================
 // Base64url encode a string (simplified - works for ASCII payload)
 static std::string Base64UrlEncode(const std::string &input) {
-	static const char *const BASE64_CHARS =
-	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	static const char *const BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 	std::string result;
 	result.reserve(((input.size() + 2) / 3) * 4);
@@ -225,7 +225,7 @@ void test_is_token_expired_past() {
 	std::cout << "\n=== Test: IsTokenExpired - Past Timestamp ===" << std::endl;
 
 	// Timestamp in the past (year 2020)
-	int64_t past_exp = 1577836800;  // 2020-01-01 00:00:00 UTC
+	int64_t past_exp = 1577836800;	// 2020-01-01 00:00:00 UTC
 
 	ASSERT_TRUE(IsTokenExpired(past_exp, 300));
 

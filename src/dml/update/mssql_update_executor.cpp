@@ -5,6 +5,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_settings.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "dml/update/mssql_update_statement.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -244,6 +245,8 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 		// Parse the TDS response to get error info and row counts
 		tds::TokenParser parser;
+		const int64_t fail_after_tokens = LoadTestFailParseAfterTokens(context_);
+		int64_t tokens_seen = 0;
 		bool done = false;
 		int timeout_ms = 30000;	 // 30 second timeout
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -280,15 +283,27 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 			bool is_eom = packet.IsEndOfMessage();
 
-			// Feed packet payload to parser
+			// Feed packet payload to parser -- but not into a parser already in
+			// Error. From there TryParseNext returns at once, so ConsumeBytes and
+			// with it CompactBuffer never run, and every fed byte is retained;
+			// a desync early in a batched response buffers the whole tail for
+			// nothing. The drain to EOM below still runs: that is what leaves the
+			// socket clean for the next statement. MSSQLSimpleQuery already does
+			// this (issue #323); these four loops are copies of the same loop.
 			const auto &payload = packet.GetPayload();
-			if (!payload.empty()) {
+			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
 				parser.Feed(payload);
 			}
 
 			// Parse tokens
 			tds::ParsedTokenType token;
 			while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
+				if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
+					// Test lever (mssql_test_fail_parse_after_tokens): drop this token
+					// and desync, as a framing error would.
+					parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
+					break;
+				}
 				UPDATE_DEBUG(2, "ExecuteBatch: parsed token type=%d", (int)token);
 				switch (token) {
 				case tds::ParsedTokenType::Done: {
@@ -320,6 +335,18 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 				}
 			}
 
+			// A parser stuck in Error answers NeedMoreData forever, so the token
+			// loop above has already exited and the EOM branch below forces done
+			// and reports SUCCESS -- dropping every token after the desync,
+			// including a SQL Server ERROR token following a stored-procedure
+			// call, which is the one a caller most needs. Record it as the
+			// failure it is. A SQL error already captured keeps precedence.
+			if (parser.GetState() == tds::ParserState::Error && error_message.empty()) {
+				error_number = 0;
+				error_message = "TDS parse error: " + parser.GetParseError();
+				UPDATE_DEBUG(1, "ExecuteBatch: %s", error_message.c_str());
+			}
+
 			// Handle EOM without done token
 			if (is_eom && !done) {
 				UPDATE_DEBUG(1, "ExecuteBatch: EOM without DONE final, marking done");
@@ -334,6 +361,17 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		// Check for errors
 		if (!error_message.empty()) {
 			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			if (error_number == 0) {
+				// A parse error is a client-side framing failure: the server ran
+				// this batch. Say so, and how far the statement had got, because
+				// in autocommit the earlier batches are already committed and
+				// there is no path back (issue #344).
+				throw IOException(
+					"UPDATE failed: %s; the server executed this batch (batch %llu), and %llu row(s) "
+					"from the %llu batch(es) before it are applied",
+					error_message, (unsigned long long)batch_count_, (unsigned long long)total_rows_updated_,
+					(unsigned long long)(batch_count_ - 1));
+			}
 			throw IOException("UPDATE failed: %s", error_message);
 		}
 

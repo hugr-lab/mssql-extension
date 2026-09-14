@@ -176,6 +176,14 @@ public:
 		return parse_error_;
 	}
 
+	//! Put the parser into Error with this reason, as a desync would (test
+	//! lever mssql_test_fail_parse_after_tokens, issue #344). From here
+	//! TryParseNext answers NeedMoreData forever and nothing is consumed.
+	void InjectParseError(const std::string &reason) {
+		parse_error_ = reason;
+		state_ = ParserState::Error;
+	}
+
 	// Reset parser state (clears everything)
 	void Reset();
 
