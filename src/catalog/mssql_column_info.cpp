@@ -18,7 +18,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 	  is_unicode(false),
 	  is_utf8(false),
 	  is_cast_required(false),
-	  is_geometry(false) {}
+	  is_geometry(false),
+	  is_identity(false) {}
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 								 uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
@@ -29,7 +30,8 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	  max_length(max_length),
 	  precision(precision),
 	  scale(scale),
-	  is_nullable(is_nullable) {
+	  is_nullable(is_nullable),
+	  is_identity(false) {
 	// Use database collation as fallback if column collation is empty
 	if (collation_name.empty() && IsTextType(sql_type_name)) {
 		this->collation_name = database_collation;

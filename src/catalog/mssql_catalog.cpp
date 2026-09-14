@@ -688,7 +688,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		insert_col.name = col.name;
 		insert_col.duckdb_type = native_types ? col.NativeDuckDBType() : col.duckdb_type;
 		insert_col.mssql_type = col.sql_type_name;
-		insert_col.is_identity = false;	 // Will be detected below if needed
+		insert_col.is_identity = col.is_identity;  // spec 062 W4: from sys.columns, via the cache
 		insert_col.is_nullable = col.is_nullable;
 		insert_col.has_default = false;	 // TODO: Query this from sys.columns
 		insert_col.collation = col.collation_name;
