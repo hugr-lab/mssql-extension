@@ -88,6 +88,37 @@ Error: Unsupported SQL Server type 'UDT' (0xF0) for column 'col_name'
 - Cast unsupported columns to supported types in your query
 - Exclude unsupported columns from SELECT
 
+### DuckDB UI: "Expected field id 65535 but got 103"
+
+```text
+Error: Expected field id 65535 but got 103 (offset=50)
+```
+
+Raised by the DuckDB UI extension (`CALL start_ui_server()`) — and only
+there — when a result contains a column read from an attached table whose
+type is `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`. The UI serializes the
+result's column types for the browser, and its reader does not know the
+`extension_info` block (field 103) that DuckDB writes for an extension type
+with modifiers; the CLI, Python and JDBC clients never serialize result
+types, so the same query runs there. Tracked as
+[issue #297](https://github.com/hugr-lab/mssql-extension/issues/297).
+
+**Solutions:**
+
+- Report plain `VARCHAR` for attached string columns, then drop the entries
+  the catalog has already loaded with the native type:
+
+  ```sql
+  SET mssql_catalog_native_types = false;
+  SELECT mssql_invalidate_cache('mydb');
+  ```
+
+  The cost is what the setting's name says: `DESCRIBE` shows `VARCHAR`
+  instead of the declared length and collation, and a CTAS or COPY back to
+  SQL Server no longer inherits them
+  ([Catalog-Reported String Types](../reading/types.md#catalog-reported-string-types)).
+- Per query, `CAST(col AS VARCHAR)` yields a plain `VARCHAR` as well.
+
 ### Slow Query Performance
 
 **Solutions:**
@@ -256,6 +287,7 @@ The codec validates the input first and falls back to a slower scalar implementa
 
 - Catalog scans auto-CAST server-specific types (`SQL_VARIANT`, `hierarchyid`, CLR UDTs) to `NVARCHAR(MAX)`, so three-part-name queries succeed; raw `mssql_scan()` needs an explicit CAST for such columns
 - Raw `mssql_scan()` returns non-Unicode `CHAR`/`VARCHAR`/`TEXT` bytes in the column's code page without transcoding them, so a non-ASCII value is not valid UTF-8 and string functions mangle it silently — add `CAST(col AS NVARCHAR(MAX))`, or read through the catalog. See [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages)
+- The DuckDB UI cannot render a result with an `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` column (`Expected field id 65535 but got 103`) — set `mssql_catalog_native_types = false` and invalidate the cache. See [DuckDB UI](#duckdb-ui-expected-field-id-65535-but-got-103)
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales
 - Connection pool statistics reset when all connections close
