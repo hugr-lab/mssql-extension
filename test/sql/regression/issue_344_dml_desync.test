@@ -43,6 +43,11 @@ SELECT mssql_exec('i344', 'IF OBJECT_ID(''dbo.i344'') IS NOT NULL DROP TABLE dbo
 statement ok
 SELECT mssql_invalidate_cache('i344');
 
+# The lever lives in the STATEMENT path's response loops; above the threshold
+# an INSERT would take the bulk path (spec 062 W2) and never meet it.
+statement ok
+SET mssql_insert_use_bcp = false;
+
 statement ok
 INSERT INTO i344.dbo.i344 SELECT i, 1 FROM range(1, 1201) t(i);
 

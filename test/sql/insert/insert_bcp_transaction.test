@@ -1,0 +1,130 @@
+# name: test/sql/insert/insert_bcp_transaction.test
+# description: a bulk-path INSERT inside a DuckDB transaction runs on the pinned connection and goes with its COMMIT / ROLLBACK (spec 062 W2, acceptance 4)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS btx (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('btx', 'IF OBJECT_ID(''dbo.BcpTx'') IS NOT NULL DROP TABLE dbo.BcpTx;
+CREATE TABLE dbo.BcpTx (id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);
+IF OBJECT_ID(''dbo.BcpTxSrc'') IS NOT NULL DROP TABLE dbo.BcpTxSrc;
+CREATE TABLE dbo.BcpTxSrc (id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('btx');
+
+statement ok
+CREATE TABLE src AS SELECT i AS id, 'v' || i AS v FROM range(1, 5001) t(i);
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+# Several batches inside the transaction, so the batch boundaries are inside
+# it too (spec 062 § 0.2: they commit with the transaction, not at DONE).
+statement ok
+SET mssql_copy_flush_rows = 1000;
+
+# --- ROLLBACK discards the whole load
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO btx.dbo.BcpTx SELECT * FROM src;
+
+# visible inside the transaction, on the pinned connection
+query I
+SELECT cnt FROM mssql_scan('btx', 'SELECT COUNT(*) AS cnt FROM dbo.BcpTx');
+----
+5000
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM btx.dbo.BcpTx;
+----
+0
+
+# --- COMMIT keeps it
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO btx.dbo.BcpTx SELECT * FROM src;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(id) FROM btx.dbo.BcpTx;
+----
+5000	12502500
+
+# --- the transaction has ONE connection: a bulk INSERT that reads the same
+# catalog inside it (the source is materialised first, spec 075 W3), followed
+# by a read of what it wrote, all on the pinned connection.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO btx.dbo.BcpTxSrc SELECT id, v FROM btx.dbo.BcpTx WHERE id <= 2000;
+
+query I
+SELECT cnt FROM mssql_scan('btx', 'SELECT COUNT(*) AS cnt FROM dbo.BcpTxSrc');
+----
+2000
+
+statement ok
+INSERT INTO btx.dbo.BcpTx SELECT id + 10000, v FROM btx.dbo.BcpTxSrc;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id > 10000) FROM btx.dbo.BcpTx;
+----
+7000	2000
+
+# --- one writer inside a transaction whatever the thread count: every row went
+# through the pinned connection, so nothing was created in the pool for it.
+statement ok
+SET threads = 4;
+
+query I
+SELECT active_connections FROM mssql_pool_stats('btx');
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO btx.dbo.BcpTx SELECT id + 20000, v FROM src;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM btx.dbo.BcpTx;
+----
+7000
+
+statement ok
+RESET mssql_copy_flush_rows;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('btx', 'DROP TABLE dbo.BcpTx; DROP TABLE dbo.BcpTxSrc');
+
+statement ok
+DETACH btx;

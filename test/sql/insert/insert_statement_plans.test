@@ -1,0 +1,97 @@
+# name: test/sql/insert/insert_statement_plans.test
+# description: the statement path stays under SQL Server's auto-parameterisation line, so distinct INSERTs share one cached plan (spec 062 W1b, § 0.5)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# SQL Server auto-parameterises a multi-row VALUES INSERT up to 1000 constants
+# per statement: below that line N distinct inserts of one shape leave ONE
+# Prepared plan; above it every statement compiles its own Adhoc plan (70 us a
+# row instead of 14) and leaves it in the cache. The default of 1000 rows per
+# statement put every table with two or more columns past the line; now no
+# statement carries more than 1000 constants. Asserted on the server's own plan
+# cache. Needs DBCC FREEPROCCACHE (ALTER SERVER STATE) -- the docker sa has it.
+#
+# A HEAP target on purpose. Auto-parameterisation needs a trivial plan, and an
+# INSERT into a table with a clustered index stops being trivial past about
+# 250 rows per statement (measured: 250 Prepared, 256 Adhoc) -- the optimizer
+# adds a sort. Those statements compile their own plan, but at the cheap end:
+# 5.3 ms against the heap's 4.7 ms for 333 rows, not the 23 ms of a statement
+# past the constant line. The cap is about the cliff, not the cache.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sp', 'IF OBJECT_ID(''dbo.StmtPlans'') IS NOT NULL DROP TABLE dbo.StmtPlans;
+CREATE TABLE dbo.StmtPlans (id INT NOT NULL, big BIGINT NULL, v NVARCHAR(40) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('sp');
+
+# Statements only, so the plan cache sees the statement path.
+statement ok
+SET mssql_insert_use_bcp = false;
+
+statement ok
+SELECT mssql_exec('sp', 'DBCC FREEPROCCACHE');
+
+# 20 inserts of 900 rows each, fresh values every time: 3 columns -> 333 rows a
+# statement -> 3 statements each (333, 333, 234) -> 60 distinct statement texts,
+# two shapes, two Prepared plans. Past the 1000-constant line every one of the
+# 60 would have been its own Adhoc plan.
+loop i 0 20
+
+statement ok
+INSERT INTO sp.dbo.StmtPlans SELECT {i} * 1000 + r, ({i} * 1000 + r) * 7919, 'value_' || ({i} * 1000 + r) FROM range(900) t(r);
+
+endloop
+
+query I
+SELECT count(*) FROM sp.dbo.StmtPlans;
+----
+18000
+
+query II
+SELECT objtype, cnt FROM mssql_scan('sp', 'SELECT p.objtype, COUNT(*) AS cnt FROM sys.dm_exec_cached_plans p CROSS APPLY sys.dm_exec_sql_text(p.plan_handle) s WHERE s.text LIKE ''%INSERT INTO%StmtPlans%'' AND s.text NOT LIKE ''%dm_exec%'' GROUP BY p.objtype') ORDER BY objtype;
+----
+Prepared	2
+
+# RETURNING (OUTPUT INSERTED rides in the statement) is NOT auto-parameterised
+# -- an OUTPUT clause takes the statement out of the trivial-plan class -- so
+# five distinct 300-row statements are five Adhoc plans. Under the constant
+# line they compile at the cheap end all the same; this pins the fact, not a
+# goal.
+statement ok
+SELECT mssql_exec('sp', 'DBCC FREEPROCCACHE');
+
+loop i 0 5
+
+statement ok
+INSERT INTO sp.dbo.StmtPlans SELECT 100000 + {i} * 1000 + r, r, 'r' FROM range(300) t(r) RETURNING id;
+
+endloop
+
+query I
+SELECT count(*) FROM sp.dbo.StmtPlans WHERE id >= 100000;
+----
+1500
+
+query II
+SELECT objtype, cnt FROM mssql_scan('sp', 'SELECT p.objtype, COUNT(*) AS cnt FROM sys.dm_exec_cached_plans p CROSS APPLY sys.dm_exec_sql_text(p.plan_handle) s WHERE s.text LIKE ''%INSERT INTO%StmtPlans%'' AND s.text NOT LIKE ''%dm_exec%'' GROUP BY p.objtype') ORDER BY objtype;
+----
+Adhoc	5
+
+statement ok
+SET mssql_insert_use_bcp = true;
+
+statement ok
+SELECT mssql_exec('sp', 'DROP TABLE dbo.StmtPlans');
+
+statement ok
+DETACH sp;

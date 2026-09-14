@@ -1,0 +1,137 @@
+# name: test/sql/insert/insert_bcp_types.test
+# description: every type family lands identically through the bulk path and the statement path (spec 062 acceptance 3)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The chunk the bulk path encodes carries the CATALOG's types -- MSSQL_NVARCHAR(n)
+# with its collation, TIMESTAMP_MS for datetime2(3), UTINYINT for tinyint -- not
+# a user's source types, so this is the one place those pairs are exercised
+# through INSERT. One DuckDB source, two identical targets, one path each, and
+# the two tables compared row by row: non-ASCII into nvarchar and into a UTF-8
+# varchar, NULLs in every column, the decimal edge, uuid, varbinary(max),
+# every date/time flavour.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS bt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bt', 'IF OBJECT_ID(''dbo.BcpTypesA'') IS NOT NULL DROP TABLE dbo.BcpTypesA;
+IF OBJECT_ID(''dbo.BcpTypesB'') IS NOT NULL DROP TABLE dbo.BcpTypesB;
+CREATE TABLE dbo.BcpTypesA (
+  id INT NOT NULL PRIMARY KEY,
+  b BIT NULL, ti TINYINT NULL, si SMALLINT NULL, bi BIGINT NULL,
+  r REAL NULL, f FLOAT NULL,
+  d182 DECIMAL(18,2) NULL, d3810 DECIMAL(38,10) NULL, m MONEY NULL,
+  nv NVARCHAR(60) NULL, v8 VARCHAR(60) COLLATE Latin1_General_100_BIN2_UTF8 NULL, vl VARCHAR(60) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, nvmax NVARCHAR(MAX) NULL,
+  vb VARBINARY(MAX) NULL, u UNIQUEIDENTIFIER NULL,
+  dt DATE NULL, tm TIME(7) NULL, dt2_3 DATETIME2(3) NULL, dt2_7 DATETIME2(7) NULL, dto DATETIMEOFFSET(7) NULL, dtm DATETIME NULL
+);
+SELECT * INTO dbo.BcpTypesB FROM dbo.BcpTypesA WHERE 1 = 0;
+ALTER TABLE dbo.BcpTypesB ADD PRIMARY KEY (id)');
+
+statement ok
+SELECT mssql_invalidate_cache('bt');
+
+# 2500 rows: every 7th row all-NULL, the rest cycling through the edge values.
+statement ok
+CREATE TABLE src AS
+SELECT i AS id,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE i % 2 = 0 END AS b,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 256)::UTINYINT END AS ti,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 13 - 32768)::SMALLINT END AS si,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 7919)::BIGINT * 1000003 END AS bi,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i / 3.0)::FLOAT END AS r,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE i / 7.0 END AS f,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 1.01)::DECIMAL(18,2) END AS d182,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE ('9999999999999999999999999999.' || lpad((i % 10000)::VARCHAR, 10, '0'))::DECIMAL(38,10) END AS d3810,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 0.0001)::DECIMAL(19,4) END AS m,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE 'Привет ' || i || ' 日本 ' || chr(9731) END AS nv,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE 'Grüße ' || i || ' ñ' END AS v8,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE 'plain ascii ' || i END AS vl,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE repeat('long text ' || i || ' ', 40) END AS nvmax,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE ('\x00\x01\xFF' || i)::BLOB END AS vb,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE ('12345678-1234-1234-1234-' || lpad((i)::VARCHAR, 12, '0'))::UUID END AS u,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE DATE '2020-01-01' + INTERVAL (i) DAY END AS dt,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE TIME '00:00:00' + INTERVAL (i * 37) SECOND + INTERVAL (i % 1000) MICROSECOND END AS tm,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (TIMESTAMP '2021-06-01 12:00:00' + INTERVAL (i) SECOND + INTERVAL (i % 1000) MILLISECOND)::TIMESTAMP_MS END AS dt2_3,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (TIMESTAMP '2021-06-01 12:00:00' + INTERVAL (i) SECOND + INTERVAL (i % 1000) MICROSECOND)::TIMESTAMP_NS END AS dt2_7,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (TIMESTAMP '2021-06-01 12:00:00' + INTERVAL (i) SECOND)::TIMESTAMPTZ END AS dto,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE TIMESTAMP '2021-06-01 12:00:00' + INTERVAL (i) SECOND + INTERVAL (i % 3 * 10) MILLISECOND END AS dtm
+FROM range(1, 2501) t(i);
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+# A: bulk (2500 rows, well above the threshold).
+statement ok
+INSERT INTO bt.dbo.BcpTypesA SELECT * FROM src;
+
+# B: statements.
+statement ok
+SET mssql_insert_use_bcp = false;
+
+statement ok
+INSERT INTO bt.dbo.BcpTypesB SELECT * FROM src;
+
+statement ok
+SET mssql_insert_use_bcp = true;
+
+query II
+SELECT (SELECT count(*) FROM bt.dbo.BcpTypesA), (SELECT count(*) FROM bt.dbo.BcpTypesB);
+----
+2500	2500
+
+# Row by row, in both directions, read back through the catalog.
+query I
+SELECT count(*) FROM (SELECT * FROM bt.dbo.BcpTypesA EXCEPT SELECT * FROM bt.dbo.BcpTypesB);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM bt.dbo.BcpTypesB EXCEPT SELECT * FROM bt.dbo.BcpTypesA);
+----
+0
+
+# And against the source, for the columns whose type round-trips exactly.
+query I
+SELECT count(*) FROM (
+  SELECT id, b, ti, si, bi, d182, d3810, nv, v8, vl, nvmax, vb, u, dt, dt2_3, dt2_7 FROM bt.dbo.BcpTypesA
+  EXCEPT
+  SELECT id, b, ti, si, bi, d182, d3810, nv, v8, vl, nvmax, vb, u, dt, dt2_3, dt2_7 FROM src);
+----
+0
+
+# The NULL rows are NULL in every column on both sides.
+query II
+SELECT
+  (SELECT count(*) FROM bt.dbo.BcpTypesA WHERE id % 7 = 0 AND b IS NULL AND nv IS NULL AND vb IS NULL AND dt2_7 IS NULL AND d3810 IS NULL),
+  (SELECT count(*) FROM bt.dbo.BcpTypesB WHERE id % 7 = 0 AND b IS NULL AND nv IS NULL AND vb IS NULL AND dt2_7 IS NULL AND d3810 IS NULL);
+----
+357	357
+
+# Non-ASCII survived both the UTF-8 varchar and the nvarchar, on both paths
+# (the server would have written '?' for a code-page miss).
+query II
+SELECT nv, v8 FROM bt.dbo.BcpTypesA WHERE id = 1;
+----
+Привет 1 日本 ☃	Grüße 1 ñ
+
+query II
+SELECT nv, v8 FROM bt.dbo.BcpTypesB WHERE id = 1;
+----
+Привет 1 日本 ☃	Grüße 1 ñ
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('bt', 'DROP TABLE dbo.BcpTypesA; DROP TABLE dbo.BcpTypesB');
+
+statement ok
+DETACH bt;

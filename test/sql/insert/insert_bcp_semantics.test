@@ -1,0 +1,95 @@
+# name: test/sql/insert/insert_bcp_semantics.test
+# description: an INSERT that loads through INSERT BULK still checks constraints, fires triggers and keeps its NULLs (spec 062 W2)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A bulk load's defaults are bcp's: check constraints ignored, triggers not
+# fired, a column's DEFAULT where the stream says NULL. That is COPY's contract
+# and it stays. An INSERT is a statement, and the bulk path sends INSERT BULK
+# with CHECK_CONSTRAINTS, FIRE_TRIGGERS and KEEP_NULLS so it behaves like one.
+# Each case below is checked on both paths (the threshold routes them).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS bs (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bs', 'IF OBJECT_ID(''dbo.BcpSemAudit'') IS NOT NULL DROP TABLE dbo.BcpSemAudit;
+IF OBJECT_ID(''dbo.BcpSem'') IS NOT NULL DROP TABLE dbo.BcpSem;
+CREATE TABLE dbo.BcpSem (id INT NOT NULL PRIMARY KEY, n INT NULL CHECK (n < 1000000), tag NVARCHAR(10) NULL DEFAULT N''dflt'');
+CREATE TABLE dbo.BcpSemAudit (id INT NOT NULL);
+EXEC(''CREATE TRIGGER dbo.BcpSemTrg ON dbo.BcpSem AFTER INSERT AS INSERT INTO dbo.BcpSemAudit (id) SELECT id FROM inserted'')');
+
+statement ok
+SELECT mssql_invalidate_cache('bs');
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+# --- CHECK constraints: enforced on both paths.
+statement error
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, CASE WHEN i = 1500 THEN 1000000 ELSE i END FROM range(1, 2001) t(i);
+----
+CHECK constraint
+
+statement error
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, CASE WHEN i = 15 THEN 1000000 ELSE i END FROM range(1, 21) t(i);
+----
+CHECK constraint
+
+query I
+SELECT count(*) FROM bs.dbo.BcpSem;
+----
+0
+
+# --- triggers fire on both paths: the audit table gets every id.
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, i FROM range(1, 2001) t(i);
+
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, i FROM range(2001, 2021) t(i);
+
+query II
+SELECT (SELECT count(*) FROM bs.dbo.BcpSem), (SELECT count(*) FROM bs.dbo.BcpSemAudit);
+----
+2020	2020
+
+# --- an explicit NULL stays NULL where the column has a DEFAULT, on both
+# paths (a bulk load would have written the default).
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n, tag) SELECT i, i, NULL FROM range(3001, 5001) t(i);
+
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n, tag) SELECT i, i, NULL FROM range(5001, 5011) t(i);
+
+query II
+SELECT count(*) FILTER (WHERE tag IS NULL), count(*) FILTER (WHERE tag = 'dflt') FROM bs.dbo.BcpSem WHERE id >= 3001;
+----
+2010	0
+
+# --- and a column left out of the list takes the server's default, on both
+# paths, as before.
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, i FROM range(6001, 8001) t(i);
+
+statement ok
+INSERT INTO bs.dbo.BcpSem (id, n) SELECT i, i FROM range(8001, 8011) t(i);
+
+query I
+SELECT count(*) FILTER (WHERE tag = 'dflt') FROM bs.dbo.BcpSem WHERE id >= 6001;
+----
+2010
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('bs', 'DROP TABLE dbo.BcpSem; DROP TABLE dbo.BcpSemAudit');
+
+statement ok
+DETACH bs;
