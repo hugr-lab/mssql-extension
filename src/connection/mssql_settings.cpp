@@ -290,6 +290,21 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT), nullptr,
 							  SetScope::GLOBAL);
 
+	// mssql_insert_use_bcp - INSERT loads through INSERT BULK (spec 062 W1);
+	// the escape hatch mssql_ctas_use_bcp is for CTAS. RETURNING and an
+	// explicit identity column stay on the statement path whatever this says.
+	config.AddExtensionOption("mssql_insert_use_bcp",
+							  "Load INSERT rows through the BCP protocol above mssql_insert_bcp_threshold rows "
+							  "(RETURNING and an explicit identity column always use statements)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_BCP), nullptr,
+							  SetScope::GLOBAL);
+
+	// mssql_insert_bcp_threshold - rows an INSERT may have and still go as
+	// statements. Decided at run time by buffering, not by a plan estimate.
+	config.AddExtensionOption(
+		"mssql_insert_bcp_threshold", "Rows up to which an INSERT is sent as statements rather than a bulk load",
+		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_INSERT_BCP_THRESHOLD), ValidatePositive, SetScope::GLOBAL);
+
 	//===----------------------------------------------------------------------===//
 	// DML (UPDATE/DELETE) Settings
 	//===----------------------------------------------------------------------===//
@@ -664,6 +679,14 @@ MSSQLInsertConfig LoadInsertConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_insert_use_returning_output", val)) {
 		config.use_returning_output = val.GetValue<bool>();
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_use_bcp", val)) {
+		config.use_bcp = val.GetValue<bool>();
+	}
+
+	if (context.TryGetCurrentSetting("mssql_insert_bcp_threshold", val)) {
+		config.bcp_threshold = static_cast<idx_t>(val.GetValue<int64_t>());
 	}
 
 	// Validate loaded config

@@ -4,6 +4,7 @@
 #include <mutex>
 #include <vector>
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_primary_key.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -96,6 +97,14 @@ public:
 	// Get approximate row count
 	idx_t GetApproxRowCount() const;
 
+	//! Physical shape of the object (heap / clustered rowstore / clustered
+	//! columnstore), from the catalog's metadata query (spec 049). What the
+	//! bulk-load TABLOCK policy and the columnstore warm-up gate read for an
+	//! INSERT (spec 062 W2), with no query of their own.
+	MSSQLIndexKind GetIndexKind() const {
+		return index_kind_;
+	}
+
 	// Get parent MSSQL catalog
 	MSSQLCatalog &GetMSSQLCatalog();
 
@@ -128,6 +137,7 @@ private:
 	vector<MSSQLColumnInfo> mssql_columns_;	 // Column metadata with collation
 	MSSQLObjectType object_type_;			 // TABLE or VIEW
 	idx_t approx_row_count_;				 // Cardinality estimate
+	MSSQLIndexKind index_kind_;				 // Physical shape (spec 049)
 
 	// Lazy-loaded PK cache.
 	// Spec 052 EnsurePKLoaded race fix: pk_load_mutex_ serialises concurrent

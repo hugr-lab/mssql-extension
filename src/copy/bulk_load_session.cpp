@@ -22,7 +22,7 @@ uint64_t ElapsedNs(TimePoint start) {
 }  // namespace
 
 string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMetadata> &columns, bool tablock,
-						  idx_t rows_per_batch) {
+						  idx_t rows_per_batch, const InsertBulkHints &hints) {
 	// A temp table is named by its bare name: `#t` lives in tempdb, and
 	// `[dbo].[#t]` sends the server looking in the current database.
 	string sql = "INSERT BULK ";
@@ -49,21 +49,46 @@ string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMet
 	// surface for anything that can set one. The hint it existed to investigate —
 	// ORDER for a clustered target — needs a real option and a guarantee that the
 	// rows really are sorted, which is its own spec.
-	if (tablock && rows_per_batch > 0) {
-		sql += " WITH (TABLOCK, ROWS_PER_BATCH = " + std::to_string(rows_per_batch) + ")";
-	} else if (tablock) {
-		sql += " WITH (TABLOCK)";
-	} else if (rows_per_batch > 0) {
-		sql += " WITH (ROWS_PER_BATCH = " + std::to_string(rows_per_batch) + ")";
+	vector<string> with;
+	if (tablock) {
+		with.push_back("TABLOCK");
+	}
+	if (rows_per_batch > 0) {
+		with.push_back("ROWS_PER_BATCH = " + std::to_string(rows_per_batch));
+	}
+	// The statement-semantics hints (see InsertBulkHints): an INSERT that
+	// loads through INSERT BULK still checks constraints, fires triggers and
+	// keeps its NULLs.
+	if (hints.check_constraints) {
+		with.push_back("CHECK_CONSTRAINTS");
+	}
+	if (hints.fire_triggers) {
+		with.push_back("FIRE_TRIGGERS");
+	}
+	if (hints.keep_nulls) {
+		with.push_back("KEEP_NULLS");
+	}
+	if (!with.empty()) {
+		sql += " WITH (";
+		for (idx_t i = 0; i < with.size(); i++) {
+			if (i > 0) {
+				sql += ", ";
+			}
+			sql += with[i];
+		}
+		sql += ")";
 	}
 	return sql;
 }
 
 BulkLoadSession::~BulkLoadSession() noexcept {
 	// The writer goes first: it holds a reference to the connection, and the
-	// release protocol closes the socket underneath it.
+	// release protocol closes the socket underneath it. An own transaction
+	// still open here is rolled back: by the ROLLBACK if the connection is
+	// Idle, by the close otherwise.
 	SnapshotWriterCounters();
 	writer_.reset();
+	transaction_.Rollback();
 	ReleaseBcpConnectionOnError(connection_, pool_handle_, transaction_pinned_, reset_on_release_);
 }
 
@@ -154,6 +179,13 @@ void BulkLoadSession::Adopt(std::shared_ptr<tds::TdsConnection> connection, cons
 	reset_on_release_ = params.reset_on_release;
 	transaction_pinned_ = transaction_pinned;
 	connection_ = std::move(connection);
+	// Before the writer and before any INSERT BULK: the transaction has to be
+	// open on the connection before the first request it should cover. A
+	// pinned connection is already inside the DuckDB transaction; Begin is a
+	// no-op for it.
+	if (params.own_transaction) {
+		transaction_.Begin(connection_, transaction_pinned_);
+	}
 	writer_ = make_uniq<BCPWriter>(*connection_, *params.target, *params.columns,
 								   params.column_mapping ? *params.column_mapping : vector<int32_t>());
 	stream_open_ = false;
@@ -228,7 +260,7 @@ void BulkLoadSession::ReleaseConnection() {
 	connection_.reset();
 }
 
-idx_t BulkLoadSession::Finish() {
+idx_t BulkLoadSession::CloseStream() {
 	if (!writer_) {
 		return 0;
 	}
@@ -252,7 +284,29 @@ idx_t BulkLoadSession::Finish() {
 	rows_in_batch_ = 0;
 	SnapshotWriterCounters();
 	writer_.reset();
+	return confirmed;
+}
+
+void BulkLoadSession::Commit() {
+	if (!transaction_.IsOpen()) {
+		return;
+	}
+	try {
+		transaction_.Commit();
+	} catch (...) {
+		Abandon();
+		throw;
+	}
+}
+
+void BulkLoadSession::Release() {
 	ReleaseConnection();
+}
+
+idx_t BulkLoadSession::Finish() {
+	const idx_t confirmed = CloseStream();
+	Commit();
+	Release();
 	return confirmed;
 }
 
@@ -263,6 +317,7 @@ void BulkLoadSession::Abandon() noexcept {
 	// block on this same thread's work.
 	SnapshotWriterCounters();
 	writer_.reset();
+	transaction_.Rollback();
 	ReleaseBcpConnectionOnError(connection_, pool_handle_, transaction_pinned_, reset_on_release_);
 	stream_open_ = false;
 	rows_in_batch_ = 0;

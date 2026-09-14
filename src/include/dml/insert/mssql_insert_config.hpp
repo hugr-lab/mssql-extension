@@ -35,6 +35,15 @@ constexpr idx_t MSSQL_MIN_INSERT_SQL_BYTES = 1024;
 //! statement crosses it.
 constexpr idx_t MSSQL_AUTO_PARAM_MAX_CONSTANTS = 1000;
 
+//! Spec 062 W1: an INSERT without RETURNING and without an explicit identity
+//! column loads through INSERT BULK once it has more rows than this.
+constexpr bool MSSQL_DEFAULT_INSERT_USE_BCP = true;
+//! Rows an INSERT may have and still go as statements. Below it BCP's fixed
+//! cost -- INSERT BULK, the stream, DONE: two round trips more than one
+//! statement -- is not worth paying; provisional, set by the spec's W8
+//! crossover measurement.
+constexpr idx_t MSSQL_DEFAULT_INSERT_BCP_THRESHOLD = 1000;
+
 //===----------------------------------------------------------------------===//
 // MSSQLInsertConfig - Configuration for INSERT operations
 //
@@ -54,6 +63,10 @@ struct MSSQLInsertConfig {
 
 	// Use OUTPUT INSERTED for RETURNING clause
 	bool use_returning_output = MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT;
+
+	//! Spec 062 W1: the bulk path and its row threshold.
+	bool use_bcp = MSSQL_DEFAULT_INSERT_USE_BCP;
+	idx_t bcp_threshold = MSSQL_DEFAULT_INSERT_BCP_THRESHOLD;
 
 	//===----------------------------------------------------------------------===//
 	// Derived Values

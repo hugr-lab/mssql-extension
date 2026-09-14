@@ -35,6 +35,7 @@
 #include <atomic>
 
 #include "copy/bcp_writer.hpp"
+#include "copy/load_transaction.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "tds/tds_connection.hpp"
@@ -87,6 +88,17 @@ struct BulkLoadSessionParams {
 	//! the release happens in a destructor that may run on a worker thread, where
 	//! there is no ClientContext to ask (issue #178).
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
+	//! Spec 062 W2: bracket this session's load in a server transaction of its
+	//! own -- BEGIN TRANSACTION before the first INSERT BULK, COMMIT from
+	//! Commit(), ROLLBACK on Abandon or destruction. For a connection the
+	//! session acquires itself (TryStart) this is the only place the bracket
+	//! can go, since the acquisition and the first INSERT BULK are one step;
+	//! an adopted connection gets it on the same flag, so the operator's
+	//! shared session and its parallel ones are treated alike. Never on a
+	//! pinned connection: the DuckDB transaction owns that one, and Adopt
+	//! ignores the flag for it. What an INSERT is -- atomic -- and what a COPY
+	//! is not (each batch commits, as bcp's does): COPY and CTAS leave it off.
+	bool own_transaction = false;
 	//! Spec 070 W2: apply the warm-up gate (hold extra writers until one
 	//! flush_rows batch has landed). True only for a COLUMNSTORE target, where a
 	//! second writer splitting a sub-threshold load costs compression. A heap or
@@ -114,8 +126,29 @@ struct BulkLoadSessionParams {
 //!                      this only renders it
 //! @param rows_per_batch `flush_rows`, told to the server up front so it can
 //!                      size the load. 0 omits the hint.
+//! The INSERT BULK hints that make a bulk load behave like an INSERT statement
+//! (spec 062 W2). By default a bulk load IGNORES check constraints, does NOT
+//! fire triggers, and puts a column's DEFAULT where the stream says NULL --
+//! bcp's contract, and COPY's. An INSERT statement does the opposite on all
+//! three, and an INSERT that went through INSERT BULK must too: measured, a
+//! 1000-row INSERT with a CHECK violation in row 950 loaded all 1000 rows.
+struct InsertBulkHints {
+	bool check_constraints = false;
+	bool fire_triggers = false;
+	bool keep_nulls = false;
+
+	//! Every hint on: what an INSERT statement does.
+	static InsertBulkHints StatementSemantics() {
+		InsertBulkHints h;
+		h.check_constraints = true;
+		h.fire_triggers = true;
+		h.keep_nulls = true;
+		return h;
+	}
+};
+
 string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMetadata> &columns, bool tablock,
-						  idx_t rows_per_batch);
+						  idx_t rows_per_batch, const InsertBulkHints &hints = InsertBulkHints());
 
 //! A bulk-load session owned by ONE thread. Not thread-safe and not meant to be:
 //! a thread either owns one of these or shares the operator's global session
@@ -203,26 +236,50 @@ public:
 	//! error; the caller owns the failure policy.
 	BulkLoadWriteResult Write(DataChunk &chunk);
 
-	//! DONE for whatever is unflushed, the server's confirmation, then the
-	//! connection goes back to whoever owns it (see Adopt).
+	//! DONE for whatever is unflushed and the server's confirmation; the
+	//! connection stays with the session, its transaction (if own) still open.
+	//! The first of the three steps Finish() runs, on its own for a caller
+	//! that has more to do on the connection before it goes back -- the INSERT
+	//! sink commits every writer's transaction only once all of them have
+	//! closed their streams (spec 062 W2), and spec 066 runs its UPDATE on the
+	//! connection that filled the `#temp`.
 	//!
 	//! DONE is sent whenever the stream is open, even for zero rows: INSERT BULK
 	//! left the connection in Executing, and only DONE closes the stream so it
 	//! can be pooled again. A session whose stream never opened — an empty
-	//! source, or every chunk went to other writers — sends nothing and just
-	//! returns the connection.
+	//! source, or every chunk went to other writers — sends nothing.
 	//!
 	//! A failure here (the server rejecting the final batch) releases the
 	//! connection the error way — closed, so the server rolls the load back and
 	//! drops its locks — and rethrows.
 	//!
 	//! @return rows the server confirmed for the final batch.
+	idx_t CloseStream();
+
+	//! COMMIT the session's own transaction (a no-op without one). Throws when
+	//! the server refuses; the connection is then released the error way.
+	void Commit();
+
+	//! The connection goes back to whoever owns it (see Adopt). A no-op once
+	//! released.
+	void Release();
+
+	//! CloseStream, Commit, Release: the whole ending, for a caller with
+	//! nothing else to do on the connection (COPY, CTAS).
+	//!
+	//! @return rows the server confirmed for the final batch.
 	idx_t Finish();
 
 	//! Close this thread's stream and return its connection WITHOUT completing
-	//! the load. For the failure path, where the connection is sitting
-	//! mid-bulk-load on the very table a cleanup DROP has to lock.
+	//! the load; an own transaction is rolled back with it. For the failure
+	//! path, where the connection is sitting mid-bulk-load on the very table a
+	//! cleanup DROP has to lock.
 	void Abandon() noexcept;
+
+	//! Is the connection the DuckDB transaction's pinned one?
+	bool IsPinned() const {
+		return transaction_pinned_;
+	}
 
 	//! Rows sent since the last flush — what Finish() reports in DONE.
 	idx_t RowsInBatch() const {
@@ -275,6 +332,9 @@ private:
 	//! Adopt only: the connection is the DuckDB transaction's, never released here.
 	bool transaction_pinned_ = false;
 	bool stream_open_ = false;
+	//! The session's own server transaction (spec 062 W2), begun when the
+	//! params asked for one and the connection is not pinned.
+	LoadTransaction transaction_;
 
 	idx_t rows_in_batch_ = 0;
 	idx_t batches_flushed_ = 0;

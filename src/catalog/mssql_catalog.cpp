@@ -12,9 +12,12 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "copy/bcp_config.hpp"
+#include "copy/bulk_load_session.hpp"
 #include "dml/ctas/mssql_ctas_planner.hpp"
 #include "dml/delete/mssql_delete_target.hpp"
 #include "dml/delete/mssql_physical_delete.hpp"
+#include "dml/insert/mssql_insert_bulk_plan.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
 #include "dml/insert/mssql_physical_insert.hpp"
@@ -711,6 +714,62 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// Load insert configuration from settings
 	MSSQLInsertConfig config = LoadInsertConfig(context);
 
+	// Spec 062 W1: the bulk path, decided here, its plan settled here. Three
+	// things keep an INSERT on the statement path whatever the setting says:
+	// RETURNING (no rows come back from INSERT BULK; OUTPUT INSERTED is a
+	// statement by construction), an explicit identity column (INSERT BULK
+	// keeps the value unconditionally, where a statement lets the server
+	// refuse it without IDENTITY_INSERT -- W4 is what makes this decidable),
+	// and the setting itself. Whether the rows are FEW enough to stay on the
+	// statement path is not known here; the sink decides that at the threshold.
+	MSSQLInsertBulkPlan bulk;
+	bulk.threshold = config.bcp_threshold;
+	if (op.return_chunk) {
+		bulk.statement_path_reason = "RETURNING";
+	} else if (!config.use_bcp) {
+		bulk.statement_path_reason = "mssql_insert_use_bcp = false";
+	} else {
+		for (auto col_idx : target.insert_column_indices) {
+			if (mssql_columns[col_idx].is_identity) {
+				bulk.statement_path_reason = "explicit identity column '" + mssql_columns[col_idx].name + "'";
+				break;
+			}
+		}
+	}
+	if (bulk.statement_path_reason.empty()) {
+		bulk.enabled = true;
+		bulk.target.catalog_name = target.catalog_name;
+		bulk.target.schema_name = target.schema_name;
+		bulk.target.table_name = target.table_name;
+		bulk.target.DetectTempTable();
+		// COLMETADATA from the catalog's own column metadata (W3): the seven
+		// fields sys.columns gives, already loaded -- no round trip, and the
+		// same mapping COPY's query goes through.
+		for (auto col_idx : target.insert_column_indices) {
+			const auto &col = mssql_columns[col_idx];
+			bulk.columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(col.name, col.sql_type_name,
+																			  col.max_length, col.precision, col.scale,
+																			  col.is_nullable, col.collation_name));
+			// The 2.0 insert child is full-width in table order, so the chunk
+			// column of a table column IS its ordinal.
+			bulk.column_mapping.push_back(static_cast<int32_t>(col_idx));
+		}
+		// The mssql_copy_* settings describe the load, not the statement that
+		// started it (spec 062 F7): batch size, TABLOCK policy, writer count.
+		const auto copy_config = mssql::LoadBCPCopyConfig(context);
+		bulk.flush_rows = copy_config.flush_rows;
+		bulk.shape = table_entry.GetIndexKind();
+		bulk.tablock = MSSQLResolveTablock(copy_config.tablock_choice, bulk.shape);
+		// An INSERT checks constraints, fires triggers and keeps its NULLs; a
+		// bulk load does none of that unless told (InsertBulkHints).
+		bulk.insert_bulk_sql = mssql::BuildInsertBulkSql(bulk.target, bulk.columns, bulk.tablock, bulk.flush_rows,
+														 mssql::InsertBulkHints::StatementSemantics());
+		Value pw;
+		if (context.TryGetCurrentSetting("mssql_copy_parallel_writers", pw)) {
+			bulk.configured_writers = pw.GetValue<int64_t>();
+		}
+	}
+
 	// Determine result types
 	vector<LogicalType> result_types;
 	if (op.return_chunk) {
@@ -724,8 +783,9 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	}
 
 	// Create the physical operator using planner.Make<T>()
-	auto &physical_insert = planner.Make<MSSQLPhysicalInsert>(std::move(result_types), op.estimated_cardinality,
-															  std::move(target), std::move(config), op.return_chunk);
+	auto &physical_insert =
+		planner.Make<MSSQLPhysicalInsert>(std::move(result_types), op.estimated_cardinality, std::move(target),
+										  std::move(config), op.return_chunk, std::move(bulk));
 
 	// Add child operator if present
 	if (plan) {
