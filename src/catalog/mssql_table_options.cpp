@@ -82,11 +82,13 @@ void MSSQLTableOptions::ApplyWithClause(const case_insensitive_map_t<unique_ptr<
 		if (!entry.second || entry.second->GetExpressionClass() != ExpressionClass::CONSTANT) {
 			throw InvalidInputException("MSSQL: table option '%s' must be a constant", entry.first);
 		}
-		auto &constant = entry.second->Cast<ConstantExpression>();
-		if (constant.GetValue().IsNull()) {
+		// DuckDB v2.0 (d673cf9): a parsed constant is a Literal -- the query
+		// text's atom -- not a Value; ToValue() binds it for the string we need.
+		auto &literal = entry.second->Cast<ConstantExpression>().GetLiteral();
+		if (literal.IsNull()) {
 			throw InvalidInputException("MSSQL: table option '%s' must not be NULL", entry.first);
 		}
-		ApplyOption(entry.first, constant.GetValue().ToString());
+		ApplyOption(entry.first, literal.ToValue().ToString());
 	}
 }
 
