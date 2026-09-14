@@ -187,6 +187,11 @@ private:
 	// race vs TransactionContext::Commit) nor a raw catalog pointer.
 	weak_ptr<tds::ConnectionPool> pool_handle_;
 	bool transaction_pinned_;
+	// Spec 075: set once ExecuteBatch has accepted the batch. The destructor
+	// closes a non-Idle connection only when it was THIS stream that put it in
+	// that state -- a stream whose Initialize was refused because the pinned
+	// connection was busy must not close it under the stream that owns it.
+	bool batch_sent_ = false;
 	//! `mssql_reset_connection` (issue #189). Captured here, not read in the
 	//! destructor: this is a release path, and it is THE release path for every
 	//! `mssql_scan` and table scan — the one that decides whether a `##temp`

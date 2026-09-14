@@ -3,6 +3,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "tds/tds_column_metadata.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_token_parser.hpp"
 
@@ -37,6 +38,10 @@ struct SimpleQueryResult {
 	uint32_t error_number = 0;
 
 	std::vector<std::string> column_names;
+	//! The COLMETADATA of every result set the batch produced, in order
+	//! (spec 075): a T-SQL sp_prepare batch answers with the prepared
+	//! statement's shape as a zero-row result set before the handle's row.
+	std::vector<std::vector<tds::ColumnMetadata>> result_sets;
 	std::vector<std::vector<std::string>> rows;
 
 	// Affected row count from DONE token (for DML operations)

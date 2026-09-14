@@ -27,6 +27,20 @@ namespace duckdb {
 // mssql_scan - Scan SQL Server data
 //===----------------------------------------------------------------------===//
 
+//! Spec 075: an sp_prepare handle lives in ONE session. In autocommit that
+//! session is a pooled connection held from Bind to InitGlobal and returned to
+//! the pool when the bind data dies -- the handle goes with the session reset,
+//! nothing is sent. In a transaction the session is the pinned connection and
+//! nothing is held here beyond the handle. Shared, because FunctionData::Copy
+//! shares.
+struct MSSQLPreparedSession {
+	int32_t handle = 0;
+	std::shared_ptr<tds::TdsConnection> connection;	 // empty inside a transaction
+	weak_ptr<tds::ConnectionPool> pool_handle;
+	bool reset_on_release = true;
+	~MSSQLPreparedSession();
+};
+
 struct MSSQLScanBindData : public FunctionData {
 	string context_name;
 	string query;
@@ -59,6 +73,19 @@ struct MSSQLScanBindData : public FunctionData {
 	// shared_ptr because FunctionData::Copy has to share it rather than duplicate
 	// the rows.
 	shared_ptr<ColumnDataCollection> materialized;
+
+	// Spec 075 (W1/W2): Bind asks sp_describe_first_result_set for the shape --
+	// or, with `prepared := true`, sp_prepare, whose answer carries it -- and
+	// the query itself runs at InitGlobal. `execute_sql` is what InitGlobal
+	// sends: the query, the sp_executesql batch of mssql_scan_params, or
+	// `EXEC sp_execute <handle>`.
+	string execute_sql;
+	bool prepared = false;
+	shared_ptr<MSSQLPreparedSession> prepared_session;
+	// The F1 fallback: the describe could not settle the shape (a batch with a
+	// temp table, a procedure, dynamic SQL) and Bind executed as it always had;
+	// result_stream_id / materialized are then set exactly as before.
+	bool executed_at_bind = false;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

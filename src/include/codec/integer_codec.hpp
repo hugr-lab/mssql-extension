@@ -69,6 +69,20 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
 size_t EstimateLiteralSize(const LogicalType &type);
 
+//! Does this value fit T-SQL's decimal(38,0), i.e. +/-(10^38 - 1)?
+//!
+//! HUGEINT reaches ~1.70e38 and UHUGEINT ~3.40e38 -- 39 digits -- so both can
+//! carry a value no SQL Server exact numeric can hold (#177). The BCP encoder
+//! has enforced this since #177; `mssql_scan_params` needs the same rule for a
+//! parameter DECLARE, so the rule lives here once and each caller words its own
+//! error (a column and a parameter do not read the same).
+//!
+//! Bounds both ends rather than negating the input: Hugeint::Negate on HUGEINT
+//! min (-2^127) is itself out of int128 range, so an abs-then-compare lets that
+//! one value slip -- the bug the #177 comment records.
+bool HugeintFitsDecimal38(const hugeint_t &value);
+bool UhugeintFitsDecimal38(const uhugeint_t &value);
+
 }  // namespace integer
 }  // namespace codec
 }  // namespace mssql

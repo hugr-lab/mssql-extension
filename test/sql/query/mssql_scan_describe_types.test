@@ -1,0 +1,115 @@
+# name: test/sql/query/mssql_scan_describe_types.test
+# description: the shape sp_describe_first_result_set gives mssql_scan agrees with the stream's COLMETADATA for every type (spec 075)
+# group: [mssql]
+# issue: 336
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The describe's rows are turned into the COLMETADATA the server would send
+# and mapped by the stream's own converter (TypeConverter::GetDuckDBType), so
+# the two paths agree by construction; InitGlobal fails the scan if they ever
+# disagree, and this file is where a disagreement would first show. The
+# catalog's mapping (MapSQLServerTypeToDuckDB) is NOT used here: it reports
+# datetime2(3/7) as TIMESTAMP_MS/NS and rowversion as VARCHAR, which the stream
+# does not.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dt75 (TYPE mssql);
+
+# Every type the extension reads, as one SELECT, through the describe...
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS tinyint) AS c_tinyint, CAST(2 AS smallint) AS c_smallint, CAST(3 AS int) AS c_int, CAST(4 AS bigint) AS c_bigint, CAST(1 AS bit) AS c_bit, CAST(1.5 AS float) AS c_float, CAST(2.5 AS real) AS c_real, CAST(12.34 AS decimal(10,2)) AS c_decimal, CAST(5 AS numeric(5,0)) AS c_numeric, CAST(9.99 AS money) AS c_money, CAST(1.11 AS smallmoney) AS c_smallmoney, CAST(''ab'' AS char(2)) AS c_char, CAST(''ab'' AS varchar(10)) AS c_varchar, CAST(''ab'' AS varchar(max)) AS c_varchar_max, CAST(N''ab'' AS nchar(2)) AS c_nchar, CAST(N''ab'' AS nvarchar(10)) AS c_nvarchar, CAST(N''ab'' AS nvarchar(max)) AS c_nvarchar_max, CAST(''x'' AS text) AS c_text, CAST(N''x'' AS ntext) AS c_ntext, CAST(0x01 AS binary(1)) AS c_binary, CAST(0x0102 AS varbinary(10)) AS c_varbinary, CAST(0x0102 AS varbinary(max)) AS c_varbinary_max, CAST(0x01 AS image) AS c_image, CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS c_uuid, CAST(''2024-01-02'' AS date) AS c_date, CAST(''12:34:56'' AS time) AS c_time, CAST(''12:34:56'' AS time(0)) AS c_time0, CAST(''2024-01-02 12:34:56'' AS datetime) AS c_datetime, CAST(''2024-01-02 12:34:56'' AS smalldatetime) AS c_smalldatetime, CAST(''2024-01-02 12:34:56'' AS datetime2) AS c_datetime2, CAST(''2024-01-02 12:34:56'' AS datetime2(0)) AS c_datetime2_0, CAST(''2024-01-02 12:34:56'' AS datetime2(3)) AS c_datetime2_3, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset) AS c_dto, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset(3)) AS c_dto3, CAST(''<a/>'' AS xml) AS c_xml, CAST(NULL AS bigint) AS c_null_bigint, CAST(NULL AS decimal(9,3)) AS c_null_decimal, 1 + 1 AS c_expr'));
+----
+c_tinyint	UTINYINT
+c_smallint	SMALLINT
+c_int	INTEGER
+c_bigint	BIGINT
+c_bit	BOOLEAN
+c_float	DOUBLE
+c_real	FLOAT
+c_decimal	DECIMAL(10,2)
+c_numeric	DECIMAL(5,0)
+c_money	DECIMAL(19,4)
+c_smallmoney	DECIMAL(10,4)
+c_char	VARCHAR
+c_varchar	VARCHAR
+c_varchar_max	VARCHAR
+c_nchar	VARCHAR
+c_nvarchar	VARCHAR
+c_nvarchar_max	VARCHAR
+c_text	VARCHAR
+c_ntext	VARCHAR
+c_binary	BLOB
+c_varbinary	BLOB
+c_varbinary_max	BLOB
+c_image	BLOB
+c_uuid	UUID
+c_date	DATE
+c_time	TIME
+c_time0	TIME
+c_datetime	TIMESTAMP
+c_smalldatetime	TIMESTAMP
+c_datetime2	TIMESTAMP
+c_datetime2_0	TIMESTAMP
+c_datetime2_3	TIMESTAMP
+c_dto	TIMESTAMP WITH TIME ZONE
+c_dto3	TIMESTAMP WITH TIME ZONE
+c_xml	VARCHAR
+c_null_bigint	BIGINT
+c_null_decimal	DECIMAL(9,3)
+c_expr	INTEGER
+
+# ... and through the prepare's COLMETADATA: the same shape, column for column.
+query I
+SELECT count(*) FROM (
+  SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS tinyint) AS c_tinyint, CAST(2 AS smallint) AS c_smallint, CAST(3 AS int) AS c_int, CAST(4 AS bigint) AS c_bigint, CAST(1 AS bit) AS c_bit, CAST(1.5 AS float) AS c_float, CAST(2.5 AS real) AS c_real, CAST(12.34 AS decimal(10,2)) AS c_decimal, CAST(5 AS numeric(5,0)) AS c_numeric, CAST(9.99 AS money) AS c_money, CAST(1.11 AS smallmoney) AS c_smallmoney, CAST(''ab'' AS char(2)) AS c_char, CAST(''ab'' AS varchar(10)) AS c_varchar, CAST(''ab'' AS varchar(max)) AS c_varchar_max, CAST(N''ab'' AS nchar(2)) AS c_nchar, CAST(N''ab'' AS nvarchar(10)) AS c_nvarchar, CAST(N''ab'' AS nvarchar(max)) AS c_nvarchar_max, CAST(''x'' AS text) AS c_text, CAST(N''x'' AS ntext) AS c_ntext, CAST(0x01 AS binary(1)) AS c_binary, CAST(0x0102 AS varbinary(10)) AS c_varbinary, CAST(0x0102 AS varbinary(max)) AS c_varbinary_max, CAST(0x01 AS image) AS c_image, CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS c_uuid, CAST(''2024-01-02'' AS date) AS c_date, CAST(''12:34:56'' AS time) AS c_time, CAST(''12:34:56'' AS time(0)) AS c_time0, CAST(''2024-01-02 12:34:56'' AS datetime) AS c_datetime, CAST(''2024-01-02 12:34:56'' AS smalldatetime) AS c_smalldatetime, CAST(''2024-01-02 12:34:56'' AS datetime2) AS c_datetime2, CAST(''2024-01-02 12:34:56'' AS datetime2(0)) AS c_datetime2_0, CAST(''2024-01-02 12:34:56'' AS datetime2(3)) AS c_datetime2_3, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset) AS c_dto, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset(3)) AS c_dto3, CAST(''<a/>'' AS xml) AS c_xml, CAST(NULL AS bigint) AS c_null_bigint, CAST(NULL AS decimal(9,3)) AS c_null_decimal, 1 + 1 AS c_expr', prepared := true))
+  EXCEPT
+  SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS tinyint) AS c_tinyint, CAST(2 AS smallint) AS c_smallint, CAST(3 AS int) AS c_int, CAST(4 AS bigint) AS c_bigint, CAST(1 AS bit) AS c_bit, CAST(1.5 AS float) AS c_float, CAST(2.5 AS real) AS c_real, CAST(12.34 AS decimal(10,2)) AS c_decimal, CAST(5 AS numeric(5,0)) AS c_numeric, CAST(9.99 AS money) AS c_money, CAST(1.11 AS smallmoney) AS c_smallmoney, CAST(''ab'' AS char(2)) AS c_char, CAST(''ab'' AS varchar(10)) AS c_varchar, CAST(''ab'' AS varchar(max)) AS c_varchar_max, CAST(N''ab'' AS nchar(2)) AS c_nchar, CAST(N''ab'' AS nvarchar(10)) AS c_nvarchar, CAST(N''ab'' AS nvarchar(max)) AS c_nvarchar_max, CAST(''x'' AS text) AS c_text, CAST(N''x'' AS ntext) AS c_ntext, CAST(0x01 AS binary(1)) AS c_binary, CAST(0x0102 AS varbinary(10)) AS c_varbinary, CAST(0x0102 AS varbinary(max)) AS c_varbinary_max, CAST(0x01 AS image) AS c_image, CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS c_uuid, CAST(''2024-01-02'' AS date) AS c_date, CAST(''12:34:56'' AS time) AS c_time, CAST(''12:34:56'' AS time(0)) AS c_time0, CAST(''2024-01-02 12:34:56'' AS datetime) AS c_datetime, CAST(''2024-01-02 12:34:56'' AS smalldatetime) AS c_smalldatetime, CAST(''2024-01-02 12:34:56'' AS datetime2) AS c_datetime2, CAST(''2024-01-02 12:34:56'' AS datetime2(0)) AS c_datetime2_0, CAST(''2024-01-02 12:34:56'' AS datetime2(3)) AS c_datetime2_3, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset) AS c_dto, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset(3)) AS c_dto3, CAST(''<a/>'' AS xml) AS c_xml, CAST(NULL AS bigint) AS c_null_bigint, CAST(NULL AS decimal(9,3)) AS c_null_decimal, 1 + 1 AS c_expr'))
+);
+----
+0
+
+# The values arrive through both paths -- which is InitGlobal's check passing
+# on every column above, since a described type the stream disagrees with
+# fails the scan.
+query IIIIIIIII
+SELECT c_int, c_decimal, c_money, c_char, c_varbinary, c_uuid, c_datetime2, c_dto, c_xml FROM mssql_scan('dt75', 'SELECT CAST(3 AS int) AS c_int, CAST(12.34 AS decimal(10,2)) AS c_decimal, CAST(9.99 AS money) AS c_money, CAST(N''ab'' AS nvarchar(2)) AS c_char, CAST(0x0102 AS varbinary(10)) AS c_varbinary, CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS c_uuid, CAST(''2024-01-02 12:34:56.1234567'' AS datetime2) AS c_datetime2, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset) AS c_dto, CAST(''<a/>'' AS xml) AS c_xml');
+----
+3	12.34	9.9900	ab	\x01\x02	6f9619ff-8b86-d011-b42d-00c04fc964ff	2024-01-02 12:34:56.123456	2024-01-02 10:34:56+00	<a/>
+
+query IIIIIIIII
+SELECT c_int, c_decimal, c_money, c_char, c_varbinary, c_uuid, c_datetime2, c_dto, c_xml FROM mssql_scan('dt75', 'SELECT CAST(3 AS int) AS c_int, CAST(12.34 AS decimal(10,2)) AS c_decimal, CAST(9.99 AS money) AS c_money, CAST(N''ab'' AS nvarchar(2)) AS c_char, CAST(0x0102 AS varbinary(10)) AS c_varbinary, CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS c_uuid, CAST(''2024-01-02 12:34:56.1234567'' AS datetime2) AS c_datetime2, CAST(''2024-01-02 12:34:56 +02:00'' AS datetimeoffset) AS c_dto, CAST(''<a/>'' AS xml) AS c_xml', prepared := true);
+----
+3	12.34	9.9900	ab	\x01\x02	6f9619ff-8b86-d011-b42d-00c04fc964ff	2024-01-02 12:34:56.123456	2024-01-02 10:34:56+00	<a/>
+
+# rowversion is binary(8) on the wire: BLOB, as the stream has always read it
+# (the catalog's mapping would say VARCHAR, and the init check would fail).
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('dt75', 'SELECT CAST(0x0000000000000001 AS timestamp) AS c_rowversion'));
+----
+c_rowversion	BLOB
+
+query I
+SELECT c_rowversion FROM mssql_scan('dt75', 'SELECT CAST(0x0000000000000001 AS timestamp) AS c_rowversion');
+----
+\x00\x00\x00\x00\x00\x00\x00\x01
+
+# The types the stream refuses are refused at bind with the stream's message,
+# as before spec 075 -- not at init with a closed connection.
+statement error
+SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v');
+----
+Unsupported SQL Server type
+
+statement error
+SELECT * FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1/'') AS h');
+----
+Unsupported SQL Server type
+
+statement ok
+DETACH dt75;

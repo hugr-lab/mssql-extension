@@ -1,0 +1,281 @@
+# name: test/sql/query/mssql_params.test
+# description: mssql_scan_params / mssql_exec_params -- parameters as sp_executesql variables (spec 075 W5)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# {'p': <value>} becomes `DECLARE @p <type> = <literal>; EXEC sp_executesql
+# N'<statement>', N'@p <type>', @p = @p`. The declaration follows W5's table
+# (below, one row per type); the server keys its plan on the statement text and
+# the declarations, so the values never enter the compiled text.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS pm75 (TYPE mssql);
+
+# --- W5's table: the value comes back through its declared type
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': true})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': true});
+----
+BOOLEAN	true
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': (-1)::TINYINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': (-1)::TINYINT});
+----
+SMALLINT	-1
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 200::UTINYINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 200::UTINYINT});
+----
+UTINYINT	200
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 3::SMALLINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 3::SMALLINT});
+----
+SMALLINT	3
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 4})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 4});
+----
+INTEGER	4
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 5::BIGINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 5::BIGINT});
+----
+BIGINT	5
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 4000000000::UINTEGER})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 4000000000::UINTEGER});
+----
+BIGINT	4000000000
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 18446744073709551615::UBIGINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 18446744073709551615::UBIGINT});
+----
+DECIMAL(20,0)	18446744073709551615
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 8::HUGEINT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 8::HUGEINT});
+----
+DECIMAL(38,0)	8
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 1.5::FLOAT})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 1.5::FLOAT});
+----
+FLOAT	1.5
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 2.5::DOUBLE})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 2.5::DOUBLE});
+----
+DOUBLE	2.5
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 12.34::DECIMAL(10,2)})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 12.34::DECIMAL(10,2)});
+----
+DECIMAL(10,2)	12.34
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': DATE '2024-01-02'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': DATE '2024-01-02'});
+----
+DATE	2024-01-02
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIME '12:34:56.123456'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIME '12:34:56.123456'});
+----
+TIME	12:34:56.123456
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP '2024-01-02 12:34:56.123456'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP '2024-01-02 12:34:56.123456'});
+----
+TIMESTAMP	2024-01-02 12:34:56.123456
+
+# TIMESTAMP_S / _MS / _NS declare datetime2(0/3/7); the result column is the
+# stream's TIMESTAMP, as for every datetime2 mssql_scan reads.
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_MS '2024-01-02 12:34:56.123'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_MS '2024-01-02 12:34:56.123'});
+----
+TIMESTAMP	2024-01-02 12:34:56.123
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_S '2024-01-02 12:34:56'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_S '2024-01-02 12:34:56'});
+----
+TIMESTAMP	2024-01-02 12:34:56
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_NS '2024-01-02 12:34:56.123456789'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMP_NS '2024-01-02 12:34:56.123456789'});
+----
+TIMESTAMP	2024-01-02 12:34:56.123456
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMPTZ '2024-01-02 12:34:56.123456+02'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': TIMESTAMPTZ '2024-01-02 12:34:56.123456+02'});
+----
+TIMESTAMP WITH TIME ZONE	2024-01-02 10:34:56.123456+00
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': '\x01\x02'::BLOB})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': '\x01\x02'::BLOB});
+----
+BLOB	\x01\x02
+
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': '6f9619ff-8b86-d011-b42d-00c04fc964ff'::UUID})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': '6f9619ff-8b86-d011-b42d-00c04fc964ff'::UUID});
+----
+UUID	6f9619ff-8b86-d011-b42d-00c04fc964ff
+
+# A string with a quote, a bracket and a non-ASCII character: nvarchar(4000)
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 'it''s [a] ünïcode'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 'it''s [a] ünïcode'});
+----
+VARCHAR	it's [a] ünïcode
+
+# Past 4000 bytes the declaration is nvarchar(max)
+query I
+SELECT length(v) FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': repeat('x', 5000)});
+----
+5000
+
+# MSSQL_VARCHAR(20) declares varchar(20)
+query I
+SELECT v FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 'abc'::MSSQL_VARCHAR(20)});
+----
+abc
+
+query I
+SELECT v FROM mssql_scan_params('pm75', 'SELECT DATALENGTH(@p) AS v', {'p': 'abc'::MSSQL_VARCHAR(20)});
+----
+3
+
+# A typed NULL travels as NULL of that type
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': NULL::INTEGER})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': NULL::INTEGER});
+----
+INTEGER	NULL
+
+# --- the declaration override
+query II
+SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @ts AS v', {'ts': TIMESTAMP '2024-01-02 12:34:56'}, '@ts datetime')) CROSS JOIN mssql_scan_params('pm75', 'SELECT @ts AS v', {'ts': TIMESTAMP '2024-01-02 12:34:56'}, '@ts datetime');
+----
+TIMESTAMP	2024-01-02 12:34:56
+
+query I
+SELECT v FROM mssql_scan_params('pm75', 'SELECT DATALENGTH(@c) AS v', {'c': 'AB'}, '@c varchar(8)');
+----
+2
+
+query I
+SELECT v FROM mssql_scan_params('pm75', 'SELECT @d + @n AS v', {'d': 1.5::DECIMAL(10,2), 'n': 2}, '@d decimal(10,2), @n int');
+----
+3.50
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 1}, '@q int');
+----
+parameter 'p' has a value but no declaration in '@q int'
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 1, 'q': 2}, '@p int');
+----
+parameter 'q' has a value but no declaration in '@p int'
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 1}, 'p int');
+----
+declaration 'p int' must start with '@name'
+
+# --- refused at bind, with the fix named
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': NULL});
+----
+parameter 'p' is NULL of no type; cast it to the column's type, e.g. NULL::INTEGER
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': [1, 2]});
+----
+a table-valued parameter needs RPC
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'my p': 1});
+----
+parameter name 'my p' is not a T-SQL identifier
+
+statement error
+SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', 5);
+----
+parameters must be a STRUCT of name -> value
+
+statement error
+SELECT mssql_exec_params('pm75', 'SELECT 1', 5);
+----
+the parameters must be a STRUCT of name -> value
+
+# --- mssql_exec_params: one round trip per row, the affected count back
+statement ok
+SELECT mssql_exec('pm75', 'IF OBJECT_ID(''dbo.pm75_t'') IS NOT NULL DROP TABLE dbo.pm75_t; CREATE TABLE dbo.pm75_t(id int NOT NULL, v nvarchar(20) NULL, ts datetime2(6) NULL)');
+
+query I
+SELECT mssql_exec_params('pm75', 'INSERT INTO dbo.pm75_t (id, v, ts) VALUES (@id, @v, @ts)', {'id': i, 'v': 'r' || i, 'ts': TIMESTAMP '2024-01-02 03:04:05.000006'}) FROM range(1, 4) t(i);
+----
+1
+1
+1
+
+query I
+SELECT mssql_exec_params('pm75', 'UPDATE dbo.pm75_t SET v = @v WHERE id > @id', {'id': 1, 'v': 'upd'});
+----
+2
+
+query III
+SELECT id, v, ts FROM mssql_scan_params('pm75', 'SELECT id, v, ts FROM dbo.pm75_t WHERE id >= @id ORDER BY id', {'id': 2});
+----
+2	upd	2024-01-02 03:04:05.000006
+3	upd	2024-01-02 03:04:05.000006
+
+# NULL parameter into a nullable column
+query I
+SELECT mssql_exec_params('pm75', 'UPDATE dbo.pm75_t SET v = @v WHERE id = @id', {'id': 3, 'v': NULL::VARCHAR});
+----
+1
+
+query I
+SELECT v IS NULL FROM mssql_scan_params('pm75', 'SELECT v FROM dbo.pm75_t WHERE id = @id', {'id': 3});
+----
+true
+
+# --- with prepared := true: sp_prepare takes the declarations, sp_execute the values
+query II
+SELECT id, v FROM mssql_scan_params('pm75', 'SELECT id, v FROM dbo.pm75_t WHERE id <= @id ORDER BY id', {'id': 2}, prepared := true);
+----
+1	r1
+2	upd
+
+# --- inside a transaction: both forms, two scans in one statement
+statement ok
+BEGIN;
+
+query I
+SELECT mssql_exec_params('pm75', 'INSERT INTO dbo.pm75_t (id, v) VALUES (@id, @v)', {'id': 4, 'v': 'in txn'});
+----
+1
+
+query II
+SELECT t1.v, t2.v FROM mssql_scan_params('pm75', 'SELECT v FROM dbo.pm75_t WHERE id = @id', {'id': 1}) t1,
+                       mssql_scan_params('pm75', 'SELECT v FROM dbo.pm75_t WHERE id = @id', {'id': 4}, prepared := true) t2;
+----
+r1	in txn
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM mssql_scan_params('pm75', 'SELECT id FROM dbo.pm75_t WHERE id = @id', {'id': 4});
+----
+0
+
+statement ok
+SELECT mssql_exec('pm75', 'DROP TABLE dbo.pm75_t');
+
+statement ok
+DETACH pm75;
