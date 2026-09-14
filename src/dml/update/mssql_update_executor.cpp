@@ -6,6 +6,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "dml/mssql_dml_outcome.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "dml/update/mssql_update_statement.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -123,6 +124,15 @@ MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 		}
 	}
 
+	// Every batch is in: one COMMIT for the statement (a no-op inside a DuckDB
+	// transaction, and when no batch was ever sent).
+	try {
+		auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
+		stmt_conn_.Commit(context_, catalog.Cast<MSSQLCatalog>());
+	} catch (const std::exception &e) {
+		return MSSQLDMLResult::Failure(string("UPDATE failed: ") + e.what(), 0, batch_count_);
+	}
+
 	UPDATE_DEBUG(1, "Finalize: done, total_updated=%llu, batch_count=%llu", (unsigned long long)total_rows_updated_,
 				 (unsigned long long)batch_count_);
 	return MSSQLDMLResult::Success(total_rows_updated_, batch_count_);
@@ -209,12 +219,10 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
-	// Acquire connection via ConnectionProvider (handles transaction pinning)
-	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
-	if (!connection) {
-		UPDATE_DEBUG(1, "ExecuteBatch: failed to acquire connection");
-		throw IOException("Failed to acquire connection for UPDATE execution");
-	}
+	// The statement's one connection -- pinned inside a DuckDB transaction,
+	// else a pool connection with the statement's own server transaction begun
+	// on it (spec 062 W1c). Throws when none can be had.
+	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
 
 	UPDATE_DEBUG(2, "ExecuteBatch: connection acquired");
 
@@ -225,7 +233,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			UPDATE_DEBUG(1, "ExecuteBatch: socket is null");
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
 			throw IOException("Connection socket is null");
 		}
 
@@ -237,7 +245,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 		if (!connection->ExecuteBatch(sql)) {
 			string error = connection->GetLastError();
 			UPDATE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
 			throw IOException("UPDATE execution failed: %s", error);
 		}
 
@@ -261,7 +269,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 				UPDATE_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				stmt_conn_.Fail(context_, mssql_catalog);
 				throw IOException("UPDATE execution timeout");
 			}
 
@@ -273,7 +281,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 			if (!socket->ReceivePacket(packet, recv_timeout)) {
 				string socket_error = socket->GetLastError();
 				UPDATE_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s'", socket_error.c_str());
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				stmt_conn_.Fail(context_, mssql_catalog);
 				throw IOException("Failed to receive TDS packet: %s", socket_error);
 			}
 
@@ -360,29 +368,28 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 		// Check for errors
 		if (!error_message.empty()) {
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
+			// What happened to the rows: the statement's server transaction is
+			// rolled back (Fail above), or they sit in the open DuckDB
+			// transaction (issue #344, spec 062 W1c). A parse error is a
+			// client-side framing failure -- the server ran this batch -- and
+			// says so.
+			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.IsPinned(), total_rows_updated_);
 			if (error_number == 0) {
-				// A parse error is a client-side framing failure: the server ran
-				// this batch. Say so, and how far the statement had got, because
-				// in autocommit the earlier batches are already committed and
-				// there is no path back (issue #344).
-				throw IOException(
-					"UPDATE failed: %s; the server executed this batch (batch %llu), and %llu row(s) "
-					"from the %llu batch(es) before it are applied",
-					error_message, (unsigned long long)batch_count_, (unsigned long long)total_rows_updated_,
-					(unsigned long long)(batch_count_ - 1));
+				throw IOException("UPDATE failed: %s; the server executed this batch (batch %llu); %s", error_message,
+								  (unsigned long long)batch_count_, outcome);
 			}
-			throw IOException("UPDATE failed: %s", error_message);
+			throw IOException("UPDATE failed: %s; %s", error_message, outcome);
 		}
 
 	} catch (const IOException &) {
 		throw;	// Re-throw IO exceptions
 	} catch (const std::exception &e) {
-		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+		stmt_conn_.Fail(context_, mssql_catalog);
 		throw IOException("UPDATE execution failed: %s", e.what());
 	}
 
-	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+	// The connection stays with the statement until Finalize commits.
 	return rows_affected;
 }
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The catalog knows which columns are IDENTITY** (spec 062 W4, the
+  metadata half of #327). `sys.columns.is_identity` rides in the four
+  column-metadata queries and on `MSSQLColumnInfo`; the INSERT planner reads
+  it instead of hard-coding false. Not yet visible through DuckDB — the
+  binder half of #327 (omitting the column from a column-list-less INSERT)
+  needs an upstream hook — but it is what routes an INSERT that names an
+  identity column onto the statement path once INSERT goes through BCP.
+
 - **Pushed filters are parameterised** (spec 076). The constants of a pushed
   filter travel as `sp_executesql` parameters declared from the column they
   are compared with, so the statement text is one fixed string per filter
@@ -60,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than one statement — degrades to the default path.
 
 ### Changed
+
+- **No INSERT statement carries more than 1000 constants** (spec 062 W1b).
+  SQL Server auto-parameterises a multi-row `VALUES` INSERT — one cached
+  plan per (table, column list, row count), compiled once — only up to 1000
+  constants; past that every statement compiles its own ad-hoc plan and
+  leaves it in the cache. The default of 1000 rows per statement put every
+  table with two or more columns past the line: a 1M-row `INSERT … SELECT`
+  into a 3-column table cost 74 s, 70 µs a row, all of it compile. Rows per
+  statement are now `min(mssql_insert_batch_size, 1000 / columns)` — 333 for
+  three columns, at 14 µs a row (measured 5.5× at the boundary). This is the
+  statement path only; the bulk path is spec 062's main work.
 
 - **One bulk-load session type for every writer** (spec 062 W0). COPY's and
   CTAS's shared writer — the one on the operator's own connection — ran their
@@ -130,6 +149,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the catalog lifecycle and the per-catalog pool.
 
 ### Fixed
+
+- **A failed INSERT, UPDATE or DELETE leaves the table as it was** (spec 062
+  W1c, closes #344). The three statement executors took a pool connection
+  per batch in autocommit, and each batch committed on its own, so a failure
+  in batch K left batches 1..K-1 applied with no way back; the interim of
+  #344 could only say so in the message. A statement now runs on ONE
+  connection — the pinned one inside a DuckDB transaction — and in
+  autocommit brackets its batches in a server transaction of its own:
+  `BEGIN TRANSACTION` before the first, `COMMIT` after the last, `ROLLBACK`
+  on any failure. The message says what happened to the rows: `rolled back`
+  in autocommit, or that they sit in the open transaction until its
+  `ROLLBACK`.
 
 - **Two reads of one catalog inside a transaction** (spec 075, #329). Two
   `mssql_scan` calls in one statement, or an `mssql_scan` beside a catalog

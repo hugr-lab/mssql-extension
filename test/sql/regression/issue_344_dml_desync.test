@@ -1,5 +1,5 @@
 # name: test/sql/regression/issue_344_dml_desync.test
-# description: a TDS desync in a DML response is reported, names what the server did, and never hangs (issues #323, #344)
+# description: a TDS desync in a DML response is reported, names what the server did, never hangs -- and leaves the table as it was (issues #323, #344; spec 062 W1c)
 # group: [mssql]
 # issue: 344
 
@@ -15,16 +15,20 @@
 # the full 30 s and then blamed the socket.
 #
 # A desync is a client-side framing failure -- by the time it is noticed the
-# server has run the batch -- and in autocommit every batch is its own
-# committed statement (#344, decided: report it, say how far it got, no
-# compensation; the batches themselves go with spec 062 / 066). So each case
-# below checks two things: the statement fails naming the desync and what was
-# executed, and the rows the server DID apply are there afterwards.
+# server has run the batch. Until spec 062 W1c every batch was its own committed
+# statement in autocommit, so a failure in batch K left batches 1..K-1 applied
+# and the message could only say so (#344). Now a statement runs on ONE
+# connection inside ONE server transaction: the failing batch and every batch
+# before it are rolled back together, and the message says that. So each case
+# below checks three things: the statement fails naming the desync and what was
+# executed, it says the rows were rolled back, and the table is exactly as it
+# was.
 #
 # mssql_test_fail_parse_after_tokens is the lever: a desync cannot be induced
 # from SQL since spec 072, so the loops put their parser into Error after N
 # tokens themselves, as a framing error would. The counts below depend on the
-# batch sizes: mssql_dml_batch_size = 500, mssql_insert_batch_size = 1000.
+# batch sizes: mssql_dml_batch_size = 500; INSERT statements carry at most
+# 1000 constants (spec 062 W1b), 500 rows for this two-column table.
 
 require mssql
 
@@ -49,7 +53,7 @@ SELECT count(*) FROM i344.dbo.i344;
 
 # --- UPDATE: 1200 rows = batches of 500, 500, 200. The first batch's response
 # desyncs at its first token: the statement fails, names the batch, and the
-# 500 rows of that batch ARE updated -- the server ran it.
+# 500 rows the server DID update are rolled back with the statement.
 statement ok
 SET mssql_test_fail_parse_after_tokens = 1;
 
@@ -61,31 +65,32 @@ TDS parse error
 statement error
 UPDATE i344.dbo.i344 SET n = 2;
 ----
-the server executed this batch (batch 1)
+the server executed this batch (batch 1); rolled back
 
 statement ok
 SET mssql_test_fail_parse_after_tokens = 0;
 
-# two failed statements above, each ran its first batch: rows 1-500 twice
+# two failed statements above, each ran its first batch and rolled it back
 query I
 SELECT count(*) FROM i344.dbo.i344 WHERE n = 2;
 ----
-500
+0
 
 # the connection the desync happened on is usable again (drained to EOM, Idle)
 query I
 SELECT count(*) FROM i344.dbo.i344 WHERE n = 1;
 ----
-700
+1200
 
-# --- DELETE: the same shape; the first batch of 500 is gone, the rest stays.
+# --- DELETE: the same shape; the first batch of 500 was deleted on the server
+# and rolled back, nothing is gone.
 statement ok
 SET mssql_test_fail_parse_after_tokens = 1;
 
 statement error
 DELETE FROM i344.dbo.i344;
 ----
-the server executed this batch
+the server executed this batch (batch 1); rolled back
 
 statement ok
 SET mssql_test_fail_parse_after_tokens = 0;
@@ -93,18 +98,23 @@ SET mssql_test_fail_parse_after_tokens = 0;
 query I
 SELECT count(*) FROM i344.dbo.i344;
 ----
-700
+1200
 
-# --- INSERT batch: 1200 rows = statements of 1000 and 200. Statement 0 runs
-# and its response desyncs: the error says so, without a "[0]" server code,
-# and its 1000 rows are in.
+# --- INSERT batch: 1200 rows = statements of 500, 500, 200 (two columns,
+# 1000 constants each). Statement 0 runs and its response desyncs: the error
+# says so, without a "[0]" server code, and its rows are rolled back.
 statement ok
 SET mssql_test_fail_parse_after_tokens = 1;
 
 statement error
 INSERT INTO i344.dbo.i344 SELECT i, 3 FROM range(2001, 3201) t(i);
 ----
-INSERT failed at statement 0 (rows 0-999): TDS parse error
+INSERT failed at statement 0 (rows 0-499): TDS parse error
+
+statement error
+INSERT INTO i344.dbo.i344 SELECT i, 3 FROM range(2001, 3201) t(i);
+----
+the server executed this statement; rolled back
 
 statement ok
 SET mssql_test_fail_parse_after_tokens = 0;
@@ -112,11 +122,11 @@ SET mssql_test_fail_parse_after_tokens = 0;
 query I
 SELECT count(*) FROM i344.dbo.i344 WHERE n = 3;
 ----
-1000
+0
 
 # --- INSERT ... RETURNING: the loop that used to hang for its full 30 s and
 # then report the socket. It now fails at once naming the desync, and the row
-# is in.
+# is rolled back.
 statement ok
 SET mssql_test_fail_parse_after_tokens = 1;
 
@@ -131,12 +141,38 @@ SET mssql_test_fail_parse_after_tokens = 0;
 query I
 SELECT count(*) FROM i344.dbo.i344 WHERE id = 9001;
 ----
-1
+0
 
-# --- with the lever off, every path is what it was (ids 1-500 went with the
-# DELETE's first batch; 2001-3000 came in with the INSERT's first statement)
+# --- inside a DuckDB transaction the rows sit in the open transaction until
+# its ROLLBACK, and the message says so.
 statement ok
-UPDATE i344.dbo.i344 SET n = 5 WHERE id BETWEEN 2001 AND 2010;
+BEGIN;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+UPDATE i344.dbo.i344 SET n = 7;
+----
+in the open transaction
+
+# DuckDB refuses every statement in an aborted transaction until ROLLBACK, the
+# SET included.
+statement ok
+ROLLBACK;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM i344.dbo.i344 WHERE n = 7;
+----
+0
+
+# --- with the lever off, every path is what it was, and the table still holds
+# its original 1200 rows
+statement ok
+UPDATE i344.dbo.i344 SET n = 5 WHERE id BETWEEN 1 AND 10;
 
 query I
 SELECT count(*) FROM i344.dbo.i344 WHERE n = 5;
@@ -147,6 +183,11 @@ query I
 INSERT INTO i344.dbo.i344 VALUES (9002, 6) RETURNING id;
 ----
 9002
+
+query I
+SELECT count(*) FROM i344.dbo.i344;
+----
+1201
 
 statement ok
 SELECT mssql_exec('i344', 'DROP TABLE dbo.i344');
