@@ -168,12 +168,14 @@ from the filter set, not from the text.
 
 ### W2 — one round trip per first touch, one collation per ATTACH
 
-- `MSSQLTableSet::LoadSingleEntry` sends the single-table metadata query, the
-  column query and the PK query as **one batch** and reads three result sets
-  from `SimpleQueryResult::result_sets` / `rows` — the parser already
-  separates them (spec 075). `EnsurePKLoaded` then finds the PK already
-  cached on the entry and sends nothing. The bulk path
-  (`mssql_preload_catalog`) is untouched.
+- `MSSQLMetadataCache::GetTableMetadata` sends the single-table metadata
+  query (which already carries the columns) and the PK query as **one batch**
+  and routes the rows by the **ordinal** of the result set they came from
+  (`ExecuteMetadataQuerySets` / `MSSQLSimpleQuery::ExecuteWithSetCallback`),
+  never by their width — a column added to either query must not silently
+  drop every key in the catalog (review of #345). `MSSQLTableEntry` is
+  constructed with the key and `EnsurePKLoaded` sends nothing. The bulk path
+  (`mssql_preload_catalog`) is untouched and still discovers lazily.
 - `MSSQLCatalog::Initialize` is a no-op once the pool exists: the second
   call (DuckDB's `AttachedDatabase::Initialize`, after the attach callback's
   own) used to rebuild the pool, log in again and ask the collation again.
@@ -197,10 +199,13 @@ Measured target: a fresh table costs one metadata round trip before its scan
 - **`test/cpp/test_filter_encoder.cpp`**: the encoder with a sink — one
   parameter per constant in order, the declaration per W1's table, the text
   with `@pN` in place; without a sink, the text unchanged from today.
-- **`test/sql/catalog/first_touch_round_trips.test`**: a fresh table's
-  columns, PK (rowid) and row count all present after one scan; the count of
-  metadata batches is measured in the PR with `MSSQL_DEBUG=1` (§ 0.2), not
-  asserted.
+- **`test/sql/catalog/first_touch_round_trips.test`**: `mssql_pool_stats`
+  makes both halves of W2 observable, so they are asserted: `connections_created`
+  is 1 right after ATTACH (one pool, one login through it), and a fresh table
+  with a primary key costs exactly two `acquire_count` (metadata + key in one
+  batch, then the scan) where it cost three; rowid-based UPDATE and DELETE
+  work on the entry as created, for a scalar and a composite key, and a table
+  without a key still refuses `rowid`.
 - Existing: `filter_pushdown*.test`, `rowid/*`, `catalog/statistics_pushdown`
   stay green with the setting on (the default) — those are the files that
   compare rows through pushed filters.

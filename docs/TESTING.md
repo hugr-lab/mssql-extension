@@ -233,6 +233,7 @@ test/
 │   │   ├── catalog_filter.test    # Catalog filter (schema_filter/table_filter) tests
 │   │   ├── catalog_filter_sources.test # Catalog filter configuration source tests
 │   │   ├── order_pushdown.test    # ORDER BY/TOP N pushdown tests (experimental)
+│   │   ├── first_touch_round_trips.test # a fresh table's metadata + PK in one batch, ATTACH one pool (spec 076)
 │   │   ├── metadata_query_parameterized.test # names as sp_executesql parameters (spec 075)
 │   │   ├── scan_parameterized_filters.test # pushed filter constants as parameters declared from the column (spec 076)
 │   │   ├── preload_catalog.test   # mssql_preload_catalog() bulk preload tests

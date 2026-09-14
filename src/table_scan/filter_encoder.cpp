@@ -383,17 +383,28 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 			// compared in the constant's type, so declare it that way.
 			return DeclarationOfValueOrEmpty(value, type);
 		}
+		if (value_rank == 6) {
+			// HUGEINT / UHUGEINT: decimal(38,0) holds +/-(10^38 - 1) and the
+			// constant may not fit. DeclarationForValue applies the shared range
+			// check and names the parameter; the server's bare "Arithmetic
+			// overflow" is what this replaces (review of #345).
+			return mssql::DeclarationForValue("p", type, value);
+		}
 		return IntegerNameOfRank(col_rank > value_rank ? col_rank : value_rank);
 	}
 	if (t == "decimal" || t == "numeric") {
 		if (type.id() != LogicalTypeId::DECIMAL) {
 			return DeclarationOfValueOrEmpty(value, type);
 		}
-		int precision = column.precision > DecimalType::GetWidth(type) ? column.precision : DecimalType::GetWidth(type);
-		int scale = column.scale > DecimalType::GetScale(type) ? column.scale : DecimalType::GetScale(type);
-		if (precision < scale) {
-			precision = scale;
-		}
+		// Never narrower than either side in BOTH dimensions: the wider scale,
+		// and enough precision for the wider INTEGER part on top of it. Taking
+		// the two maxima independently lost integer digits -- decimal(10,8)
+		// against a DECIMAL(11,1) constant gave decimal(11,8), three digits for
+		// a constant that needs ten (review of #345).
+		const int col_int = column.precision - column.scale;
+		const int val_int = DecimalType::GetWidth(type) - DecimalType::GetScale(type);
+		const int scale = column.scale > DecimalType::GetScale(type) ? column.scale : DecimalType::GetScale(type);
+		int precision = (col_int > val_int ? col_int : val_int) + scale;
 		if (precision > 38) {
 			precision = 38;
 		}
@@ -524,6 +535,19 @@ static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const Expr
 	} else if (binding.column_index < ctx.column_ids.size()) {
 		table_col_idx = ctx.column_ids[binding.column_index];
 	} else {
+		return nullptr;
+	}
+	if (table_col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+		// rowid IS the scalar primary-key column (EncodeColumnRef renders it as
+		// such), so a constant compared with it is declared from that column --
+		// a varchar key stays varchar (review of #345).
+		if (ctx.HasPKInfo() && !ctx.pk_is_composite) {
+			for (const auto &col : *ctx.mssql_columns) {
+				if (col.name == (*ctx.pk_column_names)[0]) {
+					return &col;
+				}
+			}
+		}
 		return nullptr;
 	}
 	if (table_col_idx < ctx.mssql_columns->size()) {
@@ -838,6 +862,19 @@ ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &ex
 //------------------------------------------------------------------------------
 
 ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	// Spec 076: constants register themselves in the sink as they are met, so
+	// an expression refused halfway (a comparison whose other side does not
+	// encode) would leave its parameters in the DECLARE line -- unused, and a
+	// different text per value for nothing. Roll them back on refusal.
+	const size_t mark = ctx.params ? ctx.params->params.size() : 0;
+	auto result = EncodeExpressionImpl(expr, ctx);
+	if (!result.supported && ctx.params && ctx.params->params.size() > mark) {
+		ctx.params->params.resize(mark);
+	}
+	return result;
+}
+
+ExpressionEncodeResult FilterEncoder::EncodeExpressionImpl(const Expression &expr, const ExpressionEncodeContext &ctx) {
 	// Check recursion depth
 	if (ctx.at_max_depth()) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeExpression: max depth reached");

@@ -235,6 +235,9 @@ public:
 	 * be represented as simple TableFilter objects (e.g., year(col) = 2024).
 	 */
 	static ExpressionEncodeResult EncodeExpression(const Expression &expr, const ExpressionEncodeContext &ctx);
+	//! EncodeExpression's body; the public entry adds the parameter rollback: a
+	//! refused expression leaves nothing in the sink (spec 076).
+	static ExpressionEncodeResult EncodeExpressionImpl(const Expression &expr, const ExpressionEncodeContext &ctx);
 
 	/**
 	 * Encode a DuckDB Expression as a T-SQL SEARCH CONDITION (a predicate valid

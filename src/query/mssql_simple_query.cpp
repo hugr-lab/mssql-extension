@@ -128,6 +128,13 @@ std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, cons
 
 SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
 														RowCallback callback, int timeout_ms) {
+	return ExecuteWithSetCallback(
+		connection, sql, [&callback](size_t, const std::vector<std::string> &values) { return callback(values); },
+		timeout_ms);
+}
+
+SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &connection, const std::string &sql,
+														   RowSetCallback callback, int timeout_ms) {
 	SimpleQueryResult result;
 
 	SIMPLE_QUERY_DEBUG(2, "ExecuteWithCallback: starting, timeout=%dms", timeout_ms);
@@ -280,7 +287,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 				}
 
 				// Call callback
-				if (!callback(row_values)) {
+				if (!callback(result.result_sets.empty() ? 0 : result.result_sets.size() - 1, row_values)) {
 					// Callback requested stop - cancel query
 					connection.SendAttention();
 					connection.WaitForAttentionAck(5000);

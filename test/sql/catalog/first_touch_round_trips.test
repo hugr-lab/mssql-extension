@@ -1,0 +1,93 @@
+# name: test/sql/catalog/first_touch_round_trips.test
+# description: a fresh table's metadata and primary key arrive in one batch, and ATTACH builds one pool (spec 076 W2)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Before spec 076 a table's first touch loaded its metadata on one pooled
+# connection and discovered its primary key on a second; the discovery now
+# rides in the same batch, and the entry is created with its key. And ATTACH
+# initialised the catalog twice -- our attach callback and then DuckDB's
+# AttachedDatabase::Initialize -- building two pools and logging in twice.
+# Both are observable through mssql_pool_stats: connections_created after
+# ATTACH, and acquire_count across a first touch.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ft76 (TYPE mssql);
+
+# ATTACH built ONE pool and logged in once through it (the eager validation
+# connection is not pooled). Before: two pools, the first thrown away.
+query I
+SELECT connections_created FROM mssql_pool_stats('ft76');
+----
+1
+
+statement ok
+SELECT mssql_exec('ft76', 'IF OBJECT_ID(''dbo.ft76_a'') IS NOT NULL DROP TABLE dbo.ft76_a; IF OBJECT_ID(''dbo.ft76_b'') IS NOT NULL DROP TABLE dbo.ft76_b; IF OBJECT_ID(''dbo.ft76_c'') IS NOT NULL DROP TABLE dbo.ft76_c; CREATE TABLE dbo.ft76_a(id int NOT NULL PRIMARY KEY, v nvarchar(20) NULL); CREATE TABLE dbo.ft76_b(k1 int NOT NULL, k2 varchar(10) NOT NULL, v int NULL, CONSTRAINT pk_ft76_b PRIMARY KEY (k1, k2)); CREATE TABLE dbo.ft76_c(v int NULL); INSERT INTO dbo.ft76_a VALUES (1, N''a''), (2, N''b''); INSERT INTO dbo.ft76_b VALUES (1, ''x'', 10), (1, ''y'', 20); INSERT INTO dbo.ft76_c VALUES (7)');
+
+statement ok
+SELECT mssql_invalidate_cache('ft76');
+
+# The first touch of the FIRST fresh table also loads the schema list; touch
+# one table so that is paid, then measure the next.
+query I
+SELECT count(*) FROM ft76.dbo.ft76_c;
+----
+1
+
+statement ok
+CREATE TABLE ft76_before AS SELECT acquire_count FROM mssql_pool_stats('ft76');
+
+# A fresh table with a primary key: metadata + key in one batch (one acquire),
+# then the scan itself (one acquire). Before spec 076: three.
+query II
+SELECT id, rowid FROM ft76.dbo.ft76_a ORDER BY id;
+----
+1	1
+2	2
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('ft76')) - (SELECT acquire_count FROM ft76_before);
+----
+2
+
+# The key came with the batch: rowid-based DML works on the entry as created.
+statement ok
+UPDATE ft76.dbo.ft76_a SET v = 'upd' WHERE id = 2;
+
+query I
+SELECT v FROM ft76.dbo.ft76_a WHERE id = 2;
+----
+upd
+
+# A composite key arrives the same way (key_ordinal order preserved).
+query III
+SELECT k1, k2, rowid FROM ft76.dbo.ft76_b ORDER BY k2;
+----
+1	x	{'k1': 1, 'k2': x}
+1	y	{'k1': 1, 'k2': y}
+
+statement ok
+DELETE FROM ft76.dbo.ft76_b WHERE k2 = 'y';
+
+query I
+SELECT count(*) FROM ft76.dbo.ft76_b;
+----
+1
+
+# No key: rowid is refused as before, nothing was silently invented.
+statement error
+SELECT rowid FROM ft76.dbo.ft76_c;
+----
+rowid
+
+statement ok
+SELECT mssql_exec('ft76', 'DROP TABLE dbo.ft76_a; DROP TABLE dbo.ft76_b; DROP TABLE dbo.ft76_c');
+
+statement ok
+DETACH ft76;

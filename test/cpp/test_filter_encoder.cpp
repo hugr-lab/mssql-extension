@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "catalog/mssql_column_info.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -427,6 +429,18 @@ static void TestParameterSinkDeclaresFromColumn() {
 	ASSERT_TRUE(params.params[3].declaration == "bigint");
 	ASSERT_TRUE(params.params.size() == 4);
 
+	// a refused expression leaves nothing behind: the left constant registers,
+	// the right side (a function the encoder has no mapping for) refuses, and
+	// the sink is back to its size before the comparison
+	{
+		auto unmapped = Call1("no_such_function", LogicalType::INTEGER, LogicalType::INTEGER, ColRef(fx, COL_ID));
+		auto refused = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, Const(Value::INTEGER(7)),
+														 std::move(unmapped));
+		const size_t before = params.params.size();
+		ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*refused, ctx));
+		ASSERT_TRUE(params.params.size() == before);
+	}
+
 	ASSERT_TRUE(params.ExecuteSqlBatch("SELECT 1") ==
 				"DECLARE @p0 varchar(20) = N'ab', @p1 int = 5, @p2 bigint = 3000000000, @p3 bigint = 2024;\n"
 				"EXEC sp_executesql N'SELECT 1', N'@p0 varchar(20), @p1 int, @p2 bigint, @p3 bigint', "
@@ -463,9 +477,35 @@ static void TestDeclarationForColumn() {
 	ASSERT_TRUE(decl(Col("t", 1, "tinyint", 1, 3, 0), Value::TINYINT(-1)) == "smallint");
 	ASSERT_TRUE(decl(Col("f", 1, "bit", 1, 1, 0), Value::BOOLEAN(true)) == "bit");
 	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::HUGEINT(1)) == "decimal(38,0)");
+	// a HUGEINT past decimal(38,0) is refused by name, not sent to the server
+	{
+		bool named = false;
+		try {
+			decl(Col("i", 1, "int", 4, 10, 0), Value::HUGEINT(Hugeint::POWERS_OF_TEN[38]));
+		} catch (const InvalidInputException &e) {
+			named = std::string(e.what()).find("decimal(38,0)") != std::string::npos;
+		}
+		ASSERT_TRUE(named);
+	}
+	// every integer rank declares what DeclarationForValue would for the same
+	// constant against a bit column (the column never wins there)
+	{
+		const Value samples[] = {Value::BOOLEAN(true), Value::UTINYINT(1), Value::TINYINT(1),  Value::SMALLINT(1),
+								 Value::USMALLINT(1),  Value::INTEGER(1),  Value::UINTEGER(1), Value::BIGINT(1),
+								 Value::UBIGINT(1),	   Value::HUGEINT(1),  Value::UHUGEINT(1)};
+		for (const auto &v : samples) {
+			ASSERT_TRUE(decl(Col("b", 1, "bit", 1, 1, 0), v) == DeclarationForValue("p", v.type(), v));
+		}
+	}
 	// decimals: the wider precision and scale
-	ASSERT_TRUE(decl(Col("d", 1, "decimal", 5, 9, 2), Value::DECIMAL(int64_t(15000), 10, 4)) == "decimal(10,4)");
+	// integer digits AND scale are each the wider of the two sides: decimal(9,2)
+	// has 7 integer digits, DECIMAL(10,4) has 6 -> 7 + 4 = decimal(11,4)
+	ASSERT_TRUE(decl(Col("d", 1, "decimal", 5, 9, 2), Value::DECIMAL(int64_t(15000), 10, 4)) == "decimal(11,4)");
 	ASSERT_TRUE(decl(Col("d", 1, "numeric", 5, 9, 2), Value::DECIMAL(int64_t(150), 4, 1)) == "decimal(9,2)");
+	// the review's case: decimal(10,8) against DECIMAL(11,1) needs ten integer
+	// digits and eight of scale -- decimal(18,8), not decimal(11,8)
+	ASSERT_TRUE(decl(Col("d", 1, "decimal", 9, 10, 8), Value::DECIMAL(int64_t(12345678901), 11, 1)) == "decimal(18,8)");
+	ASSERT_TRUE(decl(Col("d", 1, "decimal", 17, 38, 10), Value::DECIMAL(int64_t(1), 38, 0)) == "decimal(38,10)");
 	ASSERT_TRUE(decl(Col("d", 1, "decimal", 5, 9, 2), Value::INTEGER(2)) == "int");
 	ASSERT_TRUE(decl(Col("m", 1, "money", 8, 19, 4), Value::DECIMAL(int64_t(150), 4, 2)) == "money");
 	// floats: value-driven (declaring a DOUBLE as real would round it)

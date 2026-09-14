@@ -22,11 +22,16 @@ sidebar_position: 1
 | `mssql_exec_invalidate_cache` | BOOLEAN | false | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Default `false` (like the Postgres extension's `postgres_execute`): invalidate manually with `mssql_invalidate_cache()` after schema-changing DDL. Set `true` to auto-invalidate. |
 | `mssql_attach_validation_timeout` | BIGINT | 0 | ≥0 | ATTACH-time eager-validation timeout (seconds). `0` inherits `mssql_connection_timeout`. Spec 047 FR-011. |
 
+### Filter Pushdown Settings
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `mssql_scan_parameterize_filters` | BOOLEAN | true | - | Send the constants of a pushed filter as `sp_executesql` parameters, declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
+
 ### Statistics Settings
 
 | Setting                            | Type    | Default | Range | Description                           |
 | ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
-| `mssql_scan_parameterize_filters` | `true` | Send the constants of a pushed filter as `sp_executesql` parameters, declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
 | `mssql_enable_statistics`          | BOOLEAN | true    | -     | Enable statistics collection          |
 | `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
 | `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |
