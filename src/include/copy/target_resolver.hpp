@@ -129,6 +129,18 @@ struct BCPColumnMetadata {
 	BCPColumnMetadata(string col_name, LogicalType type, bool is_nullable = true)
 		: name(std::move(col_name)), duckdb_type(std::move(type)), nullable(is_nullable) {}
 
+	//! The metadata of an EXISTING column, from the seven fields sys.columns
+	//! gives for it (spec 062 W3): the exact TDS type token and length the
+	//! server expects in COLMETADATA, the spec 060 UTF-8 retarget, and the
+	//! DuckDB type the encoder is told to produce. One function for the two
+	//! sources of those fields -- the resolver's own query for COPY, the catalog
+	//! cache for INSERT (no round trip) -- and for the `#temp` a spec 066 fill
+	//! declares to match its target. `max_length` is sys.columns.max_length:
+	//! bytes, -1 for MAX.
+	static BCPColumnMetadata FromServerColumn(const string &name, const string &type_name, int16_t max_length,
+											  uint8_t precision, uint8_t scale, bool nullable,
+											  const string &collation_name);
+
 	//===----------------------------------------------------------------------===//
 	// Wire Format Helpers
 	//===----------------------------------------------------------------------===//
