@@ -164,8 +164,8 @@ explicit identity value unconditionally (`bcp -E` semantics;
 whose column list names an identity column must stay on the text path — and
 the catalog does not record which columns are identity (#327: the metadata
 query selects everything from `sys.columns` except `is_identity`). One more
-column in the three metadata queries, carried on `MSSQLColumnInfo`, is the
-whole of that. The *binder* half of #327 — omitting the column from the
+column in the four column-metadata queries, carried on `MSSQLColumnInfo`, is
+the whole of that. The *binder* half of #327 — omitting the column from the
 default insert list — stays blocked: DuckDB's insert binder sizes a
 column-list-less `VALUES` by `PhysicalColumnCount()`, which excludes only
 `Generated()` columns, and a generated column cannot be read back by a scan.
@@ -385,7 +385,13 @@ measured 1M rows in 0.49 s and 0.80 s at four writers against 1.78 s at one.
 Everything else — a clustered rowstore index, a heap on row locks, a
 columnstore under a table lock — gets one writer. Under `mssql_copy_tablock
 = auto` that is: heaps and columnstores fan out, clustered rowstore tables
-do not.
+do not. The shape this rule reads is queried LIVE when the stream opens
+(`TargetResolver::QueryTableShape`, one `sys.indexes` lookup on the load's
+own connection), not taken from the catalog cache: a table cached as a heap
+and given a clustered index since — through `mssql_exec`, which does not
+invalidate by default, or by another client — would otherwise fan out into
+exactly the deadlock above (self-review). The TABLOCK hint stays the one
+the plan built from the cached shape; with one writer it serialises nothing.
 
 **Statement semantics on the bulk wire.** A bulk load ignores CHECK
 constraints, does not fire triggers, and writes a column's DEFAULT where the
@@ -433,7 +439,7 @@ target's — so it takes the seven fields, never a `BCPCopyTarget`.
 
 ### W4 — `is_identity` in the catalog (#327, metadata half)
 
-`c.is_identity` joins the select list of the three column-metadata queries
+`c.is_identity` joins the select list of the four column-metadata queries
 (single table, per schema, all schemas) and rides on `MSSQLColumnInfo`; the
 `MSSQLInsertColumn` built in `PlanInsert` stops hard-coding it to false, and
 the CTAS `has_identity_column` vocabulary that exists for this is populated
@@ -454,19 +460,21 @@ place messages are rendered (#344).
 
 ### W6 — tests
 
-- `test/sql/insert/insert_bcp_paths.test`: `EXPLAIN` shows the BCP sink for
-  a plain `INSERT … SELECT` and the text operator for `RETURNING`, for an
-  explicit identity column, and under `mssql_insert_use_bcp = false`.
-- `insert_bcp_threshold.test`: N ≤ threshold rows → statement path (pool
-  stats: one statement, no bulk load); N = threshold + 1 → bulk; the row set
-  is identical either way.
+- `test/sql/insert/insert_bcp_paths.test`: the path observed through the
+  statement path's test lever (`mssql_test_fail_parse_after_tokens` lives in
+  those loops only) — bulk for a plain `INSERT … SELECT` above the
+  threshold, statements for `RETURNING`, an explicit identity column, a
+  view, a column of a type the bulk wire cannot carry (hierarchyid), and
+  under `mssql_insert_use_bcp = false`.
+- the threshold, in `insert_bcp_paths.test`: N = threshold rows → the
+  statement path; N = threshold + 1 → bulk; a lower threshold moves the
+  line; zero rows sends nothing.
 - `insert_statement_plans.test` (W1b): after `DBCC FREEPROCCACHE`, 20
-  distinct 300-row inserts into a 3-column table — and the same with
-  `RETURNING` — leave one `Prepared` plan and zero `Adhoc` ones for that
-  text (`sys.dm_exec_cached_plans` joined to `sys.dm_exec_sql_text`, § 0.5
-  as an assertion); a 30-column table gets 33-row statements (visible in
-  `MSSQL_DML_DEBUG`, asserted through the statement count the pool stats
-  report).
+  distinct 900-row inserts into a 3-column HEAP — 60 statements, two
+  shapes — leave two `Prepared` plans and no `Adhoc`
+  (`sys.dm_exec_cached_plans` joined to `sys.dm_exec_sql_text`, § 0.5 as an
+  assertion); five `RETURNING` inserts leave five `Adhoc` plans, pinning
+  that `OUTPUT` is never parameterised.
 - `insert_bcp_types.test`: every type family through both paths into the same
   table, compared row by row — non-ASCII into nvarchar and into a UTF-8
   varchar, NULLs, `datetime2(3)`/`(7)` via `TIMESTAMP_MS`/`_NS`, decimal at
@@ -486,17 +494,20 @@ place messages are rendered (#344).
   ROLLBACK` the same statements leave nothing behind and the message says
   the rows are in the open transaction.
 - `insert_bcp_parallel.test`: `SET threads = 4`, a 400k-row load fans out
-  on a heap and on a clustered columnstore (`connections_created` grows by
-  the extra writers) and stays on one writer against a clustered rowstore
-  and under `mssql_copy_parallel_writers = 1`; inside a transaction exactly
-  1 (`insert_bcp_transaction.test`).
+  on a heap (`connections_created` grows by the extra writers), loads a
+  clustered columnstore with four threads, stays on one writer against a
+  clustered rowstore and under `mssql_copy_parallel_writers = 1`, and — the
+  shape read live at stream open, not from the cache — loads a table that
+  was a heap when the catalog cached it and has a clustered index now,
+  without the client-side deadlock a stale shape would have caused; inside
+  a transaction exactly 1 (`insert_bcp_transaction.test`).
 - `insert_bcp_semantics.test`: CHECK constraints enforced, triggers fired,
   explicit NULLs kept over a DEFAULT, omitted columns defaulted — on both
   paths.
 - `insert_server_defaults.test` and `bcp_identity_column.test` keep passing
   unchanged (identity, defaults).
 - C++: `FromServerColumn` on the type table (one case per family, the UTF-8
-  retarget, `tinyint`), and the routing predicate.
+  retarget, `tinyint`).
 
 ### W7 — docs
 
@@ -585,9 +596,10 @@ shapes, the rowid mapping — 066's own, with its own measurements.
    statement path (same operator, same statement text); so does any INSERT
    of at most `mssql_insert_bcp_threshold` rows. The one change on that path
    is W1b: no statement carries more than 1000 constants.
-2. A workload of N inserts of one shape into one table, each under the
+2. A workload of N inserts of one shape into one heap, each under the
    threshold, leaves ONE cached plan on the server, not N
-   (`sys.dm_exec_cached_plans`), including with `RETURNING`.
+   (`sys.dm_exec_cached_plans`); `RETURNING` and clustered targets past
+   ~250 rows a statement compile per statement, at the cheap end (§ 0.5).
 3. Above the threshold, the rows the server holds are identical to the text
    path's, row by row, for every type family, non-ASCII and NULLs included.
 4. `ROLLBACK` discards the rows; a failed INSERT leaves **no** rows in
@@ -641,7 +653,7 @@ crossing moves to about 1000 rows. The default stays **1000**: at or below
 it an INSERT is one to three statements, and the bulk path never loses by
 more than a round trip or two. `mssql_insert_bcp_threshold` moves it.
 
-### 6.3 Per family, 1M rows (2026-09-14)
+### 6.3 Per family, 1M rows — 500k × 2 iterations (2026-09-14)
 
 `bench_live_server.sh` group `insert`: `INSERT INTO db.dbo.t SELECT c FROM
 src.syn`, one column per family, 500k rows × 2 iterations, the two paths

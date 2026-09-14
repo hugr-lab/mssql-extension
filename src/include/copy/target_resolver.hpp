@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <vector>
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -262,6 +263,16 @@ struct TargetResolver {
 	static void ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
 											BCPCopyConfig &config, const vector<LogicalType> &source_types,
 											const vector<string> &source_names);
+
+	//! The target's physical shape as the server has it NOW -- heap, clustered
+	//! rowstore, clustered columnstore -- from one sys.indexes lookup on `conn`
+	//! (spec 062 W2). The INSERT sink reads it when its stream opens rather
+	//! than trusting the catalog's cached index_kind: the writer rule turns a
+	//! stale HEAP into parallel transactional writers on what is now a
+	//! clustered index, which deadlocks client-side. Throws on a query
+	//! failure; a table without a row (a view) reports HEAP, as the catalog
+	//! query does.
+	static MSSQLIndexKind QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target);
 
 	// Get column metadata for an existing table
 	// Used when copying to existing table - BCP COLMETADATA must match target schema

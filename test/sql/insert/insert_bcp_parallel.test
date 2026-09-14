@@ -94,12 +94,32 @@ SELECT count(*), sum(id) FROM bpar.dbo.BcpParCci;
 ----
 400000	80000200000
 
+# --- the shape is read LIVE when the stream opens, not from the cache: this
+# table was a heap when the catalog cached it (the load above), and has a
+# clustered index now, added through mssql_exec, which does not invalidate.
+# A stale HEAP+TABLOCK plan would fan out into four transactional writers
+# on a clustered index -- the client-side deadlock -- and hang; one writer
+# loads it.
+statement ok
+SELECT mssql_exec('bpar', 'CREATE CLUSTERED INDEX ci ON dbo.BcpParHeap (id)');
+
+statement ok
+INSERT INTO bpar.dbo.BcpParHeap SELECT id + 1000000, v FROM src;
+
+query I
+SELECT count(*) FROM bpar.dbo.BcpParHeap;
+----
+800000
+
 # --- one writer under mssql_copy_parallel_writers = 1, whatever the shape.
 statement ok
 SET mssql_copy_parallel_writers = 1;
 
 statement ok
-SELECT mssql_exec('bpar', 'TRUNCATE TABLE dbo.BcpParHeap');
+SELECT mssql_exec('bpar', 'TRUNCATE TABLE dbo.BcpParHeap; DROP INDEX ci ON dbo.BcpParHeap');
+
+statement ok
+SELECT mssql_invalidate_cache('bpar');
 
 statement ok
 INSERT INTO bpar.dbo.BcpParHeap SELECT * FROM src;

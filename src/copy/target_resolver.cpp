@@ -431,6 +431,32 @@ static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
 	}
 }
 
+MSSQLIndexKind TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
+	// The same sys.indexes row ValidateTarget reads for COPY: index_id 0 is
+	// the heap, index_id 1 the clustered index, rowstore (type 1) or
+	// columnstore (type 5).
+	string sql;
+	if (target.IsTempTable()) {
+		sql = StringUtil::Format(
+			"SELECT ISNULL((SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1), 0) AS index_type",
+			target.GetBracketedTable());
+	} else {
+		sql = StringUtil::Format(
+			"SELECT ISNULL((SELECT TOP 1 i.type FROM sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1), 0) AS index_type",
+			target.GetFullyQualifiedName());
+	}
+	auto result = MSSQLSimpleQuery::Execute(conn, sql);
+	if (!result.success) {
+		throw IOException("could not read the shape of %s: %s", target.GetFullyQualifiedName(), result.error_message);
+	}
+	if (result.rows.empty() || result.rows[0].empty()) {
+		return MSSQLIndexKind::HEAP;
+	}
+	return MSSQLIndexKindFromSysIndexesType(result.rows[0][0]);
+}
+
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names) {

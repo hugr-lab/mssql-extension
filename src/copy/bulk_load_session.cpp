@@ -155,15 +155,25 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		// is exhausted or the server refused a bulk load, and neither clears on a
 		// later chunk — so the caller stops asking rather than re-blocking a 30 s
 		// Acquire() every chunk (spec 070 W2 review, finding 1).
-		writer_.reset();
-		stream_open_ = false;
-		if (conn) {
+		//
+		// Adopted already (the throw came from OpenStream): the session owns the
+		// connection, and an own transaction may be open on it -- Abandon rolls
+		// that back and clears the descriptor before the connection goes back,
+		// so the pool never holds a connection mid-transaction that a later
+		// destructor would then send ROLLBACK to (spec 062 self-review). Not yet
+		// adopted (Acquire failed or returned a non-Idle connection): the local
+		// handle is all there is.
+		if (connection_) {
+			Abandon();
+		} else if (conn) {
 			try {
 				params.pool->Release(conn);
 			} catch (...) {
 				// Nothing left to do — the handle is dropped either way.
 			}
 		}
+		writer_.reset();
+		stream_open_ = false;
 		connection_.reset();
 		slots_used.fetch_sub(1);
 		return Claim::Unavailable;
@@ -214,6 +224,12 @@ void BulkLoadSession::ReopenBatch() {
 
 BulkLoadWriteResult BulkLoadSession::Write(DataChunk &chunk) {
 	BulkLoadWriteResult out;
+	if (!writer_) {
+		// Abandoned (a failure on another thread) or never started: there is no
+		// connection to open a stream on. The caller's error protocol should
+		// have stopped it before this; this is what stops it anyway.
+		throw IOException("bulk-load session is closed");
+	}
 	if (!stream_open_) {
 		OpenStream();
 	}

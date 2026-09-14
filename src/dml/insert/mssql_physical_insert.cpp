@@ -6,6 +6,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "copy/load_policy.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "dml/mssql_dml_outcome.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -105,12 +106,18 @@ void RecordBulkError(MSSQLInsertGlobalSinkState &gstate, const string &message) 
 // which writer, the server's own text, and what happened to the rows before
 // it -- rolled back with the load's transaction in autocommit, or in the open
 // DuckDB transaction inside one.
-string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, const mssql::BulkLoadSession &session,
+string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, idx_t batch_no, idx_t rows_in_batch,
 						  const char *what) {
 	return StringUtil::Format("INSERT via BCP failed at batch %llu of a writer (%llu row(s) in it): %s; %s",
-							  (unsigned long long)(session.BatchesFlushed() + 1),
-							  (unsigned long long)session.RowsInBatch(), what,
+							  (unsigned long long)batch_no, (unsigned long long)rows_in_batch, what,
 							  MSSQLRowsBeforeOutcome(gstate.transaction_pinned, gstate.rows_confirmed.load()));
+}
+
+// The batch a session is on, read BEFORE the call that may fail: CloseStream
+// and Commit abandon the session on failure, and Abandon zeroes the counters.
+string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, const mssql::BulkLoadSession &session,
+						  const char *what) {
+	return BulkFailureMessage(gstate, session.BatchesFlushed() + 1, session.RowsInBatch(), what);
 }
 
 void AccountWrite(MSSQLInsertGlobalSinkState &gstate, const mssql::BulkLoadWriteResult &written) {
@@ -176,6 +183,23 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 			tds::ConnectionStateToString(connection->GetState()));
 	}
 
+	// The target's shape as the server has it NOW, on the connection just
+	// taken (Idle, one round trip): the writer rule below must not trust the
+	// catalog's cached index_kind -- a table cached as a heap and given a
+	// clustered index since (mssql_exec does not invalidate by default) would
+	// fan out into the client-side deadlock the rule exists to prevent
+	// (spec 062 self-review). The TABLOCK hint in the INSERT BULK text stays
+	// the plan's; with one writer it serialises nothing.
+	MSSQLIndexKind live_shape;
+	try {
+		live_shape = mssql::TargetResolver::QueryTableShape(*connection, bulk.target);
+	} catch (...) {
+		if (!gstate.transaction_pinned) {
+			catalog.GetConnectionPool().Release(connection);
+		}
+		throw;
+	}
+
 	gstate.shared.Adopt(std::move(connection), SessionParams(gstate, bulk), gstate.transaction_pinned);
 
 	// COPY's policy, and COPY's answer: JoinsTransaction. Inside a transaction
@@ -200,10 +224,14 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// measured 1M rows in 0.49 s and 0.80 s at four writers). Everything else
 	// -- a clustered rowstore index, a heap on row locks, a columnstore under
 	// a table lock -- gets one writer.
-	const bool locks_compatible = (bulk.shape == MSSQLIndexKind::HEAP && bulk.tablock) ||
-								  (bulk.shape == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock);
+	const bool locks_compatible = (live_shape == MSSQLIndexKind::HEAP && bulk.tablock) ||
+								  (live_shape == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock);
 	if (!locks_compatible) {
 		gstate.parallel_writer_limit = 1;
+	}
+	if (live_shape != bulk.shape) {
+		INSERT_SINK_LOG(1, "target shape changed since the catalog cached it (%d -> %d): writer_limit=%llu",
+						(int)bulk.shape, (int)live_shape, (unsigned long long)gstate.parallel_writer_limit);
 	}
 
 	INSERT_SINK_LOG(1, "stream opened after %llu staged row(s): pinned=%d, writer_limit=%llu, tablock in: %s",
@@ -275,8 +303,17 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 	// Staging phase, under the write lock: the rows are held until the
 	// threshold says which path they take. The chunk that crosses it opens the
 	// stream and goes with the drained buffer.
+	//
+	// The error check is repeated UNDER the lock, here and at the shared write
+	// below: a thread that passed the check above and then waited on the lock
+	// while the holder abandoned the shared session must not open a second
+	// stream on the closed connection, or write to a session with no writer.
 	{
 		std::unique_lock<std::mutex> lock(gstate.write_mutex);
+		if (gstate.has_error.load(std::memory_order_acquire)) {
+			std::lock_guard<std::mutex> error_lock(gstate.error_mutex);
+			throw IOException("INSERT via BCP: a parallel writer failed: %s", gstate.error_message);
+		}
 		if (!gstate.streaming) {
 			gstate.staged->Append(chunk);
 			if (!gstate.staged->Exceeds(bulk_.threshold)) {
@@ -332,6 +369,10 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 	}
 
 	std::lock_guard<std::mutex> lock(gstate.write_mutex);
+	if (gstate.has_error.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> error_lock(gstate.error_mutex);
+		throw IOException("INSERT via BCP: a parallel writer failed: %s", gstate.error_message);
+	}
 	try {
 		AccountWrite(gstate, gstate.shared.Write(chunk));
 	} catch (std::exception &e) {
@@ -357,6 +398,8 @@ SinkCombineResultType MSSQLPhysicalInsert::Combine(ExecutionContext &context, Op
 	// but its connection and its open transaction move to the global state:
 	// the commit waits until every writer has closed (Finalize), and a local
 	// state does not live that long.
+	const idx_t batch_no = lstate.session->BatchesFlushed() + 1;
+	const idx_t rows_in_batch = lstate.session->RowsInBatch();
 	try {
 		const idx_t confirmed = lstate.session->CloseStream();
 		gstate.rows_confirmed.fetch_add(confirmed, std::memory_order_relaxed);
@@ -364,8 +407,8 @@ SinkCombineResultType MSSQLPhysicalInsert::Combine(ExecutionContext &context, Op
 			gstate.batches_flushed.fetch_add(1, std::memory_order_relaxed);
 		}
 	} catch (std::exception &e) {
-		const string msg = BulkFailureMessage(gstate, *lstate.session, e.what());
-		lstate.session->Abandon();
+		// CloseStream abandoned the session before rethrowing.
+		const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, e.what());
 		RecordBulkError(gstate, msg);
 		throw IOException("%s", msg);
 	}
@@ -427,16 +470,20 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 	// load a failed commit leaves the earlier writers' rows in place -- the
 	// two-phase window of any multi-connection load; one writer (every load
 	// inside a transaction) has none.
-	try {
-		const idx_t confirmed = gstate.shared.CloseStream();
-		gstate.rows_confirmed.fetch_add(confirmed, std::memory_order_relaxed);
-		if (confirmed > 0) {
-			gstate.batches_flushed.fetch_add(1, std::memory_order_relaxed);
+	{
+		const idx_t batch_no = gstate.shared.BatchesFlushed() + 1;
+		const idx_t rows_in_batch = gstate.shared.RowsInBatch();
+		try {
+			const idx_t confirmed = gstate.shared.CloseStream();
+			gstate.rows_confirmed.fetch_add(confirmed, std::memory_order_relaxed);
+			if (confirmed > 0) {
+				gstate.batches_flushed.fetch_add(1, std::memory_order_relaxed);
+			}
+		} catch (std::exception &e) {
+			const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, e.what());
+			AbandonAll(gstate);
+			throw IOException("%s", msg);
 		}
-	} catch (std::exception &e) {
-		const string msg = BulkFailureMessage(gstate, gstate.shared, e.what());
-		AbandonAll(gstate);
-		throw IOException("%s", msg);
 	}
 	try {
 		gstate.shared.Commit();

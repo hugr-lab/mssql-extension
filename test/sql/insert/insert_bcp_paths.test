@@ -91,6 +91,31 @@ SELECT count(*), max(rid) FROM bp.dbo.BcpPathsIdent;
 ----
 3000	3000
 
+# --- a view: statements (INSERT BULK into a view is the server's call).
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BcpPathsView'') IS NOT NULL DROP VIEW dbo.BcpPathsView; EXEC(''CREATE VIEW dbo.BcpPathsView AS SELECT id, n FROM dbo.BcpPaths'')');
+
+statement ok
+SELECT mssql_invalidate_cache('bp');
+
+statement error
+INSERT INTO bp.dbo.BcpPathsView SELECT id + 10000, n FROM src;
+----
+TDS parse error
+
+# --- a column the bulk wire cannot carry (hierarchyid arrives as text the
+# server converts): statements.
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BcpPathsHid'') IS NOT NULL DROP TABLE dbo.BcpPathsHid; CREATE TABLE dbo.BcpPathsHid (id INT NOT NULL PRIMARY KEY, h HIERARCHYID NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('bp');
+
+statement error
+INSERT INTO bp.dbo.BcpPathsHid SELECT id, '/' || id || '/' FROM src;
+----
+TDS parse error
+
 # --- the setting off: statements.
 statement ok
 SET mssql_insert_use_bcp = false;
@@ -142,7 +167,7 @@ statement ok
 RESET mssql_insert_bcp_threshold;
 
 statement ok
-SELECT mssql_exec('bp', 'DROP TABLE dbo.BcpPaths; DROP TABLE dbo.BcpPathsIdent');
+SELECT mssql_exec('bp', 'DROP VIEW dbo.BcpPathsView; DROP TABLE dbo.BcpPathsHid; DROP TABLE dbo.BcpPaths; DROP TABLE dbo.BcpPathsIdent');
 
 statement ok
 DETACH bp;

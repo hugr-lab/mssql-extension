@@ -728,10 +728,26 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		bulk.statement_path_reason = "RETURNING";
 	} else if (!config.use_bcp) {
 		bulk.statement_path_reason = "mssql_insert_use_bcp = false";
+	} else if (table_entry.GetObjectType() == MSSQLObjectType::VIEW) {
+		// INSERT BULK into a view is the server's call (updatable single-table
+		// views only, INSTEAD OF triggers aside); the statement path is what an
+		// INSERT into a view always was (spec 062 self-review).
+		bulk.statement_path_reason = "target is a view";
 	} else {
 		for (auto col_idx : target.insert_column_indices) {
-			if (mssql_columns[col_idx].is_identity) {
-				bulk.statement_path_reason = "explicit identity column '" + mssql_columns[col_idx].name + "'";
+			const auto &col = mssql_columns[col_idx];
+			if (col.is_identity) {
+				bulk.statement_path_reason = "explicit identity column '" + col.name + "'";
+				break;
+			}
+			// A geometry/geography column arrives as WKB, which the statement
+			// path renders as a 0x literal the server converts; on the bulk wire
+			// FromServerColumn would declare it nvarchar and send the bytes as
+			// text. The same for the types the catalog casts to NVARCHAR(MAX)
+			// on read (hierarchyid, sql_variant): the statement path sends a
+			// string literal the server converts, the bulk wire would not.
+			if (col.is_geometry || col.is_cast_required) {
+				bulk.statement_path_reason = "column '" + col.name + "' of type " + col.sql_type_name;
 				break;
 			}
 		}

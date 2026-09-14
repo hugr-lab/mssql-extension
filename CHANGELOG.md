@@ -106,7 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wire change. One release path changed: a COPY or CTAS returning its pool
   connection after a successful load now sets the reset flag from
   `mssql_reset_connection`, as every other release path did — before, the
-  success path returned it without.
+  success path returned it without. And a CTAS whose SELECT yields no rows
+  no longer opens a bulk stream at all (it used to send `INSERT BULK` and a
+  zero-row `DONE`); the table is created the same.
 
 - **`mssql_scan` no longer executes its query at bind** (spec 075, #336).
   Bind asks `sp_describe_first_result_set` for the result's shape; the query

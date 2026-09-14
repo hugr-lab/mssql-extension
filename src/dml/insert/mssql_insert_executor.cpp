@@ -50,14 +50,17 @@ MSSQLInsertExecutor::MSSQLInsertExecutor(ClientContext &context, const MSSQLInse
 	: context_(context), target_(target), config_(config), finalized_(false), connection_pool_(nullptr) {}
 
 MSSQLInsertExecutor::~MSSQLInsertExecutor() {
-	// Ensure we finalize even if caller forgets -- but never after a failure:
-	// the transaction is rolled back and the connection gone (spec 062 W1c).
-	if (!finalized_ && !failed_ && batch_builder_ && batch_builder_->HasPendingRows()) {
-		try {
-			Finalize();
-		} catch (...) {
-			// Ignore errors in destructor
-		}
+	// Nothing is sent from here. This used to flush pending rows "in case the
+	// caller forgets" -- and DuckDB never forgets on success, so the only time
+	// it fired was an unwind that had not passed through FailStatement (a row
+	// over mssql_insert_max_sql_bytes, another operator failing, an interrupt),
+	// where it sent the pending rows and, since W1c, COMMITTED them: the
+	// partial application W1c removes, back through the destructor (spec 062
+	// self-review). The statement's transaction is rolled back and its
+	// connection returned by ~MSSQLStatementConnection.
+	if (!finalized_ && batch_builder_ && batch_builder_->HasPendingRows()) {
+		INSERT_DEBUG(1, "~MSSQLInsertExecutor: %llu pending row(s) dropped on unwind, transaction rolled back",
+					 (unsigned long long)batch_builder_->GetPendingRowCount());
 	}
 }
 
@@ -306,6 +309,8 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
+	} catch (const IOException &) {
+		throw;	// Already failed and worded above (timeout, socket)
 	} catch (const std::exception &e) {
 		FailStatement(mssql_catalog);
 		throw IOException("INSERT execution failed: %s", e.what());
@@ -384,6 +389,8 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
+	} catch (const IOException &) {
+		throw;	// Already failed and worded above
 	} catch (const std::exception &e) {
 		FailStatement(mssql_catalog);
 		throw IOException("INSERT with RETURNING execution failed: %s", e.what());

@@ -51,11 +51,18 @@ void MSSQLStatementConnection::Fail(ClientContext &context, MSSQLCatalog &catalo
 	}
 	transaction_.Rollback();
 	try {
-		if (connection_->GetState() != tds::ConnectionState::Idle &&
+		if (!transaction_pinned_ && connection_->GetState() != tds::ConnectionState::Idle &&
 			connection_->GetState() != tds::ConnectionState::Disconnected) {
 			// Mid-response: nothing can be sent down it, and nothing should be
 			// read from it by the next user. Closing ends the session — and with
 			// it any transaction the rollback above could not reach.
+			//
+			// Never for the PINNED connection: it is the DuckDB transaction's,
+			// and non-Idle there may mean another consumer's stream (spec 062
+			// self-review) -- closing it would take the transaction down with
+			// this statement. It is dropped as it is, which is what the
+			// executors did before W1c; the transaction's own ROLLBACK deals
+			// with it, and the pool closes a connection that cannot take one.
 			connection_->Close();
 		}
 		ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection_));

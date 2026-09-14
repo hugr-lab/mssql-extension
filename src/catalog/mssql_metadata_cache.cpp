@@ -252,8 +252,9 @@ static bool FlagIsSet(const string &value) {
 
 //===----------------------------------------------------------------------===//
 // Physical shape of the object, parsed out of the correlated sys.indexes lookup.
-// index_type and is_partitioned always sit last in the SELECT list, so each
-// caller passes their own indices.
+// index_type and is_partitioned sit after the per-column fields in every
+// SELECT list (is_identity follows them since spec 062 W4), so each caller
+// passes their own indices.
 //
 // The two values are parsed into locals and published together: a malformed
 // is_partitioned must not discard an index_type that parsed fine.
@@ -721,7 +722,7 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 	ExecuteMetadataQuery(
 		connection, sql,
 		[&](const vector<string> &values) {
-			// 14 columns: schema, object, type, approx_rows, the eight per-column
+			// 15 columns: schema, object, type, approx_rows, the eight per-column
 			// fields, then index_type and is_partitioned. Guard the LAST index read.
 			if (values.size() < 14) {
 				return;
@@ -900,7 +901,7 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 	ExecuteMetadataQuery(
 		connection, sql,
 		[&](const vector<string> &values) {
-			// 15 columns: object_id, schema, object, type, approx_rows, the eight
+			// 16 columns: object_id, schema, object, type, approx_rows, the eight
 			// per-column fields, then index_type and is_partitioned. Guard the LAST
 			// index read.
 			if (values.size() < 15) {
@@ -1125,7 +1126,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		ExecuteMetadataQuery(
 			connection, sql,
 			[&](const vector<string> &values) {
-				// 14 columns: schema, object, type, approx_rows, the eight per-column
+				// 15 columns: schema, object, type, approx_rows, the eight per-column
 				// fields, then index_type and is_partitioned. Guard the LAST index read.
 				if (values.size() < 14) {
 					return;
