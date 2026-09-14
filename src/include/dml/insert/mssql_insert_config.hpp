@@ -27,6 +27,14 @@ constexpr bool MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT = true;
 // Minimum allowed max_sql_bytes (1KB)
 constexpr idx_t MSSQL_MIN_INSERT_SQL_BYTES = 1024;
 
+//! SQL Server auto-parameterises a multi-row VALUES INSERT -- one cached plan
+//! per (table, column list, row count), compiled once -- only up to this many
+//! constants in the statement (spec 062 § 0.5: 300 rows × 3 columns is one
+//! Prepared plan at 4 ms a statement; 340 rows is an Adhoc plan per statement
+//! at 23 ms, and 1000 rows at 74 ms). Rows per statement are capped so no
+//! statement crosses it.
+constexpr idx_t MSSQL_AUTO_PARAM_MAX_CONSTANTS = 1000;
+
 //===----------------------------------------------------------------------===//
 // MSSQLInsertConfig - Configuration for INSERT operations
 //
@@ -54,6 +62,14 @@ struct MSSQLInsertConfig {
 	// Get effective rows per statement (minimum of batch_size and max_rows_per_statement)
 	idx_t EffectiveRowsPerStatement() const {
 		return std::min(batch_size, max_rows_per_statement);
+	}
+
+	//! Rows per statement for a table with `inserted_columns` columns in the
+	//! list: the configured cap, then the auto-parameterisation cap (spec 062
+	//! W1b) -- 333 rows for 3 columns, 33 for 30, never below 1.
+	idx_t RowsPerStatement(idx_t inserted_columns) const {
+		const idx_t by_constants = MSSQL_AUTO_PARAM_MAX_CONSTANTS / std::max<idx_t>(inserted_columns, 1);
+		return std::max<idx_t>(std::min(EffectiveRowsPerStatement(), by_constants), 1);
 	}
 
 	//===----------------------------------------------------------------------===//

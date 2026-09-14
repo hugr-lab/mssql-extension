@@ -14,9 +14,10 @@ MSSQLBatchBuilder::MSSQLBatchBuilder(const MSSQLInsertTarget &target, const MSSQ
 	  pending_row_count_(0),
 	  current_row_offset_(0),
 	  batch_count_(0),
-	  base_sql_size_(0) {
+	  base_sql_size_(0),
+	  rows_per_statement_(config.RowsPerStatement(target.insert_column_indices.size())) {
 	// Pre-allocate for typical batch sizes
-	row_literals_.reserve(config.EffectiveRowsPerStatement());
+	row_literals_.reserve(rows_per_statement_);
 
 	// Calculate base SQL size
 	CalculateBaseSQLSize();
@@ -122,8 +123,10 @@ bool MSSQLBatchBuilder::AddRow(DataChunk &chunk, idx_t row_index) {
 		return false;  // Batch full, caller should flush
 	}
 
-	// Check if we've hit the row count limit
-	if (pending_row_count_ >= config_.EffectiveRowsPerStatement()) {
+	// Check if we've hit the row count limit -- the configured one, or the
+	// 1000-constant line past which the server compiles every statement on its
+	// own and keeps the plan (spec 062 W1b).
+	if (pending_row_count_ >= rows_per_statement_) {
 		return false;  // Batch full, caller should flush
 	}
 
@@ -167,7 +170,7 @@ MSSQLInsertBatch MSSQLBatchBuilder::FlushBatch() {
 
 	// Reset for next batch
 	row_literals_.clear();
-	row_literals_.reserve(config_.EffectiveRowsPerStatement());
+	row_literals_.reserve(rows_per_statement_);
 	current_sql_bytes_ = base_sql_size_;
 	pending_row_count_ = 0;
 

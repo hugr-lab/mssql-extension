@@ -85,7 +85,8 @@ private:
 	idx_t batch_count_;			// Number of batches flushed
 
 	// Pre-calculated values for efficiency
-	idx_t base_sql_size_;  // INSERT INTO ... VALUES prefix size
+	idx_t base_sql_size_;		// INSERT INTO ... VALUES prefix size
+	idx_t rows_per_statement_;	// config cap, then the 1000-constant cap (spec 062 W1b)
 
 	// Serialize a row from DataChunk
 	// @return vector of serialized literals for each column
