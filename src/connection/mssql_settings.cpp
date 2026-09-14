@@ -149,6 +149,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "TEST ONLY: make a metadata query fail after this many rows (0 = off)",
 							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_test_fail_parse_after_tokens - TEST ONLY (issues #323, #344).
+	//
+	// Puts the TDS token parser of a DML response (INSERT batch, INSERT ...
+	// RETURNING, UPDATE, DELETE) into Error once it has returned this many
+	// tokens, the way a desync does. A desync cannot be induced from SQL any
+	// more (spec 072 taught the parser the procedure tokens), so without this
+	// the four response loops' handling of one -- drain without buffering,
+	// report it, never hang -- is untestable. 0 = off, and off costs one
+	// comparison per token in those four loops only; the result stream is
+	// untouched.
+	config.AddExtensionOption("mssql_test_fail_parse_after_tokens",
+							  "TEST ONLY: put a DML response parser into Error after this many tokens (0 = off)",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_browser_timeout_seconds - SQL Server Browser UDP query timeout (spec 045)
 	// Used when resolving named instances (host\instance) via MC-SQLR.
 	// Short by design — Browser is on the critical path of every named-instance attach.
@@ -528,6 +542,14 @@ int LoadQueryTimeout(ClientContext &context) {
 int64_t LoadTestFailMetadataAfterRows(ClientContext &context) {
 	Value val;
 	if (context.TryGetCurrentSetting("mssql_test_fail_metadata_after_rows", val)) {
+		return val.GetValue<int64_t>();
+	}
+	return 0;
+}
+
+int64_t LoadTestFailParseAfterTokens(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_test_fail_parse_after_tokens", val)) {
 		return val.GetValue<int64_t>();
 	}
 	return 0;

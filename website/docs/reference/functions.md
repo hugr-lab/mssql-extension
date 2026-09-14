@@ -70,6 +70,9 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 | `acquire_count`         | BIGINT | Times connections acquired         |
 | `acquire_timeout_count` | BIGINT | Times acquisition timed out        |
 | `pinned_count`          | BIGINT | Connections pinned to transactions (per-pool atomic; spec 047 T005) |
+| `creation_failures`     | BIGINT | Times the pool tried to open a connection and could not (issue #302) |
+| `last_create_error`     | VARCHAR | What the last failed attempt said; cleared by a creation success, never by a reuse |
+| `last_create_error_age_ms` | BIGINT | How long ago that error was recorded; NULL when there is none. A pool at its limit recovers by reuse, so the error can outlive the failure — the age is how you tell |
 
 ### mssql_refresh_cache()
 

@@ -117,6 +117,10 @@ public:
 	// Shutdown the pool (closes all connections)
 	void Shutdown();
 
+	//! Milliseconds since the recorded creation error, or -1 when there is
+	//! none (never failed, or cleared by a creation success).
+	int64_t GetLastCreateErrorAgeMs() const;
+
 	// Get context name
 	const std::string &GetContextName() const {
 		return context_name_;
@@ -136,6 +140,9 @@ private:
 	static constexpr int CREATE_BACKOFF_INITIAL_MS = 250;
 	static constexpr int CREATE_BACKOFF_MAX_MS = 4000;
 	std::string last_create_error_;
+	// When last_create_error_ was recorded; exposed as an age by pool stats so
+	// a reader can tell a live failure from one a healthy pool has outlived.
+	std::chrono::steady_clock::time_point last_create_error_at_{};
 	std::chrono::steady_clock::time_point next_create_allowed_{};
 	int create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
 
