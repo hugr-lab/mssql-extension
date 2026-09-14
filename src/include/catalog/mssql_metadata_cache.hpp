@@ -8,6 +8,7 @@
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_index_kind.hpp"
+#include "catalog/mssql_primary_key.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -83,6 +84,13 @@ struct MSSQLTableMetadata {
 	// Issue #178 (D6): all fields — including these states — are guarded by the
 	// cache-wide MSSQLMetadataCache::mutex_; the former per-table load_mutex is gone.
 	CacheLoadState columns_load_state = CacheLoadState::NOT_LOADED;
+	// Spec 076 W2: the primary key, when the load that filled this entry
+	// carried it -- GetTableMetadata sends the discovery statement in the same
+	// batch as the columns, so a fresh table costs one round trip, not two.
+	// The bulk paths do not, and MSSQLTableEntry then discovers it lazily as
+	// before (pk_loaded == false).
+	mssql::PrimaryKeyInfo pk_info;
+	bool pk_loaded = false;
 	std::chrono::steady_clock::time_point columns_last_refresh;
 
 	// Default constructor
@@ -334,6 +342,12 @@ private:
 	using MetadataResetCallback = std::function<void()>;
 	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
 							  MetadataResetCallback reset);
+	//! The same for a batch of several statements: the callback gets the
+	//! ordinal of the result set a row came from (spec 076 W2 sends the table
+	//! metadata and the primary key as one batch and reads two result sets).
+	using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
+	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
+								  MetadataResetCallback reset);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables

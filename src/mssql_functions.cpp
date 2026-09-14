@@ -755,6 +755,7 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->column_names = column_names;
 	result->result_stream_id = result_stream_id;
 	result->complex_filter_where_clause = complex_filter_where_clause;
+	result->complex_filter_params = complex_filter_params;
 	// ORDER BY pushdown fields (Spec 039)
 	result->order_by_clause = order_by_clause;
 	result->top_n = top_n;

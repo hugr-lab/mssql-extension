@@ -14,6 +14,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "query/mssql_result_stream.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/table_scan_state.hpp"
 
 #include <atomic>
@@ -121,6 +122,10 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// These are expressions like year(col) = 2024, BETWEEN, etc. that cannot be
 	// represented as simple TableFilter objects
 	mutable string complex_filter_where_clause;
+	// Spec 076: the parameters the complex-filter clause refers to (@p0..),
+	// collected at plan time with it; init copies the set and appends the
+	// simple filters' parameters, then wraps the statement.
+	mutable mssql::SqlParamSet complex_filter_params;
 
 	// ORDER BY pushdown (Spec 039)
 	// Set by MSSQLOptimizer when ORDER BY can be pushed to SQL Server

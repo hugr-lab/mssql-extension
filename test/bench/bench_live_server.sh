@@ -106,7 +106,7 @@ if [ "${MSSQL_BENCH_UNSIGNED:-0}" = "1" ]; then
 fi
 
 OUTPUT_FILE="${MSSQL_BENCH_OUTPUT:-/tmp/bench_live_server_$(date +%s).tsv}"
-DSN="Server=${HOST},${PORT};Database=${DB};User Id=${SQLUSER};Password=${PASS}"
+DSN="Server=${HOST},${PORT};Database=${DB};User Id=${SQLUSER};Password=${PASS};TrustServerCertificate=yes"
 SRC_DB="/tmp/bench_live_src_$$.duckdb"
 
 case "$(uname -s 2>/dev/null)" in
@@ -296,7 +296,7 @@ trap on_exit EXIT
 # ---------------------------------------------------------------------------
 
 echo "[bench_live] DuckDB CLI:  $DUCKDB_BIN"
-echo "[bench_live] DSN:         Server=${HOST},${PORT};Database=${DB};User Id=${SQLUSER};Password=***"
+echo "[bench_live] DSN:         Server=${HOST},${PORT};Database=${DB};User Id=${SQLUSER};Password=***;TrustServerCertificate=yes"
 echo "[bench_live] rows=${ROWS} reps=${REPS} read_iters=${READ_ITERS} write_iters=${WRITE_ITERS} threads=${THREADS}"
 echo "[bench_live] groups:      ${BENCH_GROUPS}"
 echo "[bench_live] output:      ${OUTPUT_FILE}"

@@ -25,6 +25,7 @@
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_query_executor.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/table_scan_bind.hpp"
 #include "table_scan/table_scan_state.hpp"
@@ -433,6 +434,10 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// Combine: simple filters (from FilterEncoder::Encode) + complex filters (from pushdown_complex_filter)
 	std::vector<std::string> where_conditions;
 	bool needs_duckdb_filter = false;
+	// Spec 076: the plan-time parameters first (the complex clause names them
+	// @p0..), then whatever the simple filters add.
+	mssql::SqlParamSet params = bind_data.complex_filter_params;
+	const bool parameterize = LoadScanParameterizeFilters(context);
 
 	// 1. Encode simple filters (TableFilterSet from filter_pushdown)
 	if (input.filters && input.filters->HasFilters()) {
@@ -440,7 +445,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 							 static_cast<size_t>(input.filters->FilterCount()));
 
 		auto encode_result =
-			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types);
+			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types,
+								  &bind_data.mssql_columns, parameterize ? &params : nullptr);
 
 		if (!encode_result.where_clause.empty()) {
 			where_conditions.push_back(encode_result.where_clause);
@@ -516,6 +522,11 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: ORDER BY pushdown: %s", bind_data.order_by_clause.c_str());
 	}
 
+	if (!params.params.empty()) {
+		// The text is now one fixed string per shape; the values ride in the
+		// DECLARE line, and the server keeps one plan for all of them.
+		query = params.ExecuteSqlBatch(query);
+	}
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
 	// Execute the query.
@@ -979,6 +990,7 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 	if (!bind_data.pk_column_names.empty()) {
 		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
 	}
+	ctx.mssql_columns = &bind_data.mssql_columns;
 	return ctx;
 }
 
@@ -1229,6 +1241,12 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 
 	vector<column_t> column_ids;
 	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
+	// Spec 076: the constants become parameters, kept on the bind data beside
+	// the clause that refers to them.
+	mssql::SqlParamSet params;
+	if (LoadScanParameterizeFilters(context)) {
+		ctx.params = &params;
+	}
 
 	std::vector<std::string> encoded_conditions;
 	std::vector<idx_t> expressions_to_remove;
@@ -1265,7 +1283,9 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 			where_clause += encoded_conditions[i];
 		}
 		bind_data.complex_filter_where_clause = where_clause;
-		MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: stored WHERE clause: %s", where_clause.c_str());
+		bind_data.complex_filter_params = std::move(params);
+		MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: stored WHERE clause: %s (%llu parameter(s))",
+							 where_clause.c_str(), (unsigned long long)bind_data.complex_filter_params.params.size());
 	}
 
 	MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: %zu expressions handled, %zu remaining for DuckDB",
@@ -1380,6 +1400,16 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 	// together by the common-subplan optimizer: one holds its connection open and
 	// the other does not, which is the whole point of the flag.
 	serializer.WriteProperty(106, "requires_materialization", bind_data.requires_materialization);
+	// Spec 076: the parameters the complex clause refers to, as two parallel
+	// lists (names are positional: p0, p1, ...).
+	vector<string> param_declarations;
+	vector<string> param_literals;
+	for (const auto &p : bind_data.complex_filter_params.params) {
+		param_declarations.push_back(p.declaration);
+		param_literals.push_back(p.literal);
+	}
+	serializer.WriteProperty(107, "complex_filter_param_declarations", param_declarations);
+	serializer.WriteProperty(108, "complex_filter_param_literals", param_literals);
 }
 
 // NOTE: nothing in DuckDB round-trips a logical plan today — the only caller of
@@ -1396,6 +1426,8 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto order_by_clause = deserializer.ReadProperty<string>(104, "order_by_clause");
 	auto top_n = deserializer.ReadProperty<int64_t>(105, "top_n");
 	auto requires_materialization = deserializer.ReadProperty<bool>(106, "requires_materialization");
+	auto param_declarations = deserializer.ReadProperty<vector<string>>(107, "complex_filter_param_declarations");
+	auto param_literals = deserializer.ReadProperty<vector<string>>(108, "complex_filter_param_literals");
 
 	auto &context = deserializer.Get<ClientContext &>();
 
@@ -1422,6 +1454,12 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto &result = bind_data->Cast<MSSQLCatalogScanBindData>();
 	result.requires_materialization = requires_materialization;
 	result.complex_filter_where_clause = complex_filter_where_clause;
+	if (param_declarations.size() != param_literals.size()) {
+		throw SerializationException("MSSQL: catalog scan parameter lists differ in length");
+	}
+	for (idx_t i = 0; i < param_declarations.size(); i++) {
+		result.complex_filter_params.Add(param_declarations[i], param_literals[i]);
+	}
 	result.order_by_clause = order_by_clause;
 	result.top_n = top_n;
 	return bind_data;

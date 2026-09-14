@@ -26,6 +26,18 @@ Table scans are implemented as DuckDB table functions. When a query references a
 
 **Rowid filter pushdown**: Conditions like `rowid = value` are translated into PK column conditions (e.g., `pk_col = value` for scalar PK, or multi-column conditions for composite PK).
 
+### Parameterised constants (spec 076)
+
+The constants of a pushed filter do not go into the query text. Each becomes a `@pN` parameter of an `sp_executesql` batch:
+
+```sql
+DECLARE @p0 varchar(20) = N'ab', @p1 int = 0, @p2 nvarchar(10) = N'x%';
+EXEC sp_executesql N'SELECT [id] FROM [dbo].[t] WHERE ([v] = @p0) AND ([id] > @p1) AND ([n] LIKE @p2)',
+     N'@p0 varchar(20), @p1 int, @p2 nvarchar(10)', @p0 = @p0, @p1 = @p1, @p2 = @p2
+```
+
+SQL Server keys its plan cache on the statement text and the declarations, so every scan with the same filter *shape* reuses one plan; with literals every distinct value set compiled and cached its own. The declaration comes from the **column** the constant is compared with (`FilterEncoder::DeclarationForColumn`): the column's kind, never narrower than the constant. That is what `mssql_scan_params` cannot do — it only knows the DuckDB type — and it matters: a `varchar(20)` column compared with an `nvarchar` parameter is converted on the server and loses its index seek, and a 25-character constant declared `varchar(20)` would be truncated into a false match. Rules: integer family widened to the wider of column and constant; `decimal(p,s)` to the wider of both; `varchar(k)` / `nvarchar(k)` with `k` at least the constant's length (bytes / UTF-16 units), `max` past 8000 / 4000; a non-ASCII constant goes as `nvarchar` whatever the column's collation, as the `N'...'` literal always did (a varchar *variable* takes the database's code page, not the column's); `datetime2` / `time` / `datetimeoffset` at the wider scale; `float`, `real`, `datetime` and `smalldatetime` from the constant's type (declaring a DOUBLE as `real` would round it). `IN` lists, `IS NULL` and types with no parameter form (xml, sql_variant, UDTs) stay literal; a NULL constant stays literal. The plan-time complex filters keep their parameters on the bind data (`complex_filter_params`) and the init-time simple filters append to them, so the DECLARE line is rendered once at init. `mssql_scan_parameterize_filters = false` restores the literal form — the escape hatch for parameter sniffing.
+
 ### Function Mapping
 
 `FunctionMapping` (`src/table_scan/function_mapping.cpp`) maps DuckDB functions to SQL Server equivalents for filter pushdown.

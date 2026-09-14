@@ -82,7 +82,14 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	  columns_(MakeColumnList(metadata, MSSQLReportsNativeTypes(catalog))),
 	  mssql_columns_(metadata.columns),
 	  object_type_(metadata.object_type),
-	  approx_row_count_(metadata.approx_row_count) {}
+	  approx_row_count_(metadata.approx_row_count) {
+	// Spec 076 W2: a load that carried the primary key seeds it here, and
+	// EnsurePKLoaded has nothing to fetch.
+	if (metadata.pk_loaded) {
+		pk_info_ = metadata.pk_info;
+		pk_loaded_.store(true, std::memory_order_release);
+	}
+}
 
 MSSQLTableEntry::~MSSQLTableEntry() = default;
 

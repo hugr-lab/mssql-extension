@@ -169,6 +169,48 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 	}
 }
 
+const char *PrimaryKeyInfo::DiscoverySqlTemplate() {
+	return PK_DISCOVERY_SQL_TEMPLATE;
+}
+
+bool PrimaryKeyInfo::AppendColumnFromRow(PrimaryKeyInfo &info, const vector<string> &values,
+										 const string &database_collation) {
+	if (values.size() < 8) {
+		return false;
+	}
+	string col_name = values[0];
+	int32_t col_id = 0;
+	try {
+		col_id = static_cast<int32_t>(std::stoi(values[1]));
+	} catch (...) {
+	}
+	int32_t key_ordinal = 0;
+	try {
+		key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
+	} catch (...) {
+	}
+	string type_name = values[3];
+	int16_t max_len = 0;
+	try {
+		max_len = static_cast<int16_t>(std::stoi(values[4]));
+	} catch (...) {
+	}
+	uint8_t prec = 0;
+	try {
+		prec = static_cast<uint8_t>(std::stoi(values[5]));
+	} catch (...) {
+	}
+	uint8_t scl = 0;
+	try {
+		scl = static_cast<uint8_t>(std::stoi(values[6]));
+	} catch (...) {
+	}
+	string collation = values[7];
+	info.columns.push_back(PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
+													  collation, database_collation));
+	return true;
+}
+
 PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name,
 										const string &table_name, const string &database_collation) {
 	PrimaryKeyInfo info;
@@ -186,45 +228,7 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const st
 	ExecuteMetadataQuery(
 		connection, query,
 		[&info, &database_collation](const vector<string> &values) {
-			if (values.size() >= 8) {
-				string col_name = values[0];
-				int32_t col_id = 0;
-				try {
-					col_id = static_cast<int32_t>(std::stoi(values[1]));
-				} catch (...) {
-				}
-
-				int32_t key_ordinal = 0;
-				try {
-					key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
-				} catch (...) {
-				}
-
-				string type_name = values[3];
-				int16_t max_len = 0;
-				try {
-					max_len = static_cast<int16_t>(std::stoi(values[4]));
-				} catch (...) {
-				}
-
-				uint8_t prec = 0;
-				try {
-					prec = static_cast<uint8_t>(std::stoi(values[5]));
-				} catch (...) {
-				}
-
-				uint8_t scl = 0;
-				try {
-					scl = static_cast<uint8_t>(std::stoi(values[6]));
-				} catch (...) {
-				}
-
-				string collation = values[7];
-
-				auto pk_col = PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
-														 collation, database_collation);
-				info.columns.push_back(std::move(pk_col));
-			}
+			AppendColumnFromRow(info, values, database_collation);
 		},
 		[&info]() {
 			// push_back per key column: a composite PK aborted after its first column

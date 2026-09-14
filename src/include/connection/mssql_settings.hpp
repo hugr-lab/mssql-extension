@@ -78,6 +78,9 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context);
 //! put into Error, as a desync would. 0 = off.
 int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 
+//! Spec 076: pushed filter constants as sp_executesql parameters (default true).
+bool LoadScanParameterizeFilters(ClientContext &context);
+
 // Load ATTACH credential-validation timeout (spec 047 / US2).
 // Returns mssql_attach_validation_timeout if > 0, else mssql_connection_timeout.
 int LoadAttachValidationTimeout(ClientContext &context);

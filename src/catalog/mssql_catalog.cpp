@@ -124,6 +124,17 @@ std::unique_ptr<MSSQLResultStream> MSSQLCatalog::RetrieveStream(const std::strin
 //===----------------------------------------------------------------------===//
 
 void MSSQLCatalog::Initialize(bool load_builtin) {
+	// Spec 076 W2: this runs TWICE per ATTACH -- once from the storage
+	// extension's attach callback (mssql_storage.cpp) and once from DuckDB's
+	// AttachedDatabase::Initialize right after it. The second call used to
+	// build a second pool (the first, with its freshly logged-in connection,
+	// was destroyed), log in again, and ask the collation again: two of the
+	// three logins an ATTACH cost (#324) and the "collation query twice" of
+	// spec 076 § 0.2. The pool is the artifact; once it exists, there is
+	// nothing to do.
+	if (connection_pool_) {
+		return;
+	}
 	// Spec 047: build the connection pool inline (per-catalog ownership).
 	// Replaces the MssqlPoolManager singleton lookup that lived here before.
 	// The pool is owned by this catalog and torn down via unique_ptr in the

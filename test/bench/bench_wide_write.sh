@@ -30,7 +30,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 set -a; . ./.env; set +a
-DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS}"
+DSN="Server=${MSSQL_TEST_HOST},${MSSQL_TEST_PORT};Database=TestDB;User Id=${MSSQL_TEST_USER};Password=${MSSQL_TEST_PASS};TrustServerCertificate=yes"
 ROWS=${ROWS:-500000}
 OUT=${OUT:-/tmp/bench_wide.log}
 # A/B against another binary: BIN overrides the CLI; PRELUDE_SQL (e.g.

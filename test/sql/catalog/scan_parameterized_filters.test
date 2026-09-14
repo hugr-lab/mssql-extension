@@ -1,0 +1,261 @@
+# name: test/sql/catalog/scan_parameterized_filters.test
+# description: pushed filter constants travel as sp_executesql parameters declared from the column (spec 076 W1)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# With mssql_scan_parameterize_filters on (the default) a pushed filter's
+# constants become @pN parameters of an sp_executesql batch, declared from the
+# COLUMN they are compared with; the statement text is one fixed string per
+# filter shape. Every case below runs the same predicate with the setting on
+# and off and expects the same rows: the declaration must never change what a
+# comparison means -- not by truncating a constant into a false match (a
+# 25-character constant against varchar(20)), not by narrowing an integer
+# (a BIGINT constant against int), not by rounding a scale. Plan reuse is
+# measured in the PR with sys.dm_exec_cached_plans, not asserted here.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pf76 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('pf76', 'IF OBJECT_ID(''dbo.pf76'') IS NOT NULL DROP TABLE dbo.pf76; CREATE TABLE dbo.pf76 (id int NOT NULL PRIMARY KEY, sid smallint NULL, big bigint NULL, flag bit NULL, v varchar(20) NULL, n nvarchar(10) NULL, ch char(4) NULL, d decimal(9,2) NULL, m money NULL, f float NULL, r real NULL, dt date NULL, ts datetime2(3) NULL, dto datetimeoffset(3) NULL, tm time(3) NULL, u uniqueidentifier NULL, b varbinary(8) NULL)');
+
+statement ok
+SELECT mssql_exec('pf76', 'INSERT INTO dbo.pf76 VALUES
+ (1, 10, 3000000000, 1, ''ab'', N''xy'', ''ab'', 1.50, 9.99, 1.5, 1.5, ''2024-01-02'', ''2024-01-02 03:04:05.123'', ''2024-01-02 03:04:05.123 +02:00'', ''03:04:05.123'', ''6F9619FF-8B86-D011-B42D-00C04FC964FF'', 0x0102),
+ (2, 20, 4000000000, 0, ''abc'', N''ünï'', ''cd'', 2.25, 19.99, 2.5, 2.5, ''2024-01-03'', ''2024-01-03 00:00:00'', ''2024-01-03 00:00:00 +00:00'', ''00:00:00'', ''6F9619FF-8B86-D011-B42D-00C04FC964F0'', 0x0304),
+ (3, NULL, NULL, NULL, ''abcdefghijklmnopqrst'', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('pf76');
+
+# --- each row of the declaration table: the same rows with the setting on and off
+statement ok
+SET mssql_scan_parameterize_filters = true;
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v = 'ab';
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE n = 'ünï';
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE ch = 'cd';
+----
+2
+
+# a 25-character constant against varchar(20): the declaration widens to the
+# constant, so it can never match a 20-character row by truncation
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE v = 'abcdefghijklmnopqrstuvwxy';
+----
+0
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v = 'abcdefghijklmnopqrst';
+----
+3
+
+# a BIGINT constant against an int column: declared bigint, not int
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE id = 3000000000;
+----
+0
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE big = 4000000000;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE sid = 10;
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE flag = true;
+----
+1
+
+# decimal(9,2) column with a DECIMAL(10,4) constant: declared at the wider scale
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE d = 1.5000;
+----
+1
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE d = 1.5001;
+----
+0
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE m = 19.99;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE f = 1.5;
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE r = 2.5;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE dt = DATE '2024-01-03';
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE ts = TIMESTAMP_MS '2024-01-02 03:04:05.123';
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE ts > TIMESTAMP '2024-01-02 03:04:05.123';
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE tm = TIME '03:04:05.123';
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE u = '6f9619ff-8b86-d011-b42d-00c04fc964f0'::UUID;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE b = '\x03\x04'::BLOB;
+----
+2
+
+# range, BETWEEN, LIKE (a prefix on a varchar column), IN (stays literal), IS NULL (stays literal), rowid
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE id > 1 AND id < 3;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE d BETWEEN 2 AND 3;
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v LIKE 'abc%' ORDER BY id;
+----
+2
+3
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE n LIKE '%n%';
+----
+2
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE id IN (2, 3) ORDER BY id;
+----
+2
+3
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v IS NULL;
+----
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE sid IS NULL;
+----
+3
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE rowid = 2;
+----
+2
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE v = 'ab' AND n LIKE 'x%' AND id > 0 AND d BETWEEN 1 AND 2;
+----
+1
+
+# --- and the literal form gives the same answers
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v = 'ab';
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE n = 'ünï';
+----
+2
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE v = 'abcdefghijklmnopqrstuvwxy';
+----
+0
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE id = 3000000000;
+----
+0
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE d = 1.5000;
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE ts = TIMESTAMP_MS '2024-01-02 03:04:05.123';
+----
+1
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v LIKE 'abc%' ORDER BY id;
+----
+2
+3
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76 WHERE v = 'ab' AND n LIKE 'x%' AND id > 0 AND d BETWEEN 1 AND 2;
+----
+1
+
+statement ok
+SET mssql_scan_parameterize_filters = true;
+
+# --- DML through the rowid scan (UPDATE/DELETE find their rows through a parameterised scan)
+statement ok
+UPDATE pf76.dbo.pf76 SET v = 'upd' WHERE id = 2;
+
+query I
+SELECT id FROM pf76.dbo.pf76 WHERE v = 'upd';
+----
+2
+
+statement ok
+DELETE FROM pf76.dbo.pf76 WHERE v = 'upd';
+
+query I
+SELECT count(*) FROM pf76.dbo.pf76;
+----
+2
+
+statement ok
+SELECT mssql_exec('pf76', 'DROP TABLE dbo.pf76');
+
+statement ok
+DETACH pf76;

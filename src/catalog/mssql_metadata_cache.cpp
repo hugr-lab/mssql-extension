@@ -280,8 +280,19 @@ static bool IsTTLExpired(const std::chrono::steady_clock::time_point &last_refre
 
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
+using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
+
+static void RunMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
+								 int timeout_ms, const std::function<void()> &reset);
+
 static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
 							 int timeout_ms, const std::function<void()> &reset) {
+	RunMetadataQuerySets(
+		connection, sql, [&callback](idx_t, const vector<string> &values) { callback(values); }, timeout_ms, reset);
+}
+
+static void RunMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
+								 int timeout_ms, const std::function<void()> &reset) {
 	// Log the query being executed (truncated for readability)
 	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.c_str(),
 				sql.size() > 120 ? "..." : "");
@@ -309,9 +320,9 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 	auto start = std::chrono::steady_clock::now();
 	for (int attempt = 1;; attempt++) {
 		idx_t rows_delivered = 0;
-		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
+		auto result = MSSQLSimpleQuery::ExecuteWithSetCallback(
 			connection, sql,
-			[&callback, &rows_delivered](const std::vector<std::string> &row) {
+			[&callback, &rows_delivered](idx_t result_set, const std::vector<std::string> &row) {
 				// Convert std::vector to duckdb::vector
 				vector<string> duckdb_row;
 				duckdb_row.reserve(row.size());
@@ -319,7 +330,7 @@ static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, 
 					duckdb_row.push_back(val);
 				}
 				rows_delivered++;
-				callback(duckdb_row);
+				callback(result_set, duckdb_row);
 				return true;  // continue processing
 			},
 			timeout_ms);
@@ -435,8 +446,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 
 	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so the
 	// text -- and the server's cached plan -- is the same for every table.
+	// Spec 076 W2: the primary key in the same batch -- a second result set
+	// off the same @s / @t -- so a fresh table pays one round trip.
 	string query = mssql::BuildExecuteSqlBatch(
-		SINGLE_TABLE_METADATA_SQL_TEMPLATE, "@s sysname, @t sysname",
+		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::PrimaryKeyInfo::DiscoverySqlTemplate(),
+		"@s sysname, @t sysname",
 		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
 	// Populate the cache slot in place so we never take the address of a stack
@@ -466,9 +480,9 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 		table_meta.name = table_name;
 		first_row = true;
 	};
-	ExecuteMetadataQuery(
+	ExecuteMetadataQuerySets(
 		connection, query,
-		[this, &table_meta, &first_row](const vector<string> &values) {
+		[this, &table_meta, &first_row](idx_t result_set, const vector<string> &values) {
 			// 11 columns: object_type, the eight per-column fields, then index_type
 			// and is_partitioned. The guard has to cover the LAST index read.
 			//
@@ -477,6 +491,17 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// header). It has to stay — MSSQLCatalogScanCardinality reads the
 			// catalog's copy before anything else, so removing it plans every direct
 			// query at ~1 row.
+			// Routed by which statement of the batch produced the row, never by
+			// its width: the second result set is PrimaryKeyInfo::DiscoverySqlTemplate
+			// (review of #345 -- a column added to either query must not silently
+			// drop every primary key in the catalog).
+			if (result_set == 1) {
+				mssql::PrimaryKeyInfo::AppendColumnFromRow(table_meta.pk_info, values, database_collation_);
+				return;
+			}
+			if (result_set != 0) {
+				return;
+			}
 			if (values.size() < 12) {
 				return;
 			}
@@ -544,11 +569,14 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	}
 
 	// Cache the result (slot is already in the map)
+	table_meta.pk_info.exists = !table_meta.pk_info.columns.empty();
+	table_meta.pk_info.ComputeRowIdType();
+	table_meta.pk_loaded = true;
 	table_meta.columns_load_state = CacheLoadState::LOADED;
 	table_meta.columns_last_refresh = std::chrono::steady_clock::now();
 
-	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns", schema_name.c_str(), table_name.c_str(),
-				table_meta.columns.size());
+	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loaded %zu columns, PK with %zu column(s)", schema_name.c_str(),
+				table_name.c_str(), table_meta.columns.size(), table_meta.pk_info.columns.size());
 
 	out_meta = table_meta;	// copy under mutex_ — see header contract
 	return true;
@@ -1405,6 +1433,33 @@ void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, co
 		};
 	}
 	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
+}
+
+void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection, const string &sql,
+												  MSSQLMetadataCache::MetadataSetRowCallback callback,
+												  MSSQLMetadataCache::MetadataResetCallback reset) {
+	// The #317 lever, as in ExecuteMetadataQuery: counts rows across every
+	// result set of the batch.
+	const int64_t fail_after = test_fail_after_rows_;
+	if (fail_after > 0) {
+		auto seen = make_shared_ptr<int64_t>(0);
+		auto inner = std::move(callback);
+		callback = [inner, seen, fail_after](idx_t result_set, const vector<string> &values) {
+			inner(result_set, values);
+			if (++(*seen) >= fail_after) {
+				throw IOException("mssql: injected metadata failure at row %lld (mssql_test_fail_metadata_after_rows)",
+								  (long long)fail_after);
+			}
+		};
+		auto inner_reset = std::move(reset);
+		reset = [inner_reset, seen]() {
+			*seen = 0;
+			if (inner_reset) {
+				inner_reset();
+			}
+		};
+	}
+	RunMetadataQuerySets(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 
 //===----------------------------------------------------------------------===//

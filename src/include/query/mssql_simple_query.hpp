@@ -92,6 +92,14 @@ public:
 	static SimpleQueryResult ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
 												 RowCallback callback, int timeout_ms = 30000);
 
+	//! The same, with the ordinal of the result set each row belongs to (0 for
+	//! the first COLMETADATA of the batch). A batch of several statements is
+	//! read off this: rows are routed by which statement produced them, never
+	//! by their width (spec 076 W2, review of #345).
+	using RowSetCallback = std::function<bool(size_t result_set, const std::vector<std::string> &values)>;
+	static SimpleQueryResult ExecuteWithSetCallback(tds::TdsConnection &connection, const std::string &sql,
+													RowSetCallback callback, int timeout_ms = 30000);
+
 	// Execute a query and return single scalar value
 	static std::string ExecuteScalar(tds::TdsConnection &connection, const std::string &sql, int timeout_ms = 30000);
 };
