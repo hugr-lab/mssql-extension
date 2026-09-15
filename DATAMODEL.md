@@ -774,12 +774,22 @@ stream, commits every session, releases every connection. A failure anywhere
 abandons them all — the load is rolled back, the message names the batch.
 
 Parallel writers only where their transactional loads cannot block each other:
-a heap under TABLOCK (BU locks) or a clustered columnstore without it. Anything
-else — a clustered rowstore, a heap on row locks — gets one writer, because two
-writers whose locks conflict deadlock **client-side**: B waits on a lock A's
-uncommitted rows hold, so the server stops reading B's stream, so B's thread
-blocks in `send()`, while A's commit is in `Finalize`, which waits for B's
-`Combine`. The server sees no deadlock and nothing times out.
+a **bare** heap under TABLOCK (BU locks) or a clustered columnstore without it.
+Anything else — a clustered rowstore, a heap on row locks — gets one writer,
+because two writers whose locks conflict deadlock **client-side**: B waits on a
+lock A's uncommitted rows hold, so the server stops reading B's stream, so B's
+thread blocks in `send()`, while A's commit is in `Finalize`, which waits for
+B's `Combine`. The server sees no deadlock and nothing times out.
+
+"Bare" carries weight: SQL Server hands concurrent bulk loaders compatible BU
+locks only when the table has **no indexes at all**. A heap with a nonclustered
+index on it (a `PRIMARY KEY NONCLUSTERED`, any `CREATE INDEX`) takes an
+exclusive table lock under the same hint, and would hang exactly as above. The
+base structure alone cannot answer this — `MSSQLIndexKind` comes from queries
+that filter `index_id <= 1`, which is precisely the rows a nonclustered index is
+not — so `TargetResolver::QueryTableShape` returns a `TableLoadShape` carrying
+`has_nonclustered` beside `kind`, read live on the load connection when the
+stream opens.
 
 `mssql::LoadTransaction` (`copy/load_transaction.hpp`) is the bracket itself,
 on one connection: `BEGIN TRANSACTION` with the ENVCHANGE descriptor captured

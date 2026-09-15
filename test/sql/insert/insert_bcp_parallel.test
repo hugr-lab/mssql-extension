@@ -31,7 +31,9 @@ IF OBJECT_ID(''dbo.BcpParClustered'') IS NOT NULL DROP TABLE dbo.BcpParClustered
 CREATE TABLE dbo.BcpParClustered (id INT NOT NULL PRIMARY KEY CLUSTERED, v NVARCHAR(20) NULL);
 IF OBJECT_ID(''dbo.BcpParCci'') IS NOT NULL DROP TABLE dbo.BcpParCci;
 CREATE TABLE dbo.BcpParCci (id INT NOT NULL, v NVARCHAR(20) NULL);
-CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCci');
+CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCci;
+IF OBJECT_ID(''dbo.BcpParHeapNci'') IS NOT NULL DROP TABLE dbo.BcpParHeapNci;
+CREATE TABLE dbo.BcpParHeapNci (id INT NOT NULL PRIMARY KEY NONCLUSTERED, v NVARCHAR(20) NULL)');
 
 statement ok
 SELECT mssql_invalidate_cache('bpar');
@@ -94,6 +96,29 @@ SELECT count(*), sum(id) FROM bpar.dbo.BcpParCci;
 ----
 400000	80000200000
 
+# --- a heap carrying a NONCLUSTERED index: one writer, and the rows land.
+#
+# This is a heap -- sys.indexes reports index_id 0 for it, and every query
+# that reports the base structure filters index_id <= 1, so it is
+# indistinguishable from BcpParHeap above by `kind` alone. It does NOT load
+# like one: SQL Server gives concurrent bulk loaders compatible BU locks only
+# when the table has no indexes at all, and with the nonclustered index
+# present TABLOCK takes an exclusive table lock instead. Four transactional
+# writers would then serialise into the client-side deadlock this file is
+# about.
+#
+# The regression signature is a HANG, not a wrong count: if the writer rule
+# stops accounting for the nonclustered index, this statement never returns
+# and the suite times out here. The count below is what proves the one-writer
+# load is still correct, not what catches the bug.
+statement ok
+INSERT INTO bpar.dbo.BcpParHeapNci SELECT * FROM src;
+
+query II
+SELECT count(*), sum(id) FROM bpar.dbo.BcpParHeapNci;
+----
+400000	80000200000
+
 # --- the shape is read LIVE when the stream opens, not from the cache: this
 # table was a heap when the catalog cached it (the load above), and has a
 # clustered index now, added through mssql_exec, which does not invalidate.
@@ -136,7 +161,7 @@ statement ok
 RESET mssql_insert_bcp_threshold;
 
 statement ok
-SELECT mssql_exec('bpar', 'DROP TABLE dbo.BcpParHeap; DROP TABLE dbo.BcpParClustered; DROP TABLE dbo.BcpParCci');
+SELECT mssql_exec('bpar', 'DROP TABLE dbo.BcpParHeap; DROP TABLE dbo.BcpParClustered; DROP TABLE dbo.BcpParCci; DROP TABLE dbo.BcpParHeapNci');
 
 statement ok
 DETACH bpar;

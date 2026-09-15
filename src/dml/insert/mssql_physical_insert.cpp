@@ -175,6 +175,10 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	}
 	if (connection->GetState() != tds::ConnectionState::Idle) {
 		if (!gstate.transaction_pinned) {
+			// mssql_reset_connection is honoured by every release path in the
+			// extension (issue #189); a raw pool Release() here would hand the
+			// connection back carrying whatever reset bit it happened to have.
+			connection->SetNeedsReset(gstate.reset_on_release);
 			catalog.GetConnectionPool().Release(connection);
 		}
 		throw InvalidInputException(
@@ -190,11 +194,12 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// fan out into the client-side deadlock the rule exists to prevent
 	// (spec 062 self-review). The TABLOCK hint in the INSERT BULK text stays
 	// the plan's; with one writer it serialises nothing.
-	MSSQLIndexKind live_shape;
+	mssql::TableLoadShape live;
 	try {
-		live_shape = mssql::TargetResolver::QueryTableShape(*connection, bulk.target);
+		live = mssql::TargetResolver::QueryTableShape(*connection, bulk.target);
 	} catch (...) {
 		if (!gstate.transaction_pinned) {
+			connection->SetNeedsReset(gstate.reset_on_release);
 			catalog.GetConnectionPool().Release(connection);
 		}
 		throw;
@@ -218,20 +223,33 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// for B's Combine. The server sees no deadlock -- one side is a client --
 	// and nothing times out (measured: a hang, 10 minutes and counting, on a
 	// heap without TABLOCK; a 30 s BCP timeout on a clustered rowstore). Only
-	// two shapes let concurrent transactional bulk loads coexist: a heap under
-	// TABLOCK (BU locks are mutually compatible, and nothing escalates) and a
-	// clustered columnstore without it (each session fills its own rowgroups;
-	// measured 1M rows in 0.49 s and 0.80 s at four writers). Everything else
-	// -- a clustered rowstore index, a heap on row locks, a columnstore under
-	// a table lock -- gets one writer.
-	const bool locks_compatible = (live_shape == MSSQLIndexKind::HEAP && bulk.tablock) ||
-								  (live_shape == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock);
+	// two shapes let concurrent transactional bulk loads coexist: a BARE heap
+	// under TABLOCK (BU locks are mutually compatible, and nothing escalates)
+	// and a clustered columnstore without it (each session fills its own
+	// rowgroups; measured 1M rows in 0.49 s and 0.80 s at four writers).
+	// Everything else -- a clustered rowstore index, a heap on row locks, a
+	// columnstore under a table lock -- gets one writer.
+	//
+	// "Bare" is the whole of it: SQL Server's rule is "if the table has no
+	// indexes and TABLOCK is specified, the table can be loaded concurrently
+	// by multiple clients". A heap carrying a nonclustered index takes an
+	// exclusive table lock instead, which is the deadlock above -- and
+	// live.kind cannot see that, because every query behind it filters
+	// index_id <= 1. has_nonclustered is the column that can.
+	const bool bare_heap = live.kind == MSSQLIndexKind::HEAP && !live.has_nonclustered;
+	const bool locks_compatible =
+		(bare_heap && bulk.tablock) || (live.kind == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock);
 	if (!locks_compatible) {
 		gstate.parallel_writer_limit = 1;
 	}
-	if (live_shape != bulk.shape) {
+	if (live.kind == MSSQLIndexKind::HEAP && live.has_nonclustered) {
+		INSERT_SINK_LOG(1,
+						"heap target carries a nonclustered index: one writer (under TABLOCK it takes an "
+						"exclusive table lock, not the compatible BU locks a bare heap takes)");
+	}
+	if (live.kind != bulk.shape) {
 		INSERT_SINK_LOG(1, "target shape changed since the catalog cached it (%d -> %d): writer_limit=%llu",
-						(int)bulk.shape, (int)live_shape, (unsigned long long)gstate.parallel_writer_limit);
+						(int)bulk.shape, (int)live.kind, (unsigned long long)gstate.parallel_writer_limit);
 	}
 
 	INSERT_SINK_LOG(1, "stream opened after %llu staged row(s): pinned=%d, writer_limit=%llu, tablock in: %s",
@@ -485,17 +503,36 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 			throw IOException("%s", msg);
 		}
 	}
+	// Counted, not inferred: the catch below has to say how much of the load
+	// survived, and only the number of COMMITs that returned knows that.
+	idx_t committed_writers = 0;
 	try {
 		gstate.shared.Commit();
+		committed_writers++;
 		{
 			std::lock_guard<std::mutex> finished_lock(gstate.finished_mutex);
 			for (auto &session : gstate.finished_sessions) {
 				session->Commit();
+				committed_writers++;
 			}
 		}
 	} catch (std::exception &e) {
-		const string msg = StringUtil::Format("INSERT via BCP failed to commit: %s; %s", e.what(),
-											  MSSQLRowsBeforeOutcome(gstate.transaction_pinned, 0));
+		// Each writer's COMMIT is its own round trip, so a failure part-way
+		// through leaves every writer that already committed in place. Only the
+		// one-writer case (every load inside a transaction, and any load the
+		// rule above demoted) can honestly claim nothing landed -- claiming it
+		// for a multi-writer load invites a retry onto a half-loaded table.
+		const idx_t committed = gstate.rows_confirmed.load();
+		string outcome;
+		if (committed_writers == 0) {
+			outcome = MSSQLRowsBeforeOutcome(gstate.transaction_pinned, 0);
+		} else {
+			outcome = StringUtil::Format(
+				"%llu writer(s) had already committed, so up to %llu row(s) are in the table and were NOT rolled "
+				"back -- check the table before retrying",
+				(unsigned long long)committed_writers, (unsigned long long)committed);
+		}
+		const string msg = StringUtil::Format("INSERT via BCP failed to commit: %s; %s", e.what(), outcome);
 		AbandonAll(gstate);
 		throw IOException("%s", msg);
 	}

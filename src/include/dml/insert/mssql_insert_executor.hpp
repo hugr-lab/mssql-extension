@@ -99,7 +99,10 @@ private:
 	// State
 	bool finalized_;
 	//! A batch failed: the transaction is rolled back and the connection gone,
-	//! so nothing pending may be sent (the destructor used to flush it).
+	//! so nothing pending may be sent. Enforced -- Execute, ExecuteWithReturning
+	//! and both Finalize forms refuse once it is set. What actually returns the
+	//! connection and rolls the transaction back is ~MSSQLStatementConnection;
+	//! this flag is the guard that stops a later caller sending onto the corpse.
 	bool failed_ = false;
 	MSSQLInsertStatistics statistics_;
 

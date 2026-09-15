@@ -46,19 +46,24 @@ SELECT i FROM range(1, 2501) t(i);
 2500 values hashing to 9394fe7df1c8c49a465d18f8c783d03f
 
 # RETURNING * with a server-filled column, over one statement boundary
-# exactly (334 rows = 333 + 1).
+# exactly (501 rows = 500 + 1).
+#
+# 500, not 333: the cap is MSSQL_AUTO_PARAM_MAX_CONSTANTS / the number of
+# columns in the INSERT's list, and this list names two (id, v) -- the third
+# column is the server-filled one under test. At 334 rows this case was one
+# statement and asserted nothing about crossing a boundary.
 statement ok
 SELECT mssql_exec('rb', 'TRUNCATE TABLE dbo.RetBatches');
 
 query III rowsort
-SELECT i, NULL::INTEGER, 'w' FROM range(1, 335) t(i);
+SELECT i, NULL::INTEGER, 'w' FROM range(1, 502) t(i);
 ----
-1002 values hashing to ef7f091a879e9cc23513a8839cf88608
+1503 values hashing to 1b17b822d7fd363f2539dcd132ae4676
 
 query III rowsort
-INSERT INTO rb.dbo.RetBatches (id, v) SELECT i, 'w' FROM range(1, 335) t(i) RETURNING *;
+INSERT INTO rb.dbo.RetBatches (id, v) SELECT i, 'w' FROM range(1, 502) t(i) RETURNING *;
 ----
-1002 values hashing to ef7f091a879e9cc23513a8839cf88608
+1503 values hashing to 1b17b822d7fd363f2539dcd132ae4676
 
 statement ok
 SELECT mssql_exec('rb', 'DROP TABLE dbo.RetBatches');

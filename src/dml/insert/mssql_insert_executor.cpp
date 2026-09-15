@@ -409,6 +409,9 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::Execute called after Finalize");
 	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::Execute called after a batch failed");
+	}
 
 	EnsureBatchBuilder(false);
 
@@ -446,6 +449,9 @@ vector<unique_ptr<DataChunk>> MSSQLInsertExecutor::ExecuteWithReturning(DataChun
 																		const vector<idx_t> &returning_column_ids) {
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after Finalize");
+	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after a batch failed");
 	}
 
 	EnsureBatchBuilder(true);
@@ -492,6 +498,9 @@ void MSSQLInsertExecutor::Finalize() {
 		INSERT_DEBUG(1, "Finalize: already finalized, returning");
 		return;
 	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::Finalize called after a batch failed");
+	}
 
 	finalized_ = true;
 
@@ -513,6 +522,9 @@ void MSSQLInsertExecutor::Finalize() {
 unique_ptr<DataChunk> MSSQLInsertExecutor::FinalizeWithReturning() {
 	if (finalized_) {
 		return nullptr;
+	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::FinalizeWithReturning called after a batch failed");
 	}
 
 	finalized_ = true;

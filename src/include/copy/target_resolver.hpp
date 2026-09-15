@@ -178,6 +178,26 @@ struct BCPColumnMetadata {
 };
 
 //===----------------------------------------------------------------------===//
+// The target's shape as the bulk-load writer rule needs it
+//
+// `kind` is the base structure (sys.indexes row index_id 0 or 1). That alone
+// does not decide whether concurrent transactional loaders are safe: SQL
+// Server's rule is "if the table has NO indexes and TABLOCK is specified, the
+// table can be loaded concurrently by multiple clients". A heap carrying a
+// nonclustered index (a PRIMARY KEY NONCLUSTERED, any CREATE INDEX) takes an
+// exclusive table lock under TABLOCK instead of the mutually compatible BU
+// locks a bare heap takes -- and every query that reports `kind` filters
+// index_id <= 1, so the two are indistinguishable from it.
+//===----------------------------------------------------------------------===//
+
+struct TableLoadShape {
+	//! The base structure: heap, clustered rowstore, clustered columnstore.
+	MSSQLIndexKind kind = MSSQLIndexKind::HEAP;
+	//! Any sys.indexes row with index_id > 1 on the target.
+	bool has_nonclustered = false;
+};
+
+//===----------------------------------------------------------------------===//
 // TargetResolver - Resolves and validates COPY target destinations
 //
 // Handles both URL-based (mssql://...) and catalog-based (catalog.schema.table)
@@ -269,10 +289,12 @@ struct TargetResolver {
 	//! (spec 062 W2). The INSERT sink reads it when its stream opens rather
 	//! than trusting the catalog's cached index_kind: the writer rule turns a
 	//! stale HEAP into parallel transactional writers on what is now a
-	//! clustered index, which deadlocks client-side. Throws on a query
+	//! clustered index, which deadlocks client-side. Carries has_nonclustered
+	//! alongside the base structure, because TABLOCK only makes concurrent
+	//! loaders safe on a heap with no indexes at all. Throws on a query
 	//! failure; a table without a row (a view) reports HEAP, as the catalog
 	//! query does.
-	static MSSQLIndexKind QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target);
+	static TableLoadShape QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target);
 
 	// Get column metadata for an existing table
 	// Used when copying to existing table - BCP COLMETADATA must match target schema

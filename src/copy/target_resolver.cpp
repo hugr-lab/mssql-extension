@@ -431,30 +431,47 @@ static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
 	}
 }
 
-MSSQLIndexKind TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
+TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
 	// The same sys.indexes row ValidateTarget reads for COPY: index_id 0 is
 	// the heap, index_id 1 the clustered index, rowstore (type 1) or
 	// columnstore (type 5).
+	//
+	// The second column is what index_id <= 1 cannot answer: whether anything
+	// sits ON TOP of the base structure. TABLOCK buys concurrent loaders only
+	// on a heap with no indexes at all -- add a nonclustered index and the
+	// bulk load takes an exclusive table lock, so two transactional writers
+	// serialise and (their COMMIT deferred to Finalize) hang client-side.
+	// Same round trip, one more scalar subquery.
 	string sql;
 	if (target.IsTempTable()) {
 		sql = StringUtil::Format(
 			"SELECT ISNULL((SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1), 0) AS index_type",
-			target.GetBracketedTable());
+			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1), 0) AS index_type, "
+			"CASE WHEN EXISTS (SELECT 1 FROM tempdb.sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
+			target.GetBracketedTable(), target.GetBracketedTable());
 	} else {
 		sql = StringUtil::Format(
 			"SELECT ISNULL((SELECT TOP 1 i.type FROM sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1), 0) AS index_type",
-			target.GetFullyQualifiedName());
+			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1), 0) AS index_type, "
+			"CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
+			target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
 	}
 	auto result = MSSQLSimpleQuery::Execute(conn, sql);
 	if (!result.success) {
 		throw IOException("could not read the shape of %s: %s", target.GetFullyQualifiedName(), result.error_message);
 	}
+	TableLoadShape shape;
 	if (result.rows.empty() || result.rows[0].empty()) {
-		return MSSQLIndexKind::HEAP;
+		return shape;
 	}
-	return MSSQLIndexKindFromSysIndexesType(result.rows[0][0]);
+	shape.kind = MSSQLIndexKindFromSysIndexesType(result.rows[0][0]);
+	// A row that is short here means the query shape and the parser disagree;
+	// the conservative answer is "there may be one", which costs a writer and
+	// never a hang.
+	shape.has_nonclustered = result.rows[0].size() < 2 || result.rows[0][1] != "0";
+	return shape;
 }
 
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
