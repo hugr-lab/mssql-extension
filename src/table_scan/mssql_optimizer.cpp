@@ -16,6 +16,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "copy/copy_function.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -716,7 +717,14 @@ static void CollectCatalogScans(LogicalOperator &op, std::map<string, MSSQLCatal
 // bulk load with `connection not in Idle state`, the INSERT past its first
 // batch the same way. So one scan is one too many when the plan also sinks into
 // that catalog.
-static void CollectSinkCatalogs(LogicalOperator &op, std::set<string> &catalogs) {
+// Case-insensitive, because the two sides are spelled by different people. A
+// scan is keyed by the attached catalog's own name; a COPY's is
+// MSSQLCopyBindData::catalog_name, taken verbatim from the URI's first path
+// segment -- and DuckDB resolves catalog aliases case-insensitively, so
+// 'mssql://SK75/dbo/dst' is a legal way to write a sink into `sk75`. Matching
+// those with a case-sensitive set silently finds no sink and skips the
+// materialization, which is issue #239 back again with no diagnostic.
+static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &catalogs) {
 	if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 		auto &copy = op.Cast<LogicalCopyToFile>();
 		if (copy.function.name == "bcp" && copy.bind_data) {
@@ -746,7 +754,7 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 	}
 	std::map<string, MSSQLCatalogScanTally> by_catalog;
 	CollectCatalogScans(plan, by_catalog);
-	std::set<string> sink_catalogs;
+	case_insensitive_set_t sink_catalogs;
 	CollectSinkCatalogs(plan, sink_catalogs);
 	for (auto &entry : by_catalog) {
 		auto &tally = entry.second;

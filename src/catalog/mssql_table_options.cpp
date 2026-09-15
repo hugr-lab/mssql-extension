@@ -88,7 +88,18 @@ void MSSQLTableOptions::ApplyWithClause(const case_insensitive_map_t<unique_ptr<
 		if (literal.IsNull()) {
 			throw InvalidInputException("MSSQL: table option '%s' must not be NULL", entry.first);
 		}
-		ApplyOption(entry.first, literal.ToValue().ToString());
+		// ToValue() converts the atom and can throw on its own for a number too
+		// wide even for a bignum -- WITH (data_compression = <309 digits>). Every
+		// other rejection in this function names the option, so this one does too
+		// rather than surfacing a bare conversion error.
+		string option_value;
+		try {
+			option_value = literal.ToValue().ToString();
+		} catch (const std::exception &e) {
+			throw InvalidInputException("MSSQL: table option '%s' has a value that cannot be converted: %s",
+										entry.first, e.what());
+		}
+		ApplyOption(entry.first, option_value);
 	}
 }
 
