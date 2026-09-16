@@ -4,7 +4,7 @@ name: Concurrency Tests
 # ClientContextState anchor fix under multi-threaded stress. The Makefile
 # target `test-concurrent-reads` is added in PR #127 but no CI workflow
 # invoked it — the PR author ran it locally and pasted soak results into
-# the PR. This job reproduces the full scenarios 1-8 sweep on every PR
+# the PR. This job reproduces the full scenarios 1-9 sweep on every PR
 # that touches the catalog or singleflight surfaces, so the suite cannot
 # bit-rot.
 #
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   concurrency-tests:
-    name: Concurrency stress (scenarios 1-8)
+    name: Concurrency stress (scenarios 1-9)
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -210,7 +210,7 @@ jobs:
       # propagated into vcpkg's compiler-detection probe (sub-cmake) and
       # broke it; scoping LD_PRELOAD to just the test binary's run-prefix
       # avoids that.
-      - name: Run concurrent-reads stress (spec 052 scenarios 1-8)
+      - name: Run concurrent-reads stress (spec 052 scenarios 1-9)
         run: make test-concurrent-reads
 
       - name: Dump SQL Server logs on failure
