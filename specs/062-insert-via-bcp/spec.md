@@ -759,6 +759,44 @@ per statement, so the cap is neutral for it. `RETURNING` stays the one large
 INSERT nothing here speeds up; an `OUTPUT`-free bulk load followed by a read
 is the way to get rows back fast.
 
+### 6.8 The whole PR against main, end to end (2026-09-16)
+
+One fixture, both binaries, interleaved A/B in the same session, two rounds,
+min per cell. A = main `ddec241` (before this PR), B = this branch with
+oluies' review fixes and #349 merged in. `SET threads = 4`, a bare heap
+target for the INSERT cells, 1M rows × 3 columns unless the name says
+otherwise. No settings are touched by the script — this is what the same
+statement costs a user before and after.
+
+| cell | A wall | B wall | B/A | A client CPU | B client CPU |
+| --- | --- | --- | --- | --- | --- |
+| `INSERT … SELECT`, 1M rows | 74.71 s | **0.51 s** | **0.01** | 1.604 s | 0.051 s |
+| 20 × `INSERT … SELECT` of 500 rows (under the threshold) | 0.729 s | **0.219 s** | 0.30 | 0.170 s | 0.072 s |
+| `INSERT … RETURNING`, 100k rows | 7.44 s | 7.15 s | 0.96 | 0.254 s | 0.226 s |
+| `COPY … (FORMAT 'bcp')`, 1M rows | 0.739 s | 0.520 s | 0.70 | 0.214 s | 0.087 s |
+| `CREATE TABLE … AS SELECT`, 1M rows | 0.855 s | 0.745 s | 0.87 | 0.109 s | 0.091 s |
+| `UPDATE` of 5000 rows by rowid | 0.318 s | 0.312 s | 0.98 | 0.003 s | 0.004 s |
+| `DELETE` of 5000 rows by rowid | 0.214 s | 0.223 s | 1.04 | 0.003 s | 0.003 s |
+
+Reading it:
+
+- **145× on the headline**, and 31× on client CPU — more than the 40× of
+  § 0.1 because this cell fans out to four writers on a bare heap where that
+  one measured a single writer.
+- **3.3× on small inserts**, which is W1b alone: 500 rows × 3 columns is
+  1500 constants, so before the cap every one of those twenty statements
+  compiled its own ad-hoc plan.
+- `RETURNING` is a wash (§ 6.6 says why), as designed.
+- COPY and CTAS are the W0 move, and they must not have changed: 0.70 and
+  0.87 are within the band this fixture swings over two rounds on a shared
+  docker server (§ 6.1 saw ±1.5× on the four-writer cells), and nothing in
+  the move touches the wire. Not claimed as an improvement.
+- **UPDATE and DELETE carry W1c's new server transaction, and it costs
+  nothing measurable** — 0.98 and 1.04, the latter ~9 ms over 5000 rows,
+  which is the two extra round trips (`BEGIN` and `COMMIT`) at a local RTT.
+  At a 20 ms RTT expect ~40 ms per statement, once, whatever its size. That
+  is the price of the statement no longer being applied in part (#344).
+
 ### 6.7 Before the INSERT work
 
 § 0.1 and § 0.4 are the baseline: a DuckDB table of 1M rows into an existing
