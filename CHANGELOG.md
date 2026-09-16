@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`INSERT … RETURNING` works against a table holding a column the wire cannot
+  decode raw** — a spatial UDT, `sql_variant`, `hierarchyid`. It used to fail
+  with `COLMETADATA parse error: Unsupported SQL Server type: UDT` **even when
+  the RETURNING list did not name that column**, because the generated `OUTPUT`
+  clause carries every column of the table: DuckDB's RETURNING projection sits
+  above the insert and expects the table's full width. The OUTPUT list now uses
+  the same expressions the read path does, `.STAsBinary()` for the spatial
+  types and a CAST to NVARCHAR(MAX) for the rest, so those columns come back in
+  the same shape a catalog scan gives them.
+
 - **A `GEOMETRY` value can be written into a `geometry` / `geography` column**
   (#296). It used to go as a bare `0x…` literal, which SQL Server reads as its
   own Spatial Type Binary Format rather than as the OGC WKB a DuckDB GEOMETRY

@@ -159,6 +159,10 @@ statement round trip per batch. For bulk volumes, land the WKB in a
 `varbinary(max)` column with `COPY` and convert it in one server-side
 statement.
 
+`INSERT … RETURNING` works against such a table, including when the RETURNING
+list names the spatial column: the generated `OUTPUT` clause reads it through
+`.STAsBinary()`, exactly as a scan does.
+
 **`COPY` into a table that has a spatial column drops that column**, silently
 if it is nullable and with a misleading NULL error if it is not. Use `INSERT`
 for spatial data until that is fixed.

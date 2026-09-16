@@ -1,0 +1,92 @@
+# name: test/sql/insert/insert_returning_udt_columns.test
+# description: INSERT ... RETURNING against a table holding columns the wire cannot decode raw (spatial UDTs, sql_variant, hierarchyid)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The OUTPUT clause carries EVERY column of the table, not the ones the user
+# named: DuckDB's RETURNING projection sits above the insert operator and
+# expects the table's full width. So one column the result stream cannot decode
+# failed the whole statement, even for an `INSERT ... RETURNING id` that never
+# mentioned it:
+#
+#   TDS parse error: COLMETADATA parse error: Unsupported SQL Server type: UDT
+#
+# The read path had already solved this for the same columns, and OUTPUT accepts
+# the same expressions: `.STAsBinary()` for the spatial UDTs, whose bytes then
+# arrive as the OGC WKB a DuckDB GEOMETRY wants, and a CAST to NVARCHAR(MAX) for
+# the types with no decodable wire form.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS retu (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('retu', 'IF OBJECT_ID(''dbo.RetUdtSrc'') IS NOT NULL DROP TABLE dbo.RetUdtSrc');
+
+statement ok
+SELECT mssql_exec('retu', 'IF OBJECT_ID(''dbo.RetUdt'') IS NOT NULL DROP TABLE dbo.RetUdt');
+
+statement ok
+SELECT mssql_exec('retu', 'CREATE TABLE dbo.RetUdtSrc (id INT NOT NULL PRIMARY KEY, g GEOMETRY NULL)');
+
+statement ok
+SELECT mssql_exec('retu', 'INSERT INTO dbo.RetUdtSrc VALUES (1, geometry::STGeomFromText(''POINT(3 4)'', 0))');
+
+# Every awkward type at once: a spatial UDT, a hierarchyid and a sql_variant.
+statement ok
+SELECT mssql_exec('retu', 'CREATE TABLE dbo.RetUdt (id INT IDENTITY(1,1) NOT NULL PRIMARY KEY, g GEOMETRY NULL, h HIERARCHYID NULL, v SQL_VARIANT NULL, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('retu');
+
+# --- the regression: RETURNING two ordinary columns, on a table whose other
+# three are undecodable raw. This is the statement that failed.
+query II
+INSERT INTO retu.dbo.RetUdt (n) VALUES (5) RETURNING id, n;
+----
+1	5
+
+# --- RETURNING the spatial column itself, with a value that round-trips from
+# another table. It comes back as a DuckDB GEOMETRY, not as bytes.
+query III
+INSERT INTO retu.dbo.RetUdt (g, n) SELECT g, 6 FROM retu.dbo.RetUdtSrc RETURNING id, ST_AsText(g), n;
+----
+2	POINT (3 4)	6
+
+# --- and the value really landed, read back through the server's own renderer
+# rather than trusting the round trip.
+query II
+SELECT * FROM mssql_scan('retu', 'SELECT id, g.STAsText() AS wkt FROM dbo.RetUdt WHERE id = 2');
+----
+2	POINT (3 4)
+
+# --- a sql_variant column comes back as its text form, the same as a catalog
+# scan gives.
+query III
+INSERT INTO retu.dbo.RetUdt (v, n) VALUES ('hello', 9) RETURNING id, v, n;
+----
+3	hello	9
+
+# --- RETURNING * takes the whole width, which is what the OUTPUT clause always
+# built. The types are the catalog's: GEOMETRY for the spatial column, VARCHAR
+# for the two the scan casts.
+query IIIII
+INSERT INTO retu.dbo.RetUdt (n) VALUES (11) RETURNING id, ST_AsText(g), h, v, n;
+----
+4	NULL	NULL	NULL	11
+
+query I
+SELECT count(*) FROM retu.dbo.RetUdt;
+----
+4
+
+statement ok
+SELECT mssql_exec('retu', 'DROP TABLE dbo.RetUdt; DROP TABLE dbo.RetUdtSrc');
+
+statement ok
+DETACH retu;

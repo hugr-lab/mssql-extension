@@ -1,4 +1,5 @@
 #include "dml/insert/mssql_insert_statement.hpp"
+#include "catalog/mssql_column_info.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -39,7 +40,28 @@ void MSSQLInsertStatement::InitializeCache() const {
 				output_cols += ", ";
 			}
 			const auto &col = target_.columns[target_.returning_column_indices[i]];
-			output_cols += "INSERTED." + MSSQLValueSerializer::EscapeIdentifier(col.name);
+			const string escaped = MSSQLValueSerializer::EscapeIdentifier(col.name);
+			// The OUTPUT list carries EVERY column of the table, not the ones the
+			// user named: DuckDB's RETURNING projection sits above this operator
+			// and expects the table's full width. So a single column the result
+			// stream cannot decode used to fail the whole statement, even for an
+			// `INSERT … RETURNING id` that never mentioned it — measured, a table
+			// with a geometry column answered
+			// `COLMETADATA parse error: Unsupported SQL Server type: UDT`.
+			//
+			// The read path already solved this for the same columns, and OUTPUT
+			// accepts the same expressions: a method call for the spatial UDTs,
+			// whose bytes then arrive as the OGC WKB a DuckDB GEOMETRY wants, and
+			// a CAST to NVARCHAR(MAX) for the types with no decodable wire form
+			// (sql_variant, hierarchyid, a CLR UDT). Both were tried against the
+			// server before this was written.
+			if (MSSQLColumnInfo::IsSpatialType(col.mssql_type)) {
+				output_cols += "INSERTED." + escaped + ".STAsBinary() AS " + escaped;
+			} else if (!MSSQLColumnInfo::IsKnownSQLServerType(col.mssql_type)) {
+				output_cols += "CAST(INSERTED." + escaped + " AS NVARCHAR(MAX)) AS " + escaped;
+			} else {
+				output_cols += "INSERTED." + escaped;
+			}
 		}
 		cached_output_clause_ = "OUTPUT " + output_cols;
 	}
