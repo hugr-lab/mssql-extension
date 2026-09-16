@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`COPY` no longer drops a CLR UDT column of an existing target in silence**
+  ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
+  target-metadata query joined `sys.types` on `system_type_id`, which no
+  `sys.types` row satisfies for a `geometry`, `geography` or `hierarchyid`
+  column, so the column never reached the resolver: a source column feeding one
+  was ignored and its values lost, and a NOT NULL target failed with "Cannot
+  insert the value NULL into column …" about a value the user had supplied. The
+  join is gone from all eight metadata queries — the name comes from
+  `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
+  correct for UDTs and **4.3× cheaper** (497 µs → 115 µs on a 102-column table,
+  interleaved, 200 rounds) — and a source that feeds such a column is now
+  refused by name. A source that omits it still loads and the server fills it,
+  exactly as before.
+
+- **The deferred `INSERT BULK` is guarded again.** Spec 075 W3 moved the send
+  from the sink's InitGlobal to the first chunk, but the mutex the sink takes in
+  InitGlobal is a local that dies with it — so a catalog scan of the same
+  catalog still materialising when that chunk arrived left the pinned connection
+  in Executing and the load failed with `Cannot execute: connection not in Idle
+  state`. Seen once as a CI flake; reproducible at 3 in 40 once the metadata
+  queries above changed the timing, and 0 in 30 after the fix. The guard now
+  covers the send itself, in `BulkLoadSession::OpenStream`, which is the single
+  place an `INSERT BULK` goes out for both INSERT and COPY. CTAS is unaffected:
+  it never loads on the pinned connection.
+
 ### Added
 
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than

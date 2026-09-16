@@ -123,6 +123,26 @@ struct BCPColumnMetadata {
 	// missing-column NullOnly path; a value in it is the type-mismatch error.
 	bool null_only_source = false;
 
+	// The target column's SQL Server type name, as sys.columns reports it. Kept
+	// for error messages, which have to name the type the user can see rather
+	// than the DuckDB type we mapped it to.
+	string server_type_name;
+
+	// The bulk wire cannot carry this column's type. True for the CLR UDTs
+	// (geometry, geography, hierarchyid) and sql_variant: their wire form is
+	// the server's own, not anything FromServerColumn can declare, and the
+	// VARCHAR fallback it would otherwise pick declares them as nvarchar and
+	// sends the bytes as text.
+	//
+	// Before issue #353 these columns never reached here at all — the metadata
+	// query's INNER JOIN to sys.types dropped every CLR UDT, so a source column
+	// feeding one was silently ignored and the value lost. They are visible now,
+	// which is what makes the refusal possible: a column of this kind that NO
+	// source feeds is left out of the INSERT BULK list exactly as before, and
+	// one that a source DOES feed stops the load with a message instead of
+	// discarding the data.
+	bool bulk_unsupported = false;
+
 	// Default constructor
 	BCPColumnMetadata() = default;
 

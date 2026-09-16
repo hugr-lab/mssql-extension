@@ -1,4 +1,5 @@
 #include "copy/target_resolver.hpp"
+#include "catalog/mssql_column_info.hpp"
 
 #include "tds/encoding/bcp_row_encoder.hpp"
 
@@ -807,17 +808,17 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());
@@ -1050,6 +1051,31 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 
 //===----------------------------------------------------------------------===//
 // BCPColumnMetadata::FromServerColumn
+namespace {
+
+//! Can the bulk-load wire carry a column of this SQL Server type?
+//!
+//! Two families cannot. The **spatial CLR UDTs** are readable — the scan
+//! rewrites them to `.STAsBinary()` and they arrive as WKB, which is why
+//! `IsKnownSQLServerType` admits them — but their WIRE form on the way back is
+//! SQL Server's own Spatial Type Binary Format, not those bytes, so a bulk load
+//! cannot send them. And the types with no decodable wire form at all
+//! (`sql_variant`, `hierarchyid`, any other CLR UDT) are exactly the ones
+//! `IsKnownSQLServerType` already rejects.
+//!
+//! The spatial half spells the two names out here rather than sharing a
+//! predicate, because the branch that introduces `MSSQLColumnInfo::IsSpatialType`
+//! (#352) is not merged yet; fold this into it on the rebase.
+bool BulkWireCanCarry(const string &type_name) {
+	const string lower = StringUtil::Lower(type_name);
+	if (lower == "geometry" || lower == "geography") {
+		return false;
+	}
+	return MSSQLColumnInfo::IsKnownSQLServerType(type_name);
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 
 BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const string &type_name, int16_t max_length,
@@ -1122,8 +1148,17 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 		col.duckdb_type = LogicalType::VARCHAR;
 	}
 
-	DebugLog(3, "FromServerColumn: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d", col.name.c_str(),
-			 type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale);
+	// Types the bulk wire cannot carry. The branch above has just given them the
+	// VARCHAR fallback, which would declare a geometry column as nvarchar and
+	// send WKB as text; the flag is what stops that being used silently. They
+	// only became reachable here with issue #353 — the metadata query used to
+	// drop every CLR UDT before this function ever saw it.
+	col.server_type_name = type_name;
+	col.bulk_unsupported = !BulkWireCanCarry(type_name);
+
+	DebugLog(3, "FromServerColumn: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d bulk_unsupported=%d",
+			 col.name.c_str(), type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale,
+			 col.bulk_unsupported ? 1 : 0);
 	return col;
 }
 
@@ -1137,19 +1172,19 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());

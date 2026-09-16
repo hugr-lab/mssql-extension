@@ -1,0 +1,117 @@
+# name: test/sql/copy/copy_udt_columns.test
+# description: COPY no longer drops CLR UDT columns of an existing target in silence (issue #353)
+# group: [copy]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The target-metadata query joined sys.types on system_type_id, and no sys.types
+# row satisfies that for a CLR UDT (system_type_id 240). So a geometry,
+# geography or hierarchyid column never reached the resolver at all: a source
+# column feeding one was silently ignored and its values lost, and a NOT NULL
+# target failed with "Cannot insert the value NULL into column ..." about a
+# value the user had in fact supplied.
+#
+# The join is gone from the COPY resolver's four queries — the type name comes
+# from ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)), which is
+# both correct for UDTs and measurably cheaper (497 µs -> 115 µs on a
+# 102-column table) — so the column is visible, and a source that feeds it is
+# refused by name instead of ignored.
+#
+# What did NOT change: a column no source feeds is still left out of the load
+# and the server fills it, which is what made the old behaviour look fine.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS udtc (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('udtc', 'IF OBJECT_ID(''dbo.UdtCopyTgt'') IS NOT NULL DROP TABLE dbo.UdtCopyTgt');
+
+statement ok
+SELECT mssql_exec('udtc', 'CREATE TABLE dbo.UdtCopyTgt (id INT NOT NULL PRIMARY KEY, g GEOMETRY NULL, h HIERARCHYID NULL, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('udtc');
+
+# --- the bug: a source column named like the spatial column. It used to be
+# accepted, report success and land NULL.
+statement error
+COPY (SELECT 1 AS id, '\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x40\x00\x00\x00\x00\x00\x00\x10\x40'::BLOB AS g, 7 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+----
+the bulk-load wire cannot carry
+
+# --- the message names the column and the type, because the user has to know
+# which of their columns to remove.
+statement error
+COPY (SELECT 1 AS id, '/1/' AS h, 7 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+----
+column 'h' of table '[dbo].[UdtCopyTgt]' has type hierarchyid
+
+# --- nothing landed from either attempt: the refusal is at init, before a row
+# is sent.
+query I
+SELECT count(*) FROM udtc.dbo.UdtCopyTgt;
+----
+0
+
+# --- and a source that omits the UDT columns still loads exactly as before,
+# with the server filling them.
+statement ok
+COPY (SELECT 2 AS id, 8 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+
+query III
+SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NULL THEN 1 ELSE 0 END AS both_null FROM dbo.UdtCopyTgt');
+----
+2	8	1
+
+statement ok
+SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtCopyTgt');
+
+# =============================================================================
+# The metadata queries lost a join. These pin that nothing else moved.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('udtc', 'IF OBJECT_ID(''dbo.UdtShapes'') IS NOT NULL DROP TABLE dbo.UdtShapes');
+
+statement ok
+SELECT mssql_exec('udtc', 'CREATE TABLE dbo.UdtShapes (id INT NOT NULL PRIMARY KEY, g GEOMETRY NULL, gg GEOGRAPHY NULL, h HIERARCHYID NULL, v SQL_VARIANT NULL, n NVARCHAR(10) NULL, d DECIMAL(9,3) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('udtc');
+
+# --- the catalog reports the same types it always did. It never had this bug:
+# the catalog queries already used a LEFT JOIN with a TYPE_NAME fallback, so
+# CLR UDT columns were visible there. This is here as the regression guard for
+# the resolver change, and for the identical substitution in those queries when
+# it lands. Both spatial types map to DuckDB GEOMETRY, which is why `gg` is not
+# its own thing.
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'UdtShapes' ORDER BY column_index;
+----
+id	INTEGER
+g	GEOMETRY
+gg	GEOMETRY
+h	VARCHAR
+v	VARCHAR
+n	MSSQL_NVARCHAR(10)
+d	DECIMAL(9,3)
+
+# --- and the rows still read.
+statement ok
+SELECT mssql_exec('udtc', 'INSERT INTO dbo.UdtShapes (id, n, d) VALUES (1, N''x'', 1.5)');
+
+query III
+SELECT id, n, d FROM udtc.dbo.UdtShapes;
+----
+1	x	1.500
+
+statement ok
+SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtShapes');
+
+statement ok
+DETACH udtc;

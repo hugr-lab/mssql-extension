@@ -491,6 +491,32 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
 
+		// Issue #353: a target column whose type the bulk wire cannot carry, still
+		// present after the unmatched-column drop above — which means a source
+		// column feeds it by name.
+		//
+		// This runs OUTSIDE the try above on purpose. That block ends in a bare
+		// `catch (...)` meant for "the table was just created and has no metadata
+		// yet", and it swallows everything: a refusal thrown inside it silently
+		// became a fallback to source-derived metadata, which declared a geometry
+		// column as varbinary(max) and let the server answer "Invalid column type
+		// from bcp client" instead. Measured while writing this.
+		//
+		// Until #353 such a column never got here at all: the metadata query's
+		// INNER JOIN to sys.types dropped every CLR UDT, so the source column was
+		// ignored and its values were lost with no error. A column NO source feeds
+		// is still left out of the load, exactly as before.
+		for (const auto &col : gstate->columns) {
+			if (!col.bulk_unsupported) {
+				continue;
+			}
+			throw InvalidInputException(
+				"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
+				"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
+				"Use INSERT for this table, or leave the column out of the source and let it stay NULL.",
+				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name);
+		}
+
 		// TABLOCK by the target's shape (spec 057 step 1, replacing issue #45's
 		// "new tables" rule). ValidateTarget above set target_shape — from
 		// sys.indexes for an existing table, from what we just created otherwise.
