@@ -590,10 +590,10 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// catalog's MaterializeMutex BEFORE sending the batch, so a catalog scan
 		// materialising on another thread has drained (or has not started) -- the
 		// same order table_scan.cpp keeps. Held through the drain below.
-		std::unique_lock<std::mutex> materialize_lock;
+		std::unique_lock<std::recursive_mutex> materialize_lock;
 		const bool in_transaction = !context.transaction.IsAutoCommit();
 		if (in_transaction) {
-			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+			materialize_lock = std::unique_lock<std::recursive_mutex>(mssql_catalog.MaterializeMutex());
 		}
 		MSSQLQueryExecutor executor(bind_data.context_name);
 		unique_ptr<MSSQLResultStream> stream;

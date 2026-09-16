@@ -188,6 +188,11 @@ void BulkLoadSession::Adopt(std::shared_ptr<tds::TdsConnection> connection, cons
 	collect_timings_ = params.collect_timings;
 	reset_on_release_ = params.reset_on_release;
 	transaction_pinned_ = transaction_pinned;
+	// Only a PINNED connection can collide with a materialising scan, so the
+	// flag governs rather than the caller's field: an operator that sets the
+	// mutex on a pool connection by mistake gets no lock rather than a
+	// surprising one.
+	pinned_materialize_mutex_ = transaction_pinned ? params.pinned_materialize_mutex : nullptr;
 	connection_ = std::move(connection);
 	// Before the writer and before any INSERT BULK: the transaction has to be
 	// open on the connection before the first request it should cover. A
@@ -204,6 +209,22 @@ void BulkLoadSession::Adopt(std::shared_ptr<tds::TdsConnection> connection, cons
 }
 
 void BulkLoadSession::OpenStream() {
+	// On a transaction-pinned connection, wait for any catalog scan of this
+	// catalog that is still materialising: it holds the mutex while it drains,
+	// and until it releases the connection is in Executing and this batch would
+	// fail with "Cannot execute: connection not in Idle state". The operator
+	// takes the same mutex in its InitGlobal, but that lock dies with the init
+	// and the send moved to the first chunk (spec 075 W3), so this is the only
+	// place left that covers the send itself.
+	//
+	// One-directional by construction — a materialising scan never waits on a
+	// sink — so there is no cycle to deadlock on. Null for every pool
+	// connection, which is every writer but the operator's own inside a
+	// transaction, so the uncontended case costs a null check.
+	std::unique_lock<std::recursive_mutex> materialize_lock;
+	if (pinned_materialize_mutex_) {
+		materialize_lock = std::unique_lock<std::recursive_mutex>(*pinned_materialize_mutex_);
+	}
 	auto result = MSSQLSimpleQuery::Execute(*connection_, insert_bulk_sql_);
 	if (!result.success) {
 		throw IOException("INSERT BULK failed: %s", result.error_message);
