@@ -12,11 +12,13 @@
 # target failed with "Cannot insert the value NULL into column ..." about a
 # value the user had in fact supplied.
 #
-# The join is gone from the COPY resolver's four queries — the type name comes
-# from ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)), which is
-# both correct for UDTs and measurably cheaper (497 µs -> 115 µs on a
-# 102-column table) — so the column is visible, and a source that feeds it is
-# refused by name instead of ignored.
+# The join is gone from all eight metadata queries — the COPY resolver's four
+# and the four catalog ones spec 076 optimised, which is the half of the issue
+# that was pure optimisation. The type name comes from
+# ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)), which is both
+# correct for UDTs and measurably cheaper (497 µs -> 115 µs on a 102-column
+# table) — so the column is visible, and a source that feeds it is refused by
+# name instead of ignored.
 #
 # What did NOT change: a column no source feeds is still left out of the load
 # and the server fills it, which is what made the old behaviour look fine.
@@ -51,8 +53,12 @@ COPY (SELECT 1 AS id, '/1/' AS h, 7 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORM
 ----
 column 'h' of table '[dbo].[UdtCopyTgt]' has type hierarchyid
 
-# --- nothing landed from either attempt: the refusal is at init, before a row
-# is sent.
+# --- nothing landed from either attempt. Both of those pairs are ones bind can
+# only admit for the all-NULL case (a constant `NULL AS g` arrives typed and is
+# indistinguishable from data at bind), so the column is left out of the load
+# and the refusal comes on the first chunk that carries a value — still before
+# any row reaches the wire. A pair bind CAN type-check is refused earlier, at
+# init.
 query I
 SELECT count(*) FROM udtc.dbo.UdtCopyTgt;
 ----
@@ -68,8 +74,63 @@ SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NUL
 ----
 2	8	1
 
+# --- and an all-NULL source for the UDT column loads too. `NULL AS g` is the
+# ordinary way to say "leave this column alone", and it worked before #353 —
+# by accident, because the join hid the column entirely. It has to keep
+# working: the column is dropped from the load exactly like an omitted one and
+# the server fills it. (It cannot be DECLARED instead: the type mapping gives
+# geometry the VARCHAR fallback, and an nvarchar column against a geometry
+# target makes the server refuse the whole INSERT BULK.)
+statement ok
+COPY (SELECT 3 AS id, NULL AS g, NULL AS h, 9 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+
+query III
+SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NULL THEN 1 ELSE 0 END AS both_null FROM dbo.UdtCopyTgt WHERE id = 3');
+----
+3	9	1
+
 statement ok
 SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtCopyTgt');
+
+# =============================================================================
+# rowversion: refused too, and that loses nothing. Measured by exempting the
+# type and running the load — the server answers error 273, "Cannot insert an
+# explicit value into a timestamp column". So the refusal moves a mid-stream
+# server error to a named one at init. sql_variant is the same story with a
+# different message: "Operand type clash: nvarchar(max) is incompatible with
+# sql_variant" — it does NOT convert implicitly, as one might assume.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('udtc', 'IF OBJECT_ID(''dbo.UdtRowver'') IS NOT NULL DROP TABLE dbo.UdtRowver');
+
+statement ok
+SELECT mssql_exec('udtc', 'CREATE TABLE dbo.UdtRowver (id INT NOT NULL PRIMARY KEY, rv ROWVERSION, v SQL_VARIANT NULL, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('udtc');
+
+statement error
+COPY (SELECT 1 AS id, 'x' AS rv, 5 AS n) TO 'mssql://udtc/dbo/UdtRowver' (FORMAT 'bcp', CREATE_TABLE false);
+----
+the bulk-load wire cannot carry
+
+statement error
+COPY (SELECT 1 AS id, 'anything' AS v, 5 AS n) TO 'mssql://udtc/dbo/UdtRowver' (FORMAT 'bcp', CREATE_TABLE false);
+----
+the bulk-load wire cannot carry
+
+# --- omitting them loads, and the server generates the rowversion itself.
+statement ok
+COPY (SELECT 4 AS id, 11 AS n) TO 'mssql://udtc/dbo/UdtRowver' (FORMAT 'bcp', CREATE_TABLE false);
+
+query III
+SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN rv IS NOT NULL AND v IS NULL THEN 1 ELSE 0 END AS ok FROM dbo.UdtRowver');
+----
+4	11	1
+
+statement ok
+SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtRowver');
 
 # =============================================================================
 # The metadata queries lost a join. These pin that nothing else moved.
@@ -87,9 +148,9 @@ SELECT mssql_invalidate_cache('udtc');
 # --- the catalog reports the same types it always did. It never had this bug:
 # the catalog queries already used a LEFT JOIN with a TYPE_NAME fallback, so
 # CLR UDT columns were visible there. This is here as the regression guard for
-# the resolver change, and for the identical substitution in those queries when
-# it lands. Both spatial types map to DuckDB GEOMETRY, which is why `gg` is not
-# its own thing.
+# the resolver change, and for the identical substitution those four queries
+# got in the same change. Both spatial types map to DuckDB GEOMETRY, which is
+# why `gg` is not its own thing.
 query II
 SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'UdtShapes' ORDER BY column_index;
 ----

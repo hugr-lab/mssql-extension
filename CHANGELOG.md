@@ -20,19 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
   correct for UDTs and **4.3× cheaper** (497 µs → 115 µs on a 102-column table,
   interleaved, 200 rounds) — and a source that feeds such a column is now
-  refused by name. A source that omits it still loads and the server fills it,
-  exactly as before.
-
-- **The deferred `INSERT BULK` is guarded again.** Spec 075 W3 moved the send
-  from the sink's InitGlobal to the first chunk, but the mutex the sink takes in
-  InitGlobal is a local that dies with it — so a catalog scan of the same
-  catalog still materialising when that chunk arrived left the pinned connection
-  in Executing and the load failed with `Cannot execute: connection not in Idle
-  state`. Seen once as a CI flake; reproducible at 3 in 40 once the metadata
-  queries above changed the timing, and 0 in 30 after the fix. The guard now
-  covers the send itself, in `BulkLoadSession::OpenStream`, which is the single
-  place an `INSERT BULK` goes out for both INSERT and COPY. CTAS is unaffected:
-  it never loads on the pinned connection.
+  refused by name. A source that omits such a column still loads and the server
+  fills it, exactly as before — and so does one that feeds it an entirely-NULL
+  column, which is how `NULL AS g` is written and which the old behaviour
+  allowed by accident. Such a column is left out of the load rather than
+  declared (declaring it would make the server refuse the whole `INSERT BULK`,
+  since the type mapping gives it the VARCHAR fallback), and the sink checks
+  per chunk that it really is all NULL, so a value cannot slip through in the
+  silence the issue is about. The two non-UDT types the change also refuses,
+  `sql_variant` and `rowversion`, lose nothing: measured against the server,
+  both already failed mid-stream — `Operand type clash: nvarchar(max) is
+  incompatible with sql_variant` and error 273 respectively — so the refusal
+  only moves the error earlier and names the column.
 
 ### Added
 

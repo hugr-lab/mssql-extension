@@ -121,6 +121,30 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// When non-empty, BCPWriter uses this to map source data to target columns
 	vector<int32_t> column_mapping;
 
+	//! Source columns feeding a target column the bulk wire cannot carry
+	//! (geometry, geography, sql_variant, a CLR UDT) whose pair bind admitted
+	//! for the all-NULL case only — see BCPCopyConfig::null_only_columns.
+	//!
+	//! Such a column cannot travel: the type mapping gives it the VARCHAR
+	//! fallback, so declaring it in COLMETADATA makes the server refuse the
+	//! whole `INSERT BULK` ("Invalid column type from bcp client"). It is
+	//! therefore dropped from the load exactly like an unmatched column, and
+	//! the server fills it — which is the right answer for `NULL AS g`, the
+	//! ordinary way to say "leave this column alone".
+	//!
+	//! But dropping it also drops the encoder's per-chunk guard (a dropped
+	//! column never reaches PrepareColumnStates), and a non-NULL value would
+	//! then be lost in silence — issue #353's own failure, reintroduced. So the
+	//! sink verifies these source columns itself, per chunk, and refuses the
+	//! moment a value appears. Cost: a mask walk over these columns only, and
+	//! the vector is empty for every ordinary COPY.
+	struct NullOnlyDroppedColumn {
+		idx_t source_index;	 //!< index into the source chunk
+		string name;		 //!< target column name, for the error
+		string server_type;	 //!< its SQL Server type name, for the error
+	};
+	vector<NullOnlyDroppedColumn> null_only_dropped;
+
 	// Progress tracking
 	std::atomic<idx_t> rows_sent{0};		// Total rows sent to writer
 	std::atomic<idx_t> bytes_sent{0};		// Total bytes sent

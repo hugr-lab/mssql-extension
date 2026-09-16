@@ -1063,6 +1063,23 @@ namespace {
 //! (`sql_variant`, `hierarchyid`, any other CLR UDT) are exactly the ones
 //! `IsKnownSQLServerType` already rejects.
 //!
+//! Two of those the join DID return before #353, so it is worth saying what
+//! they used to do rather than leaving a silent behaviour change. Both were
+//! declared nvarchar by the VARCHAR fallback, and both FAILED — measured
+//! against the server by exempting them here and running the load:
+//!
+//!   - `sql_variant`  -> `Operand type clash: nvarchar(max) is incompatible
+//!                        with sql_variant`. It does NOT convert implicitly.
+//!   - `rowversion` / `timestamp`
+//!                     -> error 273, `Cannot insert an explicit value into a
+//!                        timestamp column` — the column is unwritable by
+//!                        definition.
+//!
+//! So refusing them here loses nothing that worked: it moves a server error
+//! mid-stream to a named refusal at init. A source that omits such a column,
+//! or feeds it an all-NULL one, still loads — the caller drops it from the
+//! load and the server fills it (see BCPCopyInitGlobal).
+//!
 //! The spatial half spells the two names out here rather than sharing a
 //! predicate, because the branch that introduces `MSSQLColumnInfo::IsSpatialType`
 //! (#352) is not merged yet; fold this into it on the rebase.
