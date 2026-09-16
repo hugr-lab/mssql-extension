@@ -159,7 +159,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &c
 	socket->ClearReceiveBuffer();
 
 	// Send the SQL batch
-	if (!connection.ExecuteBatch(sql)) {
+	if (!connection.ExecuteBatch(sql, "simple query (metadata/DDL)")) {
 		result.success = false;
 		result.error_message = "Failed to send SQL batch: " + connection.GetLastError();
 		return result;

@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -56,6 +58,34 @@ static int GetMssqlDebugLevel() {
 	} while (0)
 
 namespace duckdb {
+
+// Connection state-transition logging (issue #356). Its own switch rather than a
+// level of MSSQL_DEBUG: that one's logging runs inside the phases it reports on
+// and distorts exactly the timing a race needs, which is documented in CLAUDE.md
+// for the counters and is doubly true here. MSSQL_CONN_STATE=1 prints one short
+// line per transition and nothing else.
+static int GetConnStateLogLevel() {
+	static int level = []() {
+		const char *env = std::getenv("MSSQL_CONN_STATE");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
+static uint64_t CurrentThreadTag() {
+	return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFF);
+}
+
+#define MSSQL_CONN_STATE_LOG(...)                       \
+	do {                                                \
+		if (GetConnStateLogLevel() > 0) {               \
+			fprintf(stderr, "[MSSQL CONN STATE] ");     \
+			fprintf(stderr, __VA_ARGS__);               \
+			fprintf(stderr, "\n");                      \
+		}                                               \
+	} while (0)
+
+
 namespace tds {
 
 TdsConnection::TdsConnection()
@@ -1227,8 +1257,35 @@ bool TdsConnection::WaitForAttentionAck(int timeout_ms) {
 	}
 }
 
-bool TdsConnection::TransitionState(ConnectionState from, ConnectionState to) {
-	return state_.compare_exchange_strong(from, to);
+void TdsConnection::NoteExecutingHolder(const char *reason) {
+	const char *label = reason ? reason : "(unnamed)";
+	last_executing_reason_.store(label, std::memory_order_relaxed);
+	last_executing_thread_.store(CurrentThreadTag(), std::memory_order_relaxed);
+	MSSQL_CONN_STATE_LOG("conn=%p spid=%u -> Executing by '%s' thread=%llu", (void *)this, spid_, label,
+						 (unsigned long long)LastExecutingThread());
+}
+
+bool TdsConnection::TransitionState(ConnectionState from, ConnectionState to, const char *reason) {
+	const ConnectionState requested_from = from;
+	const bool ok = state_.compare_exchange_strong(from, to);
+	if (ok) {
+		if (to == ConnectionState::Executing) {
+			NoteExecutingHolder(reason);
+		} else {
+			MSSQL_CONN_STATE_LOG("conn=%p spid=%u %s -> %s by '%s' thread=%llu", (void *)this, spid_,
+								 ConnectionStateToString(requested_from), ConnectionStateToString(to),
+								 reason ? reason : "(unnamed)", (unsigned long long)CurrentThreadTag());
+		}
+		return true;
+	}
+	// `from` now holds what the state actually was — the CAS wrote it back.
+	MSSQL_CONN_STATE_LOG("conn=%p spid=%u REFUSED %s -> %s by '%s' thread=%llu; state is %s, held by '%s' thread=%llu",
+						 (void *)this, spid_,
+						 ConnectionStateToString(requested_from), ConnectionStateToString(to),
+						 reason ? reason : "(unnamed)", (unsigned long long)CurrentThreadTag(),
+						 ConnectionStateToString(from), LastExecutingReason() ? LastExecutingReason() : "(nobody)",
+						 (unsigned long long)LastExecutingThread());
+	return false;
 }
 
 bool TdsConnection::IsLongIdle() const {
@@ -1265,19 +1322,32 @@ void TdsConnection::ClearTransactionDescriptor() {
 	MSSQL_CONN_DEBUG_LOG(1, "ClearTransactionDescriptor: cleared");
 }
 
-bool TdsConnection::ExecuteBatch(const std::string &sql) {
+bool TdsConnection::ExecuteBatch(const std::string &sql, const char *reason) {
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: starting, state=%d, socket_connected=%d", static_cast<int>(state_.load()),
 						 socket_ ? socket_->IsConnected() : -1);
 
 	// Can only execute from Idle state
 	ConnectionState expected = ConnectionState::Idle;
 	if (!state_.compare_exchange_strong(expected, ConnectionState::Executing)) {
+		// Name the holder. Without it this error says only that someone else has
+		// the connection, which is where issue #356 spent five wrong hypotheses.
 		last_error_ =
 			"Cannot execute: connection not in Idle state (current: " + std::string(ConnectionStateToString(expected)) +
 			")";
+		if (const char *holder = LastExecutingReason()) {
+			last_error_ += "; it was taken to Executing by '" + std::string(holder) + "' on thread " +
+						   std::to_string(LastExecutingThread()) + ", this is thread " +
+						   std::to_string(CurrentThreadTag());
+		}
+		MSSQL_CONN_STATE_LOG("conn=%p spid=%u REFUSED batch: state is %s, held by '%s' thread=%llu, this thread=%llu",
+							 (void *)this, spid_,
+							 ConnectionStateToString(expected),
+							 LastExecutingReason() ? LastExecutingReason() : "(nobody)",
+							 (unsigned long long)LastExecutingThread(), (unsigned long long)CurrentThreadTag());
 		MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: FAILED - wrong state: %d", static_cast<int>(expected));
 		return false;
 	}
+	NoteExecutingHolder(reason);
 
 	// Build SQL_BATCH packet(s) using the server-negotiated packet size
 	// This was received via ENVCHANGE during LOGIN7
