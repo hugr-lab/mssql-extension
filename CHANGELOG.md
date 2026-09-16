@@ -20,14 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
   correct for UDTs and **4.3× cheaper** (497 µs → 115 µs on a 102-column table,
   interleaved, 200 rounds) — and a source that feeds such a column is now
-  refused by name. A source that omits such a column still loads and the server
-  fills it, exactly as before — and so does one that feeds it an entirely-NULL
-  column, which is how `NULL AS g` is written and which the old behaviour
-  allowed by accident. Such a column is left out of the load rather than
-  declared (declaring it would make the server refuse the whole `INSERT BULK`,
-  since the type mapping gives it the VARCHAR fallback), and the sink checks
-  per chunk that it really is all NULL, so a value cannot slip through in the
-  silence the issue is about. The two non-UDT types the change also refuses,
+  refused by name, **at init, before a row is encoded** — so a COPY that is
+  going to fail this way writes nothing rather than committing the batches that
+  happened to precede the first value. A source that omits such a column still
+  loads and the server fills it, exactly as before, and so does one that gives
+  it a constant `NULL AS g`: that is how one says "leave this column alone", it
+  worked before #353 (by accident — the join hid the column), and it is safe
+  because DuckDB types a bare NULL as SQLNULL, which has no other value it
+  could hold. Such a column is dropped from the load rather than declared;
+  declaring it would make the server refuse the whole `INSERT BULK`, since the
+  type mapping gives it the VARCHAR fallback. The two non-UDT types the change
+  also refuses,
   `sql_variant` and `rowversion`, lose nothing: measured against the server,
   both already failed mid-stream — `Operand type clash: nvarchar(max) is
   incompatible with sql_variant` and error 273 respectively — so the refusal

@@ -399,6 +399,15 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// For newly created tables, we use source types since the table was created from them.
 		bool need_target_metadata = !bdata.config.overwrite;
 		bool need_column_mapping = false;
+		// "Nothing left to load" has to be raised OUTSIDE the try below, because
+		// that block ends in a bare `catch (...)` meant for "the table was just
+		// created and has no metadata yet" — a throw inside it silently becomes a
+		// fallback to source-derived metadata, which is how a geometry column came
+		// to be declared varbinary(max) and the server answered "Invalid column
+		// type from bcp client" instead of our message. Two ways to get here now,
+		// and they are different user errors, so they carry different text.
+		bool target_metadata_used = false;
+		idx_t dropped_null_only = 0;
 		if (need_target_metadata) {
 			// Try to get target column metadata - this will work for existing tables
 			try {
@@ -439,19 +448,34 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 						// (>= 0) target columns; the -1 entries are server-generated (IDENTITY,
 						// DEFAULT, computed) and must be left out of INSERT BULK entirely.
 						if (gstate->column_mapping[i] >= 0) {
-							// Issue #353 review: a column the wire cannot carry whose pair was
-							// admitted for the all-NULL case only. It cannot be declared (the
-							// VARCHAR fallback makes the server refuse the whole INSERT BULK),
-							// so drop it the way an unmatched column is dropped and let the
-							// server fill it — `NULL AS g` then loads, as it did before #353.
-							// Record it so the sink keeps checking it really is all NULL.
+							// Issue #353 review: a column the wire cannot carry, fed by a source
+							// that is a CONSTANT NULL — `NULL AS g`, which is how one says "leave
+							// this column alone" and which loaded before #353 (by accident: the
+							// sys.types join hid the column entirely).
+							//
+							// It cannot be declared and sent as NULLs: the type mapping gives it
+							// the VARCHAR fallback and an nvarchar column against a geometry
+							// target makes the server refuse the whole INSERT BULK. So it is
+							// dropped from the load exactly like an unmatched column and the
+							// server fills it.
+							//
+							// The test is the SOURCE TYPE, not `null_only_source`. Bind marks
+							// null_only_source for any pair it cannot type-check, which includes
+							// a fully typed source that merely happens to start with NULLs — and
+							// dropping THAT would turn a refusal at init into a refusal on
+							// whichever chunk first carries a value, by which point earlier
+							// batches have committed. A partial write is the wrong answer to a
+							// silent-data-loss issue. DuckDB types a bare NULL as SQLNULL and
+							// keeps it that way to here (measured), and a SQLNULL column has no
+							// other value it could hold, so this drop cannot lose anything.
 							const auto &col = gstate->columns[i];
-							if (col.bulk_unsupported && col.null_only_source) {
-								gstate->null_only_dropped.push_back(
-									{static_cast<idx_t>(gstate->column_mapping[i]), col.name, col.server_type_name});
+							const idx_t src = static_cast<idx_t>(gstate->column_mapping[i]);
+							if (col.bulk_unsupported && src < bdata.source_types.size() &&
+								bdata.source_types[src].id() == LogicalTypeId::SQLNULL) {
+								dropped_null_only++;
 								CopyDebugLog(1,
 											 "BCPCopyInitGlobal: omitting target column '%s' (%s) from INSERT BULK "
-											 "(all-NULL source; the wire cannot carry this type)",
+											 "(constant NULL source; the wire cannot carry this type)",
 											 col.name.c_str(), col.server_type_name.c_str());
 								continue;
 							}
@@ -463,12 +487,6 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 										 "(no matching source column; server-generated, e.g. IDENTITY/DEFAULT)",
 										 gstate->columns[i].name.c_str());
 						}
-					}
-					if (mapped_columns.empty()) {
-						throw InvalidInputException(
-							"MSSQL COPY: no source columns match target table '%s' by name; "
-							"nothing to load. Ensure source column names match the target's columns.",
-							bdata.target.GetFullyQualifiedName());
 					}
 					gstate->columns = std::move(mapped_columns);
 					gstate->column_mapping = std::move(mapped_mapping);
@@ -491,6 +509,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 								 (unsigned long long)bdata.source_names.size(),
 								 (unsigned long long)gstate->columns.size());
 				}
+				target_metadata_used = true;
 			} catch (...) {
 				// If we can't get target metadata (e.g., table was just created), use source types
 				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
@@ -521,7 +540,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// Until #353 such a column never got here at all: the metadata query's
 		// INNER JOIN to sys.types dropped every CLR UDT, so the source column was
 		// ignored and its values were lost with no error. A column NO source feeds
-		// is still left out of the load, exactly as before.
+		// is still left out of the load, exactly as before, and so is one fed by a
+		// constant NULL.
+		//
+		// This is the ONLY place such a column is refused, and it runs before a
+		// single row is encoded — so a COPY that is going to fail for this reason
+		// writes nothing at all, rather than committing the batches that happened
+		// to precede the first non-NULL value.
 		for (const auto &col : gstate->columns) {
 			if (!col.bulk_unsupported) {
 				continue;
@@ -529,8 +554,27 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			throw InvalidInputException(
 				"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
 				"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
-				"Use INSERT for this table, or leave the column out of the source and let it stay NULL.",
-				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name);
+				"Use INSERT for this table, or leave the column out of the source (a constant "
+				"`NULL AS %s` is accepted and leaves it NULL).",
+				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name, col.name);
+		}
+
+		// Nothing left to load. Deliberately outside the try, per the note above:
+		// inside it, both of these became a silent fallback to source-derived
+		// metadata. They are different mistakes and say so.
+		if (target_metadata_used && gstate->columns.empty()) {
+			if (dropped_null_only > 0) {
+				throw InvalidInputException(
+					"MSSQL COPY: every source column that matches target table '%s' feeds a column the "
+					"bulk-load wire cannot carry and was given a constant NULL, so there is nothing to "
+					"load. Drop those columns from the source, or give the statement a column the target "
+					"can take.",
+					bdata.target.GetFullyQualifiedName());
+			}
+			throw InvalidInputException(
+				"MSSQL COPY: no source columns match target table '%s' by name; "
+				"nothing to load. Ensure source column names match the target's columns.",
+				bdata.target.GetFullyQualifiedName());
 		}
 
 		// TABLOCK by the target's shape (spec 057 step 1, replacing issue #45's
@@ -643,29 +687,6 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	if (gdata.has_error.load(std::memory_order_acquire)) {
 		std::lock_guard<std::mutex> error_lock(gdata.error_mutex);
 		throw IOException("MSSQL COPY: Previous error occurred: %s", gdata.error_message);
-	}
-
-	// Issue #353 review: the columns dropped from the load because the wire
-	// cannot carry them and bind admitted the pair for all-NULL only. They never
-	// reach the encoder, so its per-chunk guard cannot see them — check here, or
-	// a value would be dropped in the silence #353 was filed about.
-	for (const auto &dropped : gdata.null_only_dropped) {
-		if (dropped.source_index >= input.ColumnCount()) {
-			continue;
-		}
-		auto &vec = input.data[dropped.source_index];
-		UnifiedVectorFormat fmt;
-		vec.ToUnifiedFormat(input.size(), fmt);
-		for (idx_t r = 0; r < input.size(); r++) {
-			if (fmt.validity.RowIsValid(fmt.sel->get_index(r))) {
-				throw InvalidInputException(
-					"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
-					"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. An "
-					"entirely-NULL source for it is accepted and leaves the column NULL; this source carries "
-					"a value. Use INSERT for this table, or leave the column out of the source.",
-					dropped.name, bdata.target.GetFullyQualifiedName(), dropped.server_type);
-			}
-		}
 	}
 
 	CopyDebugLog(2, "BCPCopySink: encoding %llu rows...", (unsigned long long)input.size());

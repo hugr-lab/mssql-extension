@@ -53,12 +53,11 @@ COPY (SELECT 1 AS id, '/1/' AS h, 7 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORM
 ----
 column 'h' of table '[dbo].[UdtCopyTgt]' has type hierarchyid
 
-# --- nothing landed from either attempt. Both of those pairs are ones bind can
-# only admit for the all-NULL case (a constant `NULL AS g` arrives typed and is
-# indistinguishable from data at bind), so the column is left out of the load
-# and the refusal comes on the first chunk that carries a value — still before
-# any row reaches the wire. A pair bind CAN type-check is refused earlier, at
-# init.
+# --- nothing landed from either attempt: the refusal is at init, before a row
+# is encoded. That is the whole point of refusing there rather than on the
+# chunk that first carries a value — past a flush boundary those earlier
+# batches are already committed, and a partial write is a poor answer to an
+# issue about losing data.
 query I
 SELECT count(*) FROM udtc.dbo.UdtCopyTgt;
 ----
@@ -74,13 +73,18 @@ SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NUL
 ----
 2	8	1
 
-# --- and an all-NULL source for the UDT column loads too. `NULL AS g` is the
+# --- a CONSTANT NULL source for the UDT column loads. `NULL AS g` is the
 # ordinary way to say "leave this column alone", and it worked before #353 —
-# by accident, because the join hid the column entirely. It has to keep
-# working: the column is dropped from the load exactly like an omitted one and
-# the server fills it. (It cannot be DECLARED instead: the type mapping gives
-# geometry the VARCHAR fallback, and an nvarchar column against a geometry
-# target makes the server refuse the whole INSERT BULK.)
+# by accident, because the join hid the column entirely. It keeps working: the
+# column is dropped from the load exactly like an omitted one and the server
+# fills it. (It cannot be DECLARED instead: the type mapping gives geometry the
+# VARCHAR fallback, and an nvarchar column against a geometry target makes the
+# server refuse the whole INSERT BULK.)
+#
+# What makes this safe is the SOURCE TYPE, not the values: DuckDB types a bare
+# NULL as SQLNULL and it is still SQLNULL here, and such a column has no other
+# value it could hold. A typed source is refused instead — see the chunk
+# boundary case below, which is what would otherwise partially load.
 statement ok
 COPY (SELECT 3 AS id, NULL AS g, NULL AS h, 9 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
 
@@ -88,6 +92,31 @@ query III
 SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NULL THEN 1 ELSE 0 END AS both_null FROM dbo.UdtCopyTgt WHERE id = 3');
 ----
 3	9	1
+
+# --- a TYPED source whose values only appear after a chunk boundary is refused
+# at init, and nothing lands. 10000 rows crosses DuckDB's 2048-row vector many
+# times over, so the first value is far from the first chunk; if the refusal
+# had been left per-chunk, the rows before it would already be on the server.
+# The row count is asserted, not just the error, because that is the half that
+# would regress silently.
+statement error
+COPY (SELECT i AS id, CASE WHEN i > 5000 THEN '/1/' END AS h, i AS n FROM range(10000) t(i)) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+----
+the bulk-load wire cannot carry
+
+query I
+SELECT count(*) FROM udtc.dbo.UdtCopyTgt WHERE id > 100;
+----
+0
+
+# --- and when every matching column is dropped that way, the message says so
+# rather than claiming no column matched — a different mistake with a different
+# fix. It also has to survive the bare `catch (...)` around the metadata load,
+# which used to turn this into a fallback that let the server complain instead.
+statement error
+COPY (SELECT NULL AS g) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+----
+there is nothing to load
 
 statement ok
 SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtCopyTgt');
