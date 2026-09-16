@@ -1,9 +1,12 @@
 # Analysis 078 — who touches the pinned connection, and when (issue #356)
 
-**Status:** analysis only, on `recon/356-pinned-connection-race` from `main`
-`b84e259`. No code changes. Written after four wrong fixes, each measured and
-withdrawn; the point of this document is to stop the guessing and map the
-actual flow first.
+**Status:** written as analysis-only, on `recon/356-pinned-connection-race`
+from `main` `b84e259`, after four wrong fixes that were each measured and
+withdrawn — the point was to stop guessing and map the actual flow first. It
+worked: §4.1 names the cause and the branch now ships the fix and the
+instrument alongside this document. Sections are left as they were written,
+with the corrections marked, because how the first five hypotheses were reached
+and why one of them was rejected wrongly is the useful part.
 
 ## 0. What is actually observed
 
@@ -102,14 +105,16 @@ rejected **wrongly**, and turned out to be the answer — see § 4.1.
   nothing.
 - **"The metadata-query rewrite is the trigger."** main fails at the same rate
   without it.
-- **"The publish-before-BEGIN window is the race."** `ConnectionProvider::GetConnection`
-  does `SetPinnedConnection(conn)` at line 163 and only then sends
+- ~~**"The publish-before-BEGIN window is the race."**~~ **THIS ONE IS THE
+  CAUSE — the rejection below is wrong. See §4.1.** Left standing as written
+  because the mistake is instructive: `ConnectionProvider::GetConnection` does
+  `SetPinnedConnection(conn)` at line 163 and only then sends
   `BEGIN TRANSACTION` at line 168, so another thread calling `GetConnection`
   in between gets the connection while BEGIN is in flight. Structurally it is a
-  real window and it fits every symptom. It is **not** the cause: widening it
-  with a 50 ms sleep gave **0 failures in 10**, where the window being the race
-  would have made it near-certain. Worth tidying on its own merits; not this
-  bug.
+  real window and it fits every symptom. It was rejected because widening it
+  with a 50 ms sleep gave **0 failures in 10** — but the sleep went in *before*
+  the BEGIN, which delays the publishing thread and lets the other one finish
+  first. That probe could only make the race rarer, so it tested nothing.
 
 ## 4.1 ROOT CAUSE, proven by the connection naming its own holder
 
@@ -168,6 +173,13 @@ lock.
 
 ## 5. Why a mutex may be the wrong tool entirely
 
+> **Superseded by §4.1/§4.2.** Sections 5–7 were the plan for what to do next
+> when the cause was still unknown. The instrument §7 asks for was built and is
+> in this branch (`MSSQL_CONN_STATE=1`), and it is what produced §4.1; the fix
+> is the critical section of §4.2, not either design in §6. Kept for the
+> reasoning about what a mutex can and cannot express here, which still
+> holds.
+
 The sink holds the pinned connection in `Executing` for the **whole load**, not
 for the send. A scan that starts executing after the stream opens finds it busy
 whatever either side locks. Holding the mutex across the stream is not
@@ -208,5 +220,11 @@ A sqllogictest cannot test a 4% race; it can only flake. What can:
   "whose stream was left open" from the guess it has been five times into a
   line in a log. This is the one thing that should be built next, before any
   further theory.
+
+**Both were built.** The logging is `MSSQL_CONN_STATE=1` and it answered the
+question on its first reproduction (§4.1). The C++ test is
+`scenario_transaction_pin_race` in `test/cpp/test_concurrent_reads.cpp`: 200
+transactions each reading from and writing to the same catalog, which is 0/200
+with the fix and 2/200 with it reverted.
 
 Both are cheap next to another round of hypothesis-and-revert.

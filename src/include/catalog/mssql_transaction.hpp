@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -21,9 +22,14 @@ class MSSQLTransactionManager;
 
 class MSSQLTransaction : public Transaction {
 public:
-	//! See pin_mutex_. Held by ConnectionProvider around the lazy pin.
-	mutex &PinMutex() const {
-		return pin_mutex_;
+	//! Take the pin lock for the whole lazy-pin sequence — see pin_mutex_.
+	//!
+	//! Hands back the guard rather than the mutex so a caller cannot hold it
+	//! out of order or forget to release it: the lock order this class needs
+	//! (pin_mutex_ before connection_mutex_) is unenforceable if the mutex
+	//! itself is public, which is what the #357 review pointed out.
+	std::unique_lock<mutex> LockForPin() const {
+		return std::unique_lock<mutex>(pin_mutex_);
 	}
 
 	MSSQLTransaction(TransactionManager &manager, ClientContext &context, MSSQLCatalog &catalog);
@@ -54,9 +60,6 @@ public:
 
 	//! Check if this transaction has a pinned connection
 	bool HasPinnedConnection() const;
-
-	//! Get the connection mutex for serializing operations on the pinned connection
-	mutex &GetConnectionMutex();
 
 	//! Check if SQL Server transaction has been started on the pinned connection
 	bool IsSqlServerTransactionActive() const;
@@ -110,7 +113,9 @@ private:
 	//! the other leaks with an open transaction.
 	//!
 	//! LOCK ORDER: this one first, `connection_mutex_` second — the accessors
-	//! take that one inside themselves and never reach for this.
+	//! take that one inside themselves and never reach for this. Neither mutex
+	//! is reachable from outside: this one only through LockForPin(), and
+	//! connection_mutex_ not at all.
 	mutable mutex pin_mutex_;
 
 	//! True if BEGIN TRANSACTION has been sent to SQL Server

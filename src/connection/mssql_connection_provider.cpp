@@ -142,7 +142,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// finds a connection that is pinned, begun and Idle — instead of either
 	// executing on one that is mid-BEGIN, or starting a second transaction of
 	// its own on a second connection.
-	lock_guard<mutex> pin_lock(txn->PinMutex());
+	auto pin_lock = txn->LockForPin();
 
 	auto pinned = txn->GetPinnedConnection();
 	if (pinned) {
@@ -213,8 +213,11 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		MSSQL_CONN_LOG("GetConnection: WARNING - No transaction descriptor found in response");
 	}
 
-	// Transition connection back to Idle (ExecuteBatch left it in Executing state)
-	conn->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle, "transaction release");
+	// Transition connection back to Idle (ExecuteBatch left it in Executing state).
+	// The label reaches a reader through an MSSQL_CONN_STATE=1 log explaining a
+	// race, so it says which operation ended here: this is the BEGIN finishing,
+	// not a COMMIT or ROLLBACK letting the connection go.
+	conn->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle, "BEGIN TRANSACTION done");
 
 	// Now it is safe to publish: the transaction is open and the connection is
 	// Idle, so the next thread through the early return above gets something it
