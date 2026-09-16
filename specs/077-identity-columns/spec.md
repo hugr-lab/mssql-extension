@@ -3,7 +3,8 @@
 **Status:** in progress on `spec/077-identity-columns` from `main` `b84e259`
 (spec 062 merged as #348 on 2026-09-16). Reconnaissance done on 2026-09-16
 against the local docker server, SQL Server 2025 RTM-CU8. Spec and
-implementation in one PR.
+implementation ship in one PR, which is why #350 is a **draft** until the code
+lands beside the spec.
 **Builds on:** spec 062 — `MSSQLColumnInfo::is_identity` already reaches
 `MSSQLInsertColumn` from `sys.columns` through the metadata cache (W4), and
 `MSSQLStatementConnection` already gives every DML statement one connection of
@@ -183,17 +184,52 @@ object and pick one deterministically.
 | `has_filter = 0` | `sys.indexes` | a filtered unique index covers a subset of rows; the rest are unaddressable |
 | every key column `is_nullable = 0` | `sys.index_columns` joined to `sys.columns`, `is_included_column = 0` | measured: a unique index on a nullable column accepts exactly one NULL row and refuses the second, so NULL is neither unique nor addressable |
 | `is_disabled = 0`, `is_hypothetical = 0` | `sys.indexes` | a disabled index enforces nothing |
+| no key column is `is_cast_required` | `MSSQLColumnInfo` | **the review's best finding, and it is a live bug on the PK path already — see below** |
+
+**The cast-required criterion, and the bug it exposes.** A unique index — and a
+PRIMARY KEY — can sit on `sql_variant` or `hierarchyid`; both were created to
+check. Those columns reach DuckDB through a server-side `CAST(col AS
+NVARCHAR(MAX))`, which § 8 measures as lossy. A rowid built from such a key is
+therefore built from a value that does not identify its row.
+
+This is not hypothetical and does not need spec 077 to reproduce. A table keyed
+by a `SQL_VARIANT` PRIMARY KEY holding two distinct `datetime2(7)` values:
+
+| what the server holds | what DuckDB reads |
+|---|---|
+| `2026-09-16T10:11:12.1234567` | `Sep 16 2026 10:11AM` |
+| `2026-09-16T10:11:59.7654321` | `Sep 16 2026 10:11AM` |
+
+`UPDATE … SET payload = 'CHANGED' WHERE payload = 'a'` through the extension
+then **reported no error and changed nothing**: the rowid VALUES JOIN compares
+a string against a sql_variant column and matches no row. A silent zero-row
+UPDATE, today. Filed as a consequence on the sql_variant issue; this criterion
+is what stops spec 077 widening it from primary keys to every unique index.
+
+`float` and `datetime` are deliberately NOT excluded: both round-trip exactly
+through the literal renderer (`float` as its shortest round-trip decimal,
+`datetime` through a `datetime2` cast that only widens), so their keys match.
+The criterion is about columns whose READ is lossy, not about types that are
+awkward to compare.
 
 **Choice, in order** (deterministic, so two sessions never disagree):
 
 1. the primary key, if there is one — unchanged behaviour for every table that
    has one;
-2. else the usable unique index with the fewest key columns;
-3. else the one whose key is narrowest in declared bytes;
-4. else, among equals, the one whose single key column `is_identity` — an
-   identity value is never updated by the application, so a rowid built on it
-   cannot move under an UPDATE;
+2. else the usable unique index whose single key column `is_identity`. The
+   review asked why this ranked below byte width, and it was right to: an
+   identity value is one the application never assigns, so a rowid built on it
+   cannot move under the very UPDATE that is using it. That is a correctness
+   property, and it outranks a size heuristic — a `BIGINT IDENTITY UNIQUE`
+   should beat an `INT UNIQUE` the application maintains by hand;
+3. else the usable unique index with the fewest key columns;
+4. else the one whose key is narrowest in declared bytes;
 5. else the lowest `index_id`.
+
+"Fewest key columns" counts key columns only, `is_included_column = 0`; an
+INCLUDE column is payload and says nothing about uniqueness. Unique indexes on
+indexed views are not candidates: the rowid has to address a row of the table
+being written, and `sys.indexes` rows for a view belong to a different object.
 
 `PrimaryKeyInfo` grows a `source` (`PRIMARY_KEY` / `UNIQUE_INDEX`) and the
 index name, because every error message that currently says "has no primary
@@ -221,8 +257,8 @@ The rule, stated in terms of what DuckDB hands us:
 
 Both the explicit form `INSERT INTO t (rid, a, b) VALUES (…)` and the
 positional form with a value for every column land in the second row, which is
-what "если их количество одинаковое" means once DuckDB has resolved it: the
-positional form fills `column_index_map` for every column, so by the time
+what "the counts are equal" resolves to once DuckDB has bound the statement:
+the positional form fills `column_index_map` for every column, so by the time
 `PlanInsert` runs the two are indistinguishable, and should be.
 
 Mechanics:
@@ -236,20 +272,57 @@ Mechanics:
 - Inside an explicit transaction the connection is pinned and shared, so the
   same discipline applies to the pinned connection, and the `OFF` must not wait
   for COMMIT.
-- The target of `SET IDENTITY_INSERT` is a **table**. A VIEW target is left
-  alone: the server refuses an explicit identity value through a view on its
-  own terms, and that error is the honest one to surface.
 - The `ON` and `OFF` go as **batches of their own**, never wrapped in `EXEC`:
   § 0.3 measured that a SET inside a nested batch is restored when that batch
   ends, so a wrapped one would silently do nothing and the INSERT would fail
   with 544.
+- **Where `OFF` is sent when the statement fails**, named precisely, because
+  "on every failure path" is not an instruction. `MSSQLStatementConnection`
+  records that it turned identity-insert on for table T. The only cleanup hook
+  is `~MSSQLStatementConnection() noexcept` → `ReleaseWithoutContext()`, which
+  by the issue #178 contract has no `ClientContext` and may run on a worker
+  thread — so `OFF` is sent **there**, after `transaction_.Rollback()` and
+  before `ReleaseBcpConnectionOnError`, with everything caught. If it throws,
+  or the connection is not Idle, the connection is **closed instead of pooled**
+  — `ReleaseBcpConnectionOnError` already closes a non-Idle connection, and
+  this makes that part of the guarantee rather than an accident. A connection
+  **pinned to a transaction** cannot be closed: there `OFF` is attempted and a
+  failure is logged, because the alternative is destroying a transaction the
+  user still owns. An interrupt or ATTENTION mid-statement leaves the
+  connection non-Idle, so it goes down the close path, and closing the session
+  clears `IDENTITY_INSERT` by construction.
 - `SET IDENTITY_INSERT` checks **ALTER on the table** (§ 0.3), and a caller
   without it gets error 1088, which says the object "does not exist or you do
   not have permissions". That message is actively misleading for someone who
   can read and insert into the table, and it is a statement the user did not
   write. So this failure is caught and re-reported: what was attempted, on
   which table, and that `SET IDENTITY_INSERT` needs ALTER while INSERT does
-  not. The server's 1088 goes in the message as the cause.
+  not. The server's 1088 goes in the message as the cause. `Acquire` has
+  already run `transaction_.Begin` by then, so the rewritten error must still
+  leave the rollback-and-release path intact; it is thrown, not swallowed.
+- **Error 8106** — "table does not have the identity property" — means the
+  cached `is_identity` is stale, most likely after DDL through `mssql_exec`,
+  which does not invalidate by default. It is mapped to a message that says so
+  and names `mssql_invalidate_cache()`.
+- **`IDENTITY_INSERT` is turned off only if this statement turned it on.** A
+  user can set it themselves through `mssql_exec` — on a pinned connection, or
+  on a pooled one with `mssql_reset_connection = false` — and clearing it
+  unconditionally would undo session state they set deliberately.
+- The target of `SET IDENTITY_INSERT` is a **table**. The VIEW case is decided
+  by the `GetObjectType() == MSSQLObjectType::VIEW` test the routing already
+  makes at `mssql_catalog.cpp:733`; a view target is left alone, and the server
+  refuses an explicit identity value through a view on its own terms.
+- **An explicit `NULL` or `DEFAULT` for the identity column.** `DEFAULT` is the
+  form that means "let the server decide", so if DuckDB leaves the column in
+  `insert_col_indices` for it, the column is dropped from the generated list
+  and no `IDENTITY_INSERT` is sent — the same outcome as not naming it. An
+  explicit `NULL` is a value, so it is sent, and the server refuses it; that
+  refusal is the honest one and is not rewritten. Which of the two DuckDB
+  actually produces is the first thing to check when the code is written, and
+  the test pins whichever it is.
+- **Security, said out loud:** turning `IDENTITY_INSERT` on grants nothing. It
+  only succeeds where the caller already holds ALTER on the table, and a caller
+  with ALTER could issue the same statement themselves through `mssql_exec`.
 
 ### W3 — the bulk path stays as spec 062 left it
 
@@ -289,7 +362,8 @@ No behaviour change; formalise what § 0.5 measured.
 
 `INSERT INTO t VALUES (1, 'x')` against a table with an identity column keeps
 failing with `Binder Error: table "t" has 3 columns but 2 values were
-supplied`. Nothing in this spec changes that, and the issue stays open.
+supplied`. Nothing in this spec changes that, and #327 closes as won't-fix
+with the reason recorded (below) rather than staying open.
 
 The reason is in § 1.3: the binder rejects the statement before any extension
 code runs, and the count it checks comes from what the catalog reports as
@@ -331,33 +405,45 @@ above; emulating the count comparison in the extension (unreachable).
 ### W5b — the refusals this spec owns
 
 Where the extension cannot do what was asked, it has to say so at the layer
-that knows why. Four places, and the message shape for each. None of them is a
-generic wrapper; each names the thing the user can change.
+that knows why. Five situations: four the extension can catch, and one it
+cannot, which is why #327 closes rather than staying open. The message shape
+for each. None of them is a generic wrapper; each names the thing the user can
+change.
 
 | Situation | Where it is caught | What the message must carry |
 |---|---|---|
 | No usable key for `rowid`, so UPDATE or DELETE cannot bind | `GetRowIdColumns` / `GetRowIdType`, the same place that throws the "no primary key" error today | that it looked for a primary key **and** for a unique index; for each unique index it rejected, the index name and the reason (filtered, or which key column is nullable); and that adding a `PRIMARY KEY` or a non-filtered `UNIQUE` on NOT NULL columns is the fix |
 | `SET IDENTITY_INSERT` refused for want of ALTER, server error 1088 | around the `ON` batch in the statement path | that the extension issued `SET IDENTITY_INSERT` because the statement supplied a value for the identity column; that this needs ALTER on the table while INSERT does not; the table name; and the server's 1088 as the cause. Never the bare 1088, which claims the table may not exist |
 | An INSERT with no column list against a table with an identity column | nowhere — DuckDB's binder, before us | nothing we can add (§ 1.3). This is why the documentation carries the worked example, and why #327 closes with the reason rather than staying open |
-| A second `SET IDENTITY_INSERT` target while one is on, server error 8107 | same place as the 1088 case | it cannot happen for one statement, so if it is ever seen it means a previous statement leaked its `ON`. The message says that outright, because it is a bug in us and the user needs to know it is not theirs |
+| A second `SET IDENTITY_INSERT` target while one is on, server error 8107 | same place as the 1088 case | that one statement targets one table, so the *other* target came from somewhere else: a previous statement of ours that leaked its `ON`, **or the user's own `mssql_exec`** on a pinned connection or on a pooled one with `mssql_reset_connection = false`. The message names both possibilities and the table the server named, and does not accuse either side |
+| Stale `is_identity` after DDL through `mssql_exec`, server error 8106 | around the `ON` batch | that the catalog believes the column is an identity and the server disagrees, and that `mssql_invalidate_cache()` is the fix |
 
-The first two are the ones a user will actually meet. The rule for both: the
-message names the statement the extension generated, not just the one the user
-wrote, because the user did not write ours and cannot debug what they cannot
-see.
+The first two are the ones a user will actually meet; the third has no place to
+be caught at all and is why #327 closes with a reason. The rule for the ones we
+do catch: the message names the statement the extension generated, not just the
+one the user wrote, because the user did not write ours and cannot debug what
+they cannot see.
 
 ### W6 — tests
 
 New file `test/sql/insert/insert_identity.test`:
 
 - explicit list without the identity column — server assigns, values ascend;
-- explicit list with it — lands verbatim, and a second statement on the same
-  connection afterwards is not silently in `IDENTITY_INSERT` mode (the leak
-  test: run it with `SET mssql_reset_connection = false`);
+- explicit list with it — lands verbatim, and a later statement is not silently
+  in `IDENTITY_INSERT` mode. **The leak test must force the same connection**,
+  or it proves nothing: the pool does not promise to hand back the one just
+  released. Pin it with `SET mssql_connection_limit = 1`, run it with
+  `SET mssql_reset_connection = false` so the pool cannot paper over a leak,
+  and assert that an explicit identity value sent through `mssql_exec` on that
+  session afterwards fails with 544;
 - positional with every column — same as the explicit list;
 - a failing statement in the middle — `IDENTITY_INSERT` is off afterwards;
 - inside an explicit transaction, then ROLLBACK;
-- a view whose base table has an identity column;
+- a view whose base table has an identity column — the expected outcome is the
+  SERVER's own refusal of an explicit identity value through a view, asserted
+  by its error number, not a message of ours;
+- an explicit `DEFAULT` and an explicit `NULL` for the identity column, pinning
+  whichever DuckDB produces (W2);
 - more rows than `mssql_insert_bcp_threshold` while naming the identity column
   — it stays on the statement path (W3) and now succeeds instead of failing
   with 544, which is the assertion that pins the routing decision;
@@ -379,15 +465,34 @@ New file `test/sql/rowid/rowid_unique_index.test`:
 
 `test/sql/copy/copy_identity.test` for W4, both directions.
 
-C++ unit tests for the candidate-choice function, which is pure given the
-index metadata and is where the tie-break belongs.
+**An existing test this spec breaks.** `test/sql/dml/no_pk_update_delete.test`
+asserts the literal text `requires a table with a primary key` at lines 43 and
+50, and W5b rewrites that message. Update it in the same commit, and keep a
+stable substring in the new message so the assertion has something durable to
+match.
+
+C++ unit tests for two pure functions: the candidate-choice rule, which is pure
+given the index metadata and is where the tie-break belongs, and the
+server-error mapping — 1088, 8106, 8107 in, our message out. The second is
+worth having as a unit test precisely because a live test would need a second
+login and a grant; what it pins is which server errors are recognised, not the
+wording.
 
 ### W7 — documentation
 
-`CLAUDE.md` (the rowid line and the DML line), `DATAMODEL.md` (the catalog
-layer's key discovery, whose diagram says "primary key"),
-`website/docs/writing/dml.md` and `CHANGELOG.md`. The README's rowid sentence
-needs the same widening.
+`CLAUDE.md` (the rowid line and the DML line), `website/docs/writing/dml.md`
+and `CHANGELOG.md`. The README's rowid sentence needs the same widening.
+
+`DATAMODEL.md` needs **two** edits, not one. The catalog layer's key-discovery
+section and its diagram say "primary key" and must widen. And the connection
+pool's lifetime section gains a new invariant, which is where it belongs rather
+than beside a key diagram: *a statement connection that turned
+`IDENTITY_INSERT` on either turns it off before release or is discarded.* That
+is a rule about what may go back into the pool, and the pool section is where
+someone looks for those.
+
+`test/sql/dml/no_pk_update_delete.test` is updated in the same commit as the
+message it asserts (W6).
 
 Two things the documentation must say in so many words, because they are the
 whole user-facing shape of this spec. An `INSERT` that supplies identity values
@@ -422,6 +527,12 @@ does not supply identity values.
 - **A user reading "identity now works" as "identity inserts are fast".** They
   are not, they are the statement path by design (W3). The documentation has to
   carry the COPY sentence, or this ships a performance surprise.
+- **A unique key on a column whose READ is lossy.** The criterion in W1 keeps
+  spec 077 from widening it, but the primary-key path already carries it today
+  and this spec does not fix that — a `SQL_VARIANT` primary key gives a silent
+  zero-row UPDATE right now. The fix belongs with the sql_variant work, and W1
+  says so rather than leaving the reader to discover that the criterion is a
+  fence around an existing hole.
 
 ## 5. Decided, not left open
 
