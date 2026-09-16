@@ -926,6 +926,109 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 
 }  // namespace
 
+// Scenario 9 (issue #356): the lazy pin of a transaction's connection.
+//
+// The FIRST statement after BEGIN is what acquires the connection, sends
+// BEGIN TRANSACTION on it and pins it. DuckDB initialises a plan's source and
+// its sink on different threads, so both reach ConnectionProvider::GetConnection
+// at once — and before the fix the connection was published to the second
+// thread BEFORE the BEGIN on it had finished, so that thread executed on a
+// connection still in Executing:
+//
+//   Cannot execute: connection not in Idle state (current: Executing)
+//
+// A statement that both READS from and WRITES to the same catalog is what puts
+// a source and a sink on one pinned connection, which is why the body is a COPY
+// out of a table in the same catalog.
+//
+// Why a loop and not one shot: this is a race, measured at roughly 4% per
+// occurrence on the machine it was found on. One iteration proves nothing;
+// a few hundred turn "unlikely" into "certain" — at 4% the chance of surviving
+// 200 iterations unbroken is about 0.03%, so a green run here is evidence and a
+// red one is a reproduction rather than a flake.
+bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
+	std::cout << "\n=== Transaction pin race (issue #356): " << iterations << " transactions ===" << std::endl;
+
+	DuckDB db(nullptr);
+	{
+		Connection setup(db);
+		load_extension(setup);
+		std::ostringstream attach;
+		attach << "ATTACH '" << cfg.Dsn("TestDB") << "' AS mssql (TYPE mssql)";
+		auto r = setup.Query(attach.str());
+		if (r->HasError()) {
+			std::cerr << "  ATTACH failed: " << r->GetError() << std::endl;
+			return false;
+		}
+		// Small on purpose: the race is in acquiring the connection, not in the
+		// volume, and 200 transactions have to stay quick.
+		setup.Query("SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_src'') IS NOT NULL DROP TABLE "
+					"dbo.pinrace_src')");
+		setup.Query("SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_dst'') IS NOT NULL DROP TABLE "
+					"dbo.pinrace_dst')");
+		auto created = setup.Query(
+			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.pinrace_src(id int NOT NULL, v nvarchar(20) NULL); "
+			"CREATE TABLE dbo.pinrace_dst(id int NOT NULL, v nvarchar(20) NULL)')");
+		if (created->HasError()) {
+			std::cerr << "  setup failed: " << created->GetError() << std::endl;
+			return false;
+		}
+		auto filled = setup.Query("COPY (SELECT i::INTEGER AS id, ('v' || i)::VARCHAR AS v FROM range(1, 201) t(i)) "
+								  "TO 'mssql://mssql/dbo/pinrace_src' (FORMAT 'bcp', CREATE_TABLE false)");
+		if (filled->HasError()) {
+			std::cerr << "  seeding failed: " << filled->GetError() << std::endl;
+			return false;
+		}
+		setup.Query("SELECT mssql_invalidate_cache('mssql')");
+	}
+
+	Connection conn(db);
+	load_extension(conn);
+	int failures = 0;
+	std::string first_error;
+	const auto start = std::chrono::steady_clock::now();
+
+	for (int i = 0; i < iterations; i++) {
+		conn.Query("BEGIN");
+		// Reads from and writes to the SAME catalog: source and sink share the
+		// one pinned connection, and this is the first statement of the
+		// transaction, so it is the one that pins it.
+		auto r = conn.Query("COPY (SELECT id, v FROM mssql.dbo.pinrace_src) TO 'mssql://mssql/dbo/pinrace_dst' "
+							"(FORMAT 'bcp', CREATE_TABLE false)");
+		if (r->HasError()) {
+			failures++;
+			if (first_error.empty()) {
+				first_error = r->GetError();
+			}
+			conn.Query("ROLLBACK");
+			continue;
+		}
+		conn.Query("COMMIT");
+		// Keep the target from growing to 200 * iterations rows.
+		conn.Query("SELECT mssql_exec('mssql', 'TRUNCATE TABLE dbo.pinrace_dst')");
+	}
+
+	const auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+	{
+		Connection cleanup(db);
+		load_extension(cleanup);
+		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.pinrace_src; "
+					  "DROP TABLE IF EXISTS dbo.pinrace_dst')");
+	}
+
+	std::cout << "  " << iterations << " transactions in " << elapsed << " ms, " << failures << " failed" << std::endl;
+	if (failures > 0) {
+		std::cerr << "  FAIL: first error was: " << first_error << std::endl;
+		std::cerr << "  This is issue #356: the connection was published to a second thread before"
+				  << " BEGIN TRANSACTION had finished on it." << std::endl;
+		return false;
+	}
+	std::cout << "  PASS: every transaction pinned its connection cleanly" << std::endl;
+	return true;
+}
+
 int main() {
 	std::cout << "==========================================" << std::endl;
 	std::cout << "Concurrent reads stress test" << std::endl;
@@ -946,6 +1049,8 @@ int main() {
 		ok &= scenario_concurrent_mixed_reads(cfg, 4, 50);
 		ok &= scenario_concurrent_mixed_reads(cfg, 8, 25);
 		ok &= scenario_concurrent_attach(cfg, 4);
+		// Scenario 9 (issue #356): the lazy pin of a transaction's connection.
+		ok &= scenario_transaction_pin_race(cfg, 200);
 		ok &= scenario_concurrent_catalog_reads(cfg, 4, 50);
 		ok &= scenario_concurrent_catalog_reads(cfg, 8, 25);
 		// Scenario 5 (spec 052 US2): 4 readers + invalidator at 50ms cadence

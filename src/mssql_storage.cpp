@@ -1196,7 +1196,7 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 	if (info.use_encrypt) {
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: executing validation query (SELECT 1)...");
 		try {
-			if (!conn.ExecuteBatch("SELECT 1")) {
+			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
 				string error = conn.GetLastError();
 				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query FAILED - %s", error.c_str());
 				conn.Close();
@@ -1267,7 +1267,7 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 	if (info.use_encrypt) {
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: executing validation query (SELECT 1)...");
 		try {
-			if (!conn.ExecuteBatch("SELECT 1")) {
+			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
 				string error = conn.GetLastError();
 				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED - %s",
 										error.c_str());
@@ -1336,7 +1336,7 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	if (info.use_encrypt) {
 		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: executing TLS validation query (SELECT 1)...");
 		try {
-			if (!conn.ExecuteBatch("SELECT 1")) {
+			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
 				string error = conn.GetLastError();
 				string translated =
 					MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);

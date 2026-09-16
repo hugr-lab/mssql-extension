@@ -151,7 +151,7 @@ public:
 	// Sends SQL_BATCH packet(s) and prepares connection for streaming response
 	// Returns true if batch was sent successfully
 	// After this, use ReceiveData() to read response packets
-	bool ExecuteBatch(const std::string &sql);
+	bool ExecuteBatch(const std::string &sql, const char *reason = "SQL batch");
 
 	// Receive more response data into provided buffer
 	// Returns bytes received, 0 on connection close, -1 on error
@@ -164,7 +164,24 @@ public:
 	}
 
 	// Attempt state transition (thread-safe)
-	bool TransitionState(ConnectionState from, ConnectionState to);
+	//! Move the connection between states, atomically. `reason` is a short
+	//! static label naming what is doing it ("scan stream", "bulk stream",
+	//! "COMMIT") — it is recorded on the connection when the state becomes
+	//! Executing, and reported by whoever next fails to take it. That is what
+	//! turns "connection not in Idle state" from a dead end into a name.
+	bool TransitionState(ConnectionState from, ConnectionState to, const char *reason = nullptr);
+
+	//! What last took this connection to Executing, and on which thread. Null
+	//! until something does; read on a failure path only.
+	const char *LastExecutingReason() const {
+		return last_executing_reason_.load(std::memory_order_relaxed);
+	}
+	uint64_t LastExecutingThread() const {
+		return last_executing_thread_.load(std::memory_order_relaxed);
+	}
+
+	//! Record the current thread and `reason` as the holder of Executing.
+	void NoteExecutingHolder(const char *reason);
 
 	// Getters
 	uint16_t GetSpid() const {
@@ -306,6 +323,16 @@ private:
 
 	std::unique_ptr<TdsSocket> socket_;
 	std::atomic<ConnectionState> state_;
+	//! See LastExecutingReason(). A `const char *` rather than a std::string, and
+	//! atomic: it is written by whoever wins the CAS into Executing and read by a
+	//! thread that just lost one, so a std::string here would be a genuine data
+	//! race — a reader could walk a buffer being reassigned. Every label passed
+	//! in is a string literal, so there is nothing to own and a relaxed atomic
+	//! pointer is both correct and free. The pair is not read atomically
+	//! together; a mismatched reason and thread in a diagnostic is acceptable,
+	//! a dangling pointer is not.
+	std::atomic<const char *> last_executing_reason_{nullptr};
+	std::atomic<uint64_t> last_executing_thread_{0};
 
 	// Spec 074: handed to TdsSocket::EnableTls on every handshake.
 	TlsOptions tls_options_;

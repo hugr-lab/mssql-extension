@@ -133,10 +133,6 @@ bool MSSQLTransaction::HasPinnedConnection() const {
 	return pinned_connection_ != nullptr;
 }
 
-mutex &MSSQLTransaction::GetConnectionMutex() {
-	return connection_mutex_;
-}
-
 bool MSSQLTransaction::IsSqlServerTransactionActive() const {
 	lock_guard<mutex> lock(connection_mutex_);
 	return sql_server_transaction_active_;

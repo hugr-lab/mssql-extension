@@ -208,7 +208,8 @@ void BulkLoadSession::OpenStream() {
 	if (!result.success) {
 		throw IOException("INSERT BULK failed: %s", result.error_message);
 	}
-	if (!connection_->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing)) {
+	if (!connection_->TransitionState(tds::ConnectionState::Idle, tds::ConnectionState::Executing,
+									  "INSERT BULK stream")) {
 		throw IOException("could not transition the bulk-load connection to Executing");
 	}
 	// The stream opens with COLMETADATA; without it the server has no schema
