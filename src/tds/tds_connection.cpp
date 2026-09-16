@@ -76,15 +76,14 @@ static uint64_t CurrentThreadTag() {
 	return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFF);
 }
 
-#define MSSQL_CONN_STATE_LOG(...)                       \
-	do {                                                \
-		if (GetConnStateLogLevel() > 0) {               \
-			fprintf(stderr, "[MSSQL CONN STATE] ");     \
-			fprintf(stderr, __VA_ARGS__);               \
-			fprintf(stderr, "\n");                      \
-		}                                               \
+#define MSSQL_CONN_STATE_LOG(...)                   \
+	do {                                            \
+		if (GetConnStateLogLevel() > 0) {           \
+			fprintf(stderr, "[MSSQL CONN STATE] "); \
+			fprintf(stderr, __VA_ARGS__);           \
+			fprintf(stderr, "\n");                  \
+		}                                           \
 	} while (0)
-
 
 namespace tds {
 
@@ -1280,8 +1279,7 @@ bool TdsConnection::TransitionState(ConnectionState from, ConnectionState to, co
 	}
 	// `from` now holds what the state actually was — the CAS wrote it back.
 	MSSQL_CONN_STATE_LOG("conn=%p spid=%u REFUSED %s -> %s by '%s' thread=%llu; state is %s, held by '%s' thread=%llu",
-						 (void *)this, spid_,
-						 ConnectionStateToString(requested_from), ConnectionStateToString(to),
+						 (void *)this, spid_, ConnectionStateToString(requested_from), ConnectionStateToString(to),
 						 reason ? reason : "(unnamed)", (unsigned long long)CurrentThreadTag(),
 						 ConnectionStateToString(from), LastExecutingReason() ? LastExecutingReason() : "(nobody)",
 						 (unsigned long long)LastExecutingThread());
@@ -1340,8 +1338,7 @@ bool TdsConnection::ExecuteBatch(const std::string &sql, const char *reason) {
 						   std::to_string(CurrentThreadTag());
 		}
 		MSSQL_CONN_STATE_LOG("conn=%p spid=%u REFUSED batch: state is %s, held by '%s' thread=%llu, this thread=%llu",
-							 (void *)this, spid_,
-							 ConnectionStateToString(expected),
+							 (void *)this, spid_, ConnectionStateToString(expected),
 							 LastExecutingReason() ? LastExecutingReason() : "(nobody)",
 							 (unsigned long long)LastExecutingThread(), (unsigned long long)CurrentThreadTag());
 		MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: FAILED - wrong state: %d", static_cast<int>(expected));
