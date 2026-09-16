@@ -754,8 +754,14 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "smallmoney";
 
 	case LogicalTypeId::VARCHAR:
+		// `json` belongs here for the same reason `xml` does: the server takes
+		// a string for it and validates the content itself. Without it a COPY
+		// into an existing table with a JSON column was refused at bind while
+		// an INSERT into the same column worked, which is the kind of split
+		// nobody can guess (issue #296 self-review).
 		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
-			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml";
+			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml" ||
+			   target_lower == "json";
 
 	case LogicalTypeId::BLOB:
 		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";

@@ -1,4 +1,7 @@
 #include "dml/insert/mssql_value_serializer.hpp"
+#include <algorithm>
+#include <cctype>
+#include "catalog/mssql_column_info.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
@@ -93,6 +96,28 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	} catch (const NotImplementedException &) {
 		throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT", type.ToString());
 	}
+}
+
+string MSSQLValueSerializer::WrapSpatialLiteral(const string &literal, const string &mssql_type) {
+	// NULL needs no reader: STGeomFromWKB(NULL, …) does return NULL, but the
+	// call would be noise in every generated statement that has one.
+	if (literal == "NULL") {
+		return literal;
+	}
+	// The membership test is MSSQLColumnInfo's, so this cannot drift from the
+	// `is_geometry` that decides an INSERT's path. Only the choice between the
+	// two T-SQL type names lives here, because only the renderer needs it.
+	if (!MSSQLColumnInfo::IsSpatialType(mssql_type)) {
+		return literal;
+	}
+	string lower_type = mssql_type;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	if (lower_type == "geography") {
+		// 4326 because geography refuses SRID 0 outright — see the header.
+		return "geography::STGeomFromWKB(" + literal + ", 4326)";
+	}
+	return "geometry::STGeomFromWKB(" + literal + ", 0)";
 }
 
 string MSSQLValueSerializer::SerializeFromVector(Vector &vector, idx_t index, const LogicalType &target_type) {

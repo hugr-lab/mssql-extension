@@ -691,6 +691,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		insert_col.name = col.name;
 		insert_col.duckdb_type = native_types ? col.NativeDuckDBType() : col.duckdb_type;
 		insert_col.mssql_type = col.sql_type_name;
+		insert_col.max_length = col.max_length;
 		insert_col.is_identity = col.is_identity;  // spec 062 W4: from sys.columns, via the cache
 		insert_col.is_nullable = col.is_nullable;
 		insert_col.has_default = false;	 // TODO: Query this from sys.columns
@@ -699,6 +700,10 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		insert_col.scale = col.scale;
 		target.columns.push_back(std::move(insert_col));
 	}
+
+	// The OUTPUT list of an INSERT … RETURNING is built by the same function as
+	// the scan's SELECT list, and that function takes this setting.
+	target.convert_varchar_max = LoadConvertVarcharMax(context);
 
 	// Set insert column indices
 	target.insert_column_indices = std::move(insert_col_indices);

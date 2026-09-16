@@ -24,6 +24,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`INSERT … RETURNING` works against a table holding a column the wire cannot
+  decode raw** — a spatial UDT, `sql_variant`, `hierarchyid`. It used to fail
+  with `COLMETADATA parse error: Unsupported SQL Server type: UDT` **even when
+  the RETURNING list did not name that column**, because the generated `OUTPUT`
+  clause carries every column of the table: DuckDB's RETURNING projection sits
+  above the insert and expects the table's full width. The OUTPUT list now uses
+  the same expressions the read path does, `.STAsBinary()` for the spatial
+  types and a CAST to NVARCHAR(MAX) for the rest, so those columns come back in
+  the same shape a catalog scan gives them.
+
+- **A `GEOMETRY` value can be written into a `geometry` / `geography` column**
+  (#296). It used to go as a bare `0x…` literal, which SQL Server reads as its
+  own Spatial Type Binary Format rather than as the OGC WKB a DuckDB GEOMETRY
+  carries, and rejects: `24210: Geometry type with an unexpected version of 0
+  received`. INSERT and UPDATE now wrap it as
+  `geometry::STGeomFromWKB(0x…, srid)`, the server-side reader for that form.
+  The **SRID is an assumption**, because `.STAsBinary()` does not carry one and
+  a value read from SQL Server has already lost it: a `geometry` target gets 0
+  (planar, undefined) and a `geography` target gets 4326 / WGS 84, since
+  geography refuses 0 outright. Set another one server-side after the load. An
+  INSERT naming a spatial column stays on the statement path whatever
+  `mssql_insert_bcp_threshold` says, as it always has — the bulk wire would
+  declare the column nvarchar and send the WKB as text.
+
+- **`ROWVERSION` columns are readable, and the native `JSON` type of SQL
+  Server 2025 is read uncast** ([#296](https://github.com/hugr-lab/mssql-extension/issues/296)).
+  Neither type name was in the catalog's table, so both took the unknown-type
+  route, `CAST(col AS NVARCHAR(MAX))`. For `rowversion` that is not merely
+  wasteful, the server **refuses** it — `[529] Explicit conversion from data
+  type timestamp to nvarchar(max) is not allowed` — so a table carrying such a
+  column could not be read at all. It is `binary(8)` on the wire and now reads
+  as `BLOB` with no conversion; the name to look for in `sys.types` is
+  `timestamp`, which has nothing to do with time. Do not write it: SQL Server
+  refuses an explicit value with error 273, so leave it out of the INSERT
+  column list. The 2025 `JSON` type arrives as `varchar(max)` under a UTF-8
+  collation and now reads as `VARCHAR` directly, where the CAST used to convert
+  every value server-side for nothing. `COPY` into an existing table with a
+  `JSON` column is accepted too: the compatibility table listed `xml` for a
+  VARCHAR source but not `json`, so a COPY was refused at bind while an INSERT
+  into the same column worked.
+
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than
   `mssql_insert_bcp_threshold` (default 1000), no `RETURNING` and no
   explicitly named identity column goes through `INSERT BULK` — the wire
@@ -43,15 +84,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks constraints, fires triggers and keeps its NULLs — a bulk load
   ignores all three by default, and COPY still does. A failed load names
   the batch and says `rolled back`. The batch size, TABLOCK policy and
-  writer count are the `mssql_copy_*` settings.
+  writer count are the `mssql_copy_*` settings. Reviewed by
+  [@oluies](https://github.com/oluies), who found the writer rule blind to a
+  nonclustered index and pushed the fix (#349, merged into #348) — a heap
+  carrying one takes Sch-M rather than BU, and the extra writers stall 30 s
+  behind it.
 
 - **The catalog knows which columns are IDENTITY** (spec 062 W4, the
   metadata half of #327). `sys.columns.is_identity` rides in the four
   column-metadata queries and on `MSSQLColumnInfo`; the INSERT planner reads
-  it instead of hard-coding false. Not yet visible through DuckDB — the
-  binder half of #327 (omitting the column from a column-list-less INSERT)
-  needs an upstream hook — but it is what routes an INSERT that names an
-  identity column onto the statement path once INSERT goes through BCP.
+  it instead of hard-coding false. It is what routes an INSERT that names an
+  identity column onto the statement path. The other half of #327 — omitting
+  the column from a column-list-less INSERT — is not reachable from an
+  extension: DuckDB's binder compares the value count against the columns the
+  catalog reports, before any extension code runs. See spec 077.
 
 - **Pushed filters are parameterised** (spec 076). The constants of a pushed
   filter travel as `sp_executesql` parameters declared from the column they
