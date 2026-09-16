@@ -33,7 +33,11 @@ IF OBJECT_ID(''dbo.BcpParCci'') IS NOT NULL DROP TABLE dbo.BcpParCci;
 CREATE TABLE dbo.BcpParCci (id INT NOT NULL, v NVARCHAR(20) NULL);
 CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCci;
 IF OBJECT_ID(''dbo.BcpParHeapNci'') IS NOT NULL DROP TABLE dbo.BcpParHeapNci;
-CREATE TABLE dbo.BcpParHeapNci (id INT NOT NULL PRIMARY KEY NONCLUSTERED, v NVARCHAR(20) NULL)');
+CREATE TABLE dbo.BcpParHeapNci (id INT NOT NULL PRIMARY KEY NONCLUSTERED, v NVARCHAR(20) NULL);
+IF OBJECT_ID(''dbo.BcpParCciNci'') IS NOT NULL DROP TABLE dbo.BcpParCciNci;
+CREATE TABLE dbo.BcpParCciNci (id INT NOT NULL, v NVARCHAR(20) NULL);
+CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCciNci;
+CREATE NONCLUSTERED INDEX nci ON dbo.BcpParCciNci (id)');
 
 statement ok
 SELECT mssql_invalidate_cache('bpar');
@@ -119,6 +123,24 @@ SELECT count(*), sum(id) FROM bpar.dbo.BcpParHeapNci;
 ----
 400000	80000200000
 
+# --- a clustered columnstore carrying a NONCLUSTERED index: one writer.
+#
+# The columnstore arm of the rule needs "bare" for the same reason the heap
+# arm does, and the review that found the heap half left this one open. It is
+# the worse of the two: four writers here did not stall, they FAILED -- a
+# writer timed out reading its BCP response after 30 s, which is an error and
+# not a failed claim, so the whole INSERT rolled back and landed nothing
+# (measured: 30.8 s and 0 rows, against 0.99 s and 400000 with one writer).
+# So the regression signature here is a failed statement, and the count below
+# is what catches it.
+statement ok
+INSERT INTO bpar.dbo.BcpParCciNci SELECT * FROM src;
+
+query II
+SELECT count(*), sum(id) FROM bpar.dbo.BcpParCciNci;
+----
+400000	80000200000
+
 # --- the shape is read LIVE when the stream opens, not from the cache: this
 # table was a heap when the catalog cached it (the load above), and has a
 # clustered index now, added through mssql_exec, which does not invalidate.
@@ -161,7 +183,7 @@ statement ok
 RESET mssql_insert_bcp_threshold;
 
 statement ok
-SELECT mssql_exec('bpar', 'DROP TABLE dbo.BcpParHeap; DROP TABLE dbo.BcpParClustered; DROP TABLE dbo.BcpParCci; DROP TABLE dbo.BcpParHeapNci');
+SELECT mssql_exec('bpar', 'DROP TABLE dbo.BcpParHeap; DROP TABLE dbo.BcpParClustered; DROP TABLE dbo.BcpParCci; DROP TABLE dbo.BcpParHeapNci; DROP TABLE dbo.BcpParCciNci');
 
 statement ok
 DETACH bpar;

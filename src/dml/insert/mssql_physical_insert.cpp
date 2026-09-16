@@ -107,7 +107,7 @@ void RecordBulkError(MSSQLInsertGlobalSinkState &gstate, const string &message) 
 // it -- rolled back with the load's transaction in autocommit, or in the open
 // DuckDB transaction inside one.
 string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, idx_t batch_no, idx_t rows_in_batch,
-						  const char *what) {
+						  const string &what) {
 	return StringUtil::Format("INSERT via BCP failed at batch %llu of a writer (%llu row(s) in it): %s; %s",
 							  (unsigned long long)batch_no, (unsigned long long)rows_in_batch, what,
 							  MSSQLRowsBeforeOutcome(gstate.transaction_pinned, gstate.rows_confirmed.load()));
@@ -116,7 +116,7 @@ string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, idx_t batch_
 // The batch a session is on, read BEFORE the call that may fail: CloseStream
 // and Commit abandon the session on failure, and Abandon zeroes the counters.
 string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, const mssql::BulkLoadSession &session,
-						  const char *what) {
+						  const string &what) {
 	return BulkFailureMessage(gstate, session.BatchesFlushed() + 1, session.RowsInBatch(), what);
 }
 
@@ -236,16 +236,26 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// exclusive table lock instead, which is the deadlock above -- and
 	// live.kind cannot see that, because every query behind it filters
 	// index_id <= 1. has_nonclustered is the column that can.
-	const bool bare_heap = live.kind == MSSQLIndexKind::HEAP && !live.has_nonclustered;
-	const bool locks_compatible =
-		(bare_heap && bulk.tablock) || (live.kind == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock);
+	// "Bare" governs BOTH arms, measured on each (spec 062 § 6.5). The heap
+	// half is the reviewed one: a nonclustered index turns the compatible BU
+	// lock into Sch-M and the load stalls 30 s per extra writer. The
+	// columnstore half was left open by that review and is WORSE -- 400k rows
+	// into a clustered columnstore carrying one nonclustered index, four
+	// writers: a writer times out reading its BCP response after 30 s, which
+	// is an error rather than a failed claim, so the whole INSERT rolls back
+	// and lands nothing. Both arms therefore want a target with no
+	// nonclustered index on it.
+	const bool bare = !live.has_nonclustered;
+	const bool locks_compatible = bare && ((live.kind == MSSQLIndexKind::HEAP && bulk.tablock) ||
+										   (live.kind == MSSQLIndexKind::CLUSTERED_COLUMNSTORE && !bulk.tablock));
 	if (!locks_compatible) {
 		gstate.parallel_writer_limit = 1;
 	}
-	if (live.kind == MSSQLIndexKind::HEAP && live.has_nonclustered) {
+	if (live.has_nonclustered && live.kind != MSSQLIndexKind::CLUSTERED) {
 		INSERT_SINK_LOG(1,
-						"heap target carries a nonclustered index: one writer (under TABLOCK it takes an "
-						"exclusive table lock, not the compatible BU locks a bare heap takes)");
+						"target carries a nonclustered index: one writer (concurrent transactional bulk loads "
+						"need a target with no index on it -- measured, a heap takes Sch-M instead of BU and "
+						"stalls, a columnstore fails its load outright)");
 	}
 	if (live.kind != bulk.shape) {
 		INSERT_SINK_LOG(1, "target shape changed since the catalog cached it (%d -> %d): writer_limit=%llu",
@@ -340,7 +350,7 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 			try {
 				OpenSharedStream(context.client, gstate, target_, bulk_);
 			} catch (std::exception &e) {
-				const string msg = BulkFailureMessage(gstate, gstate.shared, e.what());
+				const string msg = BulkFailureMessage(gstate, gstate.shared, MSSQLRawMessage(e));
 				gstate.shared.Abandon();
 				RecordBulkError(gstate, msg);
 				throw IOException("%s", msg);
@@ -378,7 +388,7 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 		try {
 			AccountWrite(gstate, lstate.session->Write(chunk));
 		} catch (std::exception &e) {
-			const string msg = BulkFailureMessage(gstate, *lstate.session, e.what());
+			const string msg = BulkFailureMessage(gstate, *lstate.session, MSSQLRawMessage(e));
 			lstate.session->Abandon();
 			RecordBulkError(gstate, msg);
 			throw IOException("%s", msg);
@@ -394,7 +404,7 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 	try {
 		AccountWrite(gstate, gstate.shared.Write(chunk));
 	} catch (std::exception &e) {
-		const string msg = BulkFailureMessage(gstate, gstate.shared, e.what());
+		const string msg = BulkFailureMessage(gstate, gstate.shared, MSSQLRawMessage(e));
 		gstate.shared.Abandon();
 		RecordBulkError(gstate, msg);
 		throw IOException("%s", msg);
@@ -426,7 +436,7 @@ SinkCombineResultType MSSQLPhysicalInsert::Combine(ExecutionContext &context, Op
 		}
 	} catch (std::exception &e) {
 		// CloseStream abandoned the session before rethrowing.
-		const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, e.what());
+		const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, MSSQLRawMessage(e));
 		RecordBulkError(gstate, msg);
 		throw IOException("%s", msg);
 	}
@@ -498,7 +508,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 				gstate.batches_flushed.fetch_add(1, std::memory_order_relaxed);
 			}
 		} catch (std::exception &e) {
-			const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, e.what());
+			const string msg = BulkFailureMessage(gstate, batch_no, rows_in_batch, MSSQLRawMessage(e));
 			AbandonAll(gstate);
 			throw IOException("%s", msg);
 		}
@@ -532,7 +542,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 				"back -- check the table before retrying",
 				(unsigned long long)committed_writers, (unsigned long long)committed);
 		}
-		const string msg = StringUtil::Format("INSERT via BCP failed to commit: %s; %s", e.what(), outcome);
+		const string msg = StringUtil::Format("INSERT via BCP failed to commit: %s; %s", MSSQLRawMessage(e), outcome);
 		AbandonAll(gstate);
 		throw IOException("%s", msg);
 	}

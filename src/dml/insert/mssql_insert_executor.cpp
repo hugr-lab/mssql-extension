@@ -7,6 +7,7 @@
 #include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
+#include "dml/mssql_dml_outcome.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
@@ -97,7 +98,7 @@ void MSSQLInsertExecutor::CommitStatement() {
 		stmt_conn_.Commit(context_, catalog);
 	} catch (const std::exception &e) {
 		failed_ = true;
-		throw IOException("INSERT failed: %s", e.what());
+		throw IOException("INSERT failed: %s", MSSQLRawMessage(e));
 	}
 }
 

@@ -781,10 +781,13 @@ lock A's uncommitted rows hold, so the server stops reading B's stream, so B's
 thread blocks in `send()`, while A's commit is in `Finalize`, which waits for
 B's `Combine`. The server sees no deadlock and nothing times out.
 
-"Bare" carries weight: SQL Server hands concurrent bulk loaders compatible BU
-locks only when the table has **no indexes at all**. A heap with a nonclustered
-index on it (a `PRIMARY KEY NONCLUSTERED`, any `CREATE INDEX`) takes an
-exclusive table lock under the same hint, and would hang exactly as above. The
+"Bare" carries weight, on both arms: SQL Server hands concurrent bulk loaders
+compatible BU locks only when the table has **no indexes at all**. A heap with
+a nonclustered index on it (a `PRIMARY KEY NONCLUSTERED`, any `CREATE INDEX`)
+takes a Sch-M lock under the same hint and stalls each extra writer for the
+30 s its `INSERT BULK` waits; a clustered columnstore carrying one is worse —
+the extra writer gets past `INSERT BULK` and times out mid-stream, which fails
+the whole INSERT. The
 base structure alone cannot answer this — `MSSQLIndexKind` comes from queries
 that filter `index_id <= 1`, which is precisely the rows a nonclustered index is
 not — so `TargetResolver::QueryTableShape` returns a `TableLoadShape` carrying

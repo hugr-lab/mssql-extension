@@ -269,7 +269,7 @@ of 1000 rows at 74 ms, no plan left behind per statement. Measured 5.5× at
 the boundary, more as statements grow. This governs everything that stays on
 the statement path — the rows below the threshold, `RETURNING`, the explicit
 identity column. Not every one of them gains: a `RETURNING` insert of a
-million rows measured 69.8 s before and 70.2 s after (§ 6.4) — an `OUTPUT
+million rows measured 69.8 s before and 70.2 s after (§ 6.6) — an `OUTPUT
 INSERTED` statement is never auto-parameterised, and its cost is ~70 µs a
 row on the server whatever the statement size, so the cap neither helps nor
 hurts it. Plain inserts under the threshold are what the cap is for. Still
@@ -378,14 +378,36 @@ reading B's stream, so B's thread blocks in `send()`; A's commit is in
 `Finalize`, which waits for B's `Combine`. The server sees no deadlock (one
 side is a client) and nothing times out — measured as a hang past ten
 minutes on a heap on row locks, and a 30 s BCP read timeout on a clustered
-rowstore. Two shapes let concurrent transactional bulk loads coexist: a heap
-under TABLOCK (BU locks are mutually compatible, nothing escalates) and a
-clustered columnstore without it (each session fills its own rowgroups) —
-measured 1M rows in 0.49 s and 0.80 s at four writers against 1.78 s at one.
-Everything else — a clustered rowstore index, a heap on row locks, a
-columnstore under a table lock — gets one writer. Under `mssql_copy_tablock
-= auto` that is: heaps and columnstores fan out, clustered rowstore tables
-do not. The shape this rule reads is queried LIVE when the stream opens
+rowstore. Two shapes let concurrent transactional bulk loads coexist: a
+**bare** heap under TABLOCK (BU locks are mutually compatible, nothing
+escalates) and a clustered columnstore without it (each session fills its own
+rowgroups) — measured 1M rows in 0.49 s and 0.80 s at four writers against
+1.78 s at one. Everything else — a clustered rowstore index, a heap on row
+locks, a columnstore under a table lock — gets one writer. Under
+`mssql_copy_tablock = auto` that is: bare heaps and columnstores fan out,
+clustered rowstore tables do not.
+
+"Bare" is the whole of it, on BOTH arms, and the base structure cannot answer
+it (review of this PR, job 1632). SQL Server hands concurrent bulk loaders
+compatible locks only when the table has **no indexes at all**;
+`MSSQLIndexKind` comes from queries that filter `index_id <= 1`, which is
+exactly the rows a nonclustered index is not, so a `PRIMARY KEY NONCLUSTERED`
+heap reported HEAP and fanned out. Measured under TABLOCK, in a transaction,
+reading `sys.dm_tran_locks` for the target (§ 6.5): a bare heap takes **BU**,
+the same heap carrying a nonclustered PK takes **Sch-M** — the lock nothing
+else is compatible with, including another Sch-M. `QueryTableShape` therefore
+returns a `TableLoadShape` carrying `has_nonclustered` beside `kind`, from a
+second scalar subquery on the same round trip.
+
+The review left the columnstore arm open, and measuring it settles it the
+other way from the heap: a clustered columnstore carrying one nonclustered
+index does not stall at four writers, it **fails** — a writer times out
+reading its BCP response after 30 s, which is an error rather than a failed
+claim, so the whole INSERT rolls back and lands nothing (30.8 s and 0 rows,
+against 0.99 s and 400000 on one writer). So `has_nonclustered` gates both
+arms: fan-out needs a target with no index on it.
+
+The shape this rule reads is queried LIVE when the stream opens
 (`TargetResolver::QueryTableShape`, one `sys.indexes` lookup on the load's
 own connection), not taken from the catalog cache: a table cached as a heap
 and given a clustered index since — through `mssql_exec`, which does not
@@ -496,11 +518,14 @@ place messages are rendered (#344).
 - `insert_bcp_parallel.test`: `SET threads = 4`, a 400k-row load fans out
   on a heap (`connections_created` grows by the extra writers), loads a
   clustered columnstore with four threads, stays on one writer against a
-  clustered rowstore and under `mssql_copy_parallel_writers = 1`, and — the
-  shape read live at stream open, not from the cache — loads a table that
-  was a heap when the catalog cached it and has a clustered index now,
-  without the client-side deadlock a stale shape would have caused; inside
-  a transaction exactly 1 (`insert_bcp_transaction.test`).
+  clustered rowstore and under `mssql_copy_parallel_writers = 1`, loads a
+  heap carrying a `PRIMARY KEY NONCLUSTERED` (whose regression signature is
+  a 30 s stall, not a wrong count) and a clustered columnstore carrying one
+  (whose signature is a failed statement), and — the shape read live at stream
+  open, not from the cache — loads a table that was a heap when the catalog
+  cached it and has a clustered index now, without the client-side deadlock
+  a stale shape would have caused; inside a transaction exactly 1
+  (`insert_bcp_transaction.test`).
 - `insert_bcp_semantics.test`: CHECK constraints enforced, triggers fired,
   explicit NULLs kept over a DEFAULT, omitted columns defaulted — on both
   paths.
@@ -686,7 +711,45 @@ server for those. The multi-column case of § 0.1 — where the statement path
 had left the auto-parameterisation line — is the wide end: 74 s against
 1.8 s, 40×.
 
-### 6.4 `RETURNING` at 1M rows, before and after W1b (2026-09-14)
+### 6.5 The writer rule's premise, measured (2026-09-15)
+
+The rule rests on which table lock `INSERT BULK ... WITH (TABLOCK)` takes.
+Read from `sys.dm_tran_locks` for the target while the load's transaction was
+still open, 5000 rows into each:
+
+| target | lock granted |
+| --- | --- |
+| heap, no indexes | **BU** (bulk update — mutually compatible) |
+| heap + `PRIMARY KEY NONCLUSTERED` | **Sch-M** (schema modification — compatible with nothing) |
+
+Two Sch-M requests cannot both be granted, so the second writer's own
+`INSERT BULK` blocks behind the first writer's still-open transaction. What
+that costs, 400k rows into a heap with a nonclustered PK, `threads = 4`,
+`mssql_copy_parallel_writers = 4`:
+
+| gate | wall | writers used |
+| --- | --- | --- |
+| before (blind to the nonclustered index) | 30.97 s | 1 of 4 |
+| after (`has_nonclustered`) | **0.55 s** | 1 of 1 |
+
+56×. The damage is bounded rather than the unbounded hang of a heap on row
+locks, and by luck: each extra writer blocks inside `TryStart`, whose 30 s
+read timeout then reports a failed claim — and a failed claim is not an error
+("a load must not fail because it could not go faster"), so the load
+completes on the shared writer after paying 30 s of dead time and silently
+losing the parallelism it asked for.
+
+The columnstore arm, the same 400k rows at four writers, is worse — there the
+extra writer gets *past* its `INSERT BULK` and times out mid-stream, which is
+an error:
+
+| clustered columnstore target | wall | rows landed |
+| --- | --- | --- |
+| no nonclustered index | 0.63 s (4 writers) | 400000 |
+| + one nonclustered index, before | 30.81 s | **0 — the INSERT failed and rolled back** |
+| + one nonclustered index, after | 0.99 s (1 writer) | 400000 |
+
+### 6.6 `RETURNING` at 1M rows, before and after W1b (2026-09-14)
 
 `INSERT INTO t SELECT * FROM src RETURNING id`, 1M rows × 3 columns, the
 pre-062 binary (1000-row statements) against this branch (333-row
@@ -696,7 +759,7 @@ per statement, so the cap is neutral for it. `RETURNING` stays the one large
 INSERT nothing here speeds up; an `OUTPUT`-free bulk load followed by a read
 is the way to get rows back fast.
 
-### 6.5 Before the INSERT work
+### 6.7 Before the INSERT work
 
 § 0.1 and § 0.4 are the baseline: a DuckDB table of 1M rows into an existing
 3-column heap costs the text path 73.7 / 74.2 / 74.9 s across three cold runs

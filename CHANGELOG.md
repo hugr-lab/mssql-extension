@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly named identity column goes through `INSERT BULK` — the wire
   COPY and CTAS use — on the transaction's pinned connection or on a pool
   connection inside a server transaction of its own, with parallel writers
-  where their loads cannot block each other (a heap under TABLOCK, a
-  clustered columnstore without it). Measured: 1M rows × 3 columns into an
-  existing table in 1.8 s on one writer and 0.5 s on four, where the
+  where their loads cannot block each other: a target with no nonclustered
+  index on it, either a heap under TABLOCK or a clustered columnstore
+  without it. SQL Server gives concurrent bulk loaders compatible BU locks
+  only on a bare heap — add a nonclustered index and the same hint takes a
+  Sch-M lock, and on a columnstore the extra writer fails its load outright. Measured: 1M
+  rows × 3 columns into an existing table in 1.8 s on one writer and 0.5 s
+  on four, where the
   statement path took 74 s. The rows are staged until the threshold decides
   the path, so the decision is exact; `RETURNING`, an identity column and
   `mssql_insert_use_bcp = false` keep the statement path. The bulk wire

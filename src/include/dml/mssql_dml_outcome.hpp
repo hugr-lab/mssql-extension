@@ -10,10 +10,19 @@
 
 #pragma once
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
+
+//! The sentence a user should read out of a caught exception. `what()` on a
+//! DuckDB exception that carries extra info returns the serialized envelope --
+//! `{"exception_type":"IO","exception_message":"MSSQL: BCP failed: ..."}` --
+//! which is what a message built with it then nests inside itself.
+inline string MSSQLRawMessage(const std::exception &e) {
+	return ErrorData(e).RawMessage();
+}
 
 //! "rolled back" in autocommit — the statement's own server transaction was
 //! rolled back, earlier batches included — or, inside a DuckDB transaction,

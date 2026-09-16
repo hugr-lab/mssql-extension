@@ -82,11 +82,15 @@ compressed rowgroups on a columnstore) and `mssql_copy_parallel_writers`.
 Parallel writers apply only where their loads cannot block each other —
 each writer holds its own server transaction until the INSERT commits them
 all, so two writers whose locks conflict would wait on each other with
-nothing to time out. That is a heap under TABLOCK and a clustered
-columnstore without it; under `mssql_copy_tablock = auto` (heap on,
-clustered off) heaps and columnstores fan out, a table with a clustered
-rowstore index loads on one writer. Inside a transaction it is always one
-writer, the transaction's own connection. With several writers there is a
+nothing to time out. That is a target with **no nonclustered index** on it:
+a heap under TABLOCK, or a clustered columnstore without it. Under
+`mssql_copy_tablock = auto` (heap on, clustered off) bare heaps and bare
+columnstores fan out, while a table with a clustered rowstore index — or one
+carrying so much as a single nonclustered index, which costs a heap a `Sch-M`
+lock instead of the compatible `BU` one and costs a columnstore the load
+itself — loads on one writer.
+Inside a transaction it is always one writer, the transaction's own
+connection. With several writers there is a
 window between the first and the last `COMMIT` in which a failed commit
 leaves the earlier writers' rows in place; one writer has none.
 
