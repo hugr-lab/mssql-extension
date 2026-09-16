@@ -148,9 +148,13 @@ no work here at all. The INSERT routing stays as it is, on purpose (W3).
 ## 1. What follows
 
 1. **rowid must stop meaning "primary key".** It should mean "a key this
-   server guarantees to address one row": a PK, or failing that a unique index
-   that is neither filtered nor nullable. Identity qualifies on those terms and
-   on no others, which is exactly how it should be treated.
+   server guarantees to address one row **and that we can send back**": a PK,
+   or failing that a unique index that is neither filtered nor nullable, and in
+   either case one whose key columns survive the round trip out to DuckDB and
+   back as a literal. Identity qualifies on those terms and on no others, which
+   is exactly how it should be treated. The second half of that sentence is not
+   decoration: a primary key that fails it produces an UPDATE that reports
+   success and changes nothing, today (W1).
 2. **The INSERT column list is already the right shape.** The only thing
    missing is the `IDENTITY_INSERT` bracket for the case where the identity
    column is in it. That is W2, and it is the whole of the INSERT work.
@@ -185,6 +189,7 @@ object and pick one deterministically.
 | every key column `is_nullable = 0` | `sys.index_columns` joined to `sys.columns`, `is_included_column = 0` | measured: a unique index on a nullable column accepts exactly one NULL row and refuses the second, so NULL is neither unique nor addressable |
 | `is_disabled = 0`, `is_hypothetical = 0` | `sys.indexes` | a disabled index enforces nothing |
 | no key column is `is_cast_required` | `MSSQLColumnInfo` | **the review's best finding, and it is a live bug on the PK path already — see below** |
+| no key column is `datetime` or `smalldatetime` | `MSSQLColumnInfo::sql_type_name` | the rowid literal cannot be made to match such a column at all — measured, see below. Lifted when [#358](https://github.com/hugr-lab/mssql-extension/issues/358) fixes the renderer |
 
 **The cast-required criterion, and the bug it exposes.** A unique index — and a
 PRIMARY KEY — can sit on `sql_variant` or `hierarchyid`; both were created to
@@ -203,19 +208,79 @@ by a `SQL_VARIANT` PRIMARY KEY holding two distinct `datetime2(7)` values:
 `UPDATE … SET payload = 'CHANGED' WHERE payload = 'a'` through the extension
 then **reported no error and changed nothing**: the rowid VALUES JOIN compares
 a string against a sql_variant column and matches no row. A silent zero-row
-UPDATE, today. Filed as a consequence on the sql_variant issue; this criterion
-is what stops spec 077 widening it from primary keys to every unique index.
+UPDATE, today. The read half is [#354](https://github.com/hugr-lab/mssql-extension/issues/354);
+the DML consequence is recorded in
+[#358](https://github.com/hugr-lab/mssql-extension/issues/358), which covers
+the class. Applying this criterion at step 1 as well as to the unique indexes
+is what keeps spec 077 from widening the hole — and closes the existing one.
 
-`float` and `datetime` are deliberately NOT excluded: both round-trip exactly
-through the literal renderer (`float` as its shortest round-trip decimal,
-`datetime` through a `datetime2` cast that only widens), so their keys match.
-The criterion is about columns whose READ is lossy, not about types that are
-awkward to compare.
+**`datetime` is excluded too, and the reason is not the one this spec first
+gave.** The earlier draft said `datetime` keys round-trip exactly "through a
+`datetime2` cast that only widens". That is wrong, and the review caught it.
+Measured against the server (TestDB, compatibility level 170), with
+`@d DATETIME = '2026-01-01 10:00:00.003'`:
+
+| comparison | result |
+| --- | --- |
+| `@d = CAST('…003' AS DATETIME)` | **match** |
+| `CAST(@d AS DATETIME2(7)) = CAST('…0033333' AS DATETIME2(7))` | **match** |
+| `@d = CAST('…0033330' AS DATETIME2(7))` — what the renderer sends today | no match |
+| `@d = CAST('…0033333' AS DATETIME2(7))` — the exactly-correct 7-digit form | **no match** |
+| `CONVERT(DATETIME, '…003333')` — 6 fractional digits | error 241 |
+
+`datetime` counts in ticks of 1/300 s, so `.003` is `.0033333…`; the read path
+decodes that to DuckDB's microsecond `TIMESTAMP` and the renderer sends six
+digits. But the fourth row is the one that matters: since compatibility level
+130 a `datetime` compared with a `datetime2` is converted **more precisely than
+`datetime2(7)` can represent**, so the mismatch is not a rounding error a
+better literal would fix. While the two sides have different types, no literal
+matches.
+
+This is a live defect on the primary-key path, not something spec 077
+introduces — filed as
+[#358](https://github.com/hugr-lab/mssql-extension/issues/358) with the
+reproduction: a table keyed by `DATETIME`, and an `UPDATE`/`DELETE` through the
+extension against the row whose key is `10:00:00.003` reports no error and
+changes nothing, while the row at `11:00:00.000` works. #358's fix is to render
+such a key as `CAST('…ss.mmm' AS DATETIME)` — three digits, the type's own
+resolution, measured to match and still sargable. When that lands this
+criterion goes away; until then it keeps spec 077 from carrying the defect from
+primary keys to every unique index.
+
+**`float` IS safe, and that half was checked rather than assumed.** A `FLOAT`
+primary key holding `0.1`, `1.0/3.0` and `1e300` — the three shapes that break
+naive float formatting — was created and all three rows were found and updated
+through the extension. The renderer emits the shortest round-trip decimal and
+both sides are the same type, so they compare equal.
+
+So the criterion is no longer "columns whose READ is lossy". It is **columns
+whose rowid literal cannot be made to match the column they came from**, which
+covers the lossy reads (`sql_variant`, `hierarchyid`) and the mixed-type
+comparison (`datetime`) alike.
+
+**Where the filtering runs.** Every criterion above except the last two is
+evaluable in `PK_DISCOVERY_SQL_TEMPLATE`; `is_cast_required` and the
+`datetime` exclusion exist only client-side, on `MSSQLColumnInfo`. Splitting
+the decision across the two would make W5b unable to report a rejected index
+*with its reason*, because a candidate filtered out inside the SQL never comes
+back. So: **the query returns every candidate index with its key columns, and
+the choice runs entirely in C++** — a pure function over the candidate list
+that W6 unit-tests without a server. The SQL keeps the cheap structural
+filters (`is_unique`, `has_filter`, `is_disabled`, `is_hypothetical`) because
+those rows are not candidates under any reading and returning them would only
+grow the result set.
 
 **Choice, in order** (deterministic, so two sessions never disagree):
 
-1. the primary key, if there is one — unchanged behaviour for every table that
-   has one;
+1. the primary key, if there is one **and it is usable by the table above**.
+   An unusable primary key falls through to step 2 rather than being taken
+   anyway. This is a deliberate change: today a `SQL_VARIANT` or `DATETIME`
+   primary key is taken and produces the silent zero-row UPDATE described
+   above, so "unchanged behaviour" would mean keeping a known wrong answer when
+   a correct key may be sitting on the same table. Where no candidate is
+   usable, W5b refuses by name and says which indexes were rejected and why —
+   a refusal the user can act on, instead of a statement that reports success
+   and does nothing;
 2. else the usable unique index whose single key column `is_identity`. The
    review asked why this ranked below byte width, and it was right to: an
    identity value is one the application never assigns, so a rowid built on it
@@ -225,6 +290,12 @@ awkward to compare.
 3. else the usable unique index with the fewest key columns;
 4. else the one whose key is narrowest in declared bytes;
 5. else the lowest `index_id`.
+
+Steps 2-5 **order the candidates**, they do not filter to one and stop: SQL
+Server permits duplicate indexes, so a table can carry several usable unique
+indexes on its identity column and step 2 can yield more than one. Each step is
+a tie-break applied to whatever the previous step left, and step 5 always
+leaves exactly one.
 
 "Fewest key columns" counts key columns only, `is_included_column = 0`; an
 INCLUDE column is payload and says nothing about uniqueness. Unique indexes on
@@ -291,6 +362,17 @@ Mechanics:
   user still owns. An interrupt or ATTENTION mid-statement leaves the
   connection non-Idle, so it goes down the close path, and closing the session
   clears `IDENTITY_INSERT` by construction.
+- **That `OFF` batch is bounded.** It goes over the network from a `noexcept`
+  destructor that by the #178 contract holds no `ClientContext`, so no
+  session-level query timeout reaches it — and "everything caught" covers
+  exceptions, not a server or a network that has stopped answering. Without a
+  bound, a destructor on a worker thread waits forever and query teardown
+  queues behind it. So the timeout is **captured at `Acquire`**, on the client
+  thread, and carried down to the release path the way `reset_on_release`
+  already is (`ReleaseBcpConnectionOnError` takes it as a parameter with no
+  default, so a new caller cannot skip the question). On expiry the connection
+  is **closed rather than pooled** — the same path a throwing `OFF` takes, and
+  closing the session clears the setting anyway.
 - `SET IDENTITY_INSERT` checks **ALTER on the table** (§ 0.3), and a caller
   without it gets error 1088, which says the object "does not exist or you do
   not have permissions". That message is actively misleading for someone who
@@ -320,6 +402,17 @@ Mechanics:
   refusal is the honest one and is not rewritten. Which of the two DuckDB
   actually produces is the first thing to check when the code is written, and
   the test pins whichever it is.
+- **`DEFAULT` and an explicit value for the identity column in the same
+  statement.** `INSERT INTO t VALUES (DEFAULT, 1), (42, 2)` asks for both at
+  once, and dropping the column from the list is a per-STATEMENT decision: the
+  column list is shared by every row of the batch, and under
+  `IDENTITY_INSERT ON` there is no way to spell "let the server assign" for a
+  single row. **The rule: refuse the statement**, naming the column and saying
+  that a batch either lets the server assign every identity value or supplies
+  every one — and that splitting the `VALUES` into separate statements is the
+  way to do both. Not split automatically: the two halves would land in
+  different batches with different identity semantics, which is a surprising
+  thing to do silently to a statement the user wrote as one. W6 covers it.
 - **Security, said out loud:** turning `IDENTITY_INSERT` on grants nothing. It
   only succeeds where the caller already holds ALTER on the table, and a caller
   with ALTER could issue the same statement themselves through `mssql_exec`.
@@ -405,14 +498,15 @@ above; emulating the count comparison in the extension (unreachable).
 ### W5b — the refusals this spec owns
 
 Where the extension cannot do what was asked, it has to say so at the layer
-that knows why. Five situations: four the extension can catch, and one it
+that knows why. Six situations: five the extension can catch, and one it
 cannot, which is why #327 closes rather than staying open. The message shape
 for each. None of them is a generic wrapper; each names the thing the user can
 change.
 
 | Situation | Where it is caught | What the message must carry |
 |---|---|---|
-| No usable key for `rowid`, so UPDATE or DELETE cannot bind | `GetRowIdColumns` / `GetRowIdType`, the same place that throws the "no primary key" error today | that it looked for a primary key **and** for a unique index; for each unique index it rejected, the index name and the reason (filtered, or which key column is nullable); and that adding a `PRIMARY KEY` or a non-filtered `UNIQUE` on NOT NULL columns is the fix |
+| No usable key for `rowid`, so UPDATE or DELETE cannot bind | `GetRowIdColumns` / `GetRowIdType`, the same place that throws the "no primary key" error today | that it looked for a primary key **and** for a unique index; for each candidate it rejected — the primary key included — the index name and the reason (filtered, or which key column is nullable); and that adding a `PRIMARY KEY` or a non-filtered `UNIQUE` on NOT NULL columns is the fix |
+| The only candidates are keyed on a column whose literal cannot match it (`sql_variant`, `hierarchyid`, `datetime`) | same place | that the key was found but cannot address a row, **naming the column and its type** — not the generic "no key" text, which would send the user to add an index they already have. For `datetime` it names [#358](https://github.com/hugr-lab/mssql-extension/issues/358), for the lossy reads [#354](https://github.com/hugr-lab/mssql-extension/issues/354), so the user can see whether a fix is coming rather than being told their schema is wrong |
 | `SET IDENTITY_INSERT` refused for want of ALTER, server error 1088 | around the `ON` batch in the statement path | that the extension issued `SET IDENTITY_INSERT` because the statement supplied a value for the identity column; that this needs ALTER on the table while INSERT does not; the table name; and the server's 1088 as the cause. Never the bare 1088, which claims the table may not exist |
 | An INSERT with no column list against a table with an identity column | nowhere — DuckDB's binder, before us | nothing we can add (§ 1.3). This is why the documentation carries the worked example, and why #327 closes with the reason rather than staying open |
 | A second `SET IDENTITY_INSERT` target while one is on, server error 8107 | same place as the 1088 case | that one statement targets one table, so the *other* target came from somewhere else: a previous statement of ours that leaked its `ON`, **or the user's own `mssql_exec`** on a pinned connection or on a pooled one with `mssql_reset_connection = false`. The message names both possibilities and the table the server named, and does not accuse either side |
@@ -435,9 +529,22 @@ New file `test/sql/insert/insert_identity.test`:
   released. Pin it with `SET mssql_connection_limit = 1`, run it with
   `SET mssql_reset_connection = false` so the pool cannot paper over a leak,
   and assert that an explicit identity value sent through `mssql_exec` on that
-  session afterwards fails with 544;
+  session afterwards fails with 544. Two things make that assertion weaker than
+  it looks, and the test has to close both:
+  - the limit is fixed when the catalog's pool is created, so
+    `SET mssql_connection_limit = 1` must come **before the `ATTACH`** (or the
+    test needs its own alias). Set afterwards it does nothing, the pool keeps
+    its old limit, and the test passes without ever pinning anything;
+  - with a limit of 1 the probe also depends on the statement connection having
+    been released first. A leaked, un-released connection makes it fail on an
+    **acquire timeout** rather than with 544 — a red test that names the wrong
+    defect. So the test asserts the error is 544 specifically, and confirms it
+    is the same session by comparing `@@SPID` before and after;
 - positional with every column — same as the explicit list;
 - a failing statement in the middle — `IDENTITY_INSERT` is off afterwards;
+- `INSERT INTO t VALUES (DEFAULT, 1), (42, 2)` — the mixed `DEFAULT`/explicit
+  batch is refused, with the message naming the column and the split as the way
+  round it;
 - inside an explicit transaction, then ROLLBACK;
 - a view whose base table has an identity column — the expected outcome is the
   SERVER's own refusal of an explicit identity value through a view, asserted
@@ -456,7 +563,13 @@ New file `test/sql/rowid/rowid_unique_index.test`:
 - `BIGINT IDENTITY UNIQUE`, no PK — `rowid` resolves, UPDATE and DELETE work;
 - a unique index on a **nullable** column — refused, and the message says why;
 - a **filtered** unique index — refused, and the message says why;
-- both a PK and a unique index — the PK wins;
+- both a PK and a unique index — the usable PK wins;
+- a **`DATETIME` primary key** alongside a usable `BIGINT UNIQUE`, with a key
+  value whose milliseconds are not a multiple of 10 (`10:00:00.003`) — the
+  unique index is chosen, and the UPDATE that silently changed nothing before
+  now changes the row. The same table **without** the unique index refuses by
+  name and points at #358. This is the regression guard for the step-1 change;
+- a `SQL_VARIANT` primary key — same two shapes, pointing at #354;
 - two usable unique indexes — the documented tie-break, asserted so the choice
   cannot drift;
 - a table with neither — the message names both things it looked for, and for
@@ -508,15 +621,26 @@ choice is obvious without measuring anything.
 **No new settings, no new functions, no new ATTACH options, no wire-format
 change.** Everything here is either a widened metadata query (W1) or two extra
 batches on a path that fails outright today (W2). That is the point of the
-narrow scope: nothing new to configure, and nothing that changes for a user who
-does not supply identity values.
+narrow scope: nothing new to configure.
+
+One behaviour does change for a user who supplies no identity values at all: a
+table whose primary key cannot address a row (`sql_variant`, `hierarchyid`,
+`datetime` — W1) moves to another unique index if it has one, and otherwise
+starts refusing UPDATE and DELETE by name. What that replaces is a statement
+that reports success and changes nothing, so it is a change worth making and
+worth saying out loud in the release notes.
 
 ## 4. Risks
 
-- **rowid changing under existing users.** A table that has a PK is
+- **rowid changing under existing users.** A table whose PK is usable is
   unaffected; a table that has only a unique index gains a rowid where it had
-  none, which turns a clean binder error into working UPDATE/DELETE. Nothing
-  that worked stops working.
+  none, which turns a clean binder error into working UPDATE/DELETE. The one
+  case that does change is a table whose PK is **not** usable — `sql_variant`,
+  `hierarchyid`, `datetime`: it either moves to another unique index or starts
+  refusing by name. That is a behaviour change, and a deliberate one: what it
+  replaces is a statement that reports success and changes nothing, which is
+  strictly worse than an error. Nothing that produced a CORRECT result stops
+  working.
 - **A leaked `IDENTITY_INSERT`.** The failure mode is silent acceptance of
   identity values on the next statement over the same pooled connection. This
   is why W6 has a leak test with `mssql_reset_connection = false`, where the
@@ -527,12 +651,16 @@ does not supply identity values.
 - **A user reading "identity now works" as "identity inserts are fast".** They
   are not, they are the statement path by design (W3). The documentation has to
   carry the COPY sentence, or this ships a performance surprise.
-- **A unique key on a column whose READ is lossy.** The criterion in W1 keeps
-  spec 077 from widening it, but the primary-key path already carries it today
-  and this spec does not fix that — a `SQL_VARIANT` primary key gives a silent
-  zero-row UPDATE right now. The fix belongs with the sql_variant work, and W1
-  says so rather than leaving the reader to discover that the criterion is a
-  fence around an existing hole.
+- **A key column whose rowid literal cannot match it.** The criterion in W1
+  keeps spec 077 from widening the hole, and since step 1 now applies the same
+  criteria to the primary key, it also closes the existing one — a
+  `SQL_VARIANT` or `DATETIME` primary key stops giving a silent zero-row UPDATE
+  and starts either using another unique index or refusing. The underlying
+  defects are still owned elsewhere:
+  [#358](https://github.com/hugr-lab/mssql-extension/issues/358) for `datetime`
+  (fix the renderer, then drop that criterion) and
+  [#354](https://github.com/hugr-lab/mssql-extension/issues/354) for
+  `sql_variant` (fix the read). This spec is the fence, not the repair.
 
 ## 5. Decided, not left open
 
