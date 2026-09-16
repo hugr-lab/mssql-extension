@@ -64,6 +64,15 @@ struct MSSQLColumnInfo {
 	static LogicalType MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length, uint8_t precision,
 												uint8_t scale);
 
+	// The two spatial CLR UDTs, by name. ONE predicate, because four things key
+	// on the same pair and they have to agree: the catalog sets `is_geometry`
+	// from it, the type map answers GEOMETRY() from it, `IsKnownSQLServerType`
+	// admits them from it, and the DML literal renderer decides from it whether
+	// to wrap a value in the server's WKB reader. If the routing and the
+	// rendering ever disagreed the failure would be silent in one direction
+	// (WKB sent as text on the bulk wire) and a server error in the other.
+	static bool IsSpatialType(const string &sql_type_name);
+
 	// Check if SQL Server type is natively supported (has explicit mapping or TDS-level support)
 	static bool IsKnownSQLServerType(const string &sql_type_name);
 

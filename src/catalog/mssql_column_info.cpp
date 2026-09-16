@@ -54,7 +54,7 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 		string lower_type = sql_type_name;
 		std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 					   [](unsigned char c) { return std::tolower(c); });
-		is_geometry = (lower_type == "geometry" || lower_type == "geography");
+		is_geometry = IsSpatialType(lower_type);
 	}
 
 	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown.
@@ -320,7 +320,7 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	// Spatial types — geometry and geography both arrive via STAsBinary() rewrite
 	// (see is_geometry handling in the constructor + table_scan::BuildColumnExpression).
 	// DuckDB's first-class GEOMETRY type stores WKB bytes — same physical storage as BLOB.
-	if (lower_type == "geometry" || lower_type == "geography") {
+	if (IsSpatialType(lower_type)) {
 		return LogicalType::GEOMETRY();
 	}
 
@@ -331,6 +331,13 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 //===----------------------------------------------------------------------===//
 // Type Checks
 //===----------------------------------------------------------------------===//
+
+bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	return lower_type == "geometry" || lower_type == "geography";
+}
 
 bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 	string lower_type = sql_type_name;
@@ -354,7 +361,7 @@ bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 		   // XML has dedicated TDS-level support (0xF1) and works without CAST
 		   lower_type == "xml" ||
 		   // Spatial UDTs — handled by table-scan rewrite to STAsBinary() (spec 045 / sub-phase 5).
-		   lower_type == "geometry" || lower_type == "geography";
+		   IsSpatialType(lower_type);
 }
 
 bool MSSQLColumnInfo::IsTextType(const string &sql_type_name) {
