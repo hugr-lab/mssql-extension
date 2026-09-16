@@ -57,6 +57,11 @@ MSSQLDMLBatch MSSQLUpdateStatement::Build(const vector<vector<Value>> &pk_values
 			const auto &col_type = target_.update_columns[col_idx].duckdb_type;
 			auto literal = MSSQLValueSerializer::Serialize(update_values[row_idx][col_idx], col_type);
 
+			// Same spatial wrapper as the INSERT path: the call sits inside the
+			// VALUES-derived table, which SQL Server accepts, so the SET clause
+			// stays a plain column reference.
+			literal = MSSQLValueSerializer::WrapSpatialLiteral(literal, target_.update_columns[col_idx].mssql_type);
+
 			// XML columns: reject if serialized literal exceeds SQL Server's TDS buffer limit
 			if (target_.update_columns[col_idx].mssql_type == "xml" && literal.size() > 4096) {
 				throw InvalidInputException(

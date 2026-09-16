@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A `GEOMETRY` value can be written into a `geometry` / `geography` column**
+  (#296). It used to go as a bare `0x…` literal, which SQL Server reads as its
+  own Spatial Type Binary Format rather than as the OGC WKB a DuckDB GEOMETRY
+  carries, and rejects: `24210: Geometry type with an unexpected version of 0
+  received`. INSERT and UPDATE now wrap it as
+  `geometry::STGeomFromWKB(0x…, srid)`, the server-side reader for that form.
+  The **SRID is an assumption**, because `.STAsBinary()` does not carry one and
+  a value read from SQL Server has already lost it: a `geometry` target gets 0
+  (planar, undefined) and a `geography` target gets 4326 / WGS 84, since
+  geography refuses 0 outright. Set another one server-side after the load. An
+  INSERT naming a spatial column stays on the statement path whatever
+  `mssql_insert_bcp_threshold` says, as it always has — the bulk wire would
+  declare the column nvarchar and send the WKB as text.
+
 - **`ROWVERSION` columns are readable, and the native `JSON` type of SQL
   Server 2025 is read uncast** ([#296](https://github.com/hugr-lab/mssql-extension/issues/296)).
   Neither type name was in the catalog's table, so both took the unknown-type

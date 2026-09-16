@@ -136,12 +136,32 @@ them to WKB (`.STAsBinary()`), so they compose with the DuckDB `spatial`
 extension. On the write side, a GEOMETRY source column lands in a
 `varbinary`/`binary`/`image` target as standard WKB.
 
-**Writing into an actual `geometry` or `geography` target does not work yet.**
-The value goes as a `0x…` binary literal and SQL Server tries to read it as its
-own Spatial Type Binary Format rather than as WKB, so it fails with
-`24210: Geometry type with an unexpected version of 0 received`. Land the WKB
-in a `varbinary(max)` column and convert it server-side with
-`geometry::STGeomFromWKB(col, srid)` until this is supported directly.
+**Writing into a `geometry` or `geography` target works, with one assumption.**
+The value goes as `geometry::STGeomFromWKB(0x…, srid)`, the server-side reader
+for the OGC WKB a DuckDB `GEOMETRY` carries. It has to be wrapped: a bare
+binary value is read as SQL Server's own Spatial Type Binary Format, which is a
+different encoding — `0xe6100000 01 0c …` against WKB's `0x01 01000000 …` for
+the same point — and fails with
+`24210: Geometry type with an unexpected version of 0 received`.
+
+The assumption is the **SRID**, which `.STAsBinary()` does not carry, so a
+value that has been read from SQL Server has already lost it. A `geometry`
+target is given **0**, the planar "undefined" SRID. A `geography` target
+refuses 0 outright (error 24204) and is given **4326 / WGS 84**. If your data
+is in another spatial reference system, set it server-side after the load
+(`UPDATE t SET g = geometry::STGeomFromWKB(g.STAsBinary(), <srid>)`) or write
+the WKB into a `varbinary(max)` column and convert it yourself.
+
+An `INSERT` that names a spatial column always goes as statements, whatever
+`mssql_insert_bcp_threshold` says: the bulk wire would declare the column as
+nvarchar and send the WKB as text. So a spatial load of any size costs a
+statement round trip per batch. For bulk volumes, land the WKB in a
+`varbinary(max)` column with `COPY` and convert it in one server-side
+statement.
+
+**`COPY` into a table that has a spatial column drops that column**, silently
+if it is nullable and with a misleading NULL error if it is not. Use `INSERT`
+for spatial data until that is fixed.
 
 ### Other Server-Specific Types
 
