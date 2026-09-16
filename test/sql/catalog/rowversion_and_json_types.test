@@ -17,9 +17,10 @@
 #   collation. The CAST worked but converted every value server-side for
 #   nothing.
 #
-# The JSON half is version-gated: the type does not exist before 2025, so the
-# test creates that table only when the server has it, and the assertions on it
-# are skipped otherwise.
+# The JSON half is version-gated. The type does not exist before 2025, and CI
+# runs 2022, so that table is created with a JSON column where the server has
+# one and an NVARCHAR(MAX) column otherwise. Every assertion then runs on both
+# servers, but only a 2025 run covers the JSON-specific behaviour.
 
 require mssql
 
@@ -158,6 +159,36 @@ SELECT count(*), count(DISTINCT rv) FROM rvt.dbo.RowVersionTypes;
 statement ok
 RESET mssql_insert_bcp_threshold;
 
+# --- COPY behaves the same way as INSERT on both counts: a source that omits
+# the column loads and the server fills it in, and one that names it is refused
+# by the server rather than silently dropping the values.
+statement ok
+COPY (SELECT 200 AS id, 'copied' AS note) TO 'mssql://rvt/dbo/RowVersionTypes' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM rvt.dbo.RowVersionTypes WHERE id = 200;
+----
+1
+
+statement error
+COPY (SELECT 201 AS id, '\x01\x02'::BLOB AS rv, 'x' AS note) TO 'mssql://rvt/dbo/RowVersionTypes' (FORMAT 'bcp', CREATE_TABLE false);
+----
+Cannot insert an explicit value into a timestamp column
+
+# --- CTAS through the extension turns the column into the plain varbinary it
+# is. There is no way to create a rowversion from a DuckDB type, and a snapshot
+# of the counter is what a copy of the table should hold.
+statement ok
+CREATE TABLE rvt.dbo.RowVersionCopy AS SELECT * FROM rvt.dbo.RowVersionTypes;
+
+query I
+SELECT count(*) FROM mssql_scan('rvt', 'SELECT c.name FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID(''dbo.RowVersionCopy'') AND c.name = ''rv'' AND t.name = ''varbinary''');
+----
+1
+
+statement ok
+SELECT mssql_exec('rvt', 'DROP TABLE dbo.RowVersionCopy');
+
 statement ok
 SELECT mssql_exec('rvt', 'DROP TABLE dbo.RowVersionTypes');
 
@@ -165,35 +196,72 @@ SELECT mssql_exec('rvt', 'DROP TABLE dbo.RowVersionTypes');
 # The native JSON type, SQL Server 2025 and later only.
 # =============================================================================
 
-statement ok
-CREATE TABLE has_json AS SELECT count(*) > 0 AS yes FROM mssql_scan('rvt', 'SELECT name FROM sys.types WHERE name = ''json''');
+# The type exists only on SQL Server 2025, and CI runs 2022, so the table is
+# created with a JSON column where there is one and an NVARCHAR(MAX) column
+# otherwise. Every assertion below then runs on both: on 2025 it exercises the
+# JSON path, on 2022 the nvarchar path it must not differ from. Be honest about
+# what that means -- on CI the JSON-specific half of #296 is NOT covered, and
+# the coverage that matters for it lives on a 2025 server.
 
-# The remaining cases run against a table that exists only on 2025; on an older
-# server the create is skipped and every assertion below reads zero rows from a
-# table that is never populated, which is what the guarded counts assert.
 statement ok
-SELECT mssql_exec('rvt', 'IF EXISTS (SELECT 1 FROM sys.types WHERE name = ''json'')
-BEGIN
-  IF OBJECT_ID(''dbo.JsonTypes'') IS NOT NULL DROP TABLE dbo.JsonTypes;
-  EXEC(''CREATE TABLE dbo.JsonTypes (id INT NOT NULL PRIMARY KEY, doc JSON NULL)'');
-  EXEC(''INSERT INTO dbo.JsonTypes (id, doc) VALUES (1, ''''{"a":1,"b":[1,2]}''''), (2, NULL)'');
-END');
+SELECT mssql_exec('rvt', 'IF OBJECT_ID(''dbo.JsonTypes'') IS NOT NULL DROP TABLE dbo.JsonTypes;
+IF EXISTS (SELECT 1 FROM sys.types WHERE name = ''json'')
+  EXEC(''CREATE TABLE dbo.JsonTypes (id INT NOT NULL PRIMARY KEY, doc JSON NULL)'')
+ELSE
+  EXEC(''CREATE TABLE dbo.JsonTypes (id INT NOT NULL PRIMARY KEY, doc NVARCHAR(MAX) NULL)'')');
+
+statement ok
+SELECT mssql_exec('rvt', 'INSERT INTO dbo.JsonTypes (id, doc) VALUES (1, ''{"a":1,"b":[1,2]}''), (2, NULL)');
 
 statement ok
 SELECT mssql_invalidate_cache('rvt');
 
-# --- on 2025 the column is VARCHAR and its bytes arrive verbatim; on an older
-# server there is no table and the query is not run at all.
+# --- the column reads as VARCHAR either way: on 2025 because the JSON type is
+# now named in the catalog's table, on 2022 because NVARCHAR(MAX) always did.
 query I
-SELECT CASE WHEN (SELECT yes FROM has_json)
-            THEN (SELECT count(*) FROM duckdb_columns()
-                  WHERE table_name = 'JsonTypes' AND column_name = 'doc' AND data_type = 'VARCHAR')
-            ELSE 1 END;
+SELECT count(*) FROM duckdb_columns() WHERE table_name = 'JsonTypes' AND column_name = 'doc' AND data_type = 'VARCHAR';
 ----
 1
 
+# --- and the bytes arrive verbatim. On 2025 this is what says the server-side
+# CAST is gone: it used to convert every value for nothing.
+query II
+SELECT id, doc FROM rvt.dbo.JsonTypes ORDER BY id;
+----
+1	{"a":1,"b":[1,2]}
+2	NULL
+
+# --- COPY into the existing column is accepted. Against a JSON target it was
+# refused at bind while an INSERT into the same column worked, because the COPY
+# compatibility table listed `xml` for a VARCHAR source but not `json` (found
+# in the #296 self-review). The server takes a string and validates the content
+# itself, as it does for xml.
 statement ok
-SELECT mssql_exec('rvt', 'IF OBJECT_ID(''dbo.JsonTypes'') IS NOT NULL DROP TABLE dbo.JsonTypes');
+COPY (SELECT 3 AS id, '{"copied":true}' AS doc) TO 'mssql://rvt/dbo/JsonTypes' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT doc FROM rvt.dbo.JsonTypes WHERE id = 3;
+----
+{"copied":true}
+
+# --- an INSERT above the bcp threshold goes through the bulk wire, which a
+# JSON column is only eligible for because it stopped being an unknown type.
+statement ok
+SET mssql_insert_bcp_threshold = 5;
+
+statement ok
+INSERT INTO rvt.dbo.JsonTypes (id, doc) SELECT i, '{"i":' || i || '}' FROM range(10, 30) s(i);
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+query II
+SELECT count(*), count(doc) FROM rvt.dbo.JsonTypes;
+----
+23	22
+
+statement ok
+SELECT mssql_exec('rvt', 'DROP TABLE dbo.JsonTypes');
 
 statement ok
 DETACH rvt;

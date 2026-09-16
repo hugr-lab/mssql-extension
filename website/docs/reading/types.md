@@ -115,7 +115,7 @@ comparison pushes down to the server as a `varbinary` parameter.
 | ------------------- | -------------- | ---------------------------- |
 | `UNIQUEIDENTIFIER`  | `UUID`         | 128-bit GUID                 |
 | `XML`               | `VARCHAR`      | PLP encoding, UTF-16LE decoded to UTF-8, up to 2 GB |
-| `JSON`              | `VARCHAR`      | SQL Server 2025 and later; arrives as UTF-8 `varchar(max)` and is read verbatim |
+| `JSON`              | `VARCHAR`      | SQL Server 2025 and later; arrives as UTF-8 `varchar(max)`, read verbatim, and writable by INSERT and COPY as a string |
 
 **XML type notes:**
 - **SELECT**: XML columns are read via the same PLP + UTF-16LE code path as NVARCHAR(MAX)
@@ -135,6 +135,13 @@ decode the legacy LOB wire forms natively (issue #197).
 them to WKB (`.STAsBinary()`), so they compose with the DuckDB `spatial`
 extension. On the write side, a GEOMETRY source column lands in a
 `varbinary`/`binary`/`image` target as standard WKB.
+
+**Writing into an actual `geometry` or `geography` target does not work yet.**
+The value goes as a `0x…` binary literal and SQL Server tries to read it as its
+own Spatial Type Binary Format rather than as WKB, so it fails with
+`24210: Geometry type with an unexpected version of 0 received`. Land the WKB
+in a `varbinary(max)` column and convert it server-side with
+`geometry::STGeomFromWKB(col, srid)` until this is supported directly.
 
 ### Other Server-Specific Types
 

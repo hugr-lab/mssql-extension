@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses an explicit value with error 273, so leave it out of the INSERT
   column list. The 2025 `JSON` type arrives as `varchar(max)` under a UTF-8
   collation and now reads as `VARCHAR` directly, where the CAST used to convert
-  every value server-side for nothing.
+  every value server-side for nothing. `COPY` into an existing table with a
+  `JSON` column is accepted too: the compatibility table listed `xml` for a
+  VARCHAR source but not `json`, so a COPY was refused at bind while an INSERT
+  into the same column worked.
 
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than
   `mssql_insert_bcp_threshold` (default 1000), no `RETURNING` and no
