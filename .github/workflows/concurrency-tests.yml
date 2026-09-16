@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   concurrency-tests:
-    name: Concurrency stress (scenarios 1-8)
+    name: Concurrency stress (scenarios 1-9)
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
