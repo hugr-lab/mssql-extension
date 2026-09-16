@@ -12,6 +12,7 @@
 #include "dml/delete/mssql_delete_target.hpp"
 #include "dml/mssql_dml_config.hpp"
 #include "dml/mssql_dml_result.hpp"
+#include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -71,6 +72,10 @@ private:
 
 	//! Total rows deleted
 	idx_t total_rows_deleted_ = 0;
+
+	//! The statement's one connection and its server transaction (spec 062
+	//! W1c, issue #344): acquired on the first batch, committed in Finalize.
+	MSSQLStatementConnection stmt_conn_;
 
 	//! Number of batches executed
 	idx_t batch_count_ = 0;

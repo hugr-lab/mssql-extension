@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <vector>
+#include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -129,6 +130,18 @@ struct BCPColumnMetadata {
 	BCPColumnMetadata(string col_name, LogicalType type, bool is_nullable = true)
 		: name(std::move(col_name)), duckdb_type(std::move(type)), nullable(is_nullable) {}
 
+	//! The metadata of an EXISTING column, from the seven fields sys.columns
+	//! gives for it (spec 062 W3): the exact TDS type token and length the
+	//! server expects in COLMETADATA, the spec 060 UTF-8 retarget, and the
+	//! DuckDB type the encoder is told to produce. One function for the two
+	//! sources of those fields -- the resolver's own query for COPY, the catalog
+	//! cache for INSERT (no round trip) -- and for the `#temp` a spec 066 fill
+	//! declares to match its target. `max_length` is sys.columns.max_length:
+	//! bytes, -1 for MAX.
+	static BCPColumnMetadata FromServerColumn(const string &name, const string &type_name, int16_t max_length,
+											  uint8_t precision, uint8_t scale, bool nullable,
+											  const string &collation_name);
+
 	//===----------------------------------------------------------------------===//
 	// Wire Format Helpers
 	//===----------------------------------------------------------------------===//
@@ -162,6 +175,26 @@ struct BCPColumnMetadata {
 	// Get SQL Server type declaration for INSERT BULK statement
 	// Returns the exact type matching the target column (e.g., "nvarchar(50)", "int")
 	string GetSQLServerTypeDeclaration() const;
+};
+
+//===----------------------------------------------------------------------===//
+// The target's shape as the bulk-load writer rule needs it
+//
+// `kind` is the base structure (sys.indexes row index_id 0 or 1). That alone
+// does not decide whether concurrent transactional loaders are safe: SQL
+// Server's rule is "if the table has NO indexes and TABLOCK is specified, the
+// table can be loaded concurrently by multiple clients". A heap carrying a
+// nonclustered index (a PRIMARY KEY NONCLUSTERED, any CREATE INDEX) takes an
+// exclusive table lock under TABLOCK instead of the mutually compatible BU
+// locks a bare heap takes -- and every query that reports `kind` filters
+// index_id <= 1, so the two are indistinguishable from it.
+//===----------------------------------------------------------------------===//
+
+struct TableLoadShape {
+	//! The base structure: heap, clustered rowstore, clustered columnstore.
+	MSSQLIndexKind kind = MSSQLIndexKind::HEAP;
+	//! Any sys.indexes row with index_id > 1 on the target.
+	bool has_nonclustered = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -250,6 +283,18 @@ struct TargetResolver {
 	static void ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
 											BCPCopyConfig &config, const vector<LogicalType> &source_types,
 											const vector<string> &source_names);
+
+	//! The target's physical shape as the server has it NOW -- heap, clustered
+	//! rowstore, clustered columnstore -- from one sys.indexes lookup on `conn`
+	//! (spec 062 W2). The INSERT sink reads it when its stream opens rather
+	//! than trusting the catalog's cached index_kind: the writer rule turns a
+	//! stale HEAP into parallel transactional writers on what is now a
+	//! clustered index, which deadlocks client-side. Carries has_nonclustered
+	//! alongside the base structure, because TABLOCK only makes concurrent
+	//! loaders safe on a heap with no indexes at all. Throws on a query
+	//! failure; a table without a row (a view) reports HEAP, as the catalog
+	//! query does.
+	static TableLoadShape QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target);
 
 	// Get column metadata for an existing table
 	// Used when copying to existing table - BCP COLMETADATA must match target schema

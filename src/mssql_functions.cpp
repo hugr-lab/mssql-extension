@@ -56,6 +56,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	// Shared, not copied: the rows are the same rows (issue #316).
 	result->materialized = materialized;
 	result->execute_sql = execute_sql;
+	result->fallback_sql = fallback_sql;
 	result->prepared = prepared;
 	result->prepared_session = prepared_session;
 	result->executed_at_bind = executed_at_bind;
@@ -74,6 +75,14 @@ MSSQLScanGlobalState::~MSSQLScanGlobalState() {
 	// Connection is automatically returned to pool when shared_ptr in result_stream is released
 	// This may trigger Cancel() if stream is still active
 	result_stream.reset();
+
+	// Only now: the stream above borrowed the session's connection, so the claim
+	// must outlive it. Ordering matters -- releasing first would let another
+	// global state take a connection that is still Executing.
+	if (claimed_session) {
+		claimed_session->in_use.store(false);
+		claimed_session.reset();
+	}
 
 	// Log total scan time (from first call to destruction, including cancel/cleanup)
 	if (timing_started) {
@@ -380,7 +389,26 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const string declarations = params.Declarations();
 
 	MSSQLDescribedShape shape;
-	auto connection = ConnectionProvider::GetConnection(context, mssql_catalog);
+	std::shared_ptr<tds::TdsConnection> connection;
+	try {
+		connection = ConnectionProvider::GetConnection(context, mssql_catalog);
+	} catch (const std::exception &e) {
+		// `prepared := true` holds one pooled connection per bound scan from here
+		// until the bind data dies -- the sp_prepare handle lives in that session
+		// and nowhere else. A statement that binds more prepared scans than
+		// mssql_connection_limit allows therefore blocks for mssql_acquire_timeout
+		// and fails HERE, during binding, where the pool exhaustion says nothing
+		// about the option that caused it.
+		if (bind_data.prepared) {
+			throw IOException(
+				"mssql_scan: could not acquire a connection for '%s' while binding a `prepared := true` scan: %s. "
+				"Each prepared scan holds one pooled connection for the life of the statement, so a plan with "
+				"several of them can exhaust mssql_connection_limit before it runs. Raise mssql_connection_limit, "
+				"or drop `prepared := true` on some of the scans.",
+				bind_data.context_name, e.what());
+		}
+		throw;
+	}
 	if (!connection) {
 		throw IOException("mssql_scan: Failed to acquire connection from pool for '%s'", bind_data.context_name);
 	}
@@ -403,6 +431,11 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 					held = true;
 				}
 				bind_data.prepared_session = std::move(session);
+				// execute_sql still holds the ad-hoc batch here (the caller set it
+				// before BindDescribedScan). Keep it: the handle below is usable
+				// only from the one session that owns it, and a second global
+				// state over this same (shared) bind data needs a way to run.
+				bind_data.fallback_sql = bind_data.execute_sql;
 				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: prepared handle %d", (int)handle);
 			} else {
@@ -564,11 +597,38 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		}
 		MSSQLQueryExecutor executor(bind_data.context_name);
 		unique_ptr<MSSQLResultStream> stream;
+		// A HELD session (autocommit) owns one connection carrying one sp_prepare
+		// handle, and FunctionData::Copy shares the bind data -- so this may not
+		// be the only global state over it. The first one here claims the
+		// connection; a second would send sp_execute down a connection the first
+		// is still streaming on and fail with "connection not in Idle state".
+		//
+		// Only a LOST claim falls back. An empty `connection` is the in-transaction
+		// case, where the handle was prepared on the pinned connection and
+		// execute_sql must still be the sp_execute form -- falling back there
+		// would quietly disable `prepared := true` inside every transaction.
+		bool claimed = false;
+		bool lost_claim = false;
 		if (bind_data.prepared_session && bind_data.prepared_session->connection) {
+			bool expected = false;
+			claimed = bind_data.prepared_session->in_use.compare_exchange_strong(expected, true);
+			lost_claim = !claimed;
+			if (claimed) {
+				// Held by the global state so its destructor gives the claim back.
+				result->claimed_session = bind_data.prepared_session;
+			}
+		}
+		if (claimed) {
 			// The handle lives in the held session; the stream borrows it and gives
 			// it back to the session, not to the pool.
 			stream = executor.ExecuteOn(context, bind_data.prepared_session->connection, bind_data.execute_sql, false,
 										false);
+		} else if (lost_claim && !bind_data.fallback_sql.empty()) {
+			// Run the ad-hoc batch on a pooled connection of our own. Same rows, no
+			// handle, one plan compilation more -- which beats failing a query the
+			// default path would have served.
+			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: prepared session already claimed, running ad-hoc");
+			stream = executor.Execute(context, bind_data.fallback_sql);
 		} else {
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}

@@ -1,0 +1,189 @@
+# name: test/sql/insert/insert_bcp_parallel.test
+# description: a bulk-path INSERT fans out to parallel writers only where their transactional loads cannot block each other (spec 062 W2)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Unlike COPY's writers, an INSERT's writers each hold a server transaction
+# open until Finalize commits them together, so two writers whose locks
+# conflict deadlock CLIENT-SIDE (one waits on the server, the other's commit
+# waits on the first's Combine) and nothing times out. Only two shapes let
+# concurrent transactional bulk loads coexist: a heap under TABLOCK (BU locks),
+# and a clustered columnstore without it. A clustered rowstore target, or a
+# heap on row locks, gets one writer.
+#
+# The writer count is observed through mssql_pool_stats: every extra writer is
+# one more connection created (the shared session takes one, each parallel
+# writer takes one more); pinned loads create none.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS bpar (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bpar', 'IF OBJECT_ID(''dbo.BcpParHeap'') IS NOT NULL DROP TABLE dbo.BcpParHeap;
+CREATE TABLE dbo.BcpParHeap (id INT NOT NULL, v NVARCHAR(20) NULL);
+IF OBJECT_ID(''dbo.BcpParClustered'') IS NOT NULL DROP TABLE dbo.BcpParClustered;
+CREATE TABLE dbo.BcpParClustered (id INT NOT NULL PRIMARY KEY CLUSTERED, v NVARCHAR(20) NULL);
+IF OBJECT_ID(''dbo.BcpParCci'') IS NOT NULL DROP TABLE dbo.BcpParCci;
+CREATE TABLE dbo.BcpParCci (id INT NOT NULL, v NVARCHAR(20) NULL);
+CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCci;
+IF OBJECT_ID(''dbo.BcpParHeapNci'') IS NOT NULL DROP TABLE dbo.BcpParHeapNci;
+CREATE TABLE dbo.BcpParHeapNci (id INT NOT NULL PRIMARY KEY NONCLUSTERED, v NVARCHAR(20) NULL);
+IF OBJECT_ID(''dbo.BcpParCciNci'') IS NOT NULL DROP TABLE dbo.BcpParCciNci;
+CREATE TABLE dbo.BcpParCciNci (id INT NOT NULL, v NVARCHAR(20) NULL);
+CREATE CLUSTERED COLUMNSTORE INDEX cci ON dbo.BcpParCciNci;
+CREATE NONCLUSTERED INDEX nci ON dbo.BcpParCciNci (id)');
+
+statement ok
+SELECT mssql_invalidate_cache('bpar');
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+# Enough rows for every thread to arrive with chunks of its own.
+statement ok
+CREATE TABLE src AS SELECT i AS id, 'v' || i AS v FROM range(1, 400001) t(i);
+
+statement ok
+CREATE TABLE created AS SELECT connections_created AS n FROM mssql_pool_stats('bpar');
+
+# --- heap under TABLOCK (auto -> on for a heap): fans out.
+statement ok
+INSERT INTO bpar.dbo.BcpParHeap SELECT * FROM src;
+
+query I
+SELECT count(*) FROM bpar.dbo.BcpParHeap;
+----
+400000
+
+query I
+SELECT (SELECT connections_created FROM mssql_pool_stats('bpar')) - (SELECT n FROM created) >= 2;
+----
+true
+
+statement ok
+UPDATE created SET n = (SELECT connections_created FROM mssql_pool_stats('bpar'));
+
+# --- clustered rowstore: one writer, one connection (the pool already holds
+# enough idle ones, so nothing new is created).
+statement ok
+INSERT INTO bpar.dbo.BcpParClustered SELECT * FROM src;
+
+query I
+SELECT count(*) FROM bpar.dbo.BcpParClustered;
+----
+400000
+
+query I
+SELECT (SELECT connections_created FROM mssql_pool_stats('bpar')) - (SELECT n FROM created);
+----
+0
+
+# --- clustered columnstore without TABLOCK (auto -> off): fans out too, and
+# every row lands.
+statement ok
+INSERT INTO bpar.dbo.BcpParCci SELECT * FROM src;
+
+query II
+SELECT count(*), sum(id) FROM bpar.dbo.BcpParCci;
+----
+400000	80000200000
+
+# --- a heap carrying a NONCLUSTERED index: one writer, and the rows land.
+#
+# This is a heap -- sys.indexes reports index_id 0 for it, and every query
+# that reports the base structure filters index_id <= 1, so it is
+# indistinguishable from BcpParHeap above by `kind` alone. It does NOT load
+# like one: SQL Server gives concurrent bulk loaders compatible BU locks only
+# when the table has no indexes at all, and with the nonclustered index
+# present TABLOCK takes an exclusive table lock instead. Four transactional
+# writers would then serialise into the client-side deadlock this file is
+# about.
+#
+# The regression signature is a HANG, not a wrong count: if the writer rule
+# stops accounting for the nonclustered index, this statement never returns
+# and the suite times out here. The count below is what proves the one-writer
+# load is still correct, not what catches the bug.
+statement ok
+INSERT INTO bpar.dbo.BcpParHeapNci SELECT * FROM src;
+
+query II
+SELECT count(*), sum(id) FROM bpar.dbo.BcpParHeapNci;
+----
+400000	80000200000
+
+# --- a clustered columnstore carrying a NONCLUSTERED index: one writer.
+#
+# The columnstore arm of the rule needs "bare" for the same reason the heap
+# arm does, and the review that found the heap half left this one open. It is
+# the worse of the two: four writers here did not stall, they FAILED -- a
+# writer timed out reading its BCP response after 30 s, which is an error and
+# not a failed claim, so the whole INSERT rolled back and landed nothing
+# (measured: 30.8 s and 0 rows, against 0.99 s and 400000 with one writer).
+# So the regression signature here is a failed statement, and the count below
+# is what catches it.
+statement ok
+INSERT INTO bpar.dbo.BcpParCciNci SELECT * FROM src;
+
+query II
+SELECT count(*), sum(id) FROM bpar.dbo.BcpParCciNci;
+----
+400000	80000200000
+
+# --- the shape is read LIVE when the stream opens, not from the cache: this
+# table was a heap when the catalog cached it (the load above), and has a
+# clustered index now, added through mssql_exec, which does not invalidate.
+# A stale HEAP+TABLOCK plan would fan out into four transactional writers
+# on a clustered index -- the client-side deadlock -- and hang; one writer
+# loads it.
+statement ok
+SELECT mssql_exec('bpar', 'CREATE CLUSTERED INDEX ci ON dbo.BcpParHeap (id)');
+
+statement ok
+INSERT INTO bpar.dbo.BcpParHeap SELECT id + 1000000, v FROM src;
+
+query I
+SELECT count(*) FROM bpar.dbo.BcpParHeap;
+----
+800000
+
+# --- one writer under mssql_copy_parallel_writers = 1, whatever the shape.
+statement ok
+SET mssql_copy_parallel_writers = 1;
+
+statement ok
+SELECT mssql_exec('bpar', 'TRUNCATE TABLE dbo.BcpParHeap; DROP INDEX ci ON dbo.BcpParHeap');
+
+statement ok
+SELECT mssql_invalidate_cache('bpar');
+
+statement ok
+INSERT INTO bpar.dbo.BcpParHeap SELECT * FROM src;
+
+query I
+SELECT count(*) FROM bpar.dbo.BcpParHeap;
+----
+400000
+
+statement ok
+RESET mssql_copy_parallel_writers;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('bpar', 'DROP TABLE dbo.BcpParHeap; DROP TABLE dbo.BcpParClustered; DROP TABLE dbo.BcpParCci; DROP TABLE dbo.BcpParHeapNci; DROP TABLE dbo.BcpParCciNci');
+
+statement ok
+DETACH bpar;

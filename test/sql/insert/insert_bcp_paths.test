@@ -1,0 +1,173 @@
+# name: test/sql/insert/insert_bcp_paths.test
+# description: which INSERTs take the bulk path and which stay on statements (spec 062 W1)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The path is observed through mssql_test_fail_parse_after_tokens: the lever
+# lives in the STATEMENT path's response loops and nowhere else, so with it set
+# an INSERT that FAILS naming a TDS parse error went as statements, and one that
+# SUCCEEDS went through INSERT BULK. Four things keep an INSERT on statements:
+# RETURNING, an explicit identity column (spec 062 W4 is what makes that
+# decidable), mssql_insert_use_bcp = false, and a row count at or under
+# mssql_insert_bcp_threshold -- decided at run time by counting, not by a plan
+# estimate, which is why the LIMIT cases below are exact.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS bp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BcpPaths'') IS NOT NULL DROP TABLE dbo.BcpPaths;
+CREATE TABLE dbo.BcpPaths (id INT NOT NULL PRIMARY KEY, n INT NULL);
+IF OBJECT_ID(''dbo.BcpPathsIdent'') IS NOT NULL DROP TABLE dbo.BcpPathsIdent;
+CREATE TABLE dbo.BcpPathsIdent (rid INT IDENTITY(1,1) PRIMARY KEY, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('bp');
+
+statement ok
+CREATE TABLE src AS SELECT i AS id, i AS n FROM range(1, 3001) t(i);
+
+statement ok
+SET mssql_insert_bcp_threshold = 1000;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+# --- above the threshold: bulk. The lever never fires; the rows are in.
+statement ok
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src;
+
+query I
+SELECT count(*) FROM bp.dbo.BcpPaths;
+----
+3000
+
+statement ok
+SELECT mssql_exec('bp', 'TRUNCATE TABLE dbo.BcpPaths');
+
+# --- exactly the threshold: statements (the bulk path starts ABOVE it).
+statement error
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src LIMIT 1000;
+----
+TDS parse error
+
+# --- one more row: bulk.
+statement ok
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src LIMIT 1001;
+
+query I
+SELECT count(*) FROM bp.dbo.BcpPaths;
+----
+1001
+
+statement ok
+SELECT mssql_exec('bp', 'TRUNCATE TABLE dbo.BcpPaths');
+
+# --- RETURNING: statements, however many rows.
+statement error
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src RETURNING id;
+----
+TDS parse error
+
+# --- an explicit identity column: statements (the server decides about the
+# value; INSERT BULK would keep it silently).
+statement error
+INSERT INTO bp.dbo.BcpPathsIdent (rid, n) SELECT id, n FROM src;
+----
+TDS parse error
+
+# --- the identity column left to the server: bulk.
+statement ok
+INSERT INTO bp.dbo.BcpPathsIdent (n) SELECT n FROM src;
+
+query II
+SELECT count(*), max(rid) FROM bp.dbo.BcpPathsIdent;
+----
+3000	3000
+
+# --- a view: statements (INSERT BULK into a view is the server's call).
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BcpPathsView'') IS NOT NULL DROP VIEW dbo.BcpPathsView; EXEC(''CREATE VIEW dbo.BcpPathsView AS SELECT id, n FROM dbo.BcpPaths'')');
+
+statement ok
+SELECT mssql_invalidate_cache('bp');
+
+statement error
+INSERT INTO bp.dbo.BcpPathsView SELECT id + 10000, n FROM src;
+----
+TDS parse error
+
+# --- a column the bulk wire cannot carry (hierarchyid arrives as text the
+# server converts): statements.
+statement ok
+SELECT mssql_exec('bp', 'IF OBJECT_ID(''dbo.BcpPathsHid'') IS NOT NULL DROP TABLE dbo.BcpPathsHid; CREATE TABLE dbo.BcpPathsHid (id INT NOT NULL PRIMARY KEY, h HIERARCHYID NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('bp');
+
+statement error
+INSERT INTO bp.dbo.BcpPathsHid SELECT id, '/' || id || '/' FROM src;
+----
+TDS parse error
+
+# --- the setting off: statements.
+statement ok
+SET mssql_insert_use_bcp = false;
+
+statement error
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src;
+----
+TDS parse error
+
+statement ok
+SET mssql_insert_use_bcp = true;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+# --- a lower threshold moves the line.
+statement ok
+SET mssql_insert_bcp_threshold = 10;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement ok
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src LIMIT 11;
+
+statement error
+INSERT INTO bp.dbo.BcpPaths SELECT id + 100, n FROM src LIMIT 10;
+----
+TDS parse error
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM bp.dbo.BcpPaths;
+----
+11
+
+# --- no rows at all: nothing sent, nothing broken.
+statement ok
+INSERT INTO bp.dbo.BcpPaths SELECT id, n FROM src WHERE id < 0;
+
+query I
+SELECT count(*) FROM bp.dbo.BcpPaths;
+----
+11
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('bp', 'DROP VIEW dbo.BcpPathsView; DROP TABLE dbo.BcpPathsHid; DROP TABLE dbo.BcpPaths; DROP TABLE dbo.BcpPathsIdent');
+
+statement ok
+DETACH bp;

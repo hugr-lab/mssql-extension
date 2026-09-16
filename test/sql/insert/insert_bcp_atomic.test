@@ -1,0 +1,113 @@
+# name: test/sql/insert/insert_bcp_atomic.test
+# description: a failed bulk-path INSERT in autocommit leaves NO rows and names the batch (spec 062 W2 / W5, closes #344 on the bulk path)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The load is sent as batches (mssql_copy_flush_rows), and before spec 062 each
+# batch's DONE would have committed it. The INSERT now brackets the whole load
+# in a server transaction of its own: the batches that succeeded before the
+# failing one are rolled back with it, the message says so, and the connection
+# goes back to the pool.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ba (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ba', 'IF OBJECT_ID(''dbo.BcpAtomic'') IS NOT NULL DROP TABLE dbo.BcpAtomic;
+CREATE TABLE dbo.BcpAtomic (id INT NOT NULL PRIMARY KEY, n INT NOT NULL CHECK (n < 1000000))');
+
+statement ok
+SELECT mssql_invalidate_cache('ba');
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+# A batch closes at the first CHUNK boundary past flush_rows, and a DuckDB
+# chunk is 2048 rows: 10000 rows arrive as five chunks, so batches 1-4 hold
+# 2048 rows each and the fifth the rest.
+statement ok
+SET mssql_copy_flush_rows = 2000;
+
+# --- a CHECK violation in row 9500: batches 1-4 (8192 rows) were confirmed,
+# batch 5 fails, everything is rolled back.
+statement ok
+CREATE TABLE src AS SELECT i AS id, CASE WHEN i = 9500 THEN 1000000 ELSE i END AS n FROM range(1, 10001) t(i);
+
+statement error
+INSERT INTO ba.dbo.BcpAtomic SELECT * FROM src;
+----
+INSERT via BCP failed at batch 5
+
+statement error
+INSERT INTO ba.dbo.BcpAtomic SELECT * FROM src;
+----
+rolled back, the 8192 row(s)
+
+query I
+SELECT count(*) FROM ba.dbo.BcpAtomic;
+----
+0
+
+# --- a duplicate key in the last batch: same outcome.
+statement ok
+CREATE TABLE src2 AS SELECT CASE WHEN i = 10000 THEN 1 ELSE i END AS id, i AS n FROM range(1, 10001) t(i);
+
+statement error
+INSERT INTO ba.dbo.BcpAtomic SELECT * FROM src2;
+----
+rolled back
+
+query I
+SELECT count(*) FROM ba.dbo.BcpAtomic;
+----
+0
+
+# --- the connection came back: nothing active, and the next load works.
+query I
+SELECT active_connections FROM mssql_pool_stats('ba');
+----
+0
+
+statement ok
+INSERT INTO ba.dbo.BcpAtomic SELECT i, i FROM range(1, 1001) t(i);
+
+query I
+SELECT count(*) FROM ba.dbo.BcpAtomic;
+----
+1000
+
+# --- inside a DuckDB transaction the rows sit in the open transaction until
+# its ROLLBACK, and the message says so.
+statement ok
+BEGIN;
+
+statement error
+INSERT INTO ba.dbo.BcpAtomic SELECT id + 5000, n FROM src;
+----
+in the open transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ba.dbo.BcpAtomic;
+----
+1000
+
+statement ok
+RESET mssql_copy_flush_rows;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('ba', 'DROP TABLE dbo.BcpAtomic');
+
+statement ok
+DETACH ba;

@@ -5,6 +5,7 @@
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_error.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
+#include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -12,6 +13,7 @@
 namespace duckdb {
 
 // Forward declarations
+class MSSQLCatalog;
 namespace tds {
 class ConnectionPool;
 class TdsConnection;
@@ -60,9 +62,12 @@ public:
 	// Execute INSERT with RETURNING (uses OUTPUT INSERTED)
 	// @param input_chunk DataChunk with rows to insert
 	// @param returning_column_ids Column IDs to return
-	// @return DataChunk containing OUTPUT INSERTED results
+	// @return one DataChunk of OUTPUT INSERTED rows per statement this chunk
+	//         completed -- every one of them, not the last (a 2048-row chunk
+	//         is several statements; the earlier ones used to be dropped)
 	// @throws MSSQLInsertException on failure
-	unique_ptr<DataChunk> ExecuteWithReturning(DataChunk &input_chunk, const vector<idx_t> &returning_column_ids);
+	vector<unique_ptr<DataChunk>> ExecuteWithReturning(DataChunk &input_chunk,
+													   const vector<idx_t> &returning_column_ids);
 
 	//===----------------------------------------------------------------------===//
 	// Finalization
@@ -93,7 +98,17 @@ private:
 
 	// State
 	bool finalized_;
+	//! A batch failed: the transaction is rolled back and the connection gone,
+	//! so nothing pending may be sent. Enforced -- Execute, ExecuteWithReturning
+	//! and both Finalize forms refuse once it is set. What actually returns the
+	//! connection and rolls the transaction back is ~MSSQLStatementConnection;
+	//! this flag is the guard that stops a later caller sending onto the corpse.
+	bool failed_ = false;
 	MSSQLInsertStatistics statistics_;
+
+	//! The statement's one connection and its server transaction (spec 062
+	//! W1c, issue #344): acquired on the first batch, committed in Finalize.
+	MSSQLStatementConnection stmt_conn_;
 
 	// Batch builder (created on first Execute call)
 	unique_ptr<class MSSQLBatchBuilder> batch_builder_;
@@ -118,6 +133,17 @@ private:
 
 	// Get connection pool from catalog
 	tds::ConnectionPool &GetConnectionPool();
+
+	// The target's catalog.
+	MSSQLCatalog &GetMSSQLCatalog();
+
+	// A batch failed: roll the statement's transaction back, return its
+	// connection, and refuse further batches.
+	void FailStatement(MSSQLCatalog &catalog);
+
+	// The last batch is in: commit the statement's transaction and return its
+	// connection.
+	void CommitStatement();
 };
 
 //===----------------------------------------------------------------------===//

@@ -58,7 +58,8 @@
 #                           table is reloaded to exactly ROWS rows (untimed)
 #                           before the read step (default: 2)
 #   MSSQL_BENCH_THREADS     DuckDB threads (default: 1, see above)
-#   MSSQL_BENCH_GROUPS      subset of "write read wide conc" (default: all but conc)
+#   MSSQL_BENCH_GROUPS      subset of "write read wide conc insert" (default: write read wide;
+#                           insert = spec 062's INSERT via BCP vs statements, per family)
 #   MSSQL_BENCH_FAMILIES    subset of family keys (default: all)
 #   MSSQL_BENCH_CONC_LIST   stream counts for the conc group (default: "1 2 4 8")
 #   MSSQL_BENCH_PACKET_SIZES  TDS frame sizes to sweep on the wide steps; needs
@@ -412,6 +413,26 @@ echo "$FAMILY_DEFS" | grep -v '^$' | while IFS='|' read -r KEY SRC_COL TSQL_TYPE
 			$(repeat_sql "$WRITE_ITERS" "COPY (SELECT ${SRC_COL} AS c FROM src.syn)
 				TO 'mssql://db/dbo/${TBL}' (FORMAT 'bcp');")
 		" "$((ROWS * WRITE_ITERS))" "1" "BCP write, ${TSQL_TYPE} -- ${NOTE}"
+	fi
+
+	if group_selected insert; then
+		# Spec 062 W8: the same rows through INSERT, both paths, interleaved by
+		# construction -- the A/B is a setting, not a binary. The bulk step is
+		# what a plain INSERT ... SELECT of this size does by default; the
+		# statement step is mssql_insert_use_bcp = false, i.e. the pre-062 path
+		# with the W1b 1000-constant cap.
+		time_step "insert_bcp_${KEY}" "$PRE_DDL" "
+			ATTACH '${SRC_DB}' AS src;
+			$(attach_sql)
+			$(repeat_sql "$WRITE_ITERS" "INSERT INTO db.dbo.${TBL} SELECT ${SRC_COL} AS c FROM src.syn;")
+		" "$((ROWS * WRITE_ITERS))" "1" "INSERT via BCP, ${TSQL_TYPE} -- ${NOTE}"
+
+		time_step "insert_stmt_${KEY}" "$PRE_DDL" "
+			ATTACH '${SRC_DB}' AS src;
+			$(attach_sql)
+			SET mssql_insert_use_bcp = false;
+			$(repeat_sql "$WRITE_ITERS" "INSERT INTO db.dbo.${TBL} SELECT ${SRC_COL} AS c FROM src.syn;")
+		" "$((ROWS * WRITE_ITERS))" "1" "INSERT as statements, ${TSQL_TYPE} -- ${NOTE}"
 	fi
 
 	if group_selected read; then

@@ -431,6 +431,49 @@ static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
 	}
 }
 
+TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
+	// The same sys.indexes row ValidateTarget reads for COPY: index_id 0 is
+	// the heap, index_id 1 the clustered index, rowstore (type 1) or
+	// columnstore (type 5).
+	//
+	// The second column is what index_id <= 1 cannot answer: whether anything
+	// sits ON TOP of the base structure. TABLOCK buys concurrent loaders only
+	// on a heap with no indexes at all -- add a nonclustered index and the
+	// bulk load takes an exclusive table lock, so two transactional writers
+	// serialise and (their COMMIT deferred to Finalize) hang client-side.
+	// Same round trip, one more scalar subquery.
+	string sql;
+	if (target.IsTempTable()) {
+		sql = StringUtil::Format(
+			"SELECT ISNULL((SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1), 0) AS index_type, "
+			"CASE WHEN EXISTS (SELECT 1 FROM tempdb.sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
+			target.GetBracketedTable(), target.GetBracketedTable());
+	} else {
+		sql = StringUtil::Format(
+			"SELECT ISNULL((SELECT TOP 1 i.type FROM sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1), 0) AS index_type, "
+			"CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i "
+			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
+			target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
+	}
+	auto result = MSSQLSimpleQuery::Execute(conn, sql);
+	if (!result.success) {
+		throw IOException("could not read the shape of %s: %s", target.GetFullyQualifiedName(), result.error_message);
+	}
+	TableLoadShape shape;
+	if (result.rows.empty() || result.rows[0].empty()) {
+		return shape;
+	}
+	shape.kind = MSSQLIndexKindFromSysIndexesType(result.rows[0][0]);
+	// A row that is short here means the query shape and the parser disagree;
+	// the conservative answer is "there may be one", which costs a writer and
+	// never a hang.
+	shape.has_nonclustered = result.rows[0].size() < 2 || result.rows[0][1] != "0";
+	return shape;
+}
+
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names) {
@@ -1006,6 +1049,85 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 }
 
 //===----------------------------------------------------------------------===//
+// BCPColumnMetadata::FromServerColumn
+//===----------------------------------------------------------------------===//
+
+BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const string &type_name, int16_t max_length,
+													  uint8_t precision, uint8_t scale, bool nullable,
+													  const string &collation_name) {
+	BCPColumnMetadata col;
+	col.name = name;
+	col.precision = precision;
+	col.scale = scale;
+	col.nullable = nullable;
+
+	// Map SQL Server type to TDS type token
+	col.tds_type_token = SQLServerTypeToTDSToken(type_name);
+	col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision, col.scale);
+
+	// Spec 060 / issue #225 (write side): a char column under a UTF-8
+	// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
+	// UTF-8 collation sends them as they are, instead of transcoding to
+	// UTF-16 here for the server to transcode back. max_length goes through
+	// unhalved because both sides now count bytes.
+	if (IsUtf8CharColumn(type_name, collation_name)) {
+		col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
+		col.max_length = max_length < 0 ? 0xFFFF : static_cast<uint16_t>(max_length);
+		col.collation = UTF8_WIRE_COLLATION;
+		col.collation_name = collation_name;
+	}
+
+	// Set a reasonable DuckDB type for encoding purposes
+	// This is used by BCPRowEncoder to know how to encode the data
+	string type_lower = StringUtil::Lower(type_name);
+	if (type_lower == "bit") {
+		col.duckdb_type = LogicalType::BOOLEAN;
+	} else if (type_lower == "tinyint") {
+		// UTINYINT, not TINYINT: SQL Server's tinyint is UNSIGNED 0..255, and
+		// this is the type the CATALOG reports for such a column too. The two
+		// names mean different wire forms here — UTINYINT is the server's one
+		// unsigned byte, TINYINT is a signed DuckDB source that travels as a
+		// smallint — so a column that is genuinely the former must say so.
+		col.duckdb_type = LogicalType::UTINYINT;
+	} else if (type_lower == "smallint") {
+		col.duckdb_type = LogicalType::SMALLINT;
+	} else if (type_lower == "int") {
+		col.duckdb_type = LogicalType::INTEGER;
+	} else if (type_lower == "bigint") {
+		col.duckdb_type = LogicalType::BIGINT;
+	} else if (type_lower == "real") {
+		col.duckdb_type = LogicalType::FLOAT;
+	} else if (type_lower == "float") {
+		col.duckdb_type = LogicalType::DOUBLE;
+	} else if (type_lower == "decimal" || type_lower == "numeric") {
+		col.duckdb_type = LogicalType::DECIMAL(col.precision, col.scale);
+	} else if (type_lower == "money") {
+		col.duckdb_type = LogicalType::DECIMAL(19, 4);
+	} else if (type_lower == "smallmoney") {
+		col.duckdb_type = LogicalType::DECIMAL(10, 4);
+	} else if (type_lower == "uniqueidentifier") {
+		col.duckdb_type = LogicalType::UUID;
+	} else if (type_lower == "date") {
+		col.duckdb_type = LogicalType::DATE;
+	} else if (type_lower == "time") {
+		col.duckdb_type = LogicalType::TIME;
+	} else if (type_lower == "datetime" || type_lower == "datetime2" || type_lower == "smalldatetime") {
+		col.duckdb_type = LogicalType::TIMESTAMP;
+	} else if (type_lower == "datetimeoffset") {
+		col.duckdb_type = LogicalType::TIMESTAMP_TZ;
+	} else if (type_lower == "varbinary" || type_lower == "binary" || type_lower == "image") {
+		col.duckdb_type = LogicalType::BLOB;
+	} else {
+		// Default to VARCHAR for text types
+		col.duckdb_type = LogicalType::VARCHAR;
+	}
+
+	DebugLog(3, "FromServerColumn: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d", col.name.c_str(),
+			 type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale);
+	return col;
+}
+
+//===----------------------------------------------------------------------===//
 // TargetResolver::GetExistingTableColumnMetadata
 //===----------------------------------------------------------------------===//
 
@@ -1044,84 +1166,24 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 	columns.reserve(result.rows.size());
 
 	for (idx_t i = 0; i < result.rows.size(); i++) {
-		if (result.rows[i].size() < 6) {
+		const auto &row = result.rows[i];
+		if (row.size() < 6) {
 			continue;
 		}
-
-		BCPColumnMetadata col;
-		col.name = result.rows[i][0];
-		const string &type_name = result.rows[i][1];
-		int16_t max_length = static_cast<int16_t>(std::stoi(result.rows[i][2]));
-		col.precision = static_cast<uint8_t>(std::stoi(result.rows[i][3]));
-		col.scale = static_cast<uint8_t>(std::stoi(result.rows[i][4]));
-		col.nullable = (result.rows[i][5] == "1" || result.rows[i][5] == "true");
-
-		// Map SQL Server type to TDS type token
-		col.tds_type_token = SQLServerTypeToTDSToken(type_name);
-		col.max_length = SQLServerTypeMaxLength(type_name, max_length, col.precision, col.scale);
-
-		// Spec 060 / issue #225 (write side): a char column under a UTF-8
-		// collation takes the bytes we already hold. Declaring BIGVARCHAR with a
-		// UTF-8 collation sends them as they are, instead of transcoding to
-		// UTF-16 here for the server to transcode back. max_length goes through
-		// unhalved because both sides now count bytes.
-		const string &collation_name = result.rows[i].size() > 6 ? result.rows[i][6] : string();
-		if (IsUtf8CharColumn(type_name, collation_name)) {
-			col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
-			col.max_length = max_length < 0 ? 0xFFFF : static_cast<uint16_t>(max_length);
-			col.collation = UTF8_WIRE_COLLATION;
-			col.collation_name = collation_name;
+		int16_t max_length = 0;
+		uint8_t precision = 0;
+		uint8_t scale = 0;
+		try {
+			max_length = static_cast<int16_t>(std::stoi(row[2]));
+			precision = static_cast<uint8_t>(std::stoi(row[3]));
+			scale = static_cast<uint8_t>(std::stoi(row[4]));
+		} catch (...) {
+			throw InvalidInputException("MSSQL COPY: malformed column metadata for '%s'", row[0]);
 		}
-
-		// Set a reasonable DuckDB type for encoding purposes
-		// This is used by BCPRowEncoder to know how to encode the data
-		string type_lower = StringUtil::Lower(type_name);
-		if (type_lower == "bit") {
-			col.duckdb_type = LogicalType::BOOLEAN;
-		} else if (type_lower == "tinyint") {
-			// UTINYINT, not TINYINT: SQL Server's tinyint is UNSIGNED 0..255, and
-			// this is the type the CATALOG reports for such a column too. The two
-			// names mean different wire forms here — UTINYINT is the server's one
-			// unsigned byte, TINYINT is a signed DuckDB source that travels as a
-			// smallint — so a column that is genuinely the former must say so.
-			col.duckdb_type = LogicalType::UTINYINT;
-		} else if (type_lower == "smallint") {
-			col.duckdb_type = LogicalType::SMALLINT;
-		} else if (type_lower == "int") {
-			col.duckdb_type = LogicalType::INTEGER;
-		} else if (type_lower == "bigint") {
-			col.duckdb_type = LogicalType::BIGINT;
-		} else if (type_lower == "real") {
-			col.duckdb_type = LogicalType::FLOAT;
-		} else if (type_lower == "float") {
-			col.duckdb_type = LogicalType::DOUBLE;
-		} else if (type_lower == "decimal" || type_lower == "numeric") {
-			col.duckdb_type = LogicalType::DECIMAL(col.precision, col.scale);
-		} else if (type_lower == "money") {
-			col.duckdb_type = LogicalType::DECIMAL(19, 4);
-		} else if (type_lower == "smallmoney") {
-			col.duckdb_type = LogicalType::DECIMAL(10, 4);
-		} else if (type_lower == "uniqueidentifier") {
-			col.duckdb_type = LogicalType::UUID;
-		} else if (type_lower == "date") {
-			col.duckdb_type = LogicalType::DATE;
-		} else if (type_lower == "time") {
-			col.duckdb_type = LogicalType::TIME;
-		} else if (type_lower == "datetime" || type_lower == "datetime2" || type_lower == "smalldatetime") {
-			col.duckdb_type = LogicalType::TIMESTAMP;
-		} else if (type_lower == "datetimeoffset") {
-			col.duckdb_type = LogicalType::TIMESTAMP_TZ;
-		} else if (type_lower == "varbinary" || type_lower == "binary" || type_lower == "image") {
-			col.duckdb_type = LogicalType::BLOB;
-		} else {
-			// Default to VARCHAR for text types
-			col.duckdb_type = LogicalType::VARCHAR;
-		}
-
-		DebugLog(3, "GetExistingTableColumnMetadata: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d",
-				 col.name.c_str(), type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale);
-
-		columns.push_back(std::move(col));
+		const bool nullable = (row[5] == "1" || row[5] == "true");
+		const string &collation_name = row.size() > 6 ? row[6] : string();
+		columns.push_back(BCPColumnMetadata::FromServerColumn(row[0], row[1], max_length, precision, scale, nullable,
+															  collation_name));
 	}
 
 	DebugLog(2, "GetExistingTableColumnMetadata: retrieved %llu columns from target table",

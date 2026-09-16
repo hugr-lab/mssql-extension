@@ -53,9 +53,9 @@ Details: [COPY TO](../writing/copy.md) and [CTAS](../writing/ctas.md).
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `mssql_copy_flush_rows` | BIGINT | 102400 | Rows per bulk-load batch — the batch boundary the **server** sees. 102 400 is SQL Server's own threshold for writing compressed columnstore rowgroups directly; smaller batches land in the delta store and never compress |
-| `mssql_copy_parallel_writers` | BIGINT | 0 | Concurrent bulk-load connections one COPY/CTAS may open. `0` derives from DuckDB threads (cap 8); `1` disables. Ignored inside explicit transactions (COPY pins one connection) |
-| `mssql_copy_tablock` | VARCHAR | `auto` | `auto` \| `true` \| `false`. `auto` decides from the target's shape: heap ON, anything clustered OFF (the hint serialises parallel loaders against a clustered index) |
+| `mssql_copy_flush_rows` | BIGINT | 102400 | Rows per bulk-load batch — the batch boundary the **server** sees, for COPY, CTAS and a bulk-path INSERT alike. 102 400 is SQL Server's own threshold for writing compressed columnstore rowgroups directly; smaller batches land in the delta store and never compress |
+| `mssql_copy_parallel_writers` | BIGINT | 0 | Concurrent bulk-load connections one COPY, CTAS or bulk-path INSERT may open. `0` derives from DuckDB threads (cap 8); `1` disables. Ignored inside explicit transactions (the load pins one connection). An INSERT fans out only on a target with **no nonclustered index** on it — a heap under TABLOCK, or a clustered columnstore without it. Its writers hold transactions, and conflicting locks would deadlock them: a heap carrying a nonclustered index takes a Sch-M lock under TABLOCK rather than the compatible BU lock, and a columnstore carrying one fails the load |
+| `mssql_copy_tablock` | VARCHAR | `auto` | `auto` \| `true` \| `false`. `auto` decides from the target's shape: heap ON, anything clustered OFF (the hint serialises parallel loaders against a clustered index). Applies to a bulk-path INSERT too |
 | `mssql_ctas_use_bcp` | BOOLEAN | true | CTAS transfers data over the bulk-load protocol (2–10× the text INSERT path) |
 | `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | What an unannotated DuckDB `VARCHAR` becomes in created tables (`NVARCHAR`/`VARCHAR`); drives CTAS and COPY alike |
 | `mssql_ctas_drop_on_failure` | BOOLEAN | false | Drop the created table when the load phase fails |
@@ -84,10 +84,16 @@ The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY 
 
 | Setting                            | Type    | Default  | Range  | Description                           |
 | ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
-| `mssql_insert_batch_size`          | BIGINT  | 1000     | ≥1     | Rows per INSERT (SQL Server limit: 1000) |
+| `mssql_insert_batch_size`          | BIGINT  | 1000     | ≥1     | Rows per INSERT statement. Under it a cap of 1000 constants per statement always applies (`1000 / columns` rows), so SQL Server auto-parameterises every statement into one cached plan per shape |
 | `mssql_insert_max_rows_per_statement` | BIGINT | 1000   | ≥1     | Hard cap on rows per INSERT           |
 | `mssql_insert_max_sql_bytes`       | BIGINT  | 8388608  | ≥1024  | Max SQL statement size (8MB)          |
 | `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Use OUTPUT INSERTED for RETURNING     |
+| `mssql_insert_use_bcp`             | BOOLEAN | true     | -      | Load an INSERT through the BCP protocol above `mssql_insert_bcp_threshold` rows. `RETURNING` and an explicit identity column always use statements. `false` is the escape hatch |
+| `mssql_insert_bcp_threshold`       | BIGINT  | 1000     | ≥1     | Rows up to which an INSERT is sent as statements; above it the bulk path. Counted as the rows arrive, not estimated |
+
+The bulk path takes its batch size, writer count and TABLOCK policy from the
+`mssql_copy_*` settings above, which describe a bulk load whatever statement
+started it. See [INSERT](../writing/dml.md#two-paths-statements-and-bcp).
 
 ### UPDATE/DELETE Settings
 

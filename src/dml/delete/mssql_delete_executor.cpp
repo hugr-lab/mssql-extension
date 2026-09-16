@@ -7,6 +7,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/delete/mssql_delete_statement.hpp"
+#include "dml/mssql_dml_outcome.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -127,6 +128,15 @@ MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
 		}
 	}
 
+	// Every batch is in: one COMMIT for the statement (a no-op inside a DuckDB
+	// transaction, and when no batch was ever sent).
+	try {
+		auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
+		stmt_conn_.Commit(context_, catalog.Cast<MSSQLCatalog>());
+	} catch (const std::exception &e) {
+		return MSSQLDMLResult::Failure(string("DELETE failed: ") + e.what(), 0, batch_count_);
+	}
+
 	DELETE_DEBUG(1, "Finalize: done, total_deleted=%llu, batch_count=%llu", (unsigned long long)total_rows_deleted_,
 				 (unsigned long long)batch_count_);
 	return MSSQLDMLResult::Success(total_rows_deleted_, batch_count_);
@@ -174,11 +184,15 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 
-	// Acquire connection via ConnectionProvider (handles transaction pinning)
-	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
-	if (!connection) {
+	// The statement's one connection -- pinned inside a DuckDB transaction,
+	// else a pool connection with the statement's own server transaction begun
+	// on it (spec 062 W1c).
+	std::shared_ptr<tds::TdsConnection> connection;
+	try {
+		connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	} catch (const std::exception &e) {
 		DELETE_DEBUG(1, "ExecuteBatch: failed to acquire connection");
-		return MSSQLDMLResult::Failure("Failed to acquire connection for DELETE execution", 0, batch_count_);
+		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
 	}
 
 	DELETE_DEBUG(2, "ExecuteBatch: connection acquired");
@@ -190,7 +204,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			DELETE_DEBUG(1, "ExecuteBatch: socket is null");
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
 			return MSSQLDMLResult::Failure("Connection socket is null", 0, batch_count_);
 		}
 
@@ -202,7 +216,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		if (!connection->ExecuteBatch(batch.sql)) {
 			string error = connection->GetLastError();
 			DELETE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
 			return MSSQLDMLResult::Failure("DELETE execution failed: " + error, 0, batch_count_);
 		}
 
@@ -226,7 +240,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 				DELETE_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				stmt_conn_.Fail(context_, mssql_catalog);
 				return MSSQLDMLResult::Failure("DELETE execution timeout", 0, batch_count_);
 			}
 
@@ -238,7 +252,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 			if (!socket->ReceivePacket(packet, recv_timeout)) {
 				string socket_error = socket->GetLastError();
 				DELETE_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s'", socket_error.c_str());
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				stmt_conn_.Fail(context_, mssql_catalog);
 				return MSSQLDMLResult::Failure("Failed to receive TDS packet: " + socket_error, 0, batch_count_);
 			}
 
@@ -325,26 +339,26 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 
 		// Check for errors
 		if (!error_message.empty()) {
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			stmt_conn_.Fail(context_, mssql_catalog);
+			// What happened to the rows (issue #344, spec 062 W1c) -- see the
+			// UPDATE executor.
+			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.IsPinned(), total_rows_deleted_);
 			if (error_number == 0) {
-				// A parse error is a client-side framing failure: the server ran
-				// this batch (issue #344) -- see the UPDATE executor.
 				return MSSQLDMLResult::Failure(
-					StringUtil::Format("DELETE failed: %s; the server executed this batch, and %llu row(s) from the "
-									   "%llu batch(es) before it are applied",
-									   error_message, (unsigned long long)total_rows_deleted_,
-									   (unsigned long long)(batch_count_ - 1)),
+					StringUtil::Format("DELETE failed: %s; the server executed this batch (batch %llu); %s",
+									   error_message, (unsigned long long)batch_count_, outcome),
 					0, batch_count_);
 			}
-			return MSSQLDMLResult::Failure("DELETE failed: " + error_message, 0, batch_count_);
+			return MSSQLDMLResult::Failure(StringUtil::Format("DELETE failed: %s; %s", error_message, outcome), 0,
+										   batch_count_);
 		}
 
-		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+		// The connection stays with the statement until Finalize commits.
 		total_rows_deleted_ += rows_affected;
 		return MSSQLDMLResult::Success(rows_affected, batch_count_);
 
 	} catch (const std::exception &e) {
-		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+		stmt_conn_.Fail(context_, mssql_catalog);
 		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
 	}
 }

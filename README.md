@@ -60,7 +60,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Row identity (`rowid`) support for tables with primary keys
 - Connection pooling with configurable limits and automatic session reset
 - TLS with the server certificate verified by default; `Encrypt`, `TrustServerCertificate` and `HostNameInCertificate` mean what they mean in the Microsoft drivers
-- Full DML support: INSERT (with RETURNING), UPDATE, DELETE
+- Full DML support: INSERT (with RETURNING), UPDATE, DELETE — every statement atomic; an INSERT above 1000 rows loads through the BCP protocol
 - CREATE TABLE AS SELECT (CTAS) with streaming and type mapping
 - High-performance COPY TO via TDS BulkLoadBCP protocol
 - Transaction support: BEGIN/COMMIT/ROLLBACK with connection pinning

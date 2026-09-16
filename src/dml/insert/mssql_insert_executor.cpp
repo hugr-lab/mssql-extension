@@ -7,6 +7,7 @@
 #include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
+#include "dml/mssql_dml_outcome.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
@@ -50,13 +51,17 @@ MSSQLInsertExecutor::MSSQLInsertExecutor(ClientContext &context, const MSSQLInse
 	: context_(context), target_(target), config_(config), finalized_(false), connection_pool_(nullptr) {}
 
 MSSQLInsertExecutor::~MSSQLInsertExecutor() {
-	// Ensure we finalize even if caller forgets
+	// Nothing is sent from here. This used to flush pending rows "in case the
+	// caller forgets" -- and DuckDB never forgets on success, so the only time
+	// it fired was an unwind that had not passed through FailStatement (a row
+	// over mssql_insert_max_sql_bytes, another operator failing, an interrupt),
+	// where it sent the pending rows and, since W1c, COMMITTED them: the
+	// partial application W1c removes, back through the destructor (spec 062
+	// self-review). The statement's transaction is rolled back and its
+	// connection returned by ~MSSQLStatementConnection.
 	if (!finalized_ && batch_builder_ && batch_builder_->HasPendingRows()) {
-		try {
-			Finalize();
-		} catch (...) {
-			// Ignore errors in destructor
-		}
+		INSERT_DEBUG(1, "~MSSQLInsertExecutor: %llu pending row(s) dropped on unwind, transaction rolled back",
+					 (unsigned long long)batch_builder_->GetPendingRowCount());
 	}
 }
 
@@ -75,6 +80,26 @@ tds::ConnectionPool &MSSQLInsertExecutor::GetConnectionPool() {
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 	connection_pool_ = &mssql_catalog.GetConnectionPool();
 	return *connection_pool_;
+}
+
+MSSQLCatalog &MSSQLInsertExecutor::GetMSSQLCatalog() {
+	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
+	return catalog.Cast<MSSQLCatalog>();
+}
+
+void MSSQLInsertExecutor::FailStatement(MSSQLCatalog &catalog) {
+	failed_ = true;
+	stmt_conn_.Fail(context_, catalog);
+}
+
+void MSSQLInsertExecutor::CommitStatement() {
+	auto &catalog = GetMSSQLCatalog();
+	try {
+		stmt_conn_.Commit(context_, catalog);
+	} catch (const std::exception &e) {
+		failed_ = true;
+		throw IOException("INSERT failed: %s", MSSQLRawMessage(e));
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -97,16 +122,11 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 	// Print first 2000 chars of SQL for debugging
 	INSERT_DEBUG(1, "ExecuteBatch: SQL preview: %.2000s%s", sql.c_str(), sql.size() > 2000 ? "..." : "");
 
-	// Get catalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
-	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-
-	// Use ConnectionProvider to get connection (handles transaction pinning)
-	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
-	if (!connection) {
-		INSERT_DEBUG(1, "ExecuteBatch: failed to acquire connection");
-		throw IOException("Failed to acquire connection for INSERT execution");
-	}
+	// The statement's one connection -- pinned inside a DuckDB transaction,
+	// else a pool connection with the statement's own server transaction begun
+	// on it (spec 062 W1c). Throws when none can be had.
+	auto &mssql_catalog = GetMSSQLCatalog();
+	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
 
 	INSERT_DEBUG(2, "ExecuteBatch: connection acquired, state=%d", (int)connection->GetState());
 
@@ -118,7 +138,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 		auto *socket = connection->GetSocket();
 		if (!socket) {
 			INSERT_DEBUG(1, "ExecuteBatch: socket is null");
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw IOException("Connection socket is null");
 		}
 
@@ -137,8 +157,10 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
+			error.rows_applied_before = statistics_.total_rows_inserted;
+			error.in_open_transaction = stmt_conn_.IsPinned();
 
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
 		}
 
@@ -162,7 +184,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 				INSERT_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
 				connection->SendAttention();
 				connection->WaitForAttentionAck(5000);
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				FailStatement(mssql_catalog);
 				throw IOException("INSERT execution timeout");
 			}
 
@@ -180,7 +202,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 				bool still_connected = socket->IsConnected();
 				INSERT_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s', connected=%d", socket_error.c_str(),
 							 still_connected);
-				ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+				FailStatement(mssql_catalog);
 				throw IOException("Failed to receive TDS packet: %s", socket_error);
 			}
 
@@ -276,23 +298,26 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 			error.sql_error_number = error_number;
 			error.sql_error_message = error_message;
 			error.rows_applied_before = statistics_.total_rows_inserted;
+			error.in_open_transaction = stmt_conn_.IsPinned();
 			// A parse error is a client-side framing failure: the server ran this
 			// statement (issue #344). The message says so; a SQL error says the
 			// server rejected it.
 			error.statement_executed = (error_number == 0);
 
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
 		}
 
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
+	} catch (const IOException &) {
+		throw;	// Already failed and worded above (timeout, socket)
 	} catch (const std::exception &e) {
-		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+		FailStatement(mssql_catalog);
 		throw IOException("INSERT execution failed: %s", e.what());
 	}
 
-	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+	// The connection stays with the statement until CommitStatement.
 
 	// Record timing
 	auto end_time = std::chrono::steady_clock::now();
@@ -305,15 +330,8 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
 																  const vector<idx_t> &returning_column_ids) {
 	const string &sql = batch.sql_statement;
-	// Get catalog for ConnectionProvider
-	auto &catalog = Catalog::GetCatalog(context_, Identifier(target_.catalog_name));
-	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-
-	// Use ConnectionProvider to get connection (handles transaction pinning)
-	auto connection = ConnectionProvider::GetConnection(context_, mssql_catalog);
-	if (!connection) {
-		throw IOException("Failed to acquire connection for INSERT execution");
-	}
+	auto &mssql_catalog = GetMSSQLCatalog();
+	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
 
 	auto start_time = std::chrono::steady_clock::now();
 	unique_ptr<DataChunk> result_chunk;
@@ -322,7 +340,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 		// Get socket for packet-based reading
 		auto *socket = connection->GetSocket();
 		if (!socket) {
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw IOException("Connection socket is null");
 		}
 
@@ -337,8 +355,10 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 			error.row_offset_end = batch.row_offset_end;
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
+			error.rows_applied_before = statistics_.total_rows_inserted;
+			error.in_open_transaction = stmt_conn_.IsPinned();
 
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
 		}
 
@@ -355,9 +375,10 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 			error.sql_error_number = parser.GetErrorNumber();
 			error.sql_error_message = parser.GetErrorMessage();
 			error.rows_applied_before = statistics_.total_rows_inserted;
+			error.in_open_transaction = stmt_conn_.IsPinned();
 			error.statement_executed = parser.IsParseError();
 
-			ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
 		}
 
@@ -369,12 +390,13 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 
 	} catch (const MSSQLInsertException &) {
 		throw;	// Re-throw insert exceptions
+	} catch (const IOException &) {
+		throw;	// Already failed and worded above
 	} catch (const std::exception &e) {
-		ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
+		FailStatement(mssql_catalog);
 		throw IOException("INSERT with RETURNING execution failed: %s", e.what());
 	}
 
-	ConnectionProvider::ReleaseConnection(context_, mssql_catalog, std::move(connection));
 	return result_chunk;
 }
 
@@ -387,6 +409,9 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::Execute called after Finalize");
+	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::Execute called after a batch failed");
 	}
 
 	EnsureBatchBuilder(false);
@@ -421,10 +446,13 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 // Execute with RETURNING (Mode B)
 //===----------------------------------------------------------------------===//
 
-unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input_chunk,
-																const vector<idx_t> &returning_column_ids) {
+vector<unique_ptr<DataChunk>> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input_chunk,
+																		const vector<idx_t> &returning_column_ids) {
 	if (finalized_) {
 		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after Finalize");
+	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::ExecuteWithReturning called after a batch failed");
 	}
 
 	EnsureBatchBuilder(true);
@@ -432,8 +460,12 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 	// Store returning column IDs for later use
 	returning_column_ids_ = returning_column_ids;
 
-	// Accumulate results across batches
-	unique_ptr<DataChunk> accumulated_results;
+	// One result chunk per statement this input chunk completes. This used to
+	// keep the LAST one only ("for simplicity"), so an INSERT ... RETURNING of
+	// more rows than one statement carries silently lost the earlier
+	// statements' rows -- above 1000 rows before, above 1000 / columns rows
+	// once spec 062 W1b sized statements under the auto-parameterisation line.
+	vector<unique_ptr<DataChunk>> results;
 
 	// Process each row in the chunk
 	for (idx_t row_idx = 0; row_idx < input_chunk.size(); row_idx++) {
@@ -442,17 +474,8 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 			// Batch is full, flush it with OUTPUT
 			auto batch = batch_builder_->FlushBatch();
 			auto batch_result = ExecuteBatchWithOutput(batch, returning_column_ids);
-
-			// Accumulate results
-			if (batch_result) {
-				if (!accumulated_results) {
-					accumulated_results = std::move(batch_result);
-				} else {
-					// Append batch_result to accumulated_results
-					// For simplicity, we'll just return the last batch for now
-					// Full accumulation would require a more complex data structure
-					accumulated_results = std::move(batch_result);
-				}
+			if (batch_result && batch_result->size() > 0) {
+				results.push_back(std::move(batch_result));
 			}
 
 			// Now add the row that didn't fit
@@ -462,7 +485,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteWithReturning(DataChunk &input
 		}
 	}
 
-	return accumulated_results;
+	return results;
 }
 
 //===----------------------------------------------------------------------===//
@@ -475,6 +498,9 @@ void MSSQLInsertExecutor::Finalize() {
 	if (finalized_) {
 		INSERT_DEBUG(1, "Finalize: already finalized, returning");
 		return;
+	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::Finalize called after a batch failed");
 	}
 
 	finalized_ = true;
@@ -489,21 +515,28 @@ void MSSQLInsertExecutor::Finalize() {
 	} else {
 		INSERT_DEBUG(1, "Finalize: no pending rows");
 	}
+	// Every batch is in: one COMMIT for the statement (a no-op inside a DuckDB
+	// transaction, and when no batch was ever sent).
+	CommitStatement();
 }
 
 unique_ptr<DataChunk> MSSQLInsertExecutor::FinalizeWithReturning() {
 	if (finalized_) {
 		return nullptr;
 	}
+	if (failed_) {
+		throw InternalException("MSSQLInsertExecutor::FinalizeWithReturning called after a batch failed");
+	}
 
 	finalized_ = true;
 
+	unique_ptr<DataChunk> result;
 	if (batch_builder_ && batch_builder_->HasPendingRows()) {
 		auto batch = batch_builder_->FlushBatch();
-		return ExecuteBatchWithOutput(batch, returning_column_ids_);
+		result = ExecuteBatchWithOutput(batch, returning_column_ids_);
 	}
-
-	return nullptr;
+	CommitStatement();
+	return result;
 }
 
 //===----------------------------------------------------------------------===//

@@ -85,7 +85,10 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	// BCPCopyInitGlobal instead.
 	~MSSQLCopyGlobalState();
 
-	// Pinned TDS connection for BulkLoad operations
+	// The load's connection during BCPCopyInitGlobal — target validation, the
+	// CREATE TABLE, the column-metadata query all go down it. Handed to
+	// `shared` at the end of init and null from then on; the destructor's
+	// release below covers only an init that threw.
 	std::shared_ptr<tds::TdsConnection> connection;
 
 	// Release targets captured in BCPCopyInitGlobal (see destructor note above).
@@ -101,8 +104,15 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	//! thread — the destructor below has no ClientContext (issue #178).
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 
-	// BCP packet writer (thread-safe)
-	unique_ptr<mssql::BCPWriter> writer;
+	//! The shared bulk-load session (spec 062 W0): every thread that does not
+	//! get a writer of its own appends to this one under `write_mutex`. It adopts
+	//! `connection` at the end of BCPCopyInitGlobal, opens its stream on the
+	//! first chunk (spec 075 W3), closes and reopens batches at `flush_rows`,
+	//! and returns the connection — pinned stays pinned — from BCPCopyFinalize.
+	//! Before W0 the same sequence lived inline here as `writer` + `bulk_started`
+	//! + StartBulkStream + FlushToServer, a second copy of what the per-thread
+	//! sessions already did.
+	mssql::BulkLoadSession shared;
 
 	// Column metadata for encoding
 	vector<mssql::BCPColumnMetadata> columns;
@@ -130,10 +140,11 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	std::atomic<idx_t> counter_sink_calls{0};	 // chunks handed to the sink
 	std::atomic<uint64_t> counter_sink_ns{0};	 // wall inside BCPCopySink
 	std::atomic<uint64_t> counter_encode_ns{0};	 // of which: BCPWriter::WriteRows
-	// Snapshotted from the BCPWriter before it is reset — the writer is destroyed
-	// in BCPCopyFinalize well before the summary prints, so reading it there gave
-	// zeroes. Decomposes counter_flush_ns into the half that is ours and the half
-	// that is the server's.
+	// The shared session's wire counters, read from it after Finish — the
+	// session snapshots them before it tears its writer down, because the
+	// summary prints after that and reading a destroyed writer gave zeroes.
+	// Decomposes counter_flush_ns into the half that is ours and the half that
+	// is the server's.
 	uint64_t counter_build_send_ns = 0;
 	uint64_t counter_server_wait_ns = 0;
 	idx_t counter_send_calls = 0;
@@ -142,11 +153,8 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 												// build + send + the server's confirmation.
 												// NOT server time alone; see PrintWriteCounters.
 
-	// INSERT BULK SQL (cached for re-execution on flush)
+	// INSERT BULK SQL, built once in BCPCopyInitGlobal; every session copies it.
 	string insert_bulk_sql;
-	//! Spec 075 W3: whether INSERT BULK + COLMETADATA have been sent on the
-	//! shared writer's connection. Not at init -- see StartBulkStream.
-	bool bulk_started = false;
 
 	// Write synchronization
 	std::mutex write_mutex;

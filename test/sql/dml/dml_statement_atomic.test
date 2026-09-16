@@ -1,0 +1,125 @@
+# name: test/sql/dml/dml_statement_atomic.test
+# description: a failed statement-path INSERT, UPDATE or DELETE leaves the table exactly as it was (spec 062 W1c, closes #344 on the statement path)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The statement path sends several statements per DML (333 rows each for a
+# 3-column INSERT, mssql_dml_batch_size rowids for UPDATE / DELETE). Each used
+# to commit on its own in autocommit, so a failure in batch K left batches
+# 1..K-1 applied (#344). A statement now runs on ONE connection inside ONE
+# server transaction of its own: the failing batch and every batch before it
+# are rolled back together, the message says so, and the connection goes back.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sa (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sa', 'IF OBJECT_ID(''dbo.StmtAtomicChild'') IS NOT NULL DROP TABLE dbo.StmtAtomicChild;
+IF OBJECT_ID(''dbo.StmtAtomic'') IS NOT NULL DROP TABLE dbo.StmtAtomic;
+CREATE TABLE dbo.StmtAtomic (id INT NOT NULL PRIMARY KEY, n INT NOT NULL CHECK (n < 1000000), v NVARCHAR(20) NULL);
+CREATE TABLE dbo.StmtAtomicChild (cid INT NOT NULL PRIMARY KEY, parent INT NOT NULL REFERENCES dbo.StmtAtomic(id))');
+
+statement ok
+SELECT mssql_invalidate_cache('sa');
+
+statement ok
+SET mssql_dml_batch_size = 500;
+
+# --- INSERT ... RETURNING: statements whatever the size. Row 950 violates the
+# CHECK, in statement 3 of 4 (333 rows each); statements 1 and 2 are rolled
+# back with it.
+statement error
+INSERT INTO sa.dbo.StmtAtomic SELECT i, CASE WHEN i = 950 THEN 1000000 ELSE i END, 'v' FROM range(1, 1201) t(i) RETURNING id;
+----
+INSERT failed at statement 2
+
+statement error
+INSERT INTO sa.dbo.StmtAtomic SELECT i, CASE WHEN i = 950 THEN 1000000 ELSE i END, 'v' FROM range(1, 1201) t(i) RETURNING id;
+----
+rolled back, the 666 row(s)
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic;
+----
+0
+
+# Now the rows, for the UPDATE and DELETE cases.
+statement ok
+INSERT INTO sa.dbo.StmtAtomic SELECT i, i, 'v' FROM range(1, 1201) t(i) RETURNING id;
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic;
+----
+1200
+
+# --- UPDATE over 1200 rowids = batches of 500, 500, 200. The third batch
+# carries the CHECK violation; the first two are rolled back with it.
+statement error
+UPDATE sa.dbo.StmtAtomic SET n = CASE WHEN id = 1150 THEN 1000000 ELSE 555555 END;
+----
+rolled back, the 1000 row(s)
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 555555;
+----
+0
+
+# --- DELETE: a child row references id 1150, so the third batch fails on the
+# foreign key; the 1000 rows the first two batches deleted are back.
+statement ok
+SELECT mssql_exec('sa', 'INSERT INTO dbo.StmtAtomicChild (cid, parent) VALUES (1, 1150)');
+
+statement error
+DELETE FROM sa.dbo.StmtAtomic;
+----
+rolled back, the 1000 row(s)
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic;
+----
+1200
+
+# --- the connection came back after each failure
+query I
+SELECT active_connections FROM mssql_pool_stats('sa');
+----
+0
+
+# --- inside a DuckDB transaction the same statements say the rows are in the
+# open transaction, and ROLLBACK leaves nothing behind.
+statement ok
+BEGIN;
+
+statement error
+UPDATE sa.dbo.StmtAtomic SET n = CASE WHEN id = 1150 THEN 1000000 ELSE 666666 END;
+----
+in the open transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 666666;
+----
+0
+
+# --- and a statement that succeeds still commits as one.
+statement ok
+UPDATE sa.dbo.StmtAtomic SET n = 777777 WHERE id <= 1100;
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 777777;
+----
+1100
+
+statement ok
+SELECT mssql_exec('sa', 'DROP TABLE dbo.StmtAtomicChild; DROP TABLE dbo.StmtAtomic');
+
+statement ok
+DETACH sa;

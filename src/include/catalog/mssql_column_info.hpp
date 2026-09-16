@@ -34,6 +34,10 @@ struct MSSQLColumnInfo {
 	bool is_geometry;		 // True for SQL Server geometry/geography columns; table scan projects
 							 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
 							 // in a LogicalType::GEOMETRY() vector via the Binary codec.
+	bool is_identity;		 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
+							 // metadata loaders after construction; the INSERT planner keeps a
+							 // column list that names one on the statement path, where the server
+							 // decides about the explicit value (error 544 without IDENTITY_INSERT).
 
 	// Default constructor
 	MSSQLColumnInfo();

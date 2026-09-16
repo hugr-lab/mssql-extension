@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include "dml/mssql_dml_outcome.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -26,9 +27,13 @@ struct MSSQLInsertError {
 	int32_t sql_error_number;  // SQL Server error number (e.g., 2627 for PK violation)
 	string sql_error_message;  // SQL Server error text
 	string sql_state;		   // SQLSTATE code if available
-	// Issue #344: what the caller can rely on when this is thrown.
-	idx_t rows_applied_before = 0;	  // rows the earlier statements put in
-	bool statement_executed = false;  // the failing statement ran on the server (a parse error)
+	// Issue #344: what the caller can rely on when this is thrown. Since spec
+	// 062 W1c the statement runs in one server transaction, so the rows the
+	// earlier statements put in are rolled back with it in autocommit, or sit
+	// in the open DuckDB transaction until its ROLLBACK.
+	idx_t rows_applied_before = 0;	   // rows the earlier statements had put in
+	bool statement_executed = false;   // the failing statement ran on the server (a parse error)
+	bool in_open_transaction = false;  // inside a DuckDB transaction (pinned connection)
 
 	// Default constructor
 	MSSQLInsertError() : statement_index(0), row_offset_start(0), row_offset_end(0), sql_error_number(0) {}
@@ -48,10 +53,12 @@ struct MSSQLInsertError {
 	//===----------------------------------------------------------------------===//
 
 	// Format error message for display
-	// Returns: "INSERT failed at statement N (rows X-Y): [error_num] message"
+	// Returns: "INSERT failed at statement N (rows X-Y): [error_num] message; <outcome>"
 	// A parse error is not "SQL Server error 0" (commit 73e6da3): no [code]
 	// for it, and a note that the server DID run the statement -- the failure
-	// is in reading the answer, so the rows are in (issue #344).
+	// is in reading the answer. What happened to the rows is the last clause
+	// (issue #344, spec 062 W1c): rolled back with the statement's own server
+	// transaction in autocommit, or in the open DuckDB transaction inside one.
 	string FormatMessage() const {
 		string msg = StringUtil::Format("INSERT failed at statement %d (rows %d-%d): ", statement_index,
 										row_offset_start, row_offset_end > 0 ? row_offset_end - 1 : 0);
@@ -60,11 +67,9 @@ struct MSSQLInsertError {
 		}
 		msg += sql_error_message;
 		if (statement_executed) {
-			msg += StringUtil::Format(
-				"; the server executed this statement, and %d row(s) from the statements "
-				"before it are applied",
-				rows_applied_before);
+			msg += "; the server executed this statement";
 		}
+		msg += "; " + MSSQLRowsBeforeOutcome(in_open_transaction, rows_applied_before);
 		return msg;
 	}
 };

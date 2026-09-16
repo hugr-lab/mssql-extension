@@ -119,7 +119,8 @@ SELECT
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
+    c.is_identity
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
@@ -149,7 +150,8 @@ SELECT
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
+    c.is_identity
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
@@ -205,7 +207,8 @@ SELECT
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
+    c.is_identity
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
@@ -234,17 +237,24 @@ SELECT
     c.precision,
     c.scale,
     c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name
+    ISNULL(c.collation_name, '') AS collation_name,
+    c.is_identity
 FROM sys.columns c
 LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 WHERE c.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";
 
+// A bit column as the simple-query layer renders it.
+static bool FlagIsSet(const string &value) {
+	return value == "1" || value == "true" || value == "True";
+}
+
 //===----------------------------------------------------------------------===//
 // Physical shape of the object, parsed out of the correlated sys.indexes lookup.
-// index_type and is_partitioned always sit last in the SELECT list, so each
-// caller passes their own indices.
+// index_type and is_partitioned sit after the per-column fields in every
+// SELECT list (is_identity follows them since spec 062 W4), so each caller
+// passes their own indices.
 //
 // The two values are parsed into locals and published together: a malformed
 // is_partitioned must not discard an index_type that parsed fine.
@@ -551,11 +561,15 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 				scl = static_cast<uint8_t>(std::stoi(values[7]));
 			} catch (...) {
 			}
-			bool nullable = (values[8] == "1" || values[8] == "true" || values[8] == "True");
+			bool nullable = FlagIsSet(values[8]);
 			string collation = values[9];
 
 			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 									 database_collation_);
+			// sys.columns.is_identity (spec 062 W4, issue #327): what the INSERT
+			// planner needs to keep an explicit identity value on the statement
+			// path, where the server decides about it.
+			col_info.is_identity = values.size() > 12 && FlagIsSet(values[12]);
 			table_meta.columns.push_back(std::move(col_info));
 		},
 		reset_slot);
@@ -708,7 +722,7 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 	ExecuteMetadataQuery(
 		connection, sql,
 		[&](const vector<string> &values) {
-			// 14 columns: schema, object, type, approx_rows, the eight per-column
+			// 15 columns: schema, object, type, approx_rows, the eight per-column
 			// fields, then index_type and is_partitioned. Guard the LAST index read.
 			if (values.size() < 14) {
 				return;
@@ -779,10 +793,11 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 				scl = static_cast<uint8_t>(std::stoi(scale_str));
 			} catch (...) {
 			}
-			bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+			bool nullable = FlagIsSet(nullable_str);
 
 			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 									 database_collation_);
+			col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
 			current_table_meta->columns.push_back(std::move(col_info));
 			column_count++;
 		},
@@ -886,7 +901,7 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 	ExecuteMetadataQuery(
 		connection, sql,
 		[&](const vector<string> &values) {
-			// 15 columns: object_id, schema, object, type, approx_rows, the eight
+			// 16 columns: object_id, schema, object, type, approx_rows, the eight
 			// per-column fields, then index_type and is_partitioned. Guard the LAST
 			// index read.
 			if (values.size() < 15) {
@@ -948,9 +963,11 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 				scl = static_cast<uint8_t>(std::stoi(values[10]));
 			} catch (...) {
 			}
-			const bool nullable = (values[11] == "1" || values[11] == "true" || values[11] == "True");
-			table_meta->columns.push_back(MSSQLColumnInfo(values[5], col_id, values[7], max_len, prec, scl, nullable,
-														  values[12], database_collation_));
+			const bool nullable = FlagIsSet(values[11]);
+			MSSQLColumnInfo col_info(values[5], col_id, values[7], max_len, prec, scl, nullable, values[12],
+									 database_collation_);
+			col_info.is_identity = values.size() > 15 && FlagIsSet(values[15]);
+			table_meta->columns.push_back(std::move(col_info));
 			column_count++;
 		},
 		[&]() {
@@ -1109,7 +1126,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		ExecuteMetadataQuery(
 			connection, sql,
 			[&](const vector<string> &values) {
-				// 14 columns: schema, object, type, approx_rows, the eight per-column
+				// 15 columns: schema, object, type, approx_rows, the eight per-column
 				// fields, then index_type and is_partitioned. Guard the LAST index read.
 				if (values.size() < 14) {
 					return;
@@ -1204,10 +1221,11 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 					scl = static_cast<uint8_t>(std::stoi(scale_str));
 				} catch (...) {
 				}
-				bool nullable = (nullable_str == "1" || nullable_str == "true" || nullable_str == "True");
+				bool nullable = FlagIsSet(nullable_str);
 
 				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 										 database_collation_);
+				col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
 				current_table_meta->columns.push_back(std::move(col_info));
 				schema_columns++;
 				column_count++;
@@ -1833,11 +1851,12 @@ void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const strin
 					scl = static_cast<uint8_t>(std::stoi(values[5]));
 				} catch (...) {
 				}
-				bool nullable = (values[6] == "1" || values[6] == "true" || values[6] == "True");
+				bool nullable = FlagIsSet(values[6]);
 				string collation = values[7];
 
 				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 										 database_collation_);
+				col_info.is_identity = values.size() > 8 && FlagIsSet(values[8]);
 				table_metadata.columns.push_back(std::move(col_info));
 			}
 		},

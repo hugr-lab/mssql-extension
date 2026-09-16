@@ -40,21 +40,89 @@ VALUES ('a', 1), ('b', 2)
 RETURNING *;
 ```
 
+### Two paths: statements and BCP
+
+An INSERT reaches SQL Server one of two ways, and the extension picks per
+statement:
+
+| the INSERT | how it is sent |
+| --- | --- |
+| more rows than `mssql_insert_bcp_threshold` (default 1000), no `RETURNING`, no explicit identity column | the BCP protocol (`INSERT BULK`), the same wire COPY and CTAS use — measured 1M rows in 1.8 s where the statements took 74 s |
+| anything else — `RETURNING`, a named identity column, `mssql_insert_use_bcp = false`, or up to the threshold rows | batched `INSERT … VALUES` statements |
+
+The threshold is decided by counting the rows as they arrive, not by a plan
+estimate, so an `INSERT … SELECT` behind a filter goes the right way too.
+
+**Every INSERT is atomic**, on either path. In autocommit the statement runs
+on one connection inside one server transaction — `BEGIN TRANSACTION` before
+its first batch, `COMMIT` after the last — so a failure anywhere leaves the
+table exactly as it was, and the error says so:
+
+```text
+INSERT via BCP failed at batch 5 of a writer (1808 row(s) in it): MSSQL: BCP failed:
+The INSERT statement conflicted with the CHECK constraint ...; rolled back, the
+8192 row(s) from the batches before it included
+```
+
+Inside a `BEGIN … COMMIT` block the rows sit in the open transaction until
+its `COMMIT` or `ROLLBACK`, and the message says that instead. The same
+holds for `UPDATE` and `DELETE`.
+
+**The bulk path behaves like an INSERT statement.** A raw bulk load ignores
+CHECK constraints, does not fire triggers and writes a column's DEFAULT
+where the data says NULL — that is `COPY`'s contract. An INSERT that goes
+through BCP sends `INSERT BULK` with `CHECK_CONSTRAINTS`, `FIRE_TRIGGERS` and
+`KEEP_NULLS`, so constraints are checked, triggers fire and an explicit NULL
+stays NULL.
+
+**Batch size and parallel writers** come from the bulk-load settings, which
+describe the load rather than the statement that started it:
+`mssql_copy_flush_rows` (the batch boundary the server sees; 102 400 lands
+compressed rowgroups on a columnstore) and `mssql_copy_parallel_writers`.
+Parallel writers apply only where their loads cannot block each other —
+each writer holds its own server transaction until the INSERT commits them
+all, so two writers whose locks conflict would wait on each other with
+nothing to time out. That is a target with **no nonclustered index** on it:
+a heap under TABLOCK, or a clustered columnstore without it. Under
+`mssql_copy_tablock = auto` (heap on, clustered off) bare heaps and bare
+columnstores fan out, while a table with a clustered rowstore index — or one
+carrying so much as a single nonclustered index, which costs a heap a `Sch-M`
+lock instead of the compatible `BU` one and costs a columnstore the load
+itself — loads on one writer.
+Inside a transaction it is always one writer, the transaction's own
+connection. With several writers there is a
+window between the first and the last `COMMIT` in which a failed commit
+leaves the earlier writers' rows in place; one writer has none.
+
 ### Batch Configuration
 
-Large inserts are automatically batched. Configure batch size:
+Statements carry at most 1000 constants each — SQL Server auto-parameterises
+a multi-row `VALUES` INSERT up to that line, so distinct inserts of one shape
+share a single cached plan; past it every statement compiles its own — and
+`mssql_insert_batch_size` caps the rows on top of that:
 
 ```sql
--- Set batch size (default: 1000, SQL Server limit)
+-- Rows per INSERT statement (default 1000; 1000 / columns applies first)
 SET mssql_insert_batch_size = 500;
 
 -- Maximum SQL statement size (default: 8MB)
 SET mssql_insert_max_sql_bytes = 4194304;
+
+-- Rows up to which an INSERT is sent as statements (default 1000)
+SET mssql_insert_bcp_threshold = 5000;
+
+-- Statements only, whatever the size
+SET mssql_insert_use_bcp = false;
 ```
 
 ### Identity Columns
 
-Identity (auto-increment) columns are automatically excluded from INSERT statements. The generated values are returned via RETURNING clause.
+A column the INSERT does not name is left out of the statement or the bulk
+column list, so the server generates its identity value or applies its
+DEFAULT. Naming an identity column keeps the INSERT on the statement path,
+where SQL Server decides about the explicit value — error 544 unless
+`IDENTITY_INSERT` is on for that session. The generated values are returned
+via the RETURNING clause.
 
 ## UPDATE
 

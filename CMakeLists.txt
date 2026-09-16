@@ -201,6 +201,7 @@ set(EXTENSION_SOURCES
     src/dml/insert/mssql_value_serializer.cpp
     src/dml/insert/mssql_insert_statement.cpp
     src/dml/insert/mssql_batch_builder.cpp
+    src/dml/mssql_statement_connection.cpp
     src/dml/insert/mssql_insert_executor.cpp
     src/dml/insert/mssql_physical_insert.cpp
     src/dml/insert/mssql_returning_parser.cpp
@@ -223,6 +224,7 @@ set(EXTENSION_SOURCES
     src/copy/target_resolver.cpp
     src/copy/bcp_writer.cpp
     src/copy/bulk_load_session.cpp
+    src/copy/load_transaction.cpp
     src/copy/copy_function.cpp
     # Azure AD authentication layer
     src/azure/azure_http.cpp

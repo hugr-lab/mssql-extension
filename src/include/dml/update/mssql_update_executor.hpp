@@ -5,6 +5,7 @@
 #include <vector>
 #include "dml/mssql_dml_config.hpp"
 #include "dml/mssql_dml_result.hpp"
+#include "dml/mssql_statement_connection.hpp"
 #include "dml/update/mssql_update_target.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -86,6 +87,10 @@ private:
 	// Statistics
 	idx_t total_rows_updated_ = 0;
 	idx_t batch_count_ = 0;
+
+	//! The statement's one connection and its server transaction (spec 062
+	//! W1c, issue #344): acquired on the first batch, committed in Finalize.
+	MSSQLStatementConnection stmt_conn_;
 
 	// Has Finalize() been called?
 	bool finalized_ = false;

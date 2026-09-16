@@ -39,6 +39,14 @@ struct MSSQLPreparedSession {
 	std::shared_ptr<tds::TdsConnection> connection;	 // empty inside a transaction
 	weak_ptr<tds::ConnectionPool> pool_handle;
 	bool reset_on_release = true;
+	//! Claimed by the first global state that executes on this session. The bind
+	//! data is SHARED by FunctionData::Copy, so one plan can init more than one
+	//! global state over it (a delim join, a duplicated CTE) -- and this session
+	//! owns exactly one connection carrying exactly one sp_prepare handle. A
+	//! second `EXEC sp_execute` down a connection the first is still streaming
+	//! on fails with "connection not in Idle state"; the loser falls back to
+	//! MSSQLScanBindData::fallback_sql on a connection of its own instead.
+	std::atomic<bool> in_use{false};
 	~MSSQLPreparedSession();
 };
 
@@ -81,6 +89,12 @@ struct MSSQLScanBindData : public FunctionData {
 	// sends: the query, the sp_executesql batch of mssql_scan_params, or
 	// `EXEC sp_execute <handle>`.
 	string execute_sql;
+	//! The ad-hoc batch that needs no prepared handle -- the query, or the
+	//! sp_executesql batch of mssql_scan_params. Kept because `execute_sql` is
+	//! overwritten with `EXEC sp_execute <handle>` when sp_prepare succeeds, and
+	//! a second global state over this same bind data cannot use that handle.
+	//! Empty unless the prepared path took over.
+	string fallback_sql;
 	bool prepared = false;
 	shared_ptr<MSSQLPreparedSession> prepared_session;
 	// The F1 fallback: the describe could not settle the shape (a batch with a
@@ -264,6 +278,13 @@ struct MSSQLScanGlobalState : public GlobalTableFunctionState {
 
 	// SQL result indices of PK columns (for reading PK data from result)
 	vector<idx_t> pk_sql_indices;
+
+	//! Set when this global state won MSSQLPreparedSession::in_use. The
+	//! destructor clears the flag AFTER releasing the stream, so the held
+	//! connection is Idle again and a later execution over the same bind data
+	//! (EXECUTE of a prepared statement re-inits the global state) takes the
+	//! handle rather than falling back to the ad-hoc batch forever.
+	shared_ptr<MSSQLPreparedSession> claimed_session;
 
 	MSSQLScanGlobalState() = default;
 	~MSSQLScanGlobalState();

@@ -1,0 +1,72 @@
+# name: test/sql/insert/insert_returning_batches.test
+# description: INSERT ... RETURNING returns every row when the insert spans several statements (spec 062 W1b follow-up; recon finding of 2026-08-05)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A RETURNING insert is sent as statements of at most 1000 / columns rows,
+# each with its own OUTPUT INSERTED result. The executor used to hand back
+# the LAST statement's result only, so an insert spanning several statements
+# silently lost the earlier ones from RETURNING (above 1000 rows before spec
+# 062, above 333 rows on a 3-column table after its W1b cap). Every row
+# comes back now, and the rows in the table agree.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rb (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('rb', 'IF OBJECT_ID(''dbo.RetBatches'') IS NOT NULL DROP TABLE dbo.RetBatches;
+CREATE TABLE dbo.RetBatches (id INT NOT NULL PRIMARY KEY, n INT NULL, v NVARCHAR(20) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('rb');
+
+# 2500 rows, 3 columns: 8 statements (333 rows each, 169 in the last), two
+# input chunks. The hash is of every id 1..2500 in order -- one statement's
+# rows missing would change it.
+query I rowsort
+INSERT INTO rb.dbo.RetBatches SELECT i, i * 2, 'v' || i FROM range(1, 2501) t(i) RETURNING id;
+----
+2500 values hashing to 9394fe7df1c8c49a465d18f8c783d03f
+
+query I
+SELECT count(*) FROM rb.dbo.RetBatches;
+----
+2500
+
+# The same through a plain sequence, to pin what the hash stands for.
+query I rowsort
+SELECT i FROM range(1, 2501) t(i);
+----
+2500 values hashing to 9394fe7df1c8c49a465d18f8c783d03f
+
+# RETURNING * with a server-filled column, over one statement boundary
+# exactly (501 rows = 500 + 1).
+#
+# 500, not 333: the cap is MSSQL_AUTO_PARAM_MAX_CONSTANTS / the number of
+# columns in the INSERT's list, and this list names two (id, v) -- the third
+# column is the server-filled one under test. At 334 rows this case was one
+# statement and asserted nothing about crossing a boundary.
+statement ok
+SELECT mssql_exec('rb', 'TRUNCATE TABLE dbo.RetBatches');
+
+query III rowsort
+SELECT i, NULL::INTEGER, 'w' FROM range(1, 502) t(i);
+----
+1503 values hashing to 1b17b822d7fd363f2539dcd132ae4676
+
+query III rowsort
+INSERT INTO rb.dbo.RetBatches (id, v) SELECT i, 'w' FROM range(1, 502) t(i) RETURNING *;
+----
+1503 values hashing to 1b17b822d7fd363f2539dcd132ae4676
+
+statement ok
+SELECT mssql_exec('rb', 'DROP TABLE dbo.RetBatches');
+
+statement ok
+DETACH rb;
