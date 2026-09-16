@@ -111,7 +111,7 @@ public:
 	//! drain. It is contended only by scans that are already serialized by
 	//! construction — they share one pinned connection and cannot run in parallel
 	//! anyway — so it costs nothing that was not already sequential.
-	std::recursive_mutex &MaterializeMutex() {
+	std::mutex &MaterializeMutex() {
 		return materialize_mutex_;
 	}
 
@@ -328,17 +328,7 @@ private:
 	//! See MaterializeMutex(). Not the transaction's connection_mutex_: that one
 	//! guards the pinned-connection member accessors and is taken and released
 	//! inside them, where this must span a whole batch-and-drain.
-	//!
-	//! RECURSIVE, and the reason is not defensive. A sink takes it in its
-	//! InitGlobal and, since spec 075 W3, sends its INSERT BULK later — from
-	//! BulkLoadSession::OpenStream, which takes it again to cover the send
-	//! itself. Those two can land on the SAME thread inside the same init, and
-	//! a plain std::mutex deadlocks there: measured, one pipeline thread parked
-	//! in OpenStream with no other thread holding anything. Re-entry is benign
-	//! by construction — the outer holder is this statement's own init, never a
-	//! competing scan — while a second THREAD still waits, which is the whole
-	//! point of the mutex.
-	std::recursive_mutex materialize_mutex_;
+	std::mutex materialize_mutex_;
 
 	// Issue #225: -1 = not observed yet, 0 = declined, 1 = granted.
 	std::atomic<int8_t> utf8_support_acked_{-1};

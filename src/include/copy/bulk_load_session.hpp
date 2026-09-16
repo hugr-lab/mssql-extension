@@ -32,8 +32,6 @@
 
 #pragma once
 
-#include <mutex>
-
 #include <atomic>
 
 #include "copy/bcp_writer.hpp"
@@ -101,26 +99,6 @@ struct BulkLoadSessionParams {
 	//! ignores the flag for it. What an INSERT is -- atomic -- and what a COPY
 	//! is not (each batch commits, as bcp's does): COPY and CTAS leave it off.
 	bool own_transaction = false;
-	//! The catalog's MaterializeMutex, set ONLY by an operator adopting a
-	//! TRANSACTION-PINNED connection; null everywhere else.
-	//!
-	//! Spec 075 W3 deferred the INSERT BULK from the operator's InitGlobal to
-	//! the first chunk, and the mutex the operator takes in InitGlobal is a
-	//! local that dies with it. So the invariant it exists for — nothing else is
-	//! draining on the pinned connection when INSERT BULK goes down it — was
-	//! being checked at a moment that is no longer the moment of sending: a
-	//! catalog scan of the same catalog still materialising when that first
-	//! chunk arrives leaves the connection in Executing, and the batch fails
-	//! with `Cannot execute: connection not in Idle state`. Intermittent, and
-	//! reproducible by anything that shifts the timing.
-	//!
-	//! `OpenStream` takes it around the send instead. It cannot deadlock: a
-	//! materialising scan holds this mutex while draining and never waits on a
-	//! sink, so the wait is one-directional.
-	//!
-	//! Null for a POOL connection by construction — TryStart never gets a pinned
-	//! one, and CTAS never loads on the pinned connection at all.
-	std::recursive_mutex *pinned_materialize_mutex = nullptr;
 	//! Spec 070 W2: apply the warm-up gate (hold extra writers until one
 	//! flush_rows batch has landed). True only for a COLUMNSTORE target, where a
 	//! second writer splitting a sub-threshold load costs compression. A heap or
@@ -338,8 +316,6 @@ private:
 	void ReleaseConnection();
 
 	std::shared_ptr<tds::TdsConnection> connection_;
-	//! See BulkLoadSessionParams::pinned_materialize_mutex.
-	std::recursive_mutex *pinned_materialize_mutex_ = nullptr;
 	unique_ptr<BCPWriter> writer_;
 	//! The ONE release mechanism. There was briefly a raw `tds::ConnectionPool *`
 	//! beside this, used by Finish() while the destructor used the handle — two

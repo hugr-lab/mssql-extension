@@ -325,9 +325,9 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	// another thread while they do. Wait for them here rather than find the
 	// pinned connection mid-stream; held for the rest of the init, because the
 	// CREATE TABLE below goes down the same connection.
-	std::unique_lock<std::recursive_mutex> materialize_lock;
+	std::unique_lock<std::mutex> materialize_lock;
 	if (gstate->transaction_pinned) {
-		materialize_lock = std::unique_lock<std::recursive_mutex>(mssql_catalog.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
 	}
 
 	// Helper to release connection on error
@@ -577,10 +577,6 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			params.flush_rows = bdata.config.flush_rows;
 			params.collect_timings = mssql::CountersEnabled();
 			params.reset_on_release = gstate->reset_on_release;
-			// The pinned connection's guard for the deferred INSERT BULK: the
-			// lock taken at the top of this function dies with it, and the send
-			// happens on the first chunk (spec 075 W3).
-			params.pinned_materialize_mutex = &mssql_catalog.MaterializeMutex();
 			gstate->shared.Adopt(std::move(gstate->connection), params, gstate->transaction_pinned);
 			gstate->connection.reset();
 		}

@@ -164,9 +164,9 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// materialised under the catalog's MaterializeMutex before a row reached
 	// this sink; taking it here is the guarantee that nothing is still
 	// draining on the pinned connection the stream is about to use.
-	std::unique_lock<std::recursive_mutex> materialize_lock;
+	std::unique_lock<std::mutex> materialize_lock;
 	if (gstate.transaction_pinned) {
-		materialize_lock = std::unique_lock<std::recursive_mutex>(catalog.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutex());
 	}
 
 	auto connection = ConnectionProvider::GetConnection(context, catalog);
@@ -205,12 +205,7 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 		throw;
 	}
 
-	// The pinned connection's guard for the deferred INSERT BULK — see
-	// BulkLoadSessionParams::pinned_materialize_mutex. The lock taken above dies
-	// with this function; the send happens on the first chunk.
-	auto adopt_params = SessionParams(gstate, bulk);
-	adopt_params.pinned_materialize_mutex = &catalog.MaterializeMutex();
-	gstate.shared.Adopt(std::move(connection), adopt_params, gstate.transaction_pinned);
+	gstate.shared.Adopt(std::move(connection), SessionParams(gstate, bulk), gstate.transaction_pinned);
 
 	// COPY's policy, and COPY's answer: JoinsTransaction. Inside a transaction
 	// the pinned connection is the one writer; outside, up to
