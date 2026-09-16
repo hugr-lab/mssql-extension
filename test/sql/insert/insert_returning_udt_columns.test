@@ -88,5 +88,52 @@ SELECT count(*) FROM retu.dbo.RetUdt;
 statement ok
 SELECT mssql_exec('retu', 'DROP TABLE dbo.RetUdt; DROP TABLE dbo.RetUdtSrc');
 
+# =============================================================================
+# The legacy LOBs: text, ntext, image. Not UDTs and not is_cast_required — they
+# are KNOWN types, which is exactly why the first version of the OUTPUT list
+# missed them. It copied two of the read path's four rewrites, and a `text`
+# value answered `Unsupported type in RowReader: TEXT` while a SELECT over the
+# same column read fine.
+#
+# A NULL in such a column is not enough to catch it: the row reader only
+# dispatches on the type for a value that is present. That is why these cases
+# all carry data.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('retu', 'IF OBJECT_ID(''dbo.RetLob'') IS NOT NULL DROP TABLE dbo.RetLob');
+
+statement ok
+SELECT mssql_exec('retu', 'CREATE TABLE dbo.RetLob (id INT IDENTITY(1,1) PRIMARY KEY, t TEXT NULL, nt NTEXT NULL, im IMAGE NULL, n INT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('retu');
+
+query IIII
+INSERT INTO retu.dbo.RetLob (t, nt, n) VALUES ('hello text', 'hello ntext', 5) RETURNING id, t, nt, n;
+----
+1	hello text	hello ntext	5
+
+# --- image too: it takes the VARBINARY(MAX) rewrite, not the NVARCHAR one, so
+# it comes back as a BLOB rather than mojibake.
+statement ok
+SELECT mssql_exec('retu', 'INSERT INTO dbo.RetLob (im, n) VALUES (CONVERT(IMAGE, 0x0102FF), 6)');
+
+query III
+INSERT INTO retu.dbo.RetLob (n) VALUES (7) RETURNING id, im, n;
+----
+3	NULL	7
+
+# --- RETURNING * over the whole width, every rewrite at once.
+query IIIII
+SELECT id, t, nt, im, n FROM retu.dbo.RetLob ORDER BY id;
+----
+1	hello text	hello ntext	NULL	5
+2	NULL	NULL	\x01\x02\xFF	6
+3	NULL	NULL	NULL	7
+
+statement ok
+SELECT mssql_exec('retu', 'DROP TABLE dbo.RetLob');
+
 statement ok
 DETACH retu;

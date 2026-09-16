@@ -34,6 +34,12 @@ struct MSSQLInsertTarget {
 	// (populated when RETURNING clause is used)
 	vector<idx_t> returning_column_indices;
 
+	// `mssql_convert_varchar_max`, resolved where the target is built. The OUTPUT
+	// list is built by the same function as the scan's SELECT list, and that
+	// function takes the setting — so a varchar(max) column is cast, or not,
+	// identically on both paths.
+	bool convert_varchar_max = true;
+
 	// Identity column tracking
 	bool has_identity_column;	  // Table has an IDENTITY column
 	idx_t identity_column_index;  // Index of identity column in columns vector

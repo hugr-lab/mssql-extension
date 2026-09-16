@@ -5,6 +5,7 @@
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "table_scan/filter_encoder.hpp"
 
 namespace duckdb {
 
@@ -379,6 +380,116 @@ bool MSSQLColumnInfo::IsUnicodeType(const string &sql_type_name) {
 				   [](unsigned char c) { return std::tolower(c); });
 
 	return lower_type == "nchar" || lower_type == "nvarchar" || lower_type == "ntext";
+}
+
+//===----------------------------------------------------------------------===//
+// Read expression (shared by the scan's SELECT list and INSERT's OUTPUT list)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+//! TEXT / NTEXT / IMAGE — the pre-2005 LOB types. Their wire tokens are not
+//! the varchar/nvarchar/varbinary ones and no codec decodes them.
+enum class LegacyLob { None, Text, NText, Image };
+
+LegacyLob LegacyLobKind(const string &sql_type_name) {
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	if (lower_type == "text") {
+		return LegacyLob::Text;
+	}
+	if (lower_type == "ntext") {
+		return LegacyLob::NText;
+	}
+	if (lower_type == "image") {
+		return LegacyLob::Image;
+	}
+	return LegacyLob::None;
+}
+
+//! Does this column need the CHAR/VARCHAR/TEXT -> NVARCHAR rewrite?
+//!
+//! Only non-Unicode text under a non-UTF-8 collation: its bytes are in the
+//! column's code page, and a DuckDB VARCHAR is UTF-8 by contract.
+bool NeedsNVarcharConversion(const string &sql_type_name, int16_t max_length, const string &collation_name,
+							 bool convert_varchar_max) {
+	if (MSSQLColumnInfo::IsUnicodeType(sql_type_name)) {
+		return false;  // already Unicode
+	}
+	if (!MSSQLColumnInfo::IsTextType(sql_type_name)) {
+		return false;  // not a string type
+	}
+	if (MSSQLColumnInfo::IsUTF8Collation(collation_name)) {
+		return false;  // UTF-8 is safe to pass through
+	}
+	// The setting governs *declared*-MAX columns only (max_length == -1), matching its name and
+	// documented purpose. A varchar(4001..8000) is not VARCHAR(MAX): the length helper promotes it
+	// to NVARCHAR(MAX) because no shorter NVARCHAR could hold it, not because the user asked for
+	// MAX, so the opt-out does not apply to it.
+	//
+	// TEXT is never opted out. Unlike varchar it has no decodable uncast wire form: it is a known
+	// type (so is_cast_required is false) and dropping the CAST would put TDS_TYPE_TEXT (0x23) on
+	// the wire, which no codec handles — the read would fail outright rather than degrade.
+	if (LegacyLobKind(sql_type_name) == LegacyLob::None && max_length == -1 && !convert_varchar_max) {
+		return false;
+	}
+	return true;
+}
+
+//! Length for the NVARCHAR CAST. MAX for VARCHAR(MAX), for the legacy LOBs, and
+//! for any CHAR/VARCHAR wider than the 4000-character inline NVARCHAR limit —
+//! such a column has no valid inline length, so it must go over as PLP.
+//! (Mirrors the >4000 PLP fallback on the BCP write path in
+//! SQLServerTypeMaxLength, src/copy/target_resolver.cpp.)
+string NVarcharLength(const string &sql_type_name, int16_t max_length) {
+	if (max_length == -1) {
+		return "MAX";
+	}
+	if (LegacyLobKind(sql_type_name) != LegacyLob::None) {
+		return "MAX";  // TEXT/NTEXT -> NVARCHAR(MAX); their max_length of 16 is the pointer size
+	}
+	if (max_length > 4000) {
+		return "MAX";  // varchar(4001..8000) -> NVARCHAR(MAX); NVARCHAR(4000) would truncate
+	}
+	return std::to_string(max_length);
+}
+
+}  // namespace
+
+string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
+											const string &collation_name, bool convert_varchar_max,
+											const string &qualifier) {
+	const string escaped_name = "[" + mssql::FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
+	const string reference = qualifier + escaped_name;
+
+	if (IsSpatialType(sql_type_name)) {
+		return reference + ".STAsBinary() AS " + escaped_name;
+	}
+
+	const LegacyLob lob_kind = LegacyLobKind(sql_type_name);
+	if (lob_kind == LegacyLob::NText) {
+		return "CAST(" + reference + " AS NVARCHAR(MAX)) AS " + escaped_name;
+	}
+	if (lob_kind == LegacyLob::Image) {
+		return "CAST(" + reference + " AS VARBINARY(MAX)) AS " + escaped_name;
+	}
+
+	// Unsupported SQL Server types (hierarchyid, sql_variant, CLR UDTs) must be
+	// CAST to NVARCHAR(MAX) so the server sends text instead of a native wire
+	// form nothing decodes.
+	if (!IsKnownSQLServerType(sql_type_name)) {
+		return "CAST(" + reference + " AS NVARCHAR(MAX)) AS " + escaped_name;
+	}
+
+	if (NeedsNVarcharConversion(sql_type_name, max_length, collation_name, convert_varchar_max)) {
+		return "CAST(" + reference + " AS NVARCHAR(" + NVarcharLength(sql_type_name, max_length) + ")) AS " +
+			   escaped_name;
+	}
+
+	// Nothing to rewrite. Unqualified this is just the column; qualified it needs
+	// the alias, or the result would come back named after the qualifier's table.
+	return qualifier.empty() ? escaped_name : reference + " AS " + escaped_name;
 }
 
 }  // namespace duckdb

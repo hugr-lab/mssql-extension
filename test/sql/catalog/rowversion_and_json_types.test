@@ -170,6 +170,13 @@ SELECT count(*) FROM rvt.dbo.RowVersionTypes WHERE id = 200;
 ----
 1
 
+# Which error the user sees here is not a race, though it looks like one: bind
+# admits the (BLOB -> timestamp) pair for the all-NULL case only, so the
+# encoder carries a per-chunk mismatch check for it too. That check cannot win.
+# BulkLoadSession::Write opens the stream before it encodes anything, and
+# OpenStream runs the `INSERT BULK` statement synchronously — the server
+# rejects the column list and throws there, one call above WriteRows. Measured
+# 20/20 as well as read off the code.
 statement error
 COPY (SELECT 201 AS id, '\x01\x02'::BLOB AS rv, 'x' AS note) TO 'mssql://rvt/dbo/RowVersionTypes' (FORMAT 'bcp', CREATE_TABLE false);
 ----

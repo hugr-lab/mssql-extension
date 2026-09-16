@@ -40,28 +40,22 @@ void MSSQLInsertStatement::InitializeCache() const {
 				output_cols += ", ";
 			}
 			const auto &col = target_.columns[target_.returning_column_indices[i]];
-			const string escaped = MSSQLValueSerializer::EscapeIdentifier(col.name);
 			// The OUTPUT list carries EVERY column of the table, not the ones the
 			// user named: DuckDB's RETURNING projection sits above this operator
 			// and expects the table's full width. So a single column the result
-			// stream cannot decode used to fail the whole statement, even for an
+			// stream cannot decode fails the whole statement, even for an
 			// `INSERT … RETURNING id` that never mentioned it — measured, a table
 			// with a geometry column answered
-			// `COLMETADATA parse error: Unsupported SQL Server type: UDT`.
+			// `COLMETADATA parse error: Unsupported SQL Server type: UDT`, and a
+			// `text` column with a value in it answered
+			// `Unsupported type in RowReader: TEXT`.
 			//
-			// The read path already solved this for the same columns, and OUTPUT
-			// accepts the same expressions: a method call for the spatial UDTs,
-			// whose bytes then arrive as the OGC WKB a DuckDB GEOMETRY wants, and
-			// a CAST to NVARCHAR(MAX) for the types with no decodable wire form
-			// (sql_variant, hierarchyid, a CLR UDT). Both were tried against the
-			// server before this was written.
-			if (MSSQLColumnInfo::IsSpatialType(col.mssql_type)) {
-				output_cols += "INSERTED." + escaped + ".STAsBinary() AS " + escaped;
-			} else if (!MSSQLColumnInfo::IsKnownSQLServerType(col.mssql_type)) {
-				output_cols += "CAST(INSERTED." + escaped + " AS NVARCHAR(MAX)) AS " + escaped;
-			} else {
-				output_cols += "INSERTED." + escaped;
-			}
+			// The read path solved this for the same columns, so this is built by
+			// the read path's own function with `INSERTED.` as the qualifier —
+			// not by a copy of it. The copy is how the `text` case survived the
+			// first fix: it carried two of the four rewrites.
+			output_cols += MSSQLColumnInfo::BuildReadExpression(col.name, col.mssql_type, col.max_length, col.collation,
+																target_.convert_varchar_max, "INSERTED.");
 		}
 		cached_output_clause_ = "OUTPUT " + output_cols;
 	}

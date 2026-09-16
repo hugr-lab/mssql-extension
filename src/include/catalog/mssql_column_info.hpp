@@ -81,6 +81,39 @@ struct MSSQLColumnInfo {
 
 	// Check if type is Unicode (NVARCHAR, NCHAR, NTEXT)
 	static bool IsUnicodeType(const string &sql_type_name);
+
+	//! The T-SQL expression that reads this column so its bytes are decodable.
+	//!
+	//! Four rewrites, and the point of having ONE function for them is that two
+	//! lists need them and used to carry different subsets. The table scan's
+	//! SELECT list is one; the other is the `OUTPUT INSERTED` list of an
+	//! `INSERT … RETURNING`, which carries every column of the table because
+	//! DuckDB's RETURNING projection sits above the operator and expects the
+	//! table's full width — so one undecodable column fails a statement that
+	//! never mentioned it. When OUTPUT copied only two of the four, a `text`
+	//! value still failed the whole INSERT with `Unsupported type in RowReader:
+	//! TEXT` while the very same column read fine through a SELECT.
+	//!
+	//!   - spatial UDTs -> `.STAsBinary()`, so the wire carries OGC WKB rather
+	//!     than SQL Server's own Spatial Type Binary Format;
+	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: no codec
+	//!     handles their wire tokens;
+	//!   - a type with no decodable wire form at all (sql_variant, hierarchyid,
+	//!     a CLR UDT) -> `NVARCHAR(MAX)`;
+	//!   - a non-UTF-8 CHAR/VARCHAR/TEXT -> `NVARCHAR(n)`, because a DuckDB
+	//!     VARCHAR is UTF-8 by contract.
+	//!
+	//! Every flag it needs is a pure function of the type name and the
+	//! collation, which is why it takes those rather than an MSSQLColumnInfo:
+	//! the INSERT path holds an MSSQLInsertColumn and would otherwise have to
+	//! grow a copy of this logic, which is exactly what went wrong.
+	//!
+	//! @param qualifier prefix for the column REFERENCE, e.g. `"INSERTED."`.
+	//!                  The alias is never qualified, so the result always comes
+	//!                  back under the column's own name.
+	static string BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
+									  const string &collation_name, bool convert_varchar_max,
+									  const string &qualifier = "");
 };
 
 }  // namespace duckdb
