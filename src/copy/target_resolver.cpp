@@ -1085,7 +1085,12 @@ namespace {
 //! (#352) is not merged yet; fold this into it on the rebase.
 bool BulkWireCanCarry(const string &type_name) {
 	const string lower = StringUtil::Lower(type_name);
-	if (lower == "geometry" || lower == "geography") {
+	// Spelled out, NOT derived from IsKnownSQLServerType, for the two that the
+	// predicate's answer is about to change under: #296 teaches it `timestamp`
+	// and `rowversion` so those columns become READABLE, which would silently
+	// re-admit them here on the merge and put error 273 back mid-stream.
+	// Readable and writable are different questions for these types.
+	if (lower == "geometry" || lower == "geography" || lower == "timestamp" || lower == "rowversion") {
 		return false;
 	}
 	return MSSQLColumnInfo::IsKnownSQLServerType(type_name);
