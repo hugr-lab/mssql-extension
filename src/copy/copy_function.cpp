@@ -415,10 +415,12 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 
-				// Columns whose pair bind admitted for the all-NULL case only
-				// (constant `NULL AS col` sources — see BCPCopyConfig): mark the
+				// Columns whose pair bind admitted for the all-NULL case only —
+				// TYPED sources; see BCPCopyConfig::null_only_columns. Mark the
 				// target metadata so PrepareColumnStates verifies the mask per
-				// chunk and routes them through the NullOnly path.
+				// chunk and routes them through the NullOnly path. A bare
+				// `NULL AS col` is a different case, decided below by its
+				// SQLNULL source type.
 				for (const auto &nn : bdata.config.null_only_columns) {
 					for (auto &col : gstate->columns) {
 						if (StringUtil::Lower(col.name) == nn) {
@@ -554,9 +556,11 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			throw InvalidInputException(
 				"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
 				"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
-				"Use INSERT for this table, or leave the column out of the source (a constant "
-				"`NULL AS %s` is accepted and leaves it NULL).",
-				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name, col.name);
+				"Use INSERT for this table, or leave the column out of the source. A literal, "
+				"uncast `NULL AS %s` is also accepted and leaves the column NULL — but a TYPED "
+				"null is not: `CAST(NULL AS VARCHAR) AS %s`, or an all-NULL column read from a "
+				"table or a file, carries a type and lands here with everything else.",
+				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name, col.name, col.name);
 		}
 
 		// Nothing left to load. Deliberately outside the try, per the note above:

@@ -93,6 +93,15 @@ SELECT * FROM mssql_scan('udtc', 'SELECT id, n, CASE WHEN g IS NULL AND h IS NUL
 ----
 3	9	1
 
+# --- a TYPED null is NOT the same thing and is refused, which is what the
+# message now says out loud. `CAST(NULL AS VARCHAR)` carries a type, so bind
+# cannot know the column stays empty, and admitting it would be the partial-load
+# trade again.
+statement error
+COPY (SELECT 4 AS id, CAST(NULL AS VARCHAR) AS h, 9 AS n) TO 'mssql://udtc/dbo/UdtCopyTgt' (FORMAT 'bcp', CREATE_TABLE false);
+----
+a TYPED null is not
+
 # --- a TYPED source whose values only appear after a chunk boundary is refused
 # at init, and nothing lands. 10000 rows crosses DuckDB's 2048-row vector many
 # times over, so the first value is far from the first chunk; if the refusal

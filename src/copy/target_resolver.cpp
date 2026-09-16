@@ -856,12 +856,17 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		matched_columns++;
 		const string &target_type_name = it->second.first;
 
-		// An incompatible pair is NOT a bind error: a constant `NULL AS col` in
-		// the source — the ordinary way to fill a column — reaches bind already
-		// typed (DuckDB gives a bare NULL a concrete type first), so it cannot
-		// be told apart from real data here. The pair is admitted for the
-		// all-NULL case only; the encoder checks the mask per chunk and raises
-		// the same type-mismatch error the moment a value shows up.
+		// An incompatible pair is NOT a bind error: an entirely-NULL source is the
+		// ordinary way to fill a column and bind cannot see the values. The pair
+		// is admitted for the all-NULL case only; the encoder checks the mask per
+		// chunk and raises the same type-mismatch error the moment a value shows
+		// up.
+		//
+		// What this does NOT cover is a bare `NULL AS col`, which DuckDB types
+		// SQLNULL and keeps that way to here — measured, against the earlier
+		// claim that a constant NULL "cannot be told apart from real data here".
+		// BCPCopyInitGlobal uses that to drop a column the bulk wire cannot carry
+		// when, and only when, its source can hold no value at all.
 		bool compatible = IsTypeCompatible(source_types[i], target_type_name);
 		if (!compatible) {
 			DebugLog(2, "ValidateExistingTableSchema: column '%s' pair (%s -> %s) admitted for all-NULL only",

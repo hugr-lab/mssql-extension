@@ -117,10 +117,15 @@ struct BCPColumnMetadata {
 	string collation_name;
 
 	// The matched source column's type is incompatible with this target column,
-	// and bind admitted the pair for the all-NULL case only (a constant NULL
-	// source arrives typed — see BCPCopyConfig::null_only_columns). The encoder
-	// verifies the mask per chunk and routes the column through the
-	// missing-column NullOnly path; a value in it is the type-mismatch error.
+	// and bind admitted the pair for the all-NULL case only — see
+	// BCPCopyConfig::null_only_columns. The encoder verifies the mask per chunk
+	// and routes the column through the missing-column NullOnly path; a value in
+	// it is the type-mismatch error.
+	//
+	// This is NOT the test for "the source is a constant NULL": it is set for any
+	// typed source whose pair bind could not check. The constant-NULL test is the
+	// source type being SQLNULL, and BCPCopyInitGlobal says why the difference
+	// matters.
 	bool null_only_source = false;
 
 	// The target column's SQL Server type name, as sys.columns reports it. Kept
