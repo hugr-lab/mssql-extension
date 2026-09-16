@@ -108,6 +108,36 @@ SELECT c FROM mssql_scan('sk75', 'SELECT count(*) AS c FROM dbo.sk75_ins');
 ----
 2500
 
+# --- the sink's catalog spelled in another case
+#
+# The scan side is keyed by the attached catalog's own name; a COPY's is
+# MSSQLCopyBindData::catalog_name, taken verbatim from the URI's first path
+# segment. DuckDB resolves catalog names case-insensitively, so this URI is a
+# legal way to write into the same catalog -- and matching the two sides with a
+# case-SENSITIVE set found no sink, skipped the materialization, and put #239
+# back with no diagnostic:
+#
+#   Invalid Input Error: MSSQL COPY: Connection is busy executing another query
+#
+# Reproduced on a build without the fix; this is the assertion that keeps it
+# fixed.
+statement ok
+SELECT mssql_exec('sk75', 'TRUNCATE TABLE dbo.sk75_copy');
+
+statement ok
+BEGIN;
+
+statement ok
+COPY (SELECT id, v FROM sk75.dbo.sk75_src) TO 'mssql://SK75/dbo/sk75_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM sk75.dbo.sk75_copy;
+----
+5000
+
 statement ok
 SELECT mssql_exec('sk75', 'DROP TABLE dbo.sk75_src; DROP TABLE dbo.sk75_copy; DROP TABLE dbo.sk75_ins');
 
